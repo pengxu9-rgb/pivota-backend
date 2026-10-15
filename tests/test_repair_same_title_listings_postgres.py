@@ -469,3 +469,55 @@ async def test_a_base_with_a_live_sibling_waits_for_the_sibling_market_then_ever
     live = {r["offer_id"] for r in await admin.fetch(
         "SELECT offer_id FROM catalog_offers WHERE product_key = $1 AND suppressed_at IS NULL", K_ALIAS)}
     assert live == {"o_al_apex", "o_al_v_apex", "o_al_v2_www", "o_al_sg", au_apex}
+
+
+K_SIB = "ext:store-brand-glow-set::99999999"
+SIB_KEPT = "https://store.example/products/glow-set"
+SIB_LEFT = "https://store.example/products/glow-set-refill"
+
+
+async def test_a_left_out_base_with_a_live_sibling_waits_for_the_sibling_market_then_every_left_out_offer_goes(
+        catalog):
+    """The same one-way rule on the same-title half: a US offer of a left-out listing whose AU Shopify Markets
+    sibling is live holds the group whole; AU runs first, then US, and every left-out listing's offer ends
+    suppressed in both markets while the kept listing's offers stay live."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    db, admin, tool, _ = catalog
+    await _product(admin, K_SIB, SIB_KEPT, SIB_KEPT + ".jpg")
+    await _offer(admin, "o_sib_kept", K_SIB, SIB_KEPT)
+    await _offer(admin, "o_sib_left", K_SIB, SIB_LEFT)
+    await _offer(admin, "o_sib_v_left", K_SIB, SIB_LEFT)
+    await _seed(admin, "s_sib_kept", K_SIB, SIB_KEPT)
+    await _seed(admin, "s_sib_left", K_SIB, SIB_LEFT)
+    # AU siblings, as shopify_markets writes them: the base's SKU and source_ref
+    au = {b: sibling_offer_id(b, "AU") for b in ("o_sib_kept", "o_sib_left", "o_sib_v_left")}
+    for b, url in (("o_sib_kept", SIB_KEPT), ("o_sib_left", SIB_LEFT), ("o_sib_v_left", SIB_LEFT)):
+        await _offer(admin, au[b], K_SIB, url, market="AU")
+    await admin.execute("UPDATE catalog_offers SET sku_key = $1 WHERE offer_id = ANY($2)", K_SIB + "::v:1",
+                        ["o_sib_v_left", au["o_sib_v_left"]])
+    before = await _state(admin)
+
+    [us] = (await tool.plan(db, hosts=[], keys=[K_SIB]))["groups"]
+    assert us["keeper"] == "glow-set" and us["skipped"] == "sibling_market_listing_live"
+    assert us["stranded_siblings"] == sorted([au["o_sib_left"], au["o_sib_v_left"]])
+    with pytest.raises(SystemExit, match="nothing to repair"):
+        await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB]))
+    assert await _state(admin) == before
+
+    [g] = (await tool.plan(db, hosts=[], keys=[K_SIB], market="AU"))["groups"]
+    assert (g["skipped"], sorted(g["suppress"]), g["deactivate"]) == (
+        None, sorted([au["o_sib_left"], au["o_sib_v_left"]]), [])
+    await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB], market="AU"))
+    [g] = (await tool.plan(db, hosts=[], keys=[K_SIB]))["groups"]
+    assert (g["skipped"], g["suppress"], g["deactivate"]) == (None, ["o_sib_left", "o_sib_v_left"], ["s_sib_left"])
+    await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB]))
+
+    rows = await admin.fetch("SELECT offer_id, source_ref, suppressed_at, suppression_reason FROM catalog_offers "
+                             "WHERE product_key = $1", K_SIB)
+    assert {r["offer_id"] for r in rows if r["suppressed_at"] is None} == {"o_sib_kept", au["o_sib_kept"]}
+    left = [r for r in rows if r["source_ref"] == SIB_LEFT]
+    assert len(left) == 4 and {r["suppression_reason"] for r in left} == {"same_key_other_listing"}
+    seeds = {r["id"]: r["status"] for r in await admin.fetch(
+        "SELECT id, status FROM external_product_seeds WHERE attached_product_key = $1", K_SIB)}
+    assert seeds == {"s_sib_kept": "active", "s_sib_left": "inactive"}

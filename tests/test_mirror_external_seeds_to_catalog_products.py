@@ -103,6 +103,91 @@ def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
     assert "ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING" in source
 
 
+@pytest.mark.parametrize("row,expected", [
+    ({"domain": " WWW.Brand.com ", "destination_url": "https://other.example/products/a"}, "www.brand.com"),
+    ({"domain": None, "destination_url": "https://www.Brand-Two.com/products/x?v=1"}, "www.brand-two.com"),
+    ({"domain": "", "destination_url": None, "canonical_url": "https://three.example/products/y"}, "three.example"),
+    # canonical BEFORE destination: the page the cart-link loader reads the seed's proofs from
+    ({"domain": None, "canonical_url": "https://canon.example/p", "destination_url": "https://dest.example/p"},
+     "canon.example"),
+    # a junk domain is skipped, never written, and never shadows a good page host
+    ({"domain": "N/A", "canonical_url": "https://canon.example/p"}, "canon.example"),
+    ({"domain": "unknown", "destination_url": "https://dest.example/p"}, "dest.example"),
+    ({"domain": "a b.com", "destination_url": "https://dest.example/p"}, "dest.example"),
+    ({"domain": "brand.com.", "destination_url": None}, "brand.com"),
+    ({"domain": "localhost", "destination_url": None, "canonical_url": None}, None),
+    ({"domain": "N/A", "canonical_url": "not a url", "destination_url": ""}, None),
+    ({}, None),
+])
+def test_mirror_source_domain_is_the_seed_host_as_spelled(row, expected) -> None:
+    """The row's source_domain is the first PLAUSIBLE host of the seed's domain, canonical_url,
+    destination_url, EXACTLY as spelled (`www.` kept, lower case) -- the mirror offer writer's order
+    and gate, and scripts/backfill_catalog_source_domain.py's mirror rule."""
+    assert mirror_module._source_domain_for_row(row) == expected
+
+
+class _MirrorApplyDb:
+    """`database` for one `_apply` pass: the candidate read answers ONE seed row; the catalog_products
+    INSERT is recorded and answers its product_key; every other read answers nothing."""
+
+    def __init__(self, seed_row):
+        self.seed_row = seed_row
+        self.product_inserts = []
+
+    async def fetch_all(self, query, values=None):
+        return [dict(self.seed_row)] if "FROM missing" in query else []
+
+    async def fetch_one(self, query, values=None):
+        if "INSERT INTO catalog_products" in query:
+            self.product_inserts.append(dict(values or {}))
+            return {"product_key": (values or {}).get("product_key")}
+        return None
+
+    async def fetch_val(self, query, values=None):
+        return None
+
+    async def execute(self, query, values=None):
+        return None
+
+
+@pytest.mark.parametrize("seed_fields,expected", [
+    ({"domain": "www.Brand.com", "canonical_url": "https://www.brand.com/products/a"}, "www.brand.com"),
+    ({"domain": "N/A", "canonical_url": "https://brand.com/products/a",
+      "destination_url": "https://other.example/products/a"}, "brand.com"),
+    ({"domain": None, "canonical_url": None, "destination_url": None}, None),
+])
+async def test_mirror_apply_writes_the_seed_host_into_source_domain(monkeypatch, seed_fields, expected) -> None:
+    """BEHAVIOURAL: one real `_apply` pass. Before 2026-10-14 the INSERT omitted source_domain, leaving
+    2,927 live mirror rows NULL: the cart-link lane finds a product by its source_domain."""
+    seed_row = {
+        "id": "seed_apply_1", "external_product_id": "ext_apply_1", "attached_product_key": None,
+        "market": "US", "tool": "*", "title": "Hydrating Serum", "price_amount": 20, "price_currency": "USD",
+        "availability": "in_stock", "image_url": None, "seed_data": {"snapshot": {"brand": "Brand"}},
+        "updated_at": None, "duplicate_count": 1, "rn": 1, "mirrored_description": "A serum.",
+        "mirrored_brand": "Brand", "mirrored_product_type": "Serum", "mirrored_category": "skincare",
+        "domain": None, "canonical_url": None, "destination_url": None,
+        **seed_fields,
+    }
+    fake = _MirrorApplyDb(seed_row)
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _seller(**kwargs):
+        return "merch_obs_apply"
+
+    import services.product_group_autogrouper as autogrouper
+    monkeypatch.setattr(mirror_module, "database", fake)
+    monkeypatch.setattr(mirror_module, "ensure_observed_seller", _seller)
+    monkeypatch.setattr(autogrouper, "ensure_singleton_group_membership", _noop)
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_sku_for_mirror_row", _noop)
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_offer_for_mirror_row", _noop)
+    monkeypatch.setattr(mirror_module, "backlink_seed_to_product", _noop)
+    monkeypatch.setattr(mirror_module, "_make_servable_enabled", lambda: False)
+    await mirror_module._apply(limit=1)
+    assert [row["source_domain"] for row in fake.product_inserts] == [expected]
+
+
 def test_mirror_insert_classifies_category_path() -> None:
     # A lip gloss resolves to the Lip Gloss subtype, not the Lipstick catch-all:
     # the classifier grew dedicated lip subtype patterns ahead of Lipstick.

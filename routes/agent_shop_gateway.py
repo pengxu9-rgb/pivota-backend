@@ -40,6 +40,12 @@ from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
+    LIVE_VERIFICATION_KEY,
+    LIVE_VERIFICATION_REQUIRED,
+    STOCK_DECLINE_KEY,
+    STOCK_OUT_OF_STOCK,
+    VARIANT_DECLINE_KEY,
+    VARIANT_NOT_NAMED,
     could_upgrade_at_click_time,
 )
 import db.merchant_purchasability as merchant_purchasability
@@ -64,6 +70,7 @@ from services.test_merchant_policy import (
     get_excluded_merchant_ids,
     filter_out_test_merchants,
 )
+from services import market_registry
 from services.external_seed_stock import seed_stock, seed_variant_stock_fields
 from services.external_seed_search import (
     SEED_SERVING_CURRENCY_CLAUSE,
@@ -98,6 +105,7 @@ from services.outbound_links_service import (
     apply_utm,
     append_referral_click_param,
     append_shopify_cart_click_attribute,
+    append_shopify_cart_country,
     extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
@@ -117,9 +125,15 @@ from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
     canonical_variant_id,
+    entry_is_the_sole_variant_read_again,
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
+    namers_agree_on_price,
+    stored_entry_answers_to,
+    stored_entry_claimed_variant_ids,
+    stored_entry_variant_ids,
+    url_named_variant_id,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -3098,8 +3112,61 @@ class OffersResolvePayload(BaseModel):
         alias="commerceSurface",
         description="Serving surface eligibility policy (agent_api | ucp | acp)",
     )
+    # OPT-IN, for a caller that verifies offers live with the merchant before serving them (the
+    # gateway's get_offers under UCP_LIVE_OFFER_READ=enforce). A seed gated ONLY for freshness is then
+    # returned flagged `requires_live_verification` instead of dropped. Absent: unchanged.
+    include_live_verification_offers: bool = Field(
+        False,
+        alias="includeLiveVerificationOffers",
+        description="Return freshness-gated seed offers flagged requires_live_verification",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+#: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
+#: gated for these alone may be returned to an opted-in caller that re-reads it live; any other
+#: reason (locale/market or currency mismatch, zero variants) still drops it.
+_FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS = frozenset(
+    {"stale_snapshot", "destination_stale", "destination_never_verified"}
+)
+
+
+def _live_lookup_variant_id(entry: Any) -> Optional[str]:
+    """The ONE merchant variant id a stored seed entry CLAIMS (variant_id, variantId, id,
+    shopify_variant_id, source_variant_id -- a JSON-LD @id's `?variant=N` included -- plus its own
+    `url`'s `variant=`), or None when it claims none or several. Never `sku`: on this corpus an
+    8+-digit sku is routinely a barcode, which would either name a wrong id or make a real one
+    ambiguous (review of #2629)."""
+    if not isinstance(entry, dict):
+        return None
+    ids = set(stored_entry_claimed_variant_ids(entry))
+    named = url_named_variant_id(entry.get("url"))
+    if named:
+        ids.add(named)
+    ids = sorted(i for i in ids if i.isdigit())
+    return ids[0] if len(ids) == 1 else None
+
+
+def _stale_variant_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A flagged offer's variant options with nothing the stale read says claimed: no `in_stock`, and
+    each stated price marked `price_stale`."""
+    out = []
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        clean = {k: v for k, v in opt.items() if k != "in_stock"}
+        if "price" in clean:
+            clean["price_stale"] = True
+        out.append(clean)
+    return out
+
+
+def _live_verification_returned_of(offers: List[Dict[str, Any]]) -> Dict[str, int]:
+    """What an opted-in caller actually receives: flagged offers in the FINAL list, and their seeds."""
+    flagged = [o for o in offers or [] if isinstance(o, dict) and o.get("requires_live_verification")]
+    seeds = {((o.get("source") or {}).get("seed_id")) for o in flagged}
+    return {"seeds": len({s for s in seeds if s}), "offers": len(flagged)}
 
 
 def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3162,7 +3229,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
             product[key] = payload.get(key)
 
     normalized: Dict[str, Any] = {"product": product}
-    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface"):
+    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
+                "include_live_verification_offers", "includeLiveVerificationOffers"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -3462,6 +3530,73 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
         or ""
     )
     return str(raw).strip()
+
+
+def _representative_seed_variant(
+    variants: List[Dict[str, Any]], row: Dict[str, Any], seed_data: Dict[str, Any], stock: Any
+) -> Optional[Dict[str, Any]]:
+    """The variant a seller listing's single offer stands for: the variant the seed is attached
+    to while it is in stock, else the first one the seed's stock rule calls in stock, else the
+    attached one, else the first. None for a listing with no stored variants (its offer is
+    product-level, as before).
+
+    The attached variant is found as `_attached_variant_is_this_offer` finds it: the ONE shared
+    reader (`stored_entry_answers_to`, #2627 -- every identity key canonically, and the `variant=` a
+    JSON-LD `@id` names), and only while the entries naming it agree on its price
+    (`namers_agree_on_price`): entries naming one variant at $19 and $29 name neither. Whether
+    that entry's offer may then carry the attached cart is still that rule's decision, made per
+    offer in `_external_seed_redirect_identity`; this only chooses which variant the listing's
+    one offer is. A sold-out attached variant does not make an in-stock listing look sold out."""
+    if not variants:
+        return None
+    attached = canonical_variant_id(
+        str(row.get("attached_variant_id") or seed_data.get("attached_variant_id") or "").strip()
+    )
+    attached_entry = None
+    if attached:
+        answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, attached)]
+        if answering and namers_agree_on_price(variants, attached):
+            attached_entry = answering[0]
+
+    def _in_stock(v: Dict[str, Any]) -> bool:
+        return seed_variant_stock_fields(v.get("availability"), stock).get("in_stock") is True
+
+    if attached_entry is not None and _in_stock(attached_entry):
+        return attached_entry
+    for v in variants:
+        if _in_stock(v):
+            return v
+    return attached_entry if attached_entry is not None else variants[0]
+
+
+# The most variants one offer lists (a foundation range can run past 50 shades).
+_MAX_VARIANT_OPTIONS = 60
+
+
+def _seed_variant_options_summary(
+    variants: List[Dict[str, Any]], stock: Any, *, fallback_currency: Optional[str]
+) -> List[Dict[str, Any]]:
+    """One listing's options as an agent chooses among them: id, label, price, stock. No links:
+    a link is minted only for the variant a caller names (`product.sku_id`), so this list costs
+    no clicks and records no issued links (ADR-025). At most `_MAX_VARIANT_OPTIONS` entries; the
+    offer's `variant_count` says how many there are."""
+    out: List[Dict[str, Any]] = []
+    for v in variants:
+        if len(out) >= _MAX_VARIANT_OPTIONS:
+            break
+        vid = _seed_offer_variant_id(v)
+        if not vid:
+            continue
+        amount, currency = _extract_price_currency_from_variant(v, fallback_currency=fallback_currency)
+        entry: Dict[str, Any] = {"variant_id": vid, "title": v.get("title") or None}
+        if amount is not None:
+            entry["price"] = amount
+            entry["currency"] = currency
+        in_stock = seed_variant_stock_fields(v.get("availability"), stock).get("in_stock")
+        if in_stock is not None:
+            entry["in_stock"] = in_stock
+        out.append(entry)
+    return out
 
 
 def _seed_variant_identity_claim(v: Dict[str, Any]) -> str:
@@ -4538,6 +4673,12 @@ async def _handle_offers_resolve(
     _preflight_stats: Dict[str, int] = {"candidates": 0, "gated": 0, "cart_prefilled": 0,
                                         "asked": 0, "memo_hits": 0, "skipped_by_budget": 0,
                                         "degraded_to_referral": 0}
+    # Carts withheld because the offer's OWN stock claim is out of stock. Its own counter, not a
+    # `_preflight_stats` key: the preflight coverage fields are computed from that dict.
+    _stock_stats: Dict[str, int] = {"declined": 0}
+    # Named-variant carts withheld as another variant's (`_cart_is_the_named_offer`). Same reason
+    # for its own dict.
+    _variant_stats: Dict[str, int] = {"declined": 0}
     # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
     # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
     # per call would re-ask for product keys the previous call already loaded. It holds only a
@@ -4547,6 +4688,13 @@ async def _handle_offers_resolve(
     # and its dial is read once. Keyed on the REQUEST's market (`market_hint`), never a row's —
     # the same provenance `market_observed` below is decided by.
     _cart_purchasability = _CartPurchasabilityGate(market_hint)
+    # THE BUYER'S CURRENCY, at the source as well as before the final cut (see
+    # `_offers_in_buyer_currency`): the seed lane stops at `limit`, so a foreign-currency seed
+    # offer that is only filtered afterwards has already taken a slot from one in the buyer's
+    # currency -- and has had a link minted for it. None when no market is declared.
+    _buyer_currency = _declared_buyer_currency(market_hint)
+    _buyer_currency_dropped: Dict[str, int] = {}
+    _live_verification_opt_in = bool(getattr(payload, "include_live_verification_offers", False))
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -4576,7 +4724,19 @@ async def _handle_offers_resolve(
                 )
                 continue
             live_verification_reasons = external_referral_live_verification_reasons(gate_status)
-            if live_verification_reasons:
+            # An OPTED-IN caller re-reads the offer live before serving it, so a seed gated only for
+            # freshness is returned to it flagged -- no cart, no stock claim, its stored price
+            # marked stale -- instead of dropped. ~45% of active US seeds fail a 7-day clock
+            # (census 2026-10-15); a multi-variant seed can never pass `stale_snapshot` from a page
+            # read, which lists one offer. Every other caller, and every other reason, unchanged.
+            requires_live_verification: Optional[List[str]] = None
+            if (
+                live_verification_reasons
+                and _live_verification_opt_in
+                and set(live_verification_reasons) <= _FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS
+            ):
+                requires_live_verification = list(live_verification_reasons)
+            elif live_verification_reasons:
                 # Recall can return a referral-only card, but offer resolution
                 # cannot synthesize commerce facts before a live merchant check.
                 mapping_candidates.append(
@@ -4600,11 +4760,6 @@ async def _handle_offers_resolve(
                     vid = _seed_offer_variant_id(v)
                     if vid and vid == sku_id:
                         matched_variants.append(v)
-            else:
-                matched_variants = variants[: min(12, max(1, limit))]
-
-            if not matched_variants:
-                matched_variants = [{}]
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
             canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
@@ -4627,6 +4782,38 @@ async def _handle_offers_resolve(
             # offer. It also read anything outside three spellings ("unknown", "Out of stock",
             # schema.org URLs) as in stock.
             _seed_stock = seed_stock(row_dict, seed_data)
+
+            # ONE OFFER PER SELLER LISTING when the caller names no variant. This op compares
+            # SELLERS; a listing's shades and sizes are one seller's options, not competing
+            # offers. It used to fan out `variants[:min(12, limit)]`, so a single-seller blush
+            # came back as five "offers" -- five shades of rarebeauty.com -- and the gateway's
+            # `best_offer` was whichever shade happened to be first (live 2026-10-14). The one
+            # offer carries the seed's own variant (`_representative_seed_variant`) for its cart
+            # link, and every variant as `variants` so the agent can see the options and name one
+            # (`product.sku_id`) for its link. A named variant still gets exactly that variant.
+            variant_options: Optional[List[Dict[str, Any]]] = None
+            variant_count = 0
+            if not sku_id:
+                representative = _representative_seed_variant(variants, row_dict, seed_data, _seed_stock)
+                matched_variants = [representative] if representative is not None else []
+                if len(variants) > 1:
+                    variant_count = sum(1 for v in variants if _seed_offer_variant_id(v))
+                    variant_options = _seed_variant_options_summary(
+                        variants,
+                        _seed_stock,
+                        fallback_currency=_observed_currency(
+                            row_dict.get("price_currency"), seed_data.get("price_currency")
+                        ),
+                    )
+
+            # WHAT A NAMED VARIANT GOT. `exact`: the caller's sku_id is one of this listing's stored variants,
+            # so the offer IS that variant (with or without a cart). `fallback`: it is not, and the offer below
+            # is the listing at its row price, selling no particular variant. The gateway keeps only `exact`
+            # offers for a named variant (PIVOTA-Agent #2438); without this it could only trust a cart, and a
+            # sold-out, non-Shopify or referral-only seller of the variant has none.
+            variant_match = ("exact" if matched_variants else "fallback") if sku_id else None
+            if not matched_variants:
+                matched_variants = [{}]
 
             # ONCE per seed, not once per variant. This is an agent-facing
             # resolve path and matched_variants can be long; a lookup inside
@@ -4692,6 +4879,10 @@ async def _handle_offers_resolve(
                 )
                 if price_amount is None:
                     price_amount = _coerce_float(row_dict.get("price_amount") or seed_data.get("price_amount") or 0) or 0.0
+                if _buyer_currency and str(currency or "").strip().upper() != _buyer_currency:
+                    _dropped_key = str(currency or "").strip().upper() or "none"
+                    _buyer_currency_dropped[_dropped_key] = _buyer_currency_dropped.get(_dropped_key, 0) + 1
+                    continue
 
                 # The variant's own signal only while the fresh column does not contradict the
                 # stored variants; otherwise the seed's claim. None = unknown, and an unknown
@@ -4722,7 +4913,31 @@ async def _handle_offers_resolve(
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                     handover=_handover,
+                    # THE ENTRY ITSELF, so the attached-variant rule identifies this offer by
+                    # object, not by an id string two stored variants may share or both lack.
+                    offer_variant=v,
                 )
+                # A NAMED VARIANT'S CART IS ITS OWN, OR THERE IS NONE. Every cart source above
+                # can answer for the PRODUCT -- the operator's seed-wide `attached_variant_id`,
+                # a sole catalog row, a sole stamped snapshot entry -- and a name no stored entry
+                # backs reaches them as the `[{}]` fallback, i.e. as a product-grain offer with
+                # no id to refuse on. Adversarial review of #2622 (2026-10-14): `sku_id=...002`
+                # answered `cart_url=/cart/...000:1` beside `variant_match: exact`; #2623 closed
+                # the stored-sibling road, the fallback road stayed open. So, once, after all of
+                # them: with a variant named, the cart id must be one of THIS offer's own ids
+                # (`_named_offer_own_ids`), else the offer ships as a referral, signed so the
+                # warm lane cannot rebuild a cart at click time (its rebuild names no variant).
+                # The preflight below then asks about the cart we would hand over, not another
+                # variant's id. No variant named: untouched.
+                _variant_declined = bool(sku_id) and not _cart_is_the_named_offer(
+                    redirect_identity.get("cart_variant_id"),
+                    seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                )
+                if _variant_declined:
+                    _variant_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
                 # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
                 #
                 # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
@@ -4768,6 +4983,12 @@ async def _handle_offers_resolve(
                 # that ships prefilled carts today. The union restores it and keeps the
                 # widening.
                 _handover_id = _handover.variant_id if _handover is not None else None
+                if sku_id and not _cart_is_the_named_offer(
+                    _handover_id, seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                ):
+                    _handover_id = None
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -4794,7 +5015,9 @@ async def _handle_offers_resolve(
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
-                if _gate_vid and checkout_preflight.is_enabled():
+                # A FLAGGED offer gets no cart (below), so it is never a hand-over to preflight: asking
+                # would spend the shared budget a later fresh offer's cart needs (review of #2629).
+                if _gate_vid and not requires_live_verification and checkout_preflight.is_enabled():
                     _preflight_stats["gated"] += 1
                     _q = (str(canonical_url or destination_url), str(_gate_vid))
                     if _q in _preflight_memo:
@@ -4855,6 +5078,29 @@ async def _handle_offers_resolve(
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
+                # THE OFFER'S OWN STOCK — no cart for an item this same answer calls sold out.
+                # `in_stock` above is what this offer PUBLISHES; with no check here a seed whose
+                # fresh column said out_of_stock shipped `in_stock: false` beside a prefilled
+                # `cart_permalink` (prod 2026-10-14, tangleangel_gb_6826386948176, market GB):
+                # the preflight is shadow-only and the purchasability gate is about the merchant
+                # x market, so nothing between the two ever read the item's stock. Only an
+                # explicit False declines; unknown (None) keeps the cart, the asymmetry every
+                # serving gate here applies (`services/external_seed_stock`). A decline takes the
+                # purchasability road: null the cart id before the mint, so the mint, the
+                # published spec and `cart_prefilled` all follow from the one value, and sign it
+                # into the token so the warm lane cannot rebuild the cart at click time. It runs
+                # BEFORE the purchasability gate so a cart that will not be built never asks the
+                # fact table.
+                _stock_declined = in_stock is False and bool(redirect_identity.get("cart_variant_id"))
+                if _stock_declined:
+                    _stock_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                if requires_live_verification:
+                    # NOTHING the stale read says is claimed: no cart (a cart is a claim that this
+                    # variant is buyable at this price now), no stock flag. The caller verifies live.
+                    in_stock = None
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+
                 # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
                 # says cannot take their card in this market? Asked on the cart the mint WOULD
                 # build (the same `resolve_cart_permalink` it calls, on the same inputs), so a
@@ -4878,6 +5124,16 @@ async def _handle_offers_resolve(
                 # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
                 # builder minted its own, the agent's lane and the /r hop would be two different
                 # clicks and the order-side join would silently split.
+                # A NAMED VARIANT'S LINK NEVER BECOMES A GUESSED CART AT CLICK TIME. Whatever left
+                # it without a cart -- the guard above, no resolvable id for that variant (the common
+                # case), a preflight refusal, the stock or purchasability gate -- the warm lane would
+                # upgrade the PDP into a cart built from the product handle alone, i.e. for whichever
+                # variant the storefront picks (`resolve_warm_handoff` sends no variant and can send
+                # none). Review of this change found that road open for every cartless named offer,
+                # not only the ones the guard declined. Product-grain links (no `sku_id`) keep the
+                # lane: the buyer has not chosen, which is what it was built for.
+                _named_without_cart = bool(sku_id) and not redirect_identity.get("cart_variant_id")
+
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -4900,6 +5156,14 @@ async def _handle_offers_resolve(
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
+                        **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
+                        # Flagged offers: the warm lane must not build the cart the mint withheld.
+                        **(
+                            {LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED}
+                            if requires_live_verification
+                            else {}
+                        ),
+                        **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -4910,6 +5174,8 @@ async def _handle_offers_resolve(
                     seller_ref=redirect_identity["seller_ref"],
                     seed_kind=redirect_identity["seed_kind"],
                     issued_clicks=_issued_clicks,
+                    # The BUYER's market (the request's), never the row's listing market.
+                    cart_country=market_hint,
                 )
                 if not redirect_url:
                     continue
@@ -4941,6 +5207,9 @@ async def _handle_offers_resolve(
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
                     click_id=stable_click_id,
                     recovery_key=_recovery_key,
+                    # The SAME pin `_make_external_redirect_url` applied to the link it signed,
+                    # from the same two inputs, so the published cart is the signed destination.
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -4957,6 +5226,9 @@ async def _handle_offers_resolve(
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
+                    stock_declined=_stock_declined,
+                    live_verification_required=bool(requires_live_verification),
+                    variant_declined=_named_without_cart,
                 )
 
                 offer_spec = {
@@ -5142,11 +5414,42 @@ async def _handle_offers_resolve(
                         "execution_spec": offer_spec,
                         "internal_checkout_items": None,
                         "confidence": confidence,
+                        **(
+                            {
+                                "variant_count": variant_count,
+                                # A flagged offer's options are the same stale read: no stock claim,
+                                # prices marked stale (the caller's live read replaces what it reads).
+                                "variants": (
+                                    _stale_variant_options(variant_options)
+                                    if requires_live_verification
+                                    else variant_options
+                                ),
+                            }
+                            if variant_options
+                            else {}
+                        ),
+                        **(
+                            {
+                                "requires_live_verification": {
+                                    "reasons": requires_live_verification,
+                                    # The stored price is the last page read's, older than 7 days
+                                    # or never stamped: shown only after a live read confirms it.
+                                    "price_stale": True,
+                                    # The id the caller's live read looks up (the offer has no
+                                    # cart, so `execution_spec.variant_id` is null): the offer's
+                                    # own stored variant, when it names exactly one.
+                                    "lookup_variant_id": _live_lookup_variant_id(v),
+                                },
+                            }
+                            if requires_live_verification
+                            else {}
+                        ),
                         "source": {
                             "type": "external_seed",
                             "seed_id": seed_id,
                             "external_product_id": row_dict.get("external_product_id") or seed_data.get("external_product_id"),
                             "variant_id": vid,
+                            **({"variant_match": variant_match} if variant_match else {}),
                             "title": title,
                             "image_url": _seed_image_url(row_dict, seed_data),
                             "canonical_url": canonical_url,
@@ -5155,7 +5458,8 @@ async def _handle_offers_resolve(
                         },
                     }
                 )
-                if len(external_offers) >= limit:
+                # Only offers that need no live check fill the lane: a flagged one may yet be withheld.
+                if sum(1 for o in external_offers if not o.get("requires_live_verification")) >= limit:
                     return
 
     # 1) External offers from external seeds (affiliate outbound)
@@ -6232,9 +6536,34 @@ async def _handle_offers_resolve(
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
+    # FLAGGED OFFERS LAST. One flagged `requires_live_verification` is served only if the caller's live
+    # read verifies it, and not every store can be read: ahead of a fresh offer it could take the slot
+    # that fresh offer would have filled and leave the buyer nothing (review of #2629). Stable, so
+    # the merit order holds within each half.
+    offers = [o for o in offers if not o.get("requires_live_verification")] + [
+        o for o in offers if o.get("requires_live_verification")
+    ]
+    # THE BUYER'S CURRENCY, BEFORE THE CUT. With a declared market, an offer priced in another
+    # currency (a GBP or KRW seed, an SGD sibling) is not an offer this buyer can take at that
+    # price, and ranking compares raw amounts across currencies. Filtering after `limit` let
+    # foreign rows take the slots and left the buyer fewer offers than exist; the gateway filters
+    # its projection too (PIVOTA-Agent#2435) but can only see what survived this cut. An offer
+    # with no currency is withheld under a declared market, as the gateway does. No market
+    # declared: nothing changes. A market the registry does not list: nothing changes either --
+    # that is not this filter's question (see market_registry).
+    offers, buyer_currency_filtered = _offers_in_buyer_currency(offers, market_hint)
+    for _code, _n in _buyer_currency_dropped.items():
+        buyer_currency_filtered[_code] = buyer_currency_filtered.get(_code, 0) + _n
     # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
     # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
-    offers = _host_diverse_head(offers, limit)
+    # Fresh offers fill the head first; FLAGGED ones (served only if the caller's live read verifies
+    # them) only fill what is left -- the head's one-per-host pass would otherwise let a flagged
+    # offer on a new host take a second fresh offer's slot (review round 2 of #2629).
+    _fresh = [o for o in offers if not o.get("requires_live_verification")]
+    _flagged = [o for o in offers if o.get("requires_live_verification")]
+    offers = _host_diverse_head(_fresh, limit)
+    if _flagged and len(offers) < limit:
+        offers = offers + _host_diverse_head(_flagged, limit - len(offers))
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
@@ -6424,6 +6753,10 @@ async def _handle_offers_resolve(
         " purchasability asked=%d declined=%d" % (
             _cart_purchasability.stats["asked"], _cart_purchasability.stats["declined"],
         ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
+    ) + (
+        " stock_declined=%d" % _stock_stats["declined"] if _stock_stats["declined"] else ""
+    ) + (
+        " variant_declined=%d" % _variant_stats["declined"] if _variant_stats["declined"] else ""
     )
     logger.info(
         _summary_msg,
@@ -6494,6 +6827,18 @@ async def _handle_offers_resolve(
             "resolution_mode": resolution_mode,
             "substitution_reason_codes": substitution_reason_codes,
             "servable_reason_codes": surface_not_servable_reason_codes,
+            **(
+                {"buyer_currency_filtered": buyer_currency_filtered}
+                if buyer_currency_filtered
+                else {}
+            ),
+            # Opted-in callers only: how many freshness-gated seeds (and their offers) came back
+            # flagged `requires_live_verification` instead of being dropped.
+            **(
+                {"live_verification_returned": _live_verification_returned_of(offers)}
+                if _live_verification_opt_in
+                else {}
+            ),
         },
     }
 
@@ -8547,6 +8892,36 @@ def _offer_destination_host(url: Optional[str]) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _declared_buyer_currency(market_hint: Optional[str]) -> Optional[str]:
+    """The currency of the market the caller declared, or None when it declared none or the
+    market registry does not list it (then no currency rule applies)."""
+    if not market_hint:
+        return None
+    entry = market_registry.market_or_none(market_hint)
+    return str((entry or {}).get("currency") or "").strip().upper() or None
+
+
+def _offers_in_buyer_currency(
+    offers: List[Dict[str, Any]], market_hint: Optional[str]
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """(offers priced in the declared market's currency, {dropped currency: count}).
+
+    Unchanged when no market is declared or the registry does not list it."""
+    expected = _declared_buyer_currency(market_hint)
+    if not expected:
+        return offers, {}
+    kept: List[Dict[str, Any]] = []
+    dropped: Dict[str, int] = {}
+    for offer in offers:
+        currency = str((offer or {}).get("currency") or "").strip().upper()
+        if currency == expected:
+            kept.append(offer)
+        else:
+            key = currency or "none"
+            dropped[key] = dropped.get(key, 0) + 1
+    return kept, dropped
+
+
 def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     """Truncate to `limit` while keeping one offer per DESTINATION HOST at the front.
 
@@ -8799,6 +9174,8 @@ def _external_seed_redirect_identity(
     seed_data: Dict[str, Any],
     offer_variant_id: Optional[str] = None,
     handover: Optional[HandoverVariant] = None,
+    # The per-variant lane's own stored entry (offers.resolve). None = a product-grain caller.
+    offer_variant: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Optional[str]]:
     """Derive the attribution identity for an external-seed redirect.
 
@@ -8998,8 +9375,25 @@ def _external_seed_redirect_identity(
             and canonical_variant_id(attached_variant_id) != _catalog_vid
         ):
             cart_variant_id = None
+        elif _catalog_vid:
+            cart_variant_id = _catalog_vid
+        elif _operator_vid and _attached_variant_is_this_offer(
+            seed_data,
+            offer_variant_id=offer_variant_id,
+            attached_variant_id=attached_variant_id,
+            offer_variant=offer_variant,
+            product_key=attached_key,
+            product_id=source_product_id,
+        ):
+            cart_variant_id = _operator_vid
         else:
-            cart_variant_id = _catalog_vid or _operator_vid
+            # THE OPERATOR ID NAMES ONE VARIANT, AND THIS OFFER MAY BE ANOTHER. It is seed-wide,
+            # so on a multi-variant seed every per-variant offer used to carry a cart for that
+            # one variant: review of #2620 (2026-10-14) shipped an in-stock $19 offer with
+            # `cart_prefilled: true` and a cart for the sold-out $29 sibling. A price belongs to
+            # the exact variant it was quoted for, so an offer that is not the attached variant
+            # gets the referral, not someone else's cart.
+            cart_variant_id = None
 
     return {
         "merchant_id": merchant_id,
@@ -9011,6 +9405,184 @@ def _external_seed_redirect_identity(
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
     }
+
+
+def _seed_source_product_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The BARE source product id `_external_seed_redirect_identity` compares variant ids against:
+    the tail of `attached_product_key` (double-colon storage form, or the pipe transport form),
+    else `external_product_id`. Same parse, so `_cart_is_the_named_offer`'s contradiction check asks
+    the question #2623's attach rule asks: with `external_product_id` instead, an entry whose `id`
+    restates the attached product read as a merchant-issued variant and refused a lone listing's
+    own cart (review r2 of the named-variant guard)."""
+    row = row or {}
+    seed_data = seed_data or {}
+    attached_key = str(row.get("attached_product_key") or seed_data.get("attached_product_key") or "").strip()
+    tail: Optional[str] = None
+    if attached_key.startswith("prod::"):
+        parts = attached_key.split("::")
+        if len(parts) >= 4:
+            tail = "::".join(parts[3:]).strip() or None
+    elif attached_key.count("|") >= 2:
+        tail = attached_key.split("|", 2)[2].strip() or None
+    return tail or str(row.get("external_product_id") or seed_data.get("external_product_id") or "").strip() or None
+
+
+def _cart_is_the_named_offer(
+    cart_variant_id: Any, *, seed_data: Dict[str, Any], offer_variant: Dict[str, Any], named_variant_id: Any,
+    product_key: Optional[str] = None, product_id: Optional[str] = None,
+) -> bool:
+    """May an offer for a NAMED variant carry a cart for `cart_variant_id`? (No cart: trivially.)
+
+    When the id is one of the offer's OWN: the named id itself, and every id the stored entry the
+    offer IS names, and the ONE snapshot entry answering to the name -- read by the lane's shared
+    reader (`stored_entry_variant_ids`: canonical identity keys, plus the `?variant=N` of a JSON-LD
+    offer `@id`-shaped id, the shape most stored entries carry, census 2026-10-15). The snapshot
+    counts because it is the same variant under another read: the route's `_seed_variants` reads
+    top-level `variants` only, so a seed storing its variants solely in `snapshot.variants` serves a
+    named one as the `[{}]` fallback while the stamp the cart comes from sits on that very snapshot
+    entry. Two snapshot entries answering to one name say nothing.
+
+    Or when the offer IS the seed's one stored variant (by object, as `_attached_variant_is_this_offer`
+    identifies it) and nothing on that entry contradicts the cart: a lone entry is "nothing to choose
+    between", the rule #2623 and #2624 apply to the operator's id and the sole catalog row, and naming
+    that variant (by its SKU, say) must not cost it the cart its listing gets unnamed. The
+    contradiction check is HERE, not left to those rules: review found only the operator rule
+    applying it to every key -- the sole catalog row is contradicted on `variant_id|variantId|id`
+    only, and the seed stamp never looks at the top-level entry -- so a lone entry stamped
+    `shopify_variant_id: ...002` was handed a sole catalog row's or a snapshot stamp's ...000.
+    Claimed ids only (`stored_entry_claimed_variant_ids`: never a `sku`, which may match a variant but
+    not refuse one; a URL-shaped id contributes its `?variant=`), judged parent-aware against the
+    attached key's product.
+    """
+    cart = canonical_variant_id(cart_variant_id)
+    if not cart:
+        return True
+
+    named = canonical_variant_id(named_variant_id)
+    own = stored_entry_variant_ids(offer_variant) | {
+        x for x in (named, url_named_variant_id(named_variant_id)) if x
+    }
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    snapshot_variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if named and isinstance(snapshot_variants, list):
+        twins = [x for x in snapshot_variants if stored_entry_answers_to(x, named)]
+        if len(twins) == 1:
+            own |= stored_entry_variant_ids(twins[0])
+    if cart in own:
+        return True
+    served = _seed_variants(seed_data)
+    # The SAME variant read twice (#2627): an entry the corroborated fold -- the snapshot holds
+    # exactly one variant and it is the cart's, the entry claims no other, the price agrees -- makes
+    # the cart's variant. That is the cart #2627 restores for a SKU-named entry; it is its own.
+    if isinstance(offer_variant, dict) and offer_variant and any(v is offer_variant for v in served) and (
+        entry_is_the_sole_variant_read_again(
+            offer_variant, variant_id=cart, stored=served, seed_data=seed_data,
+            product_key=product_key, product_id=product_id,
+        )
+    ):
+        return True
+    if not (len(served) == 1 and served[0] is offer_variant):
+        return False
+    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
+    # data that came WITH the entry. A name the caller sent is an assertion about which variant the
+    # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
+    # restated product id is not one) and differs from the cart, a cart for the other id is a silent
+    # substitution. Refusing costs at worst a click (a barcode-named single-variant listing lands on
+    # its PDP); not refusing can charge for the wrong shade. Only on this branch: everywhere else
+    # the cart is already one of the offer's own ids, or the corroborated fold above has proven the
+    # product has exactly one variant. (The name differs from the cart by construction here: it is
+    # one of `own`, and a cart in `own` has already returned.)
+    if names_a_merchant_issued_variant(named, product_key=product_key, product_id=product_id):
+        return False
+    return not any(
+        claimed != cart
+        and names_a_merchant_issued_variant(claimed, product_key=product_key, product_id=product_id)
+        for claimed in stored_entry_claimed_variant_ids(offer_variant)
+    )
+
+
+def _attached_variant_is_this_offer(
+    seed_data: Dict[str, Any],
+    *,
+    offer_variant_id: Optional[str],
+    attached_variant_id: Optional[str],
+    offer_variant: Optional[Dict[str, Any]] = None,
+    product_key: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> bool:
+    """May a seed-wide `attached_variant_id` name the cart of this offer?
+
+    PER-VARIANT LANE (`offer_variant` given — offers.resolve). The offer is identified by OBJECT
+    among the stored variants, never by an id string: two entries can share one (both `sku: X`)
+    or both have none, and string matching then handed the first, $19 entry the $29 sibling's
+    cart (review of #2623). The entry gets the cart when one of its identity keys answers to the
+    attached id. Failing that, only a seed storing exactly that one variant may still take it,
+    and only when nothing on the entry names a DIFFERENT merchant-issued variant. An offer that
+    is no stored entry (the `[{}]` fallback) gets it only on a seed storing at most one variant,
+    under the same contradiction check on its id and the lone entry.
+
+    PRODUCT-GRAIN CALLERS (`offer_variant` None — the card lanes). Unchanged from before except
+    for the contradiction check: no offer id, or a seed storing at most one variant, is "nothing
+    to choose"; otherwise the offer id must answer. The card lanes pass no per-variant identity
+    today and are a known follow-up, not this rule's job.
+
+    Ids compare canonically (a gid and its bare number agree). Contradiction uses
+    `names_a_merchant_issued_variant`, parent-aware, on CLAIM keys only — never a `sku`, which
+    on this corpus is routinely a barcode and may match but not refuse (the L3469 doctrine) —
+    and on the offer STRING only when it is a Shopify gid, since that string comes from a chain
+    that includes `sku`.
+    """
+    target = canonical_variant_id(attached_variant_id)
+    if not target:
+        return False
+    served = _seed_variants(seed_data)
+    offer = str(offer_variant_id or "").strip()
+
+    def _contradicts(value: Any) -> bool:
+        return bool(
+            names_a_merchant_issued_variant(value, product_key=product_key, product_id=product_id)
+            and canonical_variant_id(value) != target
+        )
+
+    def _offer_contradicts() -> bool:
+        # The OFFER STRING comes from `_seed_offer_variant_id`, whose chain includes `sku`: a bare
+        # number there may be a barcode, and a barcode may match but never refuse
+        # (`test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain`). Only a
+        # Shopify gid is unambiguously a variant claim, so only a gid may contradict here.
+        return offer.lower().startswith("gid://shopify/productvariant/") and _contradicts(offer)
+
+    def _entry_contradicts(v: Dict[str, Any]) -> bool:
+        # The shared reader's CLAIM ids (no `sku`), URL-shaped ids read for their `variant=`.
+        return any(_contradicts(x) for x in stored_entry_claimed_variant_ids(v))
+
+    def _answers(v: Dict[str, Any]) -> bool:
+        # The ONE reader every matcher in this lane uses (services/handover_variant_identity):
+        # it also reads `?variant=N` off a JSON-LD `@id`-shaped id, the shape most stored
+        # entries carry (census 2026-10-15).
+        return stored_entry_answers_to(v, target)
+
+    if offer_variant is not None:
+        mine = next((v for v in served if v is offer_variant), None)
+        if mine is not None:
+            if _answers(mine):
+                # Several entries naming it at different prices: whose price is the cart's?
+                return namers_agree_on_price(served, target)
+            return len(served) == 1 and not _entry_contradicts(mine)
+        if len(served) > 1:
+            return False
+        return not _offer_contradicts() and not any(_entry_contradicts(v) for v in served)
+
+    if len(served) <= 1:
+        return not _offer_contradicts() and not any(_entry_contradicts(v) for v in served)
+    if not offer:
+        return True
+    mine = [v for v in served if _seed_offer_variant_id(v) == offer]
+    if not mine:
+        return canonical_variant_id(offer) == target
+    # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
+    # say which one the offer is, so neither may lend it the attached cart.
+    return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
 
 
 def resolve_cart_permalink(
@@ -9335,6 +9907,14 @@ def _cart_prefilled_claim(
     # provable where it would otherwise be `None`. Defaulted because omitting it errs SAFE:
     # the claim stays `None` ("unknown"), never a wrong `False`.
     purchasability_tier: Optional[str] = None,
+    # Set when the offer's own stock claim withheld the cart. Signed into the token the same
+    # way, and knocked out by the warm lane the same way; defaulted for the same reason.
+    stock_declined: bool = False,
+    # Set when the offer is returned flagged `requires_live_verification`. Signed and knocked out
+    # the same way; defaulted for the same reason.
+    live_verification_required: bool = False,
+    # Set when a named variant's cart was withheld as another variant's. Same road again.
+    variant_declined: bool = False,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9406,6 +9986,9 @@ def _cart_prefilled_claim(
         ctx={
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+            **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
+            **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
+            **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
         },
         settings=settings,
     ):
@@ -9436,6 +10019,26 @@ def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
         return None
 
 
+# Token payload key for the country a minted cart was pinned to (see `_make_external_redirect_url`).
+TOKEN_CART_COUNTRY_KEY = "cart_country"
+
+
+def _cart_country_pin(market: Any, observed: Any) -> Optional[str]:
+    """The ISO-2 country a cart link is pinned to: the BUYER's market as the request declared it,
+    only when it was declared (`observed`; a defaulted "US" is not a buyer's market) and the
+    market registry lists it. Otherwise None, and the link is exactly what it was.
+
+    Never the row's listing market: an SG buyer on a US-listed card pinned to `country=US` would
+    be forced into a US checkout (review of #2622). Callers pass the request's market."""
+    if observed is not True:
+        return None
+    entry = market_registry.market_or_none(market)
+    code = market_registry.normalize_market(market)
+    if not entry or not re.fullmatch(r"[A-Z]{2}", code):
+        return None
+    return code
+
+
 def compose_attributed_destinations(
     *,
     destination_url: str,
@@ -9448,6 +10051,7 @@ def compose_attributed_destinations(
     click_id: str,
     recovery_key: Optional[str] = None,
     quantity: int = 1,
+    pin_country: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compose every attributed URL for one external offer, ONCE.
 
@@ -9497,6 +10101,12 @@ def compose_attributed_destinations(
         if cart_utm
         else None
     )
+    # THE BUYER'S MARKET ON THE CART (`_cart_country_pin`). Without it a cart permalink opens in
+    # whatever market the store picks for the visitor, so a US buyer could land in a GBP or JPY
+    # checkout. `country=<CC>` pins the checkout's market (verified live 2026-09-18, judydoll:
+    # build_shopify_cart_permalink). The PDP is not pinned: it is a page, not a checkout.
+    if cart_url and pin_country:
+        cart_url = append_shopify_cart_country(cart_url, pin_country)
     return {
         "primary": cart_url or pdp_url,
         "cart_url": cart_url,
@@ -9559,6 +10169,12 @@ async def _make_external_redirect_url(
     # ctx, destination and ids signed into the token, so the row recorded at issue time and the
     # one `/r` fills can never describe different clicks. The caller writes the batch.
     issued_clicks: Optional[List[IssuedClick]] = None,
+    # The BUYER's declared market, to pin a cart permalink's checkout to (`_cart_country_pin`).
+    # Explicit and opt-in: `market` here is the market the link is SERVED under, which on some
+    # lanes is the row's listing market, not the buyer's. None (every caller but offers.resolve
+    # today) leaves the link exactly as before. A pin is signed into the token as `cart_country`
+    # so a re-derive from the token applies the same one.
+    cart_country: Optional[str] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -9586,8 +10202,12 @@ async def _make_external_redirect_url(
         cart_variant_id=cart_variant_id,
         click_id=stable_click_id,
         quantity=quantity,
+        pin_country=_cart_country_pin(cart_country, market_observed),
     )
     join_mode = composed["join_mode"]
+    applied_cart_country = (
+        _cart_country_pin(cart_country, market_observed) if composed["cart_url"] else None
+    )
     dest = composed["primary"]
 
     runtime_allowed_domains = allowed_domains
@@ -9634,6 +10254,8 @@ async def _make_external_redirect_url(
             # Absent rather than `false` for an unobserved market, so the token is
             # byte-identical to a pre-provenance mint on that (majority) path.
             **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
+            # Only when a cart was pinned, so every other token is byte-identical to before.
+            **({TOKEN_CART_COUNTRY_KEY: applied_cart_country} if applied_cart_country else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
@@ -9714,6 +10336,8 @@ def _seed_attribution_from_redirect(
         cart_variant_id=cart_variant_id,
         click_id=click_id,
         quantity=quantity,
+        # The pin the mint applied, as the token itself records it.
+        pin_country=_cart_country_pin(payload.get(TOKEN_CART_COUNTRY_KEY), True),
     )
     if composed["primary"] != signed_dest:
         return None

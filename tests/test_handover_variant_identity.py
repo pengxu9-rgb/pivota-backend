@@ -29,6 +29,7 @@ from services.handover_variant_identity import (
     R_NO_IDENTITY,
     R_NO_PRODUCT_KEY,
     R_SEED_STAMP,
+    R_SIBLING,
     R_SOLE,
     SOURCE_CATALOG_SKU,
     SOURCE_SEED_STAMP,
@@ -632,10 +633,12 @@ def _wire(monkeypatch, *, seed_row, sku_rows):
     return seen
 
 
-def _resolve(client, sku_id="SKU-30ML", product_id=None):
+def _resolve(client, sku_id="SKU-30ML", product_id=None, named=None):
     """`sku_id` filters `matched_variants` to the one candidate naming it; `product_id` instead
-    lets the whole variant list through, which is how a multi-variant hand-over is exercised."""
-    product = {"product_id": product_id} if product_id else {"sku_id": sku_id}
+    lets the whole variant list through, which is how a multi-variant hand-over is exercised.
+    `named` names one variant of that product (`product.sku_id`), for its own offer (#2622)."""
+    product = ({"product_id": product_id, **({"sku_id": named} if named else {})}
+               if product_id else {"sku_id": sku_id})
     return client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
@@ -1152,9 +1155,18 @@ def test_a_barcode_sku_may_match_a_variant_but_may_not_refuse_one(monkeypatch, c
         ),
         sku_rows=[_row(source_variant_id=CATALOG_VID, sku_payload=None)],
     )
-    assert _resolve(client, sku_id="4901234567894").status_code == 200
+    # The STORED barcode, on the listing's offer (no variant named): it may not refuse the cart.
+    assert _resolve(client, product_id=SPID).status_code == 200
     assert seen["cart_variant_id"] == CATALOG_VID, (
         "a barcode names no variant; it is an absence of information, not a disagreement")
+
+    # A CALLER naming that barcode is different (decided 2026-10-15, be#2628): a name shaped like a
+    # merchant-issued id that differs from the cart is a claim, so the lone listing ships as a
+    # referral rather than risk substituting another variant. The accepted cost is this one: a
+    # single-variant listing named by its barcode lands on its product page instead of a cart.
+    seen.clear()
+    assert _resolve(client, sku_id="4901234567894").status_code == 200
+    assert seen["cart_variant_id"] is None
 
 
 def test_a_barcode_sku_on_the_seed_stamp_path_does_not_veto_the_stamp():
@@ -1340,22 +1352,36 @@ def test_the_preflight_memo_is_keyed_on_the_variant_as_well_as_the_page(monkeypa
         asked.append(offer["execution_spec"]["variant_id"])
         return True
 
-    _wire(
-        monkeypatch,
-        seed_row=_seed_row(
-            snapshot_extra={"storefront_platform": "shopify"},
-            variants=[
-                {"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-                {"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-            ],
-        ),
-        sku_rows=[
-            _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
-            _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
-        ],
+    # One offer per seller LISTING, so two candidates on one page in one request are two seed
+    # listings of that page -- one per shade, the shape a shade-per-seed crawl writes.
+    shade_30 = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify"},
+        variants=[{"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
+                   "price_currency": "USD", "availability": "in_stock"}],
     )
+    shade_50 = {
+        **_seed_row(
+            snapshot_extra={"storefront_platform": "shopify"},
+            variants=[{"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
+                       "price_currency": "USD", "availability": "in_stock"}],
+        ),
+        "id": "eps_handover_50ml",
+    }
+    sku_rows = [
+        _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
+        _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
+    ]
+    _wire(monkeypatch, seed_row=shade_30, sku_rows=sku_rows)
+
+    async def two_listings(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return list(sku_rows)
+        if "FROM external_product_seeds" in q:
+            return [shade_30, shade_50]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", two_listings)
     monkeypatch.setattr(gateway, "_preflight_allows_external_offer", counting_preflight)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "8")
@@ -1419,3 +1445,400 @@ def _completed(value):
     fut = asyncio.get_event_loop().create_future()
     fut.set_result(value)
     return fut
+
+
+# ---------------------------------------------------------------------------------------------
+# A SOLE CANDIDATE NAMES ITS OWN VARIANT, NOT EVERY OFFER OF A MULTI-VARIANT SEED
+#
+# R_SOLE handed the one live catalog id to ANY offer whose own name was a SKU (a SKU cannot
+# contradict). On a seed storing two variants with one catalog row, the sibling offer got the
+# other variant's cart: one variant's price quoted for another's checkout. Found 2026-10-14 in
+# review of #2620; #2623 fixed the operator-id twin in the route.
+# ---------------------------------------------------------------------------------------------
+
+def _two_variant_seed(*, b_extra=None):
+    return {"variants": [
+        {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0},
+        {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+         **(b_extra if b_extra is not None else {"shopify_variant_id": VID})},
+    ]}
+
+
+def test_a_sole_candidate_is_not_handed_to_a_sibling_offer():
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-30ML")
+    assert got.variant_id is None
+    assert got.reason == R_SIBLING and got.candidates == 1
+
+
+def test_a_sole_candidate_is_handed_to_the_offer_whose_stored_variant_carries_it():
+    """Matched through the SAME stored entry: named by its SKU, carrying the Shopify id."""
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-50ML")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_a_gid_on_the_stored_variant_still_answers_to_the_candidate():
+    seed = _two_variant_seed(b_extra={"shopify_variant_id": "gid://shopify/ProductVariant/" + VID})
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id="SKU-50ML")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_an_offer_the_stored_variants_do_not_know_is_refused_on_a_multi_variant_seed():
+    got = choose_handover_variant([_cand(VID)], seed_data=_two_variant_seed(),
+                                  offer_variant_id="SKU-100ML")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_two_stored_variants_neither_carrying_the_candidate_refuse_both_offers():
+    seed = _two_variant_seed(b_extra={})
+    for name in ("SKU-30ML", "SKU-50ML"):
+        got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
+        assert got.variant_id is None and got.reason == R_SIBLING, name
+
+
+@pytest.mark.parametrize("seed_data,name", [
+    ({"variants": [{"variant_id": "SKU-30ML"}]}, "SKU-30ML"),   # one stored variant
+    (None, "SKU-30ML"),                                          # no stored variants at all
+    (_two_variant_seed(), None),                                 # product-grain hand-over
+])
+def test_nothing_to_choose_between_keeps_the_sole_answer(seed_data, name):
+    got = choose_handover_variant([_cand(VID)], seed_data=seed_data, offer_variant_id=name)
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+async def test_the_sibling_refusal_is_counted_and_in_the_message_text():
+    r = HandoverVariantResolver()
+    r._by_key[PK] = [_cand(VID)]
+    r._primed.add(PK)
+    got = r.choose(product_key=PK, seed_data=_two_variant_seed(), offer_variant_id="SKU-30ML")
+    assert got.reason == R_SIBLING
+    assert r.stats["handover_refused_sibling"] == 1
+    assert r.stats["handover_no_identity"] == 0, "a sibling refusal is not a missing identity"
+    f = handover_coverage_fields(r.stats)
+    assert f["handover_refused_sibling"] == 1
+    assert "sibling=1" in handover_coverage_message(f)
+
+
+def test_the_sibling_offer_gets_no_cart_through_the_real_route(monkeypatch, client):
+    """End to end, real mint: one catalog row (the $29 variant), two stored variants. Each offer
+    is read by its OWN price. Before the fix the $19 offer carried the $29 variant's cart."""
+    import base64
+    from unittest.mock import AsyncMock
+    from urllib.parse import parse_qs, urlparse
+
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify",
+                        "storefront_platform_source": "products_js_v1"},
+        variants=[
+            {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0,
+             "price_currency": "USD", "availability": "in_stock"},
+            {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+             "price_currency": "USD", "availability": "in_stock",
+             "shopify_variant_id": CATALOG_VID},
+        ],
+    )
+    sku = _row(source_variant_id=CATALOG_VID,
+               sku_payload=json.dumps({"variant_id": CATALOG_VID,
+                                       "variant_id_provenance": "merchant_issued"}))
+
+    async def fake_fetch_all(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return [sku]
+        if "FROM external_product_seeds" in q:
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each.
+    offers = {}
+    for named in ("SKU-30ML", "SKU-50ML"):
+        res = _resolve(client, product_id=SPID, named=named)
+        assert res.status_code == 200, res.text
+        for o in res.json().get("offers") or []:
+            if o.get("purchase_route") == "affiliate_outbound":
+                offers[float(o["price"])] = o
+    assert set(offers) == {19.0, 29.0}, sorted(offers)
+    assert offers[19.0]["execution_spec"]["cart_url"] is None, offers[19.0]["execution_spec"]
+    tok = parse_qs(urlparse(offers[19.0]["affiliate_url"]).query)["token"][0].split(".")[0]
+    dest = json.loads(base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))["dest"]
+    assert "/cart/" not in dest and CATALOG_VID not in dest, dest
+    assert f"/cart/{CATALOG_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+
+
+# Review of #2624, P2: duplicate names. Exactly one stored entry may be the offer.
+
+
+def test_two_entries_sharing_a_sku_do_not_lend_the_candidate_to_either():
+    """Probe 1: both entries are `sku: SKU-X`; only the 50ml one carries the candidate's id."""
+    seed = {"variants": [{"sku": "SKU-X", "title": "30ml", "price_amount": 19.0},
+                         {"sku": "SKU-X", "title": "50ml", "price_amount": 29.0,
+                          "shopify_variant_id": VID}]}
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id="SKU-X")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_entries_whose_id_restates_the_product_do_not_lend_the_candidate():
+    """Probe 2: every entry's `id` is the product id, so the offer's name matches all of them."""
+    seed = {"variants": [{"id": SPID, "title": "30ml", "price_amount": 19.0},
+                         {"id": SPID, "title": "50ml", "price_amount": 29.0,
+                          "shopify_variant_id": VID}]}
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=SPID)
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+# ---------------------------------------------------------------------------------------------
+# THE SHAPE PROD STORES: census 2026-10-15 (oneoff-sibling-entries-census). #2624 refused 211
+# offers on ~105 seeds because the entry that IS the candidate carries the JSON-LD offer @id
+# (`/products/<h>?variant=N#offer`) as its variant_id, which the matcher could not read; most of
+# those seeds are ONE variant read twice (that entry + a SKU/barcode entry at the same price).
+# ---------------------------------------------------------------------------------------------
+
+from services.handover_variant_identity import (  # noqa: E402
+    stored_entry_answers_to,
+    stored_entry_variant_ids,
+    url_named_variant_id,
+)
+
+
+def _jsonld_id(vid):
+    return "/products/sweet-violet-grapefruit-hydrating-mist-1?variant=" + vid + "#offer"
+
+
+@pytest.mark.parametrize("raw,named", [
+    (_jsonld_id(VID), VID),
+    ("https://www.jurlique.com/products/x?variant=" + VID, VID),
+    ("/products/x?variant=" + VID + "&variant=" + VID, VID),
+    ("/products/x?variant=abc", ""),
+    ("/products/x?variant=", ""),
+    ("/products/x?variant=" + VID + "&variant=" + VID_B, ""),
+    ("/products/x", ""),
+    ("114807", ""),
+])
+def test_a_url_shaped_id_names_its_variant_only_when_unambiguous(raw, named):
+    assert url_named_variant_id(raw) == named
+
+
+def test_the_shared_reader_reads_the_jsonld_offer_id_and_the_entry_url():
+    entry = {"variant_id": _jsonld_id(VID)}
+    assert VID in stored_entry_variant_ids(entry)
+    assert stored_entry_answers_to(entry, "gid://shopify/ProductVariant/" + VID)
+    assert stored_entry_answers_to({"sku": "S", "url": "https://b.com/products/x?variant=" + VID}, VID)
+    assert not stored_entry_answers_to({"variant_id": "114807"}, VID)
+
+
+def _jurlique(*, snapshot=True, dup_price=31.0):
+    seed = {"variants": [
+        {"variant_id": _jsonld_id(VID), "title": "Sweet Violet Mist - 100ml",
+         "price_amount": 31, "price_currency": "USD"},
+        {"variant_id": "114807", "title": "Sweet Violet Mist",
+         "price_amount": dup_price, "price_currency": "USD"},
+    ]}
+    if snapshot:
+        seed["snapshot"] = {"variants": [{"shopify_variant_id": VID, "variant_id": VID, "title": "100 mL"}]}
+    return seed
+
+
+def test_jurlique_the_jsonld_entry_takes_its_own_candidate():
+    """B: the entry whose @id names the candidate takes it — no snapshot needed."""
+    got = choose_handover_variant([_cand(VID)], seed_data=_jurlique(snapshot=False),
+                                  offer_variant_id=_jsonld_id(VID))
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_jurlique_the_sku_entry_folds_into_the_snapshot_corroborated_sole_variant():
+    """C: the snapshot holds exactly this one variant and the SKU entry is priced as the @id
+    entry: one variant read twice, so its offer takes the same cart."""
+    got = choose_handover_variant([_cand(VID)], seed_data=_jurlique(), offer_variant_id="114807")
+    assert got.variant_id == VID and got.reason == R_SOLE
+
+
+def test_jurlique_without_the_snapshot_equal_price_alone_does_not_fold():
+    got = choose_handover_variant([_cand(VID)], seed_data=_jurlique(snapshot=False),
+                                  offer_variant_id="114807")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_jurlique_a_differently_priced_entry_does_not_fold_even_with_the_snapshot():
+    got = choose_handover_variant([_cand(VID)], seed_data=_jurlique(dup_price=44.0),
+                                  offer_variant_id="114807")
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_murad_selling_plan_entries_do_not_fold_without_the_snapshot():
+    """Murad's "variants" are subscription selling plans of ONE variant; with no snapshot to
+    corroborate that, none of them is handed the candidate."""
+    seed = {"variants": [
+        {"variant_id": "offer_1", "title": "One-Time Purchase", "price_amount": 18},
+        {"variant_id": "offer_2", "title": "1 month", "price_amount": 16.38},
+        {"variant_id": "offer_3", "title": "2 months", "price_amount": 16.38},
+    ]}
+    for name in ("offer_1", "offer_2", "offer_3"):
+        got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
+        assert got.variant_id is None and got.reason == R_SIBLING, name
+
+
+def test_a_genuine_two_variant_pair_folds_nothing():
+    """Two @id entries naming two variants at two prices: the other one is a real sibling, and
+    a snapshot naming the candidate does not make it one variant — it claims its own id."""
+    seed = {"variants": [
+        {"variant_id": _jsonld_id(VID), "price_amount": 19},
+        {"variant_id": _jsonld_id(VID_B), "price_amount": 29},
+    ], "snapshot": {"variants": [{"shopify_variant_id": VID}]}}
+    assert choose_handover_variant([_cand(VID)], seed_data=seed,
+                                   offer_variant_id=_jsonld_id(VID)).reason == R_SOLE
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=_jsonld_id(VID_B))
+    assert got.variant_id is None and got.reason == R_SIBLING
+
+
+def test_jurlique_both_offers_get_the_cart_through_the_real_route(monkeypatch, client):
+    """End to end, real mint: the @id offer by B, the SKU offer by the corroborated fold — each
+    at its own (equal) price, each with the one variant's cart."""
+    from unittest.mock import AsyncMock
+
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify",
+                        "storefront_platform_source": "products_js_v1",
+                        "variants": [{"shopify_variant_id": CATALOG_VID, "variant_id": CATALOG_VID,
+                                      "title": "100 mL"}]},
+        variants=[
+            {"variant_id": "/products/serum?variant=" + CATALOG_VID + "#offer", "title": "Serum - 30ml",
+             "price_amount": 31.0, "price_currency": "USD", "availability": "in_stock"},
+            {"variant_id": "114807", "title": "Serum", "price_amount": 31.0,
+             "price_currency": "USD", "availability": "in_stock"},
+        ],
+    )
+    sku = _row(source_variant_id=CATALOG_VID,
+               sku_payload=json.dumps({"variant_id": CATALOG_VID,
+                                       "variant_id_provenance": "merchant_issued"}))
+
+    async def fake_fetch_all(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return [sku]
+        if "FROM external_product_seeds" in q:
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each
+    # stored entry in turn; each still gets the one variant's cart at its own (equal) price.
+    named = [row["seed_data"]["variants"][0]["variant_id"], row["seed_data"]["variants"][1]["variant_id"]]
+    offers = []
+    for name in named:
+        res = _resolve(client, product_id=SPID, named=name)
+        assert res.status_code == 200, res.text
+        offers += [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert len(offers) == 2, "each named entry answers its own offer"
+    for offer in offers:
+        assert float(offer["price"]) == 31.0
+        assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or ""), offer["execution_spec"]
+    # Unnamed, the listing's one offer is that variant too, with its cart.
+    res = _resolve(client, product_id=SPID)
+    [listing] = [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert float(listing["price"]) == 31.0
+    assert f"/cart/{CATALOG_VID}:1" in (listing["execution_spec"]["cart_url"] or ""), listing["execution_spec"]
+
+
+
+def test_an_entry_claiming_another_merchant_variant_does_not_fold():
+    """The snapshot names the candidate, but this entry's own variant_id is another
+    merchant-issued variant: it is a sibling, not the sole variant read again."""
+    seed = _jurlique()
+    seed["variants"][1]["variant_id"] = VID_B
+    got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=VID_B)
+    assert got.variant_id is None
+
+
+# Review of #2627, round 1: a namer took the cart with no price check, and the fold priced
+# itself off the seed when selling plans were the entries.
+
+
+def test_a_selling_plan_url_names_no_variant():
+    assert url_named_variant_id("/products/x?variant=" + VID + "&selling_plan=111#offer") == ""
+    assert url_named_variant_id("/products/x?selling_plan=&variant=" + VID) == ""
+
+
+def _plans(*prices, snapshot=False, url_suffix=""):
+    seed = {"variants": [
+        {"variant_id": "/products/x?variant=" + VID + url_suffix + "#o" + str(i), "price_amount": p}
+        for i, p in enumerate(prices)
+    ]}
+    if snapshot:
+        seed["snapshot"] = {"variants": [{"shopify_variant_id": VID}]}
+    return seed
+
+
+def test_three_namers_at_two_prices_refuse_every_namer():
+    """Probe: one-time $18 and two $16.38 entries all naming N. Whose price is the cart's?"""
+    seed = _plans(18, 16.38, 16.38)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id is None and got.reason == R_SIBLING, entry
+
+
+def test_two_namers_at_19_and_29_refuse_both():
+    seed = _plans(19, 29)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id is None, entry
+
+
+def test_two_namers_at_one_price_both_keep_the_cart():
+    """Two offers sharing one cart is cosmetic when their prices really are equal."""
+    seed = _plans(31, 31)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id == VID and got.reason == R_SOLE, entry
+
+
+def test_a_selling_plan_entry_is_not_a_namer():
+    """With the plan's URL naming nothing, only the one-time entry names N and keeps the cart."""
+    seed = {"variants": [
+        {"variant_id": "/products/x?variant=" + VID + "#offer", "price_amount": 18},
+        {"variant_id": "/products/x?variant=" + VID + "&selling_plan=7#offer", "price_amount": 16.38},
+    ]}
+    one_time = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                       offer_variant_id=seed["variants"][0]["variant_id"])
+    plan = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                   offer_variant_id=seed["variants"][1]["variant_id"])
+    assert one_time.variant_id == VID
+    assert plan.variant_id is None
+
+
+def test_murad_plans_do_not_fold_even_at_the_seed_price():
+    """Probe: the snapshot names exactly N, the entries are a one-time $18 and a 1-month $16.38
+    plan, and the seed price is 16.38. Several prices among non-naming entries = plans: fold none
+    — before the fix the $16.38 plan folded and took the one-time cart."""
+    seed = {"price_amount": 16.38,
+            "variants": [{"variant_id": "offer_1", "title": "One-Time Purchase", "price_amount": 18},
+                         {"variant_id": "offer_2", "title": "1 month", "price_amount": 16.38}],
+            "snapshot": {"variants": [{"shopify_variant_id": VID}]}}
+    for name in ("offer_1", "offer_2"):
+        got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
+        assert got.variant_id is None and got.reason == R_SIBLING, name
+

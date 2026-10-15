@@ -7,7 +7,7 @@ content-key catalogue endpoints below, whose offers come from
 ``catalog_offers``.
 """
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 import asyncio
 import csv
 import io
@@ -34,8 +34,10 @@ from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
 from services import external_seed_destination_liveness as destination_liveness
+from services import market_registry
 from services import seed_served_url
 from services.external_offers_service import (
+    IMAGE_URLS_SCOPE_DECLARED,
     ExternalOfferUnavailable,
     resolve_external_offer,
     seed_variants_from_evidence,
@@ -1075,6 +1077,92 @@ def _seed_variant_description_map(variants: List[Dict[str, Any]]) -> Dict[str, s
     return out
 
 
+# `description_source` values (see services.external_offers_service._extract_from_html) whose text
+# the refresh never stores as a seed's description: og/meta description tags are SEO copy.
+_REFUSED_DESCRIPTION_SOURCES = frozenset({"meta"})
+
+# Who wrote `seed_data.image_urls`. The refresh stamps a gallery it writes as a page read; a
+# gallery any other writer stamped (e.g. the drain's "storefront_products_json") is never replaced
+# by a page read. Unstamped galleries (written before the stamp) follow the page-read rule.
+SEED_IMAGE_URLS_SOURCE_KEY = "image_urls_source"
+SEED_IMAGE_URLS_SOURCE_PAGE_READ = "page_read"
+# A gallery an employee set (PATCH, or seed creation's own `image_urls`): no page read replaces it.
+SEED_IMAGE_URLS_SOURCE_EMPLOYEE = "employee"
+# Where a seed's stored description came from, when a page read wrote it ("jsonld" | "page_long" |
+# "meta" | "unknown"). "meta"/"unknown" text is fill-only: real copy from a later read replaces it.
+SEED_DESCRIPTION_SOURCE_KEY = "description_source"
+_FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
+# Copy an employee supplied (creation body, CSV import): never upgraded by a page read.
+SEED_DESCRIPTION_SOURCE_EMPLOYEE = "employee"
+
+
+def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
+    """The gallery and description a page read may give a seed, by where they came from.
+
+    - `image_urls` is the read's gallery only when the snapshot marks it as the images the page
+      DECLARES as the product's (`image_urls_scope`). A snapshot written before the extractor
+      split them holds every image the page rendered -- nav tiles, banners, Instagram posts --
+      and gives no gallery; `gallery_declared` says which.
+    - `description` is the page's real copy (JSON-LD or its long-description block), with its
+      `description_source`. og/meta description text (SEO copy), or text whose source a snapshot
+      from before the split never recorded, is never `description`: it is `fill_only_description`,
+      which may fill a seed that has NO description and nothing else (Peng 2026-10-15), and
+      `description_refused_source` names why ("meta" | "unknown").
+    - `meta_description` is the page's own meta text, so a seed already storing that exact SEO
+      line can be upgraded to real copy.
+    One function for the refresh, seed creation and the creation preview, so all three store
+    (or show) the same thing."""
+    out: Dict[str, Any] = {
+        "image_urls": [],
+        "gallery_declared": False,
+        "description": None,
+        "description_source": None,
+        "fill_only_description": None,
+        "description_refused_source": None,
+        "meta_description": None,
+    }
+    if not isinstance(evidence, dict):
+        return out
+    out["gallery_declared"] = evidence.get("image_urls_scope") == IMAGE_URLS_SCOPE_DECLARED
+    raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
+    if out["gallery_declared"] and isinstance(raw_images, list):
+        cleaned = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+        out["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
+    raw_meta = evidence.get("meta_description")
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        out["meta_description"] = raw_meta.strip()
+    raw_desc = evidence.get("description")
+    if isinstance(raw_desc, str) and raw_desc.strip():
+        source = str(evidence.get("description_source") or "").strip() or None
+        if source is None or source in _REFUSED_DESCRIPTION_SOURCES:
+            refused = source or "unknown"
+            out["description_refused_source"] = refused
+            out["fill_only_description"] = raw_desc.strip()
+            if refused in _REFUSED_DESCRIPTION_SOURCES and not out["meta_description"]:
+                out["meta_description"] = raw_desc.strip()
+        else:
+            out["description"] = raw_desc.strip()
+            out["description_source"] = source
+    return out
+
+
+def _seed_description_is_upgradable(seed_data: Dict[str, Any], meta_description: Optional[str]) -> bool:
+    """May a page read's real copy replace the seed's stored description? Only SEO copy a page read
+    put there -- tagged fill-only, or exactly the page's own meta line -- and never an employee's
+    own description (`manual_overrides.description`)."""
+    existing = str(seed_data.get("description") or "").strip()
+    if not existing:
+        return False
+    if _ensure_json_obj(seed_data.get("manual_overrides")).get("description"):
+        return False
+    source = seed_data.get(SEED_DESCRIPTION_SOURCE_KEY)
+    if source == SEED_DESCRIPTION_SOURCE_EMPLOYEE:
+        return False
+    if source in _FILL_ONLY_DESCRIPTION_SOURCES:
+        return True
+    return bool(meta_description) and existing == meta_description
+
+
 def _should_replace_localized_copy(
     *,
     existing_text: Optional[str],
@@ -1572,6 +1660,33 @@ def _normalize_market(market: Optional[str]) -> str:
     return m or "US"
 
 
+def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
+    """Why a seed may not be filed under `market`, or None when it may.
+
+    The seed writers (create, storefront backfill, CSV import, edit) file a seed under the market the
+    request DECLARES, and only one the market registry lets us ingest (ADR-026 decision 2: an `off`
+    market is unknown to ingestion; an unlisted one raises). A missing market is refused, never read as
+    US, and a market is never inferred from a currency (ADR-026 decision 1): the storefront backfill
+    used to file EUR-priced seeds under a market no registry lists."""
+    code = market_registry.normalize_market(market)
+    if not code:
+        return "MARKET_REQUIRED"
+    entry = market_registry.market_or_none(code)
+    if entry is None:
+        return f"UNKNOWN_MARKET:{code}"
+    if not entry["ingest"]:
+        return f"MARKET_NOT_INGESTED:{code}"
+    return None
+
+
+def _declared_seed_market(market: Optional[str]) -> str:
+    """The declared seed market, normalized; a 400 for any market `_seed_market_refusal` refuses."""
+    refusal = _seed_market_refusal(market)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
+    return market_registry.normalize_market(market)
+
+
 def _normalize_tool(tool: Optional[str]) -> str:
     t = str(tool or "").strip()
     return t or "*"
@@ -1791,6 +1906,9 @@ class UpdateExternalSeedRequest(BaseModel):
     description: Optional[str] = None
     image_url: Optional[str] = None
     image_urls: Optional[List[str]] = None
+    # Who `image_urls` comes from: an employee (the default) or a page read (the ops refresh
+    # script). A page read never replaces a gallery another writer stamped.
+    image_urls_source: Optional[Literal["employee", "page_read"]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -1900,14 +2018,6 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     if canonical is not None:
         return canonical
     return s.lower().replace(" ", "_")
-
-
-_CURRENCY_TO_REFERRAL_MARKET = {
-    "USD": "US",
-    "SGD": "SG",
-    "JPY": "JP",
-    "EUR": "EU-DE",
-}
 
 
 def _extract_storefront_handle(product_data: Dict[str, Any]) -> Optional[str]:
@@ -2026,27 +2136,15 @@ def _build_storefront_seed_variants(
     ]
 
 
-def _infer_storefront_referral_market(candidates: List[Dict[str, Any]], explicit_market: Optional[str]) -> str:
-    if explicit_market:
-        return _normalize_market(explicit_market)
-    counts: Dict[str, int] = {}
-    for candidate in candidates:
-        currency = str(candidate.get("price_currency") or "").strip().upper()
-        market = _CURRENCY_TO_REFERRAL_MARKET.get(currency)
-        if not market:
-            continue
-        counts[market] = int(counts.get(market) or 0) + 1
-    if not counts:
-        return "US"
-    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-
-
 async def _fetch_storefront_referral_seed_candidates(
     *,
     merchant_id: str,
     limit: int,
-    market: Optional[str],
+    market: str,
 ) -> Dict[str, Any]:
+    """`market` is the caller's DECLARED market (`_declared_seed_market`), stamped on every candidate.
+    It is never read off the candidates' currency (ADR-026 decision 1)."""
+    market = _declared_seed_market(market)
     matched_domains = await get_merchant_referral_domains(merchant_id)
     primary_domain = matched_domains[0] if matched_domains else None
     if not primary_domain:
@@ -2054,7 +2152,7 @@ async def _fetch_storefront_referral_seed_candidates(
             "merchant_id": merchant_id,
             "matched_domains": matched_domains,
             "primary_domain": None,
-            "market": _normalize_market(market),
+            "market": market,
             "candidates": [],
         }
 
@@ -2134,16 +2232,15 @@ async def _fetch_storefront_referral_seed_candidates(
         if len(candidates) >= int(limit or 50):
             break
 
-    resolved_market = _infer_storefront_referral_market(candidates, market)
     for candidate in candidates:
-        candidate["market"] = resolved_market
+        candidate["market"] = market
         candidate["external_product_id"] = _stable_external_product_id(candidate["storefront_url"])
 
     return {
         "merchant_id": merchant_id,
         "matched_domains": matched_domains,
         "primary_domain": primary_domain,
-        "market": resolved_market,
+        "market": market,
         "candidates": candidates,
     }
 
@@ -2173,18 +2270,10 @@ async def _derive_seed_seller_columns(
     )
 
 
-async def _upsert_storefront_referral_seed_candidate(
-    candidate: Dict[str, Any],
-    *,
-    employee_id: Optional[str],
-) -> Dict[str, Any]:
-    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
-    storefront_url = str(candidate.get("storefront_url") or "").strip()
-    external_product_id = str(candidate.get("external_product_id") or "").strip()
-    market = _normalize_market(candidate.get("market"))
-    tool = "*"
-
-    existing_row = await database.fetch_one(
+async def _existing_storefront_referral_seed(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The active seed a storefront backfill candidate would update, matched by product key or URL in
+    ANY market partition; None when the backfill would create one."""
+    row = await database.fetch_one(
         """
         SELECT *
         FROM external_product_seeds
@@ -2199,11 +2288,26 @@ async def _upsert_storefront_referral_seed_candidate(
         LIMIT 1
         """,
         {
-            "attached_product_key": attached_product_key,
-            "external_product_id": external_product_id,
-            "canonical_url": storefront_url,
+            "attached_product_key": str(candidate.get("attached_product_key") or "").strip(),
+            "external_product_id": str(candidate.get("external_product_id") or "").strip(),
+            "canonical_url": str(candidate.get("storefront_url") or "").strip(),
         },
     )
+    return dict(row) if row else None
+
+
+async def _upsert_storefront_referral_seed_candidate(
+    candidate: Dict[str, Any],
+    *,
+    employee_id: Optional[str],
+) -> Dict[str, Any]:
+    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
+    storefront_url = str(candidate.get("storefront_url") or "").strip()
+    external_product_id = str(candidate.get("external_product_id") or "").strip()
+    market = _declared_seed_market(candidate.get("market"))
+    tool = "*"
+
+    existing_row = await _existing_storefront_referral_seed(candidate)
 
     seed_data = {
         "external_product_id": external_product_id,
@@ -2297,11 +2401,13 @@ async def _upsert_storefront_referral_seed_candidate(
                     "title": row.get("title") or candidate.get("title"),
                 }
 
+        # The row keeps the market it is filed under: a backfill refreshes a seed, it never re-files
+        # one (the existing row is matched by product key or URL in ANY market). Moving a seed to
+        # another market partition is a reviewed repair, not a side effect of re-running a backfill.
         await _execute_seed_data_stmt(
             """
             UPDATE external_product_seeds
             SET external_product_id = :external_product_id,
-                market = :market,
                 tool = :tool,
                 utm_template = :utm_template,
                 partner_type = :partner_type,
@@ -2323,11 +2429,12 @@ async def _upsert_storefront_referral_seed_candidate(
             WHERE id = :id
             """,
             {
-                **values,
+                **{k: v for k, v in values.items() if k != "market"},
                 "id": row.get("id"),
             },
         )
         seed_id = str(row.get("id") or "").strip()
+        market = str(row.get("market") or "")
         action = "updated"
     else:
         seed_id = _seed_id()
@@ -2393,6 +2500,7 @@ async def _upsert_storefront_referral_seed_candidate(
     return {
         "action": action,
         "seed_id": seed_id,
+        "market": market,
         "external_product_id": external_product_id,
         "attached_product_key": attached_product_key,
         "canonical_url": storefront_url,
@@ -2405,7 +2513,7 @@ async def _run_external_seed_import_task(
     task_id: str,
     csv_text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> None:
@@ -2527,11 +2635,17 @@ async def import_external_seeds_csv(
     req: Request,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_employee),
-    market: str = Query("US"),
+    # The market for rows that carry no `market` column. Optional (a sheet may declare every row's),
+    # never defaulted: a row with neither is refused (`_seed_market_refusal`).
+    market: Optional[str] = Query(None),
     tool: str = Query("*"),
     mode: str = Query("upsert"),
     async_import: bool = Query(False, alias="async"),
 ) -> ExternalSeedsCsvImportResponse:
+    if str(market or "").strip():
+        market = _declared_seed_market(market)
+    else:
+        market = None
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace")
     if not text.strip():
@@ -2557,7 +2671,8 @@ async def import_external_seeds_csv(
             """,
             {
                 "id": task_id,
-                "market": _normalize_market(market),
+                # NOT NULL column; '' = no sheet-wide market (every row declares its own).
+                "market": market or "",
                 "tool": _normalize_tool(tool),
                 "mode": str(mode or "upsert").strip().lower(),
                 "created_by_employee_id": created_by,
@@ -2590,7 +2705,7 @@ async def _import_external_seeds_csv_text(
     *,
     text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> ExternalSeedsCsvImportResponse:
@@ -2612,7 +2727,8 @@ async def _import_external_seeds_csv_text(
     if not text.strip():
         raise HTTPException(status_code=400, detail="EMPTY_CSV")
 
-    default_market = _normalize_market(market)
+    # No US fallback: a row files under its own `market` column or this declared one, else it is refused.
+    default_market = market_registry.normalize_market(market)
     default_tool = _normalize_tool(tool)
     mode_norm = str(mode or "upsert").strip().lower()
     if mode_norm not in ("create", "upsert"):
@@ -2640,6 +2756,9 @@ async def _import_external_seeds_csv_text(
         # Example: Tom Ford export CSV.
         groups: Dict[str, Dict[str, Any]] = {}
         group_meta: Dict[str, Dict[str, Any]] = {}
+        # Products with a variant row whose market was refused: the whole product is held, since
+        # importing only the rows that did declare a market would file it with variants missing.
+        market_refused_product_urls: set[str] = set()
 
         for idx, row in enumerate(reader, start=2):
             try:
@@ -2650,7 +2769,11 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_PRODUCT_URL")
                 product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-                row_market = _normalize_market(nrow.get("market") or default_market)
+                row_market_refusal = _seed_market_refusal(nrow.get("market") or default_market)
+                if row_market_refusal is not None:
+                    market_refused_product_urls.add(product_url)
+                    raise ValueError(row_market_refusal)
+                row_market = market_registry.normalize_market(nrow.get("market") or default_market)
                 row_tool = _normalize_tool(nrow.get("tool") or default_tool)
 
                 product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
@@ -2769,6 +2892,8 @@ async def _import_external_seeds_csv_text(
 
                 if not external_product_id or not dest:
                     raise ValueError("INVALID_GROUP")
+                if dest in market_refused_product_urls:
+                    raise ValueError(f"VARIANT_ROW_MARKET_REFUSED:{dest}")
 
                 # Deduplicate + sort variants so primary price is stable (min price first).
                 seen_variant_ids: set[str] = set()
@@ -2870,10 +2995,12 @@ async def _import_external_seeds_csv_text(
                         seed_data["brand"] = brand
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if image_urls:
                         seed_data["image_urls"] = image_urls
+                        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
                     if availability is not None:
                         seed_data["availability"] = availability
                     if variants:
@@ -2931,8 +3058,10 @@ async def _import_external_seeds_csv_text(
                     "title": title,
                     "brand": brand,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "image_urls": image_urls,
+                    **({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE} if image_urls else {}),
                     "availability": availability,
                     "variants": variants,
                     "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
@@ -3008,7 +3137,7 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_DESTINATION_URL")
                 dest = _normalize_seed_url_for_id(_require_http_url(destination_url))
 
-                row_market = _normalize_market(row.get("market") or default_market)
+                row_market = _declared_seed_market(row.get("market") or default_market)
                 row_tool = _normalize_tool(row.get("tool") or default_tool)
 
                 title = str(row.get("title") or "").strip() or None
@@ -3112,6 +3241,7 @@ async def _import_external_seeds_csv_text(
                         seed_data["title"] = title
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if availability is not None:
@@ -3202,6 +3332,7 @@ async def _import_external_seeds_csv_text(
                     "external_product_id": external_product_id,
                     "title": title,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "availability": availability,
                     "utm_template": utm_template,
@@ -3337,12 +3468,9 @@ async def preview_external_seed(
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list):
             variants = raw_variants
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        image_urls = content["image_urls"]
+        description = content["description"]
 
     return {
         "status": "success",
@@ -3710,14 +3838,32 @@ async def backfill_storefront_external_seeds(
     merchant_id = str(body.merchant_id or "").strip()
     if not merchant_id:
         raise HTTPException(status_code=400, detail="MERCHANT_ID_REQUIRED")
+    # Declared, never read off the storefront's prices (ADR-026 decision 1).
+    market = _declared_seed_market(body.market)
 
     candidate_bundle = await _fetch_storefront_referral_seed_candidates(
         merchant_id=merchant_id,
         limit=body.limit,
-        market=body.market,
+        market=market,
     )
     candidates = list(candidate_bundle.get("candidates") or [])
     if body.dry_run:
+        preview_items: List[Dict[str, Any]] = []
+        for candidate in candidates[:20]:
+            existing = await _existing_storefront_referral_seed(candidate)
+            preview_items.append(
+                {
+                    "action": "preview",
+                    # An existing seed keeps the market it is filed under (the real run never
+                    # re-files it); only a new one takes the declared market.
+                    "market": str(existing.get("market") or "") if existing else market,
+                    "existing_seed_id": existing.get("id") if existing else None,
+                    "attached_product_key": candidate.get("attached_product_key"),
+                    "canonical_url": candidate.get("storefront_url"),
+                    "title": candidate.get("title"),
+                    "external_product_id": candidate.get("external_product_id"),
+                }
+            )
         return {
             "status": "success",
             "merchant_id": merchant_id,
@@ -3729,16 +3875,7 @@ async def backfill_storefront_external_seeds(
             "created": 0,
             "updated": 0,
             "skipped": 0,
-            "items": [
-                {
-                    "action": "preview",
-                    "attached_product_key": candidate.get("attached_product_key"),
-                    "canonical_url": candidate.get("storefront_url"),
-                    "title": candidate.get("title"),
-                    "external_product_id": candidate.get("external_product_id"),
-                }
-                for candidate in candidates[:20]
-            ],
+            "items": preview_items,
         }
 
     employee_id = _employee_id_from_user(current_user)
@@ -4055,7 +4192,7 @@ async def create_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    market = _normalize_market(body.market)
+    market = _declared_seed_market(body.market)
     tool = _normalize_tool(body.tool)
     dest = _require_http_url(body.destination_url)
 
@@ -4089,15 +4226,12 @@ async def create_external_seed(
     snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    content = _snapshot_evidence_content(None)
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        snap_image_urls = content["image_urls"]
+        snap_description = content["description"]
         snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
@@ -4127,6 +4261,11 @@ async def create_external_seed(
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
+    # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
+    description_origin = (
+        SEED_DESCRIPTION_SOURCE_EMPLOYEE if (body.description or "").strip() else (content["description_source"] if snap_description else None)
+    )
+    fill_only_description = content["fill_only_description"]
     image_url = (body.image_url or "").strip() or snap_image_url
     if not image_url and body.image_urls:
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
@@ -4224,13 +4363,26 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
-        seed_data["description"] = description
+        if description and (
+            description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
+            or not str(seed_data.get("description") or "").strip()
+            or _seed_description_is_upgradable(seed_data, content["meta_description"])
+        ):
+            seed_data["description"] = description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = description_origin
+        elif not str(seed_data.get("description") or "").strip() and fill_only_description:
+            seed_data["description"] = fill_only_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
+        # (A read with no usable copy never wipes the seed's own description.)
         seed_data["image_url"] = image_url
         if body.image_urls is not None:
             cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
             seed_data["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
-        elif snap_image_urls:
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+        elif snap_image_urls and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
+            # As the refresh: never over a gallery another writer stamped.
             seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
         seed_data["partner_type"] = partner_type
@@ -4251,6 +4403,12 @@ async def create_external_seed(
         )
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
+            seed_data["snapshot"].pop("description_refused_source", None)
+        elif content["description_refused_source"]:
+            # The page's only copy is SEO (or unknown) text: an older snapshot's SEO line must not
+            # stay `snapshot.description`, which the gateway serves first (review of #2621).
+            seed_data["snapshot"]["description"] = None
+            seed_data["snapshot"]["description_refused_source"] = content["description_refused_source"]
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
         elif snap_variants:
@@ -4356,11 +4514,21 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
-            "description": description,
+            "description": description or fill_only_description,
+            **(
+                {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
+                if (description or fill_only_description)
+                else {}
+            ),
             "image_url": image_url,
             "image_urls": [str(u).strip() for u in (body.image_urls or []) if isinstance(u, str) and str(u).strip()]
             if body.image_urls is not None
             else snap_image_urls,
+            **(
+                {SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE}
+                if body.image_urls is not None
+                else ({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_PAGE_READ} if snap_image_urls else {})
+            ),
             "availability": availability,
             "variants": body.variants or ([] if variant_adoption_refused else (snap_variants or [])),
             "utm_template": utm_template,
@@ -4681,11 +4849,16 @@ async def update_external_seed(
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
         seed_data["snapshot"]["image_url"] = body.image_url
-    if body.image_urls is not None:
+    gallery_source = body.image_urls_source or SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+    if body.image_urls is not None and not (
+        gallery_source == SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) not in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ)
+    ):
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
         deduped = _dedupe_seed_image_urls(cleaned, limit=20)
         seed_data["image_urls"] = deduped
         seed_data["snapshot"]["image_urls"] = deduped
+        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = gallery_source
         if body.image_url is None and deduped:
             seed_data["image_url"] = deduped[0]
     if body.availability is not None:
@@ -4715,8 +4888,10 @@ async def update_external_seed(
         updates["external_product_id"] = external_product_id
         set_clauses.append("external_product_id = :external_product_id")
 
-    if body.market is not None:
-        updates["market"] = _normalize_market(body.market)
+    # Only a market CHANGE is guarded: the editors send the stored market back with every save, and
+    # a seed already filed under a market the guard refuses (pre-registry rows) must stay editable.
+    if body.market is not None and market_registry.normalize_market(body.market) != market_registry.normalize_market(row.get("market")):
+        updates["market"] = _declared_seed_market(body.market)
         set_clauses.append("market = :market")
     if body.tool is not None:
         updates["tool"] = _normalize_tool(body.tool)
@@ -5503,19 +5678,26 @@ async def _refresh_external_seed_by_id(
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
-    snap_image_urls: list[str] = []
-    snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
     snap_variant_census: Optional[Dict[str, Any]] = None
+    # Gallery and copy by where they came from (`_snapshot_evidence_content`). An undeclared
+    # gallery (a snapshot from before the extractor split them) leaves the stored one as is; an
+    # og/meta description is refused, because the gateway serves `snapshot.description` AHEAD of
+    # the seed's own description and that hid the real copy (us.laneige.com Lip Sleeping Mask,
+    # 2026-10-14).
     evidence = getattr(snapshot, "evidence", None)
+    content = _snapshot_evidence_content(evidence)
+    # DID THIS FETCH READ THE PRODUCT PAGE WE SERVE? A bot challenge ("Just a moment..."), a 301
+    # onto a collection or another handle, or a cached snapshot returned after a failure all
+    # declare nothing about THIS product: none of them may clear a gallery, upgrade a description
+    # or fill one with SEO copy (final review of #2621). The same pure check the freshness stamp
+    # and liveness verdict below use.
+    _, page_read_is_the_product = _read_the_served_product(row, dest, observed)
+    gallery_declared = content["gallery_declared"]
+    snap_image_urls = content["image_urls"]
+    snap_description = content["description"]
+    description_refused_source = content["description_refused_source"]
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list) and raw_variants:
             snap_variants = [v for v in raw_variants if isinstance(v, dict)]
@@ -5558,7 +5740,6 @@ async def _refresh_external_seed_by_id(
             "title": snap_title,
             "description": snap_description,
             "image_url": snap_image_url,
-            "image_urls": snap_image_urls,
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
@@ -5571,6 +5752,13 @@ async def _refresh_external_seed_by_id(
             or _to_iso(datetime.now(timezone.utc)),
         }
     )
+    # A gallery is replaced only by a declared one; an undeclared read leaves the stored one as is.
+    if gallery_declared:
+        seed_data["snapshot"]["image_urls"] = snap_image_urls
+    if description_refused_source:
+        seed_data["snapshot"]["description_refused_source"] = description_refused_source
+    else:
+        seed_data["snapshot"].pop("description_refused_source", None)
     # Only overwrite curated fields if they are missing.
     if _should_replace_localized_copy(
         existing_text=seed_data.get("description"),
@@ -5582,13 +5770,40 @@ async def _refresh_external_seed_by_id(
         seed_data["description"] = snap_description
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
+    if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
+        seed_data, content["meta_description"]
+    ):
+        # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
+        seed_data["description"] = snap_description
+        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
     if not seed_data.get("description"):
         if snap_description:
             seed_data["description"] = snap_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
+        elif page_read_is_the_product and content["fill_only_description"]:
+            # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
+            # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+            # `snapshot.description`, which the gateway serves ahead of the seed's own.
+            seed_data["description"] = content["fill_only_description"]
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
-    if snap_image_urls:
-        seed_data["image_urls"] = snap_image_urls
+    # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
+    # gallery another writer stamped: a storefront's own structured gallery (the drain's
+    # products.json `images[]`) is the product's, and a page read's one or two declared images
+    # would replace it.
+    if page_read_is_the_product and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (
+        None, SEED_IMAGE_URLS_SOURCE_PAGE_READ
+    ):
+        if snap_image_urls:
+            seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        elif gallery_declared and seed_data.get("image_urls"):
+            # The page declares NO gallery: what the seed stores came from an older read of every
+            # image the page rendered (nav tiles, banners). Cleared, so it is corrected rather than
+            # kept forever; the seed's `image_url` stays (review of #2621).
+            seed_data["image_urls"] = []
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     # The currencies the stored variants are priced in BEFORE this read is adopted (the adoption may

@@ -847,6 +847,14 @@ def read_image_urls(payload: Any) -> List[str]:
     upstream shapes vary (Shopify nests under .images[].src, Wix has
     .media, our external seeds drop a flat array). Try the common ones.
     """
+    # `fetch_products_for_key` reads rows with raw SQL, and through `databases` + asyncpg a JSONB
+    # column arrives as its TEXT (no JSON codec is registered). A str here is that text; read it,
+    # or every row reads as "no gallery of its own".
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return []
     if not isinstance(payload, dict):
         return []
     found: List[str] = []
@@ -1575,10 +1583,14 @@ def assemble_row(
     )
 
     image_urls = read_image_urls(canonical.get("product_payload"))
+    # The seed's gallery is a page read; it FILLS a product that carries no gallery of its own and
+    # is never appended to one that does. Appended, a page read's nav tiles and promo crops landed
+    # after the merchant's own images (us.laneige.com, cocomo.sg, 2026-10-14).
+    owns_gallery = bool(image_urls)
     if image_url and image_url not in image_urls:
         image_urls.insert(0, image_url)
     seed_images = seed_data.get("image_urls") if isinstance(seed_data, dict) else None
-    if isinstance(seed_images, list):
+    if not owns_gallery and isinstance(seed_images, list):
         for u in seed_images:
             if isinstance(u, str) and u.strip() and u.strip() not in image_urls:
                 image_urls.append(u.strip())

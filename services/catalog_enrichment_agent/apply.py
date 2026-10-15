@@ -23,7 +23,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from services.catalog_enrichment_agent.bulk_writer import bulk_upsert
-from services.catalog_enrichment_agent.ingestion import AGENT_VERSION, _domain_of, derive_offer_id
+from services.catalog_enrichment_agent.ingestion import (
+    AGENT_VERSION, SEED_IMAGE_URLS_SOURCE_KEY, _domain_of, derive_offer_id,
+)
 from services.seed_served_url import canonical_for_destination
 from services.catalog_offer_writer_guard import (
     WriterAuditAccumulator,
@@ -380,6 +382,14 @@ _OFFER_UPSERT_SQL = """
                         THEN catalog_offers.estimated_best_price ELSE EXCLUDED.estimated_best_price END,
                       price_confidence = EXCLUDED.price_confidence,
                       source_domain = EXCLUDED.source_domain,
+                      -- REVIVAL. An offer the retailer lane's shade fold retired ('fold_superseded',
+                      -- OFFER_FOLD_SUPERSEDED_REASON) is written again only when a later crawl sells it again
+                      -- (the shade came back, the sale ended): it comes back live. Every other suppression is
+                      -- left exactly as it is -- its own lane decides it.
+                      suppressed_at = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                           THEN NULL ELSE catalog_offers.suppressed_at END,
+                      suppression_reason = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                                THEN NULL ELSE catalog_offers.suppression_reason END,
                       offer_payload = CASE
                         WHEN catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', chr(58), chr(58), '66a3c8a4')
                          AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
@@ -387,6 +397,134 @@ _OFFER_UPSERT_SQL = """
                         THEN catalog_offers.offer_payload ELSE EXCLUDED.offer_payload END,
                       updated_at = NOW()
                     """
+
+#: The final suppression reason of an offer the retailer-ingest shade fold RETIRED: an offer of this lane that
+#: the fold no longer writes (a canonical at another page, a variant no longer folded, a second offer at a
+#: listing the plan writes), and its shopify_markets siblings. Not `*_pending`, not self-reviving: only the
+#: offer upsert above lifts it, and only when a later plan writes that same offer again.
+OFFER_FOLD_SUPERSEDED_REASON = "fold_superseded"
+
+#: The retire of ONE stale offer, in the apply's own transaction, after its upserts. It takes the offer only when
+#: (1) it is still live and of a named source_system -- a row another lane suppressed keeps that lane's reason;
+#: (2) it names what replaces it -- FAIL CLOSED: an offer with no `requires` and no `requires_any` is never
+#: retired -- and those replacements are LIVE now, after this transaction's upserts: EVERY offer in `requires`
+#: (a base offer: the product's own canonical, or the offers at its listing) and AT LEAST ONE in `requires_any`
+#: (a Markets sibling: its base's replacements' own siblings for that market). An upsert that failed, an offer the
+#: guard dropped, or a planned row another lane keeps suppressed never leaves a page without its replacement;
+#: and (3) with keep_last_live, the product keeps at least one live offer of these source_systems outside this
+#: apply's retire set -- a backstop: the retire never takes a product's last live lane offer. `updated_at` is
+#: left as it is: readers order by it, and a retire is not an update of the offer.
+RETIRE_OFFER_SQL = """
+UPDATE catalog_offers AS x
+   SET suppressed_at = NOW(),
+       suppression_reason = CAST(:reason AS text),
+       suppression_metadata = coalesce(x.suppression_metadata, '{}'::jsonb) || CAST(:meta AS jsonb)
+ WHERE x.offer_id = CAST(:offer_id AS text)
+   AND x.source_system = ANY(:source_systems)
+   AND x.suppressed_at IS NULL
+   AND cardinality(CAST(:requires AS text[])) + cardinality(CAST(:requires_any AS text[])) > 0
+   AND (SELECT count(*) FROM catalog_offers r WHERE r.offer_id = ANY(:requires) AND r.suppressed_at IS NULL)
+       = cardinality(CAST(:requires AS text[]))
+   AND (cardinality(CAST(:requires_any AS text[])) = 0 OR EXISTS (
+        SELECT 1 FROM catalog_offers a WHERE a.offer_id = ANY(:requires_any) AND a.suppressed_at IS NULL))
+   AND (NOT CAST(:keep_last_live AS boolean) OR EXISTS (
+        SELECT 1 FROM catalog_offers o
+         WHERE o.product_key = x.product_key
+           AND o.source_system = ANY(:source_systems)
+           AND o.suppressed_at IS NULL
+           AND o.offer_id <> ALL(:retire_ids)))
+RETURNING x.offer_id
+"""
+
+#: Why RETIRE_OFFER_SQL left an offer: read in the same transaction, right after it declined.
+RETIRE_DECLINED_SQL = """
+SELECT (x.suppressed_at IS NULL) AS live,
+       ((SELECT count(*) FROM catalog_offers r WHERE r.offer_id = ANY(:requires) AND r.suppressed_at IS NULL)
+        = cardinality(CAST(:requires AS text[]))
+        AND (cardinality(CAST(:requires_any AS text[])) = 0 OR EXISTS (
+             SELECT 1 FROM catalog_offers a WHERE a.offer_id = ANY(:requires_any) AND a.suppressed_at IS NULL))
+       ) AS replacement_live,
+       EXISTS (SELECT 1 FROM catalog_offers o
+                WHERE o.product_key = x.product_key
+                  AND o.source_system = ANY(:source_systems)
+                  AND o.suppressed_at IS NULL
+                  AND o.offer_id <> ALL(:retire_ids)) AS other_live
+  FROM catalog_offers x
+ WHERE x.offer_id = CAST(:offer_id AS text)
+   AND x.source_system = ANY(:source_systems)
+"""
+
+
+async def _retire_one(database: Any, *, offer_id: str, systems: List[str], requires: List[str],
+                      requires_any: List[str], reason: str, meta: str, keep_last_live: bool,
+                      retire_ids: List[str]) -> Optional[str]:
+    """Retire one offer under RETIRE_OFFER_SQL: None when retired, else why it was left. An offer naming no
+    replacement at all is never written to (no_replacement) -- the statement refuses it as well."""
+    values = {"offer_id": offer_id, "source_systems": systems, "requires": requires, "requires_any": requires_any,
+              "retire_ids": retire_ids}
+    if requires or requires_any:
+        if await database.fetch_all(RETIRE_OFFER_SQL, {**values, "reason": reason, "meta": meta,
+                                                      "keep_last_live": keep_last_live}):
+            return None
+    row = await database.fetch_one(RETIRE_DECLINED_SQL, values)
+    if row is None or not row["live"]:
+        return "not_live"
+    if not (requires or requires_any):
+        return "no_replacement"
+    if not row["replacement_live"]:
+        return "replacement_not_live"
+    return "kept_last_live"
+
+
+async def _retire_offers(database: Any, retire: Dict[str, Any], *, landed: Any = ()) -> Dict[str, Any]:
+    """Retire the stale offers a caller classified, per offer, only behind their replacements.
+
+    `retire`: reason, meta, source_systems, sibling_source_systems, and `offers` -- each {offer_id, requires: the
+    offer_ids that replace it, siblings: [{offer_id, requires_any}]}. `landed`: the offer_ids this transaction's
+    upserts wrote. An offer that names no replacement is left (no_replacement: fail closed). An offer whose
+    replacement did not land here is left (replacement_not_written), so one failed row never retires the offer it
+    was meant to replace, and never stops the rest of the host either. A sibling is retired only behind its
+    retired base AND only when one of its `requires_any` (its base's replacements' own siblings for that market)
+    is live: otherwise the market keeps the page it still sells (sibling_replacement_not_live). Returns what was
+    retired and, by reason, what was left."""
+    landed = set(landed or ())
+    reason, systems = retire["reason"], sorted(set(retire.get("source_systems") or []))
+    sibling_systems = sorted(set(retire.get("sibling_source_systems") or []))
+    offers = sorted(retire.get("offers") or [], key=lambda o: str(o["offer_id"]))
+    retire_ids = sorted(str(o["offer_id"]) for o in offers)
+    out: Dict[str, Any] = {"reason": reason, "offer_ids": [], "sibling_offer_ids": [], "left": {}}
+
+    def stamp(extra: Dict[str, Any]) -> str:
+        return json.dumps({"fold_retire": {**(retire.get("meta") or {}), **extra}}, ensure_ascii=False,
+                          sort_keys=True, default=str)
+
+    for o in offers:
+        offer_id, requires = str(o["offer_id"]), sorted(set(str(r) for r in o.get("requires") or ()))
+        if not requires:
+            out["left"].setdefault("no_replacement", []).append(offer_id)
+            continue
+        if not set(requires) <= landed:
+            out["left"].setdefault("replacement_not_written", []).append(offer_id)
+            continue
+        why = await _retire_one(database, offer_id=offer_id, systems=systems, requires=requires, requires_any=[],
+                                reason=reason, meta=stamp({"why": o.get("why")}), keep_last_live=True,
+                                retire_ids=retire_ids)
+        if why:
+            out["left"].setdefault(why, []).append(offer_id)
+            continue
+        out["offer_ids"].append(offer_id)
+        for sib in o.get("siblings") or ():
+            sib_requires_any = sorted(set(str(r) for r in sib.get("requires_any") or ()))
+            sib_why = await _retire_one(database, offer_id=str(sib["offer_id"]), systems=sibling_systems,
+                                        requires=[], requires_any=sib_requires_any, reason=reason,
+                                        meta=stamp({"why": "sibling", "base_offer_id": offer_id}),
+                                        keep_last_live=False, retire_ids=retire_ids)
+            if sib_why is None:
+                out["sibling_offer_ids"].append(str(sib["offer_id"]))
+            elif sib_why != "not_live":  # a capture never ran for that market: nothing to retire
+                out["left"].setdefault(f"sibling_{sib_why}", []).append(str(sib["offer_id"]))
+    return out
+
 
 def _offer_upsert_sql_with_market(sql: str) -> str:
     """`_OFFER_UPSERT_SQL` with `market` as an INSERT column: the statement for offer rows whose
@@ -411,9 +549,74 @@ def _offer_upsert_sql_with_market(sql: str) -> str:
 _OFFER_UPSERT_MARKET_SQL = _offer_upsert_sql_with_market(_OFFER_UPSERT_SQL)
 
 
-def _offer_sql_for(row: Dict[str, Any]) -> str:
-    """The upsert for one offer row: with `market` only when its writer declared one."""
-    return _OFFER_UPSERT_MARKET_SQL if row.get("market") is not None else _OFFER_UPSERT_SQL
+def _offer_upsert_sql_with_price_read(sql: str) -> str:
+    """`sql` that also dates the price it writes: `price_checked_at = NOW()` (migration 246).
+
+    ONLY for a plan whose caller read every offer price from the merchant in this execution
+    (`apply_ingest_plan(price_read=True)`: the retailer_ingest drain's storefront crawl). Every
+    other caller -- a Gemini answer, a replayed JSONL plan, an affiliate feed, a seed rebuild --
+    keeps the statement it ran before, byte for byte; for those rows the 246 trigger still clears
+    the stamp whenever the price moves without one.
+
+    Under the reviewed SGD 30 hold above, the stored price is kept rather than this run's read, so
+    the stored stamp is kept with it: a price this run did not write is not a price this run dated.
+
+    A row stored in ANOTHER currency is never dated. The upsert writes `currency` on insert only, so
+    this run's amount lands under the stored label (the post-apply readback then fails the job, after
+    the commit): that amount is not a price read in the row's currency, so its stamp is NULL -- what
+    the 246 trigger would have left -- never NOW().
+
+    NOW() is the WRITE time. The read it dates happened earlier in the same execution, before the
+    catalog write lock (at most WRITE_LOCK wait, ~10 min): a stamp can overstate freshness by that much.
+
+    Derived from the one statement, like `_offer_upsert_sql_with_market`, and refused unless it
+    changed exactly the three places it must."""
+    cols_old = "source_domain, offer_payload)\n"
+    vals_old = "CAST(:offer_payload AS jsonb))\n"
+    set_old = "                      updated_at = NOW()\n"
+    if any(sql.count(old) != 1 for old in (cols_old, vals_old, set_old)):
+        raise RuntimeError("_OFFER_UPSERT_SQL changed shape; update _offer_upsert_sql_with_price_read")
+    hold = ("catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', "
+            "chr(58), chr(58), '66a3c8a4')\n"
+            "                         AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'\n"
+            "                         AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20")
+    # Matched whole, anchored on the list_price CASE that applies it (offer_payload repeats the predicate):
+    # an edit to any of its lines must stop this derivation, not leave the stamp keyed to a stale hold.
+    if sql.count("list_price = CASE\n                        WHEN " + hold + "\n") != 1:
+        raise RuntimeError("_OFFER_UPSERT_SQL's reviewed-price hold changed; update _offer_upsert_sql_with_price_read")
+    return (sql.replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
+               .replace(vals_old, "CAST(:offer_payload AS jsonb), NOW())\n")
+               .replace(set_old, "                      price_checked_at = CASE\n"
+                                 f"                        WHEN {hold}\n"
+                                 "                        THEN catalog_offers.price_checked_at\n"
+                                 "                        WHEN catalog_offers.currency IS DISTINCT FROM EXCLUDED.currency THEN NULL\n"
+                                 "                        ELSE EXCLUDED.price_checked_at END,\n"
+                        + set_old))
+
+
+_OFFER_UPSERT_PRICE_READ_SQL = _offer_upsert_sql_with_price_read(_OFFER_UPSERT_SQL)
+_OFFER_UPSERT_MARKET_PRICE_READ_SQL = _offer_upsert_sql_with_price_read(_OFFER_UPSERT_MARKET_SQL)
+
+
+def _offer_sql_for(row: Dict[str, Any], *, price_read: bool = False) -> str:
+    """The upsert for one offer row: with `market` only when its writer declared one, and dating
+    the price only when the plan's caller read it (`_offer_upsert_sql_with_price_read`)."""
+    if row.get("market") is not None:
+        return _OFFER_UPSERT_MARKET_PRICE_READ_SQL if price_read else _OFFER_UPSERT_MARKET_SQL
+    return _OFFER_UPSERT_PRICE_READ_SQL if price_read else _OFFER_UPSERT_SQL
+
+
+async def _offer_price_check_present(database: Any) -> bool:
+    """Does THIS database's catalog_offers carry price_checked_at? Never raises: a failed read
+    (SQLite has no pg_attribute) is "absent", and the apply writes the statement it wrote before 246.
+    Asked of the apply's own connection, outside its write transaction (external_offer_dual_write asks
+    the global one)."""
+    from services.external_offer_dual_write import PRICE_CHECK_COLUMN_SQL
+    try:
+        row = await database.fetch_one(PRICE_CHECK_COLUMN_SQL)
+        return bool(row and row["present"])
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _refuse_offer_market_currency_mismatch(plan: Dict[str, Any]) -> None:
@@ -2083,6 +2286,23 @@ def canonical_owner_of(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _seed_without_gallery(seed: Dict[str, Any]) -> Dict[str, Any]:
+    """The seed with its `seed_data.image_urls` cut back to its one image, exactly as the seed writer stores
+    it for a seed with no structured gallery (ingestion._build_seed_inserts). For a seed attached to a product
+    another brand store owns: the PDP view takes one seed per content_key cluster and appends its images, so
+    this store's gallery would land on the owner's page. A seed without a gallery is returned as it is."""
+    raw = seed.get("seed_data")
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return seed
+    if not isinstance(data, dict) or len(data.get("image_urls") or []) < 2:
+        return seed
+    data["image_urls"] = [seed["image_url"]] if seed.get("image_url") else []
+    data.pop(SEED_IMAGE_URLS_SOURCE_KEY, None)  # no structured gallery left, so no stamp: as main writes it
+    return {**seed, "seed_data": json.dumps(data)}
+
+
 async def _guard_canonical_owner(
     plan: Dict[str, Any], database: Any, *, market: str,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -2093,7 +2313,8 @@ async def _guard_canonical_owner(
     planned brand_official row whose stored row is owned by a DIFFERENT brand-official storefront is
     applied OFFER-ONLY -- CANONICAL_OWNER_COLUMNS keep the stored values and the plan's INCI for it is
     dropped, while its SKUs and offers still land (the row is still upserted, so the apply's counts and
-    the primary-apply gate see every planned product). A canonical-market apply is never touched and
+    the primary-apply gate see every planned product); its seed lands too, with its one image and never this
+    store's structured gallery (_seed_without_gallery). A canonical-market apply is never touched and
     triggers no lookup.
 
     An off-market row with no stored copy is created as today and counted canonical_created_off_market
@@ -2148,6 +2369,9 @@ async def _guard_canonical_owner(
     plan = dict(plan)
     plan["pdps"] = out_pdps
     plan["incis"] = [r for r in incis if str(r.get("product_key") or "") not in offer_only]
+    if plan.get("seeds"):
+        plan["seeds"] = [_seed_without_gallery(s) if str(s.get("attached_product_key") or "") in offer_only else s
+                         for s in plan["seeds"]]
     counts["pdps_offer_only_canonical_owner"] = len(kept)
     counts["incis_skipped_canonical_owner"] = len(incis) - len(plan["incis"])
     counts["canonical_owner_kept"] = kept[:CANONICAL_OWNER_KEPT_CAP]
@@ -2245,8 +2469,13 @@ async def apply_ingest_plan(
     primary_readiness: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
+    retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist an ingest plan, optionally handing curated rows to serving policy.
+
+    `retire_offers` (the retailer-ingest shade fold, _retire_offers): stale offers to retire in the SAME
+    transaction as the plan's SKU and offer upserts; what was retired is counts["offers_retired"].
 
     Curated CLI/queue callers select primary_readiness explicitly. Every other
     existing door retains the original counts and best-effort persistence path.
@@ -2255,13 +2484,19 @@ async def apply_ingest_plan(
 
     `market`: the buyer market the plan's offers are priced for (the retailer_ingest job's); it decides
     whether a brand_official plan is its brand's canonical-market storefront (_guard_canonical_owner).
+
+    `price_read`: the caller vouches that every offer price in the plan was read from the merchant in
+    this execution, in the currency it is written in. The offer upsert then stamps
+    `catalog_offers.price_checked_at = NOW()` (`_offer_upsert_sql_with_price_read`). Default False:
+    nothing is dated.
     """
     from db.database import database as global_db
     from services.catalog_enrichment_agent.primary_ingestion import require_primary_plan, require_primary_apply
 
     preflight = require_primary_plan(plan) if primary_readiness else None
     counts = await _apply_ingest_plan(plan, batch_label=batch_label, db=db, batch=batch, market=market,
-                                      verified_storefront=verified_storefront)
+                                      verified_storefront=verified_storefront, price_read=price_read,
+                                      retire_offers=retire_offers)
     if not primary_readiness:
         return counts
     from services.catalog_enrichment_agent.primary_readiness import (
@@ -2290,6 +2525,8 @@ async def _apply_ingest_plan(
     batch: bool = False,
     market: str = DEFAULT_CANONICAL_MARKET,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
+    retire_offers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     """Execute an ingest plan (from `ingest_validated_jsonl`) against the DB in FK
     order. Returns counts. Per-row failures are logged and skipped (never abort the
@@ -2301,11 +2538,17 @@ async def _apply_ingest_plan(
     from db.database import database as _global_db
 
     _refuse_offer_market_currency_mismatch(plan)  # pure: before the connection, before any write
+    if retire_offers and batch:
+        # The retire must share the offers' transaction; the batched executor has none to share.
+        raise ValueError("retire_offers needs the per-row executor (batch=False)")
     database = db or _global_db
     if not getattr(database, "is_connected", False):
         await database.connect()
 
     await _refuse_parallel_retailer_listings(plan, database)
+    # Asked here, outside any write transaction. A vouched read on a database without the column
+    # writes the pre-246 statement rather than failing every offer.
+    price_read = bool(price_read) and await _offer_price_check_present(database)
     plan = await _prepare_seller_of_record(plan, database)
     # BOTH executors: the guard rewrites the planned rows before either one writes them.
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
@@ -2317,7 +2560,7 @@ async def _apply_ingest_plan(
 
     if batch:
         counts = await _apply_ingest_plan_batched(plan, batch_label=batch_label, database=database,
-                                                  verified_storefront=verified_storefront)
+                                                  verified_storefront=verified_storefront, price_read=price_read)
         counts.update(owner_counts)
         return counts
 
@@ -2424,6 +2667,7 @@ async def _apply_ingest_plan(
             counts["offers_skipped"] = sum(skip_reasons.values())
 
         # 4. catalog_offers — INSERT one row per validated retailer offer.
+        landed_offer_ids: set = set()
         for offer in _with_offer_write_defaults(accepted_offers):
             try:
                 # SAVEPOINT per row, for the SAME reason the SKU loop above has
@@ -2435,11 +2679,18 @@ async def _apply_ingest_plan(
                 # succeeded, while `counts` went on reporting them as written. The
                 # nested transaction rolls back this offer alone.
                 async with database.transaction():
-                    await database.execute(_offer_sql_for(offer), offer)
+                    await database.execute(_offer_sql_for(offer, price_read=price_read), offer)
                 counts["offers"] += 1
+                landed_offer_ids.add(str(offer.get("offer_id")))
                 audit.record_applied(1)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("insert offer failed for offer_id=%s — %s", offer.get("offer_id"), exc)
+
+        # 4b. The stale offers the caller classified, retired in THIS transaction, each only behind the
+        #     replacement offers that landed above (_retire_offers): they commit together or not at all. An
+        #     error here rolls the stage back and raises.
+        if retire_offers:
+            counts["offers_retired"] = await _retire_offers(database, retire_offers, landed=landed_offer_ids)
 
     # 5. external_product_seeds — audit + legacy compatibility.
     own_storefronts = _verified_storefronts_by_key(pdps, verified_storefront)
@@ -2485,6 +2736,7 @@ async def _apply_ingest_plan_batched(
     batch_label: str,
     database: Any,
     verified_storefront: Optional[VerifiedBrandStorefront] = None,
+    price_read: bool = False,
 ) -> Dict[str, int]:
     """Round-trip-eliminating executor. Same SQL constants, same offer guard, same
     WriterAuditAccumulator as the per-row path; each stage upserts in chunked
@@ -2633,8 +2885,10 @@ async def _apply_ingest_plan_batched(
     # the rest do not (a multi-row VALUES needs one column list). A plan normally has one shape.
     offer_rows = _with_offer_write_defaults(accepted_offers)
     applied_offers = offers_insert_skipped = 0
-    for sql in (_OFFER_UPSERT_SQL, _OFFER_UPSERT_MARKET_SQL):
-        shaped = [r for r in offer_rows if _offer_sql_for(r) is sql]
+    shapes = ((_OFFER_UPSERT_PRICE_READ_SQL, _OFFER_UPSERT_MARKET_PRICE_READ_SQL) if price_read
+              else (_OFFER_UPSERT_SQL, _OFFER_UPSERT_MARKET_SQL))
+    for sql in shapes:
+        shaped = [r for r in offer_rows if _offer_sql_for(r, price_read=price_read) is sql]
         if shaped:
             applied, skipped, _osr = await bulk_upsert(database, sql, shaped, label="offers")
             applied_offers += applied
