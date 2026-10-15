@@ -4691,6 +4691,17 @@ async def _handle_offers_resolve(
                     vid = _seed_offer_variant_id(v)
                     if vid and vid == sku_id:
                         matched_variants.append(v)
+                if not matched_variants:
+                    # THE SAME VARIANT, SPELLED DIFFERENTLY. Most stored entries carry the JSON-LD
+                    # offer @id (`/products/x?variant=N#offer`) as their id, and a caller names the
+                    # variant by N (or as a gid) -- a string match missed it, so a correct offer came
+                    # back `variant_match: fallback` and the gateway's exact-only filter dropped it.
+                    # Canonically, through the one shared reader, and only when EXACTLY ONE entry
+                    # answers (two naming it cannot say which one the caller meant; PR controller,
+                    # review of #2628).
+                    answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, sku_id)]
+                    if len(answering) == 1:
+                        matched_variants = answering
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
             canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
@@ -4838,6 +4849,9 @@ async def _handle_offers_resolve(
                     # NARROWER on purpose — see `_seed_variant_identity_claim`. A SKU may match
                     # a candidate; it may not refuse one.
                     named_variant_id=_seed_variant_identity_claim(v),
+                    # The stored entry this offer IS (by object): an id-less entry on a
+                    # multi-variant seed is not "product grain" (final review of #2622).
+                    offer_variant=v,
                 )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,

@@ -1842,3 +1842,92 @@ def test_murad_plans_do_not_fold_even_at_the_seed_price():
         got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
         assert got.variant_id is None and got.reason == R_SIBLING, name
 
+
+
+# Final review of #2622 (finding 2) and PR-controller review of #2628: the per-variant lane identifies
+# the offer by OBJECT, and a named variant is matched canonically.
+
+
+def _route_offers(monkeypatch, client, variants, *, named=None):
+    from unittest.mock import AsyncMock
+
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify", "storefront_platform_source": "products_js_v1"},
+        variants=variants,
+    )
+    sku = _row(source_variant_id=CATALOG_VID,
+               sku_payload=json.dumps({"variant_id": CATALOG_VID, "variant_id_provenance": "merchant_issued"}))
+
+    async def fake_fetch_all(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return [sku]
+        if "FROM external_product_seeds" in q:
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": []})()
+
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "0")
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com"]))
+    res = _resolve(client, product_id=SPID, named=named)
+    assert res.status_code == 200, res.text
+    return [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+
+
+def test_id_less_entries_lend_the_listing_no_sole_catalog_cart(monkeypatch, client):
+    """Two stored variants with NO id at all, one catalog row ($29's): the listing's one offer is the
+    $19 entry, and it used to read as product grain and take the $29 variant's catalog cart."""
+    [offer] = _route_offers(monkeypatch, client, [
+        {"title": "30ml", "price_amount": 19.0, "price_currency": "USD", "availability": "in_stock"},
+        {"title": "50ml", "price_amount": 29.0, "price_currency": "USD", "availability": "in_stock"},
+    ])
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_a_lone_id_less_entry_still_takes_the_sole_catalog_cart(monkeypatch, client):
+    """Nothing to choose between: unchanged."""
+    [offer] = _route_offers(monkeypatch, client, [
+        {"title": "50ml", "price_amount": 29.0, "price_currency": "USD", "availability": "in_stock"},
+    ])
+    assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or "")
+
+
+def test_a_numeric_name_finds_the_entry_stored_by_its_json_ld_offer_id(monkeypatch, client):
+    variants = [
+        {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0, "price_currency": "USD", "availability": "in_stock"},
+        {"variant_id": f"/products/serum?variant={CATALOG_VID}#offer", "title": "50ml", "price_amount": 29.0,
+         "price_currency": "USD", "availability": "in_stock"},
+    ]
+    [offer] = _route_offers(monkeypatch, client, variants, named=CATALOG_VID)
+    assert float(offer["price"]) == 29.0
+    assert offer["source"]["variant_match"] == "exact"
+    assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or "")
+
+
+def test_a_gid_name_finds_the_entry_stored_by_its_bare_number(monkeypatch, client):
+    variants = [
+        {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0, "price_currency": "USD", "availability": "in_stock"},
+        {"variant_id": CATALOG_VID, "title": "50ml", "price_amount": 29.0, "price_currency": "USD", "availability": "in_stock"},
+    ]
+    [offer] = _route_offers(monkeypatch, client, variants, named=f"gid://shopify/ProductVariant/{CATALOG_VID}")
+    assert float(offer["price"]) == 29.0
+    assert offer["source"]["variant_match"] == "exact"
+
+
+def test_a_name_two_entries_answer_to_is_still_a_fallback(monkeypatch, client):
+    variants = [
+        {"variant_id": f"/products/serum?variant={CATALOG_VID}#offer", "title": "50ml", "price_amount": 29.0,
+         "price_currency": "USD", "availability": "in_stock"},
+        {"shopify_variant_id": CATALOG_VID, "title": "50ml dup", "price_amount": 29.0, "price_currency": "USD",
+         "availability": "in_stock"},
+    ]
+    offers = _route_offers(monkeypatch, client, variants, named=CATALOG_VID)
+    assert offers and all(o["source"].get("variant_match") == "fallback" for o in offers)
