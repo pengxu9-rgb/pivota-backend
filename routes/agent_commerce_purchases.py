@@ -363,6 +363,7 @@ async def _open_a2a_purchase(
         variant_key = await reap_routes._resolve_selected_variant_key(
             merchant_domain=merchant_host, product_key=product_key,
             variant_id=req.variant_id, market_country=market_country)
+    reap_routes._refuse_named_placeholder(variant_key, product_key)
     facts, seller_ref, variant_id, seed_kind = await reap_routes._load_cart_link_item(
         merchant_domain=merchant_host, product_key=product_key, variant_key=variant_key, market_country=market_country)
     # A selected variant is bought as itself or not at all (`variant_id` above is the PROVEN one).
