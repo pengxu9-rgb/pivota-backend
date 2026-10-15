@@ -237,8 +237,8 @@ async def test_prepare_own_price_and_resolved_scope_not_caller_guessed(client, m
     assert await unchanged_state() == before
 
 def create_body(witness, idempotency_key, *, by="variant_key"):
-    """The create body a door sends from a prepare witness: its money, and its sku (`variant_key`) or
-    its storefront id (`by="variant_id"`, which the create pins the variant to) -- nothing guessed."""
+    """The create body a door sends from a prepare witness: its money, and its `variant_id` (what the
+    UCP door sends) or its sku (`by="variant_key"`, what that door sent before) -- nothing guessed."""
     return {'item_source': 'cart_link', 'merchant_domain': witness['merchant_domain'],
                 'product_key': witness['product_key'], by: witness[by],
                 'quantity': witness['quantity'], 'idempotency_key': idempotency_key,
@@ -284,7 +284,7 @@ async def test_prepare_dual_spelling_with_agreeing_prices_names_the_lowest_key(c
     assert (witness["variant_id"], witness["unit_price_minor"], witness["currency"]) == (VARIANT, 1399, "USD")
     assert (await client.post(BASE, json=body())).json() == response.json()
     assert await unchanged_state() == before
-    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-dual-spelling'))
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-dual-spelling', by="variant_id"))
     assert created.status_code == 202, created.text
     row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
     assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
@@ -352,18 +352,28 @@ async def test_prepare_placeholder_only_with_disagreeing_placeholder_offers_refu
     assert response.status_code == 409 and error(response) == "row_price_ambiguous", response.text
 
 
-async def test_prepare_never_hands_out_a_witness_its_create_would_refuse(client, monkeypatch):
+async def test_prepare_a_placeholder_priced_sole_variant_is_what_a_variant_id_create_buys(client, monkeypatch):
     """A sole variant whose real sku carries no offer: the no-key load prices the `::canonical`
-    placeholder, but a create NAMING the placeholder beside a real sku is refused -- so the witness
-    is refused here, not handed to a door whose create would then fail."""
+    placeholder, and so does a `variant_id` create -- the witness names the placeholder and the
+    create buys that variant at that price. A create NAMING the placeholder beside a real sku is
+    refused before any write, which is why the door creates by `variant_id`."""
     await seed(monkeypatch)
     placeholder = PRODUCT + "::canonical"
     await add_spelling(placeholder, source_variant_id=PRODUCT, price=None)
     await database.execute("UPDATE catalog_offers SET sku_key=:placeholder WHERE sku_key=:sku", {"placeholder": placeholder, "sku": SKU})
     before = await unchanged_state()
     response = await client.post(BASE, json=body())
-    assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    assert (witness["variant_key"], witness["variant_id"], witness["unit_price_minor"]) == (placeholder, VARIANT, 1399)
     assert await unchanged_state() == before
+    named = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-stranded-named'))
+    assert named.status_code == 409 and error(named) == "row_variant_unverified", named.text
+    assert await database.fetch_val('SELECT COUNT(*) FROM reap_agentic_purchases') == 0
+    created = await client.post('/agent/v2/commerce/reap/purchases', json=create_body(witness, 'prepare-stranded-id', by="variant_id"))
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
+    assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
 
 
 async def make_placeholder_only():
@@ -529,6 +539,8 @@ async def test_prepare_and_create_for_a_product_spelled_www_over_an_apex_seed(cl
     ("uk." + DOMAIN, "uk." + DOMAIN, None),  # a subdomain is ANOTHER store
     ("evil" + DOMAIN, "evil" + DOMAIN, None),  # a lookalike
     (DOMAIN, "uk." + DOMAIN, None),          # the seed's domain says this store, its page another
+    ("uk." + DOMAIN, DOMAIN, None),          # the seed's page is this store, its domain column another
+    ("evil" + DOMAIN, DOMAIN, None),         # ... or a lookalike
     (None, "other.example", None),           # no domain, and the page is another store
     ("www." + DOMAIN, "www." + DOMAIN, DOMAIN),  # the proof was fetched from a host the seed's page is not
 ])

@@ -23,7 +23,7 @@ schedule:
 | Job | Lane | Writer (the only proof logic) | Writes | Valid for | Schedule (UTC) |
 |---|---|---|---|---|---|
 | `reap-cart-proof-enrichment` | `enrichment` | `jobs/enrichment_cart_variant_proof.py` (#2464) | `enrichment_cart_variant_proofs`, one row per (product_key, sku_key): `ok` or a recorded refusal | 72 h | 06:41 daily |
-| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` and `shopify_cart_variant_proofs` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 10:13 daily |
+| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` and `shopify_cart_variant_proofs` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 13:13 daily |
 
 | Piece | Where |
 |---|---|
@@ -448,7 +448,8 @@ only not coincided with.
   (`/products.json` listing pages). The timeout covers the fallback where every store is read one
   `.js` per handle at 3 s: 962 handles before MAC (2,886 s, inside the budget) and MAC's ~1,870
   (5,610 s), 8,496 s in all. MAC is last so it can never starve the other four.
-- **mirror**, 10:13, budget 10,800 s, task timeout 12,600 s (the budget plus one 50-seed page).
+- **mirror**, 13:13 (10:13 until 2026-10-14; moved out of relgraph-sync's daily 10:30-11:20 window,
+  which a ~2 h full pass ran into), budget 10,800 s, task timeout 12,600 s (the budget plus one 50-seed page).
   At 3 s per seed that is ~3,600 seeds a day. **Not measured**: the first dry run's
   `writer.candidates` per domain is the measurement; if the pass is cut (exit 4) on consecutive
   days, raise both numbers in the setup script.
