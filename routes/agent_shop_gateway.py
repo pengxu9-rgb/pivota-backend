@@ -127,6 +127,7 @@ from services.handover_variant_identity import (
     namers_agree_on_price,
     stored_entry_answers_to,
     stored_entry_claimed_variant_ids,
+    stored_entry_variant_ids,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -3105,8 +3106,31 @@ class OffersResolvePayload(BaseModel):
         alias="commerceSurface",
         description="Serving surface eligibility policy (agent_api | ucp | acp)",
     )
+    # OPT-IN, for a caller that verifies offers live with the merchant before serving them (the
+    # gateway's get_offers under UCP_LIVE_OFFER_READ=enforce). A seed gated ONLY for freshness is then
+    # returned flagged `requires_live_verification` instead of dropped. Absent: unchanged.
+    include_live_verification_offers: bool = Field(
+        False,
+        alias="includeLiveVerificationOffers",
+        description="Return freshness-gated seed offers flagged requires_live_verification",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+#: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
+#: gated for these alone may be returned to an opted-in caller that re-reads it live; any other
+#: reason (locale/market or currency mismatch, zero variants) still drops it.
+_FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS = frozenset(
+    {"stale_snapshot", "destination_stale", "destination_never_verified"}
+)
+
+
+def _live_lookup_variant_id(entry: Any) -> Optional[str]:
+    """The ONE merchant variant id a stored seed entry names (any identity key, a JSON-LD @id's
+    `?variant=N` included), or None when it names none or several."""
+    ids = sorted(i for i in stored_entry_variant_ids(entry) if i.isdigit())
+    return ids[0] if len(ids) == 1 else None
 
 
 def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3169,7 +3193,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
             product[key] = payload.get(key)
 
     normalized: Dict[str, Any] = {"product": product}
-    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface"):
+    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
+                "include_live_verification_offers", "includeLiveVerificationOffers"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -4630,6 +4655,8 @@ async def _handle_offers_resolve(
     # currency -- and has had a link minted for it. None when no market is declared.
     _buyer_currency = _declared_buyer_currency(market_hint)
     _buyer_currency_dropped: Dict[str, int] = {}
+    _live_verification_opt_in = bool(getattr(payload, "include_live_verification_offers", False))
+    _live_verification_returned: Dict[str, int] = {"seeds": 0, "offers": 0}
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -4659,7 +4686,20 @@ async def _handle_offers_resolve(
                 )
                 continue
             live_verification_reasons = external_referral_live_verification_reasons(gate_status)
-            if live_verification_reasons:
+            # An OPTED-IN caller re-reads the offer live before serving it, so a seed gated only for
+            # freshness is returned to it flagged -- no cart, no stock claim, its stored price
+            # marked stale -- instead of dropped. ~45% of active US seeds fail a 7-day clock
+            # (census 2026-10-15); a multi-variant seed can never pass `stale_snapshot` from a page
+            # read, which lists one offer. Every other caller, and every other reason, unchanged.
+            requires_live_verification: Optional[List[str]] = None
+            if (
+                live_verification_reasons
+                and _live_verification_opt_in
+                and set(live_verification_reasons) <= _FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS
+            ):
+                requires_live_verification = list(live_verification_reasons)
+                _live_verification_returned["seeds"] += 1
+            elif live_verification_reasons:
                 # Recall can return a referral-only card, but offer resolution
                 # cannot synthesize commerce facts before a live merchant check.
                 mapping_candidates.append(
@@ -4989,6 +5029,12 @@ async def _handle_offers_resolve(
                 if _stock_declined:
                     _stock_stats["declined"] += 1
                     redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                if requires_live_verification:
+                    # NOTHING the stale read says is claimed: no cart (a cart is a claim that this
+                    # variant is buyable at this price now), no stock flag. The caller verifies live.
+                    in_stock = None
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                    _live_verification_returned["offers"] += 1
 
                 # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
                 # says cannot take their card in this market? Asked on the cart the mint WOULD
@@ -5287,6 +5333,22 @@ async def _handle_offers_resolve(
                         **(
                             {"variant_count": variant_count, "variants": variant_options}
                             if variant_options
+                            else {}
+                        ),
+                        **(
+                            {
+                                "requires_live_verification": {
+                                    "reasons": requires_live_verification,
+                                    # The stored price is the last page read's, older than 7 days
+                                    # or never stamped: shown only after a live read confirms it.
+                                    "price_stale": True,
+                                    # The id the caller's live read looks up (the offer has no
+                                    # cart, so `execution_spec.variant_id` is null): the offer's
+                                    # own stored variant, when it names exactly one.
+                                    "lookup_variant_id": _live_lookup_variant_id(v),
+                                },
+                            }
+                            if requires_live_verification
                             else {}
                         ),
                         "source": {
@@ -6658,6 +6720,13 @@ async def _handle_offers_resolve(
             **(
                 {"buyer_currency_filtered": buyer_currency_filtered}
                 if buyer_currency_filtered
+                else {}
+            ),
+            # Opted-in callers only: how many freshness-gated seeds (and their offers) came back
+            # flagged `requires_live_verification` instead of being dropped.
+            **(
+                {"live_verification_returned": dict(_live_verification_returned)}
+                if _live_verification_opt_in
                 else {}
             ),
         },

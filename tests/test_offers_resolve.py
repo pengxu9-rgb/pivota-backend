@@ -5884,3 +5884,81 @@ def test_two_entries_naming_the_attached_variant_at_two_prices_take_no_cart(
     for offer in offers.values():
         assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
 
+
+
+# ---------------------------------------------------------------- live-verification opt-in
+# A seed gated ONLY for freshness (7-day content/link clocks) is dropped from offers.resolve, so a
+# product search shows in stock got 0 offers (Laneige Lip Sleeping Mask, 2026-10-15; ~45% of active
+# US seeds). A caller that re-reads offers live (the gateway's get_offers under enforce) may opt in
+# and get them back flagged, with nothing the stale read says claimed.
+
+
+def _resolve_gated(monkeypatch, client, row, reasons, *, opt_in, sku_id=None):
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": list(reasons)})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com"]))
+    payload = {"product": {"product_id": "ext_spec", **({"sku_id": sku_id} if sku_id else {})},
+               "limit": 10, "market": "US", "tool": "*"}
+    if opt_in:
+        payload["includeLiveVerificationOffers"] = True
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": payload,
+                                                     "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    return [o for o in (body.get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"], body
+
+
+def test_a_freshness_gated_seed_is_still_dropped_for_a_caller_that_does_not_opt_in(monkeypatch, client):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=False)
+    assert offers == []
+    assert "live_verification_returned" not in (body.get("metadata") or {})
+
+
+@pytest.mark.parametrize("reasons", [["stale_snapshot"], ["destination_stale"], ["destination_never_verified"],
+                                     ["destination_never_verified", "stale_snapshot"]])
+def test_an_opted_in_caller_gets_the_freshness_gated_offer_flagged_with_nothing_claimed(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    [offer] = offers
+    flag = offer["requires_live_verification"]
+    assert flag["reasons"] == sorted(reasons)
+    assert flag["price_stale"] is True
+    assert flag["lookup_variant_id"] == _ATTACHED_B_VID, "the attached in-stock variant the listing stands for"
+    assert offer["execution_spec"]["cart_url"] is None, "no cart: a cart claims buyable at this price now"
+    assert offer["cart_prefilled"] is not True
+    assert "in_stock" not in offer and offer["availability"] == "unknown"
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 1, "offers": 1}
+
+
+@pytest.mark.parametrize("reasons", [["locale_market_mismatch"], ["price_currency_mismatch"], ["zero_variants"],
+                                     ["stale_snapshot", "price_currency_mismatch"]])
+def test_a_seed_gated_for_anything_but_freshness_is_dropped_even_when_opted_in(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    assert offers == []
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 0, "offers": 0}
+
+
+def test_a_fresh_seed_is_unchanged_by_the_opt_in(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "requires_live_verification" not in offer
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+def test_a_named_entry_with_a_json_ld_offer_id_is_looked_up_by_its_variant():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._live_lookup_variant_id({"variant_id": f"/products/x?variant={_ATTACHED_B_VID}#offer"}) == _ATTACHED_B_VID
+    assert gateway._live_lookup_variant_id({"variant_id": "SKU-30ML"}) is None
+    assert gateway._live_lookup_variant_id({}) is None
+    # An entry naming TWO variants (variant_id one, shopify_variant_id another) names none.
+    assert gateway._live_lookup_variant_id({"variant_id": "45253610242298", "shopify_variant_id": _ATTACHED_B_VID}) is None
