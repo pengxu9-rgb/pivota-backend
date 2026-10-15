@@ -521,15 +521,74 @@ def test_a_browse_only_store_gets_no_vid_cart(monkeypatch, client):
     assert offer["cart_prefilled"] is False
 
 
-def test_a_non_shopify_destination_gets_no_vid_cart(monkeypatch, client):
-    """No storefront evidence: `resolve_cart_permalink` cannot build a cart, so none is claimed --
-    and `execution_spec.variant_id` stays null with `cart_url`."""
-    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(shopify_evidence=False),
-                          tokens=[_token(vid=V1)])
-    assert "requires_live_verification" not in offer and offer["price"] == LIVE_PRICE
-    assert offer["execution_spec"]["cart_url"] is None
-    assert offer["execution_spec"]["variant_id"] is None
+def test_with_no_storefront_evidence_the_accepted_read_is_the_evidence_for_its_host(monkeypatch, client):
+    """No `storefront_platform`, no stamped `shopify_variant_id`: today no cart can be built. The
+    gateway only reads a store's Shopify UCP endpoint, so an accepted read of `vid` at `h` proves `h` is
+    a Shopify store -- for this offer, and only when `h` is the store the cart is built on."""
+    row = _no_cart_identity_row(shopify_evidence=False)
+    [fresh], _ = _resolve(monkeypatch, client, copy.deepcopy(row), reasons=())
+    assert fresh["execution_spec"]["cart_url"] is None, "no evidence: the normal path builds no cart"
+
+    [offer], _ = _resolve(monkeypatch, client, copy.deepcopy(row), tokens=[_token(vid=V1, h="www.brand.com")])
+    assert "requires_live_verification" not in offer
+    spec = offer["execution_spec"]
+    assert spec["cart_url"].startswith(f"https://brand.com/cart/{V1}:1"), spec
+    assert "country=US" in spec["cart_url"] and spec["variant_id"] == V1
+    assert f"/cart/{V1}:1" in _dest_of(offer) and _ctx_of(offer)["join_mode"] == "cart_permalink"
+
+    [offer], body = _resolve(monkeypatch, client, copy.deepcopy(row), tokens=[_token(vid=V1, h="shop.brand.com")])
+    assert "requires_live_verification" not in offer and offer["price"] == LIVE_PRICE, "accepted"
+    assert offer["execution_spec"]["cart_url"] is None and offer["execution_spec"]["variant_id"] is None
     assert "/cart/" not in _dest_of(offer)
+    assert body["metadata"]["live_verification_assertions"]["accepted"] == 1
+
+
+def test_the_reads_evidence_never_overrides_a_writer_verified_platform(monkeypatch, client):
+    row = _no_cart_identity_row(shopify_evidence=False)
+    row["attached_product_key"] = "prod::m_brand::wix::serum"
+    [offer], _ = _resolve(monkeypatch, client, row, tokens=[_token(vid=V1)])
+    assert "requires_live_verification" not in offer
+    assert offer["execution_spec"]["cart_url"] is None and offer["execution_spec"]["variant_id"] is None
+
+
+def test_the_reads_evidence_never_reaches_another_offer(monkeypatch, client):
+    """Two flagged seeds on the same evidence-less store; only the first has an accepted read. The
+    second stays flagged and cartless -- the evidence is that offer's, never the host's."""
+    import routes.agent_shop_gateway as gateway
+
+    first = _no_cart_identity_row(shopify_evidence=False)
+    second = copy.deepcopy(first)
+    second["id"] = "eps_spec_2"
+    second["destination_url"] = second["canonical_url"] = "https://brand.com/products/serum-2"
+    second["seed_data"]["variants"] = [
+        {"variant_id": "https://brand.com/products/serum-2?variant=41234567890003#offer", "title": "30ml",
+         "price_amount": 9.0, "price_currency": "USD", "availability": "in_stock"},
+        {"variant_id": "https://brand.com/products/serum-2?variant=41234567890004#offer", "title": "50ml",
+         "price_amount": 12.0, "price_currency": "USD", "availability": "in_stock"},
+    ]
+
+    async def fake_fetch_all(query: str, values=None):
+        return [first, second] if "FROM external_product_seeds" in str(query) else []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": ["stale_snapshot"]})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com"]))
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": {
+        "product": {"product_id": "ext_spec"}, "limit": 10, "market": "US", "tool": "*",
+        "includeLiveVerificationOffers": True, "liveVerifications": [_token(vid=V1)]},
+        "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    by_seed = {o["source"]["seed_id"]: o for o in res.json()["offers"]
+               if o.get("purchase_route") == "affiliate_outbound"}
+    assert set(by_seed) == {SEED_ID, "eps_spec_2"}
+    assert f"/cart/{V1}:1" in by_seed[SEED_ID]["execution_spec"]["cart_url"]
+    assert by_seed["eps_spec_2"]["requires_live_verification"]
+    assert by_seed["eps_spec_2"]["execution_spec"]["cart_url"] is None
+    assert "/cart/" not in _dest_of(by_seed["eps_spec_2"])
 
 
 @pytest.mark.parametrize("host,carted", [("brand.com", True), ("www.brand.com", True), ("BRAND.COM", True),
@@ -557,23 +616,32 @@ def test_the_fallback_rules_one_by_one():
 
     claims = olv.LiveVerificationClaims(sid=SEED_ID, vid=V1, m="US", c="USD", a=1.0, av=True, h="brand.com",
                                         iat=0, exp=120)
-    ident = {"cart_variant_id": None, "shop_domain": "brand.com", "platform": "shopify"}
+    ident = {"cart_variant_id": None, "shop_domain": "brand.com", "platform": "shopify", "merchant_id": "m"}
     dest = "https://brand.com/products/serum"
 
-    def allowed(**kw):
+    def identity(**kw):
         args = dict(redirect_identity=ident, destination_url=dest, handover_variant_id=None)
         args.update(kw)
-        return gateway._live_cart_fallback_allowed(claims, **args)
+        return gateway._live_cart_identity(claims, **args)
 
-    assert allowed() is True
-    assert allowed(handover_variant_id=V1) is True, "the hand-over agrees"
-    assert allowed(handover_variant_id=V2) is False, "never over another id the normal path names"
-    assert allowed(redirect_identity={**ident, "cart_variant_id": V2}) is False, "a cart already named"
-    assert allowed(redirect_identity={**ident, "platform": "external_seed"}) is False, "no permalink"
-    assert allowed(redirect_identity={**ident, "shop_domain": None}) is True, "host from the destination"
-    assert allowed(redirect_identity={**ident, "shop_domain": None},
-                   destination_url="https://us.brand.com/products/serum") is False
-    assert allowed(redirect_identity={**ident, "shop_domain": "x.myshopify.com", "platform": None}) is False, "h is brand.com"
+    assert identity() == {**ident, "cart_variant_id": V1}
+    assert identity(handover_variant_id=V1) is not None, "the hand-over agrees"
+    assert identity(handover_variant_id=V2) is None, "never over another id the normal path names"
+    assert identity(redirect_identity={**ident, "cart_variant_id": V2}) is None, "a cart already named"
+    for lane in (None, "external_seed"):
+        out = identity(redirect_identity={**ident, "platform": lane})
+        assert out == {**ident, "platform": "shopify", "cart_variant_id": V1}, "the read is the evidence"
+    assert identity(redirect_identity={**ident, "platform": "wix"}) is None, "never over a verified platform"
+    assert identity(redirect_identity={**ident, "shop_domain": None}) is not None, "host from the destination"
+    assert identity(redirect_identity={**ident, "shop_domain": None},
+                    destination_url="https://us.brand.com/products/serum") is None
+    assert identity(redirect_identity={**ident, "shop_domain": "x.myshopify.com", "platform": None}) is None, \
+        "h is brand.com"
+    bad = olv.LiveVerificationClaims(sid=SEED_ID, vid="SKU-1", m="US", c="USD", a=1.0, av=True, h="brand.com",
+                                     iat=0, exp=120)
+    assert gateway._live_cart_identity(bad, redirect_identity=ident, destination_url=dest,
+                                       handover_variant_id=None) is None, "no permalink on a non-numeric id"
+    assert ident["cart_variant_id"] is None and ident["platform"] == "shopify", "never mutates its input"
 
 
 def test_no_vid_cart_over_a_different_hand_over_id(monkeypatch, client):

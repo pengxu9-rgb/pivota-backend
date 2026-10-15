@@ -5098,13 +5098,15 @@ async def _handle_offers_resolve(
                         # a different cart id was already refused above), never a cart the storefront
                         # cannot take (`resolve_cart_permalink`, so `execution_spec.variant_id` stays
                         # null exactly when `cart_url` is), and for a named variant only its own id.
-                        # The cart path below then runs unchanged on it.
-                        if _live_cart_fallback_allowed(
+                        # The read is Shopify evidence for `h`, for this offer only
+                        # (`_live_cart_identity`). The cart path below then runs unchanged on it.
+                        _live_identity = _live_cart_identity(
                             live_claims,
                             redirect_identity=redirect_identity,
                             destination_url=str(canonical_url or destination_url),
                             handover_variant_id=_handover_id,
-                        ) and (
+                        )
+                        if _live_identity is not None and (
                             not sku_id
                             or _cart_is_the_named_offer(
                                 live_claims.vid, seed_data=seed_data, offer_variant=v,
@@ -5113,7 +5115,7 @@ async def _handle_offers_resolve(
                                 product_id=_seed_source_product_id(row_dict, seed_data),
                             )
                         ):
-                            redirect_identity = {**redirect_identity, "cart_variant_id": live_claims.vid}
+                            redirect_identity = _live_identity
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -9739,21 +9741,33 @@ def _attached_variant_is_this_offer(
     return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
 
 
-def _live_cart_fallback_allowed(
+def _live_cart_identity(
     claims: Any,
     *,
     redirect_identity: Dict[str, Any],
     destination_url: str,
     handover_variant_id: Optional[str],
-) -> bool:
-    """May an ACCEPTED gateway live read's `vid` be the cart variant of an offer whose normal path
-    names none? Only when the normal path names nothing at all (no cart id, and no hand-over id other
-    than `vid`), the read's host `h` is the store the cart would be built on (www-insensitive: a
-    variant id belongs to one Shopify store), and that store can take a cart permalink on `vid`."""
+) -> Optional[Dict[str, Any]]:
+    """The redirect identity with an ACCEPTED gateway live read's `vid` as the cart variant, for an
+    offer whose normal path names none -- or None when it may not have one.
+
+    Only when the normal path names nothing at all (no cart id, and no hand-over id other than
+    `vid`), and the read's host `h` is the store the cart would be built on (www-insensitive: a
+    variant id belongs to one Shopify store).
+
+    THE READ IS ALSO SHOPIFY EVIDENCE FOR `h`, and for this offer only. The gateway reads nothing
+    but a store's Shopify UCP endpoint (/.well-known/ucp -> /api/ucp/mcp, `lookup_catalog` on
+    gid://shopify/ProductVariant/<vid>), so a store that answered `vid` IS a Shopify store at `h`.
+    Like the snapshot's storefront evidence in `_external_seed_redirect_identity`, it may only
+    replace the INTAKE LANE label (None / "external_seed"), never a writer-verified platform; it is
+    never persisted, and no other offer sees it. `platform` feeds only the cart-permalink decisions
+    (`resolve_cart_permalink`: the purchasability gate, the mint and the published spec). Then
+    `resolve_cart_permalink` must actually build a cart on `vid`, so `execution_spec.variant_id`
+    stays null exactly when `cart_url` does."""
     if redirect_identity.get("cart_variant_id"):
-        return False
+        return None
     if handover_variant_id and str(handover_variant_id).strip() != claims.vid:
-        return False
+        return None
 
     def _store(host: Any) -> str:
         bare = normalize_shop_host(host)
@@ -9761,13 +9775,18 @@ def _live_cart_fallback_allowed(
 
     cart_host = _store(redirect_identity.get("shop_domain")) or _store(destination_url)
     if not cart_host or _store(claims.h) != cart_host:
-        return False
-    return bool(resolve_cart_permalink(
+        return None
+    platform = redirect_identity.get("platform")
+    if platform in (None, "external_seed"):
+        platform = "shopify"
+    if not resolve_cart_permalink(
         destination_url=destination_url,
         shop_domain=redirect_identity.get("shop_domain"),
-        platform=redirect_identity.get("platform"),
+        platform=platform,
         cart_variant_id=claims.vid,
-    ))
+    ):
+        return None
+    return {**redirect_identity, "platform": platform, "cart_variant_id": claims.vid}
 
 
 def resolve_cart_permalink(
