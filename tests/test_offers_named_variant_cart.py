@@ -338,3 +338,101 @@ def test_a_kept_named_variant_cart_carries_no_decline(monkeypatch, client, warm_
     offer = _resolve(monkeypatch, client, [_attached()], sku_id=ATTACHED)[0]
     assert "variant_declined" not in _payload(offer)["ctx"]
     assert offer["cart_prefilled"] is True
+
+
+# ------------------------------------------------------------------ review round 1 (2aa38bd4a)
+
+
+def _warm_eligibility(offer: Dict[str, Any], settings: Any):
+    import services.outbound_warm_handoff as warm
+
+    return warm.evaluate_warm_eligibility(
+        dest=_payload(offer)["dest"], user_agent="Mozilla/5.0 (Macintosh) Safari/605.1.15",
+        token=_token(offer), ctx=_payload(offer)["ctx"], settings=settings,
+    )
+
+
+def test_a_named_variant_with_no_resolvable_id_is_never_warmed_into_a_guessed_cart(
+    monkeypatch, client, warm_lane
+):
+    """Review r1 HIGH (p4). Five SKU-only shades, nothing names Adore's Shopify id, so the mint had no
+    cart to withhold -- and the warm lane upgraded the PDP at click time into a cart built from the
+    product handle alone: whichever shade the storefront picks."""
+    skus = [{"sku": f"RB-{i}", "title": n, "price_amount": 25.0, "price_currency": "USD",
+             "availability": "in_stock"} for i, n in enumerate(SHADES)]
+    seed = _seed(variants=skus)
+    seed["seed_data"]["snapshot"]["variants"] = [dict(v) for v in skus]
+    offer = _resolve(monkeypatch, client, [seed], sku_id="RB-2")[0]
+    assert offer["source"]["variant_match"] == "exact"
+    _assert_referral(offer)
+    assert _payload(offer)["ctx"]["variant_declined"] == "not_the_named_variant"
+    assert _warm_eligibility(offer, warm_lane) == (False, "variant_declined")
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_named_variant_the_preflight_refused_is_never_warmed(monkeypatch, client, warm_lane):
+    """Review r1 HIGH (p5). Enforce-mode preflight withdraws the named Bliss's own cart; the click
+    must not rebuild a cart for some other shade."""
+    import routes.agent_shop_gateway as gateway
+
+    async def refusing(offer):
+        return False
+
+    monkeypatch.setattr(gateway, "_preflight_allows_external_offer", refusing)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    offer = _resolve(monkeypatch, client, [_attached()], sku_id=ATTACHED)[0]
+    _assert_referral(offer)
+    assert _warm_eligibility(offer, warm_lane) == (False, "variant_declined")
+
+
+def test_a_product_grain_cartless_link_stays_warmable(monkeypatch, client, warm_lane):
+    """No variant named: the cold population the lane was built for, untouched."""
+    skus = [{"sku": f"RB-{i}", "title": n, "price_amount": 25.0, "price_currency": "USD",
+             "availability": "in_stock"} for i, n in enumerate(SHADES)]
+    seed = _seed(variants=skus)
+    seed["seed_data"]["snapshot"]["variants"] = [dict(v) for v in skus]
+    offer = _resolve(monkeypatch, client, [seed])[0]
+    assert offer["execution_spec"]["cart_url"] is None
+    assert "variant_declined" not in _payload(offer)["ctx"]
+    assert _warm_eligibility(offer, warm_lane) == (True, "allowlisted")
+
+
+@pytest.mark.parametrize("own_key", ["shopify_variant_id", "source_variant_id"])
+def test_a_lone_entry_whose_own_id_is_another_variant_takes_no_sole_catalog_cart(
+    monkeypatch, client, own_key
+):
+    """Review r1 MEDIUM (p1, p1b). One stored entry, named by its SKU, carrying ITS OWN Shopify id
+    ...002; one catalog row ...000. The sole-candidate rule contradicts on variant_id|variantId|id
+    only, so the lone-entry exception handed Adore Bliss's cart."""
+    lone = {"sku": "RB-ADORE", "title": "Adore", "price_amount": 25.0, "price_currency": "USD",
+            "availability": "in_stock", own_key: NAMED}
+    offer = _resolve(
+        monkeypatch, client, [_attached([lone], attached=None)], sku_id="RB-ADORE",
+        sku_rows=[_sku_row(ATTACHED)],
+    )[0]
+    assert offer["source"]["variant_match"] == "exact"
+    _assert_no_cart_for(offer, ATTACHED)
+
+
+def test_a_lone_entry_whose_own_stamp_is_another_variant_takes_no_snapshot_stamp(monkeypatch, client):
+    """Review r1 MEDIUM (p2). Standalone Shopify seed: the lone top-level entry is stamped ...002, the
+    one snapshot entry ...000. The seed-stamp rule reads the snapshot and never the entry."""
+    lone = {"sku": "RB-ADORE", "title": "Adore", "price_amount": 25.0, "price_currency": "USD",
+            "availability": "in_stock", "shopify_variant_id": NAMED}
+    seed = _seed(variants=[lone])
+    seed["seed_data"]["snapshot"]["variants"] = [_shade(0, "Bliss")]
+    offer = _resolve(monkeypatch, client, [seed], sku_id="RB-ADORE")[0]
+    assert offer["source"]["variant_match"] == "exact"
+    _assert_no_cart_for(offer, ATTACHED)
+    _assert_referral(offer)
+
+
+def test_the_summary_line_counts_the_guards_declines(monkeypatch, client, caplog):
+    """Prod volume of this guard must be readable; the values ride in the message text."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _resolve(monkeypatch, client, [_attached([])], sku_id=NAMED)
+    msg = next(r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("offers.resolve.summary"))
+    assert "variant_declined=1" in msg
