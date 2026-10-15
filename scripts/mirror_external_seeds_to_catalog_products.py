@@ -74,6 +74,7 @@ from services.catalog_sync_service import (
 # field mapping + upsert) is owned by services.external_offer_dual_write so the
 # mirror and the on-demand / reconciliation paths cannot drift. This script's
 # _derive_mirror_* / _upsert_canonical_offer_for_mirror_row now delegate there.
+from services.storefront_currency import plausible_domain
 from services.external_offer_dual_write import (
     derive_mirror_offer_id as _shared_offer_id,
     derive_mirror_sku_key as _shared_sku_key,
@@ -1348,26 +1349,29 @@ def _seller_domain_for_row(row_dict: Dict[str, Any]) -> str:
 
 
 def _source_domain_for_row(row_dict: Dict[str, Any]) -> Optional[str]:
-    """The mirror row's `catalog_products.source_domain`: the seed's storefront host EXACTLY as it is
-    spelled (lower case, `www.` kept) -- its `domain`, else the host of its destination_url, else of its
-    canonical_url (`_seller_domain_for_row`'s order, without that function's `www.` fold). None when
-    none is a host. The mirror never wrote this column before 2026-10-14 (2,927 live mirror rows had
-    it NULL, so the cart-link lane, which finds a product by its source_domain, could not see them);
-    `scripts/backfill_catalog_source_domain.py` fills the old rows by the same rule."""
+    """The mirror row's `catalog_products.source_domain`: the first PLAUSIBLE host of the seed's
+    domain, canonical_url, destination_url -- each tried on its own, in the mirror offer writer's
+    order (`services.external_offer_dual_write`), and canonical before destination as the cart-link
+    loader reads the seed's page -- EXACTLY as spelled (lower case, `www.` kept). `plausible_domain`
+    is that writer's gate for a permanent write: a junk domain ('N/A') is skipped, never written, and
+    never shadows a good page host. None when no field is a host. The mirror never wrote this column
+    before 2026-10-14 (2,927 live mirror rows had it NULL, so the cart-link lane, which finds a
+    product by its source_domain, could not see them); `scripts/backfill_catalog_source_domain.py`
+    fills the old rows by the same rule."""
     for candidate in (
         row_dict.get("domain"),
-        row_dict.get("destination_url"),
         row_dict.get("canonical_url"),
+        row_dict.get("destination_url"),
     ):
         raw = str(candidate or "").strip()
-        if not raw:
+        if not raw or any(ch.isspace() for ch in raw):
             continue
         try:
             host = urlsplit(raw if "://" in raw else "//" + raw).hostname
         except ValueError:
             continue
         host = (host or "").rstrip(".")
-        if host and "." in host:
+        if plausible_domain(host):
             return host
     return None
 
