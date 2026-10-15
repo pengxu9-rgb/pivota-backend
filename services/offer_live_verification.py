@@ -93,6 +93,7 @@ VARIANT_MISMATCH = "variant_mismatch"
 MARKET_MISMATCH = "market_mismatch"
 CURRENCY_MISMATCH = "currency_mismatch"
 CART_VARIANT_MISMATCH = "cart_variant_mismatch"
+HOST_MISMATCH = "host_mismatch"
 DUPLICATE = "duplicate"
 
 
@@ -146,6 +147,15 @@ def live_verification_secrets(env: Optional[Mapping[str, str]] = None) -> Tuple[
         return ()
     previous = _usable_secret(source.get(PREVIOUS_SECRET_ENV))
     return (current, previous) if previous is not None and previous != current else (current,)
+
+
+def store_host(value: Any) -> str:
+    """A bare lowercase host with any leading `www.` dropped: www and apex are one Shopify store."""
+    raw = str(value or "").strip().lower()
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    raw = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].split("@")[-1].split(":")[0].strip(".")
+    return raw[4:] if raw.startswith("www.") else raw
 
 
 def _b64url_decode(part: str) -> bytes:
@@ -289,17 +299,21 @@ class LiveVerificationLedger:
         buyer_currency: Optional[str],
         offer_currency: Optional[str],
         cart_variant_id: Optional[str],
+        offer_hosts: Sequence[Optional[str]] = (),
     ) -> Optional[LiveVerificationClaims]:
         """The claims of the first open token that unlocks THIS flagged offer, or None.
 
         `lookup_variant_id` is the id the flagged offer would carry as
         `requires_live_verification.lookup_variant_id`; `market` the request's declared market;
         `buyer_currency` that market's currency; `offer_currency` the offer's own; `cart_variant_id`
-        the id the normal cart path would build a cart on (None when it builds none)."""
+        the id the normal cart path would build a cart on (None when it builds none); `offer_hosts` the
+        stores the offer is (its cart host and its merchant_domain): the read must be of one of them,
+        case- and www.-insensitive, or it says nothing about this offer."""
         declared_market = str(market or "").strip().upper() or None
         declared_currency = str(buyer_currency or "").strip().upper() or None
         own_currency = str(offer_currency or "").strip().upper() or None
         cart_vid = str(cart_variant_id or "").strip() or None
+        stores = {store_host(h) for h in offer_hosts} - {""}
         winner: Optional[_Entry] = None
         for entry in self._open_for(seed_id):
             claims = entry.claims
@@ -309,6 +323,8 @@ class LiveVerificationLedger:
                 entry.reason = MARKET_MISMATCH
             elif not declared_currency or claims.c != declared_currency or own_currency != claims.c:
                 entry.reason = CURRENCY_MISMATCH
+            elif store_host(claims.h) not in stores:
+                entry.reason = HOST_MISMATCH
             elif cart_vid is not None and cart_vid != claims.vid:
                 # The read vouches for `vid` only: a cart built on any other id would publish its
                 # price and stock beside another variant's cart.
@@ -319,6 +335,17 @@ class LiveVerificationLedger:
             else:
                 entry.reason = DUPLICATE
         return winner.claims if winner is not None else None
+
+    @property
+    def accepted(self) -> int:
+        return sum(1 for e in self.entries if e.accepted)
+
+    def public_counts(self) -> Dict[str, int]:
+        """What the RESPONSE says: plain counts. The per-reason breakdown (`counts`) goes to the log
+        only: a public caller must not tell `no_secret` from `bad_mac`, i.e. learn whether the secret
+        is provisioned."""
+        return {"received": len(self.entries), "accepted": self.accepted,
+                "rejected": len(self.entries) - self.accepted}
 
     def counts(self) -> Dict[str, Any]:
         rejected: Dict[str, int] = {}

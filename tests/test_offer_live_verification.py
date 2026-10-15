@@ -224,7 +224,8 @@ def _ledger(tokens, *, opt_in=True, now=NOW, secrets=SECRETS):
 
 
 _MATCH = dict(lookup_variant_id="31760703160372", market="US", buyer_currency="USD",
-              offer_currency="USD", cart_variant_id=None)
+              offer_currency="USD", cart_variant_id=None,
+              offer_hosts=("https://us.laneige.com/products/lip-sleeping-mask", "us.laneige.com"))
 
 
 def test_a_matching_token_is_accepted_once():
@@ -245,6 +246,10 @@ def test_a_matching_token_is_accepted_once():
     ({"offer_currency": "SGD"}, olv.CURRENCY_MISMATCH),
     ({"offer_currency": None}, olv.CURRENCY_MISMATCH),
     ({"cart_variant_id": "31760703160373"}, olv.CART_VARIANT_MISMATCH),
+    ({"offer_hosts": ("laneige.com",)}, olv.HOST_MISMATCH),
+    ({"offer_hosts": ("https://laneige.com/products/x", "laneige.com")}, olv.HOST_MISMATCH),
+    ({"offer_hosts": ()}, olv.HOST_MISMATCH),
+    ({"offer_hosts": (None, "")}, olv.HOST_MISMATCH),
 ])
 def test_each_acceptance_rule_rejects(override, reason):
     ledger = _ledger([VECTOR_TOKEN])
@@ -256,6 +261,24 @@ def test_a_lowercase_declared_market_and_a_cart_on_the_read_variant_match():
     ledger = _ledger([VECTOR_TOKEN])
     assert ledger.match("eps_17a34f48ed404126a2970a5e",
                         **{**_MATCH, "market": "us", "cart_variant_id": "31760703160372"}) is not None
+
+
+@pytest.mark.parametrize("hosts", [("WWW.US.LANEIGE.COM",), ("https://www.us.laneige.com/products/x",),
+                                   ("laneige.com", "us.laneige.com"), ("us.laneige.com:443",)])
+def test_the_read_host_matches_either_store_case_and_www_insensitive(hosts):
+    ledger = _ledger([VECTOR_TOKEN])
+    assert ledger.match("eps_17a34f48ed404126a2970a5e", **{**_MATCH, "offer_hosts": hosts}) is not None
+
+
+def test_the_response_counts_are_plain_numbers():
+    """No per-reason breakdown leaves the process in the response: `no_secret` vs `bad_mac` would
+    tell a public caller whether the secret is provisioned."""
+    ledger = _ledger([VECTOR_TOKEN, _signed(VECTOR_CLAIMS, OTHER_SECRET), "junk"])
+    ledger.match("eps_17a34f48ed404126a2970a5e", **_MATCH)
+    assert ledger.public_counts() == {"received": 3, "accepted": 1, "rejected": 2}
+    assert ledger.counts()["rejected"] == {olv.BAD_MAC: 1, olv.MALFORMED: 1}
+    assert _ledger([VECTOR_TOKEN], secrets=()).public_counts() == _ledger(
+        [_signed(VECTOR_CLAIMS, OTHER_SECRET)]).public_counts()
 
 
 def test_another_seeds_offer_never_matches():

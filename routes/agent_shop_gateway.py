@@ -3131,6 +3131,13 @@ class OffersResolvePayload(BaseModel):
         alias="liveVerifications",
         description="Gateway-signed live verifications of flagged offers (internal)",
     )
+    # ADR-025: a dry run (the gateway's GET_OFFERS_LIVE_CART=shadow second pass) answers identically
+    # but records NO issued clicks -- its links are never handed to anyone.
+    live_verifications_dry_run: bool = Field(
+        False,
+        alias="liveVerificationsDryRun",
+        description="Answer identically, record no issued clicks (internal)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -3242,7 +3249,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
     normalized: Dict[str, Any] = {"product": product}
     for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
                 "include_live_verification_offers", "includeLiveVerificationOffers",
-                "live_verifications", "liveVerifications"):
+                "live_verifications", "liveVerifications",
+                "live_verifications_dry_run", "liveVerificationsDryRun"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -5083,6 +5091,15 @@ async def _handle_offers_resolve(
                         buyer_currency=_buyer_currency,
                         offer_currency=currency,
                         cart_variant_id=redirect_identity.get("cart_variant_id"),
+                        # The stores this offer is: the cart's host, and the merchant_domain it
+                        # publishes (computed as `offer_spec` computes it below).
+                        offer_hosts=(
+                            redirect_identity.get("shop_domain") or str(canonical_url or destination_url),
+                            redirect_identity.get("shop_domain")
+                            or row_dict.get("domain")
+                            or seed_data.get("domain")
+                            or str(canonical_url or destination_url),
+                        ),
                     )
                     if live_claims is not None:
                         offer_requires_live_verification = None
@@ -6735,7 +6752,18 @@ async def _handle_offers_resolve(
     # FAIL OPEN: a failed write is logged and the links are served anyway; losing a click record
     # must never take down search. `/r` still records a click on a link whose issue was lost (as
     # a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
-    await _issue_served_clicks(_issued_clicks, offers, caller_api_key, caller_assertion)
+    #
+    # A LIVE-VERIFICATION SECOND PASS issues only what the gateway can adopt from it. The gateway
+    # re-asks with `live_verifications` and takes ONLY the offers this answer unlocked (they carry
+    # `live_verification`); every other link in the answer is never handed to anyone, so recording it
+    # as issued would be a phantom row. And a dry run (the gateway's shadow mode) adopts nothing.
+    if bool(getattr(payload, "live_verifications_dry_run", False)):
+        _issuable_offers: List[Dict[str, Any]] = []
+    elif _live_assertions.accepted:
+        _issuable_offers = [o for o in offers if isinstance(o, dict) and o.get("live_verification")]
+    else:
+        _issuable_offers = offers
+    await _issue_served_clicks(_issued_clicks, _issuable_offers, caller_api_key, caller_assertion)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -6991,7 +7019,7 @@ async def _handle_offers_resolve(
             ),
             # Callers that sent gateway live verifications: what became of each.
             **(
-                {"live_verification_assertions": _live_assertions.counts()}
+                {"live_verification_assertions": _live_assertions.public_counts()}
                 if _live_assertions.entries
                 else {}
             ),
@@ -9769,10 +9797,7 @@ def _live_cart_identity(
     if handover_variant_id and str(handover_variant_id).strip() != claims.vid:
         return None
 
-    def _store(host: Any) -> str:
-        bare = normalize_shop_host(host)
-        return bare[4:] if bare.startswith("www.") else bare
-
+    _store = offer_live_verification.store_host
     cart_host = _store(redirect_identity.get("shop_domain")) or _store(destination_url)
     if not cart_host or _store(claims.h) != cart_host:
         return None
