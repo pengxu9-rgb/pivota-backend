@@ -436,3 +436,18 @@ def test_the_summary_line_counts_the_guards_declines(monkeypatch, client, caplog
     msg = next(r.getMessage() for r in caplog.records
                if r.getMessage().startswith("offers.resolve.summary"))
     assert "variant_declined=1" in msg
+
+
+def test_a_lone_entry_whose_id_restates_the_attached_product_keeps_its_cart(monkeypatch, client):
+    """Review r2 (p9). The lone entry's `id` is the attached product's own id. Judged against
+    `external_product_id` (`ext_...`) instead of the key's source product id, that restated product
+    id read as a merchant-issued variant, contradicted the operator's ...000, and naming the listing's
+    only variant cost it the cart it gets unnamed."""
+    lone = {"sku": "RB-ADORE", "id": SPID, "title": "Adore", "price_amount": 25.0,
+            "price_currency": "USD", "availability": "in_stock"}
+    unnamed = _resolve(monkeypatch, client, [_attached([lone])])[0]
+    assert unnamed["execution_spec"]["variant_id"] == ATTACHED
+    named = _resolve(monkeypatch, client, [_attached([lone])], sku_id="RB-ADORE")[0]
+    assert named["source"]["variant_match"] == "exact"
+    assert named["execution_spec"]["variant_id"] == ATTACHED
+    assert "variant_declined" not in _payload(named)["ctx"]

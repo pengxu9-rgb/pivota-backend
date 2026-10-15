@@ -4864,7 +4864,7 @@ async def _handle_offers_resolve(
                     redirect_identity.get("cart_variant_id"),
                     seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
                     product_key=_handover_product_key(row_dict, seed_data),
-                    product_id=row_dict.get("external_product_id"),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
                 )
                 if _variant_declined:
                     _variant_stats["declined"] += 1
@@ -4917,7 +4917,7 @@ async def _handle_offers_resolve(
                 if sku_id and not _cart_is_the_named_offer(
                     _handover_id, seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
                     product_key=_handover_product_key(row_dict, seed_data),
-                    product_id=row_dict.get("external_product_id"),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
                 ):
                     _handover_id = None
                 _cart_vid = redirect_identity.get("cart_variant_id")
@@ -9283,6 +9283,26 @@ def _external_seed_redirect_identity(
 _SEED_VARIANT_IDENTITY_KEYS = (
     "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
 )
+
+
+def _seed_source_product_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The BARE source product id `_external_seed_redirect_identity` compares variant ids against:
+    the tail of `attached_product_key` (double-colon storage form, or the pipe transport form),
+    else `external_product_id`. Same parse, so `_cart_is_the_named_offer`'s contradiction check asks
+    the question #2623's attach rule asks: with `external_product_id` instead, an entry whose `id`
+    restates the attached product read as a merchant-issued variant and refused a lone listing's
+    own cart (review r2 of the named-variant guard)."""
+    row = row or {}
+    seed_data = seed_data or {}
+    attached_key = str(row.get("attached_product_key") or seed_data.get("attached_product_key") or "").strip()
+    tail: Optional[str] = None
+    if attached_key.startswith("prod::"):
+        parts = attached_key.split("::")
+        if len(parts) >= 4:
+            tail = "::".join(parts[3:]).strip() or None
+    elif attached_key.count("|") >= 2:
+        tail = attached_key.split("|", 2)[2].strip() or None
+    return tail or str(row.get("external_product_id") or seed_data.get("external_product_id") or "").strip() or None
 
 
 def _cart_is_the_named_offer(
