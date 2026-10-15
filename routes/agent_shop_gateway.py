@@ -3479,9 +3479,10 @@ def _representative_seed_variant(
     attached one, else the first. None for a listing with no stored variants (its offer is
     product-level, as before).
 
-    The attached variant is found as `_attached_variant_is_this_offer` finds it (#2623): any of the
-    entry's identity keys, compared canonically (a gid and its bare number agree), and only when
-    exactly ONE stored entry answers -- two entries sharing an id name neither (#2624). Whether
+    The attached variant is found as `_attached_variant_is_this_offer` finds it: the ONE shared
+    reader (`stored_entry_answers_to`, #2627 -- every identity key canonically, and the `variant=` a
+    JSON-LD `@id` names), and only while the entries naming it agree on its price
+    (`namers_agree_on_price`): entries naming one variant at $19 and $29 name neither. Whether
     that entry's offer may then carry the attached cart is still that rule's decision, made per
     offer in `_external_seed_redirect_identity`; this only chooses which variant the listing's
     one offer is. A sold-out attached variant does not make an in-stock listing look sold out."""
@@ -3492,15 +3493,8 @@ def _representative_seed_variant(
     )
     attached_entry = None
     if attached:
-        answering = [
-            v for v in variants
-            if isinstance(v, dict) and any(
-                canonical_variant_id(str(v.get(k) or "").strip()) == attached
-                for k in _SEED_VARIANT_IDENTITY_KEYS
-                if v.get(k) not in (None, "")
-            )
-        ]
-        if len(answering) == 1:
+        answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, attached)]
+        if answering and namers_agree_on_price(variants, attached):
             attached_entry = answering[0]
 
     def _in_stock(v: Dict[str, Any]) -> bool:

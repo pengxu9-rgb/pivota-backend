@@ -1733,13 +1733,23 @@ def test_jurlique_both_offers_get_the_cart_through_the_real_route(monkeypatch, c
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
                         AsyncMock(return_value=["brand.com"]))
-    res = _resolve(client, product_id=SPID)
-    assert res.status_code == 200, res.text
-    offers = [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
-    assert len(offers) == 2, "one offer per stored entry: offers.resolve does not dedupe them"
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each
+    # stored entry in turn; each still gets the one variant's cart at its own (equal) price.
+    named = [row["seed_data"]["variants"][0]["variant_id"], row["seed_data"]["variants"][1]["variant_id"]]
+    offers = []
+    for name in named:
+        res = _resolve(client, product_id=SPID, named=name)
+        assert res.status_code == 200, res.text
+        offers += [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert len(offers) == 2, "each named entry answers its own offer"
     for offer in offers:
         assert float(offer["price"]) == 31.0
         assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or ""), offer["execution_spec"]
+    # Unnamed, the listing's one offer is that variant too, with its cart.
+    res = _resolve(client, product_id=SPID)
+    [listing] = [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert float(listing["price"]) == 31.0
+    assert f"/cart/{CATALOG_VID}:1" in (listing["execution_spec"]["cart_url"] or ""), listing["execution_spec"]
 
 
 
