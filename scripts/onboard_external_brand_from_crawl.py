@@ -50,7 +50,7 @@ Idempotent throughout. Input: a JSON array on --file or stdin; each item:
   {external_product_id, brand, title, category_kind, product_type,
    destination_url, image_url, price_amount, description, raw_inci,
    offer_type?("brand_direct"|"retailer", default brand_direct),
-   market?(else --market), price_currency?(default "USD")}
+   market?(else --market), price_currency}
 
 A market is DECLARED, never defaulted or inferred (ADR-026,
 docs/adr/ADR-026-a-market-is-data.md): each item carries its own `market`, or
@@ -59,6 +59,13 @@ fetched or written, the whole cohort is checked against the market registry
 (services/market_registry.py); a missing market, one the registry does not
 list, one it does not ingest, or an item market that contradicts --market
 refuses the run, dry-run included. Nothing is filed under US by default.
+
+A price's currency is its market's currency (ADR-026; market_registry.currency_for).
+Each item must carry `price_currency`, and it must be the currency the registry
+lists for the item's market. A missing one, or one that differs, refuses the run
+the same way. It is never defaulted to USD, nor inferred from the market: the
+registry says which currency a market expects, only the store says which one it
+charges.
 
 market/price_currency carry the offer's real locale instead of being forced to
 US/USD -- baking a foreign price as USD would corrupt the shared index. The
@@ -179,6 +186,32 @@ def _declared_market(p: Dict[str, Any]) -> str:
     return market_registry.normalize_market(p.get("market"))
 
 
+def _normalize_currency(currency: Any) -> str:
+    return str(currency or "").strip().upper()
+
+
+def currency_refusal(market: str, currency: Any) -> Optional[str]:
+    """Why a price in `currency` may not be filed under the (already accepted)
+    `market`, or None when it may. A missing currency is refused, never read as
+    USD or as the market's currency; one that is not the market's is refused."""
+    code = _normalize_currency(currency)
+    if not code:
+        return "CURRENCY_REQUIRED"
+    expected = market_registry.currency_for(market)
+    if code != expected:
+        return f"CURRENCY_MISMATCH:{code}!={expected}"
+    return None
+
+
+def _declared_currency(p: Dict[str, Any], market: str) -> str:
+    """The item's declared price currency, normalized. Raises on any currency
+    `currency_refusal` refuses, even when called past `resolve_cohort_currencies`."""
+    refusal = currency_refusal(market, p.get("price_currency"))
+    if refusal is not None:
+        raise ValueError(f"{p.get('external_product_id')!r}: {refusal}")
+    return _normalize_currency(p.get("price_currency"))
+
+
 def resolve_cohort_markets(
     cohort: List[Dict[str, Any]], run_market: Optional[str]
 ) -> List[str]:
@@ -206,6 +239,25 @@ def resolve_cohort_markets(
                 refusals.append(f"{epid!r}: {refusal}")
             continue
         p["market"] = code
+    return refusals
+
+
+def resolve_cohort_currencies(cohort: List[Dict[str, Any]]) -> List[str]:
+    """Stamp each item's price currency, normalized, and return every refusal.
+
+    Runs after `resolve_cohort_markets`; an item whose market was refused is
+    skipped (it has no market to check against and already refuses the run).
+    A non-empty return means the run must not proceed."""
+    refusals: List[str] = []
+    for p in cohort:
+        market = p.get("market")
+        if market_refusal(market) is not None:
+            continue
+        refusal = currency_refusal(market, p.get("price_currency"))
+        if refusal is not None:
+            refusals.append(f"{p.get('external_product_id')!r}: {refusal}")
+            continue
+        p["price_currency"] = _normalize_currency(p.get("price_currency"))
     return refusals
 
 
@@ -462,7 +514,9 @@ def build_default_seed_variant(p: Dict[str, Any]) -> Dict[str, Any]:
         "title": p.get("title") or "Default",
         "price_amount": p.get("price_amount"),
         "price": p.get("price_amount"),
-        "currency": (p.get("price_currency") or "USD").strip() or "USD",
+        # Never defaulted: the onboard path checks it against the market first, and a
+        # stored row with no currency (scripts/backfill_crawl_seed_variants.py) stays None.
+        "currency": _normalize_currency(p.get("price_currency")) or None,
         "availability": "in_stock",
         "image_url": p.get("image_url"),
         "source": "crawl_default_variant_v1",
@@ -477,6 +531,11 @@ async def _upsert_seed(
 ) -> None:
     from datetime import datetime, timezone
 
+    # Refused before anything is built or written; the variant below carries the
+    # same checked currency as the row.
+    market = _declared_market(p)
+    currency = _declared_currency(p, market)
+    p = dict(p, price_currency=currency)
     seed_data = {
         "snapshot": {
             "title": p["title"], "description": p.get("description"), "brand": p.get("brand"),
@@ -540,8 +599,8 @@ async def _upsert_seed(
          "domain": _seed_domain(p) or None,
          "url": p.get("destination_url"), "title": p["title"], "img": p.get("image_url"),
          "price": p.get("price_amount"), "data": json.dumps(seed_data, ensure_ascii=False),
-         "market": _declared_market(p),
-         "currency": (p.get("price_currency") or "USD").strip() or "USD",
+         "market": market,
+         "currency": currency,
          "seller_ref": seller_ref, "seed_kind": seed_kind},
     )
 
@@ -885,14 +944,27 @@ async def _drive(args: argparse.Namespace) -> None:
     # ADR-026: every item's market is declared (its own, or --market) and ingestible,
     # checked BEFORE the publication gate's network calls and before any write. One
     # refused item refuses the run: a partial onboard would drop products silently.
+    # A price's currency is its market's (ADR-026): each item declares price_currency,
+    # and it must be currency_for(market). Checked in the same pass; never defaulted.
     market_refusals = resolve_cohort_markets(cohort, getattr(args, "market", None))
+    currency_refusals = resolve_cohort_currencies(cohort)
+    for refusal in market_refusals:
+        print(f"REFUSED market: {refusal}", file=sys.stderr)
+    for refusal in currency_refusals:
+        print(f"REFUSED currency: {refusal}", file=sys.stderr)
+    problems = []
     if market_refusals:
-        for refusal in market_refusals:
-            print(f"REFUSED market: {refusal}", file=sys.stderr)
-        raise SystemExit(
-            f"refused: {len(market_refusals)} market problem(s); declare an ingested market "
+        problems.append(
+            f"{len(market_refusals)} market problem(s); declare an ingested market "
             f"per item or with --market ({', '.join(market_registry.ingest_markets())})"
         )
+    if currency_refusals:
+        problems.append(
+            f"{len(currency_refusals)} currency problem(s); each item's price_currency "
+            "must be its market's currency (market_registry.currency_for)"
+        )
+    if problems:
+        raise SystemExit("refused: " + "; ".join(problems))
     # extracted_at honesty contract (review finding on the variants fix):
     # snapshot.extracted_at is what the 7d stale_snapshot serving gate audits,
     # so re-running a STALE cohort file must not mint fresh-looking extraction
@@ -978,7 +1050,7 @@ async def _drive(args: argparse.Namespace) -> None:
             print(
                 f"  would onboard {p.get('external_product_id')} "
                 f"({p.get('category_kind')}) "
-                f"{p.get('price_amount')} {p.get('price_currency') or 'USD'} "
+                f"{p.get('price_amount')} {p['price_currency']} "
                 f"market={p['market']} "
                 f"{'[decision-grade only]' if not serve else '[+serving]'} "
                 f":: {p.get('title')}"
