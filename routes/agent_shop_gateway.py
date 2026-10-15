@@ -5014,28 +5014,6 @@ async def _handle_offers_resolve(
                 if _variant_declined:
                     _variant_stats["declined"] += 1
                     redirect_identity = {**redirect_identity, "cart_variant_id": None}
-                # A GATEWAY LIVE READ UNLOCKS A FLAGGED OFFER (services/offer_live_verification).
-                # Only an offer this answer would return flagged for freshness alone, and only by a
-                # verified token naming this seed, the id the flag would ask the caller to look up
-                # (`lookup_variant_id`, the named variant's entry when a sku_id is named), the
-                # declared market and its currency (the offer's own) -- and, when the normal path
-                # would build a cart, a cart on that same id: the read vouches for `vid` alone.
-                # Then, for THIS answer only, the offer is unflagged at the live price and stock and
-                # the normal cart path below runs unchanged: preflight, stock decline,
-                # purchasability gate, `cart_country` pin. Anything else leaves it flagged, as before.
-                if offer_requires_live_verification:
-                    live_claims = _live_assertions.match(
-                        seed_id,
-                        lookup_variant_id=_live_lookup_variant_id(v),
-                        market=market_hint,
-                        buyer_currency=_buyer_currency,
-                        offer_currency=currency,
-                        cart_variant_id=redirect_identity.get("cart_variant_id"),
-                    )
-                    if live_claims is not None:
-                        offer_requires_live_verification = None
-                        price_amount = live_claims.a
-                        in_stock = live_claims.av
                 # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
                 #
                 # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
@@ -5087,6 +5065,55 @@ async def _handle_offers_resolve(
                     product_id=_seed_source_product_id(row_dict, seed_data),
                 ):
                     _handover_id = None
+                # A GATEWAY LIVE READ UNLOCKS A FLAGGED OFFER (services/offer_live_verification).
+                # Only an offer this answer would return flagged for freshness alone, and only by a
+                # verified token naming this seed, the id the flag would ask the caller to look up
+                # (`lookup_variant_id`, the named variant's entry when a sku_id is named), the
+                # declared market and its currency (the offer's own) -- and, when the normal path
+                # would build a cart, a cart on that same id: the read vouches for `vid` alone.
+                # Then, for THIS answer only, the offer is unflagged at the live price and stock and
+                # the normal cart path below runs unchanged: preflight, stock decline,
+                # purchasability gate, `cart_country` pin. Anything else leaves it flagged, as before.
+                # (Here, after `_handover_id`, so the fallback below can defer to it.)
+                if offer_requires_live_verification:
+                    live_claims = _live_assertions.match(
+                        seed_id,
+                        lookup_variant_id=_live_lookup_variant_id(v),
+                        market=market_hint,
+                        buyer_currency=_buyer_currency,
+                        offer_currency=currency,
+                        cart_variant_id=redirect_identity.get("cart_variant_id"),
+                    )
+                    if live_claims is not None:
+                        offer_requires_live_verification = None
+                        price_amount = live_claims.a
+                        in_stock = live_claims.av
+                        # NO CART IDENTITY ON THE NORMAL PATH: the read's own `vid` is the cart
+                        # variant. It is merchant-authoritative -- the gateway looked up
+                        # gid://shopify/ProductVariant/<vid> on the store's own UCP endpoint, checked
+                        # the answer's handle is this offer's product and its currency the market's.
+                        # Stronger than a catalog row or a seed stamp, but only for the STORE it read:
+                        # a variant id is per Shopify store, so `h` must be the host the cart is built
+                        # on. Never over another id the normal path names (the hand-over resolver's;
+                        # a different cart id was already refused above), never a cart the storefront
+                        # cannot take (`resolve_cart_permalink`, so `execution_spec.variant_id` stays
+                        # null exactly when `cart_url` is), and for a named variant only its own id.
+                        # The cart path below then runs unchanged on it.
+                        if _live_cart_fallback_allowed(
+                            live_claims,
+                            redirect_identity=redirect_identity,
+                            destination_url=str(canonical_url or destination_url),
+                            handover_variant_id=_handover_id,
+                        ) and (
+                            not sku_id
+                            or _cart_is_the_named_offer(
+                                live_claims.vid, seed_data=seed_data, offer_variant=v,
+                                named_variant_id=sku_id,
+                                product_key=_handover_product_key(row_dict, seed_data),
+                                product_id=_seed_source_product_id(row_dict, seed_data),
+                            )
+                        ):
+                            redirect_identity = {**redirect_identity, "cart_variant_id": live_claims.vid}
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -9710,6 +9737,37 @@ def _attached_variant_is_this_offer(
     # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
     # say which one the offer is, so neither may lend it the attached cart.
     return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
+
+
+def _live_cart_fallback_allowed(
+    claims: Any,
+    *,
+    redirect_identity: Dict[str, Any],
+    destination_url: str,
+    handover_variant_id: Optional[str],
+) -> bool:
+    """May an ACCEPTED gateway live read's `vid` be the cart variant of an offer whose normal path
+    names none? Only when the normal path names nothing at all (no cart id, and no hand-over id other
+    than `vid`), the read's host `h` is the store the cart would be built on (www-insensitive: a
+    variant id belongs to one Shopify store), and that store can take a cart permalink on `vid`."""
+    if redirect_identity.get("cart_variant_id"):
+        return False
+    if handover_variant_id and str(handover_variant_id).strip() != claims.vid:
+        return False
+
+    def _store(host: Any) -> str:
+        bare = normalize_shop_host(host)
+        return bare[4:] if bare.startswith("www.") else bare
+
+    cart_host = _store(redirect_identity.get("shop_domain")) or _store(destination_url)
+    if not cart_host or _store(claims.h) != cart_host:
+        return False
+    return bool(resolve_cart_permalink(
+        destination_url=destination_url,
+        shop_domain=redirect_identity.get("shop_domain"),
+        platform=redirect_identity.get("platform"),
+        cart_variant_id=claims.vid,
+    ))
 
 
 def resolve_cart_permalink(
