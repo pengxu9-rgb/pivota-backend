@@ -4,9 +4,13 @@
 Resolution rules by source_system:
 
 - external_product_seeds_mirror_v1:
-  catalog_products.source_ref stores external_product_seeds.id. Use that
-  seed's domain. SKUs/offers inherit through product_key after the product
-  mapping is resolved.
+  catalog_products.source_ref stores external_product_seeds.id. Use the first
+  PLAUSIBLE host of that seed's domain, canonical_url, destination_url, each
+  tried on its own (`_mirror_seed_host`; the mirror's own rule,
+  scripts/mirror_external_seeds_to_catalog_products._source_domain_for_row,
+  and the mirror offer writer's): a junk domain ('N/A') never shadows a good
+  page host, because this fill is permanent. SKUs/offers inherit through
+  product_key after the product mapping is resolved.
 
 - shopify_products_sync:
   Prefer a row-embedded store domain under product_payload source/store/
@@ -55,6 +59,8 @@ from urllib.parse import urlparse
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from services.storefront_currency import plausible_domain  # noqa: E402
 
 
 CONFIRM_TOKEN = "BACKFILL_CATALOG_SOURCE_DOMAIN"
@@ -179,11 +185,9 @@ class CatalogSourceDomainBackfill:
               cp.source_system,
               cp.source_ref,
               cp.source_domain AS current_source_domain,
-              COALESCE(cp.source_domain, NULLIF(BTRIM(eps.domain), '')) AS resolved_source_domain,
-              CASE
-                WHEN cp.source_domain IS NOT NULL THEN 'existing_product_source_domain'
-                ELSE 'external_product_seeds.id'
-              END AS resolution_rule
+              eps.domain AS seed_domain,
+              eps.canonical_url AS seed_canonical_url,
+              eps.destination_url AS seed_destination_url
             FROM catalog_products cp
             LEFT JOIN external_product_seeds eps
               ON cp.source_ref = eps.id::text
@@ -205,22 +209,25 @@ class CatalogSourceDomainBackfill:
             """,
             {"source_system": SOURCE_EXTERNAL_SEEDS},
         )
-        return [
-            ProductResolution(
+        resolutions = []
+        for row in rows:
+            current = _clean_optional(row.get("current_source_domain"))
+            if current:
+                resolved, rule = _normalize_domain(current), "existing_product_source_domain"
+            else:
+                resolved, rule = _mirror_seed_host(row)
+            resolutions.append(ProductResolution(
                 product_key=str(row["product_key"]),
                 merchant_id=str(row.get("merchant_id") or ""),
                 platform=str(row.get("platform") or ""),
                 source_system=SOURCE_EXTERNAL_SEEDS,
                 source_ref=_clean_optional(row.get("source_ref")),
-                current_source_domain=_clean_optional(row.get("current_source_domain")),
-                resolved_source_domain=_normalize_domain(row.get("resolved_source_domain")),
-                resolution_rule=str(row.get("resolution_rule") or "external_product_seeds.id"),
-                unresolved_reason=None
-                if _normalize_domain(row.get("resolved_source_domain"))
-                else "seed_missing_or_empty_domain",
-            )
-            for row in rows
-        ]
+                current_source_domain=current,
+                resolved_source_domain=resolved,
+                resolution_rule=rule,
+                unresolved_reason=None if resolved else "seed_missing_or_empty_domain",
+            ))
+        return resolutions
 
     async def resolve_shopify_products_sync(self) -> list[ProductResolution]:
         return await self._resolve_store_sync_source(
@@ -1046,6 +1053,26 @@ def _normalize_domain(value: Any) -> Optional[str]:
     host = host.split(":", 1)[0]
     host = host.strip().strip(".").lower()
     return host or None
+
+
+def _mirror_seed_host(row: Mapping[str, Any]) -> tuple[Optional[str], str]:
+    """`(host, resolution_rule)` for a mirror row with no source_domain: the first PLAUSIBLE host of
+    its seed's domain, canonical_url, destination_url (in that order, each on its own), else
+    `(None, 'external_product_seeds.id')`. `plausible_domain` is the gate the mirror offer writer
+    uses for the same permanent, fill-only write: `_normalize_domain` is a parser that turns 'N/A'
+    into 'n', and a host with whitespace is never a store."""
+    for value, rule in (
+        (row.get("seed_domain"), "external_product_seeds.id"),
+        (row.get("seed_canonical_url"), "external_product_seeds.url_host"),
+        (row.get("seed_destination_url"), "external_product_seeds.url_host"),
+    ):
+        raw = _clean_optional(value)
+        if raw is None or any(ch.isspace() for ch in raw):
+            continue
+        host = _normalize_domain(raw)
+        if plausible_domain(host):
+            return host, rule
+    return None, "external_product_seeds.id"
 
 
 def _clean_optional(value: Any) -> Optional[str]:

@@ -64,7 +64,8 @@ async def test_seed_upsert_merges_seed_data_not_replaces(fake_db):
     """The conflict update must merge (`|| EXCLUDED.seed_data` over a
     COALESCE'd stored value), never bare-replace with EXCLUDED.seed_data."""
     await onboard._upsert_seed(
-        {"external_product_id": "hoverair_x1", "title": "HOVERAir X1", "price_amount": 349.0},
+        {"external_product_id": "hoverair_x1", "title": "HOVERAir X1", "price_amount": 349.0,
+         "market": "US", "price_currency": "USD"},
         seller_ref="merch_obs_deadbeefdeadbeef",
         seed_kind="self",
     )
@@ -119,7 +120,8 @@ async def test_captured_bind_payload_is_valid_json(fake_db):
     """Sanity: the `data` bind param is still JSON-serialised cohort seed_data
     (the value that becomes EXCLUDED.seed_data)."""
     await onboard._upsert_seed(
-        {"external_product_id": "x1", "title": "T", "price_amount": 1.0},
+        {"external_product_id": "x1", "title": "T", "price_amount": 1.0, "market": "US",
+         "price_currency": "USD"},
         seller_ref=None,
         seed_kind=None,
     )

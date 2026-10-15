@@ -9,7 +9,9 @@ whichever offer on the shared `::canonical` SKU was touched last); 47 sell two o
 seeds on several pages, which the seed refresh re-touches.
 
 WHAT IT DOES, per live row and host with more than one listing, for ONE market (--market, default US: the keeper is
-elected for that market's buyer; other markets' offers and seeds are counted in `other_market_left`, never written). The keeper is ingestion.elect_listing_keeper -- the
+elected for that market's buyer; other markets' offers and seeds are counted in `other_market_left`, never written;
+a row/host whose suppressed offer still has a live Shopify Markets sibling is held, see the apply order below). The
+keeper is ingestion.elect_listing_keeper -- the
 SAME function the ingest uses, fed from the catalog (see `evidence`), with the row's current listing as the
 tie-break -- so the next ingest keeps the page this repair keeps instead of bringing a second one back:
   * suppress every LIVE offer of the other listings (reason `same_key_other_listing`, the run and keeper in
@@ -52,9 +54,10 @@ over a repair); every touched content_key's served view and eligibility are rebu
   arguments: any change since -- grown, shrunk, other rows, an extra restore -- changes the digest).
   Host aliases: apply only after the drain image carries ingestion.respell_listing_host AND one crawl of the host
   has run on it, then dry-run again -- before that, a crawl under the other spelling re-mints what this suppresses.
-  Dry-run EVERY market the host is captured for (--market SG, AU, ...), and apply the SIBLING markets first, the
-  base market last: a group whose suppressed base still has a live Shopify Markets sibling is skipped
-  (`sibling_market_alias_live`, `stranded_siblings`) until that sibling's market has run.
+  Both halves: dry-run EVERY market the host is captured for (--market SG, AU, ...), and apply the SIBLING markets
+  first, the base market last: a group whose suppressed base still has a live Shopify Markets sibling is skipped
+  (`sibling_market_alias_live` / `sibling_market_listing_live`, `stranded_siblings`) until that sibling's market
+  has run.
   Folded stores: never run the same-title half (without --only-host-alias) on a store whose shade fold is on.
   Revert a run (all or nothing; refused while a LATER applied run holds any of its rows), or re-run its rebuild:
     python -m scripts.repair_same_title_listings revert --run-id samelisting_<hex>
@@ -342,6 +345,10 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
                                 if not _in_market(o, market))
         live_others = [o for v in others.values() for o in v["offers"] if o.get("suppressed_at") is None]
         suppress = [o["offer_id"] for o in live_others]
+        # The host-alias rule (plan_alias), one way: a left-out offer suppressed here strands its live Shopify Markets
+        # sibling, refreshed only while this base is live; suppressing a sibling strands nothing.
+        stranded = _live_siblings_of(live_others, [o for o in offers if o.get("suppressed_at") is None
+                                                   and not _in_market(o, market)])
         # what a revert puts back: a live offer's metadata (NULL stays NULL)
         prior_metadata = {o["offer_id"]: (_json(o["suppression_metadata"]) if o.get("suppression_metadata") is not None
                                           else None) for o in live_others}
@@ -368,7 +375,7 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
             "suppress_prior_metadata": prior_metadata,
             "deactivate_prior_updated_at": {x["id"]: None if x.get("updated_at") is None else str(x["updated_at"])
                                             for x in seeds_off},
-            "other_market_left": other_market_left,
+            "other_market_left": other_market_left, "stranded_siblings": stranded,
             "restore": restore, "deactivate": deactivate, "repoint": None, "skipped": None}
         if keeper.get("available") is False:
             # every listing of this host is gone or sold out: moving the row between dead pages (and restoring an
@@ -389,6 +396,8 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
                 # half a repair would leave the row naming one page while it sells another: leave it whole
                 entry["skipped"] = "keeper_page_unknown"
                 entry["repoint_unknown"] = {"canonical_url": bool(url), "image_url": bool(image)}
+        if not entry["skipped"] and stranded:
+            entry["skipped"] = "sibling_market_listing_live"  # held whole until the siblings' market has run
         if not entry["skipped"] and not (suppress or restore or deactivate or entry["repoint"]):
             entry["skipped"] = "nothing_to_change"  # already one live listing, the row names it, no stray seed
         groups.append(entry)

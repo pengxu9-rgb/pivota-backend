@@ -324,6 +324,53 @@ def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get(PURCHASABILITY_TIER_KEY) or "").strip().lower() == PURCHASABILITY_BROWSE_ONLY
 
 
+#: The signed-ctx key a mint stamps when the OFFER'S OWN stock claim is out of stock, so the
+#: cart was not built. A separate key from the purchasability tier because it is a different
+#: fact — about the item, not the merchant x market — and a reader of one must not have to
+#: guess which of the two a `browse_only` meant. ABSENT on every other token.
+STOCK_DECLINE_KEY = "stock_declined"
+STOCK_OUT_OF_STOCK = "out_of_stock"
+
+
+def is_stock_declined(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint withheld a cart because the offer it served
+    says `in_stock: false`. Same reason as `is_purchase_declined`: without the knockout the click
+    would build the very cart the mint refused, for an item the same answer called sold out."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(STOCK_DECLINE_KEY) or "").strip().lower() == STOCK_OUT_OF_STOCK
+
+
+#: The signed-ctx key a mint stamps when the offer was returned FLAGGED `requires_live_verification`
+#: (offers.resolve's opt-in: a freshness-gated seed, nothing its stale read says claimed). The mint
+#: built no cart for it; without the knockout the click would build one anyway, for an item the
+#: same answer said needs a live check. ABSENT on every other token.
+LIVE_VERIFICATION_KEY = "live_verification_required"
+LIVE_VERIFICATION_REQUIRED = "freshness"
+
+
+def is_live_verification_required(ctx: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(LIVE_VERIFICATION_KEY) or "").strip().lower() == LIVE_VERIFICATION_REQUIRED
+
+
+#: The signed-ctx key a mint stamps when the caller NAMED a variant and the only cart on offer
+#: was for a different one (the operator's attached variant, a sole catalog row, a sole stamped
+#: snapshot entry), so the cart was not built. ABSENT on every other token.
+VARIANT_DECLINE_KEY = "variant_declined"
+VARIANT_NOT_NAMED = "not_the_named_variant"
+
+
+def is_variant_declined(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint withheld a cart because it was not the variant the
+    caller named. This lane's rebuild carries no variant at all (see `resolve_warm_handoff`), so
+    without the knockout the click would hand the buyer a cart for a variant nobody named."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(VARIANT_DECLINE_KEY) or "").strip().lower() == VARIANT_NOT_NAMED
+
+
 def evaluate_warm_eligibility(
     *,
     dest: str,
@@ -407,6 +454,12 @@ def evaluate_warm_eligibility(
     # fact and was told `browse_only`; building a cart here would overrule it.
     if is_purchase_declined(ctx):
         return False, "purchase_declined"
+    if is_stock_declined(ctx):
+        return False, "stock_declined"
+    if is_live_verification_required(ctx):
+        return False, "live_verification_required"
+    if is_variant_declined(ctx):
+        return False, "variant_declined"
     return True, eligible_reason
 
 
