@@ -344,6 +344,13 @@ async def test_a_variant_id_beside_a_variant_key_is_refused_before_any_read(clie
     assert stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
 
 
+async def test_a_create_naming_the_canonical_placeholder_is_refused_before_the_catalog_read(client, stubs):
+    # The placeholder names no variant, so nothing would hold the purchase to the one the caller saw.
+    resp = await client.post(BASE, body(variant_key="pk_1::canonical"))
+    assert resp.status_code == 409 and "row_variant_unverified" in resp.text, resp.text
+    assert stubs.catalog == [] and await _count("a2a_rail_purchases") == 0
+
+
 async def test_a_key_that_opened_a_reap_purchase_is_replayed_by_the_reap_route(client, stubs):
     req = unified_routes.CreatePurchaseRequest.model_validate(body())
     request_hash = reap_routes._request_hash(
