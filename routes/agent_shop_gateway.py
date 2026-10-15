@@ -3471,22 +3471,44 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
 def _representative_seed_variant(
     variants: List[Dict[str, Any]], row: Dict[str, Any], seed_data: Dict[str, Any], stock: Any
 ) -> Optional[Dict[str, Any]]:
-    """The variant a seller listing's single offer links to: the variant the seed is attached
-    to, else the first one the seed's stock rule calls in stock, else the first. None for a
-    listing with no stored variants (its offer is product-level, as before)."""
+    """The variant a seller listing's single offer stands for: the variant the seed is attached
+    to while it is in stock, else the first one the seed's stock rule calls in stock, else the
+    attached one, else the first. None for a listing with no stored variants (its offer is
+    product-level, as before).
+
+    The attached variant is found as `_attached_variant_is_this_offer` finds it (#2623): any of the
+    entry's identity keys, compared canonically (a gid and its bare number agree), and only when
+    exactly ONE stored entry answers -- two entries sharing an id name neither (#2624). Whether
+    that entry's offer may then carry the attached cart is still that rule's decision, made per
+    offer in `_external_seed_redirect_identity`; this only chooses which variant the listing's
+    one offer is. A sold-out attached variant does not make an in-stock listing look sold out."""
     if not variants:
         return None
-    # The same read `_external_seed_redirect_identity` makes, so the offer's cart and its token's
-    # `variantId` name one variant.
-    attached = str(row.get("attached_variant_id") or seed_data.get("attached_variant_id") or "").strip()
+    attached = canonical_variant_id(
+        str(row.get("attached_variant_id") or seed_data.get("attached_variant_id") or "").strip()
+    )
+    attached_entry = None
     if attached:
-        for v in variants:
-            if _seed_offer_variant_id(v) == attached:
-                return v
+        answering = [
+            v for v in variants
+            if isinstance(v, dict) and any(
+                canonical_variant_id(str(v.get(k) or "").strip()) == attached
+                for k in _SEED_VARIANT_IDENTITY_KEYS
+                if v.get(k) not in (None, "")
+            )
+        ]
+        if len(answering) == 1:
+            attached_entry = answering[0]
+
+    def _in_stock(v: Dict[str, Any]) -> bool:
+        return seed_variant_stock_fields(v.get("availability"), stock).get("in_stock") is True
+
+    if attached_entry is not None and _in_stock(attached_entry):
+        return attached_entry
     for v in variants:
-        if seed_variant_stock_fields(v.get("availability"), stock).get("in_stock") is True:
+        if _in_stock(v):
             return v
-    return variants[0]
+    return attached_entry if attached_entry is not None else variants[0]
 
 
 # The most variants one offer lists (a foundation range can run past 50 shades).

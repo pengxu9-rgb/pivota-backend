@@ -5595,13 +5595,19 @@ def _attached_two_variant_row(*, b_availability: str = "in_stock", attached: str
 
 
 def _resolve_every_variant(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> dict:
-    """offers.resolve by PRODUCT, so every stored variant becomes its own offer. Keyed by price."""
-    by_price = {float(o["price"]): o for o in _resolve_by_product(monkeypatch, client, row)}
+    """Every stored variant's OWN offer, keyed by price. offers.resolve answers one offer per seller
+    listing unless the caller names a variant (pivota-backend #2622), so each stored variant is
+    named in turn (`product.sku_id`) and its offer read with the real mint."""
+    by_price = {}
+    for v in row["seed_data"]["variants"]:
+        for o in _resolve_by_product(monkeypatch, client, row, sku_id=v["variant_id"]):
+            by_price[float(o["price"])] = o
     assert set(by_price) == {19.0, 29.0}, f"one offer per stored variant: {sorted(by_price)}"
     return by_price
 
 
-def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> list:
+def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict,
+                        sku_id: str = None) -> list:
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
@@ -5616,8 +5622,8 @@ def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row
     res = client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
-              "payload": {"product": {"product_id": "ext_spec"}, "limit": 10, "market": "US",
-                          "tool": "*"},
+              "payload": {"product": {"product_id": "ext_spec", **({"sku_id": sku_id} if sku_id else {})},
+                          "limit": 10, "market": "US", "tool": "*"},
               "metadata": {"source": "creator-agent-ui"}},
     )
     assert res.status_code == 200, res.text
@@ -5625,6 +5631,45 @@ def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row
               if o.get("purchase_route") == "affiliate_outbound"]
     assert offers, "the external offer must be returned for this to prove anything"
     return offers
+
+
+# The ONE offer a listing answers when no variant is named (#2622) is subject to the same rule: it
+# stands for one stored variant, and carries the attached cart only when it IS the attached one.
+
+
+def test_the_listing_offer_is_the_attached_variant_with_its_own_cart_while_in_stock(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row())
+    assert float(offer["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+    assert offer["variant_count"] == 2
+
+
+def test_a_sold_out_attached_variant_does_not_make_the_listing_sold_out_or_lend_its_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(b_availability="out_of_stock"))
+    assert float(offer["price"]) == 19.0, "the listing stands for its in-stock variant"
+    assert offer["in_stock"] is True
+    assert offer["execution_spec"]["cart_url"] is None, "the $19 variant is not the attached one"
+    assert _ATTACHED_B_VID not in _dest_of(offer)
+
+
+def test_a_gid_attachment_still_picks_the_attached_variant_for_the_listing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(
+        attached=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}"))
+    assert float(offer["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+def test_an_attached_id_no_stored_variant_answers_to_gives_the_listing_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(b_ids={}))
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
 
 
 def test_a_sibling_offer_is_not_handed_the_attached_variants_cart(
@@ -5737,16 +5782,22 @@ def test_a_lone_variant_naming_another_merchant_id_takes_no_attached_cart(
 def test_two_entries_sharing_one_id_do_not_lend_each_other_a_cart(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    """P4 probe. Both entries are `sku: X`; only the second carries the attached id. The offers
-    dedupe to the first ($19) entry, which must not take the second's cart."""
+    """P4 probe. Both entries are `sku: X`; only the second carries the attached id.
+
+    Named by the shared id, the offers dedupe to the first ($19) entry, which must not take the
+    second's cart. Unnamed, the listing's one offer (#2622) stands for the only entry that answers
+    to the attached id, the $29 one, with exactly its own cart."""
     row = _attached_two_variant_row()
     a, b = row["seed_data"]["variants"]
     for v in (a, b):
         v.pop("variant_id")
         v["sku"] = "X"
-    (offer,) = _resolve_by_product(monkeypatch, client, row)
-    assert float(offer["price"]) == 19.0
-    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+    (named,) = _resolve_by_product(monkeypatch, client, row, sku_id="X")
+    assert float(named["price"]) == 19.0
+    assert named["execution_spec"]["cart_url"] is None, named["execution_spec"]
+    (listing,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(listing["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in listing["execution_spec"]["cart_url"]
 
 
 def test_an_explicit_other_gid_on_an_empty_seed_takes_no_attached_cart() -> None:

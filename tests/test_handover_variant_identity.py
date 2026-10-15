@@ -633,10 +633,12 @@ def _wire(monkeypatch, *, seed_row, sku_rows):
     return seen
 
 
-def _resolve(client, sku_id="SKU-30ML", product_id=None):
+def _resolve(client, sku_id="SKU-30ML", product_id=None, named=None):
     """`sku_id` filters `matched_variants` to the one candidate naming it; `product_id` instead
-    lets the whole variant list through, which is how a multi-variant hand-over is exercised."""
-    product = {"product_id": product_id} if product_id else {"sku_id": sku_id}
+    lets the whole variant list through, which is how a multi-variant hand-over is exercised.
+    `named` names one variant of that product (`product.sku_id`), for its own offer (#2622)."""
+    product = ({"product_id": product_id, **({"sku_id": named} if named else {})}
+               if product_id else {"sku_id": sku_id})
     return client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
@@ -1550,10 +1552,14 @@ def test_the_sibling_offer_gets_no_cart_through_the_real_route(monkeypatch, clie
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
                         AsyncMock(return_value=["brand.com"]))
-    res = _resolve(client, product_id=SPID)
-    assert res.status_code == 200, res.text
-    offers = {float(o["price"]): o for o in res.json().get("offers") or []
-              if o.get("purchase_route") == "affiliate_outbound"}
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each.
+    offers = {}
+    for named in ("SKU-30ML", "SKU-50ML"):
+        res = _resolve(client, product_id=SPID, named=named)
+        assert res.status_code == 200, res.text
+        for o in res.json().get("offers") or []:
+            if o.get("purchase_route") == "affiliate_outbound":
+                offers[float(o["price"])] = o
     assert set(offers) == {19.0, 29.0}, sorted(offers)
     assert offers[19.0]["execution_spec"]["cart_url"] is None, offers[19.0]["execution_spec"]
     tok = parse_qs(urlparse(offers[19.0]["affiliate_url"]).query)["token"][0].split(".")[0]
