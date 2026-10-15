@@ -5665,6 +5665,22 @@ def test_a_gid_attachment_still_picks_the_attached_variant_for_the_listing(
     assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
 
 
+def test_an_attached_id_two_stored_variants_answer_to_picks_neither_for_the_listing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Two entries claim the attached id (#2624's duplicate rule): the attachment names neither, so
+    the listing stands for its first in-stock variant, not for whichever claimant comes first."""
+    row = _attached_two_variant_row()
+    a, b = row["seed_data"]["variants"]
+    a["shopify_variant_id"] = _ATTACHED_B_VID
+    first = {"variant_id": "SKU-15ML", "title": "15ml", "price_amount": 15.0,
+             "price_currency": "USD", "availability": "in_stock"}
+    row["seed_data"]["variants"] = [first, a, b]
+    [offer] = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 15.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
 def test_an_attached_id_no_stored_variant_answers_to_gives_the_listing_no_cart(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
