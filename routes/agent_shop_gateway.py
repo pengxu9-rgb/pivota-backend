@@ -42,6 +42,8 @@ from services.outbound_warm_handoff import (
     PURCHASABILITY_TIER_KEY,
     STOCK_DECLINE_KEY,
     STOCK_OUT_OF_STOCK,
+    VARIANT_DECLINE_KEY,
+    VARIANT_NOT_NAMED,
     could_upgrade_at_click_time,
 )
 import db.merchant_purchasability as merchant_purchasability
@@ -121,12 +123,15 @@ from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
     canonical_variant_id,
+    entry_is_the_sole_variant_read_again,
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
     namers_agree_on_price,
     stored_entry_answers_to,
     stored_entry_claimed_variant_ids,
+    stored_entry_variant_ids,
+    url_named_variant_id,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -4615,6 +4620,9 @@ async def _handle_offers_resolve(
     # Carts withheld because the offer's OWN stock claim is out of stock. Its own counter, not a
     # `_preflight_stats` key: the preflight coverage fields are computed from that dict.
     _stock_stats: Dict[str, int] = {"declined": 0}
+    # Named-variant carts withheld as another variant's (`_cart_is_the_named_offer`). Same reason
+    # for its own dict.
+    _variant_stats: Dict[str, int] = {"declined": 0}
     # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
     # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
     # per call would re-ask for product keys the previous call already loaded. It holds only a
@@ -4840,6 +4848,27 @@ async def _handle_offers_resolve(
                     # object, not by an id string two stored variants may share or both lack.
                     offer_variant=v,
                 )
+                # A NAMED VARIANT'S CART IS ITS OWN, OR THERE IS NONE. Every cart source above
+                # can answer for the PRODUCT -- the operator's seed-wide `attached_variant_id`,
+                # a sole catalog row, a sole stamped snapshot entry -- and a name no stored entry
+                # backs reaches them as the `[{}]` fallback, i.e. as a product-grain offer with
+                # no id to refuse on. Adversarial review of #2622 (2026-10-14): `sku_id=...002`
+                # answered `cart_url=/cart/...000:1` beside `variant_match: exact`; #2623 closed
+                # the stored-sibling road, the fallback road stayed open. So, once, after all of
+                # them: with a variant named, the cart id must be one of THIS offer's own ids
+                # (`_named_offer_own_ids`), else the offer ships as a referral, signed so the
+                # warm lane cannot rebuild a cart at click time (its rebuild names no variant).
+                # The preflight below then asks about the cart we would hand over, not another
+                # variant's id. No variant named: untouched.
+                _variant_declined = bool(sku_id) and not _cart_is_the_named_offer(
+                    redirect_identity.get("cart_variant_id"),
+                    seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                )
+                if _variant_declined:
+                    _variant_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
                 # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
                 #
                 # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
@@ -4885,6 +4914,12 @@ async def _handle_offers_resolve(
                 # that ships prefilled carts today. The union restores it and keeps the
                 # widening.
                 _handover_id = _handover.variant_id if _handover is not None else None
+                if sku_id and not _cart_is_the_named_offer(
+                    _handover_id, seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                ):
+                    _handover_id = None
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -5013,6 +5048,16 @@ async def _handle_offers_resolve(
                 # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
                 # builder minted its own, the agent's lane and the /r hop would be two different
                 # clicks and the order-side join would silently split.
+                # A NAMED VARIANT'S LINK NEVER BECOMES A GUESSED CART AT CLICK TIME. Whatever left
+                # it without a cart -- the guard above, no resolvable id for that variant (the common
+                # case), a preflight refusal, the stock or purchasability gate -- the warm lane would
+                # upgrade the PDP into a cart built from the product handle alone, i.e. for whichever
+                # variant the storefront picks (`resolve_warm_handoff` sends no variant and can send
+                # none). Review of this change found that road open for every cartless named offer,
+                # not only the ones the guard declined. Product-grain links (no `sku_id`) keep the
+                # lane: the buyer has not chosen, which is what it was built for.
+                _named_without_cart = bool(sku_id) and not redirect_identity.get("cart_variant_id")
+
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -5036,6 +5081,7 @@ async def _handle_offers_resolve(
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
                         **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
+                        **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -5099,6 +5145,7 @@ async def _handle_offers_resolve(
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
                     stock_declined=_stock_declined,
+                    variant_declined=_named_without_cart,
                 )
 
                 offer_spec = {
@@ -6585,6 +6632,8 @@ async def _handle_offers_resolve(
         ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
     ) + (
         " stock_declined=%d" % _stock_stats["declined"] if _stock_stats["declined"] else ""
+    ) + (
+        " variant_declined=%d" % _variant_stats["declined"] if _variant_stats["declined"] else ""
     )
     logger.info(
         _summary_msg,
@@ -9228,9 +9277,101 @@ def _external_seed_redirect_identity(
     }
 
 
-#: Every key a stored seed variant may carry its own identity under. Wider than
-#: `_seed_offer_variant_id`'s chain on purpose: an operator may attach the Shopify id while the
-#: variant's first-found id is its SKU, and that variant still IS the attached one.
+def _seed_source_product_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The BARE source product id `_external_seed_redirect_identity` compares variant ids against:
+    the tail of `attached_product_key` (double-colon storage form, or the pipe transport form),
+    else `external_product_id`. Same parse, so `_cart_is_the_named_offer`'s contradiction check asks
+    the question #2623's attach rule asks: with `external_product_id` instead, an entry whose `id`
+    restates the attached product read as a merchant-issued variant and refused a lone listing's
+    own cart (review r2 of the named-variant guard)."""
+    row = row or {}
+    seed_data = seed_data or {}
+    attached_key = str(row.get("attached_product_key") or seed_data.get("attached_product_key") or "").strip()
+    tail: Optional[str] = None
+    if attached_key.startswith("prod::"):
+        parts = attached_key.split("::")
+        if len(parts) >= 4:
+            tail = "::".join(parts[3:]).strip() or None
+    elif attached_key.count("|") >= 2:
+        tail = attached_key.split("|", 2)[2].strip() or None
+    return tail or str(row.get("external_product_id") or seed_data.get("external_product_id") or "").strip() or None
+
+
+def _cart_is_the_named_offer(
+    cart_variant_id: Any, *, seed_data: Dict[str, Any], offer_variant: Dict[str, Any], named_variant_id: Any,
+    product_key: Optional[str] = None, product_id: Optional[str] = None,
+) -> bool:
+    """May an offer for a NAMED variant carry a cart for `cart_variant_id`? (No cart: trivially.)
+
+    When the id is one of the offer's OWN: the named id itself, and every id the stored entry the
+    offer IS names, and the ONE snapshot entry answering to the name -- read by the lane's shared
+    reader (`stored_entry_variant_ids`: canonical identity keys, plus the `?variant=N` of a JSON-LD
+    offer `@id`-shaped id, the shape most stored entries carry, census 2026-10-15). The snapshot
+    counts because it is the same variant under another read: the route's `_seed_variants` reads
+    top-level `variants` only, so a seed storing its variants solely in `snapshot.variants` serves a
+    named one as the `[{}]` fallback while the stamp the cart comes from sits on that very snapshot
+    entry. Two snapshot entries answering to one name say nothing.
+
+    Or when the offer IS the seed's one stored variant (by object, as `_attached_variant_is_this_offer`
+    identifies it) and nothing on that entry contradicts the cart: a lone entry is "nothing to choose
+    between", the rule #2623 and #2624 apply to the operator's id and the sole catalog row, and naming
+    that variant (by its SKU, say) must not cost it the cart its listing gets unnamed. The
+    contradiction check is HERE, not left to those rules: review found only the operator rule
+    applying it to every key -- the sole catalog row is contradicted on `variant_id|variantId|id`
+    only, and the seed stamp never looks at the top-level entry -- so a lone entry stamped
+    `shopify_variant_id: ...002` was handed a sole catalog row's or a snapshot stamp's ...000.
+    Claimed ids only (`stored_entry_claimed_variant_ids`: never a `sku`, which may match a variant but
+    not refuse one; a URL-shaped id contributes its `?variant=`), judged parent-aware against the
+    attached key's product.
+    """
+    cart = canonical_variant_id(cart_variant_id)
+    if not cart:
+        return True
+
+    named = canonical_variant_id(named_variant_id)
+    own = stored_entry_variant_ids(offer_variant) | {
+        x for x in (named, url_named_variant_id(named_variant_id)) if x
+    }
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    snapshot_variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if named and isinstance(snapshot_variants, list):
+        twins = [x for x in snapshot_variants if stored_entry_answers_to(x, named)]
+        if len(twins) == 1:
+            own |= stored_entry_variant_ids(twins[0])
+    if cart in own:
+        return True
+    served = _seed_variants(seed_data)
+    # The SAME variant read twice (#2627): an entry the corroborated fold -- the snapshot holds
+    # exactly one variant and it is the cart's, the entry claims no other, the price agrees -- makes
+    # the cart's variant. That is the cart #2627 restores for a SKU-named entry; it is its own.
+    if isinstance(offer_variant, dict) and offer_variant and any(v is offer_variant for v in served) and (
+        entry_is_the_sole_variant_read_again(
+            offer_variant, variant_id=cart, stored=served, seed_data=seed_data,
+            product_key=product_key, product_id=product_id,
+        )
+    ):
+        return True
+    if not (len(served) == 1 and served[0] is offer_variant):
+        return False
+    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
+    # data that came WITH the entry. A name the caller sent is an assertion about which variant the
+    # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
+    # restated product id is not one) and differs from the cart, a cart for the other id is a silent
+    # substitution. Refusing costs at worst a click (a barcode-named single-variant listing lands on
+    # its PDP); not refusing can charge for the wrong shade. Only on this branch: everywhere else
+    # the cart is already one of the offer's own ids, or the corroborated fold above has proven the
+    # product has exactly one variant. (The name differs from the cart by construction here: it is
+    # one of `own`, and a cart in `own` has already returned.)
+    if names_a_merchant_issued_variant(named, product_key=product_key, product_id=product_id):
+        return False
+    return not any(
+        claimed != cart
+        and names_a_merchant_issued_variant(claimed, product_key=product_key, product_id=product_id)
+        for claimed in stored_entry_claimed_variant_ids(offer_variant)
+    )
+
+
 def _attached_variant_is_this_offer(
     seed_data: Dict[str, Any],
     *,
@@ -9639,6 +9780,8 @@ def _cart_prefilled_claim(
     # Set when the offer's own stock claim withheld the cart. Signed into the token the same
     # way, and knocked out by the warm lane the same way; defaulted for the same reason.
     stock_declined: bool = False,
+    # Set when a named variant's cart was withheld as another variant's. Same road again.
+    variant_declined: bool = False,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9711,6 +9854,7 @@ def _cart_prefilled_claim(
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
             **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
+            **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
         },
         settings=settings,
     ):

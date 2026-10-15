@@ -1155,9 +1155,18 @@ def test_a_barcode_sku_may_match_a_variant_but_may_not_refuse_one(monkeypatch, c
         ),
         sku_rows=[_row(source_variant_id=CATALOG_VID, sku_payload=None)],
     )
-    assert _resolve(client, sku_id="4901234567894").status_code == 200
+    # The STORED barcode, on the listing's offer (no variant named): it may not refuse the cart.
+    assert _resolve(client, product_id=SPID).status_code == 200
     assert seen["cart_variant_id"] == CATALOG_VID, (
         "a barcode names no variant; it is an absence of information, not a disagreement")
+
+    # A CALLER naming that barcode is different (decided 2026-10-15, be#2628): a name shaped like a
+    # merchant-issued id that differs from the cart is a claim, so the lone listing ships as a
+    # referral rather than risk substituting another variant. The accepted cost is this one: a
+    # single-variant listing named by its barcode lands on its product page instead of a cart.
+    seen.clear()
+    assert _resolve(client, sku_id="4901234567894").status_code == 200
+    assert seen["cart_variant_id"] is None
 
 
 def test_a_barcode_sku_on_the_seed_stamp_path_does_not_veto_the_stamp():

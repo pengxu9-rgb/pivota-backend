@@ -2574,8 +2574,14 @@ def _resolve_exec_spec_offer(
     evidence: bool,
     row_overrides: dict = None,
     allowed_domains: list = None,
+    product: dict = None,
 ) -> dict:
-    """One external offer for the exec-spec fixture, through the real route."""
+    """One external offer for the exec-spec fixture, through the real route.
+
+    Named (`sku_id: SKU-1`) by default. `product=_PRODUCT_GRAIN` asks for the listing instead,
+    which the warm-lane claim tests need: a NAMED variant's cartless link is signed
+    `variant_declined` and never warmed (a handle-only click-time cart would be a guess at the
+    variant), so only a product-grain link is the cold population the lane upgrades."""
     import routes.agent_shop_gateway as gateway
 
     row = _seed_row_for_exec_spec(evidence=evidence)
@@ -2593,7 +2599,8 @@ def _resolve_exec_spec_offer(
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {"product": product or {"sku_id": "SKU-1"}, "limit": 10, "market": "US",
+                        "tool": "*"},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -2602,6 +2609,10 @@ def _resolve_exec_spec_offer(
               if o.get("purchase_route") == "affiliate_outbound"]
     assert offers, "the external offer must be returned for this to prove anything"
     return offers[0]
+
+
+#: The listing, not a named variant -- see `_resolve_exec_spec_offer`.
+_PRODUCT_GRAIN = {"product_id": "ext_spec"}
 
 
 def _token_of(offer: dict) -> str:
@@ -2619,7 +2630,7 @@ def test_cart_prefilled_is_null_not_false_when_the_warm_lane_could_contradict_it
 
     Without the guard this is `False` — and the buyer lands in a prefilled cart anyway.
     """
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert "cart_prefilled" in offer, "the field must still be present — null is a STATE, not an omission"
     assert offer["cart_prefilled"] is None, (
         "a `false` here is a claim the warm-handoff lane can contradict after the answer "
@@ -2675,7 +2686,7 @@ def test_cart_prefilled_tracks_the_percentage_rollout(
     """With an empty allowlist the rollout pct decides — and the claim must follow it."""
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", pct)
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert offer["cart_prefilled"] is expected
 
 
@@ -2696,7 +2707,7 @@ def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
 
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 50)
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
 
     click_eligible, reason = evaluate_warm_eligibility(
         dest=_dest_of(offer),
@@ -2753,7 +2764,7 @@ def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
     import services.outbound_warm_handoff as warm
 
     warm.memo_clear()
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert offer["cart_prefilled"] is None
 
     cart_url = "https://brand.myshopify.com/cart/c/abc123?key=k"
@@ -2917,7 +2928,7 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
     so reading it would restore a `false` the warm lane can contradict.
     """
     offer = _resolve_exec_spec_offer(
-        monkeypatch, client, evidence=False,
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
         row_overrides={
             "canonical_url": "https://brand.com/products/serum",
             "destination_url": "https://other.com/products/serum",
@@ -3309,7 +3320,7 @@ def test_rail_is_null_rather_than_referral_when_the_warm_lane_could_upgrade(
     An agent that hands the buyer `affiliate_url` (the attributed link we WANT it to use) is
     told "referral" and the buyer can land in a prefilled cart.
     """
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     spec = offer["execution_spec"]
     assert "rail" in spec, "the field must stay present — null is a STATE, not an omission"
     assert spec["rail"] is None

@@ -307,6 +307,12 @@ refused.
 said `in_stock: false` (an explicit false only — unknown stock keeps its cart). Warming it would
 build a cart for an item the same answer called sold out. Only offers.resolve stamps it so far.
 
+**`variant_declined`** (2026-10-15) runs after that: a token whose ctx says
+`variant_declined: not_the_named_variant` was minted as a PDP because the caller named a variant
+(`product.sku_id`) and the only cart on offer was another variant's — the operator's attached one,
+a sole catalog row, a sole stamped snapshot entry. This lane's rebuild carries no variant, so
+warming it would hand the buyer a cart for a variant nobody named. Only offers.resolve stamps it.
+
 **Knockout ORDER: last, not first.** It runs after the affiliate, bot and allowlist gates so
 that `warm_reason=already_cart` counts **only clicks that would otherwise have been warmed**.
 Ordered first it also swallowed bot/prefetch traffic (heavy on `/r`, and an absent UA counts
