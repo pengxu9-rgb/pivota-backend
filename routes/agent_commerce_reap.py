@@ -2003,7 +2003,7 @@ async def _load_cart_link_item(
     mirror_placeholder = placeholder if platform != "shopify" and named is None else None
     # The same gate when the placeholder is loaded BY NAME (review of #2457): it is priced by the
     # ordinary read below, and must not become the way around `live_variant_count == 1`. A create may
-    # no longer name it (`_refuse_named_placeholder`); `/purchases/prepare` and a resume still do.
+    # no longer name it (`_refuse_named_placeholder`); a resume of a stored body still may.
     if (platform != "shopify" and named is not None and _is_placeholder_sku(named, product_key)
             and _proof_live_variant_count(seed_data) != 1):
         raise svc.PurchaseRefused("row_unpriced", "a placeholder prices only a sole live variant")
@@ -2862,36 +2862,23 @@ async def prepare_reap_purchase_selection(
             product = dict(product)
             if str(product.get("platform") or "").lower() not in {"shopify", "external_seed"}:
                 raise svc.PurchaseRefused("row_not_shopify")
-            # THE ONE SELECTOR RULE, create's and resume's (`_resolve_selected_variant_key`): every sku
-            # naming the id is this listing's own; one variant spelled by two writers is priced per
-            # spelling and must agree; a placeholder-only or sole-variant product takes the no-key path.
-            variant_key = await _resolve_selected_variant_key(
+            # THE LOAD A `variant_id` CREATE MAKES, exactly: create's and resume's selector rule
+            # (`_resolve_selected_variant_key`: every sku naming the id is this listing's own; one
+            # variant spelled by two writers is priced per spelling and must agree), then the resolved
+            # key, or none -- the no-key path, for a placeholder-only or sole-variant product. The door
+            # creates by `variant_id`, never by the witness's sku, so the witness names the sku this
+            # load PRICED and the create resolves it again by this same rule.
+            resolved_key = await _resolve_selected_variant_key(
                 merchant_domain=merchant_host, product_key=product_key,
                 variant_id=variant_id, market_country=market,
             )
-            unnamed: Optional[Tuple[int, str]] = None
-            if variant_key is None:
-                # The no-key path: the witness names the sku this load PRICED, and that sku is loaded
-                # by name below, as a create naming it would load it. (Within this one snapshot the
-                # two loads read the same rows, so the price check after it is a backstop that does
-                # not fire today.) A `::canonical` key pins NO variant at create -- like a no-key
-                # create, the proof is the identity -- so a door creates by `variant_id`, which is
-                # held to the selected variant (`_require_selected_variant`).
-                priced: Dict[str, Any] = {}
-                no_key_facts, _seller, no_key_variant, _kind = await _load_cart_link_item(
-                    merchant_domain=merchant_host, product_key=product_key,
-                    variant_key=None, market_country=market, priced_sku=priced,
-                )
-                _require_selected_variant(no_key_variant, variant_id)
-                variant_key = priced["sku_key"]
-                unnamed = (no_key_facts["our_price_minor"], no_key_facts["currency"])
+            priced: Dict[str, Any] = {}
             facts, seller, resolved_id, _seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host, product_key=product_key,
-                variant_key=variant_key, market_country=market,
+                variant_key=resolved_key, market_country=market, priced_sku=priced,
             )
             _require_selected_variant(resolved_id, variant_id)
-            if unnamed is not None and unnamed != (facts["our_price_minor"], facts["currency"]):
-                raise svc.PurchaseRefused("row_price_ambiguous")
+            variant_key = priced["sku_key"]
             selected_sku = await database.fetch_one(
                 _CART_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
             )
