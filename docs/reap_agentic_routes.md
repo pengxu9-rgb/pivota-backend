@@ -102,12 +102,12 @@ The selected numeric ID resolves by create's own `variant_id` rule (see `variant
 seller/source SKU, else `row_variant_unverified`. One variant spelled by two catalog writers is
 priced per spelling; the priced spellings must agree (`row_price_ambiguous`) and the lowest SKU
 key is named. A product whose only variant it is, or that has only its `::canonical`
-placeholder, takes the no-key path, and the witness names the SKU that load priced -- which
-must then load by name (as the create carrying the witness names it) to the same variant and
-price, else the preparation refuses. **Create from a witness with `variant_id` (and the
-witness's money), not with its `variant_key`.** A `variant_id` create is held to that variant.
-A placeholder witness's `variant_key` (`<product_key>::canonical`) names no variant, so a create
-naming it is refused `409 row_variant_unverified` before anything is written. The existing cart-link reader validates active attached
+placeholder, takes the no-key path, and the witness names the SKU that load priced. This is
+exactly the load a `variant_id` create makes, so **create from a witness with `variant_id` (and
+the witness's money), not with its `variant_key`.** A `variant_id` create is held to that
+variant. A placeholder witness's `variant_key` (`<product_key>::canonical`) names no variant, so
+a create naming it is refused `409 row_variant_unverified` before anything is written -- a sole
+variant priced only on that placeholder beside an unpriced real SKU is bought by `variant_id`. The existing cart-link reader validates active attached
 source, seller identity, current storefront proof and the selected SKU's own offer. Missing,
 expired or contradictory evidence refuses. Preparation requires its usable own offers to
 agree on exact currency and minor price, and enforces the same current agent, domain, market,

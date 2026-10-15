@@ -451,3 +451,76 @@ def test_a_lone_entry_whose_id_restates_the_attached_product_keeps_its_cart(monk
     assert named["source"]["variant_match"] == "exact"
     assert named["execution_spec"]["variant_id"] == ATTACHED
     assert "variant_declined" not in _payload(named)["ctx"]
+
+
+# ------------------------------------------------------------------ #2627: ids in JSON-LD @id form
+
+
+def _jsonld(vid: str) -> str:
+    return f"https://{HOST}/products/soft-pinch-liquid-blush?variant={vid}#offer"
+
+
+def test_a_named_shade_whose_id_is_a_jsonld_offer_url_keeps_its_own_cart(monkeypatch, client):
+    """Most stored entries carry the JSON-LD offer `@id` as their id (census 2026-10-15), and that
+    @id is what the listing's option list names it by. Adore's own id is the `?variant=` of it, so
+    the operator's ...002 is its own cart -- the canonical form alone ("https://...") never matched."""
+    shades = [{"variant_id": _jsonld(str(43734829564000 + i)), "sku": f"RB-{i}", "title": n,
+               "price_amount": 25.0, "price_currency": "USD", "availability": "in_stock"}
+              for i, n in enumerate(SHADES)]
+    offer = _resolve(monkeypatch, client, [_attached(shades, attached=NAMED)], sku_id=_jsonld(NAMED))[0]
+    assert offer["source"]["variant_match"] == "exact"
+    assert offer["execution_spec"]["variant_id"] == NAMED
+
+
+def test_a_lone_entry_whose_jsonld_id_is_another_variant_takes_no_operator_cart(monkeypatch, client):
+    """The URL-named id is a CLAIM: a lone entry whose @id says ...002 refuses the operator's ...000."""
+    lone = {"variant_id": _jsonld(NAMED), "sku": "RB-ADORE", "title": "Adore", "price_amount": 25.0,
+            "price_currency": "USD", "availability": "in_stock"}
+    offer = _resolve(monkeypatch, client, [_attached([lone])], sku_id="RB-ADORE")[0]
+    _assert_no_cart_for(offer, ATTACHED)
+
+
+def test_a_shade_whose_only_id_is_its_url_variant_keeps_its_own_cart(monkeypatch, client):
+    """The entry's own `url` names it (`?variant=...002`) and nothing else does; named by its SKU, the
+    operator's ...002 is its own cart. Read only by the shared reader (`stored_entry_variant_ids`)."""
+    shades = [{"sku": f"RB-{i}", "url": _jsonld(str(43734829564000 + i)), "title": n,
+               "price_amount": 25.0, "price_currency": "USD", "availability": "in_stock"}
+              for i, n in enumerate(SHADES)]
+    seed = _attached(shades, attached=NAMED)
+    seed["seed_data"]["snapshot"]["variants"] = []  # no snapshot twin: the ENTRY's reader decides
+    offer = _resolve(monkeypatch, client, [seed], sku_id="RB-2")[0]
+    assert offer["source"]["variant_match"] == "exact"
+    assert offer["execution_spec"]["variant_id"] == NAMED
+
+
+# ------------------------------------------------------------------ a caller's name may refuse (Peng 10-15)
+
+
+def test_a_lone_entry_named_by_a_variant_shaped_id_refuses_another_variants_cart(monkeypatch, client):
+    """Review r1 p3, decided 2026-10-15. The lone entry's only id is a SKU `...002`; the caller names
+    `...002`; the operator attached `...000`. The stored SKU alone may not refuse (barcode doctrine),
+    but the CALLER asserted `...002`, so a cart for `...000` is a silent substitution: referral."""
+    lone = {"sku": NAMED, "title": "Adore", "price_amount": 25.0, "price_currency": "USD",
+            "availability": "in_stock"}
+    offer = _resolve(monkeypatch, client, [_attached([lone])], sku_id=NAMED)[0]
+    assert offer["source"]["variant_match"] == "exact"
+    _assert_no_cart_for(offer, ATTACHED)
+    _assert_referral(offer)
+    assert _payload(offer)["ctx"]["variant_declined"] == "not_the_named_variant"
+
+
+def test_a_lone_entry_named_by_the_carts_own_id_keeps_it(monkeypatch, client):
+    """The same shape, named by the id the cart IS: nothing substituted, the cart stays."""
+    lone = {"sku": ATTACHED, "title": "Bliss", "price_amount": 25.0, "price_currency": "USD",
+            "availability": "in_stock"}
+    offer = _resolve(monkeypatch, client, [_attached([lone])], sku_id=ATTACHED)[0]
+    assert offer["execution_spec"]["variant_id"] == ATTACHED
+
+
+def test_a_name_restating_the_product_id_is_not_a_variant_claim(monkeypatch, client):
+    """Parent-aware: the attached product's own id, named, is not a merchant-issued VARIANT id, so it
+    does not refuse the lone listing's cart."""
+    lone = {"sku": SPID, "title": "Adore", "price_amount": 25.0, "price_currency": "USD",
+            "availability": "in_stock"}
+    offer = _resolve(monkeypatch, client, [_attached([lone])], sku_id=SPID)[0]
+    assert offer["execution_spec"]["variant_id"] == ATTACHED

@@ -123,9 +123,15 @@ from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
     canonical_variant_id,
+    entry_is_the_sole_variant_read_again,
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
+    namers_agree_on_price,
+    stored_entry_answers_to,
+    stored_entry_claimed_variant_ids,
+    stored_entry_variant_ids,
+    url_named_variant_id,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -3478,9 +3484,10 @@ def _representative_seed_variant(
     attached one, else the first. None for a listing with no stored variants (its offer is
     product-level, as before).
 
-    The attached variant is found as `_attached_variant_is_this_offer` finds it (#2623): any of the
-    entry's identity keys, compared canonically (a gid and its bare number agree), and only when
-    exactly ONE stored entry answers -- two entries sharing an id name neither (#2624). Whether
+    The attached variant is found as `_attached_variant_is_this_offer` finds it: the ONE shared
+    reader (`stored_entry_answers_to`, #2627 -- every identity key canonically, and the `variant=` a
+    JSON-LD `@id` names), and only while the entries naming it agree on its price
+    (`namers_agree_on_price`): entries naming one variant at $19 and $29 name neither. Whether
     that entry's offer may then carry the attached cart is still that rule's decision, made per
     offer in `_external_seed_redirect_identity`; this only chooses which variant the listing's
     one offer is. A sold-out attached variant does not make an in-stock listing look sold out."""
@@ -3491,15 +3498,8 @@ def _representative_seed_variant(
     )
     attached_entry = None
     if attached:
-        answering = [
-            v for v in variants
-            if isinstance(v, dict) and any(
-                canonical_variant_id(str(v.get(k) or "").strip()) == attached
-                for k in _SEED_VARIANT_IDENTITY_KEYS
-                if v.get(k) not in (None, "")
-            )
-        ]
-        if len(answering) == 1:
+        answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, attached)]
+        if answering and namers_agree_on_price(variants, attached):
             attached_entry = answering[0]
 
     def _in_stock(v: Dict[str, Any]) -> bool:
@@ -9277,14 +9277,6 @@ def _external_seed_redirect_identity(
     }
 
 
-#: Every key a stored seed variant may carry its own identity under. Wider than
-#: `_seed_offer_variant_id`'s chain on purpose: an operator may attach the Shopify id while the
-#: variant's first-found id is its SKU, and that variant still IS the attached one.
-_SEED_VARIANT_IDENTITY_KEYS = (
-    "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
-)
-
-
 def _seed_source_product_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
     """The BARE source product id `_external_seed_redirect_identity` compares variant ids against:
     the tail of `attached_product_key` (double-colon storage form, or the pipe transport form),
@@ -9311,13 +9303,14 @@ def _cart_is_the_named_offer(
 ) -> bool:
     """May an offer for a NAMED variant carry a cart for `cart_variant_id`? (No cart: trivially.)
 
-    When the id is one of the offer's OWN, compared canonically (a gid and its number agree): the
-    named id itself, and every identity key (`_SEED_VARIANT_IDENTITY_KEYS`: Shopify stamp, variant
-    id, SKU...) of the stored entry the offer IS and of the ONE snapshot entry answering to the name.
-    The snapshot counts because it is the same variant under another read: the route's
-    `_seed_variants` reads top-level `variants` only, so a seed storing its variants solely in
-    `snapshot.variants` serves a named one as the `[{}]` fallback while the stamp the cart comes
-    from sits on that very snapshot entry. Two snapshot entries answering to one name say nothing.
+    When the id is one of the offer's OWN: the named id itself, and every id the stored entry the
+    offer IS names, and the ONE snapshot entry answering to the name -- read by the lane's shared
+    reader (`stored_entry_variant_ids`: canonical identity keys, plus the `?variant=N` of a JSON-LD
+    offer `@id`-shaped id, the shape most stored entries carry, census 2026-10-15). The snapshot
+    counts because it is the same variant under another read: the route's `_seed_variants` reads
+    top-level `variants` only, so a seed storing its variants solely in `snapshot.variants` serves a
+    named one as the `[{}]` fallback while the stamp the cart comes from sits on that very snapshot
+    entry. Two snapshot entries answering to one name say nothing.
 
     Or when the offer IS the seed's one stored variant (by object, as `_attached_variant_is_this_offer`
     identifies it) and nothing on that entry contradicts the cart: a lone entry is "nothing to choose
@@ -9327,45 +9320,56 @@ def _cart_is_the_named_offer(
     applying it to every key -- the sole catalog row is contradicted on `variant_id|variantId|id`
     only, and the seed stamp never looks at the top-level entry -- so a lone entry stamped
     `shopify_variant_id: ...002` was handed a sole catalog row's or a snapshot stamp's ...000.
-    Claim keys only, parent-aware (`names_a_merchant_issued_variant`); never a `sku`, which may match
-    but not refuse (`_seed_variant_identity_claim`).
-
-    Never otherwise. Not the operator's seed-wide id, a sole catalog row or a sole stamped entry for
-    another variant: those answer for the PRODUCT, and for a named variant a product-grain answer is
-    a guess about which variant the buyer gets.
+    Claimed ids only (`stored_entry_claimed_variant_ids`: never a `sku`, which may match a variant but
+    not refuse one; a URL-shaped id contributes its `?variant=`), judged parent-aware against the
+    attached key's product.
     """
     cart = canonical_variant_id(cart_variant_id)
     if not cart:
         return True
 
-    def _ids(entry: Any) -> set:
-        if not isinstance(entry, dict):
-            return set()
-        return {canonical_variant_id(entry.get(key)) for key in _SEED_VARIANT_IDENTITY_KEYS} - {""}
-
     named = canonical_variant_id(named_variant_id)
-    own = _ids(offer_variant) | ({named} if named else set())
+    own = stored_entry_variant_ids(offer_variant) | {
+        x for x in (named, url_named_variant_id(named_variant_id)) if x
+    }
     snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
     snapshot_variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
     if named and isinstance(snapshot_variants, list):
-        twins = [x for x in snapshot_variants if named in _ids(x)]
+        twins = [x for x in snapshot_variants if stored_entry_answers_to(x, named)]
         if len(twins) == 1:
-            own |= _ids(twins[0])
+            own |= stored_entry_variant_ids(twins[0])
     if cart in own:
         return True
     served = _seed_variants(seed_data)
+    # The SAME variant read twice (#2627): an entry the corroborated fold -- the snapshot holds
+    # exactly one variant and it is the cart's, the entry claims no other, the price agrees -- makes
+    # the cart's variant. That is the cart #2627 restores for a SKU-named entry; it is its own.
+    if isinstance(offer_variant, dict) and offer_variant and any(v is offer_variant for v in served) and (
+        entry_is_the_sole_variant_read_again(
+            offer_variant, variant_id=cart, stored=served, seed_data=seed_data,
+            product_key=product_key, product_id=product_id,
+        )
+    ):
+        return True
     if not (len(served) == 1 and served[0] is offer_variant):
         return False
+    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
+    # data that came WITH the entry. A name the caller sent is an assertion about which variant the
+    # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
+    # restated product id is not one) and differs from the cart, a cart for the other id is a silent
+    # substitution. Refusing costs at worst a click (a barcode-named single-variant listing lands on
+    # its PDP); not refusing can charge for the wrong shade. Only on this branch: everywhere else
+    # the cart is already one of the offer's own ids, or the corroborated fold above has proven the
+    # product has exactly one variant. (The name differs from the cart by construction here: it is
+    # one of `own`, and a cart in `own` has already returned.)
+    if names_a_merchant_issued_variant(named, product_key=product_key, product_id=product_id):
+        return False
     return not any(
-        names_a_merchant_issued_variant(offer_variant.get(key), product_key=product_key, product_id=product_id)
-        and canonical_variant_id(offer_variant.get(key)) != cart
-        for key in _NAMED_VARIANT_CLAIM_KEYS
+        claimed != cart
+        and names_a_merchant_issued_variant(claimed, product_key=product_key, product_id=product_id)
+        for claimed in stored_entry_claimed_variant_ids(offer_variant)
     )
-
-
-#: The keys of a stored entry that CLAIM a variant id -- `_seed_variant_identity_claim`'s chain
-#: plus the two stamps. Not `sku`/`sku_id`: a barcode may match a variant, never refuse one.
-_NAMED_VARIANT_CLAIM_KEYS = ("variant_id", "variantId", "id", "shopify_variant_id", "source_variant_id")
 
 
 def _attached_variant_is_this_offer(
@@ -9419,19 +9423,21 @@ def _attached_variant_is_this_offer(
         return offer.lower().startswith("gid://shopify/productvariant/") and _contradicts(offer)
 
     def _entry_contradicts(v: Dict[str, Any]) -> bool:
-        return any(
-            _contradicts(x)
-            for x in (_seed_variant_identity_claim(v), v.get("shopify_variant_id"), v.get("source_variant_id"))
-        )
+        # The shared reader's CLAIM ids (no `sku`), URL-shaped ids read for their `variant=`.
+        return any(_contradicts(x) for x in stored_entry_claimed_variant_ids(v))
 
     def _answers(v: Dict[str, Any]) -> bool:
-        return any(canonical_variant_id(v.get(key)) == target for key in _SEED_VARIANT_IDENTITY_KEYS)
+        # The ONE reader every matcher in this lane uses (services/handover_variant_identity):
+        # it also reads `?variant=N` off a JSON-LD `@id`-shaped id, the shape most stored
+        # entries carry (census 2026-10-15).
+        return stored_entry_answers_to(v, target)
 
     if offer_variant is not None:
         mine = next((v for v in served if v is offer_variant), None)
         if mine is not None:
             if _answers(mine):
-                return True
+                # Several entries naming it at different prices: whose price is the cart's?
+                return namers_agree_on_price(served, target)
             return len(served) == 1 and not _entry_contradicts(mine)
         if len(served) > 1:
             return False
@@ -9446,7 +9452,7 @@ def _attached_variant_is_this_offer(
         return canonical_variant_id(offer) == target
     # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
     # say which one the offer is, so neither may lend it the attached cart.
-    return len(mine) == 1 and _answers(mine[0])
+    return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
 
 
 def resolve_cart_permalink(
