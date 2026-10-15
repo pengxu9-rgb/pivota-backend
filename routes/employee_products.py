@@ -4276,6 +4276,32 @@ async def create_external_seed(
         image_url = snap_image_urls[0]
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
+    # A PAGE READ IN ANOTHER MARKET'S CURRENCY IS NOT THIS SEED'S PRICE. A store can geo-serve
+    # another market's page to the crawler, so a seed created from a CAD read stored a CAD row
+    # price. The rule is `foreign_seed_currencies` (region_pricing), shared with variant adoption
+    # and the refresh: a served or acquisition market's currency only, and a re-created seed keeps
+    # the storable currency it is already priced in. It never compares against `market`, which is
+    # a read partition, not the seed's currency (ADR-026). On refusal neither the snapshot's amount
+    # nor its currency is taken; a field the employee stated in the body stands (not validated, by
+    # the owner's decision). A re-create then keeps the row's stored values (below); a new seed
+    # leaves them NULL.
+    existing_dict = dict(existing_row) if existing_row else {}
+    snapshot_price_refused: Optional[Dict[str, Any]] = None
+    refused_currencies = foreign_seed_currencies(
+        [snap_price_currency],
+        row=existing_dict.get("price_currency"),
+        stored=_stated_variant_currencies(_seed_variants(_ensure_json_obj(existing_dict.get("seed_data")))),
+    )
+    if refused_currencies:
+        if body.price_amount is None:
+            price_amount = None
+        if not (body.price_currency or "").strip():
+            price_currency = None
+        snapshot_price_refused = {
+            "reason": "currency_not_storable_for_this_seed",
+            "currencies": refused_currencies,
+            "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
+        }
     availability = (body.availability or "").strip() or snap_availability
     utm_template = (body.utm_template or "").strip() or None
     partner_type = (body.partner_type or "").strip() or None
@@ -4618,6 +4644,7 @@ async def create_external_seed(
             },
             "variants": _seed_variants(seed_data),
         },
+        "snapshot_price_refused": snapshot_price_refused,
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
         # The page's variants, when they were priced in a currency this seed may not store.
         "variant_adoption_refused": variant_adoption_refused,
@@ -5779,6 +5806,9 @@ async def _refresh_external_seed_by_id(
             seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
+    # The currencies the stored variants are priced in BEFORE this read is adopted (the adoption may
+    # replace them with the read's): an empty row currency below is filled only in one of them.
+    stored_variant_currencies = _stated_variant_currencies(_seed_variants(seed_data))
     foreign_currencies = _foreign_refresh_variant_currencies(
         existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
@@ -5894,6 +5924,16 @@ async def _refresh_external_seed_by_id(
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_incomplete_pair"
     elif prev_currency is not None and fresh_currency != prev_currency:
+        # A scraped read never redenominates a stored price, not even to heal a currency off the
+        # registry: a misread currency is far likelier than a merchant changing one (a KRW page
+        # once arrived as a USD amount). A seed stuck in such a currency heals on re-create.
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_currency_mismatch"
+    elif prev_currency is None and foreign_seed_currencies([fresh_currency], stored=stored_variant_currencies):
+        # An empty row currency is filled only under the shared seed-currency rule
+        # (region_pricing.foreign_seed_currencies): a served or acquisition market's currency, and
+        # the one the stored variants are priced in when they state one. It used to fill from any
+        # read, so a geo-served CAD page priced a US-filed seed in CAD (reported `filled`).
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_currency_mismatch"
     else:
