@@ -122,6 +122,8 @@ from services.handover_variant_identity import (
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
+    stored_entry_answers_to,
+    stored_entry_claimed_variant_ids,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -9065,11 +9067,6 @@ def _external_seed_redirect_identity(
 #: Every key a stored seed variant may carry its own identity under. Wider than
 #: `_seed_offer_variant_id`'s chain on purpose: an operator may attach the Shopify id while the
 #: variant's first-found id is its SKU, and that variant still IS the attached one.
-_SEED_VARIANT_IDENTITY_KEYS = (
-    "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
-)
-
-
 def _attached_variant_is_this_offer(
     seed_data: Dict[str, Any],
     *,
@@ -9121,13 +9118,14 @@ def _attached_variant_is_this_offer(
         return offer.lower().startswith("gid://shopify/productvariant/") and _contradicts(offer)
 
     def _entry_contradicts(v: Dict[str, Any]) -> bool:
-        return any(
-            _contradicts(x)
-            for x in (_seed_variant_identity_claim(v), v.get("shopify_variant_id"), v.get("source_variant_id"))
-        )
+        # The shared reader's CLAIM ids (no `sku`), URL-shaped ids read for their `variant=`.
+        return any(_contradicts(x) for x in stored_entry_claimed_variant_ids(v))
 
     def _answers(v: Dict[str, Any]) -> bool:
-        return any(canonical_variant_id(v.get(key)) == target for key in _SEED_VARIANT_IDENTITY_KEYS)
+        # The ONE reader every matcher in this lane uses (services/handover_variant_identity):
+        # it also reads `?variant=N` off a JSON-LD `@id`-shaped id, the shape most stored
+        # entries carry (census 2026-10-15).
+        return stored_entry_answers_to(v, target)
 
     if offer_variant is not None:
         mine = next((v for v in served if v is offer_variant), None)

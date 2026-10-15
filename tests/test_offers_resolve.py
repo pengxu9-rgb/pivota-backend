@@ -5784,3 +5784,16 @@ def test_a_product_grain_offer_shared_by_two_entries_takes_no_attached_cart() ->
         product_key="prod::m_brand::shopify::serum", product_id="serum",
     ) is False
 
+
+def test_an_attached_id_finds_its_entry_through_the_jsonld_offer_id(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The operator path reads stored entries through the SAME shared reader: an entry whose
+    variant_id is the JSON-LD `@id` URL naming the attached variant is that variant."""
+    row = _attached_two_variant_row(b_ids={})
+    row["seed_data"]["variants"][1]["variant_id"] = (
+        "/products/serum?variant=" + _ATTACHED_B_VID + "#offer")
+    offers = _resolve_every_variant(monkeypatch, client, row)
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+    assert offers[19.0]["execution_spec"]["cart_url"] is None
+

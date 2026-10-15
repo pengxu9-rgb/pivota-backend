@@ -53,7 +53,8 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from urllib.parse import parse_qs, urlparse
 
 from services.outbound_links_service import extract_shopify_numeric_variant_id
 from services.variant_identity import MERCHANT_ISSUED, is_merchant_issued_variant_id
@@ -309,21 +310,162 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
     )
 
 
-#: Every key a stored seed variant may carry its own identity under — wider than the route's
-#: `_seed_offer_variant_id` chain, because the offer may be named by its SKU while the same
-#: entry carries the Shopify id the catalog row holds.
-_STORED_VARIANT_ID_KEYS = (
+#: Every key a stored seed variant may carry its own identity under. ONE tuple for every matcher
+#: in this lane (the route imports it): the offer may be named by its SKU while the same entry
+#: carries the Shopify id a catalog row or an operator attachment holds.
+STORED_VARIANT_ID_KEYS = (
     "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
 )
+#: The keys that CLAIM to be a variant id, so may contradict one. Never `sku`/`sku_id`: on this
+#: corpus a SKU is routinely a barcode, which may match a variant but not refuse one.
+CLAIM_VARIANT_ID_KEYS = ("variant_id", "variantId", "id", "shopify_variant_id", "source_variant_id")
+
+
+def url_named_variant_id(value: Any) -> str:
+    """The Shopify variant a URL-SHAPED id names through `variant=N`, or "".
+
+    Measured 2026-10-15 (census oneoff-sibling-entries-census): stored entries routinely carry the
+    JSON-LD offer `@id` as their `variant_id` — `/products/<handle>?variant=45253610242298#offer` —
+    and `canonical_variant_id` reads only a gid or bare digits, so the entry that IS the candidate
+    never answered to it and #2624 refused its offer (211 lost carts). The parse is strict, as in
+    `shopify_variant_identity._url_named_variant_ids`: every `variant=` value must be ASCII digits
+    and there must be exactly one distinct value, or the URL names nothing.
+    """
+    raw = _norm(value)
+    if "variant=" not in raw:
+        return ""
+    try:
+        values = parse_qs(urlparse(raw).query, keep_blank_values=True).get("variant", [])
+    except ValueError:
+        return ""
+    if not values or any(not (v.isascii() and v.isdigit()) for v in values):
+        return ""
+    distinct = set(values)
+    return distinct.pop() if len(distinct) == 1 else ""
+
+
+def _entry_ids(entry: Dict[str, Any], keys: Sequence[str]) -> Set[str]:
+    out: Set[str] = set()
+    for key in keys:
+        canonical = canonical_variant_id(entry.get(key))
+        if canonical:
+            out.add(canonical)
+        named = url_named_variant_id(entry.get(key))
+        if named:
+            out.add(named)
+    return out
+
+
+def stored_entry_variant_ids(entry: Any) -> Set[str]:
+    """Every variant id ONE stored entry names: the canonical form of each identity key, the
+    `variant=` a URL-shaped one names, and the `variant=` on the entry's own `url`. The ONE reader
+    every matcher in this lane uses, so they cannot drift apart again (#2624 review, P3)."""
+    if not isinstance(entry, dict):
+        return set()
+    out = _entry_ids(entry, STORED_VARIANT_ID_KEYS)
+    named = url_named_variant_id(entry.get("url"))
+    if named:
+        out.add(named)
+    return out
+
+
+def stored_entry_claimed_variant_ids(entry: Any) -> Set[str]:
+    """The ids an entry CLAIMS (no `sku`), URL-read too — the only ones that may contradict."""
+    if not isinstance(entry, dict):
+        return set()
+    return _entry_ids(entry, CLAIM_VARIANT_ID_KEYS)
+
+
+def stored_entry_answers_to(entry: Any, variant_id: Any) -> bool:
+    target = canonical_variant_id(variant_id)
+    return bool(target) and target in stored_entry_variant_ids(entry)
+
+
+def _entry_price(entry: Any) -> Optional[float]:
+    if not isinstance(entry, dict):
+        return None
+    for key in ("price_amount", "price"):
+        value = entry.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return round(float(value), 2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _entry_currency(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return _norm(entry.get("price_currency") or entry.get("currency")).upper()
+
+
+def snapshot_names_one_variant(seed_data: Any, variant_id: Any) -> bool:
+    """True when the seed's snapshot holds EXACTLY ONE variant and it is `variant_id` — the
+    products.js-backed statement that the product has a single variant."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if not isinstance(variants, list) or len(variants) != 1:
+        return False
+    return stored_entry_answers_to(variants[0], variant_id)
+
+
+def entry_is_the_sole_variant_read_again(
+    entry: Dict[str, Any],
+    *,
+    variant_id: Any,
+    stored: Sequence[Dict[str, Any]],
+    seed_data: Any,
+    product_key: Any = None,
+    product_id: Any = None,
+) -> bool:
+    """May an entry that does not name `variant_id` still be folded into it — the same single
+    variant read twice (JSON-LD offer + a SKU/barcode entry: census 2026-10-15)?
+
+    ONLY WITH CORROBORATION (controller ruling, 2026-10-15): the snapshot holds exactly one
+    variant and it is `variant_id`; the entry claims no OTHER variant id (a URL-named one, or a
+    claim the classifier calls merchant-issued relative to the product — a 6-digit product or SKU
+    number like jurlique's "114807" is neither); and its price (and
+    currency, where both say one) equals that of the one stored entry naming `variant_id`, or the
+    seed's own price when no entry names it. Equal price alone never folds: a same-price wrong
+    shade is still a wrong-variant cart.
+    """
+    target = canonical_variant_id(variant_id)
+    if not target or not snapshot_names_one_variant(seed_data, target):
+        return False
+    for claimed in stored_entry_claimed_variant_ids(entry) - {target}:
+        if url_named_variant_id(claimed) or claimed.isdigit() and names_a_merchant_issued_variant(
+            claimed, product_key=product_key, product_id=product_id
+        ):
+            return False
+    for key in CLAIM_VARIANT_ID_KEYS:
+        named = url_named_variant_id(entry.get(key))
+        if named and named != target:
+            return False
+    namers = [v for v in stored if stored_entry_answers_to(v, target)]
+    if len(namers) == 1:
+        reference_price, reference_currency = _entry_price(namers[0]), _entry_currency(namers[0])
+    elif not namers:
+        reference_price = _entry_price(seed_data) if isinstance(seed_data, dict) else None
+        reference_currency = _entry_currency(seed_data)
+    else:
+        return False
+    price = _entry_price(entry)
+    if price is None or reference_price is None or price != reference_price:
+        return False
+    currency = _entry_currency(entry)
+    return not (currency and reference_currency and currency != reference_currency)
 
 
 def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted: str) -> bool:
     """May the lone candidate be handed over for the offer named `wanted`?
 
     Yes when there is nothing to choose between: a product-grain hand-over (no name) or a seed
-    storing at most one variant — the case R_SOLE was written for. Otherwise only when the
-    offer's own stored variant answers to the candidate under one of its identity keys. An offer
-    the stored variants do not know is refused: we cannot say it is the candidate's variant.
+    storing at most one entry — the case R_SOLE was written for. Otherwise EXACTLY ONE stored
+    entry must be the offer, and it must name the candidate (`stored_entry_answers_to`, which
+    reads a URL-shaped id's `variant=`), or be the snapshot-corroborated sole variant read again
+    (`entry_is_the_sole_variant_read_again`). An offer the stored entries do not know is refused.
     """
     if not wanted:
         return True
@@ -331,12 +473,17 @@ def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted
     stored = [v for v in stored if isinstance(v, dict)] if isinstance(stored, list) else []
     if len(stored) <= 1:
         return True
-    mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in _STORED_VARIANT_ID_KEYS)]
+    mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in STORED_VARIANT_ID_KEYS)]
     # EXACTLY ONE entry may be this offer. Two entries answering to its name (both `sku: X`, or
     # every `id` restating the product id) cannot say which one it is, so neither lends it the
     # candidate. Review of #2624 (controller, 2026-10-14).
-    return len(mine) == 1 and any(
-        one.answers_to(_norm(mine[0].get(k))) for k in _STORED_VARIANT_ID_KEYS
+    if len(mine) != 1:
+        return False
+    if stored_entry_answers_to(mine[0], one.variant_id):
+        return True
+    return entry_is_the_sole_variant_read_again(
+        mine[0], variant_id=one.variant_id, stored=stored, seed_data=seed_data,
+        product_key=one.product_key, product_id=one.source_product_id or None,
     )
 
 
