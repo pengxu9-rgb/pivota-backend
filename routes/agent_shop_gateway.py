@@ -6511,7 +6511,14 @@ async def _handle_offers_resolve(
         buyer_currency_filtered[_code] = buyer_currency_filtered.get(_code, 0) + _n
     # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
     # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
-    offers = _host_diverse_head(offers, limit)
+    # Fresh offers fill the head first; FLAGGED ones (served only if the caller's live read verifies
+    # them) only fill what is left -- the head's one-per-host pass would otherwise let a flagged
+    # offer on a new host take a second fresh offer's slot (review round 2 of #2629).
+    _fresh = [o for o in offers if not o.get("requires_live_verification")]
+    _flagged = [o for o in offers if o.get("requires_live_verification")]
+    offers = _host_diverse_head(_fresh, limit)
+    if _flagged and len(offers) < limit:
+        offers = offers + _host_diverse_head(_flagged, limit - len(offers))
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the

@@ -6070,3 +6070,24 @@ def test_a_flagged_offer_is_never_preflighted(monkeypatch, client):
     assert asked == [], "a flagged offer has no cart to hand over, so it spends no preflight"
     _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
     assert len(asked) == 1, "the fresh offer's cart is still preflighted"
+
+
+def test_host_diversity_never_lets_a_flagged_offer_take_a_second_fresh_offers_slot(monkeypatch, client):
+    """Seeds [stale on other.com, two fresh on brand.com] at limit=2: the one-per-host head used to pick
+    the flagged other.com offer over the second fresh brand.com one (review round 2 of #2629)."""
+    import copy
+
+    stale = _other_store_row()
+    a1 = copy.deepcopy(_seed_row_for_exec_spec(evidence=False))
+    a2 = copy.deepcopy(a1)
+    a2["id"] = "eps_spec_2"
+    a2["destination_url"] = a2["canonical_url"] = "https://brand.com/products/serum-2"
+    a2["seed_data"] = {**a2["seed_data"], "destination_url": "https://brand.com/products/serum-2",
+                       "canonical_url": "https://brand.com/products/serum-2"}
+    rows = [(stale, ["stale_snapshot"]), (a1, []), (a2, [])]
+    today = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=False)
+    opted = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=True)
+    assert sorted(o["source"]["seed_id"] for o in today) == ["eps_spec", "eps_spec_2"]
+    assert sorted(o["source"]["seed_id"] for o in opted) == ["eps_spec", "eps_spec_2"]
+    roomy = _resolve_two(monkeypatch, client, rows, limit=3, opt_in=True)
+    assert [bool(o.get("requires_live_verification")) for o in roomy] == [False, False, True]
