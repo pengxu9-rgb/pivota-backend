@@ -189,7 +189,7 @@ def _seed_row(*, seed_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page) -> Dict[str, Any]:
+def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page, observed_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     import routes.employee_products as mod
 
     stored = copy.deepcopy(row)
@@ -209,6 +209,7 @@ def _refresh(monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], page) -> Dict
         if observed is not None:
             observed["status_code"] = 200
             observed["final_url"] = DEST
+            observed.update(observed_extra or {})
         return page
 
     async def record(seed_id, observation, *, now=None):
@@ -667,3 +668,43 @@ def test_creation_over_a_seed_with_no_description_fills_it_from_seo_copy_tagged(
     sd = _create_over(monkeypatch, _snapshot(_page_html(jsonld_description=None)), _polluted_seed_data())
     assert sd["description"] == SEO_LINE
     assert sd["description_source"] == "meta"
+
+
+# A read that is not the product page declares nothing about the product (confirmation round of #2621).
+_NOT_THE_PRODUCT = [
+    {"bot_challenged": True},
+    {"final_url": "https://us.laneige.com/collections/all"},
+    {"final_url": "https://us.laneige.com/products/water-sleeping-mask"},
+]
+
+
+@pytest.mark.parametrize("observed_extra", _NOT_THE_PRODUCT)
+def test_a_read_that_is_not_the_product_page_never_clears_a_gallery(monkeypatch, observed_extra):
+    seed_data = _polluted_seed_data(description=REAL_COPY)
+    stored = _refresh(monkeypatch, _seed_row(seed_data=seed_data), _snapshot(_bare_page_html()), observed_extra)
+    assert stored["seed_data"]["image_urls"] == [PRODUCT_IMG, *PAGE_ONLY_IMAGES]
+
+
+@pytest.mark.parametrize("observed_extra", _NOT_THE_PRODUCT)
+def test_a_read_that_is_not_the_product_page_never_fills_or_upgrades_a_description(monkeypatch, observed_extra):
+    empty = _refresh(monkeypatch, _seed_row(seed_data=_polluted_seed_data()),
+                     _snapshot(_page_html(jsonld_description=None)), observed_extra)
+    assert not empty["seed_data"].get("description")
+    tagged = _polluted_seed_data(description=SEO_LINE, description_source="meta")
+    up = _refresh(monkeypatch, _seed_row(seed_data=tagged), _snapshot(_page_html(jsonld_description=REAL_COPY)), observed_extra)
+    assert up["seed_data"]["description"] == SEO_LINE
+
+
+def test_employee_copy_is_never_upgraded_even_when_it_equals_the_meta_line():
+    from routes.employee_products import _seed_description_is_upgradable
+
+    assert _seed_description_is_upgradable({"description": SEO_LINE, "description_source": "employee"}, SEO_LINE) is False
+    assert _seed_description_is_upgradable({"description": SEO_LINE}, SEO_LINE) is True
+
+
+def test_creation_drops_an_older_seo_line_from_the_served_snapshot(monkeypatch):
+    existing = _polluted_seed_data(description=REAL_COPY)
+    existing["snapshot"]["description"] = SEO_LINE
+    sd = _create_over(monkeypatch, _snapshot(_page_html(jsonld_description=None)), existing)
+    assert sd["snapshot"]["description"] is None
+    assert sd["snapshot"]["description_refused_source"] == "meta"

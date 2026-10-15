@@ -998,6 +998,8 @@ SEED_IMAGE_URLS_SOURCE_EMPLOYEE = "employee"
 # "meta" | "unknown"). "meta"/"unknown" text is fill-only: real copy from a later read replaces it.
 SEED_DESCRIPTION_SOURCE_KEY = "description_source"
 _FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
+# Copy an employee supplied (creation body, CSV import): never upgraded by a page read.
+SEED_DESCRIPTION_SOURCE_EMPLOYEE = "employee"
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -1059,7 +1061,10 @@ def _seed_description_is_upgradable(seed_data: Dict[str, Any], meta_description:
         return False
     if _ensure_json_obj(seed_data.get("manual_overrides")).get("description"):
         return False
-    if seed_data.get(SEED_DESCRIPTION_SOURCE_KEY) in _FILL_ONLY_DESCRIPTION_SOURCES:
+    source = seed_data.get(SEED_DESCRIPTION_SOURCE_KEY)
+    if source == SEED_DESCRIPTION_SOURCE_EMPLOYEE:
+        return False
+    if source in _FILL_ONLY_DESCRIPTION_SOURCES:
         return True
     return bool(meta_description) and existing == meta_description
 
@@ -2896,10 +2901,12 @@ async def _import_external_seeds_csv_text(
                         seed_data["brand"] = brand
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if image_urls:
                         seed_data["image_urls"] = image_urls
+                        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
                     if availability is not None:
                         seed_data["availability"] = availability
                     if variants:
@@ -2957,8 +2964,10 @@ async def _import_external_seeds_csv_text(
                     "title": title,
                     "brand": brand,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "image_urls": image_urls,
+                    **({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE} if image_urls else {}),
                     "availability": availability,
                     "variants": variants,
                     "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
@@ -3138,6 +3147,7 @@ async def _import_external_seeds_csv_text(
                         seed_data["title"] = title
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if availability is not None:
@@ -3228,6 +3238,7 @@ async def _import_external_seeds_csv_text(
                     "external_product_id": external_product_id,
                     "title": title,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "availability": availability,
                     "utm_template": utm_template,
@@ -4158,7 +4169,7 @@ async def create_external_seed(
     description = (body.description or "").strip() or snap_description
     # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
     description_origin = (
-        "employee" if (body.description or "").strip() else (content["description_source"] if snap_description else None)
+        SEED_DESCRIPTION_SOURCE_EMPLOYEE if (body.description or "").strip() else (content["description_source"] if snap_description else None)
     )
     fill_only_description = content["fill_only_description"]
     image_url = (body.image_url or "").strip() or snap_image_url
@@ -4225,7 +4236,7 @@ async def create_external_seed(
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
         if description and (
-            description_origin == "employee"
+            description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
             or not str(seed_data.get("description") or "").strip()
             or _seed_description_is_upgradable(seed_data, content["meta_description"])
         ):
@@ -4264,6 +4275,12 @@ async def create_external_seed(
         )
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
+            seed_data["snapshot"].pop("description_refused_source", None)
+        elif content["description_refused_source"]:
+            # The page's only copy is SEO (or unknown) text: an older snapshot's SEO line must not
+            # stay `snapshot.description`, which the gateway serves first (review of #2621).
+            seed_data["snapshot"]["description"] = None
+            seed_data["snapshot"]["description_refused_source"] = content["description_refused_source"]
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
         elif snap_variants:
@@ -5517,6 +5534,12 @@ async def _refresh_external_seed_by_id(
     # 2026-10-14).
     evidence = getattr(snapshot, "evidence", None)
     content = _snapshot_evidence_content(evidence)
+    # DID THIS FETCH READ THE PRODUCT PAGE WE SERVE? A bot challenge ("Just a moment..."), a 301
+    # onto a collection or another handle, or a cached snapshot returned after a failure all
+    # declare nothing about THIS product: none of them may clear a gallery, upgrade a description
+    # or fill one with SEO copy (final review of #2621). The same pure check the freshness stamp
+    # and liveness verdict below use.
+    _, page_read_is_the_product = _read_the_served_product(row, dest, observed)
     gallery_declared = content["gallery_declared"]
     snap_image_urls = content["image_urls"]
     snap_description = content["description"]
@@ -5594,7 +5617,9 @@ async def _refresh_external_seed_by_id(
         seed_data["description"] = snap_description
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
-    if snap_description and _seed_description_is_upgradable(seed_data, content["meta_description"]):
+    if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
+        seed_data, content["meta_description"]
+    ):
         # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
         seed_data["description"] = snap_description
         seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
@@ -5602,7 +5627,7 @@ async def _refresh_external_seed_by_id(
         if snap_description:
             seed_data["description"] = snap_description
             seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
-        elif content["fill_only_description"]:
+        elif page_read_is_the_product and content["fill_only_description"]:
             # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
             # copy from a later read replaces it (Peng 2026-10-15). It never reaches
             # `snapshot.description`, which the gateway serves ahead of the seed's own.
@@ -5614,7 +5639,9 @@ async def _refresh_external_seed_by_id(
     # gallery another writer stamped: a storefront's own structured gallery (the drain's
     # products.json `images[]`) is the product's, and a page read's one or two declared images
     # would replace it.
-    if seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
+    if page_read_is_the_product and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (
+        None, SEED_IMAGE_URLS_SOURCE_PAGE_READ
+    ):
         if snap_image_urls:
             seed_data["image_urls"] = snap_image_urls
             seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
