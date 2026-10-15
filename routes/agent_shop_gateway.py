@@ -122,6 +122,7 @@ from services.handover_variant_identity import (
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
+    namers_agree_on_price,
     stored_entry_answers_to,
     stored_entry_claimed_variant_ids,
 )
@@ -9131,7 +9132,8 @@ def _attached_variant_is_this_offer(
         mine = next((v for v in served if v is offer_variant), None)
         if mine is not None:
             if _answers(mine):
-                return True
+                # Several entries naming it at different prices: whose price is the cart's?
+                return namers_agree_on_price(served, target)
             return len(served) == 1 and not _entry_contradicts(mine)
         if len(served) > 1:
             return False
@@ -9146,7 +9148,7 @@ def _attached_variant_is_this_offer(
         return canonical_variant_id(offer) == target
     # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
     # say which one the offer is, so neither may lend it the attached cart.
-    return len(mine) == 1 and _answers(mine[0])
+    return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
 
 
 def resolve_cart_permalink(

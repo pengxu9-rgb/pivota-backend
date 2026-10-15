@@ -1730,3 +1730,76 @@ def test_an_entry_claiming_another_merchant_variant_does_not_fold():
     seed["variants"][1]["variant_id"] = VID_B
     got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=VID_B)
     assert got.variant_id is None
+
+
+# Review of #2627, round 1: a namer took the cart with no price check, and the fold priced
+# itself off the seed when selling plans were the entries.
+
+
+def test_a_selling_plan_url_names_no_variant():
+    assert url_named_variant_id("/products/x?variant=" + VID + "&selling_plan=111#offer") == ""
+    assert url_named_variant_id("/products/x?selling_plan=&variant=" + VID) == ""
+
+
+def _plans(*prices, snapshot=False, url_suffix=""):
+    seed = {"variants": [
+        {"variant_id": "/products/x?variant=" + VID + url_suffix + "#o" + str(i), "price_amount": p}
+        for i, p in enumerate(prices)
+    ]}
+    if snapshot:
+        seed["snapshot"] = {"variants": [{"shopify_variant_id": VID}]}
+    return seed
+
+
+def test_three_namers_at_two_prices_refuse_every_namer():
+    """Probe: one-time $18 and two $16.38 entries all naming N. Whose price is the cart's?"""
+    seed = _plans(18, 16.38, 16.38)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id is None and got.reason == R_SIBLING, entry
+
+
+def test_two_namers_at_19_and_29_refuse_both():
+    seed = _plans(19, 29)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id is None, entry
+
+
+def test_two_namers_at_one_price_both_keep_the_cart():
+    """Two offers sharing one cart is cosmetic when their prices really are equal."""
+    seed = _plans(31, 31)
+    for entry in seed["variants"]:
+        got = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                      offer_variant_id=entry["variant_id"])
+        assert got.variant_id == VID and got.reason == R_SOLE, entry
+
+
+def test_a_selling_plan_entry_is_not_a_namer():
+    """With the plan's URL naming nothing, only the one-time entry names N and keeps the cart."""
+    seed = {"variants": [
+        {"variant_id": "/products/x?variant=" + VID + "#offer", "price_amount": 18},
+        {"variant_id": "/products/x?variant=" + VID + "&selling_plan=7#offer", "price_amount": 16.38},
+    ]}
+    one_time = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                       offer_variant_id=seed["variants"][0]["variant_id"])
+    plan = choose_handover_variant([_cand(VID)], seed_data=seed,
+                                   offer_variant_id=seed["variants"][1]["variant_id"])
+    assert one_time.variant_id == VID
+    assert plan.variant_id is None
+
+
+def test_murad_plans_do_not_fold_even_at_the_seed_price():
+    """Probe: the snapshot names exactly N, the entries are a one-time $18 and a 1-month $16.38
+    plan, and the seed price is 16.38. Several prices among non-naming entries = plans: fold none
+    — before the fix the $16.38 plan folded and took the one-time cart."""
+    seed = {"price_amount": 16.38,
+            "variants": [{"variant_id": "offer_1", "title": "One-Time Purchase", "price_amount": 18},
+                         {"variant_id": "offer_2", "title": "1 month", "price_amount": 16.38}],
+            "snapshot": {"variants": [{"shopify_variant_id": VID}]}}
+    for name in ("offer_1", "offer_2"):
+        got = choose_handover_variant([_cand(VID)], seed_data=seed, offer_variant_id=name)
+        assert got.variant_id is None and got.reason == R_SIBLING, name
+

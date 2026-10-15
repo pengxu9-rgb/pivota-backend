@@ -335,9 +335,15 @@ def url_named_variant_id(value: Any) -> str:
     if "variant=" not in raw:
         return ""
     try:
-        values = parse_qs(urlparse(raw).query, keep_blank_values=True).get("variant", [])
+        query = parse_qs(urlparse(raw).query, keep_blank_values=True)
     except ValueError:
         return ""
+    # A SUBSCRIPTION offer of the variant, not the variant: `?variant=N&selling_plan=P` is priced
+    # at the plan's price, so a cart for N would charge the one-time price against it. Review
+    # of #2627 (controller, 2026-10-15).
+    if "selling_plan" in query:
+        return ""
+    values = query.get("variant", [])
     if not values or any(not (v.isascii() and v.isdigit()) for v in values):
         return ""
     distinct = set(values)
@@ -401,6 +407,22 @@ def _entry_currency(entry: Any) -> str:
     return _norm(entry.get("price_currency") or entry.get("currency")).upper()
 
 
+def _price_key(entry: Any) -> tuple:
+    return (_entry_price(entry), _entry_currency(entry))
+
+
+def namers_agree_on_price(stored: Sequence[Dict[str, Any]], variant_id: Any) -> bool:
+    """True when the stored entries naming `variant_id` cannot disagree about its price: at most
+    one names it, or every one of them states the SAME known price (and currency). Two entries
+    naming one variant at $19 and $29 — or a one-time offer and its subscription plans — make
+    the price ambiguous, and an ambiguous price gets no cart (review of #2627, 2026-10-15)."""
+    namers = [v for v in stored if stored_entry_answers_to(v, variant_id)]
+    if len(namers) <= 1:
+        return True
+    keys = {_price_key(v) for v in namers}
+    return len(keys) == 1 and next(iter(keys))[0] is not None
+
+
 def snapshot_names_one_variant(seed_data: Any, variant_id: Any) -> bool:
     """True when the seed's snapshot holds EXACTLY ONE variant and it is `variant_id` — the
     products.js-backed statement that the product has a single variant."""
@@ -444,6 +466,16 @@ def entry_is_the_sole_variant_read_again(
         if named and named != target:
             return False
     namers = [v for v in stored if stored_entry_answers_to(v, target)]
+    # ONE VARIANT, SEVERAL PRICES among the entries that do not name it: those are selling plans
+    # or sale/compare prices, not the variant read again, and picking the one priced like the
+    # reference would hand a subscription offer the one-time cart (review of #2627: murad, seed
+    # price 16.38, the 1-month plan folded and the one-time entry did not). Fold none.
+    others = {
+        _entry_price(v) for v in stored
+        if all(v is not n for n in namers) and _entry_price(v) is not None
+    }
+    if len(others) > 1:
+        return False
     if len(namers) == 1:
         reference_price, reference_currency = _entry_price(namers[0]), _entry_currency(namers[0])
     elif not namers:
@@ -480,7 +512,7 @@ def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted
     if len(mine) != 1:
         return False
     if stored_entry_answers_to(mine[0], one.variant_id):
-        return True
+        return namers_agree_on_price(stored, one.variant_id)
     return entry_is_the_sole_variant_read_again(
         mine[0], variant_id=one.variant_id, stored=stored, seed_data=seed_data,
         product_key=one.product_key, product_id=one.source_product_id or None,

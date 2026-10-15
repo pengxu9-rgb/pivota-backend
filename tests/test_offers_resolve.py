@@ -5797,3 +5797,16 @@ def test_an_attached_id_finds_its_entry_through_the_jsonld_offer_id(
     assert f"/cart/{_ATTACHED_B_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
     assert offers[19.0]["execution_spec"]["cart_url"] is None
 
+
+def test_two_entries_naming_the_attached_variant_at_two_prices_take_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review of #2627: the operator path's namer check is price-aware too. Both entries name B
+    (one by its @id URL, one by shopify_variant_id) at $19 and $29: no cart for either."""
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"][0]["variant_id"] = (
+        "/products/serum?variant=" + _ATTACHED_B_VID + "#offer")
+    offers = _resolve_every_variant(monkeypatch, client, row)
+    for offer in offers.values():
+        assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
