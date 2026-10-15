@@ -213,11 +213,31 @@ def _stored(vid: str, **extra: Any) -> Dict[str, Any]:
 
 def test_a_page_listing_one_variant_by_link_and_by_sku_still_matches_on_the_sku():
     # The prod shape the census found: the same variant twice, once by its link (no sku), once with
-    # the variant id as `sku`. Before the link existed the `sku` offer matched; it still does, and
+    # the variant id as `sku`. When the two listings AGREE, the `sku` offer matches as before and
     # its price is the one taken.
-    offers = [_offer(99, IN, **{"@id": f"/products/{HANDLE}?variant={V50}#offer"}), _offer(100, IN, sku=V50)]
+    offers = [_offer(100, IN, **{"@id": f"/products/{HANDLE}?variant={V50}#offer"}), _offer(100, IN, sku=V50)]
     (v,), report = _reconcile([_stored(V50)], offers)
     assert (v["price_amount"], report["re_read"]) == (100.0, 1)
+
+
+def test_a_variant_the_page_prices_twice_and_differently_is_not_re_read():
+    # Review of #2631: the same shape with the page contradicting itself (link 99, sku 100). Taking
+    # either price and stamping the seed fresh would vouch for a price the page disputes.
+    offers = [_offer(99, IN, **{"@id": f"/products/{HANDLE}?variant={V50}#offer"}), _offer(100, IN, sku=V50)]
+    (v,), report = _reconcile([_stored(V50)], offers)
+    assert (v["price_amount"], report["re_read"]) == (80.0, 0)
+    assert report["not_re_read"] == [V50]
+    # The controller's probe shape: V50 by link 85 and sku 70, V15 by link 34 -- V15 is re-read, V50
+    # is not, so the seed is NOT all re-read (the stamp pops).
+    offers = [_offer(85, IN, **{"@id": f"/products/{HANDLE}?variant={V50}#offer"}), _offer(70, IN, sku=V50),
+              _offer(34, IN, **{"@id": f"/products/{HANDLE}?variant={V15}#offer"})]
+    out, report = _reconcile([_stored(V50), _stored(V15, title="15 mL", price_amount=30.0)], offers)
+    assert [v["price_amount"] for v in out] == [80.0, 34.0]
+    assert report["not_re_read"] == [V50]
+    # A listing in another currency is a contradiction too.
+    offers = [_offer(100, IN, priceCurrency="CAD", **{"@id": f"/products/{HANDLE}?variant={V50}#offer"}), _offer(100, IN, sku=V50)]
+    (v,), report = _reconcile([_stored(V50)], offers)
+    assert report["re_read"] == 0
 
 
 def test_a_link_never_claims_an_offer_another_variant_matched_by_key():

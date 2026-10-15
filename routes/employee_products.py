@@ -5207,6 +5207,19 @@ def _page_names_one_value(census: Dict[str, Any]) -> bool:
     return max(int(census.get("offers") or 0), int(census.get("data_attr_skus") or 0)) <= 1
 
 
+def _read_offer_money(rv: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+    """A read offer's own amount (rounded to cents) and stated currency; None where it states none."""
+    amount = _as_price(rv.get("price_amount"))
+    cur = str(rv.get("price_currency") or rv.get("currency") or "").strip().upper() or None
+    return (round(amount, 2) if amount is not None else None, cur)
+
+
+def _read_offer_money_disagrees(a: Tuple[Optional[float], Optional[str]], b: Tuple[Optional[float], Optional[str]]) -> bool:
+    """Two listings of one variant contradict when both state an amount, or both a currency, that differ.
+    A listing that states nothing does not contradict one that does."""
+    return (a[0] is not None and b[0] is not None and a[0] != b[0]) or (a[1] is not None and b[1] is not None and a[1] != b[1])
+
+
 def _reconcile_seed_variants_with_read(
     stored: List[Dict[str, Any]],
     read: List[Dict[str, Any]],
@@ -5301,6 +5314,22 @@ def _reconcile_seed_variants_with_read(
         if len(named) == 1:
             claims[idx] = pos = next(iter(named))
             claimants[pos] = claimants.get(pos, 0) + 1
+    # A PAGE THAT PRICES ONE VARIANT TWICE, AND DISAGREES WITH ITSELF, RE-READ NOTHING FOR IT (review
+    # of #2631). The prod shape above -- V50 by its link and by `sku=V50` -- usually repeats one price;
+    # when the two say 85 and 70, taking the key's 70 and stamping the seed fresh vouches for a price
+    # the page itself disputes. Before the link filled the siblings' gaps that was masked (they stayed
+    # not re-read, so the stamp popped). Agreeing listings keep the match.
+    for idx, v in enumerate(stored):
+        pos = claims[idx]
+        if pos is None:
+            continue
+        mine = _read_offer_money(read_variants[pos])
+        if any(
+            other != pos and _read_offer_money_disagrees(mine, _read_offer_money(read_variants[other]))
+            for i in _seed_variant_identifiers(v)
+            for other in read_by_link.get(i) or []
+        ):
+            claims[idx] = None
 
     product_cur = (str(product_currency or "").strip().upper() or None)
     refused = {str(c).strip().upper() for c in refused_currencies or () if c}
