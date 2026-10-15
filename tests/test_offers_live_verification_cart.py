@@ -787,18 +787,39 @@ def test_a_second_pass_issues_only_the_offers_it_unlocked(monkeypatch, client):
     assert issued == [_click_of(offers[SEED_ID])], "the fresh offer's link is never handed out by the gateway"
 
 
-def test_a_second_pass_that_unlocks_nothing_issues_as_today(monkeypatch, client):
-    offers, issued, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V2)])
+@pytest.mark.parametrize("why", ["variant_mismatch", "no_secret", "bad_mac", "expired", "host_mismatch"])
+def test_a_second_pass_that_unlocks_nothing_issues_nothing(monkeypatch, client, why):
+    """Tokens were SENT, none accepted: the gateway serves its first pass, so no link of this answer
+    is ever handed out -- recording them would be phantom issued rows (security review of #2632)."""
+    now = int(time.time())
+    token = {
+        "variant_mismatch": lambda: _token(vid=V2),
+        "no_secret": lambda: _token(vid=V1),
+        "bad_mac": lambda: _token(vid=V1, secret=OTHER_SECRET),
+        "expired": lambda: _token(vid=V1, iat=now - 200, exp=now - 80),
+        "host_mismatch": lambda: _token(vid=V1, h="elsewhere.com"),
+    }[why]()
+    if why == "no_secret":
+        monkeypatch.delenv(olv.SECRET_ENV)
+    offers, issued, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[token])
     assert offers[SEED_ID]["requires_live_verification"]
+    assert issued == []
+
+
+def test_a_dry_run_flag_without_tokens_is_ignored(monkeypatch, client):
+    """Only a live-verification second pass may be a dry run: a public caller cannot suppress its own
+    issuance with the flag alone."""
+    offers, issued, _ = _resolve_rows_recording_issues(monkeypatch, client, dry_run=True)
     assert sorted(issued) == sorted(_click_of(o) for o in offers.values())
+    offers, issued, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[], dry_run=True)
+    assert len(issued) == 2
 
 
-@pytest.mark.parametrize("tokens", [None, "accepted"])
-def test_a_dry_run_issues_nothing_and_answers_identically(monkeypatch, client, tokens):
-    toks = [_token(vid=V1)] if tokens else None
+def test_a_dry_run_issues_nothing_and_answers_identically(monkeypatch, client):
+    toks = [_token(vid=V1)]
     real, real_issued, real_body = _resolve_rows_recording_issues(monkeypatch, client, tokens=toks)
     dry, dry_issued, dry_body = _resolve_rows_recording_issues(monkeypatch, client, tokens=toks, dry_run=True)
-    assert real_issued and dry_issued == []
+    assert real_issued == [_click_of(real[SEED_ID])] and dry_issued == []
     assert {k: _shape(o) for k, o in dry.items()} == {k: _shape(o) for k, o in real.items()}
     assert dry_body["metadata"].get("live_verification_assertions") == \
         real_body["metadata"].get("live_verification_assertions")
@@ -871,3 +892,122 @@ def test_the_unlocked_offer_matches_the_committed_golden_fixture(monkeypatch, cl
                                              "currency": "USD", "variant_id": V1}
     assert expected["price"] == LIVE_PRICE and expected["in_stock"] is True
     assert "requires_live_verification" not in expected
+
+
+# ------------------------------------------------------------------------------------ expected totals
+# Published ONLY beside a cart that survived every gate and is pinned to the read's market.
+
+
+def test_expected_totals_ride_a_surviving_pinned_cart(monkeypatch, client):
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)])
+    spec = offer["execution_spec"]
+    assert "country=US" in spec["cart_url"]
+    assert spec["expected_item_total"] == LIVE_PRICE and spec["expected_currency"] == "USD"
+    assert spec["expected_quantity"] == 1 and spec["expected_total_expires_at"]
+
+
+_EXPECTED_KEYS = ("expected_item_total", "expected_currency", "expected_quantity", "expected_total_expires_at")
+
+
+def _assert_no_expected_totals(offer):
+    spec = offer["execution_spec"]
+    assert not any(k in spec for k in _EXPECTED_KEYS), spec
+    assert offer["live_verification"]["status"] == "verified", "still unlocked: only the totals are withheld"
+
+
+def test_no_expected_totals_when_the_preflight_removed_the_cart(monkeypatch, client):
+    from services import checkout_preflight as cp
+
+    async def refusing_preflight(offer):
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason="variant_absent", would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)])
+    assert offer["execution_spec"]["cart_url"] is None
+    _assert_no_expected_totals(offer)
+
+
+def test_no_expected_totals_when_purchasability_removed_the_cart(monkeypatch, client):
+    _purchasability_fake(monkeypatch, purchasable=False)
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)],
+                          enforce_purchasability=True)
+    assert offer["execution_spec"]["cart_url"] is None
+    _assert_no_expected_totals(offer)
+
+
+def test_no_expected_totals_when_the_read_is_out_of_stock(monkeypatch, client):
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1, av=False)])
+    assert offer["execution_spec"]["cart_url"] is None
+    _assert_no_expected_totals(offer)
+
+
+def test_no_expected_totals_with_no_cart_at_all(monkeypatch, client):
+    """No cart is ever built (the storefront takes no permalink): unlocked, priced live, no totals."""
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "resolve_cart_permalink", lambda **kw: None)
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)])
+    assert offer["execution_spec"]["cart_url"] is None
+    _assert_no_expected_totals(offer)
+
+
+def test_no_expected_totals_on_an_unpinned_cart(monkeypatch, client):
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "_cart_country_pin", lambda market, observed: None)
+    [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)])
+    assert offer["execution_spec"]["cart_url"] and "country=" not in offer["execution_spec"]["cart_url"]
+    _assert_no_expected_totals(offer)
+
+
+def test_the_pin_must_be_the_reads_market():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._cart_pinned_to("https://b.com/cart/1:1?a=1&country=US", "US")
+    assert gateway._cart_pinned_to("https://b.com/cart/1:1?country=US", "us")
+    assert not gateway._cart_pinned_to("https://b.com/cart/1:1?country=SG", "US")
+    assert not gateway._cart_pinned_to("https://b.com/cart/1:1?xcountry=US", "US")
+    assert not gateway._cart_pinned_to("https://b.com/cart/1:1", "US")
+    assert not gateway._cart_pinned_to(None, "US")
+    assert not gateway._cart_pinned_to("https://b.com/cart/1:1?country=US", None)
+
+
+# ------------------------------------------------------------------------------------ dry-run preflight
+
+
+def _counting_preflight(monkeypatch, mode):
+    from services import checkout_preflight as cp
+
+    asked = []
+
+    async def counting(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", counting)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", mode)
+    return asked
+
+
+def test_a_shadow_preflight_is_skipped_on_a_dry_run(monkeypatch, client):
+    asked = _counting_preflight(monkeypatch, "shadow")
+    real, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)])
+    n_real = len(asked)
+    assert n_real == 2, "both carts (fresh and unlocked) are preflighted on a real pass"
+    dry, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)], dry_run=True)
+    assert len(asked) == n_real, "no merchant egress, no observation row, on a dry run"
+    assert {k: _shape(o) for k, o in dry.items()} == {k: _shape(o) for k, o in real.items()}
+
+
+def test_an_enforcing_preflight_still_runs_on_a_dry_run(monkeypatch, client):
+    """Enforcing, the preflight can change the answer, and a dry run must answer identically."""
+    asked = _counting_preflight(monkeypatch, "enforce")
+    _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)], dry_run=True)
+    assert len(asked) == 2
+
+
+def test_a_dry_run_flag_without_tokens_still_preflights(monkeypatch, client):
+    asked = _counting_preflight(monkeypatch, "shadow")
+    _resolve_rows_recording_issues(monkeypatch, client, dry_run=True)
+    assert len(asked) == 1, "the fresh offer's cart; the flagged one has none"

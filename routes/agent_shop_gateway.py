@@ -4747,6 +4747,9 @@ async def _handle_offers_resolve(
         now=time.time(),
         secrets=offer_live_verification.live_verification_secrets() if _live_verification_opt_in else (),
     )
+    # A DRY RUN is only a live-verification second pass's: honoured only alongside tokens, so a
+    # public caller cannot use the flag to suppress its own ADR-025 issuance.
+    _live_dry_run = bool(getattr(payload, "live_verifications_dry_run", False)) and bool(_live_assertions.entries)
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -5161,7 +5164,16 @@ async def _handle_offers_resolve(
                 # request attached coverage fields describing work nobody did.
                 # A FLAGGED offer gets no cart (below), so it is never a hand-over to preflight: asking
                 # would spend the shared budget a later fresh offer's cart needs (review of #2629).
-                if _gate_vid and not offer_requires_live_verification and checkout_preflight.is_enabled():
+                # A DRY RUN (the gateway's shadow second pass, never handed out) spends no merchant
+                # egress and writes no observation row -- unless the preflight is ENFORCING, where it
+                # changes the answer and the dry run must answer identically. Off or shadow, it never
+                # changes what a buyer is handed, so skipping it changes nothing but its coverage.
+                if (
+                    _gate_vid
+                    and not offer_requires_live_verification
+                    and checkout_preflight.is_enabled()
+                    and not (_live_dry_run and checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE)
+                ):
                     _preflight_stats["gated"] += 1
                     _q = (str(canonical_url or destination_url), str(_gate_vid))
                     if _q in _preflight_memo:
@@ -5446,10 +5458,16 @@ async def _handle_offers_resolve(
                         "join_mode": composed_spec["join_mode"],
                     },
                 }
-                if live_claims is not None and live_claims.av:
+                if (
+                    live_claims is not None
+                    and live_claims.av
+                    and _cart_pinned_to(composed_spec["cart_url"], live_claims.m)
+                ):
                     # The item total the gateway's live read just quoted (`apply_verdicts` shape), so
                     # an agent can abort on a mismatch. Item total for quantity 1, never a landed
-                    # cost; valid for the verified-total window from the moment of the read.
+                    # cost; valid for the verified-total window from the moment of the read. ONLY
+                    # beside a cart that survived every gate (preflight, stock, purchasability) and is
+                    # pinned to the read's market: the total is a claim about THAT checkout.
                     offer_spec["expected_item_total"] = live_claims.a
                     offer_spec["expected_currency"] = live_claims.c
                     offer_spec["expected_quantity"] = 1
@@ -6757,9 +6775,13 @@ async def _handle_offers_resolve(
     # re-asks with `live_verifications` and takes ONLY the offers this answer unlocked (they carry
     # `live_verification`); every other link in the answer is never handed to anyone, so recording it
     # as issued would be a phantom row. And a dry run (the gateway's shadow mode) adopts nothing.
-    if bool(getattr(payload, "live_verifications_dry_run", False)):
+    # Keyed on tokens SENT, not accepted: when none is accepted (no secret mid-rollout, a rotation
+    # mismatch, expiry, a host/market/currency mismatch) the gateway serves its FIRST pass, so not one
+    # link of this answer is handed out. (In `on` mode each adopted offer still leaves one first-pass
+    # issued row whose link was replaced: inherent to the two-pass design.)
+    if _live_dry_run:
         _issuable_offers: List[Dict[str, Any]] = []
-    elif _live_assertions.accepted:
+    elif _live_assertions.entries:
         _issuable_offers = [o for o in offers if isinstance(o, dict) and o.get("live_verification")]
     else:
         _issuable_offers = offers
@@ -9767,6 +9789,15 @@ def _attached_variant_is_this_offer(
     # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
     # say which one the offer is, so neither may lend it the attached cart.
     return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
+
+
+def _cart_pinned_to(cart_url: Any, market: Any) -> bool:
+    """Is there a cart, and is it pinned (`country=`) to exactly this market?"""
+    if not cart_url or not market:
+        return False
+    from urllib.parse import parse_qs, urlsplit
+
+    return parse_qs(urlsplit(str(cart_url)).query).get("country") == [str(market).strip().upper()]
 
 
 def _live_cart_identity(
