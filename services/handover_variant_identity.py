@@ -490,7 +490,9 @@ def entry_is_the_sole_variant_read_again(
     return not (currency and reference_currency and currency != reference_currency)
 
 
-def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted: str) -> bool:
+def _offer_may_take_the_sole_candidate(
+    one: Candidate, *, seed_data: Any, wanted: str, offer_variant: Any = None
+) -> bool:
     """May the lone candidate be handed over for the offer named `wanted`?
 
     Yes when there is nothing to choose between: a product-grain hand-over (no name) or a seed
@@ -499,13 +501,23 @@ def _offer_may_take_the_sole_candidate(one: Candidate, *, seed_data: Any, wanted
     reads a URL-shaped id's `variant=`), or be the snapshot-corroborated sole variant read again
     (`entry_is_the_sole_variant_read_again`). An offer the stored entries do not know is refused.
     """
-    if not wanted:
-        return True
     stored = seed_data.get("variants") if isinstance(seed_data, dict) else None
     stored = [v for v in stored if isinstance(v, dict)] if isinstance(stored, list) else []
-    if len(stored) <= 1:
-        return True
-    mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in STORED_VARIANT_ID_KEYS)]
+    if offer_variant is not None:
+        # PER-VARIANT LANE (offers.resolve hands over the stored entry the offer IS): identified by
+        # OBJECT, never by its name. An entry with no id at all used to read as "no name" -- product
+        # grain -- and took the sole candidate on a multi-variant seed, so a $19 listing offer shipped
+        # the $29 variant's catalog cart (final review of #2622). The `[{}]` fallback of an unmatched
+        # name is no stored entry, so on a multi-variant seed it takes nothing.
+        if len(stored) <= 1:
+            return True
+        mine = [v for v in stored if v is offer_variant]
+    else:
+        if not wanted:
+            return True
+        if len(stored) <= 1:
+            return True
+        mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in STORED_VARIANT_ID_KEYS)]
     # EXACTLY ONE entry may be this offer. Two entries answering to its name (both `sku: X`, or
     # every `id` restating the product id) cannot say which one it is, so neither lends it the
     # candidate. Review of #2624 (controller, 2026-10-14).
@@ -529,6 +541,7 @@ def choose_handover_variant(
     product_id: Any = None,
     primed: bool = True,
     lookup_ok: bool = True,
+    offer_variant: Any = None,
 ) -> HandoverVariant:
     """The whole decision, pure — so it can be tested without a database.
 
@@ -583,7 +596,9 @@ def choose_handover_variant(
 
     if len(live) == 1:
         one = live[0]
-        if not _offer_may_take_the_sole_candidate(one, seed_data=seed_data, wanted=wanted):
+        if not _offer_may_take_the_sole_candidate(
+            one, seed_data=seed_data, wanted=wanted, offer_variant=offer_variant
+        ):
             return HandoverVariant(None, R_SIBLING, None, None, 1)
         return HandoverVariant(one.variant_id, R_SOLE, SOURCE_CATALOG_SKU, one.sku_key, 1)
 
@@ -761,8 +776,10 @@ class HandoverVariantResolver:
         offer_variant_id: Any = None,
         named_variant_id: Any = _UNSET,
         product_id: Any = None,
+        offer_variant: Any = None,
     ) -> HandoverVariant:
-        """The per-hand-over answer. Pure — `prime` already did every await."""
+        """The per-hand-over answer. Pure — `prime` already did every await. `offer_variant`: the
+        stored entry the offer IS, from offers.resolve's per-variant lane (identity by object)."""
         self.stats["handover_considered"] += 1
         key = _norm(product_key)
         if not key:
@@ -775,7 +792,7 @@ class HandoverVariantResolver:
             # that simply has no merchant-issued SKU.
             answer = choose_handover_variant(
                 (), seed_data=seed_data, offer_variant_id=offer_variant_id,
-                named_variant_id=named_variant_id, product_id=product_id,
+                named_variant_id=named_variant_id, product_id=product_id, offer_variant=offer_variant,
             )
             if not answer.resolved:
                 answer = HandoverVariant(None, R_NO_PRODUCT_KEY)
@@ -793,6 +810,7 @@ class HandoverVariantResolver:
             product_id=product_id,
             primed=key in self._primed,
             lookup_ok=key not in self._failed,
+            offer_variant=offer_variant,
         )
         self._count(answer)
         return answer
