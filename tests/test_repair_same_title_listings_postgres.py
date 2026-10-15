@@ -403,11 +403,11 @@ ALIAS_APEX, ALIAS_WWW = "https://store.example/products/base-duo", "https://www.
 
 async def _alias_rows(admin):
     """One listing crawled under both spellings of its host: a canonical and a variant shelf with an offer at each
-    spelling, a variant shelf held only at the other spelling, and another market's offer."""
+    spelling, a variant shelf held only at the other spelling, and another market's offer at the row's spelling."""
     await _product(admin, K_ALIAS, ALIAS_APEX, ALIAS_APEX + ".jpg")
     await _offer(admin, "o_al_apex", K_ALIAS, ALIAS_APEX)
     await _offer(admin, "o_al_www", K_ALIAS, ALIAS_WWW, metadata={"reconcile_batch_id": "rb_2"})
-    await _offer(admin, "o_al_sg", K_ALIAS, ALIAS_WWW, market="SG")
+    await _offer(admin, "o_al_sg", K_ALIAS, ALIAS_APEX, market="SG")
     for offer_id, url, sku in (("o_al_v_apex", ALIAS_APEX, "::v:1"), ("o_al_v_www", ALIAS_WWW, "::v:1"),
                                ("o_al_v2_www", ALIAS_WWW, "::v:2")):
         await _offer(admin, offer_id, K_ALIAS, url)
@@ -444,3 +444,80 @@ async def test_only_host_alias_leaves_the_same_title_groups_alone(catalog):
     p = await tool.plan(db, hosts=[], keys=[], only_host_alias=True)
     assert [g["product_key"] for g in p["groups"]] == [K_ALIAS]
     assert {g["product_key"] for g in (await tool.plan(db, hosts=[], keys=[]))["groups"]} > {K_ALIAS, K_BC}
+
+
+async def test_a_base_with_a_live_sibling_waits_for_the_sibling_market_then_every_alias_goes(catalog):
+    """Controller review of #2596: suppressing a base strands its live Shopify Markets sibling, suppressing a sibling
+    strands nothing. AU's siblings of the US base offers (same SKU, the base's source_ref) run first; then US."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    db, admin, tool, _ = catalog
+    await _alias_rows(admin)
+    au_www, au_apex = sibling_offer_id("o_al_www", "AU"), sibling_offer_id("o_al_apex", "AU")
+    await _offer(admin, au_www, K_ALIAS, ALIAS_WWW, market="AU")
+    await _offer(admin, au_apex, K_ALIAS, ALIAS_APEX, market="AU")
+    [us] = (await tool.plan(db, hosts=[], keys=[K_ALIAS]))["groups"]
+    assert us["skipped"] == "sibling_market_alias_live" and us["stranded_siblings"] == [au_www]
+    with pytest.raises(SystemExit, match="nothing to repair"):
+        await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_ALIAS]))
+    au = await tool.plan(db, hosts=[], keys=[K_ALIAS], market="AU")
+    assert [(g["skipped"], g["suppress"]) for g in au["groups"]] == [(None, [au_www])]
+    await tool.apply(db, au)
+    us = await tool.plan(db, hosts=[], keys=[K_ALIAS])
+    assert [(g["skipped"], g["suppress"]) for g in us["groups"]] == [(None, ["o_al_v_www", "o_al_www"])]
+    await tool.apply(db, us)
+    live = {r["offer_id"] for r in await admin.fetch(
+        "SELECT offer_id FROM catalog_offers WHERE product_key = $1 AND suppressed_at IS NULL", K_ALIAS)}
+    assert live == {"o_al_apex", "o_al_v_apex", "o_al_v2_www", "o_al_sg", au_apex}
+
+
+K_SIB = "ext:store-brand-glow-set::99999999"
+SIB_KEPT = "https://store.example/products/glow-set"
+SIB_LEFT = "https://store.example/products/glow-set-refill"
+
+
+async def test_a_left_out_base_with_a_live_sibling_waits_for_the_sibling_market_then_every_left_out_offer_goes(
+        catalog):
+    """The same one-way rule on the same-title half: a US offer of a left-out listing whose AU Shopify Markets
+    sibling is live holds the group whole; AU runs first, then US, and every left-out listing's offer ends
+    suppressed in both markets while the kept listing's offers stay live."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    db, admin, tool, _ = catalog
+    await _product(admin, K_SIB, SIB_KEPT, SIB_KEPT + ".jpg")
+    await _offer(admin, "o_sib_kept", K_SIB, SIB_KEPT)
+    await _offer(admin, "o_sib_left", K_SIB, SIB_LEFT)
+    await _offer(admin, "o_sib_v_left", K_SIB, SIB_LEFT)
+    await _seed(admin, "s_sib_kept", K_SIB, SIB_KEPT)
+    await _seed(admin, "s_sib_left", K_SIB, SIB_LEFT)
+    # AU siblings, as shopify_markets writes them: the base's SKU and source_ref
+    au = {b: sibling_offer_id(b, "AU") for b in ("o_sib_kept", "o_sib_left", "o_sib_v_left")}
+    for b, url in (("o_sib_kept", SIB_KEPT), ("o_sib_left", SIB_LEFT), ("o_sib_v_left", SIB_LEFT)):
+        await _offer(admin, au[b], K_SIB, url, market="AU")
+    await admin.execute("UPDATE catalog_offers SET sku_key = $1 WHERE offer_id = ANY($2)", K_SIB + "::v:1",
+                        ["o_sib_v_left", au["o_sib_v_left"]])
+    before = await _state(admin)
+
+    [us] = (await tool.plan(db, hosts=[], keys=[K_SIB]))["groups"]
+    assert us["keeper"] == "glow-set" and us["skipped"] == "sibling_market_listing_live"
+    assert us["stranded_siblings"] == sorted([au["o_sib_left"], au["o_sib_v_left"]])
+    with pytest.raises(SystemExit, match="nothing to repair"):
+        await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB]))
+    assert await _state(admin) == before
+
+    [g] = (await tool.plan(db, hosts=[], keys=[K_SIB], market="AU"))["groups"]
+    assert (g["skipped"], sorted(g["suppress"]), g["deactivate"]) == (
+        None, sorted([au["o_sib_left"], au["o_sib_v_left"]]), [])
+    await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB], market="AU"))
+    [g] = (await tool.plan(db, hosts=[], keys=[K_SIB]))["groups"]
+    assert (g["skipped"], g["suppress"], g["deactivate"]) == (None, ["o_sib_left", "o_sib_v_left"], ["s_sib_left"])
+    await tool.apply(db, await tool.plan(db, hosts=[], keys=[K_SIB]))
+
+    rows = await admin.fetch("SELECT offer_id, source_ref, suppressed_at, suppression_reason FROM catalog_offers "
+                             "WHERE product_key = $1", K_SIB)
+    assert {r["offer_id"] for r in rows if r["suppressed_at"] is None} == {"o_sib_kept", au["o_sib_kept"]}
+    left = [r for r in rows if r["source_ref"] == SIB_LEFT]
+    assert len(left) == 4 and {r["suppression_reason"] for r in left} == {"same_key_other_listing"}
+    seeds = {r["id"]: r["status"] for r in await admin.fetch(
+        "SELECT id, status FROM external_product_seeds WHERE attached_product_key = $1", K_SIB)}
+    assert seeds == {"s_sib_kept": "active", "s_sib_left": "inactive"}

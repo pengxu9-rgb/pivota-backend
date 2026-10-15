@@ -324,6 +324,23 @@ def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get(PURCHASABILITY_TIER_KEY) or "").strip().lower() == PURCHASABILITY_BROWSE_ONLY
 
 
+#: The signed-ctx key a mint stamps when the OFFER'S OWN stock claim is out of stock, so the
+#: cart was not built. A separate key from the purchasability tier because it is a different
+#: fact — about the item, not the merchant x market — and a reader of one must not have to
+#: guess which of the two a `browse_only` meant. ABSENT on every other token.
+STOCK_DECLINE_KEY = "stock_declined"
+STOCK_OUT_OF_STOCK = "out_of_stock"
+
+
+def is_stock_declined(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint withheld a cart because the offer it served
+    says `in_stock: false`. Same reason as `is_purchase_declined`: without the knockout the click
+    would build the very cart the mint refused, for an item the same answer called sold out."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(STOCK_DECLINE_KEY) or "").strip().lower() == STOCK_OUT_OF_STOCK
+
+
 def evaluate_warm_eligibility(
     *,
     dest: str,
@@ -407,6 +424,8 @@ def evaluate_warm_eligibility(
     # fact and was told `browse_only`; building a cart here would overrule it.
     if is_purchase_declined(ctx):
         return False, "purchase_declined"
+    if is_stock_declined(ctx):
+        return False, "stock_declined"
     return True, eligible_reason
 
 

@@ -224,12 +224,52 @@ SIBLING_UPSERT_SQL = """
       merchant_effective_price = EXCLUDED.merchant_effective_price,
       estimated_best_price = EXCLUDED.estimated_best_price,
       offer_payload = EXCLUDED.offer_payload,
+      -- A sibling the shade fold retired with its base ('fold_superseded', apply.OFFER_FOLD_SUPERSEDED_REASON)
+      -- comes back live once its base is live again (this INSERT ... SELECT reads only a live base). Any other
+      -- suppressed sibling is never touched (the WHERE below).
+      suppressed_at = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                           THEN NULL ELSE catalog_offers.suppressed_at END,
+      suppression_reason = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
+                                THEN NULL ELSE catalog_offers.suppression_reason END,
       updated_at = NOW()
-     WHERE catalog_offers.suppressed_at IS NULL
+     WHERE (catalog_offers.suppressed_at IS NULL OR catalog_offers.suppression_reason = 'fold_superseded')
        AND catalog_offers.currency = EXCLUDED.currency
        AND upper(catalog_offers.market) = upper(EXCLUDED.market)
     RETURNING offer_id
 """
+
+
+
+def _sibling_upsert_sql_with_price_read(sql: str) -> str:
+    """`sql` that also dates the price it writes: `price_checked_at = NOW()` (migration 246).
+
+    Every sibling price IS a read made in this apply run: `_run_markets_stage` re-proves the market
+    session and re-reads every product before writing (nothing is carried from the dry run), and the
+    store's own cookie or /cart.js proved the currency. Derived from the one statement and refused
+    unless exactly its three places change; `write_siblings` writes it only where the column exists."""
+    cols_old = "source_domain, offer_payload)\n"
+    vals_old = "CAST(:offer_payload AS jsonb)\n"
+    set_old = "      updated_at = NOW()\n"
+    if any(sql.count(old) != 1 for old in (cols_old, vals_old, set_old)):
+        raise RuntimeError("SIBLING_UPSERT_SQL changed shape; update _sibling_upsert_sql_with_price_read")
+    return (sql.replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
+               .replace(vals_old, "CAST(:offer_payload AS jsonb), NOW()\n")
+               .replace(set_old, "      price_checked_at = EXCLUDED.price_checked_at,\n" + set_old))
+
+
+SIBLING_UPSERT_PRICE_READ_SQL = _sibling_upsert_sql_with_price_read(SIBLING_UPSERT_SQL)
+
+
+async def _price_check_present(db: Any) -> bool:
+    """Does this database's catalog_offers carry price_checked_at? Never raises: anything but a
+    clear yes (SQLite, a fake, a failed read) writes the statement this lane wrote before 246."""
+    from services.external_offer_dual_write import PRICE_CHECK_COLUMN_SQL
+    try:
+        row = await db.fetch_one(PRICE_CHECK_COLUMN_SQL)
+        return bool(row and row["present"] is True)
+    except Exception:  # noqa: BLE001
+        return False
+
 
 #: What landed, read back per written sibling, with the index's verdict on its content_key.
 READBACK_SQL = """
@@ -733,13 +773,16 @@ async def write_siblings(planned: List[Dict[str, Any]], *, db: Any) -> Dict[str,
     for row in planned:
         require_market_currency(row["market"], row["currency"])  # the writer's own lock, per row
     accepted, reasons, _rejected = await guard_catalog_offer_rows(planned, db=db, live_only=True)
+    # Every price here was read in this apply run (see _sibling_upsert_sql_with_price_read), so it is
+    # dated wherever the column exists.
+    upsert_sql = SIBLING_UPSERT_PRICE_READ_SQL if accepted and await _price_check_present(db) else SIBLING_UPSERT_SQL
     written: List[Dict[str, Any]] = []
     not_written: List[str] = []
     for row in accepted:
         params = {k: row[k] for k in ("offer_id", "base_offer_id", "market", "availability", "currency",
                                        "list_price", "merchant_effective_price", "estimated_best_price",
                                        "price_confidence", "source_system", "offer_payload")}
-        landed = await db.fetch_val(SIBLING_UPSERT_SQL, params)
+        landed = await db.fetch_val(upsert_sql, params)
         if landed is None:
             not_written.append(row["offer_id"])
             continue

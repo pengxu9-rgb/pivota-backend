@@ -36,7 +36,7 @@ def test_prod_target_env():
 def test_prod_grows_coverage_with_bounded_review():
     env = env_function("prod", "true")
     assert env["RELGRAPH_SYNC_PRIORITIZE_UNCOVERED"] == "true"
-    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "6")
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "8")
     assert env["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "90"
     # The backfill needs the prioritize-uncovered build; the gateway cron refuses it otherwise.
     assert (env["RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT"], env["RELGRAPH_SYNC_EXPAND_TARGET_RECALL"]) == ("200", "true")
