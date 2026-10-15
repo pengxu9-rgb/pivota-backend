@@ -5,8 +5,10 @@ Resolution rules by source_system:
 
 - external_product_seeds_mirror_v1:
   catalog_products.source_ref stores external_product_seeds.id. Use that
-  seed's domain. SKUs/offers inherit through product_key after the product
-  mapping is resolved.
+  seed's domain, else the host of its destination_url, else of its
+  canonical_url (the mirror's own order, scripts/mirror_external_seeds_to_
+  catalog_products._source_domain_for_row). SKUs/offers inherit through
+  product_key after the product mapping is resolved.
 
 - shopify_products_sync:
   Prefer a row-embedded store domain under product_payload source/store/
@@ -179,9 +181,17 @@ class CatalogSourceDomainBackfill:
               cp.source_system,
               cp.source_ref,
               cp.source_domain AS current_source_domain,
-              COALESCE(cp.source_domain, NULLIF(BTRIM(eps.domain), '')) AS resolved_source_domain,
+              COALESCE(
+                cp.source_domain,
+                NULLIF(BTRIM(eps.domain), ''),
+                NULLIF(BTRIM(eps.destination_url), ''),
+                NULLIF(BTRIM(eps.canonical_url), '')
+              ) AS resolved_source_domain,
               CASE
                 WHEN cp.source_domain IS NOT NULL THEN 'existing_product_source_domain'
+                WHEN NULLIF(BTRIM(eps.domain), '') IS NOT NULL THEN 'external_product_seeds.id'
+                WHEN COALESCE(NULLIF(BTRIM(eps.destination_url), ''), NULLIF(BTRIM(eps.canonical_url), ''))
+                     IS NOT NULL THEN 'external_product_seeds.url_host'
                 ELSE 'external_product_seeds.id'
               END AS resolution_rule
             FROM catalog_products cp
