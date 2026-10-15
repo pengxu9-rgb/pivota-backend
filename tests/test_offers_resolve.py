@@ -5895,3 +5895,210 @@ def test_two_entries_naming_the_attached_variant_at_two_prices_take_no_cart(
     for offer in offers.values():
         assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
 
+
+
+# ---------------------------------------------------------------- live-verification opt-in
+# A seed gated ONLY for freshness (7-day content/link clocks) is dropped from offers.resolve, so a
+# product search shows in stock got 0 offers (Laneige Lip Sleeping Mask, 2026-10-15; ~45% of active
+# US seeds). A caller that re-reads offers live (the gateway's get_offers under enforce) may opt in
+# and get them back flagged, with nothing the stale read says claimed.
+
+
+def _resolve_gated(monkeypatch, client, row, reasons, *, opt_in, sku_id=None):
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": list(reasons)})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com"]))
+    payload = {"product": {"product_id": "ext_spec", **({"sku_id": sku_id} if sku_id else {})},
+               "limit": 10, "market": "US", "tool": "*"}
+    if opt_in:
+        payload["includeLiveVerificationOffers"] = True
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": payload,
+                                                     "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    return [o for o in (body.get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"], body
+
+
+def test_a_freshness_gated_seed_is_still_dropped_for_a_caller_that_does_not_opt_in(monkeypatch, client):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=False)
+    assert offers == []
+    assert "live_verification_returned" not in (body.get("metadata") or {})
+
+
+@pytest.mark.parametrize("reasons", [["stale_snapshot"], ["destination_stale"], ["destination_never_verified"],
+                                     ["destination_never_verified", "stale_snapshot"]])
+def test_an_opted_in_caller_gets_the_freshness_gated_offer_flagged_with_nothing_claimed(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    [offer] = offers
+    flag = offer["requires_live_verification"]
+    assert flag["reasons"] == sorted(reasons)
+    assert flag["price_stale"] is True
+    assert flag["lookup_variant_id"] == _ATTACHED_B_VID, "the attached in-stock variant the listing stands for"
+    assert offer["execution_spec"]["cart_url"] is None, "no cart: a cart claims buyable at this price now"
+    assert offer["cart_prefilled"] is not True
+    assert "in_stock" not in offer and offer["availability"] == "unknown"
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 1, "offers": 1}
+
+
+@pytest.mark.parametrize("reasons", [["locale_market_mismatch"], ["price_currency_mismatch"], ["zero_variants"],
+                                     ["stale_snapshot", "price_currency_mismatch"]])
+def test_a_seed_gated_for_anything_but_freshness_is_dropped_even_when_opted_in(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    assert offers == []
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 0, "offers": 0}
+
+
+def test_a_fresh_seed_is_unchanged_by_the_opt_in(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "requires_live_verification" not in offer
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+def test_a_named_entry_with_a_json_ld_offer_id_is_looked_up_by_its_variant():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._live_lookup_variant_id({"variant_id": f"/products/x?variant={_ATTACHED_B_VID}#offer"}) == _ATTACHED_B_VID
+    assert gateway._live_lookup_variant_id({"variant_id": "SKU-30ML"}) is None
+    assert gateway._live_lookup_variant_id({}) is None
+    # An entry naming TWO variants (variant_id one, shopify_variant_id another) names none.
+    assert gateway._live_lookup_variant_id({"variant_id": "45253610242298", "shopify_variant_id": _ATTACHED_B_VID}) is None
+
+
+def test_a_flagged_offers_link_is_never_warmed_into_the_cart_the_mint_withheld(monkeypatch, client, warm_lane):
+    """Product grain (no sku_id): nothing else knocks the token out. Without its own signed key the
+    click-time warm lane would build a cart for an offer the answer said needs a live check."""
+    import services.outbound_warm_handoff as warm
+
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    ctx = _ctx_of(offer)
+    assert ctx["live_verification_required"] == "freshness"
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer), ctx=ctx, settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "live_verification_required")
+    assert offer["cart_prefilled"] is False, "provable: the warm lane knocks the token out"
+
+
+def test_a_fresh_offers_token_carries_no_live_verification_key(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "live_verification_required" not in _ctx_of(offer)
+
+
+# Review of #2629: yield, stale variant options, barcode-safe lookup id, no preflight for flagged.
+
+
+def _resolve_two(monkeypatch, client, rows_and_reasons, *, limit, opt_in=True):
+    import routes.agent_shop_gateway as gateway
+
+    rows = [r for r, _ in rows_and_reasons]
+    by_id = {r["id"]: reasons for r, reasons in rows_and_reasons}
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return rows
+        return []
+
+    async def fake_gate(row, *args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": list(by_id.get(row.get("id"), []))})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com", "other.com"]))
+    payload = {"product": {"product_id": "ext_spec"}, "limit": limit, "market": "US", "tool": "*",
+               **({"includeLiveVerificationOffers": True} if opt_in else {})}
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": payload,
+                                                     "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    return [o for o in (res.json().get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"]
+
+
+def _other_store_row():
+    import copy
+
+    row = copy.deepcopy(_seed_row_for_exec_spec(evidence=False))
+    row.update({"id": "eps_other", "external_product_id": "ext_spec", "domain": "other.com",
+                "destination_url": "https://other.com/products/serum", "canonical_url": "https://other.com/products/serum"})
+    row["seed_data"] = {**row["seed_data"], "destination_url": "https://other.com/products/serum",
+                        "canonical_url": "https://other.com/products/serum", "domain": "other.com"}
+    return row
+
+
+def test_a_flagged_offer_never_takes_a_fresh_offers_slot(monkeypatch, client):
+    """Opting in must never cost the caller an offer it gets today: with limit=1, a stale seed ranked
+    first by merit still yields to the fresh one (the flagged one may not be verifiable)."""
+    stale = _seed_row_for_exec_spec(evidence=False)
+    fresh = _other_store_row()
+    today = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=1, opt_in=False)
+    opted = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=1, opt_in=True)
+    assert [o["source"]["seed_id"] for o in today] == ["eps_other"]
+    assert [o["source"]["seed_id"] for o in opted] == ["eps_other"]
+    both = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=2, opt_in=True)
+    assert [bool(o.get("requires_live_verification")) for o in both] == [False, True], "flagged ones last"
+
+
+def test_a_flagged_offers_variant_options_claim_no_stock_and_mark_prices_stale(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    assert offer["variants"], "the fixture lists two options"
+    for opt in offer["variants"]:
+        assert "in_stock" not in opt, opt
+        assert opt.get("price_stale") is True, opt
+    fresh, _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert all("price_stale" not in opt for opt in fresh[0]["variants"])
+
+
+def test_the_lookup_id_ignores_a_barcode_sku_and_reads_the_entry_url():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._live_lookup_variant_id({"variant_id": _ATTACHED_B_VID, "sku": "8809598451234"}) == _ATTACHED_B_VID
+    assert gateway._live_lookup_variant_id({"sku": "8809598451234"}) is None
+    assert gateway._live_lookup_variant_id({"title": "50ml", "url": f"https://brand.com/products/serum?variant={_ATTACHED_B_VID}"}) == _ATTACHED_B_VID
+
+
+def test_a_flagged_offer_is_never_preflighted(monkeypatch, client):
+    from services import checkout_preflight as cp
+
+    asked = []
+
+    async def counting_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", counting_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    assert asked == [], "a flagged offer has no cart to hand over, so it spends no preflight"
+    _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert len(asked) == 1, "the fresh offer's cart is still preflighted"
+
+
+def test_host_diversity_never_lets_a_flagged_offer_take_a_second_fresh_offers_slot(monkeypatch, client):
+    """Seeds [stale on other.com, two fresh on brand.com] at limit=2: the one-per-host head used to pick
+    the flagged other.com offer over the second fresh brand.com one (review round 2 of #2629)."""
+    import copy
+
+    stale = _other_store_row()
+    a1 = copy.deepcopy(_seed_row_for_exec_spec(evidence=False))
+    a2 = copy.deepcopy(a1)
+    a2["id"] = "eps_spec_2"
+    a2["destination_url"] = a2["canonical_url"] = "https://brand.com/products/serum-2"
+    a2["seed_data"] = {**a2["seed_data"], "destination_url": "https://brand.com/products/serum-2",
+                       "canonical_url": "https://brand.com/products/serum-2"}
+    rows = [(stale, ["stale_snapshot"]), (a1, []), (a2, [])]
+    today = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=False)
+    opted = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=True)
+    assert sorted(o["source"]["seed_id"] for o in today) == ["eps_spec", "eps_spec_2"]
+    assert sorted(o["source"]["seed_id"] for o in opted) == ["eps_spec", "eps_spec_2"]
+    roomy = _resolve_two(monkeypatch, client, rows, limit=3, opt_in=True)
+    assert [bool(o.get("requires_live_verification")) for o in roomy] == [False, False, True]

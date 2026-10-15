@@ -40,6 +40,8 @@ from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
+    LIVE_VERIFICATION_KEY,
+    LIVE_VERIFICATION_REQUIRED,
     STOCK_DECLINE_KEY,
     STOCK_OUT_OF_STOCK,
     VARIANT_DECLINE_KEY,
@@ -3110,8 +3112,61 @@ class OffersResolvePayload(BaseModel):
         alias="commerceSurface",
         description="Serving surface eligibility policy (agent_api | ucp | acp)",
     )
+    # OPT-IN, for a caller that verifies offers live with the merchant before serving them (the
+    # gateway's get_offers under UCP_LIVE_OFFER_READ=enforce). A seed gated ONLY for freshness is then
+    # returned flagged `requires_live_verification` instead of dropped. Absent: unchanged.
+    include_live_verification_offers: bool = Field(
+        False,
+        alias="includeLiveVerificationOffers",
+        description="Return freshness-gated seed offers flagged requires_live_verification",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+#: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
+#: gated for these alone may be returned to an opted-in caller that re-reads it live; any other
+#: reason (locale/market or currency mismatch, zero variants) still drops it.
+_FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS = frozenset(
+    {"stale_snapshot", "destination_stale", "destination_never_verified"}
+)
+
+
+def _live_lookup_variant_id(entry: Any) -> Optional[str]:
+    """The ONE merchant variant id a stored seed entry CLAIMS (variant_id, variantId, id,
+    shopify_variant_id, source_variant_id -- a JSON-LD @id's `?variant=N` included -- plus its own
+    `url`'s `variant=`), or None when it claims none or several. Never `sku`: on this corpus an
+    8+-digit sku is routinely a barcode, which would either name a wrong id or make a real one
+    ambiguous (review of #2629)."""
+    if not isinstance(entry, dict):
+        return None
+    ids = set(stored_entry_claimed_variant_ids(entry))
+    named = url_named_variant_id(entry.get("url"))
+    if named:
+        ids.add(named)
+    ids = sorted(i for i in ids if i.isdigit())
+    return ids[0] if len(ids) == 1 else None
+
+
+def _stale_variant_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A flagged offer's variant options with nothing the stale read says claimed: no `in_stock`, and
+    each stated price marked `price_stale`."""
+    out = []
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        clean = {k: v for k, v in opt.items() if k != "in_stock"}
+        if "price" in clean:
+            clean["price_stale"] = True
+        out.append(clean)
+    return out
+
+
+def _live_verification_returned_of(offers: List[Dict[str, Any]]) -> Dict[str, int]:
+    """What an opted-in caller actually receives: flagged offers in the FINAL list, and their seeds."""
+    flagged = [o for o in offers or [] if isinstance(o, dict) and o.get("requires_live_verification")]
+    seeds = {((o.get("source") or {}).get("seed_id")) for o in flagged}
+    return {"seeds": len({s for s in seeds if s}), "offers": len(flagged)}
 
 
 def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3174,7 +3229,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
             product[key] = payload.get(key)
 
     normalized: Dict[str, Any] = {"product": product}
-    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface"):
+    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
+                "include_live_verification_offers", "includeLiveVerificationOffers"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -4638,6 +4694,7 @@ async def _handle_offers_resolve(
     # currency -- and has had a link minted for it. None when no market is declared.
     _buyer_currency = _declared_buyer_currency(market_hint)
     _buyer_currency_dropped: Dict[str, int] = {}
+    _live_verification_opt_in = bool(getattr(payload, "include_live_verification_offers", False))
 
     async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
@@ -4667,7 +4724,19 @@ async def _handle_offers_resolve(
                 )
                 continue
             live_verification_reasons = external_referral_live_verification_reasons(gate_status)
-            if live_verification_reasons:
+            # An OPTED-IN caller re-reads the offer live before serving it, so a seed gated only for
+            # freshness is returned to it flagged -- no cart, no stock claim, its stored price
+            # marked stale -- instead of dropped. ~45% of active US seeds fail a 7-day clock
+            # (census 2026-10-15); a multi-variant seed can never pass `stale_snapshot` from a page
+            # read, which lists one offer. Every other caller, and every other reason, unchanged.
+            requires_live_verification: Optional[List[str]] = None
+            if (
+                live_verification_reasons
+                and _live_verification_opt_in
+                and set(live_verification_reasons) <= _FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS
+            ):
+                requires_live_verification = list(live_verification_reasons)
+            elif live_verification_reasons:
                 # Recall can return a referral-only card, but offer resolution
                 # cannot synthesize commerce facts before a live merchant check.
                 mapping_candidates.append(
@@ -4946,7 +5015,9 @@ async def _handle_offers_resolve(
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
-                if _gate_vid and checkout_preflight.is_enabled():
+                # A FLAGGED offer gets no cart (below), so it is never a hand-over to preflight: asking
+                # would spend the shared budget a later fresh offer's cart needs (review of #2629).
+                if _gate_vid and not requires_live_verification and checkout_preflight.is_enabled():
                     _preflight_stats["gated"] += 1
                     _q = (str(canonical_url or destination_url), str(_gate_vid))
                     if _q in _preflight_memo:
@@ -5024,6 +5095,11 @@ async def _handle_offers_resolve(
                 if _stock_declined:
                     _stock_stats["declined"] += 1
                     redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                if requires_live_verification:
+                    # NOTHING the stale read says is claimed: no cart (a cart is a claim that this
+                    # variant is buyable at this price now), no stock flag. The caller verifies live.
+                    in_stock = None
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
 
                 # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
                 # says cannot take their card in this market? Asked on the cart the mint WOULD
@@ -5081,6 +5157,12 @@ async def _handle_offers_resolve(
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
                         **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
+                        # Flagged offers: the warm lane must not build the cart the mint withheld.
+                        **(
+                            {LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED}
+                            if requires_live_verification
+                            else {}
+                        ),
                         **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
@@ -5145,6 +5227,7 @@ async def _handle_offers_resolve(
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
                     stock_declined=_stock_declined,
+                    live_verification_required=bool(requires_live_verification),
                     variant_declined=_named_without_cart,
                 )
 
@@ -5332,8 +5415,33 @@ async def _handle_offers_resolve(
                         "internal_checkout_items": None,
                         "confidence": confidence,
                         **(
-                            {"variant_count": variant_count, "variants": variant_options}
+                            {
+                                "variant_count": variant_count,
+                                # A flagged offer's options are the same stale read: no stock claim,
+                                # prices marked stale (the caller's live read replaces what it reads).
+                                "variants": (
+                                    _stale_variant_options(variant_options)
+                                    if requires_live_verification
+                                    else variant_options
+                                ),
+                            }
                             if variant_options
+                            else {}
+                        ),
+                        **(
+                            {
+                                "requires_live_verification": {
+                                    "reasons": requires_live_verification,
+                                    # The stored price is the last page read's, older than 7 days
+                                    # or never stamped: shown only after a live read confirms it.
+                                    "price_stale": True,
+                                    # The id the caller's live read looks up (the offer has no
+                                    # cart, so `execution_spec.variant_id` is null): the offer's
+                                    # own stored variant, when it names exactly one.
+                                    "lookup_variant_id": _live_lookup_variant_id(v),
+                                },
+                            }
+                            if requires_live_verification
                             else {}
                         ),
                         "source": {
@@ -5350,7 +5458,8 @@ async def _handle_offers_resolve(
                         },
                     }
                 )
-                if len(external_offers) >= limit:
+                # Only offers that need no live check fill the lane: a flagged one may yet be withheld.
+                if sum(1 for o in external_offers if not o.get("requires_live_verification")) >= limit:
                     return
 
     # 1) External offers from external seeds (affiliate outbound)
@@ -6427,6 +6536,13 @@ async def _handle_offers_resolve(
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
+    # FLAGGED OFFERS LAST. One flagged `requires_live_verification` is served only if the caller's live
+    # read verifies it, and not every store can be read: ahead of a fresh offer it could take the slot
+    # that fresh offer would have filled and leave the buyer nothing (review of #2629). Stable, so
+    # the merit order holds within each half.
+    offers = [o for o in offers if not o.get("requires_live_verification")] + [
+        o for o in offers if o.get("requires_live_verification")
+    ]
     # THE BUYER'S CURRENCY, BEFORE THE CUT. With a declared market, an offer priced in another
     # currency (a GBP or KRW seed, an SGD sibling) is not an offer this buyer can take at that
     # price, and ranking compares raw amounts across currencies. Filtering after `limit` let
@@ -6440,7 +6556,14 @@ async def _handle_offers_resolve(
         buyer_currency_filtered[_code] = buyer_currency_filtered.get(_code, 0) + _n
     # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
     # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
-    offers = _host_diverse_head(offers, limit)
+    # Fresh offers fill the head first; FLAGGED ones (served only if the caller's live read verifies
+    # them) only fill what is left -- the head's one-per-host pass would otherwise let a flagged
+    # offer on a new host take a second fresh offer's slot (review round 2 of #2629).
+    _fresh = [o for o in offers if not o.get("requires_live_verification")]
+    _flagged = [o for o in offers if o.get("requires_live_verification")]
+    offers = _host_diverse_head(_fresh, limit)
+    if _flagged and len(offers) < limit:
+        offers = offers + _host_diverse_head(_flagged, limit - len(offers))
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
@@ -6707,6 +6830,13 @@ async def _handle_offers_resolve(
             **(
                 {"buyer_currency_filtered": buyer_currency_filtered}
                 if buyer_currency_filtered
+                else {}
+            ),
+            # Opted-in callers only: how many freshness-gated seeds (and their offers) came back
+            # flagged `requires_live_verification` instead of being dropped.
+            **(
+                {"live_verification_returned": _live_verification_returned_of(offers)}
+                if _live_verification_opt_in
                 else {}
             ),
         },
@@ -9780,6 +9910,9 @@ def _cart_prefilled_claim(
     # Set when the offer's own stock claim withheld the cart. Signed into the token the same
     # way, and knocked out by the warm lane the same way; defaulted for the same reason.
     stock_declined: bool = False,
+    # Set when the offer is returned flagged `requires_live_verification`. Signed and knocked out
+    # the same way; defaulted for the same reason.
+    live_verification_required: bool = False,
     # Set when a named variant's cart was withheld as another variant's. Same road again.
     variant_declined: bool = False,
 ) -> Optional[bool]:
@@ -9854,6 +9987,7 @@ def _cart_prefilled_claim(
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
             **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
+            **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
             **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
         },
         settings=settings,

@@ -341,6 +341,20 @@ def is_stock_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get(STOCK_DECLINE_KEY) or "").strip().lower() == STOCK_OUT_OF_STOCK
 
 
+#: The signed-ctx key a mint stamps when the offer was returned FLAGGED `requires_live_verification`
+#: (offers.resolve's opt-in: a freshness-gated seed, nothing its stale read says claimed). The mint
+#: built no cart for it; without the knockout the click would build one anyway, for an item the
+#: same answer said needs a live check. ABSENT on every other token.
+LIVE_VERIFICATION_KEY = "live_verification_required"
+LIVE_VERIFICATION_REQUIRED = "freshness"
+
+
+def is_live_verification_required(ctx: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(LIVE_VERIFICATION_KEY) or "").strip().lower() == LIVE_VERIFICATION_REQUIRED
+
+
 #: The signed-ctx key a mint stamps when the caller NAMED a variant and the only cart on offer
 #: was for a different one (the operator's attached variant, a sole catalog row, a sole stamped
 #: snapshot entry), so the cart was not built. ABSENT on every other token.
@@ -442,6 +456,8 @@ def evaluate_warm_eligibility(
         return False, "purchase_declined"
     if is_stock_declined(ctx):
         return False, "stock_declined"
+    if is_live_verification_required(ctx):
+        return False, "live_verification_required"
     if is_variant_declined(ctx):
         return False, "variant_declined"
     return True, eligible_reason
