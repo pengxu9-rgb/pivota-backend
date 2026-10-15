@@ -93,6 +93,7 @@ import secrets
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -1343,13 +1344,39 @@ _CART_PRODUCT_SKUS_SQL = """
 """
 #: More live skus than this is not a product a cart link can name one variant of.
 _CART_MAX_SKUS = 50
+# The seed's STORE is decided by `_seed_storefront_host`, not by `lower(e.domain) = <POSTed host>`: a
+# seed and its mirror row spell one store's host two ways (prod 2026-10-14: 1,540 rows whose seed says
+# `www.<store>` under a product saying `<store>`, 40 the other way), and an exact match refused them all.
 _CART_SEED_VARIANT_SQL = """
-    SELECT e.attached_variant_id, e.seed_data, e.destination_url, e.canonical_url
+    SELECT e.attached_variant_id, e.seed_data, e.destination_url, e.canonical_url, e.domain
       FROM external_product_seeds e
      WHERE e.id = :seed_id AND e.status = 'active'
        AND e.attached_product_key = :product_key
-       AND lower(e.domain) = :merchant_domain AND upper(e.market) = :market_country
+       AND upper(e.market) = :market_country
 """
+
+
+def _seed_storefront_host(seed: Mapping[str, Any], merchant_domain: str) -> Optional[str]:
+    """The storefront host of a mirror row's seed, or None when the seed is not THIS store's.
+
+    It is the host of the seed's product URL (`canonical_url`, else `destination_url`): the page its
+    storefront proofs were fetched from, so the proof readers check against it exactly. The POSTed
+    host, that URL host and the seed's `domain` column (when set) must all be ONE storefront under
+    the one-`www.` rule (`_same_storefront_host`, the enrichment branch's rule too): `www.` is noise,
+    a subdomain (`uk.<store>`) or a lookalike is another store. A seed with no `domain` is placed by
+    its URL alone (the mirror derives the row's seller the same way, `domain` else the URL host).
+    """
+    url = seed.get("canonical_url") or seed.get("destination_url")
+    try:
+        host = (urlsplit(str(url)).hostname or "") if url else ""
+    except ValueError:
+        host = ""
+    if not host or not _same_storefront_host(merchant_domain, host):
+        return None
+    domain = str(seed.get("domain") or "").strip()
+    if domain and not _same_storefront_host(merchant_domain, domain):
+        return None
+    return host
 # THE MARKET'S CURRENCY, in SQL (review of #2457): an offer in another currency is not an offer for
 # this buyer -- not a price to compare, not a cheaper pick. It gates on `currency`, NEVER on
 # `market`, for the reason `services.region_pricing` gives: `market` is NOT NULL DEFAULT 'US' and
@@ -1498,8 +1525,8 @@ def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed
     "seller_ref must equal merchant_id" refused all of them. A NULL seller_ref is accepted when the
     row's `merchant_id` is EXACTLY the observed seller id the repo's own minting function derives
     for this storefront: `resolve_seed_seller_identity(brand, domain)` over the attached ACTIVE
-    seed's domain (which `_CART_SEED_VARIANT_SQL` already pinned to `merchant_domain` and this
-    product; no seed row -> None). The brand is the one the mirror minted from
+    seed's domain (which `_seed_storefront_host` already placed on `merchant_domain`'s storefront,
+    and `_CART_SEED_VARIANT_SQL` on this product; no seed row -> None). The brand is the one the mirror minted from
     (`mirrored_seed_brand`: snapshot.brand, brand, snapshot.vendor, vendor), else the product's.
     A non-null seller_ref keeps today's rule: it must equal merchant_id. Live: brand Judydoll + judydoll.com -> merch_obs_a25cbba37ef98c52.
     """
@@ -1908,10 +1935,13 @@ async def _load_cart_link_item(
         seed = await database.fetch_one(
             _CART_SEED_VARIANT_SQL,
             {"seed_id": product.get("source_ref"), "product_key": product_key,
-             "merchant_domain": merchant_domain,
              "market_country": market_country},
         )
         seed = dict(seed) if seed else {}
+        # Another store's seed is no seed: no proof is read from it, so the row is refused below.
+        seed_host = _seed_storefront_host(seed, merchant_domain) if seed else None
+        if seed_host is None:
+            seed = {}
         seed_data = seed.get("seed_data")
         if isinstance(seed_data, str):
             try:
@@ -1923,13 +1953,13 @@ async def _load_cart_link_item(
         proven = verified_cart_variant_id(
             seed_data,
             product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
-            shop_domain=merchant_domain,
+            shop_domain=seed_host or merchant_domain,
             catalog_variant_id=sku_variant,
         )
         if named is not None and not _is_placeholder_sku(named, product_key):
             selected_proof = verified_selected_cart_variant_id(
                 seed_data, product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
-                shop_domain=merchant_domain, catalog_variant_id=sku_variant,
+                shop_domain=seed_host or merchant_domain, catalog_variant_id=sku_variant,
             )
             proven = selected_proof or proven
         variant_id = proven.variant_id if proven else None

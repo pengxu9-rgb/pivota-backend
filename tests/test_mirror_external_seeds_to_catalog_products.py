@@ -103,6 +103,30 @@ def test_mirror_insert_mints_canonical_signature_on_new_rows() -> None:
     assert "ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING" in source
 
 
+@pytest.mark.parametrize("row,expected", [
+    ({"domain": " WWW.Brand.com ", "destination_url": "https://other.example/products/a"}, "www.brand.com"),
+    ({"domain": None, "destination_url": "https://www.Brand-Two.com/products/x?v=1"}, "www.brand-two.com"),
+    ({"domain": "", "destination_url": None, "canonical_url": "https://three.example/products/y"}, "three.example"),
+    ({"domain": "brand.com.", "destination_url": None}, "brand.com"),
+    ({"domain": "localhost", "destination_url": None, "canonical_url": None}, None),
+    ({}, None),
+])
+def test_mirror_source_domain_is_the_seed_host_as_spelled(row, expected) -> None:
+    """The row's source_domain is the seed's store host EXACTLY as spelled (`www.` kept, lower case):
+    its domain, else its destination_url host, else its canonical_url host -- the order the mirror
+    derives the seller from, and scripts/backfill_catalog_source_domain.py's mirror rule."""
+    assert mirror_module._source_domain_for_row(row) == expected
+
+
+def test_mirror_insert_writes_source_domain() -> None:
+    """Before 2026-10-14 the INSERT omitted source_domain, leaving 2,927 live mirror rows NULL: the
+    cart-link lane finds a product by its source_domain and could not see them."""
+    source = Path(mirror_module.__file__).read_text()
+    insert = source[source.index("INSERT INTO catalog_products ("):source.index("ON CONFLICT (merchant_id, platform, source_product_id) DO NOTHING")]
+    assert "source_domain," in insert and ":source_domain," in insert
+    assert '"source_domain": _source_domain_for_row(row_dict),' in source
+
+
 def test_mirror_insert_classifies_category_path() -> None:
     # A lip gloss resolves to the Lip Gloss subtype, not the Lipstick catch-all:
     # the classifier grew dedicated lip subtype patterns ahead of Lipstick.

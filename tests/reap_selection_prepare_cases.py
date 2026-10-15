@@ -485,3 +485,67 @@ async def test_prepare_witness_create_replay_and_paused_recovery(client, monkeyp
     assert recovered.status_code == 200, recovered.text
     assert recovered.json()['id'] == created.json()['purchase_id']
     assert await unchanged_state() == stable
+
+
+async def respell_seed(*, domain, url_host, proof_host=None):
+    """The seed's own spelling of the store: its `domain` column (None = NULL), its product URL's host,
+    and its proof's products.js host (defaults to the URL host, as the backfill writes it)."""
+    page = "https://" + url_host + "/products/lip-ink"
+    raw = await database.fetch_val("SELECT seed_data FROM external_product_seeds WHERE id=:id", {"id": SEED})
+    data = json.loads(raw)
+    data["snapshot"]["shopify_cart_proof"]["product_js_url"] = "https://" + (proof_host or url_host) + "/products/lip-ink.js"
+    await database.execute(
+        "UPDATE external_product_seeds SET domain=:domain, destination_url=:page, seed_data=:data WHERE id=:id",
+        {"domain": domain, "page": page, "data": json.dumps(data), "id": SEED})
+
+
+@pytest.mark.parametrize("seed_domain,url_host", [
+    ("www." + DOMAIN, "www." + DOMAIN),  # the seed spells the store www., the product apex (1,540 prod rows)
+    (None, DOMAIN),                      # the seed has no domain: placed by its product URL
+    (None, "www." + DOMAIN),
+])
+async def test_prepare_finds_the_seed_whichever_way_it_spells_the_store(client, monkeypatch, seed_domain, url_host):
+    await seed(monkeypatch)
+    await respell_seed(domain=seed_domain, url_host=url_host)
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 200, response.text
+    assert (response.json()["selection"]["variant_id"], response.json()["selection"]["unit_price_minor"]) == (VARIANT, 1399)
+
+
+async def test_prepare_and_create_for_a_product_spelled_www_over_an_apex_seed(client, monkeypatch):
+    """The other way round (40 prod rows): the product says `www.<store>`, the seed the apex. The door
+    POSTs the product's spelling; the proof is checked on the seed's own host."""
+    await seed(monkeypatch)
+    await database.execute("UPDATE catalog_products SET source_domain=:d WHERE product_key=:pk", {"d": "www." + DOMAIN, "pk": PRODUCT})
+    response = await client.post(BASE, json=body(merchant_domain="www." + DOMAIN))
+    assert response.status_code == 200, response.text
+    witness = response.json()["selection"]
+    created = await client.post('/agent/v2/commerce/reap/purchases', json={
+        'item_source': 'cart_link', 'merchant_domain': witness['merchant_domain'], 'product_key': witness['product_key'],
+        'variant_key': witness['variant_key'], 'quantity': 1, 'idempotency_key': 'respelled-www-product',
+        'expected_unit_price_minor': witness['unit_price_minor'], 'expected_currency': witness['currency'],
+        'return_url': 'https://agent.pivota.cc/reap/return',
+        'buyer': {'email': 'selection@example.test', 'name': 'Selection Verifier', 'phone': '+14155550100',
+                  'consent_version': 'selection-test-v1',
+                  'shipping_address': {'firstName': 'Selection', 'lastName': 'Verifier', 'phone': '+14155550100',
+                                       'addressLine1': '900 Brannan St', 'city': 'San Francisco', 'country': 'US',
+                                       'postalCode': '94103'}}})
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one('SELECT * FROM reap_agentic_purchases'))
+    assert row['variant_key'] == 'shopify:' + VARIANT and row['our_price_minor'] == 1399
+
+
+@pytest.mark.parametrize("seed_domain,url_host,proof_host", [
+    ("uk." + DOMAIN, "uk." + DOMAIN, None),  # a subdomain is ANOTHER store
+    ("evil" + DOMAIN, "evil" + DOMAIN, None),  # a lookalike
+    (DOMAIN, "uk." + DOMAIN, None),          # the seed's domain says this store, its page another
+    (None, "other.example", None),           # no domain, and the page is another store
+    ("www." + DOMAIN, "www." + DOMAIN, DOMAIN),  # the proof was fetched from a host the seed's page is not
+])
+async def test_prepare_refuses_a_seed_of_another_store(client, monkeypatch, seed_domain, url_host, proof_host):
+    await seed(monkeypatch)
+    await respell_seed(domain=seed_domain, url_host=url_host, proof_host=proof_host)
+    before = await unchanged_state()
+    response = await client.post(BASE, json=body())
+    assert response.status_code == 409 and error(response) == "row_variant_unverified", response.text
+    assert await unchanged_state() == before
