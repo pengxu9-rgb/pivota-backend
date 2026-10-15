@@ -1922,12 +1922,56 @@ def test_a_gid_name_finds_the_entry_stored_by_its_bare_number(monkeypatch, clien
     assert offer["source"]["variant_match"] == "exact"
 
 
-def test_a_name_two_entries_answer_to_is_still_a_fallback(monkeypatch, client):
+def test_a_name_agreeing_duplicates_answer_to_is_that_variant_with_its_cart(monkeypatch, client):
+    """Two entries naming one variant at ONE price are one variant (#2627's rule): exact, its cart --
+    the same cart the unnamed listing gets (review of #2630)."""
     variants = [
         {"variant_id": f"/products/serum?variant={CATALOG_VID}#offer", "title": "50ml", "price_amount": 29.0,
          "price_currency": "USD", "availability": "in_stock"},
         {"shopify_variant_id": CATALOG_VID, "title": "50ml dup", "price_amount": 29.0, "price_currency": "USD",
          "availability": "in_stock"},
     ]
+    [named] = _route_offers(monkeypatch, client, variants, named=CATALOG_VID)
+    assert named["source"]["variant_match"] == "exact"
+    assert f"/cart/{CATALOG_VID}:1" in (named["execution_spec"]["cart_url"] or "")
+    [listing] = _route_offers(monkeypatch, client, variants)
+    assert f"/cart/{CATALOG_VID}:1" in (listing["execution_spec"]["cart_url"] or "")
+
+
+def test_a_name_entries_disagree_on_the_price_of_is_a_fallback(monkeypatch, client):
+    variants = [
+        {"variant_id": f"/products/serum?variant={CATALOG_VID}#offer", "title": "50ml", "price_amount": 29.0,
+         "price_currency": "USD", "availability": "in_stock"},
+        {"shopify_variant_id": CATALOG_VID, "title": "50ml sub", "price_amount": 24.0, "price_currency": "USD",
+         "availability": "in_stock"},
+    ]
     offers = _route_offers(monkeypatch, client, variants, named=CATALOG_VID)
+    # Not matched to either entry (the price is ambiguous): the `[{}]` fallback, which keeps main's
+    # #2628-guarded cart path unchanged -- and the gateway keeps only `exact` offers for a named variant.
     assert offers and all(o["source"].get("variant_match") == "fallback" for o in offers)
+
+
+def test_naming_the_catalog_variant_on_an_id_less_seed_keeps_mains_guarded_path(monkeypatch, client):
+    """The `[{}]` fallback is no stored entry: it keeps main's path, where #2628's guard keeps the
+    cart only when it is the named id (review of #2630, probe P2)."""
+    offers = _route_offers(monkeypatch, client, [
+        {"title": "30ml", "price_amount": 19.0, "price_currency": "USD", "availability": "in_stock"},
+        {"title": "50ml", "price_amount": 29.0, "price_currency": "USD", "availability": "in_stock"},
+    ], named=CATALOG_VID)
+    [offer] = offers
+    assert offer["source"]["variant_match"] == "fallback"
+    assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or "")
+
+
+def test_the_object_rule_directly():
+    """`_offer_may_take_the_sole_candidate` with `offer_variant`, without the route."""
+    from services.handover_variant_identity import _offer_may_take_the_sole_candidate
+
+    a = {"title": "30ml", "price_amount": 19.0}
+    b = {"title": "50ml", "price_amount": 29.0, "shopify_variant_id": CATALOG_VID}
+    seed = {"variants": [a, b]}
+    one = _cand(CATALOG_VID)
+    assert _offer_may_take_the_sole_candidate(one, seed_data=seed, wanted="", offer_variant=b) is True
+    assert _offer_may_take_the_sole_candidate(one, seed_data=seed, wanted="", offer_variant=a) is False
+    assert _offer_may_take_the_sole_candidate(one, seed_data=seed, wanted="", offer_variant={"title": "x"}) is False
+    assert _offer_may_take_the_sole_candidate(one, seed_data={"variants": [a]}, wanted="", offer_variant=a) is True

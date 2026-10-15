@@ -4696,12 +4696,13 @@ async def _handle_offers_resolve(
                     # offer @id (`/products/x?variant=N#offer`) as their id, and a caller names the
                     # variant by N (or as a gid) -- a string match missed it, so a correct offer came
                     # back `variant_match: fallback` and the gateway's exact-only filter dropped it.
-                    # Canonically, through the one shared reader, and only when EXACTLY ONE entry
-                    # answers (two naming it cannot say which one the caller meant; PR controller,
-                    # review of #2628).
+                    # Canonically, through the one shared reader -- and, as #2627's rule for the
+                    # attached id, only while the entries naming it agree on its price: two entries
+                    # naming one variant at $19 and $29 cannot say which price the caller gets
+                    # (PR controller, review of #2628). Agreeing duplicates are ONE variant.
                     answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, sku_id)]
-                    if len(answering) == 1:
-                        matched_variants = answering
+                    if answering and namers_agree_on_price(variants, sku_id):
+                        matched_variants = answering[:1]
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
             canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
@@ -4850,8 +4851,10 @@ async def _handle_offers_resolve(
                     # a candidate; it may not refuse one.
                     named_variant_id=_seed_variant_identity_claim(v),
                     # The stored entry this offer IS (by object): an id-less entry on a
-                    # multi-variant seed is not "product grain" (final review of #2622).
-                    offer_variant=v,
+                    # multi-variant seed is not "product grain" (final review of #2622). The `[{}]`
+                    # fallback of an unmatched name is no stored entry: it keeps the named path,
+                    # which #2628's `_cart_is_the_named_offer` already guards.
+                    offer_variant=v if v else None,
                 )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,
