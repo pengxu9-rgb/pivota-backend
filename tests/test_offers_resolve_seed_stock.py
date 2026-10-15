@@ -118,6 +118,8 @@ def _resolve(monkeypatch: pytest.MonkeyPatch, client: TestClient, seed: Dict[str
 
 
 def _stock_by_variant(offers: List[Dict[str, Any]]) -> Dict[str, Optional[bool]]:
+    """Every variant's claim. A seller listing ships ONE offer (its own variant) and, when it has
+    several, every variant's claim in `variants` -- read both, and they must agree on the offer's."""
     out: Dict[str, Optional[bool]] = {}
     for offer in offers:
         vid = offer["source"]["variant_id"]
@@ -129,6 +131,11 @@ def _stock_by_variant(offers: List[Dict[str, Any]]) -> Dict[str, Optional[bool]]
             # Unknown is spelled one way, never as `in_stock: None`.
             assert offer.get("availability") == "unknown"
             out[vid] = UNKNOWN
+        for option in offer.get("variants") or []:
+            claim = option["in_stock"] if "in_stock" in option else UNKNOWN
+            if option["variant_id"] in out:
+                assert out[option["variant_id"]] == claim, "the offer and its own variant entry disagree"
+            out[option["variant_id"]] = claim
     return out
 
 

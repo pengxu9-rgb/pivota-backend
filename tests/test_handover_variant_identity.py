@@ -633,10 +633,12 @@ def _wire(monkeypatch, *, seed_row, sku_rows):
     return seen
 
 
-def _resolve(client, sku_id="SKU-30ML", product_id=None):
+def _resolve(client, sku_id="SKU-30ML", product_id=None, named=None):
     """`sku_id` filters `matched_variants` to the one candidate naming it; `product_id` instead
-    lets the whole variant list through, which is how a multi-variant hand-over is exercised."""
-    product = {"product_id": product_id} if product_id else {"sku_id": sku_id}
+    lets the whole variant list through, which is how a multi-variant hand-over is exercised.
+    `named` names one variant of that product (`product.sku_id`), for its own offer (#2622)."""
+    product = ({"product_id": product_id, **({"sku_id": named} if named else {})}
+               if product_id else {"sku_id": sku_id})
     return client.post(
         "/agent/shop/v1/invoke",
         json={"operation": "offers.resolve",
@@ -1341,22 +1343,36 @@ def test_the_preflight_memo_is_keyed_on_the_variant_as_well_as_the_page(monkeypa
         asked.append(offer["execution_spec"]["variant_id"])
         return True
 
-    _wire(
-        monkeypatch,
-        seed_row=_seed_row(
-            snapshot_extra={"storefront_platform": "shopify"},
-            variants=[
-                {"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-                {"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
-                 "price_currency": "USD", "availability": "in_stock"},
-            ],
-        ),
-        sku_rows=[
-            _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
-            _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
-        ],
+    # One offer per seller LISTING, so two candidates on one page in one request are two seed
+    # listings of that page -- one per shade, the shape a shade-per-seed crawl writes.
+    shade_30 = _seed_row(
+        snapshot_extra={"storefront_platform": "shopify"},
+        variants=[{"variant_id": CATALOG_VID, "title": "30ml", "price_amount": 19.0,
+                   "price_currency": "USD", "availability": "in_stock"}],
     )
+    shade_50 = {
+        **_seed_row(
+            snapshot_extra={"storefront_platform": "shopify"},
+            variants=[{"variant_id": OTHER_VID, "title": "50ml", "price_amount": 29.0,
+                       "price_currency": "USD", "availability": "in_stock"}],
+        ),
+        "id": "eps_handover_50ml",
+    }
+    sku_rows = [
+        _row(sku_key="a", source_variant_id=CATALOG_VID, sku_payload=None),
+        _row(sku_key="b", source_variant_id=OTHER_VID, sku_payload=None),
+    ]
+    _wire(monkeypatch, seed_row=shade_30, sku_rows=sku_rows)
+
+    async def two_listings(query, values=None):
+        q = str(query)
+        if "FROM catalog_skus" in q:
+            return list(sku_rows)
+        if "FROM external_product_seeds" in q:
+            return [shade_30, shade_50]
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", two_listings)
     monkeypatch.setattr(gateway, "_preflight_allows_external_offer", counting_preflight)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "shadow")
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MAX_PER_REQUEST", "8")
@@ -1536,10 +1552,14 @@ def test_the_sibling_offer_gets_no_cart_through_the_real_route(monkeypatch, clie
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
                         AsyncMock(return_value=["brand.com"]))
-    res = _resolve(client, product_id=SPID)
-    assert res.status_code == 200, res.text
-    offers = {float(o["price"]): o for o in res.json().get("offers") or []
-              if o.get("purchase_route") == "affiliate_outbound"}
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each.
+    offers = {}
+    for named in ("SKU-30ML", "SKU-50ML"):
+        res = _resolve(client, product_id=SPID, named=named)
+        assert res.status_code == 200, res.text
+        for o in res.json().get("offers") or []:
+            if o.get("purchase_route") == "affiliate_outbound":
+                offers[float(o["price"])] = o
     assert set(offers) == {19.0, 29.0}, sorted(offers)
     assert offers[19.0]["execution_spec"]["cart_url"] is None, offers[19.0]["execution_spec"]
     tok = parse_qs(urlparse(offers[19.0]["affiliate_url"]).query)["token"][0].split(".")[0]
@@ -1713,13 +1733,23 @@ def test_jurlique_both_offers_get_the_cart_through_the_real_route(monkeypatch, c
     monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
     monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
                         AsyncMock(return_value=["brand.com"]))
-    res = _resolve(client, product_id=SPID)
-    assert res.status_code == 200, res.text
-    offers = [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
-    assert len(offers) == 2, "one offer per stored entry: offers.resolve does not dedupe them"
+    # One offer per seller listing unless a variant is named (pivota-backend #2622): name each
+    # stored entry in turn; each still gets the one variant's cart at its own (equal) price.
+    named = [row["seed_data"]["variants"][0]["variant_id"], row["seed_data"]["variants"][1]["variant_id"]]
+    offers = []
+    for name in named:
+        res = _resolve(client, product_id=SPID, named=name)
+        assert res.status_code == 200, res.text
+        offers += [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert len(offers) == 2, "each named entry answers its own offer"
     for offer in offers:
         assert float(offer["price"]) == 31.0
         assert f"/cart/{CATALOG_VID}:1" in (offer["execution_spec"]["cart_url"] or ""), offer["execution_spec"]
+    # Unnamed, the listing's one offer is that variant too, with its cart.
+    res = _resolve(client, product_id=SPID)
+    [listing] = [o for o in res.json().get("offers") or [] if o.get("purchase_route") == "affiliate_outbound"]
+    assert float(listing["price"]) == 31.0
+    assert f"/cart/{CATALOG_VID}:1" in (listing["execution_spec"]["cart_url"] or ""), listing["execution_spec"]
 
 
 
