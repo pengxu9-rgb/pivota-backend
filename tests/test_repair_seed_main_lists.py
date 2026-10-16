@@ -1,16 +1,22 @@
 """scripts/ops/repair_seed_main_lists.py: the pure plan for each stored shape, its refusals, and the digest.
 
-THE STORED LISTS COME FROM THE REAL PRODUCER. Every defective main list below is what main's JSON-LD extractor
-(`_extract_from_html`) plus the seed writer's adoption (`seed_variants_from_evidence`) store for a page shaped as
-Shopify themes and subscription apps emit it -- the code that wrote the prod rows (jurlique
-eps_019f2b9eef9a429385cccc5c, murad eps_0f70f7177cecd95416d98b53). Nothing below hand-builds a defective list
-except where a test names the one field it adds (a snapshot, a link mark, a differing code).
+THE STORED LISTS ARE FROZEN FROM THE REAL PRODUCER. Every defective main list below is what main a3efcf85b's
+JSON-LD extractor (`_extract_from_html`) plus the seed writer's adoption (`seed_variants_from_evidence`) stored for a
+page shaped as Shopify themes and subscription apps emit it -- the code that wrote the prod rows (jurlique
+eps_019f2b9eef9a429385cccc5c, murad eps_0f70f7177cecd95416d98b53). Frozen from main a3efcf85b's producer (pre-#2634),
+the shapes prod rows hold, in tests/fixtures/repair_seed_main_lists_stored.json, keyed by the page's JSON-LD blocks:
+#2634 changed the producer so it no longer writes these defects, and a fixture rebuilt by the live producer would
+stop being defective. The premise tests below pin both facts. Nothing below hand-builds a defective list except where
+a test names the one field it adds (a snapshot, a link mark, a differing code).
 """
 from __future__ import annotations
 
 import copy
+import functools
+import hashlib
 import json
-from typing import Any, Dict, List, Optional
+import pathlib
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -38,28 +44,65 @@ def _product(offers: Any) -> Dict[str, Any]:
             "image": f"{STORE}/cdn/p.jpg", "offers": offers}
 
 
-def _stored(*blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The main list main's seed writer stores for this page."""
+FROZEN_STORED = pathlib.Path(__file__).resolve().parent / "fixtures" / "repair_seed_main_lists_stored.json"
+
+
+@functools.lru_cache(maxsize=1)
+def _frozen_pages() -> Dict[str, Any]:
+    return json.loads(FROZEN_STORED.read_text())["pages"]
+
+
+def _page_key(blocks: Tuple[Dict[str, Any], ...]) -> str:
+    return hashlib.sha256(json.dumps(list(blocks), sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _html(*blocks: Dict[str, Any]) -> str:
     scripts = "".join('<script type="application/ld+json">' + json.dumps(b) + "</script>" for b in blocks)
-    html = f"<html><head><title>{TITLE}</title>{scripts}</head><body></body></html>"
-    return seed_variants_from_evidence(_page(html=html).evidence)
+    return f"<html><head><title>{TITLE}</title>{scripts}</head><body></body></html>"
+
+
+def _stored(*blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The main list main a3efcf85b's seed writer (pre-#2634) stored for this page -- frozen, the shape prod rows
+    hold. A page not in the fixture fails loudly: freeze it from a pre-#2634 checkout, never from the live producer."""
+    frozen = _frozen_pages().get(_page_key(blocks))
+    if frozen is None:
+        raise KeyError(f"page {_page_key(blocks)} is not frozen in {FROZEN_STORED.name}")
+    assert frozen["blocks"] == json.loads(json.dumps(list(blocks))), "fixture key collision"
+    return copy.deepcopy(frozen["stored"])
+
+
+def _live(*blocks: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The main list the CURRENT producer stores for this page (#2634 onward)."""
+    return seed_variants_from_evidence(_page(html=_html(*blocks)).evidence)
+
+
+def _jurlique_page() -> Tuple[Dict[str, Any], ...]:
+    # Block 1: the theme's Product, the variant named only by its link `@id`. Block 2: an app's Product, the same
+    # variant carrying its SKU (and its ?variant= url, which the seed writer does not keep).
+    return (_product([_offer(31, IN, **_link_id(V50))]),
+            _product({**_offer(31, IN), "sku": SKU50, **_link_url(V50)}))
+
+
+def _gtin_pair_page() -> Tuple[Dict[str, Any], ...]:
+    return (_product([_offer(31, IN, **_link_id(V50)), _offer(31, IN, gtin13=GTIN50, **_link_url(V50))]),)
+
+
+def _murad_page(*, plans_first: bool = False) -> Tuple[Dict[str, Any], ...]:
+    one_time = _offer(48, IN, name="One-Time Purchase")
+    plans = [_offer(40.80, IN, name=n) for n in ("1 month", "2 months", "3 months")]
+    return (_product(plans + [one_time] if plans_first else [one_time] + plans),)
 
 
 def _jurlique() -> List[Dict[str, Any]]:
-    # Block 1: the theme's Product, the variant named only by its link `@id`. Block 2: an app's Product, the same
-    # variant carrying its SKU (and its ?variant= url, which the seed writer does not keep).
-    return _stored(_product([_offer(31, IN, **_link_id(V50))]),
-                   _product({**_offer(31, IN), "sku": SKU50, **_link_url(V50)}))
+    return _stored(*_jurlique_page())
 
 
 def _gtin_pair() -> List[Dict[str, Any]]:
-    return _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(31, IN, gtin13=GTIN50, **_link_url(V50))]))
+    return _stored(*_gtin_pair_page())
 
 
 def _murad(*, plans_first: bool = False) -> List[Dict[str, Any]]:
-    one_time = _offer(48, IN, name="One-Time Purchase")
-    plans = [_offer(40.80, IN, name=n) for n in ("1 month", "2 months", "3 months")]
-    return _stored(_product(plans + [one_time] if plans_first else [one_time] + plans))
+    return _stored(*_murad_page(plans_first=plans_first))
 
 
 def _row(variants: List[Dict[str, Any]], *, snapshot: Optional[List[Dict[str, Any]]] = None,
@@ -77,14 +120,29 @@ def _plan(variants, **kw) -> Dict[str, Any]:
     return tool.plan_seed(_row(variants, **kw))
 
 
-# ── the producer really writes these shapes (the premise) ──────────────────────────────────────────────────────
+# ── the premise: the frozen lists are the old producer's defects; the current producer no longer writes them ──
 
-def test_main_writes_the_three_defective_shapes():
+def test_the_frozen_lists_are_the_three_defective_shapes_the_old_producer_wrote():
+    # A structural pin on the fixture: what main a3efcf85b's producer (pre-#2634) stored, i.e. what prod rows hold.
     assert [tool.key_class(v) for v in _jurlique()] == ["link", "digits"]
+    assert [v["variant_id"] for v in _jurlique()] == [_link_id(V50)["@id"], SKU50]
     assert [tool.key_class(v) for v in _gtin_pair()] == ["link", "barcode"]
-    assert [(v["variant_id"], v["title"]) for v in _murad()] == [
-        ("offer_1", "One-Time Purchase"), ("offer_2", "1 month"), ("offer_3", "2 months"), ("offer_4", "3 months")]
+    assert [v["variant_id"] for v in _gtin_pair()] == [_link_id(V50)["@id"], GTIN50]
+    murad = [("offer_1", "One-Time Purchase"), ("offer_2", "1 month"), ("offer_3", "2 months"), ("offer_4", "3 months")]
+    assert [(v["variant_id"], v["title"]) for v in _murad()] == murad
+    assert [v["title"] for v in _murad(plans_first=True)] == ["1 month", "2 months", "3 months", "One-Time Purchase"]
     assert not any("offer_shopify_variant_id" in v for v in _jurlique() + _gtin_pair()), "the writer drops link marks"
+
+
+def test_the_current_producer_no_longer_writes_them_for_the_same_pages():
+    # #2634: the same pages now store one entry per merchant variant -- so the repair is for rows written before it.
+    (jurlique,) = _live(*_jurlique_page())
+    assert (jurlique["variant_id"], jurlique["sku"]) == (_link_id(V50)["@id"], SKU50)
+    (gtin,) = _live(*_gtin_pair_page())
+    assert (gtin["variant_id"], gtin["barcode"]) == (V50, GTIN50)
+    for plans_first in (False, True):
+        (murad,) = _live(*_murad_page(plans_first=plans_first))
+        assert (murad["title"], murad["price_amount"]) == (TITLE, 48.0)
 
 
 # ── (iii) plan lists ──────────────────────────────────────────────────────────────────────────────────────────
