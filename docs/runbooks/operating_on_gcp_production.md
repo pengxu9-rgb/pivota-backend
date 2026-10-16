@@ -222,6 +222,46 @@ Prefer `CONCURRENCY_LIMIT`: it is the spelling `deploy_backend.sh`, the proof-is
 `deploy_backend.sh` the bare name `CONCURRENCY` means the **opposite** thing — there it is the
 internal per-env constant, not an override, and exporting it changes nothing.
 
+## Add or rotate a shared secret (example: `OFFER_LIVE_VERIFICATION_SECRET`)
+
+Every automated prod deploy runs `CONFIG=preserve`:
+- `.github/workflows/deploy-prod.yml` for web and worker;
+- `deploy_gateway.sh`, whose default is `preserve`.
+
+`preserve` keeps the service's existing secret mounts. The `CONFIG=apply` inputs (`infra/gcp/secrets.<env>[.gateway].list`) are git-ignored Railway exports that no longer exist. So a secret is added by mounting it on the live service once, and it survives later deploys. There is no config file to edit.
+
+### `OFFER_LIVE_VERIFICATION_SECRET`
+
+What it is: the HMAC key for the live-verified cart (pivota-backend #2632 + PIVOTA-Agent #2451). The gateway signs a 120 s assertion of what its live UCP read just verified. offers.resolve verifies it and may mint that offer's cart. Code: `services/offer_live_verification.py` (backend) and `src/services/offerLiveVerification.js` (gateway).
+
+| Service | Runtime SA | Reads | Role |
+|---|---|---|---|
+| web | `sa-backend@pivota-prod.iam.gserviceaccount.com` | `OFFER_LIVE_VERIFICATION_SECRET`, `OFFER_LIVE_VERIFICATION_SECRET_PREVIOUS` | verifies (current, then previous) |
+| worker | `sa-worker@pivota-prod.iam.gserviceaccount.com` | same | verifies (current, then previous) |
+| gateway | `sa-gateway@pivota-prod.iam.gserviceaccount.com` | `OFFER_LIVE_VERIFICATION_SECRET` only | signs with the current value |
+
+- **Length:** at least 32 bytes after trimming whitespace. Both sides trim (Python `.strip()`, JS `.trim()`), so a trailing newline from Secret Manager is harmless. A shorter or unset value is treated as **no secret**.
+- **No secret:** the gateway signs nothing and the backend ignores every assertion. The lane is off; offers are answered exactly as without it.
+- **The gateway also needs a flag:** it uses the secret only when `GET_OFFERS_LIVE_CART` is `shadow` or `on`.
+
+**First provisioning.** Order matters:
+1. Create the secret, then grant `roles/secretmanager.secretAccessor` on it to **all three** SAs, BEFORE mounting. A mount the SA cannot read produces a revision that never boots.
+2. Mount it on **web and worker first**:
+   ```
+   gcloud run services update <svc> --update-secrets OFFER_LIVE_VERIFICATION_SECRET=OFFER_LIVE_VERIFICATION_SECRET:latest
+   ```
+   Check both boot.
+3. Then mount it on the **gateway**.
+   - If the gateway gets it first, every assertion it sends is rejected `no_secret`. That is harmless: #2632 records no issued clicks for a request whose assertions were all rejected. But it is wasted second calls.
+4. Then `GET_OFFERS_LIVE_CART=shadow`, then `on`.
+   - Watch the backend's `live_verification_assertions` log line (received / accepted / rejected by reason) and the gateway's `get_offers_live_cart` line.
+
+**Rotation.** Mounts resolve `:latest` at instance START, so a new version reaches a service only with a new revision. Only the backend reads a previous value.
+1. Put the OLD value in a secret named `OFFER_LIVE_VERIFICATION_SECRET_PREVIOUS`. Grant the two backend SAs access, and mount it on web and worker.
+2. Add the NEW value as a new version of `OFFER_LIVE_VERIFICATION_SECRET`, then roll web and worker. They now verify new-or-old.
+3. Roll the gateway. It now signs with the new value.
+4. After at least 5 minutes, unmount `_PREVIOUS` from web and worker. Assertions live 120 s, and the backend refuses any token whose lifetime exceeds 300 s.
+
 ## Railway: decommissioned as of 2026-08-25 (#1872)
 
 This section used to say Railway "remains the rollback until it is decommissioned". It has been:
