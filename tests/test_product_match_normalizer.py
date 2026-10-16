@@ -790,6 +790,41 @@ def test_a_conjunction_never_meets_nothing(a, b):
     assert not _t0c_same(a, b) and not _t0b_same(a, b)
 
 
+# Review round 5: a "+" is a conjunction only when symmetric (spaced both sides or glued both).
+ONE_SIDED_PLUS_PAIRS = [
+    (("La Roche-Posay", "Effaclar Duo+ 40ml"), ("La Roche-Posay", "Effaclar Duo & 40ml")),
+    (("La Roche-Posay", "Cicaplast Baume B5+ Multi-Purpose Balm 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 & Multi-Purpose Balm 40ml")),
+    (("Clinique", "Dramatically Different Lotion+ Moisturizer 125ml"), ("Clinique", "Dramatically Different Lotion & Moisturizer 125ml")),
+    (("Beauty of Joseon", "Relief Sun SPF50+ PA++++ 50ml"), ("Beauty of Joseon", "Relief Sun SPF50 & PA++++ 50ml")),
+]
+
+
+@pytest.mark.parametrize("a,b", ONE_SIDED_PLUS_PAIRS, ids=[f"{i:02d}" for i in range(len(ONE_SIDED_PLUS_PAIRS))])
+def test_a_one_sided_plus_is_an_edition_not_a_conjunction(a, b):
+    assert exact_title_key(*a) != exact_title_key(*b)          # T0b keys differ
+    assert not _t0b_same(a, b) and not _t0b_same(b, a)
+    assert not _t0c_same(a, b) and not _t0c_same(b, a)
+    assert "plus" in exact_title_key(*a)[1].split()
+
+
+def test_plus_reading_agrees_between_t0b_and_t0c():
+    assert exact_title_key("Beauty of Joseon", "Relief Sun SPF50+ PA++++")[1] == "relief sun spf50 plus pa plus plus plus plus"
+    # Glued on the right only is one-sided too: an edition on both tiers.
+    a, b = ("COSRX", "Rice +Probiotics Toner 150ml"), ("COSRX", "Rice + Probiotics Toner 150ml")
+    assert "plus" in title_core(*a).conflicts and "plus" not in title_core(*b).conflicts
+    assert "plus" in exact_title_key(*a)[1].split() and "plus" not in exact_title_key(*b)[1].split()
+    assert not _t0c_same(a, b) and not _t0b_same(a, b)
+    # Symmetric "+" is the conjunction on both tiers, glued or spaced.
+    for t in ("Vitamin C+E Serum 30ml", "Vitamin C + E Serum 30ml"):
+        assert "plus" not in title_core("Mad Hippie", t).conflicts
+        assert exact_title_key("Mad Hippie", t) == exact_title_key("Mad Hippie", "Vitamin C & E Serum 30ml")
+    # T0b reads "Duo + SPF30" as a conjunction (it does not blank SPF first); the signature veto
+    # (title_core calls that "+" an edition) keeps the tiers' decisions alike.
+    a, b = ("La Roche-Posay", "Effaclar Duo + SPF30 40ml"), ("La Roche-Posay", "Effaclar Duo & SPF30 40ml")
+    assert exact_title_key(*a) == exact_title_key(*b)
+    assert not _t0b_same(a, b) and not _t0c_same(a, b)
+
+
 def test_conjunction_word_only_between_two_words():
     assert title_core("X", "Rice and").core == "rice"
     assert title_core("X", "And Rice").core == "rice"
