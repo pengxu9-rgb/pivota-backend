@@ -58,6 +58,16 @@ RESERVED_STRATEGIES = frozenset({
     "multi_seller_observation", "tier3_judge", "retailer_listing_brand_prefix", "variant_barcode_match",
 })
 
+#: Strategies only their own proposer may write (their evidence carries a matcher contract the
+#: engine's readers depend on): propose-merge refuses them. Applied only here, with a digest
+#: (identity_resolution.DIGEST_REQUIRED_STRATEGIES) and at most this many proposals per batch.
+PROPOSER_OWNED_STRATEGIES = {
+    "cross_merchant_same_size": "scripts/ops/propose_cross_merchant_matches.py",
+}
+STRATEGY_MAX_PROPOSALS = {
+    "cross_merchant_same_size": 200,
+}
+
 PROPOSAL_STRATEGIES_SQL = """
 SELECT proposal_id, strategy, kind, status FROM identity_resolution_proposals
 WHERE proposal_id = ANY($1::text[])
@@ -137,6 +147,11 @@ async def main(argv: List[str]) -> int:
         ap.error("--execute needs --expect-digest from a dry run")
     if args.cmd in ("apply", "propose-merge") and reserved(args.strategy):
         ap.error(f"strategy {args.strategy!r} is reserved: another path applies it with no cap or digest")
+    if args.cmd == "propose-merge" and args.strategy in PROPOSER_OWNED_STRATEGIES:
+        ap.error(f"strategy {args.strategy!r} is written only by {PROPOSER_OWNED_STRATEGIES[args.strategy]}")
+    cap = STRATEGY_MAX_PROPOSALS.get(getattr(args, "strategy", None) or "")
+    if args.cmd == "apply" and cap is not None and args.max_proposals > cap:
+        ap.error(f"strategy {args.strategy!r} applies at most {cap} proposals per batch")
 
     import asyncpg
 

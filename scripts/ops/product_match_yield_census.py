@@ -28,7 +28,9 @@ whose key carries no size). offers.resolve, agent_pdp_view and the gateway sibli
 size awareness yet.
 
 Not modelled: the same-size price-ratio veto (no prices are read), star topology (groups are
-counted as found, not anchored), and agent tiers.
+counted as found, not anchored), and agent tiers. Those live in the strategy that proposes the
+matches (services/identity_cross_merchant_match.py, PR M4), which reads the listing signals, GTIN
+pollution and tier keys from the same module as this census (services/product_match_tiers.py).
 
 SAFETY. ONE transaction, READ ONLY, `SET LOCAL statement_timeout = '60s'`, three SELECTs (the
 third, variant titles, runs in a savepoint and is optional). Everything else is computed in
@@ -64,16 +66,13 @@ except NameError:  # python -c has no __file__; /app is the image's repo root
     _REPO_ROOT = "/app"
 sys.path.insert(0, _REPO_ROOT)
 
-from services.intake_identity import barcode_reuse_reason  # noqa: E402
-from services.product_match_normalizer import (  # noqa: E402
-    canonical_brand,
-    conflict_family,
-    exact_title_key,
-    gtin_canonical,
-    gtin_restriction,
-    parse_size,
-    size_key,
-    title_core,
+from services.product_match_normalizer import conflict_family, gtin_canonical  # noqa: E402,F401
+from services.product_match_tiers import (  # noqa: E402,F401 -- fold_host is re-exported (tests)
+    ListingSignals,
+    build_listings,
+    fold_host,
+    gtin_pollution,
+    t0a_key,
 )
 
 CENSUS = "product_match_yield"
@@ -123,51 +122,8 @@ def _line(section: str, **fields: Any) -> Dict[str, Any]:
     return {"census": CENSUS, "section": section, **fields}
 
 
-def fold_host(host: Optional[str]) -> str:
-    """Lowercase, leading "www." dropped (www/apex are one store)."""
-    h = (host or "").strip().lower().rstrip(".")
-    return h[4:] if h.startswith("www.") else h
-
-
-class _Listing:
-    """One product as seen in one market, with every normalizer signal precomputed."""
-
-    __slots__ = (
-        "product_key", "brand", "title", "content_key", "ck", "hosts", "brand_direct", "cb", "tc",
-        "size_key", "gtin", "gtin_restriction", "exact_key", "t0c_key", "t0c_set_key", "signature",
-        "variant_sizes", "merchant_id", "source_domain", "core",
-    )
-
-    def __init__(self, row: Mapping[str, Any], hosts: Set[str], brand_direct: bool,
-                 sku_titles: Sequence[str]) -> None:
-        self.product_key = str(row["product_key"])
-        self.merchant_id = row.get("merchant_id")
-        self.source_domain = row.get("source_domain")
-        self.brand = row.get("brand")
-        self.title = row.get("title")
-        self.content_key = row.get("content_key")
-        self.ck = self.content_key or f"pk:{self.product_key}"
-        self.hosts = hosts
-        self.brand_direct = brand_direct
-        self.cb = canonical_brand(self.brand)
-        self.tc = title_core(self.brand, self.title)
-        self.size_key = size_key(self.tc.size)
-        self.gtin = gtin_canonical(row.get("gtin"))
-        self.gtin_restriction = gtin_restriction(self.gtin) if self.gtin else None
-        self.exact_key = exact_title_key(self.brand, self.title)
-        self.core = tuple(self.tc.core.split())
-        keyable = bool(self.cb and self.core and self.size_key is not None)
-        self.t0c_key = (self.cb, self.core, self.size_key) if keyable else None
-        self.t0c_set_key = (self.cb, self.tc.tokens, self.size_key) if keyable else None
-        self.signature = (self.tc.conflicts, self.tc.shade_tokens)
-        sizes = {self.size_key} if self.size_key else set()
-        for t in sku_titles or ():
-            if not t or str(t).strip().lower() == "default title":
-                continue
-            sk = size_key(parse_size(t))
-            if sk:
-                sizes.add(sk)
-        self.variant_sizes = sizes
+# The census's listing IS the strategy's: one class, in services/product_match_tiers.
+_Listing = ListingSignals
 
 
 def _veto_tokens(signatures: Iterable[Tuple[frozenset, frozenset]]) -> Tuple[Set[str], Set[str]]:
@@ -303,27 +259,6 @@ class _UnionFind:
             self.parent[rb] = ra
 
 
-def build_listings(products: Sequence[Mapping[str, Any]], hosts: Sequence[Mapping[str, Any]],
-                   sku_titles: Mapping[str, Sequence[str]], market: str) -> List[_Listing]:
-    by_pk: Dict[str, Set[str]] = defaultdict(set)
-    bd: Dict[str, bool] = defaultdict(bool)
-    for h in hosts:
-        if h.get("market") != market:
-            continue
-        pk = str(h["product_key"])
-        host = fold_host(h.get("host"))
-        if host:
-            by_pk[pk].add(host)
-        else:
-            by_pk.setdefault(pk, set())
-        bd[pk] = bd[pk] or bool(h.get("brand_direct"))
-    return [
-        _Listing(p, by_pk[str(p["product_key"])], bd[str(p["product_key"])],
-                 sku_titles.get(str(p["product_key"]), ()))
-        for p in products if str(p["product_key"]) in by_pk
-    ]
-
-
 def census_market(market: str, listings: Sequence[_Listing], *, samples: int = SAMPLE_GROUPS) -> List[Dict[str, Any]]:
     """Every JSON line for one market. Pure: no I/O."""
     lines: List[Dict[str, Any]] = []
@@ -333,32 +268,9 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
     for li in listings:
         ck_hosts[li.ck].update(li.hosts)
         ck_sizes[li.ck].update(li.variant_sizes)  # title size + every variant's size
-    # GTIN pollution: one GTIN on >1 size or >1 stated shade within the market.
-    gtin_sizes: Dict[str, Set[Any]] = defaultdict(set)
-    gtin_shades: Dict[str, Set[Any]] = defaultdict(set)
-    gtin_brands: Dict[str, Set[str]] = defaultdict(set)
-    for li in listings:
-        if li.gtin and not li.gtin_restriction:
-            if li.size_key:
-                gtin_sizes[li.gtin].add(li.size_key)
-            if li.tc.shade_tokens:
-                gtin_shades[li.gtin].add(li.tc.shade_tokens)
-            gtin_brands[li.gtin].add(li.cb)
-    gtin_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for li in listings:
-        if li.gtin and not li.gtin_restriction:
-            gtin_rows[li.gtin].append({"product_key": li.product_key, "merchant_id": li.merchant_id,
-                                       "source_domain": li.source_domain, "title": li.title,
-                                       "content_key": li.content_key})
-    reuse = {g: barcode_reuse_reason(rows) for g, rows in gtin_rows.items()}
-    polluted_by_reason = Counter()
-    polluted: Set[str] = set()
-    for g in gtin_brands:
-        reason = reuse.get(g) or ("sizes_differ" if len(gtin_sizes[g]) > 1 else
-                                  "shades_differ" if len(gtin_shades[g]) > 1 else None)
-        if reason:
-            polluted.add(g)
-            polluted_by_reason[reason] += 1
+    # GTIN pollution: barcode reuse at one seller, or one GTIN on >1 size or >1 stated shade.
+    pollution = gtin_pollution(listings)
+    polluted, polluted_by_reason, gtin_brands = pollution.polluted, pollution.by_reason, pollution.gtin_brands
     restriction_hist = Counter(li.gtin_restriction for li in listings if li.gtin and li.gtin_restriction)
     lines.append(_line(
         "inputs", market=market,
@@ -383,10 +295,7 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
     ))
 
     def t0a(li: _Listing) -> Optional[Hashable]:
-        if (not li.gtin or li.gtin_restriction or li.gtin in polluted or not li.cb or li.size_key is None
-                or not li.core):
-            return None
-        return (li.gtin, li.cb, li.size_key, li.core)  # phase 1: the GTIN AND the T0c core agree
+        return t0a_key(li, polluted)  # phase 1: the GTIN AND the T0c core agree
 
     def t0a_size_missing(li: _Listing) -> Optional[Hashable]:
         if not li.gtin or li.gtin_restriction or li.gtin in polluted or not li.cb:

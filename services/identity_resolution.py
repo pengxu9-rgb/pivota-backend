@@ -269,6 +269,13 @@ A_LOSER_IS_SERVED_SQL = """
 # 'approved' and retried on every apply.
 SERVED_ROW_GUARDED_STRATEGIES: Tuple[str, ...] = ("same_url_dup", "junk_url")
 
+# Strategies whose proposals apply ONLY as part of a batch a dry run digested (scripts/identity_engine.py
+# apply --expect-digest), never through a strategy-filtered apply with no digest (the reconcile sweep's,
+# a link script's, or a future caller's apply_approved(strategies=None)). cross_merchant_same_size moves
+# listings between merchants' products (services/identity_cross_merchant_match.py): Peng reviews an
+# audit sample, then the coordinator applies batches with a digest and a cap. Test-pinned.
+DIGEST_REQUIRED_STRATEGIES: Tuple[str, ...] = ("cross_merchant_same_size",)
+
 SERVED_LOSER_SQL = """
 SELECT (""" + A_LOSER_IS_SERVED_SQL + """ LIMIT 1) AS served_loser
 FROM identity_resolution_proposals p
@@ -771,6 +778,9 @@ async def apply_approved(
             await conn.execute(BLOCK_PROPOSAL_SQL, pid, status, json.dumps(info))
             await conn.execute(INSERT_EVENT_SQL, pid, "blocked", run_id, json.dumps(info))
         for p, fp in plan["batch"]:
+            if p["strategy"] in DIGEST_REQUIRED_STRATEGIES and expect_digest is None:
+                skipped.append((p["proposal_id"], "strategy_needs_expect_digest"))
+                continue
             if p["kind"] == "merge_content_key" and expect_digest is None:
                 # A merge re-keys every live row on a content_key: it applies only as part of a batch a
                 # dry run digested (scripts/identity_engine.py), never through a strategy-filtered apply
