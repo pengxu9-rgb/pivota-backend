@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import random
 import time
 from collections import deque
@@ -65,6 +66,27 @@ def _random() -> float:
     return random.random()
 
 
+def resolve_setting(explicit: Any, env_name: str, default: float) -> float:
+    """A run's pacing knob: the flag wins, then `env_name`, then `default`. A non-finite or negative
+    value falls back to the default, loudly: a typo must never silently mean "unpaced". 0 is the
+    explicit off switch."""
+    raw: Any = explicit
+    source = "argument"
+    if raw is None:
+        raw = (os.getenv(env_name) or "").strip() or None
+        source = env_name
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        logger.warning("%s=%r is not a non-negative number; using the default %s", source, raw, default)
+        return default
+    return value
+
+
 class GlobalPaceStopped(RuntimeError):
     """The run's pacer was stopped (the IP breaker's final trip, or the run's budget ends inside a
     cool-down). No request was sent."""
@@ -91,6 +113,7 @@ class GlobalOriginPacer:
         max_new_hosts_per_minute: int,
         jitter: float = JITTER_DEFAULT,
         deadline: Optional[float] = None,
+        hard_deadline: bool = False,
     ) -> None:
         self.initial_rps = _finite_non_negative(rps, 0.0)
         self.rps = self.initial_rps
@@ -99,6 +122,11 @@ class GlobalOriginPacer:
         self.jitter = min(max(_finite_non_negative(jitter, JITTER_DEFAULT), 0.0), 0.9)
         # A monotonic instant past which no cool-down may be waited out (the run's budget).
         self.deadline = deadline
+        # OPT-IN: with `hard_deadline`, no request STARTS at or after `deadline` either; the first
+        # one that would stops the pacer. For a run with no other way to stop work already in
+        # progress (the destination sweep reads a whole catalogue per host). The refresh stops
+        # starting ROWS at its budget instead and leaves this off.
+        self.hard_deadline = bool(hard_deadline) and deadline is not None
         self.paused_until = 0.0
         self.stopped = False
         self.stop_reason: Optional[str] = None
@@ -209,6 +237,9 @@ class GlobalOriginPacer:
             # RESERVE, THEN SLEEP: both reservations happen here with no await between them.
             admitted_at = self.admit(host)
             start = max(now, admitted_at, self._next_start)
+            if self.hard_deadline and start >= self.deadline:
+                self.stop("budget spent")
+                self._check_stopped()
             self._next_start = start + self._gap()
             delay = start - now
             if delay > 0:

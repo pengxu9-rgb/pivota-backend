@@ -45,7 +45,7 @@ from urllib.parse import urlparse
 import httpx
 
 from db.database import database
-from services import crawl_politeness
+from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import shopify_edge_pacer
 from services.catalog_offer_suppression import cascade_offer_suppression
 from services import destination_dead_suppression
@@ -105,6 +105,22 @@ MAX_CATALOGUE_PAGES = 80
 # hitting any single storefront harder. Serial hosts made a full pass a sum-of-waits, which a
 # 3600s Cloud Run task timeout does not comfortably hold.
 SWEEP_HOST_CONCURRENCY = 4
+
+# STRICT GLOBAL PACING (2026-10-16), the refresh's rules (be#2640, `services.crawl_global_pacer`).
+# Measured 10-14/10-15: this sweep read 5,000 candidates across 228-354 hosts in ~15 min, ~4-5
+# requests/s from the one crawl NAT address, the fastest crawler on it; on 10-16 (after Cloudflare
+# challenge-listed the address) it took 319 backoffs from its first second and ran into the 3,600 s
+# task timeout. `SWEEP_HOST_CONCURRENCY` capped hosts in flight, not the IP's rate.
+#   * 0.5 requests/s shared by every host worker (+-30% jitter), 6 new hosts a minute: the
+#     refresh's defaults and reasons (services/external_referral_readiness._GLOBAL_RPS_DEFAULT);
+#   * a WALL-CLOCK BUDGET, which this sweep never had: at 0.5/s a 5,000-seed pass (~1,750 requests
+#     + one robots.txt per host) needs ~4,100 s, past the task timeout, so the run would be killed
+#     before printing its summary. 3,300 s, the refresh's number, under the 3,600 s timeout. No
+#     request starts after it (`hard_deadline`); a host cut short records nothing more.
+# Each is `<= 0` to switch off (rollback), flag first, then env, then default.
+SWEEP_GLOBAL_RPS_DEFAULT = 0.5
+SWEEP_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = 6
+SWEEP_BUDGET_SECONDS_DEFAULT = 3300.0
 
 # Catalogue-read outcomes. Only `ok` is a catalogue.
 CATALOGUE_OK = "ok"
@@ -242,6 +258,10 @@ async def probe_destination(
         return classify_destination(
             requested_url=url, status_code=None, transport_error="robots_disallowed"
         )
+    except crawl_global_pacer.GlobalPaceStopped:
+        # The run stopped (budget spent, or the IP breaker's final trip). NOT an observation:
+        # recording `unverifiable` for a request we never sent would stamp the seed as checked.
+        raise
     except Exception as exc:  # noqa: BLE001
         return classify_destination(
             requested_url=url, status_code=None, transport_error=type(exc).__name__
@@ -254,8 +274,9 @@ async def probe_destination(
             requested_url=url, status_code=None, transport_error=type(exc).__name__
         )
 
+    # WITH ITS HEADERS: that is how the installed IP breaker sees `cf-mitigated: challenge`.
     crawl_politeness.note_response(
-        url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers
     )
     # Teaches the shared Shopify-edge budget which hosts it covers (a no-op with its flag off).
     shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
@@ -346,6 +367,8 @@ async def _get_catalogue_page(
             await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=0)
         except crawl_politeness.RobotsDisallowed:
             return "robots_disallowed", "robots.txt"
+        except crawl_global_pacer.GlobalPaceStopped:
+            raise  # the run stopped: not a fact about this host
         except Exception as exc:  # noqa: BLE001
             return "gate_error", f"{type(exc).__name__}: {exc}"
 
@@ -357,7 +380,7 @@ async def _get_catalogue_page(
             continue
 
         crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers
         )
         shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         mitigated = resp.headers.get("cf-mitigated")
@@ -771,14 +794,57 @@ async def run_destination_sweep(
     client: Optional[httpx.AsyncClient] = None,
     retire: bool = True,
     now: Optional[datetime] = None,
+    budget_seconds: Optional[float] = None,
+    global_rps: Optional[float] = None,
+    max_new_hosts_per_minute: Optional[int] = None,
+    ip_throttle_enabled: Optional[bool] = None,
+    ip_challenge_trip_hosts: Optional[int] = None,
+    ip_challenge_window_seconds: Optional[float] = None,
+    ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Stage 1 per host, then stage 2 only for the handles the brand no longer lists.
 
     Sizing: a full pass must fit inside the `stale_snapshot` window (7 days). At ~11.4k active
     seeds that is ~1,700/day, and stage 1 makes it a few hundred requests rather than 11,400.
+
+    PACED (2026-10-16): every request of the run (catalogue pages, their retries, PDP probes,
+    robots.txt) waits on one `crawl_global_pacer.GlobalOriginPacer`, and a
+    `crawl_ip_throttle.StagedIpThrottleBreaker` watches every answer: 3 hosts answering a
+    Cloudflare challenge within 120 s pause the run 900 s and halve its rate; a second trip ends
+    it. See `SWEEP_GLOBAL_RPS_DEFAULT`.
     """
     candidates = await get_sweep_candidates(limit)
     grouped = group_by_host(candidates)
+
+    budget = crawl_global_pacer.resolve_setting(
+        budget_seconds, "EXTERNAL_SEED_DESTINATION_SWEEP_BUDGET_SECONDS", SWEEP_BUDGET_SECONDS_DEFAULT
+    )
+    pacer = crawl_global_pacer.GlobalOriginPacer(
+        rps=crawl_global_pacer.resolve_setting(
+            global_rps, "EXTERNAL_SEED_DESTINATION_SWEEP_GLOBAL_RPS", SWEEP_GLOBAL_RPS_DEFAULT
+        ),
+        max_new_hosts_per_minute=int(crawl_global_pacer.resolve_setting(
+            max_new_hosts_per_minute, "EXTERNAL_SEED_DESTINATION_SWEEP_MAX_NEW_HOSTS_PER_MINUTE",
+            SWEEP_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT,
+        )),
+        deadline=(crawl_global_pacer._now() + budget) if budget > 0 else None,
+        hard_deadline=True,
+    )
+
+    def _on_trip(breaker: crawl_ip_throttle.StagedIpThrottleBreaker, event: Dict[str, Any]) -> None:
+        if event.get("action") == "cooldown":
+            pacer.pause(breaker.cooldown_seconds)
+            pacer.set_rate(pacer.rps / 2.0)
+        else:
+            pacer.stop("ip breaker tripped")
+
+    breaker = crawl_ip_throttle.StagedIpThrottleBreaker.from_env(
+        enabled=ip_throttle_enabled,
+        challenge_trip_hosts=ip_challenge_trip_hosts,
+        challenge_window_seconds=ip_challenge_window_seconds,
+        cooldown_seconds=ip_throttle_cooldown_seconds,
+        on_trip=_on_trip,
+    )
 
     summary: Dict[str, Any] = {
         "candidates": len(candidates),
@@ -795,6 +861,15 @@ async def run_destination_sweep(
         "pending_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
         "catalogue_status": {},
+        # Hosts the run did not finish because it stopped (budget spent or the IP breaker's final
+        # trip): cut short mid-host, or never started. Kept OUT of `hosts_unverifiable`, which
+        # is the coverage alarm's numerator: we did not fail to read them, we did not ask.
+        "hosts_stopped": 0,
+        "hosts_not_started": 0,
+        # Hosts held back after a breaker trip because their latest answer was a throttle or a
+        # challenge.
+        "hosts_skipped_ip_throttle": 0,
+        "budget_seconds": budget,
     }
 
     owns_client = client is None
@@ -803,6 +878,16 @@ async def run_destination_sweep(
 
     async def sweep_one_host(host: str, seeds: List[Dict[str, Any]]) -> None:
         async with host_slot:
+            # CHECKED AT TAKE TIME, after any wait for a slot: stop STARTING hosts once the run is
+            # over (final trip, budget), and do not ask a host the breaker holds back.
+            if not pacer.stopped and pacer.deadline is not None and crawl_global_pacer._now() >= pacer.deadline:
+                pacer.stop("budget spent")
+            if pacer.stopped or breaker.tripped:
+                summary["hosts_not_started"] += 1
+                return
+            if breaker.blocks(host):
+                summary["hosts_skipped_ip_throttle"] += 1
+                return
             catalogue = await read_brand_catalogue(client, host)
             summary["catalogue_status"][catalogue.status] = (
                 summary["catalogue_status"].get(catalogue.status, 0) + 1
@@ -854,11 +939,14 @@ async def run_destination_sweep(
     try:
         # One host failing must not void the rest of the pass — the counters above are the
         # deliverable, and a half-swept corpus is strictly better than none.
-        results = await asyncio.gather(
-            *(sweep_one_host(h, s) for h, s in grouped.items()), return_exceptions=True
-        )
+        with crawl_ip_throttle.installed(breaker), crawl_global_pacer.installed(pacer):
+            results = await asyncio.gather(
+                *(sweep_one_host(h, s) for h, s in grouped.items()), return_exceptions=True
+            )
         for host, outcome in zip(grouped, results):
-            if isinstance(outcome, BaseException):
+            if isinstance(outcome, crawl_global_pacer.GlobalPaceStopped):
+                summary["hosts_stopped"] += 1
+            elif isinstance(outcome, BaseException):
                 summary["hosts_unverifiable"] += 1
                 logger.warning(
                     "destination sweep host failed",
@@ -868,6 +956,22 @@ async def run_destination_sweep(
         if owns_client:
             await client.aclose()
 
+    summary["stopped"] = pacer.stop_reason
+    # Same field names as the refresh's summary (`ip_throttled`, `breaker_trips`, `global_rps`,
+    # `final_rate`, `paces_waited_seconds`, `cooldowns`, ...), so one log filter reads both.
+    summary.update(breaker.summary())
+    summary.update(pacer.summary())
+    if breaker.tripped:
+        logger.warning(
+            "destination sweep: IP throttled (trip %d of %d); the run ended with %d host(s) cut "
+            "short and %d not started", breaker.trips, breaker.max_trips,
+            summary["hosts_stopped"], summary["hosts_not_started"],
+        )
+    elif pacer.stop_reason:
+        logger.warning(
+            "destination sweep: %s after %.0fs; %d host(s) cut short and %d not started",
+            pacer.stop_reason, budget, summary["hosts_stopped"], summary["hosts_not_started"],
+        )
     logger.info("external seed destination sweep complete", extra={"summary": summary})
     return summary
 
