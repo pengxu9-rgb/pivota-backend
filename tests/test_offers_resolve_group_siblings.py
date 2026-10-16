@@ -66,23 +66,36 @@ MEMBERS = [
 ]
 
 
-def _verdict(offer_ids=("of_sk",), **overrides) -> dict:
-    """A valid `evidence.matcher_verdict`, as M4 writes it (the contract #2635 requires)."""
+def _sku(listing_pk, offer_id):
+    """The per-variant sku_key a catalog row carries in these fixtures (`<pk>::v::<id>`)."""
+    return f"{listing_pk}::v::{offer_id}"
+
+
+def _verdict(offers=None, seeds=None, **overrides) -> dict:
+    """A valid contract-v3 `evidence.matcher_verdict`, as M4 writes it: the matched size's catalog
+    offers by (offer_id, sku_key), and the matched seeds by (seed_id, variant_id|null)."""
     v = {"strategy": "cross_merchant_same_size", "same_size": True, "rule_version": "m4-t0-2026-10-16",
-         "tier": "T0b", "size": {"value": 50, "unit": "ml", "pack": 1}, "listing_offer_ids": list(offer_ids)}
+         "tier": "T0b", "size": {"value": 50, "unit": "ml", "pack": 1},
+         "matched_offers": [{"offer_id": o, "sku_key": k}
+                            for o, k in (offers if offers is not None else [("of_sk", _sku(RETAILER_PK, "of_sk"))])],
+         "matched_seeds": [{"seed_id": sid, "variant_id": vid}
+                           for sid, vid in (seeds if seeds is not None else [("eps_spec", "SKU-50ML")])]}
     v.update(overrides)
     return v
 
 
 def _attach(listing_pk, keeper_pk=BRAND_PK, ck=CK, *, strategy="cross_merchant_same_size", status="applied",
-            kind="attach_membership", offer_ids=None, verdict=None):
+            kind="attach_membership", offer_ids=None, seeds=None, verdict=None, proposer="cross_merchant_same_size",
+            size=None):
     """An identity_resolution_proposals row: the engine joined `listing_pk` to the keeper's product,
     on a matcher verdict. Evidence keys as services/identity_resolution writes them (be#2637)."""
     ids = offer_ids if offer_ids is not None else (("of_sk",) if listing_pk == RETAILER_PK else ("of_unlisted",))
+    v = verdict if verdict is not None else _verdict([(i, _sku(listing_pk, i)) for i in ids], seeds,
+                                                     **({"size": size} if size else {}))
     return {"content_key": ck, "subject_product_keys": [listing_pk, keeper_pk], "keeper_product_key": keeper_pk,
             "strategy": strategy, "status": status, "kind": kind,
             "evidence": {"listing_product_key": listing_pk, "from_content_key": "ck_old",
-                         "matcher_verdict": _verdict(ids) if verdict is None else verdict}}
+                         **({"proposer": proposer} if proposer else {}), "matcher_verdict": v}}
 
 
 def _merge(from_pks, keeper_pk=BRAND_PK, ck=CK, *, status="applied", verdict=None):
@@ -90,8 +103,8 @@ def _merge(from_pks, keeper_pk=BRAND_PK, ck=CK, *, status="applied", verdict=Non
     return {"content_key": ck, "subject_product_keys": [*from_pks, keeper_pk], "keeper_product_key": keeper_pk,
             "strategy": "cross_merchant_same_size", "status": status, "kind": "merge_content_key",
             "evidence": {"from_product_keys": list(from_pks), "from_content_key": "ck_old", "to_content_key": ck,
-                         "matcher_verdict": (_verdict(("of_sk",), from_key_single_size=True)
-                                             if verdict is None else verdict)}}
+                         "proposer": "cross_merchant_same_size",
+                         "matcher_verdict": (_verdict(from_key_single_size=True) if verdict is None else verdict)}}
 
 
 # The retailer listing was joined to the brand's product by the phase-1 matcher: a RESOLVED group.
@@ -121,7 +134,7 @@ def _lone_seed() -> dict:
 
 
 def _catalog_row(offer_id, product_key, host, price, *, currency="USD", checked: Optional[str] = "fresh",
-                 availability="in_stock", ck=None) -> dict:
+                 availability="in_stock", ck=None, sku_key=None) -> dict:
     now = datetime.now(timezone.utc)
     stamp = {"fresh": now - timedelta(days=1), "stale": now - timedelta(days=30), None: None}[checked]
     return {
@@ -132,6 +145,7 @@ def _catalog_row(offer_id, product_key, host, price, *, currency="USD", checked:
         "destination_url": f"https://www.{host}/p/serum", "merchant_name": host,
         "content_key": ck or (CK if product_key != LONE_PK else "ck_lone_toner"),
         "price_checked_at": stamp,
+        "sku_key": sku_key or _sku(product_key, offer_id),
     }
 
 
@@ -163,7 +177,8 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
                                            if "from_product_keys" in p["evidence"] else None),
                      # jsonb -> text, as asyncpg hands it over
                      "matcher_verdict": (json.dumps(p["evidence"]["matcher_verdict"])
-                                         if "matcher_verdict" in p["evidence"] else None)}
+                                         if "matcher_verdict" in p["evidence"] else None),
+                     "proposer": p["evidence"].get("proposer")}
                     for p in proposals
                     if p["content_key"] in v["cks"] and p["status"] == "applied"
                     and p["kind"] in v["kinds"] and p["strategy"] in v["strategies"]]
@@ -181,6 +196,8 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
             pks = {m["pk"] for m in members if m["ck"] in cks}
             rows = [dict(r) for r in catalog_rows if r["product_key"] in pks]
             for r in rows:
+                if "o.sku_key AS sku_key" not in q:
+                    r.pop("sku_key", None)
                 if "price_checked_at" not in q:
                     r.pop("price_checked_at", None)
                 elif "CAST(NULL AS TIMESTAMPTZ) AS price_checked_at" in q:
@@ -660,13 +677,19 @@ def test_unresolved_group_a_cheaper_retailer_is_not_best_price_because_there_is_
     assert "price_stale" not in _by_id(body)["of:catalog_offer:of_sk"]
 
 
-def test_a_multi_size_listing_has_no_single_price_to_compare(monkeypatch, client):
-    """No variant named and the brand listing stores two sizes: its one offer's price is one of
-    them, so it does not compete; the retailer's like-for-like price still can."""
-    body = _invoke(monkeypatch, client, product_id=BRAND_SIG, flag="1",
-                   catalog_rows=[_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 35.0)])
+def test_a_multi_size_listing_competes_only_with_its_matched_variant(monkeypatch, client):
+    """The brand listing stores two sizes. Its one offer (the 50 ml, $29) competes only when the
+    verdict matched THAT variant; matched as a whole (variant_id null) or as the 30 ml, it does not --
+    and the retailer's like-for-like $35 is the best price."""
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 35.0)]
+    body = _invoke(monkeypatch, client, product_id=BRAND_SIG, flag="1", catalog_rows=rows)
     assert _by_id(body)[BRAND_OFFER]["price"] == 29.0 and _by_id(body)[BRAND_OFFER]["variant_count"] == 2
-    assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
+    assert body["best_price_offer_id"] == BRAND_OFFER
+    for seeds in ([("eps_spec", None)], [("eps_spec", "SKU-30ML")], []):
+        body = _invoke(monkeypatch, client, product_id=BRAND_SIG, flag="1", catalog_rows=rows,
+                       proposals=[_attach(RETAILER_PK, seeds=seeds)])
+        assert "price_comparable" not in _by_id(body)[BRAND_OFFER], seeds
+        assert body["best_price_offer_id"] == "of:catalog_offer:of_sk", seeds
 
 
 def test_a_stale_priced_retailer_is_listed_flagged_and_never_best_price(monkeypatch, client):
@@ -917,6 +940,7 @@ def test_the_marker_is_never_on_an_ineligible_offer(monkeypatch, client, case):
         kw["catalog_rows"] = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, currency=None)]
     elif case == "multi_size_seed":
         kw["seeds"], never = [_brand_seed()], BRAND_OFFER
+        kw["proposals"] = [_attach(RETAILER_PK, seeds=[("eps_spec", None)])]
     elif case == "named_variant_catalog":
         kw["sku_id"] = "SKU-50ML"
     elif case == "other_size_listing":
@@ -1018,8 +1042,10 @@ def test_a_seed_a_fallback_lane_found_is_never_comparable(monkeypatch, client):
     stray = _single_size_brand_seed(5.0)
     stray.update({"id": "eps_stray", "external_product_id": "ext_stray", "attached_product_key": None,
                   "domain": "stray.com", "destination_url": "https://stray.com/p/x", "canonical_url": "https://stray.com/p/x"})
+    # Even a verdict that (wrongly) lists it cannot vouch for a seed the group read did not return.
     body = _invoke(monkeypatch, client, product_id=CK, flag="1", seeds=[_single_size_brand_seed(29.0)],
-                   fuzzy_seeds=[stray])
+                   fuzzy_seeds=[stray],
+                   proposals=[_attach(RETAILER_PK, seeds=[("eps_spec", "SKU-50ML"), ("eps_stray", "SKU-50ML")])])
     stray_offer = [o for o in body["offers"] if (o.get("source") or {}).get("seed_id") == "eps_stray"]
     assert stray_offer and "price_comparable" not in stray_offer[0]
     assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
@@ -1082,10 +1108,28 @@ VERDICT_CASES = [
     ("size_pack_missing", "attach_membership", _bad(size={"value": 50, "unit": "ml"}), False),
     ("size_pack_float", "attach_membership", _bad(size={"value": 50, "unit": "ml", "pack": 1.5}), False),
     ("size_pack_zero", "attach_membership", _bad(size={"value": 50, "unit": "ml", "pack": 0}), False),
-    ("offer_ids_missing", "attach_membership", _bad(listing_offer_ids=_DROP), False),
-    ("offer_ids_empty", "attach_membership", _bad(listing_offer_ids=[]), False),
-    ("offer_ids_not_strings", "attach_membership", _bad(listing_offer_ids=[123]), False),
-    ("offer_ids_blank", "attach_membership", _bad(listing_offer_ids=[""]), False),
+    ("valid_seed_whole", "attach_membership", _verdict(seeds=[("eps_spec", None)]), True),
+    ("valid_no_seeds", "attach_membership", _verdict(seeds=[]), True),
+    ("valid_promoter_lane", "attach_membership", _verdict(offers=[("of_sk", "prod::m::p::v::4123")]), True),
+    ("offer_sku_sync_lane_without_infix", "attach_membership", _verdict(offers=[("of_sk", "sku::prod::m::p::4123")]), False),
+    ("offer_sku_variant_then_canonical", "attach_membership",
+     _verdict(offers=[("of_sk", f"{RETAILER_PK}::v:1::canonical")]), False),
+    ("valid_enrichment_lane", "attach_membership", _verdict(offers=[("of_sk", "ext:retailer:serum-sk::v:4123")]), True),
+    ("offers_missing", "attach_membership", _bad(matched_offers=_DROP), False),
+    ("offers_empty", "attach_membership", _bad(matched_offers=[]), False),
+    ("offers_not_list", "attach_membership", _bad(matched_offers={"offer_id": "of_sk"}), False),
+    ("offer_not_object", "attach_membership", _bad(matched_offers=["of_sk"]), False),
+    ("offer_id_blank", "attach_membership", _bad(matched_offers=[{"offer_id": " ", "sku_key": _sku(RETAILER_PK, "x")}]), False),
+    ("offer_sku_missing", "attach_membership", _bad(matched_offers=[{"offer_id": "of_sk"}]), False),
+    ("offer_sku_canonical", "attach_membership",
+     _bad(matched_offers=[{"offer_id": "of_sk", "sku_key": f"{RETAILER_PK}::canonical"}]), False),
+    ("offer_sku_not_per_variant", "attach_membership", _bad(matched_offers=[{"offer_id": "of_sk", "sku_key": "of_sk"}]), False),
+    ("seeds_missing", "attach_membership", _bad(matched_seeds=_DROP), False),
+    ("seeds_not_list", "attach_membership", _bad(matched_seeds={"seed_id": "eps_spec"}), False),
+    ("seed_not_object", "attach_membership", _bad(matched_seeds=["eps_spec"]), False),
+    ("seed_id_blank", "attach_membership", _bad(matched_seeds=[{"seed_id": "", "variant_id": None}]), False),
+    ("seed_variant_not_string", "attach_membership", _bad(matched_seeds=[{"seed_id": "eps_spec", "variant_id": 50}]), False),
+    ("seed_variant_blank", "attach_membership", _bad(matched_seeds=[{"seed_id": "eps_spec", "variant_id": " "}]), False),
     ("merge_without_single_size", "merge_content_key", _verdict(), False),
     ("merge_single_size_false", "merge_content_key", _verdict(from_key_single_size=False), False),
 ]
@@ -1124,9 +1168,12 @@ def test_the_local_validator_agrees_with_the_shared_one():
     import services.identity_resolution as identity_resolution
 
     shared = getattr(identity_resolution, "validate_matcher_verdict", None)
-    if shared is None:
-        pytest.skip("be#2637's shared validator is not on this base yet; the local rule is pinned above")
-    strategy = getattr(identity_resolution, "CROSS_MERCHANT_SAME_SIZE", "cross_merchant_same_size")
+    strategy = getattr(identity_resolution, "CROSS_MERCHANT_SAME_SIZE", None)
+    if shared is None and strategy is None:
+        pytest.skip("be#2637 is not on this base yet (neither the validator nor the constant); the local rule is pinned above")
+    # One without the other is a rename, not "not landed yet": fail rather than skip forever.
+    assert shared is not None, "CROSS_MERCHANT_SAME_SIZE exists but validate_matcher_verdict does not"
+    assert strategy is not None, "validate_matcher_verdict exists but CROSS_MERCHANT_SAME_SIZE does not"
     assert gateway._CROSS_MERCHANT_SAME_SIZE == strategy
     for case, kind, verdict, valid in VERDICT_CASES:
         shared_valid = not shared(kind, {"matcher_verdict": verdict}, strategy=strategy)
@@ -1194,7 +1241,9 @@ def test_a_verdict_cannot_vouch_for_an_offer_on_an_unresolved_listing(monkeypatc
     rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0),
             _catalog_row("of_mini", "ext:retailer:serum-mini", "minis.com", 5.0)]
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
-                   proposals=[_attach(RETAILER_PK, offer_ids=("of_sk", "of_mini"))], seeds=[_single_size_brand_seed(29.0)])
+                   proposals=[_attach(RETAILER_PK, verdict=_verdict(offers=[
+                       ("of_sk", _sku(RETAILER_PK, "of_sk")), ("of_mini", _sku("ext:retailer:serum-mini", "of_mini"))]))],
+                   seeds=[_single_size_brand_seed(29.0)])
     assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_mini"]
     assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
 
@@ -1247,10 +1296,132 @@ def test_stock_reads_the_flag_first_and_the_text_only_without_one():
     def comparable(o):
         return gateway._price_comparable_offers(
             [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK}, resolved_seed_ids=set(),
-            matched_catalog_offer_ids={"x"}, defaulted_currency_ids=set()) == [o]
+            matched_catalog_offers={("x", "sku::p::1")}, catalog_sku_keys={"of:catalog_offer:x": "sku::p::1"},
+            matched_seeds={}, seed_variant_counts={}, defaulted_currency_ids=set()) == [o]
 
     assert comparable(offer(availability="unknown"))
     assert not comparable(offer(availability="out_of_stock"))
     assert not comparable(offer(in_stock=False))
     assert comparable(offer(in_stock=True, availability="out_of_stock")), "a live read's flag wins"
     assert not comparable(offer(in_stock=False, availability="in_stock"))
+
+
+
+# ------------------------------------------------------------------------------- contract v3
+
+
+def _second_seed(price, *, variants=1, sid="eps_100"):
+    """A second seed on the brand listing (same product_key), single-variant 100 ml by default."""
+    r = _single_size_brand_seed(price)
+    # Its own storefront host, so the one-offer-per-host rule keeps both offers in view.
+    r.update({"id": sid, "external_product_id": f"ext_{sid}", "destination_url": f"https://{sid}.brand.com/products/x",
+              "canonical_url": f"https://{sid}.brand.com/products/x", "domain": f"{sid}.brand.com"})
+    r["seed_data"]["variants"] = [dict(r["seed_data"]["variants"][0], variant_id=f"SKU-{sid}-{i}") for i in range(variants)]
+    return r
+
+
+def test_a_seed_not_in_matched_seeds_is_never_comparable(monkeypatch, client):
+    """H1. The keeper's 50 ml seed at $29 and a second single-variant seed on the same product_key,
+    100 ml at $12: only the matched 50 ml compares, so the best price is $29 -- or none at all
+    when the verdict did not match the keeper's seed either."""
+    seeds = [_single_size_brand_seed(29.0), _second_seed(12.0)]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=seeds, catalog_rows=[])
+    hundred = [o for o in body["offers"] if (o.get("source") or {}).get("seed_id") == "eps_100"]
+    assert hundred and "price_comparable" not in hundred[0]
+    assert body["best_price_offer_id"] == BRAND_OFFER
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=seeds, catalog_rows=[],
+                   proposals=[_attach(RETAILER_PK, seeds=[])])
+    assert body["best_price_offer_id"] is None and _marked(body) == []
+
+
+def test_a_seed_matched_whole_that_gained_a_variant_is_not_comparable(monkeypatch, client):
+    """matched_seeds {seed_id, variant_id: null} means "this seed, which was one variant". A refresh
+    that added a second variant makes the entry non-comparable."""
+    prop = [_attach(RETAILER_PK, seeds=[("eps_100", None)])]
+    one = _second_seed(12.0, variants=1)
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[_single_size_brand_seed(29.0), one],
+                   catalog_rows=[], proposals=prop)
+    [o] = [o for o in body["offers"] if o["source"]["seed_id"] == "eps_100"]
+    assert o["price_comparable"] is True and body["best_price_offer_id"] == o["offer_id"]
+    two = _second_seed(12.0, variants=2)
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[_single_size_brand_seed(29.0), two],
+                   catalog_rows=[], proposals=prop)
+    [o] = [o for o in body["offers"] if o["source"]["seed_id"] == "eps_100"]
+    assert "price_comparable" not in o and body["best_price_offer_id"] is None
+
+
+def test_verdicts_of_two_sizes_on_one_key_resolve_nothing(monkeypatch, client):
+    """M1. Attach A at 50 ml (of_sk $25) and attach B at 30 ml (of_ys $11) on the same key: the key
+    has no one size, so nothing resolves -- no widening, no best price."""
+    members = MEMBERS + [_member("ext:retailer:serum-ys", "sig_grp_ys", CK, None, "ext:retailer:serum-ys")]
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 25.0),
+            _catalog_row("of_ys", "ext:retailer:serum-ys", "yesstyle.com", 11.0)]
+    props = [_attach(RETAILER_PK), _attach("ext:retailer:serum-ys", offer_ids=("of_ys",),
+                                            size={"value": 30, "unit": "ml", "pack": 1})]
+    for ident in (RETAILER_SIG, BRAND_SIG, CK):
+        body = _invoke(monkeypatch, client, product_id=ident, flag="1", members=members, catalog_rows=rows,
+                       proposals=props, seeds=[_single_size_brand_seed(29.0)])
+        assert "best_price_offer_id" not in body and _marked(body) == [], ident
+        assert not [s for s in body["metadata"]["sources"] if s["source"] == "external_product_seeds_group_siblings"]
+    # Same size spelled the same (50 == 50.0): agreement, resolved.
+    props[1] = _attach("ext:retailer:serum-ys", offer_ids=("of_ys",), size={"value": 50.0, "unit": "ml", "pack": 1})
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
+                   proposals=props, seeds=[_single_size_brand_seed(29.0)])
+    assert body["best_price_offer_id"] == "of:catalog_offer:of_ys"
+
+
+def test_a_catalog_offer_needs_its_offer_id_and_its_sku_key_matched(monkeypatch, client):
+    """M2. An offer whose id the verdict lists but whose SKU is another (re-pointed, or the
+    `::canonical` product-grain row) is not the matched size."""
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, sku_key=f"{RETAILER_PK}::canonical")]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                   seeds=[_single_size_brand_seed(29.0)])
+    assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_sk"]
+    assert body["best_price_offer_id"] == BRAND_OFFER
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, sku_key=_sku(RETAILER_PK, "other"))]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                   seeds=[_single_size_brand_seed(29.0)])
+    assert body["best_price_offer_id"] == BRAND_OFFER
+
+
+@pytest.mark.parametrize("proposer", [None, "identity_brand_link", "CROSS_MERCHANT_SAME_SIZE"])
+def test_a_proposal_not_written_by_the_strategy_module_resolves_nothing(monkeypatch, client, proposer):
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1",
+                   proposals=[_attach(RETAILER_PK, proposer=proposer)], seeds=[_single_size_brand_seed(29.0)])
+    assert BRAND_OFFER not in _by_id(body) and "best_price_offer_id" not in body
+
+
+@pytest.mark.parametrize("text", ["sold out", "soldout", "Out of stock", "https://schema.org/OutOfStock", "OutOfStock"])
+def test_every_out_of_stock_spelling_is_out_of_stock(text):
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._availability_says_out_of_stock(text)
+    o = {"offer_id": "of:catalog_offer:x", "price": 10.0, "currency": "USD", "availability": text,
+         "source": {"type": "catalog_offer", "product_key": RETAILER_PK, "offer_id": "x"}}
+    assert gateway._price_comparable_offers(
+        [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK}, resolved_seed_ids=set(),
+        matched_catalog_offers={("x", "sku::p::1")}, catalog_sku_keys={"of:catalog_offer:x": "sku::p::1"},
+        matched_seeds={}, seed_variant_counts={}, defaulted_currency_ids=set()) == []
+
+
+def test_a_price_tie_goes_to_the_higher_ranked_offer():
+    """B2. Two comparable offers at one price: the one ranked first in offers[] is the best price,
+    whichever order the comparable set is handed over in."""
+    import routes.agent_shop_gateway as gateway
+
+    a = {"offer_id": "a", "price": 10.0, "currency": "USD"}
+    b = {"offer_id": "b", "price": 10.0, "currency": "USD"}
+    assert gateway._best_price_of([a, b], [b, a])["offer_id"] == "a"
+    assert gateway._best_price_of([b, a], [a, b])["offer_id"] == "b"
+
+
+
+def test_a_fallback_under_a_named_variant_is_never_comparable_even_on_a_whole_seed_match(monkeypatch, client):
+    """A single-variant seed matched whole (variant_id null), and a caller naming a variant that seed
+    does not store: the direct lane's `fallback` offer carries the caller's id at the listing's row
+    price -- not the named variant's price, so not comparable."""
+    body = _invoke(monkeypatch, client, product_id=BRAND_SIG, flag="1", sku_id="SKU-100ML", catalog_rows=[],
+                   seeds=[_single_size_brand_seed(29.0)], proposals=[_attach(RETAILER_PK, seeds=[("eps_spec", None)])])
+    [o] = _brand_offers(body)
+    assert o["source"]["variant_match"] == "fallback" and "price_comparable" not in o
+    assert body["best_price_offer_id"] is None

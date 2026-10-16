@@ -6443,7 +6443,10 @@ async def _handle_offers_resolve(
     # direct seed does. An unresolved group -- a brand+title collision -- is answered as before.
     _group_mode = False
     _resolved_product_keys: set = set()
-    _matched_catalog_offer_ids: set = set()
+    _matched_catalog_offers: set = set()
+    _matched_seeds: Dict[str, set] = {}
+    _seed_variant_counts: Dict[str, int] = {}
+    _catalog_sku_keys: Dict[str, Optional[str]] = {}
     _resolved_seed_ids: set = set()
     _defaulted_currency_ids: set = set()
     if _group_seed_siblings_enabled() and not merchant_scope:
@@ -6459,7 +6462,14 @@ async def _handle_offers_resolve(
             _group_mode = len(group["resolved"]) >= 2
             if _group_mode:
                 _resolved_product_keys = {str(m["product_key"]) for m in group["resolved"]}
-                _matched_catalog_offer_ids = set(group["matched_offer_ids"])
+                _matched_catalog_offers = set(group["matched_offers"])
+                _matched_seeds = dict(group["matched_seeds"])
+                # How many variants each seed holds NOW: a seed matched as a whole (variant_id null)
+                # stays comparable only while it is still one sellable unit.
+                _seed_variant_counts = {
+                    str(r.get("id") or ""): len(_seed_variants(_ensure_seed_data_obj(r.get("seed_data"))))
+                    for r in group["rows"]
+                }
                 _resolved_seed_ids = {str(r.get("id") or "") for r in group["rows"]}
                 held_hosts: set = set()
                 for prior in external_offers:
@@ -6555,6 +6565,9 @@ async def _handle_offers_resolve(
         _price_select, _price_order, _price_params = (
             await _catalog_price_freshness_sql() if _group_mode else ("", "", {})
         )
+        if _group_mode:
+            # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
+            _price_select += "\n                           o.sku_key AS sku_key,"
         if ident_aliases:
             catalog_rows = await asyncio.wait_for(
                 database.fetch_all(
@@ -6709,6 +6722,8 @@ async def _handle_offers_resolve(
 
             availability = str(r.get("availability") or "").strip() or None
             price_amount = r.get("price_amount")
+            if _group_mode:
+                _catalog_sku_keys[f"of:catalog_offer:{r.get('offer_id')}"] = r.get("sku_key")
             if _group_mode and not str(r.get("currency") or "").strip():
                 # Shipped as "USD" below by default, never stated by the row: no best price on it.
                 _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
@@ -6898,7 +6913,8 @@ async def _handle_offers_resolve(
         _comparable = _price_comparable_offers(
             offers, market_hint=market_hint, named_variant=bool(sku_id),
             resolved_product_keys=_resolved_product_keys, resolved_seed_ids=_resolved_seed_ids,
-            matched_catalog_offer_ids=_matched_catalog_offer_ids,
+            matched_catalog_offers=_matched_catalog_offers, catalog_sku_keys=_catalog_sku_keys,
+            matched_seeds=_matched_seeds, seed_variant_counts=_seed_variant_counts,
             defaulted_currency_ids=_defaulted_currency_ids,
         )
         for _offer in _comparable:
@@ -9303,19 +9319,31 @@ _MATCHER_TIERS = frozenset({"T0a", "T0b", "T0c"})
 _MATCHER_SIZE_UNITS = frozenset({"ml", "g", "count"})
 
 
-def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
-    """Is `verdict` a valid same-size matcher verdict for a proposal of `kind`?
+def _per_variant_sku_key(value: Any) -> bool:
+    """A catalog_skus key that names ONE variant: it contains ingestion.VARIANT_SKU_INFIX (`::v:`;
+    the promoter's `::v::` contains it too) and is never the one-per-product `<pk>::canonical`
+    placeholder (ingestion.SKU_SUFFIX) the mirror and the canonical lane hang a product-grain offer
+    on. Exactly be#2637's `is_variant_sku_key`."""
+    from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX, VARIANT_SKU_INFIX
 
-    THE SAME RULE as the shared validator be#2637 adds (services/identity_resolution
+    return isinstance(value, str) and bool(value.strip()) and VARIANT_SKU_INFIX in value and not value.endswith(SKU_SUFFIX)
+
+
+def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
+    """Is `verdict` a valid same-size matcher verdict (contract v3) for a proposal of `kind`?
+
+    THE SAME RULE as be#2637's shared validator (services/identity_resolution
     .validate_matcher_verdict(kind, evidence, strategy) -> problems), kept here so this PR does not
     depend on that one merging first; tests/test_offers_resolve_group_siblings.py pins both to one
-    case list (identical since be#2637 49123b6a1, MATCHER_VERDICT_SIZE_UNITS). M4 writes the verdict and
-    #2637 reserves its strategy, so only the matcher can produce it:
+    case list. M4 writes the verdict and #2637 reserves its strategy, so only the matcher can
+    produce it:
       strategy 'cross_merchant_same_size'; same_size exactly true; rule_version non-empty;
       tier T0a | T0b | T0c; size {value: a number > 0, unit: ml | g | count, pack: an integer >= 1};
-      listing_offer_ids a NON-EMPTY list of non-empty strings (the matched size's
-      catalog_offers.offer_id values on the moved listing); merge_content_key also needs
-      from_key_single_size exactly true."""
+      matched_offers: a NON-EMPTY list of {offer_id, sku_key}, each a non-empty string and the
+        sku_key a PER-VARIANT one (`_per_variant_sku_key`) -- the matched size's offers;
+      matched_seeds: a list (may be empty) of {seed_id: non-empty string, variant_id: string|null};
+      merge_content_key also needs from_key_single_size exactly true.
+    (The proposal's own `evidence.proposer` is checked beside it, in `_matcher_verdict`.)"""
     if isinstance(verdict, str):
         try:
             verdict = json.loads(verdict)
@@ -9324,25 +9352,34 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
     if not isinstance(verdict, dict):
         return False
     size = verdict.get("size")
-    ids = verdict.get("listing_offer_ids")
+    offers = verdict.get("matched_offers")
+    seeds = verdict.get("matched_seeds")
     number = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    text = lambda x: isinstance(x, str) and bool(x.strip())  # noqa: E731
     return bool(
         verdict.get("strategy") == _CROSS_MERCHANT_SAME_SIZE
         and verdict.get("same_size") is True
-        and isinstance(verdict.get("rule_version"), str) and verdict["rule_version"].strip()
+        and text(verdict.get("rule_version"))
         and verdict.get("tier") in _MATCHER_TIERS
         and isinstance(size, dict)
         and number(size.get("value")) and size["value"] > 0
         and size.get("unit") in _MATCHER_SIZE_UNITS
         and isinstance(size.get("pack"), int) and not isinstance(size.get("pack"), bool) and size["pack"] >= 1
-        and isinstance(ids, list) and ids
-        and all(isinstance(i, str) and i.strip() for i in ids)
+        and isinstance(offers, list) and offers
+        and all(isinstance(o, dict) and text(o.get("offer_id")) and _per_variant_sku_key(o.get("sku_key"))
+                for o in offers)
+        and isinstance(seeds, list)
+        and all(isinstance(e, dict) and text(e.get("seed_id"))
+                and (e.get("variant_id") is None or text(e.get("variant_id"))) for e in seeds)
         and (kind != "merge_content_key" or verdict.get("from_key_single_size") is True)
     )
 
 
 def _matcher_verdict(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The proposal's `evidence.matcher_verdict` as a dict when valid (`_valid_matcher_verdict`)."""
+    """The proposal's `evidence.matcher_verdict` as a dict, when the proposal was written by the
+    strategy's own module (`evidence.proposer`) and the verdict is valid (`_valid_matcher_verdict`)."""
+    if p.get("proposer") != _CROSS_MERCHANT_SAME_SIZE:
+        return None
     v = p.get("matcher_verdict")
     if isinstance(v, str):
         try:
@@ -9354,28 +9391,47 @@ def _matcher_verdict(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def _resolved_group_members(
     members: List[Dict[str, Any]], proposals: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], set]:
-    """(the members a valid matcher verdict joined, the catalog offer ids those verdicts matched).
+) -> Tuple[List[Dict[str, Any]], set, Dict[str, set]]:
+    """(the members a valid matcher verdict joined, the (offer_id, sku_key) pairs those verdicts
+    matched, {seed_id: the variant ids matched, None = the seed's one variant}).
 
+    ONE SIZE PER KEY: when the valid verdicts on a content_key disagree on (value, unit, pack), that
+    key resolves NOTHING -- two "same size" verdicts of different sizes cannot both be the group.
     When the call named a listing (`is_anchor`), that listing must itself be resolved, and only its
     content_key's resolved members count -- an unresolved listing that collides onto a resolved
     key does not inherit the group. A bare content_key names no listing: its resolved members."""
     engine: Dict[str, set] = {}
-    matched_offers: Dict[str, set] = {}
+    sizes: Dict[str, set] = {}
+    offers: Dict[str, set] = {}
+    seeds: Dict[str, Dict[str, set]] = {}
     for p in proposals:
         verdict = _matcher_verdict(p)
         if verdict is None:
             continue
         ck = str(p.get("content_key") or "")
+        size = verdict["size"]
+        sizes.setdefault(ck, set()).add((float(size["value"]), size["unit"], int(size["pack"])))
         engine.setdefault(ck, set()).update(_proposal_joined_keys(p))
-        matched_offers.setdefault(ck, set()).update(str(i).strip() for i in verdict["listing_offer_ids"])
-    resolved = [m for m in members if str(m.get("product_key")) in engine.get(str(m.get("content_key") or ""), set())]
+        offers.setdefault(ck, set()).update((o["offer_id"].strip(), o["sku_key"].strip()) for o in verdict["matched_offers"])
+        for e in verdict["matched_seeds"]:
+            seeds.setdefault(ck, {}).setdefault(e["seed_id"].strip(), set()).add(
+                e["variant_id"].strip() if isinstance(e.get("variant_id"), str) else None
+            )
+    one_size = {ck for ck, found in sizes.items() if len(found) == 1}
+    resolved = [m for m in members
+                if str(m.get("content_key") or "") in one_size
+                and str(m.get("product_key")) in engine.get(str(m.get("content_key") or ""), set())]
     anchors = [m for m in members if m.get("is_anchor")]
     if anchors:
         anchor_keys = {str(m.get("content_key")) for m in resolved if m.get("is_anchor")}
         resolved = [m for m in resolved if str(m.get("content_key")) in anchor_keys]
-    offer_ids = set().union(*(matched_offers.get(str(m.get("content_key") or ""), set()) for m in resolved)) if resolved else set()
-    return resolved, offer_ids
+    keys = {str(m.get("content_key") or "") for m in resolved}
+    matched_offers = set().union(*(offers.get(ck, set()) for ck in keys)) if keys else set()
+    matched_seeds: Dict[str, set] = {}
+    for ck in keys:
+        for seed_id, vids in seeds.get(ck, {}).items():
+            matched_seeds.setdefault(seed_id, set()).update(vids)
+    return resolved, matched_offers, matched_seeds
 
 
 def _proposal_joined_keys(p: Dict[str, Any]) -> set:
@@ -9413,13 +9469,13 @@ async def _fetch_resolved_group(
     market_hint: Optional[str],
     deadline: float,
 ) -> Dict[str, Any]:
-    """{members, resolved, matched_offer_ids, rows}: the caller's content_key group, its RESOLVED
-    members, the catalog offers their matcher verdicts matched (`listing_offer_ids`), and the
+    """{members, resolved, matched_offers, matched_seeds, rows}: the caller's content_key group, its
+    RESOLVED members, the catalog offers and seeds their matcher verdicts matched, and the
     active seeds of those members (the seed lane's three joins -- `source_ref`, `source_product_id`
     = `external_product_id`, `attached_product_key` -- plus its status, quarantine and, as the
     identity and fuzzy fallbacks do, the buyer market's serving currency: a caller with no market is
     a US buyer, and a seed it never named must not set its currency)."""
-    out: Dict[str, Any] = {"members": [], "resolved": [], "rows": [], "matched_offer_ids": set()}
+    out: Dict[str, Any] = {"members": [], "resolved": [], "rows": [], "matched_offers": set(), "matched_seeds": {}}
     if not aliases:
         return out
     cap = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
@@ -9467,7 +9523,8 @@ async def _fetch_resolved_group(
                         SELECT content_key, kind, keeper_product_key,
                                evidence->>'listing_product_key' AS listing_product_key,
                                evidence->'from_product_keys' AS from_product_keys,
-                               evidence->'matcher_verdict' AS matcher_verdict
+                               evidence->'matcher_verdict' AS matcher_verdict,
+                               evidence->>'proposer' AS proposer
                           FROM identity_resolution_proposals
                          WHERE content_key = ANY(:cks)
                            AND status = 'applied'
@@ -9487,7 +9544,7 @@ async def _fetch_resolved_group(
     except Exception as e:  # noqa: BLE001 -- no engine evidence read is "not engine-resolved"
         logger.info("offers.resolve.group_siblings.proposals_unread", extra={"error": type(e).__name__})
         proposals = []
-    resolved, out["matched_offer_ids"] = _resolved_group_members(members, proposals)
+    resolved, out["matched_offers"], out["matched_seeds"] = _resolved_group_members(members, proposals)
     out["resolved"] = resolved
     serving_currency = seed_serving_currency(market_hint)
     if len(resolved) < 2 or serving_currency is None:
@@ -9656,18 +9713,21 @@ def _price_comparable_offers(
     named_variant: bool,
     resolved_product_keys: set,
     resolved_seed_ids: set,
-    matched_catalog_offer_ids: set,
+    matched_catalog_offers: set,
+    catalog_sku_keys: Dict[str, Optional[str]],
+    matched_seeds: Dict[str, set],
+    seed_variant_counts: Dict[str, int],
     defaulted_currency_ids: set,
 ) -> List[Dict[str, Any]]:
     """The served offers whose prices may be compared: exactly the best-price pool, which the
     gateway reads through each one's `price_comparable: true` (gw#2460). An offer is in it only if:
       * it is the SAME SELLABLE UNIT as the group: a catalog offer on a RESOLVED listing whose
-        offer_id the matcher verdict lists (`listing_offer_ids`, the matched size), or a seed the
-        resolved-group read returned -- never an internal offer, never a seed a fallback lane found,
-        never a listing or offer of another size;
+        (offer_id, sku_key) a matcher verdict lists in `matched_offers`, or a seed the resolved-group
+        read returned AND a verdict lists in `matched_seeds` (that variant, or a seed still holding
+        one variant when listed with variant_id null) -- never an internal offer, never a seed a
+        fallback lane found, never a listing, offer or seed of another size;
       * with a variant NAMED: an `exact` seed offer of it (`source.variant_match`) -- never a catalog
-        offer (it names no variant), never a fallback at a listing's row price; with none named: never
-        a seed listing several variants (its one price is one of them);
+        offer (it names no variant), never a fallback at a listing's row price;
       * FRESH: neither `price_stale` nor `requires_live_verification`;
       * NOT KNOWN OUT OF STOCK: `in_stock` false (or, with no flag, an unavailable availability);
         unknown stock may compare;
@@ -9686,18 +9746,25 @@ def _price_comparable_offers(
         if src.get("type") == "catalog_offer":
             if named_variant or src.get("product_key") not in resolved_product_keys:
                 continue
-            # ...and only the offers the matcher matched at the group's size: a resolved retailer
-            # listing can carry its 30 ml and 100 ml offers beside the matched 50 ml.
-            if src.get("offer_id") not in matched_catalog_offer_ids:
+            # ...and only an offer the matcher matched at the group's size, by its offer_id AND its
+            # per-variant sku_key: a resolved retailer listing can carry its 30 ml and 100 ml offers
+            # beside the matched 50 ml, and an id alone can be re-pointed at another SKU.
+            if (src.get("offer_id"), catalog_sku_keys.get(offer.get("offer_id"))) not in matched_catalog_offers:
                 continue
             if offer.get("offer_id") in defaulted_currency_ids:
                 continue
         elif src.get("type") == "external_seed":
             if src.get("seed_id") not in resolved_seed_ids:
                 continue
-            if named_variant and src.get("variant_match") != "exact":
+            # ...and only a seed the verdict matched: that variant, or -- matched as a whole
+            # (variant_id null) -- a seed that is STILL one variant now (a refresh can add sizes).
+            entries = matched_seeds.get(src.get("seed_id")) or set()
+            if not (
+                src.get("variant_id") in entries
+                or (None in entries and seed_variant_counts.get(src.get("seed_id"), 2) <= 1)
+            ):
                 continue
-            if not named_variant and int(offer.get("variant_count") or 0) > 1:
+            if named_variant and src.get("variant_match") != "exact":
                 continue
         else:
             continue
@@ -9705,8 +9772,7 @@ def _price_comparable_offers(
         # is a boolean (a live read corrects `in_stock` and leaves the feed's text beside it); the
         # availability text only when there is no flag. Unknown stock stays comparable.
         if offer.get("in_stock") is False or (
-            not isinstance(offer.get("in_stock"), bool)
-            and availability_is_known_unavailable(offer.get("availability"))
+            not isinstance(offer.get("in_stock"), bool) and _availability_says_out_of_stock(offer.get("availability"))
         ):
             continue
         price = offer.get("price")
@@ -9718,6 +9784,14 @@ def _price_comparable_offers(
             continue
         out.append(offer)
     return out
+
+
+def _availability_says_out_of_stock(value: Any) -> bool:
+    """The catalog arm's vocabulary (OFFER_UNAVAILABLE_AVAILABILITIES) OR the seed lane's normalizer
+    (utils.availability_vocabulary: "sold out", "soldout", "out of stock", schema.org OutOfStock...)."""
+    from utils.availability_vocabulary import OUT_OF_STOCK, normalize_availability
+
+    return availability_is_known_unavailable(value) or normalize_availability(value) == OUT_OF_STOCK
 
 
 def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]]) -> Dict[str, Any]:

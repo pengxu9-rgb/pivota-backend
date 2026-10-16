@@ -97,11 +97,16 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, 
                     **({"from_product_keys": [listing], "to_content_key": CK} if i == 1
                        else {"listing_product_key": listing}),
                     "from_content_key": "ck_old",
+                    "proposer": "cross_merchant_same_size",
                     # The matcher's verdict (M4's contract): the matched size's offers on the listing.
                     "matcher_verdict": {
                         "strategy": "cross_merchant_same_size", "same_size": True, "rule_version": "m4-test",
                         "tier": "T0b", "size": {"value": 30, "unit": "ml", "pack": 1},
-                        "listing_offer_ids": ["of_pg_ys" if i == 1 else "of_pg_sk"],
+                        # contract v3: the matched size's offers by (offer_id, per-variant sku_key),
+                        # and the matched seeds by (seed_id, variant_id).
+                        "matched_offers": [{"offer_id": "of_pg_ys" if i == 1 else "of_pg_sk",
+                                            "sku_key": f"{RETAILER2_PK if i == 1 else RETAILER_PK}::v::v1"}],
+                        "matched_seeds": [{"seed_id": "eps_pg_brand", "variant_id": "SKU-30ML"}],
                         **({"from_key_single_size": True} if i == 1 else {}),
                     },
                 })})
@@ -118,7 +123,7 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, 
                 "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,"
                 " source_variant_id, title, currency, updated_at)"
                 " VALUES (:sk,:pk,:m,'external_seed',:spid,'v1','Serum','USD',NOW())"
-            ), {"sk": f"{pk}::canonical", "pk": pk, "m": merchant, "spid": source_product_id})
+            ), {"sk": f"{pk}::v::v1", "pk": pk, "m": merchant, "spid": source_product_id})
 
         def offer(oid, pk, merchant, price, host, checked):
             c.execute(text(
@@ -131,7 +136,7 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, 
                 " VALUES (:oid,:sk,:pk,:m,'external_referral','observed','referral_only','redirect',"
                 "         'external_referral','in_stock','USD',:p,:p,'retailer',false,:dest,"
                 "         cast(:payload AS jsonb), NOW(), :checked)"
-            ), {"oid": oid, "sk": f"{pk}::canonical", "pk": pk, "m": merchant, "p": price,
+            ), {"oid": oid, "sk": f"{pk}::v::v1", "pk": pk, "m": merchant, "p": price,
                 "dest": f"https://{host}/p/serum", "payload": '{"destination_url": "https://%s/p/serum"}' % host,
                 "checked": checked})
 
