@@ -21,8 +21,9 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     STRATEGY,
     Planner,
     Snapshot,
-    evidence_problems,
+    evidence_problems as _evidence_problems,
     matcher_verdict,
+    stamp_run,
     plan_market,
     proposal_set_digest,
 )
@@ -42,6 +43,8 @@ class Cat:
         self.extra_ck_rows: Dict[str, List[str]] = {}
         self.memberships: Dict[tuple, str] = {}
         self.group_sizes: Dict[str, int] = {}
+        self.seeds: List[Dict[str, Any]] = []
+        self.proposals: List[Dict[str, Any]] = []
         self._n = 0
 
     def row(self, key: str, *, brand: str, title: str, ck: Optional[str] = None, merchant: Optional[str] = None,
@@ -52,6 +55,7 @@ class Cat:
         self.products.append({
             "product_key": key, "merchant_id": merchant, "platform": platform, "source_product_id": spid,
             "content_key": ck if ck is not None else "ck_" + key.replace(":", "_"), "pivota_signature_id": "sig_" + key,
+            "source_ref": None,
             "brand": brand, "title": title, "gtin": gtin, "source_system": "crawl", "seed_kind": seed_kind,
             "created_at": created, "image_url": f"https://img.example/{spid}.jpg",
             "canonical_url": f"https://{merchant}.example/p/{spid}"})
@@ -64,27 +68,46 @@ class Cat:
 
     def offer(self, key: str, *, price: Any = 24, host: str = "shop.example", sku: Optional[str] = "Default Title",
               currency: str = "USD", availability: str = "in_stock", brand_direct: bool = False,
-              labels: Any = None, market: str = "US", offer_id: Optional[str] = None) -> str:
+              labels: Any = None, market: str = "US", offer_id: Optional[str] = None,
+              sku_key: Optional[str] = None, mirror: bool = False, canonical: bool = False) -> str:
+        """An offer on its own per-variant SKU ("<pk>::v:<id>") unless `sku_key` names one; `mirror` is the
+        seed mirror's offer (offer:external_seed:..., on "<pk>::canonical"), `canonical` a '::canonical'
+        SKU offer."""
         self._n += 1
-        oid = offer_id or f"off_{self._n:03d}"
-        self.offers.append({"offer_id": oid, "product_key": key, "market": market,
+        oid = offer_id or (f"offer:external_seed:{self._n:032x}" if mirror else f"off_{self._n:03d}")
+        if sku_key is None:
+            sku_key = f"{key}::canonical" if (mirror or canonical) else f"{key}::v:{oid}"
+        self.offers.append({"offer_id": oid, "product_key": key, "market": market, "sku_key": sku_key,
                             "offer_type": "brand_direct" if brand_direct else "retailer",
                             "availability": availability, "currency": currency, "price": price, "host": host,
                             "sku_title": sku, "sku_labels": labels, "sku_size_fields": None})
         return oid
 
-    def sku(self, key: str, title: str) -> None:
-        self.skus.append({"product_key": key, "title": title, "labels": None})
+    def sku(self, key: str, title: str, sku_key: Optional[str] = None) -> str:
+        self._n += 1
+        sku_key = sku_key or f"{key}::v:sku{self._n}"
+        self.skus.append({"product_key": key, "sku_key": sku_key, "title": title, "labels": None})
+        return sku_key
+
+    def seed(self, seed_id: str, *, attached: Optional[str] = None, title: str = "", variants: Any = None,
+             snapshot_variants: Any = None, external_product_id: Optional[str] = None) -> str:
+        self.seeds.append({"id": seed_id, "attached_product_key": attached, "title": title,
+                           "seed_variants": variants, "snapshot_variants": snapshot_variants,
+                           "external_product_id": external_product_id})
+        return seed_id
 
     def snapshot(self) -> Snapshot:
-        ck_rows: Dict[str, List[str]] = {}
+        ck_rows: Dict[str, List[Any]] = {}
         for p in self.products:
             if p["content_key"]:
-                ck_rows.setdefault(p["content_key"], []).append(p["product_key"])
+                ck_rows.setdefault(p["content_key"], []).append(
+                    {k: p.get(k) for k in ("product_key", "title", "brand", "merchant_id", "platform",
+                                           "source_product_id", "source_ref")})
         for ck, extra in self.extra_ck_rows.items():
             ck_rows.setdefault(ck, []).extend(extra)
         return Snapshot(products=list(self.products), offers=list(self.offers), skus=list(self.skus),
-                        ck_rows=ck_rows, memberships=dict(self.memberships), group_sizes=dict(self.group_sizes))
+                        ck_rows=ck_rows, memberships=dict(self.memberships), group_sizes=dict(self.group_sizes),
+                        seeds=list(self.seeds), proposals=list(self.proposals))
 
     def plan(self, **kw):
         return plan_market(self.snapshot(), "US", **kw)
@@ -104,6 +127,11 @@ def retailer(cat: Cat, n: int, brand: str, title: str, *, price: Any = 24, host:
     cat.row(key, brand=brand, title=title, ck=ck, seed_kind="cross", **kw)
     cat.offer(key, price=price, host=host, sku=sku, availability=availability, currency=currency, offer_id=offer_id)
     return key
+
+
+def evidence_problems(p):
+    """The writer's check, on the proposal as the writer stamps it (one proposal run id)."""
+    return _evidence_problems(stamp_run([p], "cmss_test")[0])
 
 
 def outcome(plan, key: str) -> Optional[Dict[str, Any]]:
@@ -133,7 +161,6 @@ def laneige_catalog() -> Cat:
 def test_ulta_and_sephora_20g_listings_attach_to_the_brand_store_anchor():
     cat = laneige_catalog()
     ulta = retailer(cat, 1, "Laneige", "LANEIGE Lip Sleeping Mask 0.7 oz", host="www.ulta.com", sku="0.7 oz")
-    ulta_small = cat.offer(ulta, price=None, host="www.ulta.com", sku="0.3 oz")  # another size, no price
     sephora = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", host="sephora.com")
     plan = cat.plan()
     assert [p["kind"] for p in plan.proposals] == ["attach_membership", "attach_membership"]
@@ -145,9 +172,9 @@ def test_ulta_and_sephora_20g_listings_attach_to_the_brand_store_anchor():
         assert validate_matcher_verdict(p["kind"], p["evidence"]) == []
         assert p["evidence"]["matcher_verdict"]["size"] == {"value": 20.0, "unit": "g", "pack": 1}
     by_listing = {p["evidence"]["listing_product_key"]: p for p in plan.proposals}
-    ulta_ids = by_listing[ulta]["evidence"]["matcher_verdict"]["listing_offer_ids"]
-    assert ulta_small not in ulta_ids and len(ulta_ids) == 1  # the 0.3 oz offer is not the matched size
-    assert evidence_problems(by_listing[ulta]) == []
+    ulta_offers = by_listing[ulta]["evidence"]["matcher_verdict"]["matched_offers"]
+    assert [o["sku_key"].split("::v:")[0] for o in ulta_offers] == [ulta]
+    assert ulta_offers[0]["size"] == {"value": 20.0, "unit": "g", "pack": 1} and ulta_offers[0]["price"] == 24
     assert by_listing[sephora]["evidence"]["tier"] == "T0b"   # exact title
     assert by_listing[ulta]["evidence"]["tier"] == "T0c"      # brand prefix + 0.7 oz == 20 g
     assert plan.new_multi_merchant_groups == 1
@@ -173,7 +200,7 @@ def test_a_retailer_key_shared_by_two_identical_rows_proposes_merge_content_key(
     assert p["kind"] == "merge_content_key" and ev["from_product_keys"] == sorted([a, b])
     assert ev["keeper_product_key"] == LANEIGE and ev["from_content_key"] == "ck_shared"
     assert ev["matcher_verdict"]["from_key_single_size"] is True
-    assert len(ev["matcher_verdict"]["listing_offer_ids"]) == 2
+    assert len(ev["matcher_verdict"]["matched_offers"]) == 2
     assert validate_matcher_verdict(p["kind"], ev) == []
 
 
@@ -268,8 +295,10 @@ def test_a_gtin_placeholder_never_proposes(placeholder):
 # --- vetoes ------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ratio_price,vetoed", [(24 * PRICE_RATIO_MAX, False), (24 * PRICE_RATIO_MAX + 0.5, True),
-                                                (24 * PRICE_RATIO_MIN, False), (24 * PRICE_RATIO_MIN - 0.5, True)])
+@pytest.mark.parametrize("ratio_price,vetoed", [
+    (24 * 1.66, False), (24 * PRICE_RATIO_MAX, True), (24 * 2.0, True), (24 * 2.5, True),   # the window is EXCLUSIVE
+    (24 * 0.61, False), (24 * PRICE_RATIO_MIN, True), (24 * 0.5, True), (24 * 0.4, True), (24 * 0.3, True),
+])
 def test_the_same_size_price_ratio_veto(ratio_price, vetoed):
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", price=ratio_price)
@@ -285,7 +314,6 @@ def test_the_price_ratio_compares_the_in_stock_matched_offer():
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", price=9, availability="out_of_stock", sku="20g")
     cat.offer(r, price=25, sku="20g", availability="in_stock")
-    cat.offer(r, price=None, sku="8g", availability="in_stock")  # another size, unpriced: not compared
     plan = cat.plan()
     assert proposed_keys(plan) == [r]
     assert plan.proposals[0]["evidence"]["price_ratio"] == round(25 / 24, 4)
@@ -379,14 +407,18 @@ def test_offer_size_unpinned_holds():
     assert outcome(plan, s)["reason"] == "offer_size_unpinned"
 
 
-def test_listing_offer_ids_only_name_the_matched_size():
+def test_matched_offers_name_only_per_variant_offers_of_every_market():
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g", offer_id="off_20a")
     cat.offer(r, sku="Lip Sleeping Mask / 0.7 oz", offer_id="off_20b")
-    cat.offer(r, sku="8g", price=None, offer_id="off_8")
-    cat.offer(r, sku=None, labels=["Size", "3g"], price=None, offer_id="off_3")
+    cat.offer(r, sku="20g", offer_id="off_20_sg", market="SG", currency="SGD", price=32)
+    mirror = cat.offer(r, sku="Default Title", mirror=True)        # the seed mirror's offer: never named
+    canonical = cat.offer(r, sku="20g", canonical=True)            # a '::canonical' SKU offer: never named
     plan = cat.plan()
-    assert plan.proposals[0]["evidence"]["matcher_verdict"]["listing_offer_ids"] == ["off_20a", "off_20b"]
+    named = plan.proposals[0]["evidence"]["matcher_verdict"]["matched_offers"]
+    assert [o["offer_id"] for o in named] == ["off_20_sg", "off_20a", "off_20b"]
+    assert mirror not in json.dumps(named) and canonical not in json.dumps(named)
+    assert {o["market"] for o in named} == {"US", "SG"}
 
 
 # --- star topology + whole moves -------------------------------------------------------------------------
@@ -518,7 +550,8 @@ def test_evidence_carries_exactly_the_keys_be2635_reads():
         ev = p["evidence"]
         assert ev["proposer"] == STRATEGY and ev["rule_version"] == RULE_VERSION and ev["market"] == "US"
         assert ev["matcher_verdict"]["strategy"] == STRATEGY and ev["matcher_verdict"]["rule_version"]
-        assert ev["matcher_verdict"]["same_size"] is True and ev["matcher_verdict"]["listing_offer_ids"]
+        assert ev["matcher_verdict"]["same_size"] is True and ev["matcher_verdict"]["matched_offers"]
+        assert isinstance(ev["matcher_verdict"]["matched_seeds"], list)
         assert ("from_key_single_size" in ev["matcher_verdict"]) == (p["kind"] == "merge_content_key")
         assert ev["sizes"]["anchor"] == ev["matcher_verdict"]["size"]
         json.dumps(ev)  # serializable as written to jsonb
@@ -537,7 +570,11 @@ def test_every_proposal_has_a_well_formed_verdict_over_a_mixed_catalog():
 @pytest.mark.parametrize("mutate", [
     lambda p: p["evidence"]["matcher_verdict"].pop("tier"),
     lambda p: p["evidence"]["matcher_verdict"].update(same_size=False),
-    lambda p: p["evidence"]["matcher_verdict"].update(listing_offer_ids=[]),
+    lambda p: p["evidence"]["matcher_verdict"].update(matched_offers=[]),
+    lambda p: p["evidence"]["matcher_verdict"]["matched_offers"].append(
+        {"offer_id": "offer:external_seed:" + "0" * 32, "sku_key": "x::v:1"}),
+    lambda p: p["evidence"]["matcher_verdict"]["matched_offers"].append({"offer_id": "o", "sku_key": "x::canonical"}),
+    lambda p: p["evidence"]["matcher_verdict"].update(matched_seeds=[{"seed_id": "s", "variant_id": ""}]),
     lambda p: p["evidence"]["matcher_verdict"].update(size={"value": 0, "unit": "g", "pack": 1}),
     lambda p: p["evidence"]["matcher_verdict"].update(rule_version=""),
     lambda p: p["evidence"]["matcher_verdict"].update(strategy="other"),
@@ -556,7 +593,9 @@ def test_the_writers_check_rejects_a_malformed_proposal(mutate):
 
 def test_a_merge_without_the_single_size_flag_is_rejected():
     ev = {"proposer": STRATEGY, "from_product_keys": ["a"], "keeper_product_key": "k",
-          "matcher_verdict": matcher_verdict(tier="T0c", size=(20.0, "g", 1), listing_offer_ids=["o"], merge=False)}
+          "matcher_verdict": matcher_verdict(tier="T0c", size=(20.0, "g", 1),
+                                             matched_offers=[{"offer_id": "o", "sku_key": "x::v:1"}],
+                                             matched_seeds=[], merge=True, from_key_single_size=False)}
     assert validate_matcher_verdict("merge_content_key", ev)
     ev["matcher_verdict"]["from_key_single_size"] = True
     assert validate_matcher_verdict("merge_content_key", ev) == []
@@ -605,10 +644,10 @@ def test_summary_lines_report_counts_reasons_and_samples():
     retailer(cat, 20, "Laneige", "Lip Sleeping Mask 20g Refill")
     lines = cat.plan().summary(samples_per_tier=2)
     sections = [l["section"] for l in lines]
-    assert sections[:5] == ["proposals", "outcomes", "top_markets", "top_brands", "host_pairs"]
+    assert sections[:6] == ["proposals", "yield_both_ways", "outcomes", "top_markets", "top_brands", "host_pairs"]
     head = lines[0]
     assert head["proposals"] == 6 and head["by_kind"] == {"attach_membership": 5, "merge_content_key": 1}
-    assert head["digest"].startswith("cmd_") and lines[1]["vetoed"] == {"conflict:refill": 1}
+    assert head["digest"].startswith("cmd_") and lines[2]["vetoed"] == {"conflict:refill": 1}
     assert all(len(l["proposals"]) <= 2 for l in lines if l["section"] == "samples")
 
 
@@ -775,8 +814,8 @@ def test_an_offer_whose_variant_states_two_sizes_is_never_pinned():
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="Lip Sleeping Mask 20g / 8g", offer_id="off_two")
     p = Planner(cat.snapshot(), "US")
-    offer = next(o for o in p.by_pk[r].offers if o.offer_id == "off_two")
-    assert len(offer.stated_sizes) == 2 and offer.size is None
+    unit = next(u for u in p.units(r) if any(o.offer_id == "off_two" for o in u.offers))
+    assert len(unit.stated) == 2 and unit.size is None
     assert outcome(p.plan(), r)["reason"] == "offer_size_unpinned"
 
 
@@ -810,7 +849,7 @@ async def test_write_proposals_refuses_a_proposal_that_fails_the_engines_module_
     from scripts.ops import propose_cross_merchant_matches as script
 
     plan = _mixed().plan()
-    plan.proposals[0]["evidence"]["matcher_verdict"]["listing_offer_ids"] = []
+    plan.proposals[0]["evidence"]["matcher_verdict"]["matched_offers"] = []
 
     class NoConn:
         def transaction(self):
@@ -818,3 +857,396 @@ async def test_write_proposals_refuses_a_proposal_that_fails_the_engines_module_
 
     with pytest.raises(script.Refused, match="module rule"):
         await script.write_proposals(NoConn(), plan, expect_digest=plan.digest(), max_proposals=100)
+
+
+
+# --- controller review of be#2639 (H1-H3, M1-M3, L1) and contract v3 --------------------------------------
+
+
+@pytest.mark.parametrize("a,b", [
+    (("La Roche-Posay", "Cicaplast Baume B5 + Multi-Purpose Balm 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 Multi-Purpose Balm 40ml")),
+    (("La Roche-Posay", "Toleriane + Vitamin C Serum 30ml"), ("La Roche-Posay", "Toleriane Vitamin C Serum 30ml")),
+    (("Lancôme", "Teint Idole Ultra Wear 30ml 220 (C)"), ("Lancôme", "Teint Idole Ultra Wear 30ml 220")),
+    (("Klairs", "Vitamin (C) Suspension 30ml"), ("Klairs", "Vitamin Suspension 30ml")),
+])
+@pytest.mark.parametrize("flip", [False, True])
+def test_h1_the_four_inherited_false_merges_never_propose(a, b, flip):
+    if flip:
+        a, b = b, a
+    cat = Cat()
+    brand_store(cat, "ext:brand::anchor", a[0], a[1])
+    retailer(cat, 1, b[0], b[1])
+    assert cat.plan().proposals == []
+
+
+@pytest.mark.parametrize("a,b", [
+    (("Beauty of Joseon", "Relief Sun : Rice + Probiotics SPF50+ PA++++ 50ml"),
+     ("Beauty of Joseon", "Relief Sun: Rice & Probiotics SPF50+ PA++++ 50ml")),
+    (("Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment SPF 30 50ml"),
+     ("Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment SPF 30 50ml Dr.Jart+")),
+])
+def test_h1_the_normalizers_recall_pairs_propose(a, b):
+    cat = Cat()
+    brand_store(cat, "ext:brand::anchor", a[0], a[1])
+    r = retailer(cat, 1, b[0], b[1])
+    assert proposed_keys(cat.plan()) == [r]
+
+
+HYDRA = "ext:hydra::cream"
+
+
+@pytest.mark.parametrize("variant", ["Refill", "Mini", "Travel Size", "Value Size", "Tester", "Gift Set", "2-Pack",
+                                     "Jumbo", "LABEL:Size: Mini"])
+def test_h2_a_conflict_word_on_the_offers_own_variant_vetoes(variant):
+    cat = Cat()
+    brand_store(cat, HYDRA, "Hydra", "Hydra Cream 50ml", price=24)
+    if variant.startswith("LABEL:"):
+        r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", price=14, sku=None)
+        cat.offers[-1]["sku_labels"] = [variant[len("LABEL:"):]]
+    else:
+        r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", price=14, sku=variant)
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, r)["status"] == "vetoed" and outcome(plan, r)["reason"].startswith("offer_conflict:")
+
+
+def test_h2_a_variant_word_the_anchor_shares_is_no_veto():
+    cat = Cat()
+    brand_store(cat, HYDRA, "Hydra", "Hydra Cream Refill 50ml", price=24)
+    r = retailer(cat, 1, "Hydra", "Hydra Cream Refill 50ml", price=24, sku="Refill")
+    assert proposed_keys(cat.plan()) == [r]
+
+
+def test_h3_the_keeper_row_itself_must_state_the_size():
+    cat = Cat()
+    brand_store(cat, HYDRA, "Hydra", "Hydra Cream", price=48, ck="ckA")      # Default Title, no size
+    retailer(cat, 1, "Hydra", "Hydra Cream", ck="ckA", price=24, sku="50ml")  # a 50 ml row on the same key
+    r = retailer(cat, 2, "Hydra", "Hydra Cream", price=24, sku="50ml", host="new.example")
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "anchor_size_unknown"
+
+
+def test_h3_a_priced_row_on_the_anchor_key_with_no_size_is_unknown():
+    cat = laneige_catalog()
+    anchor_ck = "ck_" + LANEIGE.replace(":", "_")
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask", ck=anchor_ck, price=24)  # priced, states no size
+    r = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", host="sephora.com")
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "anchor_size_unknown"
+
+
+def test_m1_another_markets_size_holds_the_listing_and_defers_the_anchor():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.offer(r, sku="40g", market="GB", currency="GBP", price=30)
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "listing_multi_size"
+    cat2 = laneige_catalog()
+    cat2.offer(LANEIGE, sku="40g", market="GB", currency="GBP", price=30)
+    s_ = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    assert outcome(cat2.plan(), s_)["reason"] == "anchor_multi_size"
+
+
+def test_m2_an_unpriced_offer_or_sku_of_another_size_holds_the_listing():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.offer(r, price=None, sku="8g")
+    s_ = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", sku="20g", host="sephora.com")
+    cat.sku(s_, "Lip Sleeping Mask 8g")  # a SKU with no live offer
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, r)["reason"] == outcome(plan, s_)["reason"] == "listing_multi_size"
+
+
+def test_m2_from_key_single_size_is_computed_not_assumed():
+    cat = laneige_catalog()
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    snap = cat.snapshot()
+    p = Planner(snap, "US")
+    plan = p.plan()
+    assert plan.proposals[0]["evidence"]["matcher_verdict"]["from_key_single_size"] is True
+    assert all(p.row_single_size(pk, (20.0, "g", 1)) for pk in p.ck_members["ck_m"])
+    assert not p.row_single_size(LANEIGE, (8.0, "g", 1))
+
+
+def _existing(cat: Cat, *, status: str, target: str, keeper: str, size: Dict[str, Any],
+              from_ck: Optional[str] = None) -> None:
+    cat.proposals.append({"proposal_id": f"irp_{len(cat.proposals)}", "status": status, "kind": "attach_membership",
+                          "content_key": target, "keeper_product_key": keeper,
+                          "evidence": {"matcher_verdict": {"size": size}, "from_content_key": from_ck}})
+
+
+G20 = {"value": 20.0, "unit": "g", "pack": 1}
+G40 = {"value": 40.0, "unit": "g", "pack": 1}
+ANCHOR_CK = "ck_" + LANEIGE.replace(":", "_")
+
+
+def test_key_size_conflict_against_an_applied_proposal_of_another_size():
+    cat = laneige_catalog()
+    _existing(cat, status="applied", target=ANCHOR_CK, keeper=LANEIGE, size=G40, from_ck="ck_gb")
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g")
+    assert outcome(cat.plan(), r)["reason"] == "key_size_conflict"
+
+
+@pytest.mark.parametrize("status", ["proposed", "approved", "applied"])
+@pytest.mark.parametrize("case", ["other_keeper", "other_size_pending", "source_elsewhere", "target_moving",
+                                  "source_is_a_target"])
+def test_m3_pending_or_applied_conflicts_hold(status, case):
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g")
+    from_ck = "ck_" + r.replace(":", "_")
+    if case == "other_keeper":
+        _existing(cat, status=status, target=ANCHOR_CK, keeper="ext:other::row", size=G20, from_ck="ck_x")
+    elif case == "other_size_pending":
+        if status == "applied":
+            pytest.skip("an applied other size is key_size_conflict (tested above)")
+        _existing(cat, status=status, target=ANCHOR_CK, keeper=LANEIGE, size=G40, from_ck="ck_x")
+    elif case == "source_elsewhere":
+        if status == "applied":
+            pytest.skip("an applied move off the source key is history, not a conflict")
+        _existing(cat, status=status, target="ck_elsewhere", keeper="ext:else::k", size=G20, from_ck=from_ck)
+    elif case == "target_moving":
+        if status == "applied":
+            pytest.skip("an applied move off the target key is history, not a conflict")
+        _existing(cat, status=status, target="ck_elsewhere", keeper="ext:else::k", size=G20, from_ck=ANCHOR_CK)
+    else:
+        _existing(cat, status=status, target=from_ck, keeper=r, size=G20, from_ck="ck_y")
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "pending_or_applied_conflict"
+
+
+def test_m3_the_same_move_already_proposed_is_no_conflict():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g")
+    _existing(cat, status="proposed", target=ANCHOR_CK, keeper=LANEIGE, size=G20, from_ck="ck_" + r.replace(":", "_"))
+    assert proposed_keys(cat.plan()) == [r]
+
+
+@pytest.mark.parametrize("anchor_title,listing_title", [
+    ("Cotton Pads 0.5 ct", "Cotton Pads 0.5 ct"),   # truncated to 0: would be rejected and silently dropped
+    ("Cotton Pads 1/2 ct", "Cotton Pads 1/2 ct"),
+    ("Cotton Pads 1.7 ct", "Cotton Pads 1 ct"),     # truncated to 1: would meet a real 1 ct
+    ("Cotton Pads 1 ct", "Cotton Pads 1.7 ct"),
+])
+def test_a_fractional_count_holds_size_fraction_count(anchor_title, listing_title):
+    cat = Cat()
+    brand_store(cat, "ext:pads::a", "Padco", anchor_title)
+    r = retailer(cat, 1, "Padco", listing_title)
+    p = Planner(cat.snapshot(), "US")
+    v = p.judge(p.by_pk[r], p.by_pk["ext:pads::a"])
+    assert v.status == "held" and v.reasons == ["size_fraction_count"]
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "size_fraction_count"
+
+
+def test_whole_counts_still_propose():
+    cat = Cat()
+    brand_store(cat, "ext:pads::a", "Padco", "Cotton Pads 60 ct")
+    r = retailer(cat, 1, "Padco", "Padco Cotton Pads 60 ct")
+    assert proposed_keys(cat.plan()) == [r]
+
+
+# --- per-variant pinning (contract v3) -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["mirror", "canonical"])
+def test_a_match_only_on_a_mirror_or_canonical_offer_is_offer_not_variant_pinned(kind):
+    cat = laneige_catalog()
+    key = "ext:retailer:" + "01" * 16
+    cat.row(key, brand="Laneige", title="Lip Sleeping Mask 20g", seed_kind="cross")
+    cat.offer(key, sku="Default Title", **{kind: True})
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, key)["reason"] == "offer_not_variant_pinned"
+    assert outcome(plan, key)["mirror_clear"] is True
+    y = next(line for line in plan.summary() if line["section"] == "yield_both_ways")
+    assert y["mirror_recheck_additional"] == 1 and y["per_variant_only_listings"] == 0
+
+
+def test_a_mirror_offer_beside_a_variant_offer_is_never_named():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    m = cat.offer(r, sku="Default Title", mirror=True, price=23)
+    plan = cat.plan()
+    named = plan.proposals[0]["evidence"]["matcher_verdict"]["matched_offers"]
+    assert len(named) == 1 and named[0]["offer_id"] != m and "::v:" in named[0]["sku_key"]
+
+
+def test_every_verdict_passes_the_engines_v3_rule_once_stamped():
+    from services.identity_resolution import module_proposal_problems
+
+    cat = _mixed()
+    plan = cat.plan()
+    for p in stamp_run(plan.proposals, "cmss_test"):
+        assert module_proposal_problems(p, STRATEGY) == [] and evidence_problems(p) == []
+        assert "listing_offer_ids" not in p["evidence"]["matcher_verdict"]
+
+
+# --- matched_seeds --------------------------------------------------------------------------------------
+
+
+def test_matched_seeds_lists_only_same_size_seeds():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.seed("seed_one", attached=r, variants=[{"variant_id": "v1", "title": "20g"}])              # null
+    cat.seed("seed_other_size", attached=r, variants=[{"variant_id": "v9", "title": "8g"}])        # never
+    cat.seed("seed_multi", attached=LANEIGE, variants=[{"variant_id": "a", "title": "20g"},
+                                                        {"variant_id": "b", "title": "8g"}])     # names "a"
+    cat.seed("seed_multi_noid", attached=LANEIGE, variants=[{"title": "20g"}, {"title": "8g"}])  # cannot name
+    cat.seed("seed_no_variants", attached=LANEIGE, title="Lip Sleeping Mask 20g")              # not listed
+    cat.seed("seed_snapshot_only", attached=LANEIGE, snapshot_variants=[{"variant_id": "s", "title": "20g"}])
+    cat.seed("seed_unreadable", attached=LANEIGE, variants=[{"variant_id": "u", "title": "Berry"}])
+    plan = cat.plan()
+    seeds = plan.proposals[0]["evidence"]["matcher_verdict"]["matched_seeds"]
+    assert seeds == [{"seed_id": "seed_multi", "variant_id": "a"}, {"seed_id": "seed_one", "variant_id": None}]
+
+
+def test_variant_id_null_only_for_a_single_variant_seed():
+    from services.identity_cross_merchant_match import seed_matches
+
+    one = {"id": "s1", "seed_variants": [{"id": "x", "title": "20g"}]}
+    two = {"id": "s2", "seed_variants": [{"id": "x", "title": "20g"}, {"id": "y", "title": "20g Berry"}]}
+    assert seed_matches(one, (20.0, "g", 1)) == [{"seed_id": "s1", "variant_id": None}]
+    assert seed_matches(two, (20.0, "g", 1)) == [{"seed_id": "s2", "variant_id": "x"},
+                                                 {"seed_id": "s2", "variant_id": "y"}]
+    assert all(m["variant_id"] is not None for m in seed_matches(two, (20.0, "g", 1)))
+    assert seed_matches({"id": "s3", "seed_variants": []}, (20.0, "g", 1)) == []
+
+
+def test_seeds_link_by_source_ref_and_external_product_id():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.products[-1]["source_ref"] = "seed_by_ref"
+    cat.seed("seed_by_ref", variants=[{"variant_id": "v", "title": "20g"}])
+    cat.seed("seed_by_epid", external_product_id=cat.products[0]["source_product_id"],
+             variants=[{"variant_id": "w", "title": "Lip Sleeping Mask 20g"}])
+    plan = cat.plan()
+    seeds = plan.proposals[0]["evidence"]["matcher_verdict"]["matched_seeds"]
+    assert {s["seed_id"] for s in seeds} == {"seed_by_ref", "seed_by_epid"} and r
+
+
+# --- constants pinned to their sources; brand SQL patterns -------------------------------------------------
+
+
+def test_mirrored_constants_match_their_sources():
+    from services.catalog_enrichment_agent import ingestion
+    from services.external_offer_dual_write import OFFER_ID_PREFIX, derive_mirror_offer_id
+    from services.identity_cross_merchant_match import CANONICAL_SKU_SUFFIX, MIRROR_OFFER_ID_PREFIX
+
+    assert CANONICAL_SKU_SUFFIX == ingestion.SKU_SUFFIX
+    assert MIRROR_OFFER_ID_PREFIX == OFFER_ID_PREFIX and derive_mirror_offer_id("x").startswith(MIRROR_OFFER_ID_PREFIX)
+
+
+def test_brand_sql_patterns_select_a_superset_of_every_spelling():
+    import re as _re
+
+    from services.identity_cross_merchant_match import brand_sql_patterns
+    from services.product_match_normalizer import canonical_brand
+
+    pats = brand_sql_patterns(["Dior", "Lancôme", "Dr.Jart+"])
+
+    def sql_key(b):
+        return _re.sub(r"[^\w]+|_", "", b.lower())
+
+    def like(text, pat):
+        return _re.fullmatch(pat.replace("%", ".*"), text) is not None
+
+    for b in ["Christian Dior", "DIOR", "Lancôme", "Lancome", "Dr. Jart+", "Dr.Jart+", "DR.JART"]:
+        assert any(like(sql_key(b), p) for p in pats), b
+    assert canonical_brand("Christian Dior") == "dior"
+
+
+
+# --- mutation-driven (v3 round) --------------------------------------------------------------------------
+
+
+def test_h2_a_variant_word_on_the_keepers_own_variant_is_no_veto():
+    cat = Cat()
+    cat.row(HYDRA, brand="Hydra", title="Hydra Cream 50ml", seed_kind="self", created="2026-01-01")
+    cat.offer(HYDRA, price=24, sku="Refill 50ml", brand_direct=True)   # the brand sells it as a refill
+    r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", price=24, sku="Refill 50ml")
+    assert proposed_keys(cat.plan()) == [r]
+
+
+def test_h2_a_variant_with_a_conflict_word_and_no_size_never_takes_the_title_size():
+    cat = Cat()
+    cat.row(HYDRA, brand="Hydra", title="Hydra Cream 50ml", seed_kind="self", created="2026-01-01")
+    cat.offer(HYDRA, price=24, sku="Refill 50ml", brand_direct=True)
+    r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", price=24, sku="Refill")  # which size is the refill?
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "offer_size_unpinned"
+
+
+def test_h2_a_brands_own_plus_in_a_variant_title_is_not_an_edition():
+    cat = Cat()
+    brand_store(cat, "ext:drjart::cicapair", "Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment 50ml")
+    r = retailer(cat, 1, "Dr.Jart+", "Dr.Jart+ Cicapair Tiger Grass Color Correcting Treatment 50ml",
+                 sku="Dr.Jart+ Cicapair Tiger Grass Color Correcting Treatment 50ml")
+    assert proposed_keys(cat.plan()) == [r]
+
+
+@pytest.mark.parametrize("ratio,proposed", [(0.55, False), (0.65, True), (1.6, True), (1.8, False)])
+def test_l1_the_window_is_0_6_to_1_67(ratio, proposed):
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", price=round(24 * ratio, 2))
+    assert (proposed_keys(cat.plan()) == [r]) is proposed
+
+
+def test_a_whole_count_written_with_a_decimal_is_not_a_fraction():
+    cat = Cat()
+    brand_store(cat, "ext:pads::a", "Padco", "Cotton Pads 1.0 ct")
+    r = retailer(cat, 1, "Padco", "Cotton Pads 1 ct")
+    assert proposed_keys(cat.plan()) == [r]
+
+
+def test_h3_an_unpriced_sizeless_keeper_is_still_unknown():
+    cat = Cat()
+    cat.row(HYDRA, brand="Hydra", title="Hydra Cream", ck="ckA", seed_kind="self", created="2026-01-01")
+    cat.offer(HYDRA, price=None, brand_direct=True)                        # no size, no price
+    retailer(cat, 1, "Hydra", "Hydra Cream", ck="ckA", price=24, sku="50ml")
+    r = retailer(cat, 2, "Hydra", "Hydra Cream", price=24, sku="50ml", host="new.example")
+    assert outcome(cat.plan(), r)["reason"] == "anchor_size_unknown"
+
+
+def test_another_size_on_the_anchor_key_defers():
+    cat = laneige_catalog()
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 8g", ck=ANCHOR_CK, sku="8g", price=12)  # joined earlier
+    r = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", host="sephora.com")
+    assert outcome(cat.plan(), r)["reason"] == "anchor_multi_size"
+
+
+def test_a_mirror_offer_on_a_variant_sku_key_is_still_never_named():
+    cat = laneige_catalog()
+    key = "ext:retailer:" + "01" * 16
+    cat.row(key, brand="Laneige", title="Lip Sleeping Mask 20g", seed_kind="cross")
+    cat.offer(key, sku="20g", mirror=True, sku_key=f"{key}::v:odd")
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, key)["reason"] == "offer_not_variant_pinned"
+
+
+def test_run_size_conflicts_flags_a_key_given_two_sizes():
+    from services.identity_cross_merchant_match import run_size_conflicts
+
+    assert run_size_conflicts([("ck1", (20.0, "g", 1)), ("ck1", (8.0, "g", 1)), ("ck2", (20.0, "g", 1)),
+                               ("ck2", (20.0, "g", 1))]) == {"ck1"}
+
+
+def test_from_key_single_size_reads_every_row_on_the_key():
+    cat = laneige_catalog()
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    b = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    p = Planner(cat.snapshot(), "US")
+    assert p.from_key_single_size("ck_m", (20.0, "g", 1)) is True
+    cat.offer(b, price=None, sku="8g", market="GB")
+    assert Planner(cat.snapshot(), "US").from_key_single_size("ck_m", (20.0, "g", 1)) is False
+    assert p.from_key_single_size("ck_unread", (20.0, "g", 1)) is False
+
+
+def test_the_verdicts_from_key_single_size_is_the_planners_computation(monkeypatch):
+    cat = laneige_catalog()
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    monkeypatch.setattr(Planner, "from_key_single_size", lambda self, ck, size: False)
+    p = cat.plan().proposals[0]
+    assert p["evidence"]["matcher_verdict"]["from_key_single_size"] is False
+    assert any("from_key_single_size" in x for x in evidence_problems(p))  # the writer would refuse it

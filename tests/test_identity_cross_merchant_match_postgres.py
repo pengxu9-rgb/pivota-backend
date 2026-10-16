@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
-_MORE = ("045_product_groups.sql", "179_identity_resolution_d2.sql")
+_MORE = ("045_product_groups.sql", "179_identity_resolution_d2.sql", "044_external_product_seeds.sql")
 _SCHEMA = f"cross_merchant_match_test_{os.getpid()}"
 SYN = "external_seed"
 STRATEGY = "cross_merchant_same_size"
@@ -109,7 +109,7 @@ async def _product(c, key, *, merchant, title, brand="Laneige", ck, seed_kind=No
 
 async def _offer(c, key, offer_id, *, merchant, price, host, sku_title="Default Title", offer_type="retailer",
                  market="US"):  # price None: an offer the market lists without a price
-    sku_key = "sku_" + offer_id
+    sku_key = f"{key}::v:{offer_id}"  # a per-variant SKU, as the crawl lane keys it
     await c.execute(
         "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id,"
         " title, sku_payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)",
@@ -136,7 +136,6 @@ async def _catalog(c):
     await _offer(c, ANCHOR, "o_anchor", merchant="m_laneige", price=24, host="us.laneige.com", offer_type="brand_direct")
     await _product(c, ULTA, merchant="m_ulta", title="LANEIGE Lip Sleeping Mask 0.7 oz", ck="ck_ulta")
     await _offer(c, ULTA, "o_ulta_20", merchant="m_ulta", price=24, host="www.ulta.com", sku_title="0.7 oz")
-    await _offer(c, ULTA, "o_ulta_8", merchant="m_ulta", price=None, host="www.ulta.com", sku_title="0.3 oz")
     await _offer(c, ULTA, "o_ulta_sg", merchant="m_ulta", price=30, host="www.ulta.com", sku_title="0.7 oz", market="SG")
     await _product(c, SEPH, merchant="m_seph", title="Lip Sleeping Mask 20g", ck="ck_seph")
     await _offer(c, SEPH, "o_seph", merchant="m_seph", price=23, host="sephora.com")
@@ -152,7 +151,17 @@ async def _catalog(c):
     # a retailer page that also sells a PRICED 8 g: phase 1 never moves it (listing_multi_size)
     await _product(c, MULTI, merchant="m_multi", title="Lip Sleeping Mask 20g", ck="ck_multi")
     await _offer(c, MULTI, "o_multi_20", merchant="m_multi", price=24, host="multi.example", sku_title="20g")
-    await _offer(c, MULTI, "o_multi_8", merchant="m_multi", price=12, host="multi.example", sku_title="8g")
+    await _offer(c, MULTI, "o_multi_8", merchant="m_multi", price=None, host="multi.example", sku_title="8g")
+    # seeds: the anchor's single-variant 20 g seed is listed (variant_id null); a second seed of the
+    # same product in 8 g never is; Ulta's two-variant seed names its 0.7 oz variant
+    for sid, attached, variants in (
+            ("seed_anchor", ANCHOR, [{"variant_id": "a1", "title": "20g"}]),
+            ("seed_anchor_8g", ANCHOR, [{"variant_id": "a8", "title": "8g"}]),
+            ("seed_ulta", ULTA, [{"variant_id": "u20", "title": "0.7 oz"}, {"variant_id": "u8", "title": "0.3 oz"}])):
+        await c.execute(
+            "INSERT INTO external_product_seeds (id, market, destination_url, seed_data, status, attached_product_key)"
+            " VALUES ($1, 'US', 'https://x.example/' || $1, $2::jsonb, 'active', $3)",
+            sid, json.dumps({"variants": variants}), attached)
 
 
 def _args(tmp_path, *extra):
@@ -182,7 +191,7 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     head = next(line for line in out if line["section"] == "proposals")
     held = next(line for line in out if line["section"] == "outcomes")["held"]
     assert head["proposals"] == 3 and head["by_kind"] == {"attach_membership": 2, "merge_content_key": 1}
-    assert held == {"key_shared_with_unmatched": 1, "listing_multi_size": 1}
+    assert held == {"key_shared_with_unmatched": 1, "listing_multi_size": 1}  # MULTI: an unpriced 8 g too
     audit_logged = [line for line in out if line["section"] == "audit"]
     assert len(audit_logged) == 4 and {a["anchor"]["product_key"] for a in audit_logged} == {ANCHOR}
     digest = head["digest"]
@@ -222,7 +231,11 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     for r in rows:
         by_kind.setdefault(r["kind"], []).append(r)
     ulta = next(r for r in by_kind["attach_membership"] if r["evidence"]["listing_product_key"] == ULTA)
-    assert ulta["evidence"]["matcher_verdict"]["listing_offer_ids"] == ["o_ulta_20"]  # not 0.3 oz, not SG
+    mv = ulta["evidence"]["matcher_verdict"]
+    assert sorted(o["offer_id"] for o in mv["matched_offers"]) == ["o_ulta_20", "o_ulta_sg"]  # every market
+    assert {o["market"] for o in mv["matched_offers"]} == {"US", "SG"}
+    assert mv["matched_seeds"] == [{"seed_id": "seed_anchor", "variant_id": None},
+                                   {"seed_id": "seed_ulta", "variant_id": "u20"}]
     merge = by_kind["merge_content_key"][0]
     assert merge["evidence"]["from_product_keys"] == sorted([DUP_A, DUP_B])
     assert merge["evidence"]["keeper_product_key"] == ANCHOR == merge["keeper_product_key"]
@@ -261,3 +274,29 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     anchor_group = "pg_" + ANCHOR.replace(":", "_")
     assert moved[ULTA] == moved[DUP_A] == moved[DUP_B] == ("ck_anchor", anchor_group)
     assert moved[SEPH] == ("ck_seph", None) and moved[SHARED][0] == "ck_shared" and moved[MULTI][0] == "ck_multi"
+
+
+async def test_explain_plans_every_statement_and_executes_none(conn, tmp_path, capsys):
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    await _catalog(conn)
+    assert await script.run(conn, _args(tmp_path, "--explain", "--brands", "laneige")) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["statement"] for line in lines] == [n for n, _sql in script.PHASE1 + script.PHASE2]
+    assert all(line["section"] == "explain" and line["plan"] for line in lines)
+    assert not any(p.name.endswith(".jsonl") for p in tmp_path.iterdir())
+
+
+async def test_the_brand_filter_and_phase_two_read_only_the_candidate_keys(conn, tmp_path):
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    await _catalog(conn)
+    await _product(conn, "ext:retailer:" + "9" * 32, merchant="m_other", title="Snail Mucin Essence 100ml",
+                   brand="COSRX", ck="ck_cosrx")
+    await _offer(conn, "ext:retailer:" + "9" * 32, "o_cosrx", merchant="m_other", price=20, host="c.example")
+    snap, counts = await script.export_snapshot(conn, "US", brands=["Laneige"])
+    assert {p["brand"] for p in snap.products} == {"Laneige", "LANEIGE"}       # COSRX filtered in SQL
+    assert "ck_cosrx" not in snap.ck_rows and counts["candidate_content_keys"] == len(snap.ck_rows)
+    assert {o["market"] for o in snap.offers} == {"US", "SG"}                  # every market, candidate keys only
+    none, counts = await script.export_snapshot(conn, "US", brands=["Nobrand Cosmetics Example"])
+    assert none.products == [] and counts["candidate_content_keys"] == 0
