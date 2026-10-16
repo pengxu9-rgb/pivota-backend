@@ -650,7 +650,7 @@ async def _merge_fixture(db, conn, *, approve=True):
     p = merge_content_key_proposal(strategy="cross_merchant_same_size", from_content_key=loser, to_content_key=B,
                                    from_product_keys=list(rows), from_groups=rows, keeper_product_key=KEEPER,
                                    to_product_group_id="pg_brand")
-    await upsert_proposals(conn, [p])
+    await upsert_proposals(conn, [p], module_writer=M4)
     if approve:
         await approve_proposals(conn, [p["proposal_id"]], "test")
     return p["proposal_id"], loser, rows
@@ -719,7 +719,7 @@ async def test_merge_content_key_blocks_a_first_party_row_its_sync_would_rekey(d
     p = merge_content_key_proposal(strategy="cross_merchant_same_size", from_content_key=loser, to_content_key=B,
                                    from_product_keys=[first_party], from_groups={first_party: "pg_fp"},
                                    keeper_product_key=KEEPER, to_product_group_id="pg_brand")
-    await upsert_proposals(conn, [p])
+    await upsert_proposals(conn, [p], module_writer=M4)
     await approve_proposals(conn, [p["proposal_id"]], "test")
     out = await apply_approved(conn, run_id="R_FP", strategies=["cross_merchant_same_size"])
     assert out["blocked"] == [(p["proposal_id"], "blocked_unguarded_writer",
@@ -988,7 +988,7 @@ async def _m4_proposal(conn, n, *, run="m4run_1", kind="attach_membership", prop
                          evidence={"listing_product_key": listing, "from_content_key": f"ck_m4_{n}",
                                    "from_product_group_id": f"pg_m4_{n}", "to_product_group_id": "pg_brand",
                                    **extra})
-    await upsert_proposals(conn, [p])
+    await upsert_proposals(conn, [p], module_writer=M4)
     return p["proposal_id"]
 
 
@@ -1097,7 +1097,7 @@ async def test_a_module_run_proposal_of_another_kind_is_not_approvable(db, conn)
     p = new_proposal(kind="suppress_dup", strategy=M4, subject_product_keys=["a", "b"], keeper_product_key="a",
                      merchant_id=RET_M, content_key="ck_x",
                      evidence={"proposer": M4, "proposal_run_id": "m4run_1", "matcher_verdict": _verdict()})
-    await upsert_proposals(conn, [p])
+    await upsert_proposals(conn, [p], module_writer=M4)
     out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
     assert out["refused"] == "invalid_proposals" and list(out["problems"]) == [p["proposal_id"]]
     assert any("kind is 'suppress_dup'" in x for x in out["problems"][p["proposal_id"]])
@@ -1115,3 +1115,25 @@ async def test_an_approved_m4_attach_never_applies_without_a_digest(db, conn):
     out = await apply_approved(conn, run_id="R_M4", strategies=[M4])
     assert out["applied"] == [] and out["skipped"] == [(pid, "module_only_strategy_needs_expect_digest")]
     assert await _status(conn, pid) == "approved"
+
+
+
+async def test_only_the_module_may_write_its_strategys_proposals(db, conn):
+    """upsert_proposals refuses a module-only strategy's proposal unless the caller is that module
+    (module_writer=<its strategy>), and writes nothing when it refuses."""
+    from services.identity_resolution import CROSS_MERCHANT_SAME_SIZE, new_proposal, upsert_proposals
+
+    def attach(listing, strategy):
+        return new_proposal(kind="attach_membership", strategy=strategy, subject_product_keys=[listing, KEEPER],
+                            keeper_product_key=KEEPER, content_key=B,
+                            evidence={"listing_product_key": listing, "from_content_key": "ck_x",
+                                      "from_product_group_id": "pg_x", "to_product_group_id": "pg_brand"})
+
+    m4, plain = attach(_listing(60), CROSS_MERCHANT_SAME_SIZE), attach(_listing(61), "coordinator_merge")
+    for token in (None, "retailer_listing_brand_prefix", "coordinator_merge"):
+        with pytest.raises(ValueError, match="module-only"):
+            await upsert_proposals(conn, [plain, m4], module_writer=token)
+    assert await conn.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0  # not even `plain`
+    assert (await upsert_proposals(conn, [plain]))["inserted"] == 1  # other strategies need no token
+    out = await upsert_proposals(conn, [m4], module_writer=CROSS_MERCHANT_SAME_SIZE)
+    assert out["inserted"] == 1 and await _status(conn, m4["proposal_id"]) == "proposed"
