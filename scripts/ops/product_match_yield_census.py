@@ -15,6 +15,9 @@ TIERS (per market, US and SG; a product counts in each market it has a live offe
   T0b  canonical brand + catalog_identity.normalize_title equal (exact title, digits kept).
   T0c  match_key_t0c: canonical brand + ORDERED title core + (size, unit, pack count) equal.
   T0c_token_set (informational) the same with the core as a token SET: what word order costs.
+  T0a adds no joins of its own: its key is the T0c key plus the GTIN, so every T0a group is also a
+  T0c group (deliberate, the safe direction). T0a_size_not_required and T0c_token_set INCLUDE wrong
+  merges and are reported only to size what the strict tiers withhold.
 Every tier then applies the hard vetoes: a key group whose members disagree on conflict tokens
 (EDT/EDP, SPF/PA, version, format, refill/tester/mini/set/multipack ...) or shade is VETOED and
 split by (conflicts, shade). A group JOINS products when it spans >= 2 content_keys (a product
@@ -201,7 +204,8 @@ def _sample(group: Sequence[_Listing]) -> List[Dict[str, Any]]:
 
 
 def evaluate_tier(name: str, listings: Sequence[_Listing], key_fn: Callable[[_Listing], Optional[Hashable]],
-                  ck_sizes: Mapping[str, Set[Any]], *, samples: int = SAMPLE_GROUPS) -> Dict[str, Any]:
+                  ck_sizes: Mapping[str, Set[Any]], *, samples: int = SAMPLE_GROUPS,
+                  note: Optional[str] = None) -> Dict[str, Any]:
     """Group `listings` by `key_fn`, apply the signature veto, count joins. Pure."""
     by_key: Dict[Hashable, List[_Listing]] = defaultdict(list)
     for li in listings:
@@ -271,6 +275,7 @@ def evaluate_tier(name: str, listings: Sequence[_Listing], key_fn: Callable[[_Li
     accepted_samples = [{"members": _sample(g)} for g in sorted(joinable, key=lambda g: g[0].product_key)[:samples]]
     return {
         "tier": name,
+        **({"note": note} if note else {}),
         "counts": dict(out),
         "joined_products_distinct": len(joined_products),
         "veto_groups_by_token": dict(veto_by_token.most_common()),
@@ -395,8 +400,12 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
     ]
     # Informational: GTIN + brand without the size/core requirement (what T0a's strictness costs),
     # and T0c on the token SET (what keying on word order costs).
-    gtin_any = evaluate_tier("T0a_size_not_required", listings, t0a_size_missing, ck_sizes, samples=0)
-    t0c_set = evaluate_tier("T0c_token_set", listings, lambda li: li.t0c_set_key, ck_sizes, samples=samples)
+    gtin_any = evaluate_tier(
+        "T0a_size_not_required", listings, t0a_size_missing, ck_sizes, samples=0,
+        note="INFORMATIONAL, INCLUDES WRONG MERGES (e.g. cross-seller OPI shades on one GTIN): GTIN + brand only")
+    t0c_set = evaluate_tier(
+        "T0c_token_set", listings, lambda li: li.t0c_set_key, ck_sizes, samples=samples,
+        note="INFORMATIONAL, INCLUDES WRONG MERGES (Cream to Powder vs Powder to Cream): the recall word order costs")
 
     uf = _UnionFind()
     for tier in tiers:

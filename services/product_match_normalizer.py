@@ -136,6 +136,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 _VULGAR_FRACTION_RE = re.compile("[\u00bc-\u00be\u2150-\u215e]")
+_MARKS_RE = re.compile("[\u2122\u2120\u00ae\u00a9]")  # ™ ℠ ® ©
 
 
 def _fold(text: Any) -> str:
@@ -148,13 +149,16 @@ def _fold(text: Any) -> str:
     if text is None:
         return ""
     # Vulgar fractions first: NFKC turns "1½" into "11⁄2" (eleven halves), so each becomes " n/d".
-    s = _VULGAR_FRACTION_RE.sub(lambda m: " " + unicodedata.normalize("NFKC", m.group(0)).replace("⁄", "/"), str(text))
+    # Trademark marks BEFORE NFKC: NFKC spells "™" as "TM" and "℠" as "SM", which then glue onto the
+    # word ("Surge™" -> "surgetm") and hide a "+" in front of them ("Lotion+™").
+    s = _MARKS_RE.sub(" ", str(text))
+    s = _VULGAR_FRACTION_RE.sub(lambda m: " " + unicodedata.normalize("NFKC", m.group(0)).replace("⁄", "/"), s)
     s = unicodedata.normalize("NFKC", s)
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = unicodedata.normalize("NFC", s).casefold()
     s = s.replace("&", " and ").replace("’", "'").replace("‘", "'").replace("`", "'")
-    s = re.sub(r"[™®©]|\((?:r|tm)\)", " ", s)
+    s = re.sub(r"\((?:r|tm|sm|c)\)", " ", s)
     # "N°5" / "Nº5" (NFKC: "no5") / "No.5" / "No 5" are one spelling: a NUMBERED LINE (Chanel N°5,
     # Olaplex No.3), so it stays in the core as "no 5" rather than being read as a shade code.
     s = re.sub(r"\bn(?:o\.?|°)\s*(?=\d)", "no ", s)
@@ -370,11 +374,13 @@ def _floz_to_ml(value: float) -> float:
 
 
 def _ozw_to_g(value: float) -> float:
-    grams = float(round(value * 28.3495))
-    if grams in WEIGHT_NOMINAL_G:
-        return grams
-    best = min(WEIGHT_NOMINAL_G, key=lambda n: abs(n - grams))
-    return float(best) if abs(best - grams) <= _SNAP_TOLERANCE * best else grams
+    """Snap to a nominal gram size within 2%, else round -- to two decimals under 10 g, like
+    every other size (0.15 oz = 4.25 g and 0.14 oz = 3.97 g are different pencils)."""
+    exact = value * 28.3495
+    best = min(WEIGHT_NOMINAL_G, key=lambda n: abs(n - exact))
+    if abs(best - exact) <= _SNAP_TOLERANCE * best:
+        return float(best)
+    return round(exact, 2) if exact < 10 else float(round(exact))
 
 
 def _close(a: float, b: float, tol: float = _SAME_TITLE_TOLERANCE) -> bool:
@@ -552,6 +558,10 @@ def _version(m: re.Match) -> str:
     return f"v{n}"
 
 
+def _edition(m: re.Match) -> str:
+    return f"{m.group(1)}_edition"
+
+
 def _gen(m: re.Match) -> str:
     return f"gen{int(m.group(1))}"
 
@@ -571,16 +581,23 @@ CONFLICT_LEXICON: Tuple[ConflictRule, ...] = (
     ConflictRule(_spf, "spf", r"\bspf\s*(\d{1,3})\s*(\+?)", "SPF value; '50+' (KR/EU label class) is kept distinct from '50'."),
     ConflictRule("spf", "spf", r"\bspf\b", "SPF stated without a value."),
     ConflictRule(_pa, "pa", r"\bpa\s*(\+{1,4})", "PA rating (+ .. ++++), Asian UVA label."),
-    # -- "+" editions: after SPF/PA (and "1+1" packs, read by parse_size) are consumed, a "+" glued
-    # to a word is an edition: Effaclar Duo vs Duo+ / Duo (+), Cicaplast B5 vs B5+, DDML Lotion vs
-    # Lotion+. The word "plus" is the same marker. "Rice + Probiotics" (spaced) is not.
-    ConflictRule("plus", "version", r"(?<=[a-z0-9])\+(?![+\w])|\(\s*\+\s*\)|\bplus\b", "X+ / X (+) / X Plus edition."),
+    # -- "+" editions: after sizes, SPF/PA and "1+1" packs are blanked, a "+" is an edition when it
+    # is glued to a word or a percent (Duo+, B5+, Lotion+, Retinol 1%+), or not followed by a word
+    # (Effaclar Duo + SPF30 40ml, B5 +40ml, Lotion + 125ml -- what followed was a size or a rating;
+    # Duo (+), Duo [+] -- a bracket). The word "plus" is the same marker. A "+" BETWEEN two words is
+    # a conjunction ("Rice + Probiotics", "Propolis + Niacinamide") and stays out.
+    ConflictRule(
+        "plus", "version",
+        r"(?<=[a-z0-9%])\+(?![+\w])|(?<![\w+%])\+(?=\s*(?:$|[^\w\s+]))|\bplus\b",
+        "X+ / X (+) / X [+] / 'X +' before a size or the end / X Plus edition.",
+    ),
     # -- version / reformulation markers.
     ConflictRule("new_formula", "version", r"\b(?:new|improved)\s+formula(?:tion)?\b", "Declared new formula."),
     ConflictRule("reformulated", "version", r"\breformulat(?:ed|ion)\b", "Declared reformulation."),
     ConflictRule("renewal", "version", r"\brenew(?:al|ed)\b", "K-beauty 'renewal'/'renewed': new packaging, often a formula change."),
     ConflictRule("new", "version", r"\bnew\b(?!\s+(?:york|zealand))", "A lone 'new' (after 'new formula'); one-sided it vetoes."),
-    ConflictRule("limited_edition", "edition", r"\blimited(?:\s+edition)?\b|\b(?:holiday|anniversary|collectors?)\s+edition\b", "Limited / holiday edition."),
+    ConflictRule(_edition, "edition", r"\b(holiday|anniversary|collector)s?\s+edition\b", "Holiday / anniversary / collector edition, each its own token."),
+    ConflictRule("limited_edition", "edition", r"\blimited(?:\s+edition)?\b", "Limited edition."),
     ConflictRule("special_edition", "edition", r"\bspecial\s+edition\b", "Special edition."),
     ConflictRule(_version, "version", r"\b(?:v|ver\.?|version)\s*(\d+(?:[.,]\d+)?)(?![\w.])", "v2 / ver. 2 / version 2.0."),
     ConflictRule(_version, "version", r"(?<![\w.])([2-9][.,]0)(?![\w.%])", "Bare 2.0 .. 9.0 (sizes are consumed first, so '2.0 fl oz' never reaches here)."),
@@ -631,6 +648,8 @@ def conflict_family(token: str) -> str:
         return _FAMILY_BY_STATIC_TOKEN[token]
     if token.startswith("format_order:"):
         return "format"
+    if token.endswith("_edition"):
+        return "edition"
     if token.startswith("spf"):
         return "spf"
     if token.startswith("pa+"):
@@ -733,43 +752,21 @@ def _tokens(text: str) -> List[str]:
     return out
 
 
-def _remove_brand(tokens: List[str], forms: FrozenSet[str]) -> List[str]:
-    """Remove every contiguous window of 1..6 tokens that spells the brand (any measured
-    spelling, spaces and punctuation ignored), until none is left."""
-    if not forms:
-        return tokens
-    changed = True
-    while changed:
-        changed = False
-        for i in range(len(tokens)):
-            for k in range(min(6, len(tokens) - i), 0, -1):
-                if "".join(tokens[i:i + k]) in forms:
-                    tokens = tokens[:i] + tokens[i + k:]
-                    changed = True
-                    break
-            if changed:
-                break
-    return tokens
-
-
-def _clean(text: str, forms: FrozenSet[str]) -> List[str]:
+def _clean(text: str) -> List[str]:
+    """Core words of a stretch of text whose brand _blank_brand has already removed."""
     text = _PROMO_PHRASES_RE.sub(" ", text)
-    toks = _remove_brand(_tokens(text), forms)
-    toks = [t for t in toks if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
-    while len(toks) > 1 and toks[0] == "x":
-        toks = toks[1:]  # "<brand> x <partner> ...": the collab separator the brand left behind
-    return toks
+    return [t for t in _tokens(text) if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
 
 
 @lru_cache(maxsize=65536)
 def _brand_text_re(forms: FrozenSet[str]) -> Optional[re.Pattern]:
     """The brand as written in a title, punctuation-insensitive, with a glued "+" ("Dr.Jart+"),
-    so the brand's own "+" never reads as a "+" edition."""
+    so the brand's own "+" never reads as a "+" edition, and a collab "x" right after it."""
     alts = sorted((f for f in forms if len(f) >= 2), key=len, reverse=True)
     if not alts:
         return None
     body = "|".join(r"[\W_]*".join(re.escape(c) for c in f) for f in alts)
-    return re.compile(rf"(?<![^\W_])(?:{body})\+?(?![^\W_])")
+    return re.compile(rf"(?<![^\W_])(?:{body})\+?(?![^\W_])(?:\s+x(?=\s+[^\W_]))?")
 
 
 def _blank_brand(text: str, forms: FrozenSet[str]) -> str:
@@ -798,31 +795,31 @@ class TitleCore:
     size: ParsedSize
 
 
-def _shade_like(seg: str, rest: str, forms: FrozenSet[str]) -> Optional[List[str]]:
-    cand = _clean(seg, forms)
-    main = _clean(rest, forms)
+def _shade_like(seg: str, rest: str) -> Optional[List[str]]:
+    cand = _clean(seg)
+    main = _clean(rest)
     if 1 <= len(cand) <= 3 and len(main) >= 2 and not (set(cand) & _PRODUCT_NOUNS):
         return cand
     return None
 
 
-def _trailing_shade(s: str, forms: FrozenSet[str]) -> Tuple[str, List[str]]:
+def _trailing_shade(s: str) -> Tuple[str, List[str]]:
     """A trailing "(X)" / "[X]" or " - X" / " | X" segment of 1..3 words that names no product
     type, after a main part of >= 2 words, is the shade. An empty bracket (its size or SPF was
     already taken out) is dropped and the separator form is tried on what precedes it."""
     bm = _TRAILING_BRACKET_RE.search(s)
     if bm:
-        cand = _shade_like(bm.group(1), s[: bm.start()], forms)
+        cand = _shade_like(bm.group(1), s[: bm.start()])
         if cand:
             return s[: bm.start()], cand
-        if not _clean(bm.group(1), forms):
+        if not _clean(bm.group(1)):
             s = s[: bm.start()]
         else:
             return s, []
     parts = _SEPARATOR_RE.split(s)
     if len(parts) >= 2:
         rest = " ".join(parts[:-1])
-        cand = _shade_like(parts[-1], rest, forms)
+        cand = _shade_like(parts[-1], rest)
         if cand:
             return rest, cand
     return s, []
@@ -840,29 +837,30 @@ def _one_pass(text: str, forms: FrozenSet[str]) -> Tuple[List[str], List[str], L
     s = "".join(work)
     m = _SHADE_LABEL_RE.search(s)
     if m:
-        shade.extend(_clean(m.group(1), forms))
+        shade.extend(_clean(m.group(1)))
         s = s[: m.start()] + " " * (m.end() - m.start()) + s[m.end():]
     if not shade:
-        s, shade = _trailing_shade(s, forms)
+        s, shade = _trailing_shade(s)
     for pattern in _SHADE_CODE_RES:
         m = pattern.search(s)
         if m:
-            shade.extend(_clean(" ".join(g for g in m.groups() if g), forms))
+            shade.extend(_clean(" ".join(g for g in m.groups() if g)))
             s = s[: m.start()] + " " * (m.end() - m.start()) + s[m.end():]
     work = list(s)
     conflicts.extend(_extract(work, _COMPILED_FORMAT, placeholder=FORMAT_PLACEHOLDER))
-    core = _clean("".join(work), forms)
+    core = _clean("".join(work))
     return core, conflicts, shade, scan
 
 
 def title_core(brand: Any, title: Any) -> TitleCore:
     """Split a listing title into its identity core and its variant/edition parts.
 
-    Order: fold -> sizes and packs out -> conflict tokens out -> shade out (label, trailing
-    " - X" / "(X)" segment of <= 3 non-product words, codes like #21 / 2N1) -> format
-    words out (each leaves FORMAT_PLACEHOLDER at its position) -> promo phrases, stop words,
-    promo words and the brand (as a phrase, anywhere) out. Repeated on its own output until
-    stable, so title_core is idempotent.
+    Order: fold (marks stripped before NFKC) -> the brand out, as a phrase anywhere, any measured
+    spelling, with its own glued "+" and a following collab "x" -> sizes and packs out ->
+    conflict tokens out -> shade out (label, trailing " - X" / "(X)" segment of <= 3
+    non-product words, codes like #21 / 2N1) -> format words out (each leaves
+    FORMAT_PLACEHOLDER at its position) -> promo phrases, stop words and promo words out.
+    Repeated on its own output until stable, so title_core is idempotent.
     """
     forms = _brand_forms(brand)
     folded = _fold(title)
@@ -966,9 +964,13 @@ def _field(listing: Any, name: str) -> Any:
 
 
 def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
-    """T0b: (canonical_brand, catalog_identity.normalize_title) -- exact title, digits kept."""
+    """T0b: (canonical_brand, catalog_identity.normalize_title) -- exact title, digits kept.
+
+    Trademark marks are stripped first: normalize_title's NFKD spells "™" as "TM" and glues it
+    onto the word ("Surge™" -> "surgetm"). normalize_title itself is left alone (it mints
+    content_key); this only changes the matching key."""
     b = canonical_brand(brand)
-    t = normalize_title(title if isinstance(title, str) else (str(title) if title is not None else None))
+    t = normalize_title(_MARKS_RE.sub(" ", str(title)) if title is not None else None)
     return (b, t) if b and t else None
 
 

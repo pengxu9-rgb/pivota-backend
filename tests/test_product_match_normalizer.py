@@ -494,7 +494,10 @@ def test_property_nominal_fl_oz_table_round_trips():
     ("Cicaplast Baume B5+", {"plus"}), ("Moisturizing Lotion+", {"plus"}), ("Moisturizing Gel+", {"gel", "plus"}),
     ("Rice + Probiotics", set()), ("Vitamin C+E", set()), ("SPF50+ PA+++", {"spf50+", "pa+++"}), ("[1+1] Toner", {"multipack"}),
     ("Renewal", {"renewal"}), ("Renewed", {"renewal"}), ("New", {"new"}), ("Limited Edition", {"limited_edition"}),
-    ("Holiday Edition", {"limited_edition"}), ("Special Edition", {"special_edition"}), ("New York", set()),
+    ("Holiday Edition", {"holiday_edition"}), ("Limited Holiday Edition", {"limited_edition", "holiday_edition"}),
+    ("Effaclar Duo + SPF30", {"duo", "plus", "spf30"}), ("Effaclar Duo [+]", {"duo", "plus"}),
+    ("Cicaplast Baume B5 +40ml", {"plus"}), ("Moisturizing Lotion + 125ml", {"plus"}), ("Retinol 1%+", {"plus"}),
+    ("Moisturizing Lotion+™", {"plus"}), ("Effaclar Duo+™", {"duo", "plus"}), ("Glow Serum : Propolis + Niacinamide", set()), ("Special Edition", {"special_edition"}), ("New York", set()),
     ("Light", {"light"}), ("Refill", {"refill"}), ("Refillable", set()), ("Tester", {"tester"}),
     ("Unboxed", {"unboxed"}), ("No Box", {"unboxed"}), ("Deluxe Sample", {"sample"}), ("Trial Size", {"sample"}),
     ("Mini", {"mini"}), ("Travel Size", {"mini"}), ("Deluxe Mini", {"mini"}), ("Gift Set", {"set"}),
@@ -653,6 +656,20 @@ MUST_NOT_MERGE = [
     ("L2", ("NARS", "Powermatte Lipstick 4.25g"), ("NARS", "Powermatte Lipstick 4.2g")),
     # LOW-5: two measures in one title -> no primary size, so no key
     ("L5", ("Kiehl's", "Ultra Facial Duo Cream 30 ml + Serum 1.7 fl oz"), ("Kiehl's", "Ultra Facial Duo Cream 30 ml")),
+    # Review round 2: a spaced "+" before a size / rating / the end, [+], "%+", and ™ hiding a "+"
+    ("R2-M1", ("La Roche-Posay", "Effaclar Duo + SPF30 40ml"), ("La Roche-Posay", "Effaclar Duo SPF30 40ml")),
+    ("R2-M1", ("La Roche-Posay", "Cicaplast Baume B5 + 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 40ml")),
+    ("R2-M1", ("La Roche-Posay", "Cicaplast Baume B5 +40ml"), ("La Roche-Posay", "Cicaplast Baume B5 40ml")),
+    ("R2-M1", ("Clinique", "Dramatically Different Moisturizing Lotion + 125ml"),
+     ("Clinique", "Dramatically Different Moisturizing Lotion 125ml")),
+    ("R2-M1", ("La Roche-Posay", "Effaclar Duo [+] 40ml"), ("La Roche-Posay", "Effaclar Duo 40ml")),
+    ("R2-M1", ("The Ordinary", "Retinol 1%+ 30ml"), ("The Ordinary", "Retinol 1% 30ml")),
+    ("R2-M2", ("Clinique", "Dramatically Different Moisturizing Lotion+™ 125ml"),
+     ("Clinique", "Dramatically Different Moisturizing Lotion ™ 125ml")),
+    ("R2-M2", ("La Roche-Posay", "Effaclar Duo+™ 40ml"), ("La Roche-Posay", "Effaclar Duo ™ 40ml")),
+    ("R2-L1", ("Benefit", "X Factor Mascara 8.5g"), ("Benefit", "Factor Mascara 8.5g")),
+    ("R2-L2", ("NARS", "Velvet Matte Lip Pencil 0.15 oz"), ("NARS", "Velvet Matte Lip Pencil 0.14 oz")),
+    ("R2-L4", ("COSRX", "Snail Mucin Essence Limited Edition 100ml"), ("COSRX", "Snail Mucin Essence Holiday Edition 100ml")),
     # T0b: same title, no size in it -> phase 1 cannot prove the same size
     ("H2", ("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator"),
      ("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator")),
@@ -678,9 +695,26 @@ def test_review_controls_still_merge():
     assert _t0b_same(("COSRX", "Advanced Snail 96 Mucin Power Essence 100ml"), ("Cosrx", "Advanced Snail 96 Mucin Power Essence 100ml"))
 
 
-def test_x_is_kept_unless_it_is_a_leading_collab_separator():
+def test_review_round_2_must_merge():
+    # ™ is stripped before NFKC could spell it "TM" and glue it on.
+    assert _t0c_same(("Clinique", "Moisture Surge™ 50ml"), ("Clinique", "Moisture Surge 50ml"))
+    assert _t0b_same(("Clinique", "Moisture Surge™ 50ml"), ("Clinique", "Moisture Surge 50ml"))
+    assert title_core("Clinique", "Moisture Surge℠ 50ml").core == "moisture surge"
+    # A "+" between two words is a conjunction, never the "plus" edition.
+    rice = ("Beauty of Joseon", "Relief Sun : Rice + Probiotics SPF50+ PA++++ 50ml")
+    assert "plus" not in title_core(*rice).conflicts and _t0c_same(rice, rice) and _t0b_same(rice, rice)
+    assert _t0c_same(("Beauty of Joseon", "Glow Serum : Propolis + Niacinamide 30ml"),
+                     ("Beauty of Joseon", "Glow Serum Propolis + Niacinamide 1.01 fl oz"))
+    # The spaced and bracketed spellings of one "+" edition still meet.
+    assert _t0c_same(("La Roche-Posay", "Effaclar Duo + 40ml"), ("La Roche-Posay", "Effaclar Duo (+) 40ml"))
+    assert _t0c_same(("La Roche-Posay", "Effaclar Duo [+] 40ml"), ("La Roche-Posay", "Effaclar Duo+ 1.35 fl oz"))
+
+
+def test_x_is_kept_unless_it_follows_a_removed_brand():
     assert title_core("NARS", "Orgasm X Blush").core == "orgasm x blush"
+    assert title_core("Benefit", "X Factor Mascara").core == "x factor mascara"
     assert title_core("COSRX", "COSRX x Olive Young Snail Mucin Essence").core == "olive young snail mucin essence"
+    assert title_core("COSRX", "COSRX X Olive Young Snail Mucin Essence").core == "olive young snail mucin essence"
     assert title_core("Missha", "Time Revolution 5X Essence").core == "time revolution 5x essence"
 
 
@@ -708,6 +742,9 @@ def test_a_long_trailing_descriptor_is_not_a_shade():
 
 
 def test_parse_size_keeps_two_decimals_under_ten():
+    assert parse_size("0.15 oz").primary == Quantity(4.25, G)
+    assert parse_size("0.14 oz").primary == Quantity(3.97, G)
+    assert parse_size("0.25 oz").primary == Quantity(7.0, G)  # 7.09 g snaps to the printed 7 g
     assert parse_size("4.25g").primary == Quantity(4.25, G)
     assert parse_size("4.2g").primary == Quantity(4.2, G)
     assert parse_size("12.25ml").primary == Quantity(12.2, ML)
@@ -717,6 +754,8 @@ def test_parse_size_two_measures_in_one_title_have_no_primary():
     # Kills a same-title tolerance loosened from 3% (50 ml vs 30 ml would collapse at 50%).
     assert parse_size("Cream 30 ml + Serum 1.7 fl oz").primary is None
     assert len(parse_size("Cream 30 ml + Serum 1.7 fl oz").sizes) == 2
+    # Kills a truncation slack loosened from 0.3 g: 0.25 oz is 7.09 g, not 5 g.
+    assert parse_size("Balm 5 g / 0.25 oz").primary is None
     # Kills a count standing in as primary when the title states two measures.
     assert parse_size("Cream 30 ml + Serum 50 ml, 2 pcs").primary is None
 

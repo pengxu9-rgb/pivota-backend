@@ -306,8 +306,12 @@ def test_h1_t0a_also_needs_the_title_core_to_agree():
     lines = census.compute_census(rows, _us_hosts(rows, lambda r: r["source_domain"]), {}, ["US"])
     assert _get(lines, "inputs", "US")["gtins_polluted"] == 0
     assert _get(lines, "tier", "US", "T0a")["counts"].get("joinable_groups", 0) == 0
-    # T0a_size_not_required (GTIN + brand only) shows what the core requirement withheld.
-    assert _get(lines, "tier", "US", "T0a_size_not_required")["counts"]["split_key_groups"] == 1
+    # T0a_size_not_required (GTIN + brand only) shows what the core requirement withheld, and says
+    # that it includes wrong merges.
+    info = _get(lines, "tier", "US", "T0a_size_not_required")
+    assert info["counts"]["split_key_groups"] == 1 and "WRONG MERGES" in info["note"]
+    assert "WRONG MERGES" in _get(lines, "tier", "US", "T0c_token_set")["note"]
+    assert "note" not in _get(lines, "tier", "US", "T0a")
 
 
 def test_h2_t0b_defers_a_group_whose_members_are_different_sizes_or_no_size():
