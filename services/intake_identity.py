@@ -717,6 +717,75 @@ async def _listing_has_membership(ctx: Dict[str, Any], source_product_id: Option
         return True
 
 
+async def _canonical_url_row(
+    canonical_url: Optional[str],
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Tier-0c's lookup: the unique live row whose canonical_url normalizes equal to this one, with the
+    matcher's verdict, or None."""
+    if not canonical_url:
+        return None
+    from urllib.parse import urlparse
+
+    from services.pdp_matcher.deterministic import canonical_url_match, normalize_canonical_url
+
+    normalized = normalize_canonical_url(canonical_url)
+    path_only = (urlparse(normalized).path or "") if normalized else ""
+    candidates = await _candidates_by_canonical_url(path_only) if path_only else []
+    match = canonical_url_match(seed={"canonical_url": canonical_url}, candidates=candidates) if candidates else None
+    if not match:
+        return None
+    row = next(c for c in candidates if c.get("product_key") == match.get("product_key"))
+    return row, match
+
+
+async def _stored_identity_of_grouped_listing(
+    ctx: Dict[str, Any],
+    content_key: Optional[str],
+    canonical_url: Optional[str],
+    source_product_id: Optional[str],
+    merchant_id: Optional[str],
+    *,
+    strict: bool,
+) -> Optional[Tuple[Dict[str, Any], str]]:
+    """(stored row, its group) when this listing is ALREADY STORED with a content_key other than the
+    computed one AND already belongs to a product group; else None (the tiers below decide as before).
+
+    The stored row is the listing's own (same merchant + source_product_id + product_key), else the
+    unique canonical_url hit (a re-derived seller or product_key). Membership is judged by
+    _listing_has_membership (unsure means existing); the group itself must then be readable: under the
+    primary writer's strict contract an unreadable one raises (the resolver fails and the writer refuses
+    the row) rather than guess, elsewhere the guard steps aside."""
+    row: Optional[Dict[str, Any]] = None
+    own_pk = str(ctx.get("product_key") or "")
+    if own_pk and source_product_id and merchant_id:
+        for r in await _candidates_by_source_id(str(source_product_id), merchant_id):
+            if str(r.get("product_key") or "") == own_pk:
+                row = r
+                break
+    if row is None and canonical_url:
+        hit = await _canonical_url_row(canonical_url)
+        row = hit[0] if hit else None
+    if row is None or not row.get("content_key") or row.get("content_key") == content_key:
+        return None
+    if not row.get("source_product_id"):
+        return None  # product_group_members is keyed on it: such a row can hold no membership
+    member ={"merchant_id": row.get("merchant_id"), "platform": row.get("platform")}
+    if not await _listing_has_membership(member, row.get("source_product_id")):
+        return None
+    try:
+        group = await _existing_pg_for_listing(row)
+    except Exception:
+        if strict:
+            raise
+        return None
+    if not group:
+        if strict:
+            raise RuntimeError(
+                f"existing listing {row.get('product_key')} has a membership that could not be read")
+        return None
+    return row, str(group)
+
+
 def _brand_stripped_content_key(brand: Optional[str], title: Optional[str]) -> Optional[str]:
     """The family key of `title` with a LEADING brand name removed, or None when the title does not
     start with the brand (normalized as content_key normalizes titles, so "[MISSHA] X", "Missha X" and
@@ -980,6 +1049,33 @@ async def resolve_or_attach_content_identity(
                 detail={**_base_detail(), "reason": "no_identity_inputs"},
             )
 
+        # -- Before Tier-0b: an EXISTING listing keeps its identity (M3, 2026-10-16). A listing the
+        # identity engine moved (attach_membership / merge_content_key) carries a content_key that is
+        # no longer make_content_key(brand, title). If any live row later lands on its OLD key, Tier-0b
+        # below would resolve the re-crawl to that row: the PDP upsert writes the old key back and
+        # _ensure_primary_retailer_group refuses the group, failing the store job ("snap-back"). So at
+        # the crawl door, a listing already stored (its own row by product_key, else the unique
+        # canonical_url hit) whose stored key differs from the computed one and which already has a
+        # group membership keeps BOTH -- the guard Tier-0e applies (_listing_has_membership). A listing
+        # whose stored key equals the computed one goes through Tier-0b exactly as before.
+        if door == DOOR_CATALOG_ENRICHMENT:
+            kept = await _stored_identity_of_grouped_listing(
+                ctx, content_key, canonical_url, source_product_id, merchant_id, strict=strict_pg)
+            if kept is not None:
+                row, group = kept
+                ck = row["content_key"]
+                return await _finish(
+                    action=ACTION_ATTACH, content_key=ck, product_group_id=group,
+                    matcher="existing_listing_identity", door=door, merchant_ctx=ctx,
+                    detail={
+                        **_base_detail(),
+                        "matched_product_key": row.get("product_key"),
+                        "kept_content_key": ck,
+                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                    },
+                    gtin=gtin14, attach=_attach_info(row, merchant_id),
+                )
+
         # -- Tier-0b: content_key (brand+title FAMILY key).
         rows = await _rows_by_content_key(content_key, merchant_id)
         if rows:
@@ -1024,30 +1120,9 @@ async def resolve_or_attach_content_identity(
         # -- Tier-0c: canonical_url exact (the ER gate's matcher, unchanged:
         # unique normalized-equality hit or nothing).
         if canonical_url:
-            from urllib.parse import urlparse
-
-            from services.pdp_matcher.deterministic import (
-                canonical_url_match,
-                normalize_canonical_url,
-            )
-
-            normalized = normalize_canonical_url(canonical_url)
-            path_only = (urlparse(normalized).path or "") if normalized else ""
-            candidates = (
-                await _candidates_by_canonical_url(path_only) if path_only else []
-            )
-            match = (
-                canonical_url_match(
-                    seed={"canonical_url": canonical_url}, candidates=candidates
-                )
-                if candidates
-                else None
-            )
-            if match:
-                row = next(
-                    c for c in candidates
-                    if c.get("product_key") == match.get("product_key")
-                )
+            url_hit = await _canonical_url_row(canonical_url)
+            if url_hit:
+                row, match = url_hit
                 if row.get("content_key"):
                     ck = row["content_key"]
                     return await _finish(

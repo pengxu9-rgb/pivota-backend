@@ -2460,6 +2460,59 @@ async def _stage_from_kept_copy(
     return plan, counts
 
 
+#: The stored content_key of each planned row that already has a product group membership (M3).
+_GROUPED_STORED_CONTENT_KEY_SQL = """
+                SELECT cp.product_key, cp.content_key
+                FROM catalog_products cp
+                WHERE cp.product_key = ANY(:keys)
+                  AND cp.content_key IS NOT NULL
+                  AND EXISTS (
+                        SELECT 1 FROM product_group_members m
+                        WHERE m.merchant_id = cp.merchant_id
+                          AND m.platform = cp.platform
+                          AND m.platform_product_id = cp.source_product_id)
+                """
+
+
+async def _keep_grouped_content_keys(
+    plan: Dict[str, Any], database: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """With the intake identity gate OFF, a row that is already stored AND already in a product group
+    keeps its stored content_key. Returns (plan, counts).
+
+    WHY (M3, 2026-10-16). `_PDP_UPSERT_SQL` writes `COALESCE(EXCLUDED.content_key, stored)`, so a re-crawl
+    with the gate off writes the plan's make_content_key(brand, title) over the stored key. For a listing
+    the identity engine moved onto another product (attach_membership, merge_content_key) that is the
+    OLD key: the listing snaps back onto its old family while its membership stays in the new group.
+    With the gate ON the resolver chooses the key (and keeps a grouped listing's stored key itself,
+    intake_identity._stored_identity_of_grouped_listing), so this runs only with the gate off. The
+    statement keeps its single shared DO UPDATE arm (bulk_writer cannot carry a per-row condition
+    there), so the guard rewrites the planned row instead.
+
+    `counts["pdp_content_key_kept_for_grouped_row"]` is present only when a planned key was replaced."""
+    counts: Dict[str, Any] = {}
+    pdps = plan.get("pdps") or []
+    keys = sorted({str(p.get("product_key")) for p in pdps if p.get("product_key")})
+    if not keys:
+        return plan, counts
+    rows = await database.fetch_all(_GROUPED_STORED_CONTENT_KEY_SQL, {"keys": keys})
+    stored = {str(dict(r).get("product_key") or ""): dict(r).get("content_key") for r in rows or []}
+    kept = 0
+    out = []
+    for pdp in pdps:
+        ck = stored.get(str(pdp.get("product_key") or ""))
+        if ck and pdp.get("content_key") != ck:
+            pdp = {**pdp, "content_key": ck}
+            kept += 1
+        out.append(pdp)
+    if not kept:
+        return plan, counts
+    plan = dict(plan)
+    plan["pdps"] = out
+    counts["pdp_content_key_kept_for_grouped_row"] = kept
+    return plan, counts
+
+
 async def apply_ingest_plan(
     plan: Dict[str, Any],
     *,
@@ -2554,6 +2607,12 @@ async def _apply_ingest_plan(
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
     # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
     plan, stage_counts = await _stage_from_kept_copy(plan, database)
+    # BOTH executors: with the identity gate off, a grouped row keeps its stored content_key (M3).
+    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, intake_identity_enabled
+
+    if not intake_identity_enabled(DOOR_CATALOG_ENRICHMENT):
+        plan, kept_counts = await _keep_grouped_content_keys(plan, database)
+        stage_counts = {**stage_counts, **kept_counts}
     # Pure, and after the owner guard: label against the rows and keys that will actually be written.
     plan, label_counts = _label_verified_storefront_offers(plan, verified_storefront)
     owner_counts = {**owner_counts, **stage_counts, **label_counts}
