@@ -74,7 +74,8 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     Plan,
     Planner,
     Snapshot,
-    brand_sql_patterns,
+    brand_sql_regex,
+    gtin_lookup_values,
     evidence_problems,
     plan_market,
     stamp_run,
@@ -85,34 +86,48 @@ AUDIT_SAMPLE_DEFAULT = 600
 AUDIT_SEED_DEFAULT = 20261016
 OUT_DEFAULT = "/tmp/cross_merchant_match"
 
-# PHASE 1 -- the run market's candidates, brand-filtered IN SQL. $1 market, $2 brand LIKE patterns
-# over the alphanumeric brand key (identity_cross_merchant_match.brand_sql_patterns: a superset; the
-# exact canonical_brand filter runs in Python), NULL = every brand.
+# PHASE 1 -- the run market's candidates. $1 market. With --brands, $2 is a regex of literal brand
+# tokens (identity_cross_merchant_match.brand_sql_regex, a superset; the exact canonical_brand filter
+# runs in Python) matched against lower(coalesce(brand, '')) -- the expression the trigram GIN index
+# idx_catalog_products_brand_trgm (migration 059) is built on, so the scan is an index scan. Without
+# --brands the phase reads every candidate of the market: a full catalog_products scan.
 _PRODUCT_FILTER = """
     p.pivota_signature_id IS NOT NULL AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
-    AND p.sync_status = 'live'
-    AND ($2::text[] IS NULL
-         OR regexp_replace(lower(coalesce(p.brand, '')), '[^[:alnum:]]+', '', 'g') LIKE ANY($2::text[]))
+    AND p.sync_status = 'live'{brand}
     AND EXISTS (SELECT 1 FROM catalog_offers o0
                 WHERE o0.product_key = p.product_key AND o0.suppressed_at IS NULL
                   AND o0.suppression_reason IS NULL AND o0.market = $1)
 """
-PRODUCTS_SQL = f"""
+_BRAND_CLAUSE = "\n    AND lower(coalesce(p.brand, '')) ~ $2"
+
+
+def _products_sql(branded: bool) -> str:
+    return f"""
 SELECT p.product_key, p.merchant_id, p.platform, p.source_product_id, p.source_ref, p.content_key,
        p.pivota_signature_id, p.brand, p.title, p.gtin, p.source_system, p.seed_kind, p.created_at,
-       p.image_url, p.canonical_url
+       p.image_url, p.canonical_url, p.source_domain
 FROM catalog_products p
-WHERE {_PRODUCT_FILTER}
+WHERE {_PRODUCT_FILTER.format(brand=_BRAND_CLAUSE if branded else "")}
 """
+
+
 _HOST_EXPR = """lower(coalesce(nullif(btrim(o.source_domain), ''),
                       substring(o.offer_payload->>'destination_url' from '^[A-Za-z][A-Za-z0-9+.-]*://([^/:?#]+)')))"""
-HOSTS_SQL = f"""
+
+
+def _hosts_sql(branded: bool) -> str:
+    return f"""
 SELECT o.product_key, o.market, {_HOST_EXPR} AS host, bool_or(o.offer_type = 'brand_direct') AS brand_direct
 FROM catalog_offers o
 JOIN catalog_products p ON p.product_key = o.product_key
-WHERE {_PRODUCT_FILTER} AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL AND o.market = $1
+WHERE {_PRODUCT_FILTER.format(brand=_BRAND_CLAUSE if branded else "")}
+  AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL AND o.market = $1
 GROUP BY 1, 2, 3
 """
+
+
+PRODUCTS_SQL, HOSTS_SQL = _products_sql(False), _hosts_sql(False)
+PRODUCTS_BRAND_SQL, HOSTS_BRAND_SQL = _products_sql(True), _hosts_sql(True)
 # PHASE 2 -- the details for the candidate content_keys ONLY ($1 = that array, computed once in
 # Python from phase 1; no subquery re-runs, no full-table SKU scan). EVERY market's offers.
 ROWS_SQL = """
@@ -156,27 +171,48 @@ FROM external_product_seeds e
 WHERE lower(coalesce(e.status, '')) = 'active'
   AND (e.attached_product_key = ANY($1::text[]) OR e.id = ANY($2::text[]) OR e.external_product_id = ANY($3::text[]))
 """
-# This strategy's live proposals touching the keys (as target or source), every market.
-PROPOSALS_SQL = """
-SELECT r.proposal_id, r.status, r.kind, r.content_key, r.keeper_product_key,
+# This strategy's live proposals touching the keys, every market, as two lookups: as TARGET through
+# idx_identity_resolution_proposals_content_key, and as SOURCE within this strategy's live proposals
+# (idx_identity_resolution_proposals_status on (status, strategy): there is no expression index on
+# evidence->>'from_content_key', so that half reads this strategy's live rows only, never the table).
+_PROPOSAL_COLS = """r.proposal_id, r.status, r.kind, r.content_key, r.keeper_product_key,
        jsonb_build_object('matcher_verdict', r.evidence->'matcher_verdict',
-                          'from_content_key', r.evidence->'from_content_key') AS evidence
-FROM identity_resolution_proposals r
-WHERE r.strategy = $1 AND r.status = ANY($2::text[])
-  AND (r.content_key = ANY($3::text[]) OR r.evidence->>'from_content_key' = ANY($3::text[]))
+                          'from_content_key', r.evidence->'from_content_key') AS evidence"""
+PROPOSALS_SQL = f"""
+SELECT {_PROPOSAL_COLS} FROM identity_resolution_proposals r
+WHERE r.content_key = ANY($3::text[]) AND r.strategy = $1 AND r.status = ANY($2::text[])
+UNION
+SELECT {_PROPOSAL_COLS} FROM identity_resolution_proposals r
+WHERE r.status = ANY($2::text[]) AND r.strategy = $1 AND r.evidence->>'from_content_key' = ANY($3::text[])
+"""
+# EVERY live row, any brand, any market, carrying one of the candidates' GTINs (every stored spelling:
+# 14/13/12 digits), through idx_catalog_products_gtin: GTIN pollution is computed over these too, so a
+# brand-scoped run and a full run give a pair the same tier.
+GTIN_ROWS_SQL = """
+SELECT g.product_key, g.merchant_id, g.source_domain, g.brand, g.title, g.gtin, g.content_key
+FROM catalog_products g
+WHERE g.gtin = ANY($1::text[]) AND g.suppression_reason IS NULL AND g.suppressed_at IS NULL
 """
 PHASE1: Tuple[Tuple[str, str], ...] = (("products", PRODUCTS_SQL), ("hosts", HOSTS_SQL))
+PHASE1_BRANDS: Tuple[Tuple[str, str], ...] = (("products", PRODUCTS_BRAND_SQL), ("hosts", HOSTS_BRAND_SQL))
 PHASE2: Tuple[Tuple[str, str], ...] = (
     ("rows", ROWS_SQL), ("offers", OFFERS_SQL), ("skus", SKUS_SQL), ("memberships", MEMBERSHIPS_SQL),
-    ("group_sizes", GROUP_SIZES_SQL), ("seeds", SEEDS_SQL), ("proposals", PROPOSALS_SQL))
+    ("group_sizes", GROUP_SIZES_SQL), ("seeds", SEEDS_SQL), ("proposals", PROPOSALS_SQL),
+    ("gtin_rows", GTIN_ROWS_SQL))
 
 
 def _line(section: str, **fields: Any) -> Dict[str, Any]:
     return {"census": CENSUS, "section": section, **fields}
 
 
+def _phase1(brands: Sequence[str]) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Any, ...]]:
+    """The phase-1 statements and their parameters after $1 (the market)."""
+    regex = brand_sql_regex(brands) if brands else None
+    return (PHASE1_BRANDS, (regex,)) if regex else (PHASE1, ())
+
+
 def _phase2_params(name: str, cks: List[str], rows: List[Dict[str, Any]],
-                   memberships: List[Dict[str, Any]]) -> Tuple[Any, ...]:
+                   memberships: List[Dict[str, Any]], gtins: Sequence[str] = ()) -> Tuple[Any, ...]:
     pks = sorted({str(r["product_key"]) for r in rows})
     if name == "rows":
         return (cks,)
@@ -192,6 +228,8 @@ def _phase2_params(name: str, cks: List[str], rows: List[Dict[str, Any]],
                 sorted({str(r["source_product_id"]) for r in rows if r.get("source_product_id")}))
     if name == "proposals":
         return (STRATEGY, list(LIVE_PROPOSAL_STATUSES), cks)
+    if name == "gtin_rows":
+        return (sorted(gtins),)
     raise KeyError(name)
 
 
@@ -200,20 +238,22 @@ async def export_snapshot(conn: Any, market: str, *, brands: Sequence[str] = (),
     """The only read: ONE read-only transaction, statement_timeout 60s. Phase 1 reads the market's
     candidates (brand-filtered in SQL); Python computes the groups this run judges (Planner.scope);
     phase 2 reads the details for those content_keys only."""
-    patterns = brand_sql_patterns(brands) if brands else None
+    phase1, extra = _phase1(brands)
     async with conn.transaction(readonly=True):
         await conn.execute("SET LOCAL statement_timeout = '60s'")
-        products = [dict(r) for r in await conn.fetch(PRODUCTS_SQL, market, patterns)]
-        hosts = [dict(r) for r in await conn.fetch(HOSTS_SQL, market, patterns)]
-        _pks, cks = Planner(Snapshot(products=products, offers=[], skus=[], ck_rows={}, memberships={},
-                                     group_sizes={}, hosts=hosts), market,
-                            brands=brands, limit_groups=limit_groups).scope()
+        products = [dict(r) for r in await conn.fetch(phase1[0][1], market, *extra)]
+        hosts = [dict(r) for r in await conn.fetch(phase1[1][1], market, *extra)]
+        pks, cks = Planner(Snapshot(products=products, offers=[], skus=[], ck_rows={}, memberships={},
+                                    group_sizes={}, hosts=hosts), market,
+                           brands=brands, limit_groups=limit_groups).scope()
+        in_scope = set(pks)
+        gtins = gtin_lookup_values(p.get("gtin") for p in products if str(p["product_key"]) in in_scope)
         got: Dict[str, List[Dict[str, Any]]] = {"rows": [], "memberships": []}
         for name, sql in PHASE2:
             if not cks:
                 got[name] = []
                 continue
-            params = _phase2_params(name, cks, got["rows"], got["memberships"])
+            params = _phase2_params(name, cks, got["rows"], got["memberships"], gtins)
             got[name] = [dict(r) for r in await conn.fetch(sql, *params)]
     ck_rows: Dict[str, List[Dict[str, Any]]] = {}
     for r in got["rows"]:
@@ -223,7 +263,7 @@ async def export_snapshot(conn: Any, market: str, *, brands: Sequence[str] = (),
     group_sizes = {r["product_group_id"]: int(r["n"]) for r in got["group_sizes"]}
     snap = Snapshot(products=products, hosts=hosts, offers=got["offers"], skus=got["skus"], ck_rows=ck_rows,
                     memberships=memberships, group_sizes=group_sizes, seeds=got["seeds"],
-                    proposals=got["proposals"])
+                    proposals=got["proposals"], gtin_rows=got["gtin_rows"])
     counts = {"products": len(products), "candidate_content_keys": len(cks),
               **{k: len(v) for k, v in got.items()}}
     return snap, counts
@@ -232,7 +272,7 @@ async def export_snapshot(conn: Any, market: str, *, brands: Sequence[str] = (),
 async def explain(conn: Any, market: str, brands: Sequence[str]) -> List[Dict[str, Any]]:
     """EXPLAIN (no ANALYZE: nothing is executed) of every statement, for review before the timed
     run. Phase-2 statements are planned with 500 placeholder keys."""
-    patterns = brand_sql_patterns(brands) if brands else None
+    phase1, extra = _phase1(brands)
     keys = [f"ck_explain_{i}" for i in range(500)]
     fake_rows = [{"product_key": f"pk_{i}", "merchant_id": "m", "platform": "p", "source_product_id": f"s{i}",
                   "source_ref": f"r{i}"} for i in range(500)]
@@ -240,11 +280,11 @@ async def explain(conn: Any, market: str, brands: Sequence[str]) -> List[Dict[st
     out = []
     async with conn.transaction(readonly=True):
         await conn.execute("SET LOCAL statement_timeout = '60s'")
-        for name, sql in PHASE1:
-            plan = [r[0] for r in await conn.fetch("EXPLAIN " + sql, market, patterns)]
+        for name, sql in phase1:
+            plan = [r[0] for r in await conn.fetch("EXPLAIN " + sql, market, *extra)]
             out.append(_line("explain", statement=name, plan=plan))
         for name, sql in PHASE2:
-            params = _phase2_params(name, keys, fake_rows, fake_members)
+            params = _phase2_params(name, keys, fake_rows, fake_members, [f"{i:014d}" for i in range(500)])
             plan = [r[0] for r in await conn.fetch("EXPLAIN " + sql, *params)]
             out.append(_line("explain", statement=name, plan=plan))
     return out

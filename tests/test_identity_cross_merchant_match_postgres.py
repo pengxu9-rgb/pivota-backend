@@ -301,8 +301,12 @@ async def test_the_brand_filter_and_phase_two_read_only_the_candidate_keys(conn,
     await _product(conn, "ext:retailer:" + "9" * 32, merchant="m_other", title="Snail Mucin Essence 100ml",
                    brand="COSRX", ck="ck_cosrx")
     await _offer(conn, "ext:retailer:" + "9" * 32, "o_cosrx", merchant="m_other", price=20, host="c.example")
+    # M1: a COSRX row carrying the anchor's GTIN is read in phase 2 although the run is Laneige-only
+    await conn.execute("UPDATE catalog_products SET gtin = '8809643066389' WHERE product_key = ANY($1::text[])",
+                       [ANCHOR, "ext:retailer:" + "9" * 32])
     snap, counts = await script.export_snapshot(conn, "US", brands=["Laneige"])
     assert {p["brand"] for p in snap.products} == {"Laneige", "LANEIGE"}       # COSRX filtered in SQL
+    assert {r["product_key"] for r in snap.gtin_rows} == {ANCHOR, "ext:retailer:" + "9" * 32}
     assert "ck_cosrx" not in snap.ck_rows and counts["candidate_content_keys"] == len(snap.ck_rows)
     assert {o["market"] for o in snap.offers} == {"US", "SG"}                  # every market, candidate keys only
     none, counts = await script.export_snapshot(conn, "US", brands=["Nobrand Cosmetics Example"])

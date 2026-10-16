@@ -220,7 +220,7 @@ def test_without_a_brand_store_the_oldest_listing_is_the_anchor():
 def test_t0b_proves_the_size_from_variants_when_the_title_has_none():
     cat = Cat()
     brand_store(cat, LANEIGE, "LANEIGE", "Lip Sleeping Mask")
-    cat.sku(LANEIGE, "20g")
+    cat.offers[-1]["sku_title"] = "20g"  # the brand's own variant states the size
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask", sku="20 g")
     plan = cat.plan()
     assert proposed_keys(plan) == [r] and plan.proposals[0]["evidence"]["tier"] == "T0b"
@@ -348,7 +348,7 @@ def test_judge_vetoes_conflicts_and_shade_directly():
     li = p.by_pk[b]
     li.sig.tc = type(li.sig.tc)(**{**li.sig.tc.__dict__, "conflicts": li.sig.tc.conflicts | {"plus"}})
     v = p.judge(li, p.by_pk[a])
-    assert v.status == "vetoed" and v.reasons == ["conflict:plus"]
+    assert v.status == "vetoed" and v.reasons[0] == "conflict:plus"
     v = p.judge(p.by_pk[c], p.by_pk[d])
     assert v.status in ("vetoed", "held") and v.status != "pass"
 
@@ -364,7 +364,7 @@ def test_a_conflict_token_vetoed_listing_is_reported_against_the_anchor():
 def test_a_title_size_other_than_the_anchors_vetoes():
     cat = Cat()
     brand_store(cat, LANEIGE, "LANEIGE", "Lip Sleeping Mask")  # T0b on the bare title
-    cat.sku(LANEIGE, "20g")
+    cat.offers[-1]["sku_title"] = "20g"
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask", sku="8g")
     p = Planner(cat.snapshot(), "US")
     li = p.by_pk[r]
@@ -1137,23 +1137,27 @@ def test_mirrored_constants_match_their_sources():
     assert MIRROR_OFFER_ID_PREFIX == OFFER_ID_PREFIX and derive_mirror_offer_id("x").startswith(MIRROR_OFFER_ID_PREFIX)
 
 
-def test_brand_sql_patterns_select_a_superset_of_every_spelling():
+def test_brand_sql_regex_selects_a_superset_of_every_spelling_with_indexable_tokens():
     import re as _re
 
-    from services.identity_cross_merchant_match import brand_sql_patterns
-    from services.product_match_normalizer import canonical_brand
+    from services.identity_cross_merchant_match import brand_sql_regex
 
-    pats = brand_sql_patterns(["Dior", "Lancôme", "Dr.Jart+"])
+    rx = brand_sql_regex(["Dior", "Lancôme", "Dr.Jart+", "Beauty of Joseon", "Round Lab", "SK-II"])
+    for raw in ["Christian Dior", "DIOR", "Lancôme", "Lancome", "Dr. Jart+", "Dr.Jart+", "DR.JART",
+                "Beauty of Joseon", "BEAUTY OF JOSEON", "Round Lab", "ROUNDLAB", "SK-II"]:
+        assert _re.search(rx, raw.lower()), raw          # lower(coalesce(brand, '')) ~ $2
+    assert not _re.search(rx, "laneige") and not _re.search(rx, "cosrx")
+    tokens = rx.strip("()").split("|")
+    assert all(len(t.replace("\\", "")) >= 3 for t in tokens)  # every alternative has a trigram
+    assert brand_sql_regex([]) is None and brand_sql_regex(["Generic"]) is None
 
-    def sql_key(b):
-        return _re.sub(r"[^\w]+|_", "", b.lower())
 
-    def like(text, pat):
-        return _re.fullmatch(pat.replace("%", ".*"), text) is not None
+def test_gtin_lookup_values_cover_every_stored_spelling():
+    from services.identity_cross_merchant_match import gtin_lookup_values
 
-    for b in ["Christian Dior", "DIOR", "Lancôme", "Lancome", "Dr. Jart+", "Dr.Jart+", "DR.JART"]:
-        assert any(like(sql_key(b), p) for p in pats), b
-    assert canonical_brand("Christian Dior") == "dior"
+    vals = gtin_lookup_values(["8809643066389", "0 885190 832395", "bad", None])
+    assert {"8809643066389", "08809643066389"} <= set(vals)
+    assert gtin_lookup_values(["012345678905"]) == sorted({"012345678905", "0012345678905", "00012345678905"})
 
 
 
@@ -1279,3 +1283,156 @@ async def test_the_writer_names_itself_as_the_module_writer(monkeypatch):
     monkeypatch.setattr(engine, "upsert_proposals", upsert)
     out = await script.write_proposals(Conn(), plan, expect_digest=plan.digest(), max_proposals=100)
     assert out["inserted"] == len(plan.proposals) and seen and set(seen) == {STRATEGY}
+
+
+# --- controller review of a5a714f4f: H1-H3, M1, L1, variant-id spelling --------------------------------------
+
+
+@pytest.mark.parametrize("a,b", [
+    (("La Roche-Posay", "Effaclar Duo+M 40ml"), ("La Roche-Posay", "Effaclar Duo M 40ml")),
+    (("Hydra", "Cream+Serum 50ml"), ("Hydra", "Cream Serum 50ml")),
+])
+@pytest.mark.parametrize("flip", [False, True])
+def test_h1_duo_plus_m_and_cream_plus_serum_never_propose(a, b, flip):
+    if flip:
+        a, b = b, a
+    cat = Cat()
+    brand_store(cat, "ext:brand::anchor", a[0], a[1])
+    retailer(cat, 1, b[0], b[1])
+    assert cat.plan().proposals == []
+
+
+def _hydra_keeper(cat: Cat, variants: List[tuple]) -> None:
+    cat.row(HYDRA, brand="Hydra", title="Hydra Cream 50ml", seed_kind="self", created="2026-01-01")
+    for sku, price in variants:
+        cat.offer(HYDRA, sku=sku, price=price, brand_direct=True)
+
+
+@pytest.mark.parametrize("keeper_variants", [[("Jar 50ml", 24), ("Refill", 14)], [("Jar 50ml", 24), ("Refill 50ml", 14)]])
+def test_h2_a_keeper_selling_a_jar_and_a_refill_defers_both_retailers(keeper_variants):
+    cat = Cat()
+    _hydra_keeper(cat, keeper_variants)
+    refill = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku="Refill 50ml", price=14, host="r1.example")
+    jar = retailer(cat, 2, "Hydra", "Hydra Cream 50ml", sku="50ml", price=24, host="r2.example")
+    plan = cat.plan()
+    assert plan.proposals == []
+    for key in (refill, jar):
+        assert outcome(plan, key)["status"] == "deferred" and outcome(plan, key)["reason"] == "anchor_unit_conflict"
+
+
+@pytest.mark.parametrize("keeper_sku,listing_sku,proposes", [
+    ("Jar 50ml", "Refill 50ml", False),     # a refill is not the keeper's jar
+    ("Refill 50ml", "50ml", False),         # nor the reverse
+    ("Jar 50ml", "50ml", True),
+    ("Refill 50ml", "Refill 50ml", True),
+])
+def test_h2_units_compare_word_for_word(keeper_sku, listing_sku, proposes):
+    cat = Cat()
+    _hydra_keeper(cat, [(keeper_sku, 24)])
+    r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku=listing_sku, price=24)
+    plan = cat.plan()
+    if proposes:
+        assert proposed_keys(plan) == [r]
+    else:
+        assert plan.proposals == [] and outcome(plan, r)["reason"] == "offer_conflict:refill"
+
+
+def test_keeper_price_offers_are_exactly_the_matched_size_and_words():
+    cat = Cat()
+    _hydra_keeper(cat, [("Jar 50ml", 24)])
+    retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku="50ml")
+    p = Planner(cat.snapshot(), "US")
+    anchor = p.by_pk[HYDRA]
+    words = frozenset(anchor.sig.tc.conflicts)
+    assert len(p.keeper_price_offers(anchor, (50.0, "ml", 1), words)) == 1
+    assert p.keeper_price_offers(anchor, (30.0, "ml", 1), words) == []          # another size
+    assert p.keeper_price_offers(anchor, (50.0, "ml", 1), words | {"refill"}) == []  # other words
+    assert p.keeper_price_offers(anchor, (50.0, "ml", 1), words, "SG") == []     # another market
+
+
+def test_h3_matched_seeds_exclude_refill_tester_and_mini_seeds():
+    cat = Cat()
+    _hydra_keeper(cat, [("Jar 50ml", 24)])
+    r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku="50ml")
+    cat.seed("seed_multi", attached=HYDRA, title="Hydra Cream 50ml",
+             variants=[{"variant_id": "v1", "title": "50ml"}, {"variant_id": "v2", "title": "Refill 50ml"},
+                       {"variant_id": "v3", "title": "Tester 50ml"}])
+    cat.seed("seed_single_refill", attached=HYDRA, title="Hydra Cream 50ml", variants=[{"variant_id": "r", "title": "Refill"}])
+    cat.seed("seed_single_noop", attached=r, title="Hydra Cream 50ml Mini", variants=[{"variant_id": "d", "title": "Default Title"}])
+    cat.seed("seed_single_ok", attached=r, title="Hydra Cream 50ml", variants=[{"variant_id": "k", "title": "50ml"}])
+    seeds = cat.plan().proposals[0]["evidence"]["matcher_verdict"]["matched_seeds"]
+    assert seeds == [{"seed_id": "seed_multi", "variant_id": "v1"}, {"seed_id": "seed_single_ok", "variant_id": None}]
+
+
+def test_seed_sizes_must_be_exactly_the_verdict_size():
+    from services.identity_cross_merchant_match import seed_matches
+
+    size = (20.0, "g", 1)
+    assert seed_matches({"id": "a", "seed_variants": [{"id": "x", "title": "20g / 8g"}]}, size) == []
+    assert seed_matches({"id": "b", "seed_variants": [{"id": "x", "title": "20g / 8g"},
+                                                      {"id": "y", "title": "8g"}]}, size) == []
+    assert seed_matches({"id": "c", "seed_variants": [{"id": "x", "title": "20g"}]}, size) == [
+        {"seed_id": "c", "variant_id": None}]
+
+
+@pytest.mark.parametrize("variant", [{"variantId": "VID-7", "title": "20g"}, {"id": "ID-7", "title": "20g"},
+                                     {"sku": "SKU-7", "id": "ignored", "title": "20g"},
+                                     {"variant_id": " v-7 ", "variantId": "other", "title": "20g"}])
+def test_variant_id_is_spelled_as_the_seed_reader_resolves_it(variant):
+    from routes.agent_shop_gateway import _seed_offer_variant_id
+    from services.identity_cross_merchant_match import seed_matches, seed_variant_id
+
+    assert seed_variant_id(variant) == _seed_offer_variant_id(variant)
+    seed = {"id": "s", "seed_variants": [variant, {"variant_id": "other-size", "title": "8g"}]}
+    assert seed_matches(seed, (20.0, "g", 1)) == [{"seed_id": "s", "variant_id": _seed_offer_variant_id(variant)}]
+
+
+def _gtin_case(scoped: bool, with_gtin_rows: bool) -> str:
+    g = "8809643066389"
+    cat = Cat()
+    brand_store(cat, LANEIGE, "LANEIGE", "Lip Sleeping Mask 20g", gtin=g)
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", gtin=g)
+    other = []
+    for n, title in ((0xee, "Moisture Cream 50ml"), (0xef, "Body Lotion 200ml")):  # one seller reuses the GTIN
+        key = "ext:retailer:" + f"{n:02x}" * 16
+        other.append({"product_key": key, "merchant_id": "m_reuse", "source_domain": "reuse.example",
+                      "brand": "Othermaker", "title": title, "gtin": g, "content_key": "ck_" + str(n)})
+        if not scoped:
+            cat.row(key, brand="Othermaker", title=title, gtin=g, merchant="m_reuse")
+            cat.offer(key, host="reuse.example")
+    snap = cat.snapshot()
+    if with_gtin_rows:
+        snap.gtin_rows = other
+    return plan_market(snap, "US").proposals[0]["evidence"]["tier"]
+
+
+def test_m1_a_brand_scoped_run_and_a_full_run_agree_on_the_tier():
+    full = _gtin_case(scoped=False, with_gtin_rows=True)
+    assert full == "T0b"                                         # the GTIN is polluted: not T0a
+    assert _gtin_case(scoped=True, with_gtin_rows=True) == full  # phase 2 reads every row with the GTIN
+    assert _gtin_case(scoped=True, with_gtin_rows=False) == "T0a"  # what reading only the brand gave
+
+
+def test_l1_the_price_window_runs_per_market():
+    cat = laneige_catalog()
+    cat.offer(LANEIGE, sku="Default Title", market="SG", currency="SGD", price=32, brand_direct=True,
+              sku_key=cat.offers[0]["sku_key"])  # the same SKU, sold in SG too
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.offer(r, sku="20g", market="SG", currency="SGD", price=90)        # 2.8x the keeper's SG price
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "price_ratio"
+    cat2 = laneige_catalog()
+    s_ = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat2.offer(s_, sku="20g", market="GB", currency="GBP", price=90)      # the keeper sells nothing in GB
+    plan2 = cat2.plan()
+    assert proposed_keys(plan2) == [s_]
+    gb = plan2.proposals[0]["evidence"]["listings"][0]["price"]["by_market"]["GB"]
+    assert gb["skipped"] == "keeper_has_no_same_size_offer_here"
+
+
+def test_h2_a_keeper_unit_of_unknown_size_defers_even_with_the_same_words():
+    cat = Cat()
+    _hydra_keeper(cat, [("Jar 50ml", 24), ("Berry", 24)])  # which size is "Berry"?
+    r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku="50ml", price=24)
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "anchor_unit_conflict"

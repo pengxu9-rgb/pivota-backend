@@ -144,7 +144,7 @@ HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match"
                 "pending_or_applied_conflict", "price_unknown", "price_currency_mismatch",
                 "key_shared_with_unmatched", "unguarded_writer", "no_group_membership",
                 "old_group_has_other_members", "no_content_key", "old_content_key_not_read")
-DEFERRED_REASONS = ("anchor_multi_size", "anchor_size_unknown")
+DEFERRED_REASONS = ("anchor_multi_size", "anchor_size_unknown", "anchor_unit_conflict")
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +303,9 @@ class Snapshot:
                external_product_id, title, seed_variants = seed_data.variants, the MAIN list only).
     proposals: this strategy's proposed / approved / applied proposals, every market (proposal_id,
                status, kind, content_key, keeper_product_key, evidence).
+    gtin_rows: EVERY live row, any brand, any market, carrying one of the candidates' GTINs
+               (product_key, merchant_id, source_domain, brand, title, gtin, content_key): GTIN
+               pollution is computed over these too, so a brand-scoped run and a full run agree.
     """
 
     products: Sequence[Mapping[str, Any]]
@@ -314,6 +317,7 @@ class Snapshot:
     seeds: Sequence[Mapping[str, Any]] = ()
     proposals: Sequence[Mapping[str, Any]] = ()
     hosts: Sequence[Mapping[str, Any]] = ()
+    gtin_rows: Sequence[Mapping[str, Any]] = ()
 
 
 @dataclass
@@ -365,25 +369,47 @@ def _seed_variant_sizes(variant: Mapping[str, Any]) -> Set[SizeKey]:
     return _texts_sizes(_variant_texts(*(variant.get(f) for f in SEED_VARIANT_SIZE_FIELDS)))
 
 
-def seed_matches(seed: Mapping[str, Any], size: SizeKey) -> List[Dict[str, Any]]:
-    """matched_seeds entries for one seed at the verdict size. `variant_id: null` ONLY for a seed with
-    EXACTLY ONE variant whose own size (the variant's, else the seed title's) is exactly `size`. A
-    multi-variant seed names each variant (its variant_id, else id) whose size is exactly `size`, and
-    is otherwise not listed. A seed with no variants, of another size, or whose size cannot be read is
-    never listed."""
+def seed_variant_id(variant: Mapping[str, Any]) -> str:
+    """The id the seed lane's READER resolves for a variant -- routes/agent_shop_gateway.
+    _seed_offer_variant_id's chain, spelled exactly as it returns it (variant_id | variantId | sku |
+    sku_id | id, stripped). Mirrored here (that module is the HTTP router); a test pins the two."""
+    raw = (variant.get("variant_id") or variant.get("variantId") or variant.get("sku")
+           or variant.get("sku_id") or variant.get("id") or "")
+    return str(raw).strip()
+
+
+def _seed_variant_conflicts(seed: Mapping[str, Any], variant: Mapping[str, Any], brand: Any) -> FrozenSet[str]:
+    texts = _variant_texts(*(variant.get(f) for f in SEED_VARIANT_SIZE_FIELDS))
+    return _texts_conflicts(texts, brand) | _texts_conflicts(_variant_texts(seed.get("title")), brand)
+
+
+def seed_matches(seed: Mapping[str, Any], size: SizeKey, conflicts: FrozenSet[str] = frozenset(),
+                 brand: Any = None) -> List[Dict[str, Any]]:
+    """matched_seeds entries for one seed at the verdict size and the matched unit's conflict words.
+
+    A seed or variant is listed ONLY when its own size is exactly `size` AND its conflict words (the
+    variant's text plus the seed title, the MAIN variant list only) EQUAL `conflicts` -- a "Refill",
+    "Tester" or "Mini" seed is never the matched item. `variant_id: null` ONLY for a seed with EXACTLY
+    ONE variant (its size: the variant's, else the seed title's). A multi-variant seed names each such
+    variant by seed_variant_id (the reader's own spelling) and is otherwise not listed. A seed with no variants, of another
+    size, or whose size cannot be read is never listed."""
     seed_id = str(seed.get("id") or "")
     if not seed_id:
         return []
     variants = _seed_variants(seed)
     if len(variants) == 1:
         sizes = _seed_variant_sizes(variants[0]) or text_sizes(seed.get("title"))
-        return [{"seed_id": seed_id, "variant_id": None}] if sizes == {size} else []
+        if sizes == {size} and _seed_variant_conflicts(seed, variants[0], brand) == conflicts:
+            return [{"seed_id": seed_id, "variant_id": None}]
+        return []
     out = []
     for v in variants:
-        vid = v.get("variant_id") if v.get("variant_id") not in (None, "") else v.get("id")
-        if vid in (None, "") or _seed_variant_sizes(v) != {size}:
+        vid = seed_variant_id(v)
+        if not vid or _seed_variant_sizes(v) != {size}:
             continue
-        out.append({"seed_id": seed_id, "variant_id": str(vid)})
+        if _seed_variant_conflicts(seed, v, brand) != conflicts:
+            continue
+        out.append({"seed_id": seed_id, "variant_id": vid})
     return out
 
 
@@ -401,6 +427,7 @@ class Verdict:
     matched_offers: List[Dict[str, Any]] = field(default_factory=list)
     price: Dict[str, Any] = field(default_factory=dict)
     mirror_clear: bool = False
+    words: FrozenSet[str] = frozenset()
 
 
 def _side_price(offers: Iterable[Offer]) -> Tuple[Optional[float], str, str]:
@@ -470,7 +497,9 @@ class Planner:
                                                         brand_direct[str(p["product_key"])], ()), row=p)
                              for p in snap.products if str(p["product_key"]) in has_market]
         self.by_pk: Dict[str, Listing] = {li.product_key: li for li in self.all_listings}
-        self.pollution = gtin_pollution(li.sig for li in self.all_listings)
+        extra_gtin_rows = [ListingSignals(r, set(), False, ()) for r in snap.gtin_rows
+                           if str(r["product_key"]) not in self.by_pk]
+        self.pollution = gtin_pollution([*(li.sig for li in self.all_listings), *extra_gtin_rows])
         for li in self.all_listings:
             li.keys = tier_keys(li.sig, self.pollution.polluted)
         wanted = {canonical_brand(b) for b in brands or ()} - {""}
@@ -538,11 +567,12 @@ class Planner:
             return "pending_or_applied_conflict"  # others were proposed onto the key this would vacate
         return None
 
-    def matched_seeds(self, pks: Iterable[str], size: SizeKey) -> List[Dict[str, Any]]:
+    def matched_seeds(self, pks: Iterable[str], size: SizeKey, conflicts: FrozenSet[str] = frozenset(),
+                      brand: Any = None) -> List[Dict[str, Any]]:
         out: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for pk in pks:
             for seed in self.seeds_by_pk.get(pk, ()):
-                for m in seed_matches(seed, size):
+                for m in seed_matches(seed, size, conflicts, brand):
                     out[(m["seed_id"], m["variant_id"] or "")] = m
         return [out[k] for k in sorted(out)]
 
@@ -600,16 +630,26 @@ class Planner:
         out |= {s for u in self.units(pk) for s in u.stated}
         return out
 
+    def unit_words(self, li: Listing, u: Unit) -> FrozenSet[str]:
+        """A unit's conflict words: its own variant text's plus its row title's."""
+        return frozenset(u.conflicts) | frozenset(li.sig.tc.conflicts)
+
     def anchor_size(self, anchor: Listing) -> Tuple[Optional[SizeKey], Optional[str], FrozenSet[str]]:
-        """(size, None) or (None, deferral reason), and the anchor's conflict tokens (its title and the
-        keeper's own variants). The KEEPER ROW must state exactly one size; every row on the key, in
-        every market, states that size or none; a PRICED row stating none is unknown."""
+        """(size, None, the keeper unit's conflict words) or (None, deferral reason, ...).
+
+        The KEEPER ROW must state exactly one size; every row on the key, in every market, states that
+        size or none; a PRICED row stating none is unknown. Then UNIT TO UNIT: every unit of the keeper
+        must be at that size (a keeper unit of unknown size -- "Refill" with no size beside "Jar 50ml" --
+        defers) and carry the SAME conflict words; keeper units at the size with different words (a
+        jar and a refill) defer too (`anchor_unit_conflict`). Those words are what a listing's units
+        must equal."""
         ck = anchor.content_key or ""
         cache_key = (ck, anchor.product_key)
         if cache_key in self._anchor:
             return self._anchor[cache_key]
-        tokens = frozenset(anchor.sig.tc.conflicts) | frozenset(
-            t for u in self.units(anchor.product_key) for t in u.conflicts)
+        keeper_units = self.units(anchor.product_key)
+        word_sets = {self.unit_words(anchor, u) for u in keeper_units}
+        tokens = next(iter(word_sets)) if len(word_sets) == 1 else frozenset(anchor.sig.tc.conflicts)
         keeper = self.row_stated_sizes(anchor.product_key)
         result: Tuple[Optional[SizeKey], Optional[str], FrozenSet[str]]
         if not keeper:
@@ -626,6 +666,8 @@ class Planner:
                 if not stated and any(o.price is not None for o in self.offers_by_pk.get(pk, ())):
                     result = (None, "anchor_size_unknown", tokens)
                     break
+            if result[1] is None and (any(u.size != size for u in keeper_units) or len(word_sets) > 1):
+                result = (None, "anchor_unit_conflict", tokens)
         self._anchor[cache_key] = result
         return result
 
@@ -639,11 +681,14 @@ class Planner:
         rows = self.ck_members.get(from_ck)
         return bool(rows) and all(self.row_single_size(pk, size) for pk in rows)
 
-    def keeper_price_offers(self, anchor: Listing, size: SizeKey) -> List[Offer]:
-        """The keeper row's own offers in the market at `size` (the keeper states only `size`, so a unit
-        of no stated size is that size too)."""
-        return [o for u in self.units(anchor.product_key) if u.size in (size, None)
-                for o in u.offers if o.market == self.market]
+    def keeper_price_offers(self, anchor: Listing, size: SizeKey, words: FrozenSet[str],
+                            market: Optional[str] = None) -> List[Offer]:
+        """The keeper row's own offers in `market` (default: the run's) on units EXACTLY at `size` with
+        EXACTLY the matched conflict words -- never a unit of unknown size, never a refill or a tester."""
+        market = market or self.market
+        return [o for u in self.units(anchor.product_key)
+                if u.size == size and self.unit_words(anchor, u) == words
+                for o in u.offers if o.market == market]
 
     # -- the judgement ------------------------------------------------------------------------------
     def judge(self, li: Listing, anchor: Listing) -> Verdict:
@@ -656,12 +701,16 @@ class Planner:
         if (ga and gb and ga != gb and not li.sig.gtin_restriction and not anchor.sig.gtin_restriction
                 and ga not in polluted and gb not in polluted):
             vetoes.append("gtin_differs")
-        anchor_size, deferral, anchor_tokens = self.anchor_size(anchor)
+        anchor_size, deferral, keeper_words = self.anchor_size(anchor)
         if li.sig.size_key is not None and anchor_size is not None and li.sig.size_key != anchor_size:
             vetoes.append("size")
         units = self.units(li.product_key)
-        extra = sorted({t for u in units for t in u.conflicts} - anchor_tokens - set(li.sig.tc.conflicts))
-        vetoes += [f"offer_conflict:{t}" for t in extra]
+        # UNIT TO UNIT: each of the listing's units (its variant text plus its title) must carry exactly
+        # the keeper unit's conflict words -- a "Refill" variant is not the keeper's jar, nor the reverse.
+        # (Only against a decided anchor: one whose own units disagree defers every listing instead.)
+        if deferral is None:
+            extra = sorted({t for u in units for t in (self.unit_words(li, u) ^ keeper_words)})
+            vetoes += [f"offer_conflict:{t}" for t in extra]
         if vetoes:
             return Verdict("vetoed", vetoes, tiers_matched=matched)
         if (self.row_has_fraction_count(li.product_key) or self.row_has_fraction_count(anchor.product_key)
@@ -683,22 +732,35 @@ class Planner:
             mirror_clear = any(o.price is not None and o.market == self.market
                                for u in units if u.product_level and u.size == anchor_size for o in u.offers)
             return Verdict("held", ["offer_not_variant_pinned"], mirror_clear=mirror_clear, **held)
-        lp, lc, lbasis = _side_price(variant_market)
-        ap, ac, abasis = _side_price(self.keeper_price_offers(anchor, anchor_size))
-        price = {"listing": lp, "anchor": ap, "listing_currency": lc, "anchor_currency": ac,
-                 "listing_basis": lbasis, "anchor_basis": abasis, "ratio": None}
-        if lp is None or ap is None:
-            return Verdict("held", ["price_unknown"], price=price, **held)
-        if lc != ac:
-            return Verdict("held", ["price_currency_mismatch"], price=price, **held)
-        ratio = round(lp / ap, 4)
-        price["ratio"] = ratio
-        if not (PRICE_RATIO_MIN < ratio < PRICE_RATIO_MAX):
-            return Verdict("vetoed", ["price_ratio"], price=price, **held)
+        # The price window, PER MARKET: each market's matched offers against the keeper's same-market,
+        # same-size, same-words unit. The run's market must have both sides; another market where the
+        # keeper sells nothing at that size is skipped, and recorded.
+        by_market: Dict[str, Dict[str, Any]] = {}
+        price: Dict[str, Any] = {}
+        for mkt in sorted({o.market for o in variant_all} | {self.market}):
+            lp, lc, lbasis = _side_price(o for o in variant_all if o.market == mkt)
+            ap, ac, abasis = _side_price(self.keeper_price_offers(anchor, anchor_size, keeper_words, mkt))
+            entry = {"listing": lp, "anchor": ap, "listing_currency": lc, "anchor_currency": ac,
+                     "listing_basis": lbasis, "anchor_basis": abasis, "ratio": None}
+            by_market[mkt] = entry
+            if mkt == self.market:
+                price = entry
+            if lp is None or ap is None:
+                if mkt == self.market:
+                    return Verdict("held", ["price_unknown"], price={**price, "by_market": by_market}, **held)
+                entry["skipped"] = "keeper_has_no_same_size_offer_here" if ap is None else "no_listing_price_here"
+                continue
+            if lc != ac:
+                return Verdict("held", ["price_currency_mismatch"], price={**price, "by_market": by_market}, **held)
+            entry["ratio"] = round(lp / ap, 4)
+            if not (PRICE_RATIO_MIN < entry["ratio"] < PRICE_RATIO_MAX):
+                return Verdict("vetoed", ["price_ratio"], price={**price, "by_market": by_market}, **held)
+        price = {**price, "by_market": by_market}
         offers = [{"offer_id": o.offer_id, "sku_key": o.sku_key, "price": o.price, "currency": o.currency,
                    "size": _size_json(anchor_size), "market": o.market} for o in variant_all]
         return Verdict("pass", [], tier=matched[0], tiers_matched=matched, anchor_size=anchor_size,
-                       price=price, matched_offers=sorted(offers, key=lambda m: m["offer_id"]))
+                       price=price, matched_offers=sorted(offers, key=lambda m: m["offer_id"]),
+                       words=keeper_words)
 
     # -- components (star groups) ---------------------------------------------------------------
     def components(self) -> List[List[Listing]]:
@@ -1020,7 +1082,9 @@ class Plan:
         single = planner.from_key_single_size(m["from_ck"], size)
         mv = matcher_verdict(tier=tier, size=size, matched_offers=matched_offers,
                              matched_seeds=planner.matched_seeds([*(li.product_key for li in rows),
-                                                                  anchor.product_key], size),
+                                                                  anchor.product_key], size,
+                                                                 verdicts[rows[0].product_key].words,
+                                                                 anchor.sig.brand),
                              merge=merge, from_key_single_size=single)
         anchor_hosts = sorted({h for r in planner.by_ck.get(anchor.content_key or "", ()) for h in r.sig.hosts})
         row_detail = []
@@ -1177,27 +1241,47 @@ def plan_market(snap: Snapshot, market: str, *, brands: Optional[Sequence[str]] 
     return Planner(snap, market, brands=brands, limit_groups=limit_groups).plan()
 
 
-def brand_sql_patterns(brands: Sequence[str]) -> List[str]:
-    """LIKE patterns over regexp_replace(lower(brand), '[^[:alnum:]]+', '', 'g') that select a SUPERSET
-    of the rows whose canonical_brand is one of `brands` (every measured spelling of each family, the
-    accent-folded and unfolded keys); the exact canonical_brand filter then runs in Python."""
-    from services.brand_spelling import RETAILER_BRAND_SPELLINGS, brand_key
+def gtin_lookup_values(raw_gtins: Iterable[Any]) -> List[str]:
+    """Every stored spelling of the candidates' valid GTINs (14 digits and its 13/12/8-digit forms) for
+    an equality lookup on catalog_products.gtin (idx_catalog_products_gtin)."""
+    from services.product_match_normalizer import gtin_canonical
 
-    from services.product_match_normalizer import _fold  # the normalizer's own accent fold
+    out: Set[str] = set()
+    for raw in raw_gtins:
+        g = gtin_canonical(raw)
+        if not g:
+            continue
+        out.add(str(raw).strip())
+        for n in (14, 13, 12, 8):
+            if g[: 14 - n].strip("0") == "":
+                out.add(g[14 - n:])
+    return sorted(out)
+
+
+def brand_sql_regex(brands: Sequence[str]) -> Optional[str]:
+    """A POSIX regex over lower(coalesce(brand, '')) that selects a SUPERSET of the rows whose
+    canonical_brand is one of `brands`: an alternation of literal tokens -- each requested spelling
+    (raw and accent-folded), its words of 3+ characters, its canonical key, and every measured spelling
+    key of its family. Literal tokens of 3+ characters let the trigram GIN index
+    idx_catalog_products_brand_trgm (migration 059, on lower(coalesce(brand, ''))) serve the filter.
+    The exact canonical_brand filter then runs in Python. None for no brands."""
+    from services.brand_spelling import RETAILER_BRAND_SPELLINGS
 
     wanted = {canonical_brand(b) for b in brands} - {""}
-    keys: Set[str] = set(wanted)
-    for spelling, family in RETAILER_BRAND_SPELLINGS.items():
-        if family in wanted:
-            keys.add(spelling)
+    if not wanted:
+        return None
+    tokens: Set[str] = set(wanted)
+    tokens |= {k for k, family in RETAILER_BRAND_SPELLINGS.items() if family in wanted}
     for b in brands:
-        keys.add(brand_key(b))
-        keys.add(brand_key(_fold(b)))
-    return sorted(f"%{k}%" for k in keys if k)
+        for form in (str(b).strip().lower(), _fold(b).strip()):
+            tokens.add(form)
+            tokens |= {w for w in re.split(r"[^\w]+", form) if len(w) >= 3}
+    tokens = {t for t in tokens if len(t) >= 3}
+    return "(" + "|".join(re.escape(t) for t in sorted(tokens)) + ")"
 
 
 __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
-    "Snapshot", "brand_sql_patterns", "evidence_problems", "matcher_verdict", "member_fingerprint",
+    "Snapshot", "brand_sql_regex", "evidence_problems", "matcher_verdict", "member_fingerprint",
     "plan_market", "proposal_set_digest", "seed_matches", "stamp_run",
 ]
