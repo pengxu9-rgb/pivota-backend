@@ -8,7 +8,11 @@ conflict tokens never in the core).
 
 from __future__ import annotations
 
+import json
 import random
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -41,9 +45,9 @@ TITLE_CASES = [
     ("COSRX", "Advanced Snail 96 Mucin Power Essence 3.38 fl.oz / 100ml",
      "snail 96 mucin power essence", {"advanced"}, "", (100, ML, 1)),
     ("COSRX", "Snail 92 All in One Cream 100g",
-     "snail 92 all in one", {"cream"}, "", (100, G, 1)),
+     "snail 92 all in one fmt", {"cream"}, "", (100, G, 1)),
     ("COSRX", "Advanced Snail 92 All in One Cream 3.52 oz / 100g",
-     "snail 92 all in one", {"advanced", "cream"}, "", (100, G, 1)),
+     "snail 92 all in one fmt", {"advanced", "cream"}, "", (100, G, 1)),
     ("COSRX", "Advanced Snail Mucin Power Sheet Mask - 1 ct",
      "snail mucin power sheet mask", {"advanced"}, "", (1, CT, 1)),
     ("COSRX", "Advanced Snail Mucin Power Sheet Mask 10 Sheets",
@@ -51,11 +55,11 @@ TITLE_CASES = [
     ("COSRX", "Acne Pimple Master Patch 24 Patches",
      "acne pimple master patch", set(), "", (24, CT, 1)),
     ("COSRX", "COSRX Low pH Good Morning Gel Cleanser 150ml",
-     "low ph good morning cleanser", {"gel"}, "", (150, ML, 1)),
+     "low ph good morning fmt cleanser", {"gel"}, "", (150, ML, 1)),
     ("COSRX", "The Vitamin C 23 Serum 20g",
      "vitamin c 23 serum", set(), "", (20, G, 1)),
     ("COSRX", "COSRX The Retinol 0.1 Cream 20ml",
-     "retinol 0.1", {"cream"}, "", (20, ML, 1)),
+     "retinol 0.1 fmt", {"cream"}, "", (20, ML, 1)),
     ("COSRX", "Snail Mucin Trial Kit",
      "snail mucin trial", {"set"}, "", None),
     # ---- Beauty of Joseon / Round Lab / Anua / Torriden -------------------------------------
@@ -98,7 +102,7 @@ TITLE_CASES = [
     ("Torriden", "[1+1] DIVE-IN Low Molecular Hyaluronic Acid Serum 50ml",
      "dive in low molecular hyaluronic acid serum", {"multipack"}, "", (50, ML, 2)),
     ("Torriden", "DIVE-IN Low Molecular Hyaluronic Acid Soothing Cream 100ml",
-     "dive in low molecular hyaluronic acid soothing", {"cream"}, "", (100, ML, 1)),
+     "dive in low molecular hyaluronic acid soothing fmt", {"cream"}, "", (100, ML, 1)),
     # ---- other K-beauty ---------------------------------------------------------------------
     ("SKIN1004", "SKIN1004 Madagascar Centella Ampoule 100ml",
      "madagascar centella ampoule", set(), "", (100, ML, 1)),
@@ -120,15 +124,15 @@ TITLE_CASES = [
     ("Sulwhasoo", "First Care Activating Serum VI 90ml",
      "first care activating serum vi", set(), "", (90, ML, 1)),
     ("Sulwhasoo", "Concentrated Ginseng Renewing Cream EX Light 60ml",
-     "concentrated ginseng renewing", {"ex", "cream", "light"}, "", (60, ML, 1)),
+     "concentrated ginseng renewing fmt fmt", {"ex", "cream", "light", "format_order:cream>light"}, "", (60, ML, 1)),
     ("Sulwhasoo", "Concentrated Ginseng Renewing Cream EX Classic 60ml",
-     "concentrated ginseng renewing classic", {"ex", "cream"}, "", (60, ML, 1)),
+     "concentrated ginseng renewing fmt classic", {"ex", "cream"}, "", (60, ML, 1)),
     ("Etude House", "ETUDE SoonJung 2x Barrier Intensive Cream 60ml",
-     "soonjung 2x barrier intensive", {"cream"}, "", (60, ML, 1)),
+     "soonjung 2x barrier intensive fmt", {"cream"}, "", (60, ML, 1)),
     ("Mixsoon", "mixsoon Bean Essence 50ml",
      "bean essence", set(), "", (50, ML, 1)),
     ("Isntree", "Hyaluronic Acid Watery Sun Gel SPF50+ PA++++ 50ml",
-     "hyaluronic acid watery sun", {"gel", "spf50+", "pa++++"}, "", (50, ML, 1)),
+     "hyaluronic acid watery sun fmt", {"gel", "spf50+", "pa++++"}, "", (50, ML, 1)),
     ("Some By Mi", "SOME BY MI AHA BHA PHA 30 Days Miracle Toner 150ml",
      "aha bha pha 30 days miracle toner", set(), "", (150, ML, 1)),
     ("Purito SEOUL", "Purito Centella Unscented Serum 60ml",
@@ -222,23 +226,23 @@ TITLE_CASES = [
     ("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator Duo 2 x 50ml",
      "moisture surge 100h auto replenishing hydrator", {"duo", "multipack"}, "", (50, ML, 2)),
     ("Clinique", "Dramatically Different Moisturizing Gel 125ml",
-     "dramatically different moisturizing", {"gel"}, "", (125, ML, 1)),
+     "dramatically different moisturizing fmt", {"gel"}, "", (125, ML, 1)),
     ("Kiehl's Since 1851", "Kiehl's Ultra Facial Cream 1.7 fl oz / 50 ml",
-     "ultra facial", {"cream"}, "", (50, ML, 1)),
+     "ultra facial fmt", {"cream"}, "", (50, ML, 1)),
     ("Kiehl's", "Ultra Facial Cream 4.2 fl. oz.",
-     "ultra facial", {"cream"}, "", (125, ML, 1)),
+     "ultra facial fmt", {"cream"}, "", (125, ML, 1)),
     ("Kiehl's", "Ultra Facial Cream Jumbo 4.2 oz",
-     "ultra facial", {"cream", "value_size"}, "", (120, G, 1)),
+     "ultra facial fmt", {"cream", "value_size"}, "", (120, G, 1)),
     ("CeraVe", "CeraVe Moisturizing Cream 16 oz",
-     "moisturizing", {"cream"}, "", (454, G, 1)),
+     "moisturizing fmt", {"cream"}, "", (454, G, 1)),
     ("CeraVe", "Moisturizing Cream 19 oz Pack of 2",
-     "moisturizing", {"cream", "multipack"}, "", (539, G, 2)),
+     "moisturizing fmt", {"cream", "multipack"}, "", (539, G, 2)),
     ("La Roche-Posay", "Anthelios Melt-in Milk Sunscreen SPF 100 5 fl oz",
      "anthelios melt in milk sunscreen", {"spf100"}, "", (150, ML, 1)),
     ("La Roche-Posay", "Toleriane Double Repair Face Moisturizer UV SPF 30, 3.4 fl oz",
      "toleriane double repair face moisturizer uv", {"spf30"}, "", (100, ML, 1)),
     ("Drunk Elephant", "Protini Polypeptide Cream Refill 50ml",
-     "protini polypeptide", {"cream", "refill"}, "", (50, ML, 1)),
+     "protini polypeptide fmt", {"cream", "refill"}, "", (50, ML, 1)),
     ("Glow Recipe", "Glow Recipe Watermelon Glow Niacinamide Dew Drops 40ml",
      "watermelon glow niacinamide dew drops", set(), "", (40, ML, 1)),
     ("Glow Recipe", "Watermelon Glow Niacinamide Dew Drops Mini 15ml",
@@ -246,9 +250,9 @@ TITLE_CASES = [
     ("The Ordinary", "The Ordinary Niacinamide 10% + Zinc 1% 30ml",
      "niacinamide 10 zinc 1", set(), "", (30, ML, 1)),
     ("Augustinus Bader", "The Rich Cream 50ml",
-     "", {"rich", "cream"}, "", (50, ML, 1)),
+     "fmt fmt", {"rich", "cream", "format_order:rich>cream"}, "", (50, ML, 1)),
     ("Belif", "belif The True Cream Aqua Bomb 50ml",
-     "true aqua bomb", {"cream"}, "", (50, ML, 1)),
+     "true fmt aqua bomb", {"cream"}, "", (50, ML, 1)),
     ("Supergoop!", "Supergoop! Unseen Sunscreen SPF 40 1.7 fl oz",
      "unseen sunscreen", {"spf40"}, "", (50, ML, 1)),
     ("Benefit Cosmetics", "Hoola Matte Bronzer 8g",
@@ -256,7 +260,7 @@ TITLE_CASES = [
     ("Olaplex", "Olaplex No.3 Hair Perfector 100ml",
      "no 3 hair perfector", set(), "", (100, ML, 1)),
     ("Neutrogena", "Hydro Boost Water Gel Moisturizer, Fragrance Free, 1.7 oz",
-     "hydro boost water moisturizer fragrance free", {"gel"}, "", (48, G, 1)),
+     "hydro boost water fmt moisturizer fragrance free", {"gel"}, "", (48, G, 1)),
 ]
 
 
@@ -369,7 +373,7 @@ def test_veto_reasons_name_the_disagreement():
 
 def test_match_key_t0c_shape_and_none_cases():
     key = match_key_t0c({"brand": "COSRX", "title": "Advanced Snail 96 Mucin Power Essence 100ml"})
-    assert key == ("cosrx", frozenset({"snail", "96", "mucin", "power", "essence"}), (100.0, "ml", 1))
+    assert key == ("cosrx", ("snail", "96", "mucin", "power", "essence"), (100.0, "ml", 1))
 
     class Row:
         brand = "Anua"
@@ -379,7 +383,8 @@ def test_match_key_t0c_shape_and_none_cases():
     assert match_key_t0c({"brand": "", "title": "Toner 250ml"}) is None
     assert match_key_t0c({"brand": "Anua", "title": "Heartleaf 77% Soothing Toner"}) is None
     assert match_key_t0c({"brand": "Anua", "title": "Toner 30ml / 50ml"}) is None
-    assert match_key_t0c({"brand": "Augustinus Bader", "title": "The Rich Cream 50ml"}) is None  # empty core
+    assert match_key_t0c({"brand": "Augustinus Bader", "title": "The 50ml"}) is None  # empty core
+    assert match_key_t0c({"brand": "Generic", "title": "Snail Mucin Essence 100ml"}) is None  # placeholder brand
     assert match_key_t0c({"brand": "Anua", "title": None}) is None
 
 
@@ -483,7 +488,13 @@ def test_property_nominal_fl_oz_table_round_trips():
     ("2.0", {"v2"}), ("Ver. 3", {"v3"}), ("version 2.5", {"v2.5"}), ("New Formula", {"new_formula"}),
     ("Reformulated", {"reformulated"}), ("RX", {"rx"}), ("Advanced", {"advanced"}), ("EX", {"ex"}),
     ("6th Generation", {"gen6"}), ("US Version", {"market_us"}), ("Korean Formula", {"market_kr"}),
-    ("Japan Version", {"market_jp"}), ("Rich Cream", {"rich", "cream"}), ("Gel Cream", {"gel_cream"}),
+    ("Japan Version", {"market_jp"}), ("Rich Cream", {"rich", "cream", "format_order:rich>cream"}),
+    ("Gel Cream", {"gel_cream"}), ("Gel to Cream", {"gel", "cream", "format_order:gel>cream"}),
+    ("Effaclar Duo+", {"duo", "plus"}), ("Effaclar Duo (+)", {"duo", "plus"}), ("Effaclar Duo Plus", {"duo", "plus"}),
+    ("Cicaplast Baume B5+", {"plus"}), ("Moisturizing Lotion+", {"plus"}), ("Moisturizing Gel+", {"gel", "plus"}),
+    ("Rice + Probiotics", set()), ("Vitamin C+E", set()), ("SPF50+ PA+++", {"spf50+", "pa+++"}), ("[1+1] Toner", {"multipack"}),
+    ("Renewal", {"renewal"}), ("Renewed", {"renewal"}), ("New", {"new"}), ("Limited Edition", {"limited_edition"}),
+    ("Holiday Edition", {"limited_edition"}), ("Special Edition", {"special_edition"}), ("New York", set()),
     ("Light", {"light"}), ("Refill", {"refill"}), ("Refillable", set()), ("Tester", {"tester"}),
     ("Unboxed", {"unboxed"}), ("No Box", {"unboxed"}), ("Deluxe Sample", {"sample"}), ("Trial Size", {"sample"}),
     ("Mini", {"mini"}), ("Travel Size", {"mini"}), ("Deluxe Mini", {"mini"}), ("Gift Set", {"set"}),
@@ -500,7 +511,7 @@ def test_lexicon_is_one_documented_table():
     rules = CONFLICT_LEXICON + FORMAT_LEXICON
     assert all(r.note and r.family and r.pattern for r in rules)
     families = {r.family for r in rules}
-    assert families == {"concentration", "spf", "pa", "version", "market", "flag", "format"}
+    assert families == {"concentration", "spf", "pa", "version", "edition", "market", "flag", "format"}
 
 
 # ---- property: idempotence and disjointness over the corpus + generated titles ------------
@@ -592,3 +603,153 @@ def test_gtin_restriction(body, reason):
 def test_gtin_restriction_rejects_malformed():
     assert gtin_restriction(None) == "malformed"
     assert gtin_restriction("123") == "malformed"
+
+
+# ---- review of be#2636: every reported different-product pair must never merge -------------
+
+def _t0b_same(a, b):
+    """T0b at pair level: exact title key equal and no veto (conflicts, shade, size proof)."""
+    ka, kb = exact_title_key(*a), exact_title_key(*b)
+    return ka is not None and ka == kb and not veto_reasons(title_core(*a), title_core(*b))
+
+
+MUST_NOT_MERGE = [
+    # H3: a glued "+" is an edition
+    ("H3", ("La Roche-Posay", "Effaclar Duo Acne Treatment 20ml"), ("La Roche-Posay", "Effaclar Duo+ Acne Treatment 20ml")),
+    ("H3", ("La Roche-Posay", "Effaclar Duo Acne Treatment 20ml"), ("La Roche-Posay", "Effaclar Duo (+) Acne Treatment 20ml")),
+    ("H3", ("La Roche-Posay", "Cicaplast Baume B5 40ml"), ("La Roche-Posay", "Cicaplast Baume B5+ 40ml")),
+    ("H3", ("Clinique", "Dramatically Different Moisturizing Lotion 125ml"),
+     ("Clinique", "Dramatically Different Moisturizing Lotion+ 125ml")),
+    ("H3", ("Clinique", "Dramatically Different Moisturizing Gel 125ml"), ("Clinique", "Dramatically Different Moisturizing Gel+ 125ml")),
+    # M1: "x" is a word
+    ("M1", ("NARS", "Orgasm Blush 4.8g"), ("NARS", "Orgasm X Blush 4.8g")),
+    # M2: fractions
+    ("M2", ("Burt's Bees", "Lip Balm 1/2 oz"), ("Burt's Bees", "Lip Balm 2 oz")),
+    ("M2", ("Burt's Bees", "Lip Balm ½ oz"), ("Burt's Bees", "Lip Balm 2 oz")),
+    ("M2", ("Burt's Bees", "Lip Balm 1/4 oz"), ("Burt's Bees", "Lip Balm 4 oz")),
+    ("M2", ("Burt's Bees", "Lip Balm 1/2 oz"), ("Burt's Bees", "Lip Balm 1 1/2 oz")),
+    ("M2", ("Burt's Bees", "Lip Balm 1/2 oz"), ("Burt's Bees", "Lip Balm 1½ oz")),
+    # M3: reformulation / edition words
+    ("M3", ("Kiehl's", "Ultra Facial Cream 50ml"), ("Kiehl's", "New Ultra Facial Cream 50ml")),
+    ("M3", ("Kiehl's", "Ultra Facial Cream 50ml"), ("Kiehl's", "Ultra Facial Cream 50ml NEW")),
+    ("M3", ("Kiehl's", "Ultra Facial Cream 50ml"), ("Kiehl's", "Ultra Facial Cream 50ml Renewed")),
+    ("M3", ("COSRX", "Snail Mucin Essence 100ml"), ("COSRX", "Snail Mucin Essence Renewal 100ml")),
+    ("M3", ("COSRX", "Snail Mucin Essence 100ml"), ("COSRX", "Snail Mucin Essence Limited Edition 100ml")),
+    ("M3", ("COSRX", "Snail Mucin Essence 100ml"), ("COSRX", "Snail Mucin Essence Special Edition 100ml")),
+    # M4: placeholder and retailer-as-brand values name no maker
+    ("M4", ("Generic", "Snail Mucin Essence 100ml"), ("Unbranded", "Snail Mucin Essence 100ml")),
+    ("M4", ("Generic", "Snail Mucin Essence 100ml"), ("Generic", "Snail Mucin Essence 100ml")),
+    ("M4", ("N/A", "Snail Mucin Essence 100ml"), ("Unknown", "Snail Mucin Essence 100ml")),
+    ("M4", ("No Brand", "Snail Mucin Essence 100ml"), ("None", "Snail Mucin Essence 100ml")),
+    ("M4", ("Amazon", "Snail Mucin Essence 100ml"), ("Amazon", "Snail Mucin Essence 100ml")),
+    ("M4", ("YesStyle", "Snail Mucin Essence 100ml"), ("Stylevana", "Snail Mucin Essence 100ml")),
+    ("M4", ("Olive Young Global", "Snail Mucin Essence 100ml"), ("Olive Young", "Snail Mucin Essence 100ml")),
+    # LOW-1: word order
+    ("L1", ("Clinique", "Cream to Powder Foundation 30ml"), ("Clinique", "Powder to Cream Foundation 30ml")),
+    ("L1", ("Clinique", "Gel to Cream Moisturizer 50ml"), ("Clinique", "Cream to Gel Moisturizer 50ml")),
+    ("L1", ("Banila Co", "Oil to Milk Cleanser 150ml"), ("Banila Co", "Milk to Oil Cleanser 150ml")),
+    ("L1", ("Laneige", "Cream Skin Toner 150ml"), ("Laneige", "Skin Cream Toner 150ml")),
+    # LOW-2: two decimals under 10
+    ("L2", ("NARS", "Powermatte Lipstick 4.25g"), ("NARS", "Powermatte Lipstick 4.2g")),
+    # LOW-5: two measures in one title -> no primary size, so no key
+    ("L5", ("Kiehl's", "Ultra Facial Duo Cream 30 ml + Serum 1.7 fl oz"), ("Kiehl's", "Ultra Facial Duo Cream 30 ml")),
+    # T0b: same title, no size in it -> phase 1 cannot prove the same size
+    ("H2", ("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator"),
+     ("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator")),
+]
+
+
+@pytest.mark.parametrize("tag,a,b", MUST_NOT_MERGE, ids=[f"{t}-{i:02d}" for i, (t, _a, _b) in enumerate(MUST_NOT_MERGE)])
+def test_review_pairs_never_merge(tag, a, b):
+    assert not _t0c_same(a, b) and not _t0c_same(b, a)
+    assert not _t0b_same(a, b) and not _t0b_same(b, a)
+
+
+def test_review_controls_still_merge():
+    """The fixes must not cost the matches they sit next to."""
+    assert _t0c_same(("La Roche-Posay", "Effaclar Duo+ Acne Treatment 20ml"), ("La Roche Posay", "Effaclar Duo (+) Acne Treatment 20ml"))
+    assert _t0c_same(("Dr.Jart+", "Dr. Jart+ Cicapair Tiger Grass Color Correcting Treatment SPF 30 50ml"),
+                     ("Dr. Jart", "Cicapair Tiger Grass Color Correcting Treatment SPF30 50ml"))
+    assert _t0c_same(("NARS", "Orgasm X Blush 4.8g"), ("NARS", "NARS Orgasm X Blush 0.16 oz / 4.8 g"))
+    assert _t0c_same(("COSRX", "COSRX x Olive Young Snail Mucin Essence 100ml"), ("COSRX", "Olive Young Snail Mucin Essence 100ml"))
+    assert _t0c_same(("Maybelline New York", "Maybelline New York Fit Me Matte Foundation 30ml"),
+                     ("Maybelline New York", "Fit Me Matte Foundation 30ml"))
+    assert _t0c_same(("Burt's Bees", "Lip Balm 1/2 oz"), ("Burt's Bees", "Lip Balm ½ oz"))
+    assert _t0b_same(("COSRX", "Advanced Snail 96 Mucin Power Essence 100ml"), ("Cosrx", "Advanced Snail 96 Mucin Power Essence 100ml"))
+
+
+def test_x_is_kept_unless_it_is_a_leading_collab_separator():
+    assert title_core("NARS", "Orgasm X Blush").core == "orgasm x blush"
+    assert title_core("COSRX", "COSRX x Olive Young Snail Mucin Essence").core == "olive young snail mucin essence"
+    assert title_core("Missha", "Time Revolution 5X Essence").core == "time revolution 5x essence"
+
+
+@pytest.mark.parametrize("text,primary", [
+    ("Lip Balm 1/2 oz", (14, G)), ("Lip Balm ½ oz", (14, G)), ("Lip Balm 1/4 oz", (7, G)),
+    ("Lip Balm 1 1/2 oz", (43, G)), ("Lip Balm 1½ oz", (43, G)), ("Lip Balm 1-1/2 oz", (43, G)),
+    ("Serum 1/2 fl oz", (15, ML)), ("Serum ½ fl. oz.", (15, ML)), ("Balm 3/2 oz", None), ("Balm 1/0 oz", None),
+    ("Balm 1/2 oz / 14 g", (14, G)), ("30ml/50ml", None), ("1.7 fl oz/50ml", (50, ML)),
+])
+def test_parse_size_fractions(text, primary):
+    assert parse_size(text).primary == (Quantity(float(primary[0]), primary[1]) if primary else None)
+
+
+def test_parse_size_never_reads_a_denominator_as_a_size():
+    # "125/250 ml" is no fraction the fraction rule reads; "250 ml" after "5/" must not be taken.
+    assert parse_size("Toner 125/250 ml").primary is None
+    assert parse_size("Toner 125/250 ml").sizes == ()  # not even listed as a stated size
+    # A glued fraction ("Tin1/2 oz") is unreadable: the title's other size cannot be trusted alone.
+    assert parse_size("Lip Tin1/2 oz 30ml").primary is None
+
+
+def test_a_long_trailing_descriptor_is_not_a_shade():
+    tc = title_core("Tatcha", "The Dewy Skin Cream - Clean Vegan Cruelty Free")
+    assert tc.shade == "" and tc.core == "dewy skin fmt clean vegan cruelty free"
+
+
+def test_parse_size_keeps_two_decimals_under_ten():
+    assert parse_size("4.25g").primary == Quantity(4.25, G)
+    assert parse_size("4.2g").primary == Quantity(4.2, G)
+    assert parse_size("12.25ml").primary == Quantity(12.2, ML)
+
+
+def test_parse_size_two_measures_in_one_title_have_no_primary():
+    # Kills a same-title tolerance loosened from 3% (50 ml vs 30 ml would collapse at 50%).
+    assert parse_size("Cream 30 ml + Serum 1.7 fl oz").primary is None
+    assert len(parse_size("Cream 30 ml + Serum 1.7 fl oz").sizes) == 2
+    # Kills a count standing in as primary when the title states two measures.
+    assert parse_size("Cream 30 ml + Serum 50 ml, 2 pcs").primary is None
+
+
+def test_veto_reasons_require_a_proven_size():
+    a = title_core("Clinique", "Moisture Surge 100H Auto-Replenishing Hydrator")
+    assert veto_reasons(a, a) == ["size_unknown"]
+
+
+@pytest.mark.parametrize("raw", ["Generic", "GENERIC", "Unbranded", "N/A", "n/a", "NA", "Unknown", "No Brand", "None",
+                                 "null", "Other", "Default", "Amazon", "YesStyle", "Stylevana", "Olive Young",
+                                 "Olive Young Global", "OLIVE YOUNG (Global)", "Amazon US", "Generic Inc.",
+                                 "Unbranded Official"])
+def test_placeholder_brands_canonicalize_empty(raw):
+    assert canonical_brand(raw) == ""
+
+
+def test_normalizer_imports_no_io_modules():
+    """The normalizer is pure: importing it loads no HTTP, database, config or LLM module."""
+    root = Path(__file__).resolve().parents[1]
+    code = "import json, sys; import services.product_match_normalizer; print(json.dumps(sorted(sys.modules)))"
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, check=True).stdout
+    loaded = json.loads(out.strip().splitlines()[-1])
+    banned = ("httpx", "databases", "asyncpg", "sqlalchemy", "db", "config", "google", "vertexai", "openai")
+    assert [m for m in loaded if m.split(".")[0] in banned] == []
+    assert [m for m in loaded if m.startswith(("services.pdp_matcher", "services.curated_brand_feed"))] == []
+
+
+def test_brand_spelling_is_one_copy_reexported():
+    from services import brand_spelling, curated_brand_feed
+    from services.pdp_matcher import retailer_match
+
+    assert curated_brand_feed.RETAILER_BRAND_SPELLINGS is brand_spelling.RETAILER_BRAND_SPELLINGS
+    assert curated_brand_feed.RETAILER_BRAND_CANONICAL is brand_spelling.RETAILER_BRAND_CANONICAL
+    assert curated_brand_feed._brand_key is brand_spelling.brand_key
+    assert retailer_match.match_brand is brand_spelling.match_brand

@@ -8,15 +8,21 @@ GTIN 620. This census sizes the phase-1 deterministic tiers with the shared norm
 
 TIERS (per market, US and SG; a product counts in each market it has a live offer in):
   T0a  valid, non-restricted, non-polluted GTIN equal + canonical brand equal + parsed size equal
-       (a GTIN is POLLUTED when the market's listings carry it on >1 size or >1 shade).
+       + ordered title core equal (phase 1: a GTIN alone never joins two titles). A GTIN is
+       POLLUTED when intake_identity.barcode_reuse_reason says one seller reuses it (two titles or
+       two content_keys at one seller: universalnailsupplies' OPI shades on one barcode), or the
+       market's listings carry it on >1 size or >1 detected shade.
   T0b  canonical brand + catalog_identity.normalize_title equal (exact title, digits kept).
-  T0c  match_key_t0c: canonical brand + title-core token set + (size, unit, pack count) equal.
+  T0c  match_key_t0c: canonical brand + ORDERED title core + (size, unit, pack count) equal.
+  T0c_token_set (informational) the same with the core as a token SET: what word order costs.
 Every tier then applies the hard vetoes: a key group whose members disagree on conflict tokens
 (EDT/EDP, SPF/PA, version, format, refill/tester/mini/set/multipack ...) or shade is VETOED and
 split by (conflicts, shade). A group JOINS products when it spans >= 2 content_keys (a product
-without one counts as its own). A joining group is DEFERRED (phase 2) when a member product's
-variants (catalog_skus titles) or a member content_key's listings carry >1 size: offers.resolve,
-agent_pdp_view and the gateway sibling path have no size awareness yet.
+without one counts as its own). A joining group is DEFERRED (phase 2) when its members' sizes
+(title + catalog_skus variant titles) are not ONE proven size: the union holds >1 size, a member
+content_key spans >1 size, or a member has no parseable size at all (size_unknown; mostly T0b,
+whose key carries no size). offers.resolve, agent_pdp_view and the gateway sibling path have no
+size awareness yet.
 
 Not modelled: the same-size price-ratio veto (no prices are read), star topology (groups are
 counted as found, not anchored), and agent tiers.
@@ -55,6 +61,7 @@ except NameError:  # python -c has no __file__; /app is the image's repo root
     _REPO_ROOT = "/app"
 sys.path.insert(0, _REPO_ROOT)
 
+from services.intake_identity import barcode_reuse_reason  # noqa: E402
 from services.product_match_normalizer import (  # noqa: E402
     canonical_brand,
     conflict_family,
@@ -77,7 +84,8 @@ _PRODUCT_FILTER = """
     p.pivota_signature_id IS NOT NULL AND p.suppressed_at IS NULL AND p.sync_status = 'live'
 """
 PRODUCTS_SQL = f"""
-SELECT p.product_key, p.brand, p.title, p.gtin, p.content_key, p.pivota_signature_id, p.source_system
+SELECT p.product_key, p.brand, p.title, p.gtin, p.content_key, p.pivota_signature_id, p.source_system,
+       p.merchant_id, p.source_domain
 FROM catalog_products p
 WHERE {_PRODUCT_FILTER}
   AND EXISTS (SELECT 1 FROM catalog_offers o
@@ -101,6 +109,9 @@ SELECT s.product_key, array_agg(DISTINCT s.title) AS titles
 FROM catalog_skus s
 JOIN catalog_products p ON p.product_key = s.product_key
 WHERE {_PRODUCT_FILTER} AND s.suppressed_at IS NULL
+  AND EXISTS (SELECT 1 FROM catalog_offers o
+              WHERE o.product_key = p.product_key AND o.suppressed_at IS NULL
+                AND o.market = ANY($1::text[]))
 GROUP BY 1
 """
 
@@ -120,12 +131,15 @@ class _Listing:
 
     __slots__ = (
         "product_key", "brand", "title", "content_key", "ck", "hosts", "brand_direct", "cb", "tc",
-        "size_key", "gtin", "gtin_restriction", "exact_key", "t0c_key", "signature", "variant_sizes",
+        "size_key", "gtin", "gtin_restriction", "exact_key", "t0c_key", "t0c_set_key", "signature",
+        "variant_sizes", "merchant_id", "source_domain", "core",
     )
 
     def __init__(self, row: Mapping[str, Any], hosts: Set[str], brand_direct: bool,
                  sku_titles: Sequence[str]) -> None:
         self.product_key = str(row["product_key"])
+        self.merchant_id = row.get("merchant_id")
+        self.source_domain = row.get("source_domain")
         self.brand = row.get("brand")
         self.title = row.get("title")
         self.content_key = row.get("content_key")
@@ -138,8 +152,10 @@ class _Listing:
         self.gtin = gtin_canonical(row.get("gtin"))
         self.gtin_restriction = gtin_restriction(self.gtin) if self.gtin else None
         self.exact_key = exact_title_key(self.brand, self.title)
-        self.t0c_key = (self.cb, self.tc.tokens, self.size_key) if (
-            self.cb and self.tc.tokens and self.size_key is not None) else None
+        self.core = tuple(self.tc.core.split())
+        keyable = bool(self.cb and self.core and self.size_key is not None)
+        self.t0c_key = (self.cb, self.core, self.size_key) if keyable else None
+        self.t0c_set_key = (self.cb, self.tc.tokens, self.size_key) if keyable else None
         self.signature = (self.tc.conflicts, self.tc.shade_tokens)
         sizes = {self.size_key} if self.size_key else set()
         for t in sku_titles or ():
@@ -230,12 +246,21 @@ def evaluate_tier(name: str, listings: Sequence[_Listing], key_fn: Callable[[_Li
             multi_host = len(hosts) >= 2
             out["accepted_multi_host_groups"] += int(multi_host)
             out["accepted_products"] += len(sub)
-            deferred = any(len(m.variant_sizes) > 1 for m in sub) or any(len(ck_sizes.get(m.ck, ())) > 1 for m in sub)
+            # Phase 1 joins only ONE proven size: every member states a size, and the members'
+            # title + variant sizes and their content_keys' sizes are a single size together.
+            sizes_union = set().union(*(m.variant_sizes for m in sub))
+            if any(not m.variant_sizes for m in sub):
+                out["deferred_size_unknown_groups"] += 1
+                out["deferred_size_unknown_multi_host_groups"] += int(multi_host)
+                if len(deferred_samples) < samples:
+                    deferred_samples.append({"reason": "size_unknown", "members": _sample(sub)})
+                continue
+            deferred = len(sizes_union) > 1 or any(len(ck_sizes.get(m.ck, ())) > 1 for m in sub)
             if deferred:
                 out["deferred_multi_size_groups"] += 1
                 out["deferred_multi_size_multi_host_groups"] += int(multi_host)
                 if len(deferred_samples) < samples:
-                    deferred_samples.append({"members": _sample(sub)})
+                    deferred_samples.append({"reason": "multi_size", "members": _sample(sub)})
                 continue
             joinable.append(sub)
             out["joinable_groups"] += 1
@@ -314,7 +339,21 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
             if li.tc.shade_tokens:
                 gtin_shades[li.gtin].add(li.tc.shade_tokens)
             gtin_brands[li.gtin].add(li.cb)
-    polluted = {g for g in gtin_brands if len(gtin_sizes[g]) > 1 or len(gtin_shades[g]) > 1}
+    gtin_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for li in listings:
+        if li.gtin and not li.gtin_restriction:
+            gtin_rows[li.gtin].append({"product_key": li.product_key, "merchant_id": li.merchant_id,
+                                       "source_domain": li.source_domain, "title": li.title,
+                                       "content_key": li.content_key})
+    reuse = {g: barcode_reuse_reason(rows) for g, rows in gtin_rows.items()}
+    polluted_by_reason = Counter()
+    polluted: Set[str] = set()
+    for g in gtin_brands:
+        reason = reuse.get(g) or ("sizes_differ" if len(gtin_sizes[g]) > 1 else
+                                  "shades_differ" if len(gtin_shades[g]) > 1 else None)
+        if reason:
+            polluted.add(g)
+            polluted_by_reason[reason] += 1
     restriction_hist = Counter(li.gtin_restriction for li in listings if li.gtin and li.gtin_restriction)
     lines.append(_line(
         "inputs", market=market,
@@ -331,6 +370,7 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
         products_with_valid_gtin=sum(1 for li in listings if li.gtin),
         gtin_restricted_by_reason=dict(restriction_hist.most_common()),
         gtins_polluted=len(polluted),
+        gtins_polluted_by_reason=dict(polluted_by_reason.most_common()),
         gtins_on_two_brands=sum(1 for b in gtin_brands.values() if len(b) > 1),
         content_keys=len(ck_hosts),
         content_keys_multi_host_today=sum(1 for h in ck_hosts.values() if len(h) >= 2),
@@ -338,9 +378,10 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
     ))
 
     def t0a(li: _Listing) -> Optional[Hashable]:
-        if not li.gtin or li.gtin_restriction or li.gtin in polluted or not li.cb or li.size_key is None:
+        if (not li.gtin or li.gtin_restriction or li.gtin in polluted or not li.cb or li.size_key is None
+                or not li.core):
             return None
-        return (li.gtin, li.cb, li.size_key)
+        return (li.gtin, li.cb, li.size_key, li.core)  # phase 1: the GTIN AND the T0c core agree
 
     def t0a_size_missing(li: _Listing) -> Optional[Hashable]:
         if not li.gtin or li.gtin_restriction or li.gtin in polluted or not li.cb:
@@ -352,8 +393,10 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
         evaluate_tier("T0b", listings, lambda li: li.exact_key, ck_sizes, samples=samples),
         evaluate_tier("T0c", listings, lambda li: li.t0c_key, ck_sizes, samples=samples),
     ]
-    # Informational: GTIN + brand without the size requirement (how much T0a's strict size costs).
+    # Informational: GTIN + brand without the size/core requirement (what T0a's strictness costs),
+    # and T0c on the token SET (what keying on word order costs).
     gtin_any = evaluate_tier("T0a_size_not_required", listings, t0a_size_missing, ck_sizes, samples=0)
+    t0c_set = evaluate_tier("T0c_token_set", listings, lambda li: li.t0c_set_key, ck_sizes, samples=samples)
 
     uf = _UnionFind()
     for tier in tiers:
@@ -367,7 +410,7 @@ def census_market(market: str, listings: Sequence[_Listing], *, samples: int = S
     any_groups = [c for c in components.values() if len({m.ck for m in c}) >= 2]
     any_multi_host = [c for c in any_groups if len(set().union(*(m.hosts for m in c))) >= 2]
 
-    for tier in tiers + [gtin_any]:
+    for tier in tiers + [gtin_any, t0c_set]:
         tier = dict(tier)
         tier.pop("_joinable")
         sample_block = tier.pop("samples")
@@ -417,7 +460,7 @@ async def load(conn: Any, markets: Sequence[str] = MARKETS) -> Tuple[List[Dict[s
         hosts = [dict(r) for r in await conn.fetch(HOSTS_SQL, list(markets))]
         try:
             async with conn.transaction():  # savepoint: variant titles are optional
-                for r in await conn.fetch(SKU_TITLES_SQL):
+                for r in await conn.fetch(SKU_TITLES_SQL, list(markets)):
                     sku_titles[str(r["product_key"])] = [t for t in (r["titles"] or []) if t]
         except Exception as exc:  # noqa: BLE001 - deferral falls back to title sizes only
             sku_error = f"{type(exc).__name__}: {str(exc)[:200]}"

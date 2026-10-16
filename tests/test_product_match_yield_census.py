@@ -239,7 +239,7 @@ def test_load_is_one_read_only_transaction_with_a_timeout():
     assert conn.calls[1] == ("execute", "SET LOCAL statement_timeout = '60s'")
     fetches = [c for c in conn.calls if c[0] == "fetch"]
     assert len(fetches) == 3
-    assert fetches[0][2] == (["US", "SG"],) and fetches[1][2] == (["US", "SG"],)
+    assert [f[2] for f in fetches] == [(["US", "SG"],)] * 3  # every statement is market-filtered
     assert len(products) == 1 and len(hosts) == 1 and skus == {"p1": ["50ml"]} and err is None
 
 
@@ -247,6 +247,12 @@ def test_load_survives_a_failed_variant_statement():
     conn = _FakeConn(fail_skus=True)
     products, hosts, skus, err = asyncio.run(census.load(conn))
     assert skus == {} and "statement timeout" in err and len(products) == 1
+
+
+def test_every_statement_filters_to_live_signed_products_with_a_market_offer():
+    for sql in (census.PRODUCTS_SQL, census.HOSTS_SQL, census.SKU_TITLES_SQL):
+        assert "p.pivota_signature_id IS NOT NULL" in sql and "p.sync_status = 'live'" in sql
+        assert "o.market = ANY($1::text[])" in sql
 
 
 def test_the_sql_only_reads():
@@ -258,3 +264,83 @@ def test_the_sql_only_reads():
 def test_the_program_is_free_of_the_at_sign():
     # run_oneoff_job.sh picks gcloud's --args delimiter from a fixed list that starts with the at-sign.
     assert "@" not in _PATH.read_text()
+
+
+# ---- review of be#2636 ---------------------------------------------------------------------
+
+OPI_GTIN = "00619828139641"
+
+
+def _row(pk, brand, title, ck, gtin=None, merchant=None, domain=None):
+    r = _p(pk, brand, title, ck, gtin)
+    r.update(merchant_id=merchant, source_domain=domain)
+    return r
+
+
+def _us_hosts(rows, host_of):
+    return [{"product_key": r["product_key"], "market": "US", "host": host_of(r), "brand_direct": False} for r in rows]
+
+
+def test_h1_a_gtin_one_seller_reuses_across_shades_never_joins():
+    assert census.gtin_canonical(OPI_GTIN) == OPI_GTIN
+    rows = [
+        _row("ext:retailer:o1", "OPI", "Nail Lacquer Big Apple Red 15ml", "ck_o1", OPI_GTIN, "m_uns", "universalnailsupplies.com"),
+        _row("ext:retailer:o2", "OPI", "Nail Lacquer Bubble Bath 15ml", "ck_o2", OPI_GTIN, "m_uns", "universalnailsupplies.com"),
+        _row("ext:retailer:o3", "OPI", "Nail Lacquer Malaga Wine 0.5 fl oz", "ck_o3", OPI_GTIN, "m_ulta", "ulta.com"),
+    ]
+    lines = census.compute_census(rows, _us_hosts(rows, lambda r: r["source_domain"]), {}, ["US"])
+    inputs = _get(lines, "inputs", "US")
+    assert inputs["gtins_polluted"] == 1
+    assert inputs["gtins_polluted_by_reason"] == {"titles_differ_within_seller": 1}
+    t0a = _get(lines, "tier", "US", "T0a")
+    assert t0a["counts"].get("joinable_groups", 0) == 0 and t0a["counts"].get("key_groups", 0) == 0
+
+
+def test_h1_t0a_also_needs_the_title_core_to_agree():
+    # Three sellers, one shade each: no seller reuses the GTIN, yet the titles name three shades.
+    rows = [
+        _row("ext:retailer:o1", "OPI", "Nail Lacquer Big Apple Red 15ml", "ck_o1", OPI_GTIN, "m_a", "a.com"),
+        _row("ext:retailer:o2", "OPI", "Nail Lacquer Bubble Bath 15ml", "ck_o2", OPI_GTIN, "m_b", "b.com"),
+        _row("ext:retailer:o3", "OPI", "Nail Lacquer Malaga Wine 0.5 fl oz", "ck_o3", OPI_GTIN, "m_c", "c.com"),
+    ]
+    lines = census.compute_census(rows, _us_hosts(rows, lambda r: r["source_domain"]), {}, ["US"])
+    assert _get(lines, "inputs", "US")["gtins_polluted"] == 0
+    assert _get(lines, "tier", "US", "T0a")["counts"].get("joinable_groups", 0) == 0
+    # T0a_size_not_required (GTIN + brand only) shows what the core requirement withheld.
+    assert _get(lines, "tier", "US", "T0a_size_not_required")["counts"]["split_key_groups"] == 1
+
+
+def test_h2_t0b_defers_a_group_whose_members_are_different_sizes_or_no_size():
+    title = "Clinique Moisture Surge 100H Auto-Replenishing Hydrator"
+    rows = [
+        _row("ext:retailer:c1", "Clinique", title, "ck_c1", None, "m_ulta", "ulta.com"),
+        _row("ext:retailer:c2", "Clinique", title, "ck_c2", None, "m_nord", "nordstrom.com"),
+        _row("ext:retailer:c3", "Clinique", "Moisture Surge Hydrating Lotion", "ck_c3", None, "m_ulta", "ulta.com"),
+        _row("ext:retailer:c4", "Clinique", "Moisture Surge Hydrating Lotion", "ck_c4", None, "m_nord", "nordstrom.com"),
+        _row("ext:retailer:c5", "Clinique", "Moisture Surge Eye 96-Hour", "ck_c5", None, "m_ulta", "ulta.com"),
+        _row("ext:retailer:c6", "Clinique", "Moisture Surge Eye 96-Hour", "ck_c6", None, "m_nord", "nordstrom.com"),
+    ]
+    skus = {"ext:retailer:c1": ["1.7 oz"], "ext:retailer:c2": ["Jumbo 4.2 oz"],
+            "ext:retailer:c3": ["50 ml"], "ext:retailer:c4": ["15 ml"]}
+    lines = census.compute_census(rows, _us_hosts(rows, lambda r: r["source_domain"]), skus, ["US"])
+    c = _get(lines, "tier", "US", "T0b")["counts"]
+    assert c["accepted_groups"] == 3
+    assert c["deferred_multi_size_groups"] == 2   # 1.7 oz vs 4.2 oz; 50 ml vs 15 ml
+    assert c["deferred_size_unknown_groups"] == 1  # neither title nor variants state a size
+    assert c.get("joinable_groups", 0) == 0
+
+
+def test_t0c_keys_on_word_order_and_reports_what_that_costs():
+    rows = [
+        _row("ext:retailer:w1", "Clinique", "Cream to Powder Foundation 30ml", "ck_w1", None, "m_a", "a.com"),
+        _row("ext:retailer:w2", "Clinique", "Powder to Cream Foundation 30ml", "ck_w2", None, "m_b", "b.com"),
+        _row("ext:retailer:w3", "COSRX", "Snail 96 Mucin Power Essence 100ml", "ck_w3", None, "m_a", "a.com"),
+        _row("ext:retailer:w4", "COSRX", "96 Snail Mucin Power Essence 100ml", "ck_w4", None, "m_b", "b.com"),
+    ]
+    lines = census.compute_census(rows, _us_hosts(rows, lambda r: r["source_domain"]), {}, ["US"])
+    assert _get(lines, "tier", "US", "T0c")["counts"].get("joinable_groups", 0) == 0
+    # The token set joins both: the foundation pair WRONGLY (same words, one format word, so no
+    # format_order token tells them apart) and the snail pair rightly -- the snail pair is the
+    # recall the ordered key gives up.
+    t0c_set = _get(lines, "tier", "US", "T0c_token_set")
+    assert t0c_set["counts"]["joinable_groups"] == 2

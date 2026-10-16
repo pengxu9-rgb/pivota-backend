@@ -1,6 +1,7 @@
 """Shared normalizer for cross-merchant product matching (phase 1, PR "M1").
 
-Pure functions, no I/O and no database. Every matching tier of the cross-merchant design
+Pure functions, no I/O and no database; importing it loads no HTTP, database, config or LLM module
+(the brand families come from services/brand_spelling.py, a test pins this). Every matching tier of the cross-merchant design
 (T0a GTIN, T0b exact title, T0c title core, and the vetoes on all of them) reads its signals
 from here, so the strategy, the census and later the agent verifier agree on one reading of a
 listing title.
@@ -25,18 +26,21 @@ WHERE EACH RULE CAME FROM
 -------------------------
 Brand (`canonical_brand`):
   - catalog_identity.normalize_brand: lowercase, strip (R)/(TM) and corporate suffixes.
-  - pdp_matcher.retailer_match.match_brand: drop trailing storefront words official/flagship.
-  - curated_brand_feed._brand_key: alphanumeric-only casefold with "&" read as "and" (folds
-    "Dr.Jart+"/"Dr. Jart", "Round Lab"/"Roundlab", "A'PIEU"/"Apieu").
-  - curated_brand_feed.RETAILER_BRAND_SPELLINGS: the MEASURED families (Tom Ford Beauty/Tom Ford,
-    Christian Dior/Dior, ETUDE HOUSE/ETUDE, Kosé/Kose, SK-Ⅱ/SK-II, O HUI (오휘)/O HUI ...). The
-    family key is the canonical brand. Not duplicated here; imported.
+  - match_brand (was pdp_matcher.retailer_match): drop trailing storefront words official/flagship.
+  - brand_key (was curated_brand_feed._brand_key): alphanumeric-only casefold with "&" read as
+    "and" (folds "Dr.Jart+"/"Dr. Jart", "Round Lab"/"Roundlab", "A'PIEU"/"Apieu").
+  - RETAILER_BRAND_SPELLINGS: the MEASURED families (Tom Ford Beauty/Tom Ford, Christian Dior/Dior,
+    ETUDE HOUSE/ETUDE, Kosé/Kose, SK-Ⅱ/SK-II, O HUI (오휘)/O HUI ...). The family key is the
+    canonical brand. All three now live in services/brand_spelling.py (one copy; the old modules
+    re-export them).
   - NEW here: accents folded before the family lookup (Lancôme -> lancome even for brands not in
     the map), and trailing cosmetics/skincare/region words dropped ("Benefit Cosmetics",
     "MISSHA US"). The gateway's brandCore also strips beauty/paris/professional/makeup; those are
     NOT stripped here because they are part of real names (Rare Beauty, Fenty Beauty vs Fenty
     Skin, L'Oreal Paris vs L'Oreal Professionnel) and the curated families already cover the
-    measured cases (Tom Ford Beauty).
+    measured cases (Tom Ford Beauty). Placeholders (Generic, Unbranded, N/A, Unknown, No Brand ...)
+    and a retailer written as the brand (Amazon, YesStyle, Stylevana, Olive Young) canonicalize to
+    "" -- PLACEHOLDER_BRAND_KEYS -- so they never key a match.
 
 Title core (`title_core`) -- ported from TWO normalizers and reconciled:
   - PIVOTA-Agent src/services/retailerOfferIdentity.js titleCore: NFKD accent fold, "&" -> and,
@@ -50,14 +54,25 @@ Title core (`title_core`) -- ported from TWO normalizers and reconciled:
     (3) Its normalizeText drops non-ASCII; here Hangul/CJK letters are kept (a Hangul-only token
     must not vanish into an empty core). (4) Its STOP_TOKENS drop skin/face/facial; here only
     pure function words are dropped (face lotion vs body lotion). (5) Single characters are kept:
-    dropping them merged "Vitamin C Serum" with "Vitamin E Serum".
+    dropping them merged "Vitamin C Serum" with "Vitamin E Serum". "x" too (NARS "Orgasm X" is
+    not "Orgasm"); only a leading "x" left by brand removal ("COSRX x Olive Young") is dropped.
   - pivota-backend services/pdp_matcher/retailer_match.retailer_match_key: unit-ANCHORED size
     stripping (a number is dropped only with a unit, so "96 mucin", "aha 7", "aloe 54.2" stay),
     decimal sizes read from the raw title, NxM pack notation, leading brand prefix, the promo
     list. DIFFERENCES: (1) its _PROMO strips set/kit/duo/bundle/gift/value/jumbo; here those are
-    conflict tokens. (2) It strips "free"; here "free" stays ("Fragrance Free" is a different
-    formula). (3) It strips "mg"; here mg is a STRENGTH and stays in the core (500mg vs 1000mg).
-    (4) It keeps hyphens inside tokens ("dive-in"); here hyphens split ("DIVE-IN" == "Dive In").
+    conflict tokens, and so are its new/renewal/limited/special-edition words (each can mark a
+    reformulation or a different pack; a lone "new" one-sided is a veto). (2) It strips "free";
+    here "free" stays ("Fragrance Free" is a different formula). (3) It strips "mg"; here mg is a
+    STRENGTH and stays in the core (500mg vs 1000mg). (4) It keeps hyphens inside tokens
+    ("dive-in"); here hyphens split ("DIVE-IN" == "Dive In").
+  - Both normalizers DROP "+" ("Lotion+" == "Lotion"). Here a "+" glued to a word, "(+)" and the
+    word "plus" are the conflict token `plus` (Effaclar Duo vs Duo+, Cicaplast B5 vs B5+), read
+    after SPF50+/PA+++ and "1+1" packs are consumed; a brand's own "+" (Dr.Jart+) is removed with
+    the brand first.
+  - Word ORDER: both compare token sets. T0c here keys on the ORDERED core ("Cream to Powder" vs
+    "Powder to Cream"), and a format word moved to the conflicts leaves a positional placeholder
+    ("fmt") in the core, so Laneige "Cream Skin" and "Skin Cream" stay apart; two or more format
+    words also emit format_order:<a>><b> ("Gel to Cream" vs "Cream to Gel").
   - line_alias.spf_rating_conflict: SPF ratings must agree. Here every SPF/PA value is a conflict
     token on every tier (the alias lane's curated one-sided tolerance is not applied).
 
@@ -66,6 +81,8 @@ Nominal beauty conversions: printed packs say "1.0 fl oz / 30 ml", not 29.57 ml,
 nominal table first and rounds otherwise; weight oz rounds and snaps to a nominal gram size
 within 2%. A bare "oz" is weight unless the title pairs it with an equal ml value or names a
 fragrance concentration / spray / mist (US fragrance titles write "3.4 oz" for 100 ml).
+Fractions ("1/2 oz", "1 1/2 oz", "½ oz") are read as fractions; an improper or unreadable one
+leaves the title with NO primary size. Values under 10 keep two decimals (4.25 g != 4.2 g).
 
 GTIN (`gtin_canonical`, `gtin_is_restricted`): catalog_identity.validated_source_gtin (GS1
 check digit, zero-pad to 14) plus GS1 prefix rules for restricted circulation, coupons and
@@ -73,7 +90,8 @@ ISBN/ISSN (sources at GS1_RESTRICTED_PREFIXES).
 
 SAFETY DIRECTION. Every heuristic here errs toward NOT matching: an undetected shade stays in
 the core (so two shades cannot meet), a one-sided conflict token is a disagreement, a title
-with two different sizes has no primary size and so no T0c key.
+with two different sizes has no primary size and so no T0c key, and two titles with no size
+are "size_unknown" in veto_reasons (phase 1 needs a proven equal size).
 """
 
 from __future__ import annotations
@@ -84,9 +102,9 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
+from services.brand_spelling import RETAILER_BRAND_SPELLINGS, match_brand
+from services.brand_spelling import brand_key as _brand_key
 from services.catalog_identity import normalize_title, validated_source_gtin
-from services.curated_brand_feed import RETAILER_BRAND_SPELLINGS, _brand_key
-from services.pdp_matcher.retailer_match import match_brand
 
 __all__ = [
     "CONFLICT_LEXICON",
@@ -117,6 +135,9 @@ __all__ = [
 # Text folding
 # ---------------------------------------------------------------------------
 
+_VULGAR_FRACTION_RE = re.compile("[\u00bc-\u00be\u2150-\u215e]")
+
+
 def _fold(text: Any) -> str:
     """NFKC (full-width digits, the ㎖ sign, "º" -> o), accents dropped, casefolded.
 
@@ -126,7 +147,9 @@ def _fold(text: Any) -> str:
     """
     if text is None:
         return ""
-    s = unicodedata.normalize("NFKC", str(text))
+    # Vulgar fractions first: NFKC turns "1½" into "11⁄2" (eleven halves), so each becomes " n/d".
+    s = _VULGAR_FRACTION_RE.sub(lambda m: " " + unicodedata.normalize("NFKC", m.group(0)).replace("⁄", "/"), str(text))
+    s = unicodedata.normalize("NFKC", s)
     s = unicodedata.normalize("NFD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = unicodedata.normalize("NFC", s).casefold()
@@ -156,6 +179,17 @@ _BRAND_TRAILING_NOISE = frozenset({
 })
 
 
+# Values that fill a brand field without naming a brand: placeholders, and a RETAILER written as
+# the brand (marketplace exports). Two listings sharing one of these share no maker, so they
+# canonicalize to "" and never key a match. Compared as brand keys (alphanumeric, accents folded),
+# after the trailing-noise strip ("Olive Young Global" -> "oliveyoung").
+PLACEHOLDER_BRAND_KEYS = frozenset({
+    "generic", "unbranded", "nobrand", "na", "none", "null", "nil", "unknown", "other", "others",
+    "default", "brand", "various", "misc", "notapplicable", "test",
+    "amazon", "yesstyle", "stylevana", "oliveyoung", "oliveyoungglobal",
+})
+
+
 def canonical_brand(raw: Any) -> str:
     """The brand's comparison key: a RETAILER_BRAND_SPELLINGS family when the brand is in a
     measured family, else its accent-folded alphanumeric key. "" for no brand.
@@ -181,9 +215,10 @@ def _canonical_brand(raw: str) -> str:
     # the unfolded key up first, then the folded one.
     family = RETAILER_BRAND_SPELLINGS.get(_brand_key(text))
     if family:
-        return family
+        return family  # a measured family is a real brand, never a placeholder
     folded = _brand_key(_fold(text))
-    return RETAILER_BRAND_SPELLINGS.get(folded, folded)
+    family = RETAILER_BRAND_SPELLINGS.get(folded, folded)
+    return "" if family in PLACEHOLDER_BRAND_KEYS else family
 
 
 def _brand_forms(raw_brand: Any) -> FrozenSet[str]:
@@ -251,8 +286,11 @@ WEIGHT_NOMINAL_G: Tuple[int, ...] = (
     110, 113, 120, 125, 150, 170, 200, 225, 227, 250, 300, 340, 350, 400, 450, 454, 500,
 )
 _SNAP_TOLERANCE = 0.02
-# Two spellings in ONE title are the same size when within this fraction ("2.5 oz / 70 g").
+# Two spellings in ONE title are the same size when within this fraction ("2.5 oz / 70 g"), or
+# within 0.3 g/ml -- 0.01 oz, the step at which labels truncate small sizes ("4.8 g / 0.16 oz":
+# 0.16 oz is 4.54 g, 5% off at that size).
 _SAME_TITLE_TOLERANCE = 0.03
+_SAME_TITLE_SLACK = 0.3
 
 _NUM = r"(\d+(?:[.,]\d{1,2})?)"
 _UNIT_ALTS: Tuple[Tuple[str, str], ...] = (
@@ -271,7 +309,14 @@ _UNIT_RE = "|".join(f"(?P<u_{name}>{alt})" for name, alt in _UNIT_ALTS)
 # ("15 L-Ascorbic" is not 15 liters).
 _UNIT_END = r"(?![a-wyz0-9])(?!x[a-z])(?!-[a-z])"
 _QTY = rf"{_NUM}\s*(?:{_UNIT_RE}){_UNIT_END}"
-_QTY_RE = re.compile(rf"(?<![\w.]){_QTY}")
+# Never read the denominator of "1/2 oz" as "2 oz": a number right after "digit/" is not a size.
+_QTY_RE = re.compile(rf"(?<![\w.])(?<!\d/)(?<!\d⁄){_QTY}")
+# "1/2 oz", "1 1/2 oz", "1-1/2 fl oz", "½ oz" (folded to " 1/2"). A fraction that is not a proper
+# one (3/2, x/0) makes the title's size ambiguous rather than guessed.
+_FRACTION_QTY_RE = re.compile(
+    rf"(?<![\w./])(?:(\d{{1,3}})[\s-]+)?(\d{{1,2}})\s*[/⁄]\s*(\d{{1,2}})\s*(?:{_UNIT_RE}){_UNIT_END}"
+)
+_LEFTOVER_FRACTION_RE = re.compile(rf"\d\s*[/⁄]\s*\d+\s*(?:{_UNIT_RE}){_UNIT_END}")
 # A multiplier: "×"/"*" with any spacing; a plain "x" spaced on BOTH sides or on NEITHER ("2 x 30ml",
 # "2x30ml"). "5X 150ml" is Missha's "5X" line, not five bottles.
 _X = r"(?:\s*[×*]\s*|\s+x\s+|x)"
@@ -314,7 +359,8 @@ def _unit_of(m: re.Match) -> str:
 
 
 def _round_size(value: float) -> float:
-    r = round(value, 1)
+    """Two decimals under 10 (4.25 g and 4.2 g are different lipsticks), one above."""
+    r = round(value, 2) if value < 10 else round(value, 1)
     return float(int(r)) if r == int(r) else r
 
 
@@ -332,7 +378,7 @@ def _ozw_to_g(value: float) -> float:
 
 
 def _close(a: float, b: float, tol: float = _SAME_TITLE_TOLERANCE) -> bool:
-    return abs(a - b) <= tol * max(a, b)
+    return abs(a - b) <= max(tol * max(a, b), _SAME_TITLE_SLACK)
 
 
 class _RawQty(NamedTuple):
@@ -345,6 +391,7 @@ class _SizeScan:
     raw: List[_RawQty] = field(default_factory=list)
     packs: List[int] = field(default_factory=list)
     spans: List[Tuple[int, int]] = field(default_factory=list)
+    ambiguous: bool = False
 
 
 def _scan_sizes(text: str) -> _SizeScan:
@@ -366,6 +413,15 @@ def _scan_sizes(text: str) -> _SizeScan:
             return None
         return _RawQty(_num(m.group(1)), _unit_of(m))
 
+    for m in list(_FRACTION_QTY_RE.finditer(current())):
+        whole, num, den = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
+        if 0 < num < den:
+            scan.raw.append(_RawQty(whole + num / den, _unit_of(m)))
+        else:
+            scan.ambiguous = True
+        take(m.start(), m.end())
+    if _LEFTOVER_FRACTION_RE.search(current()):
+        scan.ambiguous = True
     for m in list(_PACK_BEFORE_RE.finditer(current())):
         q = qty_from(m.group("q"))
         if q:
@@ -437,7 +493,9 @@ def _resolve(scan: _SizeScan, text: str) -> ParsedSize:
     measures = [s for s in sizes if s.unit in ("ml", "g")]
     counts = [s for s in sizes if s.unit == "count"]
     primary: Optional[Quantity] = None
-    if len(measures) == 1:
+    if scan.ambiguous:
+        pass  # an unreadable fraction: no size rather than a wrong one
+    elif len(measures) == 1:
         primary = measures[0]
         if len(counts) == 1 and pack == 1:
             # "Sheet Mask 25ml 10 sheets": the count is how many come in the box.
@@ -513,9 +571,17 @@ CONFLICT_LEXICON: Tuple[ConflictRule, ...] = (
     ConflictRule(_spf, "spf", r"\bspf\s*(\d{1,3})\s*(\+?)", "SPF value; '50+' (KR/EU label class) is kept distinct from '50'."),
     ConflictRule("spf", "spf", r"\bspf\b", "SPF stated without a value."),
     ConflictRule(_pa, "pa", r"\bpa\s*(\+{1,4})", "PA rating (+ .. ++++), Asian UVA label."),
+    # -- "+" editions: after SPF/PA (and "1+1" packs, read by parse_size) are consumed, a "+" glued
+    # to a word is an edition: Effaclar Duo vs Duo+ / Duo (+), Cicaplast B5 vs B5+, DDML Lotion vs
+    # Lotion+. The word "plus" is the same marker. "Rice + Probiotics" (spaced) is not.
+    ConflictRule("plus", "version", r"(?<=[a-z0-9])\+(?![+\w])|\(\s*\+\s*\)|\bplus\b", "X+ / X (+) / X Plus edition."),
     # -- version / reformulation markers.
     ConflictRule("new_formula", "version", r"\b(?:new|improved)\s+formula(?:tion)?\b", "Declared new formula."),
     ConflictRule("reformulated", "version", r"\breformulat(?:ed|ion)\b", "Declared reformulation."),
+    ConflictRule("renewal", "version", r"\brenew(?:al|ed)\b", "K-beauty 'renewal'/'renewed': new packaging, often a formula change."),
+    ConflictRule("new", "version", r"\bnew\b(?!\s+(?:york|zealand))", "A lone 'new' (after 'new formula'); one-sided it vetoes."),
+    ConflictRule("limited_edition", "edition", r"\blimited(?:\s+edition)?\b|\b(?:holiday|anniversary|collectors?)\s+edition\b", "Limited / holiday edition."),
+    ConflictRule("special_edition", "edition", r"\bspecial\s+edition\b", "Special edition."),
     ConflictRule(_version, "version", r"\b(?:v|ver\.?|version)\s*(\d+(?:[.,]\d+)?)(?![\w.])", "v2 / ver. 2 / version 2.0."),
     ConflictRule(_version, "version", r"(?<![\w.])([2-9][.,]0)(?![\w.%])", "Bare 2.0 .. 9.0 (sizes are consumed first, so '2.0 fl oz' never reaches here)."),
     ConflictRule(_gen, "version", r"\b(\d{1,2})(?:st|nd|rd|th)\s+gen(?:eration)?\b", "6th generation."),
@@ -563,6 +629,8 @@ def conflict_family(token: str) -> str:
     """Lexicon family of a conflict token (valued tokens resolve by prefix)."""
     if token in _FAMILY_BY_STATIC_TOKEN:
         return _FAMILY_BY_STATIC_TOKEN[token]
+    if token.startswith("format_order:"):
+        return "format"
     if token.startswith("spf"):
         return "spf"
     if token.startswith("pa+"):
@@ -572,15 +640,30 @@ def conflict_family(token: str) -> str:
     return "other"
 
 
-def _extract(work: List[str], rules: Sequence[Tuple[ConflictRule, re.Pattern]]) -> List[str]:
-    found: List[str] = []
+# What a FORMAT word leaves in the core: its POSITION survives, so "Cream Skin" (Laneige) and
+# "Skin Cream" keep different ordered cores ("fmt skin" vs "skin fmt") although both move "cream"
+# to the conflict tokens. Not a lexicon token, so it never reads as a conflict on a re-pass.
+FORMAT_PLACEHOLDER = "fmt"
+
+
+def _extract(work: List[str], rules: Sequence[Tuple[ConflictRule, re.Pattern]], *,
+             placeholder: str = "") -> List[str]:
+    found: List[Tuple[int, str]] = []
     for rule, pattern in rules:
         for m in list(pattern.finditer("".join(work))):
             tok = rule.token(m) if callable(rule.token) else rule.token
-            found.append(tok)
+            found.append((m.start(), tok))
             for i in range(m.start(), m.end()):
                 work[i] = " "
-    return found
+            if placeholder and m.end() - m.start() >= len(placeholder):
+                work[m.start():m.start() + len(placeholder)] = list(placeholder)
+    tokens = [t for _pos, t in found]
+    if placeholder:
+        ordered = [t for _pos, t in sorted(found)]
+        if len(set(ordered)) > 1:
+            # "Gel to Cream" vs "Cream to Gel": same words, different products.
+            tokens.append("format_order:" + ">".join(ordered))
+    return tokens
 
 
 def conflict_tokens(text: Any) -> FrozenSet[str]:
@@ -596,13 +679,18 @@ def conflict_tokens(text: Any) -> FrozenSet[str]:
 # ---------------------------------------------------------------------------
 
 # Pure function words. Not skin/face/facial (gateway STOP_TOKENS does): they distinguish lines.
-_STOP_TOKENS = frozenset({"the", "and", "of", "for", "with", "a", "an", "by", "x"})
+# NOT "x": NARS "Orgasm X" is a different blush from "Orgasm". Only a LEADING "x" left by brand
+# removal ("COSRX x Olive Young ...", a collab) is dropped -- see _clean.
+_STOP_TOKENS = frozenset({"the", "and", "of", "for", "with", "a", "an", "by"})
 # Promo / retail-descriptor words that never name a product. NOT here: free (fragrance free),
-# double (Etude Double Lasting), plus (a reformulation), refill/set/kit/duo/gift/value/jumbo
+# double (Etude Double Lasting), plus (a conflict token), refill/set/kit/duo/gift/value/jumbo
 # (conflict tokens), original (a scent/variant name).
+# Not here (conflict tokens instead, review of be#2636): new, renewal/renewed, limited edition,
+# special edition -- each can mark a different formula or pack. A lone "edition"/"special" stays
+# in the core.
 _PROMO_TOKENS = frozenset({
-    "new", "limited", "edition", "special", "exclusive", "online", "bestseller", "bestsellers",
-    "sale", "hot", "deal", "authentic", "genuine", "official", "renewal", "renewed",
+    "exclusive", "online", "bestseller", "bestsellers", "sale", "hot", "deal", "authentic",
+    "genuine", "official",
 })
 _PROMO_PHRASES_RE = re.compile(
     r"\bk[\s-]?beauty\b|\bkorean\s+(?:skin\s*care|cosmetics?|beauty|makeup)\b|"
@@ -667,7 +755,26 @@ def _remove_brand(tokens: List[str], forms: FrozenSet[str]) -> List[str]:
 def _clean(text: str, forms: FrozenSet[str]) -> List[str]:
     text = _PROMO_PHRASES_RE.sub(" ", text)
     toks = _remove_brand(_tokens(text), forms)
-    return [t for t in toks if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
+    toks = [t for t in toks if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
+    while len(toks) > 1 and toks[0] == "x":
+        toks = toks[1:]  # "<brand> x <partner> ...": the collab separator the brand left behind
+    return toks
+
+
+@lru_cache(maxsize=65536)
+def _brand_text_re(forms: FrozenSet[str]) -> Optional[re.Pattern]:
+    """The brand as written in a title, punctuation-insensitive, with a glued "+" ("Dr.Jart+"),
+    so the brand's own "+" never reads as a "+" edition."""
+    alts = sorted((f for f in forms if len(f) >= 2), key=len, reverse=True)
+    if not alts:
+        return None
+    body = "|".join(r"[\W_]*".join(re.escape(c) for c in f) for f in alts)
+    return re.compile(rf"(?<![^\W_])(?:{body})\+?(?![^\W_])")
+
+
+def _blank_brand(text: str, forms: FrozenSet[str]) -> str:
+    pattern = _brand_text_re(forms)
+    return pattern.sub(lambda m: " " * len(m.group(0)), text) if pattern else text
 
 
 @dataclass(frozen=True)
@@ -722,6 +829,7 @@ def _trailing_shade(s: str, forms: FrozenSet[str]) -> Tuple[str, List[str]]:
 
 
 def _one_pass(text: str, forms: FrozenSet[str]) -> Tuple[List[str], List[str], List[str], _SizeScan]:
+    text = _blank_brand(text, forms)
     scan = _scan_sizes(text)
     work = list(text)
     for start, end in scan.spans:
@@ -742,7 +850,7 @@ def _one_pass(text: str, forms: FrozenSet[str]) -> Tuple[List[str], List[str], L
             shade.extend(_clean(" ".join(g for g in m.groups() if g), forms))
             s = s[: m.start()] + " " * (m.end() - m.start()) + s[m.end():]
     work = list(s)
-    conflicts.extend(_extract(work, _COMPILED_FORMAT))
+    conflicts.extend(_extract(work, _COMPILED_FORMAT, placeholder=FORMAT_PLACEHOLDER))
     core = _clean("".join(work), forms)
     return core, conflicts, shade, scan
 
@@ -752,8 +860,9 @@ def title_core(brand: Any, title: Any) -> TitleCore:
 
     Order: fold -> sizes and packs out -> conflict tokens out -> shade out (label, trailing
     " - X" / "(X)" segment of <= 3 non-product words, codes like #21 / 2N1) -> format
-    words out -> promo phrases, stop words, promo words and the brand (as a phrase, anywhere)
-    out. Repeated on its own output until stable, so title_core is idempotent.
+    words out (each leaves FORMAT_PLACEHOLDER at its position) -> promo phrases, stop words,
+    promo words and the brand (as a phrase, anywhere) out. Repeated on its own output until
+    stable, so title_core is idempotent.
     """
     forms = _brand_forms(brand)
     folded = _fold(title)
@@ -863,8 +972,13 @@ def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
     return (b, t) if b and t else None
 
 
-def match_key_t0c(listing: Any) -> Optional[Tuple[str, FrozenSet[str], Tuple[float, str, int]]]:
-    """T0c deterministic key: (canonical_brand, title-core token set, (size, unit, pack_count)).
+def match_key_t0c(listing: Any) -> Optional[Tuple[str, Tuple[str, ...], Tuple[float, str, int]]]:
+    """T0c deterministic key: (canonical_brand, ORDERED title-core tokens, (size, unit, pack_count)).
+
+    Ordered, not a token set (review of be#2636): "Cream to Powder" vs "Powder to Cream", "Oil to
+    Milk" vs "Milk to Oil", Laneige "Cream Skin" vs "Skin Cream" are different products. The cost
+    is recall where two stores order the same words differently ("Snail 96 Mucin Essence" vs
+    "96 Snail Mucin Essence"); the census reports that as the T0c_token_set tier.
 
     None when the brand or the core is empty, or no single primary size parses. The key does
     NOT carry shade or conflict tokens: a caller grouping by it MUST then apply veto_reasons (or
@@ -879,15 +993,19 @@ def match_key_t0c(listing: Any) -> Optional[Tuple[str, FrozenSet[str], Tuple[flo
     sk = size_key(tc.size)
     if not tc.tokens or sk is None:
         return None
-    return (cb, tc.tokens, sk)
+    return (cb, tuple(tc.core.split()), sk)
 
 
 def veto_reasons(a: TitleCore, b: TitleCore) -> List[str]:
     """Why two title cores are NOT one buyable item, empty when nothing vetoes. One-sided
-    tokens are disagreements too ("EDP" vs nothing is not known to agree)."""
+    tokens are disagreements too ("EDP" vs nothing is not known to agree), and two titles with
+    no parseable size are "size_unknown" (phase 1 needs a proven equal size)."""
     reasons = [f"conflict:{t}" for t in sorted(a.conflicts ^ b.conflicts)]
     if a.shade_tokens != b.shade_tokens:
         reasons.append("shade")
-    if size_key(a.size) != size_key(b.size):
+    sa, sb = size_key(a.size), size_key(b.size)
+    if sa != sb:
         reasons.append("size")
+    elif sa is None:
+        reasons.append("size_unknown")  # phase 1 merges same-size only: no size, no proof
     return reasons
