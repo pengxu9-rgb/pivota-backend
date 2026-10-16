@@ -962,7 +962,9 @@ M4 = "cross_merchant_same_size"
 
 def _verdict(**over):
     v = {"strategy": M4, "rule_version": "t0.v1", "tier": "T0b", "same_size": True,
-         "size": {"value": 30, "unit": "ml", "pack": 1}, "listing_offer_ids": ["off_1"]}
+         "size": {"value": 30, "unit": "ml", "pack": 1},
+         "matched_offers": [{"offer_id": "off_1", "sku_key": _listing(40) + "::v:4500001"}],
+         "matched_seeds": [{"seed_id": "eps_m4", "variant_id": "4500001"}]}
     v.update(over)
     return v
 
@@ -1021,7 +1023,9 @@ async def test_an_m4_run_is_approved_exactly_under_its_digest(db, conn):
     (dict(drop_verdict=True), "matcher_verdict missing"),
     (dict(verdict=_verdict(tier="fuzzy")), "tier"),
     (dict(verdict=_verdict(same_size=False)), "same_size"),
-    (dict(verdict=_verdict(listing_offer_ids=[])), "listing_offer_ids"),
+    (dict(verdict=_verdict(matched_offers=[])), "matched_offers"),
+    (dict(verdict=_verdict(matched_offers=[{"offer_id": "off_1", "sku_key": "ext:x::canonical"}])), "per-variant"),
+    (dict(verdict=_verdict(matched_seeds=None)), "matched_seeds"),
     (dict(kind="merge_content_key", verdict=_verdict()), "from_key_single_size"),
     (dict(proposer="hand_made"), "evidence.proposer"),
 ])
