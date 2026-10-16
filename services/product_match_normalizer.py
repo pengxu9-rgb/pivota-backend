@@ -587,16 +587,16 @@ CONFLICT_LEXICON: Tuple[ConflictRule, ...] = (
     ConflictRule(_spf, "spf", r"\bspf\s*(\d{1,3})\s*(\+?)", "SPF value; '50+' (KR/EU label class) is kept distinct from '50'."),
     ConflictRule("spf", "spf", r"\bspf\b", "SPF stated without a value."),
     ConflictRule(_pa, "pa", r"\bpa\s*(\+{1,4})", "PA rating (+ .. ++++), Asian UVA label."),
-    # -- "+" editions: after sizes, SPF/PA and "1+1" packs are blanked, a "+" is an edition when it
-    # is glued to a word or a percent (Duo+, B5+, Lotion+, Retinol 1%+), or not followed by a word
-    # (Effaclar Duo + SPF30 40ml, B5 +40ml, Lotion + 125ml -- what followed was a size or a rating;
-    # Duo (+), Duo [+] -- a bracket), or glued on the right only ("B5 +Balm"). The word "plus" is
-    # the same marker. A "+" symmetric BETWEEN two words ("Rice + Probiotics", "C+E") is a
-    # conjunction (_CONJUNCTION_PLUS_RE) and stays out.
+    # -- "+" editions. By the time this rule runs, sizes and "1+1" packs (parse_size), the brand's
+    # own "+" (_blank_brand), SPF/PA ratings (the rules above, run first) and every CONJUNCTION "+"
+    # (_CONJUNCTION_RE, symmetric between two words) are gone. So every "+" still standing is an
+    # edition -- glued on one side (Duo+, B5+, Retinol 1%+, "B5 +Balm"), bracketed (Duo (+), [+]),
+    # or before a size / rating / the end (Duo + SPF30 40ml) -- and no "+" is ever dropped
+    # silently. The word "plus" is the same marker.
     ConflictRule(
         "plus", "version",
-        r"(?<=[a-z0-9%])\+(?![+\w])|(?<![\w+%])\+(?=\s*(?:$|[^\w\s+]))|(?<=\s)\+(?=[^\W_])|\bplus\b",
-        "X+ / X (+) / X [+] / 'X +' before a size or the end / 'X +Y' (one-sided) / X Plus edition.",
+        r"\+|\bplus\b",
+        "Every '+' left once sizes, SPF/PA, packs, the brand and conjunctions are read; the word 'plus'.",
     ),
     # -- version / reformulation markers.
     ConflictRule("new_formula", "version", r"\b(?:new|improved)\s+formula(?:tion)?\b", "Declared new formula."),
@@ -643,6 +643,11 @@ FORMAT_LEXICON: Tuple[ConflictRule, ...] = (
     ConflictRule("light", "format", r"\blight\b|\blite\b", "Light texture edition."),
 )
 _COMPILED: Tuple[Tuple[ConflictRule, re.Pattern], ...] = tuple((r, re.compile(r.pattern)) for r in CONFLICT_LEXICON)
+# Ratings are read FIRST (their "+" is part of the rating: SPF50+, PA++++), then conjunctions are
+# decided (_CONJUNCTION_RE), then every other rule in table order.
+_RATING_FAMILIES = frozenset({"spf", "pa"})
+_COMPILED_RATINGS = tuple((r, c) for r, c in _COMPILED if r.family in _RATING_FAMILIES)
+_COMPILED_AFTER_RATINGS = tuple((r, c) for r, c in _COMPILED if r.family not in _RATING_FAMILIES)
 _COMPILED_FORMAT: Tuple[Tuple[ConflictRule, re.Pattern], ...] = tuple((r, re.compile(r.pattern)) for r in FORMAT_LEXICON)
 _FAMILY_BY_STATIC_TOKEN: Dict[str, str] = {
     r.token: r.family for r in CONFLICT_LEXICON + FORMAT_LEXICON if isinstance(r.token, str)
@@ -676,6 +681,9 @@ FORMAT_PLACEHOLDER = "fmt"
 # `plus` rule already took every "+" that is glued, bracketed or not followed by a word, so what
 # remains joins two words. One word for all three spellings, so "Rice + Probiotics" = "Rice &
 # Probiotics" = "Rice and Probiotics", "AHA + BHA" = "AHA & BHA", "Vitamin C+E" = "Vitamin C & E".
+# Decided in _one_pass right after SPF/PA and BEFORE conflict/format words are removed, and kept
+# even if a neighbour is removed later: "Toner+Refill" -> "toner join" != "Toner Refill",
+# "Cream+Serum" -> "fmt join serum" = "Cream & Serum".
 # Never silently dropped: "Cicaplast B5 + Multi-Purpose Balm" is not "B5 Multi-Purpose Balm",
 # "Rice + Probiotics" is not "Rice Probiotics" (the safe direction). ACCEPTED COST: "Hair & Body
 # Wash" no longer meets "Hair Body Wash". A brand's own "&" (Dolce & Gabbana, Sand & Sky) is gone
@@ -683,10 +691,15 @@ FORMAT_PLACEHOLDER = "fmt"
 # alphanumeric word that is no lexicon token, so it is stable on a re-pass.
 CONJUNCTION_PLACEHOLDER = "join"
 # A "+" is a conjunction ONLY when it is symmetric between two words: spaced on both sides
-# ("Rice + Probiotics", "Niacinamide 10% + Zinc") or glued on both ("Vitamin C+E"). One-sided
-# ("Duo+ 40ml", "B5+ Multi-Purpose Balm", "Rice +Probiotics") is the `plus` edition, on T0c (the
-# lexicon rule) and T0b (exact_title_key) alike.
-_CONJUNCTION_PLUS_RE = re.compile(r"(?<=[^\W_]|%)(?:\s+\+\s+|\+)(?=[^\W_])")
+# ("Rice + Probiotics", "Niacinamide 10% + Zinc") or glued on both ("Vitamin C+E", "Duo+M",
+# "Cream+Serum"). One-sided ("Duo+ 40ml", "B5+ Multi-Purpose Balm", "Rice +Probiotics") is the
+# `plus` edition, on T0c (the lexicon rule) and T0b (exact_title_key) alike.
+_CONJUNCTION_PLUS = r"\s+\+\s+|\+"
+_CONJUNCTION_PLUS_RE = re.compile(rf"(?<=[^\W_]|%)(?:{_CONJUNCTION_PLUS})(?=[^\W_])")
+# T0c decides "&" (folded to "and") and the word "and" between two words at the same point, so
+# the three spellings stay one conjunction whatever is removed around them later.
+_RATING_PLUS_RE = re.compile(r"\bspf\s*\d{1,3}\s*\+|\bpa\s*\+{1,4}")
+_CONJUNCTION_RE = re.compile(rf"(?<=[^\W_]|%)(?:{_CONJUNCTION_PLUS}|\s+and\s+)(?=[^\W_])")
 
 
 def _extract(work: List[str], rules: Sequence[Tuple[ConflictRule, re.Pattern]], *,
@@ -778,17 +791,16 @@ def _tokens(text: str) -> List[str]:
 
 
 def _clean(text: str) -> List[str]:
-    """Core words of a stretch of text whose brand _blank_brand has already removed. A conjunction
-    -- "+" between two words, "&" (folded to "and"), "and" -- BETWEEN two kept words becomes
-    CONJUNCTION_PLACEHOLDER; at either end, or repeated, it is dropped."""
+    """Core words of a stretch of text whose brand _blank_brand has already removed and whose
+    conjunctions _one_pass has already turned into CONJUNCTION_PLACEHOLDER. That word is KEPT even
+    when a neighbour was later removed ("Toner+Refill" -> "toner join": not "Toner Refill"); only
+    a repeat collapses. An "and" still standing was at an edge ("Rice and", "And Rice"): dropped."""
     text = _PROMO_PHRASES_RE.sub(" ", text)
-    text = _CONJUNCTION_PLUS_RE.sub(" and ", text)
-    words = [t for t in _tokens(text) if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
     out: List[str] = []
-    for i, t in enumerate(words):
-        if t in ("and", CONJUNCTION_PLACEHOLDER):
-            if out and out[-1] != CONJUNCTION_PLACEHOLDER and any(w not in ("and", CONJUNCTION_PLACEHOLDER) for w in words[i + 1:]):
-                out.append(CONJUNCTION_PLACEHOLDER)
+    for t in _tokens(text):
+        if t in _STOP_TOKENS or t in _PROMO_TOKENS or t == "and":
+            continue
+        if t == CONJUNCTION_PLACEHOLDER and out and out[-1] == CONJUNCTION_PLACEHOLDER:
             continue
         out.append(t)
     return out
@@ -869,7 +881,13 @@ def _one_pass(text: str, forms: FrozenSet[str]) -> Tuple[List[str], List[str], L
     for start, end in scan.spans:
         for i in range(start, end):
             work[i] = " "
-    conflicts = _extract(work, _COMPILED)
+    conflicts = _extract(work, _COMPILED_RATINGS)
+    # Conjunctions are decided HERE: after sizes and SPF/PA (their "+" is theirs), BEFORE any
+    # conflict or format word is removed -- else "Duo+M" / "Cream+Serum" / "Toner+Refill" lose a
+    # neighbour ("duo", "cream", "refill") first and the "+" between them is no longer between
+    # two words.
+    work = list(_CONJUNCTION_RE.sub(f" {CONJUNCTION_PLACEHOLDER} ", "".join(work)))
+    conflicts.extend(_extract(work, _COMPILED_AFTER_RATINGS))
     shade: List[str] = []
     s = "".join(work)
     m = _SHADE_LABEL_RE.search(s)
@@ -1023,6 +1041,8 @@ def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
         pattern = _brand_text_re(_brand_forms(brand))
         if pattern is not None:
             text = pattern.sub(lambda m: m.group(0).replace("+", " "), text)
+        # Ratings first, as on T0c: "SPF50+PA++++" keeps its 50+ (not "spf50 and pa").
+        text = _RATING_PLUS_RE.sub(lambda m: m.group(0).replace("+", " plus "), text)
         text = _CONJUNCTION_PLUS_RE.sub(" and ", text).replace("+", " plus ")
         t = normalize_title(text)
     return (b, t) if b and t else None
