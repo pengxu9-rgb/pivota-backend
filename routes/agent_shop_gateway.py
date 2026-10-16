@@ -6861,6 +6861,10 @@ async def _handle_offers_resolve(
             offers = live_offer_verification.apply_verdicts(offers, verdicts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("live offer verification failed; serving unverified: %s", exc)
+    if _group_mode:
+        # FRESH AHEAD OF STALE in what ships (contract line 5): the host-diverse head can lift a stale
+        # offer on a new host above a fresh second offer of a held one, and verification reorders.
+        offers = [o for o in offers if not o.get("price_stale")] + [o for o in offers if o.get("price_stale")]
 
     # ADR-025 D1: record the click ids of the links this response ACTUALLY hands out, with the
     # agent they were issued to. Here, after every lane (including the retry lanes and the
@@ -6885,12 +6889,18 @@ async def _handle_offers_resolve(
     else:
         _issuable_offers = offers
     await _issue_served_clicks(_issued_clicks, _issuable_offers, caller_api_key, caller_assertion)
-    # BEST PRICE in a resolved group: like for like, fresh, one currency (`_best_price_of`).
-    _best_price = _best_price_of(
-        offers, _buyer_currency, named_variant=bool(sku_id),
-        resolved_product_keys=_resolved_product_keys, resolved_seed_ids=_resolved_seed_ids,
-        defaulted_currency_ids=_defaulted_currency_ids,
-    ) if _group_mode else None
+    # BEST PRICE in a resolved group: the COMPARABLE set (`_price_comparable_offers`), each member
+    # marked `price_comparable: true`, and the cheapest of it. Nothing marked outside a group.
+    _best_price = None
+    if _group_mode:
+        _comparable = _price_comparable_offers(
+            offers, market_hint=market_hint, named_variant=bool(sku_id),
+            resolved_product_keys=_resolved_product_keys, resolved_seed_ids=_resolved_seed_ids,
+            defaulted_currency_ids=_defaulted_currency_ids,
+        )
+        for _offer in _comparable:
+            _offer["price_comparable"] = True
+        _best_price = _best_price_of(offers, _comparable)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -9289,8 +9299,7 @@ def _resolved_group_members(members: List[Dict[str, Any]], proposals: List[Dict[
 
     engine: Dict[str, set] = {}
     for p in proposals:
-        keys = set(p.get("subject_product_keys") or []) | ({p["keeper_product_key"]} if p.get("keeper_product_key") else set())
-        engine.setdefault(str(p.get("content_key") or ""), set()).update(str(k) for k in keys)
+        engine.setdefault(str(p.get("content_key") or ""), set()).update(_proposal_joined_keys(p))
     key_gtins: Dict[str, set] = {}
     for m in members:
         g = normalize_gtin(m.get("gtin"))
@@ -9309,6 +9318,26 @@ def _resolved_group_members(members: List[Dict[str, Any]], proposals: List[Dict[
         anchor_keys = {str(m.get("content_key")) for m in resolved if m.get("is_anchor")}
         resolved = [m for m in resolved if str(m.get("content_key")) in anchor_keys]
     return resolved
+
+
+def _proposal_joined_keys(p: Dict[str, Any]) -> set:
+    """The listings an applied move joined, read from the proposal's EVIDENCE as the engine writes it
+    (services/identity_resolution, be#2637): attach_membership -> `listing_product_key` + the keeper;
+    merge_content_key -> `from_product_keys` + the keeper. Nothing else counts."""
+    keys: set = set()
+    keeper = str(p.get("keeper_product_key") or "").strip()
+    if p.get("kind") == "attach_membership":
+        keys.add(str(p.get("listing_product_key") or "").strip())
+    elif p.get("kind") == "merge_content_key":
+        moved = p.get("from_product_keys")
+        if isinstance(moved, str):
+            try:
+                moved = json.loads(moved)
+            except ValueError:
+                moved = None
+        keys.update(str(k).strip() for k in (moved if isinstance(moved, list) else []))
+    keys.discard("")
+    return keys | {keeper} if keys and keeper else set()
 
 
 def _seed_row_host(row: Dict[str, Any]) -> str:
@@ -9377,7 +9406,9 @@ async def _fetch_resolved_group(
                 await asyncio.wait_for(
                     db.fetch_all(
                         """
-                        SELECT content_key, subject_product_keys, keeper_product_key
+                        SELECT content_key, kind, keeper_product_key,
+                               evidence->>'listing_product_key' AS listing_product_key,
+                               evidence->'from_product_keys' AS from_product_keys
                           FROM identity_resolution_proposals
                          WHERE content_key = ANY(:cks)
                            AND status = 'applied'
@@ -9537,8 +9568,8 @@ def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, An
             checked = datetime.fromisoformat(price_checked_at.strip().replace("Z", "+00:00"))
         except ValueError:
             checked = None
-    if checked is not None and checked.tzinfo is None:
-        checked = checked.replace(tzinfo=timezone.utc)
+    if checked is not None:
+        checked = checked.replace(tzinfo=timezone.utc) if checked.tzinfo is None else checked.astimezone(timezone.utc)
     fresh = checked is not None and checked >= datetime.now(timezone.utc) - timedelta(
         days=EXTERNAL_REFERRAL_STALE_DAYS
     )
@@ -9557,33 +9588,33 @@ def _mark_price_stale(offers: List[Dict[str, Any]]) -> None:
             offer["price_stale"] = True
 
 
-def _best_price_of(
+def _price_comparable_offers(
     offers: List[Dict[str, Any]],
-    buyer_currency: Optional[str],
     *,
+    market_hint: Optional[str],
     named_variant: bool,
     resolved_product_keys: set,
     resolved_seed_ids: set,
     defaulted_currency_ids: set,
-) -> Dict[str, Any]:
-    """The cheapest FRESH price, like for like, in ONE currency, among offers that ship.
-
-    THE CONTRACT. `best_price_offer_id` only ever names an offer in this answer that is:
-      * a member of the RESOLVED group -- a catalog offer on a resolved listing, or a seed of one
-        (same item, same size by the resolution rule); never an internal offer or a fallback-lane
-        seed, whose relation to the group is unproven;
-      * with a variant NAMED: an `exact` offer of that variant (`source.variant_match`), never a
-        catalog offer (it names no variant) and never a fallback at the listing's row price;
-        with none named: never a seed listing several variants, whose one price is one of them;
-      * FRESH: not `price_stale` (a catalog price unread for 7 days, or a seed the readiness gate
-        found stale; a gateway-verified seed carries no flag);
-      * priced in a currency the row actually stated (a NULL catalog currency defaulted to USD is
-        out), and the same currency as every other candidate: the buyer's declared one, else the
-        first candidate's in rank order -- two currencies are never compared.
-    Within that, a seller that can sell beats one that says it cannot (as the gateway's `best_offer`
-    reads it), then price, then rank. Nothing qualifies: no best price, rather than a wrong one."""
-    candidates = []
-    for rank, offer in enumerate(offers):
+) -> List[Dict[str, Any]]:
+    """The served offers whose prices may be compared: exactly the best-price pool, which the
+    gateway reads through each one's `price_comparable: true` (gw#2460). An offer is in it only if:
+      * it is the SAME SELLABLE UNIT as the group: a catalog offer on a RESOLVED listing, or a seed
+        the resolved-group read returned (a resolved group is same-size by construction) -- never an
+        internal offer, never a seed a fallback lane found, never a listing of another size;
+      * with a variant NAMED: an `exact` seed offer of it (`source.variant_match`) -- never a catalog
+        offer (it names no variant), never a fallback at a listing's row price; with none named: never
+        a seed listing several variants (its one price is one of them);
+      * FRESH: neither `price_stale` nor `requires_live_verification`;
+      * priced in a currency the row STATED (a NULL catalog currency defaulted to "USD" is out), spelled
+        as uppercase ISO 4217, and equal to the BUYER's: the declared market's currency, or USD for a
+        caller that declares none (a US buyer, as the seed lanes read it). A declared market with no
+        known currency compares nothing."""
+    basis = _declared_buyer_currency(market_hint) if market_hint else seed_serving_currency(None)
+    if not basis:
+        return []
+    out: List[Dict[str, Any]] = []
+    for offer in offers:
         if not isinstance(offer, dict) or offer.get("price_stale") or offer.get("requires_live_verification"):
             continue
         src = offer.get("source") or {}
@@ -9604,19 +9635,25 @@ def _best_price_of(
         price = offer.get("price")
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
             continue
-        currency = str(offer.get("currency") or "").strip().upper()
-        if currency:
-            candidates.append((rank, float(price), currency, offer))
-    basis = buyer_currency or (candidates[0][2] if candidates else None)
-    pool = [c for c in candidates if c[2] == basis]
+        # EXACTLY the basis, which is an uppercase ISO code from the market registry: a lowercase or
+        # padded spelling is not a currency this check vouches for.
+        if offer.get("currency") != basis:
+            continue
+        out.append(offer)
+    return out
+
+
+def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The cheapest of the comparable set (`_price_comparable_offers`), as `metadata.best_price`; its
+    `offer_id` is the response's `best_price_offer_id`. A seller that can sell beats one that says it
+    cannot (as the gateway's `best_offer` reads it), then price, then rank. Empty set: no best price."""
     stale = sum(1 for o in offers if isinstance(o, dict) and o.get("price_stale"))
-    if not pool:
+    if not comparable:
         return {"offer_id": None, "currency": None, "fresh_priced": 0, "stale_priced": stale}
-    rank, price, currency, offer = min(
-        pool, key=lambda c: (1 if _offer_is_known_unavailable(c[3]) else 0, c[1], c[0])
-    )
-    return {"offer_id": offer.get("offer_id"), "price": price, "currency": currency,
-            "fresh_priced": len(pool), "stale_priced": stale}
+    rank = {id(o): i for i, o in enumerate(offers)}
+    best = min(comparable, key=lambda o: (1 if _offer_is_known_unavailable(o) else 0, float(o["price"]), rank[id(o)]))
+    return {"offer_id": best.get("offer_id"), "price": float(best["price"]), "currency": best["currency"],
+            "fresh_priced": len(comparable), "stale_priced": stale}
 
 
 def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:

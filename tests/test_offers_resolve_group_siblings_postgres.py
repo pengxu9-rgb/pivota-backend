@@ -15,6 +15,7 @@ SQL statement of the lane is the route's own.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -85,10 +86,15 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, 
         for i, (listing, status, strategy) in enumerate(moves):
             c.execute(text(
                 "INSERT INTO identity_resolution_proposals (proposal_id, proposal_key, kind, strategy,"
-                " resolver_version, content_key, subject_product_keys, keeper_product_key, member_fingerprint, status)"
-                " VALUES (:id, :id, 'attach_membership', :strategy, 'test', :ck, :subjects, :keeper, 'fp', :status)"
+                " resolver_version, content_key, subject_product_keys, keeper_product_key, member_fingerprint, status,"
+                " evidence)"
+                " VALUES (:id, :id, :kind, :strategy, 'test', :ck, :subjects, :keeper, 'fp', :status, cast(:ev AS jsonb))"
             ), {"id": f"irp_{i}", "strategy": strategy, "ck": CK, "subjects": [listing, BRAND_PK],
-                "keeper": BRAND_PK, "status": status})
+                "keeper": BRAND_PK, "status": status,
+                # attach: evidence.listing_product_key; merge: evidence.from_product_keys (be#2637).
+                "kind": "merge_content_key" if i == 1 else "attach_membership",
+                "ev": (json.dumps({"from_product_keys": [listing], "from_content_key": "ck_old", "to_content_key": CK})
+                       if i == 1 else json.dumps({"listing_product_key": listing, "from_content_key": "ck_old"}))})
 
         def product(pk, sig, merchant, source_ref, source_product_id):
             c.execute(text(
@@ -206,6 +212,10 @@ def test_a_retailer_listing_reaches_the_brand_seed_on_postgres(schema_engine, mo
         assert hosts == ["brand.com", "stylekorean.com", "yesstyle.com"], (ident, hosts, res["metadata"]["sources"])
         assert _sources(res, "catalog_offers")[0]["status"] == "ok"
         assert res["best_price_offer_id"] == "of:catalog_offer:of_pg_sk", "fresh and cheapest"
+        marked = sorted(o["offer_id"] for o in res["offers"] if o.get("price_comparable") is True)
+        assert marked == ["of:catalog_offer:of_pg_sk", "of:catalog_offer:of_pg_ys",
+                          "of:external_seed:eps_pg_brand:SKU-30ML"], marked
+        assert all(o["price_checked_at"].endswith("+00:00") for o in res["offers"] if o.get("price_checked_at"))
 
 
 def test_flag_off_sends_none_of_it(schema_engine, monkeypatch):
