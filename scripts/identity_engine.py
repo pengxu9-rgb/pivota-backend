@@ -25,6 +25,10 @@ digest -- one prod one-off at a time, under the CPU gate, outside drains and 05:
 Strategy names other paths auto-apply are RESERVED here (RESERVED_STRATEGIES): the reconcile sweep
 and the link scripts apply every approved proposal of their strategy with no cap or digest, so a
 proposal written or approved here under one of their names would bypass this CLI's governance.
+A strategy only its own module may produce (MODULE_ONLY_STRATEGIES: cross_merchant_same_size, from
+services/identity_cross_merchant_match.py) is reserved too -- no hand-made proposal or approval under
+its name -- but its module's proposals may be APPLIED here, always capped, and with --execute only
+under the dry run's --expect-digest.
 """
 from __future__ import annotations
 
@@ -56,7 +60,13 @@ from services.identity_resolution import (  # noqa: E402
 RESERVED_STRATEGIES = frozenset({
     "same_url_dup", "junk_url", "campaign_clone", "campaign_clone_ambiguous", "seed_first_party_twin",
     "multi_seller_observation", "tier3_judge", "retailer_listing_brand_prefix", "variant_barcode_match",
+    "cross_merchant_same_size",
 })
+
+#: Reserved strategies whose proposals only their own strategy module produces. This CLI never writes or
+#: approves one, but may apply them: --max-proposals is always required, and --execute needs the dry
+#: run's --expect-digest (as for every strategy here).
+MODULE_ONLY_STRATEGIES = frozenset({"cross_merchant_same_size"})
 
 PROPOSAL_STRATEGIES_SQL = """
 SELECT proposal_id, strategy, kind, status FROM identity_resolution_proposals
@@ -94,6 +104,8 @@ def _detail(raw: Any) -> Dict[str, Any]:
 
 async def build_merge(conn, *, from_ck: str, to_ck: str, keeper: str, strategy: str) -> Dict[str, Any]:
     """A merge_content_key proposal from the live rows on `from_ck` and their memberships now."""
+    if reserved(strategy):
+        raise SystemExit(f"strategy {strategy!r} is reserved: only its own path may write its proposals")
     rows = list(await conn.fetch(FROM_KEY_ROWS_SQL, from_ck))
     if not rows:
         raise SystemExit(f"no live rows on {from_ck}")
@@ -135,7 +147,9 @@ async def main(argv: List[str]) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "apply" and args.execute and not args.expect_digest:
         ap.error("--execute needs --expect-digest from a dry run")
-    if args.cmd in ("apply", "propose-merge") and reserved(args.strategy):
+    if args.cmd == "propose-merge" and reserved(args.strategy):
+        ap.error(f"strategy {args.strategy!r} is reserved: only its own path may write its proposals")
+    if args.cmd == "apply" and reserved(args.strategy) and args.strategy not in MODULE_ONLY_STRATEGIES:
         ap.error(f"strategy {args.strategy!r} is reserved: another path applies it with no cap or digest")
 
     import asyncpg

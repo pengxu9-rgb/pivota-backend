@@ -98,9 +98,9 @@ def engine(monkeypatch):
 @pytest.mark.asyncio
 async def test_every_write_is_a_dry_run_unless_execute(engine):
     calls, conn = engine
-    await cli.main(["apply", "--strategy", "cross_merchant_same_size", "--max-proposals", "5"])
+    await cli.main(["apply", "--strategy", "m3_hand_merge", "--max-proposals", "5"])
     await cli.main(["revert-proposal", "irp_x"])
-    conn.rows = [{"proposal_id": "irp_x", "strategy": "cross_merchant_same_size", "kind": "merge_content_key",
+    conn.rows = [{"proposal_id": "irp_x", "strategy": "m3_hand_merge", "kind": "merge_content_key",
                   "status": "proposed"}]
     await cli.main(["approve", "irp_x", "--by", "peng"])
     assert calls["apply"][0]["dry_run"] is True and calls["revert"][0]["dry_run"] is True
@@ -115,6 +115,10 @@ async def test_every_write_is_a_dry_run_unless_execute(engine):
     ["apply", "--strategy", "retailer_listing_brand_prefix", "--max-proposals", "5"],
     ["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k", "--strategy", "junk_url"],
     ["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k", "--strategy", "variant_barcode_match"],
+    ["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k", "--strategy", "cross_merchant_same_size",
+     "--write"],
+    ["apply", "--strategy", "cross_merchant_same_size", "--max-proposals", "5", "--execute"],  # no digest
+    ["apply", "--strategy", "cross_merchant_same_size", "--expect-digest", "ird_x", "--execute"],  # no cap
 ])
 async def test_a_reserved_strategy_name_is_refused_before_connecting(engine, argv):
     calls, _ = engine
@@ -147,4 +151,38 @@ def test_every_strategy_another_path_applies_by_name_is_reserved():
         written |= set(re.findall(r'strategy\s*=\s*"([a-z0-9_]+)"', (root / name).read_text()))
     written |= {identity_brand_link.STRATEGY, identity_barcode_link.STRATEGY, JUDGE_STRATEGY,
                 *AUTO_APPROVE_STRATEGIES}
+    m4 = root / "identity_cross_merchant_match.py"  # the M4 module (its own branch): its STRATEGY too
+    if m4.exists():
+        written |= set(re.findall(r'^STRATEGY\s*=\s*"([a-z0-9_]+)"', m4.read_text(), re.M))
     assert written and written <= cli.RESERVED_STRATEGIES, written - cli.RESERVED_STRATEGIES
+
+
+
+@pytest.mark.asyncio
+async def test_a_module_only_strategy_is_applied_capped_and_digested_never_approved_by_hand(engine):
+    """cross_merchant_same_size: only services/identity_cross_merchant_match.py writes its proposals.
+    The coordinator may apply them here (dry run, then --execute with that run's digest, always capped);
+    nobody may approve one here."""
+    calls, conn = engine
+    assert "cross_merchant_same_size" in cli.RESERVED_STRATEGIES
+    await cli.main(["apply", "--strategy", "cross_merchant_same_size", "--max-proposals", "150"])
+    await cli.main(["apply", "--strategy", "cross_merchant_same_size", "--max-proposals", "150",
+                    "--expect-digest", "ird_abc", "--execute"])
+    assert [(c["dry_run"], c["max_proposals"], c["expect_digest"], c["strategies"]) for c in calls["apply"]] == [
+        (True, 150, None, ["cross_merchant_same_size"]),
+        (False, 150, "ird_abc", ["cross_merchant_same_size"])]
+    conn.rows = [{"proposal_id": "irp_m4", "strategy": "cross_merchant_same_size", "kind": "attach_membership",
+                  "status": "proposed"}]
+    with pytest.raises(SystemExit):
+        await cli.main(["approve", "irp_m4", "--by", "peng", "--execute"])
+    assert calls["approve"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_merge_refuses_a_reserved_strategy_before_reading():
+    class Boom:
+        async def fetch(self, *a):
+            raise AssertionError("read before the reservation check")
+
+    with pytest.raises(SystemExit):
+        await cli.build_merge(Boom(), from_ck="a", to_ck="b", keeper="k", strategy="cross_merchant_same_size")
