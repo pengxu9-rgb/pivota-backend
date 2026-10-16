@@ -1016,6 +1016,30 @@ def _extract_image_urls_from_data_attrs(html: str, base_url: str) -> list[str]:
     return urls
 
 
+def _link_variant_digits(raw: Any) -> str:
+    """The one `?variant=` digits value a link carries, selling plan or not ("" otherwise)."""
+    text = str(raw or "").strip()
+    if "variant=" not in text:
+        return ""
+    try:
+        values = {v for k, v in parse_qsl(urlparse(text).query, keep_blank_values=True) if k == "variant"}
+    except ValueError:
+        return ""
+    value = values.pop() if len(values) == 1 else ""
+    return value if value.isascii() and value.isdigit() else ""
+
+
+def _entry_variant_names(entry: Dict[str, Any]) -> set:
+    """Every merchant variant id a read entry (a plan's included) names: its link mark, the
+    `?variant=` its key spells, and a bare numeric / gid key."""
+    from services.outbound_links_service import extract_shopify_numeric_variant_id
+
+    vid = str(entry.get("variant_id") or "").strip()
+    names = {str(entry.get("offer_shopify_variant_id") or "").strip(), _link_variant_digits(vid),
+             extract_shopify_numeric_variant_id(vid) or ""}
+    return names - {""}
+
+
 def _read_variant_claim(entry: Dict[str, Any]) -> Optional[str]:
     """The ONE merchant variant id a read entry positively names, or None.
 
@@ -1264,6 +1288,13 @@ def _extract_jsonld_variants_with_census(
         # og:price -- the first or selected variant's. The refresh refuses a census carrying this,
         # so a single stored variant never takes another variant's price off it.
         "plans_only": bool(plan_refs) and not distinct,
+        # The variants a dropped plan names that NO remaining offer names (review of #2634): the
+        # page sells them, only by subscription, so the offers left are not the page's every value
+        # and the refresh refuses its single-variant product-level re-read off this census.
+        "orphan_plan_variants": sorted(
+            set().union(*(_entry_variant_names(v) for v in all_variants if v.get("_selling_plan")))
+            - set().union(*(_entry_variant_names(v) for v in list(distinct) + normalized))
+        ),
     }
     for v in list(all_variants) + normalized:
         for key in ("_offer_ref", "_price_refused", "_id_source", "_selling_plan", "_product_name"):

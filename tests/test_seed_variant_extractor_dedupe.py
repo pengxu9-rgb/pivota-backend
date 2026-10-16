@@ -257,13 +257,13 @@ def test_twin_entries_not_positively_the_same_variant_at_one_price_never_fold(of
 # ==== review of #2634 ==========================================================================
 
 
-def _reconcile(stored: List[Dict[str, Any]], html: str):
+def _reconcile(stored: List[Dict[str, Any]], html: str, product_amount: Any = None):
     from routes.employee_products import _reconcile_seed_variants_with_read
 
     page = _page(html=html)
     return _reconcile_seed_variants_with_read(
-        stored, page.evidence["variants"], product_amount=None, product_currency="USD",
-        product_availability=None, census=page.evidence["variant_census"])
+        stored, page.evidence["variants"], product_amount=product_amount, product_currency="USD",
+        product_availability=None, census=page.evidence["variant_census"], product_title=TITLE)
 
 
 def _stored(vid: str, price: float, title: str = "50 mL") -> Dict[str, Any]:
@@ -352,8 +352,11 @@ def test_a_plans_only_page_never_hands_a_single_variant_another_variants_price(m
     # A unit on the spec with no billingDuration is not a recurring charge.
     {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "48", "priceCurrency": "USD",
                             "unitText": "month"}},
+    # A zero duration bills nothing recurring.
+    {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "48", "priceCurrency": "USD",
+                            "billingDuration": 0}},
 ], ids=["sellingPlan_false", "selling_plan_id_zero", "installment", "downpayment",
-        "per_day_unit_price", "per_month_unit_price", "unit_text_without_duration"])
+        "per_day_unit_price", "per_month_unit_price", "unit_text_without_duration", "billing_duration_zero"])
 def test_twin_a_one_time_offer_with_a_benign_spec_is_kept_and_prices_the_product(extra):
     out = _extract(_product([_offer(48, IN, sku="A50", **extra), _offer(30, IN, sku="A15")]))
     assert [v["variant_id"] for v in out["variants"]] == ["A50", "A15"]
@@ -367,7 +370,8 @@ def test_twin_a_one_time_offer_with_a_benign_spec_is_kept_and_prices_the_product
     ({"sku": "LIP-RUBY", "name": "Ruby"}, {"sku": "LIP-CORAL", "name": "Coral"}),
     ({"gtin13": GTIN50}, {"gtin13": GTIN15}),
     ({"name": "Ruby"}, {"name": "Coral"}),
-], ids=["two_skus_two_titles", "two_barcodes", "two_titles"])
+    ({"sku": "LIP-RUBY"}, {"sku": "LIP-CORAL"}),
+], ids=["two_skus_two_titles", "two_barcodes", "two_titles", "two_skus_same_title"])
 def test_two_variants_sharing_the_selected_variants_link_stay_apart(a, b):
     # A theme stamps the SELECTED variant's url on every offer.
     out = _extract(_product([_offer(22, IN, **_link_url(V50), **a), _offer(22, IN, **_link_url(V50), **b)]))
@@ -438,3 +442,145 @@ def test_an_offers_second_visit_is_not_an_id_collision(offers):
     out = _extract(_product(offers))
     assert not any(v.get("id_collided") for v in out["variants"])
     assert out["variant_census"]["duplicate_ids"] == 0
+
+
+# ==== second review of #2634 ===================================================================
+
+
+# ---- 1. a stored id spelled as the @id link meets a read keyed by the digits
+
+
+def test_a_list_stored_by_its_at_id_links_re_reads_beside_a_url_only_block():
+    # The controller's repro: an @id block and a url-only block. The url-only offers are keyed by
+    # their digits and the fold keeps the digits; the stored `@id` spellings must still meet them.
+    html = _html(_product([_offer(85, IN, **_link_id(V50)), _offer(34, IN, **_link_id(V15))]),
+                 _product([_offer(85, IN, **_link_url(V50)), _offer(34, IN, **_link_url(V15))]))
+    assert [v["variant_id"] for v in _page(html=html).evidence["variants"]] == [V50, V15]
+    out, report = _reconcile([_stored(_link_id(V50)["@id"], 80.0), _stored(_link_id(V15)["@id"], 30.0, "15 mL")], html)
+    assert [v["price_amount"] for v in out] == [85.0, 34.0]
+    assert (report["re_read"], report["not_re_read_count"]) == (2, 0)
+
+
+@pytest.mark.parametrize("spell", [
+    lambda variant, gtin, sku: _link_id(variant)["@id"],
+    lambda variant, gtin, sku: gtin,
+    lambda variant, gtin, sku: variant,
+    lambda variant, gtin, sku: f"gid://shopify/ProductVariant/{variant}",
+    lambda variant, gtin, sku: sku,
+], ids=["at_id_link", "gtin", "digits", "gid", "sku"])
+def test_every_repaired_spelling_of_a_list_re_reads(spell):
+    # A theme block (@id + sku) and an app block (gtin + url): the read keeps one entry per size,
+    # keyed by its digits, carrying its sku and barcode. A list repaired to ANY of these spellings
+    # must keep its re-reads.
+    html = _html(_product([_offer(85, IN, sku="SKU-50", **_link_id(V50)), _offer(34, IN, sku="SKU-15", **_link_id(V15))]),
+                 _product([_offer(85, IN, gtin13=GTIN50, **_link_url(V50)), _offer(34, IN, gtin13=GTIN15, **_link_url(V15))]))
+    read = _page(html=html).evidence["variants"]
+    assert [(v["variant_id"], v.get("sku"), v.get("barcode")) for v in read] == [(V50, "SKU-50", GTIN50), (V15, "SKU-15", GTIN15)]
+    stored = [_stored(spell(V50, GTIN50, "SKU-50"), 80.0), _stored(spell(V15, GTIN15, "SKU-15"), 30.0, "15 mL")]
+    out, report = _reconcile(stored, html)
+    assert [v["price_amount"] for v in out] == [85.0, 34.0]
+    assert report["re_read"] == 2
+
+
+def test_twin_a_stored_link_spelling_naming_two_read_offers_reads_neither():
+    # One stored entry, two spellings: its `@id` names V50 while its `sku` is V15's. One stored
+    # entry cannot be two offers.
+    html = _html(_product([_offer(85, IN, **_link_url(V50)), _offer(34, IN, sku="SKU-15", **_link_url(V15))]))
+    (v,), report = _reconcile([_stored(_link_id(V50)["@id"], 80.0) | {"sku": "SKU-15"}], html)
+    assert (v["price_amount"], report["re_read"]) == (80.0, 0)
+
+
+# ---- 2. a plan naming a variant no remaining offer names
+
+
+def _orphan_plan_html(plan_variant: str = V50) -> str:
+    # A (V15) is sold one-time at 40; B (V50) only as a plan at 60.
+    plan = _offer(60, IN, **{"@id": f"/products/{HANDLE}?variant={plan_variant}&selling_plan=7#offer"})
+    return _html(_product([_offer(40, IN, **_link_id(V15)), plan]))
+
+
+@pytest.mark.parametrize("stored_id", [_link_id(V50)["@id"], "B-60"], ids=["at_id_link", "non_native_code"])
+def test_a_plan_for_another_variant_never_prices_a_single_stored_variant(monkeypatch, stored_id):
+    from tests.test_external_seed_refresh_writes_variants import _refresh, _seed_row
+
+    page = _page(html=_orphan_plan_html())
+    assert page.evidence["variant_census"]["orphan_plan_variants"] == [V50]
+    row = _seed_row(variants=[_stored(stored_id, 60.0)], price=60.0, availability="in_stock")
+    _, persisted = _refresh(monkeypatch, row, page)
+    seed = persisted["seed_data"]
+    assert [v["price_amount"] for v in seed["variants"]] == [60.0]
+    assert seed["snapshot"]["variant_refresh"]["status"] == "not_all_re_read"
+
+
+def test_twin_a_plan_of_the_remaining_variant_is_no_orphan(monkeypatch):
+    # The plan names the one-time offer's own variant: the page still sells one value.
+    from tests.test_external_seed_refresh_writes_variants import _refresh, _seed_row
+
+    page = _page(html=_orphan_plan_html(V15))
+    assert page.evidence["variant_census"]["orphan_plan_variants"] == []
+    row = _seed_row(variants=[_stored("A-40", 38.0)], price=38.0, availability="in_stock")
+    _, persisted = _refresh(monkeypatch, row, page)
+    assert [v["price_amount"] for v in persisted["seed_data"]["variants"]] == [40.0]
+
+
+# ---- 3. a shared barcode never hands a missing shade its sibling's read
+
+
+def test_a_shade_missing_from_the_read_never_takes_its_siblings_read_by_a_shared_barcode():
+    coral = {**_offer(26, OUT, name="Coral", gtin13=GTIN50, **_link_url(V15))}
+    stored_ruby = _stored(GTIN50, 22.0, "Ruby")
+    (v,), report = _reconcile([stored_ruby], _html(_product([coral])))
+    assert (v["price_amount"], v["availability"], report["re_read"]) == (22.0, "in_stock", 0)
+    # The same barcode under the same title is the same variant.
+    (v,), report = _reconcile([_stored(GTIN50, 22.0, "Coral")], _html(_product([coral])))
+    assert (v["price_amount"], report["re_read"]) == (26.0, 1)
+
+
+def test_twin_a_barcode_two_read_offers_carry_bridges_neither():
+    # A merchant data error: one barcode on two sizes, same price, different stock.
+    offers = [_offer(30, IN, gtin13=GTIN50, **_link_url(V50)), _offer(30, OUT, gtin13=GTIN50, **_link_url(V15))]
+    (v,), report = _reconcile([_stored(GTIN50, 28.0)], _html(_product(offers)))
+    assert (v["price_amount"], report["re_read"]) == (28.0, 0)
+
+
+# ---- the fallback still sees a folded entry's sku as a page code
+
+
+def test_a_folded_entrys_sku_still_vouches_for_the_single_variant_fallback():
+    # The jurlique fold keeps the `@id` key and the app node's sku. With no currency on the
+    # offers the per-offer price is not taken; the single-variant fallback takes the product's,
+    # because the stored sku is a code the page states.
+    def no_currency(offer):
+        return {k: v for k, v in offer.items() if k != "priceCurrency"}
+
+    html = _html(_product([no_currency(_offer(31, IN, **_link_id(V50)))]),
+                 _product([no_currency(_offer(31, IN, sku="114807", **_link_url(V50)))]))
+    (read,) = _page(html=html).evidence["variants"]
+    assert (read["variant_id"], read["sku"]) == (_link_id(V50)["@id"], "114807")
+    (v,), _ = _reconcile([_stored("local-1", 30.0) | {"sku": "114807"}], html, product_amount=31.0)
+    assert v["price_amount"] == 31.0
+
+
+def test_a_plans_only_page_whose_plans_name_no_variant_still_names_no_single_value(monkeypatch):
+    # Plans marked by a selling-plan key, with no link: nothing for `orphan_plan_variants` to name,
+    # and `plans_only` alone keeps og:price (A's 40) off the stored B.
+    from tests.test_external_seed_refresh_writes_variants import _refresh, _seed_row
+
+    offers = [_offer(40, IN, sku="A", selling_plan_id=11), _offer(60, IN, sku="B", selling_plan_id=12)]
+    meta = '<meta property="product:price:amount" content="40"><meta property="product:price:currency" content="USD">'
+    page = _page(html=_html(_product(offers)).replace("</head>", meta + "</head>"))
+    census = page.evidence["variant_census"]
+    assert (census["plans_only"], census["orphan_plan_variants"]) == (True, [])
+    row = _seed_row(variants=[_stored("B-60", 60.0)], price=60.0, availability="in_stock")
+    _, persisted = _refresh(monkeypatch, row, page)
+    assert [v["price_amount"] for v in persisted["seed_data"]["variants"]] == [60.0]
+
+
+def test_a_single_variant_stored_by_its_at_id_link_never_takes_another_variants_price():
+    # The page lists only V15; the seed stores V50 under its `@id` spelling. The product-level
+    # fallback must see V50 as a different native variant, as it would the bare digits.
+    html = _html(_product([_offer(40, IN, **_link_id(V15))]))
+    (v,), _ = _reconcile([_stored(_link_id(V50)["@id"], 60.0)], html, product_amount=40.0)
+    assert v["price_amount"] == 60.0
+    (v,), _ = _reconcile([_stored(V50, 60.0)], html, product_amount=40.0)  # the digits, same answer
+    assert v["price_amount"] == 60.0

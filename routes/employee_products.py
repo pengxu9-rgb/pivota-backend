@@ -5161,23 +5161,96 @@ def _read_variant_link(read_variant: Dict[str, Any]) -> Optional[str]:
     return linked or None
 
 
+def _variant_id_spellings(raw: Any) -> List[str]:
+    """The canonical spellings of ONE variant id: the `?variant=` digits a link-shaped id names
+    (`url_named_variant_id`; "" for a selling-plan link) and the bare digits of a `gid://` id
+    (`canonical_variant_id`). Empty for anything else -- a SKU or a barcode has no other spelling."""
+    from services.handover_variant_identity import canonical_variant_id, url_named_variant_id
+
+    text = str(raw or "").strip()
+    out: List[str] = []
+    for spelled in (url_named_variant_id(text), canonical_variant_id(text)):
+        if spelled and spelled != text and spelled not in out:
+            out.append(spelled)
+    return out
+
+
+def _seed_variant_match_ids(variant: Dict[str, Any]) -> List[str]:
+    """`_seed_variant_identifiers` plus each one's canonical spellings (`_variant_id_spellings`).
+
+    Review of #2634. A stored list keyed by the JSON-LD `@id` link
+    ("/products/h?variant=111#offer") never met a read keyed by the bare digits "111" -- what the
+    extractor keys a url-only offer by, and what a fold of the two keeps -- so it was never re-read
+    again, nor was a list a repair re-keyed to the `@id` spelling. Each spelling is still an exact
+    id the stored entry names, and the reconcile's ambiguity rules apply to the union: a stored
+    entry whose spellings name two read offers names neither.
+    """
+    out = list(_seed_variant_identifiers(variant))
+    for ident in list(out):
+        for spelled in _variant_id_spellings(ident):
+            if spelled not in out:
+                out.append(spelled)
+    return out
+
+
 def _read_variant_bridges(read_variant: Dict[str, Any]) -> List[str]:
     """Every id OTHER than its key that a read variant can be matched on: its link
-    (`_read_variant_link`), and the `sku` / `barcode` the extractor keeps beside the key.
+    (`_read_variant_link`), the `sku` the extractor keeps beside a folded entry's key, and the bare
+    digits of a `gid://` key. NOT the `?variant=` a link-shaped key spells: the extractor marks a
+    link's variant only when the link is on the page's OWN product (`offer_shopify_variant_id`),
+    and a `?variant=` on another product's link must not match. The `barcode` is a separate
+    bridge (`_read_variant_barcode`).
 
-    Review of #2634. The extractor no longer keys an offer by its barcode, and keeps ONE entry for
-    a variant the page lists twice (by its link, and by a node carrying its SKU), keyed by the
-    link. A seed adopted from an older read stores the barcode or the SKU as the variant's id, and
-    matching on the key alone stopped re-reading it. Like the link, these only FILL A GAP the keys
-    leave, under the same uniqueness rules: still exact equality on an identifier the page states.
+    Review of #2634. The extractor keeps ONE entry for a variant the page lists twice (by its
+    link, and by a node carrying its SKU), keyed by the link. A seed adopted from an older read
+    stores the SKU as the variant's id, and matching on the key alone stopped re-reading it. Like
+    the link, these only FILL A GAP the keys leave, under the same uniqueness rules: still exact
+    equality on an identifier the page states.
     """
     out: List[str] = []
-    for raw in (_read_variant_link(read_variant), read_variant.get("sku"), read_variant.get("barcode")):
+    from services.outbound_links_service import extract_shopify_numeric_variant_id
+
+    key = _seed_variant_key(read_variant)
+    gid_digits = extract_shopify_numeric_variant_id(key)
+    for raw in (_read_variant_link(read_variant), read_variant.get("sku"), gid_digits if gid_digits != key else None):
         if raw is None or isinstance(raw, (dict, list, bool)):
             continue
         text = str(raw).strip()
         if text and text not in out:
             out.append(text)
+    return out
+
+
+def _read_variant_barcode(read_variant: Dict[str, Any]) -> Optional[str]:
+    """The barcode the extractor keeps on a read variant (it is no longer ever the key), which a
+    seed adopted from an older read may store as the variant's id."""
+    raw = read_variant.get("barcode")
+    text = str(raw).strip() if raw is not None and not isinstance(raw, (dict, list, bool)) else ""
+    return text or None
+
+
+def _titles_agree(stored: Dict[str, Any], read: Dict[str, Any], product_title: Optional[str]) -> bool:
+    """May a BARCODE bridge pair these two? A barcode is not unique across a store's shades (a
+    shared barcode is a merchant's data error, but a common one): a stored shade missing from the
+    read must not take its sibling's price and stock through it. They agree when either title is
+    empty or just the product's name, or both name the same thing. Review of #2634."""
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    a, b, product = norm(stored.get("title")), norm(read.get("title")), norm(product_title)
+    return not a or not b or a == b or (bool(product) and product in (a, b))
+
+
+def _canonical_native_variant_ids(variant: Dict[str, Any]) -> set:
+    """`_native_refresh_variant_ids` plus the `?variant=` a link-shaped id names: the reconcile's
+    "is this the same native variant" checks must not miss a stored `@id` spelling of one."""
+    from services.handover_variant_identity import url_named_variant_id
+
+    out = set(_native_refresh_variant_ids(variant))
+    for key in ("variant_id", "id", "shopify_variant_id"):
+        named = url_named_variant_id(variant.get(key))
+        if named:
+            out.add(named)
     return out
 
 
@@ -5249,6 +5322,7 @@ def _reconcile_seed_variants_with_read(
     product_availability: Optional[str],
     census: Optional[Dict[str, Any]],
     refused_currencies: Iterable[str] = (),
+    product_title: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Write what this refresh re-read into the STORED variants the builders serve.
 
@@ -5290,16 +5364,20 @@ def _reconcile_seed_variants_with_read(
 
     read_by_id: Dict[str, List[int]] = {}
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
-    read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_native = set().union(*(_canonical_native_variant_ids(rv) for rv in read_variants)) if read_variants else set()
     read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
                        for k in ("price_currency", "currency") if rv.get(k)}
     read_by_link: Dict[str, List[int]] = {}
+    read_by_barcode: Dict[str, List[int]] = {}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
             read_by_id.setdefault(key, []).append(pos)
         for bridge in _read_variant_bridges(rv):
             read_by_link.setdefault(bridge, []).append(pos)
+        barcode = _read_variant_barcode(rv)
+        if barcode:
+            read_by_barcode.setdefault(barcode, []).append(pos)
     # An id the page itself states as a BARCODE is not a native variant id, wherever a stored
     # variant carries it (a seed adopted from an older read stores it as `variant_id`).
     read_barcodes = {str(rv["barcode"]).strip() for rv in read_variants if rv.get("barcode")}
@@ -5311,7 +5389,7 @@ def _reconcile_seed_variants_with_read(
     for v in stored:
         named = {
             read_by_id[i][0]
-            for i in _seed_variant_identifiers(v)
+            for i in _seed_variant_match_ids(v)
             if len(read_by_id.get(i) or []) == 1
         }
         pos = next(iter(named)) if len(named) == 1 else None
@@ -5325,13 +5403,18 @@ def _reconcile_seed_variants_with_read(
     # link beside the keys made that id two offers and dropped the re-read.
     key_claimed = set(claimants)
     for idx, v in enumerate(stored):
-        ids = _seed_variant_identifiers(v)
+        ids = _seed_variant_match_ids(v)
         if claims[idx] is not None or any(i in read_by_id for i in ids):
             continue
         named = {
             read_by_link[i][0]
             for i in ids
             if len(read_by_link.get(i) or []) == 1 and read_by_link[i][0] not in key_claimed
+        } | {
+            read_by_barcode[i][0]
+            for i in ids
+            if len(read_by_barcode.get(i) or []) == 1 and read_by_barcode[i][0] not in key_claimed
+            and _titles_agree(v, read_variants[read_by_barcode[i][0]], product_title)
         }
         if len(named) == 1:
             claims[idx] = pos = next(iter(named))
@@ -5348,8 +5431,8 @@ def _reconcile_seed_variants_with_read(
         mine = _read_offer_money(read_variants[pos])
         if any(
             other != pos and _read_offer_money_disagrees(mine, _read_offer_money(read_variants[other]))
-            for i in _seed_variant_identifiers(v)
-            for other in read_by_link.get(i) or []
+            for i in _seed_variant_match_ids(v)
+            for other in (read_by_link.get(i) or []) + (read_by_barcode.get(i) or [])
         ):
             claims[idx] = None
 
@@ -5358,9 +5441,11 @@ def _reconcile_seed_variants_with_read(
     single = len(stored) == 1
     # `plans_only`: every offer the page listed was a subscription plan, so `offers` is 0 and the
     # product price is og:price -- some variant's -- not a value the page vouches is the only one.
+    # `orphan_plan_variants`: a dropped plan named a variant no remaining offer names, so the page
+    # sells more than its remaining offers; "one offer left" no longer means "one value".
     census_ok = isinstance(census, dict) and not (
         census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
-        or census.get("plans_only")
+        or census.get("plans_only") or census.get("orphan_plan_variants")
     )
     single_takes_price = (
         single
@@ -5401,7 +5486,7 @@ def _reconcile_seed_variants_with_read(
         # An agreeing product price cannot override an explicit different native variant ID.
         # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
         # numeric ID through the existing identifier match or the single-product fallback.
-        stored_native = _native_refresh_variant_ids(v) - read_barcodes
+        stored_native = _canonical_native_variant_ids(v) - read_barcodes
         fallback_identity_ok = len(stored_native) <= 1 and not (
             stored_native and read_native and read_native != stored_native
         )
@@ -5425,7 +5510,7 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
-            rv_native = _native_refresh_variant_ids(rv)
+            rv_native = _canonical_native_variant_ids(rv)
             per_variant = (
                 not rv.get("id_collided") and not rv.get("offer_aggregate")
                 and len(stored_native) <= 1 and len(rv_native) <= 1
@@ -6157,6 +6242,7 @@ async def _refresh_external_seed_by_id(
             product_availability=fresh_availability,
             census=snap_variant_census,
             refused_currencies=foreign_currencies,
+            product_title=seed_data.get("title") or snap_title,
         )
         if reconciled:
             served_container["variants"] = reconciled
