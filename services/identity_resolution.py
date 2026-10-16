@@ -488,6 +488,9 @@ CROSS_MERCHANT_SAME_SIZE = "cross_merchant_same_size"
 MODULE_ONLY_STRATEGIES: Tuple[str, ...] = (CROSS_MERCHANT_SAME_SIZE,)
 
 MATCHER_VERDICT_TIERS = ("T0a", "T0b", "T0c")
+#: The normalized units a verdict's size may be in (fl oz is normalized to ml before it gets here) --
+#: the same set be#2635's rule accepts, so the two rules are identical.
+MATCHER_VERDICT_SIZE_UNITS = ("ml", "g", "count")
 
 MODULE_RUN_PROPOSALS_SQL = """
 SELECT * FROM identity_resolution_proposals
@@ -505,7 +508,8 @@ def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
     A verdict is {strategy, rule_version, tier, same_size, size: {value, unit, pack}, listing_offer_ids,
     from_key_single_size (merge_content_key only)}: the strategy that judged it, a non-empty rule
     version, a deterministic tier (T0a GTIN / T0b brand+title / T0c title core + size), same_size
-    true, the size compared (value > 0, a unit, pack >= 1), the listing's offers it covers, and -- for
+    true, the size compared (value > 0, unit ml / g / count, pack >= 1), the listing's offers it covers,
+    and -- for
     a merge, which moves every row on the losing key -- that the losing key holds a single size."""
     v = (evidence or {}).get("matcher_verdict")
     if not isinstance(v, dict):
@@ -526,8 +530,8 @@ def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
         value, unit, pack = size.get("value"), size.get("unit"), size.get("pack")
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
             problems.append("matcher_verdict.size.value is not a positive number")
-        if not (isinstance(unit, str) and unit.strip()):
-            problems.append("matcher_verdict.size.unit empty")
+        if unit not in MATCHER_VERDICT_SIZE_UNITS:
+            problems.append(f"matcher_verdict.size.unit not in {list(MATCHER_VERDICT_SIZE_UNITS)}")
         if isinstance(pack, bool) or not isinstance(pack, int) or pack < 1:
             problems.append("matcher_verdict.size.pack is not an integer >= 1")
     offers = v.get("listing_offer_ids")

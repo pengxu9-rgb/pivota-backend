@@ -236,7 +236,7 @@ def test_the_sweep_and_the_link_scripts_never_name_the_module_strategy():
 
 @pytest.mark.parametrize("kind,verdict,ok", [
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
-                           "same_size": True, "size": {"value": 1.7, "unit": "fl oz", "pack": 2},
+                           "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 2},
                            "listing_offer_ids": ["o1", "o2"]}, True),
     ("merge_content_key", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c",
                            "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 1},
@@ -289,3 +289,15 @@ async def test_propose_merge_denies_any_strategy_not_on_the_allowlist(engine, st
 
     with pytest.raises(SystemExit):
         await cli.build_merge(Boom(), from_ck="a", to_ck="b", keeper="k", strategy=strategy)
+
+
+
+@pytest.mark.parametrize("unit,ok", [("ml", True), ("g", True), ("count", True), ("fl oz", False), ("oz", False),
+                                     ("ML", False), ("", False), (None, False)])
+def test_the_verdict_size_unit_is_one_of_be2635s_units(unit, ok):
+    from services.identity_resolution import MATCHER_VERDICT_SIZE_UNITS, validate_matcher_verdict
+
+    assert MATCHER_VERDICT_SIZE_UNITS == ("ml", "g", "count")
+    verdict = {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c", "same_size": True,
+               "size": {"value": 50, "unit": unit, "pack": 1}, "listing_offer_ids": ["o1"]}
+    assert (validate_matcher_verdict("attach_membership", {"matcher_verdict": verdict}) == []) is ok
