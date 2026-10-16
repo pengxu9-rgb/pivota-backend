@@ -234,26 +234,31 @@ def test_the_sweep_and_the_link_scripts_never_name_the_module_strategy():
     assert not named & cli.MODULE_ONLY_STRATEGIES
 
 
+#: Contract v3's offer and seed lists, well formed: one offer on a per-variant SKU, no seeds.
+MATCH = {"matched_offers": [{"offer_id": "off_1", "sku_key": "ext:retailer:" + "a" * 32 + "::v:4500001"}],
+         "matched_seeds": []}
+
+
 @pytest.mark.parametrize("kind,verdict,ok", [
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
                            "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 2},
-                           "listing_offer_ids": ["o1", "o2"]}, True),
+                           **MATCH}, True),
     ("merge_content_key", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c",
                            "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 1},
-                           "listing_offer_ids": ["o1"], "from_key_single_size": True}, True),
+                           **MATCH, "from_key_single_size": True}, True),
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": " ", "tier": "T0a",
                            "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 1},
-                           "listing_offer_ids": ["o1"]}, False),
+                           **MATCH}, False),
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
                            "same_size": True, "size": {"value": True, "unit": "ml", "pack": 1},
-                           "listing_offer_ids": ["o1"]}, False),
+                           **MATCH}, False),
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
                            "same_size": True, "size": {"value": 50, "unit": "", "pack": 0},
-                           "listing_offer_ids": ["o1"]}, False),
+                           **MATCH}, False),
     ("attach_membership", {"strategy": "other", "rule_version": "v1", "tier": "T0a", "same_size": True,
-                           "size": {"value": 50, "unit": "ml", "pack": 1}, "listing_offer_ids": ["o1"]}, False),
+                           "size": {"value": 50, "unit": "ml", "pack": 1}, **MATCH}, False),
     ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
-                           "same_size": True, "size": None, "listing_offer_ids": ["o1"]}, False),
+                           "same_size": True, "size": None, **MATCH}, False),
 ])
 def test_the_shared_matcher_verdict_rule(kind, verdict, ok):
     from services.identity_resolution import validate_matcher_verdict
@@ -299,5 +304,92 @@ def test_the_verdict_size_unit_is_one_of_be2635s_units(unit, ok):
 
     assert MATCHER_VERDICT_SIZE_UNITS == ("ml", "g", "count")
     verdict = {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c", "same_size": True,
-               "size": {"value": 50, "unit": unit, "pack": 1}, "listing_offer_ids": ["o1"]}
+               "size": {"value": 50, "unit": unit, "pack": 1}, **MATCH}
     assert (validate_matcher_verdict("attach_membership", {"matcher_verdict": verdict}) == []) is ok
+
+
+
+def _v3(**over):
+    v = {"strategy": "cross_merchant_same_size", "rule_version": "v3", "tier": "T0a", "same_size": True,
+         "size": {"value": 30, "unit": "ml", "pack": 1}, **MATCH}
+    v.update(over)
+    return {"matcher_verdict": v}
+
+
+OFFER = {"offer_id": "off_1", "sku_key": "ext:retailer:" + "a" * 32 + "::v:4500001"}
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"matched_offers": None}, "matched_offers is not a non-empty list"),
+    ({"matched_offers": []}, "matched_offers is not a non-empty list"),
+    ({"matched_offers": "off_1"}, "matched_offers is not a non-empty list"),
+    ({"matched_offers": ["off_1"]}, "matched_offers[0].offer_id"),
+    ({"matched_offers": [{**OFFER, "offer_id": ""}]}, "matched_offers[0].offer_id"),
+    ({"matched_offers": [{**OFFER, "sku_key": "ext:retailer:" + "a" * 32 + "::canonical"}]}, "per-variant"),
+    ({"matched_offers": [{**OFFER, "sku_key": "prod::external_seed::external_seed::ext_bf55::canonical"}]},
+     "per-variant"),  # the mirror's one-per-product key
+    ({"matched_offers": [{**OFFER, "sku_key": "ext:retailer:" + "a" * 32}]}, "per-variant"),
+    ({"matched_offers": [{**OFFER, "sku_key": "ext:retailer:" + "a" * 32 + "::v:1::canonical"}]}, "per-variant"),
+    ({"matched_offers": [OFFER, {"offer_id": "off_2"}]}, "matched_offers[1].sku_key"),
+    ({"matched_seeds": None}, "matched_seeds is not a list"),
+    ({"matched_seeds": [{"variant_id": "1"}]}, "matched_seeds[0].seed_id"),
+    ({"matched_seeds": ["eps_1"]}, "matched_seeds[0].seed_id"),
+    ({"matched_seeds": [{"seed_id": "eps_1", "variant_id": ""}]}, "matched_seeds[0].variant_id"),
+    ({"matched_seeds": [{"seed_id": "eps_1", "variant_id": 45}]}, "matched_seeds[0].variant_id"),
+])
+def test_contract_v3_offer_and_seed_rules(over, needle):
+    from services.identity_resolution import validate_matcher_verdict
+
+    problems = validate_matcher_verdict("attach_membership", _v3(**over))
+    assert any(needle in p for p in problems), problems
+
+
+@pytest.mark.parametrize("over", [
+    {},
+    {"matched_offers": [{**OFFER, "sku_key": "ext:sku-identity-gate::0badc0de::v::4500001"}]},  # promoter spelling
+    {"matched_offers": [OFFER, {**OFFER, "offer_id": "off_2"}]},
+    {"matched_seeds": [{"seed_id": "eps_1", "variant_id": None}, {"seed_id": "eps_2", "variant_id": "4500001"}]},
+])
+def test_contract_v3_well_formed_verdicts(over):
+    from services.identity_resolution import validate_matcher_verdict
+
+    assert validate_matcher_verdict("attach_membership", _v3(**over)) == []
+
+
+def test_the_v2_listing_offer_ids_field_no_longer_satisfies_the_rule():
+    from services.identity_resolution import validate_matcher_verdict
+
+    v2 = _v3()
+    del v2["matcher_verdict"]["matched_offers"], v2["matcher_verdict"]["matched_seeds"]
+    v2["matcher_verdict"]["listing_offer_ids"] = ["off_1"]
+    problems = validate_matcher_verdict("attach_membership", v2)
+    assert any("matched_offers" in p for p in problems) and any("matched_seeds" in p for p in problems)
+
+
+@pytest.mark.parametrize("evidence,key", [
+    (_v3(), (30.0, "ml", 1)),
+    (_v3(size={"value": 1, "unit": "count", "pack": 3}), (1.0, "count", 3)),
+    (_v3(size={"value": 30, "unit": "fl oz", "pack": 1}), None),
+    (_v3(size={"value": 0, "unit": "ml", "pack": 1}), None),
+    (_v3(size=None), None),
+    ({}, None),
+    (None, None),
+])
+def test_verdict_size_key(evidence, key):
+    from services.identity_resolution import verdict_size_key
+
+    assert verdict_size_key(evidence) == key
+    if key:  # equal sizes written as int or float compare equal, for one-size-per-key checks
+        same = _v3(size={"value": float(key[0]), "unit": key[1], "pack": key[2]})
+        assert verdict_size_key(same) == key
+
+
+def test_module_proposal_problems_needs_the_proposer_and_the_run():
+    from services.identity_resolution import module_proposal_problems
+
+    p = {"strategy": "cross_merchant_same_size", "kind": "attach_membership",
+         "evidence": {**_v3(), "proposer": "cross_merchant_same_size", "proposal_run_id": "m4run_1"}}
+    assert module_proposal_problems(p, "cross_merchant_same_size") == []
+    for field, needle in (("proposer", "evidence.proposer"), ("proposal_run_id", "evidence.proposal_run_id")):
+        bad = {**p, "evidence": {k: v for k, v in p["evidence"].items() if k != field}}
+        assert any(needle in x for x in module_proposal_problems(bad, "cross_merchant_same_size"))

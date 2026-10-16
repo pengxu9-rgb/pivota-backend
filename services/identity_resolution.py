@@ -500,46 +500,98 @@ FOR UPDATE
 """
 
 
+def _str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _size_problems(size: Any) -> List[str]:
+    if not isinstance(size, dict):
+        return ["matcher_verdict.size missing"]
+    problems = []
+    value, unit, pack = size.get("value"), size.get("unit"), size.get("pack")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        problems.append("matcher_verdict.size.value is not a positive number")
+    if unit not in MATCHER_VERDICT_SIZE_UNITS:
+        problems.append(f"matcher_verdict.size.unit not in {list(MATCHER_VERDICT_SIZE_UNITS)}")
+    if isinstance(pack, bool) or not isinstance(pack, int) or pack < 1:
+        problems.append("matcher_verdict.size.pack is not an integer >= 1")
+    return problems
+
+
+def is_variant_sku_key(sku_key: Any) -> bool:
+    """A per-variant SKU key (`<product_key>::v:<variant>`, ingestion.VARIANT_SKU_INFIX; the promoter's
+    `::v::` spelling contains it too) -- never the one-per-product `<product_key>::canonical` placeholder
+    the mirror and the canonical lane write."""
+    from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX, VARIANT_SKU_INFIX
+
+    return _str(sku_key) and VARIANT_SKU_INFIX in sku_key and not sku_key.endswith(SKU_SUFFIX)
+
+
 def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
                              strategy: str = CROSS_MERCHANT_SAME_SIZE) -> List[str]:
     """The problems with a proposal's evidence.matcher_verdict ([] = well formed). One rule, shared by
-    the approve path here, the M4 strategy module that writes the verdict, and be#2635.
+    the approve path here, the M4 strategy module that writes the verdict, and be#2635 (contract v3).
 
-    A verdict is {strategy, rule_version, tier, same_size, size: {value, unit, pack}, listing_offer_ids,
-    from_key_single_size (merge_content_key only)}: the strategy that judged it, a non-empty rule
-    version, a deterministic tier (T0a GTIN / T0b brand+title / T0c title core + size), same_size
-    true, the size compared (value > 0, unit ml / g / count, pack >= 1), the listing's offers it covers,
-    and -- for
-    a merge, which moves every row on the losing key -- that the losing key holds a single size."""
+    A verdict is:
+      strategy               the strategy that judged it;
+      rule_version           non-empty;
+      tier                   T0a (GTIN) / T0b (brand+title) / T0c (title core + size);
+      same_size              true;
+      size                   {value > 0, unit ml | g | count, pack >= 1} (verdict_size_key);
+      matched_offers         NON-EMPTY [{offer_id, sku_key}]: the offers the match covers, each on a
+                             per-variant SKU (is_variant_sku_key), never a ::canonical / mirror key;
+      matched_seeds          a list, possibly empty, of {seed_id, variant_id (str or null)};
+      from_key_single_size   true, for a merge_content_key (it moves every row on the losing key).
+
+    `variant_id: null` in matched_seeds is allowed ONLY for a seed that had exactly one variant when the
+    verdict was written; a multi-variant seed must name its variant. This function cannot see the
+    seed, so that is the WRITER's obligation (the M4 module, be#2635) and every READER that acts on the
+    verdict (apply, serving) must re-check it against the seed it loads, refusing a null variant_id
+    on a seed that now has more than one variant."""
     v = (evidence or {}).get("matcher_verdict")
     if not isinstance(v, dict):
         return ["matcher_verdict missing"]
     problems: List[str] = []
     if v.get("strategy") != strategy:
         problems.append(f"matcher_verdict.strategy is not {strategy}")
-    if not (isinstance(v.get("rule_version"), str) and v["rule_version"].strip()):
+    if not _str(v.get("rule_version")):
         problems.append("matcher_verdict.rule_version empty")
     if v.get("tier") not in MATCHER_VERDICT_TIERS:
         problems.append(f"matcher_verdict.tier not in {list(MATCHER_VERDICT_TIERS)}")
     if v.get("same_size") is not True:
         problems.append("matcher_verdict.same_size is not true")
-    size = v.get("size")
-    if not isinstance(size, dict):
-        problems.append("matcher_verdict.size missing")
+    problems += _size_problems(v.get("size"))
+    offers = v.get("matched_offers")
+    if not (isinstance(offers, list) and offers):
+        problems.append("matcher_verdict.matched_offers is not a non-empty list")
     else:
-        value, unit, pack = size.get("value"), size.get("unit"), size.get("pack")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            problems.append("matcher_verdict.size.value is not a positive number")
-        if unit not in MATCHER_VERDICT_SIZE_UNITS:
-            problems.append(f"matcher_verdict.size.unit not in {list(MATCHER_VERDICT_SIZE_UNITS)}")
-        if isinstance(pack, bool) or not isinstance(pack, int) or pack < 1:
-            problems.append("matcher_verdict.size.pack is not an integer >= 1")
-    offers = v.get("listing_offer_ids")
-    if not (isinstance(offers, list) and offers and all(isinstance(o, str) and o.strip() for o in offers)):
-        problems.append("matcher_verdict.listing_offer_ids empty")
+        for n, o in enumerate(offers):
+            if not (isinstance(o, dict) and _str(o.get("offer_id"))):
+                problems.append(f"matcher_verdict.matched_offers[{n}].offer_id empty")
+            if not (isinstance(o, dict) and is_variant_sku_key(o.get("sku_key"))):
+                problems.append(f"matcher_verdict.matched_offers[{n}].sku_key is not a per-variant SKU key")
+    seeds = v.get("matched_seeds")
+    if not isinstance(seeds, list):
+        problems.append("matcher_verdict.matched_seeds is not a list")
+    else:
+        for n, sd in enumerate(seeds):
+            if not (isinstance(sd, dict) and _str(sd.get("seed_id"))):
+                problems.append(f"matcher_verdict.matched_seeds[{n}].seed_id empty")
+            elif sd.get("variant_id") is not None and not _str(sd.get("variant_id")):
+                problems.append(f"matcher_verdict.matched_seeds[{n}].variant_id is not a string or null")
     if kind == "merge_content_key" and v.get("from_key_single_size") is not True:
         problems.append("matcher_verdict.from_key_single_size is not true")
     return problems
+
+
+def verdict_size_key(evidence: Optional[Dict[str, Any]]) -> Optional[Tuple[float, str, int]]:
+    """(value, unit, pack) of a verdict's size, normalized for comparison, or None when absent or
+    malformed: the key be#2635 and M4 group by to check one size per content_key."""
+    v = (evidence or {}).get("matcher_verdict")
+    size = v.get("size") if isinstance(v, dict) else None
+    if _size_problems(size):
+        return None
+    return (float(size["value"]), size["unit"], int(size["pack"]))
 
 
 def module_proposal_problems(p: Dict[str, Any], strategy: str) -> List[str]:
@@ -553,6 +605,8 @@ def module_proposal_problems(p: Dict[str, Any], strategy: str) -> List[str]:
         problems.append(f"strategy is {p.get('strategy')}")
     if ev.get("proposer") != strategy:
         problems.append(f"evidence.proposer is {ev.get('proposer')!r}, not {strategy!r}")
+    if not _str(ev.get("proposal_run_id")):
+        problems.append("evidence.proposal_run_id empty")
     return problems + validate_matcher_verdict(p.get("kind") or "", ev, strategy)
 
 
