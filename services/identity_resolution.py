@@ -595,14 +595,17 @@ def verdict_size_key(evidence: Optional[Dict[str, Any]]) -> Optional[Tuple[float
 
 
 def module_proposal_problems(p: Dict[str, Any], strategy: str) -> List[str]:
-    """Why a proposal is not an approvable product of `strategy`'s module: its proposer marker
-    (evidence.proposer, written by the module) and its matcher verdict."""
+    """Why a proposal is not an approvable product of `strategy`'s module: its kind (a membership move:
+    attach_membership or merge_content_key), its proposer marker and run (evidence.proposer,
+    evidence.proposal_run_id, written by the module) and its matcher verdict."""
     ev = p.get("evidence") or {}
     if isinstance(ev, str):
         ev = json.loads(ev or "{}")
     problems = []
     if p.get("strategy") != strategy:
         problems.append(f"strategy is {p.get('strategy')}")
+    if p.get("kind") not in MEMBERSHIP_KINDS:
+        problems.append(f"kind is {p.get('kind')!r}, not one of {list(MEMBERSHIP_KINDS)}")
     if ev.get("proposer") != strategy:
         problems.append(f"evidence.proposer is {ev.get('proposer')!r}, not {strategy!r}")
     if not _str(ev.get("proposal_run_id")):
@@ -659,7 +662,14 @@ async def approve_module_run(
         approved = await approve_proposals(conn, out["proposals"], decided_by.strip())
         if sorted(approved) != sorted(out["proposals"]):
             raise RuntimeError(f"approved {len(approved)} of {len(out['proposals'])} proposals")
-    return {**out, "approved": approved}
+        # The approval is durable, not only a CLI log line: one 'approved' event per proposal, carrying
+        # the digest it was approved under (identity_resolution_events.run_id = the proposal run).
+        approval = {"digest": digest, "strategy": strategy, "proposal_run_id": proposal_run_id,
+                    "decided_by": decided_by.strip(), "approved_at": datetime.now(timezone.utc).isoformat(),
+                    "proposals": len(approved)}
+        for pid in out["proposals"]:
+            await conn.execute(INSERT_EVENT_SQL, pid, "approved", proposal_run_id, json.dumps(approval))
+    return {**out, "approved": approved, "approval": approval}
 
 
 async def _apply_suppress_dup(conn, p: Dict[str, Any], run_id: str) -> Dict[str, Any]:
@@ -960,11 +970,15 @@ async def apply_approved(
             await conn.execute(BLOCK_PROPOSAL_SQL, pid, status, json.dumps(info))
             await conn.execute(INSERT_EVENT_SQL, pid, "blocked", run_id, json.dumps(info))
         for p, fp in plan["batch"]:
-            if p["kind"] == "merge_content_key" and expect_digest is None:
-                # A merge re-keys every live row on a content_key: it applies only as part of a batch a
+            if expect_digest is None and (p["kind"] == "merge_content_key"
+                                          or p["strategy"] in MODULE_ONLY_STRATEGIES):
+                # A merge re-keys every live row on a content_key, and a module-only strategy's proposals
+                # (any kind) were approved as one digested run: either applies only as part of a batch a
                 # dry run digested (scripts/identity_engine.py), never through a strategy-filtered apply
                 # such as the reconcile sweep's or a link script's. Left approved.
-                skipped.append((p["proposal_id"], "merge_content_key_needs_expect_digest"))
+                why = ("merge_content_key_needs_expect_digest" if p["kind"] == "merge_content_key"
+                       else "module_only_strategy_needs_expect_digest")
+                skipped.append((p["proposal_id"], why))
                 continue
             if p["kind"] == "suppress_dup":
                 detail = await _apply_suppress_dup(conn, p, run_id)
