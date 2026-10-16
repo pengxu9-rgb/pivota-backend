@@ -746,9 +746,12 @@ async def _stored_identity_of_grouped_listing(
     merchant_id: Optional[str],
     *,
     strict: bool,
-) -> Optional[Tuple[Dict[str, Any], str]]:
-    """(stored row, its group) when this listing is ALREADY STORED with a content_key other than the
-    computed one AND already belongs to a product group; else None (the tiers below decide as before).
+    gtin_content_key: Optional[str] = None,
+) -> Optional[Tuple[Dict[str, Any], str, bool]]:
+    """(stored row, its group, gtin_conflict) when this listing is ALREADY STORED, already belongs to a
+    product group, and either its stored content_key is not the computed one or Tier-0a would resolve
+    it to another family (`gtin_content_key`, the key Tier-0a would pick, differs from the stored one:
+    gtin_conflict). Else None: the tiers below decide as before.
 
     The stored row is the listing's own (same merchant + source_product_id + product_key), else the
     unique canonical_url hit (a re-derived seller or product_key). Membership is judged by
@@ -765,7 +768,10 @@ async def _stored_identity_of_grouped_listing(
     if row is None and canonical_url:
         hit = await _canonical_url_row(canonical_url)
         row = hit[0] if hit else None
-    if row is None or not row.get("content_key") or row.get("content_key") == content_key:
+    if row is None or not row.get("content_key"):
+        return None
+    gtin_conflict = bool(gtin_content_key) and gtin_content_key != row.get("content_key")
+    if row.get("content_key") == content_key and not gtin_conflict:
         return None
     if not row.get("source_product_id"):
         return None  # product_group_members is keyed on it: such a row can hold no membership
@@ -783,7 +789,7 @@ async def _stored_identity_of_grouped_listing(
             raise RuntimeError(
                 f"existing listing {row.get('product_key')} has a membership that could not be read")
         return None
-    return row, str(group)
+    return row, str(group), gtin_conflict
 
 
 def _brand_stripped_content_key(brand: Optional[str], title: Optional[str]) -> Optional[str]:
@@ -924,6 +930,48 @@ async def resolve_or_attach_content_identity(
             if gtin14 in untrusted:
                 legacy_rows = []
 
+        # -- First, ahead of every matching tier: an EXISTING grouped listing keeps its identity (M3,
+        # 2026-10-16). A listing the identity engine moved (attach_membership / merge_content_key)
+        # carries a content_key that is no longer make_content_key(brand, title). If a live row later
+        # lands on its OLD key, Tier-0b would resolve the re-crawl to that row; if its GTIN sits on
+        # another family, Tier-0a would. Either way the PDP upsert writes that key over the stored one
+        # and _ensure_primary_retailer_group refuses the group, failing the store job ("snap-back").
+        # So at the crawl door, a listing already stored (its own row by product_key, else the unique
+        # canonical_url hit) that already has a group membership (_listing_has_membership, the guard
+        # Tier-0e applies) keeps its stored key AND group when that key is not the computed one, or
+        # when Tier-0a would resolve it to another family. The GTIN case is never silent: it FLAGs
+        # `grouped_listing_gtin_conflict` for review (pdp_review_tasks + the provenance event). A
+        # grouped listing on its computed key whose GTIN agrees, and every ungrouped or new listing, go
+        # through the tiers below exactly as before.
+        if door == DOOR_CATALOG_ENRICHMENT:
+            gtin_ck = ((legacy_rows[0].get("content_key") or content_key) if gtin14 and legacy_rows else None)
+            kept = await _stored_identity_of_grouped_listing(
+                ctx, content_key, canonical_url, source_product_id, merchant_id, strict=strict_pg,
+                gtin_content_key=gtin_ck)
+            if kept is not None:
+                row, group, gtin_conflict = kept
+                ck = row["content_key"]
+                detail = {
+                    **_base_detail(),
+                    "matched_product_key": row.get("product_key"),
+                    "kept_content_key": ck,
+                    "deposit_basis": _deposit_basis(brand, title, gtin, ck),
+                }
+                action, matcher = ACTION_ATTACH, "existing_listing_identity"
+                if gtin_conflict:
+                    action, matcher = ACTION_FLAG, "grouped_listing_gtin_conflict"
+                    detail.update({
+                        "reason": matcher,
+                        "conflict_product_key": legacy_rows[0].get("product_key"),
+                        "gtin_content_key": gtin_ck,
+                        "kept_product_group_id": group,
+                    })
+                    await _flag_review_once(door, ctx, ck, matcher, detail)
+                return await _finish(
+                    action=action, content_key=ck, product_group_id=group, matcher=matcher, door=door,
+                    merchant_ctx=ctx, detail=detail, gtin=gtin14, attach=_attach_info(row, merchant_id),
+                )
+
         # -- Tier-0a: GTIN attribute (authoritative, cross-merchant). A GS1 GTIN
         # identifies one physical product regardless of who sells it or how the
         # title is phrased, so it OUTRANKS brand+title. A barcode the reuse guard
@@ -1048,33 +1096,6 @@ async def resolve_or_attach_content_identity(
                 matcher=None, door=door, merchant_ctx=ctx, gtin=gtin14,
                 detail={**_base_detail(), "reason": "no_identity_inputs"},
             )
-
-        # -- Before Tier-0b: an EXISTING listing keeps its identity (M3, 2026-10-16). A listing the
-        # identity engine moved (attach_membership / merge_content_key) carries a content_key that is
-        # no longer make_content_key(brand, title). If any live row later lands on its OLD key, Tier-0b
-        # below would resolve the re-crawl to that row: the PDP upsert writes the old key back and
-        # _ensure_primary_retailer_group refuses the group, failing the store job ("snap-back"). So at
-        # the crawl door, a listing already stored (its own row by product_key, else the unique
-        # canonical_url hit) whose stored key differs from the computed one and which already has a
-        # group membership keeps BOTH -- the guard Tier-0e applies (_listing_has_membership). A listing
-        # whose stored key equals the computed one goes through Tier-0b exactly as before.
-        if door == DOOR_CATALOG_ENRICHMENT:
-            kept = await _stored_identity_of_grouped_listing(
-                ctx, content_key, canonical_url, source_product_id, merchant_id, strict=strict_pg)
-            if kept is not None:
-                row, group = kept
-                ck = row["content_key"]
-                return await _finish(
-                    action=ACTION_ATTACH, content_key=ck, product_group_id=group,
-                    matcher="existing_listing_identity", door=door, merchant_ctx=ctx,
-                    detail={
-                        **_base_detail(),
-                        "matched_product_key": row.get("product_key"),
-                        "kept_content_key": ck,
-                        "deposit_basis": _deposit_basis(brand, title, gtin, ck),
-                    },
-                    gtin=gtin14, attach=_attach_info(row, merchant_id),
-                )
 
         # -- Tier-0b: content_key (brand+title FAMILY key).
         rows = await _rows_by_content_key(content_key, merchant_id)

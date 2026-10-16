@@ -289,6 +289,85 @@ async def test_a_stored_listing_without_membership_is_left_to_the_tiers_below(db
     assert (out["content_key"], out["evidence"]["matcher"]) == ("ck_hand_set", "source_product_id_match")
 
 
+GTIN = "08809643062985"  # check digit valid (canonical_gtin)
+OTHER_TITLE = "Artemisia Calming Essence Ampoule"   # another family carrying the same GTIN
+
+
+async def _gtin_family(db):
+    """An older row of ANOTHER seller and family, carrying the GTIN the listing's page now shows."""
+    other = "ext:retailer:" + "e" * 32
+    await _row(db, other, "merch_obs_gtin_seller", _ck("Missha", OTHER_TITLE), title=OTHER_TITLE,
+               group="pg_gtin_family")
+    await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
+                     {"g": GTIN, "k": other})
+    return other
+
+
+async def _resolve_with_gtin(listing, *, url=None):
+    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
+
+    return await resolve_or_attach_content_identity(
+        brand="Missha", title=LISTING_TITLE, gtin=GTIN, canonical_url=url, source_product_id=_spid(listing),
+        door=DOOR_CATALOG_ENRICHMENT, merchant_ctx={"merchant_id": RET_M, "platform": SYN,
+                                                   "product_key": listing, "strict_group_resolution": True})
+
+
+async def test_a_grouped_listing_is_not_moved_by_gtin_and_the_conflict_is_flagged(db):
+    """Tier-0a would attach the listing to the other family (its GTIN is there, older): a grouped listing
+    keeps its stored key and group instead, and the conflict goes to review -- never a silent move."""
+    other = await _gtin_family(db)
+    listing = _listing(16)
+    await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
+    out = await _resolve_with_gtin(listing)
+    assert (out["action"], out["content_key"], out["product_group_id"]) == ("FLAG", A, "pg_listing")
+    assert out["evidence"]["matcher"] == "grouped_listing_gtin_conflict"
+    detail = out["evidence"]["evidence"]
+    assert (detail["reason"], detail["conflict_product_key"], detail["gtin_content_key"]) == (
+        "grouped_listing_gtin_conflict", other, _ck("Missha", OTHER_TITLE))
+    tasks = await db.fetch_all("SELECT pdp_id, module_key, status, checklist FROM pdp_review_tasks")
+    [task] = [dict(t) for t in tasks]
+    checklist = json.loads(task["checklist"]) if isinstance(task["checklist"], str) else task["checklist"]
+    assert (task["pdp_id"], task["module_key"], task["status"]) == (listing, "identity", "needs_review")
+    assert (checklist["matcher"], checklist["candidate_product_key"]) == ("grouped_listing_gtin_conflict", other)
+    event = await db.fetch_one("SELECT action, matcher, content_key, product_group_id FROM intake_identity_events"
+                               " WHERE product_key = :k", {"k": listing})
+    assert (event["action"], event["matcher"], event["content_key"], event["product_group_id"]) == (
+        "FLAG", "grouped_listing_gtin_conflict", A, "pg_listing")
+    await _resolve_with_gtin(listing)  # a re-crawl does not stack a second task
+    assert len(await db.fetch_all("SELECT id FROM pdp_review_tasks")) == 1
+
+
+async def test_a_moved_listing_is_not_pulled_back_by_a_gtin_on_its_old_family(db, conn):
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
+                     {"g": GTIN, "k": _listing(2)})  # the row on the OLD key carries the GTIN
+    out = await _resolve_with_gtin(listing, url=url)
+    assert (out["action"], out["content_key"], out["product_group_id"]) == ("FLAG", B, "pg_brand")
+    assert out["evidence"]["matcher"] == "grouped_listing_gtin_conflict"
+
+
+async def test_an_ungrouped_listing_still_resolves_by_gtin_as_before(db):
+    await _gtin_family(db)
+    stored = _listing(17)  # stored, never grouped
+    await _row(db, stored, RET_M, A, title=LISTING_TITLE)
+    new = _listing(18)     # never seen
+    for listing in (stored, new):
+        out = await _resolve_with_gtin(listing)
+        assert (out["action"], out["content_key"], out["evidence"]["matcher"]) == (
+            "FLAG", _ck("Missha", OTHER_TITLE), "gtin_match_brand_title_drift")
+        assert out["product_group_id"] == "pg_gtin_family"
+
+
+async def test_a_grouped_listing_whose_gtin_agrees_resolves_through_tier_0a_as_before(db):
+    listing = _listing(19)
+    await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
+    await db.execute("UPDATE catalog_products SET gtin = :g WHERE product_key = :k", {"g": GTIN, "k": listing})
+    out = await _resolve_with_gtin(listing)
+    assert (out["action"], out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (
+        "ATTACH", A, "pg_listing", "gtin_match")
+    assert await db.fetch_all("SELECT id FROM pdp_review_tasks") == []
+
+
 async def _planned_pdp(stored, *, content_key):
     """A plan row for the stored listing (every bind the upsert names), as a re-crawl plans it."""
     import re
