@@ -738,26 +738,68 @@ async def _canonical_url_row(
     return row, match
 
 
-async def _stored_identity_of_grouped_listing(
+# --- The engine-move guard (M3) -----------------------------------------------------------------
+
+ENGINE_MOVE_GUARD_ENV = "INTAKE_IDENTITY_ENGINE_MOVE_GUARD"
+
+MATCHER_ENGINE_MOVED = "engine_moved_listing_identity"
+MATCHER_GTIN_CONFLICT = "grouped_listing_gtin_conflict"
+#: The guard kept an engine-moved listing's stored content_key but could not verify all of it (its
+#: group, or the move itself, was unreadable). The writer then keeps the row's EXISTING membership
+#: (no group target) instead of refusing the row -- which would fail the whole store's apply.
+MATCHER_ENGINE_MOVED_UNVERIFIED = "engine_moved_listing_kept_unverified"
+
+#: Did the identity ENGINE move this listing onto the content_key it carries now? An applied (not
+#: reverted) attach_membership or merge_content_key proposal targets the proposal's `content_key`, so
+#: the lookup rides idx_identity_resolution_proposals_content_key: the few proposals onto this key.
+ENGINE_MOVED_ONTO_SQL = """
+        SELECT 1 FROM identity_resolution_proposals p
+        WHERE p.content_key = :content_key
+          AND p.status = 'applied'
+          AND p.kind IN ('attach_membership', 'merge_content_key')
+          AND (p.evidence->>'listing_product_key' = :product_key
+               OR p.evidence->'from_product_keys' @> jsonb_build_array(CAST(:product_key AS text)))
+        LIMIT 1
+        """
+
+
+def engine_move_guard_enabled() -> bool:
+    """Default OFF: with it off the resolver and the crawl writer behave exactly as before M3. It is
+    turned on together with the first approved merge apply."""
+    return os.getenv(ENGINE_MOVE_GUARD_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _engine_moved_onto(product_key: str, content_key: str) -> bool:
+    from db.database import database
+
+    row = await database.fetch_one(ENGINE_MOVED_ONTO_SQL, {"content_key": content_key,
+                                                           "product_key": product_key})
+    return row is not None
+
+
+async def _engine_moved_listing_identity(
     ctx: Dict[str, Any],
     content_key: Optional[str],
     canonical_url: Optional[str],
     source_product_id: Optional[str],
     merchant_id: Optional[str],
     *,
-    strict: bool,
     gtin_content_key: Optional[str] = None,
-) -> Optional[Tuple[Dict[str, Any], str, bool]]:
-    """(stored row, its group, gtin_conflict) when this listing is ALREADY STORED, already belongs to a
-    product group, and either its stored content_key is not the computed one or Tier-0a would resolve
-    it to another family (`gtin_content_key`, the key Tier-0a would pick, differs from the stored one:
-    gtin_conflict). Else None: the tiers below decide as before.
+) -> Optional[Dict[str, Any]]:
+    """The stored identity of a listing the identity ENGINE moved, when the tiers would take it
+    elsewhere; else None (the tiers decide exactly as before).
 
-    The stored row is the listing's own (same merchant + source_product_id + product_key), else the
-    unique canonical_url hit (a re-derived seller or product_key). Membership is judged by
-    _listing_has_membership (unsure means existing); the group itself must then be readable: under the
-    primary writer's strict contract an unreadable one raises (the resolver fails and the writer refuses
-    the row) rather than guess, elsewhere the guard steps aside."""
+    Returns {row, group, gtin_conflict, unverified} when ALL hold:
+      - the listing is stored: its own row (same merchant + source_product_id + product_key), else the
+        unique canonical_url hit (a re-derived seller or product_key);
+      - its stored content_key is not the computed one, or Tier-0a would resolve it to another family
+        (`gtin_content_key`, the key Tier-0a would pick, differs from the stored one: gtin_conflict);
+      - an applied, not reverted, engine move put it on that stored key (ENGINE_MOVED_ONTO_SQL).
+    A listing the engine never moved keeps today's behaviour, so a title or brand fix still re-keys it.
+
+    Fails closed for THIS listing only: when the move lookup or the group read fails, or the group is
+    missing, the stored key is still kept and `unverified` names why; the writer keeps the existing
+    membership rather than refuse the row and fail the store's whole apply."""
     row: Optional[Dict[str, Any]] = None
     own_pk = str(ctx.get("product_key") or "")
     if own_pk and source_product_id and merchant_id:
@@ -768,28 +810,79 @@ async def _stored_identity_of_grouped_listing(
     if row is None and canonical_url:
         hit = await _canonical_url_row(canonical_url)
         row = hit[0] if hit else None
-    if row is None or not row.get("content_key"):
+    if row is None or not row.get("content_key") or not row.get("source_product_id"):
         return None
-    gtin_conflict = bool(gtin_content_key) and gtin_content_key != row.get("content_key")
-    if row.get("content_key") == content_key and not gtin_conflict:
-        return None
-    if not row.get("source_product_id"):
-        return None  # product_group_members is keyed on it: such a row can hold no membership
-    member ={"merchant_id": row.get("merchant_id"), "platform": row.get("platform")}
-    if not await _listing_has_membership(member, row.get("source_product_id")):
+    stored = row["content_key"]
+    gtin_conflict = bool(gtin_content_key) and gtin_content_key != stored
+    if stored == content_key and not gtin_conflict:
         return None
     try:
+        if not await _engine_moved_onto(str(row.get("product_key") or ""), stored):
+            return None
+    except Exception as exc:  # noqa: BLE001 -- unsure: keep the stored identity, never move it
+        logger.warning("intake_identity engine-move lookup failed for %s: %s", row.get("product_key"),
+                       str(exc)[:200])
+        return {"row": row, "group": None, "gtin_conflict": gtin_conflict,
+                "unverified": "engine_move_lookup_failed"}
+    try:
         group = await _existing_pg_for_listing(row)
-    except Exception:
-        if strict:
-            raise
-        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("intake_identity group read failed for %s: %s", row.get("product_key"), str(exc)[:200])
+        return {"row": row, "group": None, "gtin_conflict": gtin_conflict, "unverified": "group_unreadable"}
     if not group:
-        if strict:
-            raise RuntimeError(
-                f"existing listing {row.get('product_key')} has a membership that could not be read")
-        return None
-    return row, str(group), gtin_conflict
+        return {"row": row, "group": None, "gtin_conflict": gtin_conflict, "unverified": "membership_missing"}
+    return {"row": row, "group": str(group), "gtin_conflict": gtin_conflict, "unverified": None}
+
+
+#: A review task's id is a function of (matcher, listing), so the insert is an upsert on the table's
+#: primary key: two concurrent crawls of one listing cannot both enqueue (no read-then-insert race).
+REVIEW_TASK_UPSERT_SQL = """
+        INSERT INTO pdp_review_tasks
+          (id, pdp_id, module_key, status, priority, qa_sample, checklist, policy_labels,
+           created_at, updated_at)
+        VALUES
+          (:id, :pdp_id, 'identity', 'needs_review', 'normal', FALSE, CAST(:checklist AS jsonb),
+           CAST(:policy_labels AS jsonb), NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+        """
+
+
+def review_task_id(matcher: str, product_key: Optional[str]) -> str:
+    import hashlib
+
+    raw = f"{matcher}|{product_key or ''}"
+    return "pdptask_idm_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+async def _flag_review_upsert(
+    door: str,
+    merchant_ctx: Dict[str, Any],
+    content_key: Optional[str],
+    matcher: str,
+    detail: Dict[str, Any],
+) -> None:
+    """_flag_review's task (same rail and checklist shape), keyed per (matcher, listing): one task per
+    listing however often or concurrently it is re-crawled. Best-effort, never raises."""
+    from db.database import database
+
+    product_key = merchant_ctx.get("product_key")
+    try:
+        await database.execute(REVIEW_TASK_UPSERT_SQL, {
+            "id": review_task_id(matcher, product_key),
+            "pdp_id": str(product_key or "")[:96],
+            "checklist": json.dumps({
+                "source": "intake_identity",
+                "audit_product_key": product_key,
+                "audit_content_key": content_key,
+                "candidate_product_key": detail.get("conflict_product_key"),
+                "matcher": matcher,
+                "confidence": None,
+                "evidence": {**detail, "door": door},
+            }, ensure_ascii=False, default=str),
+            "policy_labels": json.dumps(["entity_resolution", "intake_identity"]),
+        })
+    except Exception as exc:  # noqa: BLE001 -- review enqueue is best-effort, as _flag_review's
+        logger.warning("intake_identity review upsert failed for %s: %s", product_key, str(exc)[:200])
 
 
 def _brand_stripped_content_key(brand: Optional[str], title: Optional[str]) -> Optional[str]:
@@ -930,26 +1023,23 @@ async def resolve_or_attach_content_identity(
             if gtin14 in untrusted:
                 legacy_rows = []
 
-        # -- First, ahead of every matching tier: an EXISTING grouped listing keeps its identity (M3,
-        # 2026-10-16). A listing the identity engine moved (attach_membership / merge_content_key)
-        # carries a content_key that is no longer make_content_key(brand, title). If a live row later
-        # lands on its OLD key, Tier-0b would resolve the re-crawl to that row; if its GTIN sits on
-        # another family, Tier-0a would. Either way the PDP upsert writes that key over the stored one
-        # and _ensure_primary_retailer_group refuses the group, failing the store job ("snap-back").
-        # So at the crawl door, a listing already stored (its own row by product_key, else the unique
-        # canonical_url hit) that already has a group membership (_listing_has_membership, the guard
-        # Tier-0e applies) keeps its stored key AND group when that key is not the computed one, or
-        # when Tier-0a would resolve it to another family. The GTIN case is never silent: it FLAGs
-        # `grouped_listing_gtin_conflict` for review (pdp_review_tasks + the provenance event). A
-        # grouped listing on its computed key whose GTIN agrees, and every ungrouped or new listing, go
-        # through the tiers below exactly as before.
-        if door == DOOR_CATALOG_ENRICHMENT:
+        # -- First, ahead of every matching tier (M3, 2026-10-16; INTAKE_IDENTITY_ENGINE_MOVE_GUARD,
+        # default OFF): a listing the identity ENGINE moved keeps its identity. attach_membership /
+        # merge_content_key leave it on a content_key that is no longer make_content_key(brand, title).
+        # If a live row later lands on its OLD key, Tier-0b would resolve the re-crawl to that row; if
+        # its GTIN sits on another family, Tier-0a would. Either way the PDP upsert writes that key over
+        # the engine's and _ensure_primary_retailer_group refuses the group, failing the store job
+        # ("snap-back"). So at the crawl door, a listing with an applied, not reverted, engine move onto
+        # its stored key keeps that key and its group. The GTIN case is never silent: it FLAGs
+        # `grouped_listing_gtin_conflict` (one pdp_review_tasks entry per listing + the provenance
+        # event). Every listing the engine never moved -- nearly all of them -- goes through the tiers
+        # below exactly as before, so title and brand fixes still re-key it.
+        if door == DOOR_CATALOG_ENRICHMENT and engine_move_guard_enabled():
             gtin_ck = ((legacy_rows[0].get("content_key") or content_key) if gtin14 and legacy_rows else None)
-            kept = await _stored_identity_of_grouped_listing(
-                ctx, content_key, canonical_url, source_product_id, merchant_id, strict=strict_pg,
-                gtin_content_key=gtin_ck)
+            kept = await _engine_moved_listing_identity(
+                ctx, content_key, canonical_url, source_product_id, merchant_id, gtin_content_key=gtin_ck)
             if kept is not None:
-                row, group, gtin_conflict = kept
+                row = kept["row"]
                 ck = row["content_key"]
                 detail = {
                     **_base_detail(),
@@ -957,19 +1047,23 @@ async def resolve_or_attach_content_identity(
                     "kept_content_key": ck,
                     "deposit_basis": _deposit_basis(brand, title, gtin, ck),
                 }
-                action, matcher = ACTION_ATTACH, "existing_listing_identity"
-                if gtin_conflict:
-                    action, matcher = ACTION_FLAG, "grouped_listing_gtin_conflict"
+                action, matcher = ACTION_ATTACH, MATCHER_ENGINE_MOVED
+                if kept["gtin_conflict"]:
+                    action, matcher = ACTION_FLAG, MATCHER_GTIN_CONFLICT
                     detail.update({
-                        "reason": matcher,
+                        "reason": MATCHER_GTIN_CONFLICT,
                         "conflict_product_key": legacy_rows[0].get("product_key"),
                         "gtin_content_key": gtin_ck,
-                        "kept_product_group_id": group,
+                        "kept_product_group_id": kept["group"],
                     })
-                    await _flag_review_once(door, ctx, ck, matcher, detail)
+                    await _flag_review_upsert(door, ctx, ck, MATCHER_GTIN_CONFLICT, detail)
+                if kept["unverified"]:
+                    matcher = MATCHER_ENGINE_MOVED_UNVERIFIED
+                    detail["unverified"] = kept["unverified"]
                 return await _finish(
-                    action=action, content_key=ck, product_group_id=group, matcher=matcher, door=door,
-                    merchant_ctx=ctx, detail=detail, gtin=gtin14, attach=_attach_info(row, merchant_id),
+                    action=action, content_key=ck, product_group_id=kept["group"], matcher=matcher,
+                    door=door, merchant_ctx=ctx, detail=detail, gtin=gtin14,
+                    attach=_attach_info(row, merchant_id),
                 )
 
         # -- Tier-0a: GTIN attribute (authoritative, cross-merchant). A GS1 GTIN

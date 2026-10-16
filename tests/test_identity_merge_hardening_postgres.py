@@ -9,9 +9,12 @@ PDP upsert (services.catalog_enrichment_agent.apply), and the identity engine
 (services.identity_resolution: apply_approved, its dry run and digest, revert_proposal,
 merge_content_key):
 
-  1. snap-back: a listing the engine moved stays on its new content_key and group when a row is later
-     minted on its OLD key and the listing is re-crawled -- with the identity gate on (the resolver keeps
-     it) and off (the writer keeps the stored key);
+  1. snap-back (INTAKE_IDENTITY_ENGINE_MOVE_GUARD on): a listing the engine moved stays on its new
+     content_key and group when a row is later minted on its OLD key, or its GTIN sits on another family
+     (FLAGged once per listing), and the listing is re-crawled -- with the identity gate on (the resolver
+     keeps it) and off (the writer keeps the stored key). Listings the engine never moved, and reverted
+     moves, resolve exactly as before; an unreadable read keeps that one listing's stored identity
+     without refusing the row. With the flag OFF the resolver is origin/main's (the parity cases);
   2. pre-flight: an attach whose listing has no product_group_members row is marked
      blocked_no_membership and the rest of the run applies, instead of the whole run aborting;
   3. batch cap + digest: a stale digest refuses with nothing written; the cap is respected;
@@ -196,7 +199,31 @@ async def _attach_proposal(conn, listing_key, *, from_ck=A, from_group, to_group
     return p["proposal_id"]
 
 
-# --- 1. snap-back ------------------------------------------------------------------------------------
+# --- 1. snap-back guard (INTAKE_IDENTITY_ENGINE_MOVE_GUARD) -----------------------------------------
+
+GUARD_ENV = "INTAKE_IDENTITY_ENGINE_MOVE_GUARD"
+GTIN = "08809643062985"  # check digit valid (canonical_gtin)
+OTHER_TITLE = "Artemisia Calming Essence Ampoule"   # another family carrying the same GTIN
+
+
+@pytest.fixture()
+def guard_on(monkeypatch):
+    monkeypatch.setenv(GUARD_ENV, "1")
+
+
+@pytest.fixture()
+def guard_off(monkeypatch):
+    monkeypatch.delenv(GUARD_ENV, raising=False)
+
+
+async def _resolve(listing, *, title=LISTING_TITLE, url=None, gtin=None):
+    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
+
+    return await resolve_or_attach_content_identity(
+        brand="Missha", title=title, gtin=gtin, canonical_url=url, source_product_id=_spid(listing),
+        door=DOOR_CATALOG_ENRICHMENT, merchant_ctx={"merchant_id": RET_M, "platform": SYN,
+                                                   "source_domain": "koolseoul.example",
+                                                   "product_key": listing, "strict_group_resolution": True})
 
 
 async def _moved_listing_then_a_row_on_its_old_key(db, conn):
@@ -206,9 +233,9 @@ async def _moved_listing_then_a_row_on_its_old_key(db, conn):
     url = "https://koolseoul.example/products/missha-artemisia-calming-ampoule"
     await _brand_product(db)
     await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing", url=url)
-    await _attach_proposal(conn, listing, from_group="pg_listing")
+    pid = await _attach_proposal(conn, listing, from_group="pg_listing")
     out = await apply_approved(conn, run_id="R_MOVE", strategies=[STRATEGY])
-    assert len(out["applied"]) == 1 and out["skipped"] == [] and out["blocked"] == []
+    assert out["applied"] == [pid] and out["skipped"] == [] and out.get("blocked", []) == []
     assert await _state(db, listing) == (B, "pg_brand", True)
     # Later: another retailer's listing of the same wording mints its own family on the OLD key.
     await _row(db, _listing(2), "merch_obs_other", A, title=LISTING_TITLE, group="pg_other",
@@ -216,18 +243,32 @@ async def _moved_listing_then_a_row_on_its_old_key(db, conn):
     return listing, url
 
 
-async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gate_on(db, conn):
+async def _gtin_family(db):
+    """An older row of ANOTHER seller and family, carrying the GTIN the listing's page now shows."""
+    other = "ext:retailer:" + "e" * 32
+    await _row(db, other, "merch_obs_gtin_seller", _ck("Missha", OTHER_TITLE), title=OTHER_TITLE,
+               group="pg_gtin_family")
+    await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
+                     {"g": GTIN, "k": other})
+    return other
+
+
+async def _tasks(db, matcher):
+    rows = [dict(r) for r in await db.fetch_all("SELECT id, pdp_id, module_key, status, checklist"
+                                                " FROM pdp_review_tasks")]
+    for r in rows:
+        if isinstance(r["checklist"], str):
+            r["checklist"] = json.loads(r["checklist"])
+    return [r for r in rows if (r["checklist"] or {}).get("matcher") == matcher]
+
+
+async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gate_on(db, conn, guard_on):
     from services.catalog_enrichment_agent import apply as writer
-    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
 
     listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
-    ctx = {"merchant_id": RET_M, "platform": SYN, "source_domain": "koolseoul.example",
-           "product_key": listing, "strict_group_resolution": True}
-    out = await resolve_or_attach_content_identity(
-        brand="Missha", title=LISTING_TITLE, canonical_url=url, source_product_id=_spid(listing),
-        door=DOOR_CATALOG_ENRICHMENT, merchant_ctx=ctx)
+    out = await _resolve(listing, url=url)
     assert (out["action"], out["content_key"], out["product_group_id"]) == ("ATTACH", B, "pg_brand")
-    assert out["evidence"]["matcher"] == "existing_listing_identity"
+    assert out["evidence"]["matcher"] == "engine_moved_listing_identity"
 
     # The writer's own store path for this PDP: identity step, real upsert, group persistence.
     stored = dict(await db.fetch_one("SELECT * FROM catalog_products WHERE product_key = :k", {"k": listing}))
@@ -242,19 +283,22 @@ async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gat
     assert await _state(db, listing) == (B, "pg_brand", True)
 
 
-async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gate_off(db, conn):
+async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gate_off(db, conn, guard_on):
     from services.catalog_enrichment_agent import apply as writer
 
     listing, _ = await _moved_listing_then_a_row_on_its_old_key(db, conn)
     stored = dict(await db.fetch_one("SELECT * FROM catalog_products WHERE product_key = :k", {"k": listing}))
     new_row = {"product_key": _listing(3), "content_key": "ck_new_row"}  # not stored: untouched
-    ungrouped = _listing(14)  # stored, but never grouped: the planned key is written as before
+    ungrouped = _listing(14)  # stored, never grouped
     await _row(db, ungrouped, RET_M, "ck_stored_ungrouped", title="Other")
+    never_moved = _listing(20)  # stored AND grouped, but the engine never moved it: re-keys as today
+    await _row(db, never_moved, RET_M, "ck_stored_grouped", title="Other", group="pg_never_moved")
     plan = {"pdps": [await _planned_pdp(stored, content_key=A), new_row,
-                     {"product_key": ungrouped, "content_key": "ck_planned"}]}
+                     {"product_key": ungrouped, "content_key": "ck_planned"},
+                     {"product_key": never_moved, "content_key": "ck_planned_too"}]}
     kept, counts = await writer._keep_grouped_content_keys(plan, db)
     assert counts == {"pdp_content_key_kept_for_grouped_row": 1}
-    assert [p["content_key"] for p in kept["pdps"]] == [B, "ck_new_row", "ck_planned"]
+    assert [p["content_key"] for p in kept["pdps"]] == [B, "ck_new_row", "ck_planned", "ck_planned_too"]
     await db.execute(writer._PDP_UPSERT_SQL, kept["pdps"][0])
     assert await _state(db, listing) == (B, "pg_brand", True)
     # Control: the same upsert carrying the plan's key is exactly the snap-back the guard prevents.
@@ -262,110 +306,202 @@ async def test_a_moved_listing_stays_on_its_new_key_when_re_crawled_with_the_gat
     assert (await _state(db, listing))[0] == A
 
 
-async def test_a_listing_whose_stored_key_is_its_own_still_resolves_through_tier_0b(db):
-    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
+async def test_a_grouped_listing_the_engine_never_moved_still_re_keys(db, guard_on):
+    """Nearly every crawled listing is grouped (the writer ensures a primary group per listing): the
+    guard must leave them all to the tiers, so a title or brand fix still re-keys the listing."""
+    listing = _listing(21)
+    await _row(db, listing, RET_M, "ck_before_title_fix", title="Missha Artemisia Calming Ampule",
+               group="pg_listing")
+    await _row(db, _listing(22), "merch_obs_other", A, title=LISTING_TITLE, group="pg_other")
+    out = await _resolve(listing)
+    assert (out["content_key"], out["evidence"]["matcher"]) == (A, "content_key")
 
+
+async def test_a_reverted_move_is_not_guarded(db, conn, guard_on):
+    """revert_run marks a proposal reverted even when it left a listing that had moved since: such a
+    listing is no longer the engine's, and resolves as today."""
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await conn.execute("UPDATE identity_resolution_proposals SET status = 'reverted'")
+    out = await _resolve(listing, url=url)
+    assert (out["content_key"], out["evidence"]["matcher"]) == (A, "content_key")
+
+
+async def test_the_writer_does_not_keep_a_reverted_move(db, conn, guard_on):
+    from services.catalog_enrichment_agent import apply as writer
+
+    listing, _ = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await conn.execute("UPDATE identity_resolution_proposals SET status = 'reverted'")
+    plan = {"pdps": [{"product_key": listing, "content_key": A}]}
+    kept, counts = await writer._keep_grouped_content_keys(plan, db)
+    assert counts == {} and kept["pdps"][0]["content_key"] == A
+
+
+async def test_a_listing_whose_stored_key_is_its_own_still_resolves_through_tier_0b(db, guard_on):
     listing = _listing(4)
     await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
-    out = await resolve_or_attach_content_identity(
-        brand="Missha", title=LISTING_TITLE, source_product_id=_spid(listing), door=DOOR_CATALOG_ENRICHMENT,
-        merchant_ctx={"merchant_id": RET_M, "platform": SYN, "product_key": listing,
-                      "strict_group_resolution": True})
+    out = await _resolve(listing)
     assert (out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (A, "pg_listing",
                                                                                         "content_key")
 
 
-async def test_a_stored_listing_without_membership_is_left_to_the_tiers_below(db):
-    """Off the computed key but in no group: nothing to keep, so the guard steps aside (no error) and the
-    listing's own row answers through Tier-0d as before."""
-    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
+@pytest.mark.parametrize("broken,reason", [("_existing_pg_for_listing", "group_unreadable"),
+                                           ("_engine_moved_onto", "engine_move_lookup_failed")])
+async def test_an_unreadable_read_keeps_the_stored_identity_for_that_listing_only(db, conn, guard_on, monkeypatch,
+                                                                                 broken, reason):
+    """Fail closed for THIS listing: keep its stored key and its existing membership and record why --
+    never refuse the row, which fails the store's whole apply (require_primary_apply)."""
+    from services import intake_identity as ii
+    from services.catalog_enrichment_agent import apply as writer
 
-    listing = _listing(15)
-    await _row(db, listing, RET_M, "ck_hand_set", title=LISTING_TITLE)
-    out = await resolve_or_attach_content_identity(
-        brand="Missha", title=LISTING_TITLE, source_product_id=_spid(listing), door=DOOR_CATALOG_ENRICHMENT,
-        merchant_ctx={"merchant_id": RET_M, "platform": SYN, "product_key": listing,
-                      "strict_group_resolution": True})
-    assert (out["content_key"], out["evidence"]["matcher"]) == ("ck_hand_set", "source_product_id_match")
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    real = getattr(ii, broken)
 
+    async def flaky(*args, **kwargs):
+        raise ConnectionError("read failed")
 
-GTIN = "08809643062985"  # check digit valid (canonical_gtin)
-OTHER_TITLE = "Artemisia Calming Essence Ampoule"   # another family carrying the same GTIN
+    monkeypatch.setattr(ii, broken, flaky)
+    out = await _resolve(listing, url=url)
+    assert (out["action"], out["content_key"], out["product_group_id"]) == ("ATTACH", B, None)
+    assert out["evidence"]["matcher"] == "engine_moved_listing_kept_unverified"
+    assert out["evidence"]["evidence"]["unverified"] == reason
+    event = await db.fetch_one("SELECT matcher FROM intake_identity_events WHERE product_key = :k", {"k": listing})
+    assert event["matcher"] == "engine_moved_listing_kept_unverified"
 
-
-async def _gtin_family(db):
-    """An older row of ANOTHER seller and family, carrying the GTIN the listing's page now shows."""
-    other = "ext:retailer:" + "e" * 32
-    await _row(db, other, "merch_obs_gtin_seller", _ck("Missha", OTHER_TITLE), title=OTHER_TITLE,
-               group="pg_gtin_family")
-    await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
-                     {"g": GTIN, "k": other})
-    return other
-
-
-async def _resolve_with_gtin(listing, *, url=None):
-    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
-
-    return await resolve_or_attach_content_identity(
-        brand="Missha", title=LISTING_TITLE, gtin=GTIN, canonical_url=url, source_product_id=_spid(listing),
-        door=DOOR_CATALOG_ENRICHMENT, merchant_ctx={"merchant_id": RET_M, "platform": SYN,
-                                                   "product_key": listing, "strict_group_resolution": True})
+    stored = dict(await db.fetch_one("SELECT * FROM catalog_products WHERE product_key = :k", {"k": listing}))
+    pdp = await _planned_pdp(stored, content_key=A)
+    targets, refusals = {}, {}
+    assert await writer._apply_pdp_identity_gate(pdp, identity_gate_on=True, group_targets=targets,
+                                                 refusals=refusals)
+    assert listing not in targets  # no group target: the existing membership is kept, not refused
+    monkeypatch.setattr(ii, broken, real)
+    await db.execute(writer._PDP_UPSERT_SQL, pdp)
+    assert await writer._ensure_primary_retailer_group(pdp, database=db, target=None, refusals=refusals)
+    assert refusals == {} and await _state(db, listing) == (B, "pg_brand", True)
 
 
-async def test_a_grouped_listing_is_not_moved_by_gtin_and_the_conflict_is_flagged(db):
-    """Tier-0a would attach the listing to the other family (its GTIN is there, older): a grouped listing
-    keeps its stored key and group instead, and the conflict goes to review -- never a silent move."""
+async def test_a_moved_listing_is_not_moved_by_gtin_and_the_conflict_is_flagged(db, conn, guard_on):
+    """Tier-0a would attach the moved listing to another family (its GTIN is there, older): it keeps its
+    stored key and group instead, and the conflict goes to review -- never a silent move."""
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
     other = await _gtin_family(db)
-    listing = _listing(16)
-    await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
-    out = await _resolve_with_gtin(listing)
-    assert (out["action"], out["content_key"], out["product_group_id"]) == ("FLAG", A, "pg_listing")
+    out = await _resolve(listing, url=url, gtin=GTIN)
+    assert (out["action"], out["content_key"], out["product_group_id"]) == ("FLAG", B, "pg_brand")
     assert out["evidence"]["matcher"] == "grouped_listing_gtin_conflict"
     detail = out["evidence"]["evidence"]
     assert (detail["reason"], detail["conflict_product_key"], detail["gtin_content_key"]) == (
         "grouped_listing_gtin_conflict", other, _ck("Missha", OTHER_TITLE))
-    tasks = await db.fetch_all("SELECT pdp_id, module_key, status, checklist FROM pdp_review_tasks")
-    [task] = [dict(t) for t in tasks]
-    checklist = json.loads(task["checklist"]) if isinstance(task["checklist"], str) else task["checklist"]
+    [task] = await _tasks(db, "grouped_listing_gtin_conflict")
     assert (task["pdp_id"], task["module_key"], task["status"]) == (listing, "identity", "needs_review")
-    assert (checklist["matcher"], checklist["candidate_product_key"]) == ("grouped_listing_gtin_conflict", other)
+    assert task["checklist"]["candidate_product_key"] == other
     event = await db.fetch_one("SELECT action, matcher, content_key, product_group_id FROM intake_identity_events"
                                " WHERE product_key = :k", {"k": listing})
     assert (event["action"], event["matcher"], event["content_key"], event["product_group_id"]) == (
-        "FLAG", "grouped_listing_gtin_conflict", A, "pg_listing")
-    await _resolve_with_gtin(listing)  # a re-crawl does not stack a second task
-    assert len(await db.fetch_all("SELECT id FROM pdp_review_tasks")) == 1
+        "FLAG", "grouped_listing_gtin_conflict", B, "pg_brand")
+    await _resolve(listing, url=url, gtin=GTIN)  # a re-crawl does not stack a second task
+    assert len(await _tasks(db, "grouped_listing_gtin_conflict")) == 1
 
 
-async def test_a_moved_listing_is_not_pulled_back_by_a_gtin_on_its_old_family(db, conn):
+async def test_a_moved_listing_is_not_pulled_back_by_a_gtin_on_its_old_family(db, conn, guard_on):
     listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
     await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
                      {"g": GTIN, "k": _listing(2)})  # the row on the OLD key carries the GTIN
-    out = await _resolve_with_gtin(listing, url=url)
+    out = await _resolve(listing, url=url, gtin=GTIN)
     assert (out["action"], out["content_key"], out["product_group_id"]) == ("FLAG", B, "pg_brand")
     assert out["evidence"]["matcher"] == "grouped_listing_gtin_conflict"
 
 
-async def test_an_ungrouped_listing_still_resolves_by_gtin_as_before(db):
+async def test_a_grouped_listing_the_engine_never_moved_still_resolves_by_gtin(db, guard_on):
+    await _gtin_family(db)
+    listing = _listing(16)
+    await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
+    out = await _resolve(listing, gtin=GTIN)
+    assert (out["content_key"], out["evidence"]["matcher"]) == (_ck("Missha", OTHER_TITLE),
+                                                               "gtin_match_brand_title_drift")
+    assert await _tasks(db, "grouped_listing_gtin_conflict") == []
+
+
+async def test_an_ungrouped_listing_still_resolves_by_gtin_as_before(db, guard_on):
     await _gtin_family(db)
     stored = _listing(17)  # stored, never grouped
     await _row(db, stored, RET_M, A, title=LISTING_TITLE)
     new = _listing(18)     # never seen
     for listing in (stored, new):
-        out = await _resolve_with_gtin(listing)
+        out = await _resolve(listing, gtin=GTIN)
         assert (out["action"], out["content_key"], out["evidence"]["matcher"]) == (
             "FLAG", _ck("Missha", OTHER_TITLE), "gtin_match_brand_title_drift")
         assert out["product_group_id"] == "pg_gtin_family"
 
 
-async def test_a_grouped_listing_whose_gtin_agrees_resolves_through_tier_0a_as_before(db):
+async def test_the_review_task_dedupe_is_a_primary_key_upsert_not_a_read(db, conn):
+    """Two transactions racing to flag one listing: the second waits on the first's key and inserts
+    nothing. A read-then-insert would let both insert."""
+    import asyncpg
+
+    from services.intake_identity import REVIEW_TASK_UPSERT_SQL, review_task_id
+
+    sql = REVIEW_TASK_UPSERT_SQL
+    for n, name in enumerate((":id", ":pdp_id", ":checklist", ":policy_labels"), start=1):
+        sql = sql.replace(name, f"${n}")
+    args = (review_task_id("grouped_listing_gtin_conflict", "ext:retailer:x"), "ext:retailer:x",
+            json.dumps({"matcher": "grouped_listing_gtin_conflict"}), json.dumps([]))
+    other = await asyncpg.connect(_plain_url(), server_settings={"search_path": _SCHEMA})
+    try:
+        first, second = conn.transaction(), other.transaction()
+        await first.start()
+        await second.start()
+        assert await conn.execute(sql, *args) == "INSERT 0 1"
+        import asyncio
+
+        racing = asyncio.ensure_future(other.execute(sql, *args))
+        await asyncio.sleep(0.2)
+        assert not racing.done()  # blocked on the first transaction's key
+        await first.commit()
+        assert await racing == "INSERT 0 0"
+        await second.commit()
+    finally:
+        await other.close()
+    assert await conn.fetchval("SELECT count(*) FROM pdp_review_tasks") == 1
+
+
+# --- 1b. flag OFF: exactly origin/main ---------------------------------------------------------------
+
+
+async def test_parity_flag_off_a_moved_listing_resolves_as_before(db, conn, guard_off):
+    """With INTAKE_IDENTITY_ENGINE_MOVE_GUARD off the resolver is origin/main's: the re-crawl of a moved
+    listing resolves through Tier-0b to the row on its old key (the snap-back the flag exists for)."""
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    out = await _resolve(listing, url=url)
+    assert (out["action"], out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (
+        "ATTACH", A, "pg_other", "content_key")
+
+
+async def test_parity_flag_off_a_gtin_conflict_resolves_as_before(db, conn, guard_off):
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await _gtin_family(db)
+    out = await _resolve(listing, url=url, gtin=GTIN)
+    assert (out["content_key"], out["evidence"]["matcher"]) == (_ck("Missha", OTHER_TITLE),
+                                                               "gtin_match_brand_title_drift")
+    assert await _tasks(db, "grouped_listing_gtin_conflict") == []
+
+
+async def test_a_grouped_listing_whose_gtin_agrees_resolves_through_tier_0a_as_before(db, guard_on):
     listing = _listing(19)
     await _row(db, listing, RET_M, A, title=LISTING_TITLE, group="pg_listing")
     await db.execute("UPDATE catalog_products SET gtin = :g WHERE product_key = :k", {"g": GTIN, "k": listing})
-    out = await _resolve_with_gtin(listing)
+    out = await _resolve(listing, gtin=GTIN)
     assert (out["action"], out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (
         "ATTACH", A, "pg_listing", "gtin_match")
     assert await db.fetch_all("SELECT id FROM pdp_review_tasks") == []
+
+
+async def test_a_moved_listing_whose_gtin_agrees_is_kept_without_a_flag(db, conn, guard_on):
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await db.execute("UPDATE catalog_products SET gtin = :g, created_at = '2026-01-01' WHERE product_key = :k",
+                     {"g": GTIN, "k": KEEPER})  # the GTIN sits on the family the engine moved it onto
+    out = await _resolve(listing, url=url, gtin=GTIN)
+    assert (out["action"], out["content_key"], out["evidence"]["matcher"]) == (
+        "ATTACH", B, "engine_moved_listing_identity")
+    assert await _tasks(db, "grouped_listing_gtin_conflict") == []
 
 
 async def _planned_pdp(stored, *, content_key):

@@ -1012,6 +1012,15 @@ async def _apply_pdp_identity_gate(
             conflict_merchant_id=skip.get("conflict_merchant_id"),
         )
         return False
+    from services.intake_identity import MATCHER_ENGINE_MOVED_UNVERIFIED
+    if matcher == MATCHER_ENGINE_MOVED_UNVERIFIED:
+        # The resolver kept an engine-moved listing's stored key but could not read its group: keep the
+        # EXISTING membership (no target; _ensure_primary_retailer_group never overwrites one) rather
+        # than refuse the row, which would fail the store's whole apply. The reason is in provenance.
+        logger.warning("apply_ingest_plan: kept engine-moved identity unverified for product_key=%s (%s)",
+                       pdp.get("product_key"), (detail or {}).get("unverified") if isinstance(detail, dict) else None)
+        pdp["content_key"] = content_key
+        return True
     if str(pdp.get("product_key") or "").startswith("ext:retailer:") and group_targets is not None:
         target = ident.get("product_group_id")
         if not isinstance(target, str) or not target.strip():
@@ -2460,32 +2469,38 @@ async def _stage_from_kept_copy(
     return plan, counts
 
 
-#: The stored content_key of each planned row that already has a product group membership (M3).
+#: The stored content_key of each planned row the identity ENGINE moved onto it: an applied, not
+#: reverted, attach_membership / merge_content_key proposal targeting that key -- the resolver's
+#: intake_identity.ENGINE_MOVED_ONTO_SQL, here for a whole plan in one round trip (M3). As in the
+#: resolver, the stored key is kept even if the membership has gone missing since.
 _GROUPED_STORED_CONTENT_KEY_SQL = """
                 SELECT cp.product_key, cp.content_key
                 FROM catalog_products cp
                 WHERE cp.product_key = ANY(:keys)
                   AND cp.content_key IS NOT NULL
                   AND EXISTS (
-                        SELECT 1 FROM product_group_members m
-                        WHERE m.merchant_id = cp.merchant_id
-                          AND m.platform = cp.platform
-                          AND m.platform_product_id = cp.source_product_id)
+                        SELECT 1 FROM identity_resolution_proposals p
+                        WHERE p.content_key = cp.content_key
+                          AND p.status = 'applied'
+                          AND p.kind IN ('attach_membership', 'merge_content_key')
+                          AND (p.evidence->>'listing_product_key' = cp.product_key
+                               OR p.evidence->'from_product_keys' @> jsonb_build_array(cp.product_key)))
                 """
 
 
 async def _keep_grouped_content_keys(
     plan: Dict[str, Any], database: Any,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-    """With the intake identity gate OFF, a row that is already stored AND already in a product group
-    keeps its stored content_key. Returns (plan, counts).
+    """With the intake identity gate OFF and INTAKE_IDENTITY_ENGINE_MOVE_GUARD on, a row the identity
+    engine moved keeps its stored content_key. Returns (plan, counts). Every other
+    row is written exactly as before, so a title or brand fix still re-keys it.
 
     WHY (M3, 2026-10-16). `_PDP_UPSERT_SQL` writes `COALESCE(EXCLUDED.content_key, stored)`, so a re-crawl
     with the gate off writes the plan's make_content_key(brand, title) over the stored key. For a listing
     the identity engine moved onto another product (attach_membership, merge_content_key) that is the
     OLD key: the listing snaps back onto its old family while its membership stays in the new group.
     With the gate ON the resolver chooses the key (and keeps a grouped listing's stored key itself,
-    intake_identity._stored_identity_of_grouped_listing), so this runs only with the gate off. The
+    intake_identity._engine_moved_listing_identity), so this runs only with the gate off. The
     statement keeps its single shared DO UPDATE arm (bulk_writer cannot carry a per-row condition
     there), so the guard rewrites the planned row instead.
 
@@ -2607,10 +2622,12 @@ async def _apply_ingest_plan(
     plan, owner_counts = await _guard_canonical_owner(plan, database, market=market)
     # BOTH executors too: the stage the upsert writes must describe the copy the upsert keeps.
     plan, stage_counts = await _stage_from_kept_copy(plan, database)
-    # BOTH executors: with the identity gate off, a grouped row keeps its stored content_key (M3).
-    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, intake_identity_enabled
+    # BOTH executors: with the identity gate off, a row the identity engine moved keeps its stored
+    # content_key (M3, INTAKE_IDENTITY_ENGINE_MOVE_GUARD, default off: no lookup at all).
+    from services.intake_identity import (DOOR_CATALOG_ENRICHMENT, engine_move_guard_enabled,
+                                          intake_identity_enabled)
 
-    if not intake_identity_enabled(DOOR_CATALOG_ENRICHMENT):
+    if engine_move_guard_enabled() and not intake_identity_enabled(DOOR_CATALOG_ENRICHMENT):
         plan, kept_counts = await _keep_grouped_content_keys(plan, database)
         stage_counts = {**stage_counts, **kept_counts}
     # Pure, and after the owner guard: label against the rows and keys that will actually be written.
