@@ -6445,9 +6445,8 @@ async def _handle_offers_resolve(
     _resolved_product_keys: set = set()
     _matched_catalog_offers: set = set()
     _matched_seeds: Dict[str, set] = {}
-    _seed_variant_counts: Dict[str, int] = {}
+    _seed_variants_now: Dict[str, List[Dict[str, Any]]] = {}
     _catalog_sku_keys: Dict[str, Optional[str]] = {}
-    _resolved_seed_ids: set = set()
     _defaulted_currency_ids: set = set()
     if _group_seed_siblings_enabled() and not merchant_scope:
         sibling_started = time.perf_counter()
@@ -6464,13 +6463,13 @@ async def _handle_offers_resolve(
                 _resolved_product_keys = {str(m["product_key"]) for m in group["resolved"]}
                 _matched_catalog_offers = set(group["matched_offers"])
                 _matched_seeds = dict(group["matched_seeds"])
-                # How many variants each seed holds NOW: a seed matched as a whole (variant_id null)
-                # stays comparable only while it is still one sellable unit.
-                _seed_variant_counts = {
-                    str(r.get("id") or ""): len(_seed_variants(_ensure_seed_data_obj(r.get("seed_data"))))
+                # Each seed's stored variants NOW: a seed matched as a whole (variant_id null) stays
+                # comparable only while it is still one sellable unit, and a named match is read
+                # against the stored entry under every spelling the seed lane reads.
+                _seed_variants_now = {
+                    str(r.get("id") or ""): _seed_variants(_ensure_seed_data_obj(r.get("seed_data")))
                     for r in group["rows"]
                 }
-                _resolved_seed_ids = {str(r.get("id") or "") for r in group["rows"]}
                 held_hosts: set = set()
                 for prior in external_offers:
                     held_hosts |= _offer_hosts(prior)
@@ -6737,7 +6736,12 @@ async def _handle_offers_resolve(
                     "price": float(price_amount) if price_amount is not None else None,
                     "currency": str(r.get("currency") or "USD").strip() or "USD",
                     "availability": availability,
-                    "in_stock": not availability_is_known_unavailable(availability),
+                    # In a resolved group, the seed lane's wider vocabulary too ("sold out", the
+                    # schema.org OutOfStock URL...), so a sold-out retailer is never best price.
+                    "in_stock": not (
+                        _availability_says_out_of_stock(availability) if _group_mode
+                        else availability_is_known_unavailable(availability)
+                    ),
                     "url": destination,
                     "purchase_route": "affiliate_outbound",
                     # NEVER the raw destination under this key. `affiliate_url` MEANS an
@@ -6912,9 +6916,9 @@ async def _handle_offers_resolve(
     if _group_mode:
         _comparable = _price_comparable_offers(
             offers, market_hint=market_hint, named_variant=bool(sku_id),
-            resolved_product_keys=_resolved_product_keys, resolved_seed_ids=_resolved_seed_ids,
+            resolved_product_keys=_resolved_product_keys,
             matched_catalog_offers=_matched_catalog_offers, catalog_sku_keys=_catalog_sku_keys,
-            matched_seeds=_matched_seeds, seed_variant_counts=_seed_variant_counts,
+            matched_seeds=_matched_seeds, seed_variants=_seed_variants_now,
             defaulted_currency_ids=_defaulted_currency_ids,
         )
         for _offer in _comparable:
@@ -9712,11 +9716,10 @@ def _price_comparable_offers(
     market_hint: Optional[str],
     named_variant: bool,
     resolved_product_keys: set,
-    resolved_seed_ids: set,
     matched_catalog_offers: set,
     catalog_sku_keys: Dict[str, Optional[str]],
     matched_seeds: Dict[str, set],
-    seed_variant_counts: Dict[str, int],
+    seed_variants: Dict[str, List[Dict[str, Any]]],
     defaulted_currency_ids: set,
 ) -> List[Dict[str, Any]]:
     """The served offers whose prices may be compared: exactly the best-price pool, which the
@@ -9754,15 +9757,10 @@ def _price_comparable_offers(
             if offer.get("offer_id") in defaulted_currency_ids:
                 continue
         elif src.get("type") == "external_seed":
-            if src.get("seed_id") not in resolved_seed_ids:
-                continue
             # ...and only a seed the verdict matched: that variant, or -- matched as a whole
             # (variant_id null) -- a seed that is STILL one variant now (a refresh can add sizes).
-            entries = matched_seeds.get(src.get("seed_id")) or set()
-            if not (
-                src.get("variant_id") in entries
-                or (None in entries and seed_variant_counts.get(src.get("seed_id"), 2) <= 1)
-            ):
+            if not _seed_offer_matched(src, matched_seeds.get(src.get("seed_id")) or set(),
+                                       seed_variants.get(src.get("seed_id"))):
                 continue
             if named_variant and src.get("variant_match") != "exact":
                 continue
@@ -9784,6 +9782,28 @@ def _price_comparable_offers(
             continue
         out.append(offer)
     return out
+
+
+def _seed_offer_matched(src: Dict[str, Any], entries: set, variants: Optional[List[Dict[str, Any]]]) -> bool:
+    """Does a `matched_seeds` entry vouch for this seed offer?
+
+    `variants` is the seed's stored variants as read now -- None when the resolved-group read did
+    not return the seed, which is then no member offer at all (the ONE membership check for seeds).
+    A NAMED entry matches the stored entry this offer stands for (found by the offer's id,
+    `_seed_offer_variant_id`: variant_id | variantId | sku | sku_id | id) under every identity key the
+    seed lane reads (`stored_entry_answers_to`: those ids, gid, `?variant=`, the Shopify id).
+    A NULL entry ("the seed, which had one variant") holds only while the seed still has at most one."""
+    if variants is None:
+        return False
+    offer_vid = str(src.get("variant_id") or "")
+    stored = next((v for v in variants if _seed_offer_variant_id(v) == offer_vid), None)
+    for entry in entries:
+        if entry is None:
+            if len(variants) <= 1:
+                return True
+        elif stored is not None and stored_entry_answers_to(stored, entry):
+            return True
+    return False
 
 
 def _availability_says_out_of_stock(value: Any) -> bool:

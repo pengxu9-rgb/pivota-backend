@@ -1045,7 +1045,8 @@ def test_a_seed_a_fallback_lane_found_is_never_comparable(monkeypatch, client):
     # Even a verdict that (wrongly) lists it cannot vouch for a seed the group read did not return.
     body = _invoke(monkeypatch, client, product_id=CK, flag="1", seeds=[_single_size_brand_seed(29.0)],
                    fuzzy_seeds=[stray],
-                   proposals=[_attach(RETAILER_PK, seeds=[("eps_spec", "SKU-50ML"), ("eps_stray", "SKU-50ML")])])
+                   proposals=[_attach(RETAILER_PK, seeds=[("eps_spec", "SKU-50ML"), ("eps_stray", "SKU-50ML"),
+                                                          ("eps_stray", None)])])
     stray_offer = [o for o in body["offers"] if (o.get("source") or {}).get("seed_id") == "eps_stray"]
     assert stray_offer and "price_comparable" not in stray_offer[0]
     assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
@@ -1295,9 +1296,9 @@ def test_stock_reads_the_flag_first_and_the_text_only_without_one():
 
     def comparable(o):
         return gateway._price_comparable_offers(
-            [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK}, resolved_seed_ids=set(),
+            [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK},
             matched_catalog_offers={("x", "sku::p::1")}, catalog_sku_keys={"of:catalog_offer:x": "sku::p::1"},
-            matched_seeds={}, seed_variant_counts={}, defaulted_currency_ids=set()) == [o]
+            matched_seeds={}, seed_variants={}, defaulted_currency_ids=set()) == [o]
 
     assert comparable(offer(availability="unknown"))
     assert not comparable(offer(availability="out_of_stock"))
@@ -1399,9 +1400,9 @@ def test_every_out_of_stock_spelling_is_out_of_stock(text):
     o = {"offer_id": "of:catalog_offer:x", "price": 10.0, "currency": "USD", "availability": text,
          "source": {"type": "catalog_offer", "product_key": RETAILER_PK, "offer_id": "x"}}
     assert gateway._price_comparable_offers(
-        [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK}, resolved_seed_ids=set(),
+        [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK},
         matched_catalog_offers={("x", "sku::p::1")}, catalog_sku_keys={"of:catalog_offer:x": "sku::p::1"},
-        matched_seeds={}, seed_variant_counts={}, defaulted_currency_ids=set()) == []
+        matched_seeds={}, seed_variants={}, defaulted_currency_ids=set()) == []
 
 
 def test_a_price_tie_goes_to_the_higher_ranked_offer():
@@ -1425,3 +1426,63 @@ def test_a_fallback_under_a_named_variant_is_never_comparable_even_on_a_whole_se
     [o] = _brand_offers(body)
     assert o["source"]["variant_match"] == "fallback" and "price_comparable" not in o
     assert body["best_price_offer_id"] is None
+
+
+# ----------------------------------------------------------------------------- review of 759b7ab25
+
+
+@pytest.mark.parametrize("text", ["https://schema.org/OutOfStock", "sold out"])
+def test_a_catalog_row_sold_out_in_the_seed_lane_spelling_is_never_best_price(monkeypatch, client, text):
+    """Through the ROUTE, from a catalog_offers row: the arm's own vocabulary misses these spellings,
+    so in a resolved group its `in_stock` reads them through the seed lane's normalizer -- the matched
+    $15 retailer ships `in_stock: false`, is not comparable, and the fresh $29 brand is the best price.
+    Flag off: the arm's answer is unchanged."""
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, availability=text)]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                   seeds=[_single_size_brand_seed(29.0)])
+    _assert_contract(body)
+    sk = _by_id(body)["of:catalog_offer:of_sk"]
+    assert sk["in_stock"] is False and "price_comparable" not in sk
+    assert body["best_price_offer_id"] == BRAND_OFFER
+    off = _invoke(monkeypatch, client, product_id=RETAILER_SIG, catalog_rows=rows, seeds=[_single_size_brand_seed(29.0)])
+    assert _by_id(off)["of:catalog_offer:of_sk"]["in_stock"] is True, "flag off: byte-identical to main"
+
+
+@pytest.mark.parametrize("other", [
+    pytest.param({"value": 50, "unit": "ml", "pack": 2}, id="pack_differs"),
+    pytest.param({"value": 50, "unit": "g", "pack": 1}, id="unit_differs"),
+])
+def test_verdicts_differing_only_in_pack_or_unit_resolve_nothing(monkeypatch, client, other):
+    members = MEMBERS + [_member("ext:retailer:serum-ys", "sig_grp_ys", CK, None, "ext:retailer:serum-ys")]
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 25.0),
+            _catalog_row("of_ys", "ext:retailer:serum-ys", "yesstyle.com", 11.0)]
+    props = [_attach(RETAILER_PK), _attach("ext:retailer:serum-ys", offer_ids=("of_ys",), size=other)]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
+                   proposals=props, seeds=[_single_size_brand_seed(29.0)])
+    assert "best_price_offer_id" not in body and _marked(body) == []
+    assert BRAND_OFFER not in _by_id(body)
+
+
+def _id_keyed_seed(price=29.0):
+    """A seed whose one variant keys its id as `id` (no variant_id), with its Shopify id beside it."""
+    r = _single_size_brand_seed(price)
+    v = dict(r["seed_data"]["variants"][0])
+    v.pop("variant_id")
+    v["id"] = "4512"
+    r["seed_data"]["variants"] = [v]
+    return r
+
+
+@pytest.mark.parametrize("named,comparable", [
+    pytest.param("4512", True, id="by_id_key"),
+    pytest.param(_ATTACHED_B_VID, True, id="by_shopify_id"),
+    pytest.param(f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}", True, id="by_gid"),
+    pytest.param("9999", False, id="another_variant"),
+])
+def test_a_matched_seed_variant_is_read_under_every_spelling_the_seed_lane_reads(monkeypatch, client, named, comparable):
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[_id_keyed_seed()], catalog_rows=[],
+                   proposals=[_attach(RETAILER_PK, seeds=[("eps_spec", named)])])
+    [o] = _brand_offers(body)
+    assert o["source"]["variant_id"] == "4512"
+    assert (o.get("price_comparable") is True) is comparable
+    assert (body["best_price_offer_id"] == o["offer_id"]) is comparable
