@@ -885,6 +885,8 @@ def _assert_contract(body):
         assert not o.get("price_stale") and not o.get("requires_live_verification")
         assert re.fullmatch(r"[A-Z]{3}", o["currency"])
         assert (o.get("source") or {}).get("type") in ("catalog_offer", "external_seed")
+    for o in marked:                                                                  # 7
+        assert o.get("in_stock") is not False and o.get("availability") not in ("out_of_stock", "sold_out")
     stale_seen = False                                                                # 5
     for o in offers:
         if o.get("requires_live_verification"):
@@ -1105,22 +1107,32 @@ def test_a_proposal_resolves_only_on_a_valid_matcher_verdict(monkeypatch, client
         assert _marked(body) == []
 
 
+# Where the local rule is deliberately STRICTER than the shared one (unit must be ml | g | count).
+LOCAL_ONLY_REJECTS = {"size_unit_oz"}
+
+
 def test_the_local_validator_agrees_with_the_shared_one():
-    """be#2637 adds services/identity_resolution.validate_matcher_verdict; until both are on main the
-    rule lives here too. When the shared one is importable, both must answer every pinned case alike."""
+    """be#2637 adds services/identity_resolution.validate_matcher_verdict(kind, evidence, strategy=...)
+    -> [problems]; until both are on main the rule lives here too. When the shared one is importable,
+    both answer every pinned case alike, except where the local rule is documented as stricter -- and
+    the local rule is never the weaker of the two."""
     import routes.agent_shop_gateway as gateway
 
     for case, kind, verdict, valid in VERDICT_CASES:
         assert gateway._valid_matcher_verdict(kind, verdict) is valid, case
-    shared = getattr(__import__("services.identity_resolution", fromlist=["x"]), "validate_matcher_verdict", None)
+    import services.identity_resolution as identity_resolution
+
+    shared = getattr(identity_resolution, "validate_matcher_verdict", None)
     if shared is None:
         pytest.skip("be#2637's shared validator is not on this base yet; the local rule is pinned above")
+    strategy = getattr(identity_resolution, "CROSS_MERCHANT_SAME_SIZE", "cross_merchant_same_size")
+    assert gateway._CROSS_MERCHANT_SAME_SIZE == strategy
     for case, kind, verdict, valid in VERDICT_CASES:
-        try:
-            got = shared(verdict, kind=kind)
-        except TypeError:
-            got = shared(kind, verdict)
-        assert bool(got) is valid, case
+        shared_valid = not shared(kind, {"matcher_verdict": verdict}, strategy=strategy)
+        if case in LOCAL_ONLY_REJECTS:
+            assert valid is False and shared_valid is True, case
+        else:
+            assert shared_valid is valid, case
 
 
 def test_only_the_offers_the_matcher_matched_are_comparable(monkeypatch, client):
@@ -1184,3 +1196,60 @@ def test_a_verdict_cannot_vouch_for_an_offer_on_an_unresolved_listing(monkeypatc
                    proposals=[_attach(RETAILER_PK, offer_ids=("of_sk", "of_mini"))], seeds=[_single_size_brand_seed(29.0)])
     assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_mini"]
     assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
+
+
+
+def test_a_known_out_of_stock_offer_is_never_comparable(monkeypatch, client):
+    """Contract line 7. A fresh $15 retailer offer the feed says is out of stock is listed but is not
+    comparable and not best price; the in-stock brand at $29 is."""
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, availability="out_of_stock")]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                   seeds=[_single_size_brand_seed(29.0)])
+    _assert_contract(body)
+    sk = _by_id(body)["of:catalog_offer:of_sk"]
+    assert sk["in_stock"] is False and "price_comparable" not in sk
+    assert body["best_price_offer_id"] == BRAND_OFFER
+    # A sold-out SEED, likewise: the in-stock retailer is the best price.
+    oos = _single_size_brand_seed(9.0)
+    oos["availability"] = "out_of_stock"
+    for v in oos["seed_data"]["variants"]:
+        v["availability"] = "out_of_stock"
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[oos])
+    _assert_contract(body)
+    assert _by_id(body)[BRAND_OFFER]["in_stock"] is False and "price_comparable" not in _by_id(body)[BRAND_OFFER]
+    assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
+    # Every offer sold out: no best price, no marker.
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[oos], catalog_rows=rows)
+    assert body["best_price_offer_id"] is None and _marked(body) == []
+
+
+def test_unknown_stock_may_compare(monkeypatch, client):
+    unknown = _single_size_brand_seed(9.0)
+    unknown["availability"] = None
+    for v in unknown["seed_data"]["variants"]:
+        v["availability"] = "unknown"
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", seeds=[unknown])
+    brand = _by_id(body)[BRAND_OFFER]
+    assert "in_stock" not in brand and brand["availability"] == "unknown"
+    assert brand["price_comparable"] is True and body["best_price_offer_id"] == BRAND_OFFER
+
+
+def test_stock_reads_the_flag_first_and_the_text_only_without_one():
+    """No lane ships an eligible offer with OOS text and no flag today; the rule is pinned on the helper
+    so a future lane cannot slip one in. A boolean flag decides over stale feed text either way."""
+    import routes.agent_shop_gateway as gateway
+
+    def offer(**kw):
+        return {"offer_id": "of:catalog_offer:x", "price": 10.0, "currency": "USD",
+                "source": {"type": "catalog_offer", "product_key": RETAILER_PK, "offer_id": "x"}, **kw}
+
+    def comparable(o):
+        return gateway._price_comparable_offers(
+            [o], market_hint="US", named_variant=False, resolved_product_keys={RETAILER_PK}, resolved_seed_ids=set(),
+            matched_catalog_offer_ids={"x"}, defaulted_currency_ids=set()) == [o]
+
+    assert comparable(offer(availability="unknown"))
+    assert not comparable(offer(availability="out_of_stock"))
+    assert not comparable(offer(in_stock=False))
+    assert comparable(offer(in_stock=True, availability="out_of_stock")), "a live read's flag wins"
+    assert not comparable(offer(in_stock=False, availability="in_stock"))

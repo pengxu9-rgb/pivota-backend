@@ -9278,7 +9278,13 @@ OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT = 25
 OFFERS_RESOLVE_GROUP_SIBLING_SEEDS_PER_HOST = 2
 # The whole lane's wall clock. Past it, the lane serves what it has and says so (`deadline_hit`).
 OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS = 1.5
-RESOLVED_GROUP_STRATEGIES = ("cross_merchant_same_size",)
+# The strategy name is the engine's (be#2637 adds CROSS_MERCHANT_SAME_SIZE and reserves it for M4);
+# read from there when present so the two can never drift, the literal until then.
+try:
+    from services.identity_resolution import CROSS_MERCHANT_SAME_SIZE as _CROSS_MERCHANT_SAME_SIZE
+except ImportError:  # be#2637 not on this base yet
+    _CROSS_MERCHANT_SAME_SIZE = "cross_merchant_same_size"
+RESOLVED_GROUP_STRATEGIES = (_CROSS_MERCHANT_SAME_SIZE,)
 RESOLVED_GROUP_KINDS = ("attach_membership", "merge_content_key")
 
 
@@ -9301,8 +9307,10 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
     """Is `verdict` a valid same-size matcher verdict for a proposal of `kind`?
 
     THE SAME RULE as the shared validator be#2637 adds (services/identity_resolution
-    .validate_matcher_verdict), kept here so this PR does not depend on that one merging first;
-    tests/test_offers_resolve_group_siblings.py pins both to one case list. M4 writes the verdict and
+    .validate_matcher_verdict(kind, evidence, strategy) -> problems), kept here so this PR does not
+    depend on that one merging first; tests/test_offers_resolve_group_siblings.py pins both to one
+    case list. ONE deliberate difference: the unit must be ml | g | count here (the shared rule takes
+    any non-empty unit), so this read is never weaker than the shared one. M4 writes the verdict and
     #2637 reserves its strategy, so only the matcher can produce it:
       strategy 'cross_merchant_same_size'; same_size exactly true; rule_version non-empty;
       tier T0a | T0b | T0c; size {value: a number > 0, unit: ml | g | count, pack: an integer >= 1};
@@ -9320,7 +9328,7 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
     ids = verdict.get("listing_offer_ids")
     number = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
     return bool(
-        verdict.get("strategy") == "cross_merchant_same_size"
+        verdict.get("strategy") == _CROSS_MERCHANT_SAME_SIZE
         and verdict.get("same_size") is True
         and isinstance(verdict.get("rule_version"), str) and verdict["rule_version"].strip()
         and verdict.get("tier") in _MATCHER_TIERS
@@ -9662,6 +9670,8 @@ def _price_comparable_offers(
         offer (it names no variant), never a fallback at a listing's row price; with none named: never
         a seed listing several variants (its one price is one of them);
       * FRESH: neither `price_stale` nor `requires_live_verification`;
+      * NOT KNOWN OUT OF STOCK: `in_stock` false (or, with no flag, an unavailable availability);
+        unknown stock may compare;
       * priced in a currency the row STATED (a NULL catalog currency defaulted to "USD" is out), spelled
         as uppercase ISO 4217, and equal to the BUYER's: the declared market's currency, or USD for a
         caller that declares none (a US buyer, as the seed lanes read it). A declared market with no
@@ -9692,6 +9702,14 @@ def _price_comparable_offers(
                 continue
         else:
             continue
+        # KNOWN OUT OF STOCK is not a price anyone can pay (contract line 7). The flag decides when it
+        # is a boolean (a live read corrects `in_stock` and leaves the feed's text beside it); the
+        # availability text only when there is no flag. Unknown stock stays comparable.
+        if offer.get("in_stock") is False or (
+            not isinstance(offer.get("in_stock"), bool)
+            and availability_is_known_unavailable(offer.get("availability"))
+        ):
+            continue
         price = offer.get("price")
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
             continue
@@ -9705,13 +9723,13 @@ def _price_comparable_offers(
 
 def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
     """The cheapest of the comparable set (`_price_comparable_offers`), as `metadata.best_price`; its
-    `offer_id` is the response's `best_price_offer_id`. A seller that can sell beats one that says it
-    cannot (as the gateway's `best_offer` reads it), then price, then rank. Empty set: no best price."""
+    `offer_id` is the response's `best_price_offer_id`: the lowest price, then rank (a known
+    out-of-stock offer is never in the set). Empty set: no best price."""
     stale = sum(1 for o in offers if isinstance(o, dict) and o.get("price_stale"))
     if not comparable:
         return {"offer_id": None, "currency": None, "fresh_priced": 0, "stale_priced": stale}
     rank = {id(o): i for i, o in enumerate(offers)}
-    best = min(comparable, key=lambda o: (1 if _offer_is_known_unavailable(o) else 0, float(o["price"]), rank[id(o)]))
+    best = min(comparable, key=lambda o: (float(o["price"]), rank[id(o)]))
     return {"offer_id": best.get("offer_id"), "price": float(best["price"]), "currency": best["currency"],
             "fresh_priced": len(comparable), "stale_priced": stale}
 
