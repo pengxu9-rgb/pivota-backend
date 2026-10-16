@@ -53,7 +53,8 @@ def schema_engine():
         metadata.create_all(engine, tables=[metadata.tables[t] for t in (
             "catalog_products", "catalog_offers", "catalog_merchants", "catalog_skus")])
         with engine.begin() as c:
-            for f in ("044_external_product_seeds.sql", "134_catalog_source_quarantine.sql"):
+            for f in ("044_external_product_seeds.sql", "134_catalog_source_quarantine.sql",
+                      "179_identity_resolution_d2.sql"):
                 c.exec_driver_sql((_MIGRATIONS / f).read_text())
             # mig 246, as db/schema_guard heals it onto prod (the shared Table does not carry it).
             c.execute(text("ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS price_checked_at TIMESTAMPTZ NULL"))
@@ -65,13 +66,29 @@ def schema_engine():
         admin.dispose()
 
 
-def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True):
+def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, resolved=True):
     from sqlalchemy import text
 
     now = datetime.now(timezone.utc)
     with engine.begin() as c:
-        for t in ("catalog_offers", "catalog_skus", "catalog_products", "catalog_merchants", "external_product_seeds"):
+        for t in ("catalog_offers", "catalog_skus", "catalog_products", "catalog_merchants", "external_product_seeds",
+                  "identity_resolution_proposals"):
             c.execute(text(f"DELETE FROM {t}"))
+        # The engine joined both retailer listings to the brand's product (applied, same-size
+        # strategy). Unresolved: the same two listings, one move REVERTED and one by another
+        # strategy -- neither counts.
+        moves = (
+            ((RETAILER_PK, "applied", "cross_merchant_same_size"), (RETAILER2_PK, "applied", "cross_merchant_same_size"))
+            if resolved else
+            ((RETAILER_PK, "reverted", "cross_merchant_same_size"), (RETAILER2_PK, "applied", "same_url_dup"))
+        )
+        for i, (listing, status, strategy) in enumerate(moves):
+            c.execute(text(
+                "INSERT INTO identity_resolution_proposals (proposal_id, proposal_key, kind, strategy,"
+                " resolver_version, content_key, subject_product_keys, keeper_product_key, member_fingerprint, status)"
+                " VALUES (:id, :id, 'attach_membership', :strategy, 'test', :ck, :subjects, :keeper, 'fp', :status)"
+            ), {"id": f"irp_{i}", "strategy": strategy, "ck": CK, "subjects": [listing, BRAND_PK],
+                "keeper": BRAND_PK, "status": status})
 
         def product(pk, sig, merchant, source_ref, source_product_id):
             c.execute(text(
@@ -122,6 +139,15 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True):
                 "         cast(:sd AS jsonb),'active',NULL)"
             ), {"sd": '{"variants": [{"variant_id": "SKU-30ML", "price_amount": 19, "price_currency": "USD",'
                       ' "availability": "in_stock"}]}'})
+            # A SUPERSEDED seed of the same listing (a tombstone): never read, never served.
+            c.execute(text(
+                "INSERT INTO external_product_seeds (id, external_product_id, market, tool, destination_url,"
+                " canonical_url, domain, title, price_amount, price_currency, availability, seed_data, status,"
+                " attached_product_key)"
+                " VALUES ('eps_pg_tomb','ext_pg_tomb','US','*','https://brand-old.com/products/serum',"
+                "         'https://brand-old.com/products/serum','brand-old.com','Serum',5,'USD','in_stock',"
+                "         '{}'::jsonb,'superseded',:pk)"
+            ), {"pk": BRAND_PK})
 
 
 def _resolve(monkeypatch, product_id, *, limit=10, flag="1", seed_reasons=()):
@@ -174,7 +200,7 @@ def test_a_retailer_listing_reaches_the_brand_seed_on_postgres(schema_engine, mo
     for ident in (RETAILER_SIG, RETAILER_PK, BRAND_SIG, CK):
         res = _resolve(monkeypatch, ident)
         [grp] = _sources(res, "external_product_seeds_group_siblings")
-        assert grp["status"] in ("ok", "empty") and grp["members"] == 3, (ident, grp)
+        assert grp["status"] in ("ok", "empty") and grp["members"] == 3 and grp["resolved"] == 3, (ident, grp)
         hosts = sorted((o.get("execution_spec") or {}).get("merchant_domain") or o["url"].split("/")[2]
                        for o in res["offers"])
         assert hosts == ["brand.com", "stylekorean.com", "yesstyle.com"], (ident, hosts, res["metadata"]["sources"])
@@ -245,3 +271,20 @@ def test_a_withdrawn_listing_lends_its_seed_to_no_sibling(schema_engine, monkeyp
     res = _resolve(monkeypatch, RETAILER_SIG)
     assert not _sources(res, "external_product_seeds_group_siblings"), "no live anchor: no group"
     assert not any(o["offer_id"].startswith("of:external_seed:") for o in res["offers"])
+
+
+def test_an_unresolved_group_reads_no_sibling_seed_on_postgres(schema_engine, monkeypatch):
+    """Only a reverted move and another strategy's move on the key: not a group. The member and
+    proposal reads run (and prepare on Postgres); no seed is read, nothing is best price."""
+    _rows(schema_engine, retailer_checked=datetime.now(timezone.utc), resolved=False)
+    for ident in (RETAILER_SIG, "sig_pg_grp_retailer_2", BRAND_SIG):
+        res = _resolve(monkeypatch, ident)
+        assert not _sources(res, "external_product_seeds_group_siblings"), ident
+        assert "best_price_offer_id" not in res
+
+
+def test_a_superseded_seed_is_never_served_through_a_sibling(schema_engine, monkeypatch):
+    _rows(schema_engine, retailer_checked=datetime.now(timezone.utc))
+    res = _resolve(monkeypatch, RETAILER_SIG)
+    assert _sources(res, "external_product_seeds_group_siblings")[0]["row_count"] == 1
+    assert not any("brand-old.com" in str(o.get("source")) for o in res["offers"])

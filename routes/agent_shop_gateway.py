@@ -4753,8 +4753,14 @@ async def _handle_offers_resolve(
     # Every seed row any lane has already put through the gates below, so the group-sibling lane
     # (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS) never gates one twice. Written, never read, when off.
     _considered_seed_ids: set[str] = set()
+    # One open-recovery-task read per MERCHANT per request, not per seed row: it decorates the link
+    # only, and a group's seeds repeat merchants.
+    _recovery_tasks_memo: Dict[str, List[Dict[str, Any]]] = {}
+    _sibling_lane: Dict[str, Any] = {"deadline_hit": False, "no_named_variant": 0}
 
-    async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
+    async def _append_external_offers_from_seed_rows(
+        seed_rows: List[Any], *, sibling: bool = False, deadline: Optional[float] = None,
+    ) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
@@ -4763,6 +4769,9 @@ async def _handle_offers_resolve(
             for r in seed_rows
         )
         for row in seed_rows:
+            if deadline is not None and time.perf_counter() >= deadline:
+                _sibling_lane["deadline_hit"] = True
+                return
             row_dict = _row_to_dict(row)
             _considered_seed_ids.add(str(row_dict.get("id") or "").strip())
             blocked, gate_status = await should_block_external_referral_runtime(
@@ -4843,6 +4852,12 @@ async def _handle_offers_resolve(
                     answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, sku_id)]
                     if answering and namers_agree_on_price(variants, sku_id):
                         matched_variants = answering[:1]
+                if sibling and not matched_variants:
+                    # A SIBLING LISTING THAT DOES NOT STORE THE NAMED VARIANT ships nothing. Its
+                    # fallback would be the listing at its row price under the caller's sku_id --
+                    # another listing's id on a price for a variant nobody showed it sells.
+                    _sibling_lane["no_named_variant"] += 1
+                    continue
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
             canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
@@ -4925,7 +4940,9 @@ async def _handle_offers_resolve(
             # try around the derivation is what turned a programming error
             # into silence last time.
             _open_recovery_tasks: List[Dict[str, Any]] = []
-            if _seed_merchant_id:
+            if _seed_merchant_id in _recovery_tasks_memo:
+                _open_recovery_tasks = _recovery_tasks_memo[_seed_merchant_id]
+            elif _seed_merchant_id:
                 try:
                     from db.merchant_tasks import list_open_recovery_tasks
 
@@ -4942,6 +4959,7 @@ async def _handle_offers_resolve(
                     # through click_id -> commerce_interactions row, so this
                     # costs a shortcut, never a sale.
                     _open_recovery_tasks = []
+                _recovery_tasks_memo[_seed_merchant_id] = _open_recovery_tasks
 
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
@@ -6419,34 +6437,50 @@ async def _handle_offers_resolve(
     # The catalog arm below widens a listing id to every listing on its content_key, but sources
     # only `retailer` offers; a brand's offer reaches this answer through the SEED lane, which
     # resolves the ONE row the caller named. So a retailer listing's id returned the retailer
-    # siblings and no brand. This runs the seed lane's own lookups (source_ref, external_product_id,
-    # attached_product_key) for the group's other listings and hands every row to the SAME
-    # `_append_external_offers_from_seed_rows`, so each faces every gate a direct seed does. Only
-    # when the group really has 2+ live listings: a product with no siblings is untouched.
+    # siblings and no brand. For a RESOLVED group only (`_fetch_resolved_group`: listings proven to
+    # be the same item), this runs the seed lane's own lookups for the other resolved listings and
+    # hands the rows to the SAME `_append_external_offers_from_seed_rows`, so each faces every gate a
+    # direct seed does. An unresolved group -- a brand+title collision -- is answered as before.
     _group_mode = False
+    _resolved_product_keys: set = set()
+    _resolved_seed_ids: set = set()
+    _defaulted_currency_ids: set = set()
     if _group_seed_siblings_enabled() and not merchant_scope:
         sibling_started = time.perf_counter()
+        sibling_deadline = sibling_started + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS
         try:
-            members, sibling_rows = await _fetch_group_sibling_seed_rows(
+            group = await _fetch_resolved_group(
                 database,
                 aliases=[a for a in (product_id_aliases + sku_id_aliases) if a],
-                exclude_seed_ids=_considered_seed_ids,
-                limit=attached_seed_limit,
+                market_hint=market_hint,
+                deadline=sibling_deadline,
             )
-            _group_mode = len(members) >= 2
+            _group_mode = len(group["resolved"]) >= 2
             if _group_mode:
+                _resolved_product_keys = {str(m["product_key"]) for m in group["resolved"]}
+                _resolved_seed_ids = {str(r.get("id") or "") for r in group["rows"]}
+                held_hosts: set = set()
+                for prior in external_offers:
+                    held_hosts |= _offer_hosts(prior)
+                to_gate, skipped = _sibling_rows_to_gate(
+                    group["rows"], considered=_considered_seed_ids, held_hosts=held_hosts,
+                )
                 prior_count = len(external_offers)
-                await _append_external_offers_from_seed_rows(sibling_rows)
+                await _append_external_offers_from_seed_rows(to_gate, sibling=True, deadline=sibling_deadline)
                 deduped = _dedupe_sibling_offers_by_host(external_offers, prior_count)
                 _record_source(
                     source="external_product_seeds_group_siblings",
-                    status="ok" if sibling_rows else "empty",
-                    reason_code="ok" if sibling_rows else "no_candidates",
+                    status="ok" if to_gate else "empty",
+                    reason_code="ok" if to_gate else "no_candidates",
                     source_started=sibling_started,
-                    row_count=len(sibling_rows),
-                    query="external_seed_by_content_key_group",
-                    extra={"members": len(members), "deduped": deduped,
-                           "emitted": len(external_offers) - prior_count},
+                    row_count=len(group["rows"]),
+                    query="external_seed_by_resolved_group",
+                    extra={"members": len(group["members"]), "resolved": len(group["resolved"]),
+                           "gated": len(to_gate), "skipped": skipped, "deduped": deduped,
+                           "emitted": len(external_offers) - prior_count,
+                           **({"no_named_variant": _sibling_lane["no_named_variant"]}
+                              if _sibling_lane["no_named_variant"] else {}),
+                           **({"deadline_hit": True} if _sibling_lane["deadline_hit"] else {})},
                 )
         except Exception as e:
             logger.info("offers.resolve.external.group_siblings.failed", extra={"error": str(e)})
@@ -6456,7 +6490,7 @@ async def _handle_offers_resolve(
                 reason_code=_classify_db_reason_code(e),
                 source_started=sibling_started,
                 error=type(e).__name__,
-                query="external_seed_by_content_key_group",
+                query="external_seed_by_resolved_group",
             )
 
     # CATALOG OFFERS — the third source, and the one that holds the retailer competition.
@@ -6673,6 +6707,9 @@ async def _handle_offers_resolve(
 
             availability = str(r.get("availability") or "").strip() or None
             price_amount = r.get("price_amount")
+            if _group_mode and not str(r.get("currency") or "").strip():
+                # Shipped as "USD" below by default, never stated by the row: no best price on it.
+                _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
             external_offers.append(
                 {
                     "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
@@ -6762,6 +6799,8 @@ async def _handle_offers_resolve(
             query="catalog_offers_by_canonical_identity",
         )
 
+    if _group_mode:
+        _mark_price_stale(external_offers)
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
@@ -6846,8 +6885,12 @@ async def _handle_offers_resolve(
     else:
         _issuable_offers = offers
     await _issue_served_clicks(_issued_clicks, _issuable_offers, caller_api_key, caller_assertion)
-    # BEST PRICE in a merged group: fresh prices only, one currency only (`_best_price_of`).
-    _best_price = _best_price_of(offers, _buyer_currency) if _group_mode else None
+    # BEST PRICE in a resolved group: like for like, fresh, one currency (`_best_price_of`).
+    _best_price = _best_price_of(
+        offers, _buyer_currency, named_variant=bool(sku_id),
+        resolved_product_keys=_resolved_product_keys, resolved_seed_ids=_resolved_seed_ids,
+        defaulted_currency_ids=_defaulted_currency_ids,
+    ) if _group_mode else None
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -9192,51 +9235,116 @@ def _offers_in_buyer_currency(
     return kept, dropped
 
 
-# ── offers.resolve over a merged content_key group (cross-merchant matching M2) ────────────────
+# ── offers.resolve over a RESOLVED content_key group (cross-merchant matching M2) ──────────────
 #
 # OFF by default (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS). Read per request, so it flips without a
-# restart. With it off -- or on, for a product whose content_key has one live listing -- the handler
-# sends the statements and returns the bytes it did before.
+# restart. With it off -- or on, for a product whose group is not RESOLVED -- the handler returns
+# the bytes it did before.
+#
+# A content_key is sha(brand::title::gtin) and deliberately non-unique: two listings sharing one are
+# a brand+title (or GTIN) collision, not a judgement that they sell the same item -- a 30 ml and a
+# 100 ml of one title land on one key. So sharing a key proves nothing about size, and comparing
+# their prices would call a mini the "best price". A group is RESOLVED, member by member, only on
+# evidence that the listings are the same item:
+#   * ENGINE: the listing was joined by an APPLIED (not reverted) identity-engine move of the
+#     phase-1 cross-merchant strategy -- same-size by construction (design v2, decision 1) -- read
+#     from identity_resolution_proposals by its content_key index;
+#   * GTIN: the key itself was minted from a GTIN (a member's own brand/title/gtin hash to it) and
+#     the listing carries that same GTIN -- a GTIN names one size.
+# Only resolved listings are siblings; a call naming an unresolved listing is answered as before.
 OFFERS_RESOLVE_GROUP_SEED_SIBLINGS_ENV = "OFFERS_RESOLVE_GROUP_SEED_SIBLINGS"
-# At most this many listings of one group are read. Phase 1 merges same-size listings under ONE
-# brand anchor (design v2, star topology), and the 2026-10-16 census puts a group at a handful of
-# merchant hosts; 25 is several times that, so a real group is never cut, while a degenerate
-# content_key (a placeholder title shared by hundreds of rows) cannot fan the seed lookup out into
-# hundreds of ANY() binds. The named listing sorts first, so a cut never drops the caller's own row.
+# At most this many listings of one content_key are read. Phase 1 merges same-size listings under ONE
+# brand anchor (star topology) and a real group has a handful of hosts; 25 is several times that,
+# while a degenerate key (a placeholder title on hundreds of rows) cannot fan out. The named listing
+# sorts first, so the cut never drops the caller's own row.
 OFFERS_RESOLVE_GROUP_SIBLING_LIMIT = 25
+# Sibling seed rows put through the gates per request, and per destination host. Every gated row can
+# cost a recovery-task read, a preflight and a mint, so the lane is bounded in rows AND in time.
+OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT = 25
+OFFERS_RESOLVE_GROUP_SIBLING_SEEDS_PER_HOST = 2
+# The whole lane's wall clock. Past it, the lane serves what it has and says so (`deadline_hit`).
+OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS = 1.5
+RESOLVED_GROUP_STRATEGIES = ("cross_merchant_same_size",)
+RESOLVED_GROUP_KINDS = ("attach_membership", "merge_content_key")
 
 
 def _group_seed_siblings_enabled() -> bool:
     return _env_bool(OFFERS_RESOLVE_GROUP_SEED_SIBLINGS_ENV, False)
 
 
-async def _fetch_group_sibling_seed_rows(
+def _remaining_timeout(deadline: float, cap: float) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise asyncio.TimeoutError("group sibling budget spent")
+    return max(0.05, min(cap, remaining))
+
+
+def _resolved_group_members(members: List[Dict[str, Any]], proposals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The members proven to be the same item (see the block comment): engine-joined or GTIN-keyed.
+
+    When the call named a listing (`is_anchor`), that listing must itself be resolved, and only its
+    content_key's resolved members count -- an unresolved listing that collides onto a resolved
+    key does not inherit the group. A bare content_key names no listing: its resolved members."""
+    from services.catalog_identity import make_content_key, normalize_gtin
+
+    engine: Dict[str, set] = {}
+    for p in proposals:
+        keys = set(p.get("subject_product_keys") or []) | ({p["keeper_product_key"]} if p.get("keeper_product_key") else set())
+        engine.setdefault(str(p.get("content_key") or ""), set()).update(str(k) for k in keys)
+    key_gtins: Dict[str, set] = {}
+    for m in members:
+        g = normalize_gtin(m.get("gtin"))
+        if g and m.get("content_key") and make_content_key(m.get("brand"), m.get("title"), m.get("gtin")) == m.get("content_key"):
+            key_gtins.setdefault(str(m["content_key"]), set()).add(g)
+    resolved = []
+    for m in members:
+        ck = str(m.get("content_key") or "")
+        gtins = key_gtins.get(ck) or set()
+        if str(m.get("product_key")) in engine.get(ck, set()) or (
+            len(gtins) == 1 and normalize_gtin(m.get("gtin")) in gtins
+        ):
+            resolved.append(m)
+    anchors = [m for m in members if m.get("is_anchor")]
+    if anchors:
+        anchor_keys = {str(m.get("content_key")) for m in resolved if m.get("is_anchor")}
+        resolved = [m for m in resolved if str(m.get("content_key")) in anchor_keys]
+    return resolved
+
+
+def _seed_row_host(row: Dict[str, Any]) -> str:
+    return (
+        _offer_destination_host(row.get("canonical_url"))
+        or _offer_destination_host(row.get("destination_url"))
+        or _offer_destination_host(f"https://{row.get('domain')}" if row.get("domain") else None)
+    )
+
+
+async def _fetch_resolved_group(
     db: Any,
     *,
     aliases: List[str],
-    exclude_seed_ids: set,
-    limit: int,
-) -> Tuple[List[Dict[str, Any]], List[Any]]:
-    """(the live listings of the caller's content_key group, their active seed rows not yet gated).
-
-    The group is resolved as the catalog arm resolves it -- a signature, product_key or content_key
-    names a LIVE listing, and every live listing on its content_key is a member -- so the two lanes
-    can never disagree about who belongs. The seeds are found by the SAME three joins the seed lane
-    uses for one listing: `source_ref` (the mirror binds the seed id), `source_product_id` =
-    `external_product_id` (legacy mirror rows), and `attached_product_key` = the listing's key.
-    Status and quarantine are the direct lane's own SQL; every other gate runs per row in
-    `_append_external_offers_from_seed_rows`, the function every seed lane goes through.
-    """
+    market_hint: Optional[str],
+    deadline: float,
+) -> Dict[str, Any]:
+    """{members, resolved, rows}: the caller's content_key group, its RESOLVED members, and the
+    active seeds of those members (the seed lane's three joins -- `source_ref`, `source_product_id`
+    = `external_product_id`, `attached_product_key` -- plus its status, quarantine and, as the
+    identity and fuzzy fallbacks do, the buyer market's serving currency: a caller with no market is
+    a US buyer, and a seed it never named must not set its currency)."""
+    out: Dict[str, Any] = {"members": [], "resolved": [], "rows": []}
     if not aliases:
-        return [], []
-    timeout = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
-    members = [
+        return out
+    cap = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
+    out["members"] = members = [
         _row_to_dict(r)
         for r in (
             await asyncio.wait_for(
                 db.fetch_all(
                     """
-                    SELECT s.product_key, s.source_ref, s.source_product_id
+                    SELECT s.product_key, s.source_ref, s.source_product_id, s.content_key,
+                           s.gtin, s.brand, s.title,
+                           (s.pivota_signature_id = ANY(:aliases)
+                            OR s.product_key = ANY(:aliases)) AS is_anchor
                       FROM catalog_products s
                      WHERE s.content_key IN (
                            SELECT a.content_key FROM catalog_products a
@@ -9255,18 +9363,47 @@ async def _fetch_group_sibling_seed_rows(
                     """,
                     {"aliases": aliases[:16], "limit": OFFERS_RESOLVE_GROUP_SIBLING_LIMIT},
                 ),
-                timeout=timeout,
+                timeout=_remaining_timeout(deadline, cap),
             )
             or []
         )
     ]
     if len(members) < 2:
-        return members, []
+        return out
+    try:
+        proposals = [
+            _row_to_dict(r)
+            for r in (
+                await asyncio.wait_for(
+                    db.fetch_all(
+                        """
+                        SELECT content_key, subject_product_keys, keeper_product_key
+                          FROM identity_resolution_proposals
+                         WHERE content_key = ANY(:cks)
+                           AND status = 'applied'
+                           AND kind = ANY(:kinds)
+                           AND strategy = ANY(:strategies)
+                         LIMIT 200
+                        """,
+                        {"cks": sorted({str(m["content_key"]) for m in members if m.get("content_key")}),
+                         "kinds": list(RESOLVED_GROUP_KINDS), "strategies": list(RESOLVED_GROUP_STRATEGIES)},
+                    ),
+                    timeout=_remaining_timeout(deadline, cap),
+                )
+                or []
+            )
+        ]
+    except Exception as e:  # noqa: BLE001 -- no engine evidence read is "not engine-resolved"
+        logger.info("offers.resolve.group_siblings.proposals_unread", extra={"error": type(e).__name__})
+        proposals = []
+    out["resolved"] = resolved = _resolved_group_members(members, proposals)
+    serving_currency = seed_serving_currency(market_hint)
+    if len(resolved) < 2 or serving_currency is None:
+        return out
 
     def _vals(key: str) -> List[str]:
-        return sorted({str(m.get(key) or "").strip() for m in members} - {""})
+        return sorted({str(m.get(key) or "").strip() for m in resolved} - {""})
 
-    seed_ids, external_ids, product_keys = _vals("source_ref"), _vals("source_product_id"), _vals("product_key")
     rows = await asyncio.wait_for(
         db.fetch_all(
             f"""
@@ -9276,21 +9413,45 @@ async def _fetch_group_sibling_seed_rows(
                AND (id = ANY(:seed_ids)
                     OR external_product_id = ANY(:external_ids)
                     OR attached_product_key = ANY(:product_keys))
+               AND {SEED_SERVING_CURRENCY_CLAUSE}
              {_seed_quarantine_clause()}
              ORDER BY updated_at DESC, created_at DESC
              LIMIT :limit
             """,
             {
                 # "" pads an empty arm with a typed, match-nothing value, as the sig lane does.
-                "seed_ids": seed_ids or [""],
-                "external_ids": external_ids or [""],
-                "product_keys": product_keys or [""],
-                "limit": limit,
+                "seed_ids": _vals("source_ref") or [""],
+                "external_ids": _vals("source_product_id") or [""],
+                "product_keys": _vals("product_key") or [""],
+                "serving_currency": serving_currency,
+                "limit": 2 * OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT,
             },
         ),
-        timeout=timeout,
+        timeout=_remaining_timeout(deadline, cap),
     )
-    return members, [r for r in (rows or []) if str(_row_to_dict(r).get("id") or "").strip() not in exclude_seed_ids]
+    out["rows"] = [_row_to_dict(r) for r in rows or []]
+    return out
+
+
+def _sibling_rows_to_gate(rows: List[Dict[str, Any]], *, considered: set, held_hosts: set) -> Tuple[List[Dict[str, Any]], int]:
+    """(rows worth gating, how many were skipped). BEFORE any offer or link is minted: a row another
+    lane already gated, a row whose host an earlier offer already holds, a host's third row, and
+    everything past the lane's row cap are skipped."""
+    kept: List[Dict[str, Any]] = []
+    per_host: Dict[str, int] = {}
+    for row in rows:
+        if str(row.get("id") or "").strip() in considered:
+            continue
+        host = _seed_row_host(row)
+        if host and host in held_hosts:
+            continue
+        if host and per_host.get(host, 0) >= OFFERS_RESOLVE_GROUP_SIBLING_SEEDS_PER_HOST:
+            continue
+        per_host[host] = per_host.get(host, 0) + 1
+        kept.append(row)
+        if len(kept) >= OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT:
+            break
+    return kept, len(rows) - len(kept)
 
 
 def _offer_hosts(offer: Dict[str, Any]) -> set:
@@ -9308,12 +9469,10 @@ def _offer_hosts(offer: Dict[str, Any]) -> set:
 def _dedupe_sibling_offers_by_host(offers: List[Dict[str, Any]], first_new: int) -> int:
     """Drop, in place, every offer from `first_new` on whose host an earlier offer already holds.
 
-    ONE OFFER PER MERCHANT. A group's listings can share a seller (the brand's own two listings of
-    one product, or a seed the direct lane already served), and two links to one store are one
-    place to send the buyer. Among the new offers a FRESH one beats a `requires_live_verification`
-    one on the same host, so the gate's verdict, not the row order, decides which survives. Every
-    new offer is marked `source.reached_via` so a merge's effect can be read off the answer.
-    Returns how many were dropped."""
+    ONE OFFER PER MERCHANT. Rows on a held host are skipped before they are gated
+    (`_sibling_rows_to_gate`); this settles the siblings among themselves, where the gate's verdict
+    decides: a FRESH offer beats a `requires_live_verification` one on the same host. Every new
+    offer is marked `source.reached_via`. Returns how many were dropped."""
     held: set = set()
     for prior in offers[:first_new]:
         held |= _offer_hosts(prior)
@@ -9343,14 +9502,18 @@ async def _catalog_price_freshness_sql() -> Tuple[str, str, Dict[str, Any]]:
     246) is stamped only by a writer that READ the price and is cleared by trigger when the price
     moves without a read; `updated_at` is NOT a price read (85% of served offers share their stamp
     minute with 100+ rows, mig 246). NULL is "no read on record" and is stale. The column is healed
-    onto prod by db/schema_guard at boot; until it is present no price is known fresh, so every
-    catalog offer reads stale -- listed, flagged, never best price -- and the statement still runs.
-    The ORDER BY term sits after stock and before price, so the LIMIT never cuts a fresh seller for
-    a cheaper stale one."""
+    onto prod by db/schema_guard at boot; until it is present (or the probe does not answer within
+    0.5 s) no price is known fresh, so every catalog offer reads stale -- listed, flagged, never best
+    price -- and the statement still runs. The ORDER BY term sits after stock and before price, so
+    the LIMIT never cuts a fresh seller for a cheaper stale one."""
     from services.external_offer_dual_write import price_check_column_present
     from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
 
-    if not await price_check_column_present():
+    try:
+        present = await asyncio.wait_for(price_check_column_present(), timeout=0.5)
+    except asyncio.TimeoutError:
+        present = False
+    if not present:
         return "\n                           CAST(NULL AS TIMESTAMPTZ) AS price_checked_at,", "", {}
     since = datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
     return (
@@ -9363,7 +9526,7 @@ async def _catalog_price_freshness_sql() -> Tuple[str, str, Dict[str, Any]]:
 
 def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, Any]:
     """`price_checked_at` (ISO, or None for no read on record) and, when the price is not fresh,
-    `price_stale: true` -- the key the seed lane already prints on a stale price."""
+    `price_stale: true` -- top-level, the one place both lanes say it (see `_mark_price_stale`)."""
     from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
 
     checked: Optional[datetime] = None
@@ -9385,18 +9548,58 @@ def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, An
     }
 
 
-def _best_price_of(offers: List[Dict[str, Any]], buyer_currency: Optional[str]) -> Dict[str, Any]:
-    """The cheapest FRESH price among the offers that ship, in ONE currency.
+def _mark_price_stale(offers: List[Dict[str, Any]]) -> None:
+    """ONE place for the stale-price flag on both lanes: a seed offer flagged
+    `requires_live_verification` (whose nested `price_stale` stays, for compatibility) also says
+    `price_stale: true` at top level, where a catalog offer says it."""
+    for offer in offers:
+        if isinstance(offer, dict) and offer.get("requires_live_verification"):
+            offer["price_stale"] = True
 
-    Fresh: not `price_stale` (a catalog price unread for 7 days) and not `requires_live_verification`
-    (a seed the readiness gate found stale; one a gateway live read verified carries no flag). One
-    currency: the buyer's declared one, else the currency of the first fresh priced offer in rank
-    order -- amounts in two currencies are never compared. Within that, a seller that can sell beats
-    one that says it cannot (as the gateway's `best_offer` reads it), then price, then rank. No
-    fresh priced offer: no best price, rather than a stale one."""
+
+def _best_price_of(
+    offers: List[Dict[str, Any]],
+    buyer_currency: Optional[str],
+    *,
+    named_variant: bool,
+    resolved_product_keys: set,
+    resolved_seed_ids: set,
+    defaulted_currency_ids: set,
+) -> Dict[str, Any]:
+    """The cheapest FRESH price, like for like, in ONE currency, among offers that ship.
+
+    THE CONTRACT. `best_price_offer_id` only ever names an offer in this answer that is:
+      * a member of the RESOLVED group -- a catalog offer on a resolved listing, or a seed of one
+        (same item, same size by the resolution rule); never an internal offer or a fallback-lane
+        seed, whose relation to the group is unproven;
+      * with a variant NAMED: an `exact` offer of that variant (`source.variant_match`), never a
+        catalog offer (it names no variant) and never a fallback at the listing's row price;
+        with none named: never a seed listing several variants, whose one price is one of them;
+      * FRESH: not `price_stale` (a catalog price unread for 7 days, or a seed the readiness gate
+        found stale; a gateway-verified seed carries no flag);
+      * priced in a currency the row actually stated (a NULL catalog currency defaulted to USD is
+        out), and the same currency as every other candidate: the buyer's declared one, else the
+        first candidate's in rank order -- two currencies are never compared.
+    Within that, a seller that can sell beats one that says it cannot (as the gateway's `best_offer`
+    reads it), then price, then rank. Nothing qualifies: no best price, rather than a wrong one."""
     candidates = []
     for rank, offer in enumerate(offers):
         if not isinstance(offer, dict) or offer.get("price_stale") or offer.get("requires_live_verification"):
+            continue
+        src = offer.get("source") or {}
+        if src.get("type") == "catalog_offer":
+            if named_variant or src.get("product_key") not in resolved_product_keys:
+                continue
+            if offer.get("offer_id") in defaulted_currency_ids:
+                continue
+        elif src.get("type") == "external_seed":
+            if src.get("seed_id") not in resolved_seed_ids:
+                continue
+            if named_variant and src.get("variant_match") != "exact":
+                continue
+            if not named_variant and int(offer.get("variant_count") or 0) > 1:
+                continue
+        else:
             continue
         price = offer.get("price")
         if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
