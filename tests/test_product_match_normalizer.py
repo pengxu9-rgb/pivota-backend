@@ -114,7 +114,7 @@ TITLE_CASES = [
     ("Laneige", "Lip Sleeping Mask Berry 0.7 oz",
      "lip sleeping mask berry", set(), "", (20, G, 1)),
     ("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift",
-     "lip sleeping mask berry", {"gift"}, "", (20, G, 1)),
+     "lip sleeping mask berry join", {"gift"}, "", (20, G, 1)),
     ("Laneige", "Lip Sleeping Mask Collection",
      "lip sleeping mask", {"set"}, "", None),
     ("Laneige", "Water Sleeping Mask EX 70ml",
@@ -736,8 +736,10 @@ def test_review_round_3_marks_brand_plus_and_trailing_brand_x():
     assert title_core(*rice).core == "relief sun rice join probiotics"
     assert _t0c_same(rice, ("Beauty of Joseon", "Relief Sun: Rice + Probiotics 1.69 fl oz"))
     assert _t0b_same(rice, ("BEAUTY OF JOSEON", "Relief Sun : Rice + Probiotics 50ml"))
-    # ...and a "+" with nothing after it (a gift line removed) leaves no marker.
-    assert title_core("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift").core == "lip sleeping mask berry"
+    # A "+" between two words is decided BEFORE the gift words are removed, so its join stays:
+    # "Berry + Free Gift" = "Berry & Free Gift", but not "Berry Free Gift" (the safe direction).
+    assert title_core("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift").core == "lip sleeping mask berry join"
+    assert _t0c_same(("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift"), ("Laneige", "Lip Sleeping Mask Berry 20g & Free Gift"))
 
 
 # ---- review round 4 (recall before the census): one conjunction word; brand "+" on T0b -------
@@ -805,6 +807,46 @@ def test_a_one_sided_plus_is_an_edition_not_a_conjunction(a, b):
     assert not _t0b_same(a, b) and not _t0b_same(b, a)
     assert not _t0c_same(a, b) and not _t0c_same(b, a)
     assert "plus" in exact_title_key(*a)[1].split()
+
+
+# Review round 6: a glued "+" whose neighbour is a conflict/format word is still a conjunction.
+GLUED_NEIGHBOUR_PAIRS = [
+    (("La Roche-Posay", "Effaclar Duo+M 40ml"), ("La Roche-Posay", "Effaclar Duo M 40ml")),
+    (("Belif", "Aqua Bomb Cream+Serum 50ml"), ("Belif", "Aqua Bomb Cream Serum 50ml")),
+    (("Klairs", "Supple Preparation Toner+Refill 180ml"), ("Klairs", "Supple Preparation Toner Refill 180ml")),
+    (("Laneige", "Lip Sleeping Mask Mini+Refill 8g"), ("Laneige", "Lip Sleeping Mask Mini Refill 8g")),
+    (("Clinique", "Moisture Surge Duo+Gift 50ml"), ("Clinique", "Moisture Surge Duo Gift 50ml")),
+]
+
+
+@pytest.mark.parametrize("a,b", GLUED_NEIGHBOUR_PAIRS, ids=[f"{i:02d}" for i in range(len(GLUED_NEIGHBOUR_PAIRS))])
+def test_a_glued_plus_next_to_a_conflict_word_is_never_dropped(a, b):
+    assert match_key_t0c({"brand": a[0], "title": a[1]}) != match_key_t0c({"brand": b[0], "title": b[1]})
+    assert exact_title_key(*a) != exact_title_key(*b)
+    assert not _t0c_same(a, b) and not _t0c_same(b, a)
+    assert not _t0b_same(a, b) and not _t0b_same(b, a)
+
+
+def test_glued_conjunction_equals_the_ampersand_spelling():
+    for amp in ("Aqua Bomb Cream & Serum 50ml", "Aqua Bomb Cream and Serum 50ml", "Aqua Bomb Cream + Serum 50ml"):
+        assert _t0c_same(("Belif", "Aqua Bomb Cream+Serum 50ml"), ("Belif", amp)), amp
+    assert title_core("Belif", "Aqua Bomb Cream+Serum 50ml").core == "aqua bomb fmt join serum"
+    assert title_core("La Roche-Posay", "Effaclar Duo+M 40ml").core == "effaclar join m"
+    assert title_core("Klairs", "Supple Preparation Toner+Refill").core == "supple preparation toner join"
+    # Two conjunctions around a removed word collapse to one join.
+    assert title_core("Belif", "Aqua Bomb Cream+Refill+Serum").core == "aqua bomb fmt join serum"
+
+
+def test_no_plus_is_ever_dropped_silently():
+    """Every "+" ends up as a rating, a pack, the brand's own, a conjunction (join) or `plus`."""
+    for title in ("Duo+M", "Cream+Serum", "Toner+Refill", "Mini+Refill", "Duo+Gift", "Gel+", "+Gel", "Duo +", "Duo (+)",
+                  "B5 +Balm", "Rice+ Probiotics", "Lotion+™ 125ml", "Cream+Refill+Gift", "x+y"):
+        tc = title_core("Brandless Co", title)
+        assert "plus" in tc.conflicts or "join" in tc.tokens, (title, tc)
+    # Ratings keep their own "+", on both tiers.
+    tc = title_core("Beauty of Joseon", "Relief Sun SPF50+PA++++ 50ml")
+    assert {"spf50+", "pa++++"} <= tc.conflicts and "join" not in tc.tokens and "plus" not in tc.conflicts
+    assert exact_title_key("Beauty of Joseon", "Relief Sun SPF50+PA++++")[1] == "relief sun spf50 plus pa plus plus plus plus"
 
 
 def test_plus_reading_agrees_between_t0b_and_t0c():
