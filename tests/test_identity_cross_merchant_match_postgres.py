@@ -223,6 +223,13 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
 
     rows = await _proposals(c)
     assert {r["status"] for r in rows} == {"proposed"}            # never approved or applied here
+    # #2637 L3: the engine's writer refuses this strategy from anyone but its module (nothing written)
+    from services.identity_resolution import upsert_proposals
+    stray = {**rows[0], "proposal_id": "irp_stray", "proposal_key": "irk_stray"}
+    for token in (None, "coordinator_merge"):
+        with pytest.raises(ValueError):
+            await upsert_proposals(c, [stray], module_writer=token)
+    assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals WHERE proposal_id = 'irp_stray'") == 0
     assert {r["strategy"] for r in rows} == {STRATEGY}
     assert {r["evidence"]["proposal_run_id"] for r in rows} == {run_id}
     assert {r["evidence"]["proposer"] for r in rows} == {STRATEGY}

@@ -329,7 +329,8 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
         for p in stamped:
-            counts = await upsert_proposals(conn, [p])
+            # #2637 (L3): only this module may write this strategy's proposals, and says so.
+            counts = await upsert_proposals(conn, [p], module_writer=STRATEGY)
             if counts["inserted"]:
                 inserted.append(p)
     return {"proposal_run_id": run_id, "proposed": len(stamped), "inserted": len(inserted),

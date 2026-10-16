@@ -1250,3 +1250,32 @@ def test_the_verdicts_from_key_single_size_is_the_planners_computation(monkeypat
     p = cat.plan().proposals[0]
     assert p["evidence"]["matcher_verdict"]["from_key_single_size"] is False
     assert any("from_key_single_size" in x for x in evidence_problems(p))  # the writer would refuse it
+
+
+
+@pytest.mark.asyncio
+async def test_the_writer_names_itself_as_the_module_writer(monkeypatch):
+    """#2637 L3: upsert_proposals refuses this strategy's proposals unless module_writer names it."""
+    from scripts.ops import propose_cross_merchant_matches as script
+    import services.identity_resolution as engine
+
+    plan = _mixed().plan()
+    seen = []
+
+    async def upsert(conn, proposals, *, module_writer=None):
+        seen.append(module_writer)
+        return {"proposed": len(proposals), "inserted": len(proposals), "deduped": 0}
+
+    class Conn:
+        def transaction(self):
+            class Tx:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+            return Tx()
+
+    monkeypatch.setattr(engine, "upsert_proposals", upsert)
+    out = await script.write_proposals(Conn(), plan, expect_digest=plan.digest(), max_proposals=100)
+    assert out["inserted"] == len(plan.proposals) and seen and set(seen) == {STRATEGY}
