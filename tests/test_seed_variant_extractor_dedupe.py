@@ -113,9 +113,11 @@ def test_a_plan_named_as_one_is_dropped_beside_any_sibling(plan_name):
     {"url": f"{STORE}/products/{HANDLE}?variant={V50}&selling_plan=691234"},
     {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "40.80", "priceCurrency": "USD",
                             "billingDuration": 1, "unitCode": "MON"}},
+    # `billingDuration` alone (no unit) is a recurring charge too.
     {"priceSpecification": [{"@type": "UnitPriceSpecification", "price": "40.80", "priceCurrency": "USD",
-                             "referenceQuantity": {"@type": "QuantitativeValue", "value": 1, "unitCode": "MON"}}]},
-])
+                             "billingDuration": 1}]},
+], ids=["sellingPlan_object", "selling_plan_id", "selling_plan_link", "billing_duration_monthly",
+        "billing_duration_alone"])
 def test_a_structural_plan_is_dropped_even_when_it_carries_an_id(plan):
     # The one-time offer and the plan both name V50; the plan is cheaper. Only the one-time stays,
     # and the plan is not a second listing of V50 either.
@@ -209,9 +211,10 @@ def test_a_variant_named_by_link_and_by_its_numeric_id_keeps_the_numeric_id():
 def test_a_barcode_node_linking_the_variant_folds_into_it():
     # Rules (b)+(c): a node carrying only the GTIN and the variant's url used to be a 13-digit
     # "variant" beside the link entry at the same price.
+    # The barcode node is keyed by the digits its url names, so it is the entry kept.
     out = _extract(_product([_offer(31, IN, **_link_id(V50)), _offer(31, IN, gtin13=GTIN50, **_link_url(V50))]))
     (v,) = out["variants"]
-    assert (v["variant_id"], v["barcode"]) == (_link_id(V50)["@id"], GTIN50)
+    assert (v["variant_id"], v["barcode"], v["offer_shopify_variant_id"]) == (V50, GTIN50, V50)
 
 
 def test_a_folded_read_still_re_reads_the_drains_size():
@@ -249,3 +252,189 @@ def test_twin_entries_not_positively_the_same_variant_at_one_price_never_fold(of
     assert len(out["variants"]) == len(offers)
     assert out["variant_census"]["folded_duplicates"] == 0
     assert out["variant_census"]["offers"] == len(offers)
+
+
+# ==== review of #2634 ==========================================================================
+
+
+def _reconcile(stored: List[Dict[str, Any]], html: str):
+    from routes.employee_products import _reconcile_seed_variants_with_read
+
+    page = _page(html=html)
+    return _reconcile_seed_variants_with_read(
+        stored, page.evidence["variants"], product_amount=None, product_currency="USD",
+        product_availability=None, census=page.evidence["variant_census"])
+
+
+def _stored(vid: str, price: float, title: str = "50 mL") -> Dict[str, Any]:
+    return {"variant_id": vid, "title": title, "price_amount": price, "price_currency": "USD", "availability": "in_stock"}
+
+
+def _dawn_offers(price50: float = 48, price15: float = 30) -> List[Dict[str, Any]]:
+    """Shopify Dawn: no sku, no @id -- the barcode and the variant's url."""
+    return [_offer(price50, IN, gtin13=GTIN50, **_link_url(V50)), _offer(price15, IN, gtin13=GTIN15, **_link_url(V15))]
+
+
+# ---- 1. a sku-less offer is keyed by the variant it links, and a stored barcode id still bridges
+
+
+def test_a_dawn_offer_is_keyed_by_its_variant_not_its_position():
+    variants = _variants(_product(_dawn_offers()))
+    assert [(v["variant_id"], v["barcode"]) for v in variants] == [(V50, GTIN50), (V15, GTIN15)]
+    assert all(variant_id_provenance(v["variant_id"]) == MERCHANT_ISSUED for v in variants)
+
+
+def test_a_seed_stored_with_barcode_ids_is_still_re_read_by_the_barcode(monkeypatch):
+    from tests.test_external_seed_refresh_writes_variants import _refresh, _seed_row
+
+    row = _seed_row(variants=[_stored(GTIN50, 45.0), _stored(GTIN15, 28.0, "15 mL")], price=28.0, availability="in_stock")
+    _, persisted = _refresh(monkeypatch, row, _page(html=_html(_product(_dawn_offers(48, 30)))))
+    seed = persisted["seed_data"]
+    assert {v["variant_id"]: v["price_amount"] for v in seed["variants"]} == {GTIN50: 48.0, GTIN15: 30.0}
+    assert seed["snapshot"]["variant_refresh"]["status"] == "all_re_read"
+
+
+def test_twin_offers_repeating_the_bare_product_url_stay_two_entries():
+    offers = [_offer(48, IN, url=DEST), _offer(30, IN, url=DEST)]
+    assert [v["variant_id"] for v in _variants(_product(offers))] == ["offer_1", "offer_2"]
+
+
+def test_a_url_naming_another_products_variant_keys_by_the_url_but_marks_nothing():
+    url = f"{STORE}/products/another-product?variant={V50}"
+    (v,) = _variants(_product([_offer(48, IN, url=url)]))
+    assert v["variant_id"] == url and "offer_shopify_variant_id" not in v
+
+
+# ---- 2. a page whose every offer is a plan names no single value
+
+
+def _plans_only_html(meta_price: float) -> str:
+    offers = [_offer(40, IN, sku="A", url=f"{STORE}/products/{HANDLE}?variant={V15}&selling_plan=1"),
+              _offer(60, IN, sku="B", url=f"{STORE}/products/{HANDLE}?variant={V50}&selling_plan=1")]
+    meta = (f'<meta property="product:price:amount" content="{meta_price}">'
+            '<meta property="product:price:currency" content="USD">')
+    return _html(_product(offers)).replace("</head>", meta + "</head>")
+
+
+def test_a_plans_only_page_never_hands_a_single_variant_another_variants_price(monkeypatch):
+    # The page lists A at 40 and B at 60, both as plans; og:price is A's 40. The seed stores only B
+    # at 60. Re-reading "the product's one price" would rewrite B to 40 and stamp it fresh.
+    from tests.test_external_seed_refresh_writes_variants import _refresh, _seed_row
+
+    page = _page(html=_plans_only_html(40))
+    census = page.evidence["variant_census"]
+    assert (census["offers"], census["selling_plans"], census["plans_only"]) == (0, 2, True)
+    row = _seed_row(variants=[_stored("B", 60.0)], price=60.0, availability="in_stock")
+    _, persisted = _refresh(monkeypatch, row, page)
+    seed = persisted["seed_data"]
+    assert [v["price_amount"] for v in seed["variants"]] == [60.0]
+    assert seed["snapshot"]["variant_refresh"]["status"] == "not_all_re_read"
+    assert "extracted_at" not in seed["snapshot"]
+
+
+# ---- 3. one-time offers that only LOOK structural are kept, and keep the product price
+
+
+@pytest.mark.parametrize("extra", [
+    {"sellingPlan": False},
+    {"selling_plan_id": 0},
+    # "Pay in 4" installments: billed over 4 weeks, but a one-time sale.
+    {"priceSpecification": [{"@type": "UnitPriceSpecification", "price": "12", "priceCurrency": "USD",
+                             "priceComponentType": "https://schema.org/Installment",
+                             "billingDuration": 4, "unitCode": "WEE"}]},
+    {"priceSpecification": [{"@type": "UnitPriceSpecification", "price": "10", "priceCurrency": "USD",
+                             "priceComponentType": "Downpayment", "billingDuration": 1}]},
+    # Unit pricing per day / per month of supply is not a billing period.
+    {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "1.60", "priceCurrency": "USD",
+                            "referenceQuantity": {"value": 1, "unitCode": "DAY"}}},
+    {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "48", "priceCurrency": "USD",
+                            "referenceQuantity": {"value": 1, "unitCode": "MON"}}},
+    # A unit on the spec with no billingDuration is not a recurring charge.
+    {"priceSpecification": {"@type": "UnitPriceSpecification", "price": "48", "priceCurrency": "USD",
+                            "unitText": "month"}},
+], ids=["sellingPlan_false", "selling_plan_id_zero", "installment", "downpayment",
+        "per_day_unit_price", "per_month_unit_price", "unit_text_without_duration"])
+def test_twin_a_one_time_offer_with_a_benign_spec_is_kept_and_prices_the_product(extra):
+    out = _extract(_product([_offer(48, IN, sku="A50", **extra), _offer(30, IN, sku="A15")]))
+    assert [v["variant_id"] for v in out["variants"]] == ["A50", "A15"]
+    assert out["price_amount"] == 48.0  # the sitemap ingest reads this product-level price
+
+
+# ---- 4. two shades behind one (wrong) link never fold
+
+
+@pytest.mark.parametrize("a,b", [
+    ({"sku": "LIP-RUBY", "name": "Ruby"}, {"sku": "LIP-CORAL", "name": "Coral"}),
+    ({"gtin13": GTIN50}, {"gtin13": GTIN15}),
+    ({"name": "Ruby"}, {"name": "Coral"}),
+], ids=["two_skus_two_titles", "two_barcodes", "two_titles"])
+def test_two_variants_sharing_the_selected_variants_link_stay_apart(a, b):
+    # A theme stamps the SELECTED variant's url on every offer.
+    out = _extract(_product([_offer(22, IN, **_link_url(V50), **a), _offer(22, IN, **_link_url(V50), **b)]))
+    assert len(out["variants"]) == 2
+    assert out["variant_census"]["folded_duplicates"] == 0
+
+
+def test_a_stored_two_shade_seed_re_reads_both_shades_behind_one_link():
+    offers = [_offer(24, IN, sku="LIP-RUBY", name="Ruby", **_link_url(V50)),
+              _offer(24, IN, sku="LIP-CORAL", name="Coral", **_link_url(V50))]
+    out, report = _reconcile([_stored("LIP-RUBY", 22.0, "Ruby"), _stored("LIP-CORAL", 22.0, "Coral")],
+                             _html(_product(offers)))
+    assert [v["price_amount"] for v in out] == [24.0, 24.0]
+    assert report["re_read"] == 2
+
+
+def test_a_title_that_is_only_the_product_name_does_not_block_the_fold():
+    out = _extract(_product([_offer(31, IN, name=TITLE, **_link_id(V50)),
+                             _offer(31, IN, sku="114807", name="50 mL", **_link_url(V50))]))
+    (v,) = out["variants"]
+    assert v["sku"] == "114807"
+
+
+# ---- 5. a correct sku-keyed list keeps every re-read after the fold
+
+
+def test_a_seed_stored_by_sku_is_re_read_through_the_folded_entrys_sku():
+    # Theme block: link entries. App block: the same variants carrying sku and url.
+    html = _html(_product([_offer(85, IN, **_link_id(V50)), _offer(34, IN, **_link_id(V15))]),
+                 _product([_offer(85, IN, sku="SKU-A", **_link_url(V50)), _offer(34, IN, sku="SKU-B", **_link_url(V15))]))
+    assert [v.get("sku") for v in _page(html=html).evidence["variants"]] == ["SKU-A", "SKU-B"]
+    out, report = _reconcile([_stored("SKU-A", 80.0), _stored("SKU-B", 30.0, "15 mL")], html)
+    assert [v["price_amount"] for v in out] == [85.0, 34.0]
+    assert report["re_read"] == 2 and report["not_re_read_count"] == 0
+
+
+# ---- surviving mutants of the first review
+
+
+@pytest.mark.parametrize("second", [
+    {"@type": "Offer", "lowPrice": "31", "priceCurrency": "USD", "availability": IN, **_link_url(V50)},
+    {"@type": "AggregateOffer", "lowPrice": "31", "highPrice": "31", "price": "31", "priceCurrency": "USD",
+     "availability": IN, **_link_url(V50)},
+], ids=["range_bound_price", "aggregate_offer"])
+def test_twin_a_range_price_or_an_aggregate_offer_never_folds(second):
+    out = _extract(_product([_offer(31, IN, **_link_id(V50)), second]))
+    assert len(out["variants"]) == 2
+
+
+def test_twin_a_bare_cadence_beside_an_ordinary_sibling_is_kept():
+    # Only a one-time or plan sibling makes "2 months" a plan.
+    assert len(_variants(_product([_offer(48, IN, name="Full size"), _offer(40, IN, name="2 months")]))) == 2
+
+
+def test_twin_an_offer_named_as_its_product_is_never_dropped_by_its_name():
+    name = "Glow Subscription Kit"
+    variants = _variants(_product([_offer(30, IN, name=name), _offer(20, IN, name="Refill")], name=name))
+    assert [v["price_amount"] for v in variants] == [30.0, 20.0]
+
+
+@pytest.mark.parametrize("offers", [
+    [_offer(22, IN, gtin13=GTIN50, **_link_url(V50)), _offer(22, IN, gtin13=GTIN15, **_link_url(V50))],
+    [_offer(48, IN, name="Full size"), _offer(30, IN, name="Travel")],
+], ids=["sibling_shared_link", "positional"])
+def test_an_offers_second_visit_is_not_an_id_collision(offers):
+    # The lone-Offer revisit re-keys an offer (`offer_1`, or the link its siblings shared); that is
+    # the same offer, not a second one under that id.
+    out = _extract(_product(offers))
+    assert not any(v.get("id_collided") for v in out["variants"])
+    assert out["variant_census"]["duplicate_ids"] == 0

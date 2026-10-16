@@ -5161,6 +5161,26 @@ def _read_variant_link(read_variant: Dict[str, Any]) -> Optional[str]:
     return linked or None
 
 
+def _read_variant_bridges(read_variant: Dict[str, Any]) -> List[str]:
+    """Every id OTHER than its key that a read variant can be matched on: its link
+    (`_read_variant_link`), and the `sku` / `barcode` the extractor keeps beside the key.
+
+    Review of #2634. The extractor no longer keys an offer by its barcode, and keeps ONE entry for
+    a variant the page lists twice (by its link, and by a node carrying its SKU), keyed by the
+    link. A seed adopted from an older read stores the barcode or the SKU as the variant's id, and
+    matching on the key alone stopped re-reading it. Like the link, these only FILL A GAP the keys
+    leave, under the same uniqueness rules: still exact equality on an identifier the page states.
+    """
+    out: List[str] = []
+    for raw in (_read_variant_link(read_variant), read_variant.get("sku"), read_variant.get("barcode")):
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
     for key in ("price_amount", "price", "amount", "value", "list_price"):
@@ -5278,9 +5298,11 @@ def _reconcile_seed_variants_with_read(
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
             read_by_id.setdefault(key, []).append(pos)
-        link = _read_variant_link(rv)
-        if link:
-            read_by_link.setdefault(link, []).append(pos)
+        for bridge in _read_variant_bridges(rv):
+            read_by_link.setdefault(bridge, []).append(pos)
+    # An id the page itself states as a BARCODE is not a native variant id, wherever a stored
+    # variant carries it (a seed adopted from an older read stores it as `variant_id`).
+    read_barcodes = {str(rv["barcode"]).strip() for rv in read_variants if rv.get("barcode")}
 
     # Which read offer each stored variant names, through ANY of its own identifiers. A read
     # offer two stored variants both claim is ambiguous for both.
@@ -5334,8 +5356,11 @@ def _reconcile_seed_variants_with_read(
     product_cur = (str(product_currency or "").strip().upper() or None)
     refused = {str(c).strip().upper() for c in refused_currencies or () if c}
     single = len(stored) == 1
+    # `plans_only`: every offer the page listed was a subscription plan, so `offers` is 0 and the
+    # product price is og:price -- some variant's -- not a value the page vouches is the only one.
     census_ok = isinstance(census, dict) and not (
         census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
+        or census.get("plans_only")
     )
     single_takes_price = (
         single
@@ -5376,7 +5401,7 @@ def _reconcile_seed_variants_with_read(
         # An agreeing product price cannot override an explicit different native variant ID.
         # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
         # numeric ID through the existing identifier match or the single-product fallback.
-        stored_native = _native_refresh_variant_ids(v)
+        stored_native = _native_refresh_variant_ids(v) - read_barcodes
         fallback_identity_ok = len(stored_native) <= 1 and not (
             stored_native and read_native and read_native != stored_native
         )
@@ -5384,6 +5409,8 @@ def _reconcile_seed_variants_with_read(
         read_codes = {_seed_variant_key(rv) for rv in read_variants
                       if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
                       and not _native_refresh_variant_ids(rv)}
+        # A SKU the extractor kept beside a folded entry's link key is a code the page states too.
+        read_codes |= {str(rv["sku"]).strip() for rv in read_variants if rv.get("sku")}
         if stored_codes and read_codes and not stored_codes.intersection(read_codes):
             fallback_identity_ok = False
         stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}

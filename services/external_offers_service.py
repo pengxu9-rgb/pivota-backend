@@ -543,8 +543,22 @@ _OFFER_ID_KEYS = ("sku", "skuId", "productID", "mpn")
 _OFFER_BARCODE_KEYS = ("gtin13", "gtin", "gtin14", "gtin12", "gtin8")
 
 
-def _offer_variant_id(offer: Dict[str, Any], item: Dict[str, Any], idx: int) -> Tuple[str, str]:
-    """(variant_id, the field it came from) for the offer at position `idx` of its list."""
+def _offer_variant_id(
+    offer: Dict[str, Any], item: Dict[str, Any], idx: int, linked: Optional[str] = None
+) -> Tuple[str, str]:
+    """(variant_id, the field it came from) for the offer at position `idx` of its list.
+
+    A SKU-LESS OFFER IS KEYED BY THE VARIANT IT LINKS, NOT BY ITS POSITION (review of #2634). A
+    Dawn-style Shopify offer carries no `sku` and no `@id`, only its barcode and a `url`
+    ".../products/<handle>?variant=<digits>". With the barcode out of the chain it would fall to
+    `offer_N`, which the seed refresh never matches, so a stored size could never be re-read. It
+    is keyed by the `?variant=` digits when they name the page's own product (`linked`, the
+    `offer_shopify_variant_id` mark), else by its `url` when that names one variant. A `url`
+    naming NO variant (the bare product page every offer repeats) stays positional: keying by it
+    would collapse every size of the page into one.
+    """
+    from services.handover_variant_identity import url_named_variant_id
+
     for node in (offer, item):
         for key in _OFFER_ID_KEYS:
             if node.get(key):
@@ -552,6 +566,12 @@ def _offer_variant_id(offer: Dict[str, Any], item: Dict[str, Any], idx: int) -> 
     for node in (offer, item):
         if node.get("@id"):
             return str(node["@id"]), "@id"
+    if linked:
+        return str(linked), "link"
+    for node in (offer, item):
+        url = node.get("url")
+        if isinstance(url, str) and url_named_variant_id(url.strip()):
+            return url.strip(), "url"
     return f"offer_{idx + 1}", "position"
 
 
@@ -574,16 +594,19 @@ def _offer_barcode(offer: Dict[str, Any], item: Dict[str, Any]) -> Optional[str]
 #
 #   STRUCTURAL (any offer)
 #     * `selling_plan_key`  -- the offer or its item states a plan under `sellingPlan`,
-#                              `selling_plan`, `sellingPlanId` or `selling_plan_id`;
+#                              `selling_plan`, `sellingPlanId` or `selling_plan_id` with a TRUTHY,
+#                              non-boolean value (`sellingPlan: false`, `selling_plan_id: 0` are a
+#                              theme saying "no plan");
 #     * `selling_plan_link` -- its `@id`/`url` (or its item's) carries a NON-EMPTY `selling_plan=`
 #                              query value (Shopify's plan permalink; an empty one is a theme's
 #                              one-time link);
-#     * `billing_spec`      -- a priceSpecification states `billingDuration`, or bills per a time
-#                              unit (`unitCode`/`referenceQuantity.unitCode` MON/WEE/DAY/ANN, or a
-#                              `unitText` naming one) -- schema.org's recurring-charge shape. NOT
-#                              `billingIncrement` alone (billing granularity, not recurrence) and
-#                              NOT a `referenceQuantity` in a size unit ("per 100 ml" is unit
-#                              pricing of a one-time sale).
+#     * `billing_spec`      -- a priceSpecification component is a RECURRING charge: it states
+#                              `billingDuration` and is not an Installment / Downpayment
+#                              (`priceComponentType` or `@type`): "pay in 4 over 4 weeks" is a
+#                              one-time sale paid in parts. Nothing else on a spec is read: not
+#                              `billingIncrement` (billing granularity), not `unitCode`/`unitText`
+#                              alone, and not `referenceQuantity` in ANY unit (unit pricing, "per
+#                              100 ml" or "per day", of a one-time sale). Review of #2634.
 #   BY NAME (positional `offer_N` offers only: nothing else identifies them; never a lone offer,
 #   never an offer named as the product, and never when it would leave the list with no offer)
 #     * `plan_name`         -- "subscribe"/"subscription", "auto-replenish", "auto-ship",
@@ -597,8 +620,7 @@ def _offer_barcode(offer: Dict[str, Any], item: Dict[str, Any]) -> Optional[str]
 #   is titled as an unnamed offer would be (the product's name), since the label names a
 #   purchase mode, not a variant.
 _SELLING_PLAN_KEYS = ("sellingPlan", "selling_plan", "sellingPlanId", "selling_plan_id")
-_TIME_UNIT_CODES = frozenset({"MON", "WEE", "DAY", "ANN"})
-_TIME_UNIT_TEXT = re.compile(r"^\s*(?:per\s+)?(?:day|week|month|year)s?\s*$", re.IGNORECASE)
+_NON_RECURRING_COMPONENTS = ("installment", "downpayment")
 _PLAN_NAME = re.compile(
     r"\bsubscri(?:be|bed|bing|ption)s?\b"
     r"|\bauto[\s-]?(?:replenish\w*|ship\w*|deliver\w*|renew\w*)"
@@ -619,7 +641,7 @@ def _offer_links(offer: Dict[str, Any], item: Dict[str, Any]) -> list[str]:
 
 def _structural_plan_signal(offer: Dict[str, Any], item: Dict[str, Any]) -> Optional[str]:
     for node in (offer, item):
-        if any(node.get(key) not in (None, "", [], {}) for key in _SELLING_PLAN_KEYS):
+        if any(node.get(key) and not isinstance(node.get(key), bool) for key in _SELLING_PLAN_KEYS):
             return "selling_plan_key"
     for raw in _offer_links(offer, item):
         if "selling_plan" not in raw:
@@ -634,15 +656,12 @@ def _structural_plan_signal(offer: Dict[str, Any], item: Dict[str, Any]) -> Opti
     for s in spec if isinstance(spec, list) else [spec]:
         if not isinstance(s, dict):
             continue
-        if s.get("billingDuration") not in (None, ""):
+        kinds = [s.get("priceComponentType"), s.get("@type")]
+        kinds = [str(x) for k in kinds for x in (k if isinstance(k, list) else [k]) if x]
+        if any(k.rstrip("/").rsplit("/", 1)[-1].strip().lower() in _NON_RECURRING_COMPONENTS for k in kinds):
+            continue
+        if s.get("billingDuration") not in (None, "", 0, "0") and not isinstance(s.get("billingDuration"), bool):
             return "billing_spec"
-        ref = s.get("referenceQuantity") if isinstance(s.get("referenceQuantity"), dict) else {}
-        for unit in (s.get("unitCode"), ref.get("unitCode")):
-            if isinstance(unit, str) and unit.strip().upper() in _TIME_UNIT_CODES:
-                return "billing_spec"
-        for text in (s.get("unitText"), ref.get("unitText")):
-            if isinstance(text, str) and _TIME_UNIT_TEXT.match(text):
-                return "billing_spec"
     return None
 
 
@@ -704,13 +723,28 @@ def _offer_variants_from_node(
 
     plan_reasons, one_time_offers = _selling_plan_reasons(offer_list, product_name)
 
+    # A LINK KEYS AN OFFER ONLY WHEN NO SIBLING SHARES IT (review of #2634). A theme that stamps the
+    # SELECTED variant's url on every offer links two shades to one `?variant=`; keyed by it they
+    # would collide and one shade would be dropped. Such offers stay positional -- their barcode
+    # (kept as `barcode`) is what still matches a stored id.
+    keyed: Dict[int, Tuple[str, str, Optional[str]]] = {}
+    for idx, offer in enumerate(offer_list):
+        if isinstance(offer, dict):
+            item = _offer_item(offer)
+            linked = _offer_shopify_variant_id(offer, item, page_urls)
+            keyed[idx] = (*_offer_variant_id(offer, item, idx, linked), linked)
+    link_keys = [vid for vid, src, _ in keyed.values() if src in ("link", "url")]
+    for idx, (vid, src, linked) in list(keyed.items()):
+        if src in ("link", "url") and link_keys.count(vid) > 1:
+            keyed[idx] = (f"offer_{idx + 1}", "position", linked)
+
     variants: list[Dict[str, Any]] = []
     for idx, offer in enumerate(offer_list):
         if not isinstance(offer, dict):
             continue
         item = _offer_item(offer)
 
-        variant_id, id_source = _offer_variant_id(offer, item, idx)
+        variant_id, id_source, shopify_variant = keyed[idx]
         barcode = _offer_barcode(offer, item)
 
         # A one-time offer beside dropped plans is titled as an unnamed offer: its name is a
@@ -741,7 +775,6 @@ def _offer_variants_from_node(
         price_amount, price_status = _read_price(price_raw, currency, signals, jsonld=True)
         availability_raw = offer.get("availability") or item.get("availability")
         availability = _availability_from_raw(str(availability_raw)) if availability_raw else "unknown"
-        shopify_variant = _offer_shopify_variant_id(offer, item, page_urls)
 
         variants.append(
             {
@@ -765,6 +798,9 @@ def _offer_variants_from_node(
                 # caller drops it by object, on every visit).
                 "_id_source": id_source,
                 "_selling_plan": plan_reasons.get(id(offer)),
+                # Transient: the product this offer was read under, so the fold can tell an
+                # offer titled as its product from one titled as a shade/size.
+                "_product_name": product_name,
             }
         )
 
@@ -1002,6 +1038,23 @@ def _read_variant_claim(entry: Dict[str, Any]) -> Optional[str]:
     return extract_shopify_numeric_variant_id(vid) or None
 
 
+def _entries_name_different_variants(group: list[Dict[str, Any]]) -> bool:
+    """Do entries that share one `?variant=` link still say they are DIFFERENT variants?
+
+    A theme that stamps the SELECTED variant's url on every offer (review of #2634: LIP-RUBY and
+    LIP-CORAL, titled Ruby and Coral, one price, one `?variant=`) links two shades to one id. The
+    link is then wrong, not the shades: they stay apart when they carry two different SKUs, two
+    different barcodes, or two different titles neither of which is just the product's name.
+    """
+    def norm(value: Any) -> str:
+        return str(value or "").strip().casefold()
+
+    skus = {norm(e.get("variant_id") if e.get("_id_source") in ("sku", "skuId") else e.get("sku")) for e in group} - {""}
+    barcodes = {norm(e.get("barcode")) for e in group} - {""}
+    titles = {norm(e.get("title")) for e in group if norm(e.get("title")) != norm(e.get("_product_name"))} - {""}
+    return len(skus) > 1 or len(barcodes) > 1 or len(titles) > 1
+
+
 def _fold_same_variant_reads(entries: list[Dict[str, Any]]) -> Tuple[list[Dict[str, Any]], set]:
     """Collapse entries ONE read lists for the SAME merchant variant. Returns (entries, the
     `_offer_ref`s folded away).
@@ -1022,6 +1075,9 @@ def _fold_same_variant_reads(entries: list[Dict[str, Any]]) -> Tuple[list[Dict[s
     page ties them (left for a products.js-backed repair). Listings that disagree stay apart, so
     `routes/employee_products._reconcile_seed_variants_with_read` still refuses to re-read a
     variant the page prices twice (review of #2631).
+
+    Entries sharing one link that still name different variants (two SKUs, two barcodes, two
+    titles that are not the product's name: `_entries_name_different_variants`) never fold.
 
     The kept entry is the one whose own key is the bare numeric id, else the one whose key is the
     link; it keeps the other's SKU as `sku` (or its `mpn`), its link mark and its barcode.
@@ -1060,6 +1116,7 @@ def _fold_same_variant_reads(entries: list[Dict[str, Any]]) -> Tuple[list[Dict[s
             or not all(e.get("price_exact") is True for e in group)
             or any(e.get("offer_aggregate") for e in group)
             or len(states) > 1
+            or _entries_name_different_variants(group)
         ):
             continue
 
@@ -1143,7 +1200,17 @@ def _extract_jsonld_variants_with_census(
     # second visit as a lone Offer node (where no sibling is visible) must not bring it back.
     plan_refs = {v.get("_offer_ref") for v in variants if v.get("_selling_plan")}
     all_variants = variants
-    variants = [v for v in variants if v.get("_offer_ref") not in plan_refs]
+    # ONE ID PER OFFER OBJECT: the one its first visit gave it. The Product visit sees the offer
+    # among its siblings; the lone-Offer revisit cannot (a positional offer comes back `offer_1`,
+    # a sibling-shared link comes back keyed by the link), so a revisit's different id is not a
+    # second offer and must not read as an id collision.
+    first_id: Dict[int, str] = {}
+    for v in variants:
+        first_id.setdefault(v.get("_offer_ref"), str(v.get("variant_id") or "").strip())
+    variants = [
+        v for v in variants
+        if v.get("_offer_ref") not in plan_refs and str(v.get("variant_id") or "").strip() == first_id[v.get("_offer_ref")]
+    ]
     refs_by_id: Dict[str, set] = {}
     by_ref: Dict[int, Dict[str, Any]] = {}
     for v in variants:
@@ -1192,9 +1259,14 @@ def _extract_jsonld_variants_with_census(
         # name (see `_selling_plan_reasons`, `_fold_same_variant_reads`): neither is in `offers`.
         "selling_plans": len(plan_refs),
         "folded_duplicates": len(folded_refs),
+        # EVERY offer the page listed was a plan (review of #2634). `offers` is then 0, which
+        # `_page_names_one_value` reads as "one value", while the product price falls back to
+        # og:price -- the first or selected variant's. The refresh refuses a census carrying this,
+        # so a single stored variant never takes another variant's price off it.
+        "plans_only": bool(plan_refs) and not distinct,
     }
     for v in list(all_variants) + normalized:
-        for key in ("_offer_ref", "_price_refused", "_id_source", "_selling_plan"):
+        for key in ("_offer_ref", "_price_refused", "_id_source", "_selling_plan", "_product_name"):
             v.pop(key, None)
     return normalized, census
 
