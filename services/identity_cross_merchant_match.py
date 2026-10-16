@@ -35,7 +35,11 @@ THE JUDGEMENT (listing vs anchor), in order:
      else DEFERRED to phase 2 (`anchor_multi_size`, `anchor_size_unknown`);
   4. the listing's offers whose own size (SKU title / visible option labels / sku_payload option
      fields; the listing title only when the listing has exactly one priced offer in the market)
-     equals the anchor's size: `listing_offer_ids`. None -> held (`offer_size_unpinned`);
+     equals the anchor's size: `listing_offer_ids`. None -> held (`offer_size_unpinned`). PHASE 1
+     moves a listing only when EVERY live priced offer it has in the market is pinned to that size: a
+     listing that also sells other (or unreadable) sizes is held (`listing_multi_size`), because
+     moving it whole would put those offers on the anchor's single-size PDP, and agent_pdp_view
+     aggregates price ranges and variants with no size awareness;
   5. same-size price: the cheapest matched offer (in-stock ones first) against the anchor's cheapest
      offer in the market; no price (`price_unknown`) or two currencies (`price_currency_mismatch`)
      -> held; a ratio above 2.0 or below 0.5 -> vetoed (`price_ratio`: sets, minis, testers).
@@ -48,7 +52,10 @@ and each group a moving row leaves must hold only moving rows (`old_group_has_ot
 EVIDENCE CONTRACT (read by be#2635's resolved-group read and the engine): attach_membership carries
 evidence.listing_product_key + keeper_product_key; merge_content_key carries
 evidence.from_product_keys + keeper_product_key; both carry evidence.proposer and
-evidence.matcher_verdict (see `matcher_verdict` / `validate_matcher_verdict`).
+evidence.matcher_verdict (built by `matcher_verdict`; checked by the ENGINE's
+identity_resolution.validate_matcher_verdict / module_proposal_problems -- one shared rule, #2637).
+The strategy is one of the engine's MODULE_ONLY_STRATEGIES: only this module produces its proposals,
+and identity_engine approves one whole proposal run of them (approve --strategy --run --expect-digest).
 
 Pure: no I/O here. scripts/ops/propose_cross_merchant_matches.py exports the snapshot (one read-only
 transaction) and writes proposals through the engine's writer.
@@ -67,8 +74,10 @@ from typing import Any, Dict, Hashable, Iterable, List, Mapping, Optional, Seque
 from services.identity_resolution import (
     member_fingerprint,
     merge_content_key_proposal,
+    module_proposal_problems,
     new_proposal,
     proposal_fingerprint,
+    validate_matcher_verdict,
 )
 from services.product_match_normalizer import canonical_brand, veto_reasons
 from services.product_match_tiers import (
@@ -92,8 +101,7 @@ PRICE_RATIO_MIN = 0.5
 CONFIDENCE = {"T0a": 0.97, "T0b": 0.95, "T0c": 0.9}
 IN_STOCK = frozenset({"in_stock", "instock", "limited_stock", "low_stock", "available"})
 VETOES_CHECKED: Tuple[str, ...] = ("conflict_tokens", "shade", "gtin_differs", "size", "anchor_single_size",
-                                   "offer_size_pinned", "price_ratio")
-SIZE_UNITS = ("ml", "g", "count")
+                                   "offer_size_pinned", "listing_single_size", "price_ratio")
 #: sku_payload fields that can name a variant's size (the export reads only these).
 SKU_PAYLOAD_SIZE_FIELDS: Tuple[str, ...] = ("variant_title", "title", "size", "option1", "option2", "option3",
                                             "options", "selected_options")
@@ -101,6 +109,7 @@ SKU_PAYLOAD_SIZE_FIELDS: Tuple[str, ...] = ("variant_title", "title", "size", "o
 # Outcome reasons. HELD goes to a human; DEFERRED waits for phase 2 (size-aware serving); VETOED is a
 # different buyable item. None of them is ever proposed.
 HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "offer_size_unpinned",
+                "listing_multi_size",
                 "price_unknown", "price_currency_mismatch", "key_shared_with_unmatched", "unguarded_writer",
                 "no_group_membership", "old_group_has_other_members", "no_content_key",
                 "old_content_key_not_read")
@@ -357,6 +366,10 @@ class Planner:
         pinned = [o for o in li.offers if o.size == anchor_size]
         if not pinned:
             return Verdict("held", ["offer_size_unpinned"], tiers_matched=matched, anchor_size=anchor_size)
+        if any(o.price is not None and o.size != anchor_size for o in li.offers):
+            # Phase 1: a priced offer of another (or an unreadable) size would ride along onto the
+            # anchor's single-size PDP. Move the listing only when ALL its priced offers are this size.
+            return Verdict("held", ["listing_multi_size"], tiers_matched=matched, anchor_size=anchor_size)
         lp, lc, lbasis = _side_price(pinned)
         ap, ac, abasis = _side_price(anchor.offers)  # the anchor row's own price (single-size product)
         price = {"listing": lp, "anchor": ap, "listing_currency": lc, "anchor_currency": ac,
@@ -576,43 +589,23 @@ def matcher_verdict(*, tier: str, size: SizeKey, listing_offer_ids: Sequence[str
     return v
 
 
-def validate_matcher_verdict(kind: str, evidence: Mapping[str, Any]) -> List[str]:
-    """Why a proposal's evidence does not meet the M4 contract (empty when it does)."""
-    errs: List[str] = []
-    ev = evidence or {}
-    if ev.get("proposer") != STRATEGY:
-        errs.append("proposer")
-    v = ev.get("matcher_verdict")
-    if not isinstance(v, Mapping):
-        return errs + ["matcher_verdict_missing"]
-    if v.get("strategy") != STRATEGY:
-        errs.append("strategy")
-    if not isinstance(v.get("rule_version"), str) or not v.get("rule_version"):
-        errs.append("rule_version")
-    if v.get("tier") not in TIERS:
-        errs.append("tier")
-    if v.get("same_size") is not True:
-        errs.append("same_size")
-    size = v.get("size")
-    if not (isinstance(size, Mapping) and isinstance(size.get("value"), (int, float))
-            and not isinstance(size.get("value"), bool) and size.get("value") > 0
-            and size.get("unit") in SIZE_UNITS and isinstance(size.get("pack"), int)
-            and not isinstance(size.get("pack"), bool) and size.get("pack") >= 1):
-        errs.append("size")
-    ids = v.get("listing_offer_ids")
-    if not (isinstance(ids, list) and ids and all(isinstance(i, str) and i for i in ids)):
-        errs.append("listing_offer_ids")
-    if kind == "merge_content_key":
-        if v.get("from_key_single_size") is not True:
-            errs.append("from_key_single_size")
-        if not ev.get("from_product_keys") or not ev.get("keeper_product_key"):
-            errs.append("from_product_keys")
-    elif kind == "attach_membership":
-        if not ev.get("listing_product_key") or not ev.get("keeper_product_key"):
-            errs.append("listing_product_key")
-    else:
-        errs.append("kind")
-    return errs
+def evidence_problems(p: Mapping[str, Any]) -> List[str]:
+    """Everything the writer checks before a proposal may be inserted: the engine's module rule
+    (strategy, evidence.proposer, identity_resolution.validate_matcher_verdict -- #2637's one shared
+    rule) plus the keys be#2635 reads (listing_product_key or from_product_keys, keeper_product_key)."""
+    ev = p.get("evidence") or {}
+    kind = p.get("kind") or ""
+    problems = list(validate_matcher_verdict(kind, dict(ev), STRATEGY))
+    problems += [x for x in module_proposal_problems(dict(p), STRATEGY) if x not in problems]
+    if ev.get("keeper_product_key") != p.get("keeper_product_key") or not ev.get("keeper_product_key"):
+        problems.append("evidence.keeper_product_key is not the proposal's keeper")
+    if kind == "attach_membership" and not ev.get("listing_product_key"):
+        problems.append("evidence.listing_product_key missing")
+    if kind == "merge_content_key" and not ev.get("from_product_keys"):
+        problems.append("evidence.from_product_keys missing")
+    if kind not in ("attach_membership", "merge_content_key"):
+        problems.append(f"kind {kind!r}")
+    return problems
 
 
 def _key_json(k: Optional[Hashable]) -> Any:
@@ -801,17 +794,10 @@ def proposal_set_digest(proposals: Sequence[Mapping[str, Any]]) -> str:
     return "cmd_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
 
 
-def approve_digest(proposals: Sequence[Mapping[str, Any]]) -> str:
-    """The digest an approval of one proposal run pins: the same lines over the rows as WRITTEN
-    (evidence carries proposal_run_id), so `identity_engine approve --run R --expect-digest D`
-    approves exactly what this writer inserted."""
-    lines = sorted(f"{p['proposal_id']}\t{proposal_fingerprint(dict(p))}" for p in proposals)
-    return "irad_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
-
-
 def stamp_run(proposals: Sequence[Mapping[str, Any]], run_id: str) -> List[Dict[str, Any]]:
-    """Copies of `proposals` whose evidence carries the proposal run id (one per --write-proposals).
-    proposal_id / proposal_key do not depend on it, so a re-run dedupes onto the rows already there."""
+    """Copies of `proposals` whose evidence carries the proposal run id (one per --write-proposals):
+    the run identity_resolution.approve_module_run approves as a whole. proposal_id / proposal_key do
+    not depend on it, so a re-run dedupes onto the rows already there (still in the earlier run)."""
     return [{**p, "evidence": {**(p.get("evidence") or {}), "proposal_run_id": run_id}} for p in proposals]
 
 
@@ -822,6 +808,6 @@ def plan_market(snap: Snapshot, market: str, *, brands: Optional[Sequence[str]] 
 
 __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
-    "Snapshot", "approve_digest", "matcher_verdict", "member_fingerprint", "plan_market",
-    "proposal_set_digest", "stamp_run", "validate_matcher_verdict",
+    "Snapshot", "evidence_problems", "matcher_verdict", "member_fingerprint", "plan_market",
+    "proposal_set_digest", "stamp_run",
 ]

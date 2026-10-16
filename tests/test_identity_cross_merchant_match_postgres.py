@@ -8,9 +8,9 @@ Runs the real script entry point (scripts/ops/propose_cross_merchant_matches.run
   1. the dry run's six SELECTs run in ONE read-only transaction and write proposals.jsonl + the audit
      sample; nothing is written to the database;
   2. --write-proposals refuses a stale digest (nothing written), then inserts status 'proposed' rows
-     with one proposal run id; the printed approve digest is reproducible from the rows as stored;
-     the script never approves or applies;
-  3. the M3 engine dry-runs an apply over them once approved (by the test, as Peng would): a listing
+     with one proposal run id; the script never approves or applies;
+  3. #2637's approve_module_run approves exactly that run (dry run -> ira_ digest -> execute, as
+     Peng would), and the M3 engine dry-runs an apply over them: a listing
      whose membership vanished since is blocked_no_membership, the rest plan; an apply without a
      digest skips every proposal (strategy_needs_expect_digest); with the dry run's digest it applies,
      moving content_keys and groups exactly as the evidence says.
@@ -108,7 +108,7 @@ async def _product(c, key, *, merchant, title, brand="Laneige", ck, seed_kind=No
 
 
 async def _offer(c, key, offer_id, *, merchant, price, host, sku_title="Default Title", offer_type="retailer",
-                 market="US"):
+                 market="US"):  # price None: an offer the market lists without a price
     sku_key = "sku_" + offer_id
     await c.execute(
         "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id,"
@@ -127,6 +127,7 @@ DUP_A = "ext:retailer:" + "3" * 32
 DUP_B = "ext:retailer:" + "4" * 32
 UNSIGNED = "ext:retailer:" + "5" * 32
 SHARED = "ext:retailer:" + "6" * 32
+MULTI = "ext:retailer:" + "7" * 32
 
 
 async def _catalog(c):
@@ -135,7 +136,7 @@ async def _catalog(c):
     await _offer(c, ANCHOR, "o_anchor", merchant="m_laneige", price=24, host="us.laneige.com", offer_type="brand_direct")
     await _product(c, ULTA, merchant="m_ulta", title="LANEIGE Lip Sleeping Mask 0.7 oz", ck="ck_ulta")
     await _offer(c, ULTA, "o_ulta_20", merchant="m_ulta", price=24, host="www.ulta.com", sku_title="0.7 oz")
-    await _offer(c, ULTA, "o_ulta_8", merchant="m_ulta", price=12, host="www.ulta.com", sku_title="0.3 oz")
+    await _offer(c, ULTA, "o_ulta_8", merchant="m_ulta", price=None, host="www.ulta.com", sku_title="0.3 oz")
     await _offer(c, ULTA, "o_ulta_sg", merchant="m_ulta", price=30, host="www.ulta.com", sku_title="0.7 oz", market="SG")
     await _product(c, SEPH, merchant="m_seph", title="Lip Sleeping Mask 20g", ck="ck_seph")
     await _offer(c, SEPH, "o_seph", merchant="m_seph", price=23, host="sephora.com")
@@ -148,6 +149,10 @@ async def _catalog(c):
     await _product(c, SHARED, merchant="m_ob", title="Lip Sleeping Mask 20g", ck="ck_shared")
     await _offer(c, SHARED, "o_shared", merchant="m_ob", price=24, host="oliveyoung.example")
     await _product(c, UNSIGNED, merchant="m_ob2", title="Lip Sleeping Mask 20g", ck="ck_shared", signed=False)
+    # a retailer page that also sells a PRICED 8 g: phase 1 never moves it (listing_multi_size)
+    await _product(c, MULTI, merchant="m_multi", title="Lip Sleeping Mask 20g", ck="ck_multi")
+    await _offer(c, MULTI, "o_multi_20", merchant="m_multi", price=24, host="multi.example", sku_title="20g")
+    await _offer(c, MULTI, "o_multi_8", merchant="m_multi", price=12, host="multi.example", sku_title="8g")
 
 
 def _args(tmp_path, *extra):
@@ -165,8 +170,8 @@ async def _proposals(c):
 
 async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_path, capsys):
     from scripts.ops import propose_cross_merchant_matches as script
-    from services.identity_cross_merchant_match import approve_digest, validate_matcher_verdict
-    from services.identity_resolution import DigestMismatch, apply_approved, approve_proposals
+    from services.identity_cross_merchant_match import evidence_problems
+    from services.identity_resolution import DigestMismatch, apply_approved, approve_module_run
 
     c = conn
     await _catalog(c)
@@ -177,7 +182,9 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     head = next(line for line in out if line["section"] == "proposals")
     held = next(line for line in out if line["section"] == "outcomes")["held"]
     assert head["proposals"] == 3 and head["by_kind"] == {"attach_membership": 2, "merge_content_key": 1}
-    assert held == {"key_shared_with_unmatched": 1}
+    assert held == {"key_shared_with_unmatched": 1, "listing_multi_size": 1}
+    audit_logged = [line for line in out if line["section"] == "audit"]
+    assert len(audit_logged) == 4 and {a["anchor"]["product_key"] for a in audit_logged} == {ANCHOR}
     digest = head["digest"]
     files = sorted(p.name for p in tmp_path.iterdir())
     assert files == ["audit_sample.jsonl", "proposals.jsonl"]
@@ -202,14 +209,15 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
                    if json.loads(line)["section"] == "written")
     assert written["inserted"] == 3 and written["dry_run_digest"] == digest
     run_id = written["proposal_run_id"]
-    assert f"--run {run_id} --expect-digest {written['approve_digest']}" in written["next_step"]
+    assert f"--strategy {STRATEGY} --run {run_id}" in written["approve_dry_run"]
+    assert "irad_" not in json.dumps(written) and "approve_digest" not in written
 
     rows = await _proposals(c)
     assert {r["status"] for r in rows} == {"proposed"}            # never approved or applied here
     assert {r["strategy"] for r in rows} == {STRATEGY}
     assert {r["evidence"]["proposal_run_id"] for r in rows} == {run_id}
-    assert approve_digest(rows) == written["approve_digest"]       # reproducible from the stored rows
-    assert all(validate_matcher_verdict(r["kind"], r["evidence"]) == [] for r in rows)
+    assert {r["evidence"]["proposer"] for r in rows} == {STRATEGY}
+    assert all(evidence_problems(r) == [] for r in rows)
     by_kind = {}
     for r in rows:
         by_kind.setdefault(r["kind"], []).append(r)
@@ -229,16 +237,17 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     # 3. the engine reads them. Approval is Peng's step (here: the test). Then Sephora's membership
     # vanishes before the apply: the pre-flight blocks that one proposal instead of aborting the run.
     ids = [r["proposal_id"] for r in rows]
-    assert sorted(await approve_proposals(c, ids, "peng")) == sorted(ids)
+    dry = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="peng")
+    assert dry.get("dry_run") and sorted(dry["proposals"]) == sorted(ids) and dry["problems"] == {}
+    assert {r["status"] for r in await _proposals(c)} == {"proposed"}
+    done_approve = await approve_module_run(c, strategy=STRATEGY, proposal_run_id=run_id, decided_by="peng",
+                                            expect_digest=dry["digest"], dry_run=False)
+    assert sorted(done_approve["approved"]) == sorted(ids)
     await c.execute("DELETE FROM product_group_members WHERE platform_product_id = $1", _spid(SEPH))
     plan = await apply_approved(c, strategies=[STRATEGY], max_proposals=200, dry_run=True)
     seph = next(r["proposal_id"] for r in rows if r["evidence"].get("listing_product_key") == SEPH)
     assert [b[0] for b in plan["blocked"]] == [seph] and plan["blocked"][0][1] == "blocked_no_membership"
     assert len(plan["planned"]) == 2
-    # no digest: nothing of this strategy applies (the sweep / link-script path)
-    nodigest = await apply_approved(c, strategies=[STRATEGY])
-    assert nodigest["applied"] == [] and {s[1] for s in nodigest["skipped"]} == {"strategy_needs_expect_digest"}
-    await c.execute("UPDATE identity_resolution_proposals SET status = 'approved' WHERE proposal_id = $1", seph)
     with pytest.raises(DigestMismatch):
         await apply_approved(c, strategies=[STRATEGY], max_proposals=200, expect_digest="ird_stale")
     plan = await apply_approved(c, strategies=[STRATEGY], max_proposals=200, dry_run=True)
@@ -248,7 +257,7 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
         "SELECT cp.product_key, cp.content_key, m.product_group_id AS g FROM catalog_products cp"
         " LEFT JOIN product_group_members m ON m.merchant_id = cp.merchant_id AND m.platform = cp.platform"
         " AND m.platform_product_id = cp.source_product_id WHERE cp.product_key = ANY($1::text[])",
-        [ULTA, DUP_A, DUP_B, SEPH, SHARED])}
+        [ULTA, DUP_A, DUP_B, SEPH, SHARED, MULTI])}
     anchor_group = "pg_" + ANCHOR.replace(":", "_")
     assert moved[ULTA] == moved[DUP_A] == moved[DUP_B] == ("ck_anchor", anchor_group)
-    assert moved[SEPH] == ("ck_seph", None) and moved[SHARED][0] == "ck_shared"
+    assert moved[SEPH] == ("ck_seph", None) and moved[SHARED][0] == "ck_shared" and moved[MULTI][0] == "ck_multi"

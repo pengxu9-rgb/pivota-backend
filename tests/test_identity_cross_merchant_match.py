@@ -21,11 +21,12 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     STRATEGY,
     Planner,
     Snapshot,
+    evidence_problems,
     matcher_verdict,
     plan_market,
     proposal_set_digest,
-    validate_matcher_verdict,
 )
+from services.identity_resolution import validate_matcher_verdict  # noqa: E402  (#2637's one rule)
 from test_product_match_normalizer import MUST_NOT_MERGE  # noqa: E402
 
 SYN = "external_seed"
@@ -132,7 +133,7 @@ def laneige_catalog() -> Cat:
 def test_ulta_and_sephora_20g_listings_attach_to_the_brand_store_anchor():
     cat = laneige_catalog()
     ulta = retailer(cat, 1, "Laneige", "LANEIGE Lip Sleeping Mask 0.7 oz", host="www.ulta.com", sku="0.7 oz")
-    ulta_small = cat.offer(ulta, price=12, host="www.ulta.com", sku="0.3 oz")  # another size on the same page
+    ulta_small = cat.offer(ulta, price=None, host="www.ulta.com", sku="0.3 oz")  # another size, no price
     sephora = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", host="sephora.com")
     plan = cat.plan()
     assert [p["kind"] for p in plan.proposals] == ["attach_membership", "attach_membership"]
@@ -146,6 +147,7 @@ def test_ulta_and_sephora_20g_listings_attach_to_the_brand_store_anchor():
     by_listing = {p["evidence"]["listing_product_key"]: p for p in plan.proposals}
     ulta_ids = by_listing[ulta]["evidence"]["matcher_verdict"]["listing_offer_ids"]
     assert ulta_small not in ulta_ids and len(ulta_ids) == 1  # the 0.3 oz offer is not the matched size
+    assert evidence_problems(by_listing[ulta]) == []
     assert by_listing[sephora]["evidence"]["tier"] == "T0b"   # exact title
     assert by_listing[ulta]["evidence"]["tier"] == "T0c"      # brand prefix + 0.7 oz == 20 g
     assert plan.new_multi_merchant_groups == 1
@@ -283,7 +285,7 @@ def test_the_price_ratio_compares_the_in_stock_matched_offer():
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", price=9, availability="out_of_stock", sku="20g")
     cat.offer(r, price=25, sku="20g", availability="in_stock")
-    cat.offer(r, price=5, sku="8g", availability="in_stock")  # cheaper, but another size
+    cat.offer(r, price=None, sku="8g", availability="in_stock")  # another size, unpriced: not compared
     plan = cat.plan()
     assert proposed_keys(plan) == [r]
     assert plan.proposals[0]["evidence"]["price_ratio"] == round(25 / 24, 4)
@@ -381,8 +383,8 @@ def test_listing_offer_ids_only_name_the_matched_size():
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g", offer_id="off_20a")
     cat.offer(r, sku="Lip Sleeping Mask / 0.7 oz", offer_id="off_20b")
-    cat.offer(r, sku="8g", price=10, offer_id="off_8")
-    cat.offer(r, sku=None, labels=["Size", "3g"], price=4, offer_id="off_3")
+    cat.offer(r, sku="8g", price=None, offer_id="off_8")
+    cat.offer(r, sku=None, labels=["Size", "3g"], price=None, offer_id="off_3")
     plan = cat.plan()
     assert plan.proposals[0]["evidence"]["matcher_verdict"]["listing_offer_ids"] == ["off_20a", "off_20b"]
 
@@ -532,24 +534,32 @@ def test_every_proposal_has_a_well_formed_verdict_over_a_mixed_catalog():
     assert all(validate_matcher_verdict(p["kind"], p["evidence"]) == [] for p in plan.proposals)
 
 
-@pytest.mark.parametrize("mutate,err", [
-    (lambda v: v.pop("tier"), "tier"),
-    (lambda v: v.update(same_size=False), "same_size"),
-    (lambda v: v.update(listing_offer_ids=[]), "listing_offer_ids"),
-    (lambda v: v.update(size={"value": 20, "unit": "oz", "pack": 1}), "size"),
-    (lambda v: v.update(rule_version=""), "rule_version"),
-    (lambda v: v.update(strategy="other"), "strategy"),
+@pytest.mark.parametrize("mutate", [
+    lambda p: p["evidence"]["matcher_verdict"].pop("tier"),
+    lambda p: p["evidence"]["matcher_verdict"].update(same_size=False),
+    lambda p: p["evidence"]["matcher_verdict"].update(listing_offer_ids=[]),
+    lambda p: p["evidence"]["matcher_verdict"].update(size={"value": 0, "unit": "g", "pack": 1}),
+    lambda p: p["evidence"]["matcher_verdict"].update(rule_version=""),
+    lambda p: p["evidence"]["matcher_verdict"].update(strategy="other"),
+    lambda p: p["evidence"].update(proposer="someone_else"),
+    lambda p: p["evidence"].pop("listing_product_key"),
+    lambda p: p["evidence"].update(keeper_product_key="not_the_keeper"),
 ])
-def test_validate_matcher_verdict_rejects_malformed(mutate, err):
-    ev = {"proposer": STRATEGY, "listing_product_key": "l", "keeper_product_key": "k",
+def test_the_writers_check_rejects_a_malformed_proposal(mutate):
+    cat = laneige_catalog()
+    retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g")
+    p = json.loads(json.dumps(cat.plan().proposals[0]))
+    assert evidence_problems(p) == []
+    mutate(p)
+    assert evidence_problems(p)
+
+
+def test_a_merge_without_the_single_size_flag_is_rejected():
+    ev = {"proposer": STRATEGY, "from_product_keys": ["a"], "keeper_product_key": "k",
           "matcher_verdict": matcher_verdict(tier="T0c", size=(20.0, "g", 1), listing_offer_ids=["o"], merge=False)}
-    assert validate_matcher_verdict("attach_membership", ev) == []
-    mutate(ev["matcher_verdict"])
-    assert err in validate_matcher_verdict("attach_membership", ev)
-    merge_ev = {"proposer": STRATEGY, "from_product_keys": ["a"], "keeper_product_key": "k",
-                "matcher_verdict": matcher_verdict(tier="T0c", size=(20.0, "g", 1), listing_offer_ids=["o"], merge=False)}
-    assert "from_key_single_size" in validate_matcher_verdict("merge_content_key", merge_ev)
-    assert "proposer" in validate_matcher_verdict("attach_membership", {**ev, "proposer": "x"})
+    assert validate_matcher_verdict("merge_content_key", ev)
+    ev["matcher_verdict"]["from_key_single_size"] = True
+    assert validate_matcher_verdict("merge_content_key", ev) == []
 
 
 # --- digest + audit --------------------------------------------------------------------------------------
@@ -605,25 +615,25 @@ def test_summary_lines_report_counts_reasons_and_samples():
 # --- the engine never applies it without a digest; the CLI governs it --------------------------------------
 
 
-def test_the_strategy_is_digest_gated_and_never_auto_applied():
+def test_the_strategy_is_the_engines_module_only_strategy_and_never_auto_applied():
     from scripts import identity_engine as cli
     from services import identity_barcode_link, identity_brand_link
     from services.identity_reconcile_sweep import AUTO_APPROVE_STRATEGIES
-    from services.identity_resolution import DIGEST_REQUIRED_STRATEGIES
+    from services.identity_resolution import MODULE_ONLY_STRATEGIES
 
-    assert STRATEGY in DIGEST_REQUIRED_STRATEGIES
-    assert STRATEGY not in AUTO_APPROVE_STRATEGIES and STRATEGY not in cli.RESERVED_STRATEGIES
+    assert STRATEGY in MODULE_ONLY_STRATEGIES and STRATEGY in cli.RESERVED_STRATEGIES
+    assert STRATEGY not in AUTO_APPROVE_STRATEGIES
     assert STRATEGY not in (identity_brand_link.STRATEGY, identity_barcode_link.STRATEGY)
-    assert cli.PROPOSER_OWNED_STRATEGIES[STRATEGY].endswith("propose_cross_merchant_matches.py")
-    assert cli.STRATEGY_MAX_PROPOSALS[STRATEGY] == 200
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("argv", [
     ["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k", "--strategy", STRATEGY],
-    ["apply", "--strategy", STRATEGY, "--max-proposals", "201"],
+    ["approve", "irp_x", "--by", "peng", "--strategy", STRATEGY, "--run", "cmss_x"],
+    ["approve", "--strategy", STRATEGY, "--run", "cmss_x", "--by", "peng", "--execute"],
+    ["apply", "--strategy", STRATEGY, "--max-proposals", "5", "--execute"],
 ])
-async def test_the_cli_refuses_hand_proposals_and_oversized_batches(monkeypatch, argv):
+async def test_the_engine_cli_governs_it(monkeypatch, argv):
     from scripts import identity_engine as cli
 
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -640,6 +650,7 @@ def test_the_script_has_no_at_sign_and_defaults_to_a_dry_run():
     assert "@" not in Path(script.__file__).read_text()
     args = script.parse_args([])
     assert args.dry_run and not args.write_proposals and args.market == "US" and args.audit_size == 600
+    assert args.out == "/tmp/cross_merchant_match"
     with pytest.raises(SystemExit):
         script.parse_args(["--write-proposals", "--max-proposals", "5"])
     with pytest.raises(SystemExit):
@@ -765,3 +776,43 @@ def test_an_offer_whose_variant_states_two_sizes_is_never_pinned():
     offer = next(o for o in p.by_pk[r].offers if o.offer_id == "off_two")
     assert len(offer.stated_sizes) == 2 and offer.size is None
     assert outcome(p.plan(), r)["reason"] == "offer_size_unpinned"
+
+
+# --- phase 1: a listing that also sells another size never moves ---------------------------------------
+
+
+def test_a_listing_that_also_sells_another_priced_size_is_held_listing_multi_size():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "LANEIGE Lip Sleeping Mask 0.7 oz", sku="0.7 oz")
+    cat.offer(r, price=12, sku="0.3 oz")  # a priced 0.3 oz would ride along onto the 20 g PDP
+    s_ = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", sku="20g", host="sephora.com")
+    cat.offer(s_, price=30, sku="Default Title")  # a priced offer whose size cannot be read
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, r)["reason"] == outcome(plan, s_)["reason"] == "listing_multi_size"
+    assert outcome(plan, r)["status"] == "held"
+
+
+def test_a_merge_key_with_a_multi_size_row_holds_every_row():
+    cat = laneige_catalog()
+    a = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    b = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m", sku="20g")
+    cat.offer(b, price=12, sku="8g")
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, b)["reason"] == "listing_multi_size" and outcome(plan, a)["reason"] == "key_shared_with_unmatched"
+
+
+@pytest.mark.asyncio
+async def test_write_proposals_refuses_a_proposal_that_fails_the_engines_module_rule():
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    plan = _mixed().plan()
+    plan.proposals[0]["evidence"]["matcher_verdict"]["listing_offer_ids"] = []
+
+    class NoConn:
+        def transaction(self):
+            raise AssertionError("nothing may be written")
+
+    with pytest.raises(script.Refused, match="module rule"):
+        await script.write_proposals(NoConn(), plan, expect_digest=plan.digest(), max_proposals=100)
