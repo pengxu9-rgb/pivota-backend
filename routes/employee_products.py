@@ -5164,12 +5164,26 @@ def _read_variant_link(read_variant: Dict[str, Any]) -> Optional[str]:
 def _variant_id_spellings(raw: Any) -> List[str]:
     """The canonical spellings of ONE variant id: the `?variant=` digits a link-shaped id names
     (`url_named_variant_id`; "" for a selling-plan link) and the bare digits of a `gid://` id
-    (`canonical_variant_id`). Empty for anything else -- a SKU or a barcode has no other spelling."""
+    (`canonical_variant_id`). Empty for anything else -- a SKU or a barcode has no other spelling.
+
+    A LINK'S `?variant=` IS ITS SPELLING ONLY WHEN IT CANNOT BE ANOTHER STORE'S (delta review of
+    #2634). The link a seed stores is either relative -- the JSON-LD `@id` "/products/h?variant=N#offer"
+    of the seed's own page, so its own store -- or absolute, possibly on another host (a related
+    product, a marketplace copy); and the reconcile does not know the seed's host. So an absolute
+    link's digits count only when they have Shopify-variant length (8+ digits, like
+    `_native_refresh_variant_ids`): Shopify variant ids are global database ids, so a value that
+    long names one variant whatever host carries it, while a short `?variant=1001` on
+    other-store.com would match a SKU "1001" on this page by coincidence.
+    """
     from services.handover_variant_identity import canonical_variant_id, url_named_variant_id
 
     text = str(raw or "").strip()
+    named = url_named_variant_id(text)
+    relative = text.startswith("/") and not text.startswith("//")
+    if named and not relative and len(named) < 8:
+        named = ""
     out: List[str] = []
-    for spelled in (url_named_variant_id(text), canonical_variant_id(text)):
+    for spelled in (named, canonical_variant_id(text)):
         if spelled and spelled != text and spelled not in out:
             out.append(spelled)
     return out

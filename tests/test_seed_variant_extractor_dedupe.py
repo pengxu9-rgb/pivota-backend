@@ -584,3 +584,78 @@ def test_a_single_variant_stored_by_its_at_id_link_never_takes_another_variants_
     assert v["price_amount"] == 60.0
     (v,), _ = _reconcile([_stored(V50, 60.0)], html, product_amount=40.0)  # the digits, same answer
     assert v["price_amount"] == 60.0
+
+
+# ==== delta review of #2634 ====================================================================
+
+
+# ---- the #2631 dispute check reads a stored entry's canonical and barcode spellings too
+
+
+def test_a_variant_priced_twice_is_refused_through_the_stored_at_id_spelling():
+    # Stored by its `@id`, the key matches the link offer (85); a SKU node linking the same
+    # variant says 70. The stored spelling's digits are what reach the second listing.
+    html = _html(_product([_offer(85, IN, **_link_id(V50)), _offer(70, IN, sku="SKU-50", **_link_url(V50))]))
+    (v,), report = _reconcile([_stored(_link_id(V50)["@id"], 80.0)], html)
+    assert (v["price_amount"], report["re_read"]) == (80.0, 0)
+
+
+def test_a_variant_priced_twice_is_refused_through_the_stored_barcode():
+    # Keyed by the digits (85); an app node carrying the stored entry's barcode says 70.
+    html = _html(_product([_offer(85, IN, **_link_url(V50)), _offer(70, IN, sku="APP-50", gtin13=GTIN50)]))
+    (v,), report = _reconcile([_stored(V50, 80.0) | {"barcode": GTIN50}], html)
+    assert (v["price_amount"], report["re_read"]) == (80.0, 0)
+
+
+# ---- a link's ?variant= is a stored spelling only when it cannot be another store's
+
+
+@pytest.mark.parametrize("stored_id,re_read", [
+    ("https://other-store.com/products/x?variant=1001", 0),     # foreign, short: a coincidence
+    ("/products/x?variant=1001", 1),                             # relative: the seed's own page
+    (f"https://other-store.com/products/x?variant={V50}", 1),    # Shopify-length: one variant anywhere
+], ids=["foreign_short", "relative_short", "absolute_shopify_length"])
+def test_a_stored_links_variant_spelling_needs_its_own_page_or_a_shopify_length_id(stored_id, re_read):
+    sku = "1001" if "1001" in stored_id else V50
+    html = _html(_product([_offer(85, IN, sku=sku), _offer(34, IN, sku="OTHER")]))
+    _, report = _reconcile([_stored(stored_id, 80.0)], html)
+    assert report["re_read"] == re_read
+
+
+# ---- surviving mutants of the second review
+
+
+def test_a_stored_at_id_spelling_gap_fills_onto_a_sku_keyed_offer_linking_it():
+    # Keys never meet (the read is keyed by SKUs); only the stored spelling's digits meet the
+    # offers' links.
+    html = _html(_product([_offer(85, IN, sku="SKU-50", **_link_url(V50)), _offer(34, IN, sku="SKU-15", **_link_url(V15))]))
+    out, report = _reconcile([_stored(_link_id(V50)["@id"], 80.0), _stored(_link_id(V15)["@id"], 30.0, "15 mL")], html)
+    assert [v["price_amount"] for v in out] == [85.0, 34.0]
+    assert report["re_read"] == 2
+
+
+def test_an_offer_linking_another_variant_never_prices_a_stored_variant_through_a_shared_sku():
+    # The stored V50 shares its SKU with an entry the page keys by V15's `@id` (the fold kept the
+    # link and the app node's sku): the native ids disagree, so nothing is taken per offer.
+    html = _html(_product([_offer(34, IN, **_link_id(V15))]),
+                 _product([_offer(34, IN, sku="SHARED", **_link_url(V15))]))
+    (read,) = _page(html=html).evidence["variants"]
+    assert (read["variant_id"], read["sku"]) == (_link_id(V15)["@id"], "SHARED")
+    (v,), report = _reconcile([_stored(V50, 80.0) | {"sku": "SHARED"}], html)
+    assert (v["price_amount"], report["re_read"]) == (80.0, 0)
+
+
+def test_a_read_keyed_by_a_gid_meets_a_stored_numeric_id():
+    gid = f"gid://shopify/ProductVariant/{V50}"
+    html = _html(_product([_offer(85, IN, **{"@id": gid}), _offer(34, IN, **{"@id": f"gid://shopify/ProductVariant/{V15}"})]))
+    out, report = _reconcile([_stored(V50, 80.0), _stored(V15, 30.0, "15 mL")], html)
+    assert [v["price_amount"] for v in out] == [85.0, 34.0]
+
+
+def test_a_barcode_never_claims_an_offer_another_stored_variant_matched_by_key():
+    # One variant stored twice (its id, and its barcode). The key match stands; the barcode entry
+    # must not make the offer ambiguous and cost the key match its re-read.
+    html = _html(_product([_offer(85, IN, gtin13=GTIN50, **_link_url(V50)), _offer(34, IN, **_link_url(V15))]))
+    out, report = _reconcile([_stored(V50, 80.0), _stored(GTIN50, 80.0)], html)
+    assert [v["price_amount"] for v in out] == [85.0, 80.0]
+    assert report["not_re_read"] == [GTIN50]
