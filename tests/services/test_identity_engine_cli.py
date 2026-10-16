@@ -69,10 +69,11 @@ def engine(monkeypatch):
     """asyncpg and the engine stubbed: records how each entry point was called."""
     import asyncpg
 
-    calls: Dict[str, list] = {"apply": [], "revert": [], "approve": []}
+    calls: Dict[str, list] = {"apply": [], "revert": [], "approve": [], "connect": []}
     conn = _Conn()
 
     async def connect(*a, **k):
+        calls["connect"].append(a)
         return conn
 
     async def apply(c, **kw):
@@ -124,7 +125,7 @@ async def test_a_reserved_strategy_name_is_refused_before_connecting(engine, arg
     calls, _ = engine
     with pytest.raises(SystemExit):
         await cli.main(argv)
-    assert calls["apply"] == []
+    assert calls["apply"] == [] and calls["connect"] == []
 
 
 @pytest.mark.asyncio
@@ -186,3 +187,75 @@ async def test_build_merge_refuses_a_reserved_strategy_before_reading():
 
     with pytest.raises(SystemExit):
         await cli.build_merge(Boom(), from_ck="a", to_ck="b", keeper="k", strategy="cross_merchant_same_size")
+
+
+@pytest.fixture
+def module_run(engine, monkeypatch):
+    calls, conn = engine
+    calls["module_run"] = []
+
+    async def approve_run(c, **kw):
+        calls["module_run"].append(kw)
+        return {"dry_run": kw["dry_run"]}
+
+    monkeypatch.setattr(cli, "approve_module_run", approve_run)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_an_m4_run_is_approved_only_by_run_and_digest(module_run):
+    calls = module_run
+    base = ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng"]
+    await cli.main([*base, "--run", "m4run_1"])
+    await cli.main([*base, "--run", "m4run_1", "--expect-digest", "ira_x", "--execute"])
+    assert [(c["proposal_run_id"], c["expect_digest"], c["dry_run"]) for c in calls["module_run"]] == [
+        ("m4run_1", None, True), ("m4run_1", "ira_x", False)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argv", [
+    ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng", "--execute"],                # no run
+    ["approve", "--strategy", "cross_merchant_same_size", "--by", "peng", "--run", "r", "--execute"],  # no digest
+    ["approve", "irp_1", "--strategy", "cross_merchant_same_size", "--by", "peng", "--run", "r"],      # by id
+    ["approve", "--strategy", "retailer_listing_brand_prefix", "--by", "peng", "--run", "r"],          # not module-only
+    ["approve", "irp_1", "--by", "peng", "--expect-digest", "ira_x", "--execute"],
+])
+async def test_every_other_approval_shape_for_a_module_strategy_is_refused(module_run, argv):
+    with pytest.raises(SystemExit):
+        await cli.main(argv)
+    assert module_run["module_run"] == [] and module_run["approve"] == []
+
+
+def test_the_sweep_and_the_link_scripts_never_name_the_module_strategy():
+    from services import identity_barcode_link, identity_brand_link
+    from services.identity_reconcile_sweep import AUTO_APPROVE_STRATEGIES, JUDGE_STRATEGY
+
+    named = {*AUTO_APPROVE_STRATEGIES, JUDGE_STRATEGY, identity_brand_link.STRATEGY, identity_barcode_link.STRATEGY}
+    assert not named & cli.MODULE_ONLY_STRATEGIES
+
+
+@pytest.mark.parametrize("kind,verdict,ok", [
+    ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
+                           "same_size": True, "size": {"value": 1.7, "unit": "fl oz", "pack": 2},
+                           "listing_offer_ids": ["o1", "o2"]}, True),
+    ("merge_content_key", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c",
+                           "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 1},
+                           "listing_offer_ids": ["o1"], "from_key_single_size": True}, True),
+    ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": " ", "tier": "T0a",
+                           "same_size": True, "size": {"value": 50, "unit": "ml", "pack": 1},
+                           "listing_offer_ids": ["o1"]}, False),
+    ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
+                           "same_size": True, "size": {"value": True, "unit": "ml", "pack": 1},
+                           "listing_offer_ids": ["o1"]}, False),
+    ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
+                           "same_size": True, "size": {"value": 50, "unit": "", "pack": 0},
+                           "listing_offer_ids": ["o1"]}, False),
+    ("attach_membership", {"strategy": "other", "rule_version": "v1", "tier": "T0a", "same_size": True,
+                           "size": {"value": 50, "unit": "ml", "pack": 1}, "listing_offer_ids": ["o1"]}, False),
+    ("attach_membership", {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0a",
+                           "same_size": True, "size": None, "listing_offer_ids": ["o1"]}, False),
+])
+def test_the_shared_matcher_verdict_rule(kind, verdict, ok):
+    from services.identity_resolution import validate_matcher_verdict
+
+    assert (validate_matcher_verdict(kind, {"matcher_verdict": verdict}) == []) is ok

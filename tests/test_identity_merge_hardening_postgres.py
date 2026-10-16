@@ -953,3 +953,99 @@ async def test_revert_proposal_refuses_a_merge_whose_member_moved(db, conn):
     back = await revert_proposal(conn, pid, dry_run=False)
     assert back["refused"] == "moved_since_apply"
     assert await _state(db, _listing(10)) == (B, "pg_brand", True) and await _events(conn) == events
+
+
+# --- module-only strategy: approval of one M4 proposal run -------------------------------------------
+
+M4 = "cross_merchant_same_size"
+
+
+def _verdict(**over):
+    v = {"strategy": M4, "rule_version": "t0.v1", "tier": "T0b", "same_size": True,
+         "size": {"value": 30, "unit": "ml", "pack": 1}, "listing_offer_ids": ["off_1"]}
+    v.update(over)
+    return v
+
+
+async def _m4_proposal(conn, n, *, run="m4run_1", kind="attach_membership", proposer=M4, verdict=None,
+                       drop_verdict=False):
+    from services.identity_resolution import merge_content_key_proposal, new_proposal, upsert_proposals
+
+    extra = {"proposer": proposer, "proposal_run_id": run}
+    if not drop_verdict:
+        extra["matcher_verdict"] = verdict if verdict is not None else _verdict(
+            **({"from_key_single_size": True} if kind == "merge_content_key" else {}))
+    listing = _listing(40 + n)
+    if kind == "merge_content_key":
+        p = merge_content_key_proposal(strategy=M4, from_content_key=f"ck_m4_{n}", to_content_key=B,
+                                       from_product_keys=[listing], from_groups={listing: f"pg_m4_{n}"},
+                                       keeper_product_key=KEEPER, to_product_group_id="pg_brand", evidence=extra)
+    else:
+        p = new_proposal(kind="attach_membership", strategy=M4, subject_product_keys=[listing, KEEPER],
+                         keeper_product_key=KEEPER, merchant_id=RET_M, content_key=B,
+                         evidence={"listing_product_key": listing, "from_content_key": f"ck_m4_{n}",
+                                   "from_product_group_id": f"pg_m4_{n}", "to_product_group_id": "pg_brand",
+                                   **extra})
+    await upsert_proposals(conn, [p])
+    return p["proposal_id"]
+
+
+async def test_an_m4_run_is_approved_exactly_under_its_digest(db, conn):
+    from services.identity_resolution import DigestMismatch, approve_module_run
+
+    run = [await _m4_proposal(conn, 1), await _m4_proposal(conn, 2), await _m4_proposal(conn, 3,
+                                                                                         kind="merge_content_key")]
+    other_run = await _m4_proposal(conn, 4, run="m4run_2")
+    dry = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    assert dry["dry_run"] is True and sorted(dry["proposals"]) == sorted(run) and dry["problems"] == {}
+    assert [await _status(conn, p) for p in run] == ["proposed"] * 3
+
+    refused = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+                                       dry_run=False)
+    assert refused["refused"] == "expect_digest_required"
+    late = await _m4_proposal(conn, 5)  # the run grew after the dry run: a different set
+    with pytest.raises(DigestMismatch):
+        await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+                                 expect_digest=dry["digest"], dry_run=False)
+    assert [await _status(conn, p) for p in [*run, late]] == ["proposed"] * 4
+
+    again = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+                                   expect_digest=again["digest"], dry_run=False)
+    assert sorted(out["approved"]) == sorted([*run, late])
+    assert [await _status(conn, p) for p in [*run, late]] == ["approved"] * 4
+    assert await _status(conn, other_run) == "proposed"
+
+
+@pytest.mark.parametrize("make,needle", [
+    (dict(drop_verdict=True), "matcher_verdict missing"),
+    (dict(verdict=_verdict(tier="fuzzy")), "tier"),
+    (dict(verdict=_verdict(same_size=False)), "same_size"),
+    (dict(verdict=_verdict(listing_offer_ids=[])), "listing_offer_ids"),
+    (dict(kind="merge_content_key", verdict=_verdict()), "from_key_single_size"),
+    (dict(proposer="hand_made"), "evidence.proposer"),
+])
+async def test_an_m4_run_with_one_bad_proposal_approves_nothing(db, conn, make, needle):
+    from services.identity_resolution import approve_module_run
+
+    good = await _m4_proposal(conn, 1)
+    bad = await _m4_proposal(conn, 2, **make)
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng")
+    assert out["refused"] == "invalid_proposals" and list(out["problems"]) == [bad]
+    assert any(needle in p for p in out["problems"][bad])
+    written = await approve_module_run(conn, strategy=M4, proposal_run_id="m4run_1", decided_by="peng",
+                                       expect_digest=out["digest"], dry_run=False)
+    assert written["refused"] == "invalid_proposals"
+    assert [await _status(conn, p) for p in (good, bad)] == ["proposed", "proposed"]
+
+
+async def test_approve_module_run_refuses_without_a_run_or_for_another_strategy(db, conn):
+    from services.identity_resolution import approve_module_run
+
+    with pytest.raises(ValueError):
+        await approve_module_run(conn, strategy=M4, proposal_run_id="", decided_by="peng")
+    with pytest.raises(ValueError):
+        await approve_module_run(conn, strategy="retailer_listing_brand_prefix", proposal_run_id="r",
+                                 decided_by="peng")
+    out = await approve_module_run(conn, strategy=M4, proposal_run_id="no_such_run", decided_by="peng")
+    assert out["refused"] == "no_proposed_proposals_in_run"

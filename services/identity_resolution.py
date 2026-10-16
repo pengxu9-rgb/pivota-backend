@@ -473,6 +473,133 @@ async def approve_proposals(conn, proposal_ids: List[str], decided_by: str) -> L
     return [r["proposal_id"] for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Module-only strategies: proposals one strategy module produces, approved per proposal run (M3)
+# ---------------------------------------------------------------------------
+
+#: Strategies whose proposals only their own module may produce. Their approval is an explicit human
+#: step over one whole proposal run (approve_module_run, via scripts/identity_engine.py approve
+#: --strategy ... --run ... --expect-digest ... --execute); never the sweep, a schedule or a hand-made
+#: proposal.
+MODULE_ONLY_STRATEGIES: Tuple[str, ...] = ("cross_merchant_same_size",)
+
+MATCHER_VERDICT_TIERS = ("T0a", "T0b", "T0c")
+
+MODULE_RUN_PROPOSALS_SQL = """
+SELECT * FROM identity_resolution_proposals
+WHERE strategy = $1 AND status = 'proposed' AND evidence->>'proposal_run_id' = $2
+ORDER BY created_at, proposal_id
+FOR UPDATE
+"""
+
+
+def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
+                             strategy: str = "cross_merchant_same_size") -> List[str]:
+    """The problems with a proposal's evidence.matcher_verdict ([] = well formed). One rule, shared by
+    the approve path here, the M4 strategy module that writes the verdict, and be#2635.
+
+    A verdict is {strategy, rule_version, tier, same_size, size: {value, unit, pack}, listing_offer_ids,
+    from_key_single_size (merge_content_key only)}: the strategy that judged it, a non-empty rule
+    version, a deterministic tier (T0a GTIN / T0b brand+title / T0c title core + size), same_size
+    true, the size compared (value > 0, a unit, pack >= 1), the listing's offers it covers, and -- for
+    a merge, which moves every row on the losing key -- that the losing key holds a single size."""
+    v = (evidence or {}).get("matcher_verdict")
+    if not isinstance(v, dict):
+        return ["matcher_verdict missing"]
+    problems: List[str] = []
+    if v.get("strategy") != strategy:
+        problems.append(f"matcher_verdict.strategy is not {strategy}")
+    if not (isinstance(v.get("rule_version"), str) and v["rule_version"].strip()):
+        problems.append("matcher_verdict.rule_version empty")
+    if v.get("tier") not in MATCHER_VERDICT_TIERS:
+        problems.append(f"matcher_verdict.tier not in {list(MATCHER_VERDICT_TIERS)}")
+    if v.get("same_size") is not True:
+        problems.append("matcher_verdict.same_size is not true")
+    size = v.get("size")
+    if not isinstance(size, dict):
+        problems.append("matcher_verdict.size missing")
+    else:
+        value, unit, pack = size.get("value"), size.get("unit"), size.get("pack")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            problems.append("matcher_verdict.size.value is not a positive number")
+        if not (isinstance(unit, str) and unit.strip()):
+            problems.append("matcher_verdict.size.unit empty")
+        if isinstance(pack, bool) or not isinstance(pack, int) or pack < 1:
+            problems.append("matcher_verdict.size.pack is not an integer >= 1")
+    offers = v.get("listing_offer_ids")
+    if not (isinstance(offers, list) and offers and all(isinstance(o, str) and o.strip() for o in offers)):
+        problems.append("matcher_verdict.listing_offer_ids empty")
+    if kind == "merge_content_key" and v.get("from_key_single_size") is not True:
+        problems.append("matcher_verdict.from_key_single_size is not true")
+    return problems
+
+
+def module_proposal_problems(p: Dict[str, Any], strategy: str) -> List[str]:
+    """Why a proposal is not an approvable product of `strategy`'s module: its proposer marker
+    (evidence.proposer, written by the module) and its matcher verdict."""
+    ev = p.get("evidence") or {}
+    if isinstance(ev, str):
+        ev = json.loads(ev or "{}")
+    problems = []
+    if p.get("strategy") != strategy:
+        problems.append(f"strategy is {p.get('strategy')}")
+    if ev.get("proposer") != strategy:
+        problems.append(f"evidence.proposer is {ev.get('proposer')!r}, not {strategy!r}")
+    return problems + validate_matcher_verdict(p.get("kind") or "", ev, strategy)
+
+
+def approval_digest(proposals: Sequence[Dict[str, Any]]) -> str:
+    """Digest over the exact ordered set a module-run approval decides: each proposal's id and
+    proposal_fingerprint (kind, strategy, keeper, target, subjects, evidence)."""
+    lines = [f"approve\t{p['proposal_id']}\t{proposal_fingerprint(p)}" for p in proposals]
+    return "ira_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
+
+
+async def approve_module_run(
+    conn,
+    *,
+    strategy: str,
+    proposal_run_id: str,
+    decided_by: str,
+    expect_digest: Optional[str] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Approve exactly the 'proposed' proposals one run of `strategy`'s module wrote
+    (evidence.proposal_run_id), all or nothing: every one must carry the module's proposer marker and
+    a well-formed matcher verdict, and -- to write -- the digest over that exact set must equal the
+    dry run's. Dry run by default (returns the set, any problems, and the digest)."""
+    if strategy not in MODULE_ONLY_STRATEGIES:
+        raise ValueError(f"{strategy!r} is not a module-only strategy")
+    if not (proposal_run_id or "").strip():
+        raise ValueError("a proposal run id is required")
+    if not (decided_by or "").strip():
+        raise ValueError("decided_by is required")
+    async with conn.transaction():
+        rows = [dict(r) for r in await conn.fetch(MODULE_RUN_PROPOSALS_SQL, strategy, proposal_run_id)]
+        for r in rows:
+            if isinstance(r.get("evidence"), str):
+                r["evidence"] = json.loads(r["evidence"] or "{}")
+        problems = {r["proposal_id"]: module_proposal_problems(r, strategy) for r in rows}
+        problems = {k: v for k, v in problems.items() if v}
+        digest = approval_digest(rows)
+        out = {"strategy": strategy, "proposal_run_id": proposal_run_id, "digest": digest,
+               "proposals": [r["proposal_id"] for r in rows], "problems": problems}
+        if not rows:
+            return {**out, "refused": "no_proposed_proposals_in_run"}
+        if problems:
+            return {**out, "refused": "invalid_proposals"}
+        if dry_run:
+            return {**out, "dry_run": True}
+        if expect_digest is None:
+            return {**out, "refused": "expect_digest_required"}
+        if expect_digest != digest:
+            raise DigestMismatch(expect_digest, digest)
+        approved = await approve_proposals(conn, out["proposals"], decided_by.strip())
+        if sorted(approved) != sorted(out["proposals"]):
+            raise RuntimeError(f"approved {len(approved)} of {len(out['proposals'])} proposals")
+    return {**out, "approved": approved}
+
+
 async def _apply_suppress_dup(conn, p: Dict[str, Any], run_id: str) -> Dict[str, Any]:
     """One suppress_dup proposal. Raises on validation failure only for
     programming errors; data drift returns {'skipped': reason}."""

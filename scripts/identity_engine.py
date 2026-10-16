@@ -21,13 +21,20 @@ digest -- one prod one-off at a time, under the CPU gate, outside drains and 05:
     python -m scripts.identity_engine propose-merge ... --write
   Approve named proposals (dry run lists them; --execute writes the approval):
     python -m scripts.identity_engine approve irp_... irp_... --by "<who>" --execute
+  Approve ONE run of a module-only strategy's proposals (the ONLY approval path for them; all or
+  nothing; each needs the module's proposer marker and a well-formed matcher verdict):
+    python -m scripts.identity_engine approve --strategy cross_merchant_same_size --run <proposal_run_id> \
+        --by "<who>"                                      # dry run: the set, any problems, the digest
+    python -m scripts.identity_engine approve --strategy cross_merchant_same_size --run <proposal_run_id> \
+        --by "<who>" --expect-digest ira_... --execute
 
 Strategy names other paths auto-apply are RESERVED here (RESERVED_STRATEGIES): the reconcile sweep
 and the link scripts apply every approved proposal of their strategy with no cap or digest, so a
 proposal written or approved here under one of their names would bypass this CLI's governance.
 A strategy only its own module may produce (MODULE_ONLY_STRATEGIES: cross_merchant_same_size, from
-services/identity_cross_merchant_match.py) is reserved too -- no hand-made proposal or approval under
-its name -- but its module's proposals may be APPLIED here, always capped, and with --execute only
+services/identity_cross_merchant_match.py) is reserved too -- no hand-made proposal, no approval by
+id -- but one whole proposal run of its module may be approved here (approve --strategy --run, under
+that run's --expect-digest), and its approved proposals APPLIED, always capped, and with --execute only
 under the dry run's --expect-digest.
 """
 from __future__ import annotations
@@ -46,7 +53,9 @@ from services.identity_resolution import (  # noqa: E402
     MEMBER_GROUP_SQL,
     ATTACH_ROW_SQL,
     RUN_EVENTS_SQL,
+    MODULE_ONLY_STRATEGIES as _ENGINE_MODULE_ONLY,
     apply_approved,
+    approve_module_run,
     approve_proposals,
     merge_content_key_proposal,
     revert_proposal,
@@ -63,10 +72,10 @@ RESERVED_STRATEGIES = frozenset({
     "cross_merchant_same_size",
 })
 
-#: Reserved strategies whose proposals only their own strategy module produces. This CLI never writes or
-#: approves one, but may apply them: --max-proposals is always required, and --execute needs the dry
-#: run's --expect-digest (as for every strategy here).
-MODULE_ONLY_STRATEGIES = frozenset({"cross_merchant_same_size"})
+#: Reserved strategies whose proposals only their own strategy module produces (the engine's list). This
+#: CLI never writes one or approves one by id; it approves a whole module run (approve_module_run) and
+#: applies them: --max-proposals is always required, and --execute needs the dry run's --expect-digest.
+MODULE_ONLY_STRATEGIES = frozenset(_ENGINE_MODULE_ONLY)
 
 PROPOSAL_STRATEGIES_SQL = """
 SELECT proposal_id, strategy, kind, status FROM identity_resolution_proposals
@@ -141,10 +150,25 @@ async def main(argv: List[str]) -> int:
     m.add_argument("--strategy", required=True)
     m.add_argument("--write", action="store_true")
     ok = sub.add_parser("approve")
-    ok.add_argument("proposal_ids", nargs="+")
+    ok.add_argument("proposal_ids", nargs="*")
     ok.add_argument("--by", required=True)
+    ok.add_argument("--strategy", help="a module-only strategy: approve one proposal run of it (--run)")
+    ok.add_argument("--run", help="the module's proposal run id (evidence.proposal_run_id)")
+    ok.add_argument("--expect-digest")
     ok.add_argument("--execute", action="store_true")
     args = ap.parse_args(argv)
+    if args.cmd == "approve":
+        if args.strategy is not None or args.run is not None:
+            if args.strategy not in MODULE_ONLY_STRATEGIES:
+                ap.error("--strategy/--run approve a run of a module-only strategy only")
+            if not args.run or args.proposal_ids:
+                ap.error("a module-only strategy is approved by --run <proposal_run_id>, never by id")
+            if args.execute and not args.expect_digest:
+                ap.error("--execute needs --expect-digest from a dry run of this --run")
+        elif not args.proposal_ids:
+            ap.error("name the proposals to approve")
+        elif args.expect_digest:
+            ap.error("--expect-digest belongs to approve --strategy --run")
     if args.cmd == "apply" and args.execute and not args.expect_digest:
         ap.error("--execute needs --expect-digest from a dry run")
     if args.cmd == "propose-merge" and reserved(args.strategy):
@@ -174,6 +198,10 @@ async def main(argv: List[str]) -> int:
             result = {"proposal": p}
             if args.write:
                 result["written"] = await upsert_proposals(conn, [p])
+        elif args.strategy is not None:
+            result = await approve_module_run(conn, strategy=args.strategy, proposal_run_id=args.run,
+                                              decided_by=args.by, expect_digest=args.expect_digest,
+                                              dry_run=not args.execute)
         else:
             rows = [dict(r) for r in await conn.fetch(PROPOSAL_STRATEGIES_SQL, args.proposal_ids)]
             bad = sorted(r["proposal_id"] for r in rows if reserved(r["strategy"]))
