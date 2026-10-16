@@ -64,17 +64,17 @@ TITLE_CASES = [
      "snail mucin trial", {"set"}, "", None),
     # ---- Beauty of Joseon / Round Lab / Anua / Torriden -------------------------------------
     ("Beauty of Joseon", "Beauty of Joseon Relief Sun : Rice + Probiotics SPF50+ PA++++ 50ml",
-     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
+     "relief sun rice join probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun: Rice + Probiotics (SPF50+ PA++++) 1.69 fl oz",
-     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
+     "relief sun rice join probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF 50 PA+++ 50ml",
-     "relief sun rice plusjoin probiotics", {"spf50", "pa+++"}, "", (50, ML, 1)),
+     "relief sun rice join probiotics", {"spf50", "pa+++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF50+ PA++++ 50ml (US Version)",
-     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++", "market_us"}, "", (50, ML, 1)),
+     "relief sun rice join probiotics", {"spf50+", "pa++++", "market_us"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF50+ PA++++ 50ml Korean Version",
-     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++", "market_kr"}, "", (50, ML, 1)),
+     "relief sun rice join probiotics", {"spf50+", "pa++++", "market_kr"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Glow Serum : Propolis + Niacinamide 30ml",
-     "glow serum propolis plusjoin niacinamide", set(), "", (30, ML, 1)),
+     "glow serum propolis join niacinamide", set(), "", (30, ML, 1)),
     ("Round Lab", "ROUND LAB 1025 Dokdo Toner 200ml",
      "1025 dokdo toner", set(), "", (200, ML, 1)),
     ("ROUNDLAB", "Roundlab 1025 Dokdo Toner 6.76 fl oz",
@@ -183,9 +183,9 @@ TITLE_CASES = [
     ("Yves Saint Laurent", "Libre EDP 1.6 oz",
      "libre", {"edp"}, "", (50, ML, 1)),
     ("Jo Malone London", "Jo Malone Wood Sage & Sea Salt Cologne 100ml",
-     "wood sage sea salt", {"cologne"}, "", (100, ML, 1)),
+     "wood sage join sea salt", {"cologne"}, "", (100, ML, 1)),
     ("Jo Malone", "Wood Sage and Sea Salt Cologne 3.4 fl oz",
-     "wood sage sea salt", {"cologne"}, "", (100, ML, 1)),
+     "wood sage join sea salt", {"cologne"}, "", (100, ML, 1)),
     ("Sol de Janeiro", "Cheirosa 62 Perfume Mist 240ml",
      "cheirosa 62", {"body_mist"}, "", (240, ML, 1)),
     ("Bath & Body Works", "Japanese Cherry Blossom Fine Fragrance Mist 8 fl oz",
@@ -248,7 +248,7 @@ TITLE_CASES = [
     ("Glow Recipe", "Watermelon Glow Niacinamide Dew Drops Mini 15ml",
      "watermelon glow niacinamide dew drops", {"mini"}, "", (15, ML, 1)),
     ("The Ordinary", "The Ordinary Niacinamide 10% + Zinc 1% 30ml",
-     "niacinamide 10 plusjoin zinc 1", set(), "", (30, ML, 1)),
+     "niacinamide 10 join zinc 1", set(), "", (30, ML, 1)),
     ("Augustinus Bader", "The Rich Cream 50ml",
      "fmt fmt", {"rich", "cream", "format_order:rich>cream"}, "", (50, ML, 1)),
     ("Belif", "belif The True Cream Aqua Bomb 50ml",
@@ -733,11 +733,85 @@ def test_review_round_3_marks_brand_plus_and_trailing_brand_x():
     assert not _t0c_same(("NARS", "Orgasm Blush NARS X 4.8g"), ("NARS", "Orgasm Blush 4.8g"))
     # A "+" between two words is a positional core word: equal spellings still meet.
     rice = ("Beauty of Joseon", "Relief Sun : Rice + Probiotics 50ml")
-    assert title_core(*rice).core == "relief sun rice plusjoin probiotics"
+    assert title_core(*rice).core == "relief sun rice join probiotics"
     assert _t0c_same(rice, ("Beauty of Joseon", "Relief Sun: Rice + Probiotics 1.69 fl oz"))
     assert _t0b_same(rice, ("BEAUTY OF JOSEON", "Relief Sun : Rice + Probiotics 50ml"))
     # ...and a "+" with nothing after it (a gift line removed) leaves no marker.
     assert title_core("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift").core == "lip sleeping mask berry"
+
+
+# ---- review round 4 (recall before the census): one conjunction word; brand "+" on T0b -------
+
+MUST_MERGE_CONJUNCTIONS = [
+    (("Beauty of Joseon", "Relief Sun : Rice + Probiotics 50ml"), ("Beauty of Joseon", "Relief Sun : Rice & Probiotics 50ml")),
+    (("Beauty of Joseon", "Relief Sun : Rice + Probiotics 50ml"), ("Beauty of Joseon", "Relief Sun: Rice and Probiotics 1.69 fl oz")),
+    (("The Ordinary", "Niacinamide 10% + Zinc 1% 30ml"), ("The Ordinary", "Niacinamide 10% & Zinc 1% 30ml")),
+    (("Paula's Choice", "C + E Ferulic Serum 30ml"), ("Paula's Choice", "C & E Ferulic Serum 30ml")),
+    (("Mad Hippie", "Vitamin C + E Serum 30ml"), ("Mad Hippie", "Vitamin C & E Serum 30ml")),
+    (("Mad Hippie", "Vitamin C+E Serum 30ml"), ("Mad Hippie", "Vitamin C & E Serum 30ml")),
+    (("The Ordinary", "The Ordinary Hyaluronic Acid 2% + B5 30ml"), ("The Ordinary", "Hyaluronic Acid 2% & B5 30ml")),
+    (("COSRX", "AHA + BHA Clarifying Treatment Toner 150ml"), ("COSRX", "AHA & BHA Clarifying Treatment Toner 150ml")),
+    (("Beauty of Joseon", "Glow Serum : Propolis + Niacinamide 30ml"), ("Beauty of Joseon", "Glow Serum Propolis & Niacinamide 30ml")),
+    # A brand's own "&" is blanked with the brand, so it never becomes the conjunction word.
+    (("Dolce & Gabbana", "Dolce & Gabbana Light Blue Eau de Toilette 100ml"), ("Dolce and Gabbana", "Light Blue Eau de Toilette 100ml")),
+    (("Sand & Sky", "Sand & Sky Australian Pink Clay Porefining Face Mask 100g"), ("Sand and Sky", "Australian Pink Clay Porefining Face Mask 100g")),
+]
+
+
+@pytest.mark.parametrize("a,b", MUST_MERGE_CONJUNCTIONS, ids=[f"{i:02d}" for i in range(len(MUST_MERGE_CONJUNCTIONS))])
+def test_conjunction_spellings_merge_on_t0c(a, b):
+    assert _t0c_same(a, b) and _t0c_same(b, a)
+
+
+@pytest.mark.parametrize("titles", [
+    ("Relief Sun Rice + Probiotics 50ml", "Relief Sun Rice & Probiotics 50ml", "Relief Sun Rice and Probiotics 50ml"),
+    ("Niacinamide 10% + Zinc 1% 30ml", "Niacinamide 10% & Zinc 1% 30ml"),
+    ("C + E Ferulic 30ml", "C & E Ferulic 30ml"),
+    ("Vitamin C+E Serum 30ml", "Vitamin C + E Serum 30ml", "Vitamin C & E Serum 30ml"),
+    ("Hyaluronic Acid 2% + B5 30ml", "Hyaluronic Acid 2% & B5 30ml"),
+    ("AHA + BHA Toner 150ml", "AHA & BHA Toner 150ml"),
+    ("Glow Serum Propolis + Niacinamide 30ml", "Glow Serum Propolis & Niacinamide 30ml"),
+])
+def test_conjunction_spellings_share_the_t0b_key(titles):
+    keys = {exact_title_key("COSRX", t) for t in titles}
+    assert None not in keys and len(keys) == 1, keys
+    # ...and a conjunction never shares it with nothing: "Rice + Probiotics" != "Rice Probiotics".
+    assert exact_title_key("COSRX", titles[0].replace("+", " ")) not in keys
+
+
+@pytest.mark.parametrize("a,b", [
+    (("La Roche-Posay", "Cicaplast Baume B5 + Multi-Purpose Balm 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 Multi-Purpose Balm 40ml")),
+    (("Beauty of Joseon", "Relief Sun Rice + Probiotics 50ml"), ("Beauty of Joseon", "Relief Sun Rice Probiotics 50ml")),
+    (("Beauty of Joseon", "Relief Sun Rice & Probiotics 50ml"), ("Beauty of Joseon", "Relief Sun Rice Probiotics 50ml")),
+    # ACCEPTED COST, pinned so it is a decision and not a surprise: "&" is no longer silent.
+    (("Kiehl's", "Hair & Body Wash 250ml"), ("Kiehl's", "Hair Body Wash 250ml")),
+])
+def test_a_conjunction_never_meets_nothing(a, b):
+    assert not _t0c_same(a, b) and not _t0b_same(a, b)
+
+
+def test_conjunction_word_only_between_two_words():
+    assert title_core("X", "Rice and").core == "rice"
+    assert title_core("X", "And Rice").core == "rice"
+    assert title_core("X", "Rice & & Probiotics").core == "rice join probiotics"
+    assert title_core("X", "Rice + & Probiotics").core == "rice join probiotics"
+    assert title_core("X", "Rice and the Probiotics").core == "rice join probiotics"
+
+
+def test_t0b_drops_only_the_brands_own_plus():
+    assert exact_title_key("Dr.Jart+", "Dr.Jart+ Cicapair Cream") == exact_title_key("Dr. Jart", "Dr. Jart Cicapair Cream")
+    assert _t0b_same(("Dr.Jart+", "Dr.Jart+ Cicapair Cream 50ml"), ("Dr. Jart", "Dr. Jart Cicapair Cream 50ml"))
+    # ...but an edition "+" after the brand still keys apart.
+    assert exact_title_key("Dr.Jart+", "Dr.Jart+ Cicapair+ Cream") != exact_title_key("Dr.Jart+", "Dr.Jart+ Cicapair Cream")
+    assert exact_title_key("La Roche-Posay", "Effaclar Duo+") == exact_title_key("La Roche-Posay", "Effaclar Duo Plus")
+
+
+def test_brand_then_x_then_a_word_is_read_as_a_collab():
+    """ACCEPTED unless "X" is a real line: "NARS X Blush" reads like "COSRX x Olive Young" (the
+    x after the brand is a collab separator), so it meets "NARS Blush". An X line inside the
+    name ("Orgasm X") is kept and stays apart."""
+    assert _t0c_same(("NARS", "NARS X Blush 4.8g"), ("NARS", "NARS Blush 4.8g"))
+    assert not _t0c_same(("NARS", "Orgasm X Blush 4.8g"), ("NARS", "Orgasm Blush 4.8g"))
 
 
 def test_x_is_kept_unless_it_follows_a_removed_brand():
