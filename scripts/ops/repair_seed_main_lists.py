@@ -38,7 +38,11 @@ CONSERVATIVE: WHEN IN DOUBT THE SEED IS HELD (untouched, listed with its reason)
                        NOTHING of it onto the kept entry, and is written only with `--include-sole-pair`.
      The kept entry is the LINK entry (its `variant_id` and every other field kept); on positive evidence the folded
      entry's key is added to it as `sku` (iv) or `barcode` (ii), with the folded entry's own `sku`/`barcode` fields
-     when the kept one lacks them, and its title only when the kept one has none. Never folded: differing SKUs, differing
+     when the kept one lacks them, and its title only when the kept one has none. Tie evidence is read from
+     `sku`/`sku_id` and the barcode fields only, never `mpn` (a product-level model number). A code about to be
+     copied onto the kept entry that may name a variant (a `sku` of 8+ digits failing the GS1 check, a `barcode`
+     that is not a valid GTIN, or a value equal to another entry's id or ?variant=) holds the whole seed
+     (`copied_code_may_be_variant_id`): `sku` is a key the stored-variant matchers read. Never folded: differing SKUs, differing
      barcodes, differing or unknown prices, differing or missing currencies, differing stock, differing titles
      that are not the product's name, two ?variant= ids, a key that is itself another variant's id. Every
      non-link entry of a seed must be tied, or the whole seed is held (a partial repair still serves a duplicate).
@@ -149,10 +153,13 @@ _ONE_TIME_NAME = re.compile(
 _POSITIONAL = re.compile(r"^offer_\d+$")  # routes/employee_products._POSITIONAL_OFFER_ID
 _BARCODE_LENGTHS = (8, 12, 13, 14)
 # Codes a snapshot / link entry may carry a SKU or a barcode under.
-_SKU_FIELDS = ("sku", "sku_id", "mpn")
+_SKU_FIELDS = ("sku", "sku_id")
 _BARCODE_FIELDS = ("barcode", "gtin13", "gtin", "gtin12", "gtin14", "gtin8")
-# The fields that must agree on the code a fold adds (an `mpn` is a model number, not the variant's SKU).
-_AGREE_FIELDS = {"sku": ("sku", "sku_id"), "barcode": _BARCODE_FIELDS}
+# The ONLY fields that tie a code to a variant. Never `mpn`: a model number is product-level, shared by every
+# variant (review of #2638).
+_TIE_FIELDS = _SKU_FIELDS + _BARCODE_FIELDS
+# The fields that must agree on the code a fold adds.
+_AGREE_FIELDS = {"sku": _SKU_FIELDS, "barcode": _BARCODE_FIELDS}
 _STOCK_KEYS = ("availability", "in_stock", "available", "stock", "inventory_status")
 # A Shopify single-variant product's own variant title: the product's name for title compatibility.
 _PRODUCT_NAME_TITLES = ("default title",)
@@ -426,8 +433,8 @@ def _tie_of(x: Dict[str, Any], key: str, cls: str, links: Dict[int, str], entrie
         return None, evidence, "key_is_a_variant_id"
 
     # (c) a snapshot entry carrying this code names the variant
-    codes = _key_codes(key, cls) | _codes(x, _SKU_FIELDS + _BARCODE_FIELDS)
-    matches = [s for s in snapshot if codes & _codes(s, _SKU_FIELDS + _BARCODE_FIELDS)]
+    codes = _key_codes(key, cls) | _codes(x, _TIE_FIELDS)
+    matches = [s for s in snapshot if codes & _codes(s, _TIE_FIELDS)]
     if matches:
         claimed = set().union(*(_snapshot_claims(s) for s in matches))
         if len(matches) != 1 or len(claimed) != 1:
@@ -440,7 +447,7 @@ def _tie_of(x: Dict[str, Any], key: str, cls: str, links: Dict[int, str], entrie
             return None, evidence, why
 
     # (d) a link entry already carries this code as a field
-    carriers = {n for i, n in links.items() if _key_codes(key, cls) & _codes(entries[i], _SKU_FIELDS + _BARCODE_FIELDS)}
+    carriers = {n for i, n in links.items() if _key_codes(key, cls) & _codes(entries[i], _TIE_FIELDS)}
     if len(carriers) > 1:
         return None, evidence, "link_fields_ambiguous"
     if carriers:
@@ -468,6 +475,30 @@ def _fold_refusal(kept: Mapping[str, Any], x: Mapping[str, Any], names: Sequence
     if not _titles_compatible(kept.get("title"), x.get("title"), names):
         return "title_differs"
     return None
+
+
+def _copied_code_may_be_variant_id(field: str, value: str, x: Mapping[str, Any],
+                                   entries: Sequence[Mapping[str, Any]]) -> bool:
+    """May a code about to be written onto the kept entry name a VARIANT? `sku` is a key every stored-variant
+    matcher reads (`STORED_VARIANT_ID_KEYS`), so a variant id written there makes the kept entry answer for that
+    variant: an offer for B would resolve to A (review of #2638). Refused when:
+      * a `sku` of 8+ digits that is not a valid GTIN (the merchant-issued shape), or a `barcode` that is not one;
+      * it equals another entry's id, or the ?variant= another entry's id or url names.
+    """
+    v = _text(value)
+    if field == "sku" and v.isascii() and v.isdigit() and len(v) >= 8 and not gs1_valid(v):
+        return True
+    if field == "barcode" and not gs1_valid(v):
+        return True
+    others: Set[str] = set()
+    for e in entries:
+        if e is x:
+            continue
+        others |= {_text(e.get("variant_id"))} | set(stored_entry_claimed_variant_ids(e))
+        named = url_named_variant_id(e.get("url"))
+        if named:
+            others.add(named)
+    return bool({v, canonical_variant_id(v)} & (others - {""}))
 
 
 def _sole_pair_refusal(kept: Mapping[str, Any], x: Mapping[str, Any], n: str, entries: Sequence[Dict[str, Any]],
@@ -571,11 +602,15 @@ def plan_pairs(entries: List[Dict[str, Any]], row: Mapping[str, Any], names: Seq
             # A sole pair is tied by the snapshot's variant COUNT alone, which says nothing about the code: the
             # duplicate is dropped, and nothing of it is written onto the kept entry (review of #2638, M1).
             continue
+        copies: Dict[str, str] = {}
         if not _text(kept.get(field)):
-            patches[k][field] = key
+            copies[field] = key
         for f in ("sku", "barcode"):
             if f != field and _text(x.get(f)) and not _text(kept.get(f)) and f not in patches[k]:
-                patches[k][f] = _text(x.get(f))
+                copies[f] = _text(x.get(f))
+        if any(_copied_code_may_be_variant_id(f, v, x, entries) for f, v in copies.items()):
+            return _held(kind, "copied_code_may_be_variant_id")
+        patches[k].update(copies)
         if not _text(kept.get("title")) and _text(x.get("title")):
             patches[k]["title"] = _text(x.get("title"))
 

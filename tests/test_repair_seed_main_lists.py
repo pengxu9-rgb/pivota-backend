@@ -572,3 +572,76 @@ def test_no_positive_link_holds_are_listed_for_a_re_read():
     by = {x["line"]: x for x in tool.report_lines({"scanned": 1, "seeds": [out], "summary_gap": None})}
     assert by["reread"]["seed_ids"] == ["eps_test"]
     assert by["notes"]["no_positive_link"].startswith("1 seed(s)")
+
+
+# ── second review of #2638 ───────────────────────────────────────────────────────────────────────────────────
+
+def _two_links_and(x: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(12, IN, **_link_id(V15)), x]))
+
+
+def test_a_copied_sku_that_is_another_variants_id_holds_the_seed():
+    # The repro: a valid-GTIN entry carrying B's id as its sku, tied to A by the snapshot's barcode. Copying the sku
+    # onto A made stored_entry_answers_to(A, B) true: an offer for B would resolve to A.
+    before = _two_links_and(_offer(31, IN, gtin13=GTIN50))
+    before[2]["sku"] = V15
+    out = _plan(before, snapshot=[_snap(V50, barcode=GTIN50), _snap(V15, price_amount=12.0)])
+    assert (out["action"], out["reason"]) == ("held", "copied_code_may_be_variant_id")
+
+
+def test_a_copied_barcode_that_is_not_a_gtin_holds_the_seed():
+    before = _jurlique()
+    before[1]["barcode"] = "12345678"  # fails the check digit
+    out = _plan(before, snapshot=[_snap(V50, sku=SKU50)])
+    assert (out["action"], out["reason"]) == ("held", "copied_code_may_be_variant_id")
+    before[1]["barcode"] = GTIN50  # a real GTIN is still kept
+    assert _plan(before, snapshot=[_snap(V50, sku=SKU50)])["after"] == [{**before[0], "sku": SKU50, "barcode": GTIN50}]
+
+
+def test_a_copied_code_naming_another_entrys_variant_holds_the_seed():
+    # A GTIN-valid 13-digit Shopify id (it happens): the check digit cannot tell it, the list can.
+    b = "4006381333931"
+    before = _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(12, IN, **_link_id(b)),
+                               _offer(31, IN, sku=SKU50)]))
+    before[2]["barcode"] = b
+    out = _plan(before, snapshot=[_snap(V50, sku=SKU50), _snap(b, price_amount=12.0)])
+    assert (out["action"], out["reason"]) == ("held", "copied_code_may_be_variant_id")
+
+
+def test_an_mpn_in_the_snapshot_ties_nothing():
+    # (c): a model number is product-level; the snapshot stating it beside A is no evidence for "LT".
+    before = _two_links_and(_offer(31, IN, sku="LT"))
+    out = _plan(before, snapshot=[_snap(V50, mpn="LT"), _snap(V15, price_amount=12.0)])
+    assert (out["action"], out["reason"]) == ("held", "no_positive_link")
+    # The two-entry form is no snapshot tie either: at most the opt-in sole_pair lane.
+    two = _pair(V50, "LT")
+    assert _plan(two, snapshot=[_snap(V50, mpn="LT")])["evidence"] == ["sole_pair"]
+
+
+def test_an_mpn_on_the_link_entry_ties_nothing():
+    # (d): a link entry carrying a product-level mpn equal to the key.
+    before = _pair(V50, "LT")
+    before[0]["mpn"] = "LT"
+    out = _plan(before)
+    assert (out["action"], out["reason"]) == ("held", "no_positive_link")
+
+
+def test_a_copied_code_another_entrys_url_names_holds_the_seed():
+    b = "4006381333931"
+    before = _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(12, IN, **_link_id(V15)),
+                               _offer(31, IN, sku=SKU50)]))
+    before[1]["url"] = f"{STORE}/products/{HANDLE}?variant={b}"
+    before[2]["barcode"] = b
+    out = _plan(before, snapshot=[_snap(V50, sku=SKU50), _snap(V15, price_amount=12.0)])
+    assert (out["action"], out["reason"]) == ("held", "copied_code_may_be_variant_id")
+
+
+def test_a_copied_id_shaped_sku_holds_even_naming_no_entry_of_the_list():
+    # 14 digits, fails the check digit: a variant id of this product the list does not hold, still never a sku.
+    before = _two_links_and(_offer(31, IN, gtin13=GTIN50))
+    before[2]["sku"] = "45253610242311"
+    out = _plan(before, snapshot=[_snap(V50, barcode=GTIN50), _snap(V15, price_amount=12.0)])
+    assert (out["action"], out["reason"]) == ("held", "copied_code_may_be_variant_id")
+    before[2]["sku"] = "RL-50"  # an ordinary SKU is still kept
+    assert _plan(before, snapshot=[_snap(V50, barcode=GTIN50), _snap(V15, price_amount=12.0)])["after"][0] == {
+        **before[0], "barcode": GTIN50, "sku": "RL-50"}
