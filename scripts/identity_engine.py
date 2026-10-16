@@ -16,8 +16,9 @@ digest -- one prod one-off at a time, under the CPU gate, outside drains and 05:
   Undo ONE applied proposal (refused if anything it moved has moved since), then rebuild the views:
     python -m scripts.identity_engine revert-proposal irp_...            # dry run
     python -m scripts.identity_engine revert-proposal irp_... --execute
-  Propose merging every live row on one content_key into another product (status 'proposed'):
-    python -m scripts.identity_engine propose-merge --from-ck ck_A --to-ck ck_B --keeper PK --strategy S
+  Propose merging every live row on one content_key into another product (status 'proposed'); the
+  strategy must be in HAND_PROPOSABLE_STRATEGIES (default deny):
+    python -m scripts.identity_engine propose-merge --from-ck ck_A --to-ck ck_B --keeper PK --strategy coordinator_merge
     python -m scripts.identity_engine propose-merge ... --write
   Approve named proposals (dry run lists them; --execute writes the approval):
     python -m scripts.identity_engine approve irp_... irp_... --by "<who>" --execute
@@ -53,6 +54,7 @@ from services.identity_resolution import (  # noqa: E402
     MEMBER_GROUP_SQL,
     ATTACH_ROW_SQL,
     RUN_EVENTS_SQL,
+    CROSS_MERCHANT_SAME_SIZE,
     MODULE_ONLY_STRATEGIES as _ENGINE_MODULE_ONLY,
     apply_approved,
     approve_module_run,
@@ -69,8 +71,13 @@ from services.identity_resolution import (  # noqa: E402
 RESERVED_STRATEGIES = frozenset({
     "same_url_dup", "junk_url", "campaign_clone", "campaign_clone_ambiguous", "seed_first_party_twin",
     "multi_seller_observation", "tier3_judge", "retailer_listing_brand_prefix", "variant_barcode_match",
-    "cross_merchant_same_size",
+    CROSS_MERCHANT_SAME_SIZE,
 })
+
+#: The ONLY strategies propose-merge may write (default deny): hand-built merges that no other path
+#: approves or applies by name. A strategy the sweep, a link script or a module adds is therefore never
+#: hand-proposable by accident; a test also keeps this set disjoint from RESERVED_STRATEGIES.
+HAND_PROPOSABLE_STRATEGIES = frozenset({"coordinator_merge"})
 
 #: Reserved strategies whose proposals only their own strategy module produces (the engine's list). This
 #: CLI never writes one or approves one by id; it approves a whole module run (approve_module_run) and
@@ -113,8 +120,9 @@ def _detail(raw: Any) -> Dict[str, Any]:
 
 async def build_merge(conn, *, from_ck: str, to_ck: str, keeper: str, strategy: str) -> Dict[str, Any]:
     """A merge_content_key proposal from the live rows on `from_ck` and their memberships now."""
-    if reserved(strategy):
-        raise SystemExit(f"strategy {strategy!r} is reserved: only its own path may write its proposals")
+    if strategy not in HAND_PROPOSABLE_STRATEGIES or reserved(strategy):
+        raise SystemExit(f"strategy {strategy!r} may not be hand-proposed: use one of "
+                         f"{sorted(HAND_PROPOSABLE_STRATEGIES)}")
     rows = list(await conn.fetch(FROM_KEY_ROWS_SQL, from_ck))
     if not rows:
         raise SystemExit(f"no live rows on {from_ck}")
@@ -171,8 +179,10 @@ async def main(argv: List[str]) -> int:
             ap.error("--expect-digest belongs to approve --strategy --run")
     if args.cmd == "apply" and args.execute and not args.expect_digest:
         ap.error("--execute needs --expect-digest from a dry run")
-    if args.cmd == "propose-merge" and reserved(args.strategy):
-        ap.error(f"strategy {args.strategy!r} is reserved: only its own path may write its proposals")
+    if args.cmd == "propose-merge" and (args.strategy not in HAND_PROPOSABLE_STRATEGIES
+                                        or reserved(args.strategy)):
+        ap.error(f"strategy {args.strategy!r} may not be hand-proposed: use one of "
+                 f"{sorted(HAND_PROPOSABLE_STRATEGIES)}")
     if args.cmd == "apply" and reserved(args.strategy) and args.strategy not in MODULE_ONLY_STRATEGIES:
         ap.error(f"strategy {args.strategy!r} is reserved: another path applies it with no cap or digest")
 

@@ -481,7 +481,11 @@ async def approve_proposals(conn, proposal_ids: List[str], decided_by: str) -> L
 #: step over one whole proposal run (approve_module_run, via scripts/identity_engine.py approve
 #: --strategy ... --run ... --expect-digest ... --execute); never the sweep, a schedule or a hand-made
 #: proposal.
-MODULE_ONLY_STRATEGIES: Tuple[str, ...] = ("cross_merchant_same_size",)
+#: M4's strategy (services/identity_cross_merchant_match.py). The one spelling every module imports:
+#: this engine, scripts/identity_engine.py, the M4 module and be#2635.
+CROSS_MERCHANT_SAME_SIZE = "cross_merchant_same_size"
+
+MODULE_ONLY_STRATEGIES: Tuple[str, ...] = (CROSS_MERCHANT_SAME_SIZE,)
 
 MATCHER_VERDICT_TIERS = ("T0a", "T0b", "T0c")
 
@@ -494,7 +498,7 @@ FOR UPDATE
 
 
 def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
-                             strategy: str = "cross_merchant_same_size") -> List[str]:
+                             strategy: str = CROSS_MERCHANT_SAME_SIZE) -> List[str]:
     """The problems with a proposal's evidence.matcher_verdict ([] = well formed). One rule, shared by
     the approve path here, the M4 strategy module that writes the verdict, and be#2635.
 
