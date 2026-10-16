@@ -66,20 +66,32 @@ MEMBERS = [
 ]
 
 
+def _verdict(offer_ids=("of_sk",), **overrides) -> dict:
+    """A valid `evidence.matcher_verdict`, as M4 writes it (the contract #2635 requires)."""
+    v = {"strategy": "cross_merchant_same_size", "same_size": True, "rule_version": "m4-t0-2026-10-16",
+         "tier": "T0b", "size": {"value": 50, "unit": "ml", "pack": 1}, "listing_offer_ids": list(offer_ids)}
+    v.update(overrides)
+    return v
+
+
 def _attach(listing_pk, keeper_pk=BRAND_PK, ck=CK, *, strategy="cross_merchant_same_size", status="applied",
-            kind="attach_membership"):
-    """An identity_resolution_proposals row: the engine joined `listing_pk` to the keeper's product.
-    Evidence keys as services/identity_resolution writes them (be#2637 head 50905a502)."""
+            kind="attach_membership", offer_ids=None, verdict=None):
+    """An identity_resolution_proposals row: the engine joined `listing_pk` to the keeper's product,
+    on a matcher verdict. Evidence keys as services/identity_resolution writes them (be#2637)."""
+    ids = offer_ids if offer_ids is not None else (("of_sk",) if listing_pk == RETAILER_PK else ("of_unlisted",))
     return {"content_key": ck, "subject_product_keys": [listing_pk, keeper_pk], "keeper_product_key": keeper_pk,
             "strategy": strategy, "status": status, "kind": kind,
-            "evidence": {"listing_product_key": listing_pk, "from_content_key": "ck_old"}}
+            "evidence": {"listing_product_key": listing_pk, "from_content_key": "ck_old",
+                         "matcher_verdict": _verdict(ids) if verdict is None else verdict}}
 
 
-def _merge(from_pks, keeper_pk=BRAND_PK, ck=CK, *, status="applied"):
+def _merge(from_pks, keeper_pk=BRAND_PK, ck=CK, *, status="applied", verdict=None):
     """A merge_content_key proposal: every row of another key (`from_product_keys`) moved onto ck."""
     return {"content_key": ck, "subject_product_keys": [*from_pks, keeper_pk], "keeper_product_key": keeper_pk,
             "strategy": "cross_merchant_same_size", "status": status, "kind": "merge_content_key",
-            "evidence": {"from_product_keys": list(from_pks), "from_content_key": "ck_old", "to_content_key": ck}}
+            "evidence": {"from_product_keys": list(from_pks), "from_content_key": "ck_old", "to_content_key": ck,
+                         "matcher_verdict": (_verdict(("of_sk",), from_key_single_size=True)
+                                             if verdict is None else verdict)}}
 
 
 # The retailer listing was joined to the brand's product by the phase-1 matcher: a RESOLVED group.
@@ -148,7 +160,10 @@ def _fake_db(*, members, seeds, catalog_rows, proposals, calls, fuzzy_seeds=()):
             return [{"content_key": p["content_key"], "kind": p["kind"], "keeper_product_key": p["keeper_product_key"],
                      "listing_product_key": p["evidence"].get("listing_product_key"),
                      "from_product_keys": (json.dumps(p["evidence"]["from_product_keys"])
-                                           if "from_product_keys" in p["evidence"] else None)}
+                                           if "from_product_keys" in p["evidence"] else None),
+                     # jsonb -> text, as asyncpg hands it over
+                     "matcher_verdict": (json.dumps(p["evidence"]["matcher_verdict"])
+                                         if "matcher_verdict" in p["evidence"] else None)}
                     for p in proposals
                     if p["content_key"] in v["cks"] and p["status"] == "applied"
                     and p["kind"] in v["kinds"] and p["strategy"] in v["strategies"]]
@@ -403,39 +418,35 @@ def test_an_unresolved_group_is_answered_exactly_as_main(monkeypatch, client, pr
     assert _same(_golden_responses(monkeypatch, client, flag="1", proposals=proposals), want)
 
 
-def test_a_gtin_keyed_group_is_resolved_and_a_collision_on_it_is_not(monkeypatch, client):
-    """GTIN basis: the key is the hash of a member's brand/title/GTIN, and a listing carrying that
-    GTIN is the same item. A listing that lands on the key WITHOUT the GTIN (a title collision) is
-    not a member, and a call naming it is answered as on main."""
+def test_a_gtin_keyed_group_without_a_matcher_verdict_is_not_resolved(monkeypatch, client):
+    """GTIN basis DEFERRED (phase 1 trusts only the matcher's verdict). The OPI repro of the review: the
+    key minted from "OPI / Nail Lacquer / 00619828139641" also carries Big Apple Red and Malaga Wine,
+    which reuse that GTIN -- different shades. Without an engine verdict nothing is resolved: no sibling
+    seed, no price_comparable, no best price. Same for the gtin "0" repro."""
     from services.catalog_identity import make_content_key
 
-    gtin = "8809598452961"
-    ck = make_content_key("Brand", "Serum", gtin)
-    members = [
-        _member(BRAND_PK, BRAND_SIG, ck, "eps_spec", "ext_spec", gtin=gtin),
-        _member(RETAILER_PK, RETAILER_SIG, ck, None, RETAILER_PK, gtin=gtin, title="Serum 50ml (Brand)"),
-        _member("ext:retailer:serum-mini", "sig_grp_mini", ck, None, "ext:retailer:serum-mini", gtin=None),
-    ]
-    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 25.0, ck=ck),
-            _catalog_row("of_mini", "ext:retailer:serum-mini", "minis.com", 9.0, ck=ck)]
-    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, proposals=[],
-                   catalog_rows=rows, seeds=[_single_size_brand_seed(price=29.0)])
-    assert _group_source(body)["resolved"] == 2
-    assert BRAND_OFFER in _by_id(body)
-    # The $9 mini is listed (the catalog arm is unchanged) but is not part of the group's price.
-    assert "of:catalog_offer:of_mini" in _by_id(body)
-    assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
-    # The collision listing named directly: not a member, no widening, no best price.
-    body = _invoke(monkeypatch, client, product_id="sig_grp_mini", flag="1", members=members, proposals=[],
-                   catalog_rows=rows, seeds=[_single_size_brand_seed(price=29.0)])
-    assert BRAND_OFFER not in _by_id(body) and "best_price_offer_id" not in body
-    assert not [s for s in body["metadata"]["sources"] if s["source"] == "external_product_seeds_group_siblings"]
+    for gtin, title in (("00619828139641", "Nail Lacquer"), ("0", "Nail Lacquer")):
+        ck = make_content_key("OPI", title, gtin)
+        members = [
+            _member(BRAND_PK, BRAND_SIG, ck, "eps_spec", "ext_spec", gtin=gtin, brand="OPI", title=title),
+            _member(RETAILER_PK, RETAILER_SIG, ck, None, RETAILER_PK, gtin=gtin, brand="OPI",
+                    title="Nail Lacquer Big Apple Red"),
+            _member("ext:retailer:malaga", "sig_malaga", ck, None, "ext:retailer:malaga", gtin=gtin, brand="OPI",
+                    title="Nail Lacquer Malaga Wine"),
+        ]
+        rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 9.0, ck=ck),
+                _catalog_row("of_malaga", "ext:retailer:malaga", "malaga.com", 8.0, ck=ck)]
+        for ident in (RETAILER_SIG, BRAND_SIG, ck):
+            body = _invoke(monkeypatch, client, product_id=ident, flag="1", members=members, proposals=[],
+                           catalog_rows=rows, seeds=[_single_size_brand_seed(29.0)])
+            assert "best_price_offer_id" not in body and _marked(body) == [], (gtin, ident)
+            assert not [s for s in body["metadata"]["sources"] if s["source"] == "external_product_seeds_group_siblings"]
+        assert BRAND_OFFER not in _by_id(_invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members,
+                                                 proposals=[], catalog_rows=rows, seeds=[_single_size_brand_seed()]))
 
 
 def test_a_shared_gtin_on_a_brand_title_key_is_not_a_gtin_basis(monkeypatch, client):
-    """Both listings carry one GTIN, but the key they share was minted from brand+title (no GTIN in
-    it): the key is not GTIN-derived, so the GTIN basis does not apply and, with no engine move, the
-    group is unresolved."""
+    """Both listings carry one GTIN on a brand+title key: GTIN equality is not a verdict."""
     gtin = "8809598452961"
     members = [dict(m, gtin=gtin) for m in MEMBERS]
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, proposals=[])
@@ -680,7 +691,7 @@ def test_a_fresh_retailer_ranks_ahead_of_a_cheaper_stale_one(monkeypatch, client
     """The catalog arm hands rows over in stock-then-price order; in a resolved group a fresh price
     moves ahead of every stale one, which stays listed behind it."""
     members = MEMBERS + [_member("ext:retailer:serum-ys", "sig_grp_ys", CK, None, "ext:retailer:serum-ys")]
-    proposals = RESOLVED + [_attach("ext:retailer:serum-ys")]
+    proposals = RESOLVED + [_attach("ext:retailer:serum-ys", offer_ids=("of_ys",))]
     rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 12.0, checked=None),
             _catalog_row("of_ys", "ext:retailer:serum-ys", "yesstyle.com", 24.0)]
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
@@ -1019,6 +1030,157 @@ def test_the_limit_keeps_a_fresh_seller_over_a_stale_one(monkeypatch, client):
     rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 12.0, checked=None),
             _catalog_row("of_ys", "ext:retailer:serum-ys", "yesstyle.com", 24.0)]
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
-                   proposals=RESOLVED + [_attach("ext:retailer:serum-ys")], limit=1,
+                   proposals=RESOLVED + [_attach("ext:retailer:serum-ys", offer_ids=("of_ys",))], limit=1,
                    reasons={"eps_spec": ("currency_mismatch",)})
     assert [o["offer_id"] for o in body["offers"]] == ["of:catalog_offer:of_ys"]
+
+
+# ------------------------------------------------- the matcher verdict: shape, offers, mixed groups
+
+
+def _bad(**over):
+    v = _verdict()
+    for k, val in over.items():
+        if val is _DROP:
+            v.pop(k, None)
+        else:
+            v[k] = val
+    return v
+
+
+_DROP = object()
+_SIZE = {"value": 50, "unit": "ml", "pack": 1}
+
+# (case id, kind, verdict, valid?) -- the pinned list `_valid_matcher_verdict` and be#2637's shared
+# validate_matcher_verdict must agree on (test_the_local_validator_agrees_with_the_shared_one).
+VERDICT_CASES = [
+    ("valid_attach", "attach_membership", _verdict(), True),
+    ("valid_merge", "merge_content_key", _verdict(from_key_single_size=True), True),
+    ("valid_count_pack", "attach_membership", _verdict(size={"value": 1, "unit": "count", "pack": 3}), True),
+    ("valid_grams_float", "attach_membership", _verdict(size={"value": 7.5, "unit": "g", "pack": 1}), True),
+    ("no_verdict", "attach_membership", None, False),
+    ("not_an_object", "attach_membership", ["cross_merchant_same_size"], False),
+    ("strategy_missing", "attach_membership", _bad(strategy=_DROP), False),
+    ("strategy_other", "attach_membership", _bad(strategy="identity_brand_link"), False),
+    ("same_size_missing", "attach_membership", _bad(same_size=_DROP), False),
+    ("same_size_false", "attach_membership", _bad(same_size=False), False),
+    ("same_size_truthy_string", "attach_membership", _bad(same_size="true"), False),
+    ("rule_version_missing", "attach_membership", _bad(rule_version=_DROP), False),
+    ("rule_version_blank", "attach_membership", _bad(rule_version="  "), False),
+    ("tier_missing", "attach_membership", _bad(tier=_DROP), False),
+    ("tier_fuzzy", "attach_membership", _bad(tier="T1"), False),
+    ("size_missing", "attach_membership", _bad(size=_DROP), False),
+    ("size_not_object", "attach_membership", _bad(size="50ml"), False),
+    ("size_value_missing", "attach_membership", _bad(size={"unit": "ml", "pack": 1}), False),
+    ("size_value_string", "attach_membership", _bad(size={"value": "50", "unit": "ml", "pack": 1}), False),
+    ("size_value_bool", "attach_membership", _bad(size={"value": True, "unit": "ml", "pack": 1}), False),
+    ("size_value_zero", "attach_membership", _bad(size={"value": 0, "unit": "ml", "pack": 1}), False),
+    ("size_unit_missing", "attach_membership", _bad(size={"value": 50, "pack": 1}), False),
+    ("size_unit_oz", "attach_membership", _bad(size={"value": 1.7, "unit": "oz", "pack": 1}), False),
+    ("size_pack_missing", "attach_membership", _bad(size={"value": 50, "unit": "ml"}), False),
+    ("size_pack_float", "attach_membership", _bad(size={"value": 50, "unit": "ml", "pack": 1.5}), False),
+    ("size_pack_zero", "attach_membership", _bad(size={"value": 50, "unit": "ml", "pack": 0}), False),
+    ("offer_ids_missing", "attach_membership", _bad(listing_offer_ids=_DROP), False),
+    ("offer_ids_empty", "attach_membership", _bad(listing_offer_ids=[]), False),
+    ("offer_ids_not_strings", "attach_membership", _bad(listing_offer_ids=[123]), False),
+    ("offer_ids_blank", "attach_membership", _bad(listing_offer_ids=[""]), False),
+    ("merge_without_single_size", "merge_content_key", _verdict(), False),
+    ("merge_single_size_false", "merge_content_key", _verdict(from_key_single_size=False), False),
+]
+
+
+@pytest.mark.parametrize("case,kind,verdict,valid", VERDICT_CASES, ids=[c[0] for c in VERDICT_CASES])
+def test_a_proposal_resolves_only_on_a_valid_matcher_verdict(monkeypatch, client, case, kind, verdict, valid):
+    if kind == "merge_content_key":
+        p = _merge([RETAILER_PK], verdict=verdict)
+    else:
+        p = _attach(RETAILER_PK, verdict=verdict)
+    if verdict is None:
+        p["evidence"].pop("matcher_verdict")
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", proposals=[p],
+                   seeds=[_single_size_brand_seed(29.0)])
+    assert (BRAND_OFFER in _by_id(body)) is valid, case
+    assert ("best_price_offer_id" in body) is valid, case
+    if not valid:
+        assert _marked(body) == []
+
+
+def test_the_local_validator_agrees_with_the_shared_one():
+    """be#2637 adds services/identity_resolution.validate_matcher_verdict; until both are on main the
+    rule lives here too. When the shared one is importable, both must answer every pinned case alike."""
+    import routes.agent_shop_gateway as gateway
+
+    for case, kind, verdict, valid in VERDICT_CASES:
+        assert gateway._valid_matcher_verdict(kind, verdict) is valid, case
+    shared = getattr(__import__("services.identity_resolution", fromlist=["x"]), "validate_matcher_verdict", None)
+    if shared is None:
+        pytest.skip("be#2637's shared validator is not on this base yet; the local rule is pinned above")
+    for case, kind, verdict, valid in VERDICT_CASES:
+        try:
+            got = shared(verdict, kind=kind)
+        except TypeError:
+            got = shared(kind, verdict)
+        assert bool(got) is valid, case
+
+
+def test_only_the_offers_the_matcher_matched_are_comparable(monkeypatch, client):
+    """H3. A resolved retailer listing carries 30 ml $15 and 100 ml $40 beside the brand's single-size
+    50 ml $29, and the verdict lists only the 50 ml offer: the 30 ml (which the host dedupe keeps, being
+    cheapest) and the 100 ml are listed but never comparable, never best price."""
+    rows = [_catalog_row("of_sk30", RETAILER_PK, "stylekorean.com", 15.0),
+            _catalog_row("of_sk100", RETAILER_PK, "stylekorean.com", 40.0)]
+    for listed in (("of_sk50",), ("of_sk100",)):
+        body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                       proposals=[_attach(RETAILER_PK, offer_ids=listed)], seeds=[_single_size_brand_seed(29.0)])
+        _assert_contract(body)
+        assert "of:catalog_offer:of_sk30" in _by_id(body)
+        assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_sk30"]
+        assert body["best_price_offer_id"] == BRAND_OFFER, listed
+    # The matched offer, when it is the one served, IS comparable.
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
+                   proposals=[_attach(RETAILER_PK, offer_ids=("of_sk30",))], seeds=[_single_size_brand_seed(29.0)])
+    assert body["best_price_offer_id"] == "of:catalog_offer:of_sk30"
+
+
+def test_an_unresolved_member_of_a_mixed_group_lends_no_seed(monkeypatch, client):
+    """Resolved brand + retailer, plus an unresolved listing on the same key with its OWN seed: that
+    seed is never read by the sibling lane and never shown."""
+    u_seed = _single_size_brand_seed(9.0)
+    u_seed.update({"id": "eps_u", "external_product_id": "ext_u", "attached_product_key": "ext:retailer:u",
+                   "domain": "ustore.com", "destination_url": "https://ustore.com/p/u", "canonical_url": "https://ustore.com/p/u"})
+    members = MEMBERS + [_member("ext:retailer:u", "sig_u", CK, "eps_u", "ext_u")]
+    calls: List[str] = []
+    import routes.agent_shop_gateway as gateway
+
+    seen_binds: List[dict] = []
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members,
+                   seeds=[_single_size_brand_seed(29.0), u_seed], calls=calls)
+    real = gateway.database.fetch_all
+
+    async def spy(query, values=None):
+        if "attached_product_key = ANY(:product_keys)" in str(query):
+            seen_binds.append(dict(values or {}))
+        return await real(query, values)
+
+    monkeypatch.setattr(gateway.database, "fetch_all", spy)
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": {
+        "product": {"product_id": RETAILER_SIG}, "limit": 10, "market": "US", "tool": "*"},
+        "metadata": {"source": "creator-agent-ui"}})
+    body = res.json()
+    assert BRAND_OFFER in _by_id(body)
+    assert "eps_u" not in {(o.get("source") or {}).get("seed_id") for o in body["offers"]}
+    [binds] = seen_binds
+    assert "eps_u" not in binds["seed_ids"] and "ext_u" not in binds["external_ids"]
+    assert "ext:retailer:u" not in binds["product_keys"]
+
+
+def test_a_verdict_cannot_vouch_for_an_offer_on_an_unresolved_listing(monkeypatch, client):
+    """Both checks, not either: an offer id a verdict lists is comparable only on a RESOLVED listing
+    (a verdict naming another listing's offer -- bad data -- vouches for nothing there)."""
+    members = MEMBERS + [_member("ext:retailer:serum-mini", "sig_grp_mini", CK, None, "ext:retailer:serum-mini")]
+    rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0),
+            _catalog_row("of_mini", "ext:retailer:serum-mini", "minis.com", 5.0)]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
+                   proposals=[_attach(RETAILER_PK, offer_ids=("of_sk", "of_mini"))], seeds=[_single_size_brand_seed(29.0)])
+    assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_mini"]
+    assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"

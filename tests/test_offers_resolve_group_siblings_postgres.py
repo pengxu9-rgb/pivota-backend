@@ -93,8 +93,18 @@ def _rows(engine, *, retailer_checked, retailer2_checked=None, brand_seed=True, 
                 "keeper": BRAND_PK, "status": status,
                 # attach: evidence.listing_product_key; merge: evidence.from_product_keys (be#2637).
                 "kind": "merge_content_key" if i == 1 else "attach_membership",
-                "ev": (json.dumps({"from_product_keys": [listing], "from_content_key": "ck_old", "to_content_key": CK})
-                       if i == 1 else json.dumps({"listing_product_key": listing, "from_content_key": "ck_old"}))})
+                "ev": json.dumps({
+                    **({"from_product_keys": [listing], "to_content_key": CK} if i == 1
+                       else {"listing_product_key": listing}),
+                    "from_content_key": "ck_old",
+                    # The matcher's verdict (M4's contract): the matched size's offers on the listing.
+                    "matcher_verdict": {
+                        "strategy": "cross_merchant_same_size", "same_size": True, "rule_version": "m4-test",
+                        "tier": "T0b", "size": {"value": 30, "unit": "ml", "pack": 1},
+                        "listing_offer_ids": ["of_pg_ys" if i == 1 else "of_pg_sk"],
+                        **({"from_key_single_size": True} if i == 1 else {}),
+                    },
+                })})
 
         def product(pk, sig, merchant, source_ref, source_product_id):
             c.execute(text(
