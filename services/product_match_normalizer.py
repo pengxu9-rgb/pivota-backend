@@ -65,10 +65,12 @@ Title core (`title_core`) -- ported from TWO normalizers and reconciled:
     here "free" stays ("Fragrance Free" is a different formula). (3) It strips "mg"; here mg is a
     STRENGTH and stays in the core (500mg vs 1000mg). (4) It keeps hyphens inside tokens
     ("dive-in"); here hyphens split ("DIVE-IN" == "Dive In").
-  - Both normalizers DROP "+" ("Lotion+" == "Lotion"). Here a "+" glued to a word, "(+)" and the
-    word "plus" are the conflict token `plus` (Effaclar Duo vs Duo+, Cicaplast B5 vs B5+), read
-    after SPF50+/PA+++ and "1+1" packs are consumed; a brand's own "+" (Dr.Jart+) is removed with
-    the brand first.
+  - Both normalizers DROP "+" ("Lotion+" == "Lotion"). Here no "+" is ever dropped. Read after
+    sizes, SPF50+/PA+++ and "1+1" packs are consumed, and after a brand's own "+" (Dr.Jart+) went
+    with the brand: a "+" glued to a word or a percent, or followed by no word ("Duo+", "B5+",
+    "1%+", "Duo + SPF30 40ml", "Duo (+)", "Duo [+]") and the word "plus" are the conflict token
+    `plus`; a "+" BETWEEN two words ("Rice + Probiotics", "B5 + Multi-Purpose Balm") stays in the
+    core as CONJUNCTION_PLACEHOLDER, and exact_title_key keeps every "+" as a word.
   - Word ORDER: both compare token sets. T0c here keys on the ORDERED core ("Cream to Powder" vs
     "Powder to Cream"), and a format word moved to the conflicts leaves a positional placeholder
     ("fmt") in the core, so Laneige "Cream Skin" and "Skin Cream" stay apart; two or more format
@@ -137,6 +139,7 @@ __all__ = [
 
 _VULGAR_FRACTION_RE = re.compile("[\u00bc-\u00be\u2150-\u215e]")
 _MARKS_RE = re.compile("[\u2122\u2120\u00ae\u00a9]")  # ™ ℠ ® ©
+_TEXT_MARKS_RE = re.compile(r"\((?:r|tm)\)", re.IGNORECASE)
 
 
 def _fold(text: Any) -> str:
@@ -158,7 +161,10 @@ def _fold(text: Any) -> str:
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = unicodedata.normalize("NFC", s).casefold()
     s = s.replace("&", " and ").replace("’", "'").replace("‘", "'").replace("`", "'")
-    s = re.sub(r"\((?:r|tm|sm|c)\)", " ", s)
+    # Textual "(TM)" / "(R)" only. NOT "(C)": a textual (C) is the cool-undertone shade code
+    # ("Teint Idole 220 (C)") or a vitamin ("Vitamin (C) Suspension"); the © sign itself is
+    # already gone (_MARKS_RE, before NFKC).
+    s = _TEXT_MARKS_RE.sub(" ", s)
     # "N°5" / "Nº5" (NFKC: "no5") / "No.5" / "No 5" are one spelling: a NUMBERED LINE (Chanel N°5,
     # Olaplex No.3), so it stays in the core as "no 5" rather than being read as a shade code.
     s = re.sub(r"\bn(?:o\.?|°)\s*(?=\d)", "no ", s)
@@ -664,6 +670,16 @@ def conflict_family(token: str) -> str:
 # to the conflict tokens. Not a lexicon token, so it never reads as a conflict on a re-pass.
 FORMAT_PLACEHOLDER = "fmt"
 
+# What a "+" BETWEEN two words leaves in the core (review round 3 of be#2636). The `plus` rule
+# already took every "+" that is glued, bracketed or not followed by a word; what remains joins two
+# words, and it is never silently dropped: "Cicaplast B5 + Multi-Purpose Balm" and "Toleriane +
+# Vitamin C" are not "B5 Multi-Purpose Balm" / "Toleriane Vitamin C". Kept as a positional core
+# word, not a conflict token: it is a conjunction, not an edition. Cost: "Rice + Probiotics" no
+# longer equals "Rice & Probiotics" or "Rice Probiotics" (recall only; it still equals itself).
+# One alphanumeric word that is no lexicon token, so it is stable on a re-pass.
+CONJUNCTION_PLACEHOLDER = "plusjoin"
+_CONJUNCTION_PLUS_RE = re.compile(r"(?<=[^\W_]|%)\s*\+\s*(?=[^\W_])")  # "Niacinamide 10% + Zinc" too
+
 
 def _extract(work: List[str], rules: Sequence[Tuple[ConflictRule, re.Pattern]], *,
              placeholder: str = "") -> List[str]:
@@ -753,8 +769,10 @@ def _tokens(text: str) -> List[str]:
 
 
 def _clean(text: str) -> List[str]:
-    """Core words of a stretch of text whose brand _blank_brand has already removed."""
+    """Core words of a stretch of text whose brand _blank_brand has already removed. A "+" still
+    standing BETWEEN two words leaves CONJUNCTION_PLACEHOLDER at its position."""
     text = _PROMO_PHRASES_RE.sub(" ", text)
+    text = _CONJUNCTION_PLUS_RE.sub(f" {CONJUNCTION_PLACEHOLDER} ", text)
     return [t for t in _tokens(text) if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
 
 
@@ -766,7 +784,8 @@ def _brand_text_re(forms: FrozenSet[str]) -> Optional[re.Pattern]:
     if not alts:
         return None
     body = "|".join(r"[\W_]*".join(re.escape(c) for c in f) for f in alts)
-    return re.compile(rf"(?<![^\W_])(?:{body})\+?(?![^\W_])(?:\s+x(?=\s+[^\W_]))?")
+    # The collab "x" needs a WORD after it ("COSRX x Olive Young"); "NARS X 4.8g" keeps its x.
+    return re.compile(rf"(?<![^\W_])(?:{body})\+?(?![^\W_])(?:\s+x(?=\s+[^\W\d_]))?")
 
 
 def _blank_brand(text: str, forms: FrozenSet[str]) -> str:
@@ -966,11 +985,16 @@ def _field(listing: Any, name: str) -> Any:
 def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
     """T0b: (canonical_brand, catalog_identity.normalize_title) -- exact title, digits kept.
 
-    Trademark marks are stripped first: normalize_title's NFKD spells "™" as "TM" and glues it
-    onto the word ("Surge™" -> "surgetm"). normalize_title itself is left alone (it mints
+    Trademark marks (the signs, and a textual "(TM)" / "(R)") are stripped first: normalize_title's
+    NFKD spells "™" as "TM" and glues it onto the word ("Surge™" -> "surgetm"). Every "+" is kept
+    as a word (normalize_title would drop it): "B5 + Multi-Purpose Balm" is not "B5 Multi-Purpose
+    Balm" on the exact-title tier either. normalize_title itself is left alone (it mints
     content_key); this only changes the matching key."""
     b = canonical_brand(brand)
-    t = normalize_title(_MARKS_RE.sub(" ", str(title)) if title is not None else None)
+    t = None
+    if title is not None:
+        raw = _TEXT_MARKS_RE.sub(" ", _MARKS_RE.sub(" ", str(title)))
+        t = normalize_title(raw.replace("+", f" {CONJUNCTION_PLACEHOLDER} "))
     return (b, t) if b and t else None
 
 
