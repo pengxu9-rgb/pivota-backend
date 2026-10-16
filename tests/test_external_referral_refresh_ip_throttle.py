@@ -23,6 +23,7 @@ import httpx
 import pytest
 
 import jobs.external_referral_refresh as job
+import services.crawl_global_pacer as cgp
 import services.crawl_ip_throttle as cit
 import services.crawl_politeness as cp
 import services.external_offers_service as svc
@@ -39,12 +40,21 @@ PLAIN = {"server": "nginx"}
 def _clean(monkeypatch: pytest.MonkeyPatch):
     cp.reset_for_tests()
     cit.reset_for_tests()
+    cgp.reset_for_tests()
     # No robots fetch, and no real sleeps: pacing and backoff still RUN, at zero length.
     monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "false")
     monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
     monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "0")
     monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "0")
+    # The rules in this file are the 429 rule's. No global rate or new-host cap (their rules have
+    # their own file, tests/test_external_referral_refresh_global_pacing.py); the cool-down stage is
+    # ON at its default and passes on the virtual clock `_drive` installs.
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", "0")
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE", "0")
     for name in (
+        "CRAWL_IP_CHALLENGE_TRIP_HOSTS",
+        "CRAWL_IP_CHALLENGE_WINDOW_SECONDS",
+        "CRAWL_IP_THROTTLE_COOLDOWN_SECONDS",
         "CRAWL_IP_THROTTLE_TRIP_HOSTS",
         "CRAWL_IP_THROTTLE_WINDOW_SECONDS",
         "CRAWL_IP_THROTTLE_BREAKER_ENABLED",
@@ -86,9 +96,18 @@ def _drive(
         err, "_fetch_refresh_candidate_hosts",
         lambda ids: asyncio.sleep(0, result={s: cp.host_of(url_of[s]) for s in ids}),
     )
+    # ONE VIRTUAL CLOCK for the breaker and the run's global pacer, so a cool-down (900 s by
+    # default) passes instantly and the breaker sees it pass. `fake_clock` additionally lets an
+    # answer set the clock (its third element).
     clock = {"t": 0.0}
-    if fake_clock:
-        monkeypatch.setattr(cit, "_now", lambda: clock["t"])
+
+    async def _virtual_sleep(seconds: float) -> None:
+        clock["t"] += max(0.0, seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(cit, "_now", lambda: clock["t"])
+    monkeypatch.setattr(cgp, "_now", lambda: clock["t"])
+    monkeypatch.setattr(cgp, "_sleep", _virtual_sleep)
 
     def handler(request: httpx.Request) -> httpx.Response:
         status, headers, at = answer_of[str(request.url)]
@@ -150,41 +169,68 @@ def _storm_rows(shopify_hosts: int = 20) -> List[Tuple[str, Answer]]:
 # --------------------------------------------------------------------- the 09-30 storm
 
 
-def test_the_09_30_storm_trips_and_non_shopify_hosts_carry_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    rows = _storm_rows()
+def test_the_09_30_storm_cools_down_and_non_shopify_hosts_carry_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FIRST trip (10 distinct 429 hosts in 60 s) is a cool-down, not the end: the run pauses,
+    resumes, and from then on holds back hosts whose latest answer was a throttle and, the 429 rule
+    having tripped, known Shopify-served ones. Five more throttled hosts after the cool-down are not
+    ten, so there is no second trip and the run finishes."""
+    rows = _storm_rows(15)
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
     called = _hosts_called(rows, stamped, seed_ids)
 
-    assert summary["ip_throttled"] is True
-    assert summary["status"] == "ip_throttled"
-    assert summary["ip_throttle_trip_host_count"] == 10, "trips on the 10th distinct host"
-    assert summary["ip_throttle_tripped_at"] and summary["ip_throttle_first_429_at"]
+    assert summary["breaker_trips"] == 1 and summary["cooldowns"] == 1
+    assert summary["cooldown_seconds"] == cit.COOLDOWN_SECONDS_DEFAULT
+    event = summary["breaker_trip_events"][0]
+    assert event["reason"] == "throttle" and event["action"] == "cooldown"
+    assert event["throttle_hosts"] == 10, "trips on the 10th distinct host"
+    assert summary["ip_throttled"] is False, "a cool-down is not the end of the run"
+    assert summary["status"] != "ip_throttled"
+    assert summary["ip_throttle_first_429_at"]
     assert summary["ip_throttle_last_429_at"] >= summary["ip_throttle_first_429_at"]
-    # Every ulta row was still read: the breaker holds back Shopify-served hosts only.
-    assert called["www.ulta.com"] == 60
+    # Every ulta row was still read: the breaker holds back throttled / Shopify-served hosts only.
+    assert called["www.ulta.com"] == 45
     # A Shopify host KNOWN from an earlier 200 is held back at take time, with no row in flight.
     assert called["known.shop"] == 1
-    # Each throttled Shopify host was asked exactly once: s0..s9 before the trip, s10..s19 on
+    # Each throttled Shopify host was asked exactly once: s0..s9 before the trip, s10..s14 on
     # first contact (unknown until they answer), then their lanes drained.
-    assert all(called[f"s{i}.shop"] == 1 for i in range(20)), called
-    assert summary["skipped_for_ip_throttle"] == 2 + 20 * 2
+    assert all(called[f"s{i}.shop"] == 1 for i in range(15)), called
+    assert summary["skipped_for_ip_throttle"] == 2 + 15 * 2
     assert set(summary["ip_throttle_skips"].values()) == {2}, "top 10 hosts, two rows each"
     # The per-host breaker never saw a streak: this is the IP breaker's doing, not its.
     assert summary["skipped_for_host_backoff"] == 0
     # Skipped rows are out of the yield denominator, like the other breakers' skips.
-    assert summary["attempted_count"] == len(stamped) == len(rows) - 42
+    assert summary["attempted_count"] == len(stamped) == len(rows) - 32
+
+
+def test_the_09_30_storm_ends_the_run_on_its_second_trip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Twenty throttled hosts: s0..s9 trip the cool-down, s10..s19 are ten MORE distinct hosts
+    after it, and the second trip ends the run: nothing more is started, ulta included."""
+    rows = _storm_rows(20)
+    summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
+    called = _hosts_called(rows, stamped, seed_ids)
+
+    assert summary["ip_throttled"] is True and summary["status"] == "ip_throttled"
+    assert summary["breaker_trips"] == 2 and summary["cooldowns"] == 1
+    assert [e["action"] for e in summary["breaker_trip_events"]] == ["cooldown", "stop"]
+    assert summary["ip_throttle_trip_host_count"] == 10, "ten NEW hosts after the cool-down"
+    assert summary["ip_throttle_tripped_at"]
+    assert all(called[f"s{i}.shop"] == 1 for i in range(20)), called
+    # ulta read until the end: its round-1 rows, its first 10 of round 2 ... and nothing after.
+    assert called["www.ulta.com"] < 60
+    assert len(stamped) + summary["skipped_for_ip_throttle"] == len(rows)
+    assert "www.ulta.com" in summary["ip_throttle_skips"], "the end of the run defers every lane"
 
 
 def test_skipped_rows_are_never_handed_to_the_refresher(monkeypatch: pytest.MonkeyPatch) -> None:
     """Handing a seed to the refresher is what stamps `last_crawl_attempt_at`. A row the IP
     breaker held back must not be stamped, so it sorts first (NULLS FIRST / oldest) tomorrow."""
-    rows = _storm_rows()
+    rows = _storm_rows(15)
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
     held = [s for s in seed_ids if s not in stamped]
-    assert len(held) == summary["skipped_for_ip_throttle"] == 42
+    assert len(held) == summary["skipped_for_ip_throttle"] == 32
     assert len(set(stamped)) == len(stamped), "no row stamped twice"
     assert {rows[seed_ids.index(s)][0] for s in held} <= (
-        {"known.shop"} | {f"s{i}.shop" for i in range(20)}
+        {"known.shop"} | {f"s{i}.shop" for i in range(15)}
     ), "only Shopify-served rows are held back"
 
 
@@ -206,31 +252,32 @@ def _markerless_storm_rows(hosts: int) -> List[Tuple[str, Answer]]:
 def test_the_09_30_storm_trips_with_markerless_429s(monkeypatch: pytest.MonkeyPatch) -> None:
     """The review's P1: a breaker that needed Shopify markers would not have fired on 09-30. The
     trip counts DISTINCT hosts, and a host that throttled is stopped after its one request."""
-    rows = _markerless_storm_rows(20)
+    rows = _markerless_storm_rows(15)
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
     called = _hosts_called(rows, stamped, seed_ids)
-    assert summary["status"] == "ip_throttled"
-    assert summary["ip_throttle_trip_host_count"] == 10
-    assert summary["ip_throttle_trip_shopify_host_count"] == 0, "no marker was needed"
-    assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 0
-    assert called["www.ulta.com"] == 60, "a host that never throttles is never held back"
-    # m0..m9 before the trip, m10..m19 on first contact: one request each, then their lanes drain.
-    assert all(called[f"m{i}.example"] == 1 for i in range(20)), called
-    assert summary["skipped_for_ip_throttle"] == 20 * 2
+    assert summary["breaker_trips"] == 1
+    assert summary["breaker_trip_events"][0]["throttle_hosts"] == 10
+    assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 0, "no marker was needed"
+    assert called["www.ulta.com"] == 45, "a host that never throttles is never held back"
+    # m0..m9 before the trip, m10..m14 on first contact: one request each, then their lanes drain.
+    assert all(called[f"m{i}.example"] == 1 for i in range(15)), called
+    assert summary["skipped_for_ip_throttle"] == 15 * 2
     assert summary["skipped_for_host_backoff"] == 0
-    assert summary["throttle_diagnostics"]["retry_after"] == {"none": 20}
+    assert summary["throttle_diagnostics"]["retry_after"] == {"none": 15}
+    assert summary["ip_throttle_plain_429_responses"] == 15
+    assert summary["ip_throttle_challenge_responses"] == 0
 
 
 def test_the_markerless_storm_trips_with_four_workers(monkeypatch: pytest.MonkeyPatch) -> None:
     """The reviewer's reproduction: 4 workers, 30 hosts answering 429 with only
-    `server: cloudflare`. The Shopify-marker version read `ip_throttled=False, status success`."""
+    `server: cloudflare`. The Shopify-marker version read `ip_throttled=False, status success`.
+    Thirty hosts are a cool-down and then, twenty more distinct hosts later, the end."""
     rows = _markerless_storm_rows(30)
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=4)
     called = _hosts_called(rows, stamped, seed_ids)
     assert summary["ip_throttled"] is True and summary["status"] == "ip_throttled"
-    assert called["www.ulta.com"] == 90
-    assert all(called[f"m{i}.example"] == 1 for i in range(30)), called
-    assert summary["skipped_for_ip_throttle"] == 30 * 2
+    assert summary["breaker_trips"] == 2 and summary["cooldowns"] == 1
+    assert all(called.get(f"m{i}.example", 0) <= 1 for i in range(30)), called
     assert len(stamped) + summary["skipped_for_ip_throttle"] == len(rows)
 
 
@@ -248,7 +295,7 @@ def test_a_host_that_throttled_once_and_then_read_keeps_being_read(
     rows += [("www.ulta.com", PLAIN_OK)] * 88
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
     called = _hosts_called(rows, stamped, seed_ids)
-    assert summary["ip_throttled"] is True
+    assert summary["breaker_trips"] == 1
     assert summary["ip_throttle_hosts"] == 13, "ulta's early 429 is still reported"
     assert called["www.ulta.com"] == 121, "every ulta row is read after the trip"
     assert "www.ulta.com" not in summary["ip_throttle_skips"]
@@ -274,8 +321,7 @@ def test_the_storm_trips_with_four_workers_too(monkeypatch: pytest.MonkeyPatch) 
     rows = _storm_rows(30)
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=4)
     called = _hosts_called(rows, stamped, seed_ids)
-    assert summary["status"] == "ip_throttled"
-    assert called["www.ulta.com"] == 90
+    assert summary["status"] == "ip_throttled" and summary["breaker_trips"] == 2
     assert max(n for h, n in called.items() if h.endswith(".shop")) <= 2
     assert summary["skipped_for_ip_throttle"] > 0
     assert len(stamped) + summary["skipped_for_ip_throttle"] == len(rows)
@@ -346,7 +392,7 @@ def test_nine_hosts_do_not_trip_and_the_tenth_does(monkeypatch: pytest.MonkeyPat
     cp.reset_for_tests()
     ten = [(f"h{i}.example", (429, {"server": "nginx"}, None)) for i in range(10)]
     summary, _, _ = _drive(monkeypatch, ten, concurrency=1)
-    assert summary["ip_throttled"] is True
+    assert summary["breaker_trips"] == 1, "the first trip is the cool-down"
     assert summary["ip_throttle_peak_shopify_hosts_in_window"] == 0
 
 
@@ -359,7 +405,7 @@ def test_a_503_counts_only_with_a_retry_after(monkeypatch: pytest.MonkeyPatch) -
     cp.reset_for_tests()
     timed = [(f"t{i}.shop", (503, dict(SHOPIFY, **{"retry-after": "30"}), None)) for i in range(12)]
     summary, _, _ = _drive(monkeypatch, timed, concurrency=1)
-    assert summary["ip_throttled"] is True
+    assert summary["breaker_trips"] == 1
 
 
 def test_a_shopify_host_is_recognised_from_an_earlier_answer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -370,8 +416,8 @@ def test_a_shopify_host_is_recognised_from_an_earlier_answer(monkeypatch: pytest
     rows += [(f"k{i}.shop", (429, {"server": "cloudflare", "retry-after": "60"}, None)) for i in range(10)]
     rows += [("k10.shop", SHOP_OK)]
     summary, stamped, seed_ids = _drive(monkeypatch, rows, concurrency=1)
-    assert summary["ip_throttled"] is True
-    assert summary["ip_throttle_trip_shopify_host_count"] == 10
+    assert summary["breaker_trips"] == 1
+    assert summary["breaker_trip_events"][0]["shopify_hosts"] == 10
     assert _hosts_called(rows, stamped, seed_ids)["k10.shop"] == 1, "known Shopify, held back"
 
 
@@ -395,7 +441,15 @@ def test_the_kill_switch_argument_and_a_zero_trip_disable_it(monkeypatch: pytest
     summary, _, _ = _drive(monkeypatch, _storm_rows(), concurrency=1, ip_throttle_enabled=False)
     assert summary["ip_throttled"] is False
     cp.reset_for_tests()
+    # A zero 429 trip disables the 429 rule only; the challenge rule keeps the breaker armed, and
+    # these 429s carry no challenge, so nothing trips.
     monkeypatch.setenv("CRAWL_IP_THROTTLE_TRIP_HOSTS", "0")
+    summary, _, _ = _drive(monkeypatch, _storm_rows(), concurrency=1)
+    assert summary["ip_throttled"] is False and summary["breaker_trips"] == 0
+    assert summary["ip_throttle_breaker_armed"] is True
+    cp.reset_for_tests()
+    # Both rules at zero disarm it.
+    monkeypatch.setenv("CRAWL_IP_CHALLENGE_TRIP_HOSTS", "0")
     summary, _, _ = _drive(monkeypatch, _storm_rows(), concurrency=1)
     assert summary["ip_throttled"] is False and summary["ip_throttle_breaker_armed"] is False
 

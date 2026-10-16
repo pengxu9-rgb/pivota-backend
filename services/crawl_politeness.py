@@ -46,7 +46,7 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 
-from services import crawl_ip_throttle
+from services import crawl_global_pacer, crawl_ip_throttle
 
 ROBOTS_TRANSPORT_FACTORY = ContextVar("robots_transport_factory", default=None)
 
@@ -235,6 +235,10 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
     delay: Optional[float] = None
     cancelled = False
     try:
+        # THE ROBOTS FETCH IS AN ORIGIN REQUEST TOO, and a new host's first: with a run's global
+        # pacer installed (`services.crawl_global_pacer`) it takes a slot like any page fetch. A
+        # no-op otherwise.
+        await crawl_global_pacer.acquire(host)
         timeout = _f("CRAWL_ROBOTS_TIMEOUT_SECONDS", _ROBOTS_TIMEOUT_DEFAULT)
         # `follow_redirects` is LOAD-BEARING, not incidental: 7 of 17 domains in the live cohort
         # serve robots.txt via at least one redirect, and without this the 3xx falls past the
@@ -272,6 +276,11 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
             except Exception:  # noqa: BLE001 - a malformed Crawl-delay is not a reason to stop
                 delay = None
         # Any non-200 (404 = no robots, 5xx = could not ask) caches as "nothing to obey".
+    except crawl_global_pacer.GlobalPaceStopped:
+        # NOT "robots unavailable": nothing was asked, so nothing may be cached for a TTL. Handled
+        # like a cancellation, and it propagates so the page fetch is not sent either.
+        cancelled = True
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.info("robots.txt unavailable for %s (%s); proceeding without restrictions", host, exc)
     except asyncio.CancelledError:
@@ -425,6 +434,13 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
     delay = start - now
     if delay > 0:
         await asyncio.sleep(delay)
+    # THE RUN'S GLOBAL PACER (`services.crawl_global_pacer`), when one is installed: the IP's total
+    # rate and its new-hosts-per-minute cap, AFTER the host's own slot so no global slot is spent
+    # while the host interval is still running. A no-op with none installed, so every other lane
+    # runs exactly as before. Like the shared Shopify slot below, a wait here moves the host's
+    # next slot with it: the host interval is measured from when the request really starts.
+    if await crawl_global_pacer.acquire(host) > 0:
+        state.next_allowed = max(state.next_allowed, time.monotonic() + interval)
     if edge is not None and unbounded:
         # AN UNBOUNDED CALLER (every batch job) takes the shared slot AFTER its host slot, so no
         # shared slot is spent while the host's own interval is still running. It can never be

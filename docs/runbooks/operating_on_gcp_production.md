@@ -102,7 +102,8 @@ gcloud run jobs create "$JOB" --project pivota-prod --region us-west1 \
   --network default --subnet default --vpc-egress all-traffic \
   `# ^ if this job FETCHES FROM A MERCHANT, use --subnet pivota-crawl instead: the default` \
   `# subnet egresses from 8.231.167.230, the payment-allowlisted address, and NAT port` \
-  `# exhaustion is per-IP. pivota-crawl egresses from 34.82.199.35.` \
+  `# exhaustion is per-IP. pivota-crawl egresses from 136.67.250.98 (since 2026-10-16;` \
+  `# 34.82.199.35 before, kept reserved for rollback).` \
   --set-secrets DATABASE_URL=DATABASE_URL:latest \
   --set-env-vars PIVOTA_ENV=production \
   --max-retries 0 --task-timeout 600s \

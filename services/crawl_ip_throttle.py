@@ -53,7 +53,7 @@ import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +345,226 @@ class IpThrottleBreaker:
                 "cf_mitigated": self.cf_mitigated,
             },
         }
+
+
+def is_challenge(diag: Mapping[str, str]) -> bool:
+    """A Cloudflare bot challenge (`cf-mitigated: challenge`), whatever the status it came with.
+
+    Counted APART from a plain 429: a 429 says "slower", a challenge says Cloudflare has scored our
+    address as a bot, and on 2026-10-16 that verdict followed the IP across 334 unrelated hosts.
+    """
+    return str(diag.get("cf-mitigated") or "").strip().lower() == "challenge"
+
+
+CHALLENGE_TRIP_HOSTS_DEFAULT = 3
+CHALLENGE_WINDOW_SECONDS_DEFAULT = 120.0
+COOLDOWN_SECONDS_DEFAULT = 900.0
+
+
+class StagedIpThrottleBreaker(IpThrottleBreaker):
+    """The IP breaker with an EARLIER trip and a cool-down stage, for a run that has a global pacer.
+
+    TWO TRIP RULES, either one trips:
+      * CHALLENGE: `challenge_trip_hosts` distinct hosts answering `cf-mitigated: challenge` within
+        `challenge_window_seconds` (default 3 in 120 s). 2026-10-16: tm899 peaked at 262
+        challenge-or-429 hosts in 60 s and zt5zz drew 359 challenges in its first two minutes; no
+        night of 10-08..10-15 had more than 12 throttled hosts in the whole run;
+      * THROTTLE: the parent's rule over 429 / 503 + Retry-After, `trip_hosts` in `window_seconds`
+        (default 10 in 60 s), unchanged.
+
+    WHAT A TRIP DOES. The first one (of `max_trips`, default 2) starts a cool-down of
+    `cooldown_seconds` through `on_trip` (the refresh pauses its pacer and halves its rate) and the
+    run carries on after it; from then on a host whose latest answer was a throttle or a
+    challenge is not asked again, and, if the throttle rule tripped (the 09-30 Shopify-edge shape),
+    neither is a known Shopify-served host. The last one sets `tripped`, which ends the run, with
+    `status: ip_throttled` and exit 3 as before. `cooldown_seconds <= 0` makes the first trip the
+    last, i.e. no cool-down stage.
+
+    AFTER A COOL-DOWN ONLY NEW EVIDENCE COUNTS. Answers to requests that were already in flight when
+    the trip landed arrive during the cool-down; they are recorded in the diagnostics but cannot
+    count toward the next trip, and neither can anything seen before the cool-down ended.
+
+    The kill switch is the parent's (`enabled=False`); setting one rule's threshold <= 0 disables
+    that rule only.
+    """
+
+    def __init__(
+        self,
+        *,
+        trip_hosts: int = TRIP_HOSTS_DEFAULT,
+        window_seconds: float = WINDOW_SECONDS_DEFAULT,
+        enabled: bool = True,
+        challenge_trip_hosts: int = CHALLENGE_TRIP_HOSTS_DEFAULT,
+        challenge_window_seconds: float = CHALLENGE_WINDOW_SECONDS_DEFAULT,
+        cooldown_seconds: float = COOLDOWN_SECONDS_DEFAULT,
+        max_trips: int = 2,
+        on_trip: Optional[Callable[["StagedIpThrottleBreaker", Dict[str, Any]], None]] = None,
+    ) -> None:
+        super().__init__(trip_hosts=trip_hosts, window_seconds=window_seconds, enabled=enabled)
+        self.challenge_trip_hosts = int(challenge_trip_hosts)
+        cwin = float(challenge_window_seconds)
+        if not math.isfinite(cwin) or cwin <= 0:
+            logger.warning(
+                "crawl ip throttle: challenge window %r is not a positive number of seconds; "
+                "using the default %.0fs", challenge_window_seconds, CHALLENGE_WINDOW_SECONDS_DEFAULT,
+            )
+            cwin = CHALLENGE_WINDOW_SECONDS_DEFAULT
+        self.challenge_window_seconds = cwin
+        cool = float(cooldown_seconds)
+        self.cooldown_seconds = cool if math.isfinite(cool) and cool > 0 else 0.0
+        self.max_trips = max(1, int(max_trips)) if self.cooldown_seconds > 0 else 1
+        # Armed when EITHER rule is: the parent disarms itself on `trip_hosts <= 0`.
+        self.enabled = bool(enabled) and (self.trip_hosts > 0 or self.challenge_trip_hosts > 0)
+        self.on_trip = on_trip
+        self.trips = 0
+        self.trip_events: List[Dict[str, Any]] = []
+        self.cooling_until = 0.0
+        # Nothing observed before this monotonic instant counts toward a trip.
+        self._counts_since = -math.inf
+        self._block_shopify = False
+        self._recent_challenge: Dict[str, float] = {}
+        self.challenge_responses = 0
+        self.plain_throttle_responses = 0
+        self.challenge_hosts: Set[str] = set()
+        self.peak_challenge_hosts = 0
+
+    @classmethod
+    def from_env(  # type: ignore[override]
+        cls,
+        *,
+        trip_hosts: Optional[int] = None,
+        window_seconds: Optional[float] = None,
+        enabled: Optional[bool] = None,
+        challenge_trip_hosts: Optional[int] = None,
+        challenge_window_seconds: Optional[float] = None,
+        cooldown_seconds: Optional[float] = None,
+        on_trip: Optional[Callable[["StagedIpThrottleBreaker", Dict[str, Any]], None]] = None,
+    ) -> "StagedIpThrottleBreaker":
+        """An explicit argument wins, then the env (the parent's three, plus
+        CRAWL_IP_CHALLENGE_TRIP_HOSTS / CRAWL_IP_CHALLENGE_WINDOW_SECONDS /
+        CRAWL_IP_THROTTLE_COOLDOWN_SECONDS), then the defaults."""
+        if trip_hosts is None:
+            trip_hosts = int(_env_float("CRAWL_IP_THROTTLE_TRIP_HOSTS", TRIP_HOSTS_DEFAULT))
+        if window_seconds is None:
+            window_seconds = _env_float("CRAWL_IP_THROTTLE_WINDOW_SECONDS", WINDOW_SECONDS_DEFAULT)
+        if enabled is None:
+            enabled = _env_enabled("CRAWL_IP_THROTTLE_BREAKER_ENABLED")
+        if challenge_trip_hosts is None:
+            challenge_trip_hosts = int(
+                _env_float("CRAWL_IP_CHALLENGE_TRIP_HOSTS", CHALLENGE_TRIP_HOSTS_DEFAULT)
+            )
+        if challenge_window_seconds is None:
+            challenge_window_seconds = _env_float(
+                "CRAWL_IP_CHALLENGE_WINDOW_SECONDS", CHALLENGE_WINDOW_SECONDS_DEFAULT
+            )
+        if cooldown_seconds is None:
+            cooldown_seconds = _env_float("CRAWL_IP_THROTTLE_COOLDOWN_SECONDS", COOLDOWN_SECONDS_DEFAULT)
+        return cls(
+            trip_hosts=trip_hosts, window_seconds=window_seconds, enabled=enabled,
+            challenge_trip_hosts=challenge_trip_hosts,
+            challenge_window_seconds=challenge_window_seconds,
+            cooldown_seconds=cooldown_seconds, on_trip=on_trip,
+        )
+
+    def cooling(self, now: Optional[float] = None) -> bool:
+        return (_now() if now is None else now) < self.cooling_until
+
+    def _counted(self, recent: Dict[str, float]) -> int:
+        return sum(1 for at in recent.values() if at >= self._counts_since)
+
+    def observe(self, host: str, status_code: int, diag: Mapping[str, str]) -> None:
+        key = str(host or "").strip().lower()
+        if not key:
+            return
+        status = int(status_code)
+        armed = self.enabled
+        # The parent records its window and every diagnostic, and never trips: the trip is ours.
+        self.enabled = False
+        try:
+            super().observe(key, status, diag)
+        finally:
+            self.enabled = armed
+        now = _now()
+        if is_challenge(diag):
+            self.challenge_responses += 1
+            _remember(self.challenge_hosts, key)
+            # A challenge is a throttle answer for `blocks()`, whatever its status (a 403 is not one
+            # to the parent, which has just cleared the host).
+            _remember(self.last_answer_throttled, key)
+            self._recent_challenge[key] = now
+        elif is_ip_throttle_signal(status, diag):
+            self.plain_throttle_responses += 1
+        self._prune(self._recent_challenge, now, self.challenge_window_seconds)
+        self.peak_challenge_hosts = max(self.peak_challenge_hosts, len(self._recent_challenge))
+        # No separate "cooling" test: everything observed during a cool-down is older than
+        # `_counts_since`, which is the cool-down's end, so `_counted` already leaves it out.
+        if not armed or self.tripped:
+            return
+        challenge_hosts = self._counted(self._recent_challenge)
+        throttle_hosts = self._counted(self._recent_all)
+        if self.challenge_trip_hosts > 0 and challenge_hosts >= self.challenge_trip_hosts:
+            self._trip("challenge", now, challenge_hosts, throttle_hosts)
+        elif self.trip_hosts > 0 and throttle_hosts >= self.trip_hosts:
+            self._trip("throttle", now, challenge_hosts, throttle_hosts)
+
+    def _trip(self, reason: str, now: float, challenge_hosts: int, throttle_hosts: int) -> None:
+        self.trips += 1
+        wall = _wall_now()
+        final = self.trips >= self.max_trips
+        if reason == "throttle":
+            self._block_shopify = True
+        event: Dict[str, Any] = {
+            "trip": self.trips,
+            "at": wall,
+            "reason": reason,
+            "challenge_hosts": challenge_hosts,
+            "throttle_hosts": throttle_hosts,
+            "shopify_hosts": self._counted(self._recent_shopify),
+            "action": "stop" if final else "cooldown",
+        }
+        if final:
+            self.tripped = True
+            self.tripped_at = wall
+            self.trip_host_count = max(challenge_hosts, throttle_hosts)
+            self.trip_shopify_host_count = event["shopify_hosts"]
+        else:
+            self.cooling_until = now + self.cooldown_seconds
+            self._counts_since = self.cooling_until
+            event["cooldown_seconds"] = self.cooldown_seconds
+        self.trip_events.append(event)
+        logger.warning(
+            "crawl ip throttle: trip %d/%d (%s): %d distinct hosts answered a Cloudflare challenge "
+            "within %.0fs, %d answered 429/503+Retry-After within %.0fs (first throttle %s); %s",
+            self.trips, self.max_trips, reason, challenge_hosts, self.challenge_window_seconds,
+            throttle_hosts, self.window_seconds, self.first_throttle_at,
+            "ending the run" if final else f"cooling down {self.cooldown_seconds:.0f}s, then half rate",
+        )
+        if self.on_trip is not None:
+            self.on_trip(self, event)
+
+    def blocks(self, host: str) -> bool:
+        """After ANY trip: a host whose latest answer was a throttle or a challenge, and, once the
+        throttle rule has tripped, a known Shopify-served host. Never before the first trip."""
+        if not self.trips:
+            return False
+        key = str(host or "").strip().lower()
+        return key in self.last_answer_throttled or (self._block_shopify and key in self.shopify_hosts)
+
+    def summary(self) -> Dict[str, Any]:
+        out = super().summary()
+        out.update({
+            "ip_throttle_challenge_trip_hosts": self.challenge_trip_hosts,
+            "ip_throttle_challenge_window_seconds": self.challenge_window_seconds,
+            "ip_throttle_cooldown_seconds": self.cooldown_seconds,
+            "ip_throttle_max_trips": self.max_trips,
+            "ip_throttle_challenge_responses": self.challenge_responses,
+            "ip_throttle_plain_429_responses": self.plain_throttle_responses,
+            "ip_throttle_challenge_hosts": len(self.challenge_hosts),
+            "ip_throttle_peak_challenge_hosts_in_window": self.peak_challenge_hosts,
+            "breaker_trips": self.trips,
+            "breaker_trip_events": list(self.trip_events),
+        })
+        return out
 
 
 _ACTIVE: List[IpThrottleBreaker] = []
