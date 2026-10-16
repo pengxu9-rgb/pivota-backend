@@ -69,8 +69,8 @@ Title core (`title_core`) -- ported from TWO normalizers and reconciled:
     sizes, SPF50+/PA+++ and "1+1" packs are consumed, and after a brand's own "+" (Dr.Jart+) went
     with the brand: a "+" glued to a word or a percent, or followed by no word ("Duo+", "B5+",
     "1%+", "Duo + SPF30 40ml", "Duo (+)", "Duo [+]") and the word "plus" are the conflict token
-    `plus`; a "+" BETWEEN two words ("Rice + Probiotics", "B5 + Multi-Purpose Balm") stays in the
-    core as CONJUNCTION_PLACEHOLDER, and exact_title_key keeps every "+" as a word.
+    `plus`; a "+" BETWEEN two words, "&" and "and" are one conjunction word in the core
+    (CONJUNCTION_PLACEHOLDER, "join"), and exact_title_key reads them the same way.
   - Word ORDER: both compare token sets. T0c here keys on the ORDERED core ("Cream to Powder" vs
     "Powder to Cream"), and a format word moved to the conflicts leaves a positional placeholder
     ("fmt") in the core, so Laneige "Cream Skin" and "Skin Cream" stay apart; two or more format
@@ -670,14 +670,17 @@ def conflict_family(token: str) -> str:
 # to the conflict tokens. Not a lexicon token, so it never reads as a conflict on a re-pass.
 FORMAT_PLACEHOLDER = "fmt"
 
-# What a "+" BETWEEN two words leaves in the core (review round 3 of be#2636). The `plus` rule
-# already took every "+" that is glued, bracketed or not followed by a word; what remains joins two
-# words, and it is never silently dropped: "Cicaplast B5 + Multi-Purpose Balm" and "Toleriane +
-# Vitamin C" are not "B5 Multi-Purpose Balm" / "Toleriane Vitamin C". Kept as a positional core
-# word, not a conflict token: it is a conjunction, not an edition. Cost: "Rice + Probiotics" no
-# longer equals "Rice & Probiotics" or "Rice Probiotics" (recall only; it still equals itself).
-# One alphanumeric word that is no lexicon token, so it is stable on a re-pass.
-CONJUNCTION_PLACEHOLDER = "plusjoin"
+# What a CONJUNCTION leaves in the core (review rounds 3-4 of be#2636): a "+" between two words,
+# "&" (folded to "and") and the word "and" between two words are ONE positional core word. The
+# `plus` rule already took every "+" that is glued, bracketed or not followed by a word, so what
+# remains joins two words. One word for all three spellings, so "Rice + Probiotics" = "Rice &
+# Probiotics" = "Rice and Probiotics", "AHA + BHA" = "AHA & BHA", "Vitamin C+E" = "Vitamin C & E".
+# Never silently dropped: "Cicaplast B5 + Multi-Purpose Balm" is not "B5 Multi-Purpose Balm",
+# "Rice + Probiotics" is not "Rice Probiotics" (the safe direction). ACCEPTED COST: "Hair & Body
+# Wash" no longer meets "Hair Body Wash". A brand's own "&" (Dolce & Gabbana, Sand & Sky) is gone
+# with the brand before this runs. Not a conflict token (a conjunction is not an edition); one
+# alphanumeric word that is no lexicon token, so it is stable on a re-pass.
+CONJUNCTION_PLACEHOLDER = "join"
 _CONJUNCTION_PLUS_RE = re.compile(r"(?<=[^\W_]|%)\s*\+\s*(?=[^\W_])")  # "Niacinamide 10% + Zinc" too
 
 
@@ -716,7 +719,8 @@ def conflict_tokens(text: Any) -> FrozenSet[str]:
 # Pure function words. Not skin/face/facial (gateway STOP_TOKENS does): they distinguish lines.
 # NOT "x": NARS "Orgasm X" is a different blush from "Orgasm". Only a LEADING "x" left by brand
 # removal ("COSRX x Olive Young ...", a collab) is dropped -- see _clean.
-_STOP_TOKENS = frozenset({"the", "and", "of", "for", "with", "a", "an", "by"})
+# NOT "and": between two words it is the conjunction word (CONJUNCTION_PLACEHOLDER) -- see _clean.
+_STOP_TOKENS = frozenset({"the", "of", "for", "with", "a", "an", "by"})
 # Promo / retail-descriptor words that never name a product. NOT here: free (fragrance free),
 # double (Etude Double Lasting), plus (a conflict token), refill/set/kit/duo/gift/value/jumbo
 # (conflict tokens), original (a scent/variant name).
@@ -769,11 +773,20 @@ def _tokens(text: str) -> List[str]:
 
 
 def _clean(text: str) -> List[str]:
-    """Core words of a stretch of text whose brand _blank_brand has already removed. A "+" still
-    standing BETWEEN two words leaves CONJUNCTION_PLACEHOLDER at its position."""
+    """Core words of a stretch of text whose brand _blank_brand has already removed. A conjunction
+    -- "+" between two words, "&" (folded to "and"), "and" -- BETWEEN two kept words becomes
+    CONJUNCTION_PLACEHOLDER; at either end, or repeated, it is dropped."""
     text = _PROMO_PHRASES_RE.sub(" ", text)
-    text = _CONJUNCTION_PLUS_RE.sub(f" {CONJUNCTION_PLACEHOLDER} ", text)
-    return [t for t in _tokens(text) if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
+    text = _CONJUNCTION_PLUS_RE.sub(" and ", text)
+    words = [t for t in _tokens(text) if t not in _STOP_TOKENS and t not in _PROMO_TOKENS]
+    out: List[str] = []
+    for i, t in enumerate(words):
+        if t in ("and", CONJUNCTION_PLACEHOLDER):
+            if out and out[-1] != CONJUNCTION_PLACEHOLDER and any(w not in ("and", CONJUNCTION_PLACEHOLDER) for w in words[i + 1:]):
+                out.append(CONJUNCTION_PLACEHOLDER)
+            continue
+        out.append(t)
+    return out
 
 
 @lru_cache(maxsize=65536)
@@ -985,16 +998,23 @@ def _field(listing: Any, name: str) -> Any:
 def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
     """T0b: (canonical_brand, catalog_identity.normalize_title) -- exact title, digits kept.
 
-    Trademark marks (the signs, and a textual "(TM)" / "(R)") are stripped first: normalize_title's
-    NFKD spells "™" as "TM" and glues it onto the word ("Surge™" -> "surgetm"). Every "+" is kept
-    as a word (normalize_title would drop it): "B5 + Multi-Purpose Balm" is not "B5 Multi-Purpose
-    Balm" on the exact-title tier either. normalize_title itself is left alone (it mints
-    content_key); this only changes the matching key."""
+    The title is read through _fold first (trademark signs and a textual "(TM)" / "(R)" gone --
+    normalize_title's NFKD would spell "™" "TM" and glue it on --, accents folded, "&" -> "and").
+    Then no "+" is dropped (normalize_title would drop it):
+      - the brand's own glued "+" goes ("Dr.Jart+ Cicapair" = "Dr. Jart Cicapair");
+      - a "+" between two words reads "and", like "&" ("Rice + Probiotics" = "Rice & Probiotics"
+        = "Rice and Probiotics"; "B5 + Multi-Purpose Balm" != "B5 Multi-Purpose Balm");
+      - any other "+" (an edition: "Duo+", "Duo (+)", "Lotion + 125ml") reads "plus".
+    normalize_title itself is left alone (it mints content_key); this only changes the matching key."""
     b = canonical_brand(brand)
     t = None
     if title is not None:
-        raw = _TEXT_MARKS_RE.sub(" ", _MARKS_RE.sub(" ", str(title)))
-        t = normalize_title(raw.replace("+", f" {CONJUNCTION_PLACEHOLDER} "))
+        text = _fold(title)
+        pattern = _brand_text_re(_brand_forms(brand))
+        if pattern is not None:
+            text = pattern.sub(lambda m: m.group(0).replace("+", " "), text)
+        text = _CONJUNCTION_PLUS_RE.sub(" and ", text).replace("+", " plus ")
+        t = normalize_title(text)
     return (b, t) if b and t else None
 
 
