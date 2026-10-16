@@ -619,9 +619,11 @@ def test_the_strategy_is_the_engines_module_only_strategy_and_never_auto_applied
     from scripts import identity_engine as cli
     from services import identity_barcode_link, identity_brand_link
     from services.identity_reconcile_sweep import AUTO_APPROVE_STRATEGIES
-    from services.identity_resolution import MODULE_ONLY_STRATEGIES
+    from services.identity_resolution import CROSS_MERCHANT_SAME_SIZE, MODULE_ONLY_STRATEGIES
 
+    assert STRATEGY is CROSS_MERCHANT_SAME_SIZE  # imported from the engine, not re-spelled
     assert STRATEGY in MODULE_ONLY_STRATEGIES and STRATEGY in cli.RESERVED_STRATEGIES
+    assert STRATEGY not in cli.HAND_PROPOSABLE_STRATEGIES
     assert STRATEGY not in AUTO_APPROVE_STRATEGIES
     assert STRATEGY not in (identity_brand_link.STRATEGY, identity_barcode_link.STRATEGY)
 

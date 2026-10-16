@@ -72,6 +72,7 @@ from decimal import Decimal
 from typing import Any, Dict, Hashable, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from services.identity_resolution import (
+    CROSS_MERCHANT_SAME_SIZE,
     member_fingerprint,
     merge_content_key_proposal,
     module_proposal_problems,
@@ -90,7 +91,7 @@ from services.product_match_tiers import (
     tier_keys,
 )
 
-STRATEGY = "cross_merchant_same_size"
+STRATEGY = CROSS_MERCHANT_SAME_SIZE  # the engine's name for it (#2637); only this module produces it
 RULE_VERSION = "cmss.v1"
 RETAILER_LISTING_PREFIX = "ext:retailer:"
 #: Rows the crawl door's resolver keeps on their stored content_key once the engine moved them
