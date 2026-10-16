@@ -64,17 +64,17 @@ TITLE_CASES = [
      "snail mucin trial", {"set"}, "", None),
     # ---- Beauty of Joseon / Round Lab / Anua / Torriden -------------------------------------
     ("Beauty of Joseon", "Beauty of Joseon Relief Sun : Rice + Probiotics SPF50+ PA++++ 50ml",
-     "relief sun rice probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
+     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun: Rice + Probiotics (SPF50+ PA++++) 1.69 fl oz",
-     "relief sun rice probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
+     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF 50 PA+++ 50ml",
-     "relief sun rice probiotics", {"spf50", "pa+++"}, "", (50, ML, 1)),
+     "relief sun rice plusjoin probiotics", {"spf50", "pa+++"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF50+ PA++++ 50ml (US Version)",
-     "relief sun rice probiotics", {"spf50+", "pa++++", "market_us"}, "", (50, ML, 1)),
+     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++", "market_us"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Relief Sun Rice + Probiotics SPF50+ PA++++ 50ml Korean Version",
-     "relief sun rice probiotics", {"spf50+", "pa++++", "market_kr"}, "", (50, ML, 1)),
+     "relief sun rice plusjoin probiotics", {"spf50+", "pa++++", "market_kr"}, "", (50, ML, 1)),
     ("Beauty of Joseon", "Glow Serum : Propolis + Niacinamide 30ml",
-     "glow serum propolis niacinamide", set(), "", (30, ML, 1)),
+     "glow serum propolis plusjoin niacinamide", set(), "", (30, ML, 1)),
     ("Round Lab", "ROUND LAB 1025 Dokdo Toner 200ml",
      "1025 dokdo toner", set(), "", (200, ML, 1)),
     ("ROUNDLAB", "Roundlab 1025 Dokdo Toner 6.76 fl oz",
@@ -248,7 +248,7 @@ TITLE_CASES = [
     ("Glow Recipe", "Watermelon Glow Niacinamide Dew Drops Mini 15ml",
      "watermelon glow niacinamide dew drops", {"mini"}, "", (15, ML, 1)),
     ("The Ordinary", "The Ordinary Niacinamide 10% + Zinc 1% 30ml",
-     "niacinamide 10 zinc 1", set(), "", (30, ML, 1)),
+     "niacinamide 10 plusjoin zinc 1", set(), "", (30, ML, 1)),
     ("Augustinus Bader", "The Rich Cream 50ml",
      "fmt fmt", {"rich", "cream", "format_order:rich>cream"}, "", (50, ML, 1)),
     ("Belif", "belif The True Cream Aqua Bomb 50ml",
@@ -656,6 +656,13 @@ MUST_NOT_MERGE = [
     ("L2", ("NARS", "Powermatte Lipstick 4.25g"), ("NARS", "Powermatte Lipstick 4.2g")),
     # LOW-5: two measures in one title -> no primary size, so no key
     ("L5", ("Kiehl's", "Ultra Facial Duo Cream 30 ml + Serum 1.7 fl oz"), ("Kiehl's", "Ultra Facial Duo Cream 30 ml")),
+    # Review round 3: a textual "(C)" is a shade code or a vitamin, not a copyright mark
+    ("R3-C", ("Lancôme", "Teint Idole Ultra Wear 30ml 220 (C)"), ("Lancôme", "Teint Idole Ultra Wear 30ml 220")),
+    ("R3-C", ("Too Faced", "Born This Way Foundation 30ml Natural Beige (C)"), ("Too Faced", "Born This Way Foundation 30ml Natural Beige")),
+    ("R3-C", ("Klairs", "Vitamin (C) Suspension 30ml"), ("Klairs", "Vitamin Suspension 30ml")),
+    # Review round 3: a "+" between two words is kept (as a core word), never dropped
+    ("R3-+", ("La Roche-Posay", "Cicaplast Baume B5 + Multi-Purpose Balm 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 Multi-Purpose Balm 40ml")),
+    ("R3-+", ("La Roche-Posay", "Toleriane + Vitamin C Serum 30ml"), ("La Roche-Posay", "Toleriane Vitamin C Serum 30ml")),
     # Review round 2: a spaced "+" before a size / rating / the end, [+], "%+", and ™ hiding a "+"
     ("R2-M1", ("La Roche-Posay", "Effaclar Duo + SPF30 40ml"), ("La Roche-Posay", "Effaclar Duo SPF30 40ml")),
     ("R2-M1", ("La Roche-Posay", "Cicaplast Baume B5 + 40ml"), ("La Roche-Posay", "Cicaplast Baume B5 40ml")),
@@ -708,6 +715,29 @@ def test_review_round_2_must_merge():
     # The spaced and bracketed spellings of one "+" edition still meet.
     assert _t0c_same(("La Roche-Posay", "Effaclar Duo + 40ml"), ("La Roche-Posay", "Effaclar Duo (+) 40ml"))
     assert _t0c_same(("La Roche-Posay", "Effaclar Duo [+] 40ml"), ("La Roche-Posay", "Effaclar Duo+ 1.35 fl oz"))
+
+
+def test_review_round_3_marks_brand_plus_and_trailing_brand_x():
+    # Textual "(TM)" / "(R)" fold away on T0c and T0b; "(C)" does not (MUST_NOT_MERGE R3-C).
+    for marked in ("Moisture Surge(TM) 50ml", "Moisture Surge (R) 50ml", "Moisture Surge (tm) 50ml"):
+        assert _t0c_same(("Clinique", marked), ("Clinique", "Moisture Surge 50ml")), marked
+        assert _t0b_same(("Clinique", marked), ("Clinique", "Moisture Surge 50ml")), marked
+    # A brand's own "+" at the END of the title goes with the brand; it is not a "+" edition.
+    tail = ("Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment 50ml Dr.Jart+")
+    assert "plus" not in title_core(*tail).conflicts
+    assert _t0c_same(tail, ("Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment 50ml"))
+    # The brand is removed only as whole words: "Fresh" does not eat the "Fresh" of "Freshly".
+    assert title_core("Fresh", "Fresh Freshly Picked Lip Balm").core == "freshly picked lip balm"
+    # "<brand> x" with nothing after it is no collab separator: the "x" stays a word.
+    assert title_core("NARS", "Orgasm Blush NARS X").core == "orgasm blush x"
+    assert not _t0c_same(("NARS", "Orgasm Blush NARS X 4.8g"), ("NARS", "Orgasm Blush 4.8g"))
+    # A "+" between two words is a positional core word: equal spellings still meet.
+    rice = ("Beauty of Joseon", "Relief Sun : Rice + Probiotics 50ml")
+    assert title_core(*rice).core == "relief sun rice plusjoin probiotics"
+    assert _t0c_same(rice, ("Beauty of Joseon", "Relief Sun: Rice + Probiotics 1.69 fl oz"))
+    assert _t0b_same(rice, ("BEAUTY OF JOSEON", "Relief Sun : Rice + Probiotics 50ml"))
+    # ...and a "+" with nothing after it (a gift line removed) leaves no marker.
+    assert title_core("Laneige", "Lip Sleeping Mask Berry 20g + Free Gift").core == "lip sleeping mask berry"
 
 
 def test_x_is_kept_unless_it_follows_a_removed_brand():
