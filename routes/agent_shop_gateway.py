@@ -9309,8 +9309,7 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
     THE SAME RULE as the shared validator be#2637 adds (services/identity_resolution
     .validate_matcher_verdict(kind, evidence, strategy) -> problems), kept here so this PR does not
     depend on that one merging first; tests/test_offers_resolve_group_siblings.py pins both to one
-    case list. ONE deliberate difference: the unit must be ml | g | count here (the shared rule takes
-    any non-empty unit), so this read is never weaker than the shared one. M4 writes the verdict and
+    case list (identical since be#2637 49123b6a1, MATCHER_VERDICT_SIZE_UNITS). M4 writes the verdict and
     #2637 reserves its strategy, so only the matcher can produce it:
       strategy 'cross_merchant_same_size'; same_size exactly true; rule_version non-empty;
       tier T0a | T0b | T0c; size {value: a number > 0, unit: ml | g | count, pack: an integer >= 1};

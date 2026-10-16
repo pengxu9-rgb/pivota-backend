@@ -1107,15 +1107,16 @@ def test_a_proposal_resolves_only_on_a_valid_matcher_verdict(monkeypatch, client
         assert _marked(body) == []
 
 
-# Where the local rule is deliberately STRICTER than the shared one (unit must be ml | g | count).
-LOCAL_ONLY_REJECTS = {"size_unit_oz"}
+# Cases the local rule may reject while the shared one accepts: none since be#2637 49123b6a1 restricts
+# the unit to MATCHER_VERDICT_SIZE_UNITS (ml | g | count), as the local rule does. Kept as the place to
+# record any future deliberate divergence; the local rule must never be the weaker one.
+LOCAL_ONLY_REJECTS: set = set()
 
 
 def test_the_local_validator_agrees_with_the_shared_one():
     """be#2637 adds services/identity_resolution.validate_matcher_verdict(kind, evidence, strategy=...)
     -> [problems]; until both are on main the rule lives here too. When the shared one is importable,
-    both answer every pinned case alike, except where the local rule is documented as stricter -- and
-    the local rule is never the weaker of the two."""
+    both answer every pinned case alike."""
     import routes.agent_shop_gateway as gateway
 
     for case, kind, verdict, valid in VERDICT_CASES:
