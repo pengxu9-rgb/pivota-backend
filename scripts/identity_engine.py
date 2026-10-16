@@ -19,8 +19,12 @@ digest -- one prod one-off at a time, under the CPU gate, outside drains and 05:
   Propose merging every live row on one content_key into another product (status 'proposed'):
     python -m scripts.identity_engine propose-merge --from-ck ck_A --to-ck ck_B --keeper PK --strategy S
     python -m scripts.identity_engine propose-merge ... --write
-  Approve named proposals:
-    python -m scripts.identity_engine approve irp_... irp_... --by "<who>"
+  Approve named proposals (dry run lists them; --execute writes the approval):
+    python -m scripts.identity_engine approve irp_... irp_... --by "<who>" --execute
+
+Strategy names other paths auto-apply are RESERVED here (RESERVED_STRATEGIES): the reconcile sweep
+and the link scripts apply every approved proposal of their strategy with no cap or digest, so a
+proposal written or approved here under one of their names would bypass this CLI's governance.
 """
 from __future__ import annotations
 
@@ -44,6 +48,26 @@ from services.identity_resolution import (  # noqa: E402
     revert_proposal,
     upsert_proposals,
 )
+
+
+#: Strategies some other path approves or applies by strategy name alone: the reconcile sweep's
+#: allowlist and every strategy its proposers write (services.identity_resolution_strategies), and the
+#: link scripts' (identity_brand_link, identity_barcode_link). Pinned against those modules by tests.
+RESERVED_STRATEGIES = frozenset({
+    "same_url_dup", "junk_url", "campaign_clone", "campaign_clone_ambiguous", "seed_first_party_twin",
+    "multi_seller_observation", "tier3_judge", "retailer_listing_brand_prefix", "variant_barcode_match",
+})
+
+PROPOSAL_STRATEGIES_SQL = """
+SELECT proposal_id, strategy, kind, status FROM identity_resolution_proposals
+WHERE proposal_id = ANY($1::text[])
+"""
+
+
+def reserved(strategy: str) -> bool:
+    from services.identity_reconcile_sweep import AUTO_APPROVE_STRATEGIES
+
+    return strategy in RESERVED_STRATEGIES or strategy in AUTO_APPROVE_STRATEGIES
 
 
 def moved_details(details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -107,9 +131,12 @@ async def main(argv: List[str]) -> int:
     ok = sub.add_parser("approve")
     ok.add_argument("proposal_ids", nargs="+")
     ok.add_argument("--by", required=True)
+    ok.add_argument("--execute", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "apply" and args.execute and not args.expect_digest:
         ap.error("--execute needs --expect-digest from a dry run")
+    if args.cmd in ("apply", "propose-merge") and reserved(args.strategy):
+        ap.error(f"strategy {args.strategy!r} is reserved: another path applies it with no cap or digest")
 
     import asyncpg
 
@@ -134,7 +161,14 @@ async def main(argv: List[str]) -> int:
             if args.write:
                 result["written"] = await upsert_proposals(conn, [p])
         else:
-            result = {"approved": await approve_proposals(conn, args.proposal_ids, args.by.strip())}
+            rows = [dict(r) for r in await conn.fetch(PROPOSAL_STRATEGIES_SQL, args.proposal_ids)]
+            bad = sorted(r["proposal_id"] for r in rows if reserved(r["strategy"]))
+            if bad:
+                raise SystemExit(f"refusing to approve proposals of reserved strategies: {bad}")
+            if args.execute:
+                result = {"approved": await approve_proposals(conn, args.proposal_ids, args.by.strip())}
+            else:
+                result = {"dry_run": True, "would_approve": [r for r in rows if r["status"] == "proposed"]}
         print("RESULT " + json.dumps(result, default=str), flush=True)
         return 0
     finally:

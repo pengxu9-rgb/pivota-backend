@@ -41,7 +41,8 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
-_MORE = ("045_product_groups.sql", "179_identity_resolution_d2.sql", "177_intake_identity_events.sql")
+_MORE = ("045_product_groups.sql", "179_identity_resolution_d2.sql", "177_intake_identity_events.sql",
+         "044_external_product_seeds.sql", "085_agent_pdp_view.sql")
 _SCHEMA = f"identity_merge_hardening_test_{os.getpid()}"
 
 SYN = "external_seed"          # the crawl lane's platform
@@ -655,12 +656,20 @@ async def _merge_fixture(db, conn, *, approve=True):
     return p["proposal_id"], loser, rows
 
 
+async def _digested_apply(conn, strategy, run_id):
+    """The governed path: a dry run's digest, then the apply that must match it."""
+    from services.identity_resolution import apply_approved
+
+    plan = await apply_approved(conn, strategies=[strategy], dry_run=True)
+    return await apply_approved(conn, run_id=run_id, strategies=[strategy], expect_digest=plan["digest"])
+
+
 async def test_merge_content_key_moves_every_live_row_and_membership(db, conn):
-    from services.identity_resolution import apply_approved, revert_proposal
+    from services.identity_resolution import revert_proposal
 
     pid, loser, rows = await _merge_fixture(db, conn)
     before = {k: await _state(db, k) for k in [*rows, _listing(12)]}
-    out = await apply_approved(conn, run_id="R_MERGE", strategies=["cross_merchant_same_size"])
+    out = await _digested_apply(conn, "cross_merchant_same_size", "R_MERGE")
     assert out["applied"] == [pid] and out["skipped"] == [] and out["blocked"] == []
     for key in rows:
         assert await _state(db, key) == (B, "pg_brand", True)
@@ -677,11 +686,9 @@ async def test_merge_content_key_moves_every_live_row_and_membership(db, conn):
 
 
 async def test_merge_content_key_cas_refuses_a_changed_member_set(db, conn):
-    from services.identity_resolution import apply_approved
-
     pid, loser, rows = await _merge_fixture(db, conn)
     await _row(db, _listing(13), "merch_obs_late", loser, title="Artemisia Ampoule", group="pg_late")
-    out = await apply_approved(conn, run_id="R_CAS", strategies=["cross_merchant_same_size"])
+    out = await _digested_apply(conn, "cross_merchant_same_size", "R_CAS")
     assert out["applied"] == [] and out["skipped"] == [(pid, "member_set_drift")]
     for key, group in rows.items():
         assert await _state(db, key) == (loser, group, True)
@@ -689,12 +696,10 @@ async def test_merge_content_key_cas_refuses_a_changed_member_set(db, conn):
 
 
 async def test_merge_content_key_cas_refuses_a_moved_membership(db, conn):
-    from services.identity_resolution import apply_approved
-
     pid, loser, rows = await _merge_fixture(db, conn)
     await db.execute("UPDATE product_group_members SET product_group_id = 'pg_elsewhere'"
                      " WHERE platform_product_id = :s", {"s": _spid(_listing(11))})
-    out = await apply_approved(conn, run_id="R_CAS2", strategies=["cross_merchant_same_size"])
+    out = await _digested_apply(conn, "cross_merchant_same_size", "R_CAS2")
     assert out["skipped"] == [(pid, "member_group_drift")]
     assert (await _state(db, _listing(10)))[0] == loser
 
@@ -729,3 +734,218 @@ async def test_the_cli_builds_the_merge_proposal_from_live_state(db, conn):
     p = await build_merge(conn, from_ck=loser, to_ck=B, keeper=KEEPER, strategy="cross_merchant_same_size")
     assert p["proposal_id"] == pid  # the same move dedupes onto the proposal already written
     assert p["evidence"]["from_groups"] == dict(sorted(rows.items()))
+
+
+
+# --- M3 review: governance and phase-1 merge-path gaps ---------------------------------------------
+
+
+async def test_a_merge_never_applies_without_a_digest_whatever_its_strategy_name(db, conn):
+    """A merge approved under a name a strategy-filtered apply uses (the link script's, the sweep's) is
+    refused by that apply: it applies only as part of a digested batch."""
+    from services.identity_resolution import apply_approved
+
+    pid, loser, rows = await _merge_fixture(db, conn)
+    await conn.execute("UPDATE identity_resolution_proposals SET strategy = 'retailer_listing_brand_prefix'")
+    out = await apply_approved(conn, run_id="R_LINK", strategies=["retailer_listing_brand_prefix"])
+    assert out["applied"] == [] and out["skipped"] == [(pid, "merge_content_key_needs_expect_digest")]
+    assert await _status(conn, pid) == "approved"
+    for key, group in rows.items():
+        assert await _state(db, key) == (loser, group, True)
+
+
+async def test_the_sweep_allowlist_approves_only_dedup_proposals(db, conn):
+    from services.identity_reconcile_sweep import APPROVE_ALLOWLIST_SQL, HELD_AUTO_APPROVE_SQL
+
+    pid, _, _ = await _merge_fixture(db, conn, approve=False)
+    await conn.execute("UPDATE identity_resolution_proposals SET strategy = 'same_url_dup'")
+    assert await conn.fetch(APPROVE_ALLOWLIST_SQL, ["same_url_dup", "junk_url"]) == []
+    assert (await conn.fetchrow(HELD_AUTO_APPROVE_SQL, ["same_url_dup", "junk_url"]))["n"] == 0
+    assert await _status(conn, pid) == "proposed"
+
+
+async def test_revert_run_keeps_a_move_it_left_in_place_applied_and_guarded(db, conn, guard_on):
+    """revert_run skips a listing that moved since the run; its proposal stays 'applied', so the guard
+    still protects the listing on the engine's key."""
+    from services.identity_resolution import revert_run
+
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    pids = [r["proposal_id"] for r in await conn.fetch("SELECT proposal_id FROM identity_resolution_proposals")]
+    await db.execute("UPDATE product_group_members SET product_group_id = 'pg_curated' WHERE platform_product_id = :s",
+                     {"s": _spid(listing)})  # re-curated: still on B, in another group
+    back = await revert_run(conn, "R_MOVE")
+    assert back["proposals_reverted"] == [] and back["detached"][0]["why"] == "moved_since_run"
+    assert [await _status(conn, p) for p in pids] == ["applied"]
+    out = await _resolve(listing, url=url)
+    assert (out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (
+        B, "pg_curated", "engine_moved_listing_identity")
+
+
+async def test_revert_run_marks_what_it_moved_back_reverted(db, conn):
+    from services.identity_resolution import apply_approved, revert_run
+
+    pids = await _three_approved(db, conn)
+    await apply_approved(conn, run_id="R_BACK", strategies=[STRATEGY])
+    await db.execute("UPDATE product_group_members SET product_group_id = 'pg_curated' WHERE platform_product_id = :s",
+                     {"s": _spid(_listing(8))})
+    back = await revert_run(conn, "R_BACK")
+    assert sorted(back["proposals_reverted"]) == sorted([pids[0], pids[2]])
+    assert [await _status(conn, p) for p in pids] == ["reverted", "applied", "reverted"]
+
+
+async def _merged(db, conn):
+    pid, loser, rows = await _merge_fixture(db, conn)
+    out = await _digested_apply(conn, "cross_merchant_same_size", "R_MERGED")
+    assert out["applied"] == [pid]
+    # Later: a new listing of the loser's wording mints on the loser key again.
+    await _row(db, _listing(23), "merch_obs_new", loser, title="Artemisia Ampoule", group="pg_new")
+    return pid, loser, rows
+
+
+async def test_a_merge_moved_listing_is_guarded_in_the_resolver_and_the_writer(db, conn, guard_on):
+    from services.catalog_enrichment_agent import apply as writer
+
+    _, loser, rows = await _merged(db, conn)
+    moved = _listing(10)
+    out = await _resolve(moved, title="Artemisia Ampoule")
+    assert (out["content_key"], out["product_group_id"], out["evidence"]["matcher"]) == (
+        B, "pg_brand", "engine_moved_listing_identity")
+    plan = {"pdps": [{"product_key": k, "content_key": loser} for k in rows]}
+    kept, counts = await writer._keep_grouped_content_keys(plan, db)
+    assert counts == {"pdp_content_key_kept_for_grouped_row": 3}
+    assert {p["content_key"] for p in kept["pdps"]} == {B}
+
+
+async def test_the_keeper_and_a_never_moved_sibling_on_the_engine_key_still_re_key(db, conn, guard_on):
+    """Only the listings the engine MOVED are guarded: the keeper (the product they joined) and a sibling
+    that reached the key by itself re-key on a title fix exactly as today."""
+    from services.catalog_enrichment_agent import apply as writer
+    from services.intake_identity import DOOR_CATALOG_ENRICHMENT, resolve_or_attach_content_identity
+
+    await _merged(db, conn)
+    sibling = _listing(24)
+    await _row(db, sibling, RET_M, B, title="Missha Artemisia Calming Ampule", group="pg_brand")
+    fixed = "Artemisia Calming Ampoule Fixed"
+    await _row(db, _listing(25), "merch_obs_other", _ck("Missha", fixed), title=fixed, group="pg_fixed")
+    await _row(db, _listing(26), "merch_obs_other2", A, title=LISTING_TITLE, group="pg_a")
+    keeper_out = await resolve_or_attach_content_identity(
+        brand="Missha", title=fixed, source_product_id=_spid(KEEPER), door=DOOR_CATALOG_ENRICHMENT,
+        merchant_ctx={"merchant_id": BRAND_M, "platform": SYN, "product_key": KEEPER,
+                      "strict_group_resolution": True})
+    assert (keeper_out["content_key"], keeper_out["evidence"]["matcher"]) == (_ck("Missha", fixed), "content_key")
+    sib_out = await _resolve(sibling)
+    assert (sib_out["content_key"], sib_out["evidence"]["matcher"]) == (A, "content_key")
+    plan = {"pdps": [{"product_key": KEEPER, "content_key": "ck_keeper_planned"},
+                     {"product_key": sibling, "content_key": "ck_sibling_planned"}]}
+    kept, counts = await writer._keep_grouped_content_keys(plan, db)
+    assert counts == {} and [p["content_key"] for p in kept["pdps"]] == ["ck_keeper_planned", "ck_sibling_planned"]
+
+
+async def test_a_new_gtin_conflict_gets_a_new_task(db, conn, guard_on):
+    listing, url = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    other = await _gtin_family(db)
+    await _resolve(listing, url=url, gtin=GTIN)
+    await _resolve(listing, url=url, gtin=GTIN)
+    assert len(await _tasks(db, "grouped_listing_gtin_conflict")) == 1
+    await db.execute("UPDATE catalog_products SET content_key = 'ck_another_family' WHERE product_key = :k",
+                     {"k": other})  # the GTIN now points at another family: a new conflict
+    await _resolve(listing, url=url, gtin=GTIN)
+    tasks = await _tasks(db, "grouped_listing_gtin_conflict")
+    assert sorted(t["checklist"]["evidence"]["gtin_content_key"] for t in tasks) == sorted(
+        [_ck("Missha", OTHER_TITLE), "ck_another_family"])
+
+
+async def test_the_writer_keeps_stored_keys_when_its_lookup_fails(db, conn, guard_on):
+    """The guard's own read failing (here: no proposals table) never fails the store's apply: every
+    stored row keeps its key, new rows are written as planned, and it is counted."""
+    from services.catalog_enrichment_agent import apply as writer
+
+    listing, _ = await _moved_listing_then_a_row_on_its_old_key(db, conn)
+    await conn.execute("DROP TABLE identity_resolution_proposals CASCADE")
+    plan = {"pdps": [{"product_key": listing, "content_key": A},
+                     {"product_key": _listing(27), "content_key": "ck_brand_new"}]}
+    kept, counts = await writer._keep_grouped_content_keys(plan, db)
+    assert counts == {"engine_move_lookup_failed": 1, "pdp_content_key_kept_unverified": 1}
+    assert [p["content_key"] for p in kept["pdps"]] == [B, "ck_brand_new"]
+
+
+async def test_the_blocked_set_and_the_proposals_themselves_are_in_the_digest(db, conn):
+    from services.identity_resolution import DigestMismatch, apply_approved
+
+    pids = await _three_approved(db, conn)
+    first = await apply_approved(conn, strategies=[STRATEGY], dry_run=True)
+    orphan = _listing(28)
+    await _row(db, orphan, "merch_obs_orphan", "ck_orphan", title="Orphan")
+    await _attach_proposal(conn, orphan, from_ck="ck_orphan", from_group=None)
+    second = await apply_approved(conn, strategies=[STRATEGY], dry_run=True)
+    assert second["planned"] == first["planned"] == pids and len(second["blocked"]) == 1
+    assert second["digest"] != first["digest"]
+    with pytest.raises(DigestMismatch):
+        await apply_approved(conn, strategies=[STRATEGY], expect_digest=first["digest"])
+    # Same ids, same before-state, but a proposal's evidence changed: a different apply.
+    await conn.execute("UPDATE identity_resolution_proposals SET evidence = evidence || '{\"note\": 1}'::jsonb"
+                       " WHERE proposal_id = $1", pids[0])
+    third = await apply_approved(conn, strategies=[STRATEGY], dry_run=True)
+    assert third["planned"] == pids and third["digest"] != second["digest"]
+    assert await _events(conn) == []
+
+
+async def _dedup_pair(db, conn):
+    """Two same-merchant rows on one key, each backed by an active seed, and an approved suppress_dup."""
+    from services.identity_resolution import approve_proposals, new_proposal, upsert_proposals
+
+    for key in ("ext:dup-keeper::1", "ext:dup-loser::2"):
+        await _row(db, key, BRAND_M, "ck_dup", title="Dup", group=f"pg_{key[-1]}")
+        await db.execute("INSERT INTO external_product_seeds (id, market, destination_url, attached_product_key)"
+                         " VALUES (:i, 'US', :u, :k)", {"i": f"eps_{key[-1]}", "u": f"https://x.example/{key[-1]}",
+                                                         "k": key})
+        await db.execute("UPDATE catalog_products SET source_ref = :i WHERE product_key = :k",
+                         {"i": f"eps_{key[-1]}", "k": key})
+    p = new_proposal(kind="suppress_dup", strategy="m3_test_dedup",
+                     subject_product_keys=["ext:dup-keeper::1", "ext:dup-loser::2"],
+                     keeper_product_key="ext:dup-keeper::1", merchant_id=BRAND_M, content_key="ck_dup")
+    await upsert_proposals(conn, [p])
+    await approve_proposals(conn, [p["proposal_id"]], "test")
+    return p["proposal_id"]
+
+
+async def _seed_status(db, sid):
+    return await db.fetch_val("SELECT status FROM external_product_seeds WHERE id = :i", {"i": sid})
+
+
+async def test_revert_proposal_restores_a_suppress_dup_and_its_seed(db, conn):
+    from services.identity_resolution import apply_approved, revert_proposal
+
+    pid = await _dedup_pair(db, conn)
+    out = await apply_approved(conn, run_id="R_DUP", strategies=["m3_test_dedup"])
+    assert out["applied"] == [pid]
+    assert (await _state(db, "ext:dup-loser::2"))[2] is False and await _seed_status(db, "eps_2") == "inactive"
+    back = await revert_proposal(conn, pid, dry_run=False)
+    assert back["restored_rows"] == ["ext:dup-loser::2"] and back["reactivated_seeds"] == ["eps_2"]
+    assert (await _state(db, "ext:dup-loser::2"))[2] is True and await _seed_status(db, "eps_2") == "active"
+    assert await _status(conn, pid) == "reverted"
+
+
+async def test_revert_proposal_refuses_a_suppress_dup_whose_tombstone_moved(db, conn):
+    from services.identity_resolution import apply_approved, revert_proposal
+
+    pid = await _dedup_pair(db, conn)
+    await apply_approved(conn, run_id="R_DUP2", strategies=["m3_test_dedup"])
+    await db.execute("UPDATE catalog_products SET suppression_reason = NULL, suppression_metadata = NULL"
+                     " WHERE product_key = 'ext:dup-loser::2'")  # someone revived it by hand
+    back = await revert_proposal(conn, pid, dry_run=False)
+    assert back["refused"] == "moved_since_apply"
+    assert await _seed_status(db, "eps_2") == "inactive" and await _status(conn, pid) == "applied"
+
+
+async def test_revert_proposal_refuses_a_merge_whose_member_moved(db, conn):
+    from services.identity_resolution import revert_proposal
+
+    pid, loser, rows = await _merge_fixture(db, conn)
+    await _digested_apply(conn, "cross_merchant_same_size", "R_MREV")
+    await db.execute("UPDATE product_group_members SET product_group_id = 'pg_elsewhere'"
+                     " WHERE platform_product_id = :s", {"s": _spid(_listing(11))})
+    events = await _events(conn)
+    back = await revert_proposal(conn, pid, dry_run=False)
+    assert back["refused"] == "moved_since_apply"
+    assert await _state(db, _listing(10)) == (B, "pg_brand", True) and await _events(conn) == events

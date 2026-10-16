@@ -316,10 +316,13 @@ SELECT proposal_id, detail FROM identity_resolution_events
 WHERE run_id = $1 AND action = 'applied'
 """
 
+# Only what the revert actually undid: a membership move it left in place (moved since the run) stays
+# 'applied', so the engine-move guard keeps protecting that listing.
 MARK_REVERTED_SQL = """
 UPDATE identity_resolution_proposals
 SET status = 'reverted'
 WHERE run_id = $1 AND status = 'applied'
+  AND (kind <> ALL($2::text[]) OR proposal_id = ANY($3::text[]))
 RETURNING proposal_id
 """
 
@@ -593,10 +596,19 @@ def preflight_block(p: Dict[str, Any], state: Dict[str, Any]) -> Optional[Tuple[
     return None
 
 
-def batch_digest(planned: Sequence[Tuple[str, str]], blocked: Sequence[Tuple[str, str, str]]) -> str:
-    """Digest over the exact ordered apply set (proposal id + before-state fingerprint) and the
+def proposal_fingerprint(p: Dict[str, Any]) -> str:
+    """What the proposal itself says it will do: kind, keeper, target, subjects and evidence."""
+    raw = json.dumps({k: p.get(k) for k in ("kind", "strategy", "keeper_product_key", "content_key",
+                                             "subject_product_keys", "evidence")},
+                     sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def batch_digest(planned: Sequence[Tuple[str, str, str]], blocked: Sequence[Tuple[str, str, str]]) -> str:
+    """Digest over the exact ordered apply set -- each proposal's id, what it says it will do
+    (proposal_fingerprint: kind, keeper, evidence) and its before-state fingerprint -- and the
     proposals the run will mark blocked: what a dry run showed is what --expect-digest lets apply."""
-    lines = [f"apply\t{pid}\t{fp}" for pid, fp in planned]
+    lines = [f"apply\t{pid}\t{pfp}\t{fp}" for pid, pfp, fp in planned]
     lines += [f"block\t{pid}\t{status}\t{reason}" for pid, status, reason in blocked]
     return "ird_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
 
@@ -706,7 +718,7 @@ async def _plan_apply(conn, strategies: Optional[Sequence[str]], max_proposals: 
         eligible.append((p, state_fingerprint(state)))
     batch = eligible if max_proposals is None else eligible[:max_proposals]
     deferred = [] if max_proposals is None else [p["proposal_id"] for p, _ in eligible[max_proposals:]]
-    planned = [(p["proposal_id"], fp) for p, fp in batch]
+    planned = [(p["proposal_id"], proposal_fingerprint(p), fp) for p, fp in batch]
     return {"batch": batch, "blocked": blocked, "deferred": deferred,
             "digest": batch_digest(planned, blocked)}
 
@@ -759,6 +771,12 @@ async def apply_approved(
             await conn.execute(BLOCK_PROPOSAL_SQL, pid, status, json.dumps(info))
             await conn.execute(INSERT_EVENT_SQL, pid, "blocked", run_id, json.dumps(info))
         for p, fp in plan["batch"]:
+            if p["kind"] == "merge_content_key" and expect_digest is None:
+                # A merge re-keys every live row on a content_key: it applies only as part of a batch a
+                # dry run digested (scripts/identity_engine.py), never through a strategy-filtered apply
+                # such as the reconcile sweep's or a link script's. Left approved.
+                skipped.append((p["proposal_id"], "merge_content_key_needs_expect_digest"))
+                continue
             if p["kind"] == "suppress_dup":
                 detail = await _apply_suppress_dup(conn, p, run_id)
             elif p["kind"] == "attach_membership":
@@ -839,12 +857,15 @@ async def _revert_merge(conn, detail: Dict[str, Any], label: str) -> None:
 async def revert_run(conn, run_id: str) -> Dict[str, Any]:
     """The unmerge path: restore every row this run suppressed, reactivate
     exactly the seeds it deactivated (from the apply events), and mark the
-    proposals reverted. Append-only events record the revert."""
+    proposals reverted -- except a membership move left in place because its
+    listing moved since the run, which stays 'applied' (and so stays guarded).
+    Append-only events record the revert."""
     async with conn.transaction():
         rows = await conn.fetch(REVERT_ROWS_SQL, run_id)
         restored = [r["product_key"] for r in rows]
         seed_ids: List[str] = []
         detached: List[Dict[str, Any]] = []
+        moved_back: List[str] = []
         for ev in await conn.fetch(RUN_EVENTS_SQL, run_id):
             detail = ev["detail"]
             if isinstance(detail, str):
@@ -863,13 +884,16 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
                 else:
                     await _revert_merge(conn, detail, run_id)
                 detached.append({**detail, "reverted": True})
+                if ev["proposal_id"]:
+                    moved_back.append(ev["proposal_id"])
         reactivated = []
         if seed_ids:
             reactivated = [
                 str(r["id"]) for r in await conn.fetch(REACTIVATE_SEEDS_SQL, seed_ids)
             ]
         reverted = [
-            r["proposal_id"] for r in await conn.fetch(MARK_REVERTED_SQL, run_id)
+            r["proposal_id"] for r in await conn.fetch(
+                MARK_REVERTED_SQL, run_id, list(MEMBERSHIP_KINDS), moved_back)
         ]
         await conn.execute(
             INSERT_EVENT_SQL, None, "reverted", run_id,

@@ -2488,6 +2488,12 @@ _GROUPED_STORED_CONTENT_KEY_SQL = """
                 """
 
 
+_STORED_CONTENT_KEY_SQL = """
+                SELECT product_key, content_key FROM catalog_products
+                WHERE product_key = ANY(:keys) AND content_key IS NOT NULL
+                """
+
+
 async def _keep_grouped_content_keys(
     plan: Dict[str, Any], database: Any,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -2510,7 +2516,21 @@ async def _keep_grouped_content_keys(
     keys = sorted({str(p.get("product_key")) for p in pdps if p.get("product_key")})
     if not keys:
         return plan, counts
-    rows = await database.fetch_all(_GROUPED_STORED_CONTENT_KEY_SQL, {"keys": keys})
+    count_key = "pdp_content_key_kept_for_grouped_row"
+    try:
+        rows = await database.fetch_all(_GROUPED_STORED_CONTENT_KEY_SQL, {"keys": keys})
+    except Exception as exc:  # noqa: BLE001 -- never fail the store's apply on the guard's own read
+        # Unsure which rows the engine moved: keep EVERY stored row's key (fail closed per row, as the
+        # resolver's engine_moved_listing_kept_unverified), write new rows as planned, and count it.
+        logger.warning("apply_ingest_plan: engine-move lookup failed, keeping stored content_keys: %s",
+                       str(exc)[:200])
+        count_key = "pdp_content_key_kept_unverified"
+        counts["engine_move_lookup_failed"] = 1
+        try:
+            rows = await database.fetch_all(_STORED_CONTENT_KEY_SQL, {"keys": keys})
+        except Exception as exc2:  # noqa: BLE001 -- nothing readable: the plan as is (origin/main's write)
+            logger.warning("apply_ingest_plan: stored content_key read failed too: %s", str(exc2)[:200])
+            return plan, counts
     stored = {str(dict(r).get("product_key") or ""): dict(r).get("content_key") for r in rows or []}
     kept = 0
     out = []
@@ -2524,7 +2544,7 @@ async def _keep_grouped_content_keys(
         return plan, counts
     plan = dict(plan)
     plan["pdps"] = out
-    counts["pdp_content_key_kept_for_grouped_row"] = kept
+    counts[count_key] = kept
     return plan, counts
 
 

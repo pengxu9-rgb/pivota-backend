@@ -847,10 +847,12 @@ REVIEW_TASK_UPSERT_SQL = """
         """
 
 
-def review_task_id(matcher: str, product_key: Optional[str]) -> str:
+def review_task_id(matcher: str, product_key: Optional[str], conflict_key: Optional[str] = None) -> str:
+    """One task per (matcher, listing, conflict): a re-crawl of the same conflict never stacks a second
+    task, and a NEW conflict (another family) gets its own even after the first was closed."""
     import hashlib
 
-    raw = f"{matcher}|{product_key or ''}"
+    raw = f"{matcher}|{product_key or ''}|{conflict_key or ''}"
     return "pdptask_idm_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -860,15 +862,17 @@ async def _flag_review_upsert(
     content_key: Optional[str],
     matcher: str,
     detail: Dict[str, Any],
+    conflict_key: Optional[str] = None,
 ) -> None:
-    """_flag_review's task (same rail and checklist shape), keyed per (matcher, listing): one task per
-    listing however often or concurrently it is re-crawled. Best-effort, never raises."""
+    """_flag_review's task (same rail and checklist shape), keyed per (matcher, listing, conflict): one
+    task per conflict however often or concurrently the listing is re-crawled. Best-effort, never
+    raises."""
     from db.database import database
 
     product_key = merchant_ctx.get("product_key")
     try:
         await database.execute(REVIEW_TASK_UPSERT_SQL, {
-            "id": review_task_id(matcher, product_key),
+            "id": review_task_id(matcher, product_key, conflict_key),
             "pdp_id": str(product_key or "")[:96],
             "checklist": json.dumps({
                 "source": "intake_identity",
@@ -1056,7 +1060,7 @@ async def resolve_or_attach_content_identity(
                         "gtin_content_key": gtin_ck,
                         "kept_product_group_id": kept["group"],
                     })
-                    await _flag_review_upsert(door, ctx, ck, MATCHER_GTIN_CONFLICT, detail)
+                    await _flag_review_upsert(door, ctx, ck, MATCHER_GTIN_CONFLICT, detail, conflict_key=gtin_ck)
                 if kept["unverified"]:
                     matcher = MATCHER_ENGINE_MOVED_UNVERIFIED
                     detail["unverified"] = kept["unverified"]
