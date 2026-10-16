@@ -8,6 +8,8 @@ they are, because the nightly refresh's reconcile cannot fold two stored entries
 
   (ii)  [link, barcode] -- ONE variant stored twice: its JSON-LD `@id` link ("/products/<h>?variant=<N>#offer")
         and an entry keyed by its 13-digit GTIN (or a 12/14/8-digit barcode), at the same price/currency/stock.
+        A numeric key is a barcode ONLY with a GS1 length AND a valid check digit; any other numeric key of 8+
+        digits may be another variant's id (Shopify ids fail the check digit) and is HELD (`key_may_be_variant_id`).
   (iii) plan list -- subscription selling plans stored as variants: positional `offer_1..offer_N` entries titled
         with plan vocabulary ("One-Time Purchase", "1 month", "Subscribe & Save", "every 6 weeks"...)
         (murad eps_0f70f7177cecd95416d98b53).
@@ -27,29 +29,37 @@ CONSERVATIVE: WHEN IN DOUBT THE SEED IS HELD (untouched, listed with its reason)
      * `link_mark`  -- the non-link entry carries `offer_shopify_variant_id` / a `url` naming the same ?variant=N;
      * `snapshot`   -- exactly one `snapshot.variants` entry carries that SKU/barcode and it names variant N;
      * `link_field` -- the link entry itself already carries that SKU/barcode as a field;
-     * `sole_pair`  -- the list is exactly [one link, one non-link] with identical price, currency and stock and
-                       compatible titles, AND the snapshot holds exactly one variant and it is N
-                       (`snapshot_names_one_variant`: the stored page evidence of a single variant).
-     The kept entry is the LINK entry (its `variant_id` and every other field kept); the folded entry's key is
-     added to it as `sku` (iv) or `barcode` (ii), with the folded entry's own `sku`/`barcode` fields when the kept
-     one lacks them, and its title only when the kept one has none. Never folded: differing SKUs, differing
+     * `sole_pair`  -- the list is exactly [one link, one non-link] with identical price, currency and stock, the
+                       snapshot holds exactly one variant and it is N (`snapshot_names_one_variant`), AND the
+                       entry passes the read-time rule `entry_is_the_sole_variant_read_again` (no other
+                       merchant-issued-shaped id: a GTIN never folds this way), its title (if any) is the product's
+                       name or the kept entry's, and it states no size the kept entry does not. The snapshot is
+                       EVIDENCE only, never copied (Peng, 2026-10-16). A sole pair drops the duplicate and writes
+                       NOTHING of it onto the kept entry, and is written only with `--include-sole-pair`.
+     The kept entry is the LINK entry (its `variant_id` and every other field kept); on positive evidence the folded
+     entry's key is added to it as `sku` (iv) or `barcode` (ii), with the folded entry's own `sku`/`barcode` fields
+     when the kept one lacks them, and its title only when the kept one has none. Never folded: differing SKUs, differing
      barcodes, differing or unknown prices, differing or missing currencies, differing stock, differing titles
      that are not the product's name, two ?variant= ids, a key that is itself another variant's id. Every
      non-link entry of a seed must be tied, or the whole seed is held (a partial repair still serves a duplicate).
   (iii) drop the plan entries (#2634's rules: by name only for positional entries, never a lone entry, never one
      named as the product, never every entry). Exactly one entry left -> kept, retitled to the product's name when
      its title is a purchase mode ("One-Time Purchase"). None left, several left, or a plan-shaped list whose rules
-     drop nothing (no one-time anchor) -> HELD and listed in the `reread` line for a fresh page re-read.
+     drop nothing (no one-time anchor) -> HELD and listed in the `reread` line for a fresh page re-read. As in #2634,
+     prepaid subscription entries ("3 Month Subscription" beside "Single Box") and day cadences ("30 days" beside
+     "One-Time Purchase") are dropped as plans; the dry run's `notes` line says so.
 
 WHAT IT WRITES. Only `seed_data.variants`, rebuilt IN SQL from the stored elements (kept elements by ordinal, plus
 a string patch on the kept one), so no price/stock bytes are round-tripped through Python. Never
 `snapshot.variants`, never a list where there was none, never `extracted_at`, never `updated_at`: the next refresh
 decides freshness.
 
-BOUND TO THE REVIEWED DRY RUN. The dry run reads every candidate (active, `seed_data.variants` an array of 2+) in
-ONE read-only transaction (statement_timeout 60s) and prints JSON lines: counts per kind, held by reason,
-confirmation counts for shapes needing no action, per-market / per-host top 20, the digest (sha256 over the
-ordered (seed_id, before_hash, after_hash) set), and 10 before/after samples per kind. `--apply` re-runs that dry
+BOUND TO THE REVIEWED DRY RUN. The dry run pages every active seed in ONE read-only transaction (statement_timeout
+60s), detoasting each seed_data once, and plans the candidates (`seed_data.variants` an array of 2+). It prints JSON
+lines: counts per kind, held by reason, confirmation counts for shapes needing no action (and active seeds with a
+snapshot quality summary but no root one), the `sole_pair` lane on its own line, (iii) seeds whose seed-level price
+differs from the kept entry's, `notes`, per-market / per-host top 20, the digest (sha256 over the ordered
+(seed_id, before_hash, after_hash) set), the `reread` ids, and 10 before/after samples per kind. `--apply` re-runs that dry
 run in the same process and refuses unless its digest equals `--expect-digest`; `--max-seeds` caps the plan BEFORE
 the digest (so run the dry run with the same caps you apply with).
 
@@ -62,8 +72,9 @@ AUDIT AND REVERT (the reversible seed-repair pattern of scripts/backfill_seed_va
 manifest goes to identity_resolution_events before any write. Each seed's write and its revert record (its exact
 before-variants, copied in SQL, plus its post-write fingerprint) are ONE statement, so no seed is written without
 its record. One writer_audit_log row per batch carries `dry_run_report_hash` = the digest. `--revert <run_id>`
-restores the before-variants of every seed still at its post-write fingerprint; a seed rewritten since (the
-nightly refresh) is left as it is and reported `changed_since_apply`. Refused while a LATER unreverted run wrote
+restores the before-variants of every seed still at its post-write fingerprint AND its apply-time `updated_at` and
+`snapshot.extracted_at`; a seed rewritten or re-stamped since (the nightly refresh) is left as it is and reported
+`changed_since_apply`, and one an interrupted earlier revert already restored is reported `already_reverted`. Refused while a LATER unreverted run wrote
 any of the same seeds.
 
   Dry run (default; READ ONLY; writes nothing):
@@ -73,7 +84,8 @@ any of the same seeds.
   Revert a run:
     ... scripts/ops/repair_seed_main_lists.py --revert mainlist_<hex>
 
-Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh. Never run it from a laptop against production.
+Needs DATABASE_URL: run it through scripts/ops/run_oneoff_job.sh on the pinned merge image (IMAGE=...), the same
+image for the dry run and the apply. Never run it from a laptop against production.
 """
 from __future__ import annotations
 
@@ -89,10 +101,13 @@ from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlparse, urlsplit
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# `python -c` / an exec has no __file__: fall back to the repo root as the working directory.
+_HERE = globals().get("__file__") or os.path.join(os.getcwd(), "scripts", "ops", "repair_seed_main_lists.py")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_HERE)))))
 
 from services.handover_variant_identity import (  # noqa: E402
     canonical_variant_id,
+    entry_is_the_sole_variant_read_again,
     namers_agree_on_price,
     snapshot_names_one_variant,
     stored_entry_claimed_variant_ids,
@@ -170,8 +185,22 @@ def canonical_hash(value: Any) -> str:
                                      default=str).encode()).hexdigest()
 
 
+def gs1_valid(digits: str) -> bool:
+    """A GTIN-8/12/13/14: a GS1 length AND a valid mod-10 check digit (weights 3,1,... from the right)."""
+    if not (digits.isascii() and digits.isdigit()) or len(digits) not in _BARCODE_LENGTHS:
+        return False
+    total = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(digits[:-1])))
+    return (10 - total % 10) % 10 == int(digits[-1])
+
+
 def key_class(entry: Mapping[str, Any]) -> str:
-    """What an entry's `variant_id` is: link | positional | barcode | digits | sku | gid | link_other | empty."""
+    """What an entry's `variant_id` is: link | positional | barcode | numeric_id | digits | sku | gid | link_other |
+    empty.
+
+    A numeric key is a `barcode` ONLY when it is a valid GTIN (GS1 length and check digit). Any other numeric key
+    of 8+ digits is `numeric_id`: the shape `services.variant_identity` calls merchant-issued (a Shopify variant id
+    is 11-14 digits and fails the check digit 9 times in 10), so it may be ANOTHER variant's id and is never folded
+    (review of #2638, H1). A shorter numeric key ("114807") is a merchant SKU (`digits`)."""
     vid = _text(entry.get("variant_id"))
     if not vid:
         return "empty"
@@ -184,7 +213,9 @@ def key_class(entry: Mapping[str, Any]) -> str:
     if vid.startswith("gid://"):
         return "gid"
     if vid.isascii() and vid.isdigit():
-        return "barcode" if len(vid) in _BARCODE_LENGTHS else "digits"
+        if gs1_valid(vid):
+            return "barcode"
+        return "numeric_id" if len(vid) >= 8 else "digits"
     return "sku"
 
 
@@ -210,6 +241,23 @@ def _titles_compatible(a: Any, b: Any, names: Sequence[str]) -> bool:
     return not na or not nb or na == nb or _is_product_name(a, names) or _is_product_name(b, names)
 
 
+_SIZE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*-?\s*(fl\.?\s*oz|ml|cl|l|kg|mg|g|oz|lbs?|ct|count|pcs?|pack|caps(?:ules)?|tabs?)(?![a-z])",
+    re.IGNORECASE)
+
+
+def size_tokens(*texts: Any) -> Set[str]:
+    """The sizes a title / SKU states ("50 mL", "SIZE-15ML", "1.7 fl. oz"), normalised ("50ml", "15ml", "1.7floz")."""
+    out: Set[str] = set()
+    for t in texts:
+        for amount, unit in _SIZE.findall(_text(t)):
+            amount = amount.replace(",", ".")
+            if "." in amount:
+                amount = amount.rstrip("0").rstrip(".")
+            out.add(amount + re.sub(r"[\s.]", "", unit.lower()))
+    return out
+
+
 def _price(entry: Mapping[str, Any]) -> Optional[float]:
     for key in ("price_amount", "price"):  # handover_variant_identity._entry_price's precedence
         value = entry.get(key)
@@ -231,15 +279,22 @@ def _stock(entry: Mapping[str, Any]) -> tuple:
         _text(entry.get("inventory_quantity")),)
 
 
-def _code(value: Any) -> str:
-    """One spelling of a SKU or barcode for comparison: a barcode without its leading zeros (GTIN-13 vs its
-    GTIN-14 padding), a SKU case-folded (#2634's `_entries_name_different_variants` norm)."""
+def _code(value: Any, *, barcode: bool = False) -> str:
+    """One spelling of a code for comparison: a SKU case-folded (#2634's norm), a BARCODE without its leading zeros
+    (GTIN-13 vs its GTIN-14 padding). A SKU keeps its zeros: "0123" is not "123" (review of #2638, L2)."""
     t = _text(value)
-    return (t.lstrip("0") or "0") if t.isascii() and t.isdigit() else t.casefold()
+    if barcode and t.isascii() and t.isdigit():
+        return t.lstrip("0") or "0"
+    return t.casefold()
 
 
 def _codes(entry: Mapping[str, Any], fields: Sequence[str]) -> Set[str]:
-    return {_code(v) for v in (entry.get(k) for k in fields) if _text(v)}
+    return {_code(entry.get(k), barcode=k in _BARCODE_FIELDS) for k in fields if _text(entry.get(k))}
+
+
+def _key_codes(key: str, cls: str) -> Set[str]:
+    """The spellings a stored key may meet a code field in: as a SKU, and as a barcode when it is one."""
+    return {_code(key)} | ({_code(key, barcode=True)} if cls == "barcode" else set())
 
 
 def _structural_plan(entry: Mapping[str, Any]) -> bool:
@@ -337,7 +392,7 @@ def _snapshot_claims(s: Mapping[str, Any]) -> Set[str]:
     return {x for x in out if x.isdigit()}
 
 
-def _tie_of(x: Dict[str, Any], key: str, links: Dict[int, str], entries: List[Dict[str, Any]],
+def _tie_of(x: Dict[str, Any], key: str, cls: str, links: Dict[int, str], entries: List[Dict[str, Any]],
             snapshot: List[Dict[str, Any]]) -> Tuple[Optional[str], List[str], Optional[str]]:
     """(variant N the non-link entry is positively tied to, evidence, hold reason)."""
     ns = set(links.values())
@@ -371,7 +426,7 @@ def _tie_of(x: Dict[str, Any], key: str, links: Dict[int, str], entries: List[Di
         return None, evidence, "key_is_a_variant_id"
 
     # (c) a snapshot entry carrying this code names the variant
-    codes = {_code(key)} | _codes(x, _SKU_FIELDS + _BARCODE_FIELDS)
+    codes = _key_codes(key, cls) | _codes(x, _SKU_FIELDS + _BARCODE_FIELDS)
     matches = [s for s in snapshot if codes & _codes(s, _SKU_FIELDS + _BARCODE_FIELDS)]
     if matches:
         claimed = set().union(*(_snapshot_claims(s) for s in matches))
@@ -385,7 +440,7 @@ def _tie_of(x: Dict[str, Any], key: str, links: Dict[int, str], entries: List[Di
             return None, evidence, why
 
     # (d) a link entry already carries this code as a field
-    carriers = {n for i, n in links.items() if _code(key) in _codes(entries[i], _SKU_FIELDS + _BARCODE_FIELDS)}
+    carriers = {n for i, n in links.items() if _key_codes(key, cls) & _codes(entries[i], _SKU_FIELDS + _BARCODE_FIELDS)}
     if len(carriers) > 1:
         return None, evidence, "link_fields_ambiguous"
     if carriers:
@@ -415,44 +470,78 @@ def _fold_refusal(kept: Mapping[str, Any], x: Mapping[str, Any], names: Sequence
     return None
 
 
+def _sole_pair_refusal(kept: Mapping[str, Any], x: Mapping[str, Any], n: str, entries: Sequence[Dict[str, Any]],
+                       seed_data: Mapping[str, Any], row: Mapping[str, Any], names: Sequence[str]) -> Optional[str]:
+    """Why a sole pair may NOT fold, or None. Its only evidence is a stale snapshot's variant COUNT, so it must
+    pass the read-time rule it mirrors and must not look like a second variant (review of #2638, H1/M1):
+
+      * `services.handover_variant_identity.entry_is_the_sole_variant_read_again` (the 10-15 ruling): the entry
+        claims no other merchant-issued-shaped id, and its price is the one entry naming N's;
+      * its title, when it has one, is the product's name or the kept entry's title (a related "Lip Liner" node
+        at the same price is another product, not a second listing);
+      * no size its title or SKU states ("SIZE-15ML") that the kept entry / product name does not state.
+    """
+    product = row.get("platform_product_id")
+    seed = {**seed_data, "price_amount": row.get("seed_price")}
+    if not entry_is_the_sole_variant_read_again(dict(x), variant_id=n, stored=list(entries), seed_data=seed,
+                                                 product_key=row.get("attached_product_key"),
+                                                 product_id=product):
+        return "sole_pair_read_rule_refuses"
+    title = _text(x.get("title"))
+    if title and not _is_product_name(title, names) and _norm(title) != _norm(kept.get("title")):
+        return "sole_pair_title_differs"
+    mine = size_tokens(title, x.get("variant_id"), x.get("sku"), x.get("sku_id"))
+    theirs = size_tokens(kept.get("title"), kept.get("sku"), kept.get("sku_id"), *names)
+    if mine - theirs:
+        return "sole_pair_size_differs"
+    return None
+
+
 def plan_pairs(entries: List[Dict[str, Any]], row: Mapping[str, Any], names: Sequence[str]) -> Optional[Dict[str, Any]]:
     """Kinds (ii) / (iv), or None when the list is not a [link, non-link] list."""
     classes = [key_class(e) for e in entries]
     links = {i: url_named_variant_id(entries[i].get("variant_id")) for i, c in enumerate(classes) if c == "link"}
-    nonlinks = [i for i, c in enumerate(classes) if c in ("barcode", "sku", "digits")]
+    nonlinks = [i for i, c in enumerate(classes) if c in ("barcode", "sku", "digits", "numeric_id")]
     if not links or not nonlinks:
         return None
     ns = list(links.values())
-    kinds = {"ii" if classes[i] == "barcode" else "iv" for i in nonlinks}
+    kinds = {"ii" if classes[i] == "barcode" or (classes[i] == "numeric_id" and len(
+        _text(entries[i].get("variant_id"))) in _BARCODE_LENGTHS) else "iv" for i in nonlinks}
     kind = "ii+iv" if len(kinds) > 1 else next(iter(kinds))
-    if any(c not in ("link", "barcode", "sku", "digits") for c in classes):
+    if any(c not in ("link", "barcode", "sku", "digits", "numeric_id") for c in classes):
         return _held(kind, "other_entry_shapes")
     if len(set(ns)) != len(ns):
         return _held(kind, "duplicate_link_entries")
     if any(canonical_variant_id(entries[i].get("variant_id")) in set(ns) for i in nonlinks):
         return _held(kind, "numeric_id_beside_its_link")
+    if any(classes[i] == "numeric_id" for i in nonlinks):
+        return _held(kind, "key_may_be_variant_id")
 
     seed_data = {"snapshot": {"variants": _snapshot_variants(row)}}
     snapshot = seed_data["snapshot"]["variants"]
     ties: Dict[int, str] = {}
     evidence: Set[str] = set()
     for i in nonlinks:
-        tie, ev, why = _tie_of(entries[i], _text(entries[i].get("variant_id")), links, entries, snapshot)
+        tie, ev, why = _tie_of(entries[i], _text(entries[i].get("variant_id")), classes[i], links, entries, snapshot)
         if why:
             return _held(kind, why)
         if tie is not None:
             ties[i] = tie
             evidence.update(ev)
-    untied = [i for i in nonlinks if i not in ties]
-    if untied:
-        (n,) = ns if len(ns) == 1 else (None,)
-        if len(entries) == 2 and len(links) == 1 and n and snapshot_names_one_variant(seed_data, n):
-            ties[untied[0]] = n
-            evidence.add("sole_pair")
-        else:
-            return _held(kind, "no_positive_link")
-
     link_of = {n: i for i, n in links.items()}
+    untied = [i for i in nonlinks if i not in ties]
+    sole: Set[int] = set()
+    if untied:
+        n = ns[0] if len(ns) == 1 else None
+        if not (len(entries) == 2 and len(links) == 1 and n and snapshot_names_one_variant(seed_data, n)):
+            return _held(kind, "no_positive_link", reread=True)
+        why = _sole_pair_refusal(entries[link_of[n]], entries[untied[0]], n, entries, seed_data, row, names)
+        if why:
+            return _held(kind, why, reread=True)
+        ties[untied[0]] = n
+        sole.add(untied[0])
+        evidence.add("sole_pair")
+
     patches: Dict[int, Dict[str, Any]] = {i: {} for i in links}
     folded: Set[int] = set()
     for i in nonlinks:
@@ -471,12 +560,17 @@ def plan_pairs(entries: List[Dict[str, Any]], row: Mapping[str, Any], names: Seq
         # this fold adds, and on the other code wherever two of them state one.
         snap_n = [s for s in snapshot if n in _snapshot_claims(s)]
         for source in [kept, x] + snap_n:
-            if _codes(source, fields) - {_code(key)}:
+            if _codes(source, fields) - {_code(key, barcode=field == "barcode")}:
                 return _held(kind, f"{field}_differs")
         for source in [x] + snap_n:
             mine, theirs = _codes(kept, _AGREE_FIELDS[other]), _codes(source, _AGREE_FIELDS[other])
             if mine and theirs and mine != theirs:
                 return _held(kind, f"{other}_differs")
+        folded.add(i)
+        if i in sole:
+            # A sole pair is tied by the snapshot's variant COUNT alone, which says nothing about the code: the
+            # duplicate is dropped, and nothing of it is written onto the kept entry (review of #2638, M1).
+            continue
         if not _text(kept.get(field)):
             patches[k][field] = key
         for f in ("sku", "barcode"):
@@ -484,7 +578,6 @@ def plan_pairs(entries: List[Dict[str, Any]], row: Mapping[str, Any], names: Seq
                 patches[k][f] = _text(x.get(f))
         if not _text(kept.get("title")) and _text(x.get("title")):
             patches[k]["title"] = _text(x.get("title"))
-        folded.add(i)
 
     ops = [{"pos": pos, "i": i, "patch": patches.get(i, {})}
            for pos, i in enumerate(j for j in range(len(entries)) if j not in folded)]
@@ -505,7 +598,8 @@ def confirmation_shape(entries: Sequence[Mapping[str, Any]]) -> Optional[str]:
     """Shapes the controller verified re-read fine after #2634 (counted, never written)."""
     classes = {key_class(e) for e in entries}
     return {frozenset({"barcode"}): "i_gtin_only", frozenset({"sku"}): "v_sku_only",
-            frozenset({"link"}): "vii_link_only", frozenset({"digits"}): "digits_only"}.get(frozenset(classes))
+            frozenset({"link"}): "vii_link_only", frozenset({"digits"}): "digits_only",
+            frozenset({"numeric_id"}): "numeric_ids_only"}.get(frozenset(classes))
 
 
 def _host(row: Mapping[str, Any]) -> str:
@@ -536,18 +630,24 @@ def plan_seed(row: Mapping[str, Any]) -> Dict[str, Any]:
     if decision["action"] == "write":
         after = apply_ops(entries, decision["ops"])
         out.update(after=after, before_hash=canonical_hash(entries), after_hash=canonical_hash(after))
+        if decision["kind"] == "iii":
+            seed_price, kept_price = _price({"price_amount": row.get("seed_price")}), _price(after[0])
+            out["seed_price_differs"] = seed_price is not None and seed_price != kept_price
     return out
 
 
 def cap(seeds: List[Dict[str, Any]], *, kinds: Optional[Iterable[str]] = None,
-        max_seeds: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Narrow the writes BEFORE the digest: a capped dry run and its apply carry the same caps."""
+        max_seeds: Optional[int] = None, include_sole_pair: bool = False) -> List[Dict[str, Any]]:
+    """Narrow the writes BEFORE the digest: a capped dry run and its apply carry the same caps. A fold whose only
+    evidence is `sole_pair` is written only with `include_sole_pair` (Peng approves that lane explicitly)."""
     want = set(kinds or ())
     kept = 0
     for s in sorted(seeds, key=lambda s: s["seed_id"]):
         if s["action"] != "write":
             continue
-        if want and s["kind"] not in want:
+        if "sole_pair" in s.get("evidence", ()) and not include_sole_pair:
+            s.update(action="held", reason="sole_pair_not_selected")
+        elif want and s["kind"] not in want:
             s.update(action="held", reason="kind_not_selected")
         elif max_seeds is not None and kept >= max_seeds:
             s.update(action="held", reason="max_seeds")
@@ -571,6 +671,10 @@ def report_lines(p: Mapping[str, Any], samples: int = SAMPLES) -> List[Dict[str,
     writes = [s for s in seeds if s["action"] == "write"]
     held = [s for s in seeds if s["action"] == "held"]
     kinds = Counter(s["kind"] for s in writes)
+    held_reasons = Counter(s["reason"] for s in held)
+    sole_w = [s for s in writes if "sole_pair" in s.get("evidence", ())]
+    sole_h = [s for s in held if s["reason"] == "sole_pair_not_selected"]
+    price_w = [s for s in writes if s.get("seed_price_differs")]
     by_market: Dict[str, Counter] = defaultdict(Counter)
     by_host: Dict[str, Counter] = defaultdict(Counter)
     for s in writes + held:
@@ -587,13 +691,28 @@ def report_lines(p: Mapping[str, Any], samples: int = SAMPLES) -> List[Dict[str,
         {"line": "counts", "candidates": p["scanned"], "to_write": len(writes),
          "kinds": {k: kinds.get(k, 0) for k in KINDS},
          "evidence": dict(Counter(e for s in writes for e in s["evidence"])),
-         "held": dict(Counter(s["reason"] for s in held)),
+         "held": dict(held_reasons),
          "held_by_kind": {k: dict(Counter(s["reason"] for s in held if s["kind"] == k))
                           for k in sorted({s["kind"] for s in held})},
          "entries_dropped": sum(len(s["dropped"]) for s in writes)},
         {"line": "confirmation", **{k: v for k, v in sorted(Counter(
             s.get("shape") for s in seeds if s["action"] == "none" and s.get("shape")).items())},
          "snapshot_quality_summary_without_root": p.get("summary_gap")},
+        # Its own line so the lane is approved explicitly (--include-sole-pair): its only evidence is a snapshot
+        # holding one variant.
+        {"line": "sole_pair", "to_write": len(sole_w), "not_selected": len(sole_h),
+         "seed_ids": sorted(s["seed_id"] for s in sole_w + sole_h)[:200]},
+        {"line": "iii_seed_price_differs", "seeds": len(price_w),
+         "seed_ids": sorted(s["seed_id"] for s in price_w)[:50],
+         "note": "seed-level price differs from the kept one-time entry's (read-only; the next refresh re-reads it)"},
+        {"line": "notes",
+         "plans": "Prepaid subscription entries (\"3 Month Subscription\", \"6 Month Subscription\" beside \"Single "
+                  "Box\") and cadences (\"30 days\", \"60 days\") beside a one-time entry are DROPPED as plans, "
+                  "consistent with #2634's extractor.",
+         "sole_pair": f"{len(sole_w) + len(sole_h)} seed(s) fold on sole_pair evidence only; written only with "
+                      "--include-sole-pair.",
+         "no_positive_link": f"{held_reasons.get('no_positive_link', 0)} seed(s) held as no_positive_link need a "
+                             "fresh page re-read (listed on the reread line)."},
         {"line": "by_market", "top": top(by_market)},
         {"line": "by_host", "top": top(by_host)},
         {"line": "digest", "digest": plan_digest(seeds), "seeds": len(writes)},
@@ -612,36 +731,50 @@ def report_lines(p: Mapping[str, Any], samples: int = SAMPLES) -> List[Dict[str,
 
 # ── database ──────────────────────────────────────────────────────────────────────────────────────────────────
 
-def _fp(alias: str) -> str:
-    """md5 over everything the plan reads: the main list, the snapshot list, and the product-name fields."""
-    a = alias
-    return (f"md5(coalesce(({a}.seed_data->'variants')::text, '') || '|' || "
-            f"coalesce(({a}.seed_data->'snapshot'->'variants')::text, '') || '|' || "
-            f"coalesce({a}.seed_data->>'title', '') || '|' || coalesce({a}.seed_data->>'product_name', '') || '|' || "
-            f"coalesce({a}.title, '') || '|' || coalesce({a}.seed_data->'snapshot'->>'title', ''))")
+def _fp(sd: str, title: str) -> str:
+    """md5 over everything the plan reads: the main list, the snapshot list, and the product-name fields. `sd` is
+    an expression for seed_data (the column, or the once-extracted copy of its keys: same values, same text)."""
+    return (f"md5(coalesce(({sd}->'variants')::text, '') || '|' || "
+            f"coalesce(({sd}->'snapshot'->'variants')::text, '') || '|' || "
+            f"coalesce({sd}->>'title', '') || '|' || coalesce({sd}->>'product_name', '') || '|' || "
+            f"coalesce({title}, '') || '|' || coalesce({sd}->'snapshot'->>'title', ''))")
 
 
+_ROW_FP = _fp("s.seed_data", "s.title")
+
+# ONE detoast of seed_data per row (review of #2638, L3): its top-level keys this plan reads are extracted once
+# (`strict $.keyvalue()`, silent, so a non-object seed_data yields nothing instead of failing the run); every
+# other read works on that in-memory copy. Every active seed is paged (the summary-gap count needs them all);
+# only a qualifying one (a main list of 2+) returns its lists.
+_KEYS = ("variants", "snapshot", "title", "product_name", "product", "price_amount", "price",
+         "pdp_field_quality_summary")
 CANDIDATES_SQL = f"""
-SELECT s.id, s.market, s.domain, s.canonical_url, s.destination_url, s.title,
-       s.seed_data->'variants' AS variants,
-       s.seed_data->'snapshot'->'variants' AS snapshot_variants,
-       s.seed_data->>'title' AS sd_title, s.seed_data->>'product_name' AS sd_product_name,
-       s.seed_data->'snapshot'->>'title' AS snapshot_title,
-       {_fp('s')} AS fp
-FROM external_product_seeds s
-WHERE s.id > :after AND s.status = 'active'
-  AND jsonb_typeof(s.seed_data->'variants') = 'array'
-  AND jsonb_array_length(s.seed_data->'variants') >= 2
-ORDER BY s.id
-LIMIT :page
-"""
-
-SUMMARY_GAP_SQL = """
-SELECT count(*) FILTER (WHERE s.status = 'active') AS active, count(*) AS all_rows
-FROM external_product_seeds s
-WHERE jsonb_typeof(s.seed_data->'snapshot') = 'object'
-  AND (s.seed_data->'pdp_field_quality_summary') IS NULL
-  AND (s.seed_data->'snapshot'->'pdp_field_quality_summary') IS NOT NULL
+WITH page AS (
+  SELECT s.id, s.market, s.domain, s.canonical_url, s.destination_url, s.title, s.attached_product_key,
+         s.price_amount AS col_price,
+         (SELECT jsonb_object_agg(kv->>'key', kv->'value')
+            FROM jsonb_path_query(s.seed_data, 'strict $.keyvalue()', '{{}}', true) AS kv
+           WHERE kv->>'key' IN ({", ".join(f"'{k}'" for k in _KEYS)})) AS sd
+  FROM external_product_seeds s
+  WHERE s.id > :after AND s.status = 'active'
+  ORDER BY s.id
+  LIMIT :page
+), q AS (
+  SELECT p.*, (jsonb_typeof(p.sd->'variants') = 'array' AND jsonb_array_length(p.sd->'variants') >= 2) AS qualifies
+  FROM page p
+)
+SELECT q.id, q.qualifies, q.market, q.domain, q.canonical_url, q.destination_url, q.title, q.attached_product_key,
+       CASE WHEN q.qualifies THEN q.sd->'variants' END AS variants,
+       CASE WHEN q.qualifies THEN q.sd->'snapshot'->'variants' END AS snapshot_variants,
+       q.sd->>'title' AS sd_title, q.sd->>'product_name' AS sd_product_name,
+       q.sd->'snapshot'->>'title' AS snapshot_title,
+       q.sd->'product'->>'platform_product_id' AS platform_product_id,
+       coalesce(q.sd->>'price_amount', q.sd->>'price', q.col_price::text) AS seed_price,
+       ((q.sd->'pdp_field_quality_summary') IS NULL AND jsonb_typeof(q.sd->'snapshot') = 'object'
+        AND (q.sd->'snapshot'->'pdp_field_quality_summary') IS NOT NULL) AS summary_gap,
+       CASE WHEN q.qualifies THEN {_fp("q.sd", "q.title")} END AS fp
+FROM q
+ORDER BY q.id
 """
 
 # One statement per seed: the CAS write AND its revert record, so neither lands without the other.
@@ -649,7 +782,7 @@ APPLY_SQL = f"""
 WITH cur AS (
   SELECT s.id, s.seed_data->'variants' AS before_variants
   FROM external_product_seeds s
-  WHERE s.id = :id AND s.status = 'active' AND {_fp('s')} = :fp
+  WHERE s.id = :id AND s.status = 'active' AND {_ROW_FP} = :fp
 ), upd AS (
   UPDATE external_product_seeds s
   SET seed_data = jsonb_set(s.seed_data, '{{variants}}', (
@@ -657,13 +790,15 @@ WITH cur AS (
         FROM jsonb_to_recordset(CAST(:ops AS jsonb)) AS op(pos int, i int, patch jsonb)
         JOIN jsonb_array_elements(s.seed_data->'variants') WITH ORDINALITY AS e(v, ord) ON e.ord = op.i + 1))
   FROM cur
-  WHERE s.id = cur.id AND s.status = 'active' AND {_fp('s')} = :fp
-  RETURNING s.id, {_fp('s')} AS fp_after
+  WHERE s.id = cur.id AND s.status = 'active' AND {_ROW_FP} = :fp
+  RETURNING s.id, {_ROW_FP} AS fp_after, extract(epoch FROM s.updated_at)::text AS updated_epoch,
+            s.seed_data->'snapshot'->>'extracted_at' AS extracted_at
 )
 INSERT INTO identity_resolution_events (proposal_id, action, run_id, detail)
 SELECT NULL, CAST(:action AS text), CAST(:run_id AS text),
        jsonb_build_object('seed_id', u.id, 'kind', CAST(:kind AS text), 'fp_before', CAST(:fp AS text),
-                          'fp_after', u.fp_after, 'ops', CAST(:ops AS jsonb), 'before_variants', c.before_variants)
+                          'fp_after', u.fp_after, 'updated_epoch', u.updated_epoch, 'extracted_at', u.extracted_at,
+                          'ops', CAST(:ops AS jsonb), 'before_variants', c.before_variants)
 FROM upd u JOIN cur c ON c.id = u.id
 RETURNING id
 """
@@ -673,8 +808,18 @@ UPDATE external_product_seeds s
 SET seed_data = jsonb_set(s.seed_data, '{{variants}}', ev.detail->'before_variants')
 FROM identity_resolution_events ev
 WHERE ev.id = :event_id AND ev.action = CAST(:action AS text) AND s.id = ev.detail->>'seed_id'
-  AND {_fp('s')} = ev.detail->>'fp_after'
+  AND {_ROW_FP} = ev.detail->>'fp_after'
+  -- Freshness too (review of #2638, L1): a refresh that re-stamped the seed since the apply owns it now.
+  AND extract(epoch FROM s.updated_at)::text IS NOT DISTINCT FROM ev.detail->>'updated_epoch'
+  AND (s.seed_data->'snapshot'->>'extracted_at') IS NOT DISTINCT FROM ev.detail->>'extracted_at'
 RETURNING s.id
+"""
+
+# A seed an earlier, interrupted revert of this run already restored (review of #2638, L5).
+ALREADY_REVERTED_SQL = f"""
+SELECT s.id FROM external_product_seeds s JOIN identity_resolution_events ev
+  ON ev.id = :event_id AND ev.action = CAST(:action AS text) AND s.id = ev.detail->>'seed_id'
+WHERE {_ROW_FP} = ev.detail->>'fp_before'
 """
 
 EVENT_SQL = """
@@ -698,26 +843,26 @@ WHERE e.action = :seed_action AND e.run_id <> :run_id AND e.id > :after_id AND e
 
 
 async def plan(db: Any, *, page: int = PAGE, seed_ids: Optional[Iterable[str]] = None,
-               kinds: Optional[Iterable[str]] = None, max_seeds: Optional[int] = None) -> Dict[str, Any]:
+               kinds: Optional[Iterable[str]] = None, max_seeds: Optional[int] = None,
+               include_sole_pair: bool = False) -> Dict[str, Any]:
     want = {i.strip() for i in seed_ids or [] if i and i.strip()}
     seeds: List[Dict[str, Any]] = []
-    after, scanned = "", 0
+    after, scanned, gap = "", 0, 0
     while True:
         rows = [dict(r) for r in await db.fetch_all(CANDIDATES_SQL, {"after": after, "page": page})]
         if not rows:
             break
         after = rows[-1]["id"]
         for r in rows:
-            if want and r["id"] not in want:
+            gap += bool(r["summary_gap"])
+            if not r["qualifies"] or (want and r["id"] not in want):
                 continue
             scanned += 1
             seeds.append(plan_seed(r))
         if len(rows) < page:
             break
-    gap = await db.fetch_one(SUMMARY_GAP_SQL)
-    cap(seeds, kinds=kinds, max_seeds=max_seeds)
-    return {"scanned": scanned, "seeds": seeds,
-            "summary_gap": {"active": int(gap["active"] or 0), "all_rows": int(gap["all_rows"] or 0)} if gap else None}
+    cap(seeds, kinds=kinds, max_seeds=max_seeds, include_sole_pair=include_sole_pair)
+    return {"scanned": scanned, "seeds": seeds, "summary_gap": {"active": gap}}
 
 
 async def dry_run(db: Any, **caps: Any) -> Dict[str, Any]:
@@ -745,10 +890,10 @@ def _chunks(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
 
 
 async def apply(db: Any, *, expect_digest: str, max_seeds: int, seed_ids: Optional[Iterable[str]] = None,
-                kinds: Optional[Iterable[str]] = None, batch_size: int = BATCH_SIZE, sleep_s: float = SLEEP_S,
-                actor: str = WRITER) -> Dict[str, Any]:
+                kinds: Optional[Iterable[str]] = None, include_sole_pair: bool = False, batch_size: int = BATCH_SIZE,
+                sleep_s: float = SLEEP_S, actor: str = WRITER) -> Dict[str, Any]:
     """Re-plan (same process, same caps), refuse on any digest but the reviewed one, then write in CAS batches."""
-    p = await dry_run(db, seed_ids=seed_ids, kinds=kinds, max_seeds=max_seeds)
+    p = await dry_run(db, seed_ids=seed_ids, kinds=kinds, max_seeds=max_seeds, include_sole_pair=include_sole_pair)
     digest = plan_digest(p["seeds"])
     if not expect_digest or expect_digest != digest:
         raise SystemExit(f"refused: --expect-digest {expect_digest!r} is not this plan's {digest}; dry-run again with "
@@ -762,7 +907,8 @@ async def apply(db: Any, *, expect_digest: str, max_seeds: int, seed_ids: Option
     await _record(db, RUN_ACTION, run_id, {"run_id": run_id, "digest": digest, "seeds": len(writes),
                                             "kinds": dict(Counter(s["kind"] for s in writes)),
                                             "caps": {"max_seeds": max_seeds, "kinds": sorted(kinds or []),
-                                                     "seed_ids": sorted(seed_ids or [])}})
+                                                     "seed_ids": sorted(seed_ids or []),
+                                                     "include_sole_pair": include_sole_pair}})
     applied: List[str] = []
     skipped: List[str] = []
     for n, batch in enumerate(_chunks(writes, max(1, batch_size))):
@@ -811,14 +957,20 @@ async def revert(db: Any, run_id: str, *, batch_size: int = BATCH_SIZE, sleep_s:
     digest = (manifest or {}).get("digest")
     reverted: List[str] = []
     changed: List[str] = []
+    already: List[str] = []
     for n, batch in enumerate(_chunks(seeds, max(1, batch_size))):
         mine_reverted: List[str] = []
         mine_changed: List[str] = []
         async with db.transaction():
             await _bounded(db)
             for r in batch:
-                row = await db.fetch_one(REVERT_SQL, {"event_id": r["id"], "action": SEED_ACTION})
-                (mine_reverted if row else mine_changed).append(r["seed_id"])
+                params = {"event_id": r["id"], "action": SEED_ACTION}
+                if await db.fetch_one(REVERT_SQL, params):
+                    mine_reverted.append(r["seed_id"])
+                elif await db.fetch_one(ALREADY_REVERTED_SQL, params):
+                    already.append(r["seed_id"])
+                else:
+                    mine_changed.append(r["seed_id"])
             await db.execute(AUDIT_SQL, {
                 "writer": WRITER, "batch": f"{run_id}:revert:{n}", "digest": digest, "applied": len(mine_reverted),
                 "skipped": len(mine_changed), "actor": actor,
@@ -827,8 +979,8 @@ async def revert(db: Any, run_id: str, *, batch_size: int = BATCH_SIZE, sleep_s:
         changed += mine_changed
         if sleep_s and n * batch_size + len(batch) < len(seeds):
             await asyncio.sleep(sleep_s)
-    done = {"run_id": run_id, "reverted": len(reverted), "changed_since_apply": len(changed),
-            "changed_ids": changed}
+    done = {"run_id": run_id, "reverted": len(reverted), "already_reverted": len(already),
+            "changed_since_apply": len(changed), "changed_ids": changed}
     await _record(db, REVERTED_ACTION, run_id, done)
     return done
 
@@ -842,7 +994,8 @@ async def run(args: argparse.Namespace) -> int:
             out = await revert(database, args.revert, batch_size=args.batch_size, sleep_s=args.sleep)
             print(json.dumps({"line": "reverted", **out}, default=str), flush=True)
             return 0
-        caps = {"seed_ids": args.seed_ids, "kinds": args.kinds, "max_seeds": args.max_seeds}
+        caps = {"seed_ids": args.seed_ids, "kinds": args.kinds, "max_seeds": args.max_seeds,
+                "include_sole_pair": args.include_sole_pair}
         if args.apply:
             out = await apply(database, expect_digest=args.expect_digest, batch_size=args.batch_size,
                               sleep_s=args.sleep, **caps)
@@ -867,6 +1020,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-seeds", dest="max_seeds", type=int, help="write at most this many seeds (seed id order)")
     p.add_argument("--seed-ids", dest="seed_ids", nargs="+", help="only these seeds")
     p.add_argument("--kinds", nargs="+", choices=KINDS, help="only these kinds")
+    p.add_argument("--include-sole-pair", dest="include_sole_pair", action="store_true",
+                   help="also write folds whose only evidence is sole_pair (needs Peng's explicit approval)")
     p.add_argument("--batch-size", dest="batch_size", type=int, default=BATCH_SIZE)
     p.add_argument("--sleep", type=float, default=SLEEP_S, help="seconds between write batches")
     p.add_argument("--page", type=int, default=PAGE)

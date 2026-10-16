@@ -160,7 +160,8 @@ def test_a_sole_pair_folds_only_on_a_single_variant_snapshot_naming_its_link():
     before = _jurlique()
     out = _plan(before, snapshot=[_snap(V50)])
     assert (out["action"], out["evidence"]) == ("write", ["sole_pair"])
-    assert out["after"] == [{**before[0], "sku": SKU50}]
+    # The snapshot's COUNT says nothing about the code: the duplicate is dropped, its SKU is not written (M1).
+    assert out["after"] == [before[0]]
     assert _plan(before, snapshot=[_snap(V15)])["reason"] == "no_positive_link"  # names another variant
     assert _plan(before, snapshot=[{"title": TITLE}])["reason"] == "no_positive_link"  # names none
 
@@ -256,7 +257,8 @@ def test_differing_barcodes_are_never_folded():
     before = _gtin_pair()
     before[0] = {**before[0], "barcode": GTIN15}
     assert _plan(before, snapshot=[_snap(V50, barcode=GTIN50)])["reason"] == "barcode_differs"
-    assert _plan(_gtin_pair(), snapshot=[_snap(V50, barcode=GTIN15)])["reason"] == "barcode_differs"
+    # Untied by the snapshot (it states another barcode), and a GTIN never folds on a sole pair (read rule).
+    assert _plan(_gtin_pair(), snapshot=[_snap(V50, barcode=GTIN15)])["reason"] == "sole_pair_read_rule_refuses"
 
 
 def test_a_sku_fold_never_overrides_a_differing_barcode():
@@ -289,9 +291,11 @@ def test_a_code_two_snapshot_entries_carry_is_ambiguous():
 
 
 def test_a_key_that_is_another_variants_id_holds():
-    # A 14-digit key is barcode-shaped, but the snapshot calls it a variant: two variants, not one read twice.
-    before = _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(31, IN, sku=V15)]))
-    assert _plan(before, snapshot=[_snap(V50), _snap(V15)])["reason"] == "key_is_a_variant_id"
+    # A valid GTIN-13 key, but the snapshot calls those digits a variant: two variants, not one read twice.
+    other = "4006381333931"
+    before = _stored(_product([_offer(31, IN, **_link_id(V50)), _offer(31, IN, sku=other)]))
+    assert tool.key_class(before[1]) == "barcode"
+    assert _plan(before, snapshot=[_snap(V50), _snap(other)])["reason"] == "key_is_a_variant_id"
 
 
 def test_a_numeric_id_beside_its_own_link_is_out_of_scope():
@@ -445,3 +449,126 @@ def test_an_entry_named_as_the_product_is_never_a_plan():
     before = _stored(_product([_offer(30, IN, name=name), _offer(10, IN, name="Travel Size")]))
     out = tool.plan_seed(_row(before, title=name, sd_title=name, snapshot_title=name))
     assert out["action"] == "none"
+
+
+# ── review of #2638 (controller, 2026-10-16) ─────────────────────────────────────────────────────────────────
+
+def _pair(link_variant: str, key: str, *, link_title: str = TITLE, key_title: str = TITLE) -> List[Dict[str, Any]]:
+    before = _stored(_product([_offer(31, IN, **_link_id(link_variant)), _offer(31, IN, sku=key)]))
+    before[0]["title"], before[1]["title"] = link_title, key_title
+    return before
+
+
+def test_h1_p3_an_id_shaped_key_never_folds_onto_a_sole_pair():
+    # The repro: an 11-digit key one off the link's variant id. Folding it put "39876543299" on the kept entry as
+    # its sku, and stored_entry_answers_to(kept, "39876543299") then named it: a wrong-variant cart.
+    before = _pair("39876543210", "39876543299")
+    assert tool.key_class(before[1]) == "numeric_id"
+    out = _plan(before, snapshot=[{"variant_id": "39876543210"}])
+    assert (out["action"], out["reason"]) == ("held", "key_may_be_variant_id")
+
+
+def test_h1_p2_a_shopify_shaped_14_digit_key_is_not_a_barcode():
+    assert not tool.gs1_valid("45253610242311")
+    before = _pair(V50, "45253610242311")
+    assert tool.key_class(before[1]) == "numeric_id"
+    assert _plan(before, snapshot=[_snap(V50)])["reason"] == "key_may_be_variant_id"
+
+
+@pytest.mark.parametrize("digits, ok", [(GTIN50, True), ("036000291452", True), ("96385074", True),
+                                        ("12345678", False), (V50, False), ("114807", False)])
+def test_gs1_check_digit(digits, ok):
+    assert tool.gs1_valid(digits) is ok
+
+
+def test_a_gtin_never_folds_on_a_sole_pair():
+    # entry_is_the_sole_variant_read_again refuses an entry claiming a merchant-issued-shaped id; a GTIN-13 is one.
+    out = _plan(_gtin_pair(), snapshot=[_snap(V50)])
+    assert (out["action"], out["reason"], out["reread"]) == ("held", "sole_pair_read_rule_refuses", True)
+
+
+def test_m1_a_sku_naming_another_size_never_folds_on_a_sole_pair():
+    # A theme link for 50 mL and an app node SIZE-15ML at the same price, beside a stale one-entry snapshot.
+    before = _pair(V50, "SIZE-15ML", link_title="50 mL")
+    assert _plan(before, snapshot=[_snap(V50)])["reason"] == "sole_pair_size_differs"
+    # ...while a SKU naming the size the kept entry states folds.
+    same = _pair(V50, "RL-50ML", link_title="50 mL")
+    assert _plan(same, snapshot=[_snap(V50)])["action"] == "write"
+
+
+def test_m1_a_related_product_node_never_folds_on_a_sole_pair():
+    before = _pair(V50, "LL-01", key_title="Lip Liner")
+    assert _plan(before, snapshot=[_snap(V50)])["reason"] == "sole_pair_title_differs"
+    # The same title on positive (snapshot) evidence is the variant's own name read twice: compatible as before.
+    tied = _plan(before, snapshot=[_snap(V50, sku="LL-01")])
+    assert (tied["action"], tied["evidence"]) == ("write", ["snapshot"])
+
+
+def test_size_tokens():
+    assert tool.size_tokens("50 mL", "SIZE-15ML", "1.7 fl. oz", "1.50 oz", "Rose 100g") == {
+        "50ml", "15ml", "1.7floz", "1.5oz", "100g"}
+    assert tool.size_tokens("114807", "Default Title", "Lip Liner") == set()
+
+
+def test_sole_pair_writes_only_when_its_lane_is_selected():
+    seeds = [tool.plan_seed(_row(_jurlique(), snapshot=[_snap(V50)], seed_id="eps_sole")),
+             tool.plan_seed(_row(_murad(), seed_id="eps_plan"))]
+    held = tool.cap(copy.deepcopy(seeds))
+    assert [(s["seed_id"], s["action"], s.get("reason")) for s in held] == [
+        ("eps_sole", "held", "sole_pair_not_selected"), ("eps_plan", "write", None)]
+    chosen = tool.cap(copy.deepcopy(seeds), include_sole_pair=True)
+    assert [s["action"] for s in chosen] == ["write", "write"]
+    assert tool.plan_digest(held) != tool.plan_digest(chosen)
+    by = {x["line"]: x for x in tool.report_lines({"scanned": 2, "seeds": held, "summary_gap": None})}
+    assert (by["sole_pair"]["to_write"], by["sole_pair"]["not_selected"], by["sole_pair"]["seed_ids"]) == (
+        0, 1, ["eps_sole"])
+    assert "--include-sole-pair" in by["notes"]["sole_pair"]
+
+
+def test_m2_a_non_positional_entry_is_never_judged_a_plan_by_name():
+    before = _stored(_product([_offer(31, IN, name="Subscribe & Save", **_link_id(V50)),
+                               _offer(12, IN, name="15 mL", **_link_id(V15))]))
+    out = _plan(before)
+    assert (out["action"], out["shape"]) == ("none", "vii_link_only")
+
+
+def test_m2_two_snapshot_entries_carrying_one_code_are_ambiguous_even_naming_one_variant():
+    out = _plan(_jurlique(), snapshot=[_snap(V50, sku=SKU50), _snap(V50, sku=SKU50, title="dup")])
+    assert out["reason"] == "snapshot_ambiguous"
+
+
+def test_l2_a_skus_leading_zeros_are_its_own():
+    # "0114807" is not "114807": no snapshot tie, and the sole pair then refuses on the differing SKU.
+    before = _pair(V50, "0" + SKU50)
+    assert _plan(before, snapshot=[_snap(V50, sku=SKU50)])["reason"] == "sku_differs"
+
+
+def test_l4_a_plan_list_whose_seed_price_is_a_plans_is_reported():
+    out = tool.plan_seed(_row(_murad(), seed_price="16.38"))
+    assert out["action"] == "write" and out["seed_price_differs"] is True
+    assert tool.plan_seed(_row(_murad(), seed_price="48.0"))["seed_price_differs"] is False
+    line = next(x for x in tool.report_lines({"scanned": 1, "seeds": [out], "summary_gap": None})
+                if x["line"] == "iii_seed_price_differs")
+    assert (line["seeds"], line["seed_ids"]) == (1, ["eps_test"])
+
+
+def test_prepaid_subscriptions_and_day_cadences_are_dropped_as_plans():
+    # Stated plainly in the dry run's notes line: consistent with #2634's extractor.
+    boxes = _stored(_product([_offer(30, IN, name="Single Box"), _offer(80, IN, name="3 Month Subscription"),
+                              _offer(150, IN, name="6 Month Subscription")]))
+    out = _plan(boxes)
+    assert (out["action"], [v["title"] for v in out["after"]]) == ("write", ["Single Box"])
+    days = _stored(_product([_offer(48, IN, name="One-Time Purchase"), _offer(41, IN, name="30 days"),
+                             _offer(41, IN, name="60 days")]))
+    out = _plan(days)
+    assert (out["action"], [v["title"] for v in out["after"]]) == ("write", [TITLE])
+    notes = next(x for x in tool.report_lines({"scanned": 1, "seeds": [out], "summary_gap": None})
+                 if x["line"] == "notes")
+    assert "Month Subscription" in notes["plans"] and "30 days" in notes["plans"]
+
+
+def test_no_positive_link_holds_are_listed_for_a_re_read():
+    out = _plan(_jurlique())
+    by = {x["line"]: x for x in tool.report_lines({"scanned": 1, "seeds": [out], "summary_gap": None})}
+    assert by["reread"]["seed_ids"] == ["eps_test"]
+    assert by["notes"]["no_positive_link"].startswith("1 seed(s)")

@@ -46,6 +46,7 @@ async def db():
         await admin.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, market TEXT NOT NULL, "
                             "tool TEXT NOT NULL DEFAULT '*', status TEXT NOT NULL DEFAULT 'active', "
                             "destination_url TEXT NOT NULL, canonical_url TEXT, domain TEXT, title TEXT, "
+                            "price_amount DOUBLE PRECISION NULL, attached_product_key TEXT NULL, "
                             "seed_data JSONB NOT NULL DEFAULT '{}'::jsonb, "
                             "updated_at TIMESTAMPTZ NOT NULL DEFAULT '2026-10-01T00:00:00Z')")
         await admin.execute("CREATE TABLE identity_resolution_events (id BIGSERIAL PRIMARY KEY, proposal_id TEXT, "
@@ -93,7 +94,7 @@ async def _three(admin) -> Dict[str, str]:
     return {
         "murad": await _store(admin, "eps_murad", _seed_data(_murad())),
         "jurlique": await _store(admin, "eps_jurlique", _seed_data(_jurlique(), snapshot_variants=[_snap(V50, sku=SKU50)])),
-        "gtin": await _store(admin, "eps_gtin", _seed_data(_gtin_pair(), snapshot_variants=[_snap(V50)])),
+        "gtin": await _store(admin, "eps_gtin", _seed_data(_gtin_pair(), snapshot_variants=[_snap(V50, barcode=GTIN50)])),
         "held": await _store(admin, "eps_held", _seed_data(_jurlique())),
     }
 
@@ -225,7 +226,7 @@ async def test_the_summary_gap_is_counted(db):
     await _store(admin, "eps_gap_inactive", gap, status="inactive")
     await _store(admin, "eps_both", {**gap, "pdp_field_quality_summary": {"ok": 1}})
     p = await tool.dry_run(database)
-    assert p["summary_gap"] == {"active": 1, "all_rows": 2}
+    assert p["summary_gap"] == {"active": 1}
 
 
 async def test_revert_restores_the_exact_before_bytes_of_unchanged_seeds(db):
@@ -303,3 +304,85 @@ async def test_the_dry_run_report_reads_the_market_and_host(db):
     assert by["counts"]["kinds"] == {"ii": 1, "iii": 2, "iv": 1, "ii+iv": 0}
     assert {r["key"] for r in by["by_market"]["top"]} == {"US", "SG"}
     assert by["by_host"]["top"][0]["key"] == "eyurs.com"
+
+
+# ── review of #2638 (controller, 2026-10-16) ─────────────────────────────────────────────────────────────────
+
+async def test_l6_the_updates_own_fingerprint_recheck_skips_a_seed_changed_under_its_lock(db):
+    """`cur` reads the statement's snapshot; only the UPDATE's own WHERE is re-evaluated on the row a concurrent
+    writer commits while the apply waits for its lock (READ COMMITTED re-check). This pins THAT check alone: the
+    refresh holds the row with an uncommitted change through the plan and into the write, then commits."""
+    import asyncio
+
+    database, admin, tool = db
+    sid = await _store(admin, "eps_murad", _seed_data(_murad()))
+    reviewed = await _digest(tool, database)
+    held = admin.transaction()
+    await held.start()
+    committed = False
+    try:
+        await admin.execute("UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{variants,0,title}', "
+                            "'\"Refreshed\"') WHERE id = $1", sid)
+        task = asyncio.ensure_future(tool.apply(database, expect_digest=reviewed, max_seeds=1, sleep_s=0))
+        await asyncio.sleep(1.0)  # the apply has planned (old bytes) and now waits on the row lock
+        assert not task.done()
+        await held.commit()
+        committed = True
+        out = await asyncio.wait_for(task, timeout=10)
+    finally:
+        if not committed:
+            await held.rollback()
+    assert (out["applied"], out["cas_skipped"]) == (0, 1)
+    after = (await _row(admin, sid))["seed_data"]["variants"]
+    assert [v["title"] for v in after] == ["Refreshed", "1 month", "2 months", "3 months"]
+    assert await admin.fetchval("SELECT count(*) FROM identity_resolution_events WHERE action = $1",
+                                tool.SEED_ACTION) == 0
+
+
+@pytest.mark.parametrize("freshen", [
+    "UPDATE external_product_seeds SET updated_at = updated_at + interval '1 minute' WHERE id = $1",
+    "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{snapshot,extracted_at}', "
+    "'\"2026-10-17T05:20:00+00:00\"') WHERE id = $1",
+], ids=["updated_at", "extracted_at"])
+async def test_l1_revert_leaves_a_seed_a_refresh_re_stamped(db, freshen):
+    database, admin, tool = db
+    sid = await _store(admin, "eps_murad", _seed_data(_murad()))
+    out = await tool.apply(database, expect_digest=await _digest(tool, database), max_seeds=1, sleep_s=0)
+    repaired = await _row(admin, sid)
+    await admin.execute(freshen, sid)  # the main list's bytes are unchanged; its freshness is not
+    done = await tool.revert(database, out["run_id"], sleep_s=0)
+    assert (done["reverted"], done["changed_since_apply"]) == (0, 1)
+    assert (await _row(admin, sid))["seed_data"]["variants"] == repaired["seed_data"]["variants"]
+
+
+async def test_l5_an_interrupted_revert_rerun_reports_already_reverted_seeds(db):
+    database, admin, tool = db
+    ids = await _three(admin)
+    out = await tool.apply(database, expect_digest=await _digest(tool, database), max_seeds=10, sleep_s=0)
+    # A first revert restored one seed, then died before recording the run as reverted.
+    first = await admin.fetchval("SELECT id FROM identity_resolution_events WHERE action = $1 ORDER BY id LIMIT 1",
+                                 tool.SEED_ACTION)
+    assert await database.fetch_one(tool.REVERT_SQL, {"event_id": first, "action": tool.SEED_ACTION})
+    done = await tool.revert(database, out["run_id"], sleep_s=0)
+    assert (done["reverted"], done["already_reverted"], done["changed_since_apply"]) == (2, 1, 0)
+    assert (await _row(admin, ids["jurlique"]))["seed_data"]["variants"] == _jurlique()
+
+
+async def test_a_sole_pair_is_written_only_with_its_lane_selected(db):
+    database, admin, tool = db
+    sid = await _store(admin, "eps_sole", _seed_data(_jurlique(), snapshot_variants=[_snap(V50)]))
+    p = await tool.dry_run(database)
+    assert [(s["action"], s["reason"]) for s in p["seeds"]] == [("held", "sole_pair_not_selected")]
+    with pytest.raises(SystemExit, match="nothing to write"):
+        await tool.apply(database, expect_digest=tool.plan_digest(p["seeds"]), max_seeds=1, sleep_s=0)
+    reviewed = await _digest(tool, database, include_sole_pair=True)
+    await tool.apply(database, expect_digest=reviewed, max_seeds=1, include_sole_pair=True, sleep_s=0)
+    assert (await _row(admin, sid))["seed_data"]["variants"] == [_jurlique()[0]]  # dropped, no sku written
+
+
+async def test_a_non_object_seed_data_is_skipped_not_fatal(db):
+    database, admin, tool = db
+    await _store(admin, "eps_scalar", None, raw='"not an object"')
+    await _store(admin, "eps_murad", _seed_data(_murad()))
+    p = await tool.dry_run(database)
+    assert [s["seed_id"] for s in p["seeds"]] == ["eps_murad"]
