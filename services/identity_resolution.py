@@ -449,9 +449,20 @@ def suppression_metadata(proposal: Dict[str, Any], run_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def upsert_proposals(conn, proposals: List[Dict[str, Any]]) -> Dict[str, int]:
+async def upsert_proposals(conn, proposals: List[Dict[str, Any]], *,
+                           module_writer: Optional[str] = None) -> Dict[str, int]:
     """Insert proposals; re-proposals of an unchanged group dedupe on
-    proposal_key. Returns counts."""
+    proposal_key. Returns counts.
+
+    A proposal of a MODULE_ONLY_STRATEGIES strategy is written only by that strategy's own module,
+    which says so with `module_writer=<that strategy>` (keyword-only; M4 passes
+    module_writer=CROSS_MERCHANT_SAME_SIZE). Any other caller -- or a token naming another strategy --
+    is refused before anything is written."""
+    refused = sorted({str(p.get("strategy")) for p in proposals
+                      if p.get("strategy") in MODULE_ONLY_STRATEGIES and p.get("strategy") != module_writer})
+    if refused:
+        raise ValueError(f"proposals of module-only strategies {refused} are written only by their module "
+                         f"(module_writer=<strategy>); got module_writer={module_writer!r}")
     inserted = 0
     for p in proposals:
         row = await conn.fetchrow(
