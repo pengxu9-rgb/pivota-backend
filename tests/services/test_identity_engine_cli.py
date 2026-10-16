@@ -99,9 +99,9 @@ def engine(monkeypatch):
 @pytest.mark.asyncio
 async def test_every_write_is_a_dry_run_unless_execute(engine):
     calls, conn = engine
-    await cli.main(["apply", "--strategy", "m3_hand_merge", "--max-proposals", "5"])
+    await cli.main(["apply", "--strategy", "coordinator_merge", "--max-proposals", "5"])
     await cli.main(["revert-proposal", "irp_x"])
-    conn.rows = [{"proposal_id": "irp_x", "strategy": "m3_hand_merge", "kind": "merge_content_key",
+    conn.rows = [{"proposal_id": "irp_x", "strategy": "coordinator_merge", "kind": "merge_content_key",
                   "status": "proposed"}]
     await cli.main(["approve", "irp_x", "--by", "peng"])
     assert calls["apply"][0]["dry_run"] is True and calls["revert"][0]["dry_run"] is True
@@ -259,3 +259,33 @@ def test_the_shared_matcher_verdict_rule(kind, verdict, ok):
     from services.identity_resolution import validate_matcher_verdict
 
     assert (validate_matcher_verdict(kind, {"matcher_verdict": verdict}) == []) is ok
+
+
+
+def test_the_shared_strategy_constant_is_the_one_spelling():
+    from services import identity_resolution as ir
+
+    assert ir.CROSS_MERCHANT_SAME_SIZE == "cross_merchant_same_size"
+    assert ir.CROSS_MERCHANT_SAME_SIZE in cli.RESERVED_STRATEGIES
+    assert cli.MODULE_ONLY_STRATEGIES == {ir.CROSS_MERCHANT_SAME_SIZE}
+
+
+def test_hand_proposable_strategies_are_an_allowlist_disjoint_from_reserved():
+    assert cli.HAND_PROPOSABLE_STRATEGIES and not cli.HAND_PROPOSABLE_STRATEGIES & cli.RESERVED_STRATEGIES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["some_new_strategy", "cross_merchant_same_size", "same_url_dup"])
+async def test_propose_merge_denies_any_strategy_not_on_the_allowlist(engine, strategy):
+    calls, _ = engine
+    with pytest.raises(SystemExit):
+        await cli.main(["propose-merge", "--from-ck", "a", "--to-ck", "b", "--keeper", "k",
+                        "--strategy", strategy, "--write"])
+    assert calls["connect"] == []
+
+    class Boom:
+        async def fetch(self, *a):
+            raise AssertionError("read before the allowlist check")
+
+    with pytest.raises(SystemExit):
+        await cli.build_merge(Boom(), from_ck="a", to_ck="b", keeper="k", strategy=strategy)

@@ -731,7 +731,7 @@ async def test_the_cli_builds_the_merge_proposal_from_live_state(db, conn):
     from scripts.identity_engine import build_merge
 
     pid, loser, rows = await _merge_fixture(db, conn, approve=False)
-    p = await build_merge(conn, from_ck=loser, to_ck=B, keeper=KEEPER, strategy="m3_hand_merge")
+    p = await build_merge(conn, from_ck=loser, to_ck=B, keeper=KEEPER, strategy="coordinator_merge")
     written = await conn.fetchrow("SELECT evidence, keeper_product_key, content_key FROM identity_resolution_proposals"
                                   " WHERE proposal_id = $1", pid)
     ev = json.loads(written["evidence"]) if isinstance(written["evidence"], str) else written["evidence"]
