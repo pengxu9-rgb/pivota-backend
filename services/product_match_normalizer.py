@@ -590,12 +590,13 @@ CONFLICT_LEXICON: Tuple[ConflictRule, ...] = (
     # -- "+" editions: after sizes, SPF/PA and "1+1" packs are blanked, a "+" is an edition when it
     # is glued to a word or a percent (Duo+, B5+, Lotion+, Retinol 1%+), or not followed by a word
     # (Effaclar Duo + SPF30 40ml, B5 +40ml, Lotion + 125ml -- what followed was a size or a rating;
-    # Duo (+), Duo [+] -- a bracket). The word "plus" is the same marker. A "+" BETWEEN two words is
-    # a conjunction ("Rice + Probiotics", "Propolis + Niacinamide") and stays out.
+    # Duo (+), Duo [+] -- a bracket), or glued on the right only ("B5 +Balm"). The word "plus" is
+    # the same marker. A "+" symmetric BETWEEN two words ("Rice + Probiotics", "C+E") is a
+    # conjunction (_CONJUNCTION_PLUS_RE) and stays out.
     ConflictRule(
         "plus", "version",
-        r"(?<=[a-z0-9%])\+(?![+\w])|(?<![\w+%])\+(?=\s*(?:$|[^\w\s+]))|\bplus\b",
-        "X+ / X (+) / X [+] / 'X +' before a size or the end / X Plus edition.",
+        r"(?<=[a-z0-9%])\+(?![+\w])|(?<![\w+%])\+(?=\s*(?:$|[^\w\s+]))|(?<=\s)\+(?=[^\W_])|\bplus\b",
+        "X+ / X (+) / X [+] / 'X +' before a size or the end / 'X +Y' (one-sided) / X Plus edition.",
     ),
     # -- version / reformulation markers.
     ConflictRule("new_formula", "version", r"\b(?:new|improved)\s+formula(?:tion)?\b", "Declared new formula."),
@@ -681,7 +682,11 @@ FORMAT_PLACEHOLDER = "fmt"
 # with the brand before this runs. Not a conflict token (a conjunction is not an edition); one
 # alphanumeric word that is no lexicon token, so it is stable on a re-pass.
 CONJUNCTION_PLACEHOLDER = "join"
-_CONJUNCTION_PLUS_RE = re.compile(r"(?<=[^\W_]|%)\s*\+\s*(?=[^\W_])")  # "Niacinamide 10% + Zinc" too
+# A "+" is a conjunction ONLY when it is symmetric between two words: spaced on both sides
+# ("Rice + Probiotics", "Niacinamide 10% + Zinc") or glued on both ("Vitamin C+E"). One-sided
+# ("Duo+ 40ml", "B5+ Multi-Purpose Balm", "Rice +Probiotics") is the `plus` edition, on T0c (the
+# lexicon rule) and T0b (exact_title_key) alike.
+_CONJUNCTION_PLUS_RE = re.compile(r"(?<=[^\W_]|%)(?:\s+\+\s+|\+)(?=[^\W_])")
 
 
 def _extract(work: List[str], rules: Sequence[Tuple[ConflictRule, re.Pattern]], *,
@@ -1002,9 +1007,14 @@ def exact_title_key(brand: Any, title: Any) -> Optional[Tuple[str, str]]:
     normalize_title's NFKD would spell "™" "TM" and glue it on --, accents folded, "&" -> "and").
     Then no "+" is dropped (normalize_title would drop it):
       - the brand's own glued "+" goes ("Dr.Jart+ Cicapair" = "Dr. Jart Cicapair");
-      - a "+" between two words reads "and", like "&" ("Rice + Probiotics" = "Rice & Probiotics"
-        = "Rice and Probiotics"; "B5 + Multi-Purpose Balm" != "B5 Multi-Purpose Balm");
-      - any other "+" (an edition: "Duo+", "Duo (+)", "Lotion + 125ml") reads "plus".
+      - a "+" symmetric between two words (spaced both sides or glued both sides) reads "and",
+        like "&" ("Rice + Probiotics" = "Rice & Probiotics" = "Rice and Probiotics"; "B5 +
+        Multi-Purpose Balm" != "B5 Multi-Purpose Balm");
+      - any other "+" (an edition: "Duo+ 40ml", "B5+ Multi-Purpose Balm", "Duo (+)", "SPF50+")
+        reads "plus".
+    T0b does not blank sizes or SPF/PA first, so "Duo + SPF30" reads "duo and spf30" here while
+    title_core calls that "+" an edition; the signature veto (title_core conflicts) is applied to
+    every T0b group, so the two tiers still decide alike.
     normalize_title itself is left alone (it mints content_key); this only changes the matching key."""
     b = canonical_brand(brand)
     t = None
