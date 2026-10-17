@@ -180,6 +180,8 @@ async def _simulate(row_id: str) -> Dict[str, Any]:
         product_currency=col_cur or fresh_cur,
         product_availability=availability if availability.lower() not in ("", "unknown") else None,
         census=fields.get("variant_census"),
+        # What the refresh passes: the barcode bridge accepts a read titled as the product.
+        product_title=seed_data.get("title") or extracted.get("title"),
     )
     return report
 
