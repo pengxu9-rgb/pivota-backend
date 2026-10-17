@@ -36,28 +36,35 @@ MODES
       this invocation) and prints the proposal run id and the approve DRY-RUN command, whose output
       carries the ira_ digest the --execute approval needs.
 
-SELECTION (four flags, mutually exclusive):
-  --only-proposals PATH        keep only the proposal_ids a LOCAL file names (laptop dry runs);
-  --exclude-proposals PATH     keep all but those;
-  --only-proposal-ids a,b,c    the same, inline (what a Cloud Run one-off job takes: it cannot see a
-  --exclude-proposal-ids a,b,c laptop path; run_oneoff_job.sh picks an --args delimiter absent from the
-                               payload, so the commas survive).
-  A file holds one proposal_id per line (blank and '#' lines ignored) or a JSON list. gs:// paths are
-  REFUSED (no untested bucket read). Every form goes through ONE normalisation
-  (identity_cross_merchant_match.normalise_proposal_ids: strip, refuse empty / whitespace-only /
-  malformed entries -- a proposal_id is irp_ + 32 lowercase hex -- then de-dup and sort), and the
-  digest marks only the MODE, so --only-proposals FILE and --only-proposal-ids LIST naming the same
-  ids give the same digest. Any read or parse failure refuses (exit 2); it never falls back to no
-  selection. An id that is not among THIS run's proposals refuses the run (exit 2, naming it): a stale
-  list must not silently select less; so does an empty list or a selection that keeps nothing. The
-  selection is FOLDED INTO THE DIGEST (proposal_set_digest: each selected proposal's id AND its
-  fingerprint -- kind, strategy, keeper, target content_key, subjects, evidence -- plus a line carrying
-  the mode and the sorted selected ids), so a digest printed for a subset never authorises the full
-  set, another subset, or the same ids with changed content, and the full set's digest never
-  authorises a subset. The dry run prints the subset's digest, count and a next_step carrying the
-  flag in the form used (the inline form prints the sorted id list); --write-proposals takes the
-  same selection, recomputes, and refuses on a mismatch. Counts, samples, proposals.jsonl and the
-  audit sample are of the subset and say so ("selection").
+SELECTION (four flags, mutually exclusive). Each entry is "<proposal_id>=<content fingerprint>":
+  --only-proposals PATH          keep only the proposals a LOCAL file names (laptop dry runs);
+  --only-proposal-ids a=f,b=g    the same, inline (what a Cloud Run one-off job takes: it cannot see a
+                                 laptop path; run_oneoff_job.sh picks an --args delimiter absent from
+                                 the payload, so the commas survive);
+  --exclude-proposals PATH       DRY RUNS ONLY: keep all but those;
+  --exclude-proposal-ids a=f,... DRY RUNS ONLY.
+  The content fingerprint (cfp_, identity_cross_merchant_match.content_fingerprint; spec in that
+  module's docstring) covers every (moved listing, anchor) pair of the proposal as the audit rows
+  show it: both sides' product_key, canonical_url, title, size, price, currency, plus tier and kind.
+  The dry run prints it on every audit row, every sample and in a "fingerprints" line; the review
+  page recomputes it in JavaScript from the audit rows. Every given fingerprint is recomputed and a
+  mismatch refuses (exit 2): a write can only include a proposal whose listings and anchor are
+  content-identical to what was reviewed.
+  A file holds one entry per line (blank and '#' lines ignored) or a JSON list. gs:// paths are
+  REFUSED. Every form goes through ONE normalisation (normalise_proposal_ids: strip, refuse empty /
+  whitespace-only / malformed entries -- irp_ + 32 lowercase hex = cfp_ + 24 lowercase hex -- or one
+  id with two fingerprints, then de-dup and sort), and the digest marks only the MODE, so
+  --only-proposals FILE and --only-proposal-ids LIST naming the same entries give the same digest.
+  Any read or parse failure refuses (exit 2), never falling back to no selection. An id that is not
+  among THIS run's proposals refuses (exit 2, naming it); so does an empty list or a selection that
+  keeps nothing. The selection is FOLDED INTO THE DIGEST (proposal_set_digest: each selected
+  proposal's id and proposal_fingerprint, plus a line carrying the mode and the sorted id=cfp
+  entries). The dry run prints the subset's digest, count and a next_step carrying the flag in the
+  form used (shell-quoted path, or the sorted inline entries); --write-proposals takes the same
+  selection, recomputes, and refuses on a mismatch. A SELECTED write also refuses while ANY
+  'proposed' proposal of this strategy exists (an earlier run an approve could take whole), and when
+  any selected proposal already exists (it would dedupe into another run); its run then holds exactly
+  the selection. Counts, samples, proposals.jsonl and the audit sample are of the subset and say so.
 
 SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
   --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
@@ -86,6 +93,7 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -424,12 +432,14 @@ def _gcs_upload(bucket: str, name: str, body: bytes) -> None:  # pragma: no cove
 
 
 #: (mode, normalised proposal_ids, the selection flag as next_step prints it)
-Selection = Tuple[str, List[str], str]
+#: (mode, {proposal_id: reviewed content fingerprint}, the selection flag as next_step prints it)
+Selection = Tuple[str, Dict[str, str], str]
 
 
-def parse_proposal_ids(text: str, *, source: str = "the selection file") -> List[str]:
-    """proposal_ids from a selection file's text: a JSON list, or one id per line (blank lines and
-    lines starting with '#' ignored), through normalise_proposal_ids. Raises Refused."""
+def parse_proposal_ids(text: str, *, source: str = "the selection file") -> Dict[str, str]:
+    """{proposal_id: cfp} from a selection file's text: a JSON list of "id=cfp" strings, or one
+    "id=cfp" per line (blank lines and lines starting with '#' ignored), through
+    normalise_proposal_ids. Raises Refused."""
     body = text.strip()
     if body.startswith("["):
         try:
@@ -444,38 +454,45 @@ def parse_proposal_ids(text: str, *, source: str = "the selection file") -> List
         raise Refused(str(exc)) from exc
 
 
-def load_selection(args: argparse.Namespace) -> Optional[Selection]:
-    """The selection one of the four flags names, else None. Refuses (Refused, exit 2) a gs:// path,
-    an unreadable file, any malformed entry and an empty selection -- before the database is read,
-    and never by falling back to no selection."""
+def _load_selection(args: argparse.Namespace) -> Optional[Selection]:
     for mode in ("only", "exclude"):
         path = getattr(args, f"{mode}_proposals", None)
         inline = getattr(args, f"{mode}_proposal_ids", None)
         if path is not None:
             flag = f"--{mode}-proposals"
             if path.strip().lower().startswith("gs://"):
-                raise Refused(f"{flag} {path}: gs:// is not read (no untested bucket path); pass the ids "
-                              f"inline with --{mode}-proposal-ids id1,id2,... instead")
-            try:
-                with open(path, encoding="utf-8") as fh:
-                    text = fh.read()
-            except (OSError, UnicodeDecodeError) as exc:
-                raise Refused(f"{flag} {path}: cannot read it ({exc})") from exc
-            ids = parse_proposal_ids(text, source=f"{flag} {path}")
-            shown = f"{flag} {path}"
+                raise Refused(f"{flag} {path}: gs:// is not read (no untested bucket path); pass the "
+                              f"selection inline with --{mode}-proposal-ids id1=cfp1,id2=cfp2,... instead")
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            entries = parse_proposal_ids(text, source=f"{flag} {path}")
+            shown = f"{flag} {shlex.quote(path)}"
         elif inline is not None:
             flag = f"--{mode}-proposal-ids"
             try:
-                ids = normalise_proposal_ids(inline.split(","), source=flag) if inline.strip() else []
+                entries = normalise_proposal_ids(inline.split(","), source=flag) if inline.strip() else {}
             except SelectionError as exc:
                 raise Refused(str(exc)) from exc
-            shown = f"{flag} {','.join(ids)}"
+            shown = f"{flag} {','.join(f'{pid}={fp}' for pid, fp in entries.items())}"
         else:
             continue
-        if not ids:
+        if not entries:
             raise Refused(f"{flag} names no proposal_id: an empty selection is refused")
-        return mode, ids, shown
+        return mode, entries, shown
     return None
+
+
+def load_selection(args: argparse.Namespace) -> Optional[Selection]:
+    """The selection one of the four flags names, else None. EVERY failure -- a gs:// path, an
+    unreadable or undecodable file, any malformed entry, an empty selection, anything unexpected --
+    is Refused (exit 2) before the database is read; it never falls back to no selection and never
+    escapes as a traceback."""
+    try:
+        return _load_selection(args)
+    except Refused:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- by design: any failure refuses, nothing falls through
+        raise Refused(f"the proposal selection could not be read: {type(exc).__name__}: {exc}") from exc
 
 
 def selection_flag(selection: Optional[Selection]) -> str:
@@ -526,6 +543,8 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
     if len(plan.proposals) > max_proposals:
         raise Refused(f"{len(plan.proposals)} proposals exceed --max-proposals {max_proposals}; "
                       "narrow with --brands / --limit-groups")
+    if plan.selection is not None and plan.selection[0] != "only":
+        raise Refused("--write-proposals writes only an --only selection; --exclude is for dry runs")
     run_id = run_id or new_proposal_run_id()
     stamped = stamp_run(plan.proposals, run_id)
     bad = {p["proposal_id"]: errs for p in stamped if (errs := evidence_problems(p))}
@@ -533,6 +552,8 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
         raise Refused(f"proposals fail the engine's module rule: {dict(list(bad.items())[:5])}")
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
+        if plan.selection is not None:
+            await refuse_unsafe_selected_write(conn, [p["proposal_id"] for p in stamped])
         for p in stamped:
             # #2637 (L3): only this module may write this strategy's proposals, and says so. module_writer
             # is a CONVENTION the engine's Python writer checks, not a database constraint: nothing in
@@ -542,9 +563,46 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
             counts = await upsert_proposals(conn, [p], module_writer=STRATEGY)
             if counts["inserted"]:
                 inserted.append(p)
+        if plan.selection is not None and len(inserted) != len(stamped):
+            # a concurrent writer since the check above: roll the whole selected write back
+            raise Refused(f"{len(stamped) - len(inserted)} selected proposal(s) deduped onto existing rows; "
+                          "a selected write must insert every proposal into its own run (rolled back)")
     return {"proposal_run_id": run_id, "proposed": len(stamped), "inserted": len(inserted),
             "deduped": len(stamped) - len(inserted), "dry_run_digest": digest,
             **({"selection": plan.selection_info} if plan.selection_info else {})}
+
+
+PENDING_SQL = """
+SELECT r.proposal_id, r.evidence->>'proposal_run_id' AS proposal_run_id
+FROM identity_resolution_proposals r
+WHERE r.strategy = $1 AND r.status = 'proposed'
+ORDER BY r.proposal_id
+LIMIT 20
+"""
+EXISTING_SQL = """
+SELECT r.proposal_id, r.status, r.evidence->>'proposal_run_id' AS proposal_run_id
+FROM identity_resolution_proposals r
+WHERE r.proposal_id = ANY($1::text[])
+ORDER BY r.proposal_id
+LIMIT 20
+"""
+
+
+async def refuse_unsafe_selected_write(conn: Any, proposal_ids: Sequence[str]) -> None:
+    """A selected write must leave its run holding EXACTLY the selection, and no other pending run of
+    this strategy may exist: #2637 approves a module run as a whole, so an earlier full-set write
+    still 'proposed' (or a selected proposal deduping onto an older run) would let an approve take
+    more than was labelled. Raises Refused."""
+    pending = [dict(r) for r in await conn.fetch(PENDING_SQL, STRATEGY)]
+    if pending:
+        runs = sorted({str(r["proposal_run_id"]) for r in pending})
+        raise Refused(f"{STRATEGY} already has pending ('proposed') proposals under run(s) {runs} "
+                      f"(first: {[r['proposal_id'] for r in pending][:5]}): reject or resolve them before a "
+                      "selected write, or an approve of that run could take more than was labelled")
+    existing = [dict(r) for r in await conn.fetch(EXISTING_SQL, list(proposal_ids))]
+    if existing:
+        raise Refused(f"{len(existing)}+ selected proposal(s) already exist and would dedupe (deduped > 0): "
+                      f"{[(r['proposal_id'], r['status'], r['proposal_run_id']) for r in existing][:5]}")
 
 
 def approve_commands(run_id: str) -> Dict[str, str]:
@@ -565,14 +623,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap.add_argument("--market", default="US")
     select = ap.add_mutually_exclusive_group()
     select.add_argument("--only-proposals", metavar="PATH",
-                        help="keep only the proposal_ids this LOCAL file names (one per line or a JSON list; "
-                             "gs:// refused); folded into the digest")
+                        help="keep only the proposals this LOCAL file names as id=cfp (one per line or a JSON "
+                             "list; gs:// refused); each content fingerprint is verified; folded into the digest")
     select.add_argument("--exclude-proposals", metavar="PATH",
-                        help="keep every proposal except those this LOCAL file names; folded into the digest")
-    select.add_argument("--only-proposal-ids", metavar="ID,ID,...",
-                        help="keep only these proposal_ids (comma-separated; same digest as the file form)")
-    select.add_argument("--exclude-proposal-ids", metavar="ID,ID,...",
-                        help="keep every proposal except these proposal_ids (comma-separated)")
+                        help="DRY RUNS ONLY: keep every proposal except those this LOCAL file names (id=cfp)")
+    select.add_argument("--only-proposal-ids", metavar="ID=CFP,...",
+                        help="keep only these id=cfp proposals (comma-separated; same digest as the file form)")
+    select.add_argument("--exclude-proposal-ids", metavar="ID=CFP,...",
+                        help="DRY RUNS ONLY: keep every proposal except these id=cfp (comma-separated)")
     scope = ap.add_mutually_exclusive_group()
     scope.add_argument("--brands", default="", help="comma-separated brands (canonical brand match)")
     scope.add_argument("--all-brands", action="store_true",
@@ -585,6 +643,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = ap.parse_args(list(argv))
     if args.write_proposals and (not args.expect_digest or not args.max_proposals or args.max_proposals < 1):
         ap.error("--write-proposals needs --expect-digest (from a dry run) and --max-proposals >= 1")
+    if args.write_proposals and (args.exclude_proposals is not None or args.exclude_proposal_ids is not None):
+        ap.error("--write-proposals writes only an --only selection; --exclude-proposals / "
+                 "--exclude-proposal-ids are for dry runs")
     if args.explain and any(getattr(args, a) is not None for a in (
             "only_proposals", "exclude_proposals", "only_proposal_ids", "exclude_proposal_ids")):
         ap.error("--explain plans the statements only; it takes no proposal selection")

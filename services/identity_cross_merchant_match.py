@@ -83,6 +83,44 @@ approval or an apply. Its `size` is the offer's OWN -- the one size its own SKU 
 key is ABSENT when they state none (a "Default Title" offer pinned through the row title): the
 anchor's size is never copied onto an offer.
 
+CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the pair
+content Peng reviewed, so a selected write refuses a proposal whose listings, anchor, prices, titles,
+sizes, tier or kind changed since (a proposal_id pins only the structural move). It is computed from
+the AUDIT-ROW fields alone, so the static review page reproduces it in JavaScript from the audit JSON
+lines, and it deliberately reads NOTHING of RULE_VERSION / VETOES_CHECKED / evidence (a rule bump
+does not invalidate labels; the write's cmd_ digest still pins the evidence). Canonical form:
+  1. Input: every audit row of the proposal (ALL its (moved listing, anchor) pairs; --audit-size must
+     be >= the run's pairs or the page cannot see them all). Each row has kind, tier, and listing /
+     anchor objects with product_key, canonical_url, title, size {value, unit, pack} or null, price,
+     currency.
+  2. Per row, an object with keys in EXACTLY this order:
+       {"kind": K, "tier": T, "listing": SIDE, "anchor": SIDE}
+     SIDE = {"product_key", "canonical_url", "title", "size", "price", "currency"} in that order;
+     size = null, or {"value", "unit", "pack"} in that order.
+  3. Values: strings verbatim (no trimming or case folding) or null; kind, tier and product_key must
+     be strings.
+     NUMBERS ARE STRINGS: price -> JS Number(x).toFixed(2); size.value and size.pack ->
+     Number(x).toFixed(4); null stays null. Python reproduces toFixed exactly (js_fixed: the double's
+     exact decimal value rounded half away from zero), so 67 and 67.0 both give "67.00" (Cloud Logging
+     turns 67.0 into 67) and 10.125 gives "10.13", 1.005 gives "1.00". Finite values below 1e21 only.
+  4. Sort the row objects by listing.product_key, then anchor.product_key, comparing UTF-16 code
+     units (JS `a < b`); a (listing, anchor) pair appears once.
+  5. Serialise the array as JSON with no whitespace and non-ASCII kept as is (JS
+     JSON.stringify(rows); Python json.dumps(rows, ensure_ascii=False, separators=(",", ":"))),
+     encode UTF-8, sha256, lowercase hex; the fingerprint is "cfp_" + the first 24 hex digits.
+  JS reference:
+     const fx = (x, d) => x == null ? null : Number(x).toFixed(d);
+     const side = s => ({product_key: s.product_key, canonical_url: s.canonical_url ?? null,
+       title: s.title ?? null, size: s.size == null ? null : {value: fx(s.size.value, 4),
+       unit: s.size.unit ?? null, pack: fx(s.size.pack, 4)}, price: fx(s.price, 2),
+       currency: s.currency ?? null});
+     const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+     const objs = rows.map(r => ({kind: r.kind, tier: r.tier, listing: side(r.listing),
+       anchor: side(r.anchor)})).sort((a, b) => cmp(a.listing.product_key, b.listing.product_key)
+       || cmp(a.anchor.product_key, b.anchor.product_key));
+     cfp = "cfp_" + hex(sha256(utf8(JSON.stringify(objs)))).slice(0, 24);
+  A selection names each proposal as "<proposal_id>=<cfp>"; Plan.select refuses any mismatch.
+
 Pure: no I/O here. scripts/ops/propose_cross_merchant_matches.py exports the snapshot (one read-only
 transaction, two phases) and writes proposals through the engine's writer.
 """
@@ -97,7 +135,8 @@ import string
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal
+import math
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, FrozenSet, Hashable, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from services.identity_resolution import (
@@ -1230,27 +1269,61 @@ class Plan:
                 n += 1
         return n
 
-    def select(self, mode: str, ids: Iterable[str]) -> None:
-        """Narrow the run to a hand-labelled subset (--only-proposal[s|-ids] / --exclude-...): keeps
+    def select(self, mode: str, entries: Mapping[str, str]) -> None:
+        """Narrow the run to a hand-labelled subset (--only-proposal[s|-ids] / --exclude-...), given as
+        {proposal_id: content fingerprint}. Refuses (SelectionError) an unknown id, an empty selection,
+        one that keeps nothing, and ANY id whose content fingerprint is not what was reviewed. Keeps
         select_proposals' choice in proposals AND pairs (so the counts, samples and audit sample are of
-        the subset), and records the selection so digest() folds it in -- a subset's digest never
-        authorises the full set or another subset. Raises SelectionError (unknown id, empty selection).
+        the subset), and records (mode, sorted "id=cfp" of the kept proposals) so digest() folds it in.
         Outcomes (held / deferred / vetoed) stay those of the full run."""
         if self.selection is not None:
             raise SelectionError("a selection was already applied to this plan")
         full = len(self.proposals)
-        run_digest = self.digest()
-        id_list = list(ids)
-        kept = select_proposals(self.proposals, mode, id_list)
+        given = dict(entries)
+        kept = select_proposals(self.proposals, mode, list(given))
+        now = self.content_fingerprints()
+        changed = {pid: {"reviewed": fp, "now": now[pid]} for pid, fp in sorted(given.items()) if now[pid] != fp}
+        if changed:
+            raise SelectionError(
+                f"{len(changed)} selected proposal(s) are not the content that was reviewed (content "
+                f"fingerprint mismatch: a listing, anchor, price, title, size, tier or kind changed): {changed}")
         keep_ids = {p["proposal_id"] for p in kept}
         self.proposals = kept
         self.pairs = [pr for pr in self.pairs if pr["proposal_id"] in keep_ids]
-        self.selection = (mode, tuple(sorted(keep_ids)))
+        self.selection = (mode, tuple(sorted(f"{pid}={now[pid]}" for pid in keep_ids)))
         self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
-        self.selection_info = {"applied": True, "mode": mode, "ids_given": len(set(id_list)),
-                               "selected": len(kept), "of": full, "run_digest": run_digest,
+        self.selection_info = {"applied": True, "mode": mode, "ids_given": len(given),
+                               "fingerprints_verified": len(given), "selected": len(kept), "of": full,
                                "note": ("counts, samples and the audit sample are of the SELECTED proposals; "
                                         "outcomes and yield_both_ways are of the full run")}
+
+    def _pair_row(self, pr: Mapping[str, Any]) -> Dict[str, Any]:
+        """One (moved listing, anchor) pair as the audit sample shows it -- the content fingerprint's
+        only input, so the review page and the writer read the same fields."""
+        li, an, v = pr["listing"], pr["anchor"], pr["verdict"]
+        return {
+            "proposal_id": pr["proposal_id"], "kind": pr["kind"], "tier": pr["tier"], "market": self.market,
+            "size": _size_json(v.anchor_size), "price_ratio": v.price.get("ratio"),
+            "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
+                                   [o["offer_id"] for o in v.matched_offers]),
+            "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
+        }
+
+    def content_fingerprints(self) -> Dict[str, str]:
+        """{proposal_id: cfp_...} over EVERY pair of each proposal (not the audit sample). Raises
+        SelectionError if a proposal's pairs do not name exactly the listings it moves."""
+        rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for pr in self.pairs:
+            rows[pr["proposal_id"]].append(self._pair_row(pr))
+        out: Dict[str, str] = {}
+        for p in self.proposals:
+            ev = p.get("evidence") or {}
+            moved = sorted(ev.get("from_product_keys") or [ev.get("listing_product_key")])
+            seen = sorted(r["listing"]["product_key"] for r in rows.get(p["proposal_id"], ()))
+            if seen != moved:
+                raise SelectionError(f"proposal {p['proposal_id']} moves {moved} but its audit pairs name {seen}")
+            out[p["proposal_id"]] = content_fingerprint(rows[p["proposal_id"]])
+        return out
 
     # -- reporting --------------------------------------------------------------------------------
     def digest(self) -> str:
@@ -1291,15 +1364,20 @@ class Plan:
             {"section": "host_pairs", "market": self.market,
              "pairs": [{"pair": k, "listings": n} for k, n in sorted(host_pairs.items(), key=lambda kv: (-kv[1], kv[0]))[:top]]},
         ]
+        cfps = self.content_fingerprints()
         for tier in TIERS:
             sample = [p for p in self.proposals if p["evidence"]["tier"] == tier][:samples_per_tier]
             lines.append({"section": "samples", "market": self.market, "tier": tier,
                           **({"selection": self._selection_brief()} if self.selection_info else {}), "proposals": [
-                {"proposal_id": p["proposal_id"], "kind": p["kind"], "keeper": p["keeper_product_key"],
+                {"proposal_id": p["proposal_id"], "content_fingerprint": cfps[p["proposal_id"]], "kind": p["kind"],
+                 "keeper": p["keeper_product_key"],
                  "anchor_title": p["evidence"]["anchor"]["title"],
                  "listings": [{"title": d["title"], "hosts": d["hosts"], "ratio": d["price_ratio"]}
                               for d in p["evidence"]["listings"]],
                  "size": p["evidence"]["matcher_verdict"]["size"]} for p in sample]})
+        lines.append({"section": "fingerprints", "market": self.market,
+                      **({"selection": self._selection_brief()} if self.selection_info else {}),
+                      "content_fingerprints": dict(sorted(cfps.items()))})
         return lines
 
     def _selection_brief(self) -> Dict[str, Any]:
@@ -1313,18 +1391,9 @@ class Plan:
         rng = random.Random(seed)
         picked = pool if len(pool) <= size else rng.sample(pool, size)
         picked.sort(key=lambda x: (x["proposal_id"], x["listing"].product_key))
-        out = []
-        for pr in picked:
-            li, an, v = pr["listing"], pr["anchor"], pr["verdict"]
-            out.append({
-                "proposal_id": pr["proposal_id"], "kind": pr["kind"], "tier": pr["tier"], "market": self.market,
-                "size": _size_json(v.anchor_size), "price_ratio": v.price.get("ratio"),
-                "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
-                                       [o["offer_id"] for o in v.matched_offers]),
-                "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
-                **({"selection": self._selection_brief()} if self.selection_info else {}),
-            })
-        return out
+        cfps = self.content_fingerprints()
+        return [{**self._pair_row(pr), "content_fingerprint": cfps[pr["proposal_id"]],
+                 **({"selection": self._selection_brief()} if self.selection_info else {})} for pr in picked]
 
 
 def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]) -> Dict[str, Any]:
@@ -1337,6 +1406,82 @@ def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]
 SELECTION_MODES = ("only", "exclude")
 #: identity_resolution.new_proposal: "irp_" + the first 32 hex digits of sha256(proposal_key).
 PROPOSAL_ID_RE = re.compile(r"irp_[0-9a-f]{32}")
+#: content_fingerprint: "cfp_" + the first 24 hex digits of sha256 (module docstring).
+CONTENT_FINGERPRINT_RE = re.compile(r"cfp_[0-9a-f]{24}")
+_JS_FIXED_LIMIT = 1e21
+
+
+def js_fixed(x: Any, places: int) -> Optional[str]:
+    """JavaScript's Number(x).toFixed(places), exactly: None -> None; else the double's EXACT decimal
+    value rounded half away from zero (toFixed's "pick the larger n" on |x|). -0.0 is 0. Refuses a
+    non-finite value or one >= 1e21 (toFixed switches to exponent notation there)."""
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        raise ValueError(f"not a number: {x!r}")
+    f = float(x)
+    if not math.isfinite(f) or abs(f) >= _JS_FIXED_LIMIT:
+        raise ValueError(f"js_fixed takes a finite number below 1e21, not {x!r}")
+    if f == 0:
+        f = 0.0
+    q = Decimal(f).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    return format(q, "f")
+
+
+def _cfp_text(v: Any, what: str, *, required: bool = False) -> Optional[str]:
+    if v is None and not required:
+        return None
+    if not isinstance(v, str):
+        raise ValueError(f"content fingerprint: {what} must be a string{'' if required else ' or null'}, not {v!r}")
+    return v
+
+
+def _cfp_side(side: Mapping[str, Any], name: str) -> Dict[str, Any]:
+    size = side.get("size")
+    return {
+        "product_key": _cfp_text(side.get("product_key"), f"{name}.product_key", required=True),
+        "canonical_url": _cfp_text(side.get("canonical_url"), f"{name}.canonical_url"),
+        "title": _cfp_text(side.get("title"), f"{name}.title"),
+        "size": None if size is None else {"value": js_fixed(size.get("value"), 4),
+                                           "unit": _cfp_text(size.get("unit"), f"{name}.size.unit"),
+                                           "pack": js_fixed(size.get("pack"), 4)},
+        "price": js_fixed(side.get("price"), 2),
+        "currency": _cfp_text(side.get("currency"), f"{name}.currency"),
+    }
+
+
+def content_fingerprint_payload(rows: Iterable[Mapping[str, Any]]) -> str:
+    """The canonical JSON a content fingerprint hashes (module docstring, CONTENT FINGERPRINT)."""
+    objs = [{"kind": _cfp_text(r.get("kind"), "kind", required=True),
+             "tier": _cfp_text(r.get("tier"), "tier", required=True),
+             "listing": _cfp_side(r["listing"], "listing"), "anchor": _cfp_side(r["anchor"], "anchor")}
+            for r in rows]
+    if not objs:
+        raise ValueError("content fingerprint: a proposal has at least one (listing, anchor) pair")
+
+    def utf16(s: str) -> bytes:  # JS compares strings by UTF-16 code units
+        return s.encode("utf-16-be", "surrogatepass")
+
+    objs.sort(key=lambda o: (utf16(o["listing"]["product_key"]), utf16(o["anchor"]["product_key"])))
+    pairs = [(o["listing"]["product_key"], o["anchor"]["product_key"]) for o in objs]
+    if len(set(pairs)) != len(pairs):
+        raise ValueError(f"content fingerprint: a (listing, anchor) pair appears twice: {pairs}")
+    return json.dumps(objs, ensure_ascii=False, separators=(",", ":"))
+
+
+def content_fingerprint(rows: Iterable[Mapping[str, Any]]) -> str:
+    """cfp_ + 24 hex of sha256 over content_fingerprint_payload(rows): ALL the audit rows of ONE
+    proposal. Reproducible in JavaScript from the audit JSON lines (module docstring)."""
+    payload = content_fingerprint_payload(rows)
+    return "cfp_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def content_fingerprints_from_audit_rows(rows: Iterable[Mapping[str, Any]]) -> Dict[str, str]:
+    """{proposal_id: cfp_} from audit rows alone -- what the review page computes."""
+    by: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by[r["proposal_id"]].append(r)
+    return {pid: content_fingerprint(rs) for pid, rs in sorted(by.items())}
 
 
 class SelectionError(ValueError):
@@ -1348,9 +1493,9 @@ def proposal_set_digest(proposals: Sequence[Mapping[str, Any]], *,
     """Deterministic digest of a proposal set: each proposal's id and what it says it will do
     (identity_resolution.proposal_fingerprint: kind, keeper, target, subjects, evidence), sorted.
 
-    `selection` (mode, selected proposal_ids) is the hand-labelled subset the run was narrowed to:
-    `proposals` are then the SELECTED ones, and a last line carrying the mode and the sorted selected
-    ids is folded in. With no selection the digest is exactly the unselected one, so a subset's digest
+    `selection` (mode, the kept proposals' "id=cfp" entries) is the hand-labelled subset the run was
+    narrowed to: `proposals` are then the SELECTED ones, and a last line carrying the mode and the
+    sorted entries is folded in. With no selection the digest is exactly the unselected one, so a subset's digest
     never equals the full set's, nor another subset's, nor the same subset reached the other way."""
     lines = sorted(f"{p['proposal_id']}\t{proposal_fingerprint(dict(p))}" for p in proposals)
     if selection is not None:
@@ -1361,23 +1506,32 @@ def proposal_set_digest(proposals: Sequence[Mapping[str, Any]], *,
     return "cmd_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
 
 
-def normalise_proposal_ids(raw: Iterable[Any], *, source: str = "the selection") -> List[str]:
+def normalise_proposal_ids(raw: Iterable[Any], *, source: str = "the selection") -> Dict[str, str]:
     """THE one normalisation of a selection, whatever its form (a file's lines, a JSON list, an inline
-    comma list): strip each entry, refuse an entry that is not a string, is empty / whitespace-only, or
-    is not a well-formed proposal_id (PROPOSAL_ID_RE), then de-duplicate and sort. The same set of ids
-    always yields the same list, so the file and inline forms of one mode give the same digest.
-    Empty input -> [] (the caller refuses an empty selection)."""
-    out: Set[str] = set()
+    comma list). Each entry is "<proposal_id>=<content fingerprint>": strip it, refuse an entry that is
+    not a string, is empty / whitespace-only, has no "=", whose id is not PROPOSAL_ID_RE or whose
+    fingerprint is not CONTENT_FINGERPRINT_RE (a BOM is named), or one id given two fingerprints; then
+    de-duplicate and sort by id. The same set always yields the same mapping, so the file and inline
+    forms of one mode give the same digest. Empty input -> {} (the caller refuses an empty selection)."""
+    out: Dict[str, str] = {}
     for n, entry in enumerate(raw, 1):
         if not isinstance(entry, str):
             raise SelectionError(f"{source}: entry {n} is not a string: {entry!r}")
-        pid = entry.strip()
-        if not pid:
+        item = entry.strip()
+        if not item:
             raise SelectionError(f"{source}: entry {n} is empty or whitespace-only")
+        bom = " (it carries a BOM, U+FEFF: save the file as UTF-8 without one)" if "\ufeff" in item else ""
+        pid, sep, fp = item.partition("=")
+        if not sep:
+            raise SelectionError(f"{source}: entry {n} {item!r} is not <proposal_id>=<cfp_ fingerprint>{bom}")
         if not PROPOSAL_ID_RE.fullmatch(pid):
-            raise SelectionError(f"{source}: entry {n} {pid!r} is not a proposal_id (irp_ + 32 lowercase hex)")
-        out.add(pid)
-    return sorted(out)
+            raise SelectionError(f"{source}: entry {n} {pid!r} is not a proposal_id (irp_ + 32 lowercase hex){bom}")
+        if not CONTENT_FINGERPRINT_RE.fullmatch(fp):
+            raise SelectionError(f"{source}: entry {n} {fp!r} is not a content fingerprint (cfp_ + 24 lowercase hex)")
+        if out.get(pid, fp) != fp:
+            raise SelectionError(f"{source}: {pid} is given two content fingerprints: {out[pid]} and {fp}")
+        out[pid] = fp
+    return dict(sorted(out.items()))
 
 
 def select_proposals(proposals: Sequence[Mapping[str, Any]], mode: str,
@@ -1631,4 +1785,6 @@ __all__ = [
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
     "proposal_set_digest", "seed_matches", "select_brand_spellings", "select_proposals", "stamp_run",
     "PROPOSAL_ID_RE", "SELECTION_MODES", "SelectionError", "normalise_proposal_ids",
+    "CONTENT_FINGERPRINT_RE", "content_fingerprint", "content_fingerprint_payload",
+    "content_fingerprints_from_audit_rows", "js_fixed",
 ]
