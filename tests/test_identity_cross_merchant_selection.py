@@ -18,7 +18,7 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     proposal_set_digest,
     select_proposals,
 )
-from test_identity_cross_merchant_match import _mixed  # noqa: E402
+from test_identity_cross_merchant_match import _mixed, brand_store, retailer  # noqa: E402
 
 
 def _ids(plan):
@@ -133,14 +133,36 @@ def test_counts_samples_and_the_audit_sample_are_of_the_subset_and_say_so():
     assert "selection" not in full.summary()[0] and all("selection" not in r for r in full.audit_rows())
 
 
+def _two_anchors():
+    cat = _mixed()
+    brand_store(cat, "ext:laneige-water-sleeping-mask::w1", "LANEIGE", "Water Sleeping Mask 70ml",
+                host="us.laneige.com")
+    retailer(cat, 30, "Laneige", "Water Sleeping Mask 70ml", host="r30.example")
+    return cat
+
+
 def test_new_multi_merchant_groups_are_recounted_for_the_subset():
-    full = _mixed().plan()
-    assert full.new_multi_merchant_groups == 1
-    one = _ids(full)[:1]
-    plan = _selected("only", one)
-    assert plan.new_multi_merchant_groups == 1   # one retailer + the brand store = two hosts
-    # sanity: an independently built plan agrees with itself after the same selection
-    assert _selected("only", one).summary()[0]["expected_new_multi_merchant_groups"] == 1
+    cat = _two_anchors()
+    full = cat.plan()
+    assert full.new_multi_merchant_groups == 2   # each brand store gains a retailer host
+    lip = [p["proposal_id"] for p in full.proposals if "lip" in p["keeper_product_key"]]
+    assert 0 < len(lip) < len(full.proposals)
+    plan = cat.plan()
+    plan.select("only", lip)
+    assert plan.new_multi_merchant_groups == 1
+    assert plan.summary()[0]["expected_new_multi_merchant_groups"] == 1
+
+
+def test_the_digest_folds_the_selected_ids_themselves():
+    """Defence in depth: the marker carries the ids, so a selection whose ids disagree with the
+    proposals it is paired with can never reproduce a digest."""
+    plan = _mixed().plan()
+    ids = _ids(plan)
+    props = plan.proposals[:2]
+    d = proposal_set_digest(props, selection=("only", ids[:2]))
+    assert proposal_set_digest(props, selection=("only", list(reversed(ids[:2])))) == d
+    assert proposal_set_digest(props, selection=("only", ids[:3])) != d
+    assert proposal_set_digest(props, selection=("exclude", ids[:2])) != d
 
 
 # --- the ops script ---------------------------------------------------------------------------------------
