@@ -27,7 +27,7 @@ import mimetypes
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple, get_args
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, get_args
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -9333,7 +9333,42 @@ def _per_variant_sku_key(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip()) and VARIANT_SKU_INFIX in value and not value.endswith(SKU_SUFFIX)
 
 
-def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
+def _sku_key_on_moved_listing(sku_key: Any, moved_product_keys: Sequence[str]) -> bool:
+    """`sku_key` is `<one of the moved product keys>::v:<non-empty variant>` (the promoter's `::v::`
+    included): a matched offer is a variant of a row the proposal really moves, never another
+    product's SKU and never an empty variant part. Exactly be#2637's `sku_key_on_moved_listing`."""
+    from services.catalog_enrichment_agent.ingestion import VARIANT_SKU_INFIX
+
+    if not _per_variant_sku_key(sku_key):
+        return False
+    for pk in moved_product_keys:
+        prefix = f"{pk}{VARIANT_SKU_INFIX}"
+        if sku_key.startswith(prefix) and sku_key[len(prefix):].lstrip(":").strip():
+            return True
+    return False
+
+
+def _proposal_moved_keys(kind: Optional[str], evidence: Dict[str, Any]) -> List[str]:
+    """The product keys a membership proposal MOVES, from its evidence as the engine writes it:
+    attach_membership -> `listing_product_key`; merge_content_key -> `from_product_keys` (a list;
+    the jsonb column may arrive as text). Exactly be#2637's `_moved_product_keys`."""
+    if kind == "attach_membership":
+        keys = [evidence.get("listing_product_key")]
+    elif kind == "merge_content_key":
+        moved = evidence.get("from_product_keys")
+        if isinstance(moved, str):
+            try:
+                moved = json.loads(moved)
+            except ValueError:
+                moved = None
+        keys = list(moved) if isinstance(moved, (list, tuple)) else []
+    else:
+        keys = []
+    return [k for k in keys if isinstance(k, str) and k.strip()]
+
+
+def _valid_matcher_verdict(kind: Optional[str], verdict: Any,
+                           moved_product_keys: Sequence[str] = ()) -> bool:
     """Is `verdict` a valid same-size matcher verdict (contract v3) for a proposal of `kind`?
 
     THE SAME RULE as be#2637's shared validator (services/identity_resolution
@@ -9344,7 +9379,10 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
       strategy 'cross_merchant_same_size'; same_size exactly true; rule_version non-empty;
       tier T0a | T0b | T0c; size {value: a number > 0, unit: ml | g | count, pack: an integer >= 1};
       matched_offers: a NON-EMPTY list of {offer_id, sku_key}, each a non-empty string and the
-        sku_key a PER-VARIANT one (`_per_variant_sku_key`) -- the matched size's offers;
+        sku_key a PER-VARIANT one of a row the proposal MOVES (`_sku_key_on_moved_listing` against
+        `moved_product_keys`, `_proposal_moved_keys`) -- the matched size's offers. The pin is
+        (offer_id, sku_key); price, currency, size and market on an offer are INFORMATIONAL and never
+        read here;
       matched_seeds: a list (may be empty) of {seed_id: non-empty string, variant_id: string|null};
       merge_content_key also needs from_key_single_size exactly true.
     (The proposal's own `evidence.proposer` is checked beside it, in `_matcher_verdict`.)"""
@@ -9370,8 +9408,8 @@ def _valid_matcher_verdict(kind: Optional[str], verdict: Any) -> bool:
         and size.get("unit") in _MATCHER_SIZE_UNITS
         and isinstance(size.get("pack"), int) and not isinstance(size.get("pack"), bool) and size["pack"] >= 1
         and isinstance(offers, list) and offers
-        and all(isinstance(o, dict) and text(o.get("offer_id")) and _per_variant_sku_key(o.get("sku_key"))
-                for o in offers)
+        and all(isinstance(o, dict) and text(o.get("offer_id"))
+                and _sku_key_on_moved_listing(o.get("sku_key"), moved_product_keys) for o in offers)
         and isinstance(seeds, list)
         and all(isinstance(e, dict) and text(e.get("seed_id"))
                 and (e.get("variant_id") is None or text(e.get("variant_id"))) for e in seeds)
@@ -9390,7 +9428,7 @@ def _matcher_verdict(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             v = json.loads(v)
         except ValueError:
             return None
-    return v if _valid_matcher_verdict(p.get("kind"), v) else None
+    return v if _valid_matcher_verdict(p.get("kind"), v, _proposal_moved_keys(p.get("kind"), p)) else None
 
 
 def _resolved_group_members(

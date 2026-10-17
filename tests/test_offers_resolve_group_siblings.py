@@ -1111,7 +1111,7 @@ VERDICT_CASES = [
     ("size_pack_zero", "attach_membership", _bad(size={"value": 50, "unit": "ml", "pack": 0}), False),
     ("valid_seed_whole", "attach_membership", _verdict(seeds=[("eps_spec", None)]), True),
     ("valid_no_seeds", "attach_membership", _verdict(seeds=[]), True),
-    ("valid_promoter_lane", "attach_membership", _verdict(offers=[("of_sk", "prod::m::p::v::4123")]), True),
+    ("valid_promoter_lane", "attach_membership", _verdict(offers=[("of_sk", f"{RETAILER_PK}::v::4123")]), True),
     ("offer_sku_sync_lane_without_infix", "attach_membership", _verdict(offers=[("of_sk", "sku::prod::m::p::4123")]), False),
     ("offer_sku_variant_then_canonical", "attach_membership",
      _verdict(offers=[("of_sk", f"{RETAILER_PK}::v:1::canonical")]), False),
@@ -1131,6 +1131,22 @@ VERDICT_CASES = [
     ("seed_id_blank", "attach_membership", _bad(matched_seeds=[{"seed_id": "", "variant_id": None}]), False),
     ("seed_variant_not_string", "attach_membership", _bad(matched_seeds=[{"seed_id": "eps_spec", "variant_id": 50}]), False),
     ("seed_variant_blank", "attach_membership", _bad(matched_seeds=[{"seed_id": "eps_spec", "variant_id": " "}]), False),
+    # The sku_key must be a variant of a row the proposal MOVES (controller 10-17): the attach's
+    # listing_product_key, a member of the merge's from_product_keys (both RETAILER_PK here).
+    ("offer_sku_other_product", "attach_membership", _verdict(offers=[("of_sk", "ext:other::x::v:9")]), False),
+    ("offer_sku_other_prod_key", "attach_membership", _verdict(offers=[("of_sk", "prod::zzz::v:9")]), False),
+    ("offer_sku_bare_infix", "attach_membership", _verdict(offers=[("of_sk", "x::v:")]), False),
+    ("offer_sku_empty_variant", "attach_membership", _verdict(offers=[("of_sk", f"{RETAILER_PK}::v:")]), False),
+    ("offer_sku_empty_promoter_variant", "attach_membership", _verdict(offers=[("of_sk", f"{RETAILER_PK}::v::")]), False),
+    ("offer_sku_blank_variant", "attach_membership", _verdict(offers=[("of_sk", f"{RETAILER_PK}::v: ")]), False),
+    ("offer_sku_longer_key_same_prefix", "attach_membership", _verdict(offers=[("of_sk", f"{RETAILER_PK}x::v:9")]), False),
+    ("offer_sku_keeper_on_merge", "merge_content_key",
+     _verdict(offers=[("of_sk", f"{BRAND_PK}::v:9")], from_key_single_size=True), False),
+    ("valid_merge_moved_member", "merge_content_key",
+     _verdict(offers=[("of_sk", f"{RETAILER_PK}::v:9")], from_key_single_size=True), True),
+    ("offer_informational_fields_ignored", "attach_membership",
+     _verdict(offers=[]) | {"matched_offers": [{"offer_id": "of_sk", "sku_key": _sku(RETAILER_PK, "of_sk"), "price": None,
+                                                 "currency": "XYZ", "market": "MARS", "size": {"value": 30}}]}, True),
     ("merge_without_single_size", "merge_content_key", _verdict(), False),
     ("merge_single_size_false", "merge_content_key", _verdict(from_key_single_size=False), False),
 ]
@@ -1165,7 +1181,7 @@ def test_the_local_validator_agrees_with_the_shared_one():
     import routes.agent_shop_gateway as gateway
 
     for case, kind, verdict, valid in VERDICT_CASES:
-        assert gateway._valid_matcher_verdict(kind, verdict) is valid, case
+        assert gateway._valid_matcher_verdict(kind, verdict, [RETAILER_PK]) is valid, case
     import services.identity_resolution as identity_resolution
 
     shared = getattr(identity_resolution, "validate_matcher_verdict", None)
@@ -1177,7 +1193,8 @@ def test_the_local_validator_agrees_with_the_shared_one():
     assert strategy is not None, "validate_matcher_verdict exists but CROSS_MERCHANT_SAME_SIZE does not"
     assert gateway._CROSS_MERCHANT_SAME_SIZE == strategy
     for case, kind, verdict, valid in VERDICT_CASES:
-        shared_valid = not shared(kind, {"matcher_verdict": verdict}, strategy=strategy)
+        evidence = {"listing_product_key": RETAILER_PK, "from_product_keys": [RETAILER_PK], "matcher_verdict": verdict}
+        shared_valid = not shared(kind, evidence, strategy=strategy)
         if case in LOCAL_ONLY_REJECTS:
             assert valid is False and shared_valid is True, case
         else:
@@ -1236,14 +1253,22 @@ def test_an_unresolved_member_of_a_mixed_group_lends_no_seed(monkeypatch, client
 
 
 def test_a_verdict_cannot_vouch_for_an_offer_on_an_unresolved_listing(monkeypatch, client):
-    """Both checks, not either: an offer id a verdict lists is comparable only on a RESOLVED listing
-    (a verdict naming another listing's offer -- bad data -- vouches for nothing there)."""
+    """Both checks, not either: an offer a verdict lists is comparable only on a RESOLVED listing.
+    (1) A verdict naming another listing's SKU is INVALID as a whole (the sku_key prefix rule): it
+    resolves nothing. (2) Defense in depth: a catalog row on an unresolved listing whose sku_key (bad
+    data) carries the resolved listing's prefix is still not comparable there."""
     members = MEMBERS + [_member("ext:retailer:serum-mini", "sig_grp_mini", CK, None, "ext:retailer:serum-mini")]
     rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0),
             _catalog_row("of_mini", "ext:retailer:serum-mini", "minis.com", 5.0)]
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
                    proposals=[_attach(RETAILER_PK, verdict=_verdict(offers=[
                        ("of_sk", _sku(RETAILER_PK, "of_sk")), ("of_mini", _sku("ext:retailer:serum-mini", "of_mini"))]))],
+                   seeds=[_single_size_brand_seed(29.0)])
+    assert _marked(body) == [] and "best_price_offer_id" not in body
+    rows[1] = _catalog_row("of_mini", "ext:retailer:serum-mini", "minis.com", 5.0, sku_key=_sku(RETAILER_PK, "of_mini"))
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", members=members, catalog_rows=rows,
+                   proposals=[_attach(RETAILER_PK, verdict=_verdict(offers=[
+                       ("of_sk", _sku(RETAILER_PK, "of_sk")), ("of_mini", _sku(RETAILER_PK, "of_mini"))]))],
                    seeds=[_single_size_brand_seed(29.0)])
     assert "price_comparable" not in _by_id(body)["of:catalog_offer:of_mini"]
     assert body["best_price_offer_id"] == "of:catalog_offer:of_sk"
