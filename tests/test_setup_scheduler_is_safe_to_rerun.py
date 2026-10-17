@@ -760,13 +760,13 @@ def test_the_sweep_create_path_keeps_the_full_definition(tmp_path):
     )
 
 
-@pytest.mark.parametrize("live_args, no_retire", [(LIVE_ARGS_RETIRING, False), (LIVE_ARGS_OBSERVING, True)])
-def test_the_sweep_update_path_keeps_env_secrets_and_the_live_retire_choice(tmp_path, live_args, no_retire):
-    """Review item 6: a plain re-run must not wipe hand-set env or secrets, reset cpu/memory, or flip
-    the live job's retire choice (RETIRE unset on this run)."""
+@pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
+def test_the_sweep_update_path_keeps_env_and_secrets(tmp_path, retire, no_retire):
+    """Review item 6: a re-run must not wipe hand-set env or secrets or reset cpu/memory; the
+    retire choice is the one stated on the run."""
     calls = _run(tmp_path, {
-        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": None,
-        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": live_args,
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": retire,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path),
     })
     (tokens,) = _sweep_calls(calls)
     assert tokens[:4] == ["run", "jobs", "update", SWEEP]
@@ -779,6 +779,19 @@ def test_the_sweep_update_path_keeps_env_secrets_and_the_live_retire_choice(tmp_
     assert args.endswith(",--no-retire") is no_retire
 
 
+@pytest.mark.parametrize("live_args", [LIVE_ARGS_RETIRING, LIVE_ARGS_OBSERVING, ""])
+def test_an_update_without_a_stated_retire_choice_is_refused(tmp_path, live_args):
+    """Whatever the live job runs, an update that does not state RETIRE is refused before any write:
+    the script never reads the job template back (test_ops_scripts_read_the_serving_revision), and a
+    guessed default could silently arm or disarm retirement."""
+    calls, proc = _run_full(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": None,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": live_args,
+    }, expect_rc=2)
+    assert _sweep_calls(calls) == []
+    assert "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in proc.stderr
+
+
 @pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
 def test_an_explicit_retire_flag_wins_on_update(tmp_path, retire, no_retire):
     calls = _run(tmp_path, {
@@ -789,10 +802,3 @@ def test_an_explicit_retire_flag_wins_on_update(tmp_path, retire, no_retire):
     assert _values(tokens, "--args")[-1].endswith(",--no-retire") is no_retire
 
 
-def test_an_unreadable_live_job_refuses_to_guess_the_retire_choice(tmp_path):
-    calls, proc = _run_full(tmp_path, {
-        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": None,
-        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": "",
-    }, expect_rc=2)
-    assert _sweep_calls(calls) == []
-    assert "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in proc.stderr

@@ -933,24 +933,20 @@ sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
 # EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION defaulting to false. A plain re-run of this script for any
 # other job would then silently disarm retirement and the pending suppression, and wipe hand-set env.
 # So the UPDATE path passes only the image, the args, --max-retries and --task-timeout, and the
-# retire choice in the args is the LIVE job's own unless EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE is
-# set on this run: read back from the job (`--no-retire` present or not), and refused if it cannot
-# be read. CREATE (a fresh project) keeps mkcrawljob and its full definition.
+# retire choice in the args must be stated on the run (EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false):
+# an update without it is refused, never guessed. CREATE (a fresh project) keeps mkcrawljob and its full definition.
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
   echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE pending=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION)"
   SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300"
   if have "$GCLOUD" run jobs describe external-seed-destination-sweep --region "$REGION"; then
-    if [ -n "$_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT" ]; then
-      SWEEP_NO_RETIRE=$([ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && echo false || echo true)
-    else
-      LIVE_SWEEP_ARGS=$("$GCLOUD" run jobs describe external-seed-destination-sweep --region "$REGION" \
-        --format='value(spec.template.spec.template.spec.containers[0].args)' 2>/dev/null || true)
-      case "$LIVE_SWEEP_ARGS" in
-        *--no-retire*) SWEEP_NO_RETIRE=true ;;
-        *jobs.external_seed_destination_sweep*) SWEEP_NO_RETIRE=false ;;
-        *) echo "external-seed-destination-sweep: could not read the live job's args to keep its retire choice; set EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false explicitly" >&2; exit 2 ;;
-      esac
+    # The retire choice must be STATED on an update. Reading it back from the job would be a template
+    # read, which this script never does for a runtime question (tests/test_ops_scripts_read_the_
+    # serving_revision.py); guessing a default could silently arm or disarm retirement.
+    if [ -z "$_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT" ]; then
+      echo "external-seed-destination-sweep exists: set EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false explicitly for this update (check the live job's args for --no-retire first); refusing to guess" >&2
+      exit 2
     fi
+    SWEEP_NO_RETIRE=$([ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && echo false || echo true)
     [ "$SWEEP_NO_RETIRE" = true ] && SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
     echo "   (update: image, args, --max-retries 0, --task-timeout 3600s only; env and secrets untouched; no-retire=$SWEEP_NO_RETIRE)"
     "$GCLOUD" run jobs update external-seed-destination-sweep --region "$REGION" --image "$BACKEND_IMAGE" \
