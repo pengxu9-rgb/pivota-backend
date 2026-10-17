@@ -356,7 +356,14 @@ def is_challenge(diag: Mapping[str, str]) -> bool:
     return str(diag.get("cf-mitigated") or "").strip().lower() == "challenge"
 
 
-CHALLENGE_TRIP_HOSTS_DEFAULT = 3
+# 8, not 3 (controller review of be#2640, 2026-10-17): the refresh's healthy nights already draw a few
+# challenges. Distinct hosts answering `cf-mitigated: challenge` (429/503, from the `crawl backoff`
+# lines) in the busiest 120 s of each night, 10-08..10-15: 4 / 3 / 3 / 1 / 2 / 1 (10-12 and 10-14: none),
+# with ichibanm.com challenged on 5 of those nights. The listing night, 10-16 (tm899), peaked at 360. A
+# default of 3 would have cooled down 3 of 6 healthy nights; 8 is twice the healthy peak and still trips
+# within the first seconds of a 10-16 night. Hosts that challenge every night belong in
+# CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS (a data fact set at rollout), not in this number.
+CHALLENGE_TRIP_HOSTS_DEFAULT = 8
 CHALLENGE_WINDOW_SECONDS_DEFAULT = 120.0
 COOLDOWN_SECONDS_DEFAULT = 900.0
 # Hosts that challenge EVERY request whatever the IP's standing (a store whose Cloudflare zone runs
@@ -390,7 +397,7 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
 
     TWO TRIP RULES, either one trips:
       * CHALLENGE: `challenge_trip_hosts` distinct hosts answering `cf-mitigated: challenge` within
-        `challenge_window_seconds` (default 3 in 120 s). 2026-10-16: tm899 peaked at 262
+        `challenge_window_seconds` (default 8 in 120 s; healthy nights peak at 4). 2026-10-16: tm899 peaked at 262
         challenge-or-429 hosts in 60 s and zt5zz drew 359 challenges in its first two minutes; no
         night of 10-08..10-15 had more than 12 throttled hosts in the whole run;
       * THROTTLE: the parent's rule over 429 / 503 + Retry-After, `trip_hosts` in `window_seconds`
