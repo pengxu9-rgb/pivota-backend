@@ -70,6 +70,7 @@ _INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
 _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE+set}"
 _CATALOG_DESTINATION_SWEEP_EXPLICIT="${CATALOG_DESTINATION_SWEEP+set}"
 _EXTERNAL_REFERRAL_REFRESH_EXPLICIT="${EXTERNAL_REFERRAL_REFRESH+set}"
 # Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
@@ -915,15 +916,49 @@ sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
 # most brand hosts and reports "0 dead links" while having seen almost nothing.
 # task-timeout is raised over the crawl default because per-host pacing is the point: ~1,700 seeds
 # a day is a full corpus pass inside the 7-day staleness window.
+#
+# PACED SINCE be#2641 (2026-10-17): every request waits on one global bucket (0.5/s, 6 new hosts a
+# minute) and the run carries a wall-clock budget, so these values are the ones agreed for it:
+#   --limit 3500 --budget-seconds 3300   prod read 5,000 candidates in ~15 min unpaced; paced, a run
+#                                        spends its 3,300 s budget (under the 3,600 s task timeout,
+#                                        so it prints its own summary) and leaves the rest of the
+#                                        3,500 for tomorrow (`hosts_not_started`).
+#   --max-retries 0                      OVERRIDES mkcrawljob's 1: an exit 3 (ip_throttled) or a crash
+#                                        must not re-run a full pass from the same address minutes
+#                                        after it was throttled. The next night is the retry.
+#
+# AN EXISTING JOB IS UPDATED, NOT REBUILT (controller review of be#2641, 2026-10-17). mkcrawljob on an
+# existing job is an `update` carrying --set-env-vars (REPLACES the whole env), --set-secrets
+# (replaces the mounts), --cpu 1 --memory 1Gi, and args with `--no-retire` unless RETIRE=true; with
+# EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION defaulting to false. A plain re-run of this script for any
+# other job would then silently disarm retirement and the pending suppression, and wipe hand-set env.
+# So the UPDATE path passes only the image, the args, --max-retries and --task-timeout, and the
+# retire choice in the args must be stated on the run (EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false):
+# an update without it is refused, never guessed. CREATE (a fresh project) keeps mkcrawljob and its full definition.
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
   echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE pending=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION)"
-  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,1700"
-  [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
-  mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
-    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
-    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" \
-    --task-timeout 3600s \
-    --command python --args="$SWEEP_ARGS"
+  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300"
+  if have "$GCLOUD" run jobs describe external-seed-destination-sweep --region "$REGION"; then
+    # The retire choice must be STATED on an update. Reading it back from the job would be a template
+    # read, which this script never does for a runtime question (tests/test_ops_scripts_read_the_
+    # serving_revision.py); guessing a default could silently arm or disarm retirement.
+    if [ -z "$_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT" ]; then
+      echo "external-seed-destination-sweep exists: set EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false explicitly for this update (check the live job's args for --no-retire first); refusing to guess" >&2
+      exit 2
+    fi
+    SWEEP_NO_RETIRE=$([ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && echo false || echo true)
+    [ "$SWEEP_NO_RETIRE" = true ] && SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
+    echo "   (update: image, args, --max-retries 0, --task-timeout 3600s only; env and secrets untouched; no-retire=$SWEEP_NO_RETIRE)"
+    "$GCLOUD" run jobs update external-seed-destination-sweep --region "$REGION" --image "$BACKEND_IMAGE" \
+      --max-retries 0 --task-timeout 3600s --command python --args="$SWEEP_ARGS" --quiet
+  else
+    [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
+    mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
+      --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" \
+      --task-timeout 3600s --max-retries 0 \
+      --command python --args="$SWEEP_ARGS"
+  fi
 else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi

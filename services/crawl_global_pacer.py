@@ -236,6 +236,9 @@ class GlobalOriginPacer:
         self.jitter = min(max(_finite_non_negative(jitter, JITTER_DEFAULT), 0.0), 0.9)
         # A monotonic instant past which no cool-down may be waited out (the run's budget).
         self.deadline = deadline
+        # No request STARTS at or after `deadline` either (be#2640 review L1): the first one that
+        # would stops the pacer. This was the destination sweep's opt-in `hard_deadline` (be#2641);
+        # the review made it the rule for every run, so the flag is gone.
         self.paused_until = 0.0
         self.stopped = False
         self.stop_reason: Optional[str] = None

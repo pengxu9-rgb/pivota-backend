@@ -103,7 +103,11 @@ FAKE_GCLOUD = textwrap.dedent(
       "scheduler jobs describe")
         grep -qx "$4" "$EXISTING_TRIGGERS_FILE" && exit 0 || exit 1 ;;
       "run jobs describe")                      # jobs: "create" unless EXISTING_JOBS_FILE names them
-        [ -n "${EXISTING_JOBS_FILE:-}" ] && grep -qx "$4" "$EXISTING_JOBS_FILE" && exit 0 || exit 1 ;;
+        if [ -n "${EXISTING_JOBS_FILE:-}" ] && grep -qx "$4" "$EXISTING_JOBS_FILE"; then
+          case "$*" in *--format*) printf '%s' "${FAKE_JOB_ARGS:-}" ;; esac   # the live job's args
+          exit 0
+        fi
+        exit 1 ;;
       "iam service-accounts") exit 0 ;;
       "run revisions describe") printf '%s' "$REVISION_JSON"; exit 0 ;;
       "run services describe")
@@ -723,3 +727,78 @@ def test_the_refresh_update_path_touches_only_image_retries_timeout_and_args(tmp
     for flag in ("--set-env-vars", "--set-secrets", "--update-env-vars", "--subnet", "--memory", "--cpu",
                  "--service-account"):
         assert _values(tokens, flag) == [], f"{flag} must not be on the update path"
+
+
+# ── the external-seed destination sweep (be#2641): an UPDATE never rebuilds the job ─────────────────
+SWEEP = "external-seed-destination-sweep"
+
+
+def _sweep_calls(calls: list[str]) -> list[list[str]]:
+    return [c.split() for c in calls
+            if c.startswith(f"run jobs create {SWEEP} ") or c.startswith(f"run jobs update {SWEEP} ")]
+
+
+def _existing_sweep(tmp_path: Path) -> str:
+    jobs = tmp_path / "jobs.txt"
+    jobs.write_text(SWEEP + "\n")
+    return str(jobs)
+
+
+LIVE_ARGS_RETIRING = "-m;jobs.external_seed_destination_sweep;--limit;5000"
+LIVE_ARGS_OBSERVING = "-m;jobs.external_seed_destination_sweep;--limit;5000;--no-retire"
+
+
+def test_the_sweep_create_path_keeps_the_full_definition(tmp_path):
+    calls = _run(tmp_path, {"EXTERNAL_SEED_DESTINATION_SWEEP": "true"})
+    (tokens,) = _sweep_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "create", SWEEP]
+    assert _values(tokens, "--max-retries")[-1] == "0"
+    assert _values(tokens, "--subnet") == ["pivota-crawl"]
+    assert _values(tokens, "--set-env-vars") and _values(tokens, "--set-secrets")
+    assert _values(tokens, "--args")[-1] == (
+        "-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300,--no-retire"
+    )
+
+
+@pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
+def test_the_sweep_update_path_keeps_env_and_secrets(tmp_path, retire, no_retire):
+    """Review item 6: a re-run must not wipe hand-set env or secrets or reset cpu/memory; the
+    retire choice is the one stated on the run."""
+    calls = _run(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": retire,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path),
+    })
+    (tokens,) = _sweep_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "update", SWEEP]
+    for flag in ("--set-env-vars", "--set-secrets", "--update-env-vars", "--update-secrets", "--subnet",
+                 "--memory", "--cpu", "--service-account", "--network"):
+        assert _values(tokens, flag) == [], f"{flag} must not be on the update path"
+    assert _values(tokens, "--max-retries") == ["0"] and _values(tokens, "--task-timeout") == ["3600s"]
+    args = _values(tokens, "--args")[-1]
+    assert args.startswith("-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300")
+    assert args.endswith(",--no-retire") is no_retire
+
+
+@pytest.mark.parametrize("live_args", [LIVE_ARGS_RETIRING, LIVE_ARGS_OBSERVING, ""])
+def test_an_update_without_a_stated_retire_choice_is_refused(tmp_path, live_args):
+    """Whatever the live job runs, an update that does not state RETIRE is refused before any write:
+    the script never reads the job template back (test_ops_scripts_read_the_serving_revision), and a
+    guessed default could silently arm or disarm retirement."""
+    calls, proc = _run_full(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": None,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": live_args,
+    }, expect_rc=2)
+    assert _sweep_calls(calls) == []
+    assert "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in proc.stderr
+
+
+@pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
+def test_an_explicit_retire_flag_wins_on_update(tmp_path, retire, no_retire):
+    calls = _run(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": retire,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": LIVE_ARGS_OBSERVING if not no_retire else LIVE_ARGS_RETIRING,
+    })
+    (tokens,) = _sweep_calls(calls)
+    assert _values(tokens, "--args")[-1].endswith(",--no-retire") is no_retire
+
+

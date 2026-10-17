@@ -232,7 +232,10 @@ def test_the_schedule_never_overlaps_the_daily_crawls_on_the_same_address(tmp_pa
     seed_block = seed_block[: seed_block.index("\nelse")]
     seed_timeout = _last_int(r"--task-timeout (\d+)s", helper + seed_block)
     seed_retries = _last_int(r"--max-retries (\d+)", helper + seed_block)
-    assert seed_retries >= 1, "precondition: this is the retry the first schedule missed"
+    # The helper's default retry is still read (the first version of this schedule missed it); since
+    # be#2641 the paced sweep overrides it to 0, after the default, so the override is what counts.
+    assert _last_int(r"--max-retries (\d+)", helper) >= 1, "precondition: mkcrawljob's default retry is read"
+    assert seed_retries == 0, "the sweep's own --max-retries 0 wins over mkcrawljob's default"
 
     for name, theirs in (
         ("tierb-cart-link-eligibility", _windows(tierb_cron, tierb_timeout, tierb_retries)),
