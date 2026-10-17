@@ -235,7 +235,8 @@ class TestApplyFlow:
         conn.served_loser = "b"
         result = await apply_approved(conn, run_id="RUN1")
         pid = conn.approved[0]["proposal_id"]
-        assert result == {"run_id": "RUN1", "applied": [], "skipped": [(pid, "a_loser_is_served")]}
+        assert {k: result[k] for k in ("run_id", "applied", "skipped", "blocked", "deferred")} == {
+            "run_id": "RUN1", "applied": [], "skipped": [(pid, "a_loser_is_served")], "blocked": [], "deferred": []}
         assert conn.suppressed == [] and conn.deactivated == [] and conn.marked == []
         [(held_id, held)] = conn.held
         assert held_id == pid
