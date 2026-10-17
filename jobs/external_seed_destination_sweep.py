@@ -129,7 +129,7 @@ def main() -> int:
     parser.add_argument(
         "--ip-challenge-trip-hosts", type=int, default=None,
         help="Distinct hosts answering a Cloudflare challenge within the window that trip the IP "
-             "breaker. Defaults to CRAWL_IP_CHALLENGE_TRIP_HOSTS, then 3. <= 0 disables this rule.",
+             "breaker. Defaults to CRAWL_IP_CHALLENGE_TRIP_HOSTS, then 8. <= 0 disables this rule.",
     )
     parser.add_argument(
         "--ip-challenge-window-seconds", type=float, default=None,

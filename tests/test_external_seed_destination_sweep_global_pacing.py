@@ -137,6 +137,10 @@ def _seeds(hosts: List[str]) -> List[Dict[str, Any]]:
 
 
 def _sweep(monkeypatch, client, seeds, *, concurrency: Optional[int] = None, **kwargs):
+    # The storm fixtures trip on three challenge hosts; the shipped default (8) is pinned in
+    # test_the_env_and_flag_defaults, which passes nothing.
+    if kwargs.pop("shipped_defaults", False) is False:
+        kwargs.setdefault("ip_challenge_trip_hosts", 3)
     recorded: List[str] = []
 
     async def fake_candidates(limit):
@@ -398,11 +402,11 @@ def test_every_pacer_deadline_is_hard(vclock) -> None:
 
 def test_the_env_and_flag_defaults(monkeypatch, vclock) -> None:
     client = _Client(vclock)
-    summary, _r, _p = _sweep(monkeypatch, client, _seeds(["a.example"]))
+    summary, _r, _p = _sweep(monkeypatch, client, _seeds(["a.example"]), shipped_defaults=True)
     assert (summary["global_rps"], summary["max_new_hosts_per_minute"], summary["budget_seconds"]) == (
         0.5, 6, 3300.0,
     )
-    assert summary["ip_throttle_challenge_trip_hosts"] == 3
+    assert summary["ip_throttle_challenge_trip_hosts"] == 8
     assert summary["ip_throttle_challenge_window_seconds"] == 120.0
     assert summary["ip_throttle_cooldown_seconds"] == 900.0
     cgp.reset_for_tests()

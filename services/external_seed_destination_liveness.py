@@ -897,8 +897,8 @@ async def run_destination_sweep(
 
     PACED (2026-10-16): every request of the run (catalogue pages, their retries, PDP probes,
     robots.txt) waits on one `crawl_global_pacer.GlobalOriginPacer`, and a
-    `crawl_ip_throttle.StagedIpThrottleBreaker` watches every answer: 3 hosts answering a
-    Cloudflare challenge within 120 s pause the run 900 s and halve its rate; a second trip ends
+    `crawl_ip_throttle.StagedIpThrottleBreaker` watches every answer: 8 hosts answering a
+    Cloudflare challenge within 120 s (healthy refresh nights peak at 4) pause the run 900 s and halve its rate; a second trip ends
     it. See `SWEEP_GLOBAL_RPS_DEFAULT`.
     """
     candidates = await get_sweep_candidates(limit)
