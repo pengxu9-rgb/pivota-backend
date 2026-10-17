@@ -33,6 +33,7 @@ from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
+from services import crawl_global_pacer
 from services import external_seed_destination_liveness as destination_liveness
 from services import market_registry
 from services import seed_served_url
@@ -5727,6 +5728,12 @@ async def _refresh_external_seed_by_id(
             "domain": report_host or None,
             "destination_refresh": destination_refresh,
         }
+    except crawl_global_pacer.GlobalPaceStopped:
+        # NOT AN ATTEMPT (review M1, 2026-10-17): the run's global pacer refused to send the request
+        # (the IP breaker's final trip, or the budget ending). Stamping it would push a row nobody
+        # read behind every other row; it propagates unstamped, and the batch counts it with the
+        # rows it deferred (`skipped_for_ip_throttle` / `skipped_for_budget`).
+        raise
     except Exception as exc:
         # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
         # the product, so no observation is recorded and the failure streak does not move.

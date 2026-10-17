@@ -246,15 +246,29 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
         # dark for 41% of the cohort. `max_redirects` is capped because httpx applies `timeout`
         # PER HOP, so the default 20 would make this fetch's worst case ~20x the nominal timeout
         # on a request path that has no auth in front of it.
+        #
+        # EVERY HOP PAYS (review M2, 2026-10-17): the global pacer's request hook takes a slot for
+        # each redirect hop after the first and admits a hop onto another host as a new host. A
+        # no-op with no pacer installed. The hop cap stays `_MAX_ROBOTS_REDIRECTS` (3, under the
+        # pacer's 5).
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            max_redirects=_MAX_ROBOTS_REDIRECTS,
             headers={"User-Agent": user_agent},
+            **crawl_global_pacer.redirect_client_kwargs(_MAX_ROBOTS_REDIRECTS),
             **({"transport": ROBOTS_TRANSPORT_FACTORY.get()(), "trust_env": False}
                if ROBOTS_TRANSPORT_FACTORY.get() else {}),
         ) as client:
             resp = await client.get(f"https://{host}/robots.txt")
+        # A ROBOTS ANSWER IS AN ORIGIN ANSWER (review L2). It used to reach neither the host's
+        # backoff nor the IP breaker, so a robots.txt 429 or Cloudflare challenge -- often a new
+        # host's FIRST answer -- was invisible to both. Keyed on the host asked, like the gate.
+        # `clears=False`: a robots 200/404 says nothing about the PAGES, so it must not wipe a
+        # backoff a page 429 armed (the robots cache expiring mid-backoff would otherwise end it).
+        note_response(
+            f"https://{host}/robots.txt", resp.status_code,
+            retry_after=resp.headers.get("retry-after"), headers=resp.headers, clears=False,
+        )
         if resp.status_code == 200:
             parser = RobotFileParser()
             # Size-capped for the same reason `MAX_BODY_BYTES` caps the page fetch: an unbounded
@@ -457,8 +471,12 @@ def note_response(
     *,
     retry_after: Optional[str] = None,
     headers: Any = None,
+    clears: bool = True,
 ) -> None:
     """Feed a response back in so the next request to this host is paced accordingly.
+
+    `clears=False` (the robots.txt fetch) records a 429/503 and feeds the breaker like any answer,
+    but a non-block answer does not reset the host's streak or backoff.
 
     `headers` is optional and never changes the pacing. When given it is (a) forwarded to any
     installed `crawl_ip_throttle` breaker, for every status, and (b) on a 429/503 its allowlisted
@@ -470,6 +488,20 @@ def note_response(
         return
     if headers is not None:
         crawl_ip_throttle.observe_response(host, status_code, headers)
+        if status_code not in (429, 503) and crawl_ip_throttle.is_challenge(
+            crawl_ip_throttle.capture_throttle_headers(headers)
+        ):
+            # A CHALLENGE THAT IS NOT A 429 (Cloudflare answers 403 + `cf-mitigated: challenge`)
+            # left no line at all before 2026-10-17, so the 3-hosts-in-120 s challenge rule had no
+            # per-host, per-night baseline to be calibrated from (review M5). One WARNING per
+            # challenged response, host only, the same shape as the backoff line below.
+            logger.warning(
+                "crawl challenge: %s returned %s [%s]", host, status_code,
+                crawl_ip_throttle.format_throttle_headers(crawl_ip_throttle.capture_throttle_headers(headers)),
+            )
+    if not clears and status_code not in (429, 503):
+        # Nothing to record for the pacing state, and no state to create for it.
+        return
     # Bounded here too, not only in await_slot: note_response CREATES state, and a caller that
     # only ever records responses (or one whose requests are all refused) would otherwise grow
     # this cache past the ceiling without await_slot ever running.

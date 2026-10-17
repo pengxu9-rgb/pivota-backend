@@ -48,9 +48,10 @@ def _clean(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "0")
     # The rules in this file are the 429 rule's. No global rate or new-host cap (their rules have
     # their own file, tests/test_external_referral_refresh_global_pacing.py); the cool-down stage is
-    # ON at its default and passes on the virtual clock `_drive` installs.
-    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", "0")
-    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE", "0")
+    # ON at its default and passes on the virtual clock `_drive` installs. Since 2026-10-17 a 0 rate
+    # or cap is refused (it used to mean "off"), so the pacer runs UNPACED through its one kill
+    # switch, which still carries the breaker's cool-down and stop.
+    monkeypatch.setenv("CRAWL_GLOBAL_PACER_DISABLED", "true")
     for name in (
         "CRAWL_IP_CHALLENGE_TRIP_HOSTS",
         "CRAWL_IP_CHALLENGE_WINDOW_SECONDS",
@@ -122,16 +123,21 @@ def _drive(
     stamped: List[str] = []
 
     async def refresh(seed_id: str) -> Dict[str, Any]:
-        stamped.append(seed_id)
         url = url_of[seed_id]
         try:
             await svc._fetch_html(url, max_wait=0)
+        except cgp.GlobalPaceStopped:
+            # As `_refresh_external_seed_by_id` does since 2026-10-17: a request the pacer refused
+            # re-raises BEFORE the stamp, so it is not recorded as stamped here either.
+            raise
         except svc.ExternalOfferUnavailable as exc:
+            stamped.append(seed_id)
             return {
                 "status": "degraded",
                 "error": f"destination_unavailable: http {exc.status_code}",
                 "domain": cp.host_of(url),
             }
+        stamped.append(seed_id)
         return {"status": "success", "price_refresh": {"status": "unchanged"}, "projection": {}}
 
     summary = asyncio.run(err.run_external_referral_refresh_batch(

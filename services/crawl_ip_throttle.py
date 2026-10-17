@@ -53,7 +53,7 @@ import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +359,30 @@ def is_challenge(diag: Mapping[str, str]) -> bool:
 CHALLENGE_TRIP_HOSTS_DEFAULT = 3
 CHALLENGE_WINDOW_SECONDS_DEFAULT = 120.0
 COOLDOWN_SECONDS_DEFAULT = 900.0
+# Hosts that challenge EVERY request whatever the IP's standing (a store whose Cloudflare zone runs
+# "under attack" mode for all bots, say). Their answers are recorded but never counted toward a trip,
+# so three of them in one queue head cannot trip a healthy night. Comma- or space-separated, `www.`
+# folded. EMPTY BY DEFAULT: the 2026-10-17 review found the 3-in-120 s rule has no healthy-night
+# baseline yet (docs: the pacing census's challenge_baseline.md); fill it from that baseline, never
+# by guessing.
+CHALLENGE_EXCLUDED_HOSTS_ENV = "CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS"
+_MAX_TOP_CHALLENGE_HOSTS = 20
+
+
+def _fold_host(host: Any) -> str:
+    key = str(host or "").strip().lower()
+    return key[4:] if key.startswith("www.") else key
+
+
+def parse_excluded_hosts(raw: Any) -> Set[str]:
+    """`CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS` as a set of `www.`-folded hosts."""
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        parts = raw.replace(",", " ").split()
+    else:
+        parts = [str(item) for item in raw]
+    return {folded for folded in (_fold_host(part) for part in parts) if folded}
 
 
 class StagedIpThrottleBreaker(IpThrottleBreaker):
@@ -399,8 +423,14 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
         cooldown_seconds: float = COOLDOWN_SECONDS_DEFAULT,
         max_trips: int = 2,
         on_trip: Optional[Callable[["StagedIpThrottleBreaker", Dict[str, Any]], None]] = None,
+        excluded_hosts: Optional[Iterable[str]] = None,
     ) -> None:
         super().__init__(trip_hosts=trip_hosts, window_seconds=window_seconds, enabled=enabled)
+        self.excluded_hosts: Set[str] = parse_excluded_hosts(excluded_hosts)
+        self.excluded_challenge_responses = 0
+        # host -> challenges it answered this run, for the per-night baseline the 3-in-120 s rule
+        # never had (review M5). Bounded like every other host-keyed store here.
+        self.challenge_counts: Dict[str, int] = {}
         self.challenge_trip_hosts = int(challenge_trip_hosts)
         cwin = float(challenge_window_seconds)
         if not math.isfinite(cwin) or cwin <= 0:
@@ -439,10 +469,14 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
         challenge_window_seconds: Optional[float] = None,
         cooldown_seconds: Optional[float] = None,
         on_trip: Optional[Callable[["StagedIpThrottleBreaker", Dict[str, Any]], None]] = None,
+        excluded_hosts: Optional[Iterable[str]] = None,
     ) -> "StagedIpThrottleBreaker":
         """An explicit argument wins, then the env (the parent's three, plus
         CRAWL_IP_CHALLENGE_TRIP_HOSTS / CRAWL_IP_CHALLENGE_WINDOW_SECONDS /
-        CRAWL_IP_THROTTLE_COOLDOWN_SECONDS), then the defaults."""
+        CRAWL_IP_THROTTLE_COOLDOWN_SECONDS / CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS), then the
+        defaults."""
+        if excluded_hosts is None:
+            excluded_hosts = parse_excluded_hosts(os.getenv(CHALLENGE_EXCLUDED_HOSTS_ENV))
         if trip_hosts is None:
             trip_hosts = int(_env_float("CRAWL_IP_THROTTLE_TRIP_HOSTS", TRIP_HOSTS_DEFAULT))
         if window_seconds is None:
@@ -463,8 +497,11 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
             trip_hosts=trip_hosts, window_seconds=window_seconds, enabled=enabled,
             challenge_trip_hosts=challenge_trip_hosts,
             challenge_window_seconds=challenge_window_seconds,
-            cooldown_seconds=cooldown_seconds, on_trip=on_trip,
+            cooldown_seconds=cooldown_seconds, on_trip=on_trip, excluded_hosts=excluded_hosts,
         )
+
+    def is_excluded(self, host: str) -> bool:
+        return bool(self.excluded_hosts) and _fold_host(host) in self.excluded_hosts
 
     def cooling(self, now: Optional[float] = None) -> bool:
         return (_now() if now is None else now) < self.cooling_until
@@ -485,13 +522,25 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
         finally:
             self.enabled = armed
         now = _now()
+        excluded = self.is_excluded(key)
+        if excluded:
+            # AN ALWAYS-CHALLENGING HOST NEVER COUNTS (CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS): its 429
+            # leaves the parent's throttle window too. Its diagnostics stay, and `blocks()` still
+            # holds it back after a trip, since its latest answer was still a refusal.
+            self._recent_all.pop(key, None)
+            self._recent_shopify.pop(key, None)
         if is_challenge(diag):
             self.challenge_responses += 1
             _remember(self.challenge_hosts, key)
+            if key in self.challenge_counts or len(self.challenge_counts) < _MAX_TRACKED_HOSTS:
+                self.challenge_counts[key] = self.challenge_counts.get(key, 0) + 1
             # A challenge is a throttle answer for `blocks()`, whatever its status (a 403 is not one
             # to the parent, which has just cleared the host).
             _remember(self.last_answer_throttled, key)
-            self._recent_challenge[key] = now
+            if excluded:
+                self.excluded_challenge_responses += 1
+            else:
+                self._recent_challenge[key] = now
         elif is_ip_throttle_signal(status, diag):
             self.plain_throttle_responses += 1
         self._prune(self._recent_challenge, now, self.challenge_window_seconds)
@@ -563,6 +612,13 @@ class StagedIpThrottleBreaker(IpThrottleBreaker):
             "ip_throttle_peak_challenge_hosts_in_window": self.peak_challenge_hosts,
             "breaker_trips": self.trips,
             "breaker_trip_events": list(self.trip_events),
+            # The per-host challenge counts behind the rule, busiest first (review M5): the evidence
+            # a host belongs on CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS, or does not.
+            "ip_throttle_challenge_top_hosts": dict(
+                sorted(self.challenge_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:_MAX_TOP_CHALLENGE_HOSTS]
+            ),
+            "ip_throttle_challenge_excluded_hosts": sorted(self.excluded_hosts)[:_MAX_TOP_CHALLENGE_HOSTS],
+            "ip_throttle_excluded_challenge_responses": self.excluded_challenge_responses,
         })
         return out
 

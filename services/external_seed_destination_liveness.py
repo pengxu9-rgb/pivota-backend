@@ -828,7 +828,6 @@ async def run_destination_sweep(
             SWEEP_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT,
         )),
         deadline=(crawl_global_pacer._now() + budget) if budget > 0 else None,
-        hard_deadline=True,
     )
 
     def _on_trip(breaker: crawl_ip_throttle.StagedIpThrottleBreaker, event: Dict[str, Any]) -> None:
