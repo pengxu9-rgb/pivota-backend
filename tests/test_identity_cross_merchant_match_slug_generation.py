@@ -16,11 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from services.identity_cross_merchant_match import (  # noqa: E402
     HELD_REASONS,
+    RULE_VERSION,
     VETOES_CHECKED,
     Planner,
     slug_generation,
     slug_generation_differs,
-    url_slug,
+    slug_segment_words,
+    url_slug_segments,
 )
 from test_identity_cross_merchant_match import Cat, brand_store, outcome, proposed_keys, retailer  # noqa: E402
 
@@ -156,16 +158,34 @@ def test_a_pair_whose_slugs_agree_or_carry_no_generation_word_still_proposes(nam
 
 # --- the slug reader -------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("url, slug", [
+@pytest.mark.parametrize("url, segments", [
     ("https://dodoskin.com/products/ohui-miracle-moisture-cleansing-foam-200ml-renewal",
-     "ohui miracle moisture cleansing foam 200ml renewal"),
-    ("https://x.example/products/etude-soon-jung-cream/?variant=123#reviews", "etude soon jung cream"),
-    ("https://x.example/shop/etude_soon_jung_cream.html", "etude soon jung cream"),
-    ("https://x.example/p/o-hui-essence-%EB%A6%AC%EB%89%B4%EC%96%BC", "o hui essence 리뉴얼"),
-    ("", ""), (None, ""), ("https://x.example/", ""),
+     ["ohui miracle moisture cleansing foam 200ml renewal"]),
+    ("https://x.example/products/etude-soon-jung-cream/?variant=123#reviews", ["etude soon jung cream"]),
+    ("https://x.example/shop/etude_soon_jung_cream.html", ["shop", "etude soon jung cream"]),
+    ("https://x.example/p/o-hui-essence-%EB%A6%AC%EB%89%B4%EC%96%BC", ["o hui essence 리뉴얼"]),
+    # Every segment that can name the product, not only the last: Amazon, an id after the name, YesStyle.
+    ("https://www.amazon.com/ETUDE-Moistfull-Collagen-Eye-Cream-2019-New-Version/dp/B07ABCDEF1",
+     ["ETUDE Moistfull Collagen Eye Cream 2019 New Version"]),
+    ("https://s.example/product/ohui-foam-2019-new/12345/", ["ohui foam 2019 new"]),
+    ("https://www.yesstyle.com/en/etude-collagen-cream-2019-new/info.html/pid.1234",
+     ["en", "etude collagen cream 2019 new"]),
+    ("https://s.example/goods/item-77/sku_9/id-12/detail.jsp", []),
+    ("https://ohui.co.kr/product/view.do?prdCd=123", []),
+    # A listing page's handle is no edition: "/collections/new-arrivals/..." is not "new".
+    ("https://s.example/collections/new-arrivals/products/etude-collagen-cream", ["etude collagen cream"]),
+    ("https://s.example/category/2019-new/etude-collagen-cream", ["etude collagen cream"]),
+    ("https://s.example/products/리뉴얼-오휘-에센스", ["리뉴얼 오휘 에센스"]),
+    ("", []), (None, []), ("https://x.example/", []),
 ])
-def test_url_slug_reads_the_last_path_segment(url, slug):
-    assert url_slug(url) == slug
+def test_url_slug_segments_reads_every_segment_that_can_name_the_product(url, segments):
+    assert url_slug_segments(url) == segments
+
+
+def test_a_segment_that_does_not_name_the_product_is_not_read():
+    title = "ETUDE Moistfull Collagen Cream 75ml"
+    gen = slug_generation("https://s.example/new/2019-renewal/etude-moistfull-collagen-cream-75ml", "ETUDE", title)
+    assert gen.words == frozenset() and gen.readable
 
 
 OHUI_TITLE = "O HUI Prime Advancer De-aging Ampoule Serum 50ml"
@@ -193,8 +213,8 @@ def test_retailer_slug_noise_is_never_a_generation(slug):
 
 
 @pytest.mark.parametrize("slug, words", [
-    ("etudehouse-collagen-cream-75ml-2019-new", {"year_2019", "new"}),
-    ("etudehouse-collagen-cream-75ml-2019-brand-new-version", {"year_2019", "new"}),
+    ("ohui-cleansing-foam-200ml-2019-new", {"year_2019", "new"}),
+    ("o-hui-cleansing-foam-200ml-2019-brand-new-version", {"year_2019", "new"}),
     ("ohui-cleansing-foam-200ml-renewal", {"renewal"}),
     ("ohui-cleansing-foam-200ml-renewed", {"renewal"}),
     ("ohui-cleansing-foam-200ml-%EB%A6%AC%EB%89%B4%EC%96%BC", {"renewal"}),
@@ -205,6 +225,27 @@ def test_retailer_slug_noise_is_never_a_generation(slug):
     ("ohui-cleansing-foam-limited-edition-200ml", {"limited_edition"}),
     ("ohui-cleansing-foam-holiday-edition-200ml", {"holiday_edition"}),
     ("ohui-cleansing-foam-2023-200ml", {"year_2023"}),
+    # round 2: slug spellings the title lexicon lacks, and glued forms
+    ("ohui-cleansing-foam-200ml-2021ver", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-21ver", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-ver2021", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-ver-2021", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-2021-ver", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-newver", {"new"}),
+    ("ohui-cleansing-foam-200ml-new2021", {"new", "year_2021"}),
+    ("ohui-cleansing-foam-200ml-2021new", {"new", "year_2021"}),
+    ("ohui-cleansing-foam-200ml-renewal2021", {"renewal", "year_2021"}),
+    ("ohui-cleansing-foam-200ml-renewed2023", {"renewal", "year_2023"}),
+    ("ohui-cleansing-foam-200ml-newest2021", {"new", "year_2021"}),
+    ("ohui-cleansing-foam-200ml-renew", {"renewal"}),
+    ("ohui-cleansing-foam-200ml-relaunch", {"renewal"}),
+    ("ohui-cleansing-foam-200ml-relaunched", {"renewal"}),
+    ("ohui-cleansing-foam-200ml-upgraded", {"upgraded"}),
+    ("ohui-cleansing-foam-200ml-upgrade", {"upgraded"}),
+    ("ohui-cleansing-foam-200ml-newest-version", {"new"}),
+    ("ohui-cleansing-foam-200ml-2nd-edition", {"edition_2"}),
+    ("ohui-cleansing-foam-200ml-3rd-edition", {"edition_3"}),
+    ("ohui-cleansing-foam-200ml-%EC%8B%A0%ED%98%95", {"new"}),
 ])
 def test_generation_words_read_from_a_slug(slug, words):
     assert _gen(slug, title="OHUI Miracle Moisture Cleansing Foam 200ml").words == words
@@ -216,9 +257,23 @@ def test_generation_words_read_from_a_slug(slug, words):
     "ohui-cleansing-foam-2009-200ml", "ohui-cleansing-foam-2040-200ml", "ohui-cleansing-foam-20190-200ml",
     "ohui-cleansing-foam-12019-200ml", "ohui-cleansing-foam-sku2019-200ml",
     "ohui-cleansing-foam-new-york-200ml",
+    # no word inside a word, glued or not
+    "ohui-cleansing-foam-renewalist-200ml", "ohui-cleansing-foam-newborn-200ml", "ohui-cleansing-foam-renewing-200ml",
+    "ohui-cleansing-foam-newyork2021x-200ml", "ohui-cleansing-foam-50ver-200ml", "ohui-cleansing-foam-121ver-200ml",
+    "ohui-cleansing-foam-2021verb-200ml", "ohui-cleansing-foam-newsletter-200ml", "ohui-cleansing-foam-upgrades-200ml",
+    "ohui-cleansing-foam-2nd-200ml", "ohui-cleansing-foam-sinew2021-200ml", "ohui-cleansing-foam-xrenewal2021-200ml",
+    "ohui-cleansing-foam-x21ver-200ml",
 ])
 def test_line_words_flags_and_non_year_numbers_are_not_slug_generation_words(slug):
     assert _gen(slug, title="OHUI Miracle Moisture Cleansing Foam 200ml").words == frozenset()
+
+
+def test_ver_year_and_year_ver_read_as_the_same_words():
+    assert slug_segment_words("foam ver 2021") == slug_segment_words("foam 2021 ver") == {"year_2021"}
+    assert slug_segment_words("foam ver 2") == {"v2"}
+    a = _gen("ohui-miracle-moisture-cleansing-foam-200ml-ver-2021", title="OHUI Miracle Moisture Cleansing Foam 200ml")
+    b = _gen("ohui-miracle-moisture-cleansing-foam-200ml-2021-ver", title="OHUI Miracle Moisture Cleansing Foam 200ml")
+    assert not slug_generation_differs(a, b)
 
 
 def test_two_different_years_disagree_and_the_same_renewal_agrees():
@@ -257,6 +312,14 @@ def test_named_lines_compare_only_between_two_readable_slugs():
 def test_ohui_named_lines(slug, line):
     title = "O HUI Prime Advancer Ampoule Serum Miracle Moisture Essence The First Eye Cream 50ml"
     assert _gen(slug, title=title).lines == {line}
+
+
+@pytest.mark.parametrize("brand", ["오휘", "LG O HUI", "LG생활건강 오휘"])
+def test_named_lines_run_for_every_spelling_of_the_brand(brand):
+    title = "Prime Advancer De-aging Ampoule Serum 50ml"
+    stale = _gen("ohui-prime-advancer-ampoule-serum-50ml", brand, title)
+    named = _gen("o-hui-prime-advancer-de-aging-ampoule-serum-50ml", brand, title)
+    assert named.lines == {"de_aging"} and slug_generation_differs(stale, named)
 
 
 def test_named_lines_are_scoped_to_their_brand():
@@ -305,3 +368,46 @@ def test_a_veto_inside_the_judgement_still_wins_over_the_slug_hold():
     planner = Planner(cat.snapshot(), "US")
     v = planner.judge(planner.by_pk[li], planner.by_pk[an])
     assert v.status == "vetoed" and v.reasons == ["gtin_differs"]
+
+
+def test_the_rule_version_is_v4_and_the_evidence_shows_each_rows_url():
+    assert RULE_VERSION == "cmss.v4"
+    listing, anchor = PROPOSED_PAIRS["etude_sebum_soak_pact_brand_prefix_noise"]
+    cat, _li, _an = _pair(listing, anchor)
+    (p,) = cat.plan().proposals
+    ev = p["evidence"]
+    assert ev["rule_version"] == ev["matcher_verdict"]["rule_version"] == "cmss.v4"
+    assert ev["anchor"]["canonical_url"] == anchor[3]
+    assert [d["canonical_url"] for d in ev["listings"]] == [listing[3]]
+
+
+def test_a_generation_word_outside_the_last_segment_holds():
+    """An Amazon URL keeps the product name before /dp/<ASIN>: its "2019-New-Version" still holds."""
+    listing = ("ETUDE", "ETUDE Moistfull Collagen Eye Cream 28ml", 21.5,
+               "https://www.amazon.com/ETUDE-Moistfull-Collagen-Eye-Cream-2019-New-Version/dp/B07ABCDEF1")
+    anchor = ("ETUDE", "[EtudeHouse] Moistfull Collagen Eye Cream 28ml", 17.6,
+              "https://luxiface.com/products/etudehouse-moistfull-collagen-eye-cream-28ml")
+    v, _cat, _li = _verdict(listing, anchor)
+    assert (v.status, v.reasons) == ("held", ["slug_generation_mismatch"])
+
+
+def _merge_catalog(renewal_url: str) -> Tuple[Cat, str, str]:
+    cat = Cat()
+    an = retailer(cat, 1, "O HUI", "OHUI Miracle Moisture Cleansing Foam 200ml", price=26, created="2026-01-01")
+    _set_url(cat, an, "https://dodoskin.com/products/ohui-miracle-moisture-cleansing-foam-200ml")
+    a = retailer(cat, 2, "O HUI", "O HUI Miracle Moisture Cleansing Foam 200ml", price=28, ck="ck_foam_shared")
+    _set_url(cat, a, "https://kbeautymakeup.com/products/o-hui-miracle-moisture-cleansing-foam-200ml")
+    b = retailer(cat, 3, "O HUI", "O HUI Miracle Moisture Cleansing Foam 200ml", price=27, ck="ck_foam_shared")
+    _set_url(cat, b, renewal_url)
+    return cat, a, b
+
+
+def test_one_renewal_row_holds_the_whole_merge_key():
+    clean, a, b = _merge_catalog("https://nanasbeautyholic.com/products/o-hui-miracle-moisture-cleansing-foam-200ml")
+    (p,) = clean.plan().proposals
+    assert p["kind"] == "merge_content_key" and sorted(p["evidence"]["from_product_keys"]) == sorted([a, b])
+    cat, a, b = _merge_catalog("https://nanasbeautyholic.com/products/o-hui-miracle-moisture-cleansing-foam-200ml-renewal")
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert (outcome(plan, b)["status"], outcome(plan, b)["reason"]) == ("held", "slug_generation_mismatch")
+    assert (outcome(plan, a)["status"], outcome(plan, a)["reason"]) == ("held", "key_shared_with_unmatched")

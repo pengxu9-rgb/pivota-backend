@@ -38,7 +38,7 @@ THE JUDGEMENT (listing vs anchor), in order:
      variants (Refill, Mini, Travel Size, Value Size, Tester, Gift Set, 2-Pack, Jumbo, "Size: Mini")
      that the anchor (its title and the keeper's variants) lacks (`offer_conflict:<token>`);
   2b. `slug_generation_mismatch` (HELD, not vetoed): the generation words of the two rows'
-     canonical_url slugs differ -- "...-2019-brand-new-version", "...-renewal", an O HUI slug
+     canonical_url paths (every segment naming the product) differ -- "...-2019-brand-new-version", "...-renewal", an O HUI slug
      without the "de-aging" its partner's slug carries (slug_generation, SLUG_NAMED_LINES);
   3. the ANCHOR's size, DEFERRED to phase 2 unless single: the KEEPER ROW itself must state exactly
      one size (its title or its own variants) and every row on the anchor key, in every market,
@@ -129,7 +129,7 @@ from services.product_match_tiers import (
 from services.region_pricing import pricing_currency_for_region_or_none
 
 STRATEGY = CROSS_MERCHANT_SAME_SIZE  # the engine's name for it (#2637); only this module produces it
-RULE_VERSION = "cmss.v3"
+RULE_VERSION = "cmss.v4"  # v4: slug_generation_mismatch
 RETAILER_LISTING_PREFIX = "ext:retailer:"
 #: Rows the crawl door's resolver keeps on their stored content_key once the engine moved them
 #: (identity_resolution.RESOLVER_GUARDED_PREFIX). A first-party row is re-keyed by its own sync.
@@ -255,40 +255,71 @@ def offer_text_sizes(offer: Mapping[str, Any]) -> Set[SizeKey]:
 # WHY (Gemini review of the 2026-10-17 US dry run, brands ohui + etude, 80 audit pairs, all T0c):
 # titles that agree on every tier can still name two GENERATIONS of one product -- Etude's 2019
 # "Etude House" Moistfull Collagen jar vs its 2021 renewal, O HUI's Prime Advancer before and after
-# the "De-aging" renaming -- and the retailer often keeps the generation only in the product URL's
-# slug ("...-eye-cream-28ml-2019-brand-new-version", "...-cleansing-foam-200ml-renewal", or
+# the "De-aging" renaming -- and the retailer often keeps the generation only in the product URL
+# ("...-eye-cream-28ml-2019-brand-new-version", "...-cleansing-foam-200ml-renewal", or
 # "ohui-prime-advancer-ampoule-serum-50ml" under a title that now says "De-aging"). So the planner
-# also reads each row's canonical_url slug (the last path segment; the export reads no offer
-# destination URL), and when the two sides' slug generation words DIFFER the pair is HELD for a
-# human. Never vetoed: a slug is retailer-written and can be stale (a page created in 2019 and
-# re-imaged since), so it is a reason to look, not proof.
+# also reads each row's canonical_url path (the export reads no offer destination URL), and when the
+# two sides' generation words DIFFER the pair is HELD for a human. Never vetoed: a URL is
+# retailer-written and can be stale (a page created in 2019 and re-imaged since), so it is a reason
+# to look, not proof.
+#
+# WHICH PATH SEGMENTS: every segment that NAMES THE PRODUCT, not only the last -- Amazon puts the name
+# before "/dp/<ASIN>", some stores before "/<id>/", YesStyle before "/info.html/pid.<n>". A segment
+# is skipped when it is an id (no letter at all, "pid.1234" / "id-77" / "sku_9", an Amazon ASIN), a
+# structural word (_SLUG_STRUCTURAL: dp, product(s), info, ...), the handle right after a listing
+# word (_SLUG_LISTING_PARENTS: "/collections/new-arrivals/products/x" is no "new" edition), or when
+# it shares no core word with the row's own title (a locale, a category, "view.do").
 #
 # The words, kept conservative:
-#   - from the normalizer's own CONFLICT_LEXICON (title_core on the slug text, the row's brand
+#   - from the normalizer's own CONFLICT_LEXICON (title_core on the segment, the row's brand
 #     removed), ONLY the generation tokens: renewal (renewal / renewed), new, new_formula,
 #     reformulated, v<N> (v2 / ver 2 / version 2), gen<N>, and the edition family
-#     (limited_edition, special_edition, holiday_ / anniversary_ / collector_edition). NOT plus, rx,
-#     advanced, intense, ex: those are line words retailers keep or drop in slugs at will, and the
+#     (limited_edition, special_edition, holiday_ / anniversary_ / collector_edition). A year-valued
+#     version reads as the year: "ver-2021" = "2021-ver" = "2021ver" = "21ver" = {year_2021}. NOT
+#     plus, rx, advanced, intense, ex: line words retailers keep or drop in slugs at will, and the
 #     titles' own conflict tokens already veto them;
-#   - a year edition: a standalone 2010-2039 slug word ("...-2019-new") -> year_<YYYY>;
-#   - the Korean "리뉴얼" (renewal) -> renewal;
-#   - SLUG_NAMED_LINES: per canonical brand, the named lines a renewal renamed. Unlike the words
-#     above these are ordinary product-name words, so they are compared only when BOTH slugs are
-#     readable (share a core word with their own row's title): an id-only slug ("/p/12345") says
-#     nothing about a line name.
+#   - SLUG_EXTRA_WORDS (slug spellings the title lexicon lacks): renew / relaunch(ed) / 리뉴얼 ->
+#     renewal; newest / 신형 ("new model") -> new; upgrade(d) -> upgraded; "2nd edition" -> edition_2;
+#   - a year edition: a standalone 2010-2039 word ("...-2019-new") -> year_<YYYY>;
+#   - glued forms are split first, ONLY around a year or one of the words above, never inside a
+#     word: "2021new", "new2021", "renewal2021", "2021ver", "21ver", "newver" ("renewalist",
+#     "newborn", "new-york", "sku2019" stay word-free);
+#   - SLUG_NAMED_LINES: per brand, the named lines a renewal renamed. Unlike the words above these
+#     are ordinary product-name words, so they are compared only when BOTH sides have a readable
+#     segment (one that shares a core word with their own row's title).
 # Retailer slug noise never matches any of these: brand prefixes ("etudehouse-", "o-hui-"), size
 # suffixes ("-150ml-5-07fl-oz", "-50ml-60ml"), product ids, de-dup suffixes ("-1", "-2", "-copy",
 # "-사본") and marketing words ("korean-cosmetics-beauty").
 #
-# What it cannot see: a generation shown only in the packaging IMAGE, with slugs that agree
-# (5 of the 8 pairs Gemini called different in that sample).
+# What it cannot see: a generation shown only in the packaging IMAGE, with URLs that agree
+# (5 of the 8 pairs Gemini called different in that sample). Not handled: EUC-KR or double-encoded
+# Korean in a URL.
 SLUG_GENERATION_STATIC_TOKENS = frozenset({"renewal", "new", "new_formula", "reformulated"})
 _SLUG_VALUED_GENERATION_RE = re.compile(r"v\d+(?:\.\d+)?|gen\d+|[a-z]+_edition")
+_SLUG_YEAR_VERSION_RE = re.compile(r"v(20[1-3][0-9])")
 _SLUG_YEAR_RE = re.compile(r"(?<![0-9a-z])(20[1-3][0-9])(?![0-9a-z])")
-_SLUG_KOREAN_RENEWAL = "리뉴얼"
+_SLUG_GLUE_WORDS = "newest|new|renewal|renewed|renew|relaunched|relaunch|ver"
+#: Glued year / word forms, split before the words are read (applied in this order).
+_SLUG_GLUE: Tuple[Tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"(?<![0-9a-z])new(ver|version)(?![a-z])"), r"new \1"),
+    (re.compile(rf"(?<![0-9a-z])(20[1-3][0-9])({_SLUG_GLUE_WORDS})(?![a-z])"), r"\1 \2"),
+    (re.compile(r"(?<![0-9a-z])([1-3][0-9])ver(?![a-z])"), r"20\1 ver"),
+    (re.compile(rf"(?<![0-9a-z])({_SLUG_GLUE_WORDS})(20[1-3][0-9])(?![0-9a-z])"), r"\1 \2"),
+)
+#: (token, or a callable of the match; pattern on the folded, de-glued segment).
+SLUG_EXTRA_WORDS: Tuple[Tuple[Any, "re.Pattern[str]"], ...] = (
+    ("renewal", re.compile(r"\b(?:renew|relaunch(?:ed)?)\b|리뉴얼")),
+    ("new", re.compile(r"\bnewest\b|신형")),
+    ("upgraded", re.compile(r"\bupgraded?\b")),
+    (lambda m: f"edition_{int(m.group(1))}", re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+edition\b")),
+)
 _SLUG_SEPARATOR_RE = re.compile(r"[-_+.,~]+")
-_SLUG_EXTENSION_RE = re.compile(r"\.(?:html?|php|aspx?)$", re.IGNORECASE)
-#: canonical brand -> (token, pattern on the folded slug text): the lines a renewal renamed.
+_SLUG_EXTENSION_RE = re.compile(r"\.(?:html?|php|aspx?|do|jsp)$", re.IGNORECASE)
+_SLUG_STRUCTURAL = frozenset({"dp", "gp", "product", "products", "p", "item", "items", "goods", "info",
+                              "detail", "details", "view"})
+_SLUG_LISTING_PARENTS = frozenset({"collections", "collection", "category", "categories", "tag", "tags"})
+_SLUG_ID_RE = re.compile(r"(?:pid|id|sku|item|no|prd)[.\-_]?\d+|b0[0-9a-z]{8}")
+#: canonical brand -> (token, pattern on the folded segment): the lines a renewal renamed.
 #: ohui: "Phyto Vital" (the Prime Advancer line before its renewal), "De-aging" (the renewed Prime
 #: Advancer), "Pink Barrier" (Miracle Moisture's renewal), "Geniture" (The First's renewal).
 SLUG_NAMED_LINES: Mapping[str, Tuple[Tuple[str, "re.Pattern[str]"], ...]] = {
@@ -297,33 +328,68 @@ SLUG_NAMED_LINES: Mapping[str, Tuple[Tuple[str, "re.Pattern[str]"], ...]] = {
              ("pink_barrier", re.compile(r"\bpink\s*barrier\b")),
              ("geniture", re.compile(r"\bgeniture\b"))),
 }
+#: canonical_brand spellings of a SLUG_NAMED_LINES brand that canonical_brand keeps apart.
+SLUG_NAMED_LINE_BRAND_ALIASES: Mapping[str, str] = {"오휘": "ohui", "lgohui": "ohui", "lg생활건강오휘": "ohui"}
 
 
-def url_slug(url: Any) -> str:
-    """The product URL's last path segment, percent-decoded, its extension dropped and separators
-    read as spaces ("https://x.com/products/ohui-foam-200ml-renewal" -> "ohui foam 200ml renewal")."""
+def url_slug_segments(url: Any) -> List[str]:
+    """The product URL's path segments that can name a product, each percent-decoded, its extension
+    dropped and its separators read as spaces; ids, structural words and listing handles skipped."""
     if not url:
-        return ""
+        return []
     try:
         path = urlsplit(str(url).strip()).path
     except ValueError:
-        return ""
-    seg = next((s for s in reversed(path.split("/")) if s), "")
-    seg = _SLUG_EXTENSION_RE.sub("", unquote(seg))
-    return " ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split())
+        return []
+    out: List[str] = []
+    after_listing = False
+    for raw in path.split("/"):
+        seg = _SLUG_EXTENSION_RE.sub("", unquote(raw).strip())
+        if not seg:
+            continue
+        low = seg.lower()
+        if after_listing:
+            after_listing = False
+            continue
+        if low in _SLUG_LISTING_PARENTS:
+            after_listing = True
+            continue
+        if low in _SLUG_STRUCTURAL or not any(c.isalpha() for c in seg) or _SLUG_ID_RE.fullmatch(low):
+            continue
+        out.append(" ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split()))
+    return out
 
 
 def _is_slug_generation_token(token: str) -> bool:
     return token in SLUG_GENERATION_STATIC_TOKENS or bool(_SLUG_VALUED_GENERATION_RE.fullmatch(token))
 
 
+def slug_segment_words(segment: str, brand: Any = None) -> FrozenSet[str]:
+    """The generation words of one URL segment (see the comment above)."""
+    text = _fold(segment)
+    for pattern, repl in _SLUG_GLUE:
+        text = pattern.sub(repl, text)
+    words: Set[str] = set()
+    for t in title_core(brand, text).conflicts:
+        year = _SLUG_YEAR_VERSION_RE.fullmatch(t)
+        if year:
+            words.add(f"year_{year.group(1)}")
+        elif _is_slug_generation_token(t):
+            words.add(t)
+    words |= {f"year_{y}" for y in _SLUG_YEAR_RE.findall(text)}
+    for token, pattern in SLUG_EXTRA_WORDS:
+        for m in pattern.finditer(text):
+            words.add(token(m) if callable(token) else token)
+    return frozenset(words)
+
+
 @dataclass(frozen=True)
 class SlugGeneration:
-    """What one row's canonical_url slug says about the product's generation.
+    """What one row's canonical_url says about the product's generation.
 
     words:    generation / edition words and year editions (compared always: none is a product-name word).
     lines:    SLUG_NAMED_LINES tokens of the row's brand.
-    readable: the slug shares a core word with the row's own title (it names the product)."""
+    readable: a segment shares a core word with the row's own title (the URL names the product)."""
 
     words: FrozenSet[str] = frozenset()
     lines: FrozenSet[str] = frozenset()
@@ -331,18 +397,20 @@ class SlugGeneration:
 
 
 def slug_generation(url: Any, brand: Any, title: Any) -> SlugGeneration:
-    """The SlugGeneration of a row's canonical_url (empty for no URL or an empty path)."""
-    slug = url_slug(url)
-    if not slug:
-        return SlugGeneration()
-    tc = title_core(brand, slug)
-    folded = _fold(slug)
-    words = {t for t in tc.conflicts if _is_slug_generation_token(t)}
-    words |= {f"year_{y}" for y in _SLUG_YEAR_RE.findall(folded)}
-    if _SLUG_KOREAN_RENEWAL in folded:
-        words.add("renewal")
-    lines = {tok for tok, pat in SLUG_NAMED_LINES.get(canonical_brand(brand), ()) if pat.search(folded)}
-    readable = bool(tc.tokens & title_core(brand, title).tokens) if title else False
+    """The SlugGeneration of a row's canonical_url, read from its readable segments only."""
+    title_tokens = title_core(brand, title).tokens if title else frozenset()
+    cb = canonical_brand(brand)
+    named = SLUG_NAMED_LINES.get(SLUG_NAMED_LINE_BRAND_ALIASES.get(cb, cb), ())
+    words: Set[str] = set()
+    lines: Set[str] = set()
+    readable = False
+    for seg in url_slug_segments(url):
+        if not title_core(brand, seg).tokens & title_tokens:
+            continue
+        readable = True
+        words |= slug_segment_words(seg, brand)
+        folded = _fold(seg)
+        lines |= {tok for tok, pat in named if pat.search(folded)}
     return SlugGeneration(frozenset(words), frozenset(lines), readable)
 
 
@@ -1229,7 +1297,7 @@ def _key_json(k: Optional[Hashable]) -> Any:
 def _row_brief(li: Listing, *, offer_ids: Sequence[str] = ()) -> Dict[str, Any]:
     return {"product_key": li.product_key, "title": li.sig.title, "brand": li.sig.brand,
             "hosts": sorted(li.sig.hosts), "title_size": _size_json(li.sig.size_key),
-            "offer_ids": sorted(offer_ids)}
+            "canonical_url": li.row.get("canonical_url"), "offer_ids": sorted(offer_ids)}
 
 
 @dataclass
@@ -1650,5 +1718,5 @@ __all__ = [
     "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
     "proposal_set_digest", "seed_matches", "select_brand_spellings", "slug_generation", "slug_generation_differs",
-    "stamp_run", "url_slug",
+    "slug_segment_words", "stamp_run", "url_slug_segments",
 ]
