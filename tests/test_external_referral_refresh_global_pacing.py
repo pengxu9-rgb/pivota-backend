@@ -396,9 +396,31 @@ def test_a_cool_down_that_outlasts_the_budget_stops_instead_of_waiting(vclock: V
 
 
 def _breaker(**kwargs: Any) -> Tuple[cit.StagedIpThrottleBreaker, List[Dict[str, Any]]]:
+    """The rule's mechanics are tested at a 3-host trip (small fixtures); the shipped default (8) has
+    its own test below."""
+    kwargs.setdefault("challenge_trip_hosts", 3)
     events: List[Dict[str, Any]] = []
     breaker = cit.StagedIpThrottleBreaker(on_trip=lambda _b, e: events.append(e), **kwargs)
     return breaker, events
+
+
+def test_the_default_challenge_trip_survives_a_healthy_night_and_trips_a_listing_night(
+    vclock: VirtualClock,
+) -> None:
+    """Healthy nights 10-08..10-15 peaked at 4 challenged hosts in 120 s; the 10-16 listing night at
+    360. The default must let the first through and stop the second within a few hosts."""
+    assert cit.CHALLENGE_TRIP_HOSTS_DEFAULT == 8
+    events: List[Dict[str, Any]] = []
+    breaker = cit.StagedIpThrottleBreaker(on_trip=lambda _b, e: events.append(e))
+    assert breaker.challenge_trip_hosts == 8
+    for n in range(4):  # 10-08's peak: 4 hosts inside 120 s
+        breaker.observe(f"h{n}.example", *CHALLENGE)
+    assert not events and breaker.trips == 0
+    for n in range(4, 7):
+        breaker.observe(f"h{n}.example", *CHALLENGE)
+    assert not events, "7 hosts is still under the default"
+    breaker.observe("h7.example", *CHALLENGE)
+    assert len(events) == 1 and breaker.trips == 1
 
 
 def test_three_challenge_hosts_trip_a_cool_down_and_two_do_not(vclock: VirtualClock) -> None:
@@ -505,7 +527,7 @@ def test_the_breaker_reads_its_env(monkeypatch: pytest.MonkeyPatch, vclock: Virt
         monkeypatch.delenv(name)
     breaker = cit.StagedIpThrottleBreaker.from_env()
     assert (breaker.challenge_trip_hosts, breaker.challenge_window_seconds, breaker.cooldown_seconds) == (
-        3, 120.0, 900.0,
+        8, 120.0, 900.0,
     )
 
 
@@ -524,6 +546,8 @@ def _drive(
     """Run the real batch over `rows` (host, answer), one seed per row, in queue order. Returns the
     summary, the seeds handed to the refresher (stamped), every request the stub answered as
     (virtual time, url), and the run's pacer."""
+    # The storm fixtures are three challenge hosts per trip; the shipped default (8) is tested on its own.
+    batch_kwargs.setdefault("ip_challenge_trip_hosts", 3)
     seed_ids = [f"eps_{i}" for i in range(len(rows))]
     url_of = {s: f"https://{host}/products/p{i}" for i, (s, (host, _)) in enumerate(zip(seed_ids, rows))}
     answer_of = {url_of[s]: answer for s, (_h, answer) in zip(seed_ids, rows)}
@@ -941,6 +965,7 @@ def test_the_final_trip_defers_rows_in_flight_unstamped(
     """Four workers, the first trip is the last: rows waiting for a slot when it lands are refused,
     never stamped, and counted in `skipped_for_ip_throttle`."""
     monkeypatch.setenv("CRAWL_IP_THROTTLE_COOLDOWN_SECONDS", "0")
+    monkeypatch.setenv("CRAWL_IP_CHALLENGE_TRIP_HOSTS", "3")  # a 3-host trip; the default (8) has its own test
     hosts = [f"c{i}.example" for i in range(3)] + [f"ok{i}.example" for i in range(8)]
     rows = {f"eps_{i}": _seed_row(f"eps_{i}", host) for i, host in enumerate(hosts)}
 

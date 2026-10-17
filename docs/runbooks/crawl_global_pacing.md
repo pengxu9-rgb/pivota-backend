@@ -25,6 +25,7 @@ All resolve through `crawl_global_pacer.resolve_setting`: the flag, then the env
 | `--max-new-hosts-per-minute` / `EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE` | 6 | rounded up, at least 1; counts real first-request starts (redirect hops onto a new host included) |
 | `--budget-seconds` / `EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS` | 3300 | > 0; no request starts at or after it |
 | `EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH` | 0.5 | in (0, 1]; the share of candidates a budget stop must reach to count as `success` |
+| `CRAWL_IP_CHALLENGE_TRIP_HOSTS` | 8 | distinct challenged hosts in `CRAWL_IP_CHALLENGE_WINDOW_SECONDS` (120) that trip the cool-down. Healthy nights 10-08..10-15 peaked at 4/3/3/1/2/1; the 10-16 listing night at 360 |
 | `CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS` | empty | comma/space list, `www.` folded: hosts whose challenges never count toward a trip |
 
 Every redirect hop takes a global slot (an httpx request hook, `redirect_client_kwargs`), and a crawl
