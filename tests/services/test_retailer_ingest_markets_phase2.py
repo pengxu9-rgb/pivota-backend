@@ -39,7 +39,7 @@ from services.crawl_politeness import RobotsDisallowed
 from services.region_pricing import has_offer_priced_for_any_region_sql, require_market_currency
 from services.retailer_ingest import pipeline, shopify_markets as markets
 from tests.services.test_retailer_ingest_explicit_market import _Catalog, quiet_writer  # noqa: F401 -- fixture
-from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 -- the state-machine fixture
+from tests.services.test_retailer_ingest_pipeline import env, job, run_flags  # noqa: F401 -- the state-machine fixture
 
 HOST, BRAND = "aud-brand.example.com", "Example AUD Brand"
 GOTO_META = {"name": "Example AUD Brand", "myshopify_domain": "example-aud.myshopify.com", "currency": "AUD",
@@ -171,7 +171,7 @@ async def test_an_au_job_refuses_to_run_where_nothing_stops_its_rows_serving(env
 
 async def test_a_us_job_needs_no_such_gate(env, monkeypatch):  # noqa: F811
     monkeypatch.setattr(gates, "agent_decision_gates_enabled", lambda: False)
-    assert (await pipeline.run_stage(job(), db=env.db))["status"] == "apply_due"
+    assert (await pipeline.run_stage(job(), db=env.db))["status"] == "apply_due", run_flags(env)
 
 
 def _sqlite_offers(offers):
@@ -427,7 +427,7 @@ async def test_an_au_job_over_products_the_us_store_owns_attaches_offers_and_end
     j = {"id": "rij_fb", "domain": "frankbody.com", "brand": "Frank Body", "status": "apply_due", "attempts": 0,
          "max_attempts": 6, "options": {"vendors": ["Frank Body"], "source_role": "brand_official", "market": "AU"}}
     out = await pipeline.run_stage(j, db=db)
-    assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+    assert (out["status"], out["outcome"]) == ("done", "applied"), (env.ledger.transitions[-1], run_flags(env))
     assert len(db.written("catalog_products")) == owned
     assert all(r["canonical_url"].startswith("https://us.frankbody.com/") for r in db.written("catalog_products"))
     assert {(o["market"], o["currency"], o["source_domain"]) for o in db.written("catalog_offers")} == {
@@ -1125,7 +1125,7 @@ async def test_an_aud_base_store_becomes_us_servable_only_through_its_usd_siblin
     dry = await pipeline.run_stage(au_job(), db=catalog)
     assert dry["status"] == "apply_due", list(env.ledger.runs.values())[-1].get("flags")
     out = await pipeline.run_stage(au_job("apply_due"), db=catalog)
-    assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+    assert (out["status"], out["outcome"]) == ("done", "applied"), (env.ledger.transitions[-1], run_flags(env))
     assert "stored, not served (acquisition market)" in env.ledger.transitions[-1]["reason"]
     (plan, market), = applied
     assert market == "AU"
@@ -1141,10 +1141,10 @@ async def test_an_aud_base_store_becomes_us_servable_only_through_its_usd_siblin
 
     # --- Operator step 2: the Shopify-Markets capture, market US.
     dry = await pipeline.run_stage(markets_job(), db=catalog)
-    assert (dry["status"], dry["outcome"]) == ("apply_due", "clean")
+    assert (dry["status"], dry["outcome"]) == ("apply_due", "clean"), run_flags(env)
     assert catalog.offers("market = 'US'") == []  # a dry run writes nothing
     done = await pipeline.run_stage(markets_job("apply_due"), db=catalog)
-    assert (done["status"], done["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+    assert (done["status"], done["outcome"]) == ("done", "applied"), (env.ledger.transitions[-1], run_flags(env))
     run = list(env.ledger.runs.values())[-1]
     assert run["checks"]["markets_capture"]["cart_currency"] == "USD"
     assert run["checks"]["catalog_write"] == ledger_db.CATALOG_WRITE_STARTED
@@ -1168,9 +1168,9 @@ async def test_the_runbook_re_runs_base_capture_base_capture_and_every_run_ends_
     env, catalog, applied, store = two_jobs
 
     async def both(make):
-        assert (await pipeline.run_stage(make(), db=catalog))["status"] == "apply_due"
+        assert (await pipeline.run_stage(make(), db=catalog))["status"] == "apply_due", run_flags(env)
         out = await pipeline.run_stage(make("apply_due"), db=catalog)
-        assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+        assert (out["status"], out["outcome"]) == ("done", "applied"), (env.ledger.transitions[-1], run_flags(env))
 
     await both(au_job)
     await both(markets_job)
@@ -1244,7 +1244,7 @@ async def test_a_capture_apply_whose_readback_finds_no_us_offer_fails(two_jobs, 
     await pipeline.run_stage(au_job("apply_due"), db=catalog)
     monkeypatch.setattr(catalog, "verdict", lambda ck: _classify(False))
     out = await pipeline.run_stage(markets_job("apply_due"), db=catalog)
-    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed"), run_flags(env)
     assert "still blocks it as no_us_offer" in env.ledger.transitions[-1]["reason"]
 
 

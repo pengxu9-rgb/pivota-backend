@@ -20,13 +20,31 @@ Usage:
 
     python3 -m jobs.external_seed_destination_sweep --limit 1700
     python3 -m jobs.external_seed_destination_sweep --limit 200 --no-retire   # observe only
-    python3 -m jobs.external_seed_destination_sweep --limit 3000 --budget-seconds 3300 --global-rps 0.5
+    python3 -m jobs.external_seed_destination_sweep --limit 3500 --budget-seconds 3300 --global-rps 0.5
 
 PACED SINCE 2026-10-16, with the external-referral refresh's rules (be#2640): one global rate for
 every request of the run (`--global-rps`, default 0.5), at most `--max-new-hosts-per-minute` (6) new
 hosts a minute, a wall-clock `--budget-seconds` (3300) after which no request starts, and the
 staged IP breaker (3 hosts answering a Cloudflare challenge within 120 s: a 900 s cool-down at half
-rate; a second trip ends the run, exit 3). Each knob is also an env var, and 0 switches it off.
+rate; a second trip ends the run, exit 3). Each knob is also an env var.
+
+NO KNOB HAS AN OFF VALUE (2026-10-17 review, H1). The knobs resolve through
+`crawl_global_pacer`'s shared helpers, the refresh's: 0, negative, NaN or garbage is logged at ERROR
+and the default is used; the rate is clamped to [0.05, 1.0], the new-host cap rounds up to at least
+1, the budget must be > 0. The one rollback is `CRAWL_GLOBAL_PACER_DISABLED=true`, logged at ERROR on
+every run: the pacer runs unpaced (no rate, no new-host cap) but the breaker's cool-down and stop and
+the budget's deadline still apply.
+
+THE REQUEST HOST IS THE STORED SPELLING (review M1): a catalogue is grouped with `www.` folded but
+read from the host the seeds name, and every redirect hop takes a global slot (at most 5 hops). A
+redirect that ends on another host or a challenge path (`/challenge`, `/checkpoint`, `/captcha`,
+`/cdn-cgi/`) is `unverifiable`, never dead (review M2). Handle-less seeds, which the sweep cannot
+verify, are queued after every verifiable one (review M3).
+
+UNPACED SIBLINGS (review LOW 2/3). `jobs.catalog_destination_sweep` (no prod job today) and
+`scripts/audit_external_seed_destination_liveness.py` read the same storefronts with NO global pacer:
+per-host politeness only. Do not schedule the first, or run the second against the crawl egress at
+scale, before they install one (docs/runbooks/crawl_global_pacing.md).
 """
 from __future__ import annotations
 
@@ -52,10 +70,10 @@ EXIT_IP_THROTTLED = 3
 # One filterable line a night, the refresh's prefix and field names.
 IP_THROTTLE_PREFIX = "IP_THROTTLE "
 _IP_THROTTLE_LINE_KEYS = (
-    "global_rps", "final_rate", "max_new_hosts_per_minute", "paced_requests", "new_hosts_contacted",
-    "paces_waited_seconds", "breaker_trips", "breaker_trip_events", "cooldowns", "cooldown_seconds",
-    "stopped", "budget_seconds", "hosts", "hosts_stopped", "hosts_not_started",
-    "hosts_skipped_ip_throttle", "throttle_diagnostics",
+    "global_rps", "final_rate", "global_pacer_disabled", "max_new_hosts_per_minute", "paced_requests",
+    "new_hosts_contacted", "paces_waited_seconds", "breaker_trips", "breaker_trip_events", "cooldowns",
+    "cooldown_seconds", "stopped", "budget_seconds", "hosts", "hosts_attempted", "hosts_stopped",
+    "hosts_not_started", "hosts_skipped_ip_throttle", "throttle_diagnostics",
 )
 
 
@@ -91,18 +109,22 @@ def main() -> int:
     parser.add_argument(
         "--budget-seconds", type=float, default=None,
         help="Wall-clock ceiling: no request starts after it. Defaults to "
-             "EXTERNAL_SEED_DESTINATION_SWEEP_BUDGET_SECONDS, then 3300. 0 disables it.",
+             "EXTERNAL_SEED_DESTINATION_SWEEP_BUDGET_SECONDS, then 3300. Must be > 0: 0, negative or "
+             "garbage is logged at ERROR and the default is used.",
     )
     parser.add_argument(
         "--global-rps", type=float, default=None,
         help="The IP's total request rate for this run, every host worker sharing it, each gap "
              "jittered +-30%%. Defaults to EXTERNAL_SEED_DESTINATION_SWEEP_GLOBAL_RPS, then 0.5. "
-             "0 disables it.",
+             "Clamped to [0.05, 1.0]; 0, negative or garbage is logged at ERROR and the default is used "
+             "(CRAWL_GLOBAL_PACER_DISABLED=true is the only off switch).",
     )
     parser.add_argument(
-        "--max-new-hosts-per-minute", type=int, default=None,
+        # float, so a fractional value reaches the helper and is rounded UP, never truncated to 0.
+        "--max-new-hosts-per-minute", type=float, default=None,
         help="Hosts contacted for the first time in any 60s window. Defaults to "
-             "EXTERNAL_SEED_DESTINATION_SWEEP_MAX_NEW_HOSTS_PER_MINUTE, then 6. 0 disables it.",
+             "EXTERNAL_SEED_DESTINATION_SWEEP_MAX_NEW_HOSTS_PER_MINUTE, then 6. Rounded up, at least 1; "
+             "0, negative or garbage is logged at ERROR and the default is used.",
     )
     parser.add_argument(
         "--ip-challenge-trip-hosts", type=int, default=None,

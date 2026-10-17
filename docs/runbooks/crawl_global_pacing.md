@@ -11,7 +11,16 @@ caps the IP's total rate for the jobs that install it; `services/crawl_ip_thrott
 | Job | Paced | Where |
 |---|---|---|
 | `external-referral-refresh` (05:15Z) | yes (be#2640) | `run_external_referral_refresh_batch` |
+| `external-seed-destination-sweep` (03:15Z live) | yes (be#2641) | `run_destination_sweep`; knobs `EXTERNAL_SEED_DESTINATION_SWEEP_GLOBAL_RPS` / `_MAX_NEW_HOSTS_PER_MINUTE` / `_BUDGET_SECONDS`, same rules and kill switch |
+| `jobs.catalog_destination_sweep` | **NO** (no prod job today) | reads the same storefronts per-host-paced only. Do not schedule it (`CATALOG_DESTINATION_SWEEP=true`) before it installs a pacer |
+| `scripts/audit_external_seed_destination_liveness.py` | **NO** | an operator audit, per-host-paced only. Do not run it at scale from the crawl egress while the address is under watch |
 | every other lane | no global pacer (per-host `crawl_politeness` pacing and, for Shopify hosts, the shared edge pacer still apply) | |
+
+The destination sweep also requests each catalogue on the host spelling its seeds store (`www.` is not
+folded away for the request, only for grouping), treats a redirect that ends on another host or on a
+`/challenge`, `/checkpoint`, `/captcha` or `/cdn-cgi/` path as `unverifiable` (never dead), queues
+handle-less seeds after every verifiable one, and raises its coverage alarm on the hosts it actually
+asked (`hosts_attempted`), not on every host in the candidate list.
 
 ## Knobs (no knob has an "off" value)
 
@@ -78,6 +87,9 @@ touches an existing NAT. Address-bound side effects: `crawl_identity.md` (the re
 and `reap_cart_proofs.md` (gate (a)'s 24 h window restarts).
 
 ## Scheduling
+
+The destination sweep's definition (`EXTERNAL_SEED_DESTINATION_SWEEP=true`) runs
+`--limit 3500 --budget-seconds 3300` with `--max-retries 0` (mkcrawljob's default is 1).
 
 `EXTERNAL_REFERRAL_REFRESH=true infra/gcp/setup_scheduler.sh prod <backend> <gateway>` reconciles the
 refresh job with the rollout args `--limit 2000 --budget-seconds 3300 --host-concurrency 4` and

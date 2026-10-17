@@ -915,14 +915,24 @@ sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
 # most brand hosts and reports "0 dead links" while having seen almost nothing.
 # task-timeout is raised over the crawl default because per-host pacing is the point: ~1,700 seeds
 # a day is a full corpus pass inside the 7-day staleness window.
+#
+# PACED SINCE be#2641 (2026-10-17): every request waits on one global bucket (0.5/s, 6 new hosts a
+# minute) and the run carries a wall-clock budget, so these values are the ones agreed for it:
+#   --limit 3500 --budget-seconds 3300   prod read 5,000 candidates in ~15 min unpaced; paced, a run
+#                                        spends its 3,300 s budget (under the 3,600 s task timeout,
+#                                        so it prints its own summary) and leaves the rest of the
+#                                        3,500 for tomorrow (`hosts_not_started`).
+#   --max-retries 0                      OVERRIDES mkcrawljob's 1: an exit 3 (ip_throttled) or a crash
+#                                        must not re-run a full pass from the same address minutes
+#                                        after it was throttled. The next night is the retry.
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
   echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE pending=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION)"
-  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,1700"
+  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300"
   [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
   mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
     --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
     --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" \
-    --task-timeout 3600s \
+    --task-timeout 3600s --max-retries 0 \
     --command python --args="$SWEEP_ARGS"
 else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
