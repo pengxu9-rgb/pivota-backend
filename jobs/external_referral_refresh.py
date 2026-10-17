@@ -259,7 +259,7 @@ def main() -> int:
         help=(
             "Distinct hosts answering a Cloudflare challenge (cf-mitigated: challenge) within the "
             "challenge window that trip the IP breaker. Defaults to CRAWL_IP_CHALLENGE_TRIP_HOSTS, "
-            "then 3. <= 0 disables this rule only."
+            "then 8. <= 0 disables this rule only."
         ),
     )
     parser.add_argument(
