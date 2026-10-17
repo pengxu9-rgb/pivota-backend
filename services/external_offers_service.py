@@ -1565,7 +1565,8 @@ async def _fetch_html(
     # first contact) and caps hops at `crawl_global_pacer.MAX_REDIRECTS` (5). With no pacer
     # installed (the interactive route) the hook does nothing and only the cap applies.
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA},
-                                 **crawl_global_pacer.redirect_client_kwargs(),
+                                 **crawl_global_pacer.redirect_client_kwargs(
+                                     robots_user_agent=crawl_identity.robots_user_agent(DEFAULT_UA)),
                                  **crawl_identity.transport_kwargs()) as client:
         resp = await client.get(url)
         # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and

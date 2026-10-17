@@ -32,9 +32,10 @@ second trip out of the run (`crawl_ip_throttle.StagedIpThrottleBreaker`).
 NO KNOB HAS AN "OFF" VALUE (2026-10-17 review). `--global-rps`, `--max-new-hosts-per-minute`,
 `--budget-seconds` and their env vars resolve through `crawl_global_pacer.resolve_setting`: 0, a
 negative, NaN or garbage logs an ERROR and uses the default; the rate is clamped to [0.05, 1.0] and
-the new-host cap rounds up to at least 1. The one kill switch is `CRAWL_GLOBAL_PACER_DISABLED=true`
-(this lane also honours `EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED=false`); it logs at ERROR on
-every run and still leaves the breaker's cool-down, its stop and the budget's deadline in force.
+the new-host cap rounds up to at least 1. The one kill switch is `CRAWL_GLOBAL_PACER_DISABLED=true`,
+the exact word (any case): `1`, `yes`, `on` or anything else is unreadable, logged at ERROR, and the
+run stays paced. There is no per-lane alias. It logs at ERROR on every run and still leaves the
+breaker's cool-down, its stop and the budget's deadline in force.
 
 A FIRST TRIP LATE IN THE RUN ENDS IT AS A BUDGET STOP, EXIT 1, NOT 3 (review L3). The cool-down is
 900 s and the default budget 3,300 s, so a first trip after ~2,400 s leaves a cool-down that ends past

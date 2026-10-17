@@ -53,7 +53,7 @@ _ENV = (
     "EXTERNAL_REFERRAL_REFRESH_MIN_ORIGIN_YIELD",
     "EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS",
     "EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH",
-    "EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED",
+    "EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED",  # dropped alias: must stay unread
     "CRAWL_GLOBAL_PACER_DISABLED",
     "CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS",
 )
@@ -234,20 +234,29 @@ def test_only_the_kill_switch_runs_unpaced_and_it_still_pauses_and_stops(vclock:
         asyncio.run(pacer.acquire("h0.example"))
 
 
-@pytest.mark.parametrize("env, value, disabled", [
-    ("CRAWL_GLOBAL_PACER_DISABLED", "true", True),
-    ("CRAWL_GLOBAL_PACER_DISABLED", "1", True),
-    ("CRAWL_GLOBAL_PACER_DISABLED", "false", False),
-    ("CRAWL_GLOBAL_PACER_DISABLED", "maybe", False),
-    ("EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", "false", True),
-    ("EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", "true", False),
+@pytest.mark.parametrize("env, value, disabled, unreadable", [
+    ("CRAWL_GLOBAL_PACER_DISABLED", "true", True, False),
+    ("CRAWL_GLOBAL_PACER_DISABLED", " TRUE ", True, False),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "True", True, False),
+    # Only the exact word disables (controller review, 2026-10-17): anything else is unreadable,
+    # logged at ERROR, and the run stays PACED.
+    ("CRAWL_GLOBAL_PACER_DISABLED", "1", False, True),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "yes", False, True),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "on", False, True),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "false", False, True),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "maybe", False, True),
+    ("CRAWL_GLOBAL_PACER_DISABLED", "", False, False),
+    # The dropped per-lane alias is not read at all, in either polarity.
+    ("EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", "false", False, False),
+    ("EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", "0", False, False),
 ])
-def test_the_kill_switch_env(monkeypatch: pytest.MonkeyPatch, caplog, env, value, disabled) -> None:
+def test_the_kill_switch_env(monkeypatch: pytest.MonkeyPatch, caplog, env, value, disabled, unreadable) -> None:
     monkeypatch.setenv(env, value)
     with caplog.at_level("ERROR"):
         assert err._refresh_global_pacer_disabled() is disabled
-    if disabled:
-        assert any("DISABLED" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("DISABLED for" in m for m in errors) is disabled
+    assert any("unreadable" in m for m in errors) is unreadable
 
 
 def test_the_batch_runs_unpaced_under_the_kill_switch_and_logs_it_every_run(
@@ -332,8 +341,28 @@ def test_new_host_wait_reports_the_room_under_the_cap(vclock: VirtualClock) -> N
     assert pacer.new_host_wait() == 0
     pacer.admit("b.example")
     assert pacer.new_host_wait() == 60.0
-    vclock.t = 59.0
-    assert pacer.new_host_wait() == 1.0
+    vclock.t = 29.0
+    assert pacer.new_host_wait() == 31.0
+    pacer.release("a.example")
+    assert pacer.new_host_wait() == 0, "a released place is room again"
+
+
+def test_phantom_places_expire_and_never_push_back_an_earlier_host(vclock: VirtualClock) -> None:
+    """Controller review (LOW): places the scheduler took and never used starved a real new host to
+    t=600 s. (1) An unused place expires PENDING_GRACE_SECONDS after its own instant; (2) a host asking
+    to start ignores places reserved for later instants than its own."""
+    pacer = cgp.GlobalOriginPacer(rps=1.0, max_new_hosts_per_minute=1)
+    pacer.admit("a.example")  # its place: 0 s
+    pacer.admit("ghost.example")  # the next place: 60 s, never used
+    asyncio.run(pacer.acquire("a.example"))
+    assert pacer.grants == [0.0], "the ghost's later place did not push a (0 s) back to 120 s"
+
+    pacer = cgp.GlobalOriginPacer(rps=1.0, max_new_hosts_per_minute=1)
+    pacer.admit("ghost.example")  # 0 s, never used
+    vclock.t = cgp.PENDING_GRACE_SECONDS + 1.0
+    assert pacer.new_host_wait() == 0, "an unused place expired after its grace"
+    asyncio.run(pacer.acquire("real.example"))
+    assert pacer.grants == [cgp.PENDING_GRACE_SECONDS + 1.0]
 
 
 # ===================================================================== pause, half rate, stop
@@ -1151,3 +1180,244 @@ def test_the_challenge_top_hosts_reach_the_ip_throttle_line(
     line = job.ip_throttle_line(summary)
     assert line["ip_throttle_challenge_top_hosts"] == {"c0.example": 2}
     assert line["global_pacer_disabled"] is False
+
+
+class OrderedClock:
+    """A virtual clock whose sleepers wake IN ORDER, each at its own instant. `VirtualClock` adds
+    concurrent sleeps up, which is fine for one sleeper at a time but lets a waiter wake "after" a
+    cool-down it should have seen begin; this one resolves the earliest wake-up only once every task
+    is blocked."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self._sleepers: List[Tuple[float, int, "asyncio.Future[None]"]] = []
+        self._seq = 0
+
+    def now(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        fut = asyncio.get_running_loop().create_future()
+        self._seq += 1
+        self._sleepers.append((self.t + max(0.0, seconds), self._seq, fut))
+        await fut
+
+    async def drive(self, work) -> Any:
+        task = asyncio.ensure_future(work)
+        while not task.done():
+            for _ in range(50):
+                await asyncio.sleep(0)
+            if task.done() or not self._sleepers:
+                continue
+            self._sleepers.sort(key=lambda s: (s[0], s[1]))
+            wake, _seq, fut = self._sleepers.pop(0)
+            self.t = max(self.t, wake)
+            fut.set_result(None)
+        return task.result()
+
+
+def test_first_contacts_refused_by_a_cool_down_are_counted_again_after_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Controller mutant P20: four first-contact requests are waiting for their slots when a trip
+    lands. The three that had not gone out must NOT keep their pre-trip first-contact records: they
+    re-enter the new-host cap when they really start, after the cool-down, so the cap still holds
+    over everything that starts then (4 a minute here)."""
+    clock = OrderedClock()
+    monkeypatch.setattr(cgp, "_now", clock.now)
+    monkeypatch.setattr(cgp, "_sleep", clock.sleep)
+    monkeypatch.setattr(cgp, "_random", lambda: 0.5)
+    pacer = cgp.GlobalOriginPacer(rps=1.0, max_new_hosts_per_minute=4)
+    starts: Dict[str, float] = {}
+
+    async def first(host: str) -> None:
+        await pacer.acquire(host)
+        starts.setdefault(host, pacer.grants[-1])  # no await between the append and the return
+
+    async def trip_at_half_a_second() -> None:
+        await clock.sleep(0.5)
+        pacer.pause(900)  # the trip lands while w1..w3 wait for their slots (1, 2, 3 s)
+
+    async def run() -> None:
+        await asyncio.gather(trip_at_half_a_second(), *(first(f"w{i}.example") for i in range(4)))
+        for i in range(4):
+            await first(f"n{i}.example")
+
+    asyncio.run(clock.drive(run()))
+    assert starts["w0.example"] == 0.0, "the one that went out before the trip"
+    late = sorted(t for h, t in starts.items() if h != "w0.example")
+    assert len(late) == 7 and min(late) >= 900.5, late
+    for start in late:
+        assert sum(1 for t in late if start <= t < start + 60) <= 4, late
+
+
+# ===================================================================== review 2026-10-17 (2): host challenge streak
+
+@pytest.mark.parametrize("excluded", [False, True], ids=["plain", "excluded_from_the_ip_rule"])
+def test_a_host_challenging_every_request_is_dropped_after_three(
+    monkeypatch: pytest.MonkeyPatch, vclock: VirtualClock, excluded: bool,
+) -> None:
+    """The controller's heavy-host repro, rebuilt: one host answers 403 + `cf-mitigated: challenge`
+    to every request (ichibanm.com: 239 of 239 in one run, never stopped). After three in a row its
+    lane is drained: the other 17 rows are never handed to the refresher (unstamped) and are counted
+    per host. Excluding the host from the IP rule does not keep it in the queue."""
+    if excluded:
+        monkeypatch.setenv("CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS", "heavy.example")
+    rows = [("heavy.example", CHALLENGE)] * 20 + [(f"ok{i}.example", OK) for i in range(3)]
+    summary, stamped, requests, _pacer = _drive(monkeypatch, vclock, rows, max_new_hosts_per_minute=_NO_CAP)
+    heavy = [u for _t, u in requests if "heavy.example" in u]
+    assert len(heavy) == 3, heavy
+    assert len([s for s in stamped if int(s.split("_")[1]) < 20]) == 3
+    assert summary["skipped_for_host_challenge"] == 17
+    assert summary["host_challenge_skips"] == {"heavy.example": 17}
+    assert summary["host_challenge_trip"] == 3
+    assert summary["attempted_count"] == len(rows) - 17, "passed-over rows leave the yield denominator"
+    assert summary["status"] != "ip_throttled", "one host is not an IP storm"
+    assert all(f"https://ok{i}.example/products/p{20 + i}" in [u for _t, u in requests] for i in range(3))
+
+
+def test_an_answer_that_is_not_a_challenge_breaks_the_streak(monkeypatch: pytest.MonkeyPatch, vclock: VirtualClock) -> None:
+    rows = [("h.example", CHALLENGE), ("h.example", CHALLENGE), ("h.example", OK)] * 3
+    summary, stamped, _requests, _pacer = _drive(monkeypatch, vclock, rows, max_new_hosts_per_minute=_NO_CAP)
+    assert len(stamped) == len(rows) and summary["skipped_for_host_challenge"] == 0
+
+
+def test_the_challenge_trip_reads_its_env_and_zero_is_not_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert err._host_challenge_trip() == 3
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", "5")
+    assert err._host_challenge_trip() == 5
+    for bad in ("0", "-1", "nan", "x"):
+        monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", bad)
+        assert err._host_challenge_trip() == 3, bad
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", "1.2")
+    assert err._host_challenge_trip() == 2
+
+
+def test_the_challenge_streak_counts_any_status_and_robots_never_resets_it() -> None:
+    challenge = {"cf-mitigated": "challenge", "server": "cloudflare"}
+    cp.note_response("https://s.example/products/a", 403, headers=challenge)
+    cp.note_response("https://s.example/products/b", 429, headers=challenge)
+    assert cp.consecutive_challenges("s.example") == 2
+    cp.note_response("https://s.example/robots.txt", 404, headers={}, clears=False)
+    assert cp.consecutive_challenges("s.example") == 2, "a robots answer says nothing about the pages"
+    cp.note_response("https://s.example/robots.txt", 403, headers=challenge, clears=False)
+    assert cp.consecutive_challenges("s.example") == 3, "a challenged robots.txt is still a challenge"
+    cp.note_response("https://s.example/products/c", 200, headers={})
+    assert cp.consecutive_challenges("s.example") == 0
+
+
+# ===================================================================== review 2026-10-17 (2): hops obey robots + host slot
+
+def _hop_site(robots: Dict[str, str], chain: Dict[str, str]):
+    seen: List[Tuple[float, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        seen.append((time.monotonic(), url))
+        if request.url.path == "/robots.txt":
+            body = robots.get(request.url.host)
+            return httpx.Response(200, text=body, request=request) if body is not None else httpx.Response(404, request=request)
+        if url in chain:
+            return httpx.Response(301, headers={"location": chain[url]}, request=request)
+        return httpx.Response(200, content=b"<html></html>", request=request)
+
+    return httpx.MockTransport(handler), seen
+
+
+def test_a_cross_host_hop_is_refused_when_its_robots_disallow_it(monkeypatch: pytest.MonkeyPatch, vclock: VirtualClock) -> None:
+    """The controller's repro: a.example/p redirects to c.example/p, and c.example serves
+    `Disallow: /`. The hop is refused (RobotsDisallowed out of the fetch), c.example/p never asked."""
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    transport, seen = _hop_site({"c.example": "User-agent: *\nDisallow: /\n"},
+                                {"https://a.example/p": "https://c.example/p"})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda *a, **kw: _REAL_ASYNC_CLIENT(*a, transport=transport, **kw))
+    pacer = cgp.GlobalOriginPacer(rps=1.0, max_new_hosts_per_minute=_NO_CAP)
+    with cgp.installed(pacer):
+        with pytest.raises(cp.RobotsDisallowed):
+            asyncio.run(svc._fetch_html("https://a.example/p", max_wait=0))
+    urls = [u for _t, u in seen]
+    assert "https://c.example/robots.txt" in urls and "https://c.example/p" not in urls
+
+
+def test_a_cross_host_hop_its_robots_allow_goes_ahead(monkeypatch: pytest.MonkeyPatch, vclock: VirtualClock) -> None:
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+    transport, seen = _hop_site({"c.example": "User-agent: *\nDisallow: /private\n"},
+                                {"https://a.example/p": "https://c.example/p"})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda *a, **kw: _REAL_ASYNC_CLIENT(*a, transport=transport, **kw))
+    pacer = cgp.GlobalOriginPacer(rps=1.0, max_new_hosts_per_minute=_NO_CAP)
+    with cgp.installed(pacer):
+        asyncio.run(svc._fetch_html("https://a.example/p", max_wait=0))
+    assert [u for _t, u in seen][-1] == "https://c.example/p"
+
+
+def test_a_hop_waits_for_its_hosts_own_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real clock, scaled down: a same-host hop pays the host's 0.3 s interval, not just a global
+    slot (0.02 s here)."""
+    monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0.3")
+    monkeypatch.setattr(cgp, "RPS_MAX", 100.0)
+    transport, seen = _hop_site({}, {"https://a.example/x": "https://a.example/y"})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda *a, **kw: _REAL_ASYNC_CLIENT(*a, transport=transport, **kw))
+    pacer = cgp.GlobalOriginPacer(rps=50.0, max_new_hosts_per_minute=_NO_CAP, jitter=0.0)
+    with cgp.installed(pacer):
+        asyncio.run(svc._fetch_html("https://a.example/x", max_wait=0))
+    (t0, first), (t1, hop) = seen
+    assert (first, hop) == ("https://a.example/x", "https://a.example/y")
+    assert t1 - t0 >= 0.27, f"the hop went {t1 - t0:.3f}s after the first request"
+
+
+def test_a_hop_waits_out_its_hosts_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """b.example answered 429 a moment ago (0.4 s hold): a hop onto it waits the hold out."""
+    monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "0.4")
+    monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "5")
+    monkeypatch.setattr(cgp, "RPS_MAX", 100.0)
+    transport, seen = _hop_site({}, {"https://a.example/x": "https://b.example/x"})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda *a, **kw: _REAL_ASYNC_CLIENT(*a, transport=transport, **kw))
+    cp.note_response("https://b.example/other", 429)
+    pacer = cgp.GlobalOriginPacer(rps=50.0, max_new_hosts_per_minute=_NO_CAP, jitter=0.0)
+    with cgp.installed(pacer):
+        asyncio.run(svc._fetch_html("https://a.example/x", max_wait=0))
+    (t0, _first), (t1, hop) = seen
+    assert hop == "https://b.example/x" and t1 - t0 >= 0.3, f"{t1 - t0:.3f}s"
+
+
+def test_a_row_that_never_sent_a_request_gives_its_new_host_place_back(
+    monkeypatch: pytest.MonkeyPatch, vclock: VirtualClock,
+) -> None:
+    """Controller review (LOW), on the real scheduler: one new host a minute. gone.example's row
+    raises SEED_NOT_FOUND before any request, so its host was taken but never contacted. Its place
+    is released when the row ends, and next.example starts at once instead of a minute later."""
+    from fastapi import HTTPException
+
+    rows = [("gone.example", OK), ("next.example", OK)]
+    seed_ids = ["eps_0", "eps_1"]
+    hosts = {"eps_0": "gone.example", "eps_1": "next.example"}
+    monkeypatch.setattr(err, "get_external_referral_refresh_candidate_seed_ids",
+                        lambda *a, **k: asyncio.sleep(0, result=seed_ids))
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda ids: asyncio.sleep(0, result=dict(hosts)))
+    pacers: List[cgp.GlobalOriginPacer] = []
+    real = cgp.GlobalOriginPacer
+    monkeypatch.setattr(err.crawl_global_pacer, "GlobalOriginPacer",
+                        lambda **kw: pacers.append(real(**kw)) or pacers[-1])
+
+    async def refresh(seed_id: str) -> Dict[str, Any]:
+        if seed_id == "eps_0":
+            raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+        await pacers[0].acquire(hosts[seed_id])
+        return {"status": "success", "price_refresh": {"status": "unchanged"}, "projection": {}}
+
+    summary = asyncio.run(err.run_external_referral_refresh_batch(
+        refresh_seed_by_id=refresh, limit=len(rows), global_rps=1.0, max_new_hosts_per_minute=1,
+    ))
+    assert summary["unprocessable"] == 1
+    assert pacers[0].grants == [0.0], "next.example was not held back by gone.example's unused place"
+
+
+def test_without_a_pacer_a_hop_never_waits_on_its_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interactive route installs no pacer: a hop there must not take on the batch's unbounded
+    per-host wait. b.example is in a 2 s backoff; the hop goes at once."""
+    monkeypatch.setenv("CRAWL_BACKOFF_BASE_SECONDS", "2")
+    monkeypatch.setenv("CRAWL_MAX_BACKOFF_SECONDS", "5")
+    transport, seen = _hop_site({}, {"https://a.example/x": "https://b.example/x"})
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda *a, **kw: _REAL_ASYNC_CLIENT(*a, transport=transport, **kw))
+    cp.note_response("https://b.example/other", 429)
+    asyncio.run(svc._fetch_html("https://a.example/x", max_wait=0))
+    (t0, _first), (t1, hop) = seen
+    assert hop == "https://b.example/x" and t1 - t0 < 1.0, f"{t1 - t0:.3f}s"
