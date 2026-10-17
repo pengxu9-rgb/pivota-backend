@@ -37,6 +37,9 @@ THE JUDGEMENT (listing vs anchor), in order:
      title size that is not the anchor's (`size`); a conflict token on any of the listing's own
      variants (Refill, Mini, Travel Size, Value Size, Tester, Gift Set, 2-Pack, Jumbo, "Size: Mini")
      that the anchor (its title and the keeper's variants) lacks (`offer_conflict:<token>`);
+  2b. `slug_generation_mismatch` (HELD, not vetoed): the generation words of the two rows'
+     canonical_url slugs differ -- "...-2019-brand-new-version", "...-renewal", an O HUI slug
+     without the "de-aging" its partner's slug carries (slug_generation, SLUG_NAMED_LINES);
   3. the ANCHOR's size, DEFERRED to phase 2 unless single: the KEEPER ROW itself must state exactly
      one size (its title or its own variants) and every row on the anchor key, in every market,
      states that size or none (`anchor_multi_size`); a keeper that states none, or a priced row on
@@ -99,6 +102,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Dict, FrozenSet, Hashable, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from urllib.parse import unquote, urlsplit
 
 from services.identity_resolution import (
     CROSS_MERCHANT_SAME_SIZE,
@@ -144,7 +148,7 @@ LIVE_PROPOSAL_STATUSES = ("proposed", "approved", "applied")
 VETOES_CHECKED: Tuple[str, ...] = (
     "conflict_tokens", "shade", "gtin_differs", "size", "offer_conflict_tokens", "anchor_single_size",
     "offer_size_pinned", "listing_single_size_all_markets", "offer_variant_pinned", "offer_sku_on_listing",
-    "market_currency", "key_single_size", "pending_or_applied_conflict", "price_ratio")
+    "market_currency", "key_single_size", "pending_or_applied_conflict", "price_ratio", "slug_generation")
 #: sku_payload fields that can name a variant's size (the export reads only these).
 SKU_PAYLOAD_SIZE_FIELDS: Tuple[str, ...] = ("variant_title", "title", "size", "option1", "option2", "option3",
                                             "options", "selected_options")
@@ -155,7 +159,8 @@ SEED_VARIANT_SIZE_FIELDS: Tuple[str, ...] = ("title", "name", "option_value", "o
 
 # Outcome reasons. HELD goes to a human; DEFERRED waits for phase 2 (size-aware serving); VETOED is a
 # different buyable item. None of them is ever proposed.
-HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "size_fraction_count",
+HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "slug_generation_mismatch",
+                "size_fraction_count",
                 "offer_size_unpinned",
                 "listing_multi_size", "offer_not_variant_pinned", "offer_sku_not_on_listing",
                 "market_currency_mismatch", "keeper_market_currency_mismatch", "key_size_conflict",
@@ -242,6 +247,112 @@ def offer_text_sizes(offer: Mapping[str, Any]) -> Set[SizeKey]:
     """The sizes an offer's own variant states: its SKU title, visible option labels and the
     sku_payload option fields."""
     return _texts_sizes(_variant_texts(offer.get("sku_title"), offer.get("sku_labels"), offer.get("sku_size_fields")))
+
+
+# ---------------------------------------------------------------------------
+# Slug generation words (`slug_generation_mismatch`)
+# ---------------------------------------------------------------------------
+# WHY (Gemini review of the 2026-10-17 US dry run, brands ohui + etude, 80 audit pairs, all T0c):
+# titles that agree on every tier can still name two GENERATIONS of one product -- Etude's 2019
+# "Etude House" Moistfull Collagen jar vs its 2021 renewal, O HUI's Prime Advancer before and after
+# the "De-aging" renaming -- and the retailer often keeps the generation only in the product URL's
+# slug ("...-eye-cream-28ml-2019-brand-new-version", "...-cleansing-foam-200ml-renewal", or
+# "ohui-prime-advancer-ampoule-serum-50ml" under a title that now says "De-aging"). So the planner
+# also reads each row's canonical_url slug (the last path segment; the export reads no offer
+# destination URL), and when the two sides' slug generation words DIFFER the pair is HELD for a
+# human. Never vetoed: a slug is retailer-written and can be stale (a page created in 2019 and
+# re-imaged since), so it is a reason to look, not proof.
+#
+# The words, kept conservative:
+#   - from the normalizer's own CONFLICT_LEXICON (title_core on the slug text, the row's brand
+#     removed), ONLY the generation tokens: renewal (renewal / renewed), new, new_formula,
+#     reformulated, v<N> (v2 / ver 2 / version 2), gen<N>, and the edition family
+#     (limited_edition, special_edition, holiday_ / anniversary_ / collector_edition). NOT plus, rx,
+#     advanced, intense, ex: those are line words retailers keep or drop in slugs at will, and the
+#     titles' own conflict tokens already veto them;
+#   - a year edition: a standalone 2010-2039 slug word ("...-2019-new") -> year_<YYYY>;
+#   - the Korean "리뉴얼" (renewal) -> renewal;
+#   - SLUG_NAMED_LINES: per canonical brand, the named lines a renewal renamed. Unlike the words
+#     above these are ordinary product-name words, so they are compared only when BOTH slugs are
+#     readable (share a core word with their own row's title): an id-only slug ("/p/12345") says
+#     nothing about a line name.
+# Retailer slug noise never matches any of these: brand prefixes ("etudehouse-", "o-hui-"), size
+# suffixes ("-150ml-5-07fl-oz", "-50ml-60ml"), product ids, de-dup suffixes ("-1", "-2", "-copy",
+# "-사본") and marketing words ("korean-cosmetics-beauty").
+#
+# What it cannot see: a generation shown only in the packaging IMAGE, with slugs that agree
+# (5 of the 8 pairs Gemini called different in that sample).
+SLUG_GENERATION_STATIC_TOKENS = frozenset({"renewal", "new", "new_formula", "reformulated"})
+_SLUG_VALUED_GENERATION_RE = re.compile(r"v\d+(?:\.\d+)?|gen\d+|[a-z]+_edition")
+_SLUG_YEAR_RE = re.compile(r"(?<![0-9a-z])(20[1-3][0-9])(?![0-9a-z])")
+_SLUG_KOREAN_RENEWAL = "리뉴얼"
+_SLUG_SEPARATOR_RE = re.compile(r"[-_+.,~]+")
+_SLUG_EXTENSION_RE = re.compile(r"\.(?:html?|php|aspx?)$", re.IGNORECASE)
+#: canonical brand -> (token, pattern on the folded slug text): the lines a renewal renamed.
+#: ohui: "Phyto Vital" (the Prime Advancer line before its renewal), "De-aging" (the renewed Prime
+#: Advancer), "Pink Barrier" (Miracle Moisture's renewal), "Geniture" (The First's renewal).
+SLUG_NAMED_LINES: Mapping[str, Tuple[Tuple[str, "re.Pattern[str]"], ...]] = {
+    "ohui": (("phyto_vital", re.compile(r"\bphyto\s*vital\b")),
+             ("de_aging", re.compile(r"\bde\s*aging\b")),
+             ("pink_barrier", re.compile(r"\bpink\s*barrier\b")),
+             ("geniture", re.compile(r"\bgeniture\b"))),
+}
+
+
+def url_slug(url: Any) -> str:
+    """The product URL's last path segment, percent-decoded, its extension dropped and separators
+    read as spaces ("https://x.com/products/ohui-foam-200ml-renewal" -> "ohui foam 200ml renewal")."""
+    if not url:
+        return ""
+    try:
+        path = urlsplit(str(url).strip()).path
+    except ValueError:
+        return ""
+    seg = next((s for s in reversed(path.split("/")) if s), "")
+    seg = _SLUG_EXTENSION_RE.sub("", unquote(seg))
+    return " ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split())
+
+
+def _is_slug_generation_token(token: str) -> bool:
+    return token in SLUG_GENERATION_STATIC_TOKENS or bool(_SLUG_VALUED_GENERATION_RE.fullmatch(token))
+
+
+@dataclass(frozen=True)
+class SlugGeneration:
+    """What one row's canonical_url slug says about the product's generation.
+
+    words:    generation / edition words and year editions (compared always: none is a product-name word).
+    lines:    SLUG_NAMED_LINES tokens of the row's brand.
+    readable: the slug shares a core word with the row's own title (it names the product)."""
+
+    words: FrozenSet[str] = frozenset()
+    lines: FrozenSet[str] = frozenset()
+    readable: bool = False
+
+
+def slug_generation(url: Any, brand: Any, title: Any) -> SlugGeneration:
+    """The SlugGeneration of a row's canonical_url (empty for no URL or an empty path)."""
+    slug = url_slug(url)
+    if not slug:
+        return SlugGeneration()
+    tc = title_core(brand, slug)
+    folded = _fold(slug)
+    words = {t for t in tc.conflicts if _is_slug_generation_token(t)}
+    words |= {f"year_{y}" for y in _SLUG_YEAR_RE.findall(folded)}
+    if _SLUG_KOREAN_RENEWAL in folded:
+        words.add("renewal")
+    lines = {tok for tok, pat in SLUG_NAMED_LINES.get(canonical_brand(brand), ()) if pat.search(folded)}
+    readable = bool(tc.tokens & title_core(brand, title).tokens) if title else False
+    return SlugGeneration(frozenset(words), frozenset(lines), readable)
+
+
+def slug_generation_differs(a: SlugGeneration, b: SlugGeneration) -> bool:
+    """Do two rows' slugs disagree on the generation? Words: any difference (one-sided too: a slug
+    with no URL, or with none, does not prove the same generation as "...-renewal"). Named lines:
+    only between two readable slugs."""
+    if a.words != b.words:
+        return True
+    return a.readable and b.readable and a.lines != b.lines
 
 
 def _price(value: Any) -> Optional[float]:
@@ -538,6 +649,7 @@ class Planner:
             if li.content_key:
                 self.by_ck[li.content_key].append(li)
         self._units: Dict[str, List[Unit]] = {}
+        self._slug_generation: Dict[str, SlugGeneration] = {}
         self._anchor: Dict[Tuple[str, str], Tuple[Optional[SizeKey], Optional[str], FrozenSet[str]]] = {}
         self._index_seeds()
         self._index_proposals()
@@ -647,6 +759,13 @@ class Planner:
         self._units[pk] = out
         return out
 
+    def slug_generation(self, li: Listing) -> SlugGeneration:
+        cached = self._slug_generation.get(li.product_key)
+        if cached is None:
+            cached = slug_generation(li.row.get("canonical_url"), li.sig.brand, li.sig.title)
+            self._slug_generation[li.product_key] = cached
+        return cached
+
     def row_has_fraction_count(self, pk: str) -> bool:
         return has_fraction_count(self._title(pk)) or any(has_fraction_count(t) for u in self.units(pk) for t in u.texts)
 
@@ -740,6 +859,9 @@ class Planner:
             vetoes += [f"offer_conflict:{t}" for t in extra]
         if vetoes:
             return Verdict("vetoed", vetoes, tiers_matched=matched)
+        if slug_generation_differs(self.slug_generation(li), self.slug_generation(anchor)):
+            # The slugs name two generations the titles do not (see SLUG_NAMED_LINES): a human looks.
+            return Verdict("held", ["slug_generation_mismatch"], tiers_matched=matched)
         if (self.row_has_fraction_count(li.product_key) or self.row_has_fraction_count(anchor.product_key)
                 or (anchor_size is not None and anchor_size[1] == "count"
                     and not (anchor_size[0] >= 1 and float(anchor_size[0]).is_integer()))):
@@ -1527,5 +1649,6 @@ __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
     "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
-    "proposal_set_digest", "seed_matches", "select_brand_spellings", "stamp_run",
+    "proposal_set_digest", "seed_matches", "select_brand_spellings", "slug_generation", "slug_generation_differs",
+    "stamp_run", "url_slug",
 ]
