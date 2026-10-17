@@ -1231,7 +1231,7 @@ class Plan:
         return n
 
     def select(self, mode: str, ids: Iterable[str]) -> None:
-        """Narrow the run to a hand-labelled subset (--only-proposals / --exclude-proposals): keeps
+        """Narrow the run to a hand-labelled subset (--only-proposal[s|-ids] / --exclude-...): keeps
         select_proposals' choice in proposals AND pairs (so the counts, samples and audit sample are of
         the subset), and records the selection so digest() folds it in -- a subset's digest never
         authorises the full set or another subset. Raises SelectionError (unknown id, empty selection).
@@ -1247,7 +1247,7 @@ class Plan:
         self.pairs = [pr for pr in self.pairs if pr["proposal_id"] in keep_ids]
         self.selection = (mode, tuple(sorted(keep_ids)))
         self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
-        self.selection_info = {"applied": True, "mode": mode, "ids_in_file": len(set(id_list)),
+        self.selection_info = {"applied": True, "mode": mode, "ids_given": len(set(id_list)),
                                "selected": len(kept), "of": full, "run_digest": run_digest,
                                "note": ("counts, samples and the audit sample are of the SELECTED proposals; "
                                         "outcomes and yield_both_ways are of the full run")}
@@ -1335,6 +1335,8 @@ def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]
 
 
 SELECTION_MODES = ("only", "exclude")
+#: identity_resolution.new_proposal: "irp_" + the first 32 hex digits of sha256(proposal_key).
+PROPOSAL_ID_RE = re.compile(r"irp_[0-9a-f]{32}")
 
 
 class SelectionError(ValueError):
@@ -1359,6 +1361,25 @@ def proposal_set_digest(proposals: Sequence[Mapping[str, Any]], *,
     return "cmd_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
 
 
+def normalise_proposal_ids(raw: Iterable[Any], *, source: str = "the selection") -> List[str]:
+    """THE one normalisation of a selection, whatever its form (a file's lines, a JSON list, an inline
+    comma list): strip each entry, refuse an entry that is not a string, is empty / whitespace-only, or
+    is not a well-formed proposal_id (PROPOSAL_ID_RE), then de-duplicate and sort. The same set of ids
+    always yields the same list, so the file and inline forms of one mode give the same digest.
+    Empty input -> [] (the caller refuses an empty selection)."""
+    out: Set[str] = set()
+    for n, entry in enumerate(raw, 1):
+        if not isinstance(entry, str):
+            raise SelectionError(f"{source}: entry {n} is not a string: {entry!r}")
+        pid = entry.strip()
+        if not pid:
+            raise SelectionError(f"{source}: entry {n} is empty or whitespace-only")
+        if not PROPOSAL_ID_RE.fullmatch(pid):
+            raise SelectionError(f"{source}: entry {n} {pid!r} is not a proposal_id (irp_ + 32 lowercase hex)")
+        out.add(pid)
+    return sorted(out)
+
+
 def select_proposals(proposals: Sequence[Mapping[str, Any]], mode: str,
                      ids: Iterable[str]) -> List[Dict[str, Any]]:
     """The proposals a selection keeps: mode "only" keeps those whose proposal_id is in `ids`,
@@ -1368,15 +1389,15 @@ def select_proposals(proposals: Sequence[Mapping[str, Any]], mode: str,
         raise SelectionError(f"unknown selection mode {mode!r}")
     wanted = set(ids)
     if not wanted:
-        raise SelectionError(f"the --{mode}-proposals file names no proposal_id")
+        raise SelectionError(f"the {mode} selection names no proposal_id")
     known = {p["proposal_id"] for p in proposals}
     unknown = sorted(wanted - known)
     if unknown:
-        raise SelectionError(f"{len(unknown)} proposal_id(s) in the --{mode}-proposals file are not among this "
-                             f"run's {len(known)} proposals (stale file, or another run's): {unknown}")
+        raise SelectionError(f"{len(unknown)} proposal_id(s) in the {mode} selection are not among this "
+                             f"run's {len(known)} proposals (stale list, or another run's): {unknown}")
     keep = [dict(p) for p in proposals if (p["proposal_id"] in wanted) == (mode == "only")]
     if not keep:
-        raise SelectionError(f"the --{mode}-proposals selection keeps no proposal")
+        raise SelectionError(f"the {mode} selection keeps no proposal")
     return keep
 
 
@@ -1609,5 +1630,5 @@ __all__ = [
     "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
     "proposal_set_digest", "seed_matches", "select_brand_spellings", "select_proposals", "stamp_run",
-    "SELECTION_MODES", "SelectionError",
+    "PROPOSAL_ID_RE", "SELECTION_MODES", "SelectionError", "normalise_proposal_ids",
 ]

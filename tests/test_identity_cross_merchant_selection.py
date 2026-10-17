@@ -6,6 +6,7 @@ subset, or the same subset reached the other way round; the full set's never aut
 from __future__ import annotations
 
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -14,7 +15,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from services.identity_cross_merchant_match import (  # noqa: E402
+    PROPOSAL_ID_RE,
     SelectionError,
+    Snapshot,
+    normalise_proposal_ids,
+    plan_market,
     proposal_set_digest,
     select_proposals,
 )
@@ -54,19 +59,47 @@ def test_a_subsets_digest_differs_from_the_full_sets_and_from_another_subsets():
     assert d_full == proposal_set_digest(full.proposals)
 
 
-def test_the_subset_digest_still_pins_each_selected_proposals_evidence():
+def test_proposal_ids_are_deterministic_across_runs_over_the_same_inputs():
+    """proposal_id = irp_ + sha256(proposal_key)[:32]; the key is strategy, merchant, target content_key
+    and the move's member fingerprint -- no clock, no run id, no input order."""
+    one, two = _mixed().plan(), _mixed().plan()          # two independently built catalogs
+    assert _ids(one) == _ids(two) and one.digest() == two.digest()
+    assert [p["proposal_key"] for p in one.proposals] == [p["proposal_key"] for p in two.proposals]
+    snap = _mixed().snapshot()
+    shuffled = Snapshot(products=random.Random(5).sample(list(snap.products), len(snap.products)),
+                        offers=list(reversed(snap.offers)), skus=snap.skus, ck_rows=snap.ck_rows,
+                        memberships=snap.memberships, group_sizes=snap.group_sizes)
+    assert _ids(plan_market(shuffled, "US")) == _ids(one)
+    assert all(PROPOSAL_ID_RE.fullmatch(i) for i in _ids(one))
+
+
+def test_the_subset_digest_binds_each_selected_id_to_its_content():
+    """The id derives from the subjects (moved listing + anchor) and the move's keys, so a different
+    anchor or listing is a different id; what CAN change under one id is the evidence (prices, sizes,
+    titles, hosts, matched offers). proposal_set_digest's line per proposal carries
+    proposal_fingerprint (kind, strategy, keeper, target content_key, subjects, evidence), so the
+    subset digest moves with it."""
     cat = _mixed()
     plan = cat.plan()
     a = _ids(plan)[:3]
+    before = {p["proposal_id"]: p for p in plan.proposals}
     plan.select("only", a)
     d_a = plan.digest()
-    cat.offers[1]["price"] = 25        # one retailer's evidence changes
+    cat.offers[1]["price"] = 25        # one selected retailer's price: same pair, new evidence
     again = cat.plan()
-    changed = [p["proposal_id"] for p in again.proposals
-               if p["proposal_id"] in a and p != next(q for q in plan.proposals if q["proposal_id"] == p["proposal_id"])]
-    assert changed  # the fixture really moved a selected proposal
+    assert _ids(again) == list(before)                     # every id unchanged
+    changed = [p["proposal_id"] for p in again.proposals if p != before[p["proposal_id"]]]
+    assert len(changed) == 1 and changed[0] in a
+    q, old = next(p for p in again.proposals if p["proposal_id"] == changed[0]), before[changed[0]]
+    assert {k for k in q if q[k] != old[k]} == {"evidence"}
     again.select("only", a)
-    assert again.digest() != d_a
+    assert _ids(again) == a and again.digest() != d_a
+    # a selection over the unchanged proposals is unaffected
+    rest = [i for i in a if i != changed[0]]
+    p1, p2 = _mixed().plan(), cat.plan()
+    p1.select("only", rest)
+    p2.select("only", rest)
+    assert p1.digest() == p2.digest()
 
 
 def test_an_unknown_selection_mode_is_refused():
@@ -121,7 +154,7 @@ def test_counts_samples_and_the_audit_sample_are_of_the_subset_and_say_so():
     assert head["listings_moving"] == len(plan.pairs) < len(full.pairs)
     sel = head["selection"]
     assert sel["applied"] is True and sel["mode"] == "only"
-    assert (sel["selected"], sel["of"], sel["ids_in_file"]) == (2, 6, 2)
+    assert (sel["selected"], sel["of"], sel["ids_given"]) == (2, 6, 2)
     assert sel["run_digest"] == full.digest() and head["digest"] == plan.digest() != full.digest()
     samples = [line for line in plan.summary() if line["section"] == "samples"]
     assert samples and all(line["selection"] == {"mode": "only", "selected": 2, "of": 6} for line in samples)
@@ -173,45 +206,86 @@ def _script():
     return script
 
 
-def test_only_and_exclude_are_mutually_exclusive(tmp_path):
+A, B, C = ("irp_" + c * 32 for c in "abc")
+SELECTION_FLAGS = ("--only-proposals", "--exclude-proposals", "--only-proposal-ids", "--exclude-proposal-ids")
+
+
+def test_the_four_selection_flags_are_mutually_exclusive(tmp_path):
     script = _script()
     f = tmp_path / "ids.txt"
-    f.write_text("irp_x\n")
-    with pytest.raises(SystemExit):
-        script.parse_args(["--brands", "laneige", "--only-proposals", str(f), "--exclude-proposals", str(f)])
-    with pytest.raises(SystemExit):
-        script.parse_args(["--brands", "laneige", "--explain", "--only-proposals", str(f)])
-    args = script.parse_args(["--brands", "laneige", "--only-proposals", str(f)])
-    assert args.only_proposals == str(f) and args.exclude_proposals is None
+    f.write_text(A + "\n")
+    value = {"--only-proposals": str(f), "--exclude-proposals": str(f),
+             "--only-proposal-ids": A, "--exclude-proposal-ids": A}
+    for i, x in enumerate(SELECTION_FLAGS):
+        for y in SELECTION_FLAGS[i + 1:]:
+            with pytest.raises(SystemExit):
+                script.parse_args(["--brands", "laneige", x, value[x], y, value[y]])
+        with pytest.raises(SystemExit):
+            script.parse_args(["--brands", "laneige", "--explain", x, value[x]])
+    args = script.parse_args(["--brands", "laneige", "--only-proposal-ids", A])
+    assert args.only_proposal_ids == A and args.only_proposals is None and args.exclude_proposal_ids is None
 
 
-def test_parse_proposal_ids_reads_lines_or_a_json_list():
+def test_one_normalisation_strips_dedupes_and_sorts():
+    assert normalise_proposal_ids([f" {B} ", A, B, f"{C}\t"]) == [A, B, C]
+    assert normalise_proposal_ids([]) == []
+    for bad in ([A, ""], [A, "   "], ["irq_" + "a" * 32], ["irp_" + "a" * 31], ["irp_" + "a" * 33],
+                ["irp_" + "A" * 32], ["irp_" + "g" * 32], [A, 3], [None]):
+        with pytest.raises(SelectionError):
+            normalise_proposal_ids(bad)
+
+
+def test_parse_proposal_ids_reads_lines_or_a_json_list_through_the_one_normalisation():
     script = _script()
-    assert script.parse_proposal_ids("irp_a\n\n# labelled clean\n  irp_b  \nirp_a\n") == ["irp_a", "irp_b"]
-    assert script.parse_proposal_ids(' ["irp_b", "irp_a", "irp_b"] ') == ["irp_b", "irp_a"]
+    assert script.parse_proposal_ids(f"{B}\n\n# labelled clean\n  {A}  \n{B}\n") == [A, B]
+    assert script.parse_proposal_ids(json.dumps([B, A, B])) == [A, B]
     assert script.parse_proposal_ids("\n# nothing\n") == []
-    for bad in ('["irp_a", 3]', '["irp_a", ""]', "[irp_a"):
+    for bad in (json.dumps([A, 3]), json.dumps([A, ""]), json.dumps([A, "  "]), "[" + A,
+                json.dumps({"ids": [A]}), f"{A}\nirp_short\n", f"{A}\n{A.upper()}\n"):
         with pytest.raises(script.Refused):
             script.parse_proposal_ids(bad)
 
 
-def test_load_selection_reads_a_local_or_gcs_file_and_refuses_an_empty_or_missing_one(tmp_path):
+def test_load_selection_normalises_both_forms_identically(tmp_path):
     script = _script()
     f = tmp_path / "ids.json"
-    f.write_text('["irp_a", "irp_b"]')
-    args = script.parse_args(["--brands", "laneige", "--exclude-proposals", str(f)])
-    assert script.load_selection(args) == ("exclude", ["irp_a", "irp_b"], str(f))
+    f.write_text(json.dumps([B, A]))
+    sel = script.load_selection(script.parse_args(["--brands", "laneige", "--exclude-proposals", str(f)]))
+    assert sel == ("exclude", [A, B], f"--exclude-proposals {f}")
+    inline = script.load_selection(script.parse_args(["--brands", "laneige", "--exclude-proposal-ids",
+                                                      f" {B},{A} ,{B}"]))
+    assert inline == ("exclude", [A, B], f"--exclude-proposal-ids {A},{B}")
+    assert inline[:2] == sel[:2]
     assert script.load_selection(script.parse_args(["--brands", "laneige"])) is None
-    got = []
-    gs = script.parse_args(["--brands", "laneige", "--only-proposals", "gs://bkt/cm/clean.txt"])
-    sel = script.load_selection(gs, downloader=lambda b, n: (got.append((b, n)), b"irp_a\n")[1])
-    assert sel == ("only", ["irp_a"], "gs://bkt/cm/clean.txt") and got == [("bkt", "cm/clean.txt")]
-    empty = tmp_path / "empty.txt"
-    empty.write_text("\n\n")
-    with pytest.raises(script.Refused, match="empty selection"):
-        script.load_selection(script.parse_args(["--brands", "laneige", "--only-proposals", str(empty)]))
-    with pytest.raises(script.Refused, match="cannot read"):
-        script.load_selection(script.parse_args(["--brands", "laneige", "--only-proposals", str(tmp_path / "nope")]))
+
+
+@pytest.mark.parametrize("flag,value,reason", [
+    ("--only-proposals", "gs://bkt/cm/clean.txt", "gs:// is not read"),
+    ("--exclude-proposals", "GS://bkt/x", "gs:// is not read"),
+    ("--only-proposals", "/nonexistent/m4sel/ids.txt", "cannot read"),
+    ("--only-proposal-ids", "", "empty selection"),
+    ("--only-proposal-ids", "   ", "empty selection"),
+    ("--exclude-proposal-ids", ",", "whitespace-only"),
+    ("--only-proposal-ids", f"{A}, ,{B}", "whitespace-only"),
+    ("--only-proposal-ids", f"{A},", "whitespace-only"),
+    ("--only-proposal-ids", "irq_" + "a" * 32, "not a proposal_id"),
+    ("--only-proposal-ids", f"{A},irp_{'b' * 31}", "not a proposal_id"),
+    ("--exclude-proposal-ids", f"irp_{'c' * 40}", "not a proposal_id"),
+])
+def test_a_bad_selection_refuses(flag, value, reason):
+    script = _script()
+    with pytest.raises(script.Refused, match=reason):
+        script.load_selection(script.parse_args(["--brands", "laneige", flag, value]))
+
+
+def test_an_empty_or_malformed_file_refuses(tmp_path):
+    script = _script()
+    for text, reason in (("\n\n", "empty selection"), ("[]", "empty selection"),
+                         (f"{A}\nnot-an-id\n", "not a proposal_id"), (json.dumps([A, " "]), "whitespace-only")):
+        f = tmp_path / "ids.txt"
+        f.write_text(text)
+        with pytest.raises(script.Refused, match=reason):
+            script.load_selection(script.parse_args(["--brands", "laneige", "--only-proposals", str(f)]))
 
 
 class _NoConn:
@@ -299,7 +373,7 @@ def test_a_stale_id_or_an_empty_file_refuses_the_run_with_exit_2(offline, tmp_pa
     for mode in ("--only-proposals", "--exclude-proposals"):
         assert _run(script, "--out", str(tmp_path / "o"), mode, str(f)) == 2
         refused = [line for line in _lines(capsys) if line["section"] == "refused"]
-        assert len(refused) == 1 and stale in refused[0]["reason"] and refused[0]["selection_file"] == str(f)
+        assert len(refused) == 1 and stale in refused[0]["reason"] and refused[0]["selection"] == f"{mode} {f}"
     assert not (tmp_path / "o").exists()           # nothing written for a refused selection
 
     async def must_not_read(*_a, **_kw):
@@ -310,3 +384,63 @@ def test_a_stale_id_or_an_empty_file_refuses_the_run_with_exit_2(offline, tmp_pa
     empty.write_text("# nothing labelled\n")
     assert _run(script, "--out", str(tmp_path / "o"), "--only-proposals", str(empty)) == 2
     assert "empty selection" in [line for line in _lines(capsys) if line["section"] == "refused"][0]["reason"]
+
+
+def _outputs(capsys):
+    return next(line for line in _lines(capsys) if line["section"] == "outputs")
+
+
+@pytest.mark.parametrize("mode", ["only", "exclude"])
+def test_the_file_and_inline_forms_of_a_mode_give_the_same_digest(offline, tmp_path, capsys, mode):
+    script, cat = offline
+    ids = _ids(cat.plan())
+    chosen = ids[1:4]
+    f = tmp_path / "clean.txt"
+    f.write_text("\n".join(reversed(chosen)) + "\n" + chosen[0] + "\n")      # unsorted, duplicated
+    assert _run(script, "--out", str(tmp_path / "a"), f"--{mode}-proposals", str(f)) == 0
+    by_file = _outputs(capsys)
+    inline = ",".join([chosen[2], f" {chosen[0]} ", chosen[1], chosen[0]])
+    assert _run(script, "--out", str(tmp_path / "b"), f"--{mode}-proposal-ids", inline) == 0
+    by_ids = _outputs(capsys)
+    assert by_file["digest"] == by_ids["digest"] and by_file["proposals"] == by_ids["proposals"]
+    assert by_file["next_step"].startswith(
+        f"--write-proposals --expect-digest {by_file['digest']} --max-proposals {by_file['proposals']}"
+        f" --{mode}-proposals {f} ")
+    assert by_ids["next_step"].startswith(
+        f"--write-proposals --expect-digest {by_ids['digest']} --max-proposals {by_ids['proposals']}"
+        f" --{mode}-proposal-ids {','.join(sorted(chosen))} ")
+    other = "exclude" if mode == "only" else "only"
+    assert _run(script, "--out", str(tmp_path / "c"), f"--{other}-proposal-ids", ",".join(chosen)) == 0
+    assert _outputs(capsys)["digest"] != by_ids["digest"]                 # the mode is folded in
+
+
+def test_a_write_refuses_when_a_selected_proposals_content_changed_since_the_dry_run(offline, tmp_path, capsys):
+    script, cat = offline
+    chosen = _ids(cat.plan())[:3]
+    assert _run(script, "--out", str(tmp_path / "a"), "--only-proposal-ids", ",".join(chosen)) == 0
+    digest = _outputs(capsys)["digest"]
+    cat.offers[1]["price"] = 25                     # same ids, a selected pair's evidence changed
+    assert _ids(cat.plan())[:3] == chosen
+    assert _run(script, "--out", str(tmp_path / "b"), "--write-proposals", "--expect-digest", digest,
+                "--max-proposals", "3", "--only-proposal-ids", ",".join(chosen)) == 2
+    assert "proposal set changed" in next(line for line in _lines(capsys) if line["section"] == "refused")["reason"]
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--only-proposals", "gs://bkt/cm/clean.txt"),
+    ("--only-proposal-ids", " "),
+    ("--exclude-proposal-ids", "irp_123"),
+    ("--only-proposal-ids", "irp_" + "a" * 32 + ",,"),
+])
+def test_a_bad_selection_exits_2_before_the_database_is_read(offline, tmp_path, capsys, monkeypatch, flag, value):
+    script, _cat = offline
+
+    async def must_not_read(*_a, **_kw):
+        raise AssertionError("a bad selection is refused before the database is read")
+
+    monkeypatch.setattr(script, "export_snapshot", must_not_read)
+    for mode in ([], ["--write-proposals", "--expect-digest", "cmd_x", "--max-proposals", "5"]):
+        assert _run(script, "--out", str(tmp_path / "o"), *mode, flag, value) == 2
+        refused = [line for line in _lines(capsys) if line["section"] == "refused"]
+        assert len(refused) == 1
+    assert not (tmp_path / "o").exists()

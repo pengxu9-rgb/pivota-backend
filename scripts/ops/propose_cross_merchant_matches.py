@@ -36,18 +36,28 @@ MODES
       this invocation) and prints the proposal run id and the approve DRY-RUN command, whose output
       carries the ira_ digest the --execute approval needs.
 
-SELECTION (either mode; mutually exclusive): --only-proposals PATH keeps only the proposals whose
-  proposal_id the file names; --exclude-proposals PATH keeps all but those. PATH is a local file or
-  gs://bucket/object (read with the job's metadata-server token: UNTESTED against GCS -- a Cloud Run
-  job cannot see a laptop path), holding one proposal_id per line (blank and '#' lines ignored) or a
-  JSON list. An id that is not among THIS run's proposals refuses the run (exit 2, naming it): a stale
-  file must not silently select less; so does an empty file or a selection that keeps nothing. The
-  selection is FOLDED INTO THE DIGEST (identity_cross_merchant_match.proposal_set_digest: the selected
-  proposals plus a line carrying the mode and the sorted selected ids), so a digest printed for a
-  subset never authorises the full set or another subset, and the full set's digest never authorises
-  a subset. The dry run prints the subset's digest, count and a next_step carrying the same flag;
-  --write-proposals takes the same flag and file, recomputes, and refuses on a mismatch. Counts,
-  samples, proposals.jsonl and the audit sample are of the subset and say so ("selection").
+SELECTION (four flags, mutually exclusive):
+  --only-proposals PATH        keep only the proposal_ids a LOCAL file names (laptop dry runs);
+  --exclude-proposals PATH     keep all but those;
+  --only-proposal-ids a,b,c    the same, inline (what a Cloud Run one-off job takes: it cannot see a
+  --exclude-proposal-ids a,b,c laptop path; run_oneoff_job.sh picks an --args delimiter absent from the
+                               payload, so the commas survive).
+  A file holds one proposal_id per line (blank and '#' lines ignored) or a JSON list. gs:// paths are
+  REFUSED (no untested bucket read). Every form goes through ONE normalisation
+  (identity_cross_merchant_match.normalise_proposal_ids: strip, refuse empty / whitespace-only /
+  malformed entries -- a proposal_id is irp_ + 32 lowercase hex -- then de-dup and sort), and the
+  digest marks only the MODE, so --only-proposals FILE and --only-proposal-ids LIST naming the same
+  ids give the same digest. Any read or parse failure refuses (exit 2); it never falls back to no
+  selection. An id that is not among THIS run's proposals refuses the run (exit 2, naming it): a stale
+  list must not silently select less; so does an empty list or a selection that keeps nothing. The
+  selection is FOLDED INTO THE DIGEST (proposal_set_digest: each selected proposal's id AND its
+  fingerprint -- kind, strategy, keeper, target content_key, subjects, evidence -- plus a line carrying
+  the mode and the sorted selected ids), so a digest printed for a subset never authorises the full
+  set, another subset, or the same ids with changed content, and the full set's digest never
+  authorises a subset. The dry run prints the subset's digest, count and a next_step carrying the
+  flag in the form used (the inline form prints the sorted id list); --write-proposals takes the
+  same selection, recomputes, and refuses on a mismatch. Counts, samples, proposals.jsonl and the
+  audit sample are of the subset and say so ("selection").
 
 SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
   --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
@@ -99,6 +109,7 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     gtin_lookup_values,
     evidence_problems,
     plan_market,
+    normalise_proposal_ids,
     select_brand_spellings,
     SelectionError,
     stamp_run,
@@ -412,69 +423,63 @@ def _gcs_upload(bucket: str, name: str, body: bytes) -> None:  # pragma: no cove
         pass
 
 
-def _gcs_download(bucket: str, name: str) -> bytes:  # pragma: no cover - needs GCP
-    """Read one object with the job's service account (metadata-server token), stdlib only. UNTESTED
-    against GCS, like _gcs_upload."""
-    import urllib.parse
-    import urllib.request
-
-    tok_req = urllib.request.Request(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-        headers={"Metadata-Flavor": "Google"})
-    with urllib.request.urlopen(tok_req, timeout=10) as r:
-        token = json.loads(r.read())["access_token"]
-    url = (f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o/"
-           f"{urllib.parse.quote(name, safe='')}?alt=media")
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+#: (mode, normalised proposal_ids, the selection flag as next_step prints it)
+Selection = Tuple[str, List[str], str]
 
 
 def parse_proposal_ids(text: str, *, source: str = "the selection file") -> List[str]:
-    """proposal_ids from a selection file: a JSON list of strings, or one id per line (blank lines
-    and lines starting with '#' ignored). Order kept, duplicates dropped. Empty -> [] (the caller
-    refuses an empty selection)."""
+    """proposal_ids from a selection file's text: a JSON list, or one id per line (blank lines and
+    lines starting with '#' ignored), through normalise_proposal_ids. Raises Refused."""
     body = text.strip()
     if body.startswith("["):
         try:
             raw = json.loads(body)
         except ValueError as exc:
             raise Refused(f"{source} is not a valid JSON list: {exc}") from exc
-        if not isinstance(raw, list) or not all(isinstance(x, str) and x.strip() for x in raw):
-            raise Refused(f"{source}: a JSON selection must be a list of non-empty proposal_id strings")
-        ids = [x.strip() for x in raw]
     else:
-        ids = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    return list(dict.fromkeys(ids))
+        raw = [ln for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    try:
+        return normalise_proposal_ids(raw, source=source)
+    except SelectionError as exc:
+        raise Refused(str(exc)) from exc
 
 
-def load_selection(args: argparse.Namespace, *,
-                   downloader: Callable[[str, str], bytes] = _gcs_download) -> Optional[Tuple[str, List[str], str]]:
-    """(mode, proposal_ids, path) for --only-proposals / --exclude-proposals, else None. Refuses an
-    unreadable or empty file before anything is read from the database."""
+def load_selection(args: argparse.Namespace) -> Optional[Selection]:
+    """The selection one of the four flags names, else None. Refuses (Refused, exit 2) a gs:// path,
+    an unreadable file, any malformed entry and an empty selection -- before the database is read,
+    and never by falling back to no selection."""
     for mode in ("only", "exclude"):
         path = getattr(args, f"{mode}_proposals", None)
-        if not path:
-            continue
-        flag = f"--{mode}-proposals"
-        try:
-            if path.startswith("gs://"):
-                bucket, _, name = path[len("gs://"):].partition("/")
-                text = downloader(bucket, name).decode("utf-8")
-            else:
+        inline = getattr(args, f"{mode}_proposal_ids", None)
+        if path is not None:
+            flag = f"--{mode}-proposals"
+            if path.strip().lower().startswith("gs://"):
+                raise Refused(f"{flag} {path}: gs:// is not read (no untested bucket path); pass the ids "
+                              f"inline with --{mode}-proposal-ids id1,id2,... instead")
+            try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise Refused(f"{flag} {path}: cannot read it ({exc})") from exc
-        ids = parse_proposal_ids(text, source=f"{flag} {path}")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise Refused(f"{flag} {path}: cannot read it ({exc})") from exc
+            ids = parse_proposal_ids(text, source=f"{flag} {path}")
+            shown = f"{flag} {path}"
+        elif inline is not None:
+            flag = f"--{mode}-proposal-ids"
+            try:
+                ids = normalise_proposal_ids(inline.split(","), source=flag) if inline.strip() else []
+            except SelectionError as exc:
+                raise Refused(str(exc)) from exc
+            shown = f"{flag} {','.join(ids)}"
+        else:
+            continue
         if not ids:
-            raise Refused(f"{flag} {path} names no proposal_id: an empty selection is refused")
-        return mode, ids, path
+            raise Refused(f"{flag} names no proposal_id: an empty selection is refused")
+        return mode, ids, shown
     return None
 
 
-def selection_flag(selection: Optional[Tuple[str, List[str], str]]) -> str:
-    return "" if selection is None else f" --{selection[0]}-proposals {selection[2]}"
+def selection_flag(selection: Optional[Selection]) -> str:
+    return "" if selection is None else f" {selection[2]}"
 
 
 def write_outputs(out: str, files: Mapping[str, bytes], *,
@@ -560,10 +565,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap.add_argument("--market", default="US")
     select = ap.add_mutually_exclusive_group()
     select.add_argument("--only-proposals", metavar="PATH",
-                        help="keep only the proposal_ids this file names (one per line or a JSON list); "
-                             "folded into the digest")
+                        help="keep only the proposal_ids this LOCAL file names (one per line or a JSON list; "
+                             "gs:// refused); folded into the digest")
     select.add_argument("--exclude-proposals", metavar="PATH",
-                        help="keep every proposal except the proposal_ids this file names; folded into the digest")
+                        help="keep every proposal except those this LOCAL file names; folded into the digest")
+    select.add_argument("--only-proposal-ids", metavar="ID,ID,...",
+                        help="keep only these proposal_ids (comma-separated; same digest as the file form)")
+    select.add_argument("--exclude-proposal-ids", metavar="ID,ID,...",
+                        help="keep every proposal except these proposal_ids (comma-separated)")
     scope = ap.add_mutually_exclusive_group()
     scope.add_argument("--brands", default="", help="comma-separated brands (canonical brand match)")
     scope.add_argument("--all-brands", action="store_true",
@@ -576,8 +585,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = ap.parse_args(list(argv))
     if args.write_proposals and (not args.expect_digest or not args.max_proposals or args.max_proposals < 1):
         ap.error("--write-proposals needs --expect-digest (from a dry run) and --max-proposals >= 1")
-    if args.explain and (args.only_proposals or args.exclude_proposals):
-        ap.error("--explain plans the statements only; it takes no --only-proposals / --exclude-proposals")
+    if args.explain and any(getattr(args, a) is not None for a in (
+            "only_proposals", "exclude_proposals", "only_proposal_ids", "exclude_proposal_ids")):
+        ap.error("--explain plans the statements only; it takes no proposal selection")
     if args.limit_groups is not None and args.limit_groups < 1:
         ap.error("--limit-groups must be >= 1")
     args.market = args.market.strip().upper()
@@ -593,8 +603,7 @@ def _print(line: Mapping[str, Any]) -> None:
 
 
 async def run(conn: Any, args: argparse.Namespace, *,
-              uploader: Callable[[str, str, bytes], None] = _gcs_upload,
-              downloader: Callable[[str, str], bytes] = _gcs_download) -> int:
+              uploader: Callable[[str, str, bytes], None] = _gcs_upload) -> int:
     if getattr(args, "all_brands", False):
         _print(_line("warning", level="WARN",
                      message=("WARN --all-brands: phase 1 reads every signed live product of market "
@@ -605,8 +614,8 @@ async def run(conn: Any, args: argparse.Namespace, *,
             _print(line)
         return 0
     try:
-        selection = load_selection(args, downloader=downloader)
-    except Refused as exc:  # unreadable / empty selection file: refused before the database is read
+        selection = load_selection(args)
+    except Refused as exc:  # gs://, unreadable, malformed or empty selection: refused before any read
         _print(_line("refused", reason=str(exc)))
         return 2
     try:
@@ -630,7 +639,7 @@ async def run(conn: Any, args: argparse.Namespace, *,
         try:
             plan.select(selection[0], selection[1])
         except SelectionError as exc:
-            _print(_line("refused", reason=str(exc), selection_file=selection[2]))
+            _print(_line("refused", reason=str(exc), selection=selection[2]))
             return 2
     for line in report_lines(plan):
         _print(line)

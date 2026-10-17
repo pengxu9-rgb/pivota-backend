@@ -541,6 +541,11 @@ async def test_a_selection_is_folded_into_the_digest_and_writes_exactly_the_subs
     full_digest = head["digest"]
     ids = sorted(json.loads(x)["proposal_id"] for x in (out / "proposals.jsonl").read_text().splitlines())
     assert len(ids) == 3
+    # proposal_ids are deterministic: a second dry run over the same tables gives the same ids + digest
+    assert await script.run(c, _args(tmp_path / "again")) == 0
+    again = [json.loads(x)["proposal_id"] for x in (tmp_path / "again" / "proposals.jsonl").read_text().splitlines()]
+    assert sorted(again) == ids
+    assert next(line for line in lines() if line["section"] == "proposals")["digest"] == full_digest
     keep, rest = ids[:2], ids[2:]
     only = tmp_path / "clean.json"
     only.write_text(json.dumps(keep))
@@ -573,7 +578,12 @@ async def test_a_selection_is_folded_into_the_digest_and_writes_exactly_the_subs
         assert [line["section"] for line in lines() if line["section"] == "refused"] == ["refused"]
         assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0
 
-    # a stale id, and an empty file, refuse with exit 2 and write nothing
+    # a stale id (file or inline), an empty file, a gs:// path and a malformed inline id refuse with exit 2
+    assert await write(sub_digest, "--only-proposal-ids", ",".join([*keep, "irp_" + "0" * 32])) == 2
+    assert "irp_" + "0" * 32 in next(line for line in lines() if line["section"] == "refused")["reason"]
+    for flag in (["--only-proposals", "gs://bkt/clean.txt"], ["--only-proposal-ids", keep[0] + ",irp_x"]):
+        assert await write(sub_digest, *flag) == 2
+        assert [line["section"] for line in lines()] == ["warning", "refused"]   # --all-brands WARN, then refused
     stale = tmp_path / "stale.txt"
     stale.write_text("\n".join([*keep, "irp_" + "0" * 32]))
     assert await write(sub_digest, "--only-proposals", str(stale)) == 2
@@ -584,8 +594,9 @@ async def test_a_selection_is_folded_into_the_digest_and_writes_exactly_the_subs
     capsys.readouterr()
     assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0
 
-    # the matching digest + flag inserts exactly the selected proposals, one run id
-    assert await write(sub_digest, "--only-proposals", str(only)) == 0
+    # the dry run used the FILE; the write names the same ids INLINE (Cloud Run cannot see the file):
+    # one normalisation, one mode marker, the same digest -- and exactly the selected proposals land
+    assert await write(sub_digest, "--only-proposal-ids", f" {keep[1]},{keep[0]},{keep[1]}") == 0
     written = next(line for line in lines() if line["section"] == "written")
     assert written["inserted"] == 2 and written["dry_run_digest"] == sub_digest
     assert written["selection"]["mode"] == "only" and written["selection"]["selected"] == 2
