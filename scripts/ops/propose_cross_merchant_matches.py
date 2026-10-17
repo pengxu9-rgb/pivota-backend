@@ -36,7 +36,13 @@ MODES
       this invocation) and prints the proposal run id and the approve DRY-RUN command, whose output
       carries the ira_ digest the --execute approval needs.
 
-SCOPE: --market US (default), --brands a,b,c (canonical brand match), --limit-groups N.
+SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
+  --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
+                   stored spelling of the family ("Dr.Jart+", "Dr. Jart+", "DR JART" for drjart) is
+                   found through the trigram index, chosen exactly in Python, and read with
+                   `brand = ANY(...)` -- a scoped run equals the full run restricted to those brands;
+  --all-brands     every brand of the market: a full catalog_products scan. Refused unless asked for
+                   by name, and the run prints a WARN line.
 
 SAFETY. pivota-pg has 2 vCPU and serves live search: start only while CPU is under 35%, never
 05:15-06:15Z, 10:30-11:20Z, or during a drain or index build. One prod one-off at a time, through
@@ -74,10 +80,12 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     Plan,
     Planner,
     Snapshot,
-    brand_sql_regex,
+    brand_exact_regex,
+    brand_preselect_regexes,
     gtin_lookup_values,
     evidence_problems,
     plan_market,
+    select_brand_spellings,
     stamp_run,
 )
 
@@ -86,11 +94,21 @@ AUDIT_SAMPLE_DEFAULT = 600
 AUDIT_SEED_DEFAULT = 20261016
 OUT_DEFAULT = "/tmp/cross_merchant_match"
 
-# PHASE 1 -- the run market's candidates. $1 market. With --brands, $2 is a regex of literal brand
-# tokens (identity_cross_merchant_match.brand_sql_regex, a superset; the exact canonical_brand filter
-# runs in Python) matched against lower(coalesce(brand, '')) -- the expression the trigram GIN index
-# idx_catalog_products_brand_trgm (migration 059) is built on, so the scan is an index scan. Without
-# --brands the phase reads every candidate of the market: a full catalog_products scan.
+# PHASE 0 (--brands only) -- the stored spellings of the requested brands. $1 is one family's LOOSE
+# regex (identity_cross_merchant_match.brand_preselect_regexes: a superset of its spellings, built so
+# the trigram GIN index idx_catalog_products_brand_trgm, migration 059, on lower(coalesce(brand, '')),
+# serves it); one statement per family. DISTINCT spellings only; select_brand_spellings then keeps
+# exactly those whose canonical_brand is the family.
+BRAND_SPELLINGS_SQL = """
+SELECT DISTINCT p.brand, lower(coalesce(p.brand, '')) AS lowered
+FROM catalog_products p
+WHERE lower(coalesce(p.brand, '')) ~ $1
+"""
+# PHASE 1 -- the run market's candidates. $1 market. With --brands, the EXACT filter is
+# `p.brand = ANY($3)` over phase 0's spellings; $2 (brand_exact_regex: `^(s1|s2|...)$` of exactly
+# those spellings, lowered by PostgreSQL itself) is the same condition spelled so the trigram index
+# can find the rows -- there is no btree on brand, and no new index is added. --all-brands reads
+# every candidate of the market: a full catalog_products scan (refused unless named; WARN line).
 _PRODUCT_FILTER = """
     p.pivota_signature_id IS NOT NULL AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
     AND p.sync_status = 'live'{brand}
@@ -98,7 +116,7 @@ _PRODUCT_FILTER = """
                 WHERE o0.product_key = p.product_key AND o0.suppressed_at IS NULL
                   AND o0.suppression_reason IS NULL AND o0.market = $1)
 """
-_BRAND_CLAUSE = "\n    AND lower(coalesce(p.brand, '')) ~ $2"
+_BRAND_CLAUSE = "\n    AND lower(coalesce(p.brand, '')) ~ $2 AND p.brand = ANY($3::text[])"
 
 
 def _products_sql(branded: bool) -> str:
@@ -205,10 +223,24 @@ def _line(section: str, **fields: Any) -> Dict[str, Any]:
     return {"census": CENSUS, "section": section, **fields}
 
 
-def _phase1(brands: Sequence[str]) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Any, ...]]:
-    """The phase-1 statements and their parameters after $1 (the market)."""
-    regex = brand_sql_regex(brands) if brands else None
-    return (PHASE1_BRANDS, (regex,)) if regex else (PHASE1, ())
+def _phase1(spellings: Optional[Sequence[Tuple[str, str]]]) -> Tuple[Tuple[Tuple[str, str], ...], Tuple[Any, ...]]:
+    """The phase-1 statements and their parameters after $1 (the market): `spellings` None for
+    --all-brands, else phase 0's chosen (brand, lowered) pairs (never empty here)."""
+    if spellings is None:
+        return PHASE1, ()
+    return PHASE1_BRANDS, (brand_exact_regex(lo for _b, lo in spellings), sorted({b for b, _lo in spellings}))
+
+
+async def brand_spellings(conn: Any, brands: Sequence[str]) -> List[Tuple[str, str]]:
+    """Phase 0: (stored brand, lower(coalesce(brand, ''))) for every spelling whose canonical_brand is
+    one of `brands`' families -- loose index-served pre-select per family, exact choice in Python."""
+    found: Dict[str, str] = {}
+    for fam, regex in brand_preselect_regexes(brands).items():
+        rows = await conn.fetch(BRAND_SPELLINGS_SQL, regex)
+        lowered = {str(r["brand"]): str(r["lowered"]) for r in rows if r["brand"] is not None}
+        for b in select_brand_spellings([fam], lowered):
+            found[b] = lowered[b]
+    return sorted(found.items())
 
 
 def _phase2_params(name: str, cks: List[str], rows: List[Dict[str, Any]],
@@ -234,15 +266,22 @@ def _phase2_params(name: str, cks: List[str], rows: List[Dict[str, Any]],
 
 
 async def export_snapshot(conn: Any, market: str, *, brands: Sequence[str] = (),
-                          limit_groups: Optional[int] = None) -> Tuple[Snapshot, Dict[str, int]]:
+                          limit_groups: Optional[int] = None) -> Tuple[Snapshot, Dict[str, Any]]:
     """The only read: ONE read-only transaction, statement_timeout 60s. Phase 1 reads the market's
     candidates (brand-filtered in SQL); Python computes the groups this run judges (Planner.scope);
-    phase 2 reads the details for those content_keys only."""
-    phase1, extra = _phase1(brands)
+    phase 2 reads the details for those content_keys only. `brands` empty = every brand (the caller
+    refuses that unless --all-brands was given)."""
+    spellings: Optional[List[Tuple[str, str]]] = None
     async with conn.transaction(readonly=True):
         await conn.execute("SET LOCAL statement_timeout = '60s'")
-        products = [dict(r) for r in await conn.fetch(phase1[0][1], market, *extra)]
-        hosts = [dict(r) for r in await conn.fetch(phase1[1][1], market, *extra)]
+        if brands:
+            spellings = await brand_spellings(conn, brands)
+        if spellings == []:
+            products, hosts = [], []  # no stored spelling of any requested brand
+        else:
+            phase1, extra = _phase1(spellings)
+            products = [dict(r) for r in await conn.fetch(phase1[0][1], market, *extra)]
+            hosts = [dict(r) for r in await conn.fetch(phase1[1][1], market, *extra)]
         pks, cks = Planner(Snapshot(products=products, offers=[], skus=[], ck_rows={}, memberships={},
                                     group_sizes={}, hosts=hosts), market,
                            brands=brands, limit_groups=limit_groups).scope()
@@ -264,15 +303,18 @@ async def export_snapshot(conn: Any, market: str, *, brands: Sequence[str] = (),
     snap = Snapshot(products=products, hosts=hosts, offers=got["offers"], skus=got["skus"], ck_rows=ck_rows,
                     memberships=memberships, group_sizes=group_sizes, seeds=got["seeds"],
                     proposals=got["proposals"], gtin_rows=got["gtin_rows"])
-    counts = {"products": len(products), "candidate_content_keys": len(cks),
-              **{k: len(v) for k, v in got.items()}}
+    counts: Dict[str, Any] = {"products": len(products), "candidate_content_keys": len(cks),
+                              **{k: len(v) for k, v in got.items()}}
+    if spellings is not None:
+        counts["brand_spellings"] = [b for b, _lo in spellings]
     return snap, counts
 
 
 async def explain(conn: Any, market: str, brands: Sequence[str]) -> List[Dict[str, Any]]:
     """EXPLAIN (no ANALYZE: nothing is executed) of every statement, for review before the timed
-    run. Phase-2 statements are planned with 500 placeholder keys."""
-    phase1, extra = _phase1(brands)
+    run. Phase 0 is planned with each family's real regex; phase 1 with the requested brands as
+    placeholder spellings (phase 0 is not run); phase 2 with 500 placeholder keys."""
+    phase1, extra = _phase1([(b, b.lower()) for b in brands] if brands else None)
     keys = [f"ck_explain_{i}" for i in range(500)]
     fake_rows = [{"product_key": f"pk_{i}", "merchant_id": "m", "platform": "p", "source_product_id": f"s{i}",
                   "source_ref": f"r{i}"} for i in range(500)]
@@ -280,6 +322,9 @@ async def explain(conn: Any, market: str, brands: Sequence[str]) -> List[Dict[st
     out = []
     async with conn.transaction(readonly=True):
         await conn.execute("SET LOCAL statement_timeout = '60s'")
+        for fam, regex in brand_preselect_regexes(brands).items():
+            plan = [r[0] for r in await conn.fetch("EXPLAIN " + BRAND_SPELLINGS_SQL, regex)]
+            out.append(_line("explain", statement="brand_spellings", family=fam, plan=plan))
         for name, sql in phase1:
             plan = [r[0] for r in await conn.fetch("EXPLAIN " + sql, market, *extra)]
             out.append(_line("explain", statement=name, plan=plan))
@@ -369,7 +414,11 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
         for p in stamped:
-            # #2637 (L3): only this module may write this strategy's proposals, and says so.
+            # #2637 (L3): only this module may write this strategy's proposals, and says so. module_writer
+            # is a CONVENTION the engine's Python writer checks, not a database constraint: nothing in
+            # the schema stops other code with a connection inserting such a row. Fine for phase 1 --
+            # every write is a one-off job run by hand, and approval still needs #2637's module-run
+            # approval with its digest.
             counts = await upsert_proposals(conn, [p], module_writer=STRATEGY)
             if counts["inserted"]:
                 inserted.append(p)
@@ -393,7 +442,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap.add_argument("--expect-digest")
     ap.add_argument("--max-proposals", type=int)
     ap.add_argument("--market", default="US")
-    ap.add_argument("--brands", default="")
+    scope = ap.add_mutually_exclusive_group()
+    scope.add_argument("--brands", default="", help="comma-separated brands (canonical brand match)")
+    scope.add_argument("--all-brands", action="store_true",
+                       help="every brand of the market: a FULL catalog_products scan (prints a WARN line)")
     ap.add_argument("--limit-groups", type=int)
     ap.add_argument("--out", default=OUT_DEFAULT,
                     help="local directory (default) or gs://bucket/prefix (UNTESTED upload)")
@@ -406,6 +458,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ap.error("--limit-groups must be >= 1")
     args.market = args.market.strip().upper()
     args.brand_list = [b.strip() for b in args.brands.split(",") if b.strip()]
+    if not args.brand_list and not args.all_brands:
+        # M3: no silent full scan of catalog_products on the 2-vCPU primary.
+        ap.error("give --brands a,b,c, or --all-brands to scan every brand of the market (full table scan)")
     return args
 
 
@@ -415,6 +470,11 @@ def _print(line: Mapping[str, Any]) -> None:
 
 async def run(conn: Any, args: argparse.Namespace, *,
               uploader: Callable[[str, str, bytes], None] = _gcs_upload) -> int:
+    if getattr(args, "all_brands", False):
+        _print(_line("warning", level="WARN",
+                     message=("WARN --all-brands: phase 1 reads every signed live product of market "
+                              f"{args.market} -- a full catalog_products scan on the primary. Start only "
+                              "inside the SAFETY window (CPU under 35%).")))
     if args.explain:
         for line in await explain(conn, args.market, args.brand_list):
             _print(line)
@@ -444,7 +504,7 @@ async def run(conn: Any, args: argparse.Namespace, *,
                             uploader=uploader)
     _print(_line("outputs", files=written, digest=plan.digest(), proposals=len(plan.proposals),
                  next_step=(f"--write-proposals --expect-digest {plan.digest()} --max-proposals "
-                            f"{len(plan.proposals)} (same --market/--brands/--limit-groups)")))
+                            f"{len(plan.proposals)} (same --market, --brands or --all-brands, --limit-groups)")))
     return 0
 
 

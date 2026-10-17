@@ -167,7 +167,8 @@ async def _catalog(c):
 def _args(tmp_path, *extra):
     from scripts.ops import propose_cross_merchant_matches as script
 
-    return script.parse_args(["--out", str(tmp_path), *extra])
+    scope = [] if "--brands" in extra else ["--all-brands"]   # M3: a full scan only when named
+    return script.parse_args(["--out", str(tmp_path), *scope, *extra])
 
 
 async def _proposals(c):
@@ -188,6 +189,7 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     # 1. dry run: reports, writes files, writes nothing to the database
     assert await script.run(c, _args(tmp_path)) == 0
     out = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["level"] for line in out if line["section"] == "warning"] == ["WARN"]  # --all-brands
     head = next(line for line in out if line["section"] == "proposals")
     held = next(line for line in out if line["section"] == "outcomes")["held"]
     assert head["proposals"] == 3 and head["by_kind"] == {"attach_membership": 2, "merge_content_key": 1}
@@ -241,6 +243,10 @@ async def test_dry_run_write_proposals_and_the_engine_reading_them(conn, tmp_pat
     mv = ulta["evidence"]["matcher_verdict"]
     assert sorted(o["offer_id"] for o in mv["matched_offers"]) == ["o_ulta_20", "o_ulta_sg"]  # every market
     assert {o["market"] for o in mv["matched_offers"]} == {"US", "SG"}
+    assert all(o["size"] == {"value": 20.0, "unit": "g", "pack": 1} for o in mv["matched_offers"])  # "0.7 oz"
+    seph_mv = next(r for r in by_kind["attach_membership"]
+                   if r["evidence"]["listing_product_key"] == SEPH)["evidence"]["matcher_verdict"]
+    assert [sorted(o) for o in seph_mv["matched_offers"]] == [["currency", "market", "offer_id", "price", "sku_key"]]
     assert mv["matched_seeds"] == [{"seed_id": "seed_anchor", "variant_id": None},
                                    {"seed_id": "seed_ulta", "variant_id": "u20"}]
     merge = by_kind["merge_content_key"][0]
@@ -289,7 +295,7 @@ async def test_explain_plans_every_statement_and_executes_none(conn, tmp_path, c
     await _catalog(conn)
     assert await script.run(conn, _args(tmp_path, "--explain", "--brands", "laneige")) == 0
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [line["statement"] for line in lines] == [n for n, _sql in script.PHASE1 + script.PHASE2]
+    assert [line["statement"] for line in lines] == ["brand_spellings", *(n for n, _sql in script.PHASE1 + script.PHASE2)]
     assert all(line["section"] == "explain" and line["plan"] for line in lines)
     assert not any(p.name.endswith(".jsonl") for p in tmp_path.iterdir())
 
@@ -308,6 +314,112 @@ async def test_the_brand_filter_and_phase_two_read_only_the_candidate_keys(conn,
     assert {p["brand"] for p in snap.products} == {"Laneige", "LANEIGE"}       # COSRX filtered in SQL
     assert {r["product_key"] for r in snap.gtin_rows} == {ANCHOR, "ext:retailer:" + "9" * 32}
     assert "ck_cosrx" not in snap.ck_rows and counts["candidate_content_keys"] == len(snap.ck_rows)
+    assert counts["brand_spellings"] == ["LANEIGE", "Laneige"]
     assert {o["market"] for o in snap.offers} == {"US", "SG"}                  # every market, candidate keys only
     none, counts = await script.export_snapshot(conn, "US", brands=["Nobrand Cosmetics Example"])
     assert none.products == [] and counts["candidate_content_keys"] == 0
+
+
+# --- M2 (controller 10-17): --brands finds every stored spelling ------------------------------------------
+
+def _k(tag: str) -> str:
+    return "ext:retailer:" + (tag * 32)[:32]
+
+
+async def _spelling_catalog(c):
+    """Three brands stored under the spellings a literal-token filter missed, brand stores included."""
+    rows = [
+        # Dr.Jart+: one store anchor + three retailers, each spelled differently
+        ("ext:drjart-cicapair::s1", "Dr.Jart+", "Cicapair Tiger Grass Color Correcting Treatment 50ml", "ck_dj", True),
+        (_k("a"), "DR JART", "Cicapair Tiger Grass Color Correcting Treatment 50 ml", "ck_dj_a", False),
+        (_k("b"), "Dr. Jart+", "Cicapair Tiger Grass Color Correcting Treatment 50ml", "ck_dj_b", False),
+        (_k("c"), "Dr.Jart", "Cicapair Tiger Grass Color Correcting Treatment 50ml", "ck_dj_c", False),
+        # Dr.Jart+ Ceramidin: TWO store keys under odd spellings -> the full run holds multi_anchor
+        ("ext:drjart-ceramidin::s1", "Dr. Jart+", "Ceramidin Cream 50ml", "ck_cer_1", True),
+        ("ext:drjart-ceramidin::s2", "DR JART", "Ceramidin Cream 50ml", "ck_cer_2", True),
+        (_k("d"), "Dr.Jart+", "Ceramidin Cream 50ml", "ck_cer_r", False),
+        # L'Oréal: the store spelled with the accent, the retailer without
+        ("ext:loreal-revitalift::s1", "L'Oréal", "Revitalift Night Cream 50ml", "ck_lo", True),
+        (_k("e"), "L'Oreal", "Revitalift Night Cream 50ml", "ck_lo_e", False),
+        # SK-II: the store "SK II", the retailer "SK-II"
+        ("ext:skii-fte::s1", "SK II", "Facial Treatment Essence 230ml", "ck_sk", True),
+        (_k("f"), "SK-II", "Facial Treatment Essence 230ml", "ck_sk_f", False),
+        # a look-alike that must stay out of every scoped run
+        (_k("g"), "Dr Jart Plus", "Cicapair Tiger Grass Color Correcting Treatment 50ml", "ck_djp", False),
+    ]
+    for n, (key, brand, title, ck, store) in enumerate(rows):
+        merchant = f"m_store_{n}" if store else f"m_ret_{n}"
+        await _product(c, key, merchant=merchant, title=title, brand=brand, ck=ck,
+                       seed_kind="self" if store else None, created="2026-01-01" if store else "2026-05-01")
+        await _offer(c, key, f"o_sp_{n}", merchant=merchant, price=30, host=f"h{n}.example",
+                     offer_type="brand_direct" if store else "retailer")
+    return rows
+
+
+def _restricted(plan, family):
+    from services.product_match_normalizer import canonical_brand
+
+    keep = [p for p in plan.proposals if canonical_brand(p["evidence"]["anchor"]["brand"]) == family]
+    return ([json.dumps(p, sort_keys=True, default=str) for p in keep],
+            [o for o in plan.outcomes if o["brand"] == family])
+
+
+async def test_m2_a_scoped_run_equals_the_full_run_restricted_to_the_brand(conn):
+    from scripts.ops import propose_cross_merchant_matches as script
+    from services.identity_cross_merchant_match import plan_market
+    from services.product_match_normalizer import canonical_brand
+
+    rows = await _spelling_catalog(conn)
+    await _catalog(conn)  # Laneige too: a scoped run must not read it
+    full_snap, _ = await script.export_snapshot(conn, "US")
+    full = plan_market(full_snap, "US")
+    for requested in ("drjart", "Dr.Jart+", "loreal", "sk-ii"):
+        fam = canonical_brand(requested)
+        snap, counts = await script.export_snapshot(conn, "US", brands=[requested])
+        stores = {k for k, b, _t, _ck, store in rows if store and canonical_brand(b) == fam}
+        assert stores <= {p["product_key"] for p in snap.products}, requested   # odd-spelled anchors read
+        assert {canonical_brand(p["brand"]) for p in snap.products} == {fam}     # nothing else
+        assert set(counts["brand_spellings"]) == {b for _k_, b, *_x in rows if canonical_brand(b) == fam}
+        scoped = plan_market(snap, "US", brands=[requested])
+        assert _restricted(scoped, fam) == _restricted(full, fam), requested
+        assert scoped.proposals, requested
+    dj = plan_market((await script.export_snapshot(conn, "US", brands=["drjart"]))[0], "US", brands=["drjart"])
+    held = {o["product_key"]: o["reason"] for o in dj.outcomes}
+    assert held[_k("d")] == "multi_anchor_listing"   # both Ceramidin store keys were read, and it matches both
+    assert {p["evidence"]["keeper_product_key"] for p in dj.proposals} == {"ext:drjart-cicapair::s1"}
+    assert sorted(p["evidence"]["listing_product_key"] for p in dj.proposals) == sorted([_k("a"), _k("b"), _k("c")])
+    assert _k("g") not in {p["product_key"] for p in
+                           (await script.export_snapshot(conn, "US", brands=["drjart"]))[0].products}
+
+
+async def test_m2_the_brand_statements_are_served_by_the_trigram_index(conn):
+    """Planned against the index migration 059 defines (created here in the scratch schema, never a
+    new index): with sequential scans priced out, every phase-0 and phase-1 brand statement must be a
+    bitmap index scan on it -- a regex pg_trgm cannot extract trigrams from would still seq-scan."""
+    from scripts.ops import propose_cross_merchant_matches as script
+    from services.identity_cross_merchant_match import brand_exact_regex, brand_preselect_regexes
+
+    ext_schema = await conn.fetchval("SELECT n.nspname FROM pg_extension e JOIN pg_namespace n"
+                                     " ON n.oid = e.extnamespace WHERE e.extname = 'pg_trgm'")
+    if ext_schema is None:
+        await conn.execute(f"CREATE EXTENSION pg_trgm SCHEMA {_SCHEMA}")
+        ext_schema = _SCHEMA
+    ddl = next(stmt for stmt in (_MIGRATIONS / "059_catalog_pivot_search_indexes.sql").read_text().split(";")
+               if "idx_catalog_products_brand_trgm" in stmt)
+    ddl = ddl.replace("CONCURRENTLY ", "").replace("gin_trgm_ops", f"{ext_schema}.gin_trgm_ops")
+    await conn.execute(ddl)
+    await _spelling_catalog(conn)
+    async with conn.transaction():
+        await conn.execute("SET LOCAL enable_seqscan = off")
+        for fam, regex in brand_preselect_regexes(["drjart", "loreal", "sk-ii", "laneige", "dior"]).items():
+            plan = "\n".join(r[0] for r in await conn.fetch("EXPLAIN " + script.BRAND_SPELLINGS_SQL, regex))
+            assert "idx_catalog_products_brand_trgm" in plan and "Seq Scan" not in plan, (fam, plan)
+        spellings = [("Dr.Jart+", "dr.jart+"), ("SK II", "sk ii"), ("L'Oréal", "l'oréal")]
+        # Phase 1's brand clause on its own (the full statement's join order depends on catalog_offers,
+        # whose indexes this scratch schema does not build).
+        clause = script._BRAND_CLAUSE.replace("$2", "$1").replace("$3", "$2")
+        plan = "\n".join(r[0] for r in await conn.fetch(
+            "EXPLAIN SELECT p.product_key FROM catalog_products p WHERE TRUE" + clause,
+            brand_exact_regex(lo for _b, lo in spellings), [b for b, _lo in spellings]))
+        assert "idx_catalog_products_brand_trgm" in plan and "Seq Scan" not in plan, plan
+        assert script._BRAND_CLAUSE in script.PRODUCTS_BRAND_SQL and script._BRAND_CLAUSE in script.HOSTS_BRAND_SQL

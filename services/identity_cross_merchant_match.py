@@ -48,6 +48,9 @@ THE JUDGEMENT (listing vs anchor), in order:
      price rewritten on every seed sync) or a '::canonical' SKU -- nothing names the variant
      (identity_resolution.is_variant_sku_key). The dry run also counts how many of these a
      read-time re-checked mirror pin would admit (`mirror_recheck_additional`), for Peng;
+     `offer_sku_not_on_listing`: a per-variant offer of the listing whose sku_key is not
+     `<the listing's product_key>::v:<non-empty variant>` (another product's SKU, `x::v:`) -- the
+     pin would name something the proposal does not move;
   7. same-size price: the cheapest matched variant offer in the market (in-stock first) against the
      KEEPER ROW's own same-size price in the market; none (`price_unknown`) or two currencies
      (`price_currency_mismatch`) -> held; outside the EXCLUSIVE window 0.6 < ratio < 1.67 -> vetoed
@@ -66,9 +69,16 @@ EVIDENCE CONTRACT v3 (read by be#2635's resolved-group read and #2637's approval
 carries evidence.listing_product_key + keeper_product_key; merge_content_key carries
 evidence.from_product_keys + keeper_product_key; both carry evidence.proposer, evidence.proposal_run_id
 (stamped at write time) and evidence.matcher_verdict {strategy, rule_version, tier, same_size, size,
-matched_offers [{offer_id, sku_key, price, currency, size, market}], matched_seeds [{seed_id,
+matched_offers [{offer_id, sku_key, price, currency, market, size?}], matched_seeds [{seed_id,
 variant_id}], from_key_single_size (merge only)}, checked by the ENGINE's
 identity_resolution.validate_matcher_verdict / module_proposal_problems -- one shared rule, #2637.
+THE PIN IS (offer_id, sku_key), and every sku_key is `<the moved listing's product_key>::v:<non-empty
+variant>` (identity_resolution.sku_key_on_moved_listing): the planner holds a listing with any other
+(`offer_sku_not_on_listing`) and the writer's evidence_problems refuses one. An offer's price, currency,
+market and size are INFORMATIONAL (#2637, controller 10-17): not validated and never a basis for an
+approval or an apply. Its `size` is the offer's OWN -- the one size its own SKU texts state -- and the
+key is ABSENT when they state none (a "Default Title" offer pinned through the row title): the
+anchor's size is never copied onto an offer.
 
 Pure: no I/O here. scripts/ops/propose_cross_merchant_matches.py exports the snapshot (one read-only
 transaction, two phases) and writes proposals through the engine's writer.
@@ -93,6 +103,7 @@ from services.identity_resolution import (
     module_proposal_problems,
     new_proposal,
     proposal_fingerprint,
+    sku_key_on_moved_listing,
     validate_matcher_verdict,
     verdict_size_key,
 )
@@ -126,8 +137,8 @@ IN_STOCK = frozenset({"in_stock", "instock", "limited_stock", "low_stock", "avai
 LIVE_PROPOSAL_STATUSES = ("proposed", "approved", "applied")
 VETOES_CHECKED: Tuple[str, ...] = (
     "conflict_tokens", "shade", "gtin_differs", "size", "offer_conflict_tokens", "anchor_single_size",
-    "offer_size_pinned", "listing_single_size_all_markets", "offer_variant_pinned", "key_single_size",
-    "pending_or_applied_conflict", "price_ratio")
+    "offer_size_pinned", "listing_single_size_all_markets", "offer_variant_pinned", "offer_sku_on_listing",
+    "key_single_size", "pending_or_applied_conflict", "price_ratio")
 #: sku_payload fields that can name a variant's size (the export reads only these).
 SKU_PAYLOAD_SIZE_FIELDS: Tuple[str, ...] = ("variant_title", "title", "size", "option1", "option2", "option3",
                                             "options", "selected_options")
@@ -140,7 +151,8 @@ SEED_VARIANT_SIZE_FIELDS: Tuple[str, ...] = ("title", "name", "option_value", "o
 # different buyable item. None of them is ever proposed.
 HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "size_fraction_count",
                 "offer_size_unpinned",
-                "listing_multi_size", "offer_not_variant_pinned", "key_size_conflict",
+                "listing_multi_size", "offer_not_variant_pinned", "offer_sku_not_on_listing",
+                "key_size_conflict",
                 "pending_or_applied_conflict", "price_unknown", "price_currency_mismatch",
                 "key_shared_with_unmatched", "unguarded_writer", "no_group_membership",
                 "old_group_has_other_members", "no_content_key", "old_content_key_not_read")
@@ -732,6 +744,13 @@ class Planner:
             mirror_clear = any(o.price is not None and o.market == self.market
                                for u in units if u.product_level and u.size == anchor_size for o in u.offers)
             return Verdict("held", ["offer_not_variant_pinned"], mirror_clear=mirror_clear, **held)
+        # The pin is (offer_id, sku_key), and #2637's validate_matcher_verdict refuses a sku_key that is
+        # not `<moved product key>::v:<non-empty variant>`. Never PROPOSE one: an offer row of this
+        # listing carrying another product's SKU (`ext:other::x::v:9`) or an empty variant part
+        # (`<listing>::v:`) is a data fault a human looks at -- the whole listing is held, not quietly
+        # pinned on its remaining offers. Same helper as the engine's, so the two cannot drift.
+        if any(not sku_key_on_moved_listing(o.sku_key, [li.product_key]) for o in variant_all):
+            return Verdict("held", ["offer_sku_not_on_listing"], **held)
         # The price window, PER MARKET: each market's matched offers against the keeper's same-market,
         # same-size, same-words unit. The run's market must have both sides; another market where the
         # keeper sells nothing at that size is skipped, and recorded.
@@ -756,8 +775,23 @@ class Planner:
             if not (PRICE_RATIO_MIN < entry["ratio"] < PRICE_RATIO_MAX):
                 return Verdict("vetoed", ["price_ratio"], price={**price, "by_market": by_market}, **held)
         price = {**price, "by_market": by_market}
-        offers = [{"offer_id": o.offer_id, "sku_key": o.sku_key, "price": o.price, "currency": o.currency,
-                   "size": _size_json(anchor_size), "market": o.market} for o in variant_all]
+        # matched_offers: price, currency, market and size are INFORMATIONAL (#2637: never validated,
+        # never a decision basis; the pin is offer_id + sku_key). `size` is the offer's OWN: written only
+        # when its own unit's texts state exactly one size (u.stated), and OMITTED otherwise -- a
+        # "Default Title" offer whose unit took the row title's size is not written as the anchor's
+        # 50ml. (row_single_size above already proved every unit is the anchor's size; this only keeps
+        # the evidence from claiming what the offer itself never said.)
+        offers = []
+        for u in units:
+            for o in u.offers:
+                if not o.is_variant:
+                    continue
+                pin: Dict[str, Any] = {"offer_id": o.offer_id, "sku_key": o.sku_key, "price": o.price,
+                                       "currency": o.currency, "market": o.market}
+                own = next(iter(u.stated)) if len(u.stated) == 1 else None
+                if own is not None:
+                    pin["size"] = _size_json(own)
+                offers.append(pin)
         return Verdict("pass", [], tier=matched[0], tiers_matched=matched, anchor_size=anchor_size,
                        price=price, matched_offers=sorted(offers, key=lambda m: m["offer_id"]),
                        words=keeper_words)
@@ -990,7 +1024,9 @@ def matcher_verdict(*, tier: str, size: SizeKey, matched_offers: Sequence[Mappin
     """evidence.matcher_verdict, contract v3 (identity_resolution.validate_matcher_verdict checks it).
 
     matched_offers: the moved row(s)' per-variant offers, every market, all at the verdict size, each
-                    {offer_id, sku_key, price, currency, size, market}.
+                    {offer_id, sku_key, price, currency, market, size?}: the pin is (offer_id, sku_key),
+                    sku_key `<moved product key>::v:<variant>`; the rest is informational, and size is
+                    the offer's own stated size or absent -- never the anchor's.
     matched_seeds:  the moved and keeper rows' seeds of exactly that size (seed_matches).
     from_key_single_size: merge only -- COMPUTED by the caller over every unit of every row on the
                     losing key (Planner.row_single_size), never assumed."""
@@ -1007,8 +1043,10 @@ def matcher_verdict(*, tier: str, size: SizeKey, matched_offers: Sequence[Mappin
 def evidence_problems(p: Mapping[str, Any]) -> List[str]:
     """Everything the writer checks before a proposal may be inserted: the engine's module rule
     (strategy, evidence.proposer, evidence.proposal_run_id, identity_resolution.validate_matcher_verdict
-    -- #2637's one shared rule), the keys be#2635 reads (listing_product_key or from_product_keys,
-    keeper_product_key), and that no matched offer is a mirror offer."""
+    -- #2637's one shared rule, which also refuses any matched_offers[].sku_key that is not
+    `<moved product key>::v:<non-empty variant>`: evidence.listing_product_key for an attach, a member of
+    evidence.from_product_keys for a merge), the keys be#2635 reads (listing_product_key or
+    from_product_keys, keeper_product_key), and that no matched offer is a mirror offer."""
     ev = p.get("evidence") or {}
     kind = p.get("kind") or ""
     problems = list(validate_matcher_verdict(kind, dict(ev), STRATEGY))
@@ -1258,30 +1296,136 @@ def gtin_lookup_values(raw_gtins: Iterable[Any]) -> List[str]:
     return sorted(out)
 
 
-def brand_sql_regex(brands: Sequence[str]) -> Optional[str]:
-    """A POSIX regex over lower(coalesce(brand, '')) that selects a SUPERSET of the rows whose
-    canonical_brand is one of `brands`: an alternation of literal tokens -- each requested spelling
-    (raw and accent-folded), its words of 3+ characters, its canonical key, and every measured spelling
-    key of its family. Literal tokens of 3+ characters let the trigram GIN index
-    idx_catalog_products_brand_trgm (migration 059, on lower(coalesce(brand, ''))) serve the filter.
-    The exact canonical_brand filter then runs in Python. None for no brands."""
+# --brands, M2 (controller 10-17). A literal-token regex over lower(brand) missed real spellings:
+# `drjart` never matched "Dr.Jart+" / "Dr. Jart+" / "DR JART", `loreal` never "L'Oréal", `sk-ii` never
+# "SK II". A brand-store row filtered out never joins its component, so a scoped run could pick ONE
+# store anchor where the full run holds multi_anchor, or anchor on a retailer instead of the store.
+# Now three steps, each exact or a provable superset:
+#   1. brand_preselect_regexes: per family, a LOOSE regex the trigram GIN index
+#      idx_catalog_products_brand_trgm (migration 059, on lower(coalesce(brand, ''))) can serve,
+#      matched against DISTINCT brand spellings only (BRAND_SPELLINGS_SQL in the script);
+#   2. select_brand_spellings: the EXACT choice, in Python, by the normalizer's canonical_brand -- the
+#      same key Planner filters listings by, so the scope and the plan cannot disagree;
+#   3. the export reads `brand = ANY(<those spellings>)`, reached through the same index by
+#      brand_exact_regex (an anchored alternation of exactly those lowered spellings).
+# No new index.
+#
+# Why the loose regex is a superset. canonical_brand(raw) is a brand key: the raw brand lowercased,
+# accent-folded, trailing noise / suffix words dropped, and only its alphanumeric characters kept
+# ("&" read as "and"), then mapped through RETAILER_BRAND_SPELLINGS. So a spelling of family W spells
+# one of W's keys k with its alphanumeric RUNS ("dr", "jart" in "Dr. Jart+") in order, possibly
+# accented and separated by anything. pg_trgm also splits words on non-alphanumerics, so:
+#   - a spelling with a run of 3+ characters contains one of k's 3-grams inside that run, as written
+#     or with ONE letter accented ("oré" in "l'oréal"; Latin-1 and Latin Extended-A forms): an
+#     indexable alternation;
+#   - a spelling whose runs are ALL 1-2 characters ("SK II", "S K II") starts with k's first one or two
+#     characters followed by a separator or the end: `^sk([^[:alnum:]]|$)`, `^s([^[:alnum:]]|$)`,
+#     also indexable (pg_trgm reads `^` as a word start).
+# Measured on a local 300k-row table with the 059 index: each family's regex is a bitmap index scan
+# (~1 ms); a regex that allows a separator between EVERY pair of letters is exact but gives pg_trgm
+# no trigram (a sequential scan), as do wider accent choices and one alternation over many families --
+# hence this form. Known gaps, accepted: an all-short-runs spelling that starts with punctuation
+# ("'SK II'"); a 3-letter window with two accented letters and no other 3+ run; letters outside
+# Latin-1 / Extended-A (full-width "ＳＫ-II"); a letter whose fold is two characters (sharp s -> "ss").
+# None is in any family measured so far; the full run (--all-brands) has no such gap.
+_FOLD_RANGES = ((0x00C0, 0x0180),)
+
+
+def _build_fold_alternatives() -> Dict[str, Tuple[str, ...]]:
+    alts: Dict[str, Set[str]] = defaultdict(set)
+    for lo, hi in _FOLD_RANGES:
+        for cp in range(lo, hi):
+            ch = chr(cp).lower()
+            f = _fold(ch)
+            if len(ch) == 1 and len(f) == 1 and f.isascii() and f.isalnum() and ch != f:
+                alts[f].add(ch)
+    return {k: tuple(sorted(v)) for k, v in alts.items()}
+
+
+_FOLD_ALTERNATIVES = _build_fold_alternatives()
+_PG_SEPARATOR = "([^[:alnum:]]|$)"
+
+
+def _pg_char(c: str, *, accents: bool) -> str:
+    """One key character as a PostgreSQL ARE atom: itself, or (accents=True) an alternation of it and
+    every lowercase Latin-1 / Latin Extended-A letter that folds to it (about ten at most; pg_trgm
+    stops extracting trigrams from a wider choice, measured locally)."""
+    alts = _FOLD_ALTERNATIVES.get(c) if accents else None
+    if not alts:
+        return c if c.isalnum() else "\\" + c
+    return "(" + "|".join((c, *alts)) + ")"
+
+
+def brand_family_keys(brands: Sequence[str]) -> Dict[str, List[str]]:
+    """canonical family -> every brand key canonical_brand maps to it: the family itself and each
+    measured RETAILER_BRAND_SPELLINGS key, both as measured ("skⅱ": a stored "SKⅡ" holds no 3-gram of
+    "skii") and accent-folded."""
     from services.brand_spelling import RETAILER_BRAND_SPELLINGS
 
-    wanted = {canonical_brand(b) for b in brands} - {""}
-    if not wanted:
-        return None
-    tokens: Set[str] = set(wanted)
-    tokens |= {k for k, family in RETAILER_BRAND_SPELLINGS.items() if family in wanted}
+    out: Dict[str, Set[str]] = {}
     for b in brands:
-        for form in (str(b).strip().lower(), _fold(b).strip()):
-            tokens.add(form)
-            tokens |= {w for w in re.split(r"[^\w]+", form) if len(w) >= 3}
-    tokens = {t for t in tokens if len(t) >= 3}
-    return "(" + "|".join(re.escape(t) for t in sorted(tokens)) + ")"
+        fam = canonical_brand(b)
+        if fam:
+            out.setdefault(fam, {fam})
+    for key, fam in RETAILER_BRAND_SPELLINGS.items():
+        if fam in out:
+            for form in (key.lower(), _fold(key)):
+                k = "".join(c for c in form if c.isalnum())
+                if k:
+                    out[fam].add(k)
+    return {fam: sorted(keys) for fam, keys in sorted(out.items())}
+
+
+def _pg_variants(chars: str) -> List[str]:
+    """`chars` as PostgreSQL ARE atoms: as written, plus one variant per position whose letter has
+    accented forms, that ONE position an alternation ("or(e|é|è|...)", never all three at once: the
+    trigrams of three alternations multiply past pg_trgm's limits and it falls back to a scan)."""
+    out = ["".join(_pg_char(c, accents=False) for c in chars)]
+    for j, c in enumerate(chars):
+        if c in _FOLD_ALTERNATIVES:
+            out.append("".join(_pg_char(x, accents=(n == j)) for n, x in enumerate(chars)))
+    return out
+
+
+def brand_preselect_regexes(brands: Sequence[str]) -> Dict[str, str]:
+    """Step 1: per canonical family, a PostgreSQL regex over lower(coalesce(brand, '')) matching a
+    SUPERSET of the spellings whose canonical_brand is that family (see the comment above), in a form
+    the trigram index serves. ONE regex per family, run as one query each: a single alternation over
+    many families grows past pg_trgm's trigram limits and silently becomes a sequential scan."""
+    out: Dict[str, str] = {}
+    for fam, keys in brand_family_keys(brands).items():
+        alternatives: Set[str] = set()
+        for k in keys:
+            for i in range(len(k) - 2):
+                alternatives.update(_pg_variants(k[i:i + 3]))
+            alternatives.update("^" + v + _PG_SEPARATOR for v in _pg_variants(k[:1]))
+            if len(k) >= 2:
+                alternatives.update("^" + v + _PG_SEPARATOR for v in _pg_variants(k[:2]))
+        out[fam] = "|".join(sorted(alternatives))
+    return out
+
+
+def select_brand_spellings(brands: Sequence[str], spellings: Iterable[Any]) -> List[str]:
+    """Step 2, EXACT: the stored spellings whose canonical_brand is one of `brands`' families -- the
+    key Planner's own --brands filter compares."""
+    wanted = {canonical_brand(b) for b in brands} - {""}
+    return sorted({str(s) for s in spellings if s is not None and canonical_brand(s) in wanted})
+
+
+def brand_exact_regex(lowered_spellings: Iterable[str]) -> Optional[str]:
+    """Step 3's index path: `^(s1|s2|...)$` over exactly these lower(coalesce(brand, '')) values (as
+    PostgreSQL returned them), every ASCII non-alphanumeric escaped. The export ANDs it with the exact
+    `brand = ANY(...)`: the regex only lets idx_catalog_products_brand_trgm find the rows. None when
+    there are none."""
+    forms = sorted({str(s) for s in lowered_spellings if s})
+    if not forms:
+        return None
+    esc = ["".join(("\\" + c) if (c.isascii() and not c.isalnum()) else c for c in f) for f in forms]
+    return "^(" + "|".join(esc) + ")$"
 
 
 __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
-    "Snapshot", "brand_sql_regex", "evidence_problems", "matcher_verdict", "member_fingerprint",
-    "plan_market", "proposal_set_digest", "seed_matches", "stamp_run",
+    "Snapshot", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes", "evidence_problems",
+    "matcher_verdict", "member_fingerprint", "plan_market", "proposal_set_digest", "seed_matches", "select_brand_spellings", "stamp_run",
 ]

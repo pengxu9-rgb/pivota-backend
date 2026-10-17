@@ -594,7 +594,7 @@ def test_the_writers_check_rejects_a_malformed_proposal(mutate):
 def test_a_merge_without_the_single_size_flag_is_rejected():
     ev = {"proposer": STRATEGY, "from_product_keys": ["a"], "keeper_product_key": "k",
           "matcher_verdict": matcher_verdict(tier="T0c", size=(20.0, "g", 1),
-                                             matched_offers=[{"offer_id": "o", "sku_key": "x::v:1"}],
+                                             matched_offers=[{"offer_id": "o", "sku_key": "a::v:1"}],
                                              matched_seeds=[], merge=True, from_key_single_size=False)}
     assert validate_matcher_verdict("merge_content_key", ev)
     ev["matcher_verdict"]["from_key_single_size"] = True
@@ -689,7 +689,7 @@ def test_the_script_has_no_at_sign_and_defaults_to_a_dry_run():
     from scripts.ops import propose_cross_merchant_matches as script
 
     assert "@" not in Path(script.__file__).read_text()
-    args = script.parse_args([])
+    args = script.parse_args(["--brands", "laneige"])
     assert args.dry_run and not args.write_proposals and args.market == "US" and args.audit_size == 600
     assert args.out == "/tmp/cross_merchant_match"
     with pytest.raises(SystemExit):
@@ -1137,19 +1137,60 @@ def test_mirrored_constants_match_their_sources():
     assert MIRROR_OFFER_ID_PREFIX == OFFER_ID_PREFIX and derive_mirror_offer_id("x").startswith(MIRROR_OFFER_ID_PREFIX)
 
 
-def test_brand_sql_regex_selects_a_superset_of_every_spelling_with_indexable_tokens():
+def _py(pg_regex: str) -> str:
+    """The PostgreSQL ARE the export sends, as a Python regex (only [[:alnum:]] differs here)."""
+    return pg_regex.replace("[^[:alnum:]]", "[\\W_]")
+
+
+# M2: real spellings a literal-token filter missed (controller 10-17), and look-alikes it must not pick.
+BRAND_SPELLINGS = {
+    "drjart": ["Dr.Jart+", "Dr. Jart+", "DR JART", "Dr.Jart", "DR.JART+", "Dr Jart"],
+    "loreal": ["L'Oreal", "L'Oréal", "L’Oréal", "LOREAL"],
+    "sk-ii": ["SK II", "SK-II", "SKII", "sk-ii", "S K II", "SKⅡ"],
+    "dior": ["Christian Dior", "DIOR", "Dior Beauty"],
+    "lancome": ["Lancôme", "LANCOME"],
+    "beauty of joseon": ["Beauty of Joseon", "BEAUTY OF JOSEON"],
+    "orea": ["Oréa", "ORÉA", "Orea"],  # every 3-letter window of "oréa" holds the accent
+}
+BRAND_LOOKALIKES = ["Dr Jart Plus", "L'Oréal Paris", "SKIN1004", "Skinfood", "Laneige", "COSRX", "Jart", ""]
+
+
+@pytest.mark.parametrize("brand", sorted(BRAND_SPELLINGS))
+def test_m2_the_loose_preselect_finds_every_spelling_and_the_exact_choice_keeps_only_the_family(brand):
     import re as _re
 
-    from services.identity_cross_merchant_match import brand_sql_regex
+    from services.identity_cross_merchant_match import brand_preselect_regexes, select_brand_spellings
+    from services.product_match_normalizer import canonical_brand
 
-    rx = brand_sql_regex(["Dior", "Lancôme", "Dr.Jart+", "Beauty of Joseon", "Round Lab", "SK-II"])
-    for raw in ["Christian Dior", "DIOR", "Lancôme", "Lancome", "Dr. Jart+", "Dr.Jart+", "DR.JART",
-                "Beauty of Joseon", "BEAUTY OF JOSEON", "Round Lab", "ROUNDLAB", "SK-II"]:
-        assert _re.search(rx, raw.lower()), raw          # lower(coalesce(brand, '')) ~ $2
-    assert not _re.search(rx, "laneige") and not _re.search(rx, "cosrx")
-    tokens = rx.strip("()").split("|")
-    assert all(len(t.replace("\\", "")) >= 3 for t in tokens)  # every alternative has a trigram
-    assert brand_sql_regex([]) is None and brand_sql_regex(["Generic"]) is None
+    fam = canonical_brand(brand)
+    rx = brand_preselect_regexes([brand])
+    assert list(rx) == [fam]
+    for raw in BRAND_SPELLINGS[brand]:
+        assert canonical_brand(raw) == fam, raw
+        assert _re.search(_py(rx[fam]), raw.lower()), raw  # lower(coalesce(brand, '')) ~ $1
+    pool = [*BRAND_SPELLINGS[brand], *BRAND_LOOKALIKES, None]
+    assert select_brand_spellings([brand], pool) == sorted(BRAND_SPELLINGS[brand])
+
+
+def test_m2_one_regex_per_family_and_none_for_no_brand():
+    from services.identity_cross_merchant_match import brand_family_keys, brand_preselect_regexes
+
+    assert sorted(brand_preselect_regexes(["Dr.Jart+", "drjart", "SK-II"])) == ["drjart", "skii"]
+    assert brand_preselect_regexes([]) == {} and brand_preselect_regexes(["Generic", " "]) == {}
+    assert brand_family_keys(["dior"]) == {"dior": ["christiandior", "dior", "diorbeauty"]}
+
+
+def test_m2_brand_exact_regex_matches_exactly_the_chosen_spellings():
+    import re as _re
+
+    from services.identity_cross_merchant_match import brand_exact_regex
+
+    forms = ["dr.jart+", "dr jart", "l'oréal", "sk ii", "a|b"]
+    rx = brand_exact_regex(forms)
+    assert all(_re.fullmatch(rx, f) for f in forms)
+    for other in ["dr.jart", "drxjart+", "l'oréal paris", "sk iii", "a", "b", "dr jart+"]:
+        assert not _re.fullmatch(rx, other), other
+    assert brand_exact_regex([]) is None and brand_exact_regex([""]) is None
 
 
 def test_gtin_lookup_values_cover_every_stored_spelling():
@@ -1436,3 +1477,103 @@ def test_h2_a_keeper_unit_of_unknown_size_defers_even_with_the_same_words():
     r = retailer(cat, 1, "Hydra", "Hydra Cream 50ml", sku="50ml", price=24)
     plan = cat.plan()
     assert plan.proposals == [] and outcome(plan, r)["reason"] == "anchor_unit_conflict"
+
+
+# --- review of c717d4983 (controller 10-17) ---------------------------------------------------------------
+
+
+def test_m1a_a_matched_offer_carries_its_own_size_or_none_never_the_anchors():
+    from services.product_match_tiers import text_sizes
+
+    cat = laneige_catalog()
+    own = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="0.7 oz", offer_id="off_own")
+    bare = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", sku="Default Title", offer_id="off_bare")
+    plan = cat.plan()
+    assert proposed_keys(plan) == sorted([own, bare])
+    named = {o["offer_id"]: o for p in plan.proposals for o in p["evidence"]["matcher_verdict"]["matched_offers"]}
+    assert "size" not in named["off_bare"]                    # pinned through the title: no size written
+    (value, unit, pack), = text_sizes("0.7 oz")
+    assert named["off_own"]["size"] == {"value": float(value), "unit": unit, "pack": int(pack)}
+    for p in plan.proposals:
+        assert evidence_problems(p) == []                     # an absent size is well formed
+
+
+@pytest.mark.parametrize("bad_sku", ["ext:other::x::v:9", "ext:other::x::v:", "{listing}::v:", "{listing}::v:  "])
+def test_m1b_an_offer_on_a_sku_key_off_the_listing_is_held_never_proposed(bad_sku):
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.offer(r, sku="20g", sku_key=bad_sku.format(listing=r), offer_id="off_bad")
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, r)["status"] == "held" and outcome(plan, r)["reason"] == "offer_sku_not_on_listing"
+
+
+@pytest.mark.parametrize("bad_sku", ["ext:other::x::v:9", "ext:other::x::v:", "{listing}::v:", "{keeper}::v:k1"])
+def test_m1b_the_writers_check_refuses_a_sku_key_off_the_moved_listing(bad_sku):
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    p = json.loads(json.dumps(cat.plan().proposals[0]))
+    assert evidence_problems(p) == []
+    p["evidence"]["matcher_verdict"]["matched_offers"][0]["sku_key"] = bad_sku.format(listing=r, keeper=LANEIGE)
+    assert any("sku_key" in e for e in evidence_problems(p))
+
+
+def test_m1b_a_merges_offers_must_be_on_a_row_it_moves():
+    cat = laneige_catalog()
+    a = retailer(cat, 2, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m")
+    retailer(cat, 3, "Laneige", "Lip Sleeping Mask 20g", ck="ck_m")
+    merge = json.loads(json.dumps(next(p for p in cat.plan().proposals if p["kind"] == "merge_content_key")))
+    assert evidence_problems(merge) == []
+    offers = merge["evidence"]["matcher_verdict"]["matched_offers"]
+    assert {o["sku_key"].split("::v:")[0] for o in offers} == set(merge["evidence"]["from_product_keys"])
+    offers[0]["sku_key"] = f"{LANEIGE}::v:keeper"                # the keeper's own SKU: not moved
+    assert any("sku_key" in e for e in evidence_problems(merge))
+    offers[0]["sku_key"] = f"{a}::v:"
+    assert any("sku_key" in e for e in evidence_problems(merge))
+
+
+def test_low_a_currency_that_is_not_the_markets_is_held_in_any_market():
+    # A US offer priced in JPY against the keeper's USD price: held in the run's market.
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g", currency="JPY", price=24)
+    plan = cat.plan()
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "price_currency_mismatch"
+    # An SG offer priced in USD against the keeper's SG price in SGD: held, though the US side matches.
+    cat2 = laneige_catalog()
+    cat2.offer(LANEIGE, sku="Default Title", market="SG", currency="SGD", price=32, brand_direct=True,
+               sku_key=cat2.offers[0]["sku_key"])
+    s_ = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat2.offer(s_, sku="20g", market="SG", currency="USD", price=24)
+    plan2 = cat2.plan()
+    assert plan2.proposals == [] and outcome(plan2, s_)["reason"] == "price_currency_mismatch"
+    assert outcome(plan2, s_)["status"] == "held"
+
+
+def test_m3_the_script_refuses_a_full_scan_unless_asked_by_name():
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    for argv in ([], ["--brands", " , "], ["--write-proposals", "--expect-digest", "cmd_x", "--max-proposals", "1"],
+                 ["--explain"], ["--brands", "laneige", "--all-brands"]):
+        with pytest.raises(SystemExit):
+            script.parse_args(argv)
+    assert script.parse_args(["--all-brands"]).all_brands is True
+    assert script.parse_args(["--brands", "laneige"]).all_brands is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argv, warned", [(["--all-brands"], True), (["--brands", "laneige"], False)])
+async def test_m3_all_brands_prints_a_warn_line(monkeypatch, tmp_path, capsys, argv, warned):
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    seen = {}
+
+    async def fake_export(conn, market, *, brands=(), limit_groups=None):
+        seen["brands"] = list(brands)
+        return Cat().snapshot(), {"products": 0}
+
+    monkeypatch.setattr(script, "export_snapshot", fake_export)
+    assert await script.run(None, script.parse_args([*argv, "--out", str(tmp_path)])) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    warns = [line for line in lines if line.get("level") == "WARN"]
+    assert bool(warns) == warned and (not warned or warns[0]["message"].startswith("WARN --all-brands"))
+    assert seen["brands"] == ([] if warned else ["laneige"])
