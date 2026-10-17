@@ -14,6 +14,7 @@ from sqlalchemy import and_, select, update
 
 from db.database import database
 from db.external_offers import external_offer_snapshots
+from services import crawl_global_pacer
 from services import crawl_identity
 from services import crawl_politeness
 from services import shopify_edge_pacer
@@ -1956,7 +1957,16 @@ async def _fetch_html(
     timeout = httpx.Timeout(10.0, connect=5.0)
     # Signed (Web Bot Auth) when CRAWL_WEB_BOT_AUTH_ENABLED and a key are set; every redirect hop is
     # signed for its own host. Off: the same client as before (services/crawl_identity.py).
+    #
+    # REDIRECT HOPS ARE ORIGIN REQUESTS (review M2, 2026-10-17). `before_request` paces the FIRST
+    # request only; with httpx's default 20 hops a row could send 21 requests back to back, and a hop
+    # onto another host skipped the new-hosts-per-minute cap. `redirect_client_kwargs` installs the
+    # global pacer's request hook (a slot per hop after the first; a hop's host is admitted like any
+    # first contact) and caps hops at `crawl_global_pacer.MAX_REDIRECTS` (5). With no pacer
+    # installed (the interactive route) the hook does nothing and only the cap applies.
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": DEFAULT_UA},
+                                 **crawl_global_pacer.redirect_client_kwargs(
+                                     robots_user_agent=crawl_identity.robots_user_agent(DEFAULT_UA)),
                                  **crawl_identity.transport_kwargs()) as client:
         resp = await client.get(url)
         # BEFORE raise_for_status: a 429 IS the signal the backoff exists to consume, and
@@ -2458,6 +2468,13 @@ async def resolve_external_offer(
         refreshed_row = await _get_snapshot_row(market_norm, url_hash)
         if refreshed_row:
             return _row_to_snapshot(refreshed_row)
+    except crawl_global_pacer.GlobalPaceStopped:
+        # NOTHING WAS ASKED (review M1, 2026-10-17). The run's pacer refused the request -- the IP
+        # breaker's final trip, or the budget ending -- so there is no answer to fall back from.
+        # Handing back the cached snapshot here let `_refresh_external_seed_by_id` write it as a
+        # success and stamp `last_crawl_attempt_at`, sending a row that was never read to the back
+        # of tomorrow's queue. It propagates; the batch counts the row as deferred, unstamped.
+        raise
     except ExternalOfferUnavailable:
         # The origin ANSWERED and said no. Serving still prefers the cached snapshot (that is
         # what keeps a transient outage from blanking the catalogue), but a caller that asked

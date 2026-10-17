@@ -357,19 +357,27 @@ def test_a_budget_stop_is_visible_in_the_summary_not_just_a_shorter_count(
     assert summary["refreshed"] + summary["skipped_for_budget"] == summary["candidate_count"]
 
 
-def test_the_budget_can_be_disabled_and_falls_back_to_the_environment(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_zero_budget_is_refused_and_an_unset_one_falls_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`0` disables it outright; an unset `budget_seconds` reads the env, so an operator can
-    retune a scheduled run without a deploy."""
-    summary = _run_batch_with_clock(
-        monkeypatch,
-        candidates=[f"eps_{i}" for i in range(5)],
-        seconds_per_row=10_000.0,
-        budget_seconds=0,
-    )
-    assert summary["_refreshed"] == [f"eps_{i}" for i in range(5)]
-    assert summary["stopped_early"] is False
+    """`0` USED TO DISABLE the budget, which also left the run's global pacer with no deadline
+    (2026-10-17 review, M3). It is now an ERROR and the default (3,300 s); an unset
+    `budget_seconds` reads the env, so an operator can retune a scheduled run without a deploy."""
+    from services import external_referral_readiness as module
+
+    for zero in (0, -0.0, "0", -5):
+        assert module._refresh_budget_seconds(zero) == module.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    with caplog.at_level("ERROR"):
+        summary = _run_batch_with_clock(
+            monkeypatch,
+            candidates=[f"eps_{i}" for i in range(5)],
+            seconds_per_row=10_000.0,
+            budget_seconds=0,
+        )
+    assert summary["budget_seconds"] == module.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    assert summary["_refreshed"] == ["eps_0"], "a 0 budget no longer means 'run forever'"
+    assert summary["stopped_early"] is True
+    assert any("not a positive number" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
 
     monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS", "150")
     summary = _run_batch_with_clock(

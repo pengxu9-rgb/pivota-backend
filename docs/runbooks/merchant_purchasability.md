@@ -12,7 +12,8 @@ defaults: the sweep's Cloud Run Job is provisioned dark (gate false, trigger pau
 `routes/agent_commerce_reap.py` does not consult the fact at all.
 
 **The sweep is a Cloud Run Job, `merchant-purchasability-sweep`, on the crawl subnet
-`pivota-crawl` (NAT 34.82.199.35), fired hourly by Cloud Scheduler.** It is not a
+`pivota-crawl` (NAT 136.67.250.98 since 2026-10-16; 34.82.199.35 before, kept for rollback), fired
+hourly by Cloud Scheduler.** It is not a
 `services/audit_scheduler` job any more (it was until 2026-09-27): the worker's egress is the
 payment-partner-allowlisted NAT, and every worker deploy restarted its interval clock. See §9.
 
@@ -227,7 +228,7 @@ door.
 ### `worker` now means OUR CRAWL EGRESS
 
 Since 2026-09-27 the sweep runs in a Cloud Run Job on `pivota-crawl`, so vantage `worker` names
-**the crawl egress (NAT 34.82.199.35)** — not the worker service, and never the payment NAT
+**the crawl egress (NAT 136.67.250.98 since 2026-10-16; 34.82.199.35 before)** — not the worker service, and never the payment NAT
 (8.231.167.230) the worker leaves from. The name was kept deliberately; the alternative was a new
 vantage (say `crawl`) with `MERCHANT_PURCHASABILITY_BUYER_VANTAGE` switched to it. Measured on
 2026-09-27: prod `web` has `MERCHANT_PURCHASABILITY_ENFORCE=1` and **no**
@@ -429,7 +430,8 @@ negotiable.**
 
 ### The egress rule
 
-**The sweep must only ever run from `pivota-crawl` (NAT 34.82.199.35).** Never from `worker`,
+**The sweep must only ever run from `pivota-crawl` (NAT 136.67.250.98 since 2026-10-16;
+34.82.199.35 before, kept reserved for rollback).** Never from `worker`,
 `web` or a job on the `default` subnet: their egress is 8.231.167.230, **the address payment
 partners allowlist**, and every check renders a merchant checkout. NAT port exhaustion is per-IP;
 ~50 requests over 37 Cloudflare-fronted domains in ~1 minute once tripped a cross-domain, IP-level

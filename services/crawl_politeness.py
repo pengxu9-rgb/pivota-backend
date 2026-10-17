@@ -46,7 +46,7 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 
-from services import crawl_ip_throttle
+from services import crawl_global_pacer, crawl_ip_throttle
 
 ROBOTS_TRANSPORT_FACTORY = ContextVar("robots_transport_factory", default=None)
 
@@ -146,6 +146,12 @@ class _DomainState:
 
 
 _STATE: Dict[str, _DomainState] = {}
+# host -> Cloudflare challenges (`cf-mitigated: challenge`, at ANY status) answered in a row. Kept
+# apart from `_DomainState.consecutive_blocks`, which counts 429/503 only and drives the backoff:
+# a 403 challenge is not a pacing signal (waiting does not lift it), so it must not move the backoff,
+# but a batch needs the streak to stop asking (controller review of be#2640, 2026-10-17: ichibanm
+# answered 239 requests with a 403 challenge and was never stopped).
+_CHALLENGE_STREAK: Dict[str, int] = {}
 # host -> (expires_at_monotonic, parser or None, crawl_delay or None). A None parser is a
 # positive cache of "asked, nothing to obey" — without it a site with no robots.txt would be
 # re-asked on every single fetch.
@@ -179,6 +185,7 @@ def reset_for_tests() -> None:
     """Drop all pacing and robots state. Tests only."""
     global _ROBOTS_INFLIGHT_LOOP
     _STATE.clear()
+    _CHALLENGE_STREAK.clear()
     _ROBOTS.clear()
     _ROBOTS_INFLIGHT.clear()
     _ROBOTS_INFLIGHT_LOOP = None
@@ -235,6 +242,10 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
     delay: Optional[float] = None
     cancelled = False
     try:
+        # THE ROBOTS FETCH IS AN ORIGIN REQUEST TOO, and a new host's first: with a run's global
+        # pacer installed (`services.crawl_global_pacer`) it takes a slot like any page fetch. A
+        # no-op otherwise.
+        await crawl_global_pacer.acquire(host)
         timeout = _f("CRAWL_ROBOTS_TIMEOUT_SECONDS", _ROBOTS_TIMEOUT_DEFAULT)
         # `follow_redirects` is LOAD-BEARING, not incidental: 7 of 17 domains in the live cohort
         # serve robots.txt via at least one redirect, and without this the 3xx falls past the
@@ -242,15 +253,30 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
         # dark for 41% of the cohort. `max_redirects` is capped because httpx applies `timeout`
         # PER HOP, so the default 20 would make this fetch's worst case ~20x the nominal timeout
         # on a request path that has no auth in front of it.
+        #
+        # EVERY HOP PAYS (review M2, 2026-10-17): the global pacer's request hook takes a slot for
+        # each redirect hop after the first and admits a hop onto another host as a new host. A
+        # no-op with no pacer installed. The hop cap stays `_MAX_ROBOTS_REDIRECTS` (3, under the
+        # pacer's 5).
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            max_redirects=_MAX_ROBOTS_REDIRECTS,
             headers={"User-Agent": user_agent},
+            # `per_host=False`: a robots hop cannot wait on `await_slot`, which loads robots itself.
+            **crawl_global_pacer.redirect_client_kwargs(_MAX_ROBOTS_REDIRECTS, per_host=False),
             **({"transport": ROBOTS_TRANSPORT_FACTORY.get()(), "trust_env": False}
                if ROBOTS_TRANSPORT_FACTORY.get() else {}),
         ) as client:
             resp = await client.get(f"https://{host}/robots.txt")
+        # A ROBOTS ANSWER IS AN ORIGIN ANSWER (review L2). It used to reach neither the host's
+        # backoff nor the IP breaker, so a robots.txt 429 or Cloudflare challenge -- often a new
+        # host's FIRST answer -- was invisible to both. Keyed on the host asked, like the gate.
+        # `clears=False`: a robots 200/404 says nothing about the PAGES, so it must not wipe a
+        # backoff a page 429 armed (the robots cache expiring mid-backoff would otherwise end it).
+        note_response(
+            f"https://{host}/robots.txt", resp.status_code,
+            retry_after=resp.headers.get("retry-after"), headers=resp.headers, clears=False,
+        )
         if resp.status_code == 200:
             parser = RobotFileParser()
             # Size-capped for the same reason `MAX_BODY_BYTES` caps the page fetch: an unbounded
@@ -272,6 +298,11 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
             except Exception:  # noqa: BLE001 - a malformed Crawl-delay is not a reason to stop
                 delay = None
         # Any non-200 (404 = no robots, 5xx = could not ask) caches as "nothing to obey".
+    except crawl_global_pacer.GlobalPaceStopped:
+        # NOT "robots unavailable": nothing was asked, so nothing may be cached for a TTL. Handled
+        # like a cancellation, and it propagates so the page fetch is not sent either.
+        cancelled = True
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.info("robots.txt unavailable for %s (%s); proceeding without restrictions", host, exc)
     except asyncio.CancelledError:
@@ -425,6 +456,13 @@ async def await_slot(url: str, *, user_agent: str, max_wait: Optional[float] = N
     delay = start - now
     if delay > 0:
         await asyncio.sleep(delay)
+    # THE RUN'S GLOBAL PACER (`services.crawl_global_pacer`), when one is installed: the IP's total
+    # rate and its new-hosts-per-minute cap, AFTER the host's own slot so no global slot is spent
+    # while the host interval is still running. A no-op with none installed, so every other lane
+    # runs exactly as before. Like the shared Shopify slot below, a wait here moves the host's
+    # next slot with it: the host interval is measured from when the request really starts.
+    if await crawl_global_pacer.acquire(host) > 0:
+        state.next_allowed = max(state.next_allowed, time.monotonic() + interval)
     if edge is not None and unbounded:
         # AN UNBOUNDED CALLER (every batch job) takes the shared slot AFTER its host slot, so no
         # shared slot is spent while the host's own interval is still running. It can never be
@@ -441,8 +479,12 @@ def note_response(
     *,
     retry_after: Optional[str] = None,
     headers: Any = None,
+    clears: bool = True,
 ) -> None:
     """Feed a response back in so the next request to this host is paced accordingly.
+
+    `clears=False` (the robots.txt fetch) records a 429/503 and feeds the breaker like any answer,
+    but a non-block answer does not reset the host's streak or backoff.
 
     `headers` is optional and never changes the pacing. When given it is (a) forwarded to any
     installed `crawl_ip_throttle` breaker, for every status, and (b) on a 429/503 its allowlisted
@@ -454,6 +496,26 @@ def note_response(
         return
     if headers is not None:
         crawl_ip_throttle.observe_response(host, status_code, headers)
+        challenged = crawl_ip_throttle.is_challenge(crawl_ip_throttle.capture_throttle_headers(headers))
+        if challenged:
+            _bounded(_CHALLENGE_STREAK)
+            _CHALLENGE_STREAK[host] = _CHALLENGE_STREAK.get(host, 0) + 1
+        elif clears:
+            # Any other answer from the host's pages breaks the streak; a robots.txt answer
+            # (`clears=False`) says nothing about the pages and leaves it alone.
+            _CHALLENGE_STREAK.pop(host, None)
+        if status_code not in (429, 503) and challenged:
+            # A CHALLENGE THAT IS NOT A 429 (Cloudflare answers 403 + `cf-mitigated: challenge`)
+            # left no line at all before 2026-10-17, so the 3-hosts-in-120 s challenge rule had no
+            # per-host, per-night baseline to be calibrated from (review M5). One WARNING per
+            # challenged response, host only, the same shape as the backoff line below.
+            logger.warning(
+                "crawl challenge: %s returned %s [%s]", host, status_code,
+                crawl_ip_throttle.format_throttle_headers(crawl_ip_throttle.capture_throttle_headers(headers)),
+            )
+    if not clears and status_code not in (429, 503):
+        # Nothing to record for the pacing state, and no state to create for it.
+        return
     # Bounded here too, not only in await_slot: note_response CREATES state, and a caller that
     # only ever records responses (or one whose requests are all refused) would otherwise grow
     # this cache past the ceiling without await_slot ever running.
@@ -492,6 +554,13 @@ def note_response(
         "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs%s",
         host, status_code, state.consecutive_blocks, wait, f" [{diag}]" if diag else "",
     )
+
+
+def consecutive_challenges(host: str) -> int:
+    """How many Cloudflare challenges in a row this host has answered, at any status, as
+    `note_response` counts them (only calls that pass the response headers). Read-only, keyed by
+    `host_of(url)`. 0 for a host with no streak."""
+    return int(_CHALLENGE_STREAK.get(str(host or "").strip().lower(), 0))
 
 
 def consecutive_blocks(host: str) -> int:
