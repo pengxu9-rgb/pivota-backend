@@ -21,8 +21,12 @@ at all, by a separate coordinator dry run with Peng's go.
 RUN. A merchant fetch, so SUBNET=pivota-crawl (the default subnet leaves by the payment NAT):
 
     IMAGE=.../backend:<sha with be#2640 + be#2641> SUBNET=pivota-crawl JOB_PREFIX=reprobe-retired \\
-      bash scripts/ops/run_oneoff_job.sh scripts/ops/reprobe_retired_seed_destinations.py \\
+      bash scripts/ops/run_oneoff_job.sh scripts/ops/reprobe_retired_seed_destinations.py --on-crawl-egress \\
       --select 2026-10-15:redirected_off_product --select 2026-10-14:dead_404:addros.com
+
+A container cannot see its own subnet, so `--on-crawl-egress` is REQUIRED: without it the script
+refuses (exit 2) before reading or fetching anything (jobs/reap_cart_proof_refresh does the same).
+run_oneoff_job.sh defaults to SUBNET=default, the PAYMENT-allowlisted address.
 
 Output: one JSON line per seed ({"rp": "seed", retired_on, retired_as, now_verdict, now_http,
 final_url, note, cross_host}) and a summary with the breaker's own.
@@ -44,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import httpx  # noqa: E402
 
-from services import crawl_global_pacer, crawl_ip_throttle  # noqa: E402
+from services import crawl_global_pacer, crawl_ip_throttle, shopify_edge_pacer  # noqa: E402
 from services import external_seed_destination_liveness as liveness  # noqa: E402
 
 RPS = 0.5
@@ -62,9 +66,9 @@ SELECT_SQL = f"""
 SELECT s.id, {_DEST} AS url, s.notes
   FROM external_product_seeds s
  WHERE s.status = 'inactive'
-   AND s.notes LIKE '%auto-retired ' || $1::text || ': destination ' || $2::text || ' (%'
+   AND position('auto-retired ' || $1::text || ': destination ' || $2::text || ' (' IN s.notes) > 0
    AND ($3::text IS NULL
-        OR lower(regexp_replace(substring({_DEST} from '^https?://([^/:?#]+)'), '^www\\.', '')) = $3::text)
+        OR regexp_replace(substring(lower({_DEST}) from '^https?://([^/:?#]+)'), '^www\\.', '') = $3::text)
  ORDER BY 2
 """
 
@@ -79,6 +83,15 @@ def parse_select(value: str) -> Tuple[str, str, Optional[str]]:
     if not _DAY.match(day) or not _VERDICT.match(verdict) or (host is not None and not _HOST.match(host)):
         raise argparse.ArgumentTypeError(f"--select part not recognised in {value!r}")
     return day, verdict, host
+
+
+def retirement_note(notes: Any, selected: Optional[Sequence[str]] = None) -> Optional["re.Match[str]"]:
+    """The retirement note that matched the selection (a seed can carry several); else the last."""
+    found = list(_NOTE.finditer(str(notes or "")))
+    for m in found:
+        if selected is not None and (m.group(1), m.group(2)) == tuple(selected):
+            return m
+    return found[-1] if found else None
 
 
 def emit(kind: str, **payload: Any) -> None:
@@ -105,7 +118,7 @@ async def select_targets(conn: Any, selections: Sequence[Tuple[str, str, Optiona
         seen: Dict[str, Dict[str, Any]] = {}
         for day, verdict, host in selections:
             for row in await conn.fetch(SELECT_SQL, day, verdict, host):
-                seen.setdefault(row["id"], dict(row))
+                seen.setdefault(row["id"], {**dict(row), "selected": (day, verdict)})
         return sorted(seen.values(), key=lambda r: str(r["url"] or ""))
 
 
@@ -116,6 +129,9 @@ async def reprobe(
     client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
     """Probe each target once, paced; print a line per seed; return the summary. No writes."""
+    # OBSERVE-ONLY MEANS NO INDIRECT WRITE EITHER: with the shared Shopify-edge budget on,
+    # await_slot leases slots by writing crawl_egress_pacer rows. Off for this process.
+    os.environ[shopify_edge_pacer.ENABLED_ENV] = "false"
     pacer = crawl_global_pacer.GlobalOriginPacer(
         rps=RPS, max_new_hosts_per_minute=MAX_NEW_HOSTS_PER_MINUTE,
         deadline=crawl_global_pacer._now() + float(deadline_seconds))
@@ -132,9 +148,11 @@ async def reprobe(
     try:
         with crawl_ip_throttle.installed(breaker), crawl_global_pacer.installed(pacer):
             for target in targets:
-                match = _NOTE.search(str(target.get("notes") or ""))
+                match = retirement_note(target.get("notes"), target.get("selected"))
                 try:
-                    obs = await liveness.probe_destination(client, str(target["url"]), max_wait=None)
+                    # max_wait=0 = the sweep's: wait out the host's interval or backoff (unbounded), never
+                    # read a paced host as `CrawlPaced` -> unverifiable.
+                    obs = await liveness.probe_destination(client, str(target["url"]), max_wait=0)
                 except crawl_global_pacer.GlobalPaceStopped as exc:
                     stopped = str(exc) or "stopped"
                     emit("stopped", reason=stopped, at_seed=target["id"])
@@ -161,11 +179,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-targets", type=int, default=DEFAULT_MAX_TARGETS,
                         help="refuse when the selection is larger than this (default 80)")
     parser.add_argument("--deadline-seconds", type=float, default=DEFAULT_DEADLINE_SECONDS)
+    parser.add_argument("--on-crawl-egress", action="store_true",
+                        help="REQUIRED: this run is on the pivota-crawl subnet (a container cannot see it)")
     return parser
 
 
 async def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.on_crawl_egress:
+        print("REPROBE_ERROR refusing to fetch without --on-crawl-egress: run on the pivota-crawl subnet "
+              "(SUBNET=pivota-crawl) and say so", file=sys.stderr, flush=True)
+        return 2
     if args.max_targets < 1 or args.deadline_seconds <= 0:
         raise SystemExit("--max-targets must be >= 1 and --deadline-seconds > 0")
     targets = await load_targets(args.select)

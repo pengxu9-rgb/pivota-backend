@@ -29,6 +29,12 @@ ROWS = [
      "auto-retired 2026-10-13: destination dead_404 (http 404)"),
     ("prefix", "inactive", None, "https://fentybeauty.com/products/h",
      "auto-retired 2026-10-15: destination redirected_off_product_x (http 200)"),
+    # Upper-case scheme and host still fold to addros.com.
+    ("upper", "inactive", None, "HTTPS://WWW.ADDROS.COM/products/i",
+     "auto-retired 2026-10-14: destination dead_404 (http 404)"),
+    # `_` is not a wildcard: dead_404 must not match deadx404.
+    ("wild", "inactive", None, "https://addros.com/products/j",
+     "auto-retired 2026-10-14: destination deadx404 (http 404)"),
 ]
 
 
@@ -60,7 +66,8 @@ async def test_the_selection_matches_the_note_and_the_host(conn) -> None:
 
     rows = await tool.select_targets(conn, [("2026-10-15", "redirected_off_product", None),
                                             ("2026-10-14", "dead_404", "addros.com")])
-    assert sorted(r["id"] for r in rows) == ["a1", "a2", "r1", "r2"]
+    assert sorted(r["id"] for r in rows) == ["a1", "a2", "r1", "r2", "upper"]
+    assert {r["id"]: r["selected"] for r in rows}["a1"] == ("2026-10-14", "dead_404")
     assert {r["id"]: r["url"] for r in rows}["r2"] == "https://murad.com/products/b", "canonical_url first"
 
 
@@ -68,7 +75,7 @@ async def test_overlapping_selections_are_deduplicated(conn) -> None:
     from scripts.ops import reprobe_retired_seed_destinations as tool
 
     rows = await tool.select_targets(conn, [("2026-10-14", "dead_404", None), ("2026-10-14", "dead_404", "addros.com")])
-    assert sorted(r["id"] for r in rows) == ["a1", "a2", "o1"]
+    assert sorted(r["id"] for r in rows) == ["a1", "a2", "o1", "upper"]
 
 
 async def test_the_selection_runs_read_only(conn) -> None:

@@ -106,7 +106,8 @@ def test_a_selection_over_the_cap_is_refused_before_any_fetch(monkeypatch, capsy
 
     monkeypatch.setattr(tool, "load_targets", fake_load)
     monkeypatch.setattr(tool, "reprobe", no_probe)
-    rc = asyncio.run(tool.main(["--select", "2026-10-15:redirected_off_product", "--max-targets", "4"]))
+    rc = asyncio.run(tool.main(["--on-crawl-egress", "--select", "2026-10-15:redirected_off_product",
+                                "--max-targets", "4"]))
     assert rc == 2 and '"rp": "refused"' in capsys.readouterr().out
 
 
@@ -131,3 +132,44 @@ def test_it_runs_without_a___file__() -> None:
     finally:
         os.chdir(cwd)
     assert callable(glb["reprobe"]) and glb["SELECT_SQL"] == tool.SELECT_SQL
+
+
+def test_it_refuses_to_fetch_off_the_crawl_egress(monkeypatch, capsys) -> None:
+    """run_oneoff_job.sh defaults to the PAYMENT subnet; without --on-crawl-egress nothing is read or sent."""
+    async def no_load(selections):
+        raise AssertionError("read the database without --on-crawl-egress")
+
+    monkeypatch.setattr(tool, "load_targets", no_load)
+    rc = asyncio.run(tool.main(["--select", "2026-10-15:redirected_off_product"]))
+    assert rc == 2 and "--on-crawl-egress" in capsys.readouterr().err
+
+
+def test_the_shared_edge_budget_is_off_so_nothing_is_leased(vclock, monkeypatch) -> None:  # noqa: F811
+    """With CRAWL_SHOPIFY_EDGE_PACER_ENABLED on, await_slot would lease slots by writing
+    crawl_egress_pacer rows: an indirect write. The script turns it off for its process."""
+    from services import shopify_edge_pacer
+
+    monkeypatch.setenv(shopify_edge_pacer.ENABLED_ENV, "true")
+    seen_enabled: List[bool] = []
+    kwargs_seen: List[Dict[str, Any]] = []
+    real_probe = tool.liveness.probe_destination
+
+    async def spy(client, url, **kwargs):
+        seen_enabled.append(shopify_edge_pacer.enabled())
+        kwargs_seen.append(kwargs)
+        return await real_probe(client, url, **kwargs)
+
+    monkeypatch.setattr(tool.liveness, "probe_destination", spy)
+    asyncio.run(tool.reprobe(_targets(["https://a.example/products/alive", "https://b.example/products/alive"]),
+                             client=_client([])))
+    assert seen_enabled == [False, False]
+    assert all(k.get("max_wait") == 0 for k in kwargs_seen), "the sweep's max_wait: wait, never CrawlPaced"
+
+
+def test_the_retirement_fields_come_from_the_note_that_matched_the_selection() -> None:
+    notes = ("auto-retired 2026-10-15: destination redirected_off_product (http 200)\nreactivated\n"
+             "auto-retired 2026-10-17: destination dead_404 (http 404)")
+    m = tool.retirement_note(notes, ("2026-10-15", "redirected_off_product"))
+    assert (m.group(1), m.group(2), m.group(3)) == ("2026-10-15", "redirected_off_product", "200")
+    assert tool.retirement_note(notes, None).group(1) == "2026-10-17", "no selection: the latest note"
+    assert tool.retirement_note("no note", ("2026-10-15", "x")) is None
