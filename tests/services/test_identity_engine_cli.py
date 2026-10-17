@@ -234,9 +234,17 @@ def test_the_sweep_and_the_link_scripts_never_name_the_module_strategy():
     assert not named & cli.MODULE_ONLY_STRATEGIES
 
 
+#: The listing the proposals below move; matched offers must be variants of it.
+LISTING = "ext:retailer:" + "a" * 32
 #: Contract v3's offer and seed lists, well formed: one offer on a per-variant SKU, no seeds.
-MATCH = {"matched_offers": [{"offer_id": "off_1", "sku_key": "ext:retailer:" + "a" * 32 + "::v:4500001"}],
+MATCH = {"matched_offers": [{"offer_id": "off_1", "sku_key": LISTING + "::v:4500001"}],
          "matched_seeds": []}
+
+
+def _evidence(verdict, **ev):
+    """A proposal's evidence around `verdict`: the attach's listing_product_key and the merge's
+    from_product_keys both name LISTING unless overridden."""
+    return {"listing_product_key": LISTING, "from_product_keys": [LISTING], **ev, "matcher_verdict": verdict}
 
 
 @pytest.mark.parametrize("kind,verdict,ok", [
@@ -263,7 +271,7 @@ MATCH = {"matched_offers": [{"offer_id": "off_1", "sku_key": "ext:retailer:" + "
 def test_the_shared_matcher_verdict_rule(kind, verdict, ok):
     from services.identity_resolution import validate_matcher_verdict
 
-    assert (validate_matcher_verdict(kind, {"matcher_verdict": verdict}) == []) is ok
+    assert (validate_matcher_verdict(kind, _evidence(verdict)) == []) is ok
 
 
 
@@ -305,18 +313,18 @@ def test_the_verdict_size_unit_is_one_of_be2635s_units(unit, ok):
     assert MATCHER_VERDICT_SIZE_UNITS == ("ml", "g", "count")
     verdict = {"strategy": "cross_merchant_same_size", "rule_version": "v1", "tier": "T0c", "same_size": True,
                "size": {"value": 50, "unit": unit, "pack": 1}, **MATCH}
-    assert (validate_matcher_verdict("attach_membership", {"matcher_verdict": verdict}) == []) is ok
+    assert (validate_matcher_verdict("attach_membership", _evidence(verdict)) == []) is ok
 
 
 
-def _v3(**over):
+def _v3(evidence=None, **over):
     v = {"strategy": "cross_merchant_same_size", "rule_version": "v3", "tier": "T0a", "same_size": True,
          "size": {"value": 30, "unit": "ml", "pack": 1}, **MATCH}
     v.update(over)
-    return {"matcher_verdict": v}
+    return _evidence(v, **(evidence or {}))
 
 
-OFFER = {"offer_id": "off_1", "sku_key": "ext:retailer:" + "a" * 32 + "::v:4500001"}
+OFFER = {"offer_id": "off_1", "sku_key": LISTING + "::v:4500001"}
 
 
 @pytest.mark.parametrize("over,needle", [
@@ -350,7 +358,8 @@ def test_contract_v3_offer_and_seed_rules(over, needle):
 
 @pytest.mark.parametrize("over", [
     {},
-    {"matched_offers": [{**OFFER, "sku_key": "ext:sku-identity-gate::0badc0de::v::4500001"}]},  # promoter spelling
+    {"matched_offers": [{**OFFER, "sku_key": "ext:sku-identity-gate::0badc0de::v::4500001"}],  # promoter spelling
+     "evidence": {"listing_product_key": "ext:sku-identity-gate::0badc0de"}},
     {"matched_offers": [OFFER, {**OFFER, "offer_id": "off_2"}]},
     {"matched_seeds": [{"seed_id": "eps_1", "variant_id": None}, {"seed_id": "eps_2", "variant_id": "4500001"}]},
 ])
@@ -358,6 +367,52 @@ def test_contract_v3_well_formed_verdicts(over):
     from services.identity_resolution import validate_matcher_verdict
 
     assert validate_matcher_verdict("attach_membership", _v3(**over)) == []
+
+
+@pytest.mark.parametrize("kind,sku_key,evidence", [
+    ("attach_membership", "ext:other::x::v:9", {}),                     # another product's SKU
+    ("attach_membership", "prod::zzz::v:9", {}),
+    ("attach_membership", "x::v:", {}),
+    ("attach_membership", LISTING + "::v:", {}),                         # empty variant part
+    ("attach_membership", LISTING + "::v::", {}),
+    ("attach_membership", LISTING + "::v: ", {}),
+    ("attach_membership", LISTING + "x::v:9", {}),                       # a longer key sharing the prefix
+    ("attach_membership", LISTING + "::v:9", {"listing_product_key": None}),   # nothing named as moved
+    ("attach_membership", LISTING + "::v:9", {"listing_product_key": "ext:retailer:" + "b" * 32}),
+    ("merge_content_key", "ext:keeper::v:9", {"from_product_keys": [LISTING]}),  # the keeper is not moved
+    ("merge_content_key", LISTING + "::v:9", {"from_product_keys": []}),
+    ("merge_content_key", LISTING + "::v:9", {"from_product_keys": LISTING}),   # a string, not a list
+    ("some_other_kind", LISTING + "::v:9", {}),
+])
+def test_a_matched_offer_must_be_a_variant_of_a_row_the_proposal_moves(kind, sku_key, evidence):
+    from services.identity_resolution import validate_matcher_verdict
+
+    over = {"matched_offers": [{**OFFER, "sku_key": sku_key}]}
+    if kind == "merge_content_key":
+        over["from_key_single_size"] = True
+    problems = validate_matcher_verdict(kind, _v3(evidence=evidence, **over))
+    assert any("matched_offers[0].sku_key" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("kind,sku_key,evidence", [
+    ("attach_membership", LISTING + "::v:9", {}),
+    ("merge_content_key", "ext:b::v:9", {"from_product_keys": [LISTING, "ext:b"]}),
+])
+def test_a_variant_of_a_moved_row_is_accepted(kind, sku_key, evidence):
+    from services.identity_resolution import validate_matcher_verdict
+
+    over = {"matched_offers": [{**OFFER, "sku_key": sku_key}]}
+    if kind == "merge_content_key":
+        over["from_key_single_size"] = True
+    assert validate_matcher_verdict(kind, _v3(evidence=evidence, **over)) == []
+
+
+def test_offer_price_currency_size_and_market_are_informational():
+    """The pin is (offer_id, sku_key); the other offer fields are not validated (controller 10-17)."""
+    from services.identity_resolution import validate_matcher_verdict
+
+    odd = {**OFFER, "price": None, "currency": "XYZ", "market": "MARS", "size": {"value": 30, "unit": "ml"}}
+    assert validate_matcher_verdict("attach_membership", _v3(matched_offers=[odd])) == []
 
 
 def test_the_v2_listing_offer_ids_field_no_longer_satisfies_the_rule():

@@ -963,7 +963,9 @@ M4 = "cross_merchant_same_size"
 def _verdict(**over):
     v = {"strategy": M4, "rule_version": "t0.v1", "tier": "T0b", "same_size": True,
          "size": {"value": 30, "unit": "ml", "pack": 1},
-         "matched_offers": [{"offer_id": "off_1", "sku_key": _listing(40) + "::v:4500001"}],
+         # `{listing}` is the listing the proposal moves (_m4_proposal fills it in): a matched offer
+         # must be a variant of a moved row.
+         "matched_offers": [{"offer_id": "off_1", "sku_key": "{listing}::v:4500001"}],
          "matched_seeds": [{"seed_id": "eps_m4", "variant_id": "4500001"}]}
     v.update(over)
     return v
@@ -978,6 +980,9 @@ async def _m4_proposal(conn, n, *, run="m4run_1", kind="attach_membership", prop
         extra["matcher_verdict"] = verdict if verdict is not None else _verdict(
             **({"from_key_single_size": True} if kind == "merge_content_key" else {}))
     listing = _listing(40 + n)
+    for o in (extra.get("matcher_verdict") or {}).get("matched_offers") or []:
+        if isinstance(o, dict) and isinstance(o.get("sku_key"), str):
+            o["sku_key"] = o["sku_key"].replace("{listing}", listing)
     if kind == "merge_content_key":
         p = merge_content_key_proposal(strategy=M4, from_content_key=f"ck_m4_{n}", to_content_key=B,
                                        from_product_keys=[listing], from_groups={listing: f"pg_m4_{n}"},

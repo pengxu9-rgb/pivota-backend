@@ -538,6 +538,34 @@ def is_variant_sku_key(sku_key: Any) -> bool:
     return _str(sku_key) and VARIANT_SKU_INFIX in sku_key and not sku_key.endswith(SKU_SUFFIX)
 
 
+def _moved_product_keys(kind: str, evidence: Dict[str, Any]) -> List[str]:
+    """The product keys a membership proposal moves, from its own evidence: the listing of an
+    attach_membership, every row on the losing key of a merge_content_key."""
+    if kind == "attach_membership":
+        keys = [evidence.get("listing_product_key")]
+    elif kind == "merge_content_key":
+        keys = list(evidence.get("from_product_keys") or []) if isinstance(evidence.get("from_product_keys"),
+                                                                          (list, tuple)) else []
+    else:
+        keys = []
+    return [k for k in keys if _str(k)]
+
+
+def sku_key_on_moved_listing(sku_key: Any, moved_product_keys: Sequence[str]) -> bool:
+    """`sku_key` is `<one of the moved product keys>::v:<non-empty variant>` (the promoter's `::v::`
+    spelling included): a matched offer must be a variant of a row the proposal really moves, never
+    another product's SKU and never an empty variant part (`x::v:`)."""
+    from services.catalog_enrichment_agent.ingestion import VARIANT_SKU_INFIX
+
+    if not is_variant_sku_key(sku_key):
+        return False
+    for pk in moved_product_keys:
+        prefix = f"{pk}{VARIANT_SKU_INFIX}"
+        if sku_key.startswith(prefix) and sku_key[len(prefix):].lstrip(":").strip():
+            return True
+    return False
+
+
 def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
                              strategy: str = CROSS_MERCHANT_SAME_SIZE) -> List[str]:
     """The problems with a proposal's evidence.matcher_verdict ([] = well formed). One rule, shared by
@@ -550,7 +578,12 @@ def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
       same_size              true;
       size                   {value > 0, unit ml | g | count, pack >= 1} (verdict_size_key);
       matched_offers         NON-EMPTY [{offer_id, sku_key}]: the offers the match covers, each on a
-                             per-variant SKU (is_variant_sku_key), never a ::canonical / mirror key;
+                             per-variant SKU of a row the proposal MOVES (sku_key_on_moved_listing:
+                             `<evidence.listing_product_key>::v:<variant>` for an attach, a member of
+                             evidence.from_product_keys for a merge), never a ::canonical / mirror key.
+                             The pin is (offer_id, sku_key). Any other field on an offer (price, currency,
+                             size, market) is INFORMATIONAL: not validated and never a basis for a
+                             decision (controller 10-17; enforced only if a mirror re-check is chosen);
       matched_seeds          a list, possibly empty, of {seed_id, variant_id (str or null)};
       from_key_single_size   true, for a merge_content_key (it moves every row on the losing key).
 
@@ -573,6 +606,7 @@ def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
         problems.append("matcher_verdict.same_size is not true")
     problems += _size_problems(v.get("size"))
     offers = v.get("matched_offers")
+    moved = _moved_product_keys(kind, evidence or {})
     if not (isinstance(offers, list) and offers):
         problems.append("matcher_verdict.matched_offers is not a non-empty list")
     else:
@@ -581,6 +615,9 @@ def validate_matcher_verdict(kind: str, evidence: Optional[Dict[str, Any]],
                 problems.append(f"matcher_verdict.matched_offers[{n}].offer_id empty")
             if not (isinstance(o, dict) and is_variant_sku_key(o.get("sku_key"))):
                 problems.append(f"matcher_verdict.matched_offers[{n}].sku_key is not a per-variant SKU key")
+            elif not sku_key_on_moved_listing(o.get("sku_key"), moved):
+                problems.append(f"matcher_verdict.matched_offers[{n}].sku_key is not "
+                                f"<moved product key>::v:<variant> (moved: {moved})")
     seeds = v.get("matched_seeds")
     if not isinstance(seeds, list):
         problems.append("matcher_verdict.matched_seeds is not a list")
