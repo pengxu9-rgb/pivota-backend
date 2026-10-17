@@ -109,7 +109,7 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 : "${CATALOG_DESTINATION_SWEEP:=false}"
 : "${CATALOG_DESTINATION_SWEEP_SUPPRESS:=false}"
 # The nightly external-referral refresh (jobs/external_referral_refresh.py). LIVE in prod, but until
-# 2026-10-17 provisioned by hand only ("no script in this repo", setup_reap_cart_proof_jobs.sh), so
+# 2026-10-17 provisioned by hand only (the cart-proof setup script said "no script in this repo"), so
 # its --max-retries and args lived nowhere reviewable. OPT-IN, default false: a run that does not name
 # it leaves the live job and its trigger exactly as they are. See the job block below for what an
 # opted-in run changes and what it deliberately does not.
