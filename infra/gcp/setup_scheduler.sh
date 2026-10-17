@@ -71,6 +71,7 @@ _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
 _CATALOG_DESTINATION_SWEEP_EXPLICIT="${CATALOG_DESTINATION_SWEEP+set}"
+_EXTERNAL_REFERRAL_REFRESH_EXPLICIT="${EXTERNAL_REFERRAL_REFRESH+set}"
 # Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
 # that distinction to tell "you asked and we ignored it" from "nobody mentioned it".
 WORKERS_REQUESTED="${WORKERS-}"
@@ -107,6 +108,12 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # (pending, lifted by the next live answer) and a second withdraws it.
 : "${CATALOG_DESTINATION_SWEEP:=false}"
 : "${CATALOG_DESTINATION_SWEEP_SUPPRESS:=false}"
+# The nightly external-referral refresh (jobs/external_referral_refresh.py). LIVE in prod, but until
+# 2026-10-17 provisioned by hand only ("no script in this repo", setup_reap_cart_proof_jobs.sh), so
+# its --max-retries and args lived nowhere reviewable. OPT-IN, default false: a run that does not name
+# it leaves the live job and its trigger exactly as they are. See the job block below for what an
+# opted-in run changes and what it deliberately does not.
+: "${EXTERNAL_REFERRAL_REFRESH:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -122,6 +129,7 @@ case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERN
 case "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" in true|false) ;; *) echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION must be exactly true or false (got '$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION')" >&2; exit 2 ;; esac
 case "$CATALOG_DESTINATION_SWEEP" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
 case "$CATALOG_DESTINATION_SWEEP_SUPPRESS" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP_SUPPRESS must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP_SUPPRESS')" >&2; exit 2 ;; esac
+case "$EXTERNAL_REFERRAL_REFRESH" in true|false) ;; *) echo "EXTERNAL_REFERRAL_REFRESH must be exactly true or false (got '$EXTERNAL_REFERRAL_REFRESH')" >&2; exit 2 ;; esac
 # relgraph-sync WRITES (build + AI review apply). Unlike the lanes above, these are LIVE in prod
 # (armed by hand 2026-09-27, verified green 2026-09-30), and the job's --set-env-vars REPLACES its
 # whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
@@ -920,6 +928,43 @@ else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
 fi
 
+# ---- external-referral refresh (opt-in: EXTERNAL_REFERRAL_REFRESH=true) ----------------------
+# Re-reads the price and availability of the external seeds we serve, nightly at 05:15Z, from the
+# crawl egress (`mkcrawljob`). 2026-10-16 Cloudflare challenge-listed the crawl NAT address after
+# nights of 2.5-4.0 origin reads/s from this job; be#2640 paces it (crawl_global_pacer). These are
+# the ROLLOUT values agreed for the paced image, not a steady state:
+#   --limit 2000            prod ran --limit 15000 on 10-16. At 0.5 requests/s and 6 new hosts a
+#                           minute a 3,300 s run reaches ~1,650 requests, so 2,000 candidates is
+#                           already more than it can start; a larger limit only grows
+#                           `skipped_for_budget`. Raise it after the head-host census
+#                           (pacing_census/refresh_head_hosts.py) and a few paced nights.
+#   --budget-seconds 3300   under the 3,600 s task timeout, so the run prints its own summary.
+#   --host-concurrency 4    unchanged from prod; the global bucket, not the workers, sets the rate.
+#   --max-retries 0         an exit 1 (degraded / budget stop) or 3 (ip_throttled) must NOT be re-run
+#                           at once: a retry is a second full pass from the same address minutes after
+#                           the IP was throttled. The next night is the retry.
+# WHAT AN OPTED-IN RUN DOES NOT TOUCH on an EXISTING job: its env and its secret mounts. They were set
+# by hand (EXTERNAL_OFFER_DUAL_WRITE_ENABLED and friends; see the job's docstring), and
+# `--set-env-vars` REPLACES the whole env set, so an update passes only the image, the retries, the
+# timeout and the args. Only a CREATE (a fresh project) builds the job from `mkcrawljob` with the
+# minimal env below. The trigger keeps its pause state like every other `sched` trigger.
+if [ "$EXTERNAL_REFERRAL_REFRESH" = true ]; then
+  echo "== job: external-referral-refresh (rollout: --limit 2000 --budget-seconds 3300 --host-concurrency 4, retries 0)"
+  REFRESH_ARGS="-m,jobs.external_referral_refresh,--limit,2000,--budget-seconds,3300,--host-concurrency,4"
+  if have "$GCLOUD" run jobs describe external-referral-refresh --region "$REGION"; then
+    "$GCLOUD" run jobs update external-referral-refresh --region "$REGION" --image "$BACKEND_IMAGE" \
+      --max-retries 0 --task-timeout 3600s --command python --args="$REFRESH_ARGS" --quiet
+  else
+    mkcrawljob external-referral-refresh "$BACKEND_IMAGE" "$SA" \
+      --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-referral-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+      --task-timeout 3600s --max-retries 0 --memory 2Gi \
+      --command python --args="$REFRESH_ARGS"
+  fi
+else
+  echo "== external-referral refresh not reconciled (EXTERNAL_REFERRAL_REFRESH=false; the live job is left as it is)"
+fi
+
 # ---- catalog destination sweep (rows with no seed) ------------------------------------------
 # Same crawl egress and pacing as the seed sweep above, for catalog_enrichment_agent_v1 rows.
 if [ "$CATALOG_DESTINATION_SWEEP" = true ]; then
@@ -1016,6 +1061,10 @@ else
     "$GCLOUD" scheduler jobs pause catalog-destination-sweep-cron --location "$REGION" --quiet
     echo "   (paused: catalog-destination-sweep-cron; CATALOG_DESTINATION_SWEEP=false)"
   fi
+fi
+if [ "$EXTERNAL_REFERRAL_REFRESH" = true ]; then
+  # 05:15 UTC, the live trigger's slot: after the 03:15 sweep and the 04:10 catalog sweep.
+  sched external-referral-refresh-cron "15 5 * * *" external-referral-refresh
 fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
 # 00:52/06:52/12:52/18:52 UTC. The exact cron the GH workflow carried, and the

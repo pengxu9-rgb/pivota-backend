@@ -90,14 +90,17 @@ def _min_origin_yield() -> float:
 
 
 def _min_budget_reach() -> float:
-    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", "").strip()
-    try:
-        value = float(raw) if raw else _MIN_BUDGET_REACH_DEFAULT
-    except ValueError:
-        return _MIN_BUDGET_REACH_DEFAULT
-    if not math.isfinite(value):
-        return _MIN_BUDGET_REACH_DEFAULT
-    return min(max(value, 0.0), 1.0)
+    """EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH, read through the pacing knobs' shared helper
+    (`crawl_global_pacer.resolve_setting`) since 2026-10-17: a share in (0, 1], and 0, negative or
+    garbage is an ERROR and the default. TUNABLE BECAUSE THE GLOBAL PACER MOVED THE FLOOR UNDER IT:
+    at 0.5 rows/s and 6 new hosts a minute a host-diverse queue head (1 row per host) reaches ~331
+    of 2,000 rows in 3,300 s (0.17) and reads as degraded every night, while a head of >= 4 rows per
+    host reaches 0.5. Which one prod has is what `pacing_census/refresh_head_hosts.py` measures;
+    this knob and EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE are what to move after it,
+    without a deploy (review M4)."""
+    return crawl_global_pacer.resolve_setting(
+        None, "EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", _MIN_BUDGET_REACH_DEFAULT, maximum=1.0,
+    )
 
 
 def _host_block_trip() -> int:
@@ -180,41 +183,34 @@ def _refresh_host_concurrency(explicit: Optional[int]) -> int:
 # 6 NEW HOSTS A MINUTE because a challenged request answers instantly: with no cap, four workers
 # swept 262 distinct hosts in 60 s on 10-16. Cloudflare scores the address across every zone it
 # fronts, so breadth is what it sees. 6/min (one every 10 s) is <= 330 hosts in a 55 min run.
-_GLOBAL_RPS_DEFAULT = 0.5
-_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = 6
+_GLOBAL_RPS_DEFAULT = crawl_global_pacer.RPS_DEFAULT
+_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = crawl_global_pacer.MAX_NEW_HOSTS_PER_MINUTE_DEFAULT
 
 
-def _env_or_explicit_float(explicit: Any, env_name: str, default: float) -> float:
-    """The flag wins, then the env, then the default. Non-finite or negative falls back to the
-    default, loudly: a typo must never silently mean "unpaced"."""
-    raw: Any = explicit
-    source = "argument"
-    if raw is None:
-        raw = (os.getenv(env_name) or "").strip() or None
-        source = env_name
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        value = math.nan
-    if not math.isfinite(value) or value < 0:
-        logger.warning("%s=%r is not a non-negative number; using the default %s", source, raw, default)
-        return default
-    return value
-
-
+# ZERO IS NOT "OFF" (2026-10-17 review, M3). Both knobs used to accept 0 as "disabled", and the cap
+# went through `int()`, so 0.9 truncated to 0 and switched it off too. Both now resolve through
+# `crawl_global_pacer`, the one helper the destination sweep's knobs use as well: 0, negative, NaN or
+# garbage is an ERROR and the default; the rate is clamped to [0.05, 1.0]; the cap is rounded up and
+# is at least 1. The only off switch is CRAWL_GLOBAL_PACER_DISABLED=true (or this lane's
+# EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED=false), which logs at ERROR every run.
 def _refresh_global_rps(explicit: Optional[float]) -> float:
-    """`--global-rps`, then EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5. 0 disables the rate."""
-    return _env_or_explicit_float(explicit, "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", _GLOBAL_RPS_DEFAULT)
+    """`--global-rps`, then EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5; clamped to [0.05, 1.0]."""
+    return crawl_global_pacer.resolve_rps(explicit, "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", _GLOBAL_RPS_DEFAULT)
 
 
-def _refresh_max_new_hosts_per_minute(explicit: Optional[int]) -> int:
+def _refresh_max_new_hosts_per_minute(explicit: Optional[float]) -> int:
     """`--max-new-hosts-per-minute`, then EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE, then
-    6. 0 disables the cap."""
-    return int(_env_or_explicit_float(
+    6; rounded up, at least 1."""
+    return crawl_global_pacer.resolve_new_host_cap(
         explicit, "EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE", _MAX_NEW_HOSTS_PER_MINUTE_DEFAULT
-    ))
+    )
+
+
+def _refresh_global_pacer_disabled() -> bool:
+    """The kill switch, logged at ERROR by `crawl_global_pacer.pacer_disabled` on every run."""
+    return crawl_global_pacer.pacer_disabled(
+        legacy_enabled_env="EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", lane="external-referral-refresh",
+    )
 
 
 _MAX_STRUCTURAL_SHARE_DEFAULT = 0.2
@@ -1920,29 +1916,23 @@ EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS = 3300.0
 
 
 def _refresh_budget_seconds(explicit: Optional[float]) -> float:
-    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary).
+    """Resolve the run's wall-clock budget: the flag, then EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS,
+    then 3300. Always > 0.
 
     NON-FINITE FALLS BACK TO THE DEFAULT rather than through. `argparse type=float` accepts
     `nan` and `inf`, and either would (a) silently disable the budget, since `budget > 0` is
     False for NaN, while the summary still reported `stopped_early: false`, and (b) reach
     `json.dumps` in `jobs/external_referral_refresh.main`, which emits a bare `NaN` that is
     not valid JSON for any downstream parser.
-    """
-    def _finite(value: Any) -> Optional[float]:
-        try:
-            out = float(value)
-        except (TypeError, ValueError):
-            return None
-        return out if math.isfinite(out) else None
 
-    if explicit is not None:
-        resolved = _finite(explicit)
-        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
-    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS")
-    if raw is None or not str(raw).strip():
-        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
-    resolved = _finite(raw)
-    return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+    AND SO DOES 0 (2026-10-17 review, M3). `<= 0` used to disable the budget, which also left the
+    global pacer with no deadline: a cool-down could then be waited out into the 3,600 s task
+    timeout. It is an ERROR and the default now (`crawl_global_pacer.resolve_budget_seconds`); a run
+    that needs longer passes a longer budget.
+    """
+    return crawl_global_pacer.resolve_budget_seconds(
+        explicit, "EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS", EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    )
 
 
 async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, str]:
@@ -2012,7 +2002,7 @@ async def run_external_referral_refresh_batch(
     candidate_seed_ids: Optional[Sequence[str]] = None,
     market: Optional[str] = None,
     global_rps: Optional[float] = None,
-    max_new_hosts_per_minute: Optional[int] = None,
+    max_new_hosts_per_minute: Optional[float] = None,
     ip_challenge_trip_hosts: Optional[int] = None,
     ip_challenge_window_seconds: Optional[float] = None,
     ip_throttle_cooldown_seconds: Optional[float] = None,
@@ -2034,11 +2024,19 @@ async def run_external_referral_refresh_batch(
     # THE GLOBAL PACER (`services.crawl_global_pacer`): every origin request this run makes, page
     # fetches, retries and robots.txt, starts no sooner than its slot in one shared bucket. Its
     # deadline is the budget, so a cool-down that would outlast the run stops it instead.
-    pacer = crawl_global_pacer.GlobalOriginPacer(
-        rps=_refresh_global_rps(global_rps),
-        max_new_hosts_per_minute=_refresh_max_new_hosts_per_minute(max_new_hosts_per_minute),
-        deadline=(crawl_global_pacer._now() + budget) if budget > 0 else None,
-    )
+    #
+    # THE KILL SWITCH (CRAWL_GLOBAL_PACER_DISABLED=true) builds an UNPACED pacer rather than none:
+    # no rate and no new-host cap, but the breaker's cool-down and stop and the budget's deadline
+    # still reach every request.
+    pacer_deadline = crawl_global_pacer._now() + budget
+    if _refresh_global_pacer_disabled():
+        pacer = crawl_global_pacer.GlobalOriginPacer(unpaced=True, deadline=pacer_deadline)
+    else:
+        pacer = crawl_global_pacer.GlobalOriginPacer(
+            rps=_refresh_global_rps(global_rps),
+            max_new_hosts_per_minute=_refresh_max_new_hosts_per_minute(max_new_hosts_per_minute),
+            deadline=pacer_deadline,
+        )
 
     def _on_trip(breaker: crawl_ip_throttle.StagedIpThrottleBreaker, event: Dict[str, Any]) -> None:
         if event.get("action") == "cooldown":
@@ -2141,9 +2139,14 @@ async def run_external_referral_refresh_batch(
     # the writes and the projection. This is how to see which hosts the budget goes to.
     host_stats: Dict[str, Dict[str, float]] = {}
     rows_started = 0
+    # Rows IN FLIGHT when the pacer stopped (review M1): their request was refused, not sent, so
+    # they are deferred unstamped like the rows still queued -- to `skipped_for_ip_throttle` on the
+    # breaker's final trip, to `skipped_for_budget` when the budget ended.
+    pace_stopped_for_budget = 0
 
     async def _process(seed_id: str, host: str) -> None:
         nonlocal refreshed, refreshed_from_cache, degraded, failed, unprocessable
+        nonlocal skipped_for_ip_throttle, pace_stopped_for_budget, stopped_early
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
@@ -2218,6 +2221,18 @@ async def run_external_referral_refresh_batch(
             else:
                 failed += 1
                 errors.append({"seed_id": seed_id, "status": status, "error": result.get("error")})
+        except crawl_global_pacer.GlobalPaceStopped:
+            # REFUSED, NOT TRIED (review M1, 2026-10-17). `resolve_external_offer` and
+            # `_refresh_external_seed_by_id` re-raise this so the row is never stamped; here it is
+            # counted with the rows the stop deferred and touches nothing else: not `failed`, not
+            # the host's stats, not its unreachable streak.
+            if ip_breaker.tripped:
+                skipped_for_ip_throttle += 1
+                ip_throttle_skips[host or seed_id] = ip_throttle_skips.get(host or seed_id, 0) + 1
+            else:
+                pace_stopped_for_budget += 1
+                stopped_early = True
+            return
         except HTTPException as exc:
             # NARROW ON PURPOSE. Only the two permanent per-seed data conditions are absorbed:
             # SEED_NOT_FOUND (404) and INVALID_URL (400). ~628 seeds carry no usable destination
@@ -2371,10 +2386,13 @@ async def run_external_referral_refresh_batch(
                 # It cannot interrupt rows already in flight, so the true ceiling is `budget`
                 # plus the slowest in-flight row -- bounded, since `crawl_politeness` caps what
                 # one row can cost. A row that could only start after a cool-down that outlasts
-                # the budget is not started either.
-                if budget > 0 and (
+                # the budget is not started either, nor one after the pacer has stopped on the
+                # budget (its next slot fell past the deadline, review L1): that row's request
+                # would only be refused.
+                if (
                     (time.monotonic() - started) >= budget
                     or (pacer.deadline is not None and pacer.paused_until >= pacer.deadline)
+                    or pacer.stopped
                 ):
                     stopped_early = True
                     return
@@ -2418,7 +2436,8 @@ async def run_external_referral_refresh_batch(
             ip_breaker.trip_host_count, skipped_for_ip_throttle,
         )
     if stopped_early:
-        skipped_for_budget = sum(len(lane) for lane in lanes.values())
+        # The rows still queued, plus the ones in flight when the pacer stopped on the budget.
+        skipped_for_budget = sum(len(lane) for lane in lanes.values()) + pace_stopped_for_budget
         # LOUD, because a silent truncation reads exactly like a completed sweep: the summary
         # would otherwise show a smaller `refreshed` with no reason attached.
         logger.warning(

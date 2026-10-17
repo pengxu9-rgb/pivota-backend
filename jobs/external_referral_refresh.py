@@ -29,6 +29,28 @@ IP. Every origin request now also waits on one shared bucket (`services.crawl_gl
 answering a Cloudflare challenge within 120 s, first into a cool-down at half rate and only on its
 second trip out of the run (`crawl_ip_throttle.StagedIpThrottleBreaker`).
 
+NO KNOB HAS AN "OFF" VALUE (2026-10-17 review). `--global-rps`, `--max-new-hosts-per-minute`,
+`--budget-seconds` and their env vars resolve through `crawl_global_pacer.resolve_setting`: 0, a
+negative, NaN or garbage logs an ERROR and uses the default; the rate is clamped to [0.05, 1.0] and
+the new-host cap rounds up to at least 1. The one kill switch is `CRAWL_GLOBAL_PACER_DISABLED=true`
+(this lane also honours `EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED=false`); it logs at ERROR on
+every run and still leaves the breaker's cool-down, its stop and the budget's deadline in force.
+
+A FIRST TRIP LATE IN THE RUN ENDS IT AS A BUDGET STOP, EXIT 1, NOT 3 (review L3). The cool-down is
+900 s and the default budget 3,300 s, so a first trip after ~2,400 s leaves a cool-down that ends past
+the budget. The run does not wait into the 3,600 s task timeout for it: it stops starting rows
+(`stopped_early`, `skipped_for_budget`), and `budget_reach` is usually under `min_budget_reach`, so
+the night reports `degraded` and exits 1. `breaker_trips: 1`, `cooldowns: 1` and the IP_THROTTLE line
+say what happened; read them before reading a 1 as "slow hosts". Exit 3 (`ip_throttled`) is only the
+SECOND trip. Likewise a request whose global slot falls past the deadline is refused, not sent: the
+row is deferred unstamped and counted in `skipped_for_budget`.
+
+ROWS THE PACER REFUSED ARE NEVER STAMPED (review M1). When the breaker's final trip or the budget
+stops the pacer, a row already in flight gets `GlobalPaceStopped` instead of a request;
+`resolve_external_offer` and `_refresh_external_seed_by_id` re-raise it (no cached snapshot is
+written, `last_crawl_attempt_at` is untouched), and the batch counts the row in
+`skipped_for_ip_throttle` or `skipped_for_budget`, so it leads tomorrow's queue.
+
 COVERAGE, measured 2026-09-27 (image 8f7605b1e, serial): 3,282 rows in 3,300s, 2,220 origin
 reads, a ~12-day cycle over ~23.8k active seeds. The launch target is every SERVED seed re-read
 within 3 days. Three levers, all in this job: the queue puts served, stale seeds first and skips
@@ -96,7 +118,7 @@ async def run_daily_external_referral_refresh(
     ip_throttle_window_seconds: Optional[float] = None,
     ip_throttle_enabled: Optional[bool] = None,
     global_rps: Optional[float] = None,
-    max_new_hosts_per_minute: Optional[int] = None,
+    max_new_hosts_per_minute: Optional[float] = None,
     ip_challenge_trip_hosts: Optional[int] = None,
     ip_challenge_window_seconds: Optional[float] = None,
     ip_throttle_cooldown_seconds: Optional[float] = None,
@@ -158,7 +180,7 @@ def ip_throttle_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     # The global pacer and the staged breaker (2026-10-16): what rate the run ran at, how long it
     # waited for it, and whether it tripped, cooled down and resumed.
     keys += [
-        "global_rps", "final_rate", "max_new_hosts_per_minute", "paced_requests",
+        "global_rps", "final_rate", "global_pacer_disabled", "max_new_hosts_per_minute", "paced_requests",
         "new_hosts_contacted", "paces_waited_seconds", "breaker_trips", "breaker_trip_events",
         "cooldowns", "cooldown_seconds",
     ]
@@ -175,8 +197,8 @@ def main() -> int:
         help=(
             "Wall-clock ceiling for the run; stop starting rows once it is spent. "
             "Defaults to EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS, then to "
-            "services.external_referral_readiness.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS. "
-            "0 disables it."
+            "services.external_referral_readiness.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS (3300). "
+            "Must be > 0: 0, negative or garbage is logged at ERROR and the default is used."
         ),
     )
     parser.add_argument(
@@ -214,16 +236,20 @@ def main() -> int:
         help=(
             "The IP's total origin-request rate for this run, shared by every host worker, each gap "
             "jittered +-30%%. Every page fetch, retry and robots.txt read takes a slot. Defaults to "
-            "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5. 0 disables it."
+            "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5. Clamped to [0.05, 1.0]; 0, negative or "
+            "garbage is logged at ERROR and the default is used (CRAWL_GLOBAL_PACER_DISABLED=true is "
+            "the only off switch)."
         ),
     )
     parser.add_argument(
         "--max-new-hosts-per-minute",
-        type=int,
+        # float, so a fractional value reaches the helper and is rounded UP, never truncated to 0.
+        type=float,
         default=None,
         help=(
             "Hosts contacted for the first time in any 60s window, however fast they answer. "
-            "Defaults to EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE, then 6. 0 disables it."
+            "Defaults to EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE, then 6. Rounded up, at "
+            "least 1; 0, negative or garbage is logged at ERROR and the default is used."
         ),
     )
     parser.add_argument(
