@@ -37,8 +37,13 @@ All resolve through `crawl_global_pacer.resolve_setting`: the flag, then the env
 | `CRAWL_IP_CHALLENGE_TRIP_HOSTS` | 8 | distinct challenged hosts in `CRAWL_IP_CHALLENGE_WINDOW_SECONDS` (120) that trip the cool-down. Healthy nights 10-08..10-15 peaked at 4/3/3/1/2/1; the 10-16 listing night at 360 |
 | `CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS` | empty | comma/space list, `www.` folded: hosts whose challenges never count toward a trip |
 
-Every redirect hop takes a global slot (an httpx request hook, `redirect_client_kwargs`), and a crawl
-fetch follows at most 5 hops (robots.txt: 3).
+| `EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP` | 3 | rounded up, at least 1: a host answering this many Cloudflare challenges in a row (any status) is skipped for the rest of the run, its rows unstamped (`skipped_for_host_challenge`, `host_challenge_skips`). Excluded hosts are skipped too |
+
+Every redirect hop is gated like a first request while a pacer is installed (an httpx request hook,
+`redirect_client_kwargs`): it waits for its host's own slot (interval, backoff, Crawl-delay) and a
+global slot, and a hop onto a DIFFERENT host must be allowed by that host's robots.txt or it is not
+sent (`RobotsDisallowed`). A crawl fetch follows at most 5 hops (robots.txt: 3, global slot only).
+With no pacer installed (the interactive route) a hop only gets the hop cap.
 
 **Throughput is host-shaped.** 6 new hosts a minute is ~330 hosts in a 3,300 s run. A queue head of
 one row per host therefore reaches ~331 of 2,000 rows (`budget_reach` 0.17, `degraded`, exit 1);
@@ -47,8 +52,10 @@ one row per host therefore reaches ~331 of 2,000 rows (`budget_reach` 0.17, `deg
 
 ## The kill switch
 
-`CRAWL_GLOBAL_PACER_DISABLED=true` (the refresh also honours
-`EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED=false`). It logs at ERROR on every run, and the run's
+`CRAWL_GLOBAL_PACER_DISABLED=true`: the exact word `true` (any case). `1`, `yes`, `on`, `false` or
+any other non-empty value is UNREADABLE: it is logged at ERROR and the run stays paced, because a
+switch whose failure mode is "unpaced" must fail paced. There is no per-lane alias (an
+`..._GLOBAL_PACER_ENABLED=false` spelling existed for one commit and is not read). It logs at ERROR on every run, and the run's
 summary says `global_pacer_disabled: true`, `global_rps: null`. The pacer is still installed
 **unpaced**: no rate and no new-host cap, but the breaker's cool-down and stop and the budget's
 deadline still reach every request. Unset it when the incident is over.

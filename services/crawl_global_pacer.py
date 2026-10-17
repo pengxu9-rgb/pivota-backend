@@ -72,15 +72,18 @@ MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = 6
 # Redirect hops one crawl request may follow. httpx's default is 20, and every hop is an origin
 # request; 5 covers the longest chain seen in the robots cohort (3) with room.
 MAX_REDIRECTS = 5
-# The ONE kill switch for every lane that installs a pacer.
+# The ONE kill switch for every lane that installs a pacer. Only the exact word "true" (any case)
+# disables; see `pacer_disabled`.
 DISABLED_ENV = "CRAWL_GLOBAL_PACER_DISABLED"
-_TRUE = frozenset({"1", "true", "yes", "on"})
-_FALSE = frozenset({"0", "false", "no", "off"})
 # Past this many hosts the run stops remembering NEW ones as admitted, so each further one is
 # admitted again (re-counted against the per-minute cap): over-counting, never under-counting.
 # A refresh run is capped at 30,000 rows.
 _MAX_TRACKED_HOSTS = 50_000
 _MAX_RECORDED_GRANTS = 10_000
+# A provisional new-host place (`admit`) the scheduler never used expires this long after its own
+# instant. Its only job is to stop two workers taking the last place at once; a request that does
+# start is re-checked against real first contacts anyway, so an expired place can never break the cap.
+PENDING_GRACE_SECONDS = 30.0
 
 
 def _now() -> float:
@@ -163,13 +166,16 @@ def resolve_rps(explicit: Any, env_name: Optional[str], default: Optional[float]
     )
 
 
+def resolve_count(explicit: Any, env_name: Optional[str], default: int) -> int:
+    """A whole-number knob (a cap, a trip threshold): `resolve_setting`'s rules, rounded UP, at least
+    1. There is no 0 = off."""
+    return max(1, int(math.ceil(resolve_setting(explicit, env_name, default))))
+
+
 def resolve_new_host_cap(explicit: Any, env_name: Optional[str], default: Optional[int] = None) -> int:
     """New hosts per minute: rounded UP (`int()` used to truncate 0.9 to 0, which disabled the cap),
     and at least 1."""
-    value = resolve_setting(
-        explicit, env_name, MAX_NEW_HOSTS_PER_MINUTE_DEFAULT if default is None else default,
-    )
-    return max(1, int(math.ceil(value)))
+    return resolve_count(explicit, env_name, MAX_NEW_HOSTS_PER_MINUTE_DEFAULT if default is None else default)
 
 
 def resolve_budget_seconds(explicit: Any, env_name: Optional[str], default: float) -> float:
@@ -178,24 +184,27 @@ def resolve_budget_seconds(explicit: Any, env_name: Optional[str], default: floa
     return resolve_setting(explicit, env_name, default)
 
 
-def pacer_disabled(*, legacy_enabled_env: Optional[str] = None, lane: str = "crawl") -> bool:
-    """The explicit kill switch: `CRAWL_GLOBAL_PACER_DISABLED=true` for every lane, or a lane's
-    legacy `<...>_GLOBAL_PACER_ENABLED=false`. Logged at ERROR on every call that returns True, so
-    every unpaced run says so in its own log. An unreadable value is NOT a disable (fails paced)."""
-    raw = (os.getenv(DISABLED_ENV) or "").strip().lower()
-    disabled = raw in _TRUE
-    source = DISABLED_ENV
-    if not disabled and legacy_enabled_env:
-        legacy = (os.getenv(legacy_enabled_env) or "").strip().lower()
-        if legacy in _FALSE:
-            disabled, source = True, legacy_enabled_env
-    if raw and raw not in _TRUE and raw not in _FALSE:
-        logger.error("crawl global pacer: %s=%r is not true/false; the pacer stays ON", DISABLED_ENV, raw)
+def pacer_disabled(*, lane: str = "crawl") -> bool:
+    """The ONE kill switch, for every lane: `CRAWL_GLOBAL_PACER_DISABLED=true`.
+
+    EXACTLY "true" (any case, surrounding space ignored), nothing else (controller review of be#2640,
+    2026-10-17). `1`, `yes`, `on` and every other non-empty value are UNREADABLE: logged at ERROR, and
+    the pacer stays ON, because a switch whose failure mode is "unpaced" must fail paced. There is no
+    per-lane alias: the refresh's short-lived `EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED`, whose
+    "=false/0 means unpaced" polarity turned a typo into an unpaced run, is gone and is not read.
+    Logged at ERROR on every call that disables, so every unpaced run says so in its own log."""
+    raw = (os.getenv(DISABLED_ENV) or "").strip()
+    disabled = raw.lower() == "true"
+    if raw and not disabled:
+        logger.error(
+            "crawl global pacer: %s=%r is not the exact word 'true'; it is unreadable and the pacer "
+            "stays ON for %s", DISABLED_ENV, raw, lane,
+        )
     if disabled:
         logger.error(
-            "crawl global pacer DISABLED for %s by %s: no global rate and no new-host cap this run "
-            "(the IP breaker's cool-down and stop still apply). This is the kill switch, not a "
-            "setting; unset it as soon as the incident it was for is over.", lane, source,
+            "crawl global pacer DISABLED for %s by %s=true: no global rate and no new-host cap this "
+            "run (the IP breaker's cool-down and stop still apply). This is the kill switch, not a "
+            "setting; unset it as soon as the incident it was for is over.", lane, DISABLED_ENV,
         )
     return disabled
 
@@ -300,20 +309,33 @@ class GlobalOriginPacer:
         horizon = now - NEW_HOST_WINDOW_SECONDS
         if self._first_contacts and self._first_contacts[0] < horizon:
             self._first_contacts = [t for t in self._first_contacts if t >= horizon]
-        for key in [k for k, t in self._pending.items() if t < horizon]:
+        # PHANTOM PLACES EXPIRE (controller review, LOW): a host the scheduler took and then never
+        # asked (drained by a breaker, or its row failed before any request) used to hold its place
+        # for a full minute, and a run of them pushed a real new host out to t=600 s.
+        for key in [k for k, t in self._pending.items() if t + PENDING_GRACE_SECONDS < now]:
             del self._pending[key]
+
+    def release(self, host: str) -> None:
+        """The scheduler will not ask `host` after all (its lane was drained): give back its
+        provisional place. A no-op for a host already contacted or never taken."""
+        self._pending.pop(str(host or "").strip().lower(), None)
 
     def _next_admission(self, now: float, exclude: str = "") -> float:
         """The earliest instant a host not yet contacted could START, counting real first contacts
-        and the provisional instants of hosts taken but not yet started (`exclude`: the host
-        asking, whose own provisional instant must not hold room against itself)."""
+        and the provisional instants of hosts taken but not yet started. With `exclude` (a host
+        asking to start), its own provisional place does not hold room against it, and neither does
+        any place reserved for a LATER instant than its own (or than now, if it has none): a host
+        waiting behind it in time must not push it back."""
         cap = self.max_new_hosts_per_minute
         if cap <= 0:
             return now
         self._prune(now)
-        entries = sorted(
-            self._first_contacts + [t for k, t in self._pending.items() if k != exclude]
-        )
+        if exclude:
+            own = self._pending.get(exclude, now)
+            pending = [t for k, t in self._pending.items() if k != exclude and t <= own]
+        else:
+            pending = list(self._pending.values())
+        entries = sorted(self._first_contacts + pending)
         at = now
         if entries:
             at = max(at, entries[-1])
@@ -468,34 +490,68 @@ async def acquire(host: str) -> float:
 _HOP_MARK = "pivota_global_pacer_request"
 
 
-async def _pace_redirect_hop(request: Any) -> None:
-    """httpx `request` event hook: every redirect HOP takes a global slot (review M2).
+def _hop_hook(*, robots_user_agent: Optional[str], per_host: bool):
+    """An httpx `request` event hook: every redirect HOP is gated like a first request (review M2,
+    and the controller's follow-up of 2026-10-17).
 
     httpx calls request hooks once per request it sends, the first one and every hop
     (`_send_handling_redirects`), and builds each hop with the SAME `extensions` dict as the request
-    before it. So the first call marks that dict and returns (the caller paced the first request
-    through `crawl_politeness`), and any call that finds the mark is a hop. Marking the request, not
-    counting calls on the client, keeps this right on a client shared by many requests.
+    before it. So the first call records its host in that dict and returns (the caller already gated
+    the first request through `crawl_politeness`), and any call that finds a recorded host is a hop.
+    Marking the request, not counting calls on the client, keeps this right on a shared client.
 
-    The hop pays `acquire(host)` for ITS host, so a hop onto another host is admitted against the
-    new-hosts-per-minute cap like any first contact. A no-op with no pacer installed, so a lane
-    without one only gains the lower `MAX_REDIRECTS`. `GlobalPaceStopped` propagates out of
+    WITH A PACER INSTALLED (the batch lanes), a hop:
+      * onto a DIFFERENT host than the request before it must be allowed by THAT host's robots.txt
+        (`crawl_politeness.robots_allows`), or `RobotsDisallowed` is raised out of `client.get` and
+        the hop is not sent. The repro fetched c.example/p through a redirect despite `Disallow: /`;
+      * with `per_host`, waits for its host's own slot exactly as a first request does
+        (`crawl_politeness.await_slot`: the per-host interval, any backoff, Crawl-delay, and the
+        global bucket, where a new host is admitted against the new-hosts-per-minute cap). Unbounded
+        patience (`max_wait=0`), like every batch caller;
+      * without `per_host` (the robots.txt fetch itself, which `await_slot` would recurse into), only
+        takes a global slot.
+    With NO pacer installed (the interactive route) the hook does nothing: that lane only gains the
+    lower `MAX_REDIRECTS`, and never an unbounded wait. `GlobalPaceStopped` propagates out of
     `client.get` and the hop is not sent.
     """
-    extensions = getattr(request, "extensions", None)
-    if not isinstance(extensions, dict):
-        return
-    if not extensions.get(_HOP_MARK):
-        extensions[_HOP_MARK] = True
-        return
-    host = str(getattr(getattr(request, "url", None), "host", "") or "").strip().lower()
-    if host:
-        await acquire(host)
+
+    async def hook(request: Any) -> None:
+        extensions = getattr(request, "extensions", None)
+        if not isinstance(extensions, dict):
+            return
+        url = getattr(request, "url", None)
+        host = str(getattr(url, "host", "") or "").strip().lower()
+        previous = extensions.get(_HOP_MARK)
+        extensions[_HOP_MARK] = host or "?"
+        if previous is None or not _ACTIVE or not host:
+            return
+        if not per_host:
+            await acquire(host)
+            return
+        from services import crawl_politeness  # deferred: crawl_politeness imports this module
+
+        target = str(url)
+        user_agent = robots_user_agent or str(getattr(request, "headers", {}).get("user-agent") or "")
+        if host != previous and not await crawl_politeness.robots_allows(target, user_agent=user_agent):
+            raise crawl_politeness.RobotsDisallowed(f"robots.txt disallows the redirect hop to {target}")
+        await crawl_politeness.await_slot(target, user_agent=user_agent, max_wait=0)
+
+    return hook
 
 
-def redirect_client_kwargs(max_redirects: int = MAX_REDIRECTS) -> Dict[str, Any]:
-    """Splat into an `httpx.AsyncClient(follow_redirects=True, ...)`: the hop hook and the hop cap."""
-    return {"event_hooks": {"request": [_pace_redirect_hop]}, "max_redirects": int(max_redirects)}
+def redirect_client_kwargs(
+    max_redirects: int = MAX_REDIRECTS,
+    *,
+    robots_user_agent: Optional[str] = None,
+    per_host: bool = True,
+) -> Dict[str, Any]:
+    """Splat into an `httpx.AsyncClient(follow_redirects=True, ...)`: the hop hook and the hop cap.
+    `robots_user_agent` is the agent robots.txt is evaluated for (default: the request's own
+    User-Agent header); `per_host=False` is for the robots.txt fetch only."""
+    return {
+        "event_hooks": {"request": [_hop_hook(robots_user_agent=robots_user_agent, per_host=per_host)]},
+        "max_redirects": int(max_redirects),
+    }
 
 
 def reset_for_tests() -> None:

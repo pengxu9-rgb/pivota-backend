@@ -142,6 +142,22 @@ _UNREACHABLE_REASON_BUCKETS = frozenset({"connection", "timeout", "dns", "tls"})
 # any per-host "unreachable" statistic measured before then.
 _HOST_UNREACHABLE_TRIP_DEFAULT = 20
 
+# A host that has answered this many Cloudflare CHALLENGES IN A ROW (`cf-mitigated: challenge`, at
+# any status) is skipped for the rest of the run, its remaining rows unstamped (controller review of
+# be#2640, 2026-10-17). Neither existing breaker could see it: the 429/503 one counts only those
+# statuses, the unreachable one only network errors, and `CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS` only
+# keeps a host out of the IP rule. ichibanm.com answered 239 requests with a 403 challenge in one run
+# and was asked every time: about 15% of the run's slots spent on answers that cannot change. 3, like
+# the IP rule's own idea of "not a fluke"; through the shared helper, so 0 is never "off".
+_HOST_CHALLENGE_TRIP_DEFAULT = 3
+
+
+def _host_challenge_trip() -> int:
+    """EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP, then 3. Rounded up, at least 1."""
+    return crawl_global_pacer.resolve_count(
+        None, "EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", _HOST_CHALLENGE_TRIP_DEFAULT
+    )
+
 # Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
 # once, but every worker holds an event-loop slice for HTML parsing on a 1-vCPU job, and the
 # DB pool (DB_POOL_MAX_SIZE) is shared.
@@ -191,8 +207,8 @@ _MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = crawl_global_pacer.MAX_NEW_HOSTS_PER_MINUTE_
 # went through `int()`, so 0.9 truncated to 0 and switched it off too. Both now resolve through
 # `crawl_global_pacer`, the one helper the destination sweep's knobs use as well: 0, negative, NaN or
 # garbage is an ERROR and the default; the rate is clamped to [0.05, 1.0]; the cap is rounded up and
-# is at least 1. The only off switch is CRAWL_GLOBAL_PACER_DISABLED=true (or this lane's
-# EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED=false), which logs at ERROR every run.
+# is at least 1. The only off switch is CRAWL_GLOBAL_PACER_DISABLED=true (the exact word; there is no
+# per-lane alias), which logs at ERROR every run.
 def _refresh_global_rps(explicit: Optional[float]) -> float:
     """`--global-rps`, then EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5; clamped to [0.05, 1.0]."""
     return crawl_global_pacer.resolve_rps(explicit, "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", _GLOBAL_RPS_DEFAULT)
@@ -209,7 +225,7 @@ def _refresh_max_new_hosts_per_minute(explicit: Optional[float]) -> int:
 def _refresh_global_pacer_disabled() -> bool:
     """The kill switch, logged at ERROR by `crawl_global_pacer.pacer_disabled` on every run."""
     return crawl_global_pacer.pacer_disabled(
-        legacy_enabled_env="EXTERNAL_REFERRAL_REFRESH_GLOBAL_PACER_ENABLED", lane="external-referral-refresh",
+        lane="external-referral-refresh",
     )
 
 
@@ -2058,6 +2074,7 @@ async def run_external_referral_refresh_batch(
     skipped_for_ip_throttle = 0
     host_trip = _host_block_trip()
     unreachable_trip = _host_unreachable_trip()
+    challenge_trip = _host_challenge_trip()
     concurrency = _refresh_host_concurrency(host_concurrency)
     # Looked up whatever the breakers say: the host is also the concurrency key (one row in
     # flight per host) and the per-host timing key. Without hosts every row is its own lane.
@@ -2135,6 +2152,9 @@ async def run_external_referral_refresh_batch(
     # 09-26/27 answered a plain HEAD from outside the crawl egress.
     unreachable_samples: Dict[str, str] = {}
     skipped_for_unreachable_host = 0
+    # Hosts that answered `challenge_trip` Cloudflare challenges in a row, and the rows passed over.
+    challenged_hosts: Dict[str, int] = {}
+    skipped_for_host_challenge = 0
     # Per-host cost, measured around the refresh call: the fetch, the pacing wait it includes,
     # the writes and the projection. This is how to see which hosts the budget goes to.
     host_stats: Dict[str, Dict[str, float]] = {}
@@ -2265,6 +2285,21 @@ async def run_external_referral_refresh_batch(
                 "external referral refresh: %s answered %d 429/503s in a row; skipping its "
                 "remaining rows this run", host, crawl_politeness.consecutive_blocks(host),
             )
+        # A CHALLENGE STREAK, at any status: stop asking. The same place and the same reasoning as
+        # the 429 breaker above: the streak lives in the pacing layer (`note_response`, which sees
+        # every challenged answer this row earned, robots.txt included), and it changes WHETHER the
+        # host is asked again, never how fast. An excluded host (CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS)
+        # is skipped here like any other: exclusion keeps it out of the IP rule, not in the queue.
+        if (
+            host
+            and host not in tripped_hosts
+            and crawl_politeness.consecutive_challenges(host) >= challenge_trip
+        ):
+            challenged_hosts[host] = 0
+            logger.warning(
+                "external referral refresh: %s answered %d Cloudflare challenges in a row; skipping "
+                "its remaining rows this run", host, crawl_politeness.consecutive_challenges(host),
+            )
         if not host:
             return
         stats = host_stats.setdefault(
@@ -2359,7 +2394,7 @@ async def run_external_referral_refresh_batch(
         skipped_for_ip_throttle += remaining
 
     def _drain_tripped_lane(key: str) -> None:
-        nonlocal skipped_for_host_backoff, skipped_for_unreachable_host
+        nonlocal skipped_for_host_backoff, skipped_for_unreachable_host, skipped_for_host_challenge
         # Passed-over rows are NOT stamped (`refresh_seed_by_id` is never called), so they keep
         # their place at the head of tomorrow's queue instead of being recorded as an attempt
         # that never happened.
@@ -2367,6 +2402,9 @@ async def run_external_referral_refresh_batch(
         if key in tripped_hosts:
             tripped_hosts[key] += remaining
             skipped_for_host_backoff += remaining
+        elif key in challenged_hosts:
+            challenged_hosts[key] += remaining
+            skipped_for_host_challenge += remaining
         else:
             unreachable_hosts[key] += remaining
             skipped_for_unreachable_host += remaining
@@ -2416,7 +2454,13 @@ async def run_external_referral_refresh_batch(
             finally:
                 async with lane_freed:
                     in_flight -= 1
-                    if key in tripped_hosts or key in unreachable_hosts:
+                    # A PHANTOM PLACE (controller review, LOW): a row that ended without sending a
+                    # request (a missing seed, a refusal before the fetch) leaves its host's
+                    # provisional new-host place behind, holding room under the cap for nobody.
+                    # Give it back. A no-op once the host has really been contacted. (A drained lane
+                    # needs no release of its own: a breaker only ever drains a host that answered.)
+                    pacer.release(key)
+                    if key in tripped_hosts or key in unreachable_hosts or key in challenged_hosts:
                         _drain_tripped_lane(key)
                     elif ip_breaker.tripped and lanes.get(key):
                         _drain_ip_throttled_lane(key)
@@ -2465,6 +2509,7 @@ async def run_external_referral_refresh_batch(
         - unprocessable
         - skipped_for_host_backoff
         - skipped_for_unreachable_host
+        - skipped_for_host_challenge
         - skipped_for_ip_throttle,
     )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
@@ -2575,6 +2620,11 @@ async def run_external_referral_refresh_batch(
         "skipped_for_unreachable_host": skipped_for_unreachable_host,
         "unreachable_host_skips": dict(sorted(unreachable_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_unreachable_trip": unreachable_trip,
+        # Rows NOT attempted because their host answered `host_challenge_trip` Cloudflare
+        # challenges in a row (any status), per host. Unstamped, like the other host skips.
+        "skipped_for_host_challenge": skipped_for_host_challenge,
+        "host_challenge_skips": dict(sorted(challenged_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "host_challenge_trip": challenge_trip,
         "unreachable_host_errors": unreachable_samples,
         # Rows NOT attempted because the IP breaker tripped and their host had throttled us or is
         # Shopify-served.

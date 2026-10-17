@@ -146,6 +146,12 @@ class _DomainState:
 
 
 _STATE: Dict[str, _DomainState] = {}
+# host -> Cloudflare challenges (`cf-mitigated: challenge`, at ANY status) answered in a row. Kept
+# apart from `_DomainState.consecutive_blocks`, which counts 429/503 only and drives the backoff:
+# a 403 challenge is not a pacing signal (waiting does not lift it), so it must not move the backoff,
+# but a batch needs the streak to stop asking (controller review of be#2640, 2026-10-17: ichibanm
+# answered 239 requests with a 403 challenge and was never stopped).
+_CHALLENGE_STREAK: Dict[str, int] = {}
 # host -> (expires_at_monotonic, parser or None, crawl_delay or None). A None parser is a
 # positive cache of "asked, nothing to obey" — without it a site with no robots.txt would be
 # re-asked on every single fetch.
@@ -179,6 +185,7 @@ def reset_for_tests() -> None:
     """Drop all pacing and robots state. Tests only."""
     global _ROBOTS_INFLIGHT_LOOP
     _STATE.clear()
+    _CHALLENGE_STREAK.clear()
     _ROBOTS.clear()
     _ROBOTS_INFLIGHT.clear()
     _ROBOTS_INFLIGHT_LOOP = None
@@ -255,7 +262,8 @@ async def _load_robots(host: str, user_agent: str) -> Tuple[Optional[RobotFilePa
             timeout=timeout,
             follow_redirects=True,
             headers={"User-Agent": user_agent},
-            **crawl_global_pacer.redirect_client_kwargs(_MAX_ROBOTS_REDIRECTS),
+            # `per_host=False`: a robots hop cannot wait on `await_slot`, which loads robots itself.
+            **crawl_global_pacer.redirect_client_kwargs(_MAX_ROBOTS_REDIRECTS, per_host=False),
             **({"transport": ROBOTS_TRANSPORT_FACTORY.get()(), "trust_env": False}
                if ROBOTS_TRANSPORT_FACTORY.get() else {}),
         ) as client:
@@ -488,9 +496,15 @@ def note_response(
         return
     if headers is not None:
         crawl_ip_throttle.observe_response(host, status_code, headers)
-        if status_code not in (429, 503) and crawl_ip_throttle.is_challenge(
-            crawl_ip_throttle.capture_throttle_headers(headers)
-        ):
+        challenged = crawl_ip_throttle.is_challenge(crawl_ip_throttle.capture_throttle_headers(headers))
+        if challenged:
+            _bounded(_CHALLENGE_STREAK)
+            _CHALLENGE_STREAK[host] = _CHALLENGE_STREAK.get(host, 0) + 1
+        elif clears:
+            # Any other answer from the host's pages breaks the streak; a robots.txt answer
+            # (`clears=False`) says nothing about the pages and leaves it alone.
+            _CHALLENGE_STREAK.pop(host, None)
+        if status_code not in (429, 503) and challenged:
             # A CHALLENGE THAT IS NOT A 429 (Cloudflare answers 403 + `cf-mitigated: challenge`)
             # left no line at all before 2026-10-17, so the 3-hosts-in-120 s challenge rule had no
             # per-host, per-night baseline to be calibrated from (review M5). One WARNING per
@@ -540,6 +554,13 @@ def note_response(
         "crawl backoff: %s returned %s (consecutive=%d), holding %.1fs%s",
         host, status_code, state.consecutive_blocks, wait, f" [{diag}]" if diag else "",
     )
+
+
+def consecutive_challenges(host: str) -> int:
+    """How many Cloudflare challenges in a row this host has answered, at any status, as
+    `note_response` counts them (only calls that pass the response headers). Read-only, keyed by
+    `host_of(url)`. 0 for a host with no streak."""
+    return int(_CHALLENGE_STREAK.get(str(host or "").strip().lower(), 0))
 
 
 def consecutive_blocks(host: str) -> int:
