@@ -108,7 +108,10 @@ async def _product(c, key, *, merchant, title, brand="Laneige", ck, seed_kind=No
 
 
 async def _offer(c, key, offer_id, *, merchant, price, host, sku_title="Default Title", offer_type="retailer",
-                 market="US"):  # price None: an offer the market lists without a price
+                 market="US", currency=None):  # price None: an offer the market lists without a price
+    from services.region_pricing import pricing_currency_for_region
+
+    currency = currency or pricing_currency_for_region(market)  # the market's own (market_currency_mismatch)
     sku_key = f"{key}::v:{offer_id}"  # a per-variant SKU, as the crawl lane keys it
     await c.execute(
         "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id,"
@@ -116,8 +119,8 @@ async def _offer(c, key, offer_id, *, merchant, price, host, sku_title="Default 
         sku_key, key, merchant, SYN, _spid(key), offer_id, sku_title, json.dumps({"option1": sku_title}))
     await c.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, offer_type, market, availability,"
-        " currency, merchant_effective_price, source_domain) VALUES ($1, $2, $3, $4, $5, $6, 'in_stock', 'USD', $7, $8)",
-        offer_id, sku_key, key, merchant, offer_type, market, price, host)
+        " currency, merchant_effective_price, source_domain) VALUES ($1, $2, $3, $4, $5, $6, 'in_stock', $9, $7, $8)",
+        offer_id, sku_key, key, merchant, offer_type, market, price, host, currency)
 
 
 ANCHOR = "ext:laneige-lip-sleeping-mask::a1"
@@ -137,6 +140,7 @@ async def _catalog(c):
     await _product(c, ULTA, merchant="m_ulta", title="LANEIGE Lip Sleeping Mask 0.7 oz", ck="ck_ulta")
     await _offer(c, ULTA, "o_ulta_20", merchant="m_ulta", price=24, host="www.ulta.com", sku_title="0.7 oz")
     await _offer(c, ULTA, "o_ulta_sg", merchant="m_ulta", price=30, host="www.ulta.com", sku_title="0.7 oz", market="SG")
+    # (priced in SGD: an SG offer in USD would hold Ulta as market_currency_mismatch)
     await _product(c, SEPH, merchant="m_seph", title="Lip Sleeping Mask 20g", ck="ck_seph")
     await _offer(c, SEPH, "o_seph", merchant="m_seph", price=23, host="sephora.com")
     # one retailer content_key held by two identical live rows: they move together

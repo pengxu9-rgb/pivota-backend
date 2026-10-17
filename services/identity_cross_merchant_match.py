@@ -50,7 +50,9 @@ THE JUDGEMENT (listing vs anchor), in order:
      read-time re-checked mirror pin would admit (`mirror_recheck_additional`), for Peng;
      `offer_sku_not_on_listing`: a per-variant offer of the listing whose sku_key is not
      `<the listing's product_key>::v:<non-empty variant>` (another product's SKU, `x::v:`) -- the
-     pin would name something the proposal does not move;
+     pin would name something the proposal does not move; `market_currency_mismatch`: such an offer,
+     in ANY market, priced in a currency that is not its market's (region_pricing's map) -- held even
+     where step 7 would skip the market;
   7. same-size price: the cheapest matched variant offer in the market (in-stock first) against the
      KEEPER ROW's own same-size price in the market; none (`price_unknown`) or two currencies
      (`price_currency_mismatch`) -> held; outside the EXCLUSIVE window 0.6 < ratio < 1.67 -> vetoed
@@ -117,6 +119,7 @@ from services.product_match_tiers import (
     text_sizes,
     tier_keys,
 )
+from services.region_pricing import pricing_currency_for_region_or_none
 
 STRATEGY = CROSS_MERCHANT_SAME_SIZE  # the engine's name for it (#2637); only this module produces it
 RULE_VERSION = "cmss.v3"
@@ -138,7 +141,7 @@ LIVE_PROPOSAL_STATUSES = ("proposed", "approved", "applied")
 VETOES_CHECKED: Tuple[str, ...] = (
     "conflict_tokens", "shade", "gtin_differs", "size", "offer_conflict_tokens", "anchor_single_size",
     "offer_size_pinned", "listing_single_size_all_markets", "offer_variant_pinned", "offer_sku_on_listing",
-    "key_single_size", "pending_or_applied_conflict", "price_ratio")
+    "market_currency", "key_single_size", "pending_or_applied_conflict", "price_ratio")
 #: sku_payload fields that can name a variant's size (the export reads only these).
 SKU_PAYLOAD_SIZE_FIELDS: Tuple[str, ...] = ("variant_title", "title", "size", "option1", "option2", "option3",
                                             "options", "selected_options")
@@ -152,7 +155,7 @@ SEED_VARIANT_SIZE_FIELDS: Tuple[str, ...] = ("title", "name", "option_value", "o
 HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "size_fraction_count",
                 "offer_size_unpinned",
                 "listing_multi_size", "offer_not_variant_pinned", "offer_sku_not_on_listing",
-                "key_size_conflict",
+                "market_currency_mismatch", "key_size_conflict",
                 "pending_or_applied_conflict", "price_unknown", "price_currency_mismatch",
                 "key_shared_with_unmatched", "unguarded_writer", "no_group_membership",
                 "old_group_has_other_members", "no_content_key", "old_content_key_not_read")
@@ -751,6 +754,17 @@ class Planner:
         # pinned on its remaining offers. Same helper as the engine's, so the two cannot drift.
         if any(not sku_key_on_moved_listing(o.sku_key, [li.product_key]) for o in variant_all):
             return Verdict("held", ["offer_sku_not_on_listing"], **held)
+        # Peng's standing rule (controller 10-17): an offer's price currency IS its market's currency
+        # (services.region_pricing.REGION_PRICING_CURRENCY, the one market -> currency map; never a
+        # second copy here). An offer of the listing that breaks it -- an SG offer priced in USD, a US
+        # offer in JPY, an offer for a market the map does not know -- holds the whole listing BEFORE
+        # the price window, so it also holds in a market the window would skip
+        # (keeper_has_no_same_size_offer_here), and such an offer never reaches matched_offers. That
+        # currency is informational in the verdict does not matter: this is the decision before it. An
+        # offer with neither a price nor a currency states no price currency and is not judged here.
+        if any(o.currency != pricing_currency_for_region_or_none(o.market)
+               for o in variant_all if o.price is not None or o.currency):
+            return Verdict("held", ["market_currency_mismatch"], **held)
         # The price window, PER MARKET: each market's matched offers against the keeper's same-market,
         # same-size, same-words unit. The run's market must have both sides; another market where the
         # keeper sells nothing at that size is skipped, and recorded.

@@ -326,7 +326,13 @@ def test_no_price_or_two_currencies_hold():
     assert outcome(plan, a)["reason"] == "price_unknown" and outcome(plan, a)["status"] == "held"
     cat2 = laneige_catalog()
     b = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", currency="SGD")
-    assert outcome(cat2.plan(), b)["reason"] == "price_currency_mismatch"
+    assert outcome(cat2.plan(), b)["reason"] == "market_currency_mismatch"   # a US offer in SGD
+    # Two currencies with the listing's right: the keeper's own US offer priced in SGD.
+    cat3 = Cat()
+    cat3.row(LANEIGE, brand="LANEIGE", title="Lip Sleeping Mask 20g", seed_kind="self", created="2026-01-01")
+    cat3.offer(LANEIGE, host="us.laneige.com", brand_direct=True, currency="SGD")
+    c = retailer(cat3, 1, "Laneige", "Lip Sleeping Mask 20g")
+    assert outcome(cat3.plan(), c)["reason"] == "price_currency_mismatch"
 
 
 def test_differing_valid_gtins_veto():
@@ -1533,20 +1539,43 @@ def test_m1b_a_merges_offers_must_be_on_a_row_it_moves():
 
 
 def test_low_a_currency_that_is_not_the_markets_is_held_in_any_market():
-    # A US offer priced in JPY against the keeper's USD price: held in the run's market.
+    # A US offer priced in JPY: held in the run's market.
     cat = laneige_catalog()
     r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g", currency="JPY", price=24)
     plan = cat.plan()
-    assert plan.proposals == [] and outcome(plan, r)["reason"] == "price_currency_mismatch"
-    # An SG offer priced in USD against the keeper's SG price in SGD: held, though the US side matches.
-    cat2 = laneige_catalog()
-    cat2.offer(LANEIGE, sku="Default Title", market="SG", currency="SGD", price=32, brand_direct=True,
-               sku_key=cat2.offers[0]["sku_key"])
-    s_ = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
-    cat2.offer(s_, sku="20g", market="SG", currency="USD", price=24)
-    plan2 = cat2.plan()
-    assert plan2.proposals == [] and outcome(plan2, s_)["reason"] == "price_currency_mismatch"
-    assert outcome(plan2, s_)["status"] == "held"
+    assert plan.proposals == [] and outcome(plan, r)["reason"] == "market_currency_mismatch"
+
+
+def _sg_case(sg_currency: str, keeper_sells_sg: bool):
+    cat = laneige_catalog()
+    if keeper_sells_sg:
+        cat.offer(LANEIGE, sku="Default Title", market="SG", currency="SGD", price=32, brand_direct=True,
+                  sku_key=cat.offers[0]["sku_key"])
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    cat.offer(r, sku="20g", market="SG", currency=sg_currency, price=24 if sg_currency == "USD" else 32,
+              offer_id="off_sg")
+    return cat.plan(), r
+
+
+@pytest.mark.parametrize("keeper_sells_sg", [False, True])
+def test_market_currency_mismatch_an_sg_offer_in_usd_holds_whether_or_not_the_keeper_sells_in_sg(keeper_sells_sg):
+    """Peng's rule (controller 10-17): an offer's currency is its market's. Held even where the price
+    window would skip SG (keeper_has_no_same_size_offer_here), and never named in matched_offers."""
+    plan, r = _sg_case("USD", keeper_sells_sg)
+    assert plan.proposals == []
+    assert outcome(plan, r)["status"] == "held" and outcome(plan, r)["reason"] == "market_currency_mismatch"
+    assert "off_sg" not in json.dumps(plan.proposals)
+
+
+@pytest.mark.parametrize("keeper_sells_sg", [False, True])
+def test_market_currency_an_sg_offer_in_sgd_is_unaffected(keeper_sells_sg):
+    plan, r = _sg_case("SGD", keeper_sells_sg)
+    assert proposed_keys(plan) == [r]
+    named = plan.proposals[0]["evidence"]["matcher_verdict"]["matched_offers"]
+    assert {(o["offer_id"], o["market"], o["currency"]) for o in named if o["market"] == "SG"} == {
+        ("off_sg", "SG", "SGD")}
+    by_market = plan.proposals[0]["evidence"]["listings"][0]["price"]["by_market"]["SG"]
+    assert (by_market.get("skipped") == "keeper_has_no_same_size_offer_here") == (not keeper_sells_sg)
 
 
 def test_m3_the_script_refuses_a_full_scan_unless_asked_by_name():
