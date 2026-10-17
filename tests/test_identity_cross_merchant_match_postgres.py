@@ -520,3 +520,76 @@ async def test_m2_the_controllers_spellings_are_found_on_postgres_or_refused(con
             async with conn.transaction(readonly=True):
                 await script.brand_spellings(conn, [requested])
         assert all(b in str(exc.value) for b in refused)
+
+
+async def test_a_selection_is_folded_into_the_digest_and_writes_exactly_the_subset(conn, tmp_path, capsys):
+    """--only-proposals / --exclude-proposals on the production dialect: the full set's digest never
+    authorises a subset, a subset's never the full set or the other mode, a stale id or an empty file
+    refuses, and --write-proposals inserts exactly the selected proposals."""
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    c = conn
+    await _catalog(c)
+
+    def lines():
+        return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+    out = tmp_path / "out"
+    assert await script.run(c, _args(out)) == 0
+    full = lines()
+    head = next(line for line in full if line["section"] == "proposals")
+    full_digest = head["digest"]
+    ids = sorted(json.loads(x)["proposal_id"] for x in (out / "proposals.jsonl").read_text().splitlines())
+    assert len(ids) == 3
+    keep, rest = ids[:2], ids[2:]
+    only = tmp_path / "clean.json"
+    only.write_text(json.dumps(keep))
+    excl = tmp_path / "rest.txt"
+    excl.write_text("\n".join(rest) + "\n")
+
+    # the dry run under the selection: the subset's digest, count and a next_step carrying the flag
+    assert await script.run(c, _args(out, "--only-proposals", str(only))) == 0
+    sub = lines()
+    outputs = next(line for line in sub if line["section"] == "outputs")
+    sub_digest = outputs["digest"]
+    assert sub_digest != full_digest and outputs["proposals"] == 2
+    assert outputs["selection"]["run_digest"] == full_digest and outputs["selection"]["of"] == 3
+    assert f"--expect-digest {sub_digest} --max-proposals 2 --only-proposals {only} " in outputs["next_step"]
+    assert all(a["selection"]["mode"] == "only" for a in sub if a["section"] == "audit")
+    assert sorted(json.loads(x)["proposal_id"] for x in (out / "proposals.jsonl").read_text().splitlines()) == keep
+    # the same two reached with --exclude are another authorisation
+    assert await script.run(c, _args(out, "--exclude-proposals", str(excl))) == 0
+    excl_digest = next(line for line in lines() if line["section"] == "outputs")["digest"]
+    assert len({full_digest, sub_digest, excl_digest}) == 3
+    assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0
+
+    def write(digest, *flag):
+        return script.run(c, _args(out, "--write-proposals", "--expect-digest", digest, "--max-proposals", "3", *flag))
+
+    for digest, flag in ((full_digest, ["--only-proposals", str(only)]),    # full digest + subset flag
+                         (sub_digest, []),                                  # subset digest, no flag
+                         (sub_digest, ["--exclude-proposals", str(excl)])):  # subset digest, other mode
+        assert await write(digest, *flag) == 2
+        assert [line["section"] for line in lines() if line["section"] == "refused"] == ["refused"]
+        assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0
+
+    # a stale id, and an empty file, refuse with exit 2 and write nothing
+    stale = tmp_path / "stale.txt"
+    stale.write_text("\n".join([*keep, "irp_" + "0" * 32]))
+    assert await write(sub_digest, "--only-proposals", str(stale)) == 2
+    assert "irp_" + "0" * 32 in next(line for line in lines() if line["section"] == "refused")["reason"]
+    empty = tmp_path / "empty.txt"
+    empty.write_text("")
+    assert await write(sub_digest, "--only-proposals", str(empty)) == 2
+    capsys.readouterr()
+    assert await c.fetchval("SELECT count(*) FROM identity_resolution_proposals") == 0
+
+    # the matching digest + flag inserts exactly the selected proposals, one run id
+    assert await write(sub_digest, "--only-proposals", str(only)) == 0
+    written = next(line for line in lines() if line["section"] == "written")
+    assert written["inserted"] == 2 and written["dry_run_digest"] == sub_digest
+    assert written["selection"]["mode"] == "only" and written["selection"]["selected"] == 2
+    rows = await _proposals(c)
+    assert [r["proposal_id"] for r in rows] == keep
+    assert {r["status"] for r in rows} == {"proposed"}
+    assert {r["evidence"]["proposal_run_id"] for r in rows} == {written["proposal_run_id"]}

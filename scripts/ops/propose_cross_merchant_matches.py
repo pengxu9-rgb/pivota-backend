@@ -36,6 +36,19 @@ MODES
       this invocation) and prints the proposal run id and the approve DRY-RUN command, whose output
       carries the ira_ digest the --execute approval needs.
 
+SELECTION (either mode; mutually exclusive): --only-proposals PATH keeps only the proposals whose
+  proposal_id the file names; --exclude-proposals PATH keeps all but those. PATH is a local file or
+  gs://bucket/object (read with the job's metadata-server token: UNTESTED against GCS -- a Cloud Run
+  job cannot see a laptop path), holding one proposal_id per line (blank and '#' lines ignored) or a
+  JSON list. An id that is not among THIS run's proposals refuses the run (exit 2, naming it): a stale
+  file must not silently select less; so does an empty file or a selection that keeps nothing. The
+  selection is FOLDED INTO THE DIGEST (identity_cross_merchant_match.proposal_set_digest: the selected
+  proposals plus a line carrying the mode and the sorted selected ids), so a digest printed for a
+  subset never authorises the full set or another subset, and the full set's digest never authorises
+  a subset. The dry run prints the subset's digest, count and a next_step carrying the same flag;
+  --write-proposals takes the same flag and file, recomputes, and refuses on a mismatch. Counts,
+  samples, proposals.jsonl and the audit sample are of the subset and say so ("selection").
+
 SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
   --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
                    stored spelling of the family ("Dr.Jart+", "Dr. Jart+", "DR JART" for drjart) is
@@ -87,6 +100,7 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     evidence_problems,
     plan_market,
     select_brand_spellings,
+    SelectionError,
     stamp_run,
 )
 
@@ -398,6 +412,71 @@ def _gcs_upload(bucket: str, name: str, body: bytes) -> None:  # pragma: no cove
         pass
 
 
+def _gcs_download(bucket: str, name: str) -> bytes:  # pragma: no cover - needs GCP
+    """Read one object with the job's service account (metadata-server token), stdlib only. UNTESTED
+    against GCS, like _gcs_upload."""
+    import urllib.parse
+    import urllib.request
+
+    tok_req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"})
+    with urllib.request.urlopen(tok_req, timeout=10) as r:
+        token = json.loads(r.read())["access_token"]
+    url = (f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o/"
+           f"{urllib.parse.quote(name, safe='')}?alt=media")
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def parse_proposal_ids(text: str, *, source: str = "the selection file") -> List[str]:
+    """proposal_ids from a selection file: a JSON list of strings, or one id per line (blank lines
+    and lines starting with '#' ignored). Order kept, duplicates dropped. Empty -> [] (the caller
+    refuses an empty selection)."""
+    body = text.strip()
+    if body.startswith("["):
+        try:
+            raw = json.loads(body)
+        except ValueError as exc:
+            raise Refused(f"{source} is not a valid JSON list: {exc}") from exc
+        if not isinstance(raw, list) or not all(isinstance(x, str) and x.strip() for x in raw):
+            raise Refused(f"{source}: a JSON selection must be a list of non-empty proposal_id strings")
+        ids = [x.strip() for x in raw]
+    else:
+        ids = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return list(dict.fromkeys(ids))
+
+
+def load_selection(args: argparse.Namespace, *,
+                   downloader: Callable[[str, str], bytes] = _gcs_download) -> Optional[Tuple[str, List[str], str]]:
+    """(mode, proposal_ids, path) for --only-proposals / --exclude-proposals, else None. Refuses an
+    unreadable or empty file before anything is read from the database."""
+    for mode in ("only", "exclude"):
+        path = getattr(args, f"{mode}_proposals", None)
+        if not path:
+            continue
+        flag = f"--{mode}-proposals"
+        try:
+            if path.startswith("gs://"):
+                bucket, _, name = path[len("gs://"):].partition("/")
+                text = downloader(bucket, name).decode("utf-8")
+            else:
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise Refused(f"{flag} {path}: cannot read it ({exc})") from exc
+        ids = parse_proposal_ids(text, source=f"{flag} {path}")
+        if not ids:
+            raise Refused(f"{flag} {path} names no proposal_id: an empty selection is refused")
+        return mode, ids, path
+    return None
+
+
+def selection_flag(selection: Optional[Tuple[str, List[str], str]]) -> str:
+    return "" if selection is None else f" --{selection[0]}-proposals {selection[2]}"
+
+
 def write_outputs(out: str, files: Mapping[str, bytes], *,
                   uploader: Callable[[str, str, bytes], None] = _gcs_upload) -> List[str]:
     written = []
@@ -459,7 +538,8 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
             if counts["inserted"]:
                 inserted.append(p)
     return {"proposal_run_id": run_id, "proposed": len(stamped), "inserted": len(inserted),
-            "deduped": len(stamped) - len(inserted), "dry_run_digest": digest}
+            "deduped": len(stamped) - len(inserted), "dry_run_digest": digest,
+            **({"selection": plan.selection_info} if plan.selection_info else {})}
 
 
 def approve_commands(run_id: str) -> Dict[str, str]:
@@ -478,6 +558,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap.add_argument("--expect-digest")
     ap.add_argument("--max-proposals", type=int)
     ap.add_argument("--market", default="US")
+    select = ap.add_mutually_exclusive_group()
+    select.add_argument("--only-proposals", metavar="PATH",
+                        help="keep only the proposal_ids this file names (one per line or a JSON list); "
+                             "folded into the digest")
+    select.add_argument("--exclude-proposals", metavar="PATH",
+                        help="keep every proposal except the proposal_ids this file names; folded into the digest")
     scope = ap.add_mutually_exclusive_group()
     scope.add_argument("--brands", default="", help="comma-separated brands (canonical brand match)")
     scope.add_argument("--all-brands", action="store_true",
@@ -490,6 +576,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = ap.parse_args(list(argv))
     if args.write_proposals and (not args.expect_digest or not args.max_proposals or args.max_proposals < 1):
         ap.error("--write-proposals needs --expect-digest (from a dry run) and --max-proposals >= 1")
+    if args.explain and (args.only_proposals or args.exclude_proposals):
+        ap.error("--explain plans the statements only; it takes no --only-proposals / --exclude-proposals")
     if args.limit_groups is not None and args.limit_groups < 1:
         ap.error("--limit-groups must be >= 1")
     args.market = args.market.strip().upper()
@@ -505,7 +593,8 @@ def _print(line: Mapping[str, Any]) -> None:
 
 
 async def run(conn: Any, args: argparse.Namespace, *,
-              uploader: Callable[[str, str, bytes], None] = _gcs_upload) -> int:
+              uploader: Callable[[str, str, bytes], None] = _gcs_upload,
+              downloader: Callable[[str, str], bytes] = _gcs_download) -> int:
     if getattr(args, "all_brands", False):
         _print(_line("warning", level="WARN",
                      message=("WARN --all-brands: phase 1 reads every signed live product of market "
@@ -515,6 +604,11 @@ async def run(conn: Any, args: argparse.Namespace, *,
         for line in await explain(conn, args.market, args.brand_list):
             _print(line)
         return 0
+    try:
+        selection = load_selection(args, downloader=downloader)
+    except Refused as exc:  # unreadable / empty selection file: refused before the database is read
+        _print(_line("refused", reason=str(exc)))
+        return 2
     try:
         snap, counts = await export_snapshot(conn, args.market, brands=args.brand_list,
                                              limit_groups=args.limit_groups)
@@ -532,6 +626,12 @@ async def run(conn: Any, args: argparse.Namespace, *,
                               "run passed the blind-spot guard); review brand_spellings in the loaded line")))
     _print(_line("loaded", market=args.market, brands=args.brand_list, **counts))
     plan = plan_market(snap, args.market, brands=args.brand_list, limit_groups=args.limit_groups)
+    if selection is not None:
+        try:
+            plan.select(selection[0], selection[1])
+        except SelectionError as exc:
+            _print(_line("refused", reason=str(exc), selection_file=selection[2]))
+            return 2
     for line in report_lines(plan):
         _print(line)
     audit = plan.audit_rows(size=args.audit_size, seed=args.audit_seed)
@@ -553,8 +653,10 @@ async def run(conn: Any, args: argparse.Namespace, *,
     written = write_outputs(args.out, output_files(plan, audit_size=args.audit_size, audit_seed=args.audit_seed),
                             uploader=uploader)
     _print(_line("outputs", files=written, digest=plan.digest(), proposals=len(plan.proposals),
+                 **({"selection": plan.selection_info} if plan.selection_info else {}),
                  next_step=(f"--write-proposals --expect-digest {plan.digest()} --max-proposals "
-                            f"{len(plan.proposals)} (same --market, --brands or --all-brands, --limit-groups)")))
+                            f"{len(plan.proposals)}{selection_flag(selection)} "
+                            "(same --market, --brands or --all-brands, --limit-groups)")))
     return 0
 
 

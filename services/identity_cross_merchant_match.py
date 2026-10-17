@@ -1122,6 +1122,10 @@ class Plan:
     _decided: Set[str] = field(default_factory=set)
     pairs: List[Dict[str, Any]] = field(default_factory=list)  # (moved row, anchor) for audit + stats
     new_multi_merchant_groups: int = 0
+    #: (mode, sorted selected proposal_ids) once select() narrowed the run; folded into digest()
+    selection: Optional[Tuple[str, Tuple[str, ...]]] = None
+    selection_info: Optional[Dict[str, Any]] = None
+    _hosts_before: Dict[str, Set[str]] = field(default_factory=dict)
 
     def _outcome(self, li: Listing, status: str, reason: str, anchor: Optional[Listing],
                  reasons: Optional[List[str]] = None, tiers: Optional[List[str]] = None,
@@ -1209,17 +1213,48 @@ class Plan:
         self.proposals.sort(key=lambda p: p["proposal_id"])
         self.outcomes.sort(key=lambda o: o["product_key"])
         self.pairs.sort(key=lambda x: (x["proposal_id"], x["listing"].product_key))
+        for pr in self.pairs:
+            ck = pr["anchor"].content_key
+            if ck not in self._hosts_before:
+                self._hosts_before[ck] = {h for r in planner.by_ck.get(ck, ()) for h in r.sig.hosts}
+        self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
+
+    def _count_new_multi_merchant_groups(self) -> int:
         gained: Dict[str, Set[str]] = defaultdict(set)
         for pr in self.pairs:
             gained[pr["anchor"].content_key].update(pr["listing"].sig.hosts)
+        n = 0
         for ck, hosts in gained.items():
-            before = {h for r in planner.by_ck.get(ck, ()) for h in r.sig.hosts}
+            before = self._hosts_before.get(ck, set())
             if len(before) < 2 and len(before | hosts) >= 2:
-                self.new_multi_merchant_groups += 1
+                n += 1
+        return n
+
+    def select(self, mode: str, ids: Iterable[str]) -> None:
+        """Narrow the run to a hand-labelled subset (--only-proposals / --exclude-proposals): keeps
+        select_proposals' choice in proposals AND pairs (so the counts, samples and audit sample are of
+        the subset), and records the selection so digest() folds it in -- a subset's digest never
+        authorises the full set or another subset. Raises SelectionError (unknown id, empty selection).
+        Outcomes (held / deferred / vetoed) stay those of the full run."""
+        if self.selection is not None:
+            raise SelectionError("a selection was already applied to this plan")
+        full = len(self.proposals)
+        run_digest = self.digest()
+        id_list = list(ids)
+        kept = select_proposals(self.proposals, mode, id_list)
+        keep_ids = {p["proposal_id"] for p in kept}
+        self.proposals = kept
+        self.pairs = [pr for pr in self.pairs if pr["proposal_id"] in keep_ids]
+        self.selection = (mode, tuple(sorted(keep_ids)))
+        self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
+        self.selection_info = {"applied": True, "mode": mode, "ids_in_file": len(set(id_list)),
+                               "selected": len(kept), "of": full, "run_digest": run_digest,
+                               "note": ("counts, samples and the audit sample are of the SELECTED proposals; "
+                                        "outcomes and yield_both_ways are of the full run")}
 
     # -- reporting --------------------------------------------------------------------------------
     def digest(self) -> str:
-        return proposal_set_digest(self.proposals)
+        return proposal_set_digest(self.proposals, selection=self.selection)
 
     def summary(self, *, top: int = 30, samples_per_tier: int = 20) -> List[Dict[str, Any]]:
         by_tier = Counter(p["evidence"]["tier"] for p in self.proposals)
@@ -1237,7 +1272,8 @@ class Plan:
              "anchor_reasons": dict(sorted(self.anchor_reasons.items())),
              "already_on_anchor": self.already_on_anchor,
              "expected_new_multi_merchant_groups": self.new_multi_merchant_groups,
-             "digest": self.digest(), "rule_version": RULE_VERSION},
+             "digest": self.digest(), "rule_version": RULE_VERSION,
+             **({"selection": self.selection_info} if self.selection_info else {})},
             {"section": "yield_both_ways", "market": self.market,
              "per_variant_only_listings": len(self.pairs),
              "mirror_recheck_additional": mirror_extra,
@@ -1257,13 +1293,18 @@ class Plan:
         ]
         for tier in TIERS:
             sample = [p for p in self.proposals if p["evidence"]["tier"] == tier][:samples_per_tier]
-            lines.append({"section": "samples", "market": self.market, "tier": tier, "proposals": [
+            lines.append({"section": "samples", "market": self.market, "tier": tier,
+                          **({"selection": self._selection_brief()} if self.selection_info else {}), "proposals": [
                 {"proposal_id": p["proposal_id"], "kind": p["kind"], "keeper": p["keeper_product_key"],
                  "anchor_title": p["evidence"]["anchor"]["title"],
                  "listings": [{"title": d["title"], "hosts": d["hosts"], "ratio": d["price_ratio"]}
                               for d in p["evidence"]["listings"]],
                  "size": p["evidence"]["matcher_verdict"]["size"]} for p in sample]})
         return lines
+
+    def _selection_brief(self) -> Dict[str, Any]:
+        info = self.selection_info or {}
+        return {k: info[k] for k in ("mode", "selected", "of")}
 
     def audit_rows(self, *, size: int = 600, seed: int = 20261016) -> List[Dict[str, Any]]:
         """A seeded RANDOM sample of (moved listing, anchor) pairs for Peng's side-by-side review.
@@ -1281,6 +1322,7 @@ class Plan:
                 "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
                                        [o["offer_id"] for o in v.matched_offers]),
                 "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
+                **({"selection": self._selection_brief()} if self.selection_info else {}),
             })
         return out
 
@@ -1292,11 +1334,50 @@ def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]
             "hosts": sorted(li.sig.hosts), "offer_ids": sorted(offer_ids)}
 
 
-def proposal_set_digest(proposals: Sequence[Mapping[str, Any]]) -> str:
+SELECTION_MODES = ("only", "exclude")
+
+
+class SelectionError(ValueError):
+    """A --only-proposals / --exclude-proposals selection that must not run."""
+
+
+def proposal_set_digest(proposals: Sequence[Mapping[str, Any]], *,
+                        selection: Optional[Tuple[str, Sequence[str]]] = None) -> str:
     """Deterministic digest of a proposal set: each proposal's id and what it says it will do
-    (identity_resolution.proposal_fingerprint: kind, keeper, target, subjects, evidence), sorted."""
+    (identity_resolution.proposal_fingerprint: kind, keeper, target, subjects, evidence), sorted.
+
+    `selection` (mode, selected proposal_ids) is the hand-labelled subset the run was narrowed to:
+    `proposals` are then the SELECTED ones, and a last line carrying the mode and the sorted selected
+    ids is folded in. With no selection the digest is exactly the unselected one, so a subset's digest
+    never equals the full set's, nor another subset's, nor the same subset reached the other way."""
     lines = sorted(f"{p['proposal_id']}\t{proposal_fingerprint(dict(p))}" for p in proposals)
+    if selection is not None:
+        mode, ids = selection
+        if mode not in SELECTION_MODES:
+            raise SelectionError(f"unknown selection mode {mode!r}")
+        lines.append(f"selection\t{mode}\t{','.join(sorted(ids))}")
     return "cmd_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
+
+
+def select_proposals(proposals: Sequence[Mapping[str, Any]], mode: str,
+                     ids: Iterable[str]) -> List[Dict[str, Any]]:
+    """The proposals a selection keeps: mode "only" keeps those whose proposal_id is in `ids`,
+    "exclude" keeps the rest. Refuses (SelectionError) an empty id list, any id that is not among
+    `proposals` (a stale file must not silently select less), and a selection that keeps nothing."""
+    if mode not in SELECTION_MODES:
+        raise SelectionError(f"unknown selection mode {mode!r}")
+    wanted = set(ids)
+    if not wanted:
+        raise SelectionError(f"the --{mode}-proposals file names no proposal_id")
+    known = {p["proposal_id"] for p in proposals}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise SelectionError(f"{len(unknown)} proposal_id(s) in the --{mode}-proposals file are not among this "
+                             f"run's {len(known)} proposals (stale file, or another run's): {unknown}")
+    keep = [dict(p) for p in proposals if (p["proposal_id"] in wanted) == (mode == "only")]
+    if not keep:
+        raise SelectionError(f"the --{mode}-proposals selection keeps no proposal")
+    return keep
 
 
 def stamp_run(proposals: Sequence[Mapping[str, Any]], run_id: str) -> List[Dict[str, Any]]:
@@ -1527,5 +1608,6 @@ __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
     "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
-    "proposal_set_digest", "seed_matches", "select_brand_spellings", "stamp_run",
+    "proposal_set_digest", "seed_matches", "select_brand_spellings", "select_proposals", "stamp_run",
+    "SELECTION_MODES", "SelectionError",
 ]
