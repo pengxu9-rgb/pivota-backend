@@ -1,0 +1,713 @@
+{
+ "brand_sig": {
+  "commerce_surface": "agent_api",
+  "input": {
+   "product_id": "sig_grp_brand",
+   "sku_id": null
+  },
+  "mapping": {
+   "candidates": [
+    {
+     "confidence": 0.8,
+     "domain": "brand.com",
+     "external_product_id": "ext_spec",
+     "kind": "external_seed",
+     "reason": "matched_external_seed",
+     "seed_id": "eps_spec",
+     "variant_id": "SKU-50ML"
+    },
+    {
+     "confidence": 0.8,
+     "kind": "catalog_offer",
+     "product_key": "ext:retailer:serum-sk",
+     "reason": "matched_canonical_identity"
+    }
+   ],
+   "canonical_identity_status": "no_canonical_identity",
+   "canonical_product": null,
+   "canonical_product_group_id": null,
+   "canonical_ref": null,
+   "requested_target": {
+    "product_id": "sig_grp_brand"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "substitution_reason_codes": []
+  },
+  "metadata": {
+   "commerce_surface": "agent_api",
+   "failure_breakdown": {},
+   "has_external": true,
+   "has_internal": false,
+   "latency_ms": 0,
+   "merchant_scope": null,
+   "reason": "resolved",
+   "reason_code": "OK",
+   "requested_target": {
+    "product_id": "sig_grp_brand"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "servable_reason_codes": [],
+   "source": "offers.resolve",
+   "sources": [
+    {
+     "latency_ms": 0,
+     "ok": true,
+     "query": "external_seed_by_pivota_signature",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "external_product_seeds",
+     "status": "ok"
+    },
+    {
+     "latency_ms": 0,
+     "ok": false,
+     "query": "products_cache_by_alias",
+     "reason": "NO_CANDIDATES",
+     "reason_code": "no_candidates",
+     "row_count": 0,
+     "source": "products_cache",
+     "status": "empty"
+    },
+    {
+     "emitted": 1,
+     "latency_ms": 0,
+     "ok": true,
+     "query": "catalog_offers_by_canonical_identity",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "catalog_offers",
+     "status": "ok"
+    }
+   ],
+   "substitution_reason_codes": []
+  },
+  "offers": [
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "cart_prefilled": true,
+    "confidence": 0.8,
+    "currency": "USD",
+    "execution_spec": {
+     "cart_url": "https://brand.com/cart/43062643884185:1?utm_source=pivota&utm_medium=%2A&utm_campaign=US&attributes[pivota_click_id]=clk_0001&country=US",
+     "expires_at": null,
+     "merchant_domain": "brand.com",
+     "pdp_url": "https://brand.com/products/serum?utm_source=pivota&utm_medium=%2A&utm_campaign=US&pvt_click_id=clk_0001&utm_content=clk_0001",
+     "rail": "shopify_cart",
+     "tracking": {
+      "click_id": "clk_0001",
+      "join_mode": "cart_permalink",
+      "param": "attributes[pivota_click_id]"
+     },
+     "variant_id": "43062643884185"
+    },
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "brand.com",
+    "merchant_name": "Brand",
+    "offer_id": "of:external_seed:eps_spec:SKU-50ML",
+    "price": 29.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "Brand",
+    "source": {
+     "canonical_url": "https://brand.com/products/serum",
+     "destination_url": "https://brand.com/products/serum",
+     "domain": "brand.com",
+     "external_product_id": "ext_spec",
+     "image_url": null,
+     "seed_id": "eps_spec",
+     "title": "50ml",
+     "type": "external_seed",
+     "variant_id": "SKU-50ML"
+    },
+    "variant_count": 2,
+    "variants": [
+     {
+      "currency": "USD",
+      "in_stock": true,
+      "price": 19.0,
+      "title": "30ml",
+      "variant_id": "SKU-30ML"
+     },
+     {
+      "currency": "USD",
+      "in_stock": true,
+      "price": 29.0,
+      "title": "50ml",
+      "variant_id": "SKU-50ML"
+     }
+    ]
+   },
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "availability": "in_stock",
+    "cart_prefilled": null,
+    "confidence": 0.8,
+    "currency": "USD",
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "agent_seed::retailer::stylekorean.com",
+    "merchant_name": "stylekorean.com",
+    "offer_id": "of:catalog_offer:of_sk",
+    "price": 15.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "stylekorean.com",
+    "source": {
+     "content_key": "ck_grp_serum",
+     "destination_url": "https://www.stylekorean.com/p/serum",
+     "is_first_party": false,
+     "merchant_id": "agent_seed::retailer::stylekorean.com",
+     "offer_id": "of_sk",
+     "offer_type": "retailer",
+     "product_key": "ext:retailer:serum-sk",
+     "readiness_tier": "referral_only",
+     "type": "catalog_offer"
+    },
+    "updated_at": "2026-10-01T00:00:00",
+    "url": "https://www.stylekorean.com/p/serum"
+   }
+  ],
+  "offers_count": 2,
+  "requested_target": {
+   "product_id": "sig_grp_brand"
+  },
+  "resolution_mode": "external_only",
+  "resolved_target": null,
+  "status": "success",
+  "substitution_reason_codes": []
+ },
+ "content_key": {
+  "commerce_surface": "agent_api",
+  "input": {
+   "product_id": "ck_grp_serum",
+   "sku_id": null
+  },
+  "mapping": {
+   "candidates": [
+    {
+     "confidence": 0.8,
+     "kind": "catalog_offer",
+     "product_key": "ext:retailer:serum-sk",
+     "reason": "matched_canonical_identity"
+    }
+   ],
+   "canonical_identity_status": "no_canonical_identity",
+   "canonical_product": null,
+   "canonical_product_group_id": null,
+   "canonical_ref": null,
+   "requested_target": {
+    "product_id": "ck_grp_serum"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "substitution_reason_codes": []
+  },
+  "metadata": {
+   "commerce_surface": "agent_api",
+   "failure_breakdown": {},
+   "has_external": true,
+   "has_internal": false,
+   "latency_ms": 0,
+   "merchant_scope": null,
+   "reason": "resolved",
+   "reason_code": "OK",
+   "requested_target": {
+    "product_id": "ck_grp_serum"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "servable_reason_codes": [],
+   "source": "offers.resolve",
+   "sources": [
+    {
+     "latency_ms": 0,
+     "ok": true,
+     "query": "external_seed_by_fuzzy_ref",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 0,
+     "source": "external_product_seeds",
+     "status": "ok"
+    },
+    {
+     "latency_ms": 0,
+     "ok": false,
+     "query": "products_cache_by_alias",
+     "reason": "NO_CANDIDATES",
+     "reason_code": "no_candidates",
+     "row_count": 0,
+     "source": "products_cache",
+     "status": "empty"
+    },
+    {
+     "emitted": 1,
+     "latency_ms": 0,
+     "ok": true,
+     "query": "catalog_offers_by_canonical_identity",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "catalog_offers",
+     "status": "ok"
+    }
+   ],
+   "substitution_reason_codes": []
+  },
+  "offers": [
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "availability": "in_stock",
+    "cart_prefilled": null,
+    "confidence": 0.8,
+    "currency": "USD",
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "agent_seed::retailer::stylekorean.com",
+    "merchant_name": "stylekorean.com",
+    "offer_id": "of:catalog_offer:of_sk",
+    "price": 15.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "stylekorean.com",
+    "source": {
+     "content_key": "ck_grp_serum",
+     "destination_url": "https://www.stylekorean.com/p/serum",
+     "is_first_party": false,
+     "merchant_id": "agent_seed::retailer::stylekorean.com",
+     "offer_id": "of_sk",
+     "offer_type": "retailer",
+     "product_key": "ext:retailer:serum-sk",
+     "readiness_tier": "referral_only",
+     "type": "catalog_offer"
+    },
+    "updated_at": "2026-10-01T00:00:00",
+    "url": "https://www.stylekorean.com/p/serum"
+   }
+  ],
+  "offers_count": 1,
+  "requested_target": {
+   "product_id": "ck_grp_serum"
+  },
+  "resolution_mode": "external_only",
+  "resolved_target": null,
+  "status": "success",
+  "substitution_reason_codes": []
+ },
+ "lone_sig": {
+  "commerce_surface": "agent_api",
+  "input": {
+   "product_id": "sig_lone_toner",
+   "sku_id": null
+  },
+  "mapping": {
+   "candidates": [
+    {
+     "confidence": 0.8,
+     "domain": "lonebrand.com",
+     "external_product_id": "ext_lone",
+     "kind": "external_seed",
+     "reason": "matched_external_seed",
+     "seed_id": "eps_lone",
+     "variant_id": "SKU-50ML"
+    },
+    {
+     "confidence": 0.8,
+     "kind": "catalog_offer",
+     "product_key": "prod::m_lone::shopify::toner",
+     "reason": "matched_canonical_identity"
+    }
+   ],
+   "canonical_identity_status": "no_canonical_identity",
+   "canonical_product": null,
+   "canonical_product_group_id": null,
+   "canonical_ref": null,
+   "requested_target": {
+    "product_id": "sig_lone_toner"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "substitution_reason_codes": []
+  },
+  "metadata": {
+   "commerce_surface": "agent_api",
+   "failure_breakdown": {},
+   "has_external": true,
+   "has_internal": false,
+   "latency_ms": 0,
+   "merchant_scope": null,
+   "reason": "resolved",
+   "reason_code": "OK",
+   "requested_target": {
+    "product_id": "sig_lone_toner"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "servable_reason_codes": [],
+   "source": "offers.resolve",
+   "sources": [
+    {
+     "latency_ms": 0,
+     "ok": true,
+     "query": "external_seed_by_pivota_signature",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "external_product_seeds",
+     "status": "ok"
+    },
+    {
+     "latency_ms": 0,
+     "ok": false,
+     "query": "products_cache_by_alias",
+     "reason": "NO_CANDIDATES",
+     "reason_code": "no_candidates",
+     "row_count": 0,
+     "source": "products_cache",
+     "status": "empty"
+    },
+    {
+     "emitted": 1,
+     "latency_ms": 0,
+     "ok": true,
+     "query": "catalog_offers_by_canonical_identity",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "catalog_offers",
+     "status": "ok"
+    }
+   ],
+   "substitution_reason_codes": []
+  },
+  "offers": [
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "cart_prefilled": true,
+    "confidence": 0.8,
+    "currency": "USD",
+    "execution_spec": {
+     "cart_url": "https://lonebrand.com/cart/43062643884185:1?utm_source=pivota&utm_medium=%2A&utm_campaign=US&attributes[pivota_click_id]=clk_0001&country=US",
+     "expires_at": null,
+     "merchant_domain": "lonebrand.com",
+     "pdp_url": "https://lonebrand.com/products/toner?utm_source=pivota&utm_medium=%2A&utm_campaign=US&pvt_click_id=clk_0001&utm_content=clk_0001",
+     "rail": "shopify_cart",
+     "tracking": {
+      "click_id": "clk_0001",
+      "join_mode": "cart_permalink",
+      "param": "attributes[pivota_click_id]"
+     },
+     "variant_id": "43062643884185"
+    },
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "lonebrand.com",
+    "merchant_name": "Brand",
+    "offer_id": "of:external_seed:eps_lone:SKU-50ML",
+    "price": 29.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "Brand",
+    "source": {
+     "canonical_url": "https://lonebrand.com/products/toner",
+     "destination_url": "https://lonebrand.com/products/toner",
+     "domain": "lonebrand.com",
+     "external_product_id": "ext_lone",
+     "image_url": null,
+     "seed_id": "eps_lone",
+     "title": "50ml",
+     "type": "external_seed",
+     "variant_id": "SKU-50ML"
+    },
+    "variant_count": 2,
+    "variants": [
+     {
+      "currency": "USD",
+      "in_stock": true,
+      "price": 19.0,
+      "title": "30ml",
+      "variant_id": "SKU-30ML"
+     },
+     {
+      "currency": "USD",
+      "in_stock": true,
+      "price": 29.0,
+      "title": "50ml",
+      "variant_id": "SKU-50ML"
+     }
+    ]
+   },
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "availability": "in_stock",
+    "cart_prefilled": null,
+    "confidence": 0.8,
+    "currency": "USD",
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "agent_seed::retailer::yesstyle.com",
+    "merchant_name": "yesstyle.com",
+    "offer_id": "of:catalog_offer:of_lone_rt",
+    "price": 11.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "yesstyle.com",
+    "source": {
+     "content_key": "ck_lone_toner",
+     "destination_url": "https://www.yesstyle.com/p/serum",
+     "is_first_party": false,
+     "merchant_id": "agent_seed::retailer::yesstyle.com",
+     "offer_id": "of_lone_rt",
+     "offer_type": "retailer",
+     "product_key": "prod::m_lone::shopify::toner",
+     "readiness_tier": "referral_only",
+     "type": "catalog_offer"
+    },
+    "updated_at": "2026-10-01T00:00:00",
+    "url": "https://www.yesstyle.com/p/serum"
+   }
+  ],
+  "offers_count": 2,
+  "requested_target": {
+   "product_id": "sig_lone_toner"
+  },
+  "resolution_mode": "external_only",
+  "resolved_target": null,
+  "status": "success",
+  "substitution_reason_codes": []
+ },
+ "retailer_sig": {
+  "commerce_surface": "agent_api",
+  "input": {
+   "product_id": "sig_grp_retailer",
+   "sku_id": null
+  },
+  "mapping": {
+   "candidates": [
+    {
+     "confidence": 0.8,
+     "kind": "catalog_offer",
+     "product_key": "ext:retailer:serum-sk",
+     "reason": "matched_canonical_identity"
+    }
+   ],
+   "canonical_identity_status": "no_canonical_identity",
+   "canonical_product": null,
+   "canonical_product_group_id": null,
+   "canonical_ref": null,
+   "requested_target": {
+    "product_id": "sig_grp_retailer"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "substitution_reason_codes": []
+  },
+  "metadata": {
+   "commerce_surface": "agent_api",
+   "failure_breakdown": {},
+   "has_external": true,
+   "has_internal": false,
+   "latency_ms": 0,
+   "merchant_scope": null,
+   "reason": "resolved",
+   "reason_code": "OK",
+   "requested_target": {
+    "product_id": "sig_grp_retailer"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "servable_reason_codes": [],
+   "source": "offers.resolve",
+   "sources": [
+    {
+     "latency_ms": 0,
+     "ok": true,
+     "query": "external_seed_by_fuzzy_ref",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 0,
+     "source": "external_product_seeds",
+     "status": "ok"
+    },
+    {
+     "latency_ms": 0,
+     "ok": false,
+     "query": "products_cache_by_alias",
+     "reason": "NO_CANDIDATES",
+     "reason_code": "no_candidates",
+     "row_count": 0,
+     "source": "products_cache",
+     "status": "empty"
+    },
+    {
+     "emitted": 1,
+     "latency_ms": 0,
+     "ok": true,
+     "query": "catalog_offers_by_canonical_identity",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "catalog_offers",
+     "status": "ok"
+    }
+   ],
+   "substitution_reason_codes": []
+  },
+  "offers": [
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "availability": "in_stock",
+    "cart_prefilled": null,
+    "confidence": 0.8,
+    "currency": "USD",
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "agent_seed::retailer::stylekorean.com",
+    "merchant_name": "stylekorean.com",
+    "offer_id": "of:catalog_offer:of_sk",
+    "price": 15.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "stylekorean.com",
+    "source": {
+     "content_key": "ck_grp_serum",
+     "destination_url": "https://www.stylekorean.com/p/serum",
+     "is_first_party": false,
+     "merchant_id": "agent_seed::retailer::stylekorean.com",
+     "offer_id": "of_sk",
+     "offer_type": "retailer",
+     "product_key": "ext:retailer:serum-sk",
+     "readiness_tier": "referral_only",
+     "type": "catalog_offer"
+    },
+    "updated_at": "2026-10-01T00:00:00",
+    "url": "https://www.stylekorean.com/p/serum"
+   }
+  ],
+  "offers_count": 1,
+  "requested_target": {
+   "product_id": "sig_grp_retailer"
+  },
+  "resolution_mode": "external_only",
+  "resolved_target": null,
+  "status": "success",
+  "substitution_reason_codes": []
+ },
+ "retailer_sig_named_variant": {
+  "commerce_surface": "agent_api",
+  "input": {
+   "product_id": "sig_grp_retailer",
+   "sku_id": "SKU-50ML"
+  },
+  "mapping": {
+   "candidates": [
+    {
+     "confidence": 0.8,
+     "kind": "catalog_offer",
+     "product_key": "ext:retailer:serum-sk",
+     "reason": "matched_canonical_identity"
+    }
+   ],
+   "canonical_identity_status": "no_canonical_identity",
+   "canonical_product": null,
+   "canonical_product_group_id": null,
+   "canonical_ref": null,
+   "requested_target": {
+    "product_id": "sig_grp_retailer",
+    "sku_id": "SKU-50ML"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "substitution_reason_codes": []
+  },
+  "metadata": {
+   "commerce_surface": "agent_api",
+   "failure_breakdown": {},
+   "has_external": true,
+   "has_internal": false,
+   "latency_ms": 0,
+   "merchant_scope": null,
+   "reason": "resolved",
+   "reason_code": "OK",
+   "requested_target": {
+    "product_id": "sig_grp_retailer",
+    "sku_id": "SKU-50ML"
+   },
+   "resolution_mode": "external_only",
+   "resolved_target": null,
+   "servable_reason_codes": [],
+   "source": "offers.resolve",
+   "sources": [
+    {
+     "latency_ms": 0,
+     "ok": true,
+     "query": "external_seed_by_fuzzy_ref",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 0,
+     "source": "external_product_seeds",
+     "status": "ok"
+    },
+    {
+     "latency_ms": 0,
+     "ok": false,
+     "query": "products_cache_by_alias",
+     "reason": "SKIPPED",
+     "reason_code": "skipped_sku_text_scan_disabled",
+     "row_count": 0,
+     "source": "products_cache",
+     "status": "skipped"
+    },
+    {
+     "emitted": 1,
+     "latency_ms": 0,
+     "ok": true,
+     "query": "catalog_offers_by_canonical_identity",
+     "reason": "OK",
+     "reason_code": "ok",
+     "row_count": 1,
+     "source": "catalog_offers",
+     "status": "ok"
+    }
+   ],
+   "substitution_reason_codes": []
+  },
+  "offers": [
+   {
+    "affiliate_url": "https://pivota.test/r?token=fixed",
+    "availability": "in_stock",
+    "cart_prefilled": null,
+    "confidence": 0.8,
+    "currency": "USD",
+    "in_stock": true,
+    "internal_checkout_items": null,
+    "merchant_id": "agent_seed::retailer::stylekorean.com",
+    "merchant_name": "stylekorean.com",
+    "offer_id": "of:catalog_offer:of_sk",
+    "price": 15.0,
+    "purchase_route": "affiliate_outbound",
+    "seller": "stylekorean.com",
+    "source": {
+     "content_key": "ck_grp_serum",
+     "destination_url": "https://www.stylekorean.com/p/serum",
+     "is_first_party": false,
+     "merchant_id": "agent_seed::retailer::stylekorean.com",
+     "offer_id": "of_sk",
+     "offer_type": "retailer",
+     "product_key": "ext:retailer:serum-sk",
+     "readiness_tier": "referral_only",
+     "type": "catalog_offer"
+    },
+    "updated_at": "2026-10-01T00:00:00",
+    "url": "https://www.stylekorean.com/p/serum"
+   }
+  ],
+  "offers_count": 1,
+  "requested_target": {
+   "product_id": "sig_grp_retailer",
+   "sku_id": "SKU-50ML"
+  },
+  "resolution_mode": "external_only",
+  "resolved_target": null,
+  "status": "success",
+  "substitution_reason_codes": []
+ }
+}
