@@ -29,7 +29,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable, Mapping, Optional
 
-from services.catalog_identity import normalize_brand, normalize_title
+from services.brand_spelling import match_brand  # noqa: F401 - re-exported
+from services.catalog_identity import normalize_title
 
 # Size / weight / pack units. A leading number + one of these = packaging, dropped.
 _UNIT = (
@@ -57,22 +58,8 @@ _XPACK_RE = re.compile(r"\b\d*\s*x\s*\d+\b")
 # stray single 'x' left after size tokens around it are removed
 _STRAY_X_RE = re.compile(r"(?:^|\s)x(?:\s|$)")
 
-# Storefront descriptor tokens some vendors append to the brand name
-# ("COSRX Official", "... Flagship") that aren't part of the brand identity.
-# Conservative on purpose: dropping "shop"/"beauty"/"store" would corrupt real
-# brands ("The Face Shop", "Huda Beauty"). A brand-alias map (services/brand_alias)
-# is the general fix; this handles the common storefront-vendor case.
-_BRAND_DESCRIPTOR_TOKENS = frozenset({"official", "flagship"})
-
-
-def match_brand(brand: Optional[str]) -> str:
-    """normalize_brand + drop a trailing storefront descriptor. So a Shopify
-    vendor "COSRX Official" and a retailer/catalog "COSRX" both key as "cosrx".
-    Never strips to empty (keeps at least one token)."""
-    toks = normalize_brand(brand).split()
-    while len(toks) > 1 and toks[-1] in _BRAND_DESCRIPTOR_TOKENS:
-        toks.pop()
-    return " ".join(toks)
+# match_brand (normalize_brand + trailing storefront descriptor) lives in services/brand_spelling.py
+# with the measured brand families; imported above and re-exported here for existing callers.
 
 
 # Bundle / promo / marketing words that don't carry product identity.
