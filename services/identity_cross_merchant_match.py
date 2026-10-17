@@ -50,9 +50,10 @@ THE JUDGEMENT (listing vs anchor), in order:
      read-time re-checked mirror pin would admit (`mirror_recheck_additional`), for Peng;
      `offer_sku_not_on_listing`: a per-variant offer of the listing whose sku_key is not
      `<the listing's product_key>::v:<non-empty variant>` (another product's SKU, `x::v:`) -- the
-     pin would name something the proposal does not move; `market_currency_mismatch`: such an offer,
-     in ANY market, priced in a currency that is not its market's (region_pricing's map) -- held even
-     where step 7 would skip the market;
+     pin would name something the proposal does not move; `market_currency_mismatch`: ANY offer of
+     the listing (mirror and '::canonical' included), in ANY market, stating a price or currency that
+     is not its market's currency (region_pricing's map; an unmapped market never matches) -- held even
+     where step 7 would skip the market; `keeper_market_currency_mismatch`: the same of the keeper row;
   7. same-size price: the cheapest matched variant offer in the market (in-stock first) against the
      KEEPER ROW's own same-size price in the market; none (`price_unknown`) or two currencies
      (`price_currency_mismatch`) -> held; outside the EXCLUSIVE window 0.6 < ratio < 1.67 -> vetoed
@@ -92,6 +93,8 @@ import hashlib
 import json
 import random
 import re
+import string
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -155,7 +158,7 @@ SEED_VARIANT_SIZE_FIELDS: Tuple[str, ...] = ("title", "name", "option_value", "o
 HELD_REASONS = ("multi_anchor", "multi_anchor_listing", "no_direct_anchor_match", "size_fraction_count",
                 "offer_size_unpinned",
                 "listing_multi_size", "offer_not_variant_pinned", "offer_sku_not_on_listing",
-                "market_currency_mismatch", "key_size_conflict",
+                "market_currency_mismatch", "keeper_market_currency_mismatch", "key_size_conflict",
                 "pending_or_applied_conflict", "price_unknown", "price_currency_mismatch",
                 "key_shared_with_unmatched", "unguarded_writer", "no_group_membership",
                 "old_group_has_other_members", "no_content_key", "old_content_key_not_read")
@@ -454,6 +457,15 @@ def _side_price(offers: Iterable[Offer]) -> Tuple[Optional[float], str, str]:
         return None, "", "none"
     best = min(pool, key=lambda o: (o.price, o.offer_id))
     return best.price, best.currency, basis
+
+
+def _off_market_currency(o: Offer) -> bool:
+    """Peng's rule broken: the offer states a price or a currency, and its currency is not its
+    market's (region_pricing; a market the map does not know never matches). An offer with neither a
+    price nor a currency is not judged."""
+    if o.price is None and not o.currency:
+        return False
+    return o.currency != pricing_currency_for_region_or_none(o.market)
 
 
 def _row_info(entry: Any) -> Dict[str, Any]:
@@ -756,15 +768,21 @@ class Planner:
             return Verdict("held", ["offer_sku_not_on_listing"], **held)
         # Peng's standing rule (controller 10-17): an offer's price currency IS its market's currency
         # (services.region_pricing.REGION_PRICING_CURRENCY, the one market -> currency map; never a
-        # second copy here). An offer of the listing that breaks it -- an SG offer priced in USD, a US
-        # offer in JPY, an offer for a market the map does not know -- holds the whole listing BEFORE
-        # the price window, so it also holds in a market the window would skip
-        # (keeper_has_no_same_size_offer_here), and such an offer never reaches matched_offers. That
-        # currency is informational in the verdict does not matter: this is the decision before it. An
-        # offer with neither a price nor a currency states no price currency and is not judged here.
-        if any(o.currency != pricing_currency_for_region_or_none(o.market)
-               for o in variant_all if o.price is not None or o.currency):
+        # second copy here). EVERY offer of the listing is judged -- per-variant, mirror and
+        # '::canonical' alike, every market: they all move with the listing onto the keeper's product.
+        # One that breaks it (an SG offer priced in USD, a GB mirror in USD, a priced offer with no
+        # currency, an unpriced offer stated in the wrong currency, any offer of a market the map does
+        # not know) holds the whole listing BEFORE the price window, so it also holds in a market the
+        # window would skip (keeper_has_no_same_size_offer_here), and such an offer never reaches
+        # matched_offers. The KEEPER ROW's own offers are judged the same way
+        # (`keeper_market_currency_mismatch`): a keeper GB offer in USD is the PDP every listing would
+        # join. That currency is informational in the verdict does not matter: this is the decision
+        # before it. Only an offer with NEITHER a price NOR a currency (it states no price currency at
+        # all) is not judged.
+        if any(_off_market_currency(o) for u in units for o in u.offers):
             return Verdict("held", ["market_currency_mismatch"], **held)
+        if any(_off_market_currency(o) for u in self.units(anchor.product_key) for o in u.offers):
+            return Verdict("held", ["keeper_market_currency_mismatch"], **held)
         # The price window, PER MARKET: each market's matched offers against the keeper's same-market,
         # same-size, same-words unit. The run's market must have both sides; another market where the
         # keeper sells nothing at that size is skipped, and recorded.
@@ -1334,14 +1352,33 @@ def gtin_lookup_values(raw_gtins: Iterable[Any]) -> List[str]:
 #     indexable alternation;
 #   - a spelling whose runs are ALL 1-2 characters ("SK II", "S K II") starts with k's first one or two
 #     characters followed by a separator or the end: `^sk([^[:alnum:]]|$)`, `^s([^[:alnum:]]|$)`,
-#     also indexable (pg_trgm reads `^` as a word start).
-# Measured on a local 300k-row table with the 059 index: each family's regex is a bitmap index scan
-# (~1 ms); a regex that allows a separator between EVERY pair of letters is exact but gives pg_trgm
-# no trigram (a sequential scan), as do wider accent choices and one alternation over many families --
-# hence this form. Known gaps, accepted: an all-short-runs spelling that starts with punctuation
-# ("'SK II'"); a 3-letter window with two accented letters and no other 3+ run; letters outside
-# Latin-1 / Extended-A (full-width "ＳＫ-II"); a letter whose fold is two characters (sharp s -> "ss").
-# None is in any family measured so far; the full run (--all-brands) has no such gap.
+#     also indexable (pg_trgm reads `^` as a word start) -- or does so after ONE leading ASCII space or
+#     punctuation character (" SK-II", "(SK-II)", "[VT] Cosmetics", "(e.l.f.)": _PG_LEAD).
+# Measured on a local 300k-row table with the 059 index, by the bitmap scan's ACTUAL rows (a plan
+# that shows an Index Cond can still scan the whole index): each chunked regex returns a handful of
+# rows (~1 ms); a regex that allows a separator between EVERY pair of letters is exact but gives
+# pg_trgm no trigram (the whole index), as do wider accent choices, a non-ASCII literal, and one long
+# alternation (even one family's: hence PG_REGEX_COST_BUDGET chunks).
+#
+# THE BLIND SPOT, GUARDED (controller MEDIUM, 10-17). The loose regex still cannot see, structurally: a
+# short-run spelling behind TWO or more leading characters, or a non-ASCII one ("((SK-II))", "【VT】"),
+# and a spelling whose letters are non-ASCII beyond the folding above (full-width "ＳＫ-ＩＩ" /
+# "ＳＨＩＳＥＩＤＯ" / "Ｌａｎｅｉｇｅ", common in JP feeds; two accents in one 3-letter window; sharp s).
+# Full-width variants were measured and kept OUT of the regex: pg_trgm extracted no trigram from
+# full-width letters on the measured build (PostgreSQL 15, en_US.UTF-8 on macOS libc -- whose
+# non-ASCII character classes differ from Cloud SQL's glibc), so every such pattern scanned the whole
+# index. A scoped run must
+# not silently differ from the full run, so the script reads every DISTINCT brand of exactly those two
+# SHAPES (BRAND_BLIND_SPOT_SQL: starts non-alphanumeric, or holds a non-ASCII character), keeps those
+# whose canonical_brand after NFKC is a requested family, and REFUSES the run if any of them was not
+# found by the pre-select (brand_blind_spot_misses), naming them: use --all-brands, or fix the
+# spelling. A family with nothing in the blind spot runs as before.
+# TODO(before any JP / KR scoped run; the controller's two options): (1) full-width forms in the
+# pre-select -- re-measure on a glibc PostgreSQL (Cloud SQL's) whether pg_trgm extracts trigrams from
+# U+FF01-U+FF5E letters; if so add each chunk's full-width spelling as one more variant; (2) the
+# `(^|[^[:alnum:]])` start piece is built only for ONE leading ASCII character (_PG_LEAD); longer or
+# non-ASCII leads need another indexable form. Until then the guard refuses those runs, and the script
+# prints a WARN line for a JP / KR run or a non-ASCII chosen spelling.
 _FOLD_RANGES = ((0x00C0, 0x0180),)
 
 
@@ -1358,6 +1395,11 @@ def _build_fold_alternatives() -> Dict[str, Tuple[str, ...]]:
 
 _FOLD_ALTERNATIVES = _build_fold_alternatives()
 _PG_SEPARATOR = "([^[:alnum:]]|$)"
+#: ONE leading ASCII space or punctuation character before a short start piece (" SK-II", "(SK-II)",
+#: "[VT] Cosmetics", "(e.l.f.)"), spelled as an explicit bracket of those characters: pg_trgm reads
+#: such a class as a word boundary and still extracts the start piece's trigrams, while the generic
+#: `(^|[^[:alnum:]])` or `^[^[:alnum:]]` gives it none (measured: a scan of the whole index).
+_PG_LEAD = "^[" + "".join(("\\" + c) if c in "\\]^-[" else c for c in " " + string.punctuation) + "]"
 
 
 def _pg_char(c: str, *, accents: bool) -> str:
@@ -1371,52 +1413,95 @@ def _pg_char(c: str, *, accents: bool) -> str:
 
 
 def brand_family_keys(brands: Sequence[str]) -> Dict[str, List[str]]:
-    """canonical family -> every brand key canonical_brand maps to it: the family itself and each
-    measured RETAILER_BRAND_SPELLINGS key, both as measured ("skⅱ": a stored "SKⅡ" holds no 3-gram of
-    "skii") and accent-folded."""
+    """canonical family -> the ASCII brand keys canonical_brand maps to it: the family itself and each
+    measured RETAILER_BRAND_SPELLINGS key, accent-folded. A key that stays non-ASCII ("skⅱ", Hangul) is
+    left OUT of the regex -- pg_trgm extracted no trigram from such a literal on the measured build, and
+    one such alternative turns the whole family's scan into a full index scan -- so its spellings are
+    the blind-spot guard's (non-ASCII shape): refused, never silently missed."""
     from services.brand_spelling import RETAILER_BRAND_SPELLINGS
 
     out: Dict[str, Set[str]] = {}
     for b in brands:
         fam = canonical_brand(b)
         if fam:
-            out.setdefault(fam, {fam})
-    for key, fam in RETAILER_BRAND_SPELLINGS.items():
-        if fam in out:
-            for form in (key.lower(), _fold(key)):
-                k = "".join(c for c in form if c.isalnum())
-                if k:
-                    out[fam].add(k)
+            out.setdefault(fam, set())
+    for key in [*out, *(k for k, fam in RETAILER_BRAND_SPELLINGS.items() if fam in out)]:
+        fam = RETAILER_BRAND_SPELLINGS.get(key, key)
+        k = "".join(c for c in _fold(key) if c.isalnum())
+        if k and k.isascii() and fam in out:
+            out[fam].add(k)
     return {fam: sorted(keys) for fam, keys in sorted(out.items())}
 
 
-def _pg_variants(chars: str) -> List[str]:
-    """`chars` as PostgreSQL ARE atoms: as written, plus one variant per position whose letter has
-    accented forms, that ONE position an alternation ("or(e|é|è|...)", never all three at once: the
+def _pg_variants(chars: str) -> List[Tuple[str, int]]:
+    """`chars` as PostgreSQL ARE atoms, each with its trigram COST (how many literal spellings it
+    stands for): as written (1), plus one variant per position whose letter has accented forms, that
+    ONE position an alternation ("or(e|é|è|...)", cost = its choices; never all three at once: the
     trigrams of three alternations multiply past pg_trgm's limits and it falls back to a scan)."""
-    out = ["".join(_pg_char(c, accents=False) for c in chars)]
+    out = [("".join(_pg_char(c, accents=False) for c in chars), 1)]
     for j, c in enumerate(chars):
         if c in _FOLD_ALTERNATIVES:
-            out.append("".join(_pg_char(x, accents=(n == j)) for n, x in enumerate(chars)))
+            out.append(("".join(_pg_char(x, accents=(n == j)) for n, x in enumerate(chars)),
+                        1 + len(_FOLD_ALTERNATIVES[c])))
     return out
 
 
-def brand_preselect_regexes(brands: Sequence[str]) -> Dict[str, str]:
-    """Step 1: per canonical family, a PostgreSQL regex over lower(coalesce(brand, '')) matching a
-    SUPERSET of the spellings whose canonical_brand is that family (see the comment above), in a form
-    the trigram index serves. ONE regex per family, run as one query each: a single alternation over
-    many families grows past pg_trgm's trigram limits and silently becomes a sequential scan."""
-    out: Dict[str, str] = {}
+#: The most trigram COST one regex may carry. pg_trgm stops extracting past its internal limits
+#: (MAX_TRGM_COUNT and friends) and silently falls back to a scan of the WHOLE index -- measured: one
+#: regex per family already did that for dior, ysl and cledepeaubeaute (1,200-1,800 characters). Chunks
+#: of cost <= 200 all stayed selective on the measured build; 120 leaves a margin.
+PG_REGEX_COST_BUDGET = 120
+
+
+def brand_preselect_regexes(brands: Sequence[str]) -> Dict[str, List[str]]:
+    """Step 1: per canonical family, PostgreSQL regexes over lower(coalesce(brand, '')) whose union
+    matches a SUPERSET of the family's ASCII-keyed spellings (see the comment above), each small enough
+    for the trigram index to serve (PG_REGEX_COST_BUDGET); the script runs one query per regex. A
+    family with no ASCII key has none: every spelling of it is the blind-spot guard's."""
+    out: Dict[str, List[str]] = {}
     for fam, keys in brand_family_keys(brands).items():
-        alternatives: Set[str] = set()
+        alternatives: Dict[str, int] = {}
         for k in keys:
             for i in range(len(k) - 2):
                 alternatives.update(_pg_variants(k[i:i + 3]))
-            alternatives.update("^" + v + _PG_SEPARATOR for v in _pg_variants(k[:1]))
-            if len(k) >= 2:
-                alternatives.update("^" + v + _PG_SEPARATOR for v in _pg_variants(k[:2]))
-        out[fam] = "|".join(sorted(alternatives))
+            for start in ("^", _PG_LEAD):
+                pieces = _pg_variants(k[:1]) + (_pg_variants(k[:2]) if len(k) >= 2 else [])
+                alternatives.update((start + v + _PG_SEPARATOR, cost) for v, cost in pieces)
+        chunks: List[List[str]] = []
+        used = 0
+        for alt in sorted(alternatives):
+            if not chunks or used + alternatives[alt] > PG_REGEX_COST_BUDGET:
+                chunks.append([])
+                used = 0
+            chunks[-1].append(alt)
+            used += alternatives[alt]
+        out[fam] = ["|".join(c) for c in chunks]
     return out
+
+
+def in_brand_blind_spot(spelling: Any) -> bool:
+    """The SHAPES the pre-select may not see (BRAND_BLIND_SPOT_SQL's predicate, in Python): the stored
+    brand starts with a non-alphanumeric character, or holds any non-ASCII character."""
+    s = "" if spelling is None else str(spelling)
+    return bool(s) and (not s[0].isalnum() or not s.isascii())
+
+
+def brand_blind_spot_misses(brands: Sequence[str], candidates: Iterable[Any],
+                            found: Iterable[Any]) -> Dict[str, List[str]]:
+    """family -> the blind-spot spellings (`candidates`, BRAND_BLIND_SPOT_SQL's rows) whose
+    canonical_brand after NFKC ("ＳＫ-ＩＩ" -> "SK-II") is that requested family but which the
+    pre-select did not return (`found`: every spelling it chose). Non-empty -> the scoped run would
+    miss rows of the family, and the script refuses it. Other brands in the blind spot never count."""
+    wanted = {canonical_brand(b) for b in brands} - {""}
+    seen = {str(f) for f in found if f is not None}
+    out: Dict[str, Set[str]] = defaultdict(set)
+    for c in candidates:
+        if c is None or str(c) in seen or not in_brand_blind_spot(c):
+            continue
+        fam = canonical_brand(unicodedata.normalize("NFKC", str(c)))
+        if fam in wanted:
+            out[fam].add(str(c))
+    return {fam: sorted(v) for fam, v in sorted(out.items())}
 
 
 def select_brand_spellings(brands: Sequence[str], spellings: Iterable[Any]) -> List[str]:
@@ -1440,6 +1525,7 @@ def brand_exact_regex(lowered_spellings: Iterable[str]) -> Optional[str]:
 
 __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
-    "Snapshot", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes", "evidence_problems",
-    "matcher_verdict", "member_fingerprint", "plan_market", "proposal_set_digest", "seed_matches", "select_brand_spellings", "stamp_run",
+    "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
+    "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
+    "proposal_set_digest", "seed_matches", "select_brand_spellings", "stamp_run",
 ]

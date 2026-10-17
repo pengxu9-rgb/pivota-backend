@@ -80,6 +80,7 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     Plan,
     Planner,
     Snapshot,
+    brand_blind_spot_misses,
     brand_exact_regex,
     brand_preselect_regexes,
     gtin_lookup_values,
@@ -90,19 +91,37 @@ from services.identity_cross_merchant_match import (  # noqa: E402
 )
 
 CENSUS = "cross_merchant_match"
+#: Markets whose marketplace feeds carry the spellings the --brands pre-select is weakest on (full-width
+#: Latin in JP, bracketed brands in KR): every run there prints a WARN line.
+WARN_MARKETS = ("JP", "KR")
 AUDIT_SAMPLE_DEFAULT = 600
 AUDIT_SEED_DEFAULT = 20261016
 OUT_DEFAULT = "/tmp/cross_merchant_match"
 
-# PHASE 0 (--brands only) -- the stored spellings of the requested brands. $1 is one family's LOOSE
-# regex (identity_cross_merchant_match.brand_preselect_regexes: a superset of its spellings, built so
-# the trigram GIN index idx_catalog_products_brand_trgm, migration 059, on lower(coalesce(brand, '')),
-# serves it); one statement per family. DISTINCT spellings only; select_brand_spellings then keeps
+# PHASE 0 (--brands only) -- the stored spellings of the requested brands. $1 is one chunk of a
+# family's LOOSE regex (identity_cross_merchant_match.brand_preselect_regexes: together a superset of
+# its ASCII-keyed spellings, each chunk small enough that the trigram GIN index
+# idx_catalog_products_brand_trgm, migration 059, on lower(coalesce(brand, '')), serves it); one
+# statement per chunk. DISTINCT spellings only; select_brand_spellings then keeps
 # exactly those whose canonical_brand is the family.
 BRAND_SPELLINGS_SQL = """
 SELECT DISTINCT p.brand, lower(coalesce(p.brand, '')) AS lowered
 FROM catalog_products p
 WHERE lower(coalesce(p.brand, '')) ~ $1
+"""
+# PHASE 0, the blind-spot guard (--brands only; controller MEDIUM 10-17): every DISTINCT brand of the
+# two shapes the loose regex cannot see -- starting with a non-alphanumeric character, or holding a
+# non-ASCII one (identity_cross_merchant_match.in_brand_blind_spot is the same predicate in Python).
+# Neither shape has a trigram to extract, so this is ONE sequential scan of catalog_products (the
+# trigram index cannot serve it even with seq scans disabled). Measured locally on 300k rows / 180 MB
+# with the 059 index: a parallel seq scan, 36 ms warm, reading every heap page -- its prod cost scales
+# with the table, so it runs once per scoped run, inside the same read-only transaction and
+# statement_timeout, and the SAFETY window above applies to scoped runs too. A requested family with a spelling here that
+# the pre-select did not find refuses the run (brand_blind_spot_misses).
+BRAND_BLIND_SPOT_SQL = r"""
+SELECT DISTINCT p.brand
+FROM catalog_products p
+WHERE p.brand ~ '^[^[:alnum:]]' OR p.brand ~ '[^\x01-\x7F]'
 """
 # PHASE 1 -- the run market's candidates. $1 market. With --brands, the EXACT filter is
 # `p.brand = ANY($3)` over phase 0's spellings; $2 (brand_exact_regex: `^(s1|s2|...)$` of exactly
@@ -233,13 +252,26 @@ def _phase1(spellings: Optional[Sequence[Tuple[str, str]]]) -> Tuple[Tuple[Tuple
 
 async def brand_spellings(conn: Any, brands: Sequence[str]) -> List[Tuple[str, str]]:
     """Phase 0: (stored brand, lower(coalesce(brand, ''))) for every spelling whose canonical_brand is
-    one of `brands`' families -- loose index-served pre-select per family, exact choice in Python."""
+    one of `brands`' families -- loose index-served pre-select per family, exact choice in Python.
+    Raises Refused when a stored spelling of a requested family sits in the pre-select's blind spot
+    (BRAND_BLIND_SPOT_SQL): the scoped run would silently differ from the full run."""
     found: Dict[str, str] = {}
-    for fam, regex in brand_preselect_regexes(brands).items():
-        rows = await conn.fetch(BRAND_SPELLINGS_SQL, regex)
-        lowered = {str(r["brand"]): str(r["lowered"]) for r in rows if r["brand"] is not None}
+    for fam, regexes in brand_preselect_regexes(brands).items():
+        lowered: Dict[str, str] = {}
+        for regex in regexes:  # chunks small enough for pg_trgm (PG_REGEX_COST_BUDGET)
+            for r in await conn.fetch(BRAND_SPELLINGS_SQL, regex):
+                if r["brand"] is not None:
+                    lowered[str(r["brand"])] = str(r["lowered"])
         for b in select_brand_spellings([fam], lowered):
             found[b] = lowered[b]
+    blind = [r["brand"] for r in await conn.fetch(BRAND_BLIND_SPOT_SQL)]
+    misses = brand_blind_spot_misses(brands, blind, found)
+    if misses:
+        n = sum(len(v) for v in misses.values())
+        raise Refused(
+            f"--brands would miss {n} stored spelling(s) its index pre-select cannot see "
+            f"(leading punctuation or non-ASCII letters): {misses}. A scoped run must equal the full run "
+            "restricted to the brand: rerun with --all-brands, or fix those brand spellings")
     return sorted(found.items())
 
 
@@ -322,9 +354,13 @@ async def explain(conn: Any, market: str, brands: Sequence[str]) -> List[Dict[st
     out = []
     async with conn.transaction(readonly=True):
         await conn.execute("SET LOCAL statement_timeout = '60s'")
-        for fam, regex in brand_preselect_regexes(brands).items():
-            plan = [r[0] for r in await conn.fetch("EXPLAIN " + BRAND_SPELLINGS_SQL, regex)]
-            out.append(_line("explain", statement="brand_spellings", family=fam, plan=plan))
+        for fam, regexes in brand_preselect_regexes(brands).items():
+            for n, regex in enumerate(regexes):
+                plan = [r[0] for r in await conn.fetch("EXPLAIN " + BRAND_SPELLINGS_SQL, regex)]
+                out.append(_line("explain", statement="brand_spellings", family=fam, chunk=n, plan=plan))
+        if brands:
+            plan = [r[0] for r in await conn.fetch("EXPLAIN " + BRAND_BLIND_SPOT_SQL)]
+            out.append(_line("explain", statement="brand_blind_spot", plan=plan))
         for name, sql in phase1:
             plan = [r[0] for r in await conn.fetch("EXPLAIN " + sql, market, *extra)]
             out.append(_line("explain", statement=name, plan=plan))
@@ -479,7 +515,21 @@ async def run(conn: Any, args: argparse.Namespace, *,
         for line in await explain(conn, args.market, args.brand_list):
             _print(line)
         return 0
-    snap, counts = await export_snapshot(conn, args.market, brands=args.brand_list, limit_groups=args.limit_groups)
+    try:
+        snap, counts = await export_snapshot(conn, args.market, brands=args.brand_list,
+                                             limit_groups=args.limit_groups)
+    except Refused as exc:  # the --brands blind-spot guard
+        _print(_line("refused", reason=str(exc)))
+        return 2
+    non_ascii = [b for b in counts.get("brand_spellings") or () if not str(b).isascii()]
+    if args.market in WARN_MARKETS or non_ascii:
+        # The brand pre-select's known blind spots are full-width / non-ASCII spellings and bracketed
+        # leads (JP and KR marketplace data); the guard refuses a run that provably misses one, and this
+        # line says the run is in that territory even when it did not.
+        _print(_line("warning", level="WARN", market=args.market, non_ascii_brand_spellings=non_ascii,
+                     message=(f"WARN market {args.market} / non-ASCII brand spellings {non_ascii}: the --brands "
+                              "pre-select does not index full-width or multi-character-lead spellings (a scoped "
+                              "run passed the blind-spot guard); review brand_spellings in the loaded line")))
     _print(_line("loaded", market=args.market, brands=args.brand_list, **counts))
     plan = plan_market(snap, args.market, brands=args.brand_list, limit_groups=args.limit_groups)
     for line in report_lines(plan):

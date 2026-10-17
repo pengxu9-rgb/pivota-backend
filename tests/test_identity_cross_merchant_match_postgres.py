@@ -299,7 +299,11 @@ async def test_explain_plans_every_statement_and_executes_none(conn, tmp_path, c
     await _catalog(conn)
     assert await script.run(conn, _args(tmp_path, "--explain", "--brands", "laneige")) == 0
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [line["statement"] for line in lines] == ["brand_spellings", *(n for n, _sql in script.PHASE1 + script.PHASE2)]
+    from services.identity_cross_merchant_match import brand_preselect_regexes
+
+    chunks = len(brand_preselect_regexes(["laneige"])["laneige"])
+    assert [line["statement"] for line in lines] == ["brand_spellings"] * chunks + [
+        "brand_blind_spot", *(n for n, _sql in script.PHASE1 + script.PHASE2)]
     assert all(line["section"] == "explain" and line["plan"] for line in lines)
     assert not any(p.name.endswith(".jsonl") for p in tmp_path.iterdir())
 
@@ -350,6 +354,11 @@ async def _spelling_catalog(c):
         (_k("f"), "SK-II", "Facial Treatment Essence 230ml", "ck_sk_f", False),
         # a look-alike that must stay out of every scoped run
         (_k("g"), "Dr Jart Plus", "Cicapair Tiger Grass Color Correcting Treatment 50ml", "ck_djp", False),
+        # short-run spellings behind ONE leading character: found by the pre-select (_PG_LEAD)
+        (_k("i"), "(SK-II)", "Facial Treatment Essence 230ml", "ck_sk_i", False),
+        (_k("j"), " SK-II", "Facial Treatment Essence 230ml", "ck_sk_j", False),
+        ("ext:elf-primer::s1", "e.l.f.", "Power Grip Primer 24ml", "ck_elf_s", True),
+        (_k("h"), "(e.l.f.)", "Power Grip Primer 24ml", "ck_elf", False),
     ]
     for n, (key, brand, title, ck, store) in enumerate(rows):
         merchant = f"m_store_{n}" if store else f"m_ret_{n}"
@@ -377,7 +386,7 @@ async def test_m2_a_scoped_run_equals_the_full_run_restricted_to_the_brand(conn)
     await _catalog(conn)  # Laneige too: a scoped run must not read it
     full_snap, _ = await script.export_snapshot(conn, "US")
     full = plan_market(full_snap, "US")
-    for requested in ("drjart", "Dr.Jart+", "loreal", "sk-ii"):
+    for requested in ("drjart", "Dr.Jart+", "loreal", "sk-ii", "elf"):
         fam = canonical_brand(requested)
         snap, counts = await script.export_snapshot(conn, "US", brands=[requested])
         stores = {k for k, b, _t, _ck, store in rows if store and canonical_brand(b) == fam}
@@ -396,10 +405,22 @@ async def test_m2_a_scoped_run_equals_the_full_run_restricted_to_the_brand(conn)
                            (await script.export_snapshot(conn, "US", brands=["drjart"]))[0].products}
 
 
+def _bitmap_rows(plan_lines):
+    """The Bitmap Index Scan's ACTUAL row count on idx_catalog_products_brand_trgm, or None. A regex
+    pg_trgm extracts no trigram from still shows an Index Cond with seq scans disabled -- it scans
+    the WHOLE index and returns every row -- so the count, not the plan shape, is the proof."""
+    import re as _re
+
+    for line in plan_lines:
+        if "Bitmap Index Scan on idx_catalog_products_brand_trgm" in line:
+            return int(_re.search(r"actual time=\S+ rows=(\d+)", line).group(1))
+    return None
+
+
 async def test_m2_the_brand_statements_are_served_by_the_trigram_index(conn):
-    """Planned against the index migration 059 defines (created here in the scratch schema, never a
-    new index): with sequential scans priced out, every phase-0 and phase-1 brand statement must be a
-    bitmap index scan on it -- a regex pg_trgm cannot extract trigrams from would still seq-scan."""
+    """Planned and RUN against the index migration 059 defines (created here in the scratch schema,
+    never a new index) over 3000 filler brands: every phase-0 family regex and phase 1's brand clause
+    must be a bitmap scan on it that returns a handful of rows, never the table."""
     from scripts.ops import propose_cross_merchant_matches as script
     from services.identity_cross_merchant_match import brand_exact_regex, brand_preselect_regexes
 
@@ -413,17 +434,89 @@ async def test_m2_the_brand_statements_are_served_by_the_trigram_index(conn):
     ddl = ddl.replace("CONCURRENTLY ", "").replace("gin_trgm_ops", f"{ext_schema}.gin_trgm_ops")
     await conn.execute(ddl)
     await _spelling_catalog(conn)
+    await conn.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, brand)"
+        " SELECT 'filler:' || i, 'm_f', 'p', 'f' || i, 'T', 'qx' || lpad(i::text, 6, '0') || ' wq'"
+        " FROM generate_series(1, 3000) i")
+    await conn.execute("ANALYZE catalog_products")
     async with conn.transaction():
         await conn.execute("SET LOCAL enable_seqscan = off")
-        for fam, regex in brand_preselect_regexes(["drjart", "loreal", "sk-ii", "laneige", "dior"]).items():
-            plan = "\n".join(r[0] for r in await conn.fetch("EXPLAIN " + script.BRAND_SPELLINGS_SQL, regex))
-            assert "idx_catalog_products_brand_trgm" in plan and "Seq Scan" not in plan, (fam, plan)
-        spellings = [("Dr.Jart+", "dr.jart+"), ("SK II", "sk ii"), ("L'Oréal", "l'oréal")]
+        families = ["drjart", "loreal", "sk-ii", "laneige", "dior", "vt", "elf", "ysl", "cledepeaubeaute",
+                    "beautyofjoseon", "decorte", "etude", "esteelauder"]
+        for fam, regexes in brand_preselect_regexes(families).items():
+            for regex in regexes:
+                plan = [r[0] for r in await conn.fetch("EXPLAIN (ANALYZE) " + script.BRAND_SPELLINGS_SQL, regex)]
+                rows = _bitmap_rows(plan)
+                assert rows is not None and rows < 20, (fam, rows, plan)
+        spellings = [("Dr.Jart+", "dr.jart+"), ("SK II", "sk ii"), ("(SK-II)", "(sk-ii)"), ("L'Oréal", "l'oréal")]
         # Phase 1's brand clause on its own (the full statement's join order depends on catalog_offers,
         # whose indexes this scratch schema does not build).
         clause = script._BRAND_CLAUSE.replace("$2", "$1").replace("$3", "$2")
-        plan = "\n".join(r[0] for r in await conn.fetch(
-            "EXPLAIN SELECT p.product_key FROM catalog_products p WHERE TRUE" + clause,
-            brand_exact_regex(lo for _b, lo in spellings), [b for b, _lo in spellings]))
-        assert "idx_catalog_products_brand_trgm" in plan and "Seq Scan" not in plan, plan
+        plan = [r[0] for r in await conn.fetch(
+            "EXPLAIN (ANALYZE) SELECT p.product_key FROM catalog_products p WHERE TRUE" + clause,
+            brand_exact_regex(lo for _b, lo in spellings), [b for b, _lo in spellings])]
+        rows = _bitmap_rows(plan)
+        assert rows is not None and rows < 20, (rows, plan)
         assert script._BRAND_CLAUSE in script.PRODUCTS_BRAND_SQL and script._BRAND_CLAUSE in script.HOSTS_BRAND_SQL
+
+
+@pytest.mark.parametrize("blind", ["ＳＫ-ＩＩ", "((SK-II))"])
+async def test_m2_a_scoped_run_with_a_spelling_the_preselect_cannot_see_is_refused(conn, tmp_path, capsys, blind):
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    await _spelling_catalog(conn)
+    await _product(conn, _k("9"), merchant="m_blind", title="Facial Treatment Essence 230ml", brand=blind,
+                   ck="ck_sk_blind")
+    await _offer(conn, _k("9"), "o_blind", merchant="m_blind", price=30, host="jp.example")
+    with pytest.raises(script.Refused) as exc:
+        await script.export_snapshot(conn, "US", brands=["sk-ii"])
+    assert blind in str(exc.value) and "--all-brands" in str(exc.value) and "1 stored spelling" in str(exc.value)
+    assert await script.run(conn, _args(tmp_path, "--brands", "sk-ii")) == 2
+    refused = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["section"] for line in refused] == ["refused"] and blind in refused[0]["reason"]
+    assert not any(p.name.endswith(".jsonl") for p in tmp_path.iterdir())
+    # other families, with only spellings the pre-select sees, still run; so does the full run
+    snap, _ = await script.export_snapshot(conn, "US", brands=["drjart"])
+    assert snap.products and blind not in {p["brand"] for p in snap.products}
+    full, _ = await script.export_snapshot(conn, "US")
+    assert blind in {p["brand"] for p in full.products}
+
+
+async def test_m2_the_blind_spot_sql_is_the_python_predicate(conn):
+    from scripts.ops import propose_cross_merchant_matches as script
+    from services.identity_cross_merchant_match import in_brand_blind_spot
+
+    samples = ["ＳＫ-ＩＩ", "(SK-II)", " SK-II", "'SK II'", "[VT] Cosmetics", "(e.l.f.)", "L'Oréal", "SKⅡ",
+               "SK-II", "SK II", "Dr.Jart+", "e.l.f.", "VT Cosmetics", "Laneige", "1004 Lab"]
+    for n, b in enumerate(samples):
+        await _product(conn, _k(f"{n:x}") + "z", merchant=f"m_s{n}", title="T", brand=b, ck=f"ck_s{n}")
+    got = {r["brand"] for r in await conn.fetch(script.BRAND_BLIND_SPOT_SQL)}
+    assert got == {b for b in samples if in_brand_blind_spot(b)}
+
+
+@pytest.mark.parametrize("requested, found, refused", [
+    ("sk-ii", [" SK-II", "'SK II'", "(SK-II)", "SK-II"], ["ＳＫ-ＩＩ"]),
+    ("vt", ["[VT] Cosmetics", " VT Cosmetics"], []),
+    ("elf", [" e.l.f.", "(e.l.f.)", "e.l.f."], []),
+    ("shiseido", ["Shiseido"], ["ＳＨＩＳＥＩＤＯ"]),
+    ("laneige", ["LANEIGE"], ["Ｌａｎｅｉｇｅ"]),
+])
+async def test_m2_the_controllers_spellings_are_found_on_postgres_or_refused(conn, requested, found, refused):
+    """The real PostgreSQL regexes (not a Python emulation): each listed spelling is found by phase 0,
+    or -- full-width, which the pre-select does not index -- refused by the blind-spot guard by name.
+    Look-alikes are never chosen."""
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    lookalikes = ["SKIN1004", "Skinfood", "VTech", "Elfbar", "(e.l.f. x Disney)", "Shiseido Men", "[Laneige Homme]"]
+    for n, b in enumerate([*found, *lookalikes]):
+        await _product(conn, f"ext:sp:{n}", merchant=f"m_sp{n}", title="T", brand=b, ck=f"ck_sp{n}")
+    async with conn.transaction(readonly=True):
+        got = await script.brand_spellings(conn, [requested])
+    assert sorted(b for b, _lo in got) == sorted(found)
+    for n, b in enumerate(refused):
+        await _product(conn, f"ext:spr:{n}", merchant=f"m_spr{n}", title="T", brand=b, ck=f"ck_spr{n}")
+    if refused:
+        with pytest.raises(script.Refused) as exc:
+            async with conn.transaction(readonly=True):
+                await script.brand_spellings(conn, [requested])
+        assert all(b in str(exc.value) for b in refused)

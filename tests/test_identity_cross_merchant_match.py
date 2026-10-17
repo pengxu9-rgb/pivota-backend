@@ -327,12 +327,13 @@ def test_no_price_or_two_currencies_hold():
     cat2 = laneige_catalog()
     b = retailer(cat2, 1, "Laneige", "Lip Sleeping Mask 20g", currency="SGD")
     assert outcome(cat2.plan(), b)["reason"] == "market_currency_mismatch"   # a US offer in SGD
-    # Two currencies with the listing's right: the keeper's own US offer priced in SGD.
+    # The keeper's own US offer priced in SGD: the keeper breaks the rule (price_currency_mismatch is
+    # now unreachable -- both sides priced in their market's currency agree market by market).
     cat3 = Cat()
     cat3.row(LANEIGE, brand="LANEIGE", title="Lip Sleeping Mask 20g", seed_kind="self", created="2026-01-01")
     cat3.offer(LANEIGE, host="us.laneige.com", brand_direct=True, currency="SGD")
     c = retailer(cat3, 1, "Laneige", "Lip Sleeping Mask 20g")
-    assert outcome(cat3.plan(), c)["reason"] == "price_currency_mismatch"
+    assert outcome(cat3.plan(), c)["reason"] == "keeper_market_currency_mismatch"
 
 
 def test_differing_valid_gtins_veto():
@@ -1148,11 +1149,18 @@ def _py(pg_regex: str) -> str:
     return pg_regex.replace("[^[:alnum:]]", "[\\W_]")
 
 
+def _seen_by(pg_regexes, spelling: str) -> bool:
+    """Does any chunk of a family's pre-select match lower(spelling)?"""
+    import re as _re
+
+    return any(_re.search(_py(rx), spelling.lower()) for rx in pg_regexes)
+
+
 # M2: real spellings a literal-token filter missed (controller 10-17), and look-alikes it must not pick.
 BRAND_SPELLINGS = {
     "drjart": ["Dr.Jart+", "Dr. Jart+", "DR JART", "Dr.Jart", "DR.JART+", "Dr Jart"],
     "loreal": ["L'Oreal", "L'Oréal", "L’Oréal", "LOREAL"],
-    "sk-ii": ["SK II", "SK-II", "SKII", "sk-ii", "S K II", "SKⅡ"],
+    "sk-ii": ["SK II", "SK-II", "SKII", "sk-ii", "S K II"],
     "dior": ["Christian Dior", "DIOR", "Dior Beauty"],
     "lancome": ["Lancôme", "LANCOME"],
     "beauty of joseon": ["Beauty of Joseon", "BEAUTY OF JOSEON"],
@@ -1173,7 +1181,7 @@ def test_m2_the_loose_preselect_finds_every_spelling_and_the_exact_choice_keeps_
     assert list(rx) == [fam]
     for raw in BRAND_SPELLINGS[brand]:
         assert canonical_brand(raw) == fam, raw
-        assert _re.search(_py(rx[fam]), raw.lower()), raw  # lower(coalesce(brand, '')) ~ $1
+        assert _seen_by(rx[fam], raw), raw  # lower(coalesce(brand, '')) ~ $1, any chunk
     pool = [*BRAND_SPELLINGS[brand], *BRAND_LOOKALIKES, None]
     assert select_brand_spellings([brand], pool) == sorted(BRAND_SPELLINGS[brand])
 
@@ -1606,3 +1614,157 @@ async def test_m3_all_brands_prints_a_warn_line(monkeypatch, tmp_path, capsys, a
     warns = [line for line in lines if line.get("level") == "WARN"]
     assert bool(warns) == warned and (not warned or warns[0]["message"].startswith("WARN --all-brands"))
     assert seen["brands"] == ([] if warned else ["laneige"])
+
+
+# --- the --brands blind-spot guard (controller MEDIUM, 10-17) ----------------------------------------------
+
+BLIND = ["ＳＫ-ＩＩ", "(SK-II)", " SK-II", "'SK II'", "ＳＨＩＳＥＩＤＯ", "Ｌａｎｅｉｇｅ", " VT Cosmetics",
+         "[VT] Cosmetics", " e.l.f.", "(e.l.f.)", "L'Oréal", "SKⅡ"]
+
+
+def test_blind_spot_shapes_are_leading_punctuation_or_non_ascii():
+    from services.identity_cross_merchant_match import in_brand_blind_spot
+
+    assert all(in_brand_blind_spot(b) for b in BLIND)
+    assert not any(in_brand_blind_spot(b) for b in ["SK-II", "SK II", "Dr.Jart+", "e.l.f.", "VT Cosmetics", "", None])
+
+
+@pytest.mark.parametrize("requested, unseen", [
+    (["sk-ii"], {"skii": [" SK-II", "'SK II'", "(SK-II)", "ＳＫ-ＩＩ"]}),
+    (["laneige"], {"laneige": ["Ｌａｎｅｉｇｅ"]}),
+    (["shiseido", "vt"], {"shiseido": ["ＳＨＩＳＥＩＤＯ"], "vt": [" VT Cosmetics", "[VT] Cosmetics"]}),
+    (["drjart"], {}),                       # "(e.l.f.)" and the rest are other brands: no refusal
+])
+def test_blind_spot_misses_name_only_the_requested_familys_unseen_spellings(requested, unseen):
+    from services.identity_cross_merchant_match import brand_blind_spot_misses
+
+    found = ["SK-II", "SKⅡ", "L'Oréal"]      # what the pre-select returned (non-ASCII "SKⅡ" was seen)
+    assert brand_blind_spot_misses(requested, BLIND, found) == unseen
+
+
+def test_blind_spot_misses_are_empty_when_every_spelling_was_seen():
+    from services.identity_cross_merchant_match import brand_blind_spot_misses
+
+    assert brand_blind_spot_misses(["sk-ii"], ["SKⅡ", "(e.l.f.)", "SK-II"], ["SKⅡ", "SK-II"]) == {}
+    assert brand_blind_spot_misses([], BLIND, []) == {}
+
+
+# --- market_currency_mismatch: every offer of the listing, and the keeper's (controller 10-17) ----------
+
+@pytest.mark.parametrize("case", ["gb_mirror_usd", "sg_canonical_usd", "priced_no_currency", "unmapped_market",
+                                  "unpriced_wrong_currency"])
+def test_market_currency_every_offer_of_the_listing_is_judged(case):
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    if case == "gb_mirror_usd":            # a mirror offer: never named, but it moves with the listing
+        cat.offer(r, sku="Default Title", mirror=True, market="GB", currency="USD", price=24)
+    elif case == "sg_canonical_usd":       # a '::canonical' SKU offer
+        cat.offer(r, sku="20g", canonical=True, market="SG", currency="USD", price=24)
+    elif case == "priced_no_currency":
+        cat.offer(r, sku="20g", currency="", price=24)
+    elif case == "unmapped_market":        # region_pricing knows no "DE": never provably right
+        cat.offer(r, sku="20g", market="DE", currency="EUR", price=22)
+    else:                                  # stated in JPY, not priced: still judged
+        cat.offer(r, sku="20g", currency="JPY", price=None)
+    plan = cat.plan()
+    assert plan.proposals == []
+    assert outcome(plan, r)["status"] == "held" and outcome(plan, r)["reason"] == "market_currency_mismatch"
+
+
+def test_market_currency_an_offer_with_neither_price_nor_currency_is_not_judged():
+    cat = laneige_catalog()
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    bare = cat.offer(r, sku="20g", currency="", price=None)
+    plan = cat.plan()
+    assert proposed_keys(plan) == [r]
+    assert bare in {o["offer_id"] for o in plan.proposals[0]["evidence"]["matcher_verdict"]["matched_offers"]}
+
+
+@pytest.mark.parametrize("keeper_currency, held", [("USD", True), ("GBP", False)])
+def test_market_currency_the_keepers_own_offers_are_judged(keeper_currency, held):
+    """A keeper GB offer priced in USD holds every listing, though the listing sells nothing in GB."""
+    cat = laneige_catalog()
+    cat.offer(LANEIGE, sku="Default Title", market="GB", currency=keeper_currency, price=20, brand_direct=True,
+              sku_key=cat.offers[0]["sku_key"])
+    r = retailer(cat, 1, "Laneige", "Lip Sleeping Mask 20g", sku="20g")
+    plan = cat.plan()
+    if held:
+        assert plan.proposals == [] and outcome(plan, r)["reason"] == "keeper_market_currency_mismatch"
+    else:
+        assert proposed_keys(plan) == [r]
+
+
+# The controller's list (10-17): found by the pre-select, or -- where it cannot index the shape --
+# refused by the blind-spot guard, naming the spelling. Never silently missed.
+PRESELECT_FOUND = {"sk-ii": [" SK-II", "'SK II'", "(SK-II)"], "vt": ["[VT] Cosmetics", " VT Cosmetics"],
+                   "elf": [" e.l.f.", "(e.l.f.)", "e.l.f."]}
+GUARD_REFUSED = {"sk-ii": ["ＳＫ-ＩＩ", "((SK-II))", "SK\u2161"], "shiseido": ["ＳＨＩＳＥＩＤＯ"], "laneige": ["Ｌａｎｅｉｇｅ"]}
+LOOKALIKES = ["SKIN1004", "Skinfood", "VTech", "Elfbar", "(e.l.f. x Disney)", "Shiseido Men", "[Laneige Homme]"]
+
+
+@pytest.mark.parametrize("brand", sorted(set(PRESELECT_FOUND) | set(GUARD_REFUSED)))
+def test_m2_every_listed_spelling_is_found_or_refused_never_missed(brand):
+    import re as _re
+
+    from services.identity_cross_merchant_match import (
+        brand_blind_spot_misses,
+        brand_preselect_regexes,
+        select_brand_spellings,
+    )
+    from services.product_match_normalizer import canonical_brand
+
+    fam = canonical_brand(brand)
+    rx = brand_preselect_regexes([brand])[fam]
+    table = [*PRESELECT_FOUND.get(brand, ()), *GUARD_REFUSED.get(brand, ()), *LOOKALIKES]
+    seen = [b for b in table if _seen_by(rx, b)]
+    found = select_brand_spellings([brand], seen)
+    assert found == sorted(PRESELECT_FOUND.get(brand, ()))           # found, look-alikes excluded
+    misses = brand_blind_spot_misses([brand], table, found)
+    assert misses == ({fam: sorted(GUARD_REFUSED[brand])} if brand in GUARD_REFUSED else {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("market, spellings, warned", [
+    ("JP", ["SK-II"], True), ("KR", ["VT"], True), ("US", ["SKⅡ", "SK-II"], True), ("US", ["SK-II"], False)])
+async def test_a_jp_kr_run_or_a_non_ascii_spelling_prints_a_warn_line(monkeypatch, tmp_path, capsys, market,
+                                                                      spellings, warned):
+    from scripts.ops import propose_cross_merchant_matches as script
+
+    async def fake_export(conn, market_, *, brands=(), limit_groups=None):
+        return Cat().snapshot(), {"products": 0, "brand_spellings": spellings}
+
+    monkeypatch.setattr(script, "export_snapshot", fake_export)
+    args = script.parse_args(["--brands", "sk-ii", "--market", market, "--out", str(tmp_path)])
+    assert await script.run(None, args) == 0
+    warns = [json.loads(x) for x in capsys.readouterr().out.splitlines() if json.loads(x).get("level") == "WARN"]
+    assert bool(warns) == warned
+    if warned:
+        assert warns[0]["market"] == market and warns[0]["non_ascii_brand_spellings"] == [
+            b for b in spellings if not b.isascii()]
+
+
+def test_m2_big_families_are_chunked_and_keys_stay_ascii():
+    from services.identity_cross_merchant_match import brand_family_keys, brand_preselect_regexes
+
+    fams = ["dior", "ysl", "cledepeaubeaute", "beautyofjoseon", "decorte", "etude", "sk-ii", "laneige"]
+    chunks = brand_preselect_regexes(fams)
+    assert len(chunks["dior"]) > 1 and len(chunks["ysl"]) > 1      # one long regex fell back to a scan
+    assert all(k.isascii() for keys in brand_family_keys(fams).values() for k in keys)
+    assert brand_family_keys(["sk-ii"]) == {"skii": ["skii"]}        # the measured "skⅱ" is the guard's
+
+
+def test_m2_a_non_ascii_family_key_is_left_to_the_guard(monkeypatch):
+    """A measured key that stays non-ASCII after folding (Hangul) never enters the regex -- one such
+    literal made pg_trgm scan the whole index -- so its spellings are the blind-spot guard's."""
+    from services import brand_spelling
+    from services.identity_cross_merchant_match import brand_blind_spot_misses, brand_family_keys
+
+    from services.product_match_normalizer import _canonical_brand
+
+    monkeypatch.setitem(brand_spelling.RETAILER_BRAND_SPELLINGS, "라네즈", "laneige")
+    _canonical_brand.cache_clear()
+    try:
+        assert brand_family_keys(["laneige"]) == {"laneige": ["laneige"]}
+        assert brand_blind_spot_misses(["laneige"], ["라네즈"], []) == {"laneige": ["라네즈"]}  # refused by name
+    finally:
+        _canonical_brand.cache_clear()
