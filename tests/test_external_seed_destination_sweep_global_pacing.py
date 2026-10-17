@@ -706,3 +706,110 @@ def test_a_catalogue_hop_refused_by_the_pacer_is_a_stopped_host_not_a_catalogue_
     assert seen == ["https://brand.example/products.json?limit=250&page=1"]
     assert summary["catalogue_status"] == {} and summary["hosts_stopped"] == 1
     assert summary["hosts_unverifiable"] == 0 and not recorded
+
+
+
+# ===================================================================== review 2026-10-17 (2), be#2641
+
+@pytest.mark.parametrize("handle", ["checkpoint-mesh-bag", "challenge-coin", "captcha-kit", "cdn-cgi-lamp"])
+def test_a_product_answering_on_its_own_url_is_never_a_wall_whatever_its_handle(handle) -> None:
+    """Item 5: the challenge-path rule used to match real handles, and classify_destination feeds the
+    refresh's `_read_the_served_product`, so such a seed could never be read."""
+    url = f"https://brand.example/products/{handle}"
+    assert liveness.classify_destination(requested_url=url, status_code=200, final_url=url).verdict == \
+        liveness.VERDICT_LIVE
+    delisted = liveness.classify_destination(requested_url=url, status_code=200, final_url=url, listed_in_catalogue=False)
+    assert delisted.verdict == liveness.VERDICT_LIVE_DELISTED
+
+
+def test_a_redirect_from_a_product_to_a_challenge_page_is_unverifiable() -> None:
+    obs = liveness.classify_destination(
+        requested_url="https://brand.example/products/x", status_code=200,
+        final_url="https://brand.example/challenge?return_to=%2Fproducts%2Fx", listed_in_catalogue=False,
+    )
+    assert obs.verdict == liveness.VERDICT_UNVERIFIABLE and obs.note == "landed on a challenge path"
+
+
+def test_a_cross_host_landing_is_noted_and_flagged() -> None:
+    """Item 7: the domain-move rule stands (same handle on another host = live), and the landing is
+    recorded."""
+    obs = liveness.classify_destination(
+        requested_url="https://brand.example/products/x", status_code=200,
+        final_url="https://www.brand-store.example/products/x",
+    )
+    assert obs.verdict == liveness.VERDICT_LIVE and obs.cross_host
+    assert obs.note == "cross-host landing on www.brand-store.example"
+    renamed = liveness.classify_destination(
+        requested_url="https://brand.example/products/x", status_code=200,
+        final_url="https://brand-store.example/products/y",
+    )
+    assert renamed.verdict == liveness.VERDICT_REDIRECTED_TO_PRODUCT and renamed.cross_host
+    assert renamed.note == "-> y; cross-host landing on brand-store.example"
+    same = liveness.classify_destination(
+        requested_url="https://brand.example/products/x", status_code=200,
+        final_url="https://www.brand.example/products/x",
+    )
+    assert not same.cross_host and same.note == "", "www. folded: the same store"
+
+
+def test_the_sweep_counts_cross_host_landings(monkeypatch, vclock) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/products.json":
+            products = [{"handle": "a"}] if request.url.params.get("page") == "1" else []
+            return httpx.Response(200, json={"products": products}, request=request)
+        if request.url.host == "h.example" and request.url.path == "/products/b":
+            return httpx.Response(301, headers={"location": "https://moved.example/products/b"}, request=request)
+        return httpx.Response(200, request=request)
+
+    _real_client(monkeypatch, handler)
+    seeds = [{"id": "h:a", "canonical_url": "https://h.example/products/a"},
+             {"id": "h:b", "canonical_url": "https://h.example/products/b"}]
+    summary, recorded, _pacer = _sweep(monkeypatch, None, seeds, max_new_hosts_per_minute=_NO_CAP)
+    assert summary["cross_host_landings"] == 1
+    assert summary["verdicts"][liveness.VERDICT_LIVE_DELISTED] == 1 and summary["dead_links_found"] == 0
+
+
+def test_a_catalogue_hop_refused_by_robots_is_not_retried(monkeypatch, vclock) -> None:
+    """be#2640's hop hook refuses a cross-host hop its robots.txt disallows; the catalogue read
+    reports it as robots_disallowed at once instead of retrying a refusal three times."""
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            if request.url.host == "elsewhere.example":
+                return httpx.Response(200, text="User-agent: *\nDisallow: /\n", request=request)
+            return httpx.Response(404, request=request)
+        if request.url.host == "h.example":
+            return httpx.Response(302, headers={"location": "https://elsewhere.example/products.json"}, request=request)
+        return httpx.Response(200, json={"products": []}, request=request)
+
+    seen = _real_client(monkeypatch, handler)
+    seeds = [{"id": "h:a", "canonical_url": "https://h.example/products/a"}]
+    summary, recorded, _pacer = _sweep(monkeypatch, None, seeds, max_new_hosts_per_minute=_NO_CAP)
+    assert summary["catalogue_status"] == {"robots_disallowed": 1}
+    assert seen.count("https://h.example/products.json?limit=250&page=1") == 1
+    assert "https://elsewhere.example/products.json" not in seen and not recorded
+
+
+def test_a_probe_hop_refused_by_robots_is_a_robots_observation(monkeypatch, vclock) -> None:
+    monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "true")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            if request.url.host == "elsewhere.example":
+                return httpx.Response(200, text="User-agent: *\nDisallow: /\n", request=request)
+            return httpx.Response(404, request=request)
+        if request.url.path == "/products.json":
+            products = [{"handle": "a"}] if request.url.params.get("page") == "1" else []
+            return httpx.Response(200, json={"products": products}, request=request)
+        if request.url.path == "/products/b":
+            return httpx.Response(302, headers={"location": "https://elsewhere.example/products/b"}, request=request)
+        return httpx.Response(200, request=request)
+
+    seen = _real_client(monkeypatch, handler)
+    seeds = [{"id": "h:a", "canonical_url": "https://h.example/products/a"},
+             {"id": "h:b", "canonical_url": "https://h.example/products/b"}]
+    summary, recorded, _pacer = _sweep(monkeypatch, None, seeds, max_new_hosts_per_minute=_NO_CAP)
+    assert "https://elsewhere.example/products/b" not in seen
+    assert summary["verdicts"][liveness.VERDICT_UNVERIFIABLE] == 1 and summary["hosts_unverifiable"] == 0
+    assert recorded == ["h:a", "h:b"]

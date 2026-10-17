@@ -159,6 +159,10 @@ class DestinationObservation:
     # independent witness. Repetition cannot substitute: a WAF policy is MORE persistent than
     # a dead product, so it clears the 24h gap by construction.
     corroborated: bool = False
+    # The final URL was on ANOTHER host than the one asked (`www.` folded) and still named a product
+    # handle: a domain move (luafee.jp -> luafeejp.com) that classifies as usual. Recorded in `note`
+    # too, and counted by the sweep (`cross_host_landings`), so a run of them is visible.
+    cross_host: bool = False
 
     @property
     def confirmed_dead(self) -> bool:
@@ -247,15 +251,23 @@ def classify_destination(
             "left /products/",
             corroborated=corroborated,
         )
+    # A DOMAIN MOVE (review item 7): the verdict is the usual one, the landing host goes in the note.
+    cross_host = off_site == _OFF_SITE_OTHER_HOST
+    moved = f"cross-host landing on {_landing_host(final_url)}" if cross_host else ""
+
+    def _noted(note: str) -> str:
+        return "; ".join(part for part in (note, moved) if part)
+
     if landed != wanted:
         return DestinationObservation(
-            VERDICT_REDIRECTED_TO_PRODUCT, status_code, final_url, f"-> {landed}"
+            VERDICT_REDIRECTED_TO_PRODUCT, status_code, final_url, _noted(f"-> {landed}"), cross_host=cross_host
         )
     if listed_in_catalogue is False:
         return DestinationObservation(
-            VERDICT_LIVE_DELISTED, status_code, final_url, "absent from products.json"
+            VERDICT_LIVE_DELISTED, status_code, final_url, _noted("absent from products.json"),
+            cross_host=cross_host,
         )
-    return DestinationObservation(VERDICT_LIVE, status_code, final_url, "")
+    return DestinationObservation(VERDICT_LIVE, status_code, final_url, _noted(""), cross_host=cross_host)
 
 
 _OFF_SITE_OTHER_HOST = "landed on another host"
@@ -265,6 +277,13 @@ _CHALLENGE_PATH_RE = re.compile(r"/(?:challenge|checkpoint|captcha|cdn-cgi)(?:/|
 def _fold_www(host: str) -> str:
     host = (host or "").strip().lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def _landing_host(final_url: Optional[str]) -> str:
+    try:
+        return (urlparse(str(final_url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
@@ -281,7 +300,15 @@ def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
     landed_host = (landed.hostname or "").lower()
     if "captcha" in landed_host:
         return "landed on a captcha host"
-    if _CHALLENGE_PATH_RE.search(landed.path or ""):
+    # THE PATH RULE ONLY READS A PATH WE WERE SENT TO (controller review of be#2641, 2026-10-17).
+    # `_CHALLENGE_PATH_RE` also matches real handles (`/products/checkpoint-mesh-bag`), and this
+    # function feeds the refresh's `_read_the_served_product`: unguarded, a seed whose handle starts
+    # with challenge-, checkpoint-, captcha- or cdn-cgi- could never be read. So it applies only when
+    # the final path DIFFERS from the requested one: a product answering on its own URL is never a
+    # wall, whatever its handle. (A redirect onto a different, challenge-shaped path is still read as
+    # a wall: unverifiable, which can never retire anything.)
+    landed_path = landed.path or ""
+    if landed_path != (wanted.path or "") and _CHALLENGE_PATH_RE.search(landed_path):
         return "landed on a challenge path"
     if landed_host and _fold_www(landed_host) != _fold_www(wanted.hostname or ""):
         return _OFF_SITE_OTHER_HOST
@@ -324,6 +351,11 @@ async def probe_destination(
         # A REDIRECT HOP the pacer refused (its request hook runs inside `client.get`): the run
         # stopped mid-chain. Not an observation, exactly like a refused first request.
         raise
+    except crawl_politeness.RobotsDisallowed:
+        # A redirect hop onto another host whose robots.txt refuses it (be#2640's hop hook).
+        return classify_destination(
+            requested_url=url, status_code=None, transport_error="robots_disallowed"
+        )
     except Exception as exc:  # noqa: BLE001
         return classify_destination(
             requested_url=url, status_code=None, transport_error=type(exc).__name__
@@ -431,6 +463,10 @@ async def _get_catalogue_page(
             resp = await client.get(url, headers={"User-Agent": USER_AGENT})
         except crawl_global_pacer.GlobalPaceStopped:
             raise  # a refused redirect hop: the run stopped, not a fact about this host
+        except crawl_politeness.RobotsDisallowed:
+            # A redirect hop onto another host whose robots.txt refuses it: told not to, so no
+            # retry (retrying would only ask that robots.txt again).
+            return "robots_disallowed", "robots.txt (redirect hop)"
         except Exception as exc:  # noqa: BLE001
             last = type(exc).__name__
             await asyncio.sleep(2 * (attempt + 1))
@@ -954,6 +990,9 @@ async def run_destination_sweep(
         "pending_suppressed": 0,
         "pending_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
+        # Probes whose final URL was on ANOTHER host but still named a product handle (a domain
+        # move, classified as usual; see `DestinationObservation.cross_host`).
+        "cross_host_landings": 0,
         "catalogue_status": {},
         # Hosts the run did not finish because it stopped (budget spent or the IP breaker's final
         # trip): cut short mid-host, or never started. Kept OUT of `hosts_unverifiable`, which
@@ -974,7 +1013,8 @@ async def run_destination_sweep(
     # request hook takes a slot for each hop after the first and admits a hop onto another host as
     # a new host; at most `crawl_global_pacer.MAX_REDIRECTS` (5) hops.
     client = client or httpx.AsyncClient(
-        timeout=25.0, follow_redirects=True, **crawl_global_pacer.redirect_client_kwargs()
+        timeout=25.0, follow_redirects=True,
+        **crawl_global_pacer.redirect_client_kwargs(robots_user_agent=USER_AGENT),
     )
     host_slot = asyncio.Semaphore(SWEEP_HOST_CONCURRENCY)
 
@@ -1031,6 +1071,8 @@ async def run_destination_sweep(
                 summary["verdicts"][observation.verdict] = (
                     summary["verdicts"].get(observation.verdict, 0) + 1
                 )
+                if observation.cross_host:
+                    summary["cross_host_landings"] += 1
                 result = await record_destination_observation(
                     seed["id"], observation, now=now, suppress=retire
                 )

@@ -17,10 +17,17 @@ caps the IP's total rate for the jobs that install it; `services/crawl_ip_thrott
 | every other lane | no global pacer (per-host `crawl_politeness` pacing and, for Shopify hosts, the shared edge pacer still apply) | |
 
 The destination sweep also requests each catalogue on the host spelling its seeds store (`www.` is not
-folded away for the request, only for grouping), treats a redirect that ends on another host or on a
-`/challenge`, `/checkpoint`, `/captcha` or `/cdn-cgi/` path as `unverifiable` (never dead), queues
-handle-less seeds after every verifiable one, and raises its coverage alarm on the hosts it actually
-asked (`hosts_attempted`), not on every host in the candidate list.
+folded away for the request, only for grouping), queues handle-less seeds after every verifiable one,
+and raises its coverage alarm on the hosts it actually asked (`hosts_attempted`), not on every host in
+the candidate list. Its liveness rules for a final URL:
+
+* a redirect onto a DIFFERENT path matching `/challenge`, `/checkpoint`, `/captcha` or `/cdn-cgi/`,
+  or onto a captcha host, is `unverifiable` (never dead). A product answering on its own URL is never a
+  wall, whatever its handle (`/products/checkpoint-mesh-bag` stays readable);
+* a landing on another host that left `/products/` is `unverifiable`, never dead;
+* a landing on another host that keeps a product handle classifies as usual (same handle = a domain
+  move, `live`; another handle = `redirected_to_product`), with `cross-host landing on <host>` in the
+  observation's note and a count in the summary's `cross_host_landings`.
 
 ## Knobs (no knob has an "off" value)
 
@@ -97,7 +104,12 @@ and `reap_cart_proofs.md` (gate (a)'s 24 h window restarts).
 ## Scheduling
 
 The destination sweep's definition (`EXTERNAL_SEED_DESTINATION_SWEEP=true`) runs
-`--limit 3500 --budget-seconds 3300` with `--max-retries 0` (mkcrawljob's default is 1).
+`--limit 3500 --budget-seconds 3300` with `--max-retries 0` (mkcrawljob's default is 1). On an
+EXISTING job the script updates only the image, the args, the retries and the timeout: env, secrets,
+cpu and memory are left as they are, and the args keep the live job's retire choice (`--no-retire` or
+not, read back from the job) unless `EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE` is set on that run. If the
+live args cannot be read, the run refuses (exit 2) rather than guess. Only a CREATE builds the full
+definition.
 
 `EXTERNAL_REFERRAL_REFRESH=true infra/gcp/setup_scheduler.sh prod <backend> <gateway>` reconciles the
 refresh job with the rollout args `--limit 2000 --budget-seconds 3300 --host-concurrency 4` and
