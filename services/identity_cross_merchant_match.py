@@ -86,6 +86,64 @@ approval or an apply. Its `size` is the offer's OWN -- the one size its own SKU 
 key is ABSENT when they state none (a "Default Title" offer pinned through the row title): the
 anchor's size is never copied onto an offer.
 
+CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the
+content Peng reviewed: a selected write refuses a proposal whose fingerprint changed (a proposal_id pins
+only the structural move). THE RULE: everything the review page renders from an audit row is hashed,
+plus the verdict's PINS: each matched offer as (offer_id, sku_key) and each matched seed as (seed_id,
+variant_id). NOT hashed, on purpose: matcher_verdict.matched_offers[].price / currency / market / size,
+which are INFORMATIONAL (validate_matcher_verdict never reads them, serving re-reads prices live, and
+they churn nightly), and the evidence pinned only by the write's cmd_ digest (hosts.anchor,
+anchor_reason, tiers_matched, normalized_keys). So an offer's stored price may differ from the
+reviewed one without refusing the write; the listing and anchor prices the page shows ARE hashed. It
+is computed from the AUDIT ROWS alone
+(the dry run prints every field below on every row), so the static page reproduces it in JavaScript;
+it reads NOTHING of RULE_VERSION / VETOES_CHECKED (a rule bump does not invalidate labels; the write's
+cmd_ digest still pins the full evidence). Canonical form:
+  1. Input: EVERY audit row of the proposal -- all its (moved listing, anchor) pairs. A selected run
+     prints a full audit (audit_complete) and refuses a selected proposal missing a pair.
+  2. Per row, an object with keys in EXACTLY this order:
+       {"kind", "tier", "market", "size", "price_ratio", "listing", "anchor", "matched_offers",
+        "matched_seeds"}
+     SIDE (listing, anchor) = {"product_key", "canonical_url", "image_url", "title", "brand", "hosts",
+       "size", "price", "currency"} in that order;
+     SIZE (row size = the anchor size the pair matched at; each side's title size) = null, or
+       {"value", "unit", "pack"} in that order;
+     matched_offers = the moved listing's pinned offers as [offer_id, sku_key|null] arrays;
+     matched_seeds  = the proposal's matched seeds (matcher_verdict.matched_seeds; the same on every
+       row of the proposal) as [seed_id, variant_id|null] arrays.
+  3. Values: strings verbatim (no trimming or case folding) or null; kind, tier, market, product_key,
+     offer_id and seed_id must be strings; hosts is an array of strings, matched_offers and
+     matched_seeds arrays (all three present, possibly empty).
+     NUMBERS ARE STRINGS, one rule -- JS Number(x).toFixed(d): price d=2; price_ratio, size.value and
+     size.pack d=4; null stays null. Python reproduces toFixed exactly (js_fixed: the double's exact
+     decimal value rounded half away from zero), so 67 and 67.0 both give "67.00" (Cloud Logging turns
+     67.0 into 67), 10.125 gives "10.13", 1.005 gives "1.00". Finite values below 1e21 only.
+     THE PAGE DISPLAYS EXACTLY THESE STRINGS (toFixed(2) prices, toFixed(4) sizes and ratio), so
+     what Peng reads is what is hashed.
+  4. Ordering: hosts sorted; matched_offers and matched_seeds sorted by each element's JSON text
+     (JSON.stringify of the array); rows sorted by listing.product_key, then anchor.product_key. Every
+     comparison is by UTF-16 code units (JS `a < b`). A (listing, anchor) pair appears once.
+  5. Serialise the row array as JSON with no whitespace and non-ASCII kept as is (JS
+     JSON.stringify(rows); Python json.dumps(rows, ensure_ascii=False, separators=(",", ":"))),
+     encode UTF-8, sha256, lowercase hex; the fingerprint is "cfp_" + the first 24 hex digits.
+  JS reference (the page groups audit rows by proposal_id and calls cfp(rows)):
+     const fx = (x, d) => x == null ? null : Number(x).toFixed(d);
+     const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+     const size = z => z == null ? null : {value: fx(z.value, 4), unit: z.unit ?? null, pack: fx(z.pack, 4)};
+     const side = s => ({product_key: s.product_key, canonical_url: s.canonical_url ?? null,
+       image_url: s.image_url ?? null, title: s.title ?? null, brand: s.brand ?? null,
+       hosts: [...s.hosts].sort(cmp), size: size(s.size), price: fx(s.price, 2), currency: s.currency ?? null});
+     const tuples = xs => xs.sort((a, b) => cmp(JSON.stringify(a), JSON.stringify(b)));
+     const row = r => ({kind: r.kind, tier: r.tier, market: r.market, size: size(r.size),
+       price_ratio: fx(r.price_ratio, 4), listing: side(r.listing), anchor: side(r.anchor),
+       matched_offers: tuples(r.matched_offers.map(o => [o.offer_id, o.sku_key ?? null])),
+       matched_seeds: tuples(r.matched_seeds.map(m => [m.seed_id, m.variant_id ?? null]))});
+     const cfp = rows => "cfp_" + hex(sha256(utf8(JSON.stringify(rows.map(row).sort((a, b) =>
+       cmp(a.listing.product_key, b.listing.product_key) || cmp(a.anchor.product_key, b.anchor.product_key))))))
+       .slice(0, 24);
+  A selection names each proposal as "<proposal_id>=<cfp>"; Plan.select refuses any mismatch. (Each
+  side's offer_ids, also printed, are the matched_offers' ids by construction.)
+
 Pure: no I/O here. scripts/ops/propose_cross_merchant_matches.py exports the snapshot (one read-only
 transaction, two phases) and writes proposals through the engine's writer.
 """
@@ -100,7 +158,8 @@ import string
 import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal
+import math
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, FrozenSet, Hashable, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
@@ -1355,6 +1414,10 @@ class Plan:
     _decided: Set[str] = field(default_factory=set)
     pairs: List[Dict[str, Any]] = field(default_factory=list)  # (moved row, anchor) for audit + stats
     new_multi_merchant_groups: int = 0
+    #: (mode, sorted selected proposal_ids) once select() narrowed the run; folded into digest()
+    selection: Optional[Tuple[str, Tuple[str, ...]]] = None
+    selection_info: Optional[Dict[str, Any]] = None
+    _hosts_before: Dict[str, Set[str]] = field(default_factory=dict)
 
     def _outcome(self, li: Listing, status: str, reason: str, anchor: Optional[Listing],
                  reasons: Optional[List[str]] = None, tiers: Optional[List[str]] = None,
@@ -1442,17 +1505,106 @@ class Plan:
         self.proposals.sort(key=lambda p: p["proposal_id"])
         self.outcomes.sort(key=lambda o: o["product_key"])
         self.pairs.sort(key=lambda x: (x["proposal_id"], x["listing"].product_key))
+        for pr in self.pairs:
+            ck = pr["anchor"].content_key
+            if ck not in self._hosts_before:
+                self._hosts_before[ck] = {h for r in planner.by_ck.get(ck, ()) for h in r.sig.hosts}
+        self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
+
+    def _count_new_multi_merchant_groups(self) -> int:
         gained: Dict[str, Set[str]] = defaultdict(set)
         for pr in self.pairs:
             gained[pr["anchor"].content_key].update(pr["listing"].sig.hosts)
+        n = 0
         for ck, hosts in gained.items():
-            before = {h for r in planner.by_ck.get(ck, ()) for h in r.sig.hosts}
+            before = self._hosts_before.get(ck, set())
             if len(before) < 2 and len(before | hosts) >= 2:
-                self.new_multi_merchant_groups += 1
+                n += 1
+        return n
+
+    def select(self, mode: str, entries: Mapping[str, str]) -> None:
+        """Narrow the run to a hand-labelled subset (--only-proposal[s|-ids] / --exclude-...), given as
+        {proposal_id: content fingerprint}. Refuses (SelectionError) an unknown id, an empty selection,
+        one that keeps nothing, and ANY id whose content fingerprint is not what was reviewed. Keeps
+        select_proposals' choice in proposals AND pairs (so the counts, samples and audit sample are of
+        the subset), and records (mode, sorted "id=cfp" of the kept proposals) so digest() folds it in.
+        Outcomes (held / deferred / vetoed) stay those of the full run."""
+        if self.selection is not None:
+            raise SelectionError("a selection was already applied to this plan")
+        full = len(self.proposals)
+        given = dict(entries)
+        kept = select_proposals(self.proposals, mode, list(given))
+        now = self.content_fingerprints()
+        changed = {pid: {"reviewed": fp, "now": now[pid]} for pid, fp in sorted(given.items()) if now[pid] != fp}
+        if changed:
+            raise SelectionError(
+                f"{len(changed)} selected proposal(s) are not the content that was reviewed (content "
+                f"fingerprint mismatch: a listing, anchor, price, title, size, tier or kind changed): {changed}")
+        keep_ids = {p["proposal_id"] for p in kept}
+        self.proposals = kept
+        self.pairs = [pr for pr in self.pairs if pr["proposal_id"] in keep_ids]
+        self.selection = (mode, tuple(sorted(f"{pid}={now[pid]}" for pid in keep_ids)))
+        self.new_multi_merchant_groups = self._count_new_multi_merchant_groups()
+        self.selection_info = {"applied": True, "mode": mode, "ids_given": len(given),
+                               "fingerprints_verified": len(given), "selected": len(kept), "of": full,
+                               "note": ("counts, samples and the audit sample are of the SELECTED proposals; "
+                                        "outcomes and yield_both_ways are of the full run")}
+
+    def _matched_seeds(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {p["proposal_id"]: [{"seed_id": m["seed_id"], "variant_id": m["variant_id"]}
+                                   for m in p["evidence"]["matcher_verdict"]["matched_seeds"]]
+                for p in self.proposals}
+
+    def _pair_row(self, pr: Mapping[str, Any], seeds: Mapping[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """One (moved listing, anchor) pair as the audit sample shows it -- the content fingerprint's
+        only input, so the review page and the writer read the same fields."""
+        li, an, v = pr["listing"], pr["anchor"], pr["verdict"]
+        return {
+            "proposal_id": pr["proposal_id"], "kind": pr["kind"], "tier": pr["tier"], "market": self.market,
+            "size": _size_json(v.anchor_size), "price_ratio": v.price.get("ratio"),
+            "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
+                                   [o["offer_id"] for o in v.matched_offers]),
+            "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
+            "matched_offers": sorted(({"offer_id": o["offer_id"], "sku_key": o.get("sku_key")}
+                                      for o in v.matched_offers), key=lambda o: str(o["offer_id"])),
+            "matched_seeds": list(seeds.get(pr["proposal_id"], ())),
+        }
+
+    def audit_gaps(self, audit: Iterable[Mapping[str, Any]]) -> Dict[str, List[str]]:
+        """{proposal_id: listings it moves that `audit` does not show} for this plan's proposals -- a
+        selected run refuses any (the page could not have seen, or fingerprinted, the whole proposal)."""
+        shown: Dict[str, Set[str]] = defaultdict(set)
+        for r in audit:
+            shown[r["proposal_id"]].add(r["listing"]["product_key"])
+        gaps: Dict[str, List[str]] = {}
+        for p in self.proposals:
+            ev = p.get("evidence") or {}
+            missing = sorted(set(ev.get("from_product_keys") or [ev.get("listing_product_key")])
+                             - shown.get(p["proposal_id"], set()))
+            if missing:
+                gaps[p["proposal_id"]] = missing
+        return gaps
+
+    def content_fingerprints(self) -> Dict[str, str]:
+        """{proposal_id: cfp_...} over EVERY pair of each proposal (not the audit sample). Raises
+        SelectionError if a proposal's pairs do not name exactly the listings it moves."""
+        rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        seeds = self._matched_seeds()
+        for pr in self.pairs:
+            rows[pr["proposal_id"]].append(self._pair_row(pr, seeds))
+        out: Dict[str, str] = {}
+        for p in self.proposals:
+            ev = p.get("evidence") or {}
+            moved = sorted(ev.get("from_product_keys") or [ev.get("listing_product_key")])
+            seen = sorted(r["listing"]["product_key"] for r in rows.get(p["proposal_id"], ()))
+            if seen != moved:
+                raise SelectionError(f"proposal {p['proposal_id']} moves {moved} but its audit pairs name {seen}")
+            out[p["proposal_id"]] = content_fingerprint(rows[p["proposal_id"]])
+        return out
 
     # -- reporting --------------------------------------------------------------------------------
     def digest(self) -> str:
-        return proposal_set_digest(self.proposals)
+        return proposal_set_digest(self.proposals, selection=self.selection)
 
     def summary(self, *, top: int = 30, samples_per_tier: int = 20) -> List[Dict[str, Any]]:
         by_tier = Counter(p["evidence"]["tier"] for p in self.proposals)
@@ -1470,7 +1622,8 @@ class Plan:
              "anchor_reasons": dict(sorted(self.anchor_reasons.items())),
              "already_on_anchor": self.already_on_anchor,
              "expected_new_multi_merchant_groups": self.new_multi_merchant_groups,
-             "digest": self.digest(), "rule_version": RULE_VERSION},
+             "digest": self.digest(), "rule_version": RULE_VERSION,
+             **({"selection": self.selection_info} if self.selection_info else {})},
             {"section": "yield_both_ways", "market": self.market,
              "per_variant_only_listings": len(self.pairs),
              "mirror_recheck_additional": mirror_extra,
@@ -1488,15 +1641,25 @@ class Plan:
             {"section": "host_pairs", "market": self.market,
              "pairs": [{"pair": k, "listings": n} for k, n in sorted(host_pairs.items(), key=lambda kv: (-kv[1], kv[0]))[:top]]},
         ]
+        cfps = self.content_fingerprints()
         for tier in TIERS:
             sample = [p for p in self.proposals if p["evidence"]["tier"] == tier][:samples_per_tier]
-            lines.append({"section": "samples", "market": self.market, "tier": tier, "proposals": [
-                {"proposal_id": p["proposal_id"], "kind": p["kind"], "keeper": p["keeper_product_key"],
+            lines.append({"section": "samples", "market": self.market, "tier": tier,
+                          **({"selection": self._selection_brief()} if self.selection_info else {}), "proposals": [
+                {"proposal_id": p["proposal_id"], "content_fingerprint": cfps[p["proposal_id"]], "kind": p["kind"],
+                 "keeper": p["keeper_product_key"],
                  "anchor_title": p["evidence"]["anchor"]["title"],
                  "listings": [{"title": d["title"], "hosts": d["hosts"], "ratio": d["price_ratio"]}
                               for d in p["evidence"]["listings"]],
                  "size": p["evidence"]["matcher_verdict"]["size"]} for p in sample]})
+        lines.append({"section": "fingerprints", "market": self.market,
+                      **({"selection": self._selection_brief()} if self.selection_info else {}),
+                      "content_fingerprints": dict(sorted(cfps.items()))})
         return lines
+
+    def _selection_brief(self) -> Dict[str, Any]:
+        info = self.selection_info or {}
+        return {k: info[k] for k in ("mode", "selected", "of")}
 
     def audit_rows(self, *, size: int = 600, seed: int = 20261016) -> List[Dict[str, Any]]:
         """A seeded RANDOM sample of (moved listing, anchor) pairs for Peng's side-by-side review.
@@ -1505,17 +1668,10 @@ class Plan:
         rng = random.Random(seed)
         picked = pool if len(pool) <= size else rng.sample(pool, size)
         picked.sort(key=lambda x: (x["proposal_id"], x["listing"].product_key))
-        out = []
-        for pr in picked:
-            li, an, v = pr["listing"], pr["anchor"], pr["verdict"]
-            out.append({
-                "proposal_id": pr["proposal_id"], "kind": pr["kind"], "tier": pr["tier"], "market": self.market,
-                "size": _size_json(v.anchor_size), "price_ratio": v.price.get("ratio"),
-                "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
-                                       [o["offer_id"] for o in v.matched_offers]),
-                "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
-            })
-        return out
+        cfps = self.content_fingerprints()
+        seeds = self._matched_seeds()
+        return [{**self._pair_row(pr, seeds), "content_fingerprint": cfps[pr["proposal_id"]],
+                 **({"selection": self._selection_brief()} if self.selection_info else {})} for pr in picked]
 
 
 def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]) -> Dict[str, Any]:
@@ -1525,11 +1681,191 @@ def _audit_side(li: Listing, price: Any, currency: Any, offer_ids: Sequence[str]
             "hosts": sorted(li.sig.hosts), "offer_ids": sorted(offer_ids)}
 
 
-def proposal_set_digest(proposals: Sequence[Mapping[str, Any]]) -> str:
+SELECTION_MODES = ("only", "exclude")
+#: identity_resolution.new_proposal: "irp_" + the first 32 hex digits of sha256(proposal_key).
+PROPOSAL_ID_RE = re.compile(r"irp_[0-9a-f]{32}")
+#: content_fingerprint: "cfp_" + the first 24 hex digits of sha256 (module docstring).
+CONTENT_FINGERPRINT_RE = re.compile(r"cfp_[0-9a-f]{24}")
+_JS_FIXED_LIMIT = 1e21
+
+
+def js_fixed(x: Any, places: int) -> Optional[str]:
+    """JavaScript's Number(x).toFixed(places), exactly: None -> None; else the double's EXACT decimal
+    value rounded half away from zero (toFixed's "pick the larger n" on |x|). -0.0 is 0. Refuses a
+    non-finite value or one >= 1e21 (toFixed switches to exponent notation there)."""
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        raise ValueError(f"not a number: {x!r}")
+    f = float(x)
+    if not math.isfinite(f) or abs(f) >= _JS_FIXED_LIMIT:
+        raise ValueError(f"js_fixed takes a finite number below 1e21, not {x!r}")
+    if f == 0:
+        f = 0.0
+    q = Decimal(f).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+    return format(q, "f")
+
+
+def _cfp_text(v: Any, what: str, *, required: bool = False) -> Optional[str]:
+    if v is None and not required:
+        return None
+    if not isinstance(v, str):
+        raise ValueError(f"content fingerprint: {what} must be a string{'' if required else ' or null'}, not {v!r}")
+    return v
+
+
+def _utf16(s: str) -> bytes:  # JS compares strings by UTF-16 code units
+    return s.encode("utf-16-be", "surrogatepass")
+
+
+def _cfp_json(v: Any) -> str:
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def _cfp_size(size: Any, what: str) -> Optional[Dict[str, Any]]:
+    if size is None:
+        return None
+    if not isinstance(size, Mapping):
+        raise ValueError(f"content fingerprint: {what} must be an object or null, not {size!r}")
+    return {"value": js_fixed(size.get("value"), 4), "unit": _cfp_text(size.get("unit"), f"{what}.unit"),
+            "pack": js_fixed(size.get("pack"), 4)}
+
+
+def _cfp_list(v: Any, what: str) -> List[Any]:
+    if not isinstance(v, list):
+        raise ValueError(f"content fingerprint: {what} must be an array (audit rows from before the "
+                         f"fingerprint carried it cannot be fingerprinted), not {v!r}")
+    return v
+
+
+def _cfp_side(side: Mapping[str, Any], name: str) -> Dict[str, Any]:
+    hosts = [_cfp_text(h, f"{name}.hosts[]", required=True) for h in _cfp_list(side.get("hosts"), f"{name}.hosts")]
+    return {
+        "product_key": _cfp_text(side.get("product_key"), f"{name}.product_key", required=True),
+        "canonical_url": _cfp_text(side.get("canonical_url"), f"{name}.canonical_url"),
+        "image_url": _cfp_text(side.get("image_url"), f"{name}.image_url"),
+        "title": _cfp_text(side.get("title"), f"{name}.title"),
+        "brand": _cfp_text(side.get("brand"), f"{name}.brand"),
+        "hosts": sorted(hosts, key=_utf16),
+        "size": _cfp_size(side.get("size"), f"{name}.size"),
+        "price": js_fixed(side.get("price"), 2),
+        "currency": _cfp_text(side.get("currency"), f"{name}.currency"),
+    }
+
+
+def _cfp_tuples(items: Any, what: str, keys: Tuple[str, str]) -> List[List[Optional[str]]]:
+    out = [[_cfp_text(it.get(keys[0]), f"{what}[].{keys[0]}", required=True),
+            _cfp_text(it.get(keys[1]), f"{what}[].{keys[1]}")] for it in _cfp_list(items, what)]
+    return sorted(out, key=lambda t: _utf16(_cfp_json(t)))
+
+
+def _cfp_row(r: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"kind": _cfp_text(r.get("kind"), "kind", required=True),
+            "tier": _cfp_text(r.get("tier"), "tier", required=True),
+            "market": _cfp_text(r.get("market"), "market", required=True),
+            "size": _cfp_size(r.get("size"), "size"),
+            "price_ratio": js_fixed(r.get("price_ratio"), 4),
+            "listing": _cfp_side(r["listing"], "listing"), "anchor": _cfp_side(r["anchor"], "anchor"),
+            "matched_offers": _cfp_tuples(r.get("matched_offers"), "matched_offers", ("offer_id", "sku_key")),
+            "matched_seeds": _cfp_tuples(r.get("matched_seeds"), "matched_seeds", ("seed_id", "variant_id"))}
+
+
+def content_fingerprint_payload(rows: Iterable[Mapping[str, Any]]) -> str:
+    """The canonical JSON a content fingerprint hashes (module docstring, CONTENT FINGERPRINT)."""
+    objs = [_cfp_row(r) for r in rows]
+    if not objs:
+        raise ValueError("content fingerprint: a proposal has at least one (listing, anchor) pair")
+    objs.sort(key=lambda o: (_utf16(o["listing"]["product_key"]), _utf16(o["anchor"]["product_key"])))
+    pairs = [(o["listing"]["product_key"], o["anchor"]["product_key"]) for o in objs]
+    if len(set(pairs)) != len(pairs):
+        raise ValueError(f"content fingerprint: a (listing, anchor) pair appears twice: {pairs}")
+    return _cfp_json(objs)
+
+
+def content_fingerprint(rows: Iterable[Mapping[str, Any]]) -> str:
+    """cfp_ + 24 hex of sha256 over content_fingerprint_payload(rows): ALL the audit rows of ONE
+    proposal. Reproducible in JavaScript from the audit JSON lines (module docstring)."""
+    payload = content_fingerprint_payload(rows)
+    return "cfp_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def content_fingerprints_from_audit_rows(rows: Iterable[Mapping[str, Any]]) -> Dict[str, str]:
+    """{proposal_id: cfp_} from audit rows alone -- what the review page computes."""
+    by: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by[r["proposal_id"]].append(r)
+    return {pid: content_fingerprint(rs) for pid, rs in sorted(by.items())}
+
+
+class SelectionError(ValueError):
+    """A --only-proposals / --exclude-proposals selection that must not run."""
+
+
+def proposal_set_digest(proposals: Sequence[Mapping[str, Any]], *,
+                        selection: Optional[Tuple[str, Sequence[str]]] = None) -> str:
     """Deterministic digest of a proposal set: each proposal's id and what it says it will do
-    (identity_resolution.proposal_fingerprint: kind, keeper, target, subjects, evidence), sorted."""
+    (identity_resolution.proposal_fingerprint: kind, keeper, target, subjects, evidence), sorted.
+
+    `selection` (mode, the kept proposals' "id=cfp" entries) is the hand-labelled subset the run was
+    narrowed to: `proposals` are then the SELECTED ones, and a last line carrying the mode and the
+    sorted entries is folded in. With no selection the digest is exactly the unselected one, so a subset's digest
+    never equals the full set's, nor another subset's, nor the same subset reached the other way."""
     lines = sorted(f"{p['proposal_id']}\t{proposal_fingerprint(dict(p))}" for p in proposals)
+    if selection is not None:
+        mode, ids = selection
+        if mode not in SELECTION_MODES:
+            raise SelectionError(f"unknown selection mode {mode!r}")
+        lines.append(f"selection\t{mode}\t{','.join(sorted(ids))}")
     return "cmd_" + hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:32]
+
+
+def normalise_proposal_ids(raw: Iterable[Any], *, source: str = "the selection") -> Dict[str, str]:
+    """THE one normalisation of a selection, whatever its form (a file's lines, a JSON list, an inline
+    comma list). Each entry is "<proposal_id>=<content fingerprint>": strip it, refuse an entry that is
+    not a string, is empty / whitespace-only, has no "=", whose id is not PROPOSAL_ID_RE or whose
+    fingerprint is not CONTENT_FINGERPRINT_RE (a BOM is named), or one id given two fingerprints; then
+    de-duplicate and sort by id. The same set always yields the same mapping, so the file and inline
+    forms of one mode give the same digest. Empty input -> {} (the caller refuses an empty selection)."""
+    out: Dict[str, str] = {}
+    for n, entry in enumerate(raw, 1):
+        if not isinstance(entry, str):
+            raise SelectionError(f"{source}: entry {n} is not a string: {entry!r}")
+        item = entry.strip()
+        if not item:
+            raise SelectionError(f"{source}: entry {n} is empty or whitespace-only")
+        bom = " (it carries a BOM, U+FEFF: save the file as UTF-8 without one)" if "\ufeff" in item else ""
+        pid, sep, fp = item.partition("=")
+        if not sep:
+            raise SelectionError(f"{source}: entry {n} {item!r} is not <proposal_id>=<cfp_ fingerprint>{bom}")
+        if not PROPOSAL_ID_RE.fullmatch(pid):
+            raise SelectionError(f"{source}: entry {n} {pid!r} is not a proposal_id (irp_ + 32 lowercase hex){bom}")
+        if not CONTENT_FINGERPRINT_RE.fullmatch(fp):
+            raise SelectionError(f"{source}: entry {n} {fp!r} is not a content fingerprint (cfp_ + 24 lowercase hex)")
+        if out.get(pid, fp) != fp:
+            raise SelectionError(f"{source}: {pid} is given two content fingerprints: {out[pid]} and {fp}")
+        out[pid] = fp
+    return dict(sorted(out.items()))
+
+
+def select_proposals(proposals: Sequence[Mapping[str, Any]], mode: str,
+                     ids: Iterable[str]) -> List[Dict[str, Any]]:
+    """The proposals a selection keeps: mode "only" keeps those whose proposal_id is in `ids`,
+    "exclude" keeps the rest. Refuses (SelectionError) an empty id list, any id that is not among
+    `proposals` (a stale file must not silently select less), and a selection that keeps nothing."""
+    if mode not in SELECTION_MODES:
+        raise SelectionError(f"unknown selection mode {mode!r}")
+    wanted = set(ids)
+    if not wanted:
+        raise SelectionError(f"the {mode} selection names no proposal_id")
+    known = {p["proposal_id"] for p in proposals}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise SelectionError(f"{len(unknown)} proposal_id(s) in the {mode} selection are not among this "
+                             f"run's {len(known)} proposals (stale list, or another run's): {unknown}")
+    keep = [dict(p) for p in proposals if (p["proposal_id"] in wanted) == (mode == "only")]
+    if not keep:
+        raise SelectionError(f"the {mode} selection keeps no proposal")
+    return keep
 
 
 def stamp_run(proposals: Sequence[Mapping[str, Any]], run_id: str) -> List[Dict[str, Any]]:
@@ -1760,6 +2096,9 @@ __all__ = [
     "CONFIDENCE", "PRICE_RATIO_MAX", "PRICE_RATIO_MIN", "RULE_VERSION", "STRATEGY", "Plan", "Planner",
     "PG_REGEX_COST_BUDGET", "Snapshot", "brand_blind_spot_misses", "brand_exact_regex", "brand_family_keys", "brand_preselect_regexes",
     "evidence_problems", "in_brand_blind_spot", "matcher_verdict", "member_fingerprint", "plan_market",
-    "proposal_set_digest", "seed_matches", "select_brand_spellings", "slug_generation", "slug_generation_differs",
-    "slug_segment_words", "stamp_run", "url_slug_segments",
+    "proposal_set_digest", "seed_matches", "select_brand_spellings", "select_proposals", "slug_generation",
+    "slug_generation_differs", "slug_segment_words", "stamp_run", "url_slug_segments",
+    "PROPOSAL_ID_RE", "SELECTION_MODES", "SelectionError", "normalise_proposal_ids",
+    "CONTENT_FINGERPRINT_RE", "content_fingerprint", "content_fingerprint_payload",
+    "content_fingerprints_from_audit_rows", "js_fixed",
 ]

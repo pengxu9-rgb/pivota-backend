@@ -36,6 +36,45 @@ MODES
       this invocation) and prints the proposal run id and the approve DRY-RUN command, whose output
       carries the ira_ digest the --execute approval needs.
 
+SELECTION (four flags, mutually exclusive). Each entry is "<proposal_id>=<content fingerprint>":
+  --only-proposals PATH          keep only the proposals a LOCAL file names (laptop dry runs);
+  --only-proposal-ids a=f,b=g    the same, inline (what a Cloud Run one-off job takes: it cannot see a
+                                 laptop path; run_oneoff_job.sh picks an --args delimiter absent from
+                                 the payload, so the commas survive);
+  --exclude-proposals PATH       DRY RUNS ONLY: keep all but those;
+  --exclude-proposal-ids a=f,... DRY RUNS ONLY.
+  The content fingerprint (cfp_, identity_cross_merchant_match.content_fingerprint; spec in that
+  module's docstring) covers every (moved listing, anchor) pair of the proposal as the audit rows
+  show it: both sides' product_key, canonical_url, title, size, price, currency, plus tier and kind.
+  The dry run prints it on every audit row, every sample and in a "fingerprints" line; the review
+  page recomputes it in JavaScript from the audit rows. Every given fingerprint is recomputed and a
+  mismatch refuses (exit 2): a write can only include a proposal whose listings and anchor are
+  content-identical to what was reviewed.
+  A file holds one entry per line (blank and '#' lines ignored) or a JSON list. gs:// paths are
+  REFUSED. Every form goes through ONE normalisation (normalise_proposal_ids: strip, refuse empty /
+  whitespace-only / malformed entries -- irp_ + 32 lowercase hex = cfp_ + 24 lowercase hex -- or one
+  id with two fingerprints, then de-dup and sort), and the digest marks only the MODE, so
+  --only-proposals FILE and --only-proposal-ids LIST naming the same entries give the same digest.
+  Any read or parse failure refuses (exit 2), never falling back to no selection. An id that is not
+  among THIS run's proposals refuses (exit 2, naming it); so does an empty list or a selection that
+  keeps nothing. The selection is FOLDED INTO THE DIGEST (proposal_set_digest: each selected
+  proposal's id and proposal_fingerprint, plus a line carrying the mode and the sorted id=cfp
+  entries). The dry run prints the subset's digest, count and a next_step carrying the flag in the
+  form used (shell-quoted path, or the sorted inline entries); --write-proposals takes the same
+  selection, recomputes, and refuses on a mismatch. A SELECTED write also refuses while ANY
+  'proposed' proposal of this strategy exists (an earlier run an approve could take whole), and when
+  any selected proposal already exists (it would dedupe into another run); its run then holds exactly
+  the selection. Every write takes pg_advisory_xact_lock(hashtext('cross_merchant_same_size')) before
+  those checks, in the insert's transaction. Counts, samples, proposals.jsonl and the audit sample are
+  of the subset and say so.
+  A REJECTED (or approved / applied) proposal CANNOT be re-written by a selected write: its
+  proposal_id is deterministic, so it already exists and the write refuses (would dedupe). A changed
+  listing mints a new id; otherwise the old row must be dealt with in the engine first.
+  AUDIT COMPLETENESS: the dry run's outputs line carries audit_complete (every moving pair is in the
+  audit; false when --audit-size sampled). Any SELECTED run (dry or write) prints a FULL audit and
+  refuses a selected proposal with a pair missing from it. The review page needs every pair of a
+  proposal to compute its fingerprint: label from a run whose audit_complete is true.
+
 SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
   --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
                    stored spelling of the family ("Dr.Jart+", "Dr. Jart+", "DR JART" for drjart) is
@@ -63,6 +102,7 @@ import argparse
 import asyncio
 import json
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -86,7 +126,9 @@ from services.identity_cross_merchant_match import (  # noqa: E402
     gtin_lookup_values,
     evidence_problems,
     plan_market,
+    normalise_proposal_ids,
     select_brand_spellings,
+    SelectionError,
     stamp_run,
 )
 
@@ -398,6 +440,74 @@ def _gcs_upload(bucket: str, name: str, body: bytes) -> None:  # pragma: no cove
         pass
 
 
+#: (mode, normalised proposal_ids, the selection flag as next_step prints it)
+#: (mode, {proposal_id: reviewed content fingerprint}, the selection flag as next_step prints it)
+Selection = Tuple[str, Dict[str, str], str]
+
+
+def parse_proposal_ids(text: str, *, source: str = "the selection file") -> Dict[str, str]:
+    """{proposal_id: cfp} from a selection file's text: a JSON list of "id=cfp" strings, or one
+    "id=cfp" per line (blank lines and lines starting with '#' ignored), through
+    normalise_proposal_ids. Raises Refused."""
+    body = text.strip()
+    if body.startswith("["):
+        try:
+            raw = json.loads(body)
+        except ValueError as exc:
+            raise Refused(f"{source} is not a valid JSON list: {exc}") from exc
+    else:
+        raw = [ln for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    try:
+        return normalise_proposal_ids(raw, source=source)
+    except SelectionError as exc:
+        raise Refused(str(exc)) from exc
+
+
+def _load_selection(args: argparse.Namespace) -> Optional[Selection]:
+    for mode in ("only", "exclude"):
+        path = getattr(args, f"{mode}_proposals", None)
+        inline = getattr(args, f"{mode}_proposal_ids", None)
+        if path is not None:
+            flag = f"--{mode}-proposals"
+            if path.strip().lower().startswith("gs://"):
+                raise Refused(f"{flag} {path}: gs:// is not read (no untested bucket path); pass the "
+                              f"selection inline with --{mode}-proposal-ids id1=cfp1,id2=cfp2,... instead")
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            entries = parse_proposal_ids(text, source=f"{flag} {path}")
+            shown = f"{flag} {shlex.quote(path)}"
+        elif inline is not None:
+            flag = f"--{mode}-proposal-ids"
+            try:
+                entries = normalise_proposal_ids(inline.split(","), source=flag) if inline.strip() else {}
+            except SelectionError as exc:
+                raise Refused(str(exc)) from exc
+            shown = f"{flag} {','.join(f'{pid}={fp}' for pid, fp in entries.items())}"
+        else:
+            continue
+        if not entries:
+            raise Refused(f"{flag} names no proposal_id: an empty selection is refused")
+        return mode, entries, shown
+    return None
+
+
+def load_selection(args: argparse.Namespace) -> Optional[Selection]:
+    """The selection one of the four flags names, else None. EVERY failure -- a gs:// path, an
+    unreadable or undecodable file, any malformed entry, an empty selection, anything unexpected --
+    is Refused (exit 2) before the database is read; it never falls back to no selection and never
+    escapes as a traceback."""
+    try:
+        return _load_selection(args)
+    except Refused:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- by design: any failure refuses, nothing falls through
+        raise Refused(f"the proposal selection could not be read: {type(exc).__name__}: {exc}") from exc
+
+
+def selection_flag(selection: Optional[Selection]) -> str:
+    return "" if selection is None else f" {selection[2]}"
+
+
 def write_outputs(out: str, files: Mapping[str, bytes], *,
                   uploader: Callable[[str, str, bytes], None] = _gcs_upload) -> List[str]:
     written = []
@@ -442,6 +552,8 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
     if len(plan.proposals) > max_proposals:
         raise Refused(f"{len(plan.proposals)} proposals exceed --max-proposals {max_proposals}; "
                       "narrow with --brands / --limit-groups")
+    if plan.selection is not None and plan.selection[0] != "only":
+        raise Refused("--write-proposals writes only an --only selection; --exclude is for dry runs")
     run_id = run_id or new_proposal_run_id()
     stamped = stamp_run(plan.proposals, run_id)
     bad = {p["proposal_id"]: errs for p in stamped if (errs := evidence_problems(p))}
@@ -449,6 +561,13 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
         raise Refused(f"proposals fail the engine's module rule: {dict(list(bad.items())[:5])}")
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
+        # one writer of this strategy at a time: the pending / dedupe checks below and the inserts
+        # are one critical section (released at commit or rollback). A peer stuck holding it makes this
+        # write REFUSE after lock_timeout instead of waiting forever.
+        await conn.execute(LOCK_TIMEOUT_SQL)
+        await conn.execute(LOCK_SQL, STRATEGY)
+        if plan.selection is not None:
+            await refuse_unsafe_selected_write(conn, [p["proposal_id"] for p in stamped])
         for p in stamped:
             # #2637 (L3): only this module may write this strategy's proposals, and says so. module_writer
             # is a CONVENTION the engine's Python writer checks, not a database constraint: nothing in
@@ -458,8 +577,48 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
             counts = await upsert_proposals(conn, [p], module_writer=STRATEGY)
             if counts["inserted"]:
                 inserted.append(p)
+        if plan.selection is not None and len(inserted) != len(stamped):
+            # a concurrent writer since the check above: roll the whole selected write back
+            raise Refused(f"{len(stamped) - len(inserted)} selected proposal(s) deduped onto existing rows; "
+                          "a selected write must insert every proposal into its own run (rolled back)")
     return {"proposal_run_id": run_id, "proposed": len(stamped), "inserted": len(inserted),
-            "deduped": len(stamped) - len(inserted), "dry_run_digest": digest}
+            "deduped": len(stamped) - len(inserted), "dry_run_digest": digest,
+            **({"selection": plan.selection_info} if plan.selection_info else {})}
+
+
+LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
+LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+PENDING_SQL = """
+SELECT r.proposal_id, r.evidence->>'proposal_run_id' AS proposal_run_id
+FROM identity_resolution_proposals r
+WHERE r.strategy = $1 AND r.status = 'proposed'
+ORDER BY r.proposal_id
+LIMIT 20
+"""
+EXISTING_SQL = """
+SELECT r.proposal_id, r.status, r.evidence->>'proposal_run_id' AS proposal_run_id
+FROM identity_resolution_proposals r
+WHERE r.proposal_id = ANY($1::text[])
+ORDER BY r.proposal_id
+LIMIT 20
+"""
+
+
+async def refuse_unsafe_selected_write(conn: Any, proposal_ids: Sequence[str]) -> None:
+    """A selected write must leave its run holding EXACTLY the selection, and no other pending run of
+    this strategy may exist: #2637 approves a module run as a whole, so an earlier full-set write
+    still 'proposed' (or a selected proposal deduping onto an older run) would let an approve take
+    more than was labelled. Raises Refused."""
+    pending = [dict(r) for r in await conn.fetch(PENDING_SQL, STRATEGY)]
+    if pending:
+        runs = sorted({str(r["proposal_run_id"]) for r in pending})
+        raise Refused(f"{STRATEGY} already has pending ('proposed') proposals under run(s) {runs} "
+                      f"(first: {[r['proposal_id'] for r in pending][:5]}): reject or resolve them before a "
+                      "selected write, or an approve of that run could take more than was labelled")
+    existing = [dict(r) for r in await conn.fetch(EXISTING_SQL, list(proposal_ids))]
+    if existing:
+        raise Refused(f"{len(existing)}+ selected proposal(s) already exist and would dedupe (deduped > 0): "
+                      f"{[(r['proposal_id'], r['status'], r['proposal_run_id']) for r in existing][:5]}")
 
 
 def approve_commands(run_id: str) -> Dict[str, str]:
@@ -478,6 +637,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     ap.add_argument("--expect-digest")
     ap.add_argument("--max-proposals", type=int)
     ap.add_argument("--market", default="US")
+    select = ap.add_mutually_exclusive_group()
+    select.add_argument("--only-proposals", metavar="PATH",
+                        help="keep only the proposals this LOCAL file names as id=cfp (one per line or a JSON "
+                             "list; gs:// refused); each content fingerprint is verified; folded into the digest")
+    select.add_argument("--exclude-proposals", metavar="PATH",
+                        help="DRY RUNS ONLY: keep every proposal except those this LOCAL file names (id=cfp)")
+    select.add_argument("--only-proposal-ids", metavar="ID=CFP,...",
+                        help="keep only these id=cfp proposals (comma-separated; same digest as the file form)")
+    select.add_argument("--exclude-proposal-ids", metavar="ID=CFP,...",
+                        help="DRY RUNS ONLY: keep every proposal except these id=cfp (comma-separated)")
     scope = ap.add_mutually_exclusive_group()
     scope.add_argument("--brands", default="", help="comma-separated brands (canonical brand match)")
     scope.add_argument("--all-brands", action="store_true",
@@ -490,8 +659,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = ap.parse_args(list(argv))
     if args.write_proposals and (not args.expect_digest or not args.max_proposals or args.max_proposals < 1):
         ap.error("--write-proposals needs --expect-digest (from a dry run) and --max-proposals >= 1")
+    if args.write_proposals and (args.exclude_proposals is not None or args.exclude_proposal_ids is not None):
+        ap.error("--write-proposals writes only an --only selection; --exclude-proposals / "
+                 "--exclude-proposal-ids are for dry runs")
+    if args.explain and any(getattr(args, a) is not None for a in (
+            "only_proposals", "exclude_proposals", "only_proposal_ids", "exclude_proposal_ids")):
+        ap.error("--explain plans the statements only; it takes no proposal selection")
     if args.limit_groups is not None and args.limit_groups < 1:
         ap.error("--limit-groups must be >= 1")
+    if args.audit_size < 0:
+        ap.error("--audit-size must be >= 0")
     args.market = args.market.strip().upper()
     args.brand_list = [b.strip() for b in args.brands.split(",") if b.strip()]
     if not args.brand_list and not args.all_brands:
@@ -516,6 +693,11 @@ async def run(conn: Any, args: argparse.Namespace, *,
             _print(line)
         return 0
     try:
+        selection = load_selection(args)
+    except Refused as exc:  # gs://, unreadable, malformed or empty selection: refused before any read
+        _print(_line("refused", reason=str(exc)))
+        return 2
+    try:
         snap, counts = await export_snapshot(conn, args.market, brands=args.brand_list,
                                              limit_groups=args.limit_groups)
     except Refused as exc:  # the --brands blind-spot guard
@@ -532,9 +714,25 @@ async def run(conn: Any, args: argparse.Namespace, *,
                               "run passed the blind-spot guard); review brand_spellings in the loaded line")))
     _print(_line("loaded", market=args.market, brands=args.brand_list, **counts))
     plan = plan_market(snap, args.market, brands=args.brand_list, limit_groups=args.limit_groups)
+    if selection is not None:
+        try:
+            plan.select(selection[0], selection[1])
+        except SelectionError as exc:
+            _print(_line("refused", reason=str(exc), selection=selection[2]))
+            return 2
     for line in report_lines(plan):
         _print(line)
-    audit = plan.audit_rows(size=args.audit_size, seed=args.audit_seed)
+    # a selected run (dry or write) prints EVERY pair: the page fingerprints whole proposals
+    audit_size = len(plan.pairs) if selection is not None else args.audit_size
+    audit = plan.audit_rows(size=audit_size, seed=args.audit_seed)
+    audit_complete = len(audit) == len(plan.pairs)
+    if selection is not None:
+        gaps = plan.audit_gaps(audit)
+        if gaps:
+            _print(_line("refused", selection=selection[2], reason=(
+                f"{len(gaps)} selected proposal(s) have pairs missing from the audit, so the review page "
+                f"cannot have fingerprinted them whole: {dict(list(gaps.items())[:5])}")))
+            return 2
     if not args.write_proposals:
         for row in audit:
             _print(_line("audit", **row))
@@ -545,16 +743,20 @@ async def run(conn: Any, args: argparse.Namespace, *,
         except Refused as exc:
             _print(_line("refused", reason=str(exc)))
             return 2
-        _print(_line("written", strategy=STRATEGY, **result, **approve_commands(result["proposal_run_id"]),
+        _print(_line("written", strategy=STRATEGY, **result, audit_complete=audit_complete,
+                     **approve_commands(result["proposal_run_id"]),
                      next_step="after Peng reviewed the audit sample: approve_dry_run, then approve_execute"))
         return 0
     if args.out.startswith("gs://"):
         _print(_line("warning", gcs_upload="UNTESTED against GCS; the audit sample is also in the log lines"))
-    written = write_outputs(args.out, output_files(plan, audit_size=args.audit_size, audit_seed=args.audit_seed),
+    written = write_outputs(args.out, output_files(plan, audit_size=audit_size, audit_seed=args.audit_seed),
                             uploader=uploader)
     _print(_line("outputs", files=written, digest=plan.digest(), proposals=len(plan.proposals),
+                 audit_complete=audit_complete, audit_rows=len(audit), pairs=len(plan.pairs),
+                 **({"selection": plan.selection_info} if plan.selection_info else {}),
                  next_step=(f"--write-proposals --expect-digest {plan.digest()} --max-proposals "
-                            f"{len(plan.proposals)} (same --market, --brands or --all-brands, --limit-groups)")))
+                            f"{len(plan.proposals)}{selection_flag(selection)} "
+                            "(same --market, --brands or --all-brands, --limit-groups)")))
     return 0
 
 
