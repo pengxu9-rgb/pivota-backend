@@ -147,8 +147,9 @@ def test_the_id_pins_only_the_move_and_the_digest_and_fingerprint_pin_the_conten
 
 
 def test_the_selection_marker_binds_content_the_evidence_does_not_carry():
-    """The evidence carries no canonical_url, so proposal_fingerprint does not move when a listing's URL
-    does; the content fingerprint in the selection marker does -- a subset digest is bound to it."""
+    """The evidence carries no image_url, so proposal_fingerprint does not move when a listing's image
+    does; the content fingerprint in the selection marker does -- a subset digest is bound to it.
+    (Since #2645 the evidence row briefs carry canonical_url, so a URL change moves both.)"""
     cat = _mixed()
     ids = _ids(cat.plan())
     reviewed = _selected("only", ids[:3], cat)
@@ -156,7 +157,7 @@ def test_the_selection_marker_binds_content_the_evidence_does_not_carry():
     reviewed_digest, before = reviewed.digest(), reviewed.content_fingerprints()
     bare_before = proposal_set_digest(reviewed.proposals)
     victim = next(p for p in cat.products if p["product_key"] in _moved(reviewed))
-    victim["canonical_url"] = "https://moved.example/p/1"
+    victim["image_url"] = "https://img.example/moved.jpg"
     now = cat.plan()
     assert _ids(now) == ids
     assert proposal_set_digest(now.proposals[:3]) == bare_before                  # the evidence did not move
@@ -164,6 +165,16 @@ def test_the_selection_marker_binds_content_the_evidence_does_not_carry():
     assert len([i for i in before if before[i] != after[i]]) == 1
     now.select("only", after)
     assert now.digest() != reviewed_digest
+
+
+def test_a_canonical_url_change_now_moves_the_evidence_digest_too():
+    cat = _mixed()
+    ids = _ids(cat.plan())
+    reviewed = _selected("only", ids[:3], cat)
+    bare_before = proposal_set_digest(reviewed.proposals)
+    victim = next(p for p in cat.products if p["product_key"] in _moved(reviewed))
+    victim["canonical_url"] = "https://moved.example/p/1"
+    assert proposal_set_digest(cat.plan().proposals[:3]) != bare_before
 
 
 def test_an_unknown_selection_mode_is_refused():
