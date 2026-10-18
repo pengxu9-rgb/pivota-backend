@@ -183,6 +183,13 @@ def test_a_pair_whose_slugs_agree_or_carry_no_generation_word_still_proposes(nam
      ["new arrivals", "etude collagen cream"]),
     ("https://s.example/category/2019-new/etude-collagen-cream", ["2019 new", "etude collagen cream"]),
     ("https://s.example/products/리뉴얼-오휘-에센스", ["리뉴얼 오휘 에센스"]),
+    # Short handles that LOOK like locales are product names: only known language codes are locales,
+    # and a locale-shaped segment that is the sole candidate is still read.
+    ("https://s.example/products/bb-new", ["bb new"]),
+    ("https://s.example/products/cc-gold", ["cc gold"]),
+    ("https://s.example/products/lg-new", ["lg new"]),
+    ("https://s.example/products/en-us", ["en us"]),
+    ("https://s.example/en/products/bb-glow", ["bb glow"]),
     ("", []), (None, []), ("https://x.example/", []),
 ])
 def test_url_slug_segments_lists_the_candidate_product_segments(url, segments):
@@ -565,3 +572,13 @@ def test_the_product_segment_reading_alone_holds_for_named_lines():
     b = slug_generation("https://s.example/products/ohui-prime-advancer-de-aging-skin-softener-150ml", "O HUI",
                         OHUI_SOFTENER)
     assert a.all_lines == b.all_lines == {"de_aging"} and a.lines != b.lines and slug_generation_differs(a, b)
+
+
+def test_a_short_handle_that_looks_like_a_locale_still_holds():
+    """Controller review of a571eac4f: /products/bb-new read as a locale and gave no words, so it proposed
+    against a plain handle."""
+    title = "BB New Cream"
+    new = slug_generation("https://a.example/products/bb-new", "Brand", title)
+    plain = slug_generation("https://b.example/products/bb-cream", "Brand", title)
+    assert "new" in new.words
+    assert slug_generation_differs(new, plain)

@@ -339,8 +339,10 @@ _SLUG_EXTENSION_RE = re.compile(r"\.(?:html?|php|aspx?|do|jsp)$", re.IGNORECASE)
 _SLUG_STRUCTURAL = frozenset({"dp", "gp", "product", "products", "p", "item", "items", "goods", "info",
                               "detail", "details", "view", "collections", "collection", "category",
                               "categories", "tag", "tags", "display", "page", "amp"})
-#: A locale segment ("en", "en-us", "ko_kr", "zh-hant"): never a product name.
-_SLUG_LOCALE_RE = re.compile(r"[a-z]{2}(?:[-_][a-z]{2,4})?")
+#: A locale segment ("en", "en-us", "ko_kr", "zh-hant"): a KNOWN language code, optionally with a region or
+#: script. Not any two letters: short product handles ("bb-new", "cc-gold", "lg-new") look the same.
+_SLUG_LOCALE_LANGS = ("en|ko|ja|zh|fr|de|es|it|pt|ru|th|vi|id|ms|nl|sv|da|no|fi|pl|tr|ar|he")
+_SLUG_LOCALE_RE = re.compile(rf"(?:{_SLUG_LOCALE_LANGS})(?:[-_](?:[a-z]{{2}}|hans|hant|latn|cyrl))?")
 _SLUG_ID_RE = re.compile(r"(?:pid|id|sku|item|no|prd)[.\-_]?\d+|b0[0-9a-z]{8}")
 #: canonical brand -> (token, pattern on the folded segment): the lines a renewal renamed.
 #: ohui: "Phyto Vital" (the Prime Advancer line before its renewal), "De-aging" (the renewed Prime
@@ -368,16 +370,22 @@ def url_slug_segments(url: Any) -> List[str]:
     except ValueError:
         return []
     out: List[str] = []
+    locales: List[str] = []
     for raw in path.split("/"):
         seg = _SLUG_EXTENSION_RE.sub("", unquote(raw).strip())
         if not seg:
             continue
         low = seg.lower()
-        if (low in _SLUG_STRUCTURAL or not any(c.isalpha() for c in seg) or _SLUG_ID_RE.fullmatch(low)
-                or _SLUG_LOCALE_RE.fullmatch(low)):
+        if low in _SLUG_STRUCTURAL or not any(c.isalpha() for c in seg) or _SLUG_ID_RE.fullmatch(low):
             continue
-        out.append(" ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split()))
-    return out
+        text = " ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split())
+        if _SLUG_LOCALE_RE.fullmatch(low):
+            locales.append(text)
+            continue
+        out.append(text)
+    # A locale-shaped segment is skipped only when something else names the product: as the SOLE
+    # candidate it is read, so a short handle that happens to look like a locale is never lost.
+    return out or locales
 
 
 def _is_slug_generation_token(token: str) -> bool:
