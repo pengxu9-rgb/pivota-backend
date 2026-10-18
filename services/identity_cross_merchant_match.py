@@ -263,30 +263,37 @@ def offer_text_sizes(offer: Mapping[str, Any]) -> Set[SizeKey]:
 # retailer-written and can be stale (a page created in 2019 and re-imaged since), so it is a reason
 # to look, not proof.
 #
-# WHICH PATH SEGMENTS: every segment that NAMES THE PRODUCT, not only the last -- Amazon puts the name
-# before "/dp/<ASIN>", some stores before "/<id>/", YesStyle before "/info.html/pid.<n>". A segment
-# is skipped when it is an id (no letter at all, "pid.1234" / "id-77" / "sku_9", an Amazon ASIN), a
-# structural word (_SLUG_STRUCTURAL: dp, product(s), info, ...), the handle right after a listing
-# word (_SLUG_LISTING_PARENTS: "/collections/new-arrivals/products/x" is no "new" edition), or when
-# it shares no core word with the row's own title (a locale, a category, "view.do").
+# WHICH PATH SEGMENT: ONE product segment per URL, never a union of segments (a category handle
+# such as "/eye-cream-new-arrivals/" must neither add a word nor mask the other side's). The
+# candidates are the path segments that are not an id (no letter at all, "pid.1234" / "id-77" /
+# "sku_9", an Amazon ASIN) nor a structural or listing word (_SLUG_STRUCTURAL: dp, product(s), info,
+# collections, category, ...). The product segment is the candidate sharing the MOST core words
+# with the row's own title (the later one on a tie), and the LAST candidate when none shares any --
+# so Amazon "/<name>/dp/<ASIN>", "/product/<name>/<id>/" and YesStyle "/en/<name>/info.html/pid.<n>"
+# resolve to <name>, and a slug in another script or language than the title ("오휘 에센스" vs
+# "/products/o-hui-essence-리뉴얼"), or one that is all brand and edition ("/products/etude-2019-new"),
+# is still read.
 #
 # The words, kept conservative:
 #   - from the normalizer's own CONFLICT_LEXICON (title_core on the segment, the row's brand
 #     removed), ONLY the generation tokens: renewal (renewal / renewed), new, new_formula,
 #     reformulated, v<N> (v2 / ver 2 / version 2), gen<N>, and the edition family
 #     (limited_edition, special_edition, holiday_ / anniversary_ / collector_edition). A year-valued
-#     version reads as the year: "ver-2021" = "2021-ver" = "2021ver" = "21ver" = {year_2021}. NOT
+#     version reads as the year: "ver-2021" = "2021-ver" = "2021ver" = "21ver" = "ver-21" =
+#     {year_2021} (a two-digit version 10-39 is read as a year too). NOT
 #     plus, rx, advanced, intense, ex: line words retailers keep or drop in slugs at will, and the
 #     titles' own conflict tokens already veto them;
 #   - SLUG_EXTRA_WORDS (slug spellings the title lexicon lacks): renew / relaunch(ed) / 리뉴얼 ->
-#     renewal; newest / 신형 ("new model") -> new; upgrade(d) -> upgraded; "2nd edition" -> edition_2;
+#     renewal; newest / 신형 ("new model") -> new; upgrade(d) -> upgraded; a numbered edition ->
+#     edition_<N>: "2nd edition", "2nd limited edition", "second edition", "2 edition", and
+#     "edition 2" unless it ends the slug (there "-2" is a de-dup suffix);
 #   - a year edition: a standalone 2010-2039 word ("...-2019-new") -> year_<YYYY>;
 #   - glued forms are split first, ONLY around a year or one of the words above, never inside a
 #     word: "2021new", "new2021", "renewal2021", "2021ver", "21ver", "newver" ("renewalist",
 #     "newborn", "new-york", "sku2019" stay word-free);
 #   - SLUG_NAMED_LINES: per brand, the named lines a renewal renamed. Unlike the words above these
-#     are ordinary product-name words, so they are compared only when BOTH sides have a readable
-#     segment (one that shares a core word with their own row's title).
+#     are ordinary product-name words, so they are compared only when BOTH sides' product segments
+#     are readable (share a core word with their own row's title).
 # Retailer slug noise never matches any of these: brand prefixes ("etudehouse-", "o-hui-"), size
 # suffixes ("-150ml-5-07fl-oz", "-50ml-60ml"), product ids, de-dup suffixes ("-1", "-2", "-copy",
 # "-사본") and marketing words ("korean-cosmetics-beauty").
@@ -296,7 +303,7 @@ def offer_text_sizes(offer: Mapping[str, Any]) -> Set[SizeKey]:
 # Korean in a URL.
 SLUG_GENERATION_STATIC_TOKENS = frozenset({"renewal", "new", "new_formula", "reformulated"})
 _SLUG_VALUED_GENERATION_RE = re.compile(r"v\d+(?:\.\d+)?|gen\d+|[a-z]+_edition")
-_SLUG_YEAR_VERSION_RE = re.compile(r"v(20[1-3][0-9])")
+_SLUG_YEAR_VERSION_RE = re.compile(r"v(?:20)?([1-3][0-9])")
 _SLUG_YEAR_RE = re.compile(r"(?<![0-9a-z])(20[1-3][0-9])(?![0-9a-z])")
 _SLUG_GLUE_WORDS = "newest|new|renewal|renewed|renew|relaunched|relaunch|ver"
 #: Glued year / word forms, split before the words are read (applied in this order).
@@ -306,18 +313,24 @@ _SLUG_GLUE: Tuple[Tuple["re.Pattern[str]", str], ...] = (
     (re.compile(r"(?<![0-9a-z])([1-3][0-9])ver(?![a-z])"), r"20\1 ver"),
     (re.compile(rf"(?<![0-9a-z])({_SLUG_GLUE_WORDS})(20[1-3][0-9])(?![0-9a-z])"), r"\1 \2"),
 )
+_SLUG_ORDINALS = {w: n for n, w in enumerate(
+    ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"), start=1)}
 #: (token, or a callable of the match; pattern on the folded, de-glued segment).
 SLUG_EXTRA_WORDS: Tuple[Tuple[Any, "re.Pattern[str]"], ...] = (
     ("renewal", re.compile(r"\b(?:renew|relaunch(?:ed)?)\b|리뉴얼")),
     ("new", re.compile(r"\bnewest\b|신형")),
     ("upgraded", re.compile(r"\bupgraded?\b")),
-    (lambda m: f"edition_{int(m.group(1))}", re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+edition\b")),
+    (lambda m: f"edition_{int(m.group(1))}", re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\s+(?:[a-z]+\s+)?edition\b")),
+    (lambda m: f"edition_{_SLUG_ORDINALS[m.group(1)]}",
+     re.compile(r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:[a-z]+\s+)?edition\b")),
+    (lambda m: f"edition_{int(m.group(1))}", re.compile(r"(?<![\w.])(\d{1,2})\s+edition\b")),
+    (lambda m: f"edition_{int(m.group(1))}", re.compile(r"\bedition\s+(\d{1,2})(?=\s+\S)")),
 )
 _SLUG_SEPARATOR_RE = re.compile(r"[-_+.,~]+")
 _SLUG_EXTENSION_RE = re.compile(r"\.(?:html?|php|aspx?|do|jsp)$", re.IGNORECASE)
 _SLUG_STRUCTURAL = frozenset({"dp", "gp", "product", "products", "p", "item", "items", "goods", "info",
-                              "detail", "details", "view"})
-_SLUG_LISTING_PARENTS = frozenset({"collections", "collection", "category", "categories", "tag", "tags"})
+                              "detail", "details", "view", "collections", "collection", "category",
+                              "categories", "tag", "tags"})
 _SLUG_ID_RE = re.compile(r"(?:pid|id|sku|item|no|prd)[.\-_]?\d+|b0[0-9a-z]{8}")
 #: canonical brand -> (token, pattern on the folded segment): the lines a renewal renamed.
 #: ohui: "Phyto Vital" (the Prime Advancer line before its renewal), "De-aging" (the renewed Prime
@@ -329,12 +342,14 @@ SLUG_NAMED_LINES: Mapping[str, Tuple[Tuple[str, "re.Pattern[str]"], ...]] = {
              ("geniture", re.compile(r"\bgeniture\b"))),
 }
 #: canonical_brand spellings of a SLUG_NAMED_LINES brand that canonical_brand keeps apart.
-SLUG_NAMED_LINE_BRAND_ALIASES: Mapping[str, str] = {"오휘": "ohui", "lgohui": "ohui", "lg생활건강오휘": "ohui"}
+SLUG_NAMED_LINE_BRAND_ALIASES: Mapping[str, str] = {
+    "오휘": "ohui", "lgohui": "ohui", "lg생활건강오휘": "ohui", "ohuibylg": "ohui", "lghouseholdohui": "ohui",
+    "lghouseholdandhealthcareohui": "ohui"}
 
 
 def url_slug_segments(url: Any) -> List[str]:
-    """The product URL's path segments that can name a product, each percent-decoded, its extension
-    dropped and its separators read as spaces; ids, structural words and listing handles skipped."""
+    """The product URL's candidate product segments, in path order, each percent-decoded, its
+    extension dropped and its separators read as spaces; ids and structural / listing words skipped."""
     if not url:
         return []
     try:
@@ -342,18 +357,11 @@ def url_slug_segments(url: Any) -> List[str]:
     except ValueError:
         return []
     out: List[str] = []
-    after_listing = False
     for raw in path.split("/"):
         seg = _SLUG_EXTENSION_RE.sub("", unquote(raw).strip())
         if not seg:
             continue
         low = seg.lower()
-        if after_listing:
-            after_listing = False
-            continue
-        if low in _SLUG_LISTING_PARENTS:
-            after_listing = True
-            continue
         if low in _SLUG_STRUCTURAL or not any(c.isalpha() for c in seg) or _SLUG_ID_RE.fullmatch(low):
             continue
         out.append(" ".join(_SLUG_SEPARATOR_RE.sub(" ", seg).split()))
@@ -364,32 +372,40 @@ def _is_slug_generation_token(token: str) -> bool:
     return token in SLUG_GENERATION_STATIC_TOKENS or bool(_SLUG_VALUED_GENERATION_RE.fullmatch(token))
 
 
-def slug_segment_words(segment: str, brand: Any = None) -> FrozenSet[str]:
-    """The generation words of one URL segment (see the comment above)."""
+def _segment_reading(segment: str, brand: Any) -> Tuple[FrozenSet[str], FrozenSet[str]]:
+    """(core tokens, generation words) of one URL segment, from ONE title_core of its de-glued text."""
     text = _fold(segment)
     for pattern, repl in _SLUG_GLUE:
         text = pattern.sub(repl, text)
+    tc = title_core(brand, text)
     words: Set[str] = set()
-    for t in title_core(brand, text).conflicts:
+    for t in tc.conflicts:
         year = _SLUG_YEAR_VERSION_RE.fullmatch(t)
         if year:
-            words.add(f"year_{year.group(1)}")
+            words.add(f"year_20{year.group(1)}")
         elif _is_slug_generation_token(t):
             words.add(t)
     words |= {f"year_{y}" for y in _SLUG_YEAR_RE.findall(text)}
     for token, pattern in SLUG_EXTRA_WORDS:
         for m in pattern.finditer(text):
             words.add(token(m) if callable(token) else token)
-    return frozenset(words)
+    return tc.tokens, frozenset(words)
+
+
+def slug_segment_words(segment: str, brand: Any = None) -> FrozenSet[str]:
+    """The generation words of one URL segment (see the comment above)."""
+    return _segment_reading(segment, brand)[1]
 
 
 @dataclass(frozen=True)
 class SlugGeneration:
     """What one row's canonical_url says about the product's generation.
 
-    words:    generation / edition words and year editions (compared always: none is a product-name word).
+    All three are read from the URL's ONE product segment (see the comment above).
+    words:    generation / edition words and year editions -- compared always, readable or not: none
+              is a product-name word.
     lines:    SLUG_NAMED_LINES tokens of the row's brand.
-    readable: a segment shares a core word with the row's own title (the URL names the product)."""
+    readable: the product segment shares a core word with the row's own title (it names the product)."""
 
     words: FrozenSet[str] = frozenset()
     lines: FrozenSet[str] = frozenset()
@@ -397,21 +413,20 @@ class SlugGeneration:
 
 
 def slug_generation(url: Any, brand: Any, title: Any) -> SlugGeneration:
-    """The SlugGeneration of a row's canonical_url, read from its readable segments only."""
+    """The SlugGeneration of a row's canonical_url, from its ONE product segment: the candidate with
+    the most core words in common with the title, the later one on a tie -- so the LAST candidate
+    when none has any."""
+    readings = [(seg, *_segment_reading(seg, brand)) for seg in url_slug_segments(url)]
+    if not readings:
+        return SlugGeneration()
     title_tokens = title_core(brand, title).tokens if title else frozenset()
+    overlap, i = max((len(tokens & title_tokens), i) for i, (_seg, tokens, _words) in enumerate(readings))
+    seg, _tokens, words = readings[i]
     cb = canonical_brand(brand)
     named = SLUG_NAMED_LINES.get(SLUG_NAMED_LINE_BRAND_ALIASES.get(cb, cb), ())
-    words: Set[str] = set()
-    lines: Set[str] = set()
-    readable = False
-    for seg in url_slug_segments(url):
-        if not title_core(brand, seg).tokens & title_tokens:
-            continue
-        readable = True
-        words |= slug_segment_words(seg, brand)
-        folded = _fold(seg)
-        lines |= {tok for tok, pat in named if pat.search(folded)}
-    return SlugGeneration(frozenset(words), frozenset(lines), readable)
+    folded = _fold(seg)
+    lines = {tok for tok, pat in named if pat.search(folded)}
+    return SlugGeneration(words, frozenset(lines), overlap > 0)
 
 
 def slug_generation_differs(a: SlugGeneration, b: SlugGeneration) -> bool:

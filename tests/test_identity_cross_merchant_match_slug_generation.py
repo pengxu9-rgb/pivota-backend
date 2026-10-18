@@ -172,13 +172,14 @@ def test_a_pair_whose_slugs_agree_or_carry_no_generation_word_still_proposes(nam
      ["en", "etude collagen cream 2019 new"]),
     ("https://s.example/goods/item-77/sku_9/id-12/detail.jsp", []),
     ("https://ohui.co.kr/product/view.do?prdCd=123", []),
-    # A listing page's handle is no edition: "/collections/new-arrivals/..." is not "new".
-    ("https://s.example/collections/new-arrivals/products/etude-collagen-cream", ["etude collagen cream"]),
-    ("https://s.example/category/2019-new/etude-collagen-cream", ["etude collagen cream"]),
+    # Listing words are skipped; their handles stay candidates (the product segment is chosen below).
+    ("https://s.example/collections/new-arrivals/products/etude-collagen-cream",
+     ["new arrivals", "etude collagen cream"]),
+    ("https://s.example/category/2019-new/etude-collagen-cream", ["2019 new", "etude collagen cream"]),
     ("https://s.example/products/리뉴얼-오휘-에센스", ["리뉴얼 오휘 에센스"]),
     ("", []), (None, []), ("https://x.example/", []),
 ])
-def test_url_slug_segments_reads_every_segment_that_can_name_the_product(url, segments):
+def test_url_slug_segments_lists_the_candidate_product_segments(url, segments):
     assert url_slug_segments(url) == segments
 
 
@@ -186,6 +187,61 @@ def test_a_segment_that_does_not_name_the_product_is_not_read():
     title = "ETUDE Moistfull Collagen Cream 75ml"
     gen = slug_generation("https://s.example/new/2019-renewal/etude-moistfull-collagen-cream-75ml", "ETUDE", title)
     assert gen.words == frozenset() and gen.readable
+    listing = slug_generation("https://s.example/collections/new-arrivals/products/etude-moistfull-collagen-cream-75ml",
+                              "ETUDE", title)
+    assert listing.words == frozenset() and listing.readable
+
+
+# Round 3 (controller, BLOCKING): round 2 dropped the words of a URL whose segments share no core word
+# with the title, and unioned segments. Each of these URLs must still HOLD against a plain handle.
+UNREADABLE_BUT_MARKED = [
+    ("https://s.example/products/o-hui-essence-%EB%A6%AC%EB%89%B4%EC%96%BC", "오휘", "오휘 에센스",
+     "https://s.example/products/o-hui-essence"),
+    ("https://s.example/products/%EC%98%A4%ED%9C%98-%EC%97%90%EC%84%BC%EC%8A%A4-%EB%A6%AC%EB%89%B4%EC%96%BC",
+     "O HUI", "O HUI Essence", "https://s.example/products/ohui-essence"),
+    ("https://s.example/products/%EC%97%90%EB%9B%B0%EB%93%9C-%EC%BD%9C%EB%9D%BC%EA%B2%90-2019-new", "ETUDE",
+     "ETUDE Moistfull Collagen Cream 75ml", "https://s.example/products/etude-moistfull-collagen-cream-75ml"),
+    ("https://s.example/p/12345-renewal", "ETUDE", "ETUDE Moistfull Collagen Cream 75ml",
+     "https://s.example/products/etude-moistfull-collagen-cream-75ml"),
+    ("https://s.example/products/etude-2019-new", "ETUDE", "ETUDE Moistfull Collagen Cream 75ml",
+     "https://s.example/products/etude-moistfull-collagen-cream-75ml"),
+    ("https://s.example/category/etude-moistfull-collagen-cream-75ml-2019-new", "ETUDE",
+     "ETUDE Moistfull Collagen Cream 75ml", "https://s.example/products/etude-moistfull-collagen-cream-75ml"),
+]
+
+
+@pytest.mark.parametrize("url, brand, title, plain", UNREADABLE_BUT_MARKED)
+def test_generation_words_are_read_even_when_no_segment_names_the_product(url, brand, title, plain):
+    marked, handle = slug_generation(url, brand, title), slug_generation(plain, brand, title)
+    assert marked.words and slug_generation_differs(marked, handle) and slug_generation_differs(handle, marked)
+
+
+def test_a_category_segment_never_masks_the_other_sides_word():
+    title = "ETUDE Moistfull Collagen Eye Cream 28ml"
+    a = slug_generation("https://a.com/eye-cream-new-arrivals/etude-moistfull-collagen-eye-cream-28ml", "ETUDE", title)
+    b = slug_generation("https://b.com/products/etude-moistfull-collagen-eye-cream-28ml-new", "ETUDE", title)
+    assert a.words == frozenset() and b.words == {"new"} and slug_generation_differs(a, b)
+
+
+def test_the_category_mask_case_holds_in_the_planner():
+    listing = ("ETUDE", "ETUDE Moistfull Collagen Eye Cream 28ml", 21.5,
+               "https://a.com/eye-cream-new-arrivals/etude-moistfull-collagen-eye-cream-28ml")
+    anchor = ("ETUDE", "[EtudeHouse] Moistfull Collagen Eye Cream 28ml", 19.6,
+              "https://b.com/products/etudehouse-moistfull-collagen-eye-cream-28ml-new")
+    v, _cat, _li = _verdict(listing, anchor)
+    assert (v.status, v.reasons) == ("held", ["slug_generation_mismatch"])
+
+
+def test_one_product_segment_most_title_words_then_the_later_one():
+    title = "ETUDE Moistfull Collagen Cream 75ml"
+    # The segment with more title words wins wherever it is.
+    gen = slug_generation("https://s.example/etude-moistfull-collagen-cream-75ml/cream-2019-new", "ETUDE", title)
+    assert gen.words == frozenset() and gen.readable
+    # A tie goes to the later segment; no overlap at all falls back to the last candidate.
+    tie = slug_generation("https://s.example/collagen-2019-new/collagen-renewal", "ETUDE", title)
+    assert tie.words == {"renewal"} and tie.readable
+    none = slug_generation("https://s.example/2019-new/renewal/12345", "ETUDE", title)
+    assert none.words == {"renewal"} and not none.readable
 
 
 OHUI_TITLE = "O HUI Prime Advancer De-aging Ampoule Serum 50ml"
@@ -246,6 +302,15 @@ def test_retailer_slug_noise_is_never_a_generation(slug):
     ("ohui-cleansing-foam-200ml-2nd-edition", {"edition_2"}),
     ("ohui-cleansing-foam-200ml-3rd-edition", {"edition_3"}),
     ("ohui-cleansing-foam-200ml-%EC%8B%A0%ED%98%95", {"new"}),
+    # round 3: numbered editions, and a two-digit version is a year
+    ("ohui-cleansing-foam-200ml-1st-limited-edition", {"edition_1", "limited_edition"}),
+    ("ohui-cleansing-foam-200ml-2nd-limited-edition", {"edition_2", "limited_edition"}),
+    ("ohui-cleansing-foam-200ml-second-edition", {"edition_2"}),
+    ("ohui-cleansing-foam-200ml-first-edition", {"edition_1"}),
+    ("ohui-cleansing-foam-200ml-2-edition", {"edition_2"}),
+    ("ohui-cleansing-foam-edition-2-200ml", {"edition_2"}),
+    ("ohui-cleansing-foam-200ml-ver-21", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-version-10", {"year_2010"}),
 ])
 def test_generation_words_read_from_a_slug(slug, words):
     assert _gen(slug, title="OHUI Miracle Moisture Cleansing Foam 200ml").words == words
@@ -263,6 +328,8 @@ def test_generation_words_read_from_a_slug(slug, words):
     "ohui-cleansing-foam-2021verb-200ml", "ohui-cleansing-foam-newsletter-200ml", "ohui-cleansing-foam-upgrades-200ml",
     "ohui-cleansing-foam-2nd-200ml", "ohui-cleansing-foam-sinew2021-200ml", "ohui-cleansing-foam-xrenewal2021-200ml",
     "ohui-cleansing-foam-x21ver-200ml",
+    "ohui-cleansing-foam-200ml-edition-2",        # a final "-2" is a de-dup suffix, not edition 2
+    "ohui-cleansing-foam-200ml-" + "9" * 5000,    # a junk digit run: no word, and no crash
 ])
 def test_line_words_flags_and_non_year_numbers_are_not_slug_generation_words(slug):
     assert _gen(slug, title="OHUI Miracle Moisture Cleansing Foam 200ml").words == frozenset()
@@ -270,6 +337,10 @@ def test_line_words_flags_and_non_year_numbers_are_not_slug_generation_words(slu
 
 def test_ver_year_and_year_ver_read_as_the_same_words():
     assert slug_segment_words("foam ver 2021") == slug_segment_words("foam 2021 ver") == {"year_2021"}
+    assert slug_segment_words("foam ver 21") == slug_segment_words("foam 21ver") == {"year_2021"}
+    assert slug_segment_words("foam 1st limited edition") != slug_segment_words("foam 2nd limited edition")
+    assert (slug_segment_words("foam 2nd edition") == slug_segment_words("foam second edition")
+            == slug_segment_words("foam 2 edition") == slug_segment_words("foam edition 2 50ml") == {"edition_2"})
     assert slug_segment_words("foam ver 2") == {"v2"}
     a = _gen("ohui-miracle-moisture-cleansing-foam-200ml-ver-2021", title="OHUI Miracle Moisture Cleansing Foam 200ml")
     b = _gen("ohui-miracle-moisture-cleansing-foam-200ml-2021-ver", title="OHUI Miracle Moisture Cleansing Foam 200ml")
@@ -314,7 +385,8 @@ def test_ohui_named_lines(slug, line):
     assert _gen(slug, title=title).lines == {line}
 
 
-@pytest.mark.parametrize("brand", ["오휘", "LG O HUI", "LG생활건강 오휘"])
+@pytest.mark.parametrize("brand", ["오휘", "LG O HUI", "LG생활건강 오휘", "OHUI by LG", "LG Household O HUI",
+                                   "LG Household & Health Care O HUI"])
 def test_named_lines_run_for_every_spelling_of_the_brand(brand):
     title = "Prime Advancer De-aging Ampoule Serum 50ml"
     stale = _gen("ohui-prime-advancer-ampoule-serum-50ml", brand, title)
@@ -411,3 +483,12 @@ def test_one_renewal_row_holds_the_whole_merge_key():
     assert plan.proposals == []
     assert (outcome(plan, b)["status"], outcome(plan, b)["reason"]) == ("held", "slug_generation_mismatch")
     assert (outcome(plan, a)["status"], outcome(plan, a)["reason"]) == ("held", "key_shared_with_unmatched")
+
+
+def test_a_junk_digit_run_in_a_title_or_url_never_crashes_the_plan():
+    listing = ("ETUDE", "ETUDE Moistfull Collagen Cream 75ml " + "1" * 5000, 15.0,
+               "https://s.example/products/etude-moistfull-collagen-cream-75ml-" + "2" * 5000)
+    anchor = ("ETUDE", "ETUDE Moistfull Collagen Cream 75ml", 15.24,
+              "https://dodoskin.com/products/etudehouse-moistfull-collagen-cream-75ml")
+    cat, _li, _an = _pair(listing, anchor)
+    cat.plan()  # no ValueError / OverflowError
