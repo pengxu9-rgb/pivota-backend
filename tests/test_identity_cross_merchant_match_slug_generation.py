@@ -169,7 +169,13 @@ def test_a_pair_whose_slugs_agree_or_carry_no_generation_word_still_proposes(nam
      ["ETUDE Moistfull Collagen Eye Cream 2019 New Version"]),
     ("https://s.example/product/ohui-foam-2019-new/12345/", ["ohui foam 2019 new"]),
     ("https://www.yesstyle.com/en/etude-collagen-cream-2019-new/info.html/pid.1234",
-     ["en", "etude collagen cream 2019 new"]),
+     ["etude collagen cream 2019 new"]),
+    # Trailing junk is never a candidate: locales, Cafe24 category/display paths, amp, page.
+    ("https://s.cafe24.com/product/etude-cream-%EB%A6%AC%EB%89%B4%EC%96%BC/1234/category/25/display/1/",
+     ["etude cream 리뉴얼"]),
+    ("https://s.example/products/etude-2019-new/en-us", ["etude 2019 new"]),
+    ("https://s.example/ko_kr/products/etude-cream/amp", ["etude cream"]),
+    ("https://s.example/zh-hant/products/etude-cream/page/2", ["etude cream"]),
     ("https://s.example/goods/item-77/sku_9/id-12/detail.jsp", []),
     ("https://ohui.co.kr/product/view.do?prdCd=123", []),
     # Listing words are skipped; their handles stay candidates (the product segment is chosen below).
@@ -310,6 +316,8 @@ def test_retailer_slug_noise_is_never_a_generation(slug):
     ("ohui-cleansing-foam-200ml-2-edition", {"edition_2"}),
     ("ohui-cleansing-foam-edition-2-200ml", {"edition_2"}),
     ("ohui-cleansing-foam-200ml-ver-21", {"year_2021"}),
+    ("ohui-cleansing-foam-200ml-21-ver", {"year_2021"}),
+    ("ohui-cleansing-foam-edition-3-mini-200ml", {"edition_3"}),
     ("ohui-cleansing-foam-200ml-version-10", {"year_2010"}),
 ])
 def test_generation_words_read_from_a_slug(slug, words):
@@ -329,6 +337,9 @@ def test_generation_words_read_from_a_slug(slug, words):
     "ohui-cleansing-foam-2nd-200ml", "ohui-cleansing-foam-sinew2021-200ml", "ohui-cleansing-foam-xrenewal2021-200ml",
     "ohui-cleansing-foam-x21ver-200ml",
     "ohui-cleansing-foam-200ml-edition-2",        # a final "-2" is a de-dup suffix, not edition 2
+    "ohui-cleansing-foam-edition-30-ml",          # a size, not edition 30
+    "ohui-cleansing-foam-edition-2-pack",         # a pack count, not edition 2
+    "ohui-cleansing-foam-edition-2-oz",
     "ohui-cleansing-foam-200ml-" + "9" * 5000,    # a junk digit run: no word, and no crash
 ])
 def test_line_words_flags_and_non_year_numbers_are_not_slug_generation_words(slug):
@@ -337,7 +348,8 @@ def test_line_words_flags_and_non_year_numbers_are_not_slug_generation_words(slu
 
 def test_ver_year_and_year_ver_read_as_the_same_words():
     assert slug_segment_words("foam ver 2021") == slug_segment_words("foam 2021 ver") == {"year_2021"}
-    assert slug_segment_words("foam ver 21") == slug_segment_words("foam 21ver") == {"year_2021"}
+    assert (slug_segment_words("foam ver 21") == slug_segment_words("foam 21ver") == slug_segment_words("foam 21 ver")
+            == {"year_2021"})
     assert slug_segment_words("foam 1st limited edition") != slug_segment_words("foam 2nd limited edition")
     assert (slug_segment_words("foam 2nd edition") == slug_segment_words("foam second edition")
             == slug_segment_words("foam 2 edition") == slug_segment_words("foam edition 2 50ml") == {"edition_2"})
@@ -492,3 +504,64 @@ def test_a_junk_digit_run_in_a_title_or_url_never_crashes_the_plan():
               "https://dodoskin.com/products/etudehouse-moistfull-collagen-cream-75ml")
     cat, _li, _an = _pair(listing, anchor)
     cat.plan()  # no ValueError / OverflowError
+
+
+# Round 4 (controller): one product segment alone dropped a word a product-line directory carried, or
+# one left behind trailing junk. EITHER reading -- the product segment or the union of every
+# candidate -- differing now holds. Each of these must HOLD against a plain handle.
+ETUDE_TITLE, ETUDE_PLAIN = "ETUDE Moistfull Collagen Cream 75ml", "https://s.example/products/etude-moistfull-collagen-cream-75ml"
+OHUI_SOFTENER, OHUI_PLAIN = "O HUI Prime Advancer Skin Softener 150ml", "https://s.example/products/ohui-prime-advancer-skin-softener-150ml"
+DIRECTORY_OR_JUNK = [
+    ("https://s.example/etude-moistfull-collagen/moistfull-2019-new", "ETUDE", ETUDE_TITLE, ETUDE_PLAIN),
+    ("https://s.example/moistfull-collagen-cream/collagen-renewal", "ETUDE", ETUDE_TITLE, ETUDE_PLAIN),
+    ("https://s.example/ohui-prime-advancer-de-aging/skin-softener", "O HUI", OHUI_SOFTENER, OHUI_PLAIN),
+    ("https://s.cafe24.com/product/%EC%97%90%EB%9B%B0%EB%93%9C-%ED%81%AC%EB%A6%BC-%EB%A6%AC%EB%89%B4%EC%96%BC/1234/category/25/display/1/",
+     "ETUDE", ETUDE_TITLE, ETUDE_PLAIN),
+    ("https://s.example/products/etude-2019-new/en-us", "ETUDE", ETUDE_TITLE, ETUDE_PLAIN),
+    ("https://s.example/products/etude-2019-new/amp", "ETUDE", ETUDE_TITLE, ETUDE_PLAIN),
+]
+
+
+@pytest.mark.parametrize("url, brand, title, plain", DIRECTORY_OR_JUNK)
+def test_a_directory_word_or_trailing_junk_never_drops_the_generation(url, brand, title, plain):
+    marked, handle = slug_generation(url, brand, title), slug_generation(plain, brand, title)
+    assert slug_generation_differs(marked, handle) and slug_generation_differs(handle, marked)
+
+
+def test_the_union_reading_alone_holds_when_the_product_segments_agree():
+    # Same product segment on both sides; only the line directory on one side carries the word.
+    a = slug_generation("https://s.example/etude-moistfull-collagen/moistfull-2019-new", "ETUDE", ETUDE_TITLE)
+    b = slug_generation("https://s.example/etude-moistfull-collagen-cream-75ml-renewal/moistfull-2019-new", "ETUDE",
+                        ETUDE_TITLE)
+    assert a.all_words != b.all_words and slug_generation_differs(a, b)
+    # Named lines too, between readable product segments.
+    c = slug_generation("https://s.example/ohui-prime-advancer-de-aging/skin-softener", "O HUI", OHUI_SOFTENER)
+    e = slug_generation("https://s.example/ohui-prime-advancer/skin-softener", "O HUI", OHUI_SOFTENER)
+    assert c.words == e.words and c.lines == e.lines and c.all_lines != e.all_lines and slug_generation_differs(c, e)
+
+
+def test_two_urls_that_agree_in_both_readings_do_not_hold():
+    a = slug_generation("https://a.example/etude-moistfull-collagen/etude-moistfull-collagen-cream-75ml-2019-new",
+                        "ETUDE", ETUDE_TITLE)
+    b = slug_generation("https://b.example/products/etude-moistfull-collagen-cream-75ml-2019-new/en-us", "ETUDE",
+                        ETUDE_TITLE)
+    assert a.words == b.words == a.all_words == b.all_words == {"new", "year_2019"}
+    assert not slug_generation_differs(a, b)
+
+
+def test_the_directory_case_holds_in_the_planner():
+    listing = ("O HUI", "O HUI Prime Advancer Skin Softener 150ml", 70,
+               "https://s.example/ohui-prime-advancer-de-aging/skin-softener")
+    anchor = ("O HUI", "[OHUI] Prime Advancer Skin Softener (150ml/5.07fl.oz)", 67,
+              "https://shoppalacebeauty.com/products/ohui-prime-advancer-skin-softener-150ml-5-07fl-oz")
+    v, _cat, _li = _verdict(listing, anchor)
+    assert (v.status, v.reasons) == ("held", ["slug_generation_mismatch"])
+
+
+def test_the_product_segment_reading_alone_holds_for_named_lines():
+    # Both unions carry de_aging; only one side's PRODUCT segment does (the other's sits in a directory).
+    a = slug_generation("https://s.example/ohui-prime-advancer-de-aging/ohui-prime-advancer-skin-softener-150ml",
+                        "O HUI", OHUI_SOFTENER)
+    b = slug_generation("https://s.example/products/ohui-prime-advancer-de-aging-skin-softener-150ml", "O HUI",
+                        OHUI_SOFTENER)
+    assert a.all_lines == b.all_lines == {"de_aging"} and a.lines != b.lines and slug_generation_differs(a, b)
