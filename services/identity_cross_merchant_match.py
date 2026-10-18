@@ -83,43 +83,57 @@ approval or an apply. Its `size` is the offer's OWN -- the one size its own SKU 
 key is ABSENT when they state none (a "Default Title" offer pinned through the row title): the
 anchor's size is never copied onto an offer.
 
-CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the pair
-content Peng reviewed, so a selected write refuses a proposal whose listings, anchor, prices, titles,
-sizes, tier or kind changed since (a proposal_id pins only the structural move). It is computed from
-the AUDIT-ROW fields alone, so the static review page reproduces it in JavaScript from the audit JSON
-lines, and it deliberately reads NOTHING of RULE_VERSION / VETOES_CHECKED / evidence (a rule bump
-does not invalidate labels; the write's cmd_ digest still pins the evidence). Canonical form:
-  1. Input: every audit row of the proposal (ALL its (moved listing, anchor) pairs; --audit-size must
-     be >= the run's pairs or the page cannot see them all). Each row has kind, tier, and listing /
-     anchor objects with product_key, canonical_url, title, size {value, unit, pack} or null, price,
-     currency.
+CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the
+content Peng reviewed: a selected write refuses a proposal whose fingerprint changed (a proposal_id pins
+only the structural move). THE RULE: everything the review page renders from an audit row, and
+everything carried into evidence.matcher_verdict, is hashed. It is computed from the AUDIT ROWS alone
+(the dry run prints every field below on every row), so the static page reproduces it in JavaScript;
+it reads NOTHING of RULE_VERSION / VETOES_CHECKED (a rule bump does not invalidate labels; the write's
+cmd_ digest still pins the full evidence). Canonical form:
+  1. Input: EVERY audit row of the proposal -- all its (moved listing, anchor) pairs. A selected run
+     prints a full audit (audit_complete) and refuses a selected proposal missing a pair.
   2. Per row, an object with keys in EXACTLY this order:
-       {"kind": K, "tier": T, "listing": SIDE, "anchor": SIDE}
-     SIDE = {"product_key", "canonical_url", "title", "size", "price", "currency"} in that order;
-     size = null, or {"value", "unit", "pack"} in that order.
-  3. Values: strings verbatim (no trimming or case folding) or null; kind, tier and product_key must
-     be strings.
-     NUMBERS ARE STRINGS: price -> JS Number(x).toFixed(2); size.value and size.pack ->
-     Number(x).toFixed(4); null stays null. Python reproduces toFixed exactly (js_fixed: the double's
-     exact decimal value rounded half away from zero), so 67 and 67.0 both give "67.00" (Cloud Logging
-     turns 67.0 into 67) and 10.125 gives "10.13", 1.005 gives "1.00". Finite values below 1e21 only.
-  4. Sort the row objects by listing.product_key, then anchor.product_key, comparing UTF-16 code
-     units (JS `a < b`); a (listing, anchor) pair appears once.
-  5. Serialise the array as JSON with no whitespace and non-ASCII kept as is (JS
+       {"kind", "tier", "market", "size", "price_ratio", "listing", "anchor", "matched_offers",
+        "matched_seeds"}
+     SIDE (listing, anchor) = {"product_key", "canonical_url", "image_url", "title", "brand", "hosts",
+       "size", "price", "currency"} in that order;
+     SIZE (row size = the anchor size the pair matched at; each side's title size) = null, or
+       {"value", "unit", "pack"} in that order;
+     matched_offers = the moved listing's pinned offers as [offer_id, sku_key|null] arrays;
+     matched_seeds  = the proposal's matched seeds (matcher_verdict.matched_seeds; the same on every
+       row of the proposal) as [seed_id, variant_id|null] arrays.
+  3. Values: strings verbatim (no trimming or case folding) or null; kind, tier, market, product_key,
+     offer_id and seed_id must be strings; hosts is an array of strings, matched_offers and
+     matched_seeds arrays (all three present, possibly empty).
+     NUMBERS ARE STRINGS, one rule -- JS Number(x).toFixed(d): price d=2; price_ratio, size.value and
+     size.pack d=4; null stays null. Python reproduces toFixed exactly (js_fixed: the double's exact
+     decimal value rounded half away from zero), so 67 and 67.0 both give "67.00" (Cloud Logging turns
+     67.0 into 67), 10.125 gives "10.13", 1.005 gives "1.00". Finite values below 1e21 only.
+     THE PAGE DISPLAYS EXACTLY THESE STRINGS (toFixed(2) prices, toFixed(4) sizes and ratio), so
+     what Peng reads is what is hashed.
+  4. Ordering: hosts sorted; matched_offers and matched_seeds sorted by each element's JSON text
+     (JSON.stringify of the array); rows sorted by listing.product_key, then anchor.product_key. Every
+     comparison is by UTF-16 code units (JS `a < b`). A (listing, anchor) pair appears once.
+  5. Serialise the row array as JSON with no whitespace and non-ASCII kept as is (JS
      JSON.stringify(rows); Python json.dumps(rows, ensure_ascii=False, separators=(",", ":"))),
      encode UTF-8, sha256, lowercase hex; the fingerprint is "cfp_" + the first 24 hex digits.
-  JS reference:
+  JS reference (the page groups audit rows by proposal_id and calls cfp(rows)):
      const fx = (x, d) => x == null ? null : Number(x).toFixed(d);
-     const side = s => ({product_key: s.product_key, canonical_url: s.canonical_url ?? null,
-       title: s.title ?? null, size: s.size == null ? null : {value: fx(s.size.value, 4),
-       unit: s.size.unit ?? null, pack: fx(s.size.pack, 4)}, price: fx(s.price, 2),
-       currency: s.currency ?? null});
      const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
-     const objs = rows.map(r => ({kind: r.kind, tier: r.tier, listing: side(r.listing),
-       anchor: side(r.anchor)})).sort((a, b) => cmp(a.listing.product_key, b.listing.product_key)
-       || cmp(a.anchor.product_key, b.anchor.product_key));
-     cfp = "cfp_" + hex(sha256(utf8(JSON.stringify(objs)))).slice(0, 24);
-  A selection names each proposal as "<proposal_id>=<cfp>"; Plan.select refuses any mismatch.
+     const size = z => z == null ? null : {value: fx(z.value, 4), unit: z.unit ?? null, pack: fx(z.pack, 4)};
+     const side = s => ({product_key: s.product_key, canonical_url: s.canonical_url ?? null,
+       image_url: s.image_url ?? null, title: s.title ?? null, brand: s.brand ?? null,
+       hosts: [...s.hosts].sort(cmp), size: size(s.size), price: fx(s.price, 2), currency: s.currency ?? null});
+     const tuples = xs => xs.sort((a, b) => cmp(JSON.stringify(a), JSON.stringify(b)));
+     const row = r => ({kind: r.kind, tier: r.tier, market: r.market, size: size(r.size),
+       price_ratio: fx(r.price_ratio, 4), listing: side(r.listing), anchor: side(r.anchor),
+       matched_offers: tuples(r.matched_offers.map(o => [o.offer_id, o.sku_key ?? null])),
+       matched_seeds: tuples(r.matched_seeds.map(m => [m.seed_id, m.variant_id ?? null]))});
+     const cfp = rows => "cfp_" + hex(sha256(utf8(JSON.stringify(rows.map(row).sort((a, b) =>
+       cmp(a.listing.product_key, b.listing.product_key) || cmp(a.anchor.product_key, b.anchor.product_key))))))
+       .slice(0, 24);
+  A selection names each proposal as "<proposal_id>=<cfp>"; Plan.select refuses any mismatch. (Each
+  side's offer_ids, also printed, are the matched_offers' ids by construction.)
 
 Pure: no I/O here. scripts/ops/propose_cross_merchant_matches.py exports the snapshot (one read-only
 transaction, two phases) and writes proposals through the engine's writer.
@@ -1297,7 +1311,12 @@ class Plan:
                                "note": ("counts, samples and the audit sample are of the SELECTED proposals; "
                                         "outcomes and yield_both_ways are of the full run")}
 
-    def _pair_row(self, pr: Mapping[str, Any]) -> Dict[str, Any]:
+    def _matched_seeds(self) -> Dict[str, List[Dict[str, Any]]]:
+        return {p["proposal_id"]: [{"seed_id": m["seed_id"], "variant_id": m["variant_id"]}
+                                   for m in p["evidence"]["matcher_verdict"]["matched_seeds"]]
+                for p in self.proposals}
+
+    def _pair_row(self, pr: Mapping[str, Any], seeds: Mapping[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
         """One (moved listing, anchor) pair as the audit sample shows it -- the content fingerprint's
         only input, so the review page and the writer read the same fields."""
         li, an, v = pr["listing"], pr["anchor"], pr["verdict"]
@@ -1307,14 +1326,33 @@ class Plan:
             "listing": _audit_side(li, v.price.get("listing"), v.price.get("listing_currency"),
                                    [o["offer_id"] for o in v.matched_offers]),
             "anchor": _audit_side(an, v.price.get("anchor"), v.price.get("anchor_currency"), ()),
+            "matched_offers": sorted(({"offer_id": o["offer_id"], "sku_key": o.get("sku_key")}
+                                      for o in v.matched_offers), key=lambda o: str(o["offer_id"])),
+            "matched_seeds": list(seeds.get(pr["proposal_id"], ())),
         }
+
+    def audit_gaps(self, audit: Iterable[Mapping[str, Any]]) -> Dict[str, List[str]]:
+        """{proposal_id: listings it moves that `audit` does not show} for this plan's proposals -- a
+        selected run refuses any (the page could not have seen, or fingerprinted, the whole proposal)."""
+        shown: Dict[str, Set[str]] = defaultdict(set)
+        for r in audit:
+            shown[r["proposal_id"]].add(r["listing"]["product_key"])
+        gaps: Dict[str, List[str]] = {}
+        for p in self.proposals:
+            ev = p.get("evidence") or {}
+            missing = sorted(set(ev.get("from_product_keys") or [ev.get("listing_product_key")])
+                             - shown.get(p["proposal_id"], set()))
+            if missing:
+                gaps[p["proposal_id"]] = missing
+        return gaps
 
     def content_fingerprints(self) -> Dict[str, str]:
         """{proposal_id: cfp_...} over EVERY pair of each proposal (not the audit sample). Raises
         SelectionError if a proposal's pairs do not name exactly the listings it moves."""
         rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        seeds = self._matched_seeds()
         for pr in self.pairs:
-            rows[pr["proposal_id"]].append(self._pair_row(pr))
+            rows[pr["proposal_id"]].append(self._pair_row(pr, seeds))
         out: Dict[str, str] = {}
         for p in self.proposals:
             ev = p.get("evidence") or {}
@@ -1392,7 +1430,8 @@ class Plan:
         picked = pool if len(pool) <= size else rng.sample(pool, size)
         picked.sort(key=lambda x: (x["proposal_id"], x["listing"].product_key))
         cfps = self.content_fingerprints()
-        return [{**self._pair_row(pr), "content_fingerprint": cfps[pr["proposal_id"]],
+        seeds = self._matched_seeds()
+        return [{**self._pair_row(pr, seeds), "content_fingerprint": cfps[pr["proposal_id"]],
                  **({"selection": self._selection_brief()} if self.selection_info else {})} for pr in picked]
 
 
@@ -1436,37 +1475,72 @@ def _cfp_text(v: Any, what: str, *, required: bool = False) -> Optional[str]:
     return v
 
 
+def _utf16(s: str) -> bytes:  # JS compares strings by UTF-16 code units
+    return s.encode("utf-16-be", "surrogatepass")
+
+
+def _cfp_json(v: Any) -> str:
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def _cfp_size(size: Any, what: str) -> Optional[Dict[str, Any]]:
+    if size is None:
+        return None
+    if not isinstance(size, Mapping):
+        raise ValueError(f"content fingerprint: {what} must be an object or null, not {size!r}")
+    return {"value": js_fixed(size.get("value"), 4), "unit": _cfp_text(size.get("unit"), f"{what}.unit"),
+            "pack": js_fixed(size.get("pack"), 4)}
+
+
+def _cfp_list(v: Any, what: str) -> List[Any]:
+    if not isinstance(v, list):
+        raise ValueError(f"content fingerprint: {what} must be an array (audit rows from before the "
+                         f"fingerprint carried it cannot be fingerprinted), not {v!r}")
+    return v
+
+
 def _cfp_side(side: Mapping[str, Any], name: str) -> Dict[str, Any]:
-    size = side.get("size")
+    hosts = [_cfp_text(h, f"{name}.hosts[]", required=True) for h in _cfp_list(side.get("hosts"), f"{name}.hosts")]
     return {
         "product_key": _cfp_text(side.get("product_key"), f"{name}.product_key", required=True),
         "canonical_url": _cfp_text(side.get("canonical_url"), f"{name}.canonical_url"),
+        "image_url": _cfp_text(side.get("image_url"), f"{name}.image_url"),
         "title": _cfp_text(side.get("title"), f"{name}.title"),
-        "size": None if size is None else {"value": js_fixed(size.get("value"), 4),
-                                           "unit": _cfp_text(size.get("unit"), f"{name}.size.unit"),
-                                           "pack": js_fixed(size.get("pack"), 4)},
+        "brand": _cfp_text(side.get("brand"), f"{name}.brand"),
+        "hosts": sorted(hosts, key=_utf16),
+        "size": _cfp_size(side.get("size"), f"{name}.size"),
         "price": js_fixed(side.get("price"), 2),
         "currency": _cfp_text(side.get("currency"), f"{name}.currency"),
     }
 
 
+def _cfp_tuples(items: Any, what: str, keys: Tuple[str, str]) -> List[List[Optional[str]]]:
+    out = [[_cfp_text(it.get(keys[0]), f"{what}[].{keys[0]}", required=True),
+            _cfp_text(it.get(keys[1]), f"{what}[].{keys[1]}")] for it in _cfp_list(items, what)]
+    return sorted(out, key=lambda t: _utf16(_cfp_json(t)))
+
+
+def _cfp_row(r: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"kind": _cfp_text(r.get("kind"), "kind", required=True),
+            "tier": _cfp_text(r.get("tier"), "tier", required=True),
+            "market": _cfp_text(r.get("market"), "market", required=True),
+            "size": _cfp_size(r.get("size"), "size"),
+            "price_ratio": js_fixed(r.get("price_ratio"), 4),
+            "listing": _cfp_side(r["listing"], "listing"), "anchor": _cfp_side(r["anchor"], "anchor"),
+            "matched_offers": _cfp_tuples(r.get("matched_offers"), "matched_offers", ("offer_id", "sku_key")),
+            "matched_seeds": _cfp_tuples(r.get("matched_seeds"), "matched_seeds", ("seed_id", "variant_id"))}
+
+
 def content_fingerprint_payload(rows: Iterable[Mapping[str, Any]]) -> str:
     """The canonical JSON a content fingerprint hashes (module docstring, CONTENT FINGERPRINT)."""
-    objs = [{"kind": _cfp_text(r.get("kind"), "kind", required=True),
-             "tier": _cfp_text(r.get("tier"), "tier", required=True),
-             "listing": _cfp_side(r["listing"], "listing"), "anchor": _cfp_side(r["anchor"], "anchor")}
-            for r in rows]
+    objs = [_cfp_row(r) for r in rows]
     if not objs:
         raise ValueError("content fingerprint: a proposal has at least one (listing, anchor) pair")
-
-    def utf16(s: str) -> bytes:  # JS compares strings by UTF-16 code units
-        return s.encode("utf-16-be", "surrogatepass")
-
-    objs.sort(key=lambda o: (utf16(o["listing"]["product_key"]), utf16(o["anchor"]["product_key"])))
+    objs.sort(key=lambda o: (_utf16(o["listing"]["product_key"]), _utf16(o["anchor"]["product_key"])))
     pairs = [(o["listing"]["product_key"], o["anchor"]["product_key"]) for o in objs]
     if len(set(pairs)) != len(pairs):
         raise ValueError(f"content fingerprint: a (listing, anchor) pair appears twice: {pairs}")
-    return json.dumps(objs, ensure_ascii=False, separators=(",", ":"))
+    return _cfp_json(objs)
 
 
 def content_fingerprint(rows: Iterable[Mapping[str, Any]]) -> str:

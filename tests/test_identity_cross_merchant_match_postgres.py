@@ -522,7 +522,8 @@ async def test_m2_the_controllers_spellings_are_found_on_postgres_or_refused(con
         assert all(b in str(exc.value) for b in refused)
 
 
-async def test_a_selection_is_bound_to_reviewed_content_and_writes_exactly_the_subset(conn, tmp_path, capsys):
+async def test_a_selection_is_bound_to_reviewed_content_and_writes_exactly_the_subset(conn, tmp_path, capsys,
+                                                                                    monkeypatch):
     """--only-proposal[s|-ids] on the production dialect: entries are id=cfp; the full set's digest
     never authorises a subset (nor a subset's the full set or the other mode); a stale id, an empty or
     gs:// selection, a malformed entry and a fingerprint whose content changed refuse; a selected write
@@ -543,6 +544,10 @@ async def test_a_selection_is_bound_to_reviewed_content_and_writes_exactly_the_s
     assert await script.run(c, _args(out)) == 0
     full = lines()
     full_digest = next(line for line in full if line["section"] == "proposals")["digest"]
+    assert next(line for line in full if line["section"] == "outputs")["audit_complete"] is True
+    audit_rows = [a for a in full if a["section"] == "audit"]
+    assert all({"market", "matched_offers", "matched_seeds", "price_ratio", "size"} <= set(a) for a in audit_rows)
+    assert all({"image_url", "brand", "hosts"} <= set(a[s]) for a in audit_rows for s in ("listing", "anchor"))
     cfps = next(line for line in full if line["section"] == "fingerprints")["content_fingerprints"]
     ids = sorted(json.loads(x)["proposal_id"] for x in (out / "proposals.jsonl").read_text().splitlines())
     assert len(ids) == 3 and sorted(cfps) == ids
@@ -614,12 +619,58 @@ async def test_a_selection_is_bound_to_reviewed_content_and_writes_exactly_the_s
     await c.execute("UPDATE catalog_offers SET merchant_effective_price = 24 WHERE offer_id = 'o_ulta_20'")
     assert await count() == 0
 
+    # the controller's repros: the moved listing's image_url, and a new same-size matched offer
+    async def refused_after(change, undo):
+        await c.execute(change)
+        assert await script.run(c, _args(tmp_path / "drift")) == 0
+        drift = lines()
+        now = next(line for line in drift if line["section"] == "fingerprints")["content_fingerprints"]
+        assert sorted(now) == ids and [i for i in ids if now[i] != cfps[i]], change   # same ids, new cfp
+        assert await write(full_digest, "--only-proposal-ids", all_entries) == 2
+        assert "fingerprint mismatch" in next(line for line in lines() if line["section"] == "refused")["reason"]
+        await c.execute(undo)
+
+    await refused_after(f"UPDATE catalog_products SET image_url = 'https://img.example/swapped.jpg' WHERE product_key = '{ULTA}'",
+                        f"UPDATE catalog_products SET image_url = 'https://img.example/{_spid(ULTA)}.jpg' WHERE product_key = '{ULTA}'")
+    await _offer(c, ULTA, "o_ulta_sg2", merchant="m_ulta", price=31, host="www.ulta.com", sku_title="0.7 oz", market="SG")
+    assert await script.run(c, _args(tmp_path / "drift2")) == 0
+    grown = lines()
+    ulta_pid = next(a["proposal_id"] for a in grown if a["section"] == "audit" and a["listing"]["product_key"] == ULTA)
+    ulta_row = next(a for a in grown if a["section"] == "audit" and a["proposal_id"] == ulta_pid)
+    assert [o["offer_id"] for o in ulta_row["matched_offers"]] == ["o_ulta_20", "o_ulta_sg", "o_ulta_sg2"]
+    now = next(line for line in grown if line["section"] == "fingerprints")["content_fingerprints"]
+    assert sorted(now) == ids and now[ulta_pid] != cfps[ulta_pid]
+    assert await write(full_digest, "--only-proposal-ids", all_entries) == 2
+    assert "fingerprint mismatch" in next(line for line in lines() if line["section"] == "refused")["reason"]
+    await c.execute("DELETE FROM catalog_offers WHERE offer_id = 'o_ulta_sg2'")
+    await c.execute("DELETE FROM catalog_skus WHERE sku_key = $1", f"{ULTA}::v:o_ulta_sg2")
+    assert await count() == 0
+
+    # a selected run prints EVERY selected pair, whatever --audit-size says
+    assert await script.run(c, _args(tmp_path / "full", "--audit-size", "1", "--only-proposal-ids", all_entries)) == 0
+    sel = lines()
+    assert len([a for a in sel if a["section"] == "audit"]) == 4                     # 3 proposals, 4 pairs
+    assert next(line for line in sel if line["section"] == "outputs")["audit_complete"] is True
+
+    # the strategy's advisory lock is held while the rows are inserted (and released at commit)
+    import services.identity_resolution as engine
+    real_upsert, held = engine.upsert_proposals, []
+
+    async def upsert_seeing_the_lock(cn, proposals, **kw):
+        held.append(await cn.fetchval(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted"))
+        return await real_upsert(cn, proposals, **kw)
+
+    monkeypatch.setattr(engine, "upsert_proposals", upsert_seeing_the_lock)
+
     # the dry run used the FILE; the write names the same entries INLINE (Cloud Run cannot see the file):
     # one normalisation, one mode marker, the same digest -- and exactly the selected proposals land
     reordered = ",".join([f" {entry[keep[1]]}", entry[keep[0]], entry[keep[1]]])
     assert await write(sub_digest, "--only-proposal-ids", reordered) == 0
     written = next(line for line in lines() if line["section"] == "written")
     assert written["inserted"] == 2 and written["deduped"] == 0 and written["dry_run_digest"] == sub_digest
+    assert held == [1, 1] and written["audit_complete"] is True
+    assert await c.fetchval("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()") == 0
     assert written["selection"]["mode"] == "only" and written["selection"]["selected"] == 2
     rows = await _proposals(c)
     assert [r["proposal_id"] for r in rows] == keep

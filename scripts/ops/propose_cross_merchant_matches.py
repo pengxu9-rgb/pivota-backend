@@ -64,7 +64,16 @@ SELECTION (four flags, mutually exclusive). Each entry is "<proposal_id>=<conten
   selection, recomputes, and refuses on a mismatch. A SELECTED write also refuses while ANY
   'proposed' proposal of this strategy exists (an earlier run an approve could take whole), and when
   any selected proposal already exists (it would dedupe into another run); its run then holds exactly
-  the selection. Counts, samples, proposals.jsonl and the audit sample are of the subset and say so.
+  the selection. Every write takes pg_advisory_xact_lock(hashtext('cross_merchant_same_size')) before
+  those checks, in the insert's transaction. Counts, samples, proposals.jsonl and the audit sample are
+  of the subset and say so.
+  A REJECTED (or approved / applied) proposal CANNOT be re-written by a selected write: its
+  proposal_id is deterministic, so it already exists and the write refuses (would dedupe). A changed
+  listing mints a new id; otherwise the old row must be dealt with in the engine first.
+  AUDIT COMPLETENESS: the dry run's outputs line carries audit_complete (every moving pair is in the
+  audit; false when --audit-size sampled). Any SELECTED run (dry or write) prints a FULL audit and
+  refuses a selected proposal with a pair missing from it. The review page needs every pair of a
+  proposal to compute its fingerprint: label from a run whose audit_complete is true.
 
 SCOPE: --market US (default), --limit-groups N, and EXACTLY ONE of
   --brands a,b,c   canonical brand match (services.product_match_normalizer.canonical_brand): every
@@ -552,6 +561,9 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
         raise Refused(f"proposals fail the engine's module rule: {dict(list(bad.items())[:5])}")
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
+        # one writer of this strategy at a time: the pending / dedupe checks below and the inserts
+        # are one critical section (released at commit or rollback)
+        await conn.execute(LOCK_SQL, STRATEGY)
         if plan.selection is not None:
             await refuse_unsafe_selected_write(conn, [p["proposal_id"] for p in stamped])
         for p in stamped:
@@ -572,6 +584,7 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
             **({"selection": plan.selection_info} if plan.selection_info else {})}
 
 
+LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
 PENDING_SQL = """
 SELECT r.proposal_id, r.evidence->>'proposal_run_id' AS proposal_run_id
 FROM identity_resolution_proposals r
@@ -704,7 +717,17 @@ async def run(conn: Any, args: argparse.Namespace, *,
             return 2
     for line in report_lines(plan):
         _print(line)
-    audit = plan.audit_rows(size=args.audit_size, seed=args.audit_seed)
+    # a selected run (dry or write) prints EVERY pair: the page fingerprints whole proposals
+    audit_size = len(plan.pairs) if selection is not None else args.audit_size
+    audit = plan.audit_rows(size=audit_size, seed=args.audit_seed)
+    audit_complete = len(audit) == len(plan.pairs)
+    if selection is not None:
+        gaps = plan.audit_gaps(audit)
+        if gaps:
+            _print(_line("refused", selection=selection[2], reason=(
+                f"{len(gaps)} selected proposal(s) have pairs missing from the audit, so the review page "
+                f"cannot have fingerprinted them whole: {dict(list(gaps.items())[:5])}")))
+            return 2
     if not args.write_proposals:
         for row in audit:
             _print(_line("audit", **row))
@@ -715,14 +738,16 @@ async def run(conn: Any, args: argparse.Namespace, *,
         except Refused as exc:
             _print(_line("refused", reason=str(exc)))
             return 2
-        _print(_line("written", strategy=STRATEGY, **result, **approve_commands(result["proposal_run_id"]),
+        _print(_line("written", strategy=STRATEGY, **result, audit_complete=audit_complete,
+                     **approve_commands(result["proposal_run_id"]),
                      next_step="after Peng reviewed the audit sample: approve_dry_run, then approve_execute"))
         return 0
     if args.out.startswith("gs://"):
         _print(_line("warning", gcs_upload="UNTESTED against GCS; the audit sample is also in the log lines"))
-    written = write_outputs(args.out, output_files(plan, audit_size=args.audit_size, audit_seed=args.audit_seed),
+    written = write_outputs(args.out, output_files(plan, audit_size=audit_size, audit_seed=args.audit_seed),
                             uploader=uploader)
     _print(_line("outputs", files=written, digest=plan.digest(), proposals=len(plan.proposals),
+                 audit_complete=audit_complete, audit_rows=len(audit), pairs=len(plan.pairs),
                  **({"selection": plan.selection_info} if plan.selection_info else {}),
                  next_step=(f"--write-proposals --expect-digest {plan.digest()} --max-proposals "
                             f"{len(plan.proposals)}{selection_flag(selection)} "
