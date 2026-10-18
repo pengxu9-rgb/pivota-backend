@@ -988,8 +988,9 @@ def test_a_clean_selected_write_inserts_exactly_the_selection(upserts):
     script = _script()
     assert conn.fetched == [script.PENDING_SQL, script.EXISTING_SQL]
     # the strategy's advisory lock comes first, inside the insert's transaction
-    assert conn.executed == [(script.LOCK_SQL, (cmm.STRATEGY,))]
-    assert conn.calls[:3] == [script.LOCK_SQL, script.PENDING_SQL, script.EXISTING_SQL]
+    assert conn.executed == [(script.LOCK_TIMEOUT_SQL, ()), (script.LOCK_SQL, (cmm.STRATEGY,))]
+    assert conn.calls[:4] == [script.LOCK_TIMEOUT_SQL, script.LOCK_SQL, script.PENDING_SQL, script.EXISTING_SQL]
+    assert script.LOCK_TIMEOUT_SQL == "SET LOCAL lock_timeout = '15s'"
     assert script.LOCK_SQL == "SELECT pg_advisory_xact_lock(hashtext($1))"
 
 
@@ -998,7 +999,7 @@ def test_an_unselected_write_keeps_its_dedupe_behaviour(upserts):
     plan = _mixed().plan()
     conn = _FakeConn(pending=[{"proposal_id": "irp_" + "e" * 32, "proposal_run_id": "cmss_earlier"}])
     assert _write(plan, conn)["inserted"] == 6 and conn.fetched == []
-    assert conn.executed == [(_script().LOCK_SQL, (cmm.STRATEGY,))]      # every write takes the lock
+    assert conn.executed == [(_script().LOCK_TIMEOUT_SQL, ()), (_script().LOCK_SQL, (cmm.STRATEGY,))]  # every write takes the lock
 
 
 def test_write_proposals_itself_refuses_an_exclude_selection(upserts):
@@ -1069,3 +1070,22 @@ def test_audit_gaps_names_the_listings_an_audit_does_not_show():
     gaps = plan.audit_gaps([r for r in rows if r is not dropped])
     assert gaps == {merge["proposal_id"]: [dropped["listing"]["product_key"]]}
     assert set(plan.audit_gaps([])) == set(_ids(plan))
+
+
+@pytest.mark.parametrize("size", ["-1", "-50"])
+def test_a_negative_audit_size_is_refused_at_parse_time(size):
+    with pytest.raises(SystemExit) as exc:
+        _script().parse_args(["--brands", "ohui", "--audit-size", size])
+    assert exc.value.code == 2
+
+
+def test_offer_prices_in_the_verdict_are_informational_and_not_in_the_cfp():
+    """The cfp pins (offer_id, sku_key); an offer's stored price/currency/market/size may move."""
+    plan = _mixed().plan()
+    pid = _ids(plan)[0]
+    rows = [r for r in plan.audit_rows(size=len(plan.pairs), seed=0) if r["proposal_id"] == pid]
+    before = cmm.content_fingerprint(rows)
+    for r in rows:
+        for o in r.get("matched_offers") or []:
+            o.update({"price": 999.0, "currency": "XYZ", "market": "MARS", "size": {"value": 1, "unit": "ml", "pack": 1}})
+    assert cmm.content_fingerprint(rows) == before

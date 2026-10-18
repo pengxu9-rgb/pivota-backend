@@ -1335,8 +1335,8 @@ async def test_the_writer_names_itself_as_the_module_writer(monkeypatch):
                     return False
             return Tx()
 
-        async def execute(self, sql, *args):  # the strategy's advisory lock
-            assert sql == script.LOCK_SQL and args == (STRATEGY,)
+        async def execute(self, sql, *args):  # the lock timeout, then the strategy's advisory lock
+            assert (sql, args) in ((script.LOCK_TIMEOUT_SQL, ()), (script.LOCK_SQL, (STRATEGY,)))
 
     monkeypatch.setattr(engine, "upsert_proposals", upsert)
     out = await script.write_proposals(Conn(), plan, expect_digest=plan.digest(), max_proposals=100)

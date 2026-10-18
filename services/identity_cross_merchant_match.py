@@ -85,8 +85,14 @@ anchor's size is never copied onto an offer.
 
 CONTENT FINGERPRINT (cfp_; content_fingerprint). Binds a hand-labelled proposal to exactly the
 content Peng reviewed: a selected write refuses a proposal whose fingerprint changed (a proposal_id pins
-only the structural move). THE RULE: everything the review page renders from an audit row, and
-everything carried into evidence.matcher_verdict, is hashed. It is computed from the AUDIT ROWS alone
+only the structural move). THE RULE: everything the review page renders from an audit row is hashed,
+plus the verdict's PINS: each matched offer as (offer_id, sku_key) and each matched seed as (seed_id,
+variant_id). NOT hashed, on purpose: matcher_verdict.matched_offers[].price / currency / market / size,
+which are INFORMATIONAL (validate_matcher_verdict never reads them, serving re-reads prices live, and
+they churn nightly), and the evidence pinned only by the write's cmd_ digest (hosts.anchor,
+anchor_reason, tiers_matched, normalized_keys). So an offer's stored price may differ from the
+reviewed one without refusing the write; the listing and anchor prices the page shows ARE hashed. It
+is computed from the AUDIT ROWS alone
 (the dry run prints every field below on every row), so the static page reproduces it in JavaScript;
 it reads NOTHING of RULE_VERSION / VETOES_CHECKED (a rule bump does not invalidate labels; the write's
 cmd_ digest still pins the full evidence). Canonical form:

@@ -562,7 +562,9 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
     inserted: List[Dict[str, Any]] = []
     async with conn.transaction():
         # one writer of this strategy at a time: the pending / dedupe checks below and the inserts
-        # are one critical section (released at commit or rollback)
+        # are one critical section (released at commit or rollback). A peer stuck holding it makes this
+        # write REFUSE after lock_timeout instead of waiting forever.
+        await conn.execute(LOCK_TIMEOUT_SQL)
         await conn.execute(LOCK_SQL, STRATEGY)
         if plan.selection is not None:
             await refuse_unsafe_selected_write(conn, [p["proposal_id"] for p in stamped])
@@ -584,6 +586,7 @@ async def write_proposals(conn: Any, plan: Plan, *, expect_digest: str, max_prop
             **({"selection": plan.selection_info} if plan.selection_info else {})}
 
 
+LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
 LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
 PENDING_SQL = """
 SELECT r.proposal_id, r.evidence->>'proposal_run_id' AS proposal_run_id
@@ -664,6 +667,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ap.error("--explain plans the statements only; it takes no proposal selection")
     if args.limit_groups is not None and args.limit_groups < 1:
         ap.error("--limit-groups must be >= 1")
+    if args.audit_size < 0:
+        ap.error("--audit-size must be >= 0")
     args.market = args.market.strip().upper()
     args.brand_list = [b.strip() for b in args.brands.split(",") if b.strip()]
     if not args.brand_list and not args.all_brands:
