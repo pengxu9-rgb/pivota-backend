@@ -973,3 +973,22 @@ def test_brand_spelling_is_one_copy_reexported():
     assert curated_brand_feed.RETAILER_BRAND_CANONICAL is brand_spelling.RETAILER_BRAND_CANONICAL
     assert curated_brand_feed._brand_key is brand_spelling.brand_key
     assert retailer_match.match_brand is brand_spelling.match_brand
+
+
+@pytest.mark.parametrize("title", [
+    "Foam " + "1" * 5000,                # a core token past CPython's int-str digit limit
+    "Foam " + "0" * 5000 + "7",
+    "Foam " + "1" * 5000 + "ml",         # a size number that overflows a float
+    "Foam " + "1" * 5000 + ".5 oz",
+    "Foam 5-" + "1" * 5000 + "ml",
+])
+def test_a_junk_digit_run_never_raises(title):
+    tc = title_core("Brand", title)
+    assert tc.size.primary is None and tc.core.startswith("foam")
+
+
+def test_a_long_digit_run_only_loses_its_leading_zeros_and_short_runs_are_unchanged():
+    assert title_core(None, "Foam " + "0" * 700 + "7").core == "foam 7"
+    assert title_core(None, "Foam " + "0" * 700).core == title_core(None, "Foam 000").core == "foam 0"
+    assert title_core(None, "No. 05 Foam").core == title_core(None, "No. 5 Foam").core
+    assert size_key(parse_size("Foam 123456789ml")) == (123456789.0, "ml", 1)

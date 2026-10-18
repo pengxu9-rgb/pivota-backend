@@ -302,7 +302,9 @@ _SNAP_TOLERANCE = 0.02
 _SAME_TITLE_TOLERANCE = 0.03
 _SAME_TITLE_SLACK = 0.3
 
-_NUM = r"(\d+(?:[.,]\d{1,2})?)"
+# At most 9 integer digits: no size has more, and a longer run read as a float overflows to inf and
+# crashes _round_size (OverflowError) -- a junk run of digits is simply no size.
+_NUM = r"(\d{1,9}(?:[.,]\d{1,2})?)"
 _UNIT_ALTS: Tuple[Tuple[str, str], ...] = (
     # (canonical unit, regex) -- longest spellings first inside each alternative.
     ("floz", r"fl\.?\s*oz\.?|fluid\s+ounces?|floz|fl\.?\s*ounces?"),
@@ -779,6 +781,7 @@ _SHADE_CODE_RES: Tuple[re.Pattern, ...] = (
     re.compile(r"(?<![\w.])(\d{1,2}(?:\.\d)?[nwc]\d{0,2})(?![\w.])"),
 )
 _TOKEN_RE = re.compile(r"\d+\.\d+|[^\W_]+")
+_INT_DIGITS_MAX = 640  # well under CPython's int-str conversion limit (>= 640 when set at all)
 
 
 def _tokens(text: str) -> List[str]:
@@ -786,7 +789,12 @@ def _tokens(text: str) -> List[str]:
     punctuation split, decimals stay one token, integers lose leading zeros ("01" -> "1")."""
     out = []
     for tok in _TOKEN_RE.findall(text.replace("'", "")):
-        out.append(str(int(tok)) if tok.isdecimal() else tok)
+        if tok.isdecimal():
+            # int() refuses a run past sys.int_info.str_digits_check_threshold (4300 digits by default)
+            # with ValueError, which would crash a whole plan on one junk title: such a run only loses
+            # its leading zeros.
+            tok = str(int(tok)) if len(tok) <= _INT_DIGITS_MAX else (tok.lstrip("0") or "0")
+        out.append(tok)
     return out
 
 
