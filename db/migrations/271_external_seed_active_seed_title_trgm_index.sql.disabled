@@ -1,20 +1,28 @@
 -- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
 -- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true', which the
 -- infra/gcp deploy scripts set on EVERY Cloud Run deploy, prod and staging, before
--- db.sql_migrations.run_sql_migrations), so no deploy applies this file. It is built out of band,
--- from a one-off job, on an autocommit connection, STATEMENT BY STATEMENT: db.sql_migrations.
--- split_statements, or psql -f. Never send the whole file as one string; Postgres runs a
--- multi-statement string as one implicit transaction, and CREATE INDEX CONCURRENTLY refuses to
--- run inside one. CONCURRENTLY builds without blocking the seed writers. Run it with the primary
--- under 35 percent CPU and check
--- pg_index.indisvalid afterwards. The .sql.disabled suffix also keeps it out of the boot runner in
--- any environment that DOES run the full startup (local, CI, SKIP_HEAVY_STARTUP_INIT=false).
+-- db.sql_migrations.run_sql_migrations), so no deploy applies this file. The .sql.disabled suffix
+-- also keeps it out of the boot runner in any environment that DOES run the full startup (local,
+-- CI, SKIP_HEAVY_STARTUP_INIT=false).
+--
+-- RUNBOOK (out of band, one-off job, controller slot):
+--   * Autocommit, STATEMENT BY STATEMENT: db.sql_migrations.split_statements, or psql -f. Never send
+--     the whole file as one string; Postgres runs a multi-statement string as one implicit
+--     transaction, and CREATE INDEX CONCURRENTLY refuses to run inside one.
+--   * Primary under 35 percent CPU, outside the relgraph-sync window (10:30-11:20Z) and no drain
+--     running: a CONCURRENTLY build waits for every transaction open on the table to finish, twice,
+--     and reads every row's seed_data in each of its two passes.
+--   * Afterwards check pg_index.indisvalid for idx_eps_active_any_seed_title_trgm. A build that
+--     failed or was cancelled leaves the index INVALID, and IF NOT EXISTS then SKIPS it on a rerun:
+--     run `DROP INDEX CONCURRENTLY IF EXISTS idx_eps_active_any_seed_title_trgm` first, then rerun.
+--   * The closing ANALYZE samples the table (reading seed_data for the sampled rows) so the
+--     statistics below have data; until it runs, or autovacuum's next analyze, they are empty.
 --
 -- 271: trigram index on the seed_data title, for offers.resolve's identity retry
 -- (routes/agent_shop_gateway.py::_identity_title_arm, the external_seed_by_internal_identity
 -- statement). Unlike 270, prod does NOT have this one yet.
 --
--- That statement finds a seed by the internal product's title: per term,
+-- That statement finds a seed by the internal product's title: per multi-word term,
 --   LOWER(title) LIKE :t OR LOWER(COALESCE(seed_data->>'title','')) LIKE :t
 -- The first side is served by prod's idx_eps_active_any_title_trgm (270). The second side has no
 -- index anywhere, and one unindexed OR arm makes the whole statement a scan of the 31k-row seed
@@ -22,10 +30,24 @@
 -- the statement's text did not have to change. It indexes a short string per row; a trigram index
 -- over all of seed_data::text (idx_eps_active_any_seed_data_text_trgm) cannot stand in for it,
 -- because a common title word's trigrams appear in nearly every row's 25 KB of text.
--- schema-guard-exempt: index only, no column added.
+--
+-- The two expression STATISTICS give the planner a histogram of both sides. Without them a LIKE
+-- pattern with a leading wildcard gets a fixed per-character estimate (3-6 rows even when every row
+-- matches), and the planner would bitmap-scan a common term serially instead of keeping main's
+-- parallel Seq Scan. The partial indexes' own expression statistics are not used for that estimate (the planner
+-- skips partial indexes there), so these are on the whole table. Postgres 14+ (prod is 17).
+-- schema-guard-exempt: index and statistics only, no column added.
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_seed_title_trgm
   ON external_product_seeds USING gin (lower(COALESCE((seed_data ->> 'title'::text), ''::text)) gin_trgm_ops)
   WHERE (status = 'active'::text);
+
+CREATE STATISTICS IF NOT EXISTS stx_eps_lower_title
+  ON (lower(title)) FROM external_product_seeds;
+
+CREATE STATISTICS IF NOT EXISTS stx_eps_lower_seed_title
+  ON (lower(COALESCE((seed_data ->> 'title'::text), ''::text))) FROM external_product_seeds;
+
+ANALYZE external_product_seeds;

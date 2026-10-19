@@ -565,3 +565,39 @@ def test_the_identity_cases_hit_what_they_claim(schema_engine, monkeypatch):
     assert len(ids("Hydrating Toner", None)) == 60  # the LIMIT (attached_seed_limit) cuts it
     # Filler 1749 (brand 1749 % 97 = 3; 1749 % 3 == 0, so it also carries a seed_data.title).
     assert "eps_fill_1749" in ids("Brand3 Hydrating Toner 1749", "Brand3")
+
+
+def _seed_scan_kind(plan):
+    text_plan = "\n".join(plan)
+    if "Bitmap Heap Scan on external_product_seeds" in text_plan:
+        return "bitmap"
+    if "Seq Scan on external_product_seeds" in text_plan:
+        return "seq"
+    return "other"
+
+
+def test_a_common_one_word_term_keeps_mains_plan_custom_and_generic(schema_engine, monkeypatch):
+    """BOUND for a common term: "COSRX Toner" sends "cosrx toner" and the brand-stripped "toner",
+    which is in EVERY filler title here. A serial bitmap scan over the whole table rechecked every
+    arm row by row and cost 2.5-7x main (controller review of be#2650). The one-word term keeps
+    main's arm, so the statement keeps main's plan -- a Seq Scan, the same cost as main -- in the
+    custom AND the generic plan."""
+    _res, query, main_query, values = _identity(monkeypatch, schema_engine, title="COSRX Toner", vendor="COSRX")
+    assert values["identity_title_0"] == "%cosrx toner%" and values["identity_title_1"] == "%toner%"
+    assert "LOWER(COALESCE(title,'')) LIKE :identity_title_1" in query  # main's arm for "toner"
+    assert "LOWER(title) LIKE :identity_title_0" in query
+    for plan in (_explain(query, values), _explain_generic(query, values)):
+        assert _seed_scan_kind(plan) == "seq", plan
+    assert _seed_scan_kind(_explain(main_query, values)) == "seq"
+    assert _ids(query, values) == _ids(main_query, values)
+
+
+def test_a_common_multi_word_term_keeps_mains_scan_once_271s_statistics_are_analyzed(schema_engine, monkeypatch):
+    """"Hydrating Toner" is ONE multi-word term in every filler title. With migration 271's expression
+    statistics analyzed, the custom plan sees that and keeps main's Seq Scan; a selective term in the
+    same statement shape still gets the probes."""
+    _res, query, main_query, values = _identity(monkeypatch, schema_engine, title="Hydrating Toner", vendor=None)
+    assert "LOWER(title) LIKE :identity_title_0" in query
+    assert _seed_scan_kind(_explain(query, values)) == "seq"
+    _res, query, _main, values = _identity(monkeypatch, schema_engine, title="Great Barrier Relief", vendor=None)
+    assert _seed_scan_kind(_explain(query, values)) == "bitmap"

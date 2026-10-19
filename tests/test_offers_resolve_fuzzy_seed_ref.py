@@ -119,28 +119,49 @@ def test_the_seed_index_migrations_are_hand_applied_and_run_on_autocommit(path, 
 # --- the identity retry's title arm (external_seed_by_internal_identity) ---------------------------
 
 
-def test_a_normalized_title_term_gets_the_indexed_arms():
+def test_a_multi_word_term_gets_the_indexed_arms():
     arm = _identity_title_arm("identity_title_0", "kravebeauty great barrier relief")
     assert arm == ("(LOWER(title) LIKE :identity_title_0"
                    " OR LOWER(COALESCE(seed_data->>'title','')) LIKE :identity_title_0)")
 
 
-@pytest.mark.parametrize("term", ["", "   ", "%", "50%", "a_b", "L'Oreal", "Great Barrier"])
+_MAINS_ARM = "(LOWER(COALESCE(title,'')) LIKE :k OR LOWER(COALESCE(seed_data->>'title','')) LIKE :k)"
+
+
+@pytest.mark.parametrize("term", ["toner", "serum", "kravebeauty", "12345"])
+def test_a_one_word_term_keeps_mains_arm_and_so_mains_plan(term):
+    """The brand-stripped "toner" of "COSRX Toner" can match a large share of seeds; its unindexed
+    arm keeps the whole statement on main's parallel Seq Scan instead of a serial bitmap recheck."""
+    assert _identity_title_arm("k", term) == _MAINS_ARM
+
+
+@pytest.mark.parametrize("term", ["", "   ", "%", "50%", "a_b", "L'Oreal", "Great Barrier", "great  barrier",
+                                  " great barrier", "great barrier "])
 def test_any_other_term_keeps_mains_arm(term):
     """Dropping COALESCE(title,'') is only the same rows when '' cannot match '%<term>%'; the
     normalizer never emits these, but if it ever did they keep main's arm exactly."""
-    assert _identity_title_arm("k", term) == (
-        "(LOWER(COALESCE(title,'')) LIKE :k OR LOWER(COALESCE(seed_data->>'title','')) LIKE :k)"
-    )
+    assert _identity_title_arm("k", term) == _MAINS_ARM
 
 
-def test_the_normalizer_only_emits_terms_that_get_the_indexed_arms():
-    from routes.agent_shop_gateway import _IDENTITY_TERM_RE, _normalize_offer_title
+def test_the_normalizer_emits_single_spaced_lower_case_words():
+    """The shape `_IDENTITY_INDEXED_TERM_RE` and the same-rows argument rest on."""
+    from routes.agent_shop_gateway import _IDENTITY_INDEXED_TERM_RE, _normalize_offer_title
 
     for raw in ("KraveBeauty Great Barrier Relief", "L'Oréal Paris Revitalift 1.5% Serum", "Dr.Jart+ Cicapair™",
                 "SK-II Facial Treatment Essence (230ml)", "  ÉTUDE  House  ", "100% Pure_Glow"):
         term = _normalize_offer_title(raw)
-        assert _IDENTITY_TERM_RE.fullmatch(term), (raw, term)
+        assert re.fullmatch(r"[a-z0-9]+(?: [a-z0-9]+)*", term), (raw, term)
+        assert _IDENTITY_INDEXED_TERM_RE.fullmatch(term), (raw, term)  # all multi-word
+    assert not _IDENTITY_INDEXED_TERM_RE.fullmatch(_normalize_offer_title("Toner"))
+
+
+def test_271_carries_the_expression_statistics_the_planner_needs():
+    body = _MIGRATION_271.read_text()
+    stats = {_normalize(m) for m in re.findall(r"^CREATE STATISTICS IF NOT EXISTS \w+\s+ON \((.+)\) FROM external_product_seeds;",
+                                                body, re.M)}
+    assert stats == {"lower(title)", "lower(coalesce(seed_data->>'title',''))"}
+    assert body.rstrip().endswith("ANALYZE external_product_seeds;")
+    assert "DROP INDEX CONCURRENTLY IF EXISTS idx_eps_active_any_seed_title_trgm" in body  # the INVALID-index rerun
 
 
 def test_both_identity_arms_are_spelled_as_an_index_expression():
