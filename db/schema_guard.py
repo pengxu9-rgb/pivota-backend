@@ -3218,6 +3218,15 @@ async def ensure_required_schema_light() -> None:
                 "ADD COLUMN IF NOT EXISTS market_prices JSONB, "
                 "ADD COLUMN IF NOT EXISTS market_prices_refreshed_at TIMESTAMPTZ;"
             )
+            # mig 269: how many sellers price the product
+            # (services/agent_pdp_view_assembler.count_sellers). Nullable; the
+            # writer names it only once probed present, and readers select it
+            # through to_jsonb (seller_count_sql), so a deferred heal fails nothing.
+            # Not on the db.catalog Table -- see the probe in the assembler.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS seller_count INTEGER;"
+            )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
             # identical content under a self-referential canonical tag. The

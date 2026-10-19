@@ -22,6 +22,7 @@ from services.agent_pdp_view_assembler import (
     market_prices_entry,
     market_prices_fresh_sql,
     normalize_taxonomy_tags,
+    seller_count_sql,
 )
 from services.catalog_identity import is_content_key
 from services.catalog_sync_service import pivota_canonical_pdp_url
@@ -124,8 +125,23 @@ AGENT_PDP_VIEW_COLUMNS: Tuple[str, ...] = (
     "required_disclaimers",
 )
 
-_SELECT_COLUMNS = ",\n      ".join(AGENT_PDP_VIEW_COLUMNS)
-_SELECT_APV_COLUMNS = ",\n      ".join(f"apv.{column}" for column in AGENT_PDP_VIEW_COLUMNS)
+
+
+def _select_list(prefix: str, row_ref: str) -> str:
+    """AGENT_PDP_VIEW_COLUMNS, with seller_count (migration 269) beside offer_count. It is read
+    through to_jsonb (seller_count_sql), never by name, so the SELECT answers NULL rather than
+    failing while the column is absent; NULL also means a row built before it, and
+    _build_response then falls back to offer_count."""
+    items = []
+    for column in AGENT_PDP_VIEW_COLUMNS:
+        items.append(f"{prefix}{column}")
+        if column == "offer_count":
+            items.append(seller_count_sql(row_ref))
+    return ",\n      ".join(items)
+
+
+_SELECT_COLUMNS = _select_list("", "agent_pdp_view")
+_SELECT_APV_COLUMNS = _select_list("apv.", "apv")
 
 # Is the citable `url` this route emits actually followable? BOTH of
 # get_pdp_v2's gates, asked about apv's own signature — the exact sig the URL is
@@ -636,7 +652,7 @@ def _market_view(row: Dict[str, Any], buyer_market: Optional[str]) -> Dict[str, 
     Only for a buyer priced in another currency than the deployment's (_needs_market_view), and
     only when the row carries a FRESH version-1 summary with an entry in that currency
     (agent_pdp_view.market_prices, migration 263; the SELECT nulls a stale one): currency,
-    price_min, price_max, offer_count and offers are that currency's -- the same values the
+    price_min, price_max, offer_count, seller_count and offers are that currency's -- the same values the
     gateway serves from the same summary. Never converted. Any other case returns the row as is,
     so those responses are byte-identical to the route without this function.
     """
@@ -653,6 +669,9 @@ def _market_view(row: Dict[str, Any], buyer_market: Optional[str]) -> Dict[str, 
             "price_min": entry.get("price_min"),
             "price_max": entry.get("price_max"),
             "offer_count": entry.get("offer_count"),
+            # An entry written before seller_count has none: unknown, never the row's count,
+            # which spans every currency.
+            "seller_count": entry.get("seller_count"),
             "offers": [o for o in (entry.get("offers") or []) if isinstance(o, dict)],
         }
     )
@@ -674,6 +693,12 @@ def _build_response(
     offer_count = row.get("offer_count")
     if offer_count is None:
         offer_count = len(offers)
+    # HOW MANY SELLERS, beside how many offers: one store's shades are several offers and one
+    # seller (agent_pdp_view_assembler: THE AGGREGATES READ THE OFFERS, NOT THE TWINS). None = the
+    # row predates migration 269 (or its rebuild), and the multi-merchant scope below falls back
+    # to offer_count, as before.
+    sellers_count = row.get("seller_count")
+    multi_seller_count = offer_count if sellers_count is None else sellers_count
 
     product = _row_as_product(row)
     # SEPARATION invariant: independent (non-merchant) endorsements are a DISTINCT
@@ -687,12 +712,13 @@ def _build_response(
             "product": product,
             "offers": offers,
             "offers_count": offer_count,
+            "sellers_count": sellers_count,
             "product_group_id": product_group_id,
             "modules": [],
             "actions": [],
         },
     }
-    if product_group_id and int(offer_count or 0) > 1:
+    if product_group_id and int(multi_seller_count or 0) > 1:
         canonical_data["canonical_scope"] = "multi_merchant_canonical"
 
     payload = {
@@ -702,6 +728,7 @@ def _build_response(
                 "type": "offers",
                 "data": {
                     "offers_count": offer_count,
+                    "sellers_count": sellers_count,
                     "offers": offers,
                     "product_group_id": product_group_id,
                 },
@@ -710,6 +737,7 @@ def _build_response(
         "subject": {"type": "product_group", "id": product_group_id},
         "product_group_id": product_group_id,
         "offers_count": offer_count,
+        "sellers_count": sellers_count,
     }
     return jsonable_encoder(payload)
 

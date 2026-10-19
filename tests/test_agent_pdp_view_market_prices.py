@@ -120,7 +120,12 @@ SGD_ONLY = [
 def test_flag_off_emits_no_market_prices_key_and_the_legacy_upsert() -> None:
     row = _assemble(MIXED)
     assert "market_prices" not in row
-    assert assembler.upsert_sql_for_row(row) is assembler.UPSERT_SQL
+    # The row also carries seller_count (migration 269), written only once its column is probed
+    # present; with the column absent the upsert drops the key and is UPSERT_SQL byte for byte.
+    assert assembler.upsert_sql_for_row(row) is assembler.UPSERT_SQL_WITH_SELLER_COUNT
+    assert "market_prices" not in assembler.UPSERT_SQL_WITH_SELLER_COUNT
+    without = {k: v for k, v in row.items() if k != "seller_count"}
+    assert assembler.upsert_sql_for_row(without) is assembler.UPSERT_SQL
     assert "market_prices" not in assembler.UPSERT_SQL
     assert "market_prices" not in assembler.row_to_upsert_params(row)
 
