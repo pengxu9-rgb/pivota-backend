@@ -1,0 +1,58 @@
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
+-- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true', which the
+-- infra/gcp deploy scripts set on EVERY Cloud Run deploy, prod and staging, before
+-- db.sql_migrations.run_sql_migrations), so no deploy applies this file. It is built out of band,
+-- from a one-off job, on an autocommit connection statement at a time (CONCURRENTLY: the builds run
+-- outside a transaction and do not block the seed writers), with the primary under 35% CPU; check
+-- pg_index.indisvalid afterwards. The .sql.disabled suffix also keeps it out of the boot runner in
+-- any environment that DOES run the full startup (local, CI, SKIP_HEAVY_STARTUP_INIT=false), where a
+-- seed_data trigram build would hold boot for minutes.
+--
+-- 270: RECORDS indexes production already has. Every statement is a no-op on prod.
+--
+-- These six indexes were built on prod by hand at some point and exist in no repo file. Read on prod
+-- 2026-10-19 (read-only one-off seed-idx-1019, pg_indexes.indexdef), all valid:
+--   idx_external_product_seeds_active_external_product_id  btree
+--   idx_eps_active_any_title_trgm             9.3 MB
+--   idx_eps_active_any_seed_data_text_trgm    123 MB
+--   idx_eps_active_any_canonical_url_trgm     12 MB
+--   idx_eps_active_any_destination_url_trgm   12 MB
+--   idx_eps_active_any_domain_trgm            4.2 MB
+-- Each one is reproduced below with the same name, method, expression and predicate as prod's indexdef.
+-- IF NOT EXISTS checks the NAME only, so prod keeps its own builds.
+--
+-- WHY THEY MATTER. They are keyed on `status = 'active'` alone. The older 051/068 trigram indexes are
+-- partial on `status = 'active' AND attached_product_key IS NULL`, and on prod that is 5 of 26,950
+-- active rows (2026-10-19). offers.resolve's external_seed_by_fuzzy_ref statement
+-- (routes/agent_shop_gateway.py::_fuzzy_seed_ref_clauses) reads attached seeds too, so only these
+-- indexes can serve it. That statement's LIKE arms are spelled lower(<col>) to match them.
+--
+-- The recall_* trigram indexes prod also has on this table (derived.recall.* expressions) are a
+-- different reader's and are not recorded here.
+-- schema-guard-exempt: index only, no column added.
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_external_product_seeds_active_external_product_id
+  ON external_product_seeds USING btree (external_product_id)
+  WHERE (status = 'active'::text);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_title_trgm
+  ON external_product_seeds USING gin (lower(title) gin_trgm_ops)
+  WHERE (status = 'active'::text);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_canonical_url_trgm
+  ON external_product_seeds USING gin (lower(canonical_url) gin_trgm_ops)
+  WHERE (status = 'active'::text);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_destination_url_trgm
+  ON external_product_seeds USING gin (lower(destination_url) gin_trgm_ops)
+  WHERE (status = 'active'::text);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_seed_data_text_trgm
+  ON external_product_seeds USING gin (lower((seed_data)::text) gin_trgm_ops)
+  WHERE (status = 'active'::text);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_eps_active_any_domain_trgm
+  ON external_product_seeds USING gin (lower(domain) gin_trgm_ops)
+  WHERE (status = 'active'::text);

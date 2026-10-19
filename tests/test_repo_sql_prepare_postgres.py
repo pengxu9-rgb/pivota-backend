@@ -1433,13 +1433,15 @@ def test_hand_applied_migrations_are_in_the_fixture_and_retired_ones_are_not(pre
     names = [p.name for p in _fixture_migration_paths()]
     assert "260_catalog_products_own_name_norm.sql.disabled" in names
     assert "261_catalog_products_name_norm_trgm_index.sql.disabled" in names
+    # 270 records indexes prod already has (built by hand; offers.resolve's fuzzy seed statement).
+    assert "270_external_seed_active_any_trgm_indexes.sql.disabled" in names
     # Exact names: 014/015/017 have ACTIVE successors under the same number.
     for retired in ("002_production_tables", "007_agents_management_upgrade",
                     "014_dual_sided_revenue", "015_agent_portal_settlement",
                     "017_agent_payout_comprehensive"):
         assert (REPO_ROOT / "db" / "migrations" / f"{retired}.sql.disabled").exists(), retired
         assert f"{retired}.sql.disabled" not in names, retired
-    assert sum(n.endswith(".sql.disabled") for n in names) == 2
+    assert sum(n.endswith(".sql.disabled") for n in names) == 3
     # Every active file is in, in version order, with 260 placed by its number.
     active = [Path(p).name for p in list_migration_files(str(REPO_ROOT))]
     assert set(active) <= set(names)

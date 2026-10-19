@@ -53,7 +53,10 @@ def test_both_files_are_invisible_to_the_boot_runner_and_say_why() -> None:
     # against their columns must be planned against a schema that has them. The retired .disabled
     # files carry no marker and stay out of everything.
     assert HAND_APPLIED_MARKER == "-- HAND-APPLIED ONLY"
-    assert [Path(f).name for f in list_hand_applied_migration_files(str(REPO))] == [UP_260.name, UP_261.name]
+    # (270 is the next hand-applied file: prod's offers.resolve seed indexes, see its own test.)
+    assert [Path(f).name for f in list_hand_applied_migration_files(str(REPO))] == [
+        UP_260.name, UP_261.name, "270_external_seed_active_any_trgm_indexes.sql.disabled",
+    ]
     assert not (set(Path(f).name for f in list_hand_applied_migration_files(str(REPO))) & active)
     assert UP_260.exists() and UP_261.exists()
     for name in ("260_catalog_products_own_name_norm.sql", "261_catalog_products_name_norm_trgm_index.sql"):
