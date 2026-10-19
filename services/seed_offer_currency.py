@@ -111,3 +111,84 @@ def seed_projected_offer_in_seed_currency_sql(offer_alias: str = "o", product_ke
         f" AND NOT EXISTS (SELECT 1 FROM external_product_seeds eps_own WHERE {active}"
         f" AND {seed_currency_sql('eps_own')} IS DISTINCT FROM upper(trim(coalesce({offer_alias}.currency, ''))))))"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE SAME RULE IN PYTHON, for a read that must stay ONE statement on SQLite and Postgres.
+#
+# routes/agent_commerce_reap prices a purchase with statements whose text is identical on both
+# dialects, so both gates test the statement production sends. The predicate above is Postgres
+# SQL (jsonb_typeof, #>>). So that route selects each offer's source_system, reads the listing's
+# seeds as stored, and asks `offer_priced_in_seed_currency` below. It is a twin of
+# `seed_projected_offer_in_seed_currency_sql`, case for case, and
+# tests/test_purchase_path_seed_offer_currency_postgres.py runs both over the same rows.
+# ---------------------------------------------------------------------------------------------
+
+_MISSING = object()
+
+
+def _sql_code(value: Any) -> Optional[str]:
+    """nullif(upper(trim(value)), ''): Postgres' trim() strips spaces only."""
+    if value is None:
+        return None
+    return str(value).strip(" ").upper() or None
+
+
+def _jsonb_text(value: Any) -> Optional[str]:
+    """What `#>>` returns for a JSON value: a string as itself, a scalar as its JSON text."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _stored_json(value: Any) -> Any:
+    """A stored jsonb/JSON column as read (JSON text on asyncpg and SQLite, or a decoded value).
+    _MISSING when it is text that is not JSON, which a jsonb column cannot hold."""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return _MISSING
+    return value
+
+
+def stored_seed_currency(seed: Mapping[str, Any]) -> Optional[str]:
+    """`seed_currency_sql` for a seed row as stored: `price_currency` and `seed_data` as read.
+
+    A seed_data or snapshot that is not a JSON object (or JSON null) states no currency at all;
+    an absent or null one leaves the column to stand in."""
+    column = _sql_code(seed.get("price_currency"))
+    data = _stored_json(seed.get("seed_data"))
+    if data is None:
+        return column
+    if not isinstance(data, Mapping):
+        return None
+    snapshot = data.get("snapshot")
+    if snapshot is None:
+        return column
+    if isinstance(snapshot, Mapping):
+        return _sql_code(_jsonb_text(snapshot.get("price_currency"))) or column
+    return None
+
+
+def is_seed_projected_offer(offer: Mapping[str, Any]) -> bool:
+    return str(offer.get("source_system") or "") in SEED_PROJECTED_OFFER_SOURCE_SYSTEMS
+
+
+def offer_priced_in_seed_currency(offer: Mapping[str, Any], attached_seeds: Any) -> bool:
+    """`seed_projected_offer_in_seed_currency_sql` for one offer row (`source_system`, `currency`)
+    and EVERY seed attached to its listing (`status`, `price_currency`, `seed_data`)."""
+    if not is_seed_projected_offer(offer):
+        return True
+    active = [
+        seed for seed in attached_seeds or ()
+        if str(seed.get("status") or "").strip(" ").lower() == "active"
+    ]
+    if not active:
+        return False
+    currency = str(offer.get("currency") or "").strip(" ").upper()
+    return all(stored_seed_currency(seed) == currency for seed in active)

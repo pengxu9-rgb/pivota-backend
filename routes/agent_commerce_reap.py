@@ -132,6 +132,9 @@ from services.shopify_variant_identity import (
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
 # Imported, never re-implemented -- see `_mirror_seller_ref`.
 from services.seller_identity import resolve_seed_seller_identity
+# THE seed-currency rule for offers copied off a seed (Peng 2026-10-19), in its Python twin: these
+# statements stay one text on both dialects, and the SQL predicate is Postgres-only.
+from services.seed_offer_currency import is_seed_projected_offer, offer_priced_in_seed_currency
 # THE ONE merchant-host canonicaliser, imported rather than re-implemented: lower case, ONE
 # leading `www.` removed, and a ValueError for anything that is not a bare DNS host name —
 # including a trailing dot. It is `tierb_cart_link_eligibility`'s own key function
@@ -1161,10 +1164,13 @@ _SKUS_FOR_PRODUCT_SQL = """
 #: both, and `Decimal(str(...))` is the parse the converter already does.
 #: The ORDER BY deliberately stays on the numeric expression — ordering on the text would sort
 #: '9.00' after '10.00'.
+#: Cheapest first, and more than one: the first row `_offers_priced_in_seed_currency` keeps is the
+#: price, so a stale seed copy that happens to be cheapest cannot hide the seller's real offer.
 _OFFER_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.sku_key = :sku_key
        AND o.product_key = :product_key
@@ -1172,9 +1178,46 @@ _OFFER_SQL = """
        AND o.suppression_reason IS NULL
        AND o.suppressed_at IS NULL
        AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
-     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
-     LIMIT 1
+     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC,
+              o.offer_id ASC
+     LIMIT 20
 """
+
+#: EVERY seed attached to the listing an offer prices, as stored, for the seed-currency rule
+#: (services/seed_offer_currency): an offer copied off a seed is a price only while an ACTIVE seed is
+#: attached to its listing and every active one is read in the offer's currency. On 2026-10-19 US
+#: search served SKINTIFIC's set at USD 23.56 from offers the variant backfill copied off a seed that
+#: had since been re-read in AUD; this route must not charge that number. Bounded: past 50 seeds the
+#: listing is not one whose price anyone can vouch for, and its copied offers are refused.
+_LISTING_SEEDS_SQL = """
+    SELECT e.status, e.price_currency, e.seed_data
+      FROM external_product_seeds e
+     WHERE e.attached_product_key = :product_key
+     ORDER BY e.id
+     LIMIT 51
+"""
+_LISTING_SEEDS_MAX = 50
+
+
+async def _offers_priced_in_seed_currency(product_key: str, rows: Any) -> List[Dict[str, Any]]:
+    """`rows` (offers on `product_key`'s listing, in order) minus every offer copied off a seed
+    that is not priced in its seed's currency. An offer no seed-copying writer wrote is kept as it
+    is, and when there is none the seeds are not read at all."""
+    offers = [dict(row) for row in rows or ()]
+    if not any(is_seed_projected_offer(offer) for offer in offers):
+        return offers
+    seeds = [dict(row) for row in await database.fetch_all(
+        _LISTING_SEEDS_SQL, {"product_key": product_key}
+    )]
+    if len(seeds) > _LISTING_SEEDS_MAX:
+        seeds = []
+    kept = [offer for offer in offers if offer_priced_in_seed_currency(offer, seeds)]
+    if len(kept) != len(offers):
+        logger.warning(
+            "reap.offer_not_in_seed_currency product_key=%s refused=%s kept=%s",
+            product_key, len(offers) - len(kept), len(kept),
+        )
+    return kept
 
 
 async def _load_catalog_row(
@@ -1240,7 +1283,7 @@ async def _load_catalog_row(
             )
         sku = candidates[0]
 
-    offer = await database.fetch_one(
+    offers = await _offers_priced_in_seed_currency(product_key, await database.fetch_all(
         _OFFER_SQL,
         {
             "sku_key": sku["sku_key"],
@@ -1249,12 +1292,12 @@ async def _load_catalog_row(
             # sku — see the note above `_PRODUCT_SQL`.
             "merchant_id": str(product.get("merchant_id") or ""),
         },
-    )
-    if not offer:
+    ))
+    if not offers:
         raise svc.PurchaseRefused(
             "row_unpriced", "the eligible merchant has no usable offer of its own on this sku"
         )
-    offer = dict(offer)
+    offer = offers[0]
 
     currency = str(offer.get("currency") or sku.get("sku_currency") or "").strip().upper()
     if not currency:
@@ -1389,7 +1432,8 @@ _CART_OFFER_MARKET_CURRENCY = "upper(trim(coalesce(o.currency, ''))) = :market_c
 _CART_ALL_OFFERS_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.product_key = :product_key AND o.sku_key = :sku_key
        AND o.merchant_id = :merchant_id
@@ -1401,10 +1445,12 @@ _CART_ALL_OFFERS_SQL = """
      ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
      LIMIT 20
 """
+# Cheapest first, and more than one, for the reason `_OFFER_SQL` gives.
 _CART_OFFER_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.product_key = :product_key AND o.sku_key = :sku_key
        AND o.merchant_id = :merchant_id
@@ -1413,8 +1459,9 @@ _CART_OFFER_SQL = """
        AND lower(coalesce(o.availability, 'unknown')) NOT IN
            ('out_of_stock', 'sold_out', 'unavailable')
        AND """ + _CART_OFFER_MARKET_CURRENCY + """
-     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
-     LIMIT 1
+     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC,
+              o.offer_id ASC
+     LIMIT 20
 """
 
 
@@ -2019,16 +2066,17 @@ async def _load_cart_link_item(
     for candidate in candidates:
         if mirror_placeholder is not None and candidate["sku_key"] == mirror_placeholder["sku_key"]:
             continue  # the placeholder is only ever read below, every offer, behind the gate
-        found = await database.fetch_one(
+        found = await _offers_priced_in_seed_currency(product_key, await database.fetch_all(
             _CART_OFFER_SQL, {**offer_params, "sku_key": candidate["sku_key"]}
-        )
-        if found is not None:
-            priced.append(_priced(candidate, found))
+        ))
+        if found:
+            priced.append(_priced(candidate, found[0]))
     if (not priced and mirror_placeholder is not None
             and _proof_live_variant_count(seed_data) == 1):
-        priced = [_priced(mirror_placeholder, found) for found in await database.fetch_all(
-            _CART_ALL_OFFERS_SQL, {**offer_params, "sku_key": mirror_placeholder["sku_key"]}
-        )]
+        priced = [_priced(mirror_placeholder, found) for found in await _offers_priced_in_seed_currency(
+            product_key, await database.fetch_all(
+                _CART_ALL_OFFERS_SQL, {**offer_params, "sku_key": mirror_placeholder["sku_key"]}
+            ))]
     if len({(cur, minor) for _c, _o, cur, minor in priced}) > 1:
         raise svc.PurchaseRefused(
             "row_price_ambiguous", "the spellings of this variant carry different prices"
@@ -2896,13 +2944,16 @@ async def prepare_reap_purchase_selection(
                 and product.get("source_system") == ENRICHMENT_SOURCE_SYSTEM
             )
             if not enrichment_priced:
-                offers = [dict(row) for row in await database.fetch_all(
+                read = [dict(row) for row in await database.fetch_all(
                     _CART_ALL_OFFERS_SQL.replace("LIMIT 20", "LIMIT 21"),
                     {"product_key": product_key, "sku_key": variant_key, "merchant_id": seller,
                      "market_currency": _MARKET_CURRENCY.get(market)},
                 )]
+                # Only offers that are prices must agree: a seed copy in another currency than
+                # its seed's is no price at all (`_offers_priced_in_seed_currency`).
+                offers = await _offers_priced_in_seed_currency(product_key, read)
                 prices = {ledger.amount_minor_or_none(row.get("price"), facts["currency"]) for row in offers}
-                if len(offers) > 20 or prices != {facts["our_price_minor"]}:
+                if len(read) > 20 or prices != {facts["our_price_minor"]}:
                     raise svc.PurchaseRefused("row_price_ambiguous")
             if not context.can_access_merchant(seller):
                 raise svc.PurchaseRefused("not_available_on_this_rail")

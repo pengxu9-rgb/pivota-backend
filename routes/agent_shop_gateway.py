@@ -84,6 +84,7 @@ from services.pivot_query_service import (
     search_pivot_catalog,
 )
 from services.query_semantic_class import classify_query_semantic_class
+from services.seed_offer_currency import seed_projected_offer_in_seed_currency_sql
 from services.canonical_search_query import prepare_canonical_search_query
 from services.similarity_service import (
     SimilarityService,
@@ -4264,6 +4265,11 @@ async def _issue_served_clicks(
         )
 
 
+# The catalog-offers arm's seed-currency conjunct (services/seed_offer_currency), correlated on the
+# listing the offer prices. Bound once: it is the same text on every call.
+_SEED_PROJECTED_OFFER_IN_SEED_CURRENCY = seed_projected_offer_in_seed_currency_sql("o", "o.product_key")
+
+
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -6675,6 +6681,12 @@ async def _handle_offers_resolve(
                                     o.list_price) > 0
                        AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
                            IS NOT NULL
+                       -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
+                       -- (services/seed_offer_currency, Peng 2026-10-19). Before the window
+                       -- above ranks, so a stale copy never holds a seller's slot: SKINTIFIC's
+                       -- set carried 20 USD 23.56 offers the variant backfill copied off a seed
+                       -- since re-read in AUD, and this arm would mint a link at that price.
+                       AND {_SEED_PROJECTED_OFFER_IN_SEED_CURRENCY}
                       ) base
                       ) twins
                      -- THE PLACEHOLDER TWIN: every retailer row carries its product-level
