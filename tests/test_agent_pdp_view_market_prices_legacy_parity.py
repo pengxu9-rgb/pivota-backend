@@ -11,6 +11,14 @@ imported live.
 
 Then the same comparison through assemble_row, with the write flag on, so the flag cannot move
 a legacy column either.
+
+One deliberate change since (2026-10-19): the top-N cut takes one offer PER SELLER first (the one
+the buy pick would take from it), then fills (services/agent_pdp_view_assembler._top_offers). The
+frozen code still decides the currency, the price bounds, offer_count and the ORDER;
+`per_seller_cut` below is the cut's spec, applied to the frozen code's full sorted list. These random offers carry no product_key or sku_key, so no
+`::canonical` twin and no listing host: the seller is the merchant, and an offer with none is a
+seller of its own. tests/test_offer_caps_one_per_seller_postgres.py covers the twins and hosts on
+real rows.
 """
 
 from __future__ import annotations
@@ -134,18 +142,47 @@ def _random_offers(rnd: random.Random) -> List[Dict[str, Any]]:
     ]
 
 
-def test_aggregate_offers_matches_origin_main_on_5000_random_offer_sets() -> None:
+def per_seller_cut(ranked: List[Dict[str, Any]], n: int, currency: Optional[str]) -> List[Dict[str, Any]]:
+    """Each seller's representative -- the offer the buy pick would take from it: in the row's
+    currency, not known unavailable, explicitly in stock, cheapest, then rank -- in rank order until
+    n sellers are in, then the rest in rank order; the kept offers keep their rank order."""
+    def rep_key(i: int):
+        o = ranked[i]
+        return (currency is not None and o.get("currency") != currency,
+                availability_is_known_unavailable(o.get("availability")),
+                str(o.get("availability") or "").strip().lower() not in {"in_stock", "instock", "available"},
+                float(o["price"]), i)
+
+    best: Dict[str, int] = {}
+    for i, offer in enumerate(ranked):
+        seller = offer.get("merchant_id") or f"offer-{i}"
+        if seller not in best or rep_key(i) < rep_key(best[seller]):
+            best[seller] = i
+    picked = sorted(best.values())[:n]
+    picked += [i for i in range(len(ranked)) if i not in picked][: max(0, n - len(picked))]
+    return [ranked[i] for i in sorted(picked)]
+
+
+def test_aggregate_offers_matches_origin_main_on_5000_random_offer_sets(monkeypatch) -> None:
     rnd = random.Random(7)
+    reordered = 0
     for _ in range(5000):
         offers = _random_offers(rnd)
         urls = {"m1": "https://m1.example.com/p", "m2": None}
         trust = {"m1": {"t": 1}} if rnd.random() < 0.5 else None
         primary = rnd.choice(["m1", "m2", None])
         expected = frozen_aggregate_offers(offers, primary, urls, trust)
+        with monkeypatch.context() as m:
+            m.setattr(sys.modules[__name__], "FROZEN_OFFER_TOP_N", 10_000)
+            *_, ranked = frozen_aggregate_offers(offers, primary, urls, trust)
+        expected = (*expected[:4], per_seller_cut(ranked, FROZEN_OFFER_TOP_N, expected[0]))
         got = current.aggregate_offers(offers, primary, urls, trust)
         assert json.dumps(got, default=str) == json.dumps(expected, default=str), offers
+        reordered += got[4] != ranked[:FROZEN_OFFER_TOP_N]
         # The summary must never raise on anything aggregate_offers accepts.
         current.build_market_prices(offers, primary, urls, trust)
+    # The generator does reach the per-seller cut (a seller with several offers past the fifth).
+    assert reordered > 100, reordered
 
 
 def _offer(n, merchant, currency, price, availability="in_stock", market="US"):

@@ -745,12 +745,19 @@ def test_best_price_never_compares_two_currencies(monkeypatch, client):
     assert body["metadata"]["best_price"]["currency"] == "USD"
 
 
-def test_a_defaulted_currency_is_never_best_price(monkeypatch, client):
-    """A catalog row with NULL currency ships as "USD" by default; that is not a stated price."""
+def test_a_row_with_no_currency_is_never_given_one(monkeypatch, client):
+    """A catalog row with NULL currency states no price anyone can compare. It used to ship as "USD"
+    by default, which a US buyer's currency filter then kept. Now: no market declared, it ships with
+    no currency and is never best price; a declared market withholds it and counts it."""
     rows = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 12.0, currency=None)]
+    body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", market=None, catalog_rows=rows,
+                   seeds=[_single_size_brand_seed(29.0)])
+    assert _by_id(body)["of:catalog_offer:of_sk"]["currency"] is None
+    assert body["best_price_offer_id"] == BRAND_OFFER
     body = _invoke(monkeypatch, client, product_id=RETAILER_SIG, flag="1", catalog_rows=rows,
                    seeds=[_single_size_brand_seed(29.0)])
-    assert _by_id(body)["of:catalog_offer:of_sk"]["currency"] == "USD"
+    assert "of:catalog_offer:of_sk" not in _by_id(body)
+    assert body["metadata"]["buyer_currency_filtered"] == {"none": 1}
     assert body["best_price_offer_id"] == BRAND_OFFER
 
 
@@ -937,7 +944,9 @@ def test_the_marker_is_never_on_an_ineligible_offer(monkeypatch, client, case):
     if case == "stale_retailer":
         kw["catalog_rows"] = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, checked=None)]
     elif case == "defaulted_currency":
-        kw["catalog_rows"] = [_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0, currency=None)]
+        # No market declared, so the row is listed (with no currency) rather than withheld.
+        kw.update(market=None, catalog_rows=[_catalog_row("of_sk", RETAILER_PK, "stylekorean.com", 15.0,
+                                                          currency=None)])
     elif case == "multi_size_seed":
         kw["seeds"], never = [_brand_seed()], BRAND_OFFER
         kw["proposals"] = [_attach(RETAILER_PK, seeds=[("eps_spec", None)])]
