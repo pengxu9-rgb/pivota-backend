@@ -254,9 +254,10 @@ async def test_the_python_twin_agrees_with_the_sql_predicate_on_every_stored_sha
             " 'retailer', false)",
             {"oid": f"edge_{i}", "sku": f"{pk}::canonical", "pk": pk, "cur": currency, "src": source_system},
         )
-    # Two active seeds on one listing that disagree: no offer copied off either is a price.
+    # Two active seeds on one listing that disagree (USD and AUD): the USD copy matches one of them
+    # and is still no price. A rule that asked whether ANY active seed agrees would keep it.
     pk = "prod::merch_obs_two::external_seed::two_seeds"
-    for seed_id, column in (("eps_two_a", "USD"), ("eps_two_b", "SGD")):
+    for seed_id, column in (("eps_two_a", "USD"), ("eps_two_b", "AUD")):
         await private_db.execute(
             "INSERT INTO external_product_seeds (id, attached_product_key, status, price_currency, seed_data)"
             " VALUES (:id, :pk, 'active', :col, NULL)", {"id": seed_id, "pk": pk, "col": column})
