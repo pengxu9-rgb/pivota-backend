@@ -316,6 +316,34 @@ def _seed_catalog(engine, *, koolseoul_availability="in_stock"):
                 _insert_offer(c, offer_id=f"of_{row}_{n}", sku=f"{pk}::v:{n}", pk=pk, merchant=merchant,
                               price=price, url=url)
 
+        # ONE ROW, TWO SPELLINGS OF ITS STORE: the variant offer names the mobile host, the placeholder
+        # the bare one. Still one merchant's twins, as the assembler reads them: the placeholder goes.
+        sd_pk = "ext:retailer:subdomain"
+        sd_m = _seller("jolse.com")["merchant_id"]
+        _insert_product(c, pk=sd_pk, ck="ck_subdomain", merchant=sd_m, url="https://jolse.com/p/sd")
+        _insert_offer(c, offer_id="of_sd_v", sku=f"{sd_pk}::v:1", pk=sd_pk, merchant=sd_m, price=20,
+                      url="https://m.jolse.com/p/sd")
+        _insert_offer(c, offer_id="of_sd_c", sku=f"{sd_pk}::canonical", pk=sd_pk, merchant=sd_m, price=20,
+                      url="https://jolse.com/p/sd")
+
+        # A STATED CURRENCY BEATS NONE, with no market declared too: one store, a $10 offer that states no
+        # currency and a $12 one in USD (two variants, so no twin). The USD one represents the store.
+        bl_pk, bl_url = "ext:retailer:blank", "https://koolseoul.com/p/blank"
+        bl_m = _seller("koolseoul.com")["merchant_id"]
+        _insert_product(c, pk=bl_pk, ck="ck_blank", merchant=bl_m, url=bl_url)
+        _insert_offer(c, offer_id="of_bl_blank", sku=f"{bl_pk}::v:1", pk=bl_pk, merchant=bl_m, price=10,
+                      url=bl_url, currency=None)
+        _insert_offer(c, offer_id="of_bl_usd", sku=f"{bl_pk}::v:2", pk=bl_pk, merchant=bl_m, price=12, url=bl_url)
+
+        # ...and across stores: at limit 1 with no market, a store stating USD comes before a cheaper
+        # store stating none.
+        for row, host, price, currency in (("bx_a", "jolse.com", 9, None), ("bx_b", "stylekorean.com", 14, "USD")):
+            pk, url = f"ext:retailer:{row}", f"https://{host}/p/blank"
+            merchant = _seller(host)["merchant_id"]
+            _insert_product(c, pk=pk, ck="ck_blank_x", merchant=merchant, url=url)
+            _insert_offer(c, offer_id=f"of_{row}", sku=f"{pk}::v:1", pk=pk, merchant=merchant, price=price,
+                          url=url, currency=currency)
+
         # ANOTHER RETAILER'S OFFER ATTACHED TO A ROW (scripts/attach_retailer_offer.py, below): the row
         # is a kbeautymakeup listing with its own variant offer and placeholder twin.
         at_pk, at_url = "ext:retailer:attach", "https://kbeautymakeup.com/products/o-hui-first-serum"
@@ -505,7 +533,7 @@ def test_a_sold_out_variant_is_not_hidden_by_its_in_stock_placeholder(schema_eng
 
 # ------------------------------------------------------------------ offers.resolve's catalog arm
 
-def _resolve(monkeypatch, product_id, *, limit=10, group_flag="0"):
+def _resolve(monkeypatch, product_id, *, limit=10, group_flag="0", market="US"):
     import databases
 
     import db.database as dbmod
@@ -530,7 +558,7 @@ def _resolve(monkeypatch, product_id, *, limit=10, group_flag="0"):
         monkeypatch.setattr(dual_write, "database", db)  # the price_checked_at column probe
         try:
             return await _handle_offers_resolve(
-                OffersResolvePayload(product={"product_id": product_id}, limit=limit, market="US", tool="*",
+                OffersResolvePayload(product={"product_id": product_id}, limit=limit, market=market, tool="*",
                                      commerce_surface="agent_api"),
                 None, _BT(),
             )
@@ -639,3 +667,26 @@ def test_a_row_with_no_currency_is_withheld_from_a_buyer_in_a_declared_market(sc
     res = _resolve(monkeypatch, "ck_scheme", limit=4)
     assert "of_sch2_0" not in [o["source"]["offer_id"] for o in _catalog(res)]
     assert res["metadata"]["buyer_currency_filtered"] == {"none": 1}
+
+
+def test_a_rows_twins_on_two_spellings_of_its_host_are_still_twins(schema_engine, monkeypatch):
+    """The view and the route agree: keyed by the merchant, `m.jolse.com` and `jolse.com` on one row
+    are one store's variant offer and its placeholder."""
+    _seed_catalog(schema_engine)
+    assert [o["price"] for o in _build(monkeypatch, "ck_subdomain")["offers"]] == [20.0]
+    assert [o["source"]["offer_id"] for o in _catalog(_resolve(monkeypatch, "ck_subdomain"))] == ["of_sd_v"]
+
+
+@pytest.mark.parametrize("market", [None, "US"])
+def test_an_offer_that_states_no_currency_never_stands_for_a_store_that_states_one(
+    schema_engine, monkeypatch, market
+):
+    _seed_catalog(schema_engine)
+    [offer] = _catalog(_resolve(monkeypatch, "ck_blank", market=market))
+    assert (offer["source"]["offer_id"], offer["currency"]) == ("of_bl_usd", "USD")
+
+
+def test_a_store_that_states_its_currency_comes_before_one_that_states_none(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    [offer] = _catalog(_resolve(monkeypatch, "ck_blank_x", limit=1, market=None))
+    assert offer["source"]["offer_id"] == "of_bx_b"

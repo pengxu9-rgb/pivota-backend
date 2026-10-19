@@ -6575,18 +6575,22 @@ async def _handle_offers_resolve(
                     SELECT twins.*,
                            row_number() OVER (
                                PARTITION BY twins.seller_host
-                               ORDER BY twins.foreign_currency ASC, twins.unavailable ASC,{_price_order}
+                               ORDER BY twins.foreign_currency ASC, (twins.currency_key = '') ASC,
+                                        twins.unavailable ASC,{_price_order}
                                         twins.price_amount ASC, twins.offer_id ASC
                            ) AS seller_rank
                       FROM (
                     SELECT base.*,
                            -- Does THIS SELLER's row state a per-variant offer here? Keyed by the
-                           -- seller too: scripts/attach_retailer_offer.py hangs ANOTHER retailer's
+                           -- merchant too: scripts/attach_retailer_offer.py hangs ANOTHER retailer's
                            -- offer (Amazon, Olive Young) on an existing product as
-                           -- `<product_key>::canonical`, and that is that retailer's only offer,
-                           -- not a twin of the row's own variant offer.
+                           -- `<product_key>::canonical` under that retailer's merchant_id, and that
+                           -- is the retailer's only offer, not a twin of the row's own variant offer.
+                           -- The merchant, not the destination host: a row's two offers can name
+                           -- `sd.com` and `m.sd.com`, and the assembler (keyed by merchant on the
+                           -- row's own host) collapses those, so this must too.
                            bool_or(NOT base.is_placeholder) OVER (
-                               PARTITION BY base.product_key, base.seller_host,
+                               PARTITION BY base.product_key, base.merchant_id,
                                             base.market_key, base.currency_key
                            ) AS has_variant_offer
                       FROM (
@@ -6606,7 +6610,9 @@ async def _handle_offers_resolve(
                            upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v')) AS currency_key,
                            -- Priced in another currency than the declared market's, or in none:
                            -- withheld below (`_offers_in_buyer_currency`), so it never holds a slot
-                           -- a servable offer could fill. No market declared: false for all.
+                           -- a servable offer could fill. No market declared: false for all, and
+                           -- `currency_key = ''` (ranked right after it) still puts an offer that
+                           -- states no currency behind one that states its own.
                            (CAST(:buyer_currency AS TEXT) IS NOT NULL
                             AND upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v'))
                                 IS DISTINCT FROM CAST(:buyer_currency AS TEXT)) AS foreign_currency,
@@ -6705,6 +6711,7 @@ async def _handle_offers_resolve(
                      ORDER BY ranked.servable DESC,
                               (ranked.seller_rank > 1) ASC,
                               ranked.foreign_currency ASC,
+                              (ranked.currency_key = '') ASC,
                               ranked.unavailable ASC,{_price_order}
                               ranked.price_amount ASC,
                               ranked.offer_id ASC
@@ -6803,7 +6810,8 @@ async def _handle_offers_resolve(
                     "price": float(price_amount) if price_amount is not None else None,
                     # NEVER DEFAULTED. A row that states no currency ships none: a declared
                     # market withholds it (`_offers_in_buyer_currency`, counted as "none"), and
-                    # the statement above ranks it last for that reason. It used to ship as
+                    # the statement above ranks it behind every offer that states a currency,
+                    # with or without a market. It used to ship as
                     # "USD", which a US buyer's filter then kept as a stated USD price.
                     "currency": str(r.get("currency") or "").strip() or None,
                     "availability": availability,
