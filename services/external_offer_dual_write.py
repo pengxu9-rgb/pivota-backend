@@ -41,10 +41,11 @@ import os
 import re
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
+from services.seed_offer_currency import snapshot_currency_of
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,48 @@ MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_
 ))
 
 
+def _seed_offer_currency_and_market(
+    product_key: str, row_dict: Dict[str, Any], amount: Optional[float]
+) -> Tuple[Optional[str], str]:
+    """The currency and market the mirror offer is written with: the seed's own, never a default.
+
+    Peng 2026-10-19: a market or currency is never defaulted. This writer used to bind
+    `price_currency or "USD"` and `market or "US"`; prod 2026-10-19 still serves USD mirror offers
+    stamped that way on seeds priced in SGD (nourwish.com, 23 serving products). So:
+
+      * no market on the seed: the write is refused (the column's DEFAULT 'US' is not a declaration);
+      * an amount with no currency: refused, never labelled USD;
+      * an amount whose column currency disagrees with the page read (snapshot.price_currency,
+        services/seed_offer_currency): refused. The amount is the column's, and the page says the
+        column's currency is wrong (column USD over snapshot GBP / QAR / EUR / INR / ZAR on prod).
+
+    A refusal raises ValueError, which every caller already logs and skips per row (the mirror's
+    chain write, sync_offer_for_seed). The offer already stored is left alone, and the readers
+    (the gateway's canonical search, agent_pdp_view) refuse a projected offer whose currency is
+    not the seed's own. A seed with no amount writes an unpriced offer, with the seed's currency
+    when it states one and NULL when it states none.
+    """
+    market = str(row_dict.get("market") or "").strip().upper()
+    if not market:
+        raise ValueError(
+            f"external_offer_dual_write: refusing offer write with no seed market (product_key={product_key})"
+        )
+    column = str(row_dict.get("price_currency") or "").strip().upper() or None
+    if amount is None:
+        return column, market
+    if not column:
+        raise ValueError(
+            f"external_offer_dual_write: refusing a priced offer with no seed currency (product_key={product_key})"
+        )
+    page = snapshot_currency_of(row_dict)
+    if page and page != column:
+        raise ValueError(
+            f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
+            f"with its page read {page} (product_key={product_key})"
+        )
+    return column, market
+
+
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
@@ -350,6 +393,7 @@ async def upsert_catalog_offer_from_seed_row(
         list_price_value = float(raw_price) if raw_price is not None else None
     except (TypeError, ValueError):
         list_price_value = None
+    currency_value, market_value = _seed_offer_currency_and_market(product_key, row_dict, list_price_value)
     offer_payload = {
         "source": OFFER_SOURCE_SYSTEM,
         "destination_url": row_dict.get("destination_url"),
@@ -396,8 +440,8 @@ async def upsert_catalog_offer_from_seed_row(
             "channel": OFFER_CHANNEL,
             "availability": row_dict.get("availability"),
             "inventory_quantity": None,
-            "currency": row_dict.get("price_currency") or "USD",
-            "market": row_dict.get("market") or "US",
+            "currency": currency_value,
+            "market": market_value,
             "list_price": list_price_value,
             "merchant_effective_price": list_price_value,
             "estimated_best_price": list_price_value,
@@ -433,7 +477,9 @@ _SEED_OFFER_COLUMNS = (
     # Only what the attached lane reads of seed_data, never the whole document.
     "seed_data -> 'variants' AS seed_variants, "
     "seed_data -> 'snapshot' -> 'variants' AS snapshot_variants, "
-    "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status"
+    "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status, "
+    # The page-read currency the offer writer checks the column against (services/seed_offer_currency).
+    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency"
 )
 
 # ── the attached lane ────────────────────────────────────────────────────────────────────────────

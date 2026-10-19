@@ -134,7 +134,7 @@ async def test_offer_id_agrees_with_mirror_on_the_real_product_key(monkeypatch):
     This is the invariant the sentinel-keyed draft violated."""
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     fake = FakeDB(
-        seed={"id": "s1", "external_product_id": "ext1", "price_amount": 5.0},
+        seed={"id": "s1", "external_product_id": "ext1", "price_amount": 5.0, "price_currency": "USD", "market": "US"},
         mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER},
     )
     monkeypatch.setattr(mod, "database", fake)
@@ -155,7 +155,7 @@ async def test_self_seed_projects_brand_direct_first_party(monkeypatch):
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(
         _REAL_PK,
-        {"id": "s1", "external_product_id": "ext1", "seed_kind": "Self", "price_amount": 12.0},
+        {"id": "s1", "external_product_id": "ext1", "seed_kind": "Self", "price_amount": 12.0, "price_currency": "USD", "market": "US"},
         merchant_id=_REAL_SELLER,
     )
     params = fake.executed[0]["params"]
@@ -179,7 +179,7 @@ async def test_non_self_seed_leaves_offer_untyped(monkeypatch, seed_kind):
     default), so onboard or a human types it deliberately."""
     fake = FakeDB()
     monkeypatch.setattr(mod, "database", fake)
-    row = {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0}
+    row = {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0, "price_currency": "USD", "market": "US"}
     if seed_kind is not None:
         row["seed_kind"] = seed_kind
     await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, row, merchant_id=_REAL_SELLER)
@@ -224,7 +224,7 @@ async def test_offer_carries_normalized_source_domain(monkeypatch):
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(
         _REAL_PK,
-        {"id": "s1", "domain": "https://www.Oiad.com/", "price_amount": 12.0},
+        {"id": "s1", "domain": "https://www.Oiad.com/", "price_amount": 12.0, "price_currency": "USD", "market": "US"},
         merchant_id=_REAL_SELLER,
     )
     call = fake.executed[0]
@@ -243,7 +243,7 @@ async def test_source_domain_falls_back_to_url_hosts(monkeypatch):
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(
         _REAL_PK,
-        {"id": "s1", "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+        {"id": "s1", "canonical_url": "https://shop.example/p/1", "price_amount": 12.0, "price_currency": "USD", "market": "US"},
         merchant_id=_REAL_SELLER,
     )
     assert fake.executed[0]["params"]["source_domain"] == "shop.example"
@@ -254,7 +254,7 @@ async def test_domainless_seed_stamps_null_never_fabricates(monkeypatch):
     fake = FakeDB()
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(
-        _REAL_PK, {"id": "s1", "price_amount": 12.0}, merchant_id=_REAL_SELLER
+        _REAL_PK, {"id": "s1", "price_amount": 12.0, "price_currency": "USD", "market": "US"}, merchant_id=_REAL_SELLER
     )
     assert fake.executed[0]["params"]["source_domain"] is None
 
@@ -271,7 +271,7 @@ async def test_junk_seed_domain_does_not_shadow_a_good_url_host(monkeypatch):
     await mod.upsert_catalog_offer_from_seed_row(
         _REAL_PK,
         {"id": "s1", "domain": "N/A",
-         "canonical_url": "https://shop.example/p/1", "price_amount": 12.0},
+         "canonical_url": "https://shop.example/p/1", "price_amount": 12.0, "price_currency": "USD", "market": "US"},
         merchant_id=_REAL_SELLER,
     )
     assert fake.executed[0]["params"]["source_domain"] == "shop.example"
@@ -280,7 +280,7 @@ async def test_junk_seed_domain_does_not_shadow_a_good_url_host(monkeypatch):
     fake2 = FakeDB()
     monkeypatch.setattr(mod, "database", fake2)
     await mod.upsert_catalog_offer_from_seed_row(
-        _REAL_PK, {"id": "s1", "domain": "unknown", "price_amount": 12.0},
+        _REAL_PK, {"id": "s1", "domain": "unknown", "price_amount": 12.0, "price_currency": "USD", "market": "US"},
         merchant_id=_REAL_SELLER,
     )
     assert fake2.executed[0]["params"]["source_domain"] is None
@@ -413,9 +413,78 @@ async def test_variant_offer_projection_follows_its_switch(monkeypatch, value, c
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(
         _REAL_PK,
-        {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0,
+        {"id": "s1", "external_product_id": "ext1", "price_amount": 12.0, "price_currency": "USD", "market": "US",
          "snapshot_variants": [{"variant_id": "677289689108"}]},
         merchant_id=_REAL_SELLER,
     )
     assert len(fake.executed) == 1  # the canonical offer is written either way
     assert project.await_count == (1 if called else 0)
+
+
+# ── never a default currency or market (Peng 2026-10-19) ────────────────────────────────────────
+# Live 10-19: 23 serving nourwish.com products were priced "USD" by mirror offers this writer
+# stamped `price_currency or "USD"` on seeds priced in SGD, and US-partition seeds whose column says
+# USD over a page read in QAR / EUR / INR / ZAR carry USD offers copied off that column.
+
+
+def _priced_seed(**over):
+    row = {"id": "s1", "external_product_id": "ext1", "price_amount": 38.0, "price_currency": "SGD",
+           "market": "US", "domain": "nourwish.com", "destination_url": "https://nourwish.com/products/a"}
+    row.update(over)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_a_priced_seed_writes_its_own_currency_and_market(monkeypatch):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, _priced_seed(), merchant_id=_REAL_SELLER)
+    params = fake.executed[0]["params"]
+    assert (params["currency"], params["market"], params["list_price"]) == ("SGD", "US", 38.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("over, reason", [
+    ({"price_currency": None}, "no seed currency"),
+    ({"price_currency": "  "}, "no seed currency"),
+    ({"market": None}, "no seed market"),
+    ({"market": ""}, "no seed market"),
+    # skintific.com's shape on the sync path's projected column: column USD, page read AUD.
+    ({"price_currency": "USD", "snapshot_price_currency": "AUD"}, "disagrees with its page read AUD"),
+    # the mirror script's shape: the whole seed_data, column USD over a page read in QAR.
+    ({"price_currency": "USD", "seed_data": {"snapshot": {"price_currency": "QAR"}}}, "disagrees with its page read QAR"),
+])
+async def test_a_priced_seed_without_its_own_currency_or_market_is_refused(monkeypatch, over, reason):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    with pytest.raises(ValueError, match=reason):
+        await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, _priced_seed(**over), merchant_id=_REAL_SELLER)
+    assert fake.executed == []  # nothing written, so nothing is labelled
+
+
+@pytest.mark.asyncio
+async def test_seed_data_price_currency_is_not_evidence(monkeypatch):
+    """seed_data.price_currency is a writer-defaulted copy (16 serving SGD offers on 10-19: column
+    SGD, snapshot SGD, seed_data 'USD'). It neither refuses nor relabels the write."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK,
+        _priced_seed(seed_data={"price_currency": "USD", "snapshot": {"price_currency": "SGD"}}),
+        merchant_id=_REAL_SELLER,
+    )
+    assert fake.executed[0]["params"]["currency"] == "SGD"
+
+
+@pytest.mark.asyncio
+async def test_sync_reads_the_page_currency_and_refuses_softly(monkeypatch):
+    """The sync path selects the snapshot currency next to the column, and a refusal is the
+    fail-soft 'error' status every caller already handles, never an exception."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    assert "AS snapshot_price_currency" in mod._SEED_OFFER_COLUMNS
+    fake = FakeDB(seed=_priced_seed(price_currency="USD", snapshot_price_currency="AUD"),
+                  mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER})
+    monkeypatch.setattr(mod, "database", fake)
+    result = await mod.sync_offer_for_seed("s1")
+    assert result["status"] == "error" and "page read AUD" in result["error"]
+    assert fake.executed == []

@@ -768,7 +768,9 @@ async def _upsert_canonical_sku_for_mirror_row(
             "sku": row_dict.get("external_product_id"),
             "barcode": None,
             "title": row_dict.get("title"),
-            "currency": row_dict.get("price_currency") or "USD",
+            # The seed's own currency or none: never a USD default (Peng 2026-10-19). A
+            # currency-less seed writes a currency-less sku, as its offer writes no price.
+            "currency": str(row_dict.get("price_currency") or "").strip().upper() or None,
             "image_url": row_dict.get("image_url"),
             "visible_attributes": json.dumps({}, ensure_ascii=False),
             "visible_option_labels": json.dumps([], ensure_ascii=False),
