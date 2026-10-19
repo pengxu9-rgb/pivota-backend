@@ -84,7 +84,7 @@ from services.pivot_query_service import (
     search_pivot_catalog,
 )
 from services.query_semantic_class import classify_query_semantic_class
-from services.seed_offer_currency import seed_projected_offer_in_seed_currency_sql
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.canonical_search_query import prepare_canonical_search_query
 from services.similarity_service import (
     SimilarityService,
@@ -4265,11 +4265,6 @@ async def _issue_served_clicks(
         )
 
 
-# The catalog-offers arm's seed-currency conjunct (services/seed_offer_currency), correlated on the
-# listing the offer prices. Bound once: it is the same text on every call.
-_SEED_PROJECTED_OFFER_IN_SEED_CURRENCY = seed_projected_offer_in_seed_currency_sql("o", "o.product_key")
-
-
 async def _handle_offers_resolve(
     payload: OffersResolvePayload,
     request_metadata: Optional[Dict[str, Any]],
@@ -6570,6 +6565,7 @@ async def _handle_offers_resolve(
         _price_select, _price_order, _price_params = (
             await _catalog_price_freshness_sql() if _group_mode else ("", "", {})
         )
+        _seed_currency_guard = seed_projected_offer_guard_and_sql("o", "o.product_key")
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
@@ -6686,7 +6682,9 @@ async def _handle_offers_resolve(
                        -- above ranks, so a stale copy never holds a seller's slot: SKINTIFIC's
                        -- set carried 20 USD 23.56 offers the variant backfill copied off a seed
                        -- since re-read in AUD, and this arm would mint a link at that price.
-                       AND {_SEED_PROJECTED_OFFER_IN_SEED_CURRENCY}
+                       -- Correlated on the listing the offer prices; "" with the reader kill
+                       -- switch (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off.
+                       {_seed_currency_guard}
                       ) base
                       ) twins
                      -- THE PLACEHOLDER TWIN: every retailer row carries its product-level

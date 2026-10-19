@@ -29,7 +29,7 @@ from db.database import database
 from services.catalog_identity import validated_source_gtin
 from services.claim_safety import ensure_category_disclaimers
 from services.offer_buyability import availability_is_known_unavailable
-from services.seed_offer_currency import seed_projected_offer_in_seed_currency_sql
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
@@ -168,7 +168,8 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
     currency: on 2026-10-19 this view served SKINTIFIC's set with five USD 23.56 offers that the
     variant backfill had copied off seed_data.variants, while the seed itself had been re-read in
     AUD. The same rule bounds the gateway's search offers, so a PDP and a search card cannot
-    disagree on whether a row is a price."""
+    disagree on whether a row is a price. Kill switch: CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD=off
+    (default on, read per call), the gateway's own name."""
     if not product_keys:
         return []
     read_db = db or database
@@ -184,7 +185,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
         WHERE o.product_key = ANY(:keys)
           AND o.suppressed_at IS NULL
-          AND {seed_projected_offer_in_seed_currency_sql("o", "o.product_key")}
+          {seed_projected_offer_guard_and_sql("o", "o.product_key")}
         """,
         {"keys": product_keys},
     )

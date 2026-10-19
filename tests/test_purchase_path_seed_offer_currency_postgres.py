@@ -235,6 +235,13 @@ _EDGES = [
     ("active", "EUR", '{}', MARKETS, "USD"),                                   # not a seed copy
     ("active", "EUR", '{}', None, "USD"),                                      # no source_system
     ("active", "EUR", '{}', "", "USD"),
+    # THE COLUMN AND THE PAGE READ MUST AGREE (#2652 round 2). Disagreeing, the seed states none, so a
+    # copy in EITHER currency is no price: page-first would keep edge_17, column-first edge_16's twin.
+    ("active", "USD", '{"snapshot": {"price_currency": "EUR"}}', MIRROR, "USD"),
+    ("active", "USD", '{"snapshot": {"price_currency": "GBP"}}', MIRROR, "GBP"),
+    ("active", None, '{"snapshot": {"price_currency": "GBP"}}', MIRROR, "GBP"),     # page alone
+    ("active", None, '"a string"', MIRROR, "USD"),
+    ("active", "GBP", '{"snapshot": {"price_currency": "gbp "}}', MIRROR, "GBP"),   # agree, normalised
 ]
 
 
@@ -276,6 +283,7 @@ async def test_the_python_twin_agrees_with_the_sql_predicate_on_every_stored_sha
         "edge_0": True, "edge_1": True, "edge_2": False, "edge_3": False, "edge_4": True, "edge_5": True,
         "edge_6": True, "edge_7": False, "edge_8": True, "edge_9": False, "edge_10": False, "edge_11": True,
         "edge_12": False, "edge_13": True, "edge_14": True, "edge_15": True,
+        "edge_16": False, "edge_17": False, "edge_18": True, "edge_19": False, "edge_20": True,
     }
     assert sql["two_seeds"] is False
 
@@ -311,6 +319,40 @@ async def test_the_reap_reads_leave_no_price_on_a_listing_with_only_refused_copi
     read = await private_db.fetch_all(reap._CART_ALL_OFFERS_SQL, params)
     assert len(read) == 1 and read[0]["currency"] == "USD"
     assert await reap._offers_priced_in_seed_currency(listing, read) == []
+
+
+async def test_past_fifty_seeds_the_reap_reads_refuse_copies_the_sql_would_keep(private_db, monkeypatch):
+    """The one deliberate difference between the twin as the route applies it and the SQL: the route
+    reads at most 50 seeds per listing and refuses every copy past that; the SQL reads them all."""
+    import routes.agent_commerce_reap as reap
+
+    monkeypatch.setattr(reap, "database", private_db)
+    pk = "prod::merch_obs_many::external_seed::many_seeds"
+    for i in range(reap._LISTING_SEEDS_MAX + 1):
+        await private_db.execute(
+            "INSERT INTO external_product_seeds (id, attached_product_key, status, price_currency, seed_data)"
+            " VALUES (:id, :pk, 'active', 'USD', NULL)", {"id": f"eps_many_{i:02d}", "pk": pk})
+    await private_db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,"
+        " readiness_tier, offer_mode, channel, availability, currency, list_price, market, source_system,"
+        " offer_type, is_first_party) VALUES ('many_seeds', :sku, :pk, 'm', 'external_referral', 'observed',"
+        " 'referral_only', 'redirect', 'external_referral', 'in_stock', 'USD', 1, 'US', :src, 'retailer',"
+        " false)", {"sku": f"{pk}::canonical", "pk": pk, "src": MIRROR})
+
+    assert (await _sql_verdicts(private_db))["many_seeds"] is True
+    rows = [{"currency": "USD", "price": "1", "source_system": MIRROR}]
+    assert await reap._offers_priced_in_seed_currency(pk, rows) == []
+
+
+async def test_the_reader_kill_switch_turns_the_reap_filter_off(private_db, monkeypatch):
+    import routes.agent_commerce_reap as reap
+    from services.seed_offer_currency import SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG
+
+    monkeypatch.setattr(reap, "database", private_db)
+    rows = [{"currency": "USD", "price": "20", "source_system": MIRROR}]
+    assert await reap._offers_priced_in_seed_currency(NOUR, rows) == []
+    monkeypatch.setenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG, "off")
+    assert await reap._offers_priced_in_seed_currency(NOUR, rows) == rows
 
 
 async def test_a_listing_with_no_seed_copy_never_reads_its_seeds(private_db, monkeypatch):
@@ -385,6 +427,14 @@ async def test_the_batch_and_audit_queries_run_gated_on_postgres(private_db, mon
 
 def test_with_the_flag_off_every_eligibility_query_is_the_one_main_sends(monkeypatch):
     import services.index_pipeline_state_service as ips
+    from services.seed_offer_currency import SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG
+
+    # The reader kill switch wins over the serving flag.
+    monkeypatch.setenv(ips.SERVING_PRICE_SEED_CURRENCY_ENV, "1")
+    monkeypatch.setenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG, "off")
+    for query in (ips._BATCH_QUERY, ips._SINGLE_QUERY, ips._MULTI_QUERY):
+        assert ips.eligibility_query(query) is query
+    monkeypatch.delenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG)
 
     monkeypatch.delenv(ips.SERVING_PRICE_SEED_CURRENCY_ENV, raising=False)
     for query in (ips._BATCH_QUERY, ips._SINGLE_QUERY, ips._MULTI_QUERY):
@@ -480,6 +530,17 @@ def test_the_arm_links_the_markets_read_not_the_cheaper_usd_copy(pg_engine):
     assert _catalog_offers(res) == [("skin_markets_usd", 39.0, "USD")]
     breakdown = (res.get("metadata") or {}).get("failure_breakdown") or {}
     assert "catalog_offers" not in breakdown, breakdown
+
+
+def test_the_reader_kill_switch_puts_the_arm_back_as_it_was(pg_engine, monkeypatch):
+    """CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD=off: the statement is the pre-rule one, and the
+    cheaper USD copy is linked again (the shape this change exists to stop)."""
+    from services.seed_offer_currency import SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG
+
+    monkeypatch.setenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG, "off")
+    _plant_shared(pg_engine)
+    res = _resolve(_sig(SKIN))
+    assert [(price, ccy) for _oid, price, ccy in _catalog_offers(res)] == [(23.56, "USD")]
 
 
 @pytest.mark.parametrize("listing", [NOUR, QAR, ORPHAN])

@@ -134,7 +134,11 @@ from services.shopify_variant_identity import (
 from services.seller_identity import resolve_seed_seller_identity
 # THE seed-currency rule for offers copied off a seed (Peng 2026-10-19), in its Python twin: these
 # statements stay one text on both dialects, and the SQL predicate is Postgres-only.
-from services.seed_offer_currency import is_seed_projected_offer, offer_priced_in_seed_currency
+from services.seed_offer_currency import (
+    is_seed_projected_offer,
+    offer_priced_in_seed_currency,
+    seed_currency_guard_enabled,
+)
 # THE ONE merchant-host canonicaliser, imported rather than re-implemented: lower case, ONE
 # leading `www.` removed, and a ValueError for anything that is not a bare DNS host name —
 # including a trailing dot. It is `tierb_cart_link_eligibility`'s own key function
@@ -1166,6 +1170,8 @@ _SKUS_FOR_PRODUCT_SQL = """
 #: '9.00' after '10.00'.
 #: Cheapest first, and more than one: the first row `_offers_priced_in_seed_currency` keeps is the
 #: price, so a stale seed copy that happens to be cheapest cannot hide the seller's real offer.
+#: Bounded at 20: should 20 or more cheaper refused copies sit on one sku, the real offer is not read
+#: and the row answers `row_unpriced`. That fails closed, never a wrong price.
 _OFFER_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
@@ -1188,7 +1194,9 @@ _OFFER_SQL = """
 #: attached to its listing and every active one is read in the offer's currency. On 2026-10-19 US
 #: search served SKINTIFIC's set at USD 23.56 from offers the variant backfill copied off a seed that
 #: had since been re-read in AUD; this route must not charge that number. Bounded: past 50 seeds the
-#: listing is not one whose price anyone can vouch for, and its copied offers are refused.
+#: listing is not one whose price anyone can vouch for, and its copied offers are refused. That is the
+#: one place this route is stricter than the SQL predicate, which reads every seed and keeps a copy
+#: they all agree with (tests/test_purchase_path_seed_offer_currency_postgres.py pins both answers).
 _LISTING_SEEDS_SQL = """
     SELECT e.status, e.price_currency, e.seed_data
       FROM external_product_seeds e
@@ -1202,9 +1210,10 @@ _LISTING_SEEDS_MAX = 50
 async def _offers_priced_in_seed_currency(product_key: str, rows: Any) -> List[Dict[str, Any]]:
     """`rows` (offers on `product_key`'s listing, in order) minus every offer copied off a seed
     that is not priced in its seed's currency. An offer no seed-copying writer wrote is kept as it
-    is, and when there is none the seeds are not read at all."""
+    is, and when there is none the seeds are not read at all. With the reader kill switch
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off, every row is kept, as before the rule."""
     offers = [dict(row) for row in rows or ()]
-    if not any(is_seed_projected_offer(offer) for offer in offers):
+    if not seed_currency_guard_enabled() or not any(is_seed_projected_offer(offer) for offer in offers):
         return offers
     seeds = [dict(row) for row in await database.fetch_all(
         _LISTING_SEEDS_SQL, {"product_key": product_key}

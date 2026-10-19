@@ -79,6 +79,8 @@ from services.external_offer_dual_write import (
     derive_mirror_offer_id as _shared_offer_id,
     derive_mirror_sku_key as _shared_sku_key,
     upsert_catalog_offer_from_seed_row as _shared_upsert_offer,
+    seed_offer_amount,
+    seed_offer_currency_and_market,
 )
 # ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md) + IDENTITY_REFERENCE
 # §3 Trap T3: Path B must mint a real per-brand observed seller-of-record at
@@ -1833,6 +1835,12 @@ async def _apply(limit: int) -> Dict[str, Any]:
         product_key_for_chain = product_key
         if product_key_for_chain:
             try:
+                # Refused BEFORE any chain write (PR controller review of #2652): a seed with no
+                # currency or market for its amount, or whose column and page read disagree, writes
+                # neither its canonical sku nor its offer, so no half-written chain is left behind.
+                seed_offer_currency_and_market(
+                    product_key_for_chain, row_dict, seed_offer_amount(row_dict)
+                )
                 await _upsert_canonical_sku_for_mirror_row(
                     product_key_for_chain, row_dict, merchant_id=seller_merchant_id
                 )

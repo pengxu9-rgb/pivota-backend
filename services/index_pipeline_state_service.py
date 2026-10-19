@@ -25,7 +25,7 @@ from services.agent_decision_gates import (
 )
 from services.category_path_aliases import resolve as resolve_category_path
 from services.priced_offer_sql import priced_offer_exists_sql
-from services.seed_offer_currency import seed_projected_offer_in_seed_currency_sql
+from services.seed_offer_currency import seed_currency_guard_enabled, seed_projected_offer_in_seed_currency_sql
 from services.region_pricing import (
     acquisition_market_offer_exists_sql,
     has_offer_priced_for_any_region_sql,
@@ -984,8 +984,9 @@ _SEED_CURRENCY_GATED_QUERIES = {
 def eligibility_query(query: str) -> str:
     """`query` (_BATCH_QUERY, _SINGLE_QUERY or _MULTI_QUERY) as this process should send it: itself,
     or with has_price and has_serving_region_offer under the seed-currency rule when
-    SERVING_PRICE_REQUIRES_SEED_CURRENCY is on."""
-    if not serving_price_requires_seed_currency():
+    SERVING_PRICE_REQUIRES_SEED_CURRENCY is on and the reader kill switch
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) is not off."""
+    if not serving_price_requires_seed_currency() or not seed_currency_guard_enabled():
         return query
     return _SEED_CURRENCY_GATED_QUERIES[query]
 

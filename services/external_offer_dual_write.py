@@ -45,7 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
-from services.seed_offer_currency import snapshot_currency_of
+from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, snapshot_currency_of
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -291,7 +291,7 @@ MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_
 ))
 
 
-def _seed_offer_currency_and_market(
+def seed_offer_currency_and_market(
     product_key: str, row_dict: Dict[str, Any], amount: Optional[float]
 ) -> Tuple[Optional[str], str]:
     """The currency and market the mirror offer is written with: the seed's own, never a default.
@@ -300,37 +300,47 @@ def _seed_offer_currency_and_market(
     `price_currency or "USD"` and `market or "US"`; prod 2026-10-19 still serves USD mirror offers
     stamped that way on seeds priced in SGD (nourwish.com, 23 serving products). So:
 
-      * no market on the seed: the write is refused (the column's DEFAULT 'US' is not a declaration);
+      * no market on the seed: refused (the column's DEFAULT 'US' is not a declaration);
       * an amount with no currency: refused, never labelled USD;
-      * an amount whose column currency disagrees with the page read (snapshot.price_currency,
-        services/seed_offer_currency): refused. The amount is the column's, and the page says the
-        column's currency is wrong (column USD over snapshot GBP / QAR / EUR / INR / ZAR on prod).
+      * an amount whose column currency disagrees with the page read (snapshot.price_currency): refused.
+        Either can be the wrong one (services/seed_offer_currency), so the amount has no known unit.
 
-    A refusal raises ValueError, which every caller already logs and skips per row (the mirror's
-    chain write, sync_offer_for_seed). The offer already stored is left alone, and the readers
-    (the gateway's canonical search, agent_pdp_view) refuse a projected offer whose currency is
-    not the seed's own. A seed with no amount writes an unpriced offer, with the seed's currency
-    when it states one and NULL when it states none.
+    A refusal raises SeedOfferCurrencyRefused (a ValueError: every caller already logs and skips per
+    row; sync_offer_for_seed reports it as `refused_currency`). Nothing is written, and the offer
+    already stored is left alone. The readers (gateway search, agent_pdp_view) refuse a projected
+    offer whose currency is not the seed's. A seed with no amount writes an unpriced offer, carrying
+    the seed's currency only when its column and page read agree (or one is stated alone).
+
+    Public so the mirror's chain write can run it BEFORE its canonical-sku upsert, and a refused seed
+    leaves no half-written chain behind.
     """
     market = str(row_dict.get("market") or "").strip().upper()
     if not market:
-        raise ValueError(
+        raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write with no seed market (product_key={product_key})"
         )
-    column = str(row_dict.get("price_currency") or "").strip().upper() or None
     if amount is None:
-        return column, market
+        return seed_currency_of(row_dict), market
+    column = str(row_dict.get("price_currency") or "").strip().upper() or None
     if not column:
-        raise ValueError(
+        raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing a priced offer with no seed currency (product_key={product_key})"
         )
     page = snapshot_currency_of(row_dict)
     if page and page != column:
-        raise ValueError(
+        raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
             f"with its page read {page} (product_key={product_key})"
         )
     return column, market
+
+
+def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
+    raw_price = row_dict.get("price_amount")
+    try:
+        return float(raw_price) if raw_price is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 async def upsert_catalog_offer_from_seed_row(
@@ -388,12 +398,8 @@ async def upsert_catalog_offer_from_seed_row(
     else:
         offer_type_value = None
         is_first_party_value = False
-    raw_price = row_dict.get("price_amount")
-    try:
-        list_price_value = float(raw_price) if raw_price is not None else None
-    except (TypeError, ValueError):
-        list_price_value = None
-    currency_value, market_value = _seed_offer_currency_and_market(product_key, row_dict, list_price_value)
+    list_price_value = seed_offer_amount(row_dict)
+    currency_value, market_value = seed_offer_currency_and_market(product_key, row_dict, list_price_value)
     offer_payload = {
         "source": OFFER_SOURCE_SYSTEM,
         "destination_url": row_dict.get("destination_url"),
@@ -895,10 +901,16 @@ async def sync_offer_for_seed(
             return {"seed_id": seed_id, "status": "no_mirror_product"}
 
         product_key = mirror["product_key"]
-        await upsert_catalog_offer_from_seed_row(
-            product_key, seed, merchant_id=mirror["merchant_id"],
-            price_read=price_was_read(attached_price_source, currency_read),
-        )
+        try:
+            await upsert_catalog_offer_from_seed_row(
+                product_key, seed, merchant_id=mirror["merchant_id"],
+                price_read=price_was_read(attached_price_source, currency_read),
+            )
+        except SeedOfferCurrencyRefused as refused:
+            # Not a failure: the seed states no currency (or market) for its amount, so nothing is
+            # written. Its own status, so refresh counters and readiness can tell it from an exception.
+            logger.warning({"event": "external_offer_dual_write_refused_currency", "seed_id": seed_id, "reason": str(refused)})
+            return {"seed_id": seed_id, "status": "refused_currency", "product_key": product_key, "error": str(refused)}
         return {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
     except Exception as exc:  # noqa: BLE001
         logger.warning({

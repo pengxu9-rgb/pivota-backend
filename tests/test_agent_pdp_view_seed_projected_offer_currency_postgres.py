@@ -41,7 +41,13 @@ QAR = "prod::merch_obs_qar::external_seed::ext_qar_page"
 UPPER = "prod::merch_obs_up::external_seed::ext_upper_status"
 ORPHAN = "prod::merch_obs_orphan::external_seed::ext_no_seed"
 STRSNAP = "prod::merch_obs_str::external_seed::ext_string_snapshot"
-KEYS = [SKIN, NOUR, SGOK, COLONLY, NOCCY, INACTIVE, QAR, UPPER, ORPHAN, STRSNAP]
+TWOSEEDS = "prod::merch_obs_two::external_seed::ext_two_seeds"
+LOWER = "prod::merch_obs_low::external_seed::ext_lower_ccy"
+ARRAY = "prod::merch_obs_arr::external_seed::ext_array_seed_data"
+NOSRC = "prod::merch_obs_nosrc::external_seed::ext_no_source"
+GBP = "prod::merch_obs_gbp::external_seed::ext_col_usd_page_gbp"
+BLANKS = "prod::merch_obs_blank::external_seed::ext_blank_both"
+KEYS = [SKIN, NOUR, SGOK, COLONLY, NOCCY, INACTIVE, QAR, UPPER, ORPHAN, STRSNAP, TWOSEEDS, LOWER, ARRAY, NOSRC, GBP, BLANKS]
 
 
 def _private_url() -> str:
@@ -149,6 +155,31 @@ def _build(url: str) -> None:
             # No seed attached at all.
             offer("orphan_usd", ORPHAN, "USD", 21, "external_product_seeds_mirror_v1")
             offer("orphan_markets", ORPHAN, "USD", 20, "shopify_markets_us_localization")
+            # Two active seeds on one listing, one re-read in AUD: one disagreeing read is enough to refuse.
+            offer("two_usd", TWOSEEDS, "USD", 17, "external_product_seeds_mirror_v1")
+            offer("two_markets", TWOSEEDS, "USD", 16, "us_market_capture")
+            seed("eps_two_usd", TWOSEEDS, "USD", {"snapshot": {"price_currency": "USD"}})
+            seed("eps_two_aud", TWOSEEDS, "AUD", {"snapshot": {"price_currency": "AUD"}})
+            # The offer's currency is compared trimmed and upper-cased.
+            offer("low_aud", LOWER, "aud ", 33, "external_product_seeds_mirror_v1")
+            seed("eps_low", LOWER, "AUD", {"snapshot": {"price_currency": "AUD"}})
+            # seed_data stored as an array hides the page read: no currency.
+            offer("arr_usd", ARRAY, "USD", 29, "external_product_seeds_mirror_v1")
+            offer("arr_markets", ARRAY, "USD", 28, "us_market_capture")
+            conn.execute(text(
+                "INSERT INTO external_product_seeds (id, attached_product_key, status, market, price_amount, "
+                " price_currency, seed_data) VALUES ('eps_arr', :pk, 'active', 'US', 1, 'USD', CAST('[1, 2]' AS jsonb))"
+            ), {"pk": ARRAY})
+            # An offer no seed-copying writer wrote (source_system NULL) is not judged.
+            offer("nosrc_usd", NOSRC, "USD", 27, None)
+            seed("eps_nosrc", NOSRC, "AUD", {"snapshot": {"price_currency": "AUD"}})
+            # Column USD, page read GBP (483 seeds on 10-19): either may be wrong, so even the GBP row is no price.
+            offer("gbp_copied", GBP, "GBP", 26, "external_product_seeds_mirror_v1", market="GB")
+            offer("gbp_markets", GBP, "USD", 25, "us_market_capture")
+            seed("eps_gbp", GBP, "USD", {"snapshot": {"price_currency": "GBP"}})
+            # No currency on the copied row AND none on its seed: two blanks are not an agreement.
+            offer("blank_copied", BLANKS, None, 24, "external_product_seeds_mirror_v1")
+            seed("eps_blank", BLANKS, None, {"snapshot": {"price_amount": "24"}})
             # A snapshot stored as a JSON string hides the page read: no currency, refused.
             offer("strsnap_usd", STRSNAP, "USD", 19, "external_product_seeds_mirror_v1")
             offer("strsnap_markets", STRSNAP, "USD", 18, "us_market_capture")
@@ -183,6 +214,11 @@ def test_the_view_reads_only_offers_priced_in_their_seed_currency(db_url):
         "upper_usd",                   # 'ACTIVE ' is active
         "orphan_markets",              # no seed at all: only the store's own read
         "strsnap_markets",             # a string snapshot states no currency
+        "two_markets",                 # one of two active seeds reads AUD: the copied USD row is refused
+        "low_aud",                     # 'aud ' is AUD
+        "arr_markets",                 # an array seed_data states no currency
+        "nosrc_usd",                   # not a seed-copying writer: not judged
+        "gbp_markets",                 # column and page read disagree: the GBP copy is no price either
         "qar_markets_usd",             # the page said QAR: the USD copied off the column is refused
     ])
 
@@ -198,3 +234,36 @@ def test_the_view_row_no_longer_quotes_usd_23_56_for_the_aud_set(db_url):
     # One AUD and one USD read left: the modal tie goes to the higher code, so the row is the
     # store's own US read (shopify_markets_us_localization), USD 39.
     assert (currency, float(price_min)) == ("USD", 39.0)
+
+
+def test_a_refused_write_leaves_the_stored_offer_untouched(db_url, monkeypatch):
+    """The writer refuses (column USD, page read AUD), writes nothing, and the offer already stored
+    (skintific's AUD 56 mirror row) keeps every value it had: refusal never relabels."""
+    from databases import Database
+
+    import services.external_offer_dual_write as dual_write
+    from services.seed_offer_currency import SeedOfferCurrencyRefused
+
+    async def go():
+        db = Database(db_url)
+        await db.connect()
+        monkeypatch.setattr(dual_write, "database", db)
+        try:
+            before = dict(await db.fetch_one(
+                "SELECT currency, list_price, market, source_system FROM catalog_offers WHERE offer_id = 'mirror_aud'"))
+            stored_id = dual_write.derive_mirror_offer_id(SKIN)
+            await db.execute("UPDATE catalog_offers SET offer_id = :oid WHERE offer_id = 'mirror_aud'", {"oid": stored_id})
+            with pytest.raises(SeedOfferCurrencyRefused, match="page read AUD"):
+                await dual_write.upsert_catalog_offer_from_seed_row(SKIN, {
+                    "id": "eps_e49ba92834d24bac922e80cf", "price_amount": 23.56, "price_currency": "USD",
+                    "market": "US", "domain": "skintific.com", "snapshot_price_currency": "AUD",
+                }, merchant_id="merch_obs_9cbce09d1019844b")
+            after = dict(await db.fetch_one(
+                "SELECT currency, list_price, market, source_system FROM catalog_offers WHERE offer_id = :oid", {"oid": stored_id}))
+            await db.execute("UPDATE catalog_offers SET offer_id = 'mirror_aud' WHERE offer_id = :oid", {"oid": stored_id})
+            return before, after
+        finally:
+            await db.disconnect()
+
+    before, after = asyncio.run(go())
+    assert after == before and after["currency"] == "AUD" and float(after["list_price"]) == 56.0
