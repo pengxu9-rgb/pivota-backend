@@ -6579,6 +6579,17 @@ async def _handle_offers_resolve(
                                         twins.price_amount ASC, twins.offer_id ASC
                            ) AS seller_rank
                       FROM (
+                    SELECT base.*,
+                           -- Does THIS SELLER's row state a per-variant offer here? Keyed by the
+                           -- seller too: scripts/attach_retailer_offer.py hangs ANOTHER retailer's
+                           -- offer (Amazon, Olive Young) on an existing product as
+                           -- `<product_key>::canonical`, and that is that retailer's only offer,
+                           -- not a twin of the row's own variant offer.
+                           bool_or(NOT base.is_placeholder) OVER (
+                               PARTITION BY base.product_key, base.seller_host,
+                                            base.market_key, base.currency_key
+                           ) AS has_variant_offer
+                      FROM (
                     SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
                            o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
                            o.price_confidence, o.updated_at,{_price_select}
@@ -6591,28 +6602,29 @@ async def _handle_offers_resolve(
                            (lower(btrim(coalesce(o.availability, ''),
                                         E' \t\n\r\f\v'))
                             = ANY(:unavailable)) AS unavailable,
-                           -- Priced in another currency than the declared market's: withheld
-                           -- below (`_offers_in_buyer_currency`), so it never holds a slot a
-                           -- servable offer could fill. No market declared: false for all.
+                           upper(btrim(coalesce(o.market, ''), E' \t\n\r\f\v')) AS market_key,
+                           upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v')) AS currency_key,
+                           -- Priced in another currency than the declared market's, or in none:
+                           -- withheld below (`_offers_in_buyer_currency`), so it never holds a slot
+                           -- a servable offer could fill. No market declared: false for all.
                            (CAST(:buyer_currency AS TEXT) IS NOT NULL
                             AND upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v'))
                                 IS DISTINCT FROM CAST(:buyer_currency AS TEXT)) AS foreign_currency,
+                           -- A destination the loop below can serve: it keeps only a value that
+                           -- starts `http://` or `https://`, exactly so spelled, once trimmed.
+                           (btrim(coalesce(o.offer_payload->>'destination_url', o.source_ref),
+                                  E' \t\n\r\f\v') ~ '^https?://') AS servable,
                            -- THE SELLER: the destination host, as `_offer_destination_host` reads
                            -- it (the URL's host without userinfo or port, lower-cased, one
-                           -- leading `www.` dropped).
-                           -- No parsable host: the offer is a seller of its own.
-                           coalesce(regexp_replace(lower(split_part(regexp_replace(
+                           -- leading `www.` dropped). An unservable destination or an empty host
+                           -- is a seller of its own, never merged with another.
+                           coalesce(nullif(regexp_replace(lower(split_part(regexp_replace(
                                         substring(btrim(coalesce(o.offer_payload->>'destination_url',
                                                                  o.source_ref), E' \t\n\r\f\v')
-                                                  FROM '^[A-Za-z][A-Za-z0-9+.-]*://([^/?#]+)'),
-                                        '^.*@', ''), ':', 1)), '^www[.]', ''),
+                                                  FROM '^https?://([^/?#]+)'),
+                                        '^.*@', ''), ':', 1)), '^www[.]', ''), ''),
                                     'offer:' || o.offer_id) AS seller_host,
-                           (o.sku_key LIKE '%::canonical') AS is_placeholder,
-                           bool_or(o.sku_key NOT LIKE '%::canonical') OVER (
-                               PARTITION BY o.product_key,
-                                            upper(btrim(coalesce(o.market, ''))),
-                                            upper(btrim(coalesce(o.currency, '')))
-                           ) AS has_variant_offer
+                           (o.sku_key LIKE '%::canonical') AS is_placeholder
                       FROM catalog_products p
                       JOIN catalog_offers o ON o.product_key = p.product_key
                       LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
@@ -6657,12 +6669,14 @@ async def _handle_offers_resolve(
                                     o.list_price) > 0
                        AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
                            IS NOT NULL
+                      ) base
                       ) twins
                      -- THE PLACEHOLDER TWIN: every retailer row carries its product-level
                      -- `<product_key>::canonical` offer beside its per-variant one, to the same
-                     -- destination. The variant offer is the exact variant's price; the twin goes
-                     -- when one is there in the same market and currency, and stays as the row's
-                     -- only offer when none is.
+                     -- destination. The variant offer is the exact variant: its price AND its
+                     -- stock (a sold-out variant beside an in-stock placeholder is sold out). The
+                     -- twin goes when the same seller's row has one in the same market and
+                     -- currency, and stays as the row's only offer there when none is.
                      WHERE NOT (twins.is_placeholder AND twins.has_variant_offer)
                     ) ranked
                      -- ONE OFFER PER SELLER FIRST, then the rest, and BEFORE the LIMIT. The LIMIT
@@ -6687,7 +6701,9 @@ async def _handle_offers_resolve(
                      -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
                      -- (NBSP); a value padded with those would still sort as sellable while
                      -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
-                     ORDER BY (ranked.seller_rank > 1) ASC,
+                     -- An unservable destination (dropped by the loop below) goes last of all.
+                     ORDER BY ranked.servable DESC,
+                              (ranked.seller_rank > 1) ASC,
                               ranked.foreign_currency ASC,
                               ranked.unavailable ASC,{_price_order}
                               ranked.price_amount ASC,
@@ -6775,7 +6791,7 @@ async def _handle_offers_resolve(
             if _group_mode:
                 _catalog_sku_keys[f"of:catalog_offer:{r.get('offer_id')}"] = r.get("sku_key")
             if _group_mode and not str(r.get("currency") or "").strip():
-                # Shipped as "USD" below by default, never stated by the row: no best price on it.
+                # The row states no currency, so none ships below: no best price on it.
                 _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
             external_offers.append(
                 {
@@ -6785,7 +6801,11 @@ async def _handle_offers_resolve(
                     "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
                     "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
                     "price": float(price_amount) if price_amount is not None else None,
-                    "currency": str(r.get("currency") or "USD").strip() or "USD",
+                    # NEVER DEFAULTED. A row that states no currency ships none: a declared
+                    # market withholds it (`_offers_in_buyer_currency`, counted as "none"), and
+                    # the statement above ranks it last for that reason. It used to ship as
+                    # "USD", which a US buyer's filter then kept as a stated USD price.
+                    "currency": str(r.get("currency") or "").strip() or None,
                     "availability": availability,
                     # In a resolved group, the seed lane's wider vocabulary too ("sold out", the
                     # schema.org OutOfStock URL...), so a sold-out retailer is never best price.

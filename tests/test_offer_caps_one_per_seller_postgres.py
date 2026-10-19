@@ -125,7 +125,7 @@ def schema_engine():
         admin.dispose()
 
 
-def _insert_product(c, *, pk, ck, merchant, url, title=TITLE, sig=None):
+def _insert_product(c, *, pk, ck, merchant, url, title=TITLE, sig=None, source_domain=None):
     from sqlalchemy import text
 
     c.execute(text(
@@ -133,12 +133,12 @@ def _insert_product(c, *, pk, ck, merchant, url, title=TITLE, sig=None):
         " VALUES (:m, :m, 'external_seed', 'observed') ON CONFLICT DO NOTHING"), {"m": merchant})
     c.execute(text(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, brand,"
-        " content_key, pivota_signature_id, canonical_url, catalog_track, truth_tier, readiness_tier,"
-        " pdp_scope, pdp_lifecycle_stage, source_system, updated_at)"
-        " VALUES (:pk,:m,'external_seed',:pk,:title,:brand,:ck,:sig,:url,'citation','primary',"
+        " content_key, pivota_signature_id, canonical_url, source_domain, catalog_track, truth_tier,"
+        " readiness_tier, pdp_scope, pdp_lifecycle_stage, source_system, updated_at)"
+        " VALUES (:pk,:m,'external_seed',:pk,:title,:brand,:ck,:sig,:url,:sd,'citation','primary',"
         "         'referral_only','multi_merchant_canonical','published','catalog_enrichment_agent_v1',NOW())"
     ), {"pk": pk, "m": merchant, "title": title, "brand": BRAND, "ck": ck,
-        "sig": sig or "sig_" + hashlib.sha256(pk.encode()).hexdigest()[:24], "url": url})
+        "sig": sig or "sig_" + hashlib.sha256(pk.encode()).hexdigest()[:24], "url": url, "sd": source_domain})
 
 
 def _insert_offer(c, *, offer_id, sku, pk, merchant, price, url, market="US", currency="USD",
@@ -234,6 +234,96 @@ def _seed_catalog(engine, *, koolseoul_availability="in_stock"):
         _insert_offer(c, offer_id="of_kr_usd", sku=f"{kr_pk}::v:1", pk=kr_pk, merchant=kr_m, price=42, url=kr_url)
         _insert_offer(c, offer_id="of_kr_krw", sku=f"{kr_pk}::canonical", pk=kr_pk, merchant=kr_m, price=52000,
                       url=kr_url, market="KR", currency="KRW")
+        # ...and a placeholder in another market at the SAME currency (PR, a USD market) is not one.
+        _insert_offer(c, offer_id="of_kr_pr", sku=f"{kr_pk}::canonical", pk=kr_pk, merchant=kr_m, price=43,
+                      url=kr_url, market="PR")
+
+        # A VARIANT WHOSE KEY MERELY CONTAINS `::canonical` is a variant: only the suffix names the
+        # placeholder. Its row's placeholder is then a twin and goes.
+        tone_pk, tone_url = "ext:retailer:tone", "https://jolse.com/products/o-hui-tone-up"
+        _insert_product(c, pk=tone_pk, ck="ck_tone", merchant=mirror_m, url=tone_url, title="O HUI Tone Up")
+        _insert_offer(c, offer_id="of_tone_v", sku=f"{tone_pk}::v::canonical-beige", pk=tone_pk, merchant=mirror_m,
+                      price=33, url=tone_url)
+        _insert_offer(c, offer_id="of_tone_c", sku=f"{tone_pk}::canonical", pk=tone_pk, merchant=mirror_m,
+                      price=31, url=tone_url)
+
+        # THE VARIANT DECIDES STOCK TOO: a sold-out variant beside its in-stock placeholder is sold out.
+        so_pk, so_url = "ext:retailer:soldout", "https://koolseoul.com/products/o-hui-soldout"
+        so_m = _seller("koolseoul.com")["merchant_id"]
+        _insert_product(c, pk=so_pk, ck="ck_soldout", merchant=so_m, url=so_url, title="O HUI Sold Out")
+        _insert_offer(c, offer_id="of_so_v", sku=f"{so_pk}::v:1", pk=so_pk, merchant=so_m, price=50, url=so_url,
+                      availability="out_of_stock")
+        _insert_offer(c, offer_id="of_so_c", sku=f"{so_pk}::canonical", pk=so_pk, merchant=so_m, price=50,
+                      url=so_url)
+
+        # ONE MERCHANT ON TWO HOSTS, TWO MERCHANTS ON ONE HOST. The retired `external_seed` bucket holds
+        # two stores (hosts read from source_domain; no canonical URL), and a store-brand observed seller
+        # shares the first bucket store's host. Five sellers; the first bucket store has two more
+        # (cheap) shades that would fill the slots if its stores were one seller.
+        bucket = [
+            ("bk_a", "external_seed", "beautynetkorea.com", (10, 11, 12)),
+            ("bk_b", "external_seed", "yesstyle.com", (40,)),
+            ("ob_a", _seller("beautynetkorea.com")["merchant_id"], "beautynetkorea.com", (45,)),
+            ("bk_j", _seller("jolse.com")["merchant_id"], "jolse.com", (50,)),
+            ("bk_k", _seller("koolseoul.com")["merchant_id"], "koolseoul.com", (55,)),
+        ]
+        for row, merchant, host, prices in bucket:
+            pk = f"ext:retailer:{row}"
+            _insert_product(c, pk=pk, ck="ck_bucket", merchant=merchant, url=None, source_domain=host)
+            for n, price in enumerate(prices):
+                _insert_offer(c, offer_id=f"of_{row}_{n}", sku=f"{pk}::v:{n}", pk=pk, merchant=merchant,
+                              price=price, url=f"https://{host}/p/{row}-{n}")
+
+        # THE REPRESENTATIVE IS THE ONE THE BUY PICK WOULD TAKE. Six sellers. `gb` has a cheaper GBP
+        # offer in GB beside its in-stock USD one; `unk` has a cheaper offer of unknown stock beside
+        # its in-stock one. Their USD in-stock offers must stand for them, not be cut.
+        reps = [
+            ("gb", "stylekorean.com", ((9, "GB", "GBP", "in_stock"), (20, "US", "USD", "in_stock"))),
+            ("unk", "jolse.com", ((18, "US", "USD", "unknown"), (21, "US", "USD", "in_stock"))),
+            ("r3", "koolseoul.com", ((25, "US", "USD", "in_stock"),)),
+            ("r4", "kbeautymakeup.com", ((26, "US", "USD", "in_stock"),)),
+            ("r5", "nanasbeautyholic.com", ((27, "US", "USD", "in_stock"),)),
+            ("r6", "beautynetkorea.com", ((28, "US", "USD", "in_stock"),)),
+        ]
+        for row, host, offers in reps:
+            pk, url = f"ext:retailer:rep-{row}", f"https://{host}/p/rep"
+            merchant = _seller(host)["merchant_id"]
+            _insert_product(c, pk=pk, ck="ck_rep", merchant=merchant, url=url)
+            for n, (price, market, currency, avail) in enumerate(offers):
+                _insert_offer(c, offer_id=f"of_rep_{row}_{n}", sku=f"{pk}::v:{n}", pk=pk, merchant=merchant,
+                              price=price, url=url, market=market, currency=currency, availability=avail)
+
+        # A DESTINATION THE ROUTE CANNOT SERVE never takes its host's slot: `HTTPS://` (the loop keeps
+        # only `http://` / `https://` as spelled). And an EMPTY host is a seller of its own.
+        for row, host, offers in (
+            ("sch1", "jolse.com", ((5, "HTTPS://jolse.com/p/x"), (30, "https://jolse.com/p/x"))),
+            ("sch2", "koolseoul.com", ((10, "https://koolseoul.com/p/x"),)),
+            ("sch3", "kbeautymakeup.com", ((12, "https://kbeautymakeup.com/p/x"),)),
+            ("sch4", "stylekorean.com", ((40, "https://stylekorean.com/p/x"),)),
+        ):
+            pk = f"ext:retailer:{row}"
+            merchant = _seller(host)["merchant_id"]
+            _insert_product(c, pk=pk, ck="ck_scheme", merchant=merchant, url=f"https://{host}/p/x")
+            for n, (price, url) in enumerate(offers):
+                _insert_offer(c, offer_id=f"of_{row}_{n}", sku=f"{pk}::v:{n}", pk=pk, merchant=merchant,
+                              price=price, url=url)
+        for row, offers in (("at1", ((1, "https://@/a"),)), ("at2", ((2, "https://@/b"),)),
+                            ("at3", ((10, "https://koolseoul.com/p/y"), (11, "https://koolseoul.com/p/z")))):
+            pk = f"ext:retailer:{row}"
+            merchant = _seller("koolseoul.com")["merchant_id"]
+            _insert_product(c, pk=pk, ck="ck_empty_host", merchant=merchant, url="https://koolseoul.com/p/y")
+            for n, (price, url) in enumerate(offers):
+                _insert_offer(c, offer_id=f"of_{row}_{n}", sku=f"{pk}::v:{n}", pk=pk, merchant=merchant,
+                              price=price, url=url)
+
+        # ANOTHER RETAILER'S OFFER ATTACHED TO A ROW (scripts/attach_retailer_offer.py, below): the row
+        # is a kbeautymakeup listing with its own variant offer and placeholder twin.
+        at_pk, at_url = "ext:retailer:attach", "https://kbeautymakeup.com/products/o-hui-first-serum"
+        at_m = _seller("kbeautymakeup.com")["merchant_id"]
+        _insert_product(c, pk=at_pk, ck="ck_attach", merchant=at_m, url=at_url, title="O HUI First Serum")
+        _insert_offer(c, offer_id="of_at_v", sku=f"{at_pk}::v:1", pk=at_pk, merchant=at_m, price=48, url=at_url)
+        _insert_offer(c, offer_id="of_at_c", sku=f"{at_pk}::canonical", pk=at_pk, merchant=at_m, price=48,
+                      url=at_url)
 
 
 # ------------------------------------------------------------------ the assembler
@@ -313,12 +403,104 @@ def test_a_placeholder_with_no_variant_offer_beside_it_is_the_rows_offer(schema_
     assert [(o["price"], o["currency"]) for o in row["offers"]] == [(30.0, "USD")]
 
 
-def test_a_placeholder_in_another_market_and_currency_is_not_a_twin(schema_engine, monkeypatch):
+def test_a_placeholder_in_another_market_is_not_a_twin(schema_engine, monkeypatch):
     _seed_catalog(schema_engine)
     row = _build(monkeypatch, "ck_kr")
     assert sorted((o["market"], o["currency"], o["price"]) for o in row["offers"]) == [
-        ("KR", "KRW", 52000.0), ("US", "USD", 42.0)]
+        ("KR", "KRW", 52000.0), ("PR", "USD", 43.0), ("US", "USD", 42.0)]
     assert set(row["market_prices"]["currencies"]) == {"KRW", "USD"}
+
+
+AMAZON_URL = "https://www.amazon.com/dp/B0OHUISERUM"
+
+
+def _attach_amazon(monkeypatch):
+    """Amazon's offer onto the ck_attach row through the attach tool's REAL write path (its row
+    builder, its live-SKU precondition, its INSERT). Its view refresh is recorded, not run: the
+    tests rebuild the row themselves with build_agent_pdp_view_row."""
+    import databases
+
+    import scripts.attach_retailer_offer as attach
+    import services.catalog_offer_writer_guard as guard
+    from services.seller_identity import make_observed_retailer_id
+
+    refreshed = []
+
+    async def record(content_key, **kwargs):
+        refreshed.append(content_key)
+        return True
+
+    monkeypatch.setattr(attach, "refresh_agent_pdp_view_for_content_key", record)
+
+    async def go():
+        db = databases.Database(DATABASE_URL, server_settings={"search_path": _SCHEMA})
+        await db.connect()
+        monkeypatch.setattr(attach, "database", db)
+        monkeypatch.setattr(guard, "database", db)
+        try:
+            row = attach.build_retailer_offer_row(
+                product_key="ext:retailer:attach", merchant_id=make_observed_retailer_id("amazon.com"),
+                merchant_name="Amazon", retailer_url=AMAZON_URL, price=29.99)
+            return await attach.attach_retailer_offer(row)
+        finally:
+            await db.disconnect()
+
+    assert asyncio.run(go()) == "ck_attach" and refreshed == ["ck_attach"]
+
+
+def test_an_attached_retailers_offer_is_not_the_rows_twin(schema_engine, monkeypatch):
+    """The attach tool writes Amazon's offer as `<the row's product_key>::canonical`. It is Amazon's only
+    offer, not a twin of the kbeautymakeup row's variant offer: the twin rule is per seller."""
+    from services.seller_identity import make_observed_retailer_id
+
+    _seed_catalog(schema_engine)
+    _attach_amazon(monkeypatch)
+    row = _build(monkeypatch, "ck_attach")
+    amazon, kbeauty = make_observed_retailer_id("amazon.com"), _seller("kbeautymakeup.com")["merchant_id"]
+    assert sorted((o["merchant_id"], o["price"]) for o in row["offers"]) == sorted(
+        [(amazon, 29.99), (kbeauty, 48.0)])
+
+
+def test_one_merchant_on_two_hosts_is_two_sellers_and_two_merchants_on_one_host_are_two(
+    schema_engine, monkeypatch
+):
+    _seed_catalog(schema_engine)
+    row = _build(monkeypatch, "ck_bucket")
+    obs = _seller("beautynetkorea.com")["merchant_id"]
+    assert sorted((o["merchant_id"], o["price"]) for o in row["offers"]) == sorted([
+        ("external_seed", 10.0), ("external_seed", 40.0), (obs, 45.0),
+        (_seller("jolse.com")["merchant_id"], 50.0), (_seller("koolseoul.com")["merchant_id"], 55.0),
+    ])
+
+
+def test_a_seller_is_represented_by_its_in_stock_offer_in_the_rows_currency(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    row = _build(monkeypatch, "ck_rep")
+    assert row["currency"] == "USD"
+    stored = sorted((_store_of(o, {_seller(h)["merchant_id"]: h for h in (
+        "stylekorean.com", "jolse.com", "koolseoul.com", "kbeautymakeup.com", "nanasbeautyholic.com",
+        "beautynetkorea.com")}), o["price"], o["currency"], o["availability"]) for o in row["offers"])
+    assert stored == sorted([
+        ("stylekorean.com", 20.0, "USD", "in_stock"), ("jolse.com", 21.0, "USD", "in_stock"),
+        ("koolseoul.com", 25.0, "USD", "in_stock"), ("kbeautymakeup.com", 26.0, "USD", "in_stock"),
+        ("nanasbeautyholic.com", 27.0, "USD", "in_stock"),
+    ])
+    from services.offer_buyability import annotate_offer_buyability
+
+    [pick] = [o for o in annotate_offer_buyability(row["offers"], "US") if o["is_buy_pick"]]
+    assert (pick["price"], pick["currency"]) == (20.0, "USD")
+
+
+def test_a_variant_key_that_contains_canonical_is_a_variant(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    row = _build(monkeypatch, "ck_tone")
+    assert [o["price"] for o in row["offers"]] == [33.0]
+
+
+def test_a_sold_out_variant_is_not_hidden_by_its_in_stock_placeholder(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    row = _build(monkeypatch, "ck_soldout")
+    assert [(o["price"], o["availability"]) for o in row["offers"]] == [(50.0, "out_of_stock")]
 
 
 # ------------------------------------------------------------------ offers.resolve's catalog arm
@@ -416,3 +598,44 @@ def test_a_resolved_group_compares_every_stores_variant_offer(schema_engine, mon
     comparable = sorted(o["source"]["offer_id"] for o in offers if o.get("price_comparable") is True)
     assert comparable == sorted(_variant_offer(r) for r in ("nanas", "stylekorean", "jolse", "koolseoul"))
     assert res["best_price_offer_id"] == f"of:catalog_offer:{_variant_offer('nanas')}"
+
+
+def test_an_attached_retailers_offer_reaches_the_buyer(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    _attach_amazon(monkeypatch)
+    offers = _catalog(_resolve(monkeypatch, "ck_attach"))
+    assert sorted((_host(o), o["price"]) for o in offers) == [("amazon.com", 29.99), ("kbeautymakeup.com", 48.0)]
+    [kbeauty] = [o for o in offers if _host(o) == "kbeautymakeup.com"]
+    assert kbeauty["source"]["offer_id"] == "of_at_v", "the row's own variant offer, not its placeholder"
+
+
+def test_the_route_sells_a_sold_out_variant_as_sold_out(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    [offer] = _catalog(_resolve(monkeypatch, "ck_soldout"))
+    assert (offer["source"]["offer_id"], offer["in_stock"]) == ("of_so_v", False)
+
+
+def test_an_unservable_destination_never_takes_its_hosts_slot(schema_engine, monkeypatch):
+    """jolse's `HTTPS://` $5 offer cannot be served; were it jolse's best, jolse's servable $30 offer
+    would rank behind stylekorean's $40 and the LIMIT would cut it."""
+    _seed_catalog(schema_engine)
+    offers = _catalog(_resolve(monkeypatch, "ck_scheme", limit=3))
+    assert sorted((_host(o), o["price"]) for o in offers) == [
+        ("jolse.com", 30.0), ("kbeautymakeup.com", 12.0), ("koolseoul.com", 10.0)]
+
+
+def test_offers_with_no_host_are_not_one_seller(schema_engine, monkeypatch):
+    _seed_catalog(schema_engine)
+    offers = _catalog(_resolve(monkeypatch, "ck_empty_host", limit=2))
+    assert sorted(o["source"]["offer_id"] for o in offers) == ["of_at1_0", "of_at2_0"]
+
+
+def test_a_row_with_no_currency_is_withheld_from_a_buyer_in_a_declared_market(schema_engine, monkeypatch):
+    from sqlalchemy import text
+
+    _seed_catalog(schema_engine)
+    with schema_engine.begin() as c:
+        c.execute(text("UPDATE catalog_offers SET currency = NULL WHERE offer_id = 'of_sch2_0'"))
+    res = _resolve(monkeypatch, "ck_scheme", limit=4)
+    assert "of_sch2_0" not in [o["source"]["offer_id"] for o in _catalog(res)]
+    assert res["metadata"]["buyer_currency_filtered"] == {"none": 1}

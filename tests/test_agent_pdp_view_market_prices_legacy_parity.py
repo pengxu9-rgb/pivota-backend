@@ -12,10 +12,10 @@ imported live.
 Then the same comparison through assemble_row, with the write flag on, so the flag cannot move
 a legacy column either.
 
-One deliberate change since (2026-10-19): the top-N cut takes one offer PER SELLER first, then fills
-(services/agent_pdp_view_assembler._top_offers). The frozen code still decides the currency, the
-price bounds, offer_count and the ORDER; `per_seller_cut` below is the cut's spec, applied to the
-frozen code's full sorted list. These random offers carry no product_key or sku_key, so no
+One deliberate change since (2026-10-19): the top-N cut takes one offer PER SELLER first (the one
+the buy pick would take from it), then fills (services/agent_pdp_view_assembler._top_offers). The
+frozen code still decides the currency, the price bounds, offer_count and the ORDER;
+`per_seller_cut` below is the cut's spec, applied to the frozen code's full sorted list. These random offers carry no product_key or sku_key, so no
 `::canonical` twin and no listing host: the seller is the merchant, and an offer with none is a
 seller of its own. tests/test_offer_caps_one_per_seller_postgres.py covers the twins and hosts on
 real rows.
@@ -142,16 +142,23 @@ def _random_offers(rnd: random.Random) -> List[Dict[str, Any]]:
     ]
 
 
-def per_seller_cut(ranked: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    """The first offer of each seller in rank order until n sellers are in, then the rest in rank
-    order; the kept offers keep their rank order."""
-    picked: List[int] = []
-    sellers: set = set()
+def per_seller_cut(ranked: List[Dict[str, Any]], n: int, currency: Optional[str]) -> List[Dict[str, Any]]:
+    """Each seller's representative -- the offer the buy pick would take from it: in the row's
+    currency, not known unavailable, explicitly in stock, cheapest, then rank -- in rank order until
+    n sellers are in, then the rest in rank order; the kept offers keep their rank order."""
+    def rep_key(i: int):
+        o = ranked[i]
+        return (currency is not None and o.get("currency") != currency,
+                availability_is_known_unavailable(o.get("availability")),
+                str(o.get("availability") or "").strip().lower() not in {"in_stock", "instock", "available"},
+                float(o["price"]), i)
+
+    best: Dict[str, int] = {}
     for i, offer in enumerate(ranked):
         seller = offer.get("merchant_id") or f"offer-{i}"
-        if len(picked) < n and seller not in sellers:
-            sellers.add(seller)
-            picked.append(i)
+        if seller not in best or rep_key(i) < rep_key(best[seller]):
+            best[seller] = i
+    picked = sorted(best.values())[:n]
     picked += [i for i in range(len(ranked)) if i not in picked][: max(0, n - len(picked))]
     return [ranked[i] for i in sorted(picked)]
 
@@ -168,7 +175,7 @@ def test_aggregate_offers_matches_origin_main_on_5000_random_offer_sets(monkeypa
         with monkeypatch.context() as m:
             m.setattr(sys.modules[__name__], "FROZEN_OFFER_TOP_N", 10_000)
             *_, ranked = frozen_aggregate_offers(offers, primary, urls, trust)
-        expected = (*expected[:4], per_seller_cut(ranked, FROZEN_OFFER_TOP_N))
+        expected = (*expected[:4], per_seller_cut(ranked, FROZEN_OFFER_TOP_N, expected[0]))
         got = current.aggregate_offers(offers, primary, urls, trust)
         assert json.dumps(got, default=str) == json.dumps(expected, default=str), offers
         reordered += got[4] != ranked[:FROZEN_OFFER_TOP_N]

@@ -992,7 +992,7 @@ def aggregate_offers(
     # offer's `availability` is what catalog_sync wrote from the gate's own stock verdict
     # (standard_variant_in_stock: `available` first, then quantity), so an untracked or
     # keep-selling variant is in_stock here and a sold-out one is not.
-    top = _top_offers(pairs, listing_host_by_product_key)
+    top = _top_offers(pairs, listing_host_by_product_key, currency)
     return currency, price_min, price_max, len(normalized), top
 
 
@@ -1028,13 +1028,22 @@ def _normalized_offer_pairs(
 # of their 4-5 stores -- ck_0dc56bdd (O HUI Age Recovery Eye Cream 25 ml) stored kbeautymakeup x2
 # and nanasbeautyholic x3, the two cheapest sellers' offers and their twins.
 #
-# So, in the stored order (_offer_sort_key), and before the cut:
-#   1. A PLACEHOLDER TWIN goes: a `::canonical` offer whose own row states a per-variant offer in the
-#      same market and currency. The variant offer is the price of the exact variant; the placeholder
-#      repeats the listing at product level. A placeholder with no such sibling is the row's only
-#      offer there and stays.
-#   2. ONE OFFER PER SELLER, the best by the stored order, until OFFER_TOP_N sellers are in.
-#   3. Remaining slots, in the stored order: a seller's further offers (its other shades or sizes).
+# So, before the cut:
+#   1. A PLACEHOLDER TWIN goes: a `::canonical` offer whose own row states a per-variant offer OF THE
+#      SAME SELLER in the same market and currency. The variant offer is the exact variant -- its
+#      price and its stock (a sold-out variant beside an in-stock placeholder is sold out); the
+#      placeholder repeats the listing at product level. The seller is part of the key because
+#      scripts/attach_retailer_offer.py hangs ANOTHER retailer's offer on an existing product as
+#      `<product_key>::canonical`: that is the retailer's only offer, not a twin. A placeholder with
+#      no such sibling is its row's only offer there and stays.
+#   2. ONE OFFER PER SELLER until OFFER_TOP_N sellers are in. A seller is represented by the offer the
+#      buy pick (offer_buyability.annotate_offer_buyability) would take from it: in the row's
+#      currency, then not known unavailable, then explicitly in stock, then cheapest. The stored
+#      order alone would compare raw amounts across currencies and rank `unknown` stock with in
+#      stock, so a cheaper GBP or unknown-stock offer could stand for a seller and its in-stock offer
+#      in the row's currency be cut. Sellers enter in the stored order of those offers.
+#   3. Remaining slots, in the stored order (_offer_sort_key): a seller's further offers (its other
+#      shades, sizes or currencies).
 # The kept offers keep the stored order. One seller, or at most N offers once the twins are gone:
 # the same offers as before. offer_count, price_min and price_max still read every priced offer.
 _PLACEHOLDER_SKU_SUFFIX = "::canonical"
@@ -1055,8 +1064,9 @@ def _offer_seller_key(
     return (merchant, host)
 
 
-def _twin_group(row: Dict[str, Any]) -> Tuple[str, str, str]:
+def _twin_group(row: Dict[str, Any], seller: Tuple[str, str]) -> Tuple[Any, ...]:
     return (
+        seller,
         str(row.get("product_key") or "").strip(),
         str(row.get("market") or "").strip().upper(),
         str(row.get("currency") or "").strip().upper(),
@@ -1070,30 +1080,41 @@ def _is_placeholder_offer(row: Dict[str, Any]) -> bool:
 def _top_offers(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
+    currency: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """The stored top-N (see THE TOP-N CUT IS PER SELLER above), in the stored order."""
+    """The stored top-N (see THE TOP-N CUT IS PER SELLER above), in the stored order. `currency` is
+    the row's (aggregate_offers' modal currency); None when every offer shares one."""
+    from services.offer_buyability import IN_STOCK_AVAILABILITY
+
     ranked = sorted(pairs, key=lambda pair: _offer_sort_key(pair[1]))
-    variant_groups = {_twin_group(row) for row, _ in ranked if not _is_placeholder_offer(row)}
-    ranked = [
-        (row, n) for row, n in ranked
-        if not (_is_placeholder_offer(row) and _twin_group(row) in variant_groups)
+    keyed = [
+        (row, n, _offer_seller_key(row, listing_host_by_product_key, index))
+        for index, (row, n) in enumerate(ranked)
     ]
-    picked: List[int] = []
-    sellers: set = set()
-    for index, (row, _) in enumerate(ranked):
-        if len(picked) >= OFFER_TOP_N:
-            break
-        seller = _offer_seller_key(row, listing_host_by_product_key, index)
-        if seller not in sellers:
-            sellers.add(seller)
-            picked.append(index)
+    variant_groups = {_twin_group(row, seller) for row, _, seller in keyed if not _is_placeholder_offer(row)}
+    kept = [
+        (n, seller) for row, n, seller in keyed
+        if not (_is_placeholder_offer(row) and _twin_group(row, seller) in variant_groups)
+    ]
+
+    def representative_rank(index: int) -> Tuple[int, int, int, float, int]:
+        n = kept[index][0]
+        return (
+            1 if currency is not None and n.get("currency") != currency else 0,
+            1 if availability_is_known_unavailable(n.get("availability")) else 0,
+            0 if str(n.get("availability") or "").strip().lower() in IN_STOCK_AVAILABILITY else 1,
+            float(n.get("price") or 0.0),
+            index,
+        )
+
+    representative: Dict[Tuple[str, str], int] = {}
+    for index, (_, seller) in enumerate(kept):
+        if seller not in representative or representative_rank(index) < representative_rank(representative[seller]):
+            representative[seller] = index
+    picked = sorted(representative.values())[:OFFER_TOP_N]
     chosen = set(picked)
-    for index in range(len(ranked)):
-        if len(picked) >= OFFER_TOP_N:
-            break
-        if index not in chosen:
-            picked.append(index)
-    return [ranked[index][1] for index in sorted(picked)]
+    picked += [index for index in range(len(kept)) if index not in chosen][: max(0, OFFER_TOP_N - len(picked))]
+    return [kept[index][0] for index in sorted(picked)]
 
 
 def listing_hosts(products: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
