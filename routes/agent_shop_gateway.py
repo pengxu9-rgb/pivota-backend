@@ -3744,6 +3744,106 @@ def _expand_ref_aliases(raw_ref: Optional[str]) -> List[str]:
     return aliases[:20]
 
 
+# A ref that is an id minted by a hash or a uuid: a Pivota signature (sig_ + 32 hex), content key
+# (ck_ + 32 hex), identity proposal (irp_ + 32 hex), external seed id (ext_ + 24 hex), or a uuid.
+# A product title never contains one, so offers.resolve's fuzzy seed lookup skips its title arm
+# for these. Exact lengths, not bare prefixes: `_` is a LIKE wildcard, so a loose "ck_100" would
+# turn into %ck_100% and match the title "Pack 100ml".
+_ID_SHAPED_REF_RE = re.compile(
+    r"(?:sig_[0-9a-f]{32}|ck_[0-9a-f]{32}|irp_[0-9a-f]{32}|ext_[0-9a-f]{24}"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+def _is_id_shaped_ref(ref: str) -> bool:
+    return bool(_ID_SHAPED_REF_RE.fullmatch(str(ref or "").strip()))
+
+
+def _fuzzy_seed_ref_clauses(
+    product_id_aliases: List[str], sku_id_aliases: List[str]
+) -> Tuple[List[str], Dict[str, Any]]:
+    """The WHERE conjuncts and binds of offers.resolve's external_seed_by_fuzzy_ref statement.
+
+    Every LIKE arm is spelled the way prod's hand-built trigram GINs are keyed
+    (idx_eps_active_any_*_trgm, `gin (lower(<col>) gin_trgm_ops) WHERE status = 'active'`;
+    db/migrations/270_external_seed_active_any_trgm_indexes.sql.disabled), so each arm is a bitmap
+    probe and not a scan. The statement used to read LOWER(COALESCE(title,'')), which matches no
+    index: every call scanned the whole table (6.7-7.3 s measured on prod 2026-10-19) and timed out
+    under the 1.2 s seed budget. Dropping the COALESCE returns the same rows: a NULL column makes
+    its arm NULL instead of matching '', and '' matches '%<alias>%' only when the alias is all '%',
+    a pattern the seed_data arm (NOT NULL) of the same alias already matches on every row.
+
+    An id-shaped ref (`_is_id_shaped_ref`) skips the title arm. Its url and seed_data arms stay:
+    an ext_ id or a uuid does appear in OTHER seeds' seed_data and urls (copied attached keys,
+    Wix product ids), and with the index those arms cost a probe.
+    """
+    clauses: List[str] = []
+    params: Dict[str, Any] = {}
+    if product_id_aliases:
+        pid_clause: List[str] = []
+        for idx, pid_alias in enumerate(product_id_aliases[:8]):
+            pid_key = f"pid_{idx}"
+            like_key = f"pid_like_{idx}"
+            params[pid_key] = pid_alias
+            params[like_key] = f"%{_safe_lower(pid_alias)}%"
+            arms = [f"external_product_id = :{pid_key}"]
+            if not _is_id_shaped_ref(pid_alias):
+                arms.append(f"LOWER(title) LIKE :{like_key}")
+            arms += [
+                f"LOWER(canonical_url) LIKE :{like_key}",
+                f"LOWER(destination_url) LIKE :{like_key}",
+                f"LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}",
+            ]
+            pid_clause.append("(" + " OR ".join(arms) + ")")
+        clauses.append("(" + " OR ".join(pid_clause) + ")")
+    if sku_id_aliases:
+        sku_clause: List[str] = []
+        for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+            key = f"sku_like_{idx}"
+            params[key] = f"%{_safe_lower(sku_alias)}%"
+            sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+        clauses.append("(" + " OR ".join(sku_clause) + ")")
+    return clauses, params
+
+
+# A term the identity retry may send to the trigram indexes: two or more words of lower-case ASCII
+# letters and digits, single-spaced -- a multi-word `_normalize_offer_title` output.
+_IDENTITY_INDEXED_TERM_RE = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)+")
+
+
+def _identity_title_arm(key: str, term: str) -> str:
+    """One title term's arm of offers.resolve's external_seed_by_internal_identity statement.
+
+    main read `LOWER(COALESCE(title,'')) LIKE :t OR LOWER(COALESCE(seed_data->>'title','')) LIKE :t`,
+    and neither side matched an index, so every identity retry scanned the whole seed table. For a
+    multi-word term (`_IDENTITY_INDEXED_TERM_RE`) each side is spelled as an index is keyed, both
+    WHERE status = 'active':
+      - `LOWER(title)`: prod's `idx_eps_active_any_title_trgm` (migration 270). A NULL title makes
+        the arm NULL instead of `'' LIKE '%<term>%'`, which is false for a term with a letter or
+        digit, so the rows are the same.
+      - `LOWER(COALESCE(seed_data->>'title',''))`: main's own expression, unchanged, which
+        `idx_eps_active_any_seed_title_trgm` (migration 271, built out of band) is keyed on. Until it
+        is built the statement plans as main's did.
+
+    A ONE-word term (the brand-stripped "toner" of "COSRX Toner", "serum", "cream") keeps main's
+    arm, and with it the whole statement keeps main's plan: one unindexed OR arm makes it a parallel
+    Seq Scan, exactly as before. Such a word can sit in a large share of seed titles, and a bitmap
+    scan over most of the table rechecks every OR arm and the brand filter row by row, detoasting
+    seed_data, on one process; on a table where the word is in every title that was 2.5-7x main's
+    time (controller review of be#2650). Migration 271's expression statistics let a CUSTOM plan see
+    that a common multi-word term is common and choose main's scan itself; a GENERIC plan (asyncpg
+    prepares, and Postgres may keep a plan built without the binds) cannot, and the word count is
+    the guard that does not depend on the plan.
+
+    An indexed prefilter on seed_data::text was tried and rejected: a common title word's trigrams
+    sit in nearly every 25 KB seed_data text, and rechecking those rows cost 6.3 s for 8 terms where
+    main's scan cost 0.8 s.
+    """
+    title = "LOWER(title)" if _IDENTITY_INDEXED_TERM_RE.fullmatch(term or "") else "LOWER(COALESCE(title,''))"
+    return f"({title} LIKE :{key} OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key})"
+
+
 def _offers_scope_or_none(raw: Any) -> Optional[str]:
     """A usable merchant scope, or None.
 
@@ -4535,12 +4635,7 @@ async def _handle_offers_resolve(
         for idx, term in enumerate(title_terms):
             key = f"identity_title_{idx}"
             params[key] = f"%{term}%"
-            title_clauses.append(
-                "("
-                f"LOWER(COALESCE(title,'')) LIKE :{key}"
-                f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}"
-                ")"
-            )
+            title_clauses.append(_identity_title_arm(key, term))
 
         brand_clause = "TRUE"
         if brand_terms:
@@ -5786,31 +5881,10 @@ async def _handle_offers_resolve(
                 if seed_rows:
                     query_label = "external_seed_by_canonical_attached_prefetch"
 
-        if not seed_rows and product_id_aliases:
-            pid_clause: List[str] = []
-            for idx, pid_alias in enumerate(product_id_aliases[:8]):
-                pid_key = f"pid_{idx}"
-                like_key = f"pid_like_{idx}"
-                params[pid_key] = pid_alias
-                params[like_key] = f"%{_safe_lower(pid_alias)}%"
-                pid_clause.append(
-                    "("
-                    f"external_product_id = :{pid_key}"
-                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
-                    ")"
-                )
-            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
-
-        if not seed_rows and sku_id_aliases:
-            sku_clause: List[str] = []
-            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                key = f"sku_like_{idx}"
-                params[key] = f"%{_safe_lower(sku_alias)}%"
-                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
-            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
+        if not seed_rows:
+            fuzzy_clauses, fuzzy_params = _fuzzy_seed_ref_clauses(product_id_aliases, sku_id_aliases)
+            where_clauses += fuzzy_clauses
+            params.update(fuzzy_params)
 
         if not seed_rows and len(where_clauses) == 1:
             return {
