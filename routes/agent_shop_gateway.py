@@ -3806,6 +3806,43 @@ def _fuzzy_seed_ref_clauses(
     return clauses, params
 
 
+# A term the identity retry may send to the trigram indexes: two or more words of lower-case ASCII
+# letters and digits, single-spaced -- a multi-word `_normalize_offer_title` output.
+_IDENTITY_INDEXED_TERM_RE = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)+")
+
+
+def _identity_title_arm(key: str, term: str) -> str:
+    """One title term's arm of offers.resolve's external_seed_by_internal_identity statement.
+
+    main read `LOWER(COALESCE(title,'')) LIKE :t OR LOWER(COALESCE(seed_data->>'title','')) LIKE :t`,
+    and neither side matched an index, so every identity retry scanned the whole seed table. For a
+    multi-word term (`_IDENTITY_INDEXED_TERM_RE`) each side is spelled as an index is keyed, both
+    WHERE status = 'active':
+      - `LOWER(title)`: prod's `idx_eps_active_any_title_trgm` (migration 270). A NULL title makes
+        the arm NULL instead of `'' LIKE '%<term>%'`, which is false for a term with a letter or
+        digit, so the rows are the same.
+      - `LOWER(COALESCE(seed_data->>'title',''))`: main's own expression, unchanged, which
+        `idx_eps_active_any_seed_title_trgm` (migration 271, built out of band) is keyed on. Until it
+        is built the statement plans as main's did.
+
+    A ONE-word term (the brand-stripped "toner" of "COSRX Toner", "serum", "cream") keeps main's
+    arm, and with it the whole statement keeps main's plan: one unindexed OR arm makes it a parallel
+    Seq Scan, exactly as before. Such a word can sit in a large share of seed titles, and a bitmap
+    scan over most of the table rechecks every OR arm and the brand filter row by row, detoasting
+    seed_data, on one process; on a table where the word is in every title that was 2.5-7x main's
+    time (controller review of be#2650). Migration 271's expression statistics let a CUSTOM plan see
+    that a common multi-word term is common and choose main's scan itself; a GENERIC plan (asyncpg
+    prepares, and Postgres may keep a plan built without the binds) cannot, and the word count is
+    the guard that does not depend on the plan.
+
+    An indexed prefilter on seed_data::text was tried and rejected: a common title word's trigrams
+    sit in nearly every 25 KB seed_data text, and rechecking those rows cost 6.3 s for 8 terms where
+    main's scan cost 0.8 s.
+    """
+    title = "LOWER(title)" if _IDENTITY_INDEXED_TERM_RE.fullmatch(term or "") else "LOWER(COALESCE(title,''))"
+    return f"({title} LIKE :{key} OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key})"
+
+
 def _offers_scope_or_none(raw: Any) -> Optional[str]:
     """A usable merchant scope, or None.
 
@@ -4597,12 +4634,7 @@ async def _handle_offers_resolve(
         for idx, term in enumerate(title_terms):
             key = f"identity_title_{idx}"
             params[key] = f"%{term}%"
-            title_clauses.append(
-                "("
-                f"LOWER(COALESCE(title,'')) LIKE :{key}"
-                f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}"
-                ")"
-            )
+            title_clauses.append(_identity_title_arm(key, term))
 
         brand_clause = "TRUE"
         if brand_terms:

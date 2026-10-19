@@ -14,6 +14,12 @@ Two things are proved here, through the REAL handler and the statement it sends:
   * every ref returns the SAME rows main's statement (b86afa82c, frozen below) returns, including the
     NULL-title / NULL-url rows and the all-'%' ref the COALESCE removal could in principle change.
 
+The identity retry's statement (external_seed_by_internal_identity: the internal product's title
+terms, LIKE over the seed title and seed_data->>'title', brand terms as a filter) had the same
+disease: LOWER(COALESCE(title,'')) and an unindexed seed_data->>'title'. Its title side is now
+LOWER(title) and its seed_data side is served by migration 271's index on that exact expression; the
+same two proofs (no scan, same rows as main) are made for it below.
+
 Rows are the real seed shape (tests/fixtures/judydoll_silky_matte_lip_ink_seed_2026_09_29.json, a
 staging row read 2026-09-29) plus filler built from it, attached as prod's rows are (26,945 of 26,950
 active rows carry an attached_product_key, 2026-10-19). Runs in its own scratch schema, alone on the
@@ -112,18 +118,20 @@ def schema_engine():
         metadata.create_all(engine, tables=[metadata.tables[t] for t in (
             "catalog_products", "catalog_offers", "catalog_merchants", "catalog_skus", "products_cache")])
         with engine.connect() as c:
-            for f in ("044_external_product_seeds.sql", "134_catalog_source_quarantine.sql"):
+            # 045: the internal lane reads product_group_members for the identity retry's product.
+            for f in ("044_external_product_seeds.sql", "045_product_groups.sql", "134_catalog_source_quarantine.sql"):
                 c.exec_driver_sql((_MIGRATIONS / f).read_text())
         _load_rows(engine)
         with engine.connect() as c:
             # Migration 270's own statements, AFTER the rows (prod built them by hand on a full table),
             # one at a time on autocommit (CONCURRENTLY), as the out-of-band build runs them. The
             # trigram opclass resolves wherever pg_trgm lives.
-            body = (_MIGRATIONS / "270_external_seed_active_any_trgm_indexes.sql.disabled").read_text()
-            for stmt in split_statements(body):
-                if "CREATE EXTENSION" in stmt:
-                    continue
-                c.exec_driver_sql(stmt.replace("gin_trgm_ops", f'"{ext_schema}".gin_trgm_ops'))
+            for name in ("270_external_seed_active_any_trgm_indexes.sql.disabled",
+                         "271_external_seed_active_seed_title_trgm_index.sql.disabled"):
+                for stmt in split_statements((_MIGRATIONS / name).read_text()):
+                    if "CREATE EXTENSION" in stmt:
+                        continue
+                    c.exec_driver_sql(stmt.replace("gin_trgm_ops", f'"{ext_schema}".gin_trgm_ops'))
             c.execute(text("ANALYZE external_product_seeds"))
         yield engine
     finally:
@@ -133,18 +141,66 @@ def schema_engine():
         admin.dispose()
 
 
-def _insert(c, *, id, epid, title, canonical, destination, seed_data, attached, minutes_ago, status="active"):
+def _insert(c, *, id, epid, title, canonical, destination, seed_data, attached, minutes_ago, status="active",
+            domain="judydoll.com", currency="USD"):
     from sqlalchemy import text
 
     c.execute(text(
         "INSERT INTO external_product_seeds (id, external_product_id, market, tool, destination_url, canonical_url,"
         " domain, title, price_amount, price_currency, availability, seed_data, status, attached_product_key,"
         " created_at, updated_at)"
-        " VALUES (:id, :epid, 'US', '*', :dest, :canon, 'judydoll.com', :title, 13.99, 'USD', 'in_stock',"
+        " VALUES (:id, :epid, 'US', '*', :dest, :canon, :domain, :title, 13.99, :cur, 'in_stock',"
         "         cast(:sd AS jsonb), :status, :apk, NOW() - make_interval(mins => :m + 60),"
         "         NOW() - make_interval(mins => :m))"
     ), {"id": id, "epid": epid, "dest": destination, "canon": canonical, "title": title, "sd": json.dumps(seed_data),
-        "status": status, "apk": attached, "m": minutes_ago})
+        "status": status, "apk": attached, "m": minutes_ago, "domain": domain, "cur": currency})
+
+
+KRAVE_PID = "7777000011112"  # the internal Shopify product the identity retry starts from
+
+
+def _insert_identity_seeds(c):
+    """Seeds for the identity retry, which looks for 'great barrier relief' by title, KraveBeauty by brand."""
+    krave = {"brand": "KraveBeauty", "variants": [{"id": "1", "sku": "GBR-50", "price": "28.00"}]}
+    url = "https://{}/products/{}"
+    for row in (
+        # title column hit + brand in seed_data
+        dict(id="eps_krave_gbr", title="Great Barrier Relief", sd=krave, domain="kravebeauty.com", slug="gbr"),
+        # seed_data.title hit only (the column title has no term); brand via seed_data.vendor
+        dict(id="eps_krave_sd_title", title="GBR Serum", domain="stylekorean.com", slug="gbr-serum",
+             sd={"title": "KraveBeauty Great Barrier Relief Serum", "vendor": "KraveBeauty"}),
+        # seed_data.title with a quote: escaped in seed_data's text form, still a hit
+        dict(id="eps_krave_quoted", title=None, domain="yesstyle.com", slug="krave-gbr",
+             sd={"title": 'KraveBeauty "Great Barrier Relief" 50ml', "brand": "KraveBeauty"}),
+        # same title, another brand everywhere: the brand filter drops it
+        dict(id="eps_dupe_brand", title="Great Barrier Relief Dupe", domain="dupe.example", slug="dupe",
+             sd={"brand": "Dupeco"}),
+        # brand but no title anywhere: never a title hit
+        dict(id="eps_krave_untitled", title=None, domain="kravebeauty.com", slug="untitled", sd={"brand": "KraveBeauty"}),
+        # the title in another currency: the currency conjunct drops it
+        dict(id="eps_krave_eur", title="Great Barrier Relief", domain="kravebeauty.eu", slug="gbr-eu", sd=krave,
+             currency="EUR"),
+    ):
+        _insert(c, id=row["id"], epid="ext_" + row["id"], title=row["title"],
+                canonical=url.format(row["domain"], row["slug"]), destination=url.format(row["domain"], row["slug"]),
+                seed_data=row["sd"], attached=None, minutes_ago=5, domain=row["domain"],
+                currency=row.get("currency", "USD"))
+
+
+def _internal_product(engine, *, title, vendor):
+    """The one products_cache row the internal lane finds for KRAVE_PID: its title and vendor are
+    what the identity retry searches seeds by."""
+    from sqlalchemy import text
+
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM products_cache"))
+        c.execute(text(
+            "INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, expires_at)"
+            " VALUES ('merch_krave_test', 'shopify', :pid, cast(:pd AS json), NOW() + interval '1 day')"
+        ), {"pid": KRAVE_PID, "pd": json.dumps({
+            "id": KRAVE_PID, "title": title, **({"vendor": vendor} if vendor else {}), "currency": "USD",
+            "variants": [{"id": "4400000000001", "price": "28.00", "inventory_quantity": 5}],
+        })})
 
 
 def _load_rows(engine):
@@ -173,7 +229,9 @@ def _load_rows(engine):
                 canonical=_FIXTURE["canonical_url"], destination=_FIXTURE["destination_url"],
                 seed_data={**base_sd, "external_product_id": EXT_HIT}, attached=None, minutes_ago=4,
                 status="superseded")
-        # Filler in the same shape: other products, other ids, so the planner sees a real table.
+        _insert_identity_seeds(c)
+        # Filler in the same shape: other products, other ids, so the planner sees a real table. A
+        # third carry a top-level seed_data.title, as rows from some writers do.
         template = json.dumps(base_sd)
         c.execute(text(
             "INSERT INTO external_product_seeds (id, external_product_id, market, tool, destination_url,"
@@ -184,14 +242,16 @@ def _load_rows(engine):
             "        'https://brand' || (i % 97) || '.com/products/item-' || i, 'brand' || (i % 97) || '.com',"
             "        'Brand' || (i % 97) || ' Hydrating Toner ' || i, 20, 'USD', 'in_stock',"
             "        cast(replace(replace(replace(replace(:tpl, 'silky-matte-lip-ink', 'item-' || i), 'Silky Matte Lip Ink', 'Hydrating Toner ' || i),"
-            "             '49819267301653', (50000000000000 + i)::text), 'BURGUNDY', 'SHADE ' || i) AS jsonb),"
+            "             '49819267301653', (50000000000000 + i)::text), 'BURGUNDY', 'SHADE ' || i) AS jsonb)"
+            "        || CASE WHEN i % 3 = 0 THEN jsonb_build_object('title', 'Brand' || (i % 97) || ' Hydrating Toner ' || i)"
+            "                ELSE '{}'::jsonb END,"
             "        'active', 'prod::external_seed::external_seed::ext_' || substr(md5(i::text), 1, 24),"
             "        NOW() - make_interval(mins => 100 + i), NOW() - make_interval(mins => 100 + i)"
             " FROM generate_series(1, :n) i"
         ), {"tpl": template, "n": _FILLER})
 
 
-def _resolve(monkeypatch, product_id, *, sku_id=None, statements=None):
+def _resolve(monkeypatch, product_id, *, sku_id=None, statements=None, identity_statements=None):
     import databases
 
     import db.database as dbmod
@@ -223,6 +283,8 @@ def _resolve(monkeypatch, product_id, *, sku_id=None, statements=None):
                 "pid_like_0" in str(query) or "sku_like_0" in str(query)
             ):
                 statements.append((str(query), dict(values or {})))
+            if identity_statements is not None and ":identity_title_0" in str(query):
+                identity_statements.append((str(query), dict(values or {})))
             return await real_fetch_all(query, values)
 
         db.fetch_all = recording_fetch_all
@@ -259,6 +321,36 @@ def _explain(query, values):
     (On a 3k-row table it rightly reads the whole table through idx_external_product_seeds_status.)"""
     async def fn(db):
         return [r[0] for r in await db.fetch_all("EXPLAIN (ANALYZE, BUFFERS) " + query, values)]
+
+    return _db_call(fn)
+
+
+def _explain_generic(query, values):
+    """The GENERIC plan (PREPARE, plan_cache_mode = force_generic_plan): asyncpg prepares every
+    statement, and after five executions Postgres may keep a plan built without the bind values. That
+    plan cannot read the LIKE patterns' trigrams at plan time, so it must still choose the probes."""
+    names = []
+
+    def positional(m):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+        return f"${names.index(m.group(1)) + 1}"
+
+    sql = re.sub(r"(?<!:):([a-z_0-9]+)", positional, query)
+    args = [values[n] for n in names]
+    types = ", ".join("int" if isinstance(a, int) else "text" for a in args)
+    literals = ", ".join(str(a) if isinstance(a, int) else "'" + str(a).replace("'", "''") + "'" for a in args)
+
+    async def fn(db):
+        async with db.connection() as conn:
+            raw = conn.raw_connection
+            await raw.execute("SET plan_cache_mode = force_generic_plan")
+            await raw.execute(f"PREPARE fuzzy_generic({types}) AS {sql}")
+            try:
+                return [r[0] for r in await raw.fetch(f"EXPLAIN (ANALYZE) EXECUTE fuzzy_generic({literals})")]
+            finally:
+                await raw.execute("DEALLOCATE fuzzy_generic")
+                await raw.execute("RESET plan_cache_mode")
 
     return _db_call(fn)
 
@@ -305,6 +397,10 @@ def test_an_id_shaped_ref_is_index_probes_never_a_table_scan(schema_engine, monk
         rows = _bitmap_rows(plan, index)
         assert rows is not None and rows <= 2, (index, rows, text_plan)
     assert "idx_eps_active_any_title_trgm" not in text_plan, text_plan
+    generic = _explain_generic(query, values)
+    assert "$1" in "\n".join(generic), generic  # really the generic plan
+    assert "Seq Scan on external_product_seeds" not in "\n".join(generic), generic
+    assert "BitmapOr" in "\n".join(generic) and _rows_read(generic) <= 2, generic
     # The lane answered inside its budget instead of timing out.
     [src] = _fuzzy_source(res)
     assert src["status"] == "ok" and src["query"] == "external_seed_by_fuzzy_ref", src
@@ -384,3 +480,124 @@ def test_the_rows_cover_the_cases_they_claim(schema_engine, monkeypatch):
     # A title ref keeps its title arm.
     clauses, _ = _fuzzy_seed_ref_clauses(_expand_ref_aliases("Silky Matte"), [])
     assert "LOWER(title) LIKE :pid_like_0" in clauses[0]
+
+
+# --- the identity retry (external_seed_by_internal_identity) -------------------------------------
+
+
+def _main_identity_arm(key, term):
+    """main @ b86afa82c, verbatim."""
+    return ("(" f"LOWER(COALESCE(title,'')) LIKE :{key}"
+            f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}" ")")
+
+
+def _identity(monkeypatch, engine, *, title, vendor):
+    from routes.agent_shop_gateway import _identity_title_arm
+
+    _internal_product(engine, title=title, vendor=vendor)
+    identity_statements = []
+    res = _resolve(monkeypatch, KRAVE_PID, identity_statements=identity_statements)
+    assert identity_statements, res["metadata"]["sources"]
+    [(query, values)] = identity_statements
+    main_query = query
+    for key in sorted((k for k in values if k.startswith("identity_title_")), key=lambda k: -int(k.rsplit("_", 1)[1])):
+        term = values[key].strip("%")
+        new = _identity_title_arm(key, term)
+        assert new in main_query, (key, new)
+        main_query = main_query.replace(new, _main_identity_arm(key, term), 1)
+    assert main_query != query
+    return res, query, main_query, values
+
+
+def _identity_source(res):
+    return [s for s in res["metadata"]["sources"] if s["source"] == "external_product_seeds_identity_retry"]
+
+
+def test_the_identity_retry_probes_the_title_indexes_and_never_scans(schema_engine, monkeypatch):
+    res, query, main_query, values = _identity(monkeypatch, schema_engine, title="KraveBeauty Great Barrier Relief",
+                                               vendor="KraveBeauty")
+    assert values["identity_title_0"] == "%kravebeauty great barrier relief%"
+    assert values["identity_title_1"] == "%great barrier relief%"
+    assert "LOWER(title) LIKE :identity_title_0" in query
+    plan = _explain(query, values)
+    text_plan = "\n".join(plan)
+    assert "Seq Scan on external_product_seeds" not in text_plan, text_plan
+    assert "idx_external_product_seeds_status" not in text_plan, text_plan
+    for index in ("idx_eps_active_any_title_trgm", "idx_eps_active_any_seed_title_trgm"):
+        assert f"Bitmap Index Scan on {index}" in text_plan, (index, text_plan)
+    assert _rows_read(plan) <= 10, text_plan
+    generic = _explain_generic(query, values)
+    assert "$1" in "\n".join(generic), generic
+    assert "Seq Scan on external_product_seeds" not in "\n".join(generic), generic
+    assert "Bitmap Index Scan on idx_eps_active_any_seed_title_trgm" in "\n".join(generic), generic
+    # The yardstick: main's arms, same binds, same table, scan it.
+    main_plan = _explain(main_query, values)
+    assert "Seq Scan on external_product_seeds" in "\n".join(main_plan), main_plan
+    assert _rows_read(main_plan) >= _FILLER // 4, main_plan
+    # And the lane answered: the column-title hit, the seed_data.title hit, the quoted one.
+    [src] = _identity_source(res)
+    assert src["status"] == "ok" and src["row_count"] == 3, src
+    assert sorted(_ids(query, values)) == ["eps_krave_gbr", "eps_krave_quoted", "eps_krave_sd_title"]
+
+
+@pytest.mark.parametrize("title, vendor", [
+    ("KraveBeauty Great Barrier Relief", "KraveBeauty"),   # brand-prefixed title: two title terms
+    ("Great Barrier Relief", None),                        # no brand: the brand filter is TRUE
+    ("Great Barrier Relief", "Dupeco"),                     # the other brand's seed only
+    ("Silky Matte Lip Ink", "Judydoll"),                    # the real-shape fixture row
+    ("Brand3 Hydrating Toner 1749", "Brand3"),              # filler 1749: column title and seed_data.title
+    ("Hydrating Toner", None),                              # many rows, cut by the LIMIT
+    ("Nothing Sells This Product", "Nobody"),               # no hit at all
+])
+def test_the_identity_retry_returns_the_rows_main_returns(schema_engine, monkeypatch, title, vendor):
+    _res, query, main_query, values = _identity(monkeypatch, schema_engine, title=title, vendor=vendor)
+    assert _ids(query, values) == _ids(main_query, values), (title, vendor)
+
+
+def test_the_identity_cases_hit_what_they_claim(schema_engine, monkeypatch):
+    def ids(title, vendor):
+        _res, query, _main, values = _identity(monkeypatch, schema_engine, title=title, vendor=vendor)
+        return sorted(_ids(query, values))
+
+    assert ids("Great Barrier Relief", "Dupeco") == ["eps_dupe_brand"]
+    assert ids("Silky Matte Lip Ink", "Judydoll") == sorted([_FIXTURE["id"], "eps_cross"])
+    assert ids("Nothing Sells This Product", "Nobody") == []
+    assert len(ids("Hydrating Toner", None)) == 60  # the LIMIT (attached_seed_limit) cuts it
+    # Filler 1749 (brand 1749 % 97 = 3; 1749 % 3 == 0, so it also carries a seed_data.title).
+    assert "eps_fill_1749" in ids("Brand3 Hydrating Toner 1749", "Brand3")
+
+
+def _seed_scan_kind(plan):
+    text_plan = "\n".join(plan)
+    if "Bitmap Heap Scan on external_product_seeds" in text_plan:
+        return "bitmap"
+    if "Seq Scan on external_product_seeds" in text_plan:
+        return "seq"
+    return "other"
+
+
+def test_a_common_one_word_term_keeps_mains_plan_custom_and_generic(schema_engine, monkeypatch):
+    """BOUND for a common term: "COSRX Toner" sends "cosrx toner" and the brand-stripped "toner",
+    which is in EVERY filler title here. A serial bitmap scan over the whole table rechecked every
+    arm row by row and cost 2.5-7x main (controller review of be#2650). The one-word term keeps
+    main's arm, so the statement keeps main's plan -- a Seq Scan, the same cost as main -- in the
+    custom AND the generic plan."""
+    _res, query, main_query, values = _identity(monkeypatch, schema_engine, title="COSRX Toner", vendor="COSRX")
+    assert values["identity_title_0"] == "%cosrx toner%" and values["identity_title_1"] == "%toner%"
+    assert "LOWER(COALESCE(title,'')) LIKE :identity_title_1" in query  # main's arm for "toner"
+    assert "LOWER(title) LIKE :identity_title_0" in query
+    for plan in (_explain(query, values), _explain_generic(query, values)):
+        assert _seed_scan_kind(plan) == "seq", plan
+    assert _seed_scan_kind(_explain(main_query, values)) == "seq"
+    assert _ids(query, values) == _ids(main_query, values)
+
+
+def test_a_common_multi_word_term_keeps_mains_scan_once_271s_statistics_are_analyzed(schema_engine, monkeypatch):
+    """"Hydrating Toner" is ONE multi-word term in every filler title. With migration 271's expression
+    statistics analyzed, the custom plan sees that and keeps main's Seq Scan; a selective term in the
+    same statement shape still gets the probes."""
+    _res, query, main_query, values = _identity(monkeypatch, schema_engine, title="Hydrating Toner", vendor=None)
+    assert "LOWER(title) LIKE :identity_title_0" in query
+    assert _seed_scan_kind(_explain(query, values)) == "seq"
+    _res, query, _main, values = _identity(monkeypatch, schema_engine, title="Great Barrier Relief", vendor=None)
+    assert _seed_scan_kind(_explain(query, values)) == "bitmap"

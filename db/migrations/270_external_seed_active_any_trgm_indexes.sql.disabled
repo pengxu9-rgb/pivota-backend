@@ -2,8 +2,11 @@
 -- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true', which the
 -- infra/gcp deploy scripts set on EVERY Cloud Run deploy, prod and staging, before
 -- db.sql_migrations.run_sql_migrations), so no deploy applies this file. It is built out of band,
--- from a one-off job, on an autocommit connection statement at a time (CONCURRENTLY: the builds run
--- outside a transaction and do not block the seed writers), with the primary under 35% CPU; check
+-- from a one-off job, on an autocommit connection, STATEMENT BY STATEMENT: db.sql_migrations.
+-- split_statements, or psql -f. Never send the whole file as one string; Postgres runs a
+-- multi-statement string as one implicit transaction, and CREATE INDEX CONCURRENTLY refuses to
+-- run inside one. CONCURRENTLY builds without blocking the seed writers. Run it with the primary
+-- under 35 percent CPU and check
 -- pg_index.indisvalid afterwards. The .sql.disabled suffix also keeps it out of the boot runner in
 -- any environment that DOES run the full startup (local, CI, SKIP_HEAVY_STARTUP_INIT=false), where a
 -- seed_data trigram build would hold boot for minutes.
