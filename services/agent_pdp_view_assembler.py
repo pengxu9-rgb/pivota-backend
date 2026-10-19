@@ -941,7 +941,9 @@ def aggregate_offers(
     pairs = _normalized_offer_pairs(
         offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
     )
-    normalized = [n for _, n in pairs]
+    # The currency, the price bounds and offer_count read the offers WITHOUT their placeholder
+    # twins (THE AGGREGATES READ THE OFFERS, NOT THE TWINS, below).
+    normalized = [n for _, n, _ in _offers_without_twins(pairs, listing_host_by_product_key)]
 
     if not normalized:
         return None, None, None, 0, []
@@ -983,7 +985,7 @@ def aggregate_offers(
     # sellers can sell (since the per-seller cut; "N sellable offers" before it) — 0 rows in prod
     # on 2026-09-18. No reader of these offers (backend,
     # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
-    # and price_max still cover every offer, unavailable ones included.
+    # and price_max still cover every offer but the placeholder twins, unavailable ones included.
     #
     # Unknown availability is sellable here: one vocabulary, OFFER_UNAVAILABLE_AVAILABILITIES,
     # shared with offers.resolve; the reasons are at the constant in services/offer_buyability.py.
@@ -1045,7 +1047,19 @@ def _normalized_offer_pairs(
 #   3. Remaining slots, in the stored order (_offer_sort_key): a seller's further offers (its other
 #      shades, sizes or currencies).
 # The kept offers keep the stored order. One seller, or at most N offers once the twins are gone:
-# the same offers as before. offer_count, price_min and price_max still read every priced offer.
+# the same offers as before.
+#
+# THE AGGREGATES READ THE OFFERS, NOT THE TWINS. offer_count, price_min, price_max and the row's
+# currency (and each market_prices entry's) read the offers rule 1 keeps, and seller_count counts
+# their sellers (_offer_seller_key). Every reader of offer_count read it as a seller count --
+# agent_pdp_v1's `multi_merchant_canonical` scope, pivota-agent-ui's multi-seller cards (which drop
+# the savings badge), PIVOTA-Agent's discovery cards -- and a one-store retailer row with its one
+# twin pair counted 2. A read-only census of prod on 2026-10-19 (26,763 rows): 18,927 had
+# offer_count > 1 and 1,845 have more than one seller; dropping the twins takes 11,164 to 1, and
+# 5,918 stay above 1 on one store's shades or sizes -- the reason seller_count is a field of its own
+# and the scope reads it. A twin's price was the headline on 632 rows (price_min is
+# agent_pdp_v1's `price.current`): $19 on a placeholder beside shades from $20, a price no variant
+# has.
 _PLACEHOLDER_SKU_SUFFIX = "::canonical"
 
 
@@ -1077,6 +1091,33 @@ def _is_placeholder_offer(row: Dict[str, Any]) -> bool:
     return str(row.get("sku_key") or "").strip().endswith(_PLACEHOLDER_SKU_SUFFIX)
 
 
+def _offers_without_twins(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any], Tuple[str, str]]]:
+    """(row, offer, seller) for every offer of `pairs` but the placeholder twins (rule 1 above), in
+    the order given."""
+    keyed = [
+        (row, n, _offer_seller_key(row, listing_host_by_product_key, index))
+        for index, (row, n) in enumerate(pairs)
+    ]
+    variant_groups = {_twin_group(row, seller) for row, _, seller in keyed if not _is_placeholder_offer(row)}
+    return [
+        (row, n, seller) for row, n, seller in keyed
+        if not (_is_placeholder_offer(row) and _twin_group(row, seller) in variant_groups)
+    ]
+
+
+def count_sellers(
+    offers: List[Dict[str, Any]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
+) -> int:
+    """How many SELLERS (_offer_seller_key) price these catalog_offers rows, in any currency: the
+    row's seller_count. 0 with no priced offer."""
+    pairs = _normalized_offer_pairs(offers, None, {})
+    return len({seller for _, _, seller in _offers_without_twins(pairs, listing_host_by_product_key)})
+
+
 def _top_offers(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
@@ -1087,15 +1128,7 @@ def _top_offers(
     from services.offer_buyability import IN_STOCK_AVAILABILITY
 
     ranked = sorted(pairs, key=lambda pair: _offer_sort_key(pair[1]))
-    keyed = [
-        (row, n, _offer_seller_key(row, listing_host_by_product_key, index))
-        for index, (row, n) in enumerate(ranked)
-    ]
-    variant_groups = {_twin_group(row, seller) for row, _, seller in keyed if not _is_placeholder_offer(row)}
-    kept = [
-        (n, seller) for row, n, seller in keyed
-        if not (_is_placeholder_offer(row) and _twin_group(row, seller) in variant_groups)
-    ]
+    kept = [(n, seller) for _, n, seller in _offers_without_twins(ranked, listing_host_by_product_key)]
 
     def representative_rank(index: int) -> Tuple[int, int, int, float, int]:
         n = kept[index][0]
@@ -1155,7 +1188,8 @@ def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
 #
 #   {"version": 1,
 #    "currencies": {"USD": {"price_min": 18.0, "price_max": 24.0,
-#                           "offer_count": 3, "offers": [<top-N USD offers>]},
+#                           "offer_count": 3, "seller_count": 2,
+#                           "offers": [<top-N USD offers>]},
 #                   "SGD": {...}}}
 #
 #   * One entry per currency the offers are priced in (upper-cased ISO code;
@@ -1165,9 +1199,12 @@ def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
 #     market to a currency (services/region_pricing) and decides what it serves.
 #     Never offers.market, a DEFAULT 'US' most writers never set.
 #   * No conversion: an entry only compares amounts in its own currency.
-#   * offer_count counts every such offer, unavailable ones included, like the
-#     row-level offer_count; `offers` is that currency's top OFFER_TOP_N, one per
-#     seller first (_top_offers), in the stored order (_offer_sort_key).
+#   * offer_count counts every such offer but the placeholder twins, unavailable
+#     ones included, like the row-level offer_count, and price_min / price_max read
+#     the same offers; seller_count counts their sellers (THE AGGREGATES READ THE
+#     OFFERS, NOT THE TWINS); `offers` is that currency's top OFFER_TOP_N, one per
+#     seller first (_top_offers), in the stored order (_offer_sort_key). An entry
+#     written before seller_count has no such key.
 #   * {"version": 1, "currencies": {}} = computed, no priced offer.
 #
 # STALENESS. A writer without the flag (an old image, a one-off with no env,
@@ -1225,11 +1262,13 @@ def build_market_prices(
     currencies: Dict[str, Dict[str, Any]] = {}
     for code in sorted(by_currency):
         in_currency = by_currency[code]
-        prices = [Decimal(str(n["price"])) for _, n in in_currency]
+        kept = _offers_without_twins(in_currency, listing_host_by_product_key)
+        prices = [Decimal(str(n["price"])) for _, n, _ in kept]
         currencies[code] = {
             "price_min": float(min(prices)),
             "price_max": float(max(prices)),
-            "offer_count": len(in_currency),
+            "offer_count": len(kept),
+            "seller_count": len({seller for _, _, seller in kept}),
             "offers": _top_offers(in_currency, listing_host_by_product_key),
         }
     return {"version": MARKET_PRICES_VERSION, "currencies": currencies}
@@ -1299,9 +1338,72 @@ async def agent_pdp_view_has_market_prices(db: Any = None) -> bool:
 
 def is_missing_market_prices_column_error(exc: BaseException) -> bool:
     """asyncpg UndefinedColumnError (42703) naming the summary columns."""
+    return _is_missing_column_error(exc, "market_prices")
+
+
+def _is_missing_column_error(exc: BaseException, column: str) -> bool:
     code = getattr(exc, "sqlstate", None) or getattr(getattr(exc, "orig", None), "sqlstate", None)
     message = str(exc)
-    return (code == "42703" or "does not exist" in message) and "market_prices" in message
+    return (code == "42703" or "does not exist" in message) and column in message
+
+
+# agent_pdp_view.seller_count (migration 269), probed like the summary columns above and for the
+# same reason: migration 269 does not self-apply, schema_guard's heal can defer, and an upsert
+# naming a missing column fails every refresh. It is NOT on db.catalog's agent_pdp_view Table:
+# audit_evidence_builder and scripts/backfill_audit_content_key.py run agent_pdp_view.select(),
+# which names every Table column, so a heal that lost its lock race would turn those reads into
+# UndefinedColumn errors. routes/agent_pdp_v1 reads it through to_jsonb (SELLER_COUNT_SQL), which
+# answers NULL while the column is absent.
+_seller_count_probe: Dict[str, Any] = {"present": None, "checked_at": 0.0}
+SELLER_COUNT_COLUMN_PROBE_SQL = """
+    SELECT count(*) AS n
+    FROM information_schema.columns
+    WHERE table_name = 'agent_pdp_view'
+      AND table_schema = ANY(current_schemas(false))
+      AND column_name = 'seller_count'
+"""
+
+
+def reset_seller_count_probe() -> None:
+    _seller_count_probe.update(present=None, checked_at=0.0)
+
+
+def mark_seller_count_column_missing() -> None:
+    import time
+
+    _seller_count_probe.update(present=False, checked_at=time.monotonic())
+
+
+async def agent_pdp_view_has_seller_count(db: Any = None) -> bool:
+    import time
+
+    if _seller_count_probe["present"] is True:
+        return True
+    now = time.monotonic()
+    if (
+        _seller_count_probe["present"] is False
+        and now - _seller_count_probe["checked_at"] < _MARKET_PRICES_PROBE_RETRY_S
+    ):
+        return False
+    try:
+        row = await (db or database).fetch_one(SELLER_COUNT_COLUMN_PROBE_SQL)
+        present = bool(row) and int(dict(row).get("n") or 0) == 1
+    except Exception:  # noqa: BLE001 - an unanswerable probe is "absent": the write without it is safe
+        present = False
+    _seller_count_probe.update(present=present, checked_at=now)
+    return present
+
+
+def is_missing_seller_count_column_error(exc: BaseException) -> bool:
+    """asyncpg UndefinedColumnError (42703) naming seller_count."""
+    return _is_missing_column_error(exc, "seller_count")
+
+
+def seller_count_sql(row_ref: str) -> str:
+    """agent_pdp_view.seller_count as a SELECT expression that never names the column: NULL while
+    migration 269 is absent, so a reader cannot fail on it. `row_ref` is the table's alias, or its
+    name when it has none."""
+    return f"CAST(to_jsonb({row_ref}) ->> 'seller_count' AS INTEGER) AS seller_count"
 
 
 def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
@@ -1731,6 +1833,7 @@ def assemble_row(
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
         offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts
     )
+    sellers = count_sellers(offers, hosts)
     market_prices = (
         build_market_prices(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts)
         if market_prices_enabled()
@@ -1776,6 +1879,8 @@ def assemble_row(
         "price_min": price_min,
         "price_max": price_max,
         "offer_count": offer_count,
+        # Migration 269; written only while the column exists (execute_agent_pdp_view_upsert).
+        "seller_count": sellers,
         "offers": top_offers or None,
         "variants": variants_capped or None,
         "variants_count": variants_count,
@@ -1942,18 +2047,46 @@ def _upsert_sql_with_market_prices(base: str) -> str:
 UPSERT_SQL_WITH_MARKET_PRICES = _upsert_sql_with_market_prices(UPSERT_SQL)
 
 
+def _upsert_sql_with_seller_count(base: str) -> str:
+    """`base` (UPSERT_SQL, or its market_prices variant) plus seller_count (migration 269), beside
+    offer_count, derived so the variants never drift in any other column."""
+    insert_anchor = "      currency, price_min, price_max, offer_count, offers,\n"
+    values_anchor = "      :currency, :price_min, :price_max, :offer_count, CAST(:offers AS jsonb),\n"
+    update_anchor = "      offer_count = EXCLUDED.offer_count,\n"
+    for anchor in (insert_anchor, values_anchor, update_anchor):
+        if base.count(anchor) != 1:
+            raise RuntimeError("UPSERT_SQL changed shape; update _upsert_sql_with_seller_count")
+    return (
+        base.replace(insert_anchor, "      currency, price_min, price_max, offer_count, seller_count, offers,\n")
+        .replace(
+            values_anchor,
+            "      :currency, :price_min, :price_max, :offer_count, :seller_count, CAST(:offers AS jsonb),\n",
+        )
+        .replace(update_anchor, update_anchor + "      seller_count = EXCLUDED.seller_count,\n")
+    )
+
+
+UPSERT_SQL_WITH_SELLER_COUNT = _upsert_sql_with_seller_count(UPSERT_SQL)
+UPSERT_SQL_WITH_MARKET_PRICES_AND_SELLER_COUNT = _upsert_sql_with_seller_count(UPSERT_SQL_WITH_MARKET_PRICES)
+
+
 def upsert_sql_for_row(row: Dict[str, Any]) -> str:
-    """The upsert for an assembled row: the market_prices variant only when the
-    row carries the key (AGENT_PDP_VIEW_MARKET_PRICES on), else UPSERT_SQL byte
-    for byte -- which never names the column, so it runs before migration 263."""
+    """The upsert for an assembled row, naming market_prices only when the row carries the key
+    (AGENT_PDP_VIEW_MARKET_PRICES on) and seller_count only when the row carries it (the column
+    probed present). Neither: UPSERT_SQL byte for byte, which runs before migrations 263 and 269."""
+    if "seller_count" in row:
+        return (
+            UPSERT_SQL_WITH_MARKET_PRICES_AND_SELLER_COUNT if "market_prices" in row
+            else UPSERT_SQL_WITH_SELLER_COUNT
+        )
     return UPSERT_SQL_WITH_MARKET_PRICES if "market_prices" in row else UPSERT_SQL
 
 
 async def execute_agent_pdp_view_upsert(db: Any, row: Dict[str, Any]) -> None:
-    """Write an assembled row. The summary is written only when the columns exist;
-    otherwise -- the heal not run yet -- the row is written exactly as with the
-    flag off, so the legacy prices keep refreshing instead of every refresh
-    failing on the missing column.
+    """Write an assembled row. The summary (migration 263) and seller_count (269) are
+    each written only when their columns exist; otherwise -- the heal not run yet --
+    the row is written without them, so the legacy columns keep refreshing instead
+    of every refresh failing on the missing column.
 
     Inside a caller's transaction the missing-column retry cannot recover: the
     failed statement has already aborted the transaction, so the legacy retry
@@ -1962,15 +2095,31 @@ async def execute_agent_pdp_view_upsert(db: Any, row: Dict[str, Any]) -> None:
     absent-column case is decided by the probe before any statement runs."""
     if "market_prices" in row and not await agent_pdp_view_has_market_prices(db):
         row = {k: v for k, v in row.items() if k != "market_prices"}
+    if "seller_count" in row and not await agent_pdp_view_has_seller_count(db):
+        row = {k: v for k, v in row.items() if k != "seller_count"}
     try:
-        await db.execute(upsert_sql_for_row(row), row_to_upsert_params(row))
+        await db.execute(upsert_sql_for_row(row), _upsert_params_for_row(row))
     except Exception as exc:
-        if "market_prices" not in row or not is_missing_market_prices_column_error(exc):
-            raise
         # The probe said present and the write says otherwise (dropped after the probe).
-        mark_market_prices_columns_missing()
-        legacy = {k: v for k, v in row.items() if k != "market_prices"}
-        await db.execute(UPSERT_SQL, row_to_upsert_params(legacy))
+        missing = set()
+        if "market_prices" in row and is_missing_market_prices_column_error(exc):
+            mark_market_prices_columns_missing()
+            missing.add("market_prices")
+        if "seller_count" in row and is_missing_seller_count_column_error(exc):
+            mark_seller_count_column_missing()
+            missing.add("seller_count")
+        if not missing:
+            raise
+        legacy = {k: v for k, v in row.items() if k not in missing}
+        await db.execute(upsert_sql_for_row(legacy), _upsert_params_for_row(legacy))
+
+
+def _upsert_params_for_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """row_to_upsert_params, plus seller_count when upsert_sql_for_row names it."""
+    params = row_to_upsert_params(row)
+    if "seller_count" in row:
+        params["seller_count"] = row["seller_count"]
+    return params
 
 
 def to_jsonb(value: Any) -> Optional[str]:
@@ -1981,8 +2130,11 @@ def to_jsonb(value: Any) -> Optional[str]:
 
 def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     """Project assemble_row() output to the bind-parameter dict shape
-    UPSERT_SQL expects (JSONB columns → JSON-encoded strings)."""
+    UPSERT_SQL expects (JSONB columns → JSON-encoded strings). Never seller_count:
+    UPSERT_SQL does not name it, and a bind the statement does not define is an
+    error; execute_agent_pdp_view_upsert adds it for the statement that does."""
     params = dict(row)
+    params.pop("seller_count", None)
     params["image_urls"] = to_jsonb(row.get("image_urls"))
     params["offers"] = to_jsonb(row.get("offers"))
     params["variants"] = to_jsonb(row.get("variants"))

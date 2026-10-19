@@ -401,10 +401,11 @@ def test_the_view_stores_every_store_of_a_merged_product(schema_engine, monkeypa
     ]
     assert [o["is_primary"] for o in row["offers"]] == [True, False, False, False, False]
     assert all(o["currency"] == "USD" and o["market"] == "US" for o in row["offers"])
-    # The aggregates still read every priced offer, placeholders included: unchanged.
-    assert (row["offer_count"], row["price_min"], row["price_max"]) == (12, 36, 117)
+    # The aggregates read the offers without their twins (tests/test_agent_pdp_view_seller_count_postgres.py):
+    # 6 listings, 5 stores. Were 12 offers.
+    assert (row["offer_count"], row["seller_count"], row["price_min"], row["price_max"]) == (6, 5, 36, 117)
     usd = row["market_prices"]["currencies"]["USD"]
-    assert usd["offers"] == row["offers"] and usd["offer_count"] == 12
+    assert usd["offers"] == row["offers"] and (usd["offer_count"], usd["seller_count"]) == (6, 5)
 
 
 def test_a_sold_out_store_is_still_listed_but_after_every_store_that_can_sell(schema_engine, monkeypatch):
@@ -422,7 +423,8 @@ def test_one_store_keeps_its_five_cheapest_shades_and_the_placeholder_no_longer_
     row = _build(monkeypatch, "ck_shades")
     # The $19 product-level placeholder used to sit first in the five; the shades are the prices.
     assert [o["price"] for o in row["offers"]] == [20.0, 21.0, 22.0, 23.0, 24.0]
-    assert row["offer_count"] == 8 and row["price_min"] == 19
+    # Seven offers, one seller; the headline is the cheapest shade's, not the placeholder's $19.
+    assert (row["offer_count"], row["seller_count"], row["price_min"]) == (7, 1, 20)
 
 
 def test_a_placeholder_with_no_variant_offer_beside_it_is_the_rows_offer(schema_engine, monkeypatch):
