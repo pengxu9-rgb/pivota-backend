@@ -10031,7 +10031,8 @@ def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]
 #     child task inherits) hands it a pool connection of its own -- never the request's;
 #   * only while it is cheap to: at most OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT shadows per process
 #     (a cancelled one counts until it has unwound), and never when the pool has no more than
-#     OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE free connection. Each holds one pool connection for up
+#     OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE free connection once the shadows spawned but not yet
+#     connected are taken off it -- nor when the pool cannot be read at all (fail closed). Each holds one pool connection for up
 #     to the budget, outside Cloud Run's request concurrency, so both SKIP (never wait) and are
 #     counted by reason (`_group_shadow_skip`): on the next shadow line, and in a summary line every
 #     OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY skips;
@@ -10083,7 +10084,12 @@ _GROUP_SHADOW_CKS: Dict[str, Any] = {"cks": None, "loaded_at": 0.0, "overflow": 
 # Every shadow task until it is DONE (finished, failed, or cancelled AND unwound): the strong reference
 # that keeps a detached task alive, and the in-flight count the cap reads. Emptied by done callbacks.
 _GROUP_SHADOW_IN_FLIGHT: set = set()
-# Skips by reason (cap, pool_busy, overflow, refreshing) since the last line that reported them.
+# How many of those hold a pool connection RIGHT NOW (inside `_group_shadow_transaction`). The pool's
+# own free count already excludes them; the rest of the in-flight set is spawned-but-not-connected
+# and is subtracted from it (`_run_group_shadow`), so two spawns in one loop tick cannot both take
+# the reserve.
+_GROUP_SHADOW_CONNECTED: Dict[str, int] = {"n": 0}
+# Skips by reason (cap, pool_busy, pool_unknown, overflow, refreshing) since the last line that reported them.
 _GROUP_SHADOW_SKIPS: Dict[str, int] = {}
 _GROUP_SHADOW_RESOLVED_CKS_SQL = """
     SELECT DISTINCT content_key
@@ -10199,7 +10205,14 @@ async def _group_shadow_transaction(db: Any, is_pg: bool):
     the server refuses any write. (SQLite, local dev only, has no READ ONLY transaction.)"""
     options: Dict[str, Any] = {"readonly": True} if is_pg else {}
     async with db.transaction(force_rollback=True, **options):
-        yield
+        # Counted from the moment the connection is checked out until just before it goes back (so
+        # for an instant around each end it is counted as not holding: the reserve check then
+        # subtracts it twice, which only ever makes it skip MORE).
+        _GROUP_SHADOW_CONNECTED["n"] += 1
+        try:
+            yield
+        finally:
+            _GROUP_SHADOW_CONNECTED["n"] -= 1
 
 
 async def _group_shadow_price_column_present(reader: _GroupShadowReader) -> bool:
@@ -10475,8 +10488,19 @@ async def _run_group_shadow(snap: Dict[str, Any]) -> None:
             return
         from db.database import database
 
-        free = _group_shadow_pool_free(database)
-        if free is not None and free <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
+        try:
+            free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            free = None
+        if free is None:
+            # FAIL CLOSED: a pool we cannot read (missing, not connected, raising) may be exhausted.
+            _group_shadow_skip("pool_unknown")
+            return
+        # The pool's free count already excludes every shadow that HOLDS a connection; a shadow
+        # spawned but not yet connected (e.g. a second spawn in this same loop tick) does not show
+        # in it yet, so it is subtracted here -- never the connected ones, which would count twice.
+        not_yet_connected = max(0, len(_GROUP_SHADOW_IN_FLIGHT) - _GROUP_SHADOW_CONNECTED["n"])
+        if free - not_yet_connected <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
             _group_shadow_skip("pool_busy")
             return
         loop = asyncio.get_running_loop()
@@ -10485,10 +10509,11 @@ async def _run_group_shadow(snap: Dict[str, Any]) -> None:
         # created the usual way copies the caller's context -- i.e. the request's connection.
         task = loop.create_task(_group_shadow_task(snap, state), context=contextvars.Context())
         _GROUP_SHADOW_IN_FLIGHT.add(task)
+        # The done callback FIRST: whatever happens below, the task leaves the in-flight set when done.
+        task.add_done_callback(lambda t: _group_shadow_task_done(t, state))
         state["timer"] = loop.call_later(
             OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS, _group_shadow_budget_spent, task, snap, state,
         )
-        task.add_done_callback(lambda t: _group_shadow_task_done(t, state))
     except Exception:  # noqa: BLE001
         pass
 

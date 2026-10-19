@@ -99,6 +99,7 @@ def _fresh_shadow_cache(monkeypatch):
                         {"cks": None, "loaded_at": 0.0, "overflow": False, "refreshing": False, "failed_at": None})
     monkeypatch.setattr(gateway, "_GROUP_SHADOW_IN_FLIGHT", set())
     monkeypatch.setattr(gateway, "_GROUP_SHADOW_SKIPS", {})
+    monkeypatch.setattr(gateway, "_GROUP_SHADOW_CONNECTED", {"n": 0})
 
 
 async def _drain(timeout: float = 5.0) -> None:
@@ -776,3 +777,88 @@ def test_a_shadow_that_fails_while_unwinding_is_still_retrieved(schema_engine, m
 
     parsed = _shutdown_case(monkeypatch, lines, hang)
     assert len(parsed) == 2 and parsed[1]["error"] == "RuntimeError: rollback failed while unwinding"
+
+
+# ----------------------------------------------------------------- round 3: the reserve, exactly
+
+
+def test_two_spawns_in_one_tick_cannot_both_take_the_reserve(schema_engine, monkeypatch, lines):
+    """1 of 3 connections held: the pool reports 2 free. Two shadows spawned in the SAME loop tick
+    (neither has connected yet) must not both start -- the first takes the spare connection, the
+    second sees 2 free minus 1 spawned-not-connected = the reserve, and skips. A plain request issued
+    while the first shadow holds its connection still gets one at once."""
+    import contextvars
+
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    real = gateway._fetch_resolved_group
+
+    async def slow(db, **kw):
+        await db.fetch_all("SELECT pg_sleep(0.7)")
+        return await real(db, **kw)
+
+    async def body(h: _Harness):
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        monkeypatch.setattr(gateway, "_fetch_resolved_group", slow)
+        pool = h.db._backend._pool
+        _, bt1 = await h.call(RETAILER_SIG, flag="shadow")
+        _, bt2 = await h.call(RETAILER_SIG, flag="shadow")
+        held = await pool.acquire()
+        try:
+            free_before = pool.get_idle_size() + pool.get_max_size() - pool.get_size()
+            # Starlette awaits each callable in turn; neither suspends, so both run in ONE tick.
+            await bt1()
+            await bt2()
+            spawned = len(gateway._GROUP_SHADOW_IN_FLIGHT)
+            await asyncio.sleep(0.1)  # the spawned shadow is now inside pg_sleep
+
+            async def plain():
+                started = time.perf_counter()
+                await h.db.fetch_one("SELECT 1")
+                return time.perf_counter() - started
+
+            waited = await asyncio.get_running_loop().create_task(plain(), context=contextvars.Context())
+            await _drain()
+        finally:
+            await pool.release(held)
+        return free_before, spawned, waited
+
+    free_before, spawned, waited = _run(monkeypatch, body, min_size=1, max_size=3)
+    assert free_before == 2
+    assert waited < 0.2, f"a plain request waited {waited:.3f}s behind the shadows"
+    assert spawned == 1
+    warm_line, shadow_line = lines.parsed
+    assert shadow_line["skipped"] == {"pool_busy": 1} and "error" not in shadow_line
+
+
+@pytest.mark.parametrize("pool_state", ["missing", "raises"])
+def test_an_unreadable_pool_fails_closed(schema_engine, monkeypatch, lines, pool_state):
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+
+    class _Raises:
+        def __getattr__(self, name):
+            raise RuntimeError("pool is gone")
+
+    async def body(h: _Harness):
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        _, bt = await h.call(RETAILER_SIG, flag="shadow")
+        backend = h.db._backend
+        real_pool = backend._pool
+        backend._pool = None if pool_state == "missing" else _Raises()
+        try:
+            await bt()  # does not suspend: the swapped pool is all it sees
+            spawned = len(gateway._GROUP_SHADOW_IN_FLIGHT)
+        finally:
+            backend._pool = real_pool
+        _, after = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(after)
+        return spawned
+
+    assert _run(monkeypatch, body) == 0
+    warm_line, next_line = lines.parsed
+    assert next_line["skipped"] == {"pool_unknown": 1} and "error" not in next_line
