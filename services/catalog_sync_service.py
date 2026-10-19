@@ -963,6 +963,24 @@ def _table_debug_name(table: Any) -> str:
     return str(getattr(table, "name", None) or type(table).__name__)
 
 
+class CatalogOfferRejected(RuntimeError):
+    """The catalog_offers write boundary refused a row; nothing was written.
+
+    Raised BEFORE any statement runs, so a caller inside a transaction can catch
+    it and carry on: `ingest_standard_products` skips and counts the offer
+    instead of rolling back the merchant's whole sync over it. The message keeps
+    the text the boundary always raised, which prod log searches key on.
+    """
+
+    def __init__(self, offer_id: Any, reasons: Dict[str, int]):
+        self.offer_id = offer_id
+        self.reasons = dict(reasons or {})
+        super().__init__(
+            "catalog upsert failed table=catalog_offers pk=offer_id: "
+            f"invalid_live_catalog_offer_link_or_price offer_id={offer_id} reasons={sorted(self.reasons)}"
+        )
+
+
 async def _upsert_by_pk(
     table: Any,
     pk_name: str,
@@ -974,9 +992,9 @@ async def _upsert_by_pk(
     table_name = _table_debug_name(table)
     try:
         if table_name == "catalog_offers":
-            accepted, _, _ = await guard_catalog_offer_rows([values], db=database, require_live_links=True)
+            accepted, reasons, _ = await guard_catalog_offer_rows([values], db=database, require_live_links=True)
             if not accepted:
-                raise ValueError("invalid_live_catalog_offer_link_or_price")
+                raise CatalogOfferRejected(values.get("offer_id"), reasons)
         pk_value = values[pk_name]
         existing = await _fetch_one_by_pk(table, pk_name, pk_value)
         payload = dict(values)
@@ -993,6 +1011,8 @@ async def _upsert_by_pk(
         payload.setdefault("created_at", _utcnow())
         await database.execute(table.insert().values(**payload))
         return None
+    except CatalogOfferRejected:
+        raise
     except Exception as exc:
         raise RuntimeError(
             f"catalog upsert failed table={table_name} pk={pk_name}: {exc}"
@@ -2004,11 +2024,31 @@ async def ingest_standard_products(
                         continue
                     offer_values = accepted_offers[0]
 
-                await _upsert_by_pk(
-                    catalog_offers,
-                    "offer_id",
-                    offer_values,
-                )
+                try:
+                    await _upsert_by_pk(
+                        catalog_offers,
+                        "offer_id",
+                        offer_values,
+                    )
+                except CatalogOfferRejected as rejected:
+                    # The SKU/product upserts above KEEP a non-stale suppression
+                    # another writer set, so a variant the platform still lists can
+                    # arrive here with a parent that is not live. That is one
+                    # unservable offer, not a failed sync: before this, the raise
+                    # rolled back every product in the transaction (Wix
+                    # merch_e68c20b0189746d0, every sync 2026-10-03 -> 10-19).
+                    if audit is not None:
+                        audit.record_skips(rejected.reasons)
+                    stats["offers_skipped"] += sum(rejected.reasons.values())
+                    for reason, count in rejected.reasons.items():
+                        stats["offer_skip_reasons"][reason] = stats["offer_skip_reasons"].get(reason, 0) + count
+                    logger.warning(
+                        "catalog sync skipped offer with a non-live parent merchant=%s offer_id=%s reasons=%s",
+                        merchant_id,
+                        rejected.offer_id,
+                        rejected.reasons,
+                    )
+                    continue
                 stats["offers_ingested"] += 1
                 if audit is not None:
                     audit.record_applied(1)
