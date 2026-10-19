@@ -64,6 +64,8 @@ from services.pdp_category_classifier import (
     fold_category_with_llm_fallback,
 )
 from services.catalog_offer_writer_guard import (
+    INVALID_LIVE_PRODUCT_SKU_LINK,
+    ORPHAN_NO_SKU,
     WriterAuditAccumulator,
     make_batch_id,
     validate_catalog_offer_rows,
@@ -126,6 +128,10 @@ GUARDED_OFFER_WRITERS = {
     "universal_product_sync",
 }
 STALE_AFTER_SYNC = "stale_after_sync"
+# The guard reasons `ingest_standard_products` skips instead of failing on: the
+# offer's SKU or product exists but is not live (suppressed by another writer).
+NON_LIVE_PARENT_SKIP_REASONS = frozenset({ORPHAN_NO_SKU, INVALID_LIVE_PRODUCT_SKU_LINK})
+OFFER_SKIP_SAMPLE_SIZE = 10
 CATALOG_SYNC_PRUNE_WRITER = "catalog_sync_service_prune"
 SUPPRESSION_FIELDS = ("suppression_reason", "suppressed_at", "suppression_metadata")
 
@@ -963,6 +969,24 @@ def _table_debug_name(table: Any) -> str:
     return str(getattr(table, "name", None) or type(table).__name__)
 
 
+class CatalogOfferRejected(RuntimeError):
+    """The catalog_offers write boundary refused a row; nothing was written.
+
+    Raised BEFORE any statement runs, so a caller inside a transaction can catch
+    it and carry on: `ingest_standard_products` skips and counts the offer
+    instead of rolling back the merchant's whole sync over it. The message keeps
+    the text the boundary always raised, which prod log searches key on.
+    """
+
+    def __init__(self, offer_id: Any, reasons: Dict[str, int]):
+        self.offer_id = offer_id
+        self.reasons = dict(reasons or {})
+        super().__init__(
+            "catalog upsert failed table=catalog_offers pk=offer_id: "
+            f"invalid_live_catalog_offer_link_or_price offer_id={offer_id} reasons={sorted(self.reasons)}"
+        )
+
+
 async def _upsert_by_pk(
     table: Any,
     pk_name: str,
@@ -974,9 +998,9 @@ async def _upsert_by_pk(
     table_name = _table_debug_name(table)
     try:
         if table_name == "catalog_offers":
-            accepted, _, _ = await guard_catalog_offer_rows([values], db=database, require_live_links=True)
+            accepted, reasons, _ = await guard_catalog_offer_rows([values], db=database, require_live_links=True)
             if not accepted:
-                raise ValueError("invalid_live_catalog_offer_link_or_price")
+                raise CatalogOfferRejected(values.get("offer_id"), reasons)
         pk_value = values[pk_name]
         existing = await _fetch_one_by_pk(table, pk_name, pk_value)
         payload = dict(values)
@@ -993,6 +1017,8 @@ async def _upsert_by_pk(
         payload.setdefault("created_at", _utcnow())
         await database.execute(table.insert().values(**payload))
         return None
+    except CatalogOfferRejected:
+        raise
     except Exception as exc:
         raise RuntimeError(
             f"catalog upsert failed table={table_name} pk={pk_name}: {exc}"
@@ -1381,6 +1407,7 @@ async def ingest_standard_products(
         "offers_ingested": 0,
         "offers_skipped": 0,
         "offer_skip_reasons": {},
+        "offer_skip_sample": [],
         "products_recovered_after_stale": 0,
         "beauty_profiles_upserted": 0,
         "beauty_ingredient_rows_upserted": 0,
@@ -1438,6 +1465,7 @@ async def ingest_standard_products(
             metadata_json={"ingested_from": source_system},
         )
 
+    non_live_parent_skips = 0
     for raw_product in product_payloads or []:
         try:
             product = StandardProduct(**raw_product)
@@ -2004,11 +2032,35 @@ async def ingest_standard_products(
                         continue
                     offer_values = accepted_offers[0]
 
-                await _upsert_by_pk(
-                    catalog_offers,
-                    "offer_id",
-                    offer_values,
-                )
+                try:
+                    await _upsert_by_pk(
+                        catalog_offers,
+                        "offer_id",
+                        offer_values,
+                    )
+                except CatalogOfferRejected as rejected:
+                    # The SKU/product upserts above KEEP a non-stale suppression
+                    # another writer set, so a variant the platform still lists can
+                    # arrive here with a parent that is not live. That is one
+                    # unservable offer, not a failed sync: before this, the raise
+                    # ended the ingest at the first such product, so every later
+                    # product, the writer audit and the job bookkeeping never ran
+                    # (Wix merch_e68c20b0189746d0, every sync 2026-10-03 -> 10-19).
+                    #
+                    # ONLY that. Any other reason (a zero or missing price on a lane
+                    # with no pre-check above) still fails the sync as it did: a
+                    # quiet skip would leave the old price standing on the offer.
+                    if not rejected.reasons or not set(rejected.reasons) <= NON_LIVE_PARENT_SKIP_REASONS:
+                        raise
+                    if audit is not None:
+                        audit.record_skips(rejected.reasons)
+                    stats["offers_skipped"] += sum(rejected.reasons.values())
+                    for reason, count in rejected.reasons.items():
+                        stats["offer_skip_reasons"][reason] = stats["offer_skip_reasons"].get(reason, 0) + count
+                    non_live_parent_skips += 1
+                    if len(stats["offer_skip_sample"]) < OFFER_SKIP_SAMPLE_SIZE:
+                        stats["offer_skip_sample"].append(rejected.offer_id)
+                    continue
                 stats["offers_ingested"] += 1
                 if audit is not None:
                     audit.record_applied(1)
@@ -2311,6 +2363,17 @@ async def ingest_standard_products(
         # C1 Phase 2: dual-write trust row. Fire-and-forget — a failure here
         # never breaks ingest; the defensive cron (phase 2d) catches drift.
         await upsert_catalog_row_trust(db=database, product_key=product_key)
+
+    if non_live_parent_skips:
+        # One line per sync, not one per offer: a retired merchant re-lists every
+        # variant on every cycle (433 lines, twice a day, for the Wix pilot).
+        logger.warning(
+            "catalog sync skipped offers with a non-live parent merchant=%s source=%s count=%s sample=%s",
+            merchant_id,
+            source_system,
+            non_live_parent_skips,
+            stats["offer_skip_sample"],
+        )
 
     if job_id:
         await _upsert_by_pk(

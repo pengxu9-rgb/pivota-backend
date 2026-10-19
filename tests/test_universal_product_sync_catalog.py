@@ -108,6 +108,33 @@ def test_universal_sync_returns_success_when_catalog_ingest_succeeds(monkeypatch
     assert payload["error"] is None
 
 
+def test_universal_sync_reports_skipped_offers_on_success(monkeypatch):
+    """`catalog_synced` counts products. A merchant whose every offer was skipped
+    (all parents suppressed) must not read as a plain success."""
+    client = _client(
+        monkeypatch,
+        {
+            "products_ingested": 1,
+            "offers_ingested": 0,
+            "offers_skipped": 3,
+            "offer_skip_reasons": {"orphan_no_sku": 3},
+        },
+    )
+
+    response = client.post(
+        "/products/sync-universal/",
+        json={"merchant_id": "merch_1", "platform": "wix", "limit": 50},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["catalog_synced"] == 1
+    assert payload["offers_ingested"] == 0
+    assert payload["offers_skipped"] == 3
+    assert payload["offer_skip_reasons"] == {"orphan_no_sku": 3}
+
+
 def test_universal_sync_rejects_payment_only_source_before_catalog_fetch(monkeypatch):
     client = _client(monkeypatch, {"products_ingested": 1})
 
