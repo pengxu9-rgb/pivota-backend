@@ -14,7 +14,9 @@ READ ONLY transaction, every statement under a server-side statement_timeout, an
   * an unresolved (or merchant-scoped) request sends exactly the off path's queries -- zero extra.
 
 The background tasks run as Starlette runs them: after the handler returned, awaited in the same task
-(and so the same `databases` connection context) as the request. The rows and the schema are the
+(and so the same `databases` connection context) as the request. The callable only SPAWNS the shadow
+(Starlette 0.27 under uvicorn holds the next keep-alive request behind a background task), so each
+test then waits for the detached shadow (`_Harness.settle`). The rows and the schema are the
 group lane's own Postgres gate's (tests/test_offers_resolve_group_siblings_postgres.py).
 """
 
@@ -51,19 +53,31 @@ EVENT = "offers_resolve_group_shadow"
 
 
 class _Lines(logging.Handler):
-    """The shadow's lines as `utils.logger` ("pivota", propagate=False) emits them."""
+    """The shadow's lines as `utils.logger` ("pivota", propagate=False) emits them: `<event> <json>`."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
-        self.records: List[logging.LogRecord] = []
+        self.all: List[logging.LogRecord] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.getMessage().startswith(EVENT + " "):
-            self.records.append(record)
+        if record.getMessage().startswith(EVENT):
+            self.all.append(record)
+
+    def events(self, event: str) -> List[Dict[str, Any]]:
+        out = []
+        for r in self.all:
+            name, _, payload = r.getMessage().partition(" ")
+            if name == event:
+                out.append(json.loads(payload))
+        return out
+
+    @property
+    def records(self) -> List[logging.LogRecord]:
+        return [r for r in self.all if r.getMessage().partition(" ")[0] == EVENT]
 
     @property
     def parsed(self) -> List[Dict[str, Any]]:
-        return [json.loads(r.getMessage()[len(EVENT) + 1:]) for r in self.records]
+        return self.events(EVENT)
 
 
 @pytest.fixture
@@ -83,6 +97,19 @@ def _fresh_shadow_cache(monkeypatch):
 
     monkeypatch.setattr(gateway, "_GROUP_SHADOW_CKS",
                         {"cks": None, "loaded_at": 0.0, "overflow": False, "refreshing": False, "failed_at": None})
+    monkeypatch.setattr(gateway, "_GROUP_SHADOW_IN_FLIGHT", set())
+    monkeypatch.setattr(gateway, "_GROUP_SHADOW_SKIPS", {})
+
+
+async def _drain(timeout: float = 5.0) -> None:
+    """Wait until every detached shadow is DONE and its done callback has run."""
+    import routes.agent_shop_gateway as gateway
+
+    deadline = time.perf_counter() + timeout
+    while gateway._GROUP_SHADOW_IN_FLIGHT and time.perf_counter() < deadline:
+        await asyncio.wait(set(gateway._GROUP_SHADOW_IN_FLIGHT), timeout=max(0.01, deadline - time.perf_counter()))
+        await asyncio.sleep(0)  # done callbacks run on the next loop iteration
+    assert not gateway._GROUP_SHADOW_IN_FLIGHT, "a shadow task never finished"
 
 
 def _normalized(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -136,8 +163,13 @@ class _Harness:
         )
         return res, bt
 
+    async def settle(self, bt) -> None:
+        """Run the background tasks as Starlette does, then wait for the detached shadow they spawned."""
+        await bt()
+        await _drain()
 
-def _run(monkeypatch, body):
+
+def _run(monkeypatch, body, **pool):
     import databases
 
     import db.database as dbmod
@@ -154,14 +186,16 @@ def _run(monkeypatch, body):
     monkeypatch.setattr(outbound_links, "_now_ts", lambda: 1_790_000_000)
 
     async def go():
-        db = databases.Database(DATABASE_URL, server_settings={"search_path": _SCHEMA})
+        db = databases.Database(DATABASE_URL, server_settings={"search_path": _SCHEMA}, **pool)
         await db.connect()
         monkeypatch.setattr(dbmod, "database", db)  # the handler imports it at call time
         monkeypatch.setattr(dual_write, "database", db)  # the price_checked_at column probe
         try:
             return await body(_Harness(monkeypatch, db))
         finally:
-            await asyncio.sleep(0.05)  # let an abandoned shadow task unwind before the pool closes
+            for task in list(gateway._GROUP_SHADOW_IN_FLIGHT):  # a test that left one running
+                task.cancel()
+            await _drain()
             await db.disconnect()
 
     return asyncio.run(go())
@@ -188,7 +222,6 @@ def test_the_flag_reads_three_modes_and_anything_else_is_off(monkeypatch, raw, m
     else:
         monkeypatch.setenv(FLAG, raw)
     assert gateway._group_seed_siblings_mode() == mode
-    assert gateway._group_seed_siblings_enabled() is (mode == "on")
 
 
 # ------------------------------------------------------------------------------- the response
@@ -202,7 +235,7 @@ def test_shadow_serves_the_off_response_for_a_resolved_group(schema_engine, monk
         off, off_bt = await h.call(ident, flag=None)
         shadow, shadow_bt = await h.call(ident, flag="shadow")
         assert not off_bt.tasks and len(shadow_bt.tasks) == 1
-        await shadow_bt()  # as Starlette runs it: after the response, in the request's task
+        await h.settle(shadow_bt)  # as Starlette runs it: after the response, in the request's task
         again, _ = await h.call(ident, flag=None)
         return off, shadow, again
 
@@ -221,7 +254,7 @@ def test_shadow_serves_the_off_response_for_an_unresolved_group_and_logs_nothing
         off, _ = await h.call(RETAILER_SIG, flag=None)
         cold, cold_bt = await h.call(RETAILER_SIG, flag="shadow")
         assert len(cold_bt.tasks) == 1, "a cold key set is refreshed off the request path"
-        await cold_bt()
+        await h.settle(cold_bt)
         warm, warm_bt = await h.call(RETAILER_SIG, flag="shadow")
         assert not warm_bt.tasks, "a warm key set naming no resolved group schedules nothing"
         return off, cold, warm
@@ -244,7 +277,7 @@ def test_the_line_for_a_stale_and_a_fresh_comparable_offer(schema_engine, monkey
     async def body(h: _Harness):
         shadow, bt = await h.call(RETAILER_SIG, flag="shadow", seed_reasons=gated)
         started = time.perf_counter()
-        await bt()
+        await h.settle(bt)
         elapsed_ms = (time.perf_counter() - started) * 1000
         on, _ = await h.call(RETAILER_SIG, flag="1", seed_reasons=gated)
         return shadow, on, elapsed_ms
@@ -278,7 +311,7 @@ def test_the_line_when_no_comparable_price_is_fresh(schema_engine, monkeypatch, 
 
     async def body(h: _Harness):
         _, bt = await h.call(RETAILER_SIG, flag="shadow", seed_reasons=("currency_mismatch",))
-        await bt()
+        await h.settle(bt)
         on, _ = await h.call(RETAILER_SIG, flag="1", seed_reasons=("currency_mismatch",))
         return on
 
@@ -306,7 +339,7 @@ def test_a_shadow_past_its_budget_is_abandoned_logged_and_never_served(schema_en
     async def body(h: _Harness):
         off, _ = await h.call(RETAILER_SIG, flag=None)
         _, warm = await h.call(RETAILER_SIG, flag="shadow")
-        await warm()  # one healthy shadow first: the key set is warm, so the budget below is the group read's
+        await h.settle(warm)  # one healthy shadow first: the key set is warm, so the budget below is the group read's
 
         async def hangs(*a, **k):
             await asyncio.sleep(5)
@@ -314,17 +347,18 @@ def test_a_shadow_past_its_budget_is_abandoned_logged_and_never_served(schema_en
         monkeypatch.setattr(gateway, "_fetch_resolved_group", hangs)
         shadow, bt = await h.call(RETAILER_SIG, flag="shadow")
         started = time.perf_counter()
-        await bt()
+        await h.settle(bt)  # the budget timer cancels it; it unwinds and leaves the in-flight set
         waited = time.perf_counter() - started
         after, _ = await h.call(RETAILER_SIG, flag=None)
         return off, shadow, after, waited
 
     off, shadow, after, waited = _run(monkeypatch, body)
-    assert waited < 0.4 + 0.3, f"the background callable outlived its budget: {waited:.2f}s"
+    assert waited < 0.4 + 0.3, f"the shadow outlived its budget: {waited:.2f}s"
     assert _bytes(shadow) == _bytes(off) and _bytes(after) == _bytes(off)
     healthy, timed_out = lines.parsed
     assert "error" not in healthy
     assert timed_out["error"] == "budget_exceeded" and timed_out["product_id"] == RETAILER_SIG
+    assert 400 <= timed_out["shadow_ms"] < 700
     assert "group_best" not in timed_out
 
 
@@ -347,12 +381,12 @@ def test_a_server_side_statement_timeout_ends_a_slow_statement_and_the_next_requ
         monkeypatch.setattr(gateway, "_fetch_resolved_group", slow)
         shadow, bt = await h.call(RETAILER_SIG, flag="shadow")
         started = time.perf_counter()
-        await bt()
+        await h.settle(bt)
         waited = time.perf_counter() - started
         after, _ = await h.call(RETAILER_SIG, flag=None)
         monkeypatch.setattr(gateway, "_fetch_resolved_group", real_fetch)
         _, healthy_bt = await h.call(RETAILER_SIG, flag="shadow")
-        await healthy_bt()
+        await h.settle(healthy_bt)
         return off, shadow, after, waited
 
     off, shadow, after, waited = _run(monkeypatch, body)
@@ -376,7 +410,7 @@ def test_a_shadow_exception_is_swallowed_logged_and_never_served(schema_engine, 
     async def body(h: _Harness):
         off, _ = await h.call(RETAILER_SIG, flag=None)
         shadow, bt = await h.call(RETAILER_SIG, flag="shadow")
-        await bt()  # raises nothing
+        await h.settle(bt)  # raises nothing
         after, _ = await h.call(RETAILER_SIG, flag=None)
         return off, shadow, after
 
@@ -416,7 +450,7 @@ def test_the_shadow_mints_no_link_issues_no_click_and_sends_no_http(schema_engin
         monkeypatch.setattr(live_offer_verification, "verify_offers", spy("verify_offers"))
         monkeypatch.setattr(httpx.AsyncClient, "send", spy("httpx.AsyncClient.send"))
         monkeypatch.setattr(httpx.Client, "send", spy("httpx.Client.send"))
-        await bt()
+        await h.settle(bt)
         return shadow
 
     _run(monkeypatch, body)
@@ -448,7 +482,7 @@ def test_the_shadow_reads_on_its_own_connection_in_a_read_only_transaction(schem
     async def body(h: _Harness):
         _, bt = await h.call(RETAILER_SIG, flag="shadow")
         request_conn = h.db.connection()
-        await bt()
+        await h.settle(bt)
         # The request's connection context holds no transaction and no statement_timeout afterwards.
         assert not request_conn._transaction_stack
         assert (await h.db.fetch_one("SHOW statement_timeout"))[0] == "0"
@@ -493,7 +527,7 @@ def test_an_unresolved_or_merchant_scoped_request_sends_no_extra_query(schema_en
 
     async def body(h: _Harness):
         _, warm = await h.call(RETAILER_SIG, flag="shadow")
-        await warm()  # the resolved-key set is loaded once per TTL, off the request path
+        await h.settle(warm)  # the resolved-key set is loaded once per TTL, off the request path
         sent: List[str] = []
         _count_statements(monkeypatch, h.db, sent)
         out = {}
@@ -502,7 +536,7 @@ def test_an_unresolved_or_merchant_scoped_request_sends_no_extra_query(schema_en
             sent.clear()
             res, bt = await h.call(RETAILER_SIG, flag=flag, metadata=meta)
             assert not bt.tasks, name
-            await bt()
+            await h.settle(bt)
             out[name] = (list(sent), res)
         return out
 
@@ -522,7 +556,7 @@ def test_a_cold_key_set_costs_one_background_read_and_no_group_read(schema_engin
         _count_statements(monkeypatch, h.db, sent)
         _, bt = await h.call(RETAILER_SIG, flag="shadow")
         sent.clear()
-        await bt()
+        await h.settle(bt)
         return sent
 
     sent = _run(monkeypatch, body)
@@ -543,7 +577,7 @@ def test_a_failed_key_set_read_is_logged_once_and_not_retried_per_request(schema
         off, _ = await h.call(RETAILER_SIG, flag=None)
         first, bt = await h.call(RETAILER_SIG, flag="shadow")
         assert len(bt.tasks) == 1
-        await bt()
+        await h.settle(bt)
         second, bt2 = await h.call(RETAILER_SIG, flag="shadow")
         assert not bt2.tasks, "a failed refresh backs off: no task, no query, until the retry window"
         return off, first, second
@@ -552,3 +586,193 @@ def test_a_failed_key_set_read_is_logged_once_and_not_retried_per_request(schema
     assert _bytes(first) == _bytes(off) and _bytes(second) == _bytes(off)
     [line] = lines.parsed
     assert "UndefinedTable" in line["error"] and "content_key" not in line
+
+
+# ------------------------------------------------------------------ round 2: detached, capped, bounded
+
+
+def test_the_background_callable_returns_before_the_shadow_finishes(schema_engine, monkeypatch, lines):
+    """Starlette 0.27 under uvicorn holds the next request on a keep-alive connection until this
+    request's background tasks finish, so the callable must only spawn the shadow."""
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    real = gateway._fetch_resolved_group
+
+    async def slow(db, **kw):
+        await asyncio.sleep(0.5)
+        return await real(db, **kw)
+
+    async def body(h: _Harness):
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        monkeypatch.setattr(gateway, "_fetch_resolved_group", slow)
+        _, bt = await h.call(RETAILER_SIG, flag="shadow")
+        started = time.perf_counter()
+        await bt()  # what Starlette awaits
+        returned = time.perf_counter() - started
+        [task] = gateway._GROUP_SHADOW_IN_FLIGHT
+        running = not task.done()
+        lines_before = len(lines.parsed)
+        await _drain()
+        return returned, running, lines_before
+
+    returned, running, lines_before = _run(monkeypatch, body)
+    assert returned < 0.05, f"the background callable waited for the shadow: {returned:.3f}s"
+    assert running and lines_before == 1, "the shadow was still working when the callable returned"
+    assert len(lines.parsed) == 2 and "error" not in lines.parsed[1]
+
+
+def test_the_cap_skips_and_a_plain_request_is_not_held_behind_shadows(schema_engine, monkeypatch, lines):
+    """Pool of 3. Six resolved requests, each shadow holding a connection for 0.7 s: two run (the cap),
+    four are SKIPPED (never queued), and a plain request issued meanwhile gets a connection at once."""
+    import contextvars
+
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    real = gateway._fetch_resolved_group
+
+    async def slow(db, **kw):
+        await db.fetch_all("SELECT pg_sleep(0.7)")
+        return await real(db, **kw)
+
+    async def body(h: _Harness):
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        monkeypatch.setattr(gateway, "_fetch_resolved_group", slow)
+        for _ in range(6):
+            _, bt = await h.call(RETAILER_SIG, flag="shadow")
+            await bt()
+        in_flight = len(gateway._GROUP_SHADOW_IN_FLIGHT)
+        await asyncio.sleep(0.1)  # both shadows are inside pg_sleep, each on its own connection
+
+        async def plain():
+            started = time.perf_counter()
+            await h.db.fetch_one("SELECT 1")
+            return time.perf_counter() - started
+
+        waited = await asyncio.get_running_loop().create_task(plain(), context=contextvars.Context())
+        await _drain()
+        return in_flight, waited
+
+    in_flight, waited = _run(monkeypatch, body, min_size=1, max_size=3)
+    assert waited < 0.2, f"a plain request waited {waited:.3f}s for a connection behind the shadows"
+    assert in_flight == 2 == gateway.OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT
+    warm_line, *slow_lines = lines.parsed
+    assert len(slow_lines) == 2 and all("error" not in line for line in slow_lines), slow_lines
+    # The skips ride on the next shadow line, once: no line per skipped request.
+    assert [line.get("skipped") for line in slow_lines] == [{"cap": 4}, None]
+
+
+def test_no_shadow_starts_when_the_pool_has_no_spare_connection(schema_engine, monkeypatch, lines):
+    _rows(schema_engine, retailer_checked=_now())
+
+    async def body(h: _Harness):
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        pool = h.db._backend._pool
+        held = [await pool.acquire(), await pool.acquire()]  # 2 of 3 taken: 1 free, which is the reserve
+        try:
+            _, bt = await h.call(RETAILER_SIG, flag="shadow")
+            await bt()
+            import routes.agent_shop_gateway as gateway
+
+            skipped_in_flight = len(gateway._GROUP_SHADOW_IN_FLIGHT)
+        finally:
+            for conn in held:
+                await pool.release(conn)
+        _, bt = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(bt)
+        return skipped_in_flight
+
+    assert _run(monkeypatch, body, min_size=1, max_size=3) == 0
+    warm_line, next_line = lines.parsed
+    assert next_line["skipped"] == {"pool_busy": 1} and "error" not in next_line
+
+
+def test_an_overflowing_key_set_turns_the_shadow_off_and_says_so_once(schema_engine, monkeypatch, lines):
+    """At the key limit the set cannot gate. The shadow then shadows NOTHING (not everything), logs
+    `offers_resolve_group_shadow_disabled` once for that refresh, and counts the skips."""
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())  # one resolved key: limit 1 overflows
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT", 1)
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY", 4)
+
+    async def body(h: _Harness):
+        off, _ = await h.call(RETAILER_SIG, flag=None)
+        _, first = await h.call(RETAILER_SIG, flag="shadow")
+        assert len(first.tasks) == 1  # cold: the refresh runs in the background
+        await h.settle(first)
+        scheduled = []
+        for ident in (RETAILER_SIG, BRAND_SIG, CK):
+            res, bt = await h.call(ident, flag="shadow")
+            scheduled.append(len(bt.tasks))
+        return scheduled
+
+    assert _run(monkeypatch, body) == [0, 0, 0]
+    assert lines.parsed == [], "nothing is shadowed while the set overflows"
+    [disabled] = lines.events(EVENT + "_disabled")
+    assert disabled["reason"] == "overflow" and disabled["keys"] == 1 and disabled["limit"] == 1
+    [summary] = lines.events(EVENT + "_skips")
+    assert summary["skipped"] == {"overflow": 4}
+
+
+def _shutdown_case(monkeypatch, lines, hang):
+    """Start a shadow, then cancel every other task as a shutting-down loop does. The loop's exception
+    handler must see nothing (no "Task exception was never retrieved"), and the in-flight set must
+    empty, so the cap is never held by a dead shadow."""
+    import gc
+
+    import routes.agent_shop_gateway as gateway
+
+    seen: List[Dict[str, Any]] = []
+
+    async def body(h: _Harness):
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda _loop, ctx: seen.append(ctx))
+        _, warm = await h.call(RETAILER_SIG, flag="shadow")
+        await h.settle(warm)
+        monkeypatch.setattr(gateway, "_fetch_resolved_group", hang)
+        _, bt = await h.call(RETAILER_SIG, flag="shadow")
+        await bt()
+        await asyncio.sleep(0.1)
+        [task] = gateway._GROUP_SHADOW_IN_FLIGHT
+        for other in asyncio.all_tasks():
+            if other is not asyncio.current_task():
+                other.cancel()
+        await _drain()
+        await asyncio.sleep(gateway.OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS + 0.1)  # the timer is gone too
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        return len(gateway._GROUP_SHADOW_IN_FLIGHT)
+
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS", 0.5)
+    assert _run(monkeypatch, body) == 0
+    assert seen == [], seen
+    return lines.parsed
+
+
+def test_a_shutdown_cancel_unwinds_the_shadow_and_leaves_nothing_unretrieved(schema_engine, monkeypatch, lines):
+    _rows(schema_engine, retailer_checked=_now())
+
+    async def hang(*a, **k):
+        await asyncio.sleep(5)
+
+    parsed = _shutdown_case(monkeypatch, lines, hang)
+    assert len(parsed) == 1, "a cancelled shadow logs nothing, and its budget timer never fires"
+
+
+def test_a_shadow_that_fails_while_unwinding_is_still_retrieved(schema_engine, monkeypatch, lines):
+    _rows(schema_engine, retailer_checked=_now())
+
+    async def hang(*a, **k):
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise RuntimeError("rollback failed while unwinding")
+
+    parsed = _shutdown_case(monkeypatch, lines, hang)
+    assert len(parsed) == 2 and parsed[1]["error"] == "RuntimeError: rollback failed while unwinding"

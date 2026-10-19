@@ -6589,7 +6589,7 @@ async def _handle_offers_resolve(
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
             )
             if _group_flag == "shadow":
-                _shadow_cks.update(str(dict(row).get("content_key") or "") for row in catalog_rows or [])
+                _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
 
         # Hosts the seed lane already claimed. Read from `source`, which carries the raw
         # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
@@ -9225,10 +9225,6 @@ def _group_seed_siblings_mode() -> str:
     return "off"
 
 
-def _group_seed_siblings_enabled() -> bool:
-    return _group_seed_siblings_mode() == "on"
-
-
 def _remaining_timeout(deadline: float, cap: float) -> float:
     remaining = deadline - time.perf_counter()
     if remaining <= 0:
@@ -10027,15 +10023,23 @@ def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]
 # the off answer's best offer with the best price group mode would mark.
 #
 # WHAT IT RUNS, and what it does not:
-#   * after the response is built and sent: a FastAPI BackgroundTask, which Starlette runs once the
-#     body has gone out, so the served latency is the off latency;
+#   * after the response is built: a FastAPI BackgroundTask whose callable (`_run_group_shadow`) only
+#     SPAWNS a detached task and returns at once. It must not await the work: Starlette 0.27 under
+#     uvicorn holds the NEXT request on the same keep-alive connection until the background tasks
+#     of this one have finished (measured: 1.0 s behind a 1 s task);
 #   * in a FRESH contextvars.Context, so `databases` 0.7 (which keys the connection on a ContextVar a
 #     child task inherits) hands it a pool connection of its own -- never the request's;
+#   * only while it is cheap to: at most OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT shadows per process
+#     (a cancelled one counts until it has unwound), and never when the pool has no more than
+#     OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE free connection. Each holds one pool connection for up
+#     to the budget, outside Cloud Run's request concurrency, so both SKIP (never wait) and are
+#     counted by reason (`_group_shadow_skip`): on the next shadow line, and in a summary line every
+#     OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY skips;
 #   * every statement inside ONE `READ ONLY` transaction that always rolls back, each under a
 #     server-side `SET LOCAL statement_timeout` that ends before the shadow's deadline (so Postgres,
 #     not an asyncio cancel, ends a slow statement and the connection stays reusable);
-#   * the whole of it bounded by OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS: past it the line says
-#     `budget_exceeded` and the task is cancelled and abandoned, never awaited further;
+#   * the whole of it bounded by OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS: a timer logs
+#     `budget_exceeded` and cancels the task; nothing ever awaits it;
 #   * READS ONLY: the resolved-group read (`_fetch_resolved_group`), the price-column probe and the
 #     catalog arm's own group-mode statement (`_catalog_offers_statement`). It never runs the sibling
 #     SEED lane: that lane's gates read recovery tasks, preflight carts at the merchant and mint links,
@@ -10049,13 +10053,15 @@ def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]
 # that key). So a per-process set of those content keys, refreshed at most every
 # OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS (one query, off the request path), is a NECESSARY
 # condition: a request whose aliases and catalog rows name no key in it is not resolved and schedules
-# nothing. A key in it runs the full resolved-group check in the background.
+# nothing. A key in it runs the full resolved-group check in the background. A set that reaches
+# OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT cannot gate, so the shadow then SKIPS every request (logged once
+# per refresh) rather than shadowing all of them.
 # Known blind spot: a resolved group the off answer's catalog read returned no row for (and that the
 # caller did not name by its ck_ id) is not seen -- its group answer would rest on sibling seeds,
 # which the shadow cannot evaluate anyway.
 OFFERS_RESOLVE_GROUP_SHADOW_EVENT = "offers_resolve_group_shadow"
 OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS = 300.0
-# More keys than this and the cache stops gating (every request runs the background check).
+# This many keys or more and the set cannot gate: the shadow is OFF until a refresh reads fewer.
 OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT = 20000
 # After a FAILED refresh, no new refresh for this long: the last good set (if any) keeps gating, and
 # with none every request is skipped -- a broken read costs one query a minute, not one a request.
@@ -10065,11 +10071,20 @@ OFFERS_RESOLVE_GROUP_SHADOW_STATEMENT_MARGIN_SECONDS = 0.15
 OFFERS_RESOLVE_GROUP_SHADOW_MIN_STATEMENT_MS = 50
 # At most this many stale offers are listed on the line (the count is always whole).
 OFFERS_RESOLVE_GROUP_SHADOW_STALE_LISTED = 10
+# Shadows in flight per process, counting a cancelled one until it has unwound. Past it: skip.
+OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT = 2
+# Free pool connections (idle + not yet opened) the shadow leaves to requests: it starts only when the
+# pool has MORE than this many.
+OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE = 1
+# One `offers_resolve_group_shadow_skips` summary line per this many skips with no shadow line between.
+OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY = 1000
 _GROUP_SHADOW_CKS: Dict[str, Any] = {"cks": None, "loaded_at": 0.0, "overflow": False, "refreshing": False,
                                      "failed_at": None}
-# A task abandoned at the budget is held here until it has unwound, so it is never garbage-collected
-# mid-flight.
-_GROUP_SHADOW_ABANDONED: set = set()
+# Every shadow task until it is DONE (finished, failed, or cancelled AND unwound): the strong reference
+# that keeps a detached task alive, and the in-flight count the cap reads. Emptied by done callbacks.
+_GROUP_SHADOW_IN_FLIGHT: set = set()
+# Skips by reason (cap, pool_busy, overflow, refreshing) since the last line that reported them.
+_GROUP_SHADOW_SKIPS: Dict[str, int] = {}
 _GROUP_SHADOW_RESOLVED_CKS_SQL = """
     SELECT DISTINCT content_key
       FROM identity_resolution_proposals
@@ -10083,7 +10098,8 @@ _GROUP_SHADOW_RESOLVED_CKS_SQL = """
 
 def _group_shadow_cache_verdict(keys: set) -> str:
     """"skip" (no key names a resolved group: nothing to do), "run" (one may: check in the
-    background) or "refresh" (the key set is missing or older than its TTL: refresh, then decide)."""
+    background), "refresh" (the key set is missing or older than its TTL: refresh, then decide) or
+    "overflow" (the set hit its limit and cannot gate: the shadow is off until the next refresh)."""
     cks = _GROUP_SHADOW_CKS["cks"]
     now = time.monotonic()
     if cks is None or now - _GROUP_SHADOW_CKS["loaded_at"] >= OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS:
@@ -10092,9 +10108,51 @@ def _group_shadow_cache_verdict(keys: set) -> str:
             return "refresh"
         if cks is None:
             return "skip"
-    if _GROUP_SHADOW_CKS["overflow"] or (keys & cks):
+    if _GROUP_SHADOW_CKS["overflow"]:
+        return "overflow"
+    if keys & cks:
         return "run"
     return "skip"
+
+
+def _pivota_warning_line(event: str, payload: Dict[str, Any]) -> None:
+    """`<event> <compact JSON>` at WARNING through `utils.logger` ("pivota"), the only logger prod
+    keeps. Never raises."""
+    try:
+        from utils.logger import logger as _pivota_logger
+
+        _pivota_logger.warning(
+            "%s %s", event, json.dumps({"event": event, **payload}, sort_keys=True, separators=(",", ":"),
+                                       default=str),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _group_shadow_take_skips() -> Dict[str, int]:
+    skips = dict(_GROUP_SHADOW_SKIPS)
+    _GROUP_SHADOW_SKIPS.clear()
+    return skips
+
+
+def _group_shadow_skip(reason: str) -> None:
+    """Count a skipped shadow. No line per skip: the counts ride on the next shadow line, and every
+    OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY skips without one they go out as a summary."""
+    _GROUP_SHADOW_SKIPS[reason] = _GROUP_SHADOW_SKIPS.get(reason, 0) + 1
+    if sum(_GROUP_SHADOW_SKIPS.values()) >= OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY:
+        _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_skips", {"skipped": _group_shadow_take_skips()})
+
+
+def _group_shadow_pool_free(db: Any) -> Optional[int]:
+    """Connections the pool can still hand out without waiting (idle + not yet opened), or None when
+    there is no asyncpg pool to ask (SQLite, not connected)."""
+    pool = getattr(getattr(db, "_backend", None), "_pool", None)
+    if pool is None:
+        return None
+    try:
+        return int(pool.get_idle_size()) + max(0, int(pool.get_max_size()) - int(pool.get_size()))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class _GroupShadowReader:
@@ -10298,7 +10356,8 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
     keys = set(snap["keys"])
     if _group_shadow_cache_verdict(keys) == "refresh":
         if _GROUP_SHADOW_CKS["refreshing"]:
-            return False  # another request is refreshing the set right now: this one is not measured
+            _group_shadow_skip("refreshing")  # another shadow is refreshing the set right now
+            return False
         _GROUP_SHADOW_CKS["refreshing"] = True
         try:
             async with _group_shadow_transaction(database, is_pg):
@@ -10307,14 +10366,24 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
                     "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
                 })
             cks = frozenset(str(_row_to_dict(r).get("content_key") or "") for r in ck_rows or []) - {""}
-            _GROUP_SHADOW_CKS.update(cks=cks, loaded_at=time.monotonic(), failed_at=None,
-                                     overflow=len(ck_rows or []) >= OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT)
+            overflow = len(ck_rows or []) >= OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT
+            _GROUP_SHADOW_CKS.update(cks=cks, loaded_at=time.monotonic(), failed_at=None, overflow=overflow)
+            if overflow:
+                # ONCE per refresh, not per request: until a refresh reads fewer keys, every request skips.
+                _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_disabled", {
+                    "reason": "overflow", "keys": len(ck_rows or []),
+                    "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
+                    "retry_after_seconds": OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS,
+                })
         except BaseException:
             _GROUP_SHADOW_CKS["failed_at"] = time.monotonic()
             raise
         finally:
             _GROUP_SHADOW_CKS["refreshing"] = False
-    if _group_shadow_cache_verdict(keys) != "run":
+    verdict = _group_shadow_cache_verdict(keys)
+    if verdict == "overflow":
+        _group_shadow_skip("overflow")
+    if verdict != "run":
         return False
     async with _group_shadow_transaction(database, is_pg):
         group = await _fetch_resolved_group(reader, aliases=snap["aliases"], market_hint=snap["market"],
@@ -10340,59 +10409,86 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
     return True
 
 
-def _group_shadow_reap(task: "asyncio.Task[Any]") -> None:
-    _GROUP_SHADOW_ABANDONED.discard(task)
+def _group_shadow_emit(snap: Dict[str, Any], state: Dict[str, Any], error: Optional[str]) -> None:
+    """The ONE line of a shadow. Never raises."""
+    record = dict(state["record"])
+    reader = record.pop("_reader", None)
+    skipped = _group_shadow_take_skips()
+    _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT, {
+        "product_id": snap.get("product_id"),
+        "sku_id": snap.get("sku_id"),
+        "market": snap.get("market"),
+        **record,
+        "shadow_ms": int((time.perf_counter() - state["started"]) * 1000),
+        "shadow_db_ms": int((reader.db_seconds if reader else 0.0) * 1000),
+        "shadow_statements": reader.statements if reader else 0,
+        **({"skipped": skipped} if skipped else {}),
+        **({"error": error} if error else {}),
+    })
+
+
+async def _group_shadow_task(snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The detached shadow. Logs at most one line, and none once the budget timer has spoken."""
+    error: Optional[str] = None
+    try:
+        log = await _group_shadow_answer(
+            snap, deadline=state["started"] + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS,
+            record=state["record"],
+        )
+    except asyncio.CancelledError:
+        state["done"] = True  # the budget timer (which has logged) or shutdown: unwind, say nothing
+        raise
+    except Exception as exc:  # noqa: BLE001 -- swallowed: the shadow never reaches the response
+        log, error = True, f"{type(exc).__name__}: {str(exc)[:200]}"
+    if state["done"]:
+        return
+    state["done"] = True
+    if log:
+        _group_shadow_emit(snap, state, error)
+
+
+def _group_shadow_budget_spent(task: "asyncio.Task[Any]", snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The budget timer: log `budget_exceeded` now and cancel the task. Never waits for it to unwind;
+    it stays in _GROUP_SHADOW_IN_FLIGHT (and so counts against the cap) until it has."""
+    if state["done"] or task.done():
+        return
+    state["done"] = True
+    _group_shadow_emit(snap, state, "budget_exceeded")
+    task.cancel()
+
+
+def _group_shadow_task_done(task: "asyncio.Task[Any]", state: Dict[str, Any]) -> None:
+    _GROUP_SHADOW_IN_FLIGHT.discard(task)
+    timer = state.get("timer")
+    if timer is not None:
+        timer.cancel()
     if not task.cancelled():
-        task.exception()  # retrieved, so asyncio never logs "exception was never retrieved"
+        task.exception()  # retrieved, so asyncio never logs "Task exception was never retrieved"
 
 
 async def _run_group_shadow(snap: Dict[str, Any]) -> None:
-    """The BackgroundTasks callable. Never raises; logs at most one line."""
-    started = time.perf_counter()
-    budget = OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS
-    record: Dict[str, Any] = {}
-    error: Optional[str] = None
-    log = False
+    """The BackgroundTasks callable. SPAWNS the shadow and returns at once -- it never awaits it, so
+    the next request on this keep-alive connection is not held behind it. Never raises."""
     try:
+        if len(_GROUP_SHADOW_IN_FLIGHT) >= OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT:
+            _group_shadow_skip("cap")
+            return
+        from db.database import database
+
+        free = _group_shadow_pool_free(database)
+        if free is not None and free <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
+            _group_shadow_skip("pool_busy")
+            return
+        loop = asyncio.get_running_loop()
+        state: Dict[str, Any] = {"started": time.perf_counter(), "record": {}, "done": False, "timer": None}
         # A FRESH Context: `databases` 0.7 keeps the task's connection in a ContextVar, and a task
         # created the usual way copies the caller's context -- i.e. the request's connection.
-        task = asyncio.get_running_loop().create_task(
-            _group_shadow_answer(snap, deadline=started + budget, record=record),
-            context=contextvars.Context(),
+        task = loop.create_task(_group_shadow_task(snap, state), context=contextvars.Context())
+        _GROUP_SHADOW_IN_FLIGHT.add(task)
+        state["timer"] = loop.call_later(
+            OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS, _group_shadow_budget_spent, task, snap, state,
         )
-        done, _pending = await asyncio.wait({task}, timeout=budget)
-        if task in done:
-            log = task.result()
-        else:
-            # Cancelled and abandoned, never awaited: a statement stuck on a dead socket must not
-            # hold this callable past its budget.
-            task.cancel()
-            _GROUP_SHADOW_ABANDONED.add(task)
-            task.add_done_callback(_group_shadow_reap)
-            error, log = "budget_exceeded", True
-    except Exception as exc:  # noqa: BLE001 -- swallowed: the shadow never reaches the response
-        error, log = f"{type(exc).__name__}: {str(exc)[:200]}", True
-    if not log:
-        return
-    try:
-        reader = record.pop("_reader", None)
-        line: Dict[str, Any] = {
-            "event": OFFERS_RESOLVE_GROUP_SHADOW_EVENT,
-            "product_id": snap.get("product_id"),
-            "sku_id": snap.get("sku_id"),
-            "market": snap.get("market"),
-            **record,
-            "shadow_ms": int((time.perf_counter() - started) * 1000),
-            "shadow_db_ms": int((reader.db_seconds if reader else 0.0) * 1000),
-            "shadow_statements": reader.statements if reader else 0,
-            **({"error": error} if error else {}),
-        }
-        from utils.logger import logger as _pivota_logger  # prod keeps only "pivota" output
-
-        _pivota_logger.warning(
-            "%s %s", OFFERS_RESOLVE_GROUP_SHADOW_EVENT,
-            json.dumps(line, sort_keys=True, separators=(",", ":"), default=str),
-        )
+        task.add_done_callback(lambda t: _group_shadow_task_done(t, state))
     except Exception:  # noqa: BLE001
         pass
 
@@ -10418,7 +10514,13 @@ def _schedule_group_shadow(
         if background_tasks is None:
             return False
         keys = (set(content_keys) | set(aliases)) - {""}
-        if not keys or _group_shadow_cache_verdict(keys) == "skip":
+        if not keys:
+            return False
+        verdict = _group_shadow_cache_verdict(keys)
+        if verdict == "overflow":
+            _group_shadow_skip("overflow")
+            return False
+        if verdict == "skip":
             return False
         background_tasks.add_task(_run_group_shadow, {
             "product_id": product_id, "sku_id": sku_id, "market": market_hint, "limit": limit,
