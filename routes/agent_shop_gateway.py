@@ -3806,6 +3806,30 @@ def _fuzzy_seed_ref_clauses(
     return clauses, params
 
 
+# What `_normalize_offer_title` emits: lower-case ASCII letters, digits and spaces, never all spaces.
+_IDENTITY_TERM_RE = re.compile(r"[a-z0-9 ]*[a-z0-9][a-z0-9 ]*")
+
+
+def _identity_title_arm(key: str, term: str) -> str:
+    """One title term's arm of offers.resolve's external_seed_by_internal_identity statement.
+
+    main read `LOWER(COALESCE(title,'')) LIKE :t OR LOWER(COALESCE(seed_data->>'title','')) LIKE :t`,
+    and neither side matched an index, so every identity retry scanned the whole seed table. Each
+    side is now spelled as an index is keyed, both WHERE status = 'active':
+      - `LOWER(title)`: prod's `idx_eps_active_any_title_trgm` (migration 270). A NULL title makes
+        the arm NULL instead of `'' LIKE '%<term>%'`, which is false for any term with a letter or
+        digit -- the only kind `_normalize_offer_title` emits -- so the rows are the same.
+      - `LOWER(COALESCE(seed_data->>'title',''))`: main's own expression, unchanged, which
+        `idx_eps_active_any_seed_title_trgm` (migration 271, built out of band) is keyed on. Until it
+        is built the statement plans as main's did. An indexed prefilter on seed_data::text was tried
+        and rejected: a common title word's trigrams sit in nearly every 25 KB seed_data text, and
+        rechecking those rows cost 6.3 s for 8 terms where main's scan cost 0.8 s.
+    Any other term keeps main's arm exactly.
+    """
+    title = "LOWER(title)" if _IDENTITY_TERM_RE.fullmatch(term or "") else "LOWER(COALESCE(title,''))"
+    return f"({title} LIKE :{key} OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key})"
+
+
 def _offers_scope_or_none(raw: Any) -> Optional[str]:
     """A usable merchant scope, or None.
 
@@ -4597,12 +4621,7 @@ async def _handle_offers_resolve(
         for idx, term in enumerate(title_terms):
             key = f"identity_title_{idx}"
             params[key] = f"%{term}%"
-            title_clauses.append(
-                "("
-                f"LOWER(COALESCE(title,'')) LIKE :{key}"
-                f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}"
-                ")"
-            )
+            title_clauses.append(_identity_title_arm(key, term))
 
         brand_clause = "TRUE"
         if brand_terms:

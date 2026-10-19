@@ -371,7 +371,7 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
-        if "FROM external_product_seeds" in q and "LOWER(COALESCE(title,'')) LIKE" in q:
+        if "FROM external_product_seeds" in q and ":identity_title_0" in q:
             assert values["identity_title_0"] == "%kravebeauty great barrier relief%"
             assert values["identity_title_1"] == "%great barrier relief%"
             return [
