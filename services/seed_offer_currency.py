@@ -7,19 +7,22 @@ Serum Set" at "USD 23.56". The price came from 20 offers the variant-identity ba
 AUD 56, mirror offer AUD 56, store's live read AUD). Nothing retired the 20 USD rows.
 
 WHICH of a seed's currencies is its currency. Measured on prod 2026-10-19 (read-only censuses
-spccy-1019 / spccy2-1019, active seeds that carry a live projected offer):
+spccy-1019 .. spccy8-1019, active seeds that carry a live projected offer):
 
-  * the SNAPSHOT (seed_data.snapshot.price_currency) is the page as read. Where the column
-    disagrees with it, the column holds the writers' old `or "USD"` default (column USD with
-    snapshot GBP 483, QAR 367, EUR 166, INR 108, ZAR 64 seeds). A USD offer copied off such a
-    column is an amount that was read in another currency.
-  * the COLUMN (price_currency) stands in when the seed kept no snapshot currency.
+  * the COLUMN (price_currency) and the SNAPSHOT (seed_data.snapshot.price_currency, the page as read)
+    must AGREE. The refresh never redenominates: a read in another currency is
+    `skipped_currency_mismatch` and the column is kept (routes/employee_products). It writes the
+    snapshot from every read. So where the two disagree, either can be the wrong one:
+      - a geo-served misread over a right column (us.oiolab.co: column USD, snapshot EUR, same amount);
+      - the writers' old `or "USD"` default over a right page read (column USD with snapshot GBP 483,
+        QAR 367, EUR 166, INR 108, ZAR 64 seeds).
+    Such a seed states NO currency: no price in either direction, never relabelled.
+  * Either one stands in alone when the other is absent.
   * seed_data.price_currency is NOT evidence. It is a copy the writers default to "USD" as well:
-    16 serving SGD offers have column SGD and snapshot SGD, with amounts equal to both, while
-    their seed_data says "USD".
-
-So a seed's currency is its snapshot's, else its column's, else none. Nothing here defaults, and
-nothing infers a currency from a market or the reverse (services/region_pricing).
+    16 serving SGD offers have column SGD and snapshot SGD, with amounts equal to both, while their
+    seed_data says "USD".
+  * In SQL, a snapshot or seed_data that is not a JSON object hides the page read, so a seed with a
+    column and such a snapshot states none (it is not parsed there).
 
 The PIVOTA-Agent gateway's canonical search applies the same rule to the offers it picks
 (src/services/seedSearchOfferScope.js, seedProjectedOfferInSeedCurrencySql). Both sides must
@@ -68,24 +71,41 @@ def snapshot_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
 
 
 def seed_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
-    """The seed's own currency: its snapshot's, else its price_currency column's, else None."""
-    return snapshot_currency_of(seed) or _code(seed.get("price_currency"))
+    """The seed's own currency: its column and its page read when they agree, whichever is stated
+    when only one is, and None when they disagree or neither is stated."""
+    column = _code(seed.get("price_currency"))
+    page = snapshot_currency_of(seed)
+    if column and page and column != page:
+        return None
+    return column or page
+
+
+class SeedOfferCurrencyRefused(ValueError):
+    """A seed-offer write refused because the seed states no currency (or no market) for its amount.
+    A ValueError, so every caller that already skips a refused row keeps doing so; its own type, so a
+    caller can report it apart from a real failure (`refused_currency`)."""
 
 
 def seed_currency_sql(alias: str) -> str:
     """`seed_currency_of` in SQL for an external_product_seeds alias; NULL means the seed states no
-    currency. A seed_data or snapshot stored as anything but a JSON object (a JSON string) hides the
-    page read, so it states none: not parsed here, where one malformed string would abort the read.
-    (Prod 2026-10-19, census spccy5-1019b: active seeds' snapshots are 26,656 objects, 294 JSON null,
-    0 strings.)"""
+    currency. The same text as the gateway's seedCurrencySql (PIVOTA-Agent#2467).
+
+    ONE detoast of seed_data on the common path: seed_data is ~25 KB and TOASTed, and every reference
+    re-detoasts it (a four-reference form cost +30-35% on scoped recall, spccy6/7-1019). A simple CASE
+    evaluates its test once, `#>>` yields NULL through a non-object, and only a seed with no snapshot
+    currency pays the type checks."""
     column = f"nullif(upper(trim({alias}.price_currency)), '')"
+    page = f"nullif(upper(trim({alias}.seed_data#>>'{{snapshot,price_currency}}')), '')"
     snapshot = f"{alias}.seed_data->'snapshot'"
     return (
-        f"(CASE"
-        f" WHEN {alias}.seed_data IS NOT NULL AND jsonb_typeof({alias}.seed_data) NOT IN ('object', 'null') THEN NULL"
-        f" WHEN jsonb_typeof({snapshot}) = 'object'"
-        f" THEN coalesce(nullif(upper(trim({alias}.seed_data#>>'{{snapshot,price_currency}}')), ''), {column})"
-        f" WHEN {snapshot} IS NULL OR jsonb_typeof({snapshot}) = 'null' THEN {column}"
+        f"(CASE WHEN {column} IS NULL THEN {page}"
+        f" ELSE (CASE coalesce({page}, '~')"
+        f" WHEN {column} THEN {column}"
+        f" WHEN '~' THEN (CASE WHEN {alias}.seed_data IS NULL"
+        f" OR (jsonb_typeof({alias}.seed_data) IN ('object', 'null')"
+        f" AND ({snapshot} IS NULL OR jsonb_typeof({snapshot}) IN ('object', 'null')))"
+        f" THEN {column} END)"
+        f" END)"
         f" END)"
     )
 
@@ -101,13 +121,33 @@ def seed_projected_offer_in_seed_currency_sql(offer_alias: str = "o", product_ke
     PDP and a search card agree on whether a row is a price. Probes idx on
     external_product_seeds(attached_product_key, attached_variant_id)."""
     systems = ", ".join(f"'{value}'" for value in SEED_PROJECTED_OFFER_SOURCE_SYSTEMS)
-    active = (
-        f"eps_own.attached_product_key = {product_key_expr}"
-        f" AND lower(trim(coalesce(eps_own.status, ''))) = 'active'"
-    )
+    # ONE index probe per offer (PR controller, spccy6-1019: two correlated EXISTS cost +30-35%). bool_and
+    # over the active attached seeds is NULL when there are none, so IS TRUE fails an orphan closed; it is
+    # false as soon as one seed states another currency or none.
     return (
         f"(coalesce({offer_alias}.source_system, '') NOT IN ({systems})"
-        f" OR (EXISTS (SELECT 1 FROM external_product_seeds eps_own WHERE {active})"
-        f" AND NOT EXISTS (SELECT 1 FROM external_product_seeds eps_own WHERE {active}"
-        f" AND {seed_currency_sql('eps_own')} IS DISTINCT FROM upper(trim(coalesce({offer_alias}.currency, ''))))))"
+        f" OR (SELECT bool_and({seed_currency_sql('eps_own')} IS NOT DISTINCT FROM upper(trim(coalesce({offer_alias}.currency, ''))))"
+        f" FROM external_product_seeds eps_own"
+        f" WHERE eps_own.attached_product_key = {product_key_expr}"
+        f" AND lower(trim(coalesce(eps_own.status, ''))) = 'active') IS TRUE)"
     )
+
+
+#: KILL SWITCH, default ON, the same name as the gateway's (PIVOTA-Agent#2467): any of 0/false/off/no/
+#: disabled turns the reader guard off, read per call, and the statement is then the pre-guard one.
+SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG = "CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD"
+_GUARD_OFF = {"0", "false", "off", "no", "disabled"}
+
+
+def seed_currency_guard_enabled() -> bool:
+    import os
+
+    return str(os.getenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG) or "").strip().lower() not in _GUARD_OFF
+
+
+def seed_projected_offer_guard_and_sql(offer_alias: str = "o", product_key_expr: str = "o.product_key") -> str:
+    """The guard as `AND (...)` for a reader's WHERE, or "" with the kill switch off."""
+    if not seed_currency_guard_enabled():
+        return ""
+    return f"AND {seed_projected_offer_in_seed_currency_sql(offer_alias, product_key_expr)}"
+

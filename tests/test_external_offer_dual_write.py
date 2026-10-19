@@ -478,13 +478,35 @@ async def test_seed_data_price_currency_is_not_evidence(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sync_reads_the_page_currency_and_refuses_softly(monkeypatch):
-    """The sync path selects the snapshot currency next to the column, and a refusal is the
-    fail-soft 'error' status every caller already handles, never an exception."""
+    """The sync path selects the snapshot currency next to the column, and a refusal is reported as
+    `refused_currency`, never an exception and never the generic `error`."""
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     assert "AS snapshot_price_currency" in mod._SEED_OFFER_COLUMNS
     fake = FakeDB(seed=_priced_seed(price_currency="USD", snapshot_price_currency="AUD"),
                   mirror={"product_key": _REAL_PK, "merchant_id": _REAL_SELLER})
     monkeypatch.setattr(mod, "database", fake)
     result = await mod.sync_offer_for_seed("s1")
-    assert result["status"] == "error" and "page read AUD" in result["error"]
+    # Its own status, not "error": refresh counters and readiness tell a refusal from an exception.
+    assert result["status"] == "refused_currency" and "page read AUD" in result["error"]
     assert fake.executed == []
+
+
+@pytest.mark.asyncio
+async def test_an_unpriced_seed_writes_no_currency_when_column_and_page_disagree(monkeypatch):
+    """No amount is no price claim, but the row still carries no currency the seed cannot vouch for."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, _priced_seed(price_amount=None, price_currency="USD", snapshot_price_currency="QAR"),
+        merchant_id=_REAL_SELLER,
+    )
+    params = fake.executed[0]["params"]
+    assert (params["list_price"], params["currency"]) == (None, None)
+
+
+def test_the_refusal_is_its_own_valueerror():
+    from services.seed_offer_currency import SeedOfferCurrencyRefused
+
+    with pytest.raises(SeedOfferCurrencyRefused):
+        mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(market=""), 1.0)
+    assert issubclass(SeedOfferCurrencyRefused, ValueError)
