@@ -513,3 +513,16 @@ def test_the_refusal_is_its_own_valueerror():
     with pytest.raises(SeedOfferCurrencyRefused):
         mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(market=""), 1.0)
     assert issubclass(SeedOfferCurrencyRefused, ValueError)
+
+
+
+# -- offer_payload.price_read_source: WHO vouched for an attached-lane price -------------------------
+
+
+def test_the_attached_update_records_who_vouched_for_the_read():
+    from services import external_offer_dual_write as mod
+
+    assert mod.PRICE_READ_SOURCE_KEY == "price_read_source"
+    for sql in (mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, mod.ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK):
+        assert "'{price_read_source}'" in sql
+        assert "to_jsonb(CAST(:read_source AS text))" in sql

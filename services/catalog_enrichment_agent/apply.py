@@ -390,11 +390,20 @@ _OFFER_UPSERT_SQL = """
                                            THEN NULL ELSE catalog_offers.suppressed_at END,
                       suppression_reason = CASE WHEN catalog_offers.suppression_reason = 'fold_superseded'
                                                 THEN NULL ELSE catalog_offers.suppression_reason END,
+                      -- WHO VOUCHED for the stored price (external_offer_dual_write.PRICE_READ_SOURCE_KEY, set
+                      -- by the attached-listing lane) survives a write that read no price: this plan did not
+                      -- date the price, so the stored stamp and its source stand together.
+                      -- _offer_upsert_sql_with_price_read drops that arm: a write that READ the price dated it
+                      -- itself, so the old source no longer describes the stamp.
                       offer_payload = CASE
                         WHEN catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', chr(58), chr(58), '66a3c8a4')
                          AND catalog_offers.offer_payload->>'meitu_sg_price_reviewed_0920' = 'SGD30'
                          AND catalog_offers.list_price = 30 AND EXCLUDED.list_price = 28.20
-                        THEN catalog_offers.offer_payload ELSE EXCLUDED.offer_payload END,
+                        THEN catalog_offers.offer_payload
+                        WHEN catalog_offers.offer_payload->'price_read_source' IS NOT NULL
+                        THEN EXCLUDED.offer_payload
+                             || jsonb_build_object('price_read_source', catalog_offers.offer_payload->'price_read_source')
+                        ELSE EXCLUDED.offer_payload END,
                       updated_at = NOW()
                     """
 
@@ -570,11 +579,16 @@ def _offer_upsert_sql_with_price_read(sql: str) -> str:
     catalog write lock (at most WRITE_LOCK wait, ~10 min): a stamp can overstate freshness by that much.
 
     Derived from the one statement, like `_offer_upsert_sql_with_market`, and refused unless it
-    changed exactly the three places it must."""
+    changed exactly the places it must (and dropped the price_read_source keep-arm: this write dated the
+    price itself)."""
     cols_old = "source_domain, offer_payload)\n"
     vals_old = "CAST(:offer_payload AS jsonb))\n"
     set_old = "                      updated_at = NOW()\n"
-    if any(sql.count(old) != 1 for old in (cols_old, vals_old, set_old)):
+    keep_source = ("                        WHEN catalog_offers.offer_payload->'price_read_source' IS NOT NULL\n"
+                   "                        THEN EXCLUDED.offer_payload\n"
+                   "                             || jsonb_build_object('price_read_source', "
+                   "catalog_offers.offer_payload->'price_read_source')\n")
+    if any(sql.count(old) != 1 for old in (cols_old, vals_old, set_old, keep_source)):
         raise RuntimeError("_OFFER_UPSERT_SQL changed shape; update _offer_upsert_sql_with_price_read")
     hold = ("catalog_offers.product_key = concat('ext', chr(58), 'jungsaemmool-lip-pression-metal-serum-gloss', "
             "chr(58), chr(58), '66a3c8a4')\n"
@@ -584,7 +598,8 @@ def _offer_upsert_sql_with_price_read(sql: str) -> str:
     # an edit to any of its lines must stop this derivation, not leave the stamp keyed to a stale hold.
     if sql.count("list_price = CASE\n                        WHEN " + hold + "\n") != 1:
         raise RuntimeError("_OFFER_UPSERT_SQL's reviewed-price hold changed; update _offer_upsert_sql_with_price_read")
-    return (sql.replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
+    return (sql.replace(keep_source, "")
+               .replace(cols_old, "source_domain, offer_payload, price_checked_at)\n")
                .replace(vals_old, "CAST(:offer_payload AS jsonb), NOW())\n")
                .replace(set_old, "                      price_checked_at = CASE\n"
                                  f"                        WHEN {hold}\n"
