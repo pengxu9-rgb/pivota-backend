@@ -109,6 +109,48 @@ _NON_CORE_COMPACT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Listings that are not merchandise at all: a donation, a gift voucher, an order-protection or
+# insurance fee, a tip, a deposit. The lists above were written for samples and add-ons and named
+# none of these, so on 2026-10-21 (read-only prod census) "Heart To Tarte Donation" was live, public
+# and rendering, and fentybeauty.com's "Donate To The Clara Lionel Foundation" had been proposed by
+# the relationship graph as a competitive alternative to 8 anchors. Same blocker code as the rest,
+# deliberately: every reader of `non_core_product` (the retailer-ingest readback, the image repair,
+# the serving-status copy) already treats it as "not a product", and a new code would be invisible
+# to all of them. Searched across the joined titles + URL like the lists above. Calibrated against
+# every catalog_products and external_product_seeds row in prod: 66 + 58 matches, no real product.
+_NON_PRODUCT_LISTING_RE = re.compile(
+    r"\b(?:"
+    r"donations?|"
+    r"gift\s+(?:certificate|voucher)s?|e\s*vouchers?|store\s+credit|"
+    r"(?:shipping|package|delivery|order|parcel|shipment)\s+(?:protection|insurance|guarantee)|"
+    r"route\s+(?:shipping\s+)?(?:insurance|protection)|"
+    r"gratuity|tip\s+jar|"
+    r"(?:booking|pre\s*order|appointment|reservation|security)\s+deposit"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Words that mean "not a product" only when they ARE the listing ("Donate To The ...", "Tip",
+# "Add a Tip", "Deposit for ..."). Matched at the START of ONE title, never across the joined text:
+# "Q-Tip Precision Swabs", "Fingertip Blender", "Proceeds Donated To ..." and "Colour Deposit Mask"
+# are products.
+_NON_PRODUCT_TITLE_START_RE = re.compile(
+    r"^\W*(?:"
+    r"donate\b|"
+    r"deposit\s*(?:$|[-:(]|for\b)|"
+    r"(?:add\s+(?:a\s+)?)?tips?\W*$"
+    r")",
+    re.IGNORECASE,
+)
+
+# catalog_products.product_type as the merchant set it, separators folded to one space. Exact values
+# only: a type of "Gift Set" or "Gifts" is merchandise.
+_NON_PRODUCT_TYPES = frozenset({
+    "gift card", "gift cards", "giftcard", "giftcards", "e gift card", "e gift cards", "egift card",
+    "gift certificate", "gift voucher", "donation", "donations", "insurance", "shipping protection",
+    "package protection", "tip", "tips", "gratuity", "deposit",
+})
+
 
 def _make_extraction_content_hash(
     title: Optional[str],
@@ -164,22 +206,26 @@ def _is_non_core_product(row: Dict[str, Any], *, seed_title: str) -> bool:
 
     These rows are operational or promo artifacts rather than products users
     should discover through the commerce index: sample cards/vials, shipping
-    protection, gift cards, GWP placeholders, stickers, packettes, and promo
-    placeholders. The matcher is deliberately narrow to avoid suppressing a
-    legitimate product that happens to contain a broad word like "sample".
+    protection, gift cards and vouchers, donations, tips, deposits, GWP
+    placeholders, stickers, packettes, and promo placeholders. The matcher is
+    deliberately narrow to avoid suppressing a legitimate product that happens
+    to contain a broad word like "sample".
     """
-    values = [
+    titles = [
         seed_title,
         row.get("seed_title"),
         row.get("pdp_title"),
-        row.get("canonical_url"),
     ]
-    raw = " ".join(str(value or "") for value in values)
+    raw = " ".join(str(value or "") for value in [*titles, row.get("canonical_url")])
     normalized = re.sub(r"[^a-z0-9%]+", " ", raw.lower())
     compact = re.sub(r"[^a-z0-9%]+", "", raw.lower())
+    product_type = re.sub(r"[\s_-]+", " ", str(row.get("product_type") or "")).strip().lower()
     return bool(
         _NON_CORE_PRODUCT_RE.search(normalized)
         or _NON_CORE_COMPACT_RE.search(compact)
+        or _NON_PRODUCT_LISTING_RE.search(normalized)
+        or any(_NON_PRODUCT_TITLE_START_RE.search(str(t or "")) for t in titles)
+        or product_type in _NON_PRODUCT_TYPES
     )
 
 
@@ -376,7 +422,8 @@ def _classify_product(
     elif _is_non_core_product(row, seed_title=seed_title):
         blocker_code = "non_core_product"
         blocker_detail = (
-            "sample/gift/protection/GWP row is not eligible for commerce index serving"
+            "sample/gift card/protection/donation/tip/deposit/GWP row is not eligible "
+            "for commerce index serving"
         )
     elif not source_document_present:
         if not has_seed_row:
@@ -751,6 +798,7 @@ _ELIGIBILITY_COLUMNS = f"""
     cp.sync_status,
     cp.suppressed_at,
     cp.canonical_url,
+    cp.product_type,
     cp.category_kind,
     cp.category_path,
     pqs.content_quality_score,
@@ -1003,6 +1051,7 @@ SELECT
     cp.sync_status,
     cp.suppressed_at,
     cp.canonical_url,
+    cp.product_type,
     -- SQLite (test) path: placeholder; durable category_kind is read on the
     -- Postgres path. The category-aware disclaimer gate is flag-off in tests.
     NULL AS category_kind,

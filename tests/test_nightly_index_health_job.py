@@ -255,6 +255,108 @@ def test_non_core_detector_blocks_decal_stickers():
     assert _is_non_core_product(row, seed_title="Rare Beauty Decal Stickers") is True
 
 
+# Listings that are not products at all. The first block is titles live in the prod catalog on
+# 2026-10-21 (read-only census); "Heart To Tarte Donation" was public and rendering, and the Clara
+# Lionel donation had been proposed as a competitive alternative to 8 anchors.
+_NOT_A_PRODUCT_TITLES = [
+    "Heart To Tarte Donation",
+    "Donate To The Clara Lionel Foundation",
+    "Add-on Donation",
+    "Round Up Donation",
+    "GIFT VOUCHER",
+    "Shipping Protection by Route",
+    "SavedBy Package Protection",
+    "Green Package Protection",
+    "Delivery Guarantee",
+    # Same classes, not yet seen in prod.
+    "Gift Certificate",
+    "$50 E-Voucher",
+    "Route Insurance",
+    "Order Protection",
+    "Shipping Insurance",
+    "Tip",
+    "Add a Tip",
+    "Tips",
+    "Gratuity",
+    "Booking Deposit",
+    "Pre-Order Deposit",
+    "Deposit",
+    "Deposit for Custom Order",
+]
+
+
+@pytest.mark.parametrize("title", _NOT_A_PRODUCT_TITLES)
+def test_non_product_listing_blocks_even_with_good_content(title):
+    state = _classify_product(
+        _full_row(
+            seed_data_json={"title": title},
+            seed_title=title,
+            pdp_title=title,
+            canonical_url="https://example.com/products/listing",
+        ),
+        regression_domains=set(),
+    )
+    assert state["serving_eligible"] is False
+    assert state["index_eligible"] is False
+    assert state["blocker_code"] == "non_core_product"
+
+
+# Real products carrying the same words. The foundations are the cohort a bare "foundation" pattern
+# swept in on the first census pass (700+ live rows); the rest put "tip", "deposit", "donated" and
+# "charity" inside a product name.
+_REAL_PRODUCTS_NEAR_NON_PRODUCT_WORDS = [
+    "Pro Filt'r Soft Matte Longwear Foundation",
+    "Liquid Foundation Brush",
+    "Q-Tip Precision Tips Swabs",
+    "Fingertip Blending Sponge",
+    "Lip Tip Liquid Lipstick",
+    "Tip Top Nail Polish",
+    "Colour Deposit Mask",
+    "Color Depositing Conditioner",
+    "Lipstick (10% of Proceeds Donated to Charity)",
+    "Charity Pot Body Lotion",
+    "Holiday Gift Set",
+    "Route 66 Eau de Parfum",
+    "Buy One, Donate One Lip Balm",
+    "Deposit Only Hair Color",
+]
+
+
+@pytest.mark.parametrize("title", _REAL_PRODUCTS_NEAR_NON_PRODUCT_WORDS)
+def test_non_product_listing_rule_leaves_real_products_alone(title):
+    row = _full_row(
+        seed_data_json={"title": title},
+        seed_title=title,
+        pdp_title=title,
+        canonical_url="https://example.com/products/listing",
+    )
+    assert _is_non_core_product(row, seed_title=title) is False
+    assert _classify_product(row, regression_domains=set())["serving_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    "product_type", ["Donation", "Gift Card", "gift_card", "Gift Cards", "e-gift card", "Insurance", "Tip"],
+)
+def test_non_product_type_blocks_a_plainly_titled_listing(product_type):
+    row = _full_row(product_type=product_type, pdp_title="Clara Lionel", seed_title="Clara Lionel")
+    assert _is_non_core_product(row, seed_title="Clara Lionel") is True
+
+
+@pytest.mark.parametrize("product_type", [None, "", "Gift Set", "Gifts", "makeup", "Beauty Product", "Tools"])
+def test_merchandise_product_types_do_not_block(product_type):
+    row = _full_row(product_type=product_type)
+    assert _is_non_core_product(row, seed_title="Test product") is False
+
+
+def test_title_start_words_are_read_per_title_not_across_the_joined_text():
+    """'donate' / 'tip' / 'deposit' count only as the START of a title. Joined, a seed title ending
+    in a word and an APV title starting with another must not read as one listing."""
+    row = _full_row(seed_title="Lip Gloss", pdp_title="Lip Gloss", canonical_url="https://example.com/donate")
+    assert _is_non_core_product(row, seed_title="Lip Gloss") is False
+    row = _full_row(seed_title="Brush", pdp_title="Tip")
+    assert _is_non_core_product(row, seed_title="Brush") is True
+
+
 # ---------------------------------------------------------------------------
 # Public_indexed mapping (P1)
 # ---------------------------------------------------------------------------

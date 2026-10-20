@@ -44,7 +44,7 @@ yesterday but archived today.
 
 Blocker codes (first failing check wins):
   not_live          — catalog_products.sync_status is not 'live' (stale/archived)
-  non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
+  non_core_product  — sample/gift card/protection/donation/tip/deposit/GWP row, not a product
   no_seed           — no external seed and no APV-backed source document
   no_extraction     — a source row exists but no usable source title/document
   not_scored        — content_quality_score IS NULL (never scored; NOT a quality verdict)
