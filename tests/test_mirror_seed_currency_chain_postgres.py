@@ -89,6 +89,11 @@ def _run(db_url, monkeypatch, body):
     import scripts.mirror_external_seeds_to_catalog_products as mirror
     import services.external_offer_dual_write as dual_write
 
+    # The writer caches price_check_column_present() for the process. Start this DB's answer fresh,
+    # and leave the process's cache as it was found (monkeypatch restores both keys).
+    monkeypatch.setitem(dual_write._price_check_column, "present", False)
+    monkeypatch.setitem(dual_write._price_check_column, "checked", None)
+
     async def go():
         db = Database(db_url)
         await db.connect()
@@ -194,3 +199,48 @@ def test_m3_sync_reads_the_page_currency_through_its_own_projection(db_url, monk
     result, (_skus, offers) = _run(db_url, monkeypatch, body)
     assert result["status"] == "refused_currency" and "page read AUD" in result["error"]
     assert offers == []
+
+
+@pytest.mark.parametrize("label, seed_data, expected", [
+    ("snapshot as a JSON string", {"snapshot": '{"price_currency": "USD"}'}, "refused_currency"),
+    ("snapshot as an array", {"snapshot": ["USD"]}, "refused_currency"),
+    ("snapshot as a number", {"snapshot": 7}, "refused_currency"),
+    ("snapshot as a boolean", {"snapshot": True}, "refused_currency"),
+    ("seed_data as a JSON string", '{"snapshot": {"price_currency": "USD"}}', "refused_currency"),
+    ("seed_data as an array", [1, 2], "refused_currency"),
+    ("seed_data as a number", 7, "refused_currency"),
+    ("snapshot currency 0", {"snapshot": {"price_currency": 0}}, "refused_currency"),
+    ("snapshot currency false", {"snapshot": {"price_currency": False}}, "refused_currency"),
+    ("an agreeing object snapshot", {"snapshot": {"price_currency": "USD"}}, "synced"),
+    ("no snapshot: the column stands", {}, "synced"),
+])
+def test_sync_writes_only_what_the_readers_would_serve(db_url, monkeypatch, label, seed_data, expected):
+    """PR controller review of #2652: the sync path read only the projected snapshot currency, which a
+    driver flattens to NULL for a snapshot that is not an object, so it WROTE offers every reader then
+    withholds. It now projects the readers' own answer (seed_currency_sql) and refuses those."""
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    slug = "".join(ch for ch in label if ch.isalnum())[:24]
+    pk = f"prod::merch_obs_9cbce09d1019844b::external_seed::ext_shape_{slug}"
+    seed_id = f"eps_shape_{slug}"
+
+    async def body(db, _mirror, dual_write):
+        await db.execute(
+            "INSERT INTO external_product_seeds (id, external_product_id, destination_url, canonical_url, domain, price_amount, "
+            " price_currency, availability, market, status, seed_data) VALUES (:id, :ext, :url, :url, 'skintific.com', "
+            " 23.56, 'USD', 'in_stock', 'US', 'active', CAST(:sd AS jsonb))",
+            {"id": seed_id, "ext": f"ext_shape_{slug}", "url": f"https://skintific.com/products/{slug}", "sd": json.dumps(seed_data)})
+        await _mirror_product(db, pk)
+        await db.execute("UPDATE catalog_products SET source_ref = :sid WHERE product_key = :pk", {"sid": seed_id, "pk": pk})
+        await db.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id, title) "
+            "VALUES (:sk, :pk, :m, 'external_seed', :spid, :pk, 'Glow Cushion Set')",
+            {"sk": f"{pk}::canonical", "pk": pk, "m": SELLER, "spid": f"ext_shape_{slug}"})
+        result = await dual_write.sync_offer_for_seed(seed_id)
+        return result, await _chain_rows(db, pk)
+
+    result, (_skus, offers) = _run(db_url, monkeypatch, body)
+    assert result["status"] == expected, (label, result)
+    if expected == "refused_currency":
+        assert offers == []
+    else:
+        assert [(o["currency"], float(o["list_price"])) for o in offers] == [("USD", 23.56)]

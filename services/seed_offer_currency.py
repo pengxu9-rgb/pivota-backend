@@ -45,7 +45,25 @@ SEED_PROJECTED_OFFER_SOURCE_SYSTEMS = (
 
 
 def _code(value: Any) -> Optional[str]:
-    text = str(value or "").strip().upper()
+    """A currency the way the SQL reads one, `nullif(upper(trim(<text>)), '')`.
+
+    - trim() strips SPACES only, so a tab or a newline is kept, and "\tUSD" is not "USD", as in SQL.
+    - A JSON number, boolean, array or object is text to `#>>` ('0', 'false', '["USD"]'). Such a
+      currency is stated, not absent, so it disagrees with the offer and nothing falls back to the
+      column."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        text = json.dumps(value)
+    elif isinstance(value, (list, dict)):
+        text = json.dumps(value)
+    elif isinstance(value, bytes):
+        text = value.decode("utf-8", "replace")
+    else:
+        text = str(value)
+    text = text.strip(" ").upper()
     return text or None
 
 
@@ -98,6 +116,11 @@ def seed_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
     """The seed's own currency: its column and its page read when they agree, whichever is stated
     when only one is, and None when they disagree, neither is stated, or the payload hides the page
     read (the same answer as seed_currency_sql)."""
+    if "seed_currency" in seed:
+        # The SQL's own answer (seed_currency_sql), projected by the caller: authoritative, because
+        # only the SQL sees the jsonb types a driver flattens (a snapshot stored as a JSON string, an
+        # array seed_data). The sync path projects it (external_offer_dual_write._SEED_OFFER_COLUMNS).
+        return _code(seed.get("seed_currency"))
     column = _code(seed.get("price_currency"))
     page = snapshot_currency_of(seed)
     if column and page and column != page:
@@ -120,15 +143,16 @@ def seed_currency_sql(alias: str) -> str:
     ONE detoast of seed_data on the common path: seed_data is ~25 KB and TOASTed, and every reference
     re-detoasts it (a four-reference form cost +30-35% on scoped recall, spccy6/7-1019). A simple CASE
     evaluates its test once, `#>>` yields NULL through a non-object, and only a seed with no snapshot
-    currency pays the type checks."""
+    currency pays the type checks. The no-page-read sentinel is '', which neither side can equal: both are
+    nullif(..., ''), as in the gateway (PIVOTA-Agent#2467, f071754a8)."""
     column = f"nullif(upper(trim({alias}.price_currency)), '')"
     page = f"nullif(upper(trim({alias}.seed_data#>>'{{snapshot,price_currency}}')), '')"
     snapshot = f"{alias}.seed_data->'snapshot'"
     return (
         f"(CASE WHEN {column} IS NULL THEN {page}"
-        f" ELSE (CASE coalesce({page}, '~')"
+        f" ELSE (CASE coalesce({page}, '')"
         f" WHEN {column} THEN {column}"
-        f" WHEN '~' THEN (CASE WHEN {alias}.seed_data IS NULL"
+        f" WHEN '' THEN (CASE WHEN {alias}.seed_data IS NULL"
         f" OR (jsonb_typeof({alias}.seed_data) IN ('object', 'null')"
         f" AND ({snapshot} IS NULL OR jsonb_typeof({snapshot}) IN ('object', 'null')))"
         f" THEN {column} END)"

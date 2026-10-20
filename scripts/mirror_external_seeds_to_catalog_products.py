@@ -1994,6 +1994,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "legacy_external_seed_catalog_rows",
         "catalog_products_visible_quality_with_sig",
         "inserted_catalog_products",
+        "chain_refused_currency",
         "post_apply_missing_catalog_products",
         "post_apply_catalog_products_total",
         "post_apply_catalog_products_with_sig",
@@ -2065,6 +2066,9 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
             report["totals"] = {
                 **before_totals,
                 "inserted_catalog_products": inserted,
+                # Seeds whose chain was refused for want of a currency they can vouch for
+                # (services/seed_offer_currency): not failures, but a count worth watching.
+                "chain_refused_currency": apply_result.get("chain_refused_currency", 0),
                 "post_apply_missing_catalog_products": after_totals.get("missing_catalog_products"),
                 "post_apply_catalog_products_total": after_totals.get("catalog_products_total"),
                 "post_apply_catalog_products_with_sig": after_totals.get("catalog_products_with_sig"),

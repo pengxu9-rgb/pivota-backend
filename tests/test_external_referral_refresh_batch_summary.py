@@ -393,6 +393,20 @@ def test_a_currency_refusal_counts_as_structural(monkeypatch):
     assert summary["status"] == "success"
 
 
+@pytest.mark.parametrize("refused, wrote, status", [
+    (30, 70, "degraded"),   # 30% of attempts refused: reads stopped agreeing with the stored column
+    (12, 88, "success"),    # 12% but under the 20-refusal floor: a small night, not a spike
+    (25, 275, "success"),   # 25 refusals is past the floor, but 8.3% of attempts is the baseline's shape
+])
+def test_a_currency_refusal_spike_degrades(monkeypatch, refused, wrote, status):
+    """2026-10-19's baseline: 1,254 of 26,950 active seeds (~4.7%) refuse. Above twice that share
+    (10%), with at least 20 refusals, the night is degraded even though the attached lane wrote."""
+    rows = [_structural(status="refused_currency") for _ in range(refused)] + [_wrote() for _ in range(wrote)]
+    summary = _run(monkeypatch, rows, limit=refused + wrote)
+    assert summary["projections_refused_currency"] == refused
+    assert summary["status"] == status
+
+
 def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
     """Structural skips leave the denominator; the rest still have to land something while
     prices move."""

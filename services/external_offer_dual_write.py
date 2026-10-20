@@ -45,7 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
-from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, snapshot_currency_of
+from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, seed_currency_sql, snapshot_currency_of
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -338,8 +338,9 @@ def seed_offer_currency_and_market(
             f"with its page read {page} (product_key={product_key})"
         )
     if seed_currency_of(row_dict) is None:
-        # A seed_data or snapshot that is not an object hides the page read: the readers withhold
-        # any offer projected off it, so the writer does not write one (seed_offer_currency).
+        # A seed_data or snapshot that is not an object hides the page read (or, on the sync path, the
+        # projected seed_currency says the seed states none): the readers withhold any offer
+        # projected off it, so the writer does not write one (seed_offer_currency).
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
             f"(product_key={product_key})"
@@ -497,7 +498,11 @@ _SEED_OFFER_COLUMNS = (
     "seed_data -> 'snapshot' -> 'variants' AS snapshot_variants, "
     "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status, "
     # The page-read currency the offer writer checks the column against (services/seed_offer_currency).
-    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency"
+    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency, "
+    # ...and the seed's currency AS THE READERS COMPUTE IT. Only the SQL sees a snapshot or seed_data
+    # stored as a JSON string, array, number or boolean (the projection above flattens it to NULL), so
+    # without this the sync wrote offers that every reader then withholds (PR controller, #2652).
+    f"{seed_currency_sql('external_product_seeds')} AS seed_currency"
 )
 
 # ── the attached lane ────────────────────────────────────────────────────────────────────────────
