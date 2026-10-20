@@ -188,6 +188,78 @@ async def test_mirror_apply_writes_the_seed_host_into_source_domain(monkeypatch,
     assert [row["source_domain"] for row in fake.product_inserts] == [expected]
 
 
+@pytest.mark.parametrize("seed_fields, refused", [
+    # skintific.com's shape: column USD over a page read in AUD -> no chain at all
+    ({"price_amount": 23.56, "price_currency": "USD", "seed_data": {"snapshot": {"brand": "Brand", "price_currency": "AUD"}}}, True),
+    # the agreeing control: both writes happen
+    ({"price_amount": 56, "price_currency": "AUD", "seed_data": {"snapshot": {"brand": "Brand", "price_currency": "AUD"}}}, False),
+])
+async def test_mirror_apply_refuses_the_whole_chain_and_counts_it(monkeypatch, seed_fields, refused) -> None:
+    """BEHAVIOURAL: one real `_apply` pass (PR controller review of #2652: restoring the old direct sku
+    and offer upserts in `_apply` survived every test). A seed with no currency it can vouch for writes
+    neither its canonical sku nor its offer, and the pass counts it in `chain_refused_currency`."""
+    seed_row = {
+        "id": "seed_apply_ccy", "external_product_id": "ext_apply_ccy", "attached_product_key": None,
+        "market": "US", "tool": "*", "title": "Glow Cushion Set", "availability": "in_stock",
+        "image_url": None, "updated_at": None, "duplicate_count": 1, "rn": 1, "mirrored_description": "A set.",
+        "mirrored_brand": "Brand", "mirrored_product_type": "Serum", "mirrored_category": "skincare",
+        "domain": "brand.com", "canonical_url": "https://brand.com/products/set", "destination_url": None,
+        **seed_fields,
+    }
+    fake = _MirrorApplyDb(seed_row)
+    writes = []
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _seller(**kwargs):
+        return "merch_obs_apply"
+
+    def _record(kind):
+        async def _write(product_key, row_dict, merchant_id=None):
+            writes.append(kind)
+        return _write
+
+    import services.product_group_autogrouper as autogrouper
+    monkeypatch.setattr(mirror_module, "database", fake)
+    monkeypatch.setattr(mirror_module, "ensure_observed_seller", _seller)
+    monkeypatch.setattr(autogrouper, "ensure_singleton_group_membership", _noop)
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_sku_for_mirror_row", _record("sku"))
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_offer_for_mirror_row", _record("offer"))
+    monkeypatch.setattr(mirror_module, "backlink_seed_to_product", _noop)
+    monkeypatch.setattr(mirror_module, "_make_servable_enabled", lambda: False)
+    result = await mirror_module._apply(limit=1)
+    assert len(fake.product_inserts) == 1
+    assert writes == ([] if refused else ["sku", "offer"])
+    assert result["chain_refused_currency"] == (1 if refused else 0)
+
+
+async def test_mirror_run_reports_the_chain_refusals(monkeypatch) -> None:
+    """`_apply`'s refusal count reaches the --apply report's totals (PR controller review of #2652:
+    it was counted and then dropped). A night of refusals is visible next to `inserted_catalog_products`."""
+    import argparse
+
+    class _Db:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+    async def _report(**kwargs):
+        return {"ok": True, "totals": {"legacy_external_seed_catalog_rows": 0}, "warnings": []}
+
+    async def _apply(limit):
+        return {"inserted": 3, "vertical_guard": {}, "chain_refused_currency": 2}
+
+    monkeypatch.setattr(mirror_module, "database", _Db())
+    monkeypatch.setattr(mirror_module, "_build_report", _report)
+    monkeypatch.setattr(mirror_module, "_apply", _apply)
+    report = await mirror_module._run(argparse.Namespace(sample_limit=0, limit=10, apply=True))
+    assert report["totals"]["inserted_catalog_products"] == 3
+    assert report["totals"]["chain_refused_currency"] == 2
+
+
 def test_mirror_insert_classifies_category_path() -> None:
     # A lip gloss resolves to the Lip Gloss subtype, not the Lipstick catch-all:
     # the classifier grew dedicated lip subtype patterns ahead of Lipstick.

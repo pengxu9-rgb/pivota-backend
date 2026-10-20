@@ -179,6 +179,40 @@ async def test_the_listing_rows_take_the_re_read_prices_and_nothing_else_moves(s
         assert not rows[oid]["checked"], oid
 
 
+@pytest.mark.parametrize("snapshot_sql", [
+    # skintific.com's shape: column USD, page read AUD.
+    "jsonb_set(seed_data, '{snapshot,price_currency}', '\"AUD\"')",
+    # a snapshot stored as a JSON string hides the page read: the readers price nothing off it.
+    "jsonb_set(seed_data, '{snapshot}', to_jsonb('{\"price_currency\": \"USD\"}'::text))",
+])
+async def test_a_seed_the_readers_cannot_price_reprices_and_stamps_nothing(scoped_db, monkeypatch, snapshot_sql):
+    """PR controller review of #2657 (H1): the attached lane compared only the column to each row, so a
+    seed whose column and page read disagree re-priced its USD rows and stamped them freshly checked
+    every night, rows every reader withholds. Through the real sync it is refused, counted as
+    `refused_currency`, and no row moves. (The other tests here are the agreeing control.)"""
+    await _load(scoped_db)
+    # The listing's rows as the variant backfill copied them off the seed: the rows the readers judge.
+    await scoped_db.execute("UPDATE catalog_offers SET source_system = 'variant_identity_backfill_v1' WHERE offer_id <> 'of_ulta'")
+    await scoped_db.execute(f"UPDATE external_product_seeds SET seed_data = {snapshot_sql} WHERE id = :id", {"id": SEED_ID})
+    result = await _sync(monkeypatch, scoped_db)
+    assert result["status"] == "refused_currency", result
+    rows = await _offers(scoped_db)
+    for oid in ("of_canon", "of_v1", "of_v2", "of_v999", "of_ulta"):
+        assert not rows[oid]["touched"] and not rows[oid]["checked"], oid
+
+
+async def test_enrichment_rows_of_such_a_seed_keep_mains_behaviour(scoped_db, monkeypatch):
+    """M2 of the #2657 review: rows the enrichment lane wrote are not judged by the reader guard, so a
+    seed whose column and page read disagree still re-prices them as on main. Whether to stop stamping
+    those fresh is a decision about served offers, kept out of this change."""
+    await _load(scoped_db)
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{snapshot,price_currency}', '\"AUD\"') WHERE id = :id",
+        {"id": SEED_ID})
+    result = await _sync(monkeypatch, scoped_db)
+    assert result["status"] == "synced" and result["offers_written"] == 3, result
+
+
 async def _read_sources(db):
     rows = await db.fetch_all("SELECT offer_id, offer_payload->>'price_read_source' AS src FROM catalog_offers")
     return {r["offer_id"]: r["src"] for r in rows}

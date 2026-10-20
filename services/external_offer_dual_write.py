@@ -45,7 +45,14 @@ from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
-from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, snapshot_currency_of
+from services.seed_offer_currency import (
+    SEED_PROJECTED_OFFER_SOURCE_SYSTEMS,
+    SeedOfferCurrencyRefused,
+    currency_code,
+    seed_currency_of,
+    seed_currency_sql,
+    snapshot_currency_of,
+)
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -68,7 +75,7 @@ OFFER_MODE = "redirect"
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
 # no_mirror_product, synced, refused_currency, error -- and, for an attached seed with no mirror
-# (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
+# (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed, refused_currency,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
 #
@@ -326,7 +333,9 @@ def seed_offer_currency_and_market(
         )
     if amount is None:
         return seed_currency_of(row_dict), market
-    column = str(row_dict.get("price_currency") or "").strip().upper() or None
+    # Normalised as the readers read it (currency_code: SQL's upper(trim()), spaces only), so the
+    # writer never stores a code the readers would read differently (PR controller review of #2657).
+    column = currency_code(row_dict.get("price_currency"))
     if not column:
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing a priced offer with no seed currency (product_key={product_key})"
@@ -337,14 +346,16 @@ def seed_offer_currency_and_market(
             f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
             f"with its page read {page} (product_key={product_key})"
         )
-    if seed_currency_of(row_dict) is None:
-        # A seed_data or snapshot that is not an object hides the page read: the readers withhold
-        # any offer projected off it, so the writer does not write one (seed_offer_currency).
+    currency = seed_currency_of(row_dict)
+    if currency is None:
+        # A seed_data or snapshot that is not an object hides the page read (or, on the sync path, the
+        # projected seed_currency says the seed states none): the readers withhold any offer
+        # projected off it, so the writer does not write one (seed_offer_currency).
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
             f"(product_key={product_key})"
         )
-    return column, market
+    return currency, market
 
 
 def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
@@ -497,7 +508,11 @@ _SEED_OFFER_COLUMNS = (
     "seed_data -> 'snapshot' -> 'variants' AS snapshot_variants, "
     "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status, "
     # The page-read currency the offer writer checks the column against (services/seed_offer_currency).
-    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency"
+    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency, "
+    # ...and the seed's currency AS THE READERS COMPUTE IT. Only the SQL sees a snapshot or seed_data
+    # stored as a JSON string, array, number or boolean (the projection above flattens it to NULL), so
+    # without this the sync wrote offers that every reader then withholds (PR controller, #2652).
+    f"{seed_currency_sql('external_product_seeds')} AS seed_currency"
 )
 
 # ── the attached lane ────────────────────────────────────────────────────────────────────────────
@@ -585,7 +600,7 @@ def max_price_ratio() -> float:
 
 
 ATTACHED_LISTING_OFFERS_SQL = """
-SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref,
+SELECT o.offer_id, o.sku_key, o.merchant_id, o.currency, o.source_ref, o.source_system,
        o.list_price, o.merchant_effective_price,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,
@@ -710,8 +725,8 @@ def plan_attached_listing_offer_writes(
 
     Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n},
     "refused": [row detail for review]}. Status is `no_listing_offer` / `listing_offer_suppressed`
-    (nothing this seed may write: structural), `ambiguous_listing_seller`, `currency_not_read`,
-    or `planned` (possibly with zero writes; the caller reports why).
+    / `refused_currency` (nothing this seed may write: structural), `ambiguous_listing_seller`,
+    `currency_not_read`, or `planned` (possibly with zero writes; the caller reports why).
     """
     from services.catalog_enrichment_agent.ingestion import variant_own_price
 
@@ -730,9 +745,22 @@ def plan_attached_listing_offer_writes(
     if source == "refresh" and not currency_read:
         # The page named no currency and the reader filled in the market's. Not a reading.
         return {"status": "currency_not_read", "writes": [], "skips": {}, "refused": []}
+    # A SEED WITH NO COLUMN CURRENCY WRITES NOTHING, as on main (every row was a currency_mismatch
+    # there). Kept explicit: seed_currency_of would otherwise take a lone page read and start writing
+    # seeds this lane never wrote (PR controller review of #2657, M1).
+    currency = currency_code(seed.get("price_currency"))
+    if not currency:
+        return {"status": "refused_currency", "writes": [], "skips": {}, "refused": []}
+    # THE ROWS THE READERS WITHHOLD ARE NOT RE-PRICED (PR controller review of #2657, H1). A seed whose
+    # column (USD) and page read (AUD) disagree, or whose payload hides the page read, states no
+    # currency of its own (seed_currency_of carries the SQL's answer on the sync path). Its
+    # SEED-PROJECTED rows, which every reader withholds, were re-priced and freshness-stamped every
+    # night. They are now skipped as `refused_currency`. Rows another writer owns (the enrichment
+    # lane's listing rows) are not judged by the reader guard and keep main's behaviour: whether to
+    # stop stamping those fresh too is a decision about served offers, not part of this change (M2).
+    seed_states_currency = seed_currency_of(seed) is not None
 
     ratio = max_ratio if max_ratio is not None else max_price_ratio()
-    currency = str(seed.get("price_currency") or "").strip().upper()
     all_variants_re_read = (
         source == "refresh" and str(seed.get("variant_refresh_status") or "") == "all_re_read"
     )
@@ -750,7 +778,7 @@ def plan_attached_listing_offer_writes(
         if vid in variant_prices:
             variant_refusals[vid] = "ambiguous_variant_identity"
             continue
-        own_currencies = {str(variant.get(k)).strip().upper() for k in ("price_currency", "currency")
+        own_currencies = {currency_code(variant.get(k)) for k in ("price_currency", "currency")
                           if variant.get(k)}
         if own_currencies and own_currencies != {currency}:
             variant_refusals[vid] = "variant_currency_mismatch"
@@ -769,14 +797,17 @@ def plan_attached_listing_offer_writes(
         skips[reason] = skips.get(reason, 0) + 1
 
     for offer in live:
+        if not seed_states_currency and str(offer.get("source_system") or "") in SEED_PROJECTED_OFFER_SOURCE_SYSTEMS:
+            _skip("refused_currency")
+            continue
         if offer.get("price_repaired"):
             # A generic listing read cannot supersede reviewed native-variant evidence.
             _skip("reviewed_price_repair")
             continue
-        if not currency or str(offer.get("currency") or "").strip().upper() != currency:
+        if currency_code(offer.get("currency")) != currency:
             _skip("currency_mismatch")
             continue
-        if offer.get("sku_currency") and str(offer["sku_currency"]).strip().upper() != currency:
+        if offer.get("sku_currency") and currency_code(offer["sku_currency"]) != currency:
             _skip("sku_currency_mismatch")
             continue
         if offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}":
@@ -806,6 +837,9 @@ def plan_attached_listing_offer_writes(
                             "current": current, "read": price, "currency": currency})
             continue
         writes.append({"offer_id": offer["offer_id"], "price": price, "currency": currency})
+    if not writes and skips and set(skips) == {"refused_currency"}:
+        # Every live row was one the readers withhold: the seed itself is refused, and counted so.
+        return {"status": "refused_currency", "writes": [], "skips": skips, "refused": refused}
     return {"status": "planned", "writes": writes, "skips": skips, "refused": refused}
 
 
@@ -834,12 +868,22 @@ async def sync_attached_listing_offers(
     plan = plan_attached_listing_offer_writes(
         seed, [dict(r) for r in rows or []], source=source, currency_read=currency_read
     )
-    if plan["status"] == "currency_not_read":
+    if plan["status"] in ("currency_not_read", "refused_currency"):
         logger.warning({
             "event": "external_offer_attached_refused",
-            "reason": "currency_not_read",
+            "reason": plan["status"],
             "seed_id": seed_id,
             "product_key": product_key,
+        })
+    elif plan["skips"].get("refused_currency"):
+        # A mixed listing: its seed-projected rows were refused beside rows that still write, so the
+        # seed reports `synced` and its refusals show only in offer_skips. Logged so they are seen.
+        logger.warning({
+            "event": "external_offer_attached_refused",
+            "reason": "refused_currency",
+            "seed_id": seed_id,
+            "product_key": product_key,
+            "rows_refused": plan["skips"]["refused_currency"],
         })
     for refused in plan.get("refused") or []:
         # WARNING, not INFO: prod drops module-logger INFO. One line per refused row, for review.
