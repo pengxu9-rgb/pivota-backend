@@ -82,6 +82,7 @@ from services.external_offer_dual_write import (
     seed_offer_amount,
     seed_offer_currency_and_market,
 )
+from services.seed_offer_currency import SeedOfferCurrencyRefused
 # ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md) + IDENTITY_REFERENCE
 # §3 Trap T3: Path B must mint a real per-brand observed seller-of-record at
 # ingestion instead of stuffing everything under the banned 'external_seed'
@@ -783,6 +784,24 @@ async def _upsert_canonical_sku_for_mirror_row(
     )
 
 
+async def _write_mirror_chain(product_key: str, row_dict: Dict[str, Any], *, merchant_id: str) -> str:
+    """The canonical sku and offer for one mirrored seed, or neither: "written" or "refused_currency".
+
+    Refused BEFORE any write (PR controller review of #2652). A priced seed with no currency or
+    market of its own, or whose column and page read disagree (services/seed_offer_currency),
+    writes neither its sku nor its offer, so no half-written chain is left behind. Any other
+    failure raises, as before.
+    """
+    try:
+        seed_offer_currency_and_market(product_key, row_dict, seed_offer_amount(row_dict))
+    except SeedOfferCurrencyRefused as refused:
+        print(f"REFUSED currency for product_key={product_key}: {refused}", file=sys.stderr)
+        return "refused_currency"
+    await _upsert_canonical_sku_for_mirror_row(product_key, row_dict, merchant_id=merchant_id)
+    await _upsert_canonical_offer_for_mirror_row(product_key, row_dict, merchant_id=merchant_id)
+    return "written"
+
+
 async def _upsert_canonical_offer_for_mirror_row(
     product_key: str,
     row_dict: Dict[str, Any],
@@ -1436,6 +1455,9 @@ async def _apply(limit: int) -> Dict[str, Any]:
         values,
     )
     inserted = 0
+    # Seeds whose chain was refused for want of a currency (or market) they can vouch for: counted
+    # apart from a failed write, which is a defect, where a refusal is the seed's shape.
+    chain_refused_currency = 0
     for row in rows or []:
         row_dict = dict(row)
         external_product_id = str(row_dict.get("external_product_id") or "")
@@ -1835,18 +1857,10 @@ async def _apply(limit: int) -> Dict[str, Any]:
         product_key_for_chain = product_key
         if product_key_for_chain:
             try:
-                # Refused BEFORE any chain write (PR controller review of #2652): a seed with no
-                # currency or market for its amount, or whose column and page read disagree, writes
-                # neither its canonical sku nor its offer, so no half-written chain is left behind.
-                seed_offer_currency_and_market(
-                    product_key_for_chain, row_dict, seed_offer_amount(row_dict)
-                )
-                await _upsert_canonical_sku_for_mirror_row(
+                if await _write_mirror_chain(
                     product_key_for_chain, row_dict, merchant_id=seller_merchant_id
-                )
-                await _upsert_canonical_offer_for_mirror_row(
-                    product_key_for_chain, row_dict, merchant_id=seller_merchant_id
-                )
+                ) == "refused_currency":
+                    chain_refused_currency += 1
             except Exception as exc:
                 # Don't break the whole apply if one row's chain fails
                 # — log and continue. The next --apply pass will retry
@@ -1938,7 +1952,7 @@ async def _apply(limit: int) -> Dict[str, Any]:
             "(set MIRROR_UNRESOLVED_VERTICAL_FAIL_THRESHOLD to adjust).",
             file=sys.stderr,
         )
-    return {"inserted": inserted, "vertical_guard": guard}
+    return {"inserted": inserted, "vertical_guard": guard, "chain_refused_currency": chain_refused_currency}
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:

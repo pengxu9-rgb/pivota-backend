@@ -66,16 +66,43 @@ def snapshot_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
     caller selected one, otherwise read out of seed_data.snapshot."""
     if "snapshot_price_currency" in seed:
         return _code(seed.get("snapshot_price_currency"))
-    snapshot = _as_dict(_as_dict(seed.get("seed_data")).get("snapshot"))
-    return _code(snapshot.get("price_currency"))
+    # seed_data itself may arrive as the driver's jsonb text, but a snapshot INSIDE it that is a
+    # string is a JSON string value: the SQL reads no page read through it, and neither does this.
+    snapshot = _as_dict(seed.get("seed_data")).get("snapshot")
+    return _code(snapshot.get("price_currency")) if isinstance(snapshot, Mapping) else None
+
+
+def _hides_the_page_read(seed: Mapping[str, Any]) -> bool:
+    """seed_data, or its snapshot, held as something other than a JSON object (or null): the SQL
+    cannot read a page read through it and states no currency, so the twin does the same. (A
+    JSON-encoded object string counts as an object, as the asyncpg/databases drivers hand jsonb
+    columns back as text.)"""
+    raw = seed.get("seed_data")
+    if raw is None:
+        return False
+    data = raw
+    if isinstance(raw, (str, bytes)):
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return True
+    if data is None:
+        return False
+    if not isinstance(data, Mapping):
+        return True
+    snapshot = data.get("snapshot")
+    return snapshot is not None and not isinstance(snapshot, Mapping)
 
 
 def seed_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
     """The seed's own currency: its column and its page read when they agree, whichever is stated
-    when only one is, and None when they disagree or neither is stated."""
+    when only one is, and None when they disagree, neither is stated, or the payload hides the page
+    read (the same answer as seed_currency_sql)."""
     column = _code(seed.get("price_currency"))
     page = snapshot_currency_of(seed)
     if column and page and column != page:
+        return None
+    if column and not page and "snapshot_price_currency" not in seed and _hides_the_page_read(seed):
         return None
     return column or page
 
@@ -145,11 +172,15 @@ def seed_currency_guard_enabled() -> bool:
     return str(os.getenv(SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG) or "").strip().lower() not in _GUARD_OFF
 
 
-def seed_projected_offer_guard_and_sql(offer_alias: str = "o", product_key_expr: str = "o.product_key") -> str:
-    """The guard as `AND (...)` for a reader's WHERE, or "" with the kill switch off."""
+def seed_projected_offer_guard_and_sql(
+    offer_alias: str = "o", product_key_expr: str = "o.product_key", *, prefix: str = "\n          "
+) -> str:
+    """The guard as `<prefix>AND (...)` for a reader's WHERE, or "" with the kill switch off. A
+    reader interpolates it at the END of its previous line, so "off" adds not even a blank line
+    and the statement is byte-identical to the pre-guard one."""
     if not seed_currency_guard_enabled():
         return ""
-    return f"AND {seed_projected_offer_in_seed_currency_sql(offer_alias, product_key_expr)}"
+    return f"{prefix}AND {seed_projected_offer_in_seed_currency_sql(offer_alias, product_key_expr)}"
 
 
 

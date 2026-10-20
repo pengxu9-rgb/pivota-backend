@@ -19,6 +19,13 @@ from services import seed_offer_currency as m
     ({"price_currency": "USD", "snapshot_price_currency": "QAR"}, None),
     ({"price_currency": "SGD", "seed_data": {"price_currency": "USD", "snapshot": {"price_currency": "SGD"}}}, "SGD"),
     ({"price_currency": None, "seed_data": {}}, None),
+    # A payload that hides the page read states none, as in the SQL (seed_currency_sql).
+    ({"price_currency": "USD", "seed_data": "not json"}, None),
+    ({"price_currency": "USD", "seed_data": [1, 2]}, None),
+    ({"price_currency": "USD", "seed_data": 7}, None),
+    ({"price_currency": "USD", "seed_data": {"snapshot": '{"price_currency": "USD"}'}}, None),  # snapshot as a JSON string
+    ({"price_currency": "USD", "seed_data": '{"snapshot": {"price_amount": "1"}}'}, "USD"),  # jsonb as driver text
+    ({"price_currency": "USD", "seed_data": None}, "USD"),
 ])
 def test_seed_currency_is_known_only_when_column_and_page_read_agree(seed, expected):
     assert m.seed_currency_of(seed) == expected
@@ -26,7 +33,9 @@ def test_seed_currency_is_known_only_when_column_and_page_read_agree(seed, expec
 
 def test_the_reader_guard_is_on_unless_switched_off(monkeypatch):
     monkeypatch.delenv(m.SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG, raising=False)
-    assert m.seed_projected_offer_guard_and_sql().startswith("AND (coalesce(o.source_system")
+    assert m.seed_projected_offer_guard_and_sql().lstrip().startswith("AND (coalesce(o.source_system")
+    # Interpolated at the end of the previous line: the prefix is the newline and indent.
+    assert m.seed_projected_offer_guard_and_sql(prefix=" ").startswith(" AND (")
     for off in ("off", "0", "false", "No", " disabled "):
         monkeypatch.setenv(m.SEED_PROJECTED_OFFER_CURRENCY_GUARD_FLAG, off)
         assert m.seed_projected_offer_guard_and_sql() == ""

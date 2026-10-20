@@ -67,7 +67,7 @@ OFFER_MODE = "redirect"
 
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
-# no_mirror_product, synced, error -- and, for an attached seed with no mirror
+# no_mirror_product, synced, refused_currency, error -- and, for an attached seed with no mirror
 # (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
@@ -83,8 +83,13 @@ OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 # canonical for the listing it reads (none, or every one suppressed by a human or a quarantine). A night of these is the shape of the catalogue, not a failed write, so
 # the batch leaves them out of "a projection that should have written wrote nothing" -- on 09-27
 # `no_mirror_product` 2,220/2,220 failed the job while every one of them was this.
+#
+# `refused_currency` (2026-10-19) is one too: the seed states no currency (or market) it can vouch for
+# its amount in (services/seed_offer_currency), so the writer writes nothing rather than a default.
+# That is the seed's shape, not a failed write: 1,254 active seeds on 10-19, every night until a
+# read agrees with the column.
 OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
-    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed"}
+    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency"}
 )
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
@@ -331,6 +336,13 @@ def seed_offer_currency_and_market(
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
             f"with its page read {page} (product_key={product_key})"
+        )
+    if seed_currency_of(row_dict) is None:
+        # A seed_data or snapshot that is not an object hides the page read: the readers withhold
+        # any offer projected off it, so the writer does not write one (seed_offer_currency).
+        raise SeedOfferCurrencyRefused(
+            f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
+            f"(product_key={product_key})"
         )
     return column, market
 
