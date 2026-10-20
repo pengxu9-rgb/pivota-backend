@@ -158,6 +158,12 @@ on:
       # the `_postgres` glob, so a PR touching only them would not run the gate that runs them.
       - "tests/test_tierb_cart_link_eligibility.py"
       - "tests/test_tierb_cart_link_eligibility_job.py"
+      # tests/test_retailer_ingest_weekly_reenqueue_postgres.py runs the REAL drain stage through fixtures and
+      # helpers it imports from these four; none matches the `_postgres` glob, same reason as above.
+      - "tests/services/test_retailer_ingest_weekly_reenqueue_producer.py"
+      - "tests/services/test_retailer_ingest_markets_sg.py"
+      - "tests/services/test_retailer_ingest_markets_phase2.py"
+      - "tests/services/test_retailer_ingest_pipeline.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"

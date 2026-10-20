@@ -140,7 +140,77 @@ def max_leases_from_env() -> int:
     return 1
 
 
-async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None) -> Optional[Dict[str, Any]]:
+#: The drain shares ONE crawl NAT IP with the purchasability sweep (03:15-04:10Z) and the nightly refresh
+#: (05:15-06:10Z) and has no global pacer, so no stage may be RUNNING inside this UTC window (start
+#: inclusive, end exclusive). A claim is refused when the window is open, or when it opens within the
+#: claim's LEAD (the longest a stage may run: jobs.retailer_ingest_drain passes at least an hour), so a
+#: stage claimed before the window has ended by its start. The window only gates the claim, which takes no
+#: lease when it is refused, so nothing is stranded. "HH:MM-HH:MM" (may wrap midnight, at most
+#: MAX_CLAIM_BLACKOUT_MINUTES long) or "off". Unset = the default. A value that does not parse, or a window
+#: longer than that (swapped bounds read as a 20-hour window), keeps the DEFAULT window with a WARNING (fail
+#: closed: a typo must not let the drain crawl over the sweep, nor stop it for most of the day).
+CLAIM_BLACKOUT_ENV = "RETAILER_INGEST_CLAIM_BLACKOUT_UTC"
+DEFAULT_CLAIM_BLACKOUT = "03:00-06:30"
+MAX_CLAIM_BLACKOUT_MINUTES = 12 * 60
+_CLAIM_BLACKOUT_OFF = frozenset({"off", "none", "disabled"})
+_DAY_S = 24 * 3600
+
+
+def parse_claim_blackout(raw: str) -> Optional[tuple]:
+    """"HH:MM-HH:MM" -> (start_minute, end_minute) of the UTC day; "off" -> None. Raises ValueError
+    on anything else, including an empty window (start == end) and one longer than
+    MAX_CLAIM_BLACKOUT_MINUTES (e.g. swapped bounds, "06:30-03:00")."""
+    text = str(raw).strip().lower()
+    if text in _CLAIM_BLACKOUT_OFF:
+        return None
+    bounds = []
+    for part in text.split("-"):
+        hh, sep, mm = part.strip().partition(":")
+        if not (sep and hh.isdigit() and mm.isdigit() and len(mm) == 2 and 0 <= int(hh) <= 23
+                and 0 <= int(mm) <= 59):
+            raise ValueError(f"{CLAIM_BLACKOUT_ENV} must be HH:MM-HH:MM or off, got {raw!r}")
+        bounds.append(int(hh) * 60 + int(mm))
+    if len(bounds) != 2 or bounds[0] == bounds[1]:
+        raise ValueError(f"{CLAIM_BLACKOUT_ENV} must be two different HH:MM bounds, got {raw!r}")
+    if (bounds[1] - bounds[0]) % (24 * 60) > MAX_CLAIM_BLACKOUT_MINUTES:
+        raise ValueError(f"{CLAIM_BLACKOUT_ENV} {raw!r} is longer than {MAX_CLAIM_BLACKOUT_MINUTES // 60}h "
+                         f"(swapped bounds?)")
+    return bounds[0], bounds[1]
+
+
+def claim_blackout_from_env() -> Optional[tuple]:
+    raw = os.getenv(CLAIM_BLACKOUT_ENV)
+    if raw is None or not raw.strip():
+        return parse_claim_blackout(DEFAULT_CLAIM_BLACKOUT)
+    try:
+        return parse_claim_blackout(raw)
+    except ValueError as exc:
+        logger.warning("%s; keeping the default window %s", exc, DEFAULT_CLAIM_BLACKOUT)
+        return parse_claim_blackout(DEFAULT_CLAIM_BLACKOUT)
+
+
+def in_claim_blackout(now: datetime, window: Optional[tuple], lead_s: float = 0) -> bool:
+    """Is a claim at `now` (aware; compared in UTC) refused: inside the window, or within `lead_s` seconds
+    before it opens? None = no window."""
+    if not window:
+        return False
+    utc = now.astimezone(timezone.utc)
+    second = utc.hour * 3600 + utc.minute * 60 + utc.second
+    start, end = window[0] * 60, window[1] * 60
+    lead = min(max(0, int(lead_s)), _DAY_S - (end - start) % _DAY_S)
+    # Seconds since the refused span opened (the window start minus the lead), around the clock.
+    return (second - (start - lead)) % _DAY_S < (end - start) % _DAY_S + lead
+
+
+def format_claim_blackout(window: Optional[tuple]) -> str:
+    if not window:
+        return "off"
+    return "-".join(f"{m // 60:02d}:{m % 60:02d}" for m in window)
+
+
+async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = None,
+                        blackout: Optional[tuple] = None, now: Optional[datetime] = None,
+                        lead_s: float = 0) -> Optional[Dict[str, Any]]:
     """Claim ONE due job, or None. Up to `max_leases` stages run at once (default 1), never two at one
     host (a shared crawl IP stays polite to each store). Two applies at different hosts may both be
     claimed: an apply re-crawls and re-checks for minutes before it writes (2026-09-25: 244-2310 s per
@@ -154,9 +224,14 @@ async def claim_due_job(*, lease_seconds: int, max_leases: int = 1, db: Any = No
     second crawl on the same host. An execution that loses the lock exits idle; the next tick retries.
     This relies on READ COMMITTED (every statement takes a fresh snapshot), which is what prod runs;
     under REPEATABLE READ the snapshot would be the lock statement's and the race would return.
-    """
+
+    `blackout` (claim_blackout_from_env()) refuses the claim inside its UTC window, or `lead_s` before it,
+    before the claim statement runs: no lease is written, so a refused claim can strand nothing. None = no
+    window (the default here, so a caller that does not pass one is unchanged)."""
     if not 1 <= int(max_leases) <= MAX_LEASES_CEILING:
         raise ValueError(f"max_leases must be 1..{MAX_LEASES_CEILING}")
+    if in_claim_blackout(now or datetime.now(timezone.utc), blackout, lead_s):
+        return None
     write_db = db or database
     async with write_db.transaction():
         lane = await write_db.fetch_one(_CLAIM_LANE_LOCK_SQL)
