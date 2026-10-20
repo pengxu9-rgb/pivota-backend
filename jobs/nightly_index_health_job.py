@@ -91,6 +91,7 @@ from services.index_pipeline_state_service import (
     QUALITY_SCORE_THRESHOLD,
     _BATCH_QUERY,
     _UPSERT_QUERY,
+    eligibility_query,
     _classify_product,
     _coerce_dict,
     _extract_domain,
@@ -934,7 +935,7 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
         while True:
             try:
                 rows = await database.fetch_all(
-                    _BATCH_QUERY,
+                    eligibility_query(_BATCH_QUERY),
                     {"cursor": cursor, "batch_size": BATCH_SIZE},
                 )
             except Exception as exc:  # noqa: BLE001

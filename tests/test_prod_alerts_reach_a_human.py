@@ -243,6 +243,8 @@ def _summary_line(monkeypatch, capsys, stage, counts) -> str:
         return dict(counts)
 
     monkeypatch.setenv("RETAILER_INGEST_DRAIN_ENABLED", "1")
+    # the claim window (default 03:00-06:30Z) would make the line depend on the wall clock
+    monkeypatch.setenv("RETAILER_INGEST_CLAIM_BLACKOUT_UTC", "off")
     monkeypatch.setattr("sys.argv", ["drain"])
     monkeypatch.setattr(drain, "database", _DB())
     monkeypatch.setattr(drain.ledger, "claim_due_job", _claim)

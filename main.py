@@ -929,6 +929,15 @@ async def startup_event():
     # accepted requests but no worker tick ever drained the queue.
     # Log the exception with traceback so the boot-time failure is
     # visible in logs while preserving the best-effort contract.
+    # The effective CRAWL_FRESH switch and N, once per boot at WARNING (web and
+    # worker both run this startup), so a flip can be verified from the logs.
+    try:
+        from config.platform import service_name as _crawl_fresh_service_name
+        from services.catalog_row_trust_upserter import log_crawl_fresh_config
+        log_crawl_fresh_config(_crawl_fresh_service_name() or "web")
+    except Exception:  # noqa: BLE001 -- a log line never blocks boot
+        pass
+
     try:
         from services.audit_scheduler import start_scheduler
         await start_scheduler()
@@ -2151,6 +2160,16 @@ async def app_lifespan(_app: FastAPI):
     # purpose: during the 2026-08-05/06 incident every scheduler job was
     # wedged, and a repair mechanism must not share fate with what it repairs.
     reconnect_supervisor = asyncio.create_task(run_database_reconnect_supervisor())
+    # OFFERS_RESOLVE_GROUP_SEED_SIBLINGS=shadow only: a detached loop that refreshes the shadow's key
+    # set on its own TTL and logs `offers_resolve_group_shadow_cache`, so the shadow proves it is armed
+    # with no offers traffic. None (nothing started) in every other mode. Never blocks startup.
+    group_shadow_armer = None
+    try:
+        from routes.agent_shop_gateway import start_group_shadow_arming
+
+        group_shadow_armer = start_group_shadow_arming()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("group shadow arming not started: %s", exc)
     try:
         yield
     finally:
@@ -2160,6 +2179,10 @@ async def app_lifespan(_app: FastAPI):
         # shutdown()/shutdown_event() entirely (review round 20).
         with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
+        if group_shadow_armer is not None:
+            group_shadow_armer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await group_shadow_armer
         # ORDER IS LOAD-BEARING, and it was the wrong way round.
         #
         # `shutdown()` is `database.disconnect()`, which closes the asyncpg pool.
