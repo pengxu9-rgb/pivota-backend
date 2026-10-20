@@ -1,8 +1,8 @@
 """scripts/census_retailer_ingest_cohorts.py: its copies agree with the re-enqueue, its lines add up, and it
-can be passed inline (no at-sign, one read-only transaction)."""
+can be passed inline (no at-sign, one read-only transaction). The run on real Postgres is
+tests/test_census_retailer_ingest_cohorts_postgres.py (the dialect gate collects *_postgres.py only)."""
 import itertools
 import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,7 +35,7 @@ def test_the_constants_are_the_reenqueues_and_the_drains():
     assert census.SHIPS_TO_MARKET_FALSE == rq.SHIPS_TO_MARKET_FALSE
     assert census.DEFAULT_INTERVAL_HOURS == rq.DEFAULT_INTERVAL_HOURS
     window = ledger.parse_claim_blackout(ledger.DEFAULT_CLAIM_BLACKOUT)
-    assert census.DEFAULT_CLAIM_BLOCKED_MINUTES == window[1] - window[0] + drain.CLAIM_LEAD_FLOOR_SECONDS // 60
+    assert census.DEFAULT_CLAIM_BLOCKED_MINUTES == window[1] - window[0] + drain.DEFAULT_TASK_TIMEOUT_SECONDS // 60
 
 
 def _fragment(sql):
@@ -133,6 +133,35 @@ def test_the_ships_to_market_false_flag_is_the_reenqueues_skip(options, ships):
     assert line["ships_to_market"] is (ships if isinstance(ships, bool) else None)
 
 
+@pytest.mark.parametrize("options, ships", itertools.product(
+    [{"vendors": ["A"]}, {"vendors": ["A"], "market": "US"},
+     {"vendors": ["A"], "market": "US", "require_ships_to_market": True},
+     {"vendors": ["A"], "market": "SG", "source": "shopify_markets"}, {"vendors": ["A"], "market": "DE"}],
+    [True, False, None, "true"]))
+def test_the_ships_unverified_flag_is_the_reenqueues(options, ships):
+    job = {"id": "j1", "domain": "one.example.com", "brand": "A", "options": options, "status": "done",
+           "created_at": T0, "updated_at": T0, "lease_until": None, "last_applied_at": T0 + timedelta(days=1)}
+    run = _applied(ships=ships, market=options.get("market") if options.get("market") in ("US", "SG") else "US",
+                   currency="SGD" if options.get("market") == "SG" else "USD")
+    (line,) = census.cohort_lines([job], {"j1": run}, ledger.scope_key, NOW)
+    facts = {"j1": {"evidence": rq.evidence_from_run(run), "retired": False}}
+    decision = rq.plan_cohort(rq.cohort_key(job), [job], now=NOW, excluded=set(), facts=facts)
+    assert line[census.SHIPS_UNVERIFIED] is bool(decision.get(rq.SHIPS_UNVERIFIED))
+    assert census.SHIPS_UNVERIFIED == rq.SHIPS_UNVERIFIED
+
+
+def test_every_printed_line_carries_the_marker_and_parses():
+    lines = [{"kind": "cohort", "host": "a.example.com"}, {"kind": "host", "host": "a.example.com"},
+             {"kind": "total", "hosts": 1}]
+    out = census.render(lines)
+    assert len(out) == 3 and all(t.startswith(census.CENSUS_MARKER) for t in out)
+    assert [json.loads(t[len(census.CENSUS_MARKER):]) for t in out] == lines
+    assert census.CENSUS_MARKER == "retailer_ingest_cohort_census "
+    assert [json.loads(t[len(census.CENSUS_MARKER):])["kind"] for t in census.render(lines, cohorts_only=True)] == ["cohort"]
+    assert [json.loads(t[len(census.CENSUS_MARKER):])["kind"] for t in census.render(lines, hosts_only=True)] == [
+        "host", "total"]
+
+
 def _row(job_id, domain, brand, options, status, days):
     return {"id": job_id, "domain": domain, "brand": brand, "options": options, "status": status,
             "created_at": T0 + timedelta(days=days), "updated_at": T0 + timedelta(days=days, hours=2)}
@@ -171,6 +200,8 @@ def test_cohort_host_and_total_lines_add_up():
     assert "last_done_job_id" not in d and d["lineage"] == "open"
     e = by[("three.example.com", "E")]
     assert e[census.SHIPS_TO_MARKET_FALSE] is True and e["market"] == "US" and e["ships_to_market"] is False
+    # an explicit-market storefront cohort whose run never checked shipping: queued ungated, and counted
+    assert b[census.SHIPS_UNVERIFIED] is True and not a[census.SHIPS_UNVERIFIED] and not e[census.SHIPS_UNVERIFIED]
 
     rest = census.host_lines(lines, interval_hours=120, claim_blocked_minutes=270)
     hosts = {r["host"]: r for r in rest if r["kind"] == "host"}
@@ -178,7 +209,7 @@ def test_cohort_host_and_total_lines_add_up():
     one, two, three = hosts["one.example.com"], hosts["two.example.com"], hosts["three.example.com"]
     assert (one["cohorts"], one["done_cohorts"], one["explicit_market"], one["evidence_market"],
             one["market_unproven"], one["recrawl_cohorts"]) == (2, 2, 1, 1, 0, 2)
-    assert one["markets"] == {"SG": 1, "US": 1} and one["cycle_hours"] == 1.5
+    assert one["markets"] == {"SG": 1, "US": 1} and one["cycle_hours"] == 1.5 and one[census.SHIPS_UNVERIFIED] == 1
     assert one["projected_weekly_hours"] == round(1.5 * 168 / 120, 2) and one["ships_to_market"] == {"none": 1, "true": 1}
     assert (two["market_unproven"], two["unproven_reasons"], two["cycle_hours"], two["unproven_cycle_hours"]) == (
         1, {"no_applied_run": 1}, 0, 1.0)
@@ -187,6 +218,7 @@ def test_cohort_host_and_total_lines_add_up():
     assert (total["hosts"], total["cohorts"], total["cycle_hours"], total["market_unproven"],
             total[census.SHIPS_TO_MARKET_FALSE], total["interval_hours"]) == (3, 5, 1.5, 1, 1, 120)
     assert total["lane_hours_per_week_outside_claim_window"] == 136.5
+    assert total[census.SHIPS_UNVERIFIED] == 1  # b1 only: a ships-false cohort is skipped, not unverified
     assert census.host_lines(lines)[-1]["lane_hours_per_week_outside_claim_window"] == 136.5
 
 
@@ -194,70 +226,7 @@ def test_the_cli_refuses_a_non_postgres_url_and_a_bad_interval(monkeypatch, caps
     import asyncio
     monkeypatch.setenv("DATABASE_URL", "sqlite:///x.db")
     assert asyncio.run(census._main([])) == 2
+    (line,) = capsys.readouterr().out.splitlines()
+    assert json.loads(line[len(census.CENSUS_MARKER):])["kind"] == "error"
     with pytest.raises(SystemExit):
         asyncio.run(census._main(["--interval-hours", "168"]))
-
-
-# ------------------------------------------------------------------ real Postgres
-
-URL = os.getenv("DATABASE_URL", "")
-
-
-@pytest.mark.skipif(not URL.startswith("postgres"), reason="requires test Postgres")
-async def test_the_census_runs_read_only_on_postgres():
-    import asyncpg
-
-    if "test" not in URL.rsplit("/", 1)[-1]:
-        pytest.skip("writes fixture rows: a test database only")
-    url = URL.replace("postgresql+asyncpg://", "postgresql://")
-    conn = await asyncpg.connect(url)
-    host = "census-cohorts.example.com"
-    try:
-        await conn.execute((Path(__file__).resolve().parents[1] / "db/migrations/234_retailer_ingest_pipeline.sql").read_text())
-        opts = {"vendors": ["X"]}
-        await conn.execute(
-            "INSERT INTO retailer_ingest_jobs (id, domain, brand, options, scope_key, status, source) "
-            "VALUES ('rij_census_1', $1, 'X', $2::jsonb, $3, 'done', 'test_census')",
-            host, json.dumps(opts), ledger.scope_key(host, "X", opts))
-        await conn.execute(
-            "INSERT INTO retailer_ingest_runs (id, job_id, stage, outcome, crawl, checks, readback, started_at, finished_at) "
-            "VALUES ('rir_census_1', 'rij_census_1', 'apply', 'applied', $1::jsonb, $2::jsonb, $3::jsonb, "
-            "NOW() - interval '30 minutes', NOW())",
-            json.dumps({"storefront": {"currency": "USD"}, "presented_currency": {"pages_by_currency": {"USD": 2}},
-                        "pages": 3}),
-            json.dumps({"storefront": {"market": "US", "currency": "USD", "ships_to_market": True}, "kept": 1}),
-            json.dumps({"ok": True, "rows": [{"offers": 1, "offers_in_currency": 1, "offers_in_market": 1}]}))
-        # the crawling dry run: a held one counts (it crawled); a later throttled one does not
-        await conn.execute(
-            "INSERT INTO retailer_ingest_runs (id, job_id, stage, outcome, started_at, finished_at) VALUES "
-            "('rir_census_2', 'rij_census_1', 'dry_run', 'held', NOW() - interval '2 hours', "
-            "NOW() - interval '105 minutes'), "
-            "('rir_census_3', 'rij_census_1', 'dry_run', 'crawl_throttled', NOW() - interval '1 hour', NOW())")
-        opened, statements = [], []
-
-        class Spy:
-            """The real connection, recording the transaction it is asked for and every statement."""
-
-            def transaction(self, **kw):
-                opened.append(kw)
-                return conn.transaction(**kw)
-
-            async def execute(self, sql, *args):
-                statements.append(sql)
-                return await conn.execute(sql, *args)
-
-            async def fetch(self, sql, *args):
-                statements.append(sql)
-                return await conn.fetch(sql, *args)
-        lines = await census.census(Spy())
-        assert opened == [{"readonly": True, "isolation": "repeatable_read"}]
-        assert statements[0].startswith("SET LOCAL statement_timeout") and len(statements) == 3
-        (mine,) = [c for c in lines if c.get("host") == host and c["kind"] == "cohort"]
-        assert (mine["market"], mine["market_source"], mine["cycle_hours"], mine["ships_to_market"]) == (
-            "US", "evidence", 0.75, True)
-        assert 0 <= mine["applied_age_hours"] < 1
-        assert [ln for ln in lines if ln["kind"] == "total"]
-    finally:
-        await conn.execute("DELETE FROM retailer_ingest_runs WHERE job_id = 'rij_census_1'")
-        await conn.execute("DELETE FROM retailer_ingest_jobs WHERE id = 'rij_census_1'")
-        await conn.close()

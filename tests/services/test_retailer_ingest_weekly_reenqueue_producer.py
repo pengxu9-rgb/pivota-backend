@@ -116,28 +116,47 @@ async def test_an_explicit_market_whose_own_run_says_the_store_does_not_ship_the
     assert (decision["decision"], decision["reason"]) == ("skip", rq.SHIPS_TO_MARKET_FALSE)
 
 
-@pytest.mark.parametrize("ships_now, outcome, status", [
-    (["CA", "SG"], "store_does_not_ship_to_market", "nothing"),
-    (None, "ships_to_unverifiable", "failed"),
-])
-async def test_an_explicit_market_with_ships_unknown_is_queued_gated_and_the_drain_enforces_the_gate(
-        sg_lane, monkeypatch, ships_now, outcome, status):
+async def requeue(decision, catalog):
+    return await pipeline.run_stage({"id": "rij_requeued", "domain": decision["domain"], "brand": decision["brand"],
+                                     "status": "queued", "attempts": 0, "max_attempts": 6,
+                                     "options": decision["options"]}, db=catalog)
+
+
+async def test_an_explicit_market_with_ships_unknown_is_queued_ungated_so_its_recrawl_does_not_fail(
+        sg_lane, monkeypatch):
     env, catalog, applied, state = sg_lane
     state.store = usd_store(meta={**USD_META, "ships_to_countries": None})  # the run cannot say
     use_crawl(monkeypatch, state, presented("USD"))
     job, run = await produce(env, catalog, market="US")
     assert run["checks"]["storefront"]["ships_to_market"] is None
     decision, key = plan(job, run)
+    assert (decision["decision"], decision["market_source"], decision["ships_unverified"]) == ("enqueue", "explicit", True)
+    assert "require_ships_to_market" not in decision["options"]
+    # With the gate this re-crawl would end `failed` (ships_to_unverifiable) and stop the lineage; without it
+    # the real drain stage runs it as the human-named US job it always was.
+    out = await requeue(decision, catalog)
+    assert out["status"] == "apply_due"
+
+
+@pytest.mark.parametrize("ships_now, outcome, status", [
+    (["CA", "SG"], "store_does_not_ship_to_market", "nothing"),
+    (None, "ships_to_unverifiable", "failed"),
+])
+async def test_an_explicit_market_whose_run_says_it_ships_is_gated_and_the_drain_enforces_the_gate(
+        sg_lane, monkeypatch, ships_now, outcome, status):
+    env, catalog, applied, state = sg_lane
+    use_crawl(monkeypatch, state, presented("USD"))
+    job, run = await produce(env, catalog, market="US")
+    assert run["checks"]["storefront"]["ships_to_market"] is True
+    decision, key = plan(job, run)
     assert (decision["decision"], decision["market_source"]) == ("enqueue", "explicit")
-    assert decision["options"]["require_ships_to_market"] is True
+    assert decision["options"]["require_ships_to_market"] is True and "ships_unverified" not in decision
     assert ledger.scope_key(HOST, job["brand"], decision["options"]) == key
     # The queued job, run by the real drain stage against a store that does not (or will not say it does) ship
     # to the US: refused before anything is written.
     state.store = usd_store(meta={**USD_META, "ships_to_countries": ships_now})
     before = len(applied)
-    out = await pipeline.run_stage({"id": "rij_requeued", "domain": decision["domain"], "brand": decision["brand"],
-                                    "status": "queued", "attempts": 0, "max_attempts": 6,
-                                    "options": decision["options"]}, db=catalog)
+    out = await requeue(decision, catalog)
     assert (out["status"], out["outcome"]) == (status, outcome)
     assert len(applied) == before
 

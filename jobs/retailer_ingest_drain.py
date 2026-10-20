@@ -36,9 +36,10 @@ It does nothing unless RETAILER_INGEST_DRAIN_ENABLED=1, so creating the job is n
 CLAIM WINDOW (RETAILER_INGEST_CLAIM_BLACKOUT_UTC, default 03:00-06:30, "off" to disable): the drain shares
 the one crawl NAT IP with the purchasability sweep (03:15-04:10Z) and the nightly refresh (05:15-06:10Z) and
 has no global pacer, so no stage may still be crawling when the window opens. A claim is refused inside the
-window AND within a lead before it: the longest stage this execution has run, at least
-CLAIM_LEAD_FLOOR_SECONDS (an hour, the task timeout) -- so with the default window the last claim is just
-before 02:00, and every lane's stage has ended by 03:00. A refused tick reports outcome `claim_window`
+window AND within a lead before it: the longest stage this execution has run, at least the TASK TIMEOUT
+(--task-timeout / RETAILER_INGEST_TASK_TIMEOUT_SECONDS, 3600 s by default: no stage outlives its task) -- so
+with the default window and timeout the last claim is just before 02:00, and every lane's stage has ended by
+03:00. Raising the timeout moves the last claim earlier with it. A refused tick reports outcome `claim_window`
 (which ends the loop and still reports the lane's counts). The refusal happens before the claim statement,
 so no lease is taken and none can be stranded. The effective window is printed once per execution
 (`retailer_ingest_drain_config: `).
@@ -72,9 +73,10 @@ SUMMARY_MARKER = "retailer_ingest_drain: "
 
 #: The outcome of a tick inside the claim window: nothing claimed, the loop ends.
 CLAIM_WINDOW = "claim_window"
-#: A claim must leave at least this long before the window opens: the longest a stage runs is the task
-#: timeout (3600 s), and a stage claimed at 02:5x would otherwise crawl through the 03:15 sweep.
-CLAIM_LEAD_FLOOR_SECONDS = 3600
+#: The Cloud Run task timeout (setup_scheduler.sh: 3600 s) when neither --task-timeout nor
+#: RETAILER_INGEST_TASK_TIMEOUT_SECONDS says otherwise. It is also the claim lead's floor: a stage runs at most
+#: this long, and one claimed at 02:5x would otherwise crawl through the 03:15 sweep.
+DEFAULT_TASK_TIMEOUT_SECONDS = 3600
 #: One line per execution, before any claim: the window this execution enforces.
 CONFIG_MARKER = "retailer_ingest_drain_config: "
 
@@ -112,7 +114,7 @@ LEASE_SLACK_SECONDS = 600
 
 async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
                      clock: Callable[[], float] = time.monotonic, report: Callable[[Dict[str, Any]], None] = None,
-                     task_timeout_seconds: int = 3600, max_leases: int = 1,
+                     task_timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS, max_leases: int = 1,
                      claim_blackout: Optional[tuple] = None,
                      now: Optional[Callable[[], datetime]] = None) -> List[Dict[str, Any]]:
     """Stages back to back until nothing is due, the claim window opens, or the budget is spent. A budget
@@ -130,10 +132,11 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
         # The time left in THIS task: the lease and the stage's catalog-write deadline both come from it.
         time_left = max(0.0, task_timeout_seconds - (began - start))
         lease = min(lease_seconds, int(time_left) + LEASE_SLACK_SECONDS)
-        # No claim that could still be running when the window opens: the longest stage seen, an hour at least.
+        # No claim that could still be running when the window opens: the longest stage seen, and never less
+        # than the task timeout (the longest any stage can run).
         summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db, time_left_s=time_left,
                                    claim_blackout=claim_blackout, now=now,
-                                   claim_lead_s=max(longest, CLAIM_LEAD_FLOOR_SECONDS))
+                                   claim_lead_s=max(longest, task_timeout_seconds))
         ended = clock()
         # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
         summary["duration_s"] = round(ended - began, 1)
@@ -159,7 +162,8 @@ def main() -> int:
     parser.add_argument("--budget", type=int, default=int(os.getenv("RETAILER_INGEST_DRAIN_BUDGET_SECONDS", "0")))
     # The Cloud Run task timeout (setup_scheduler.sh: 3600s); Cloud Run does not expose it to the task.
     parser.add_argument("--task-timeout", type=int,
-                        default=int(os.getenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS", "3600")))
+                        default=int(os.getenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS",
+                                              str(DEFAULT_TASK_TIMEOUT_SECONDS))))
     # Stages in flight across overlapping executions; never two at one host. 1 = one at a time.
     parser.add_argument("--max-leases", type=int, default=ledger.max_leases_from_env())
     args = parser.parse_args()
@@ -174,7 +178,7 @@ def main() -> int:
 
     blackout = ledger.claim_blackout_from_env()
     print(CONFIG_MARKER + json.dumps({"claim_window": ledger.format_claim_blackout(blackout),
-                                      "claim_lead_floor_s": CLAIM_LEAD_FLOOR_SECONDS,
+                                      "claim_lead_floor_s": args.task_timeout,
                                       "max_leases": args.max_leases, "budget_s": args.budget}, sort_keys=True),
           flush=True)
 

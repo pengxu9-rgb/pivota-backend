@@ -47,12 +47,19 @@ PER COHORT, in order (the first that applies is the reported reason):
   exists            the insert met an open job created since the read (ON CONFLICT DO NOTHING).
 Everything else is enqueued: the latest done job's options (INCLUDING its accepted_flags, exclude_handles,
 refile_to_sets and retire_stale_brand, so the reviewer's earlier approvals apply to every re-crawl) +
-options.market + options.require_ships_to_market = true, priority 0, source "weekly_reenqueue:<that job's
-id>". require_ships_to_market makes the drain refuse the crawl (status `nothing`, or `failed` when the store
-does not state where it ships) unless the store's /meta.json ships to the job's market; it is not scope, so
-the cohort keeps its key. validate_options allows it on a storefront crawl only, so a shopify_markets
-capture (which checks shipping itself before any session) or an affiliate_feed cohort (no storefront to
-ask) is queued without it.
+options.market, priority 0, source "weekly_reenqueue:<that job's id>".
+
+THE SHIPS-TO GATE, by what the latest done job's newest applied run checked (checks.storefront.ships_to_market):
+  true      a storefront job also carries options.require_ships_to_market = true: the drain refuses the
+            crawl (status `nothing`) if the store stops shipping to the market. Not scope: the key holds.
+  false     skipped (ships_to_market_false), explicit market or not.
+  missing   (null, absent, or no applied run) an EXPLICIT-market cohort is queued WITHOUT the option -- a
+            human named its market, and with the option the drain would fail the crawl as
+            ships_to_unverifiable, raise the failed alert and end the lineage -- and is counted in the run
+            summary as `ships_unverified`. An evidence-derived market already required true.
+validate_options allows the option on a storefront crawl only, so a shopify_markets capture (which checks
+shipping itself before any session) or an affiliate_feed cohort (no storefront to ask) never carries it
+and is not counted. Options a done job already carried are copied as they were.
 
 THE MARKET, exactly:
   1. The latest done job's explicit options.market, when it is an ingest market.
@@ -139,6 +146,8 @@ NO_STORE_CURRENCY = "no_store_currency"
 CURRENCY_MARKET_MISMATCH = "currency_market_mismatch"
 SHIPS_TO_MARKET_UNPROVEN = "ships_to_market_unproven"
 SHIPS_TO_MARKET_FALSE = "ships_to_market_false"
+#: Queued (not a skip): an explicit-market storefront cohort whose last run never checked shipping.
+SHIPS_UNVERIFIED = "ships_unverified"
 #: The skips a human should see by name (the rest are the schedule working).
 NAMED_REASONS = (MARKET_UNPROVEN, INVALID_OPTIONS, SCOPE_CHANGED, FAILED_LINEAGE, RETIRED_HOST,
                  SHIPS_TO_MARKET_FALSE)
@@ -381,7 +390,8 @@ def plan_cohort(key: str, jobs: List[Dict[str, Any]], *, now: datetime, excluded
     fact = facts.get(done.get("id")) or {}
     if fact.get("retired"):
         return {**out, "reason": RETIRED_HOST}
-    if (fact.get("evidence") or {}).get("ships_to_market") is False:
+    ships = (fact.get("evidence") or {}).get("ships_to_market")
+    if ships is False:
         return {**out, "reason": SHIPS_TO_MARKET_FALSE}
     options = copy.deepcopy(_options(done.get("options")))
     market, source, why = derive_market(options, fact.get("evidence"))
@@ -390,8 +400,12 @@ def plan_cohort(key: str, jobs: List[Dict[str, Any]], *, now: datetime, excluded
     out.update(market=market, market_source=source)
     options["market"] = market
     if (options.get("source") or "storefront") == "storefront":
-        # From now on the drain itself refuses the crawl if the store does not ship to the market.
-        options["require_ships_to_market"] = True
+        if ships is True:
+            # From now on the drain itself refuses the crawl if the store does not ship to the market.
+            options["require_ships_to_market"] = True
+        elif not options.get("require_ships_to_market"):
+            # Explicit market, shipping never checked: queued as the human named it (see the docstring).
+            out["ships_unverified"] = True
     from services.retailer_ingest.pipeline import validate_options
     try:
         options = validate_options(options)
@@ -526,6 +540,7 @@ def summarize(decisions: List[Dict[str, Any]], *, dry_run: bool, now: datetime,
         "skipped": dict(sorted(skipped.items())),
         "market_source": dict(sorted(Counter(d.get("market_source") for d in taken).items())),
         "market_unproven_detail": dict(sorted(unproven.items())),
+        SHIPS_UNVERIFIED: sum(1 for d in taken if d.get(SHIPS_UNVERIFIED)),
         "named": named,
         "decisions": decisions,
     }
@@ -534,6 +549,7 @@ def summarize(decisions: List[Dict[str, Any]], *, dry_run: bool, now: datetime,
 def log_summary(summary: Dict[str, Any]) -> None:
     """ONE WARNING line per run (prod keeps WARNING from module loggers), without the per-cohort list."""
     line = {k: v for k, v in summary.items() if k != "decisions"}
-    line["queued"] = [{k: d.get(k) for k in ("host", "brand", "market", "market_source", "job_id")}
+    line["queued"] = [{k: d.get(k) for k in ("host", "brand", "market", "market_source", "job_id", SHIPS_UNVERIFIED)
+                       if k != SHIPS_UNVERIFIED or d.get(k)}
                       for d in summary.get("decisions") or [] if d["decision"] in ("enqueue", "would_enqueue")]
     logger.warning(SUMMARY_MARKER + json.dumps(line, default=str, sort_keys=True))

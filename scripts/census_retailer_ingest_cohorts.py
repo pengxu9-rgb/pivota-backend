@@ -8,11 +8,16 @@ Per cohort (db.retailer_ingest.scope_key, the key the open-job index is built on
   applied run checked: true / false / null), evidence_market and evidence_unproven (what the run's evidence
   shows, explicit or not), market + market_source (explicit first, then evidence, NEVER a default),
   market_unproven + unproven_reason, ships_to_market_false (the re-enqueue skips the cohort whatever its
-  market), cycle_hours (the latest crawling dry run -- clean or held -- plus the latest applied apply).
+  market), ships_unverified (an explicit-market storefront cohort whose run never checked shipping: queued
+  without options.require_ships_to_market), cycle_hours (the latest crawling dry run -- clean or held --
+  plus the latest applied apply).
 Then one line per host and one total line: counts of each of the above, the cycle hours of the cohorts the
 re-enqueue would re-crawl, those hours projected per week at the re-enqueue interval (--interval-hours,
 default 120: each cohort crawls 168 / interval times a week at most), and the lane hours a week leaves
 outside the drain's claim window and its one-hour lead (default 03:00-06:30, so 02:00-06:30).
+
+OUTPUT. Every line is CENSUS_MARKER followed by one JSON object, so a Cloud Run job's stdout lands in
+textPayload and is found by grepping the marker; strip the marker to parse the line.
 
 SAFETY. One READ ONLY transaction (REPEATABLE READ, so both queries read one snapshot) with SET LOCAL
 statement_timeout; it writes nothing and creates nothing. Prints JSON lines only. It carries no at-sign so
@@ -49,6 +54,8 @@ INGEST_MARKET_CURRENCY = {"US": "USD", "AU": "AUD", "JP": "JPY", "SG": "SGD"}
 OPEN_STATUSES = ("queued", "apply_due", "held")
 TERMINAL_AFTER_DONE = ("failed", "cancelled", "nothing")
 SHIPS_TO_MARKET_FALSE = "ships_to_market_false"
+SHIPS_UNVERIFIED = "ships_unverified"
+CENSUS_MARKER = "retailer_ingest_cohort_census "
 # The drain's default claim window (03:00-06:30) plus its one-hour claim lead.
 DEFAULT_CLAIM_BLOCKED_MINUTES = 210 + 60
 
@@ -230,11 +237,16 @@ def cohort_lines(jobs: List[Dict[str, Any]], runs: Dict[str, Dict[str, Any]], sc
             market, source, why = derive_market(options, evidence)
             seconds = sum(float(run.get(k) or 0) for k in ("dry_run_s", "apply_s"))
             ships = (evidence or {}).get("ships_to_market")
+            # COPY of weekly_reenqueue.plan_cohort's ships-to gate: a storefront cohort whose run never checked
+            # shipping is queued without the gate. Only an explicit market can get here (evidence required true).
+            unverified = (market is not None and ships is not True and ships is not False
+                          and (options.get("source") or "storefront") == "storefront"
+                          and not options.get("require_ships_to_market"))
             line.update({
                 "last_done_job_id": done["id"], "last_done_at": _at(done.get("updated_at") or done["created_at"]).isoformat(),
                 "explicit_market": options.get("market") not in (None, ""),
                 "ships_to_market": ships if isinstance(ships, bool) else None,
-                SHIPS_TO_MARKET_FALSE: ships is False,
+                SHIPS_TO_MARKET_FALSE: ships is False, SHIPS_UNVERIFIED: unverified,
                 "evidence_market": ev_market, "evidence_unproven": ev_why,
                 "market": market, "market_source": source or None, "market_unproven": market is None,
                 "unproven_reason": why, "cycle_hours": round(seconds / 3600.0, 3),
@@ -263,6 +275,7 @@ def host_lines(cohorts: List[Dict[str, Any]], *, interval_hours: int = DEFAULT_I
             "unproven_reasons": dict(sorted(Counter(r["unproven_reason"] for r in done if r["market_unproven"]).items())),
             "ships_to_market": dict(sorted(Counter(str(r["ships_to_market"]).lower() for r in done).items())),
             SHIPS_TO_MARKET_FALSE: sum(1 for r in done if r[SHIPS_TO_MARKET_FALSE]),
+            SHIPS_UNVERIFIED: sum(1 for r in recrawl if r[SHIPS_UNVERIFIED]),
             "markets": dict(sorted(Counter(r["market"] for r in done if r["market"]).items())),
             "lineage": dict(sorted(Counter(r["lineage"] for r in rows).items())),
             "recrawl_cohorts": len(recrawl),
@@ -303,7 +316,7 @@ async def _main(argv: List[str]) -> int:
         parser.error("--interval-hours must be 1..167")
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
     if not url.startswith("postgres"):
-        print(json.dumps({"kind": "error", "error": "DATABASE_URL must be Postgres"}))
+        print(CENSUS_MARKER + json.dumps({"kind": "error", "error": "DATABASE_URL must be Postgres"}))
         return 2
     conn = await asyncpg.connect(url)
     try:
@@ -311,11 +324,15 @@ async def _main(argv: List[str]) -> int:
                              claim_blocked_minutes=args.claim_blocked_minutes)
     finally:
         await conn.close()
-    for line in lines:
-        if (args.cohorts_only and line["kind"] != "cohort") or (args.hosts_only and line["kind"] == "cohort"):
-            continue
-        print(json.dumps(line, default=str, sort_keys=True))
+    for text in render(lines, cohorts_only=args.cohorts_only, hosts_only=args.hosts_only):
+        print(text, flush=True)
     return 0
+
+
+def render(lines: List[Dict[str, Any]], *, cohorts_only: bool = False, hosts_only: bool = False) -> List[str]:
+    """The printed lines: CENSUS_MARKER + one JSON object each."""
+    return [CENSUS_MARKER + json.dumps(line, default=str, sort_keys=True) for line in lines
+            if not ((cohorts_only and line["kind"] != "cohort") or (hosts_only and line["kind"] == "cohort"))]
 
 
 if __name__ == "__main__":

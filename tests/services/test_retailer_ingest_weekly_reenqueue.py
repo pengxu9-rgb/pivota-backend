@@ -114,12 +114,36 @@ async def test_an_explicit_market_is_copied_with_the_ships_to_gate_and_the_same_
     assert summary["enqueued"] == 1 and summary["market_source"] == {"explicit": 1}
 
 
-async def test_an_explicit_market_with_ships_unknown_is_still_queued_with_the_gate():
+async def test_an_explicit_market_with_ships_unknown_is_queued_without_the_gate_and_counted():
     options = {**BASE, "market": "US"}
     for runs in ({"rij_done": run(ships=None)}, {}):  # a run that cannot say, or no applied run at all
         db = FakeDB([mk("rij_done", options=options)], runs=runs)
-        decision = only(await go(db))
-        assert decision["decision"] == "enqueue" and decision["options"]["require_ships_to_market"] is True
+        summary = await go(db)
+        decision = only(summary)
+        assert decision["decision"] == "enqueue" and decision["ships_unverified"] is True
+        assert db.inserts[0]["options"] == options  # as the human named it: no gate the drain would fail on
+        assert summary[rq.SHIPS_UNVERIFIED] == 1
+
+
+async def test_a_gate_the_done_job_already_carried_is_kept_and_not_counted():
+    options = {**BASE, "market": "US", "require_ships_to_market": True}
+    db = FakeDB([mk("rij_done", options=options)], runs={"rij_done": run(ships=None)})
+    summary = await go(db)
+    assert db.inserts[0]["options"] == options and "ships_unverified" not in only(summary)
+    assert summary[rq.SHIPS_UNVERIFIED] == 0
+
+
+async def test_only_a_run_that_says_true_gates_the_job():
+    for ships, gated in ((True, True), (None, False)):
+        db = FakeDB([mk("rij_done", options={**BASE, "market": "US"})], runs={"rij_done": run(ships=ships)})
+        await go(db)
+        assert ("require_ships_to_market" in db.inserts[0]["options"]) is gated
+    # a string is not a ships-to answer the producer writes: unverified, never gated
+    bad = run()
+    bad["checks"]["storefront"]["ships_to_market"] = "true"
+    db = FakeDB([mk("rij_done", options={**BASE, "market": "US"})], runs={"rij_done": bad})
+    decision = only(await go(db))
+    assert "require_ships_to_market" not in db.inserts[0]["options"] and decision["ships_unverified"] is True
 
 
 async def test_any_cohort_whose_run_says_the_store_does_not_ship_there_is_skipped_before_the_market():
@@ -147,6 +171,9 @@ async def test_a_shopify_markets_capture_is_queued_without_the_storefront_only_g
     db = FakeDB([mk("rij_cap", options=options)], runs={"rij_cap": run(market="SG", currency="SGD")})
     decision = only(await go(db))
     assert decision["decision"] == "enqueue" and "require_ships_to_market" not in decision["options"]
+    assert "ships_unverified" not in decision  # a capture has no storefront gate to be unverified
+    db = FakeDB([mk("rij_cap", options=options)], runs={"rij_cap": run(market="SG", currency="SGD", ships=None)})
+    assert "ships_unverified" not in only(await go(db))
 
 
 @pytest.mark.parametrize("evidence, why", [
@@ -307,7 +334,7 @@ async def test_the_options_of_the_latest_done_job_are_the_ones_copied():
     db = FakeDB([mk("rij_a", options=old, created=NOW - timedelta(days=30)),
                  mk("rij_b", options=new, created=NOW - timedelta(days=20))])
     await go(db)
-    assert db.inserts[0]["options"] == {**new, "require_ships_to_market": True}
+    assert db.inserts[0]["options"] == new  # no applied run says it ships: queued ungated (ships_unverified)
 
 
 async def test_an_excluded_host_is_skipped_whatever_its_spelling():

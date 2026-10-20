@@ -50,8 +50,9 @@ async def db():
     try:
         await connection.execute((Path(__file__).resolve().parents[1] /
                                   "db/migrations/234_retailer_ingest_pipeline.sql").read_text())
-        # _RETIRED_SQL's seed predicate: only the columns it reads, idempotently (the gate shares one database).
-        await connection.execute("CREATE TABLE IF NOT EXISTS external_product_seeds (id text PRIMARY KEY);"
+        # _RETIRED_SQL's seed predicate: only the columns it reads, idempotently, and NO constraint (no key, no
+        # NOT NULL): the gate shares one database, and a later file may insert rows this table would refuse.
+        await connection.execute("CREATE TABLE IF NOT EXISTS external_product_seeds (id text);"
                                  "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS attached_product_key text;"
                                  "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS status text;")
     finally:

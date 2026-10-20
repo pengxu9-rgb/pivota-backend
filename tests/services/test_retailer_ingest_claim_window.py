@@ -197,20 +197,30 @@ async def test_the_last_claim_leaves_an_hour_before_the_window_and_the_stage_fin
                                        clock=lambda: next(clock), claim_blackout=WINDOW, now=lambda: next(times))
     assert [s["outcome"] for s in summaries] == ["clean", drain.CLAIM_WINDOW]
     assert stages == ["rij_1"]  # the in-flight stage ran to its end; nothing new was claimed
-    assert summaries[1]["claim_lead_s"] == drain.CLAIM_LEAD_FLOOR_SECONDS == 3600
+    assert summaries[1]["claim_lead_s"] == drain.DEFAULT_TASK_TIMEOUT_SECONDS == 3600
 
 
-async def test_the_lead_is_the_longest_stage_seen_when_that_is_longer_than_an_hour(monkeypatch):
+async def _leads(monkeypatch, *, task_timeout, stage_s):
     leads = []
 
     async def once(**kw):
         leads.append(kw["claim_lead_s"])
         return {"outcome": "clean", "jobs": {}}
     monkeypatch.setattr(drain, "drain_once", once)
-    # stage 1: 0 -> 5000 s (longer than the floor); stage 2 is then claimed with a 5000 s lead.
-    await drain.drain_loop(lease_seconds=4200, budget_seconds=11000, db=object(), task_timeout_seconds=9000,
-                           claim_blackout=WINDOW, clock=Script([0, 0, 5000, 5000, 6000]))
-    assert leads == [3600, 5000]
+    # stage 1 runs stage_s; stage 2 is claimed after it; the budget stops the loop there.
+    await drain.drain_loop(lease_seconds=4200, budget_seconds=2 * stage_s + 1000, db=object(),
+                           task_timeout_seconds=task_timeout, claim_blackout=WINDOW,
+                           clock=Script([0, 0, stage_s, stage_s, stage_s + 1000]))
+    return leads
+
+
+async def test_the_lead_floor_is_the_task_timeout_and_moves_with_it(monkeypatch):
+    assert await _leads(monkeypatch, task_timeout=3600, stage_s=900) == [3600, 3600]
+    assert await _leads(monkeypatch, task_timeout=7200, stage_s=900) == [7200, 7200]
+
+
+async def test_the_lead_is_the_longest_stage_seen_when_that_outlasts_the_task_timeout(monkeypatch):
+    assert await _leads(monkeypatch, task_timeout=4000, stage_s=5000) == [4000, 5000]
 
 
 async def test_without_a_window_the_loop_is_unchanged(monkeypatch):
@@ -224,8 +234,9 @@ async def test_without_a_window_the_loop_is_unchanged(monkeypatch):
     assert seen[0]["claim_blackout"] is None
 
 
-@pytest.mark.parametrize("env, window", [(None, (180, 390)), ("off", None), ("02:00-06:30", (120, 390))])
-def test_main_hands_the_env_window_to_the_loop(monkeypatch, capsys, env, window):
+@pytest.mark.parametrize("env, window, timeout", [(None, (180, 390), None), ("off", None, "5400"),
+                                                  ("02:00-06:30", (120, 390), "7200")])
+def test_main_hands_the_env_window_and_timeout_to_the_loop(monkeypatch, capsys, env, window, timeout):
     seen = []
 
     class DB:
@@ -236,9 +247,14 @@ def test_main_hands_the_env_window_to_the_loop(monkeypatch, capsys, env, window)
             return None
 
     async def loop(**kw):
-        seen.append(kw["claim_blackout"])
+        seen.append((kw["claim_blackout"], kw["task_timeout_seconds"]))
         return []
     capsys.readouterr()
+    if timeout is None:
+        monkeypatch.delenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS", timeout)
+    lead = int(timeout or 3600)
     if env is None:
         monkeypatch.delenv(ledger.CLAIM_BLACKOUT_ENV, raising=False)
     else:
@@ -248,10 +264,10 @@ def test_main_hands_the_env_window_to_the_loop(monkeypatch, capsys, env, window)
     monkeypatch.setattr(drain, "database", DB())
     monkeypatch.setattr(drain, "drain_loop", loop)
     assert drain.main() == 0
-    assert seen == [window]
+    assert seen == [(window, lead)]
     (config,) = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(drain.CONFIG_MARKER)]
     body = json.loads(config[len(drain.CONFIG_MARKER):])
-    assert body["claim_window"] == ledger.format_claim_blackout(window) and body["claim_lead_floor_s"] == 3600
+    assert body["claim_window"] == ledger.format_claim_blackout(window) and body["claim_lead_floor_s"] == lead
     assert not config.startswith(drain.SUMMARY_MARKER)  # the held/failed log metrics count summary lines only
 
 
