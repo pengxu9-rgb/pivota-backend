@@ -440,6 +440,10 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     global score-ordered generated queue. The cutoff feeds only the review step.
 #   RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative - the similar rail's backlog first
 #     (~3 nights); related_product (43,300 generated) after.
+#   RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true (Peng 2026-10-20, PIVOTA-Agent #2471) - the queue reviews the
+#     labels of anchors with no served alternative first, one per anchor per round, then the covered
+#     anchors by score. Only 5,933 of the 26,617 generated alternatives sat on the 2,616 uncovered
+#     anchors; the score-ordered top 3,000 reached 440 of them, this order reaches all 2,616.
 #   RELGRAPH_SYNC_REVIEW_LIMIT=10000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=16 - PREREQUISITE: a gateway
 #     image whose review-limit cap is 10,000 at every layer (PIVOTA-Agent: cron, sync routine, routine
 #     job, review script; before it, each silently capped 10,000 at 5,000). 16 is the gateway's maximum.
@@ -461,6 +465,7 @@ relgraph_sync_env(){
   if [ "$ENV" = prod ]; then
     env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=300,RELGRAPH_SYNC_REVIEW_LIMIT=10000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=16,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
     env="$env,RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false,RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z,RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative"
+    env="$env,RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true"
     env="$env,RELGRAPH_DB_DUTY_CYCLE=1"
     env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
     env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"

@@ -44,6 +44,8 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD": "false",
     "RELGRAPH_SYNC_CUTOFF": "2026-01-01T00:00:00Z",
     "RELGRAPH_SYNC_REVIEW_RELATION_TYPES": "competitive_alternative",
+    # 2026-10-20 (Peng, PIVOTA-Agent #2471): review anchors with no served alternative first.
+    "RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST": "true",
     # 2026-10-15: duty-cycle pacing (PIVOTA-Agent #2444), set by hand until 2026-10-20.
     "RELGRAPH_DB_DUTY_CYCLE": "1",
     "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED": "true",
