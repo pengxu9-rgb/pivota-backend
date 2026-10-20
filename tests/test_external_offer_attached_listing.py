@@ -149,8 +149,26 @@ def test_the_sg_row_takes_an_sgd_read_in_its_own_currency():
 
 
 def test_a_seed_with_no_currency_writes_nothing():
+    """No currency the seed can vouch for: refused before any row is planned, and counted with the
+    mirror lane's refusals (`refused_currency` is a structural skip)."""
     plan = _plan(_seed(price_currency=None), [_offer("of_canon")])
-    assert plan["writes"] == [] and plan["skips"] == {"currency_mismatch": 1}
+    assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+@pytest.mark.parametrize("over, status, writes", [
+    # skintific.com's shape on the sync path: column USD, page read AUD (projected).
+    ({"price_currency": "USD", "snapshot_price_currency": "AUD"}, "refused_currency", []),
+    # the readers' own answer, projected: the seed states none.
+    ({"price_currency": "USD", "snapshot_price_currency": None, "seed_currency": None}, "refused_currency", []),
+    # agreeing control: the USD row takes the seed's price.
+    ({"price_currency": "USD", "snapshot_price_currency": "USD", "seed_currency": "USD"}, "planned",
+     [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]),
+])
+def test_the_attached_lane_writes_only_in_the_seeds_own_currency(over, status, writes):
+    """PR controller review of #2657: this lane compared only the column to each row, so a seed whose
+    column and page read disagree re-priced and freshness-stamped rows every reader withholds."""
+    plan = _plan(_seed(**over), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"]) == (status, writes)
 
 
 @pytest.mark.parametrize("price", [None, 0, -1, "n/a"])

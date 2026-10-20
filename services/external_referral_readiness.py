@@ -245,7 +245,9 @@ def _max_structural_share() -> float:
 # A SPIKE IN CURRENCY REFUSALS (services/seed_offer_currency). A seed whose column and page read
 # disagree, or that states no currency, makes the offer writer write nothing (`refused_currency`, a
 # structural skip). On 2026-10-19 that was 1,254 of 26,950 active seeds, ~4.7%. A night sampling the
-# queue should refuse about that share. Twice it (10%) means reads started disagreeing with the
+# queue should refuse about that share of its ATTEMPTED projections: every attempted projection is one
+# seed, and both lanes (mirror and attached) refuse a seed with no currency of its own, so the
+# per-seed baseline and the per-attempt denominator measure the same thing. Twice it (10%) means reads started disagreeing with the
 # stored column (a geo-served storefront, an extractor regression), and those seeds silently stop
 # being priced. The structural-share rule cannot see it while the attached lane writes anything.
 # The minimum count keeps a tiny night (1 refusal in 5) from flapping.
@@ -254,21 +256,27 @@ _MIN_REFUSED_CURRENCY_COUNT_DEFAULT = 20
 
 
 def _max_refused_currency_share() -> float:
-    """EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE; >= 1 disables the rule."""
+    """EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE; >= 1 disables the rule.
+
+    Clamped: a share <= 0 (or not a number) would degrade every night that refuses anything, and a
+    degraded run exits 1 and fails the Cloud Run execution, so it falls back to the default."""
     raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE") or "").strip()
     try:
-        return float(raw) if raw else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+        value = float(raw) if raw else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
     except ValueError:
         return _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+    return value if math.isfinite(value) and value > 0 else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
 
 
 def _min_refused_currency_count() -> int:
-    """EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT: below this many refusals the share is noise."""
+    """EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT: below this many refusals the share is
+    noise. Clamped to >= 1 for the same reason as the share."""
     raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT") or "").strip()
     try:
-        return int(raw) if raw else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+        value = int(raw) if raw else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
     except ValueError:
         return _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+    return value if value >= 1 else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
 
 
 def batch_run_status(

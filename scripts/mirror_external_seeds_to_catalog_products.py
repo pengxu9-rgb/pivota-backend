@@ -82,7 +82,7 @@ from services.external_offer_dual_write import (
     seed_offer_amount,
     seed_offer_currency_and_market,
 )
-from services.seed_offer_currency import SeedOfferCurrencyRefused
+from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of
 # ADR-009 D2 (docs/adr/ADR-009-seller-of-record-identity.md) + IDENTITY_REFERENCE
 # §3 Trap T3: Path B must mint a real per-brand observed seller-of-record at
 # ingestion instead of stuffing everything under the banned 'external_seed'
@@ -773,7 +773,8 @@ async def _upsert_canonical_sku_for_mirror_row(
             "title": row_dict.get("title"),
             # The seed's own currency or none: never a USD default (Peng 2026-10-19). A
             # currency-less seed writes a currency-less sku, as its offer writes no price.
-            "currency": str(row_dict.get("price_currency") or "").strip().upper() or None,
+            # ...normalised and agreed exactly as the offer writer and the readers do (seed_currency_of).
+            "currency": seed_currency_of(row_dict),
             "image_url": row_dict.get("image_url"),
             "visible_attributes": json.dumps({}, ensure_ascii=False),
             "visible_option_labels": json.dumps([], ensure_ascii=False),

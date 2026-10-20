@@ -397,6 +397,9 @@ def test_a_currency_refusal_counts_as_structural(monkeypatch):
     (30, 70, "degraded"),   # 30% of attempts refused: reads stopped agreeing with the stored column
     (12, 88, "success"),    # 12% but under the 20-refusal floor: a small night, not a spike
     (25, 275, "success"),   # 25 refusals is past the floor, but 8.3% of attempts is the baseline's shape
+    (20, 80, "degraded"),   # the floor is inclusive (>= 20) ...
+    (19, 81, "success"),    # ... one under it is not
+    (20, 180, "success"),   # the share is strict: exactly 10% is not over it
 ])
 def test_a_currency_refusal_spike_degrades(monkeypatch, refused, wrote, status):
     """2026-10-19's baseline: 1,254 of 26,950 active seeds (~4.7%) refuse. Above twice that share
@@ -405,6 +408,53 @@ def test_a_currency_refusal_spike_degrades(monkeypatch, refused, wrote, status):
     summary = _run(monkeypatch, rows, limit=refused + wrote)
     assert summary["projections_refused_currency"] == refused
     assert summary["status"] == status
+
+
+@pytest.mark.parametrize("raw", ["-0.5", "0", "nan", "x"])
+def test_a_nonsense_refusal_share_falls_back_to_the_default(monkeypatch, raw):
+    """A negative or zero share would degrade every night that refuses anything, and a degraded run
+    fails the Cloud Run execution, so the env var is clamped."""
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE", raw)
+    rows = [_structural(status="refused_currency") for _ in range(25)] + [_wrote() for _ in range(275)]
+    assert _run(monkeypatch, rows, limit=300)["status"] == "success"
+
+
+async def _projected(monkeypatch, outcome):
+    """One seed's projection counters from the REAL helper (routes/employee_products), given what
+    sync_offer_for_seed returned, so the summary is fed exactly what production feeds it."""
+    import routes.employee_products as ep
+    import services.external_offer_dual_write as dual_write
+    import services.seed_data_writer as sdw
+
+    async def _sync(*args, **kwargs):
+        return dict(outcome)
+
+    async def _pdp(*args, **kwargs):
+        return "refreshed"
+
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setattr(dual_write, "sync_offer_for_seed", _sync)
+    monkeypatch.setattr(sdw, "refresh_agent_pdp_view_for_seed", _pdp)
+    return await ep._project_refreshed_seed_to_serving_surfaces("eps_x", price_source="refresh", currency_read=True)
+
+
+@pytest.mark.parametrize("lane_target", ["mirror", "attached"])
+def test_refusals_from_either_lane_reach_the_spike_rule_through_the_real_helper(monkeypatch, lane_target):
+    """`refused_currency` as the writer returns it, from the mirror lane or the attached lane (H1 of
+    the #2657 review), counted by the real per-seed helper and summarised by the real batch."""
+    refused = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "refused_currency"}))
+    wrote = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "synced", "target": lane_target}))
+    assert refused.get("skip_refused_currency") == 1 and wrote.get("wrote_" + lane_target) == 1
+
+    def _row(projection):
+        row = _ok(projected=0)
+        row["projection"] = dict(projection)
+        return row
+
+    summary = _run(monkeypatch, [_row(refused) for _ in range(30)] + [_row(wrote) for _ in range(70)], limit=100)
+    assert summary["projections_refused_currency"] == 30
+    assert summary["projection_structural_skips"] == 30
+    assert summary["status"] == "degraded"
 
 
 def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):

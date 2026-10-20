@@ -160,6 +160,29 @@ def test_m6_a_currency_less_seed_writes_a_currency_less_sku_never_usd(db_url, mo
     assert [(o["currency"], o["list_price"]) for o in offers] == [(None, None)]
 
 
+@pytest.mark.parametrize("label, column, seed_data", [
+    ("column and page read disagree", "USD", {"snapshot": {"price_currency": "AUD"}}),
+    ("column with a trailing newline", "USD\n", {"snapshot": {"price_currency": "USD"}}),
+])
+def test_an_unpriced_seed_carries_only_a_currency_the_readers_agree_with(db_url, monkeypatch, label, column, seed_data):
+    """PR controller review of #2657 (L1): the sku (and the unpriced offer) carry the seed's currency as
+    the readers compute it (seed_currency_of), never a column the readers would refuse, so neither a
+    disagreeing column nor one that differs only in trailing whitespace is written as 'USD'."""
+    slug = "".join(ch for ch in label if ch.isalnum())[:24]
+    pk = f"prod::merch_obs_9cbce09d1019844b::external_seed::ext_l1_{slug}"
+
+    async def body(db, mirror, _dual_write):
+        await _mirror_product(db, pk)
+        status = await mirror._write_mirror_chain(pk, _seed_row(
+            pk, price_amount=None, price_currency=column, seed_data=seed_data), merchant_id=SELLER)
+        return status, await _chain_rows(db, pk)
+
+    status, (skus, offers) = _run(db_url, monkeypatch, body)
+    assert status == "written"
+    assert [s["currency"] for s in skus] == [None]
+    assert [(o["currency"], o["list_price"]) for o in offers] == [(None, None)]
+
+
 def test_m6_control_a_priced_agreeing_seed_writes_its_own_currency(db_url, monkeypatch):
     pk = "prod::merch_obs_9cbce09d1019844b::external_seed::ext_m6_control"
 

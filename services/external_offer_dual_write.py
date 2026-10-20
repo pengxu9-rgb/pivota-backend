@@ -45,7 +45,13 @@ from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
-from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, seed_currency_sql, snapshot_currency_of
+from services.seed_offer_currency import (
+    SeedOfferCurrencyRefused,
+    currency_code,
+    seed_currency_of,
+    seed_currency_sql,
+    snapshot_currency_of,
+)
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -68,7 +74,7 @@ OFFER_MODE = "redirect"
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
 # no_mirror_product, synced, refused_currency, error -- and, for an attached seed with no mirror
-# (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
+# (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed, refused_currency,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
 #
@@ -326,7 +332,9 @@ def seed_offer_currency_and_market(
         )
     if amount is None:
         return seed_currency_of(row_dict), market
-    column = str(row_dict.get("price_currency") or "").strip().upper() or None
+    # Normalised as the readers read it (currency_code: SQL's upper(trim()), spaces only), so the
+    # writer never stores a code the readers would read differently (PR controller review of #2657).
+    column = currency_code(row_dict.get("price_currency"))
     if not column:
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing a priced offer with no seed currency (product_key={product_key})"
@@ -337,7 +345,8 @@ def seed_offer_currency_and_market(
             f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
             f"with its page read {page} (product_key={product_key})"
         )
-    if seed_currency_of(row_dict) is None:
+    currency = seed_currency_of(row_dict)
+    if currency is None:
         # A seed_data or snapshot that is not an object hides the page read (or, on the sync path, the
         # projected seed_currency says the seed states none): the readers withhold any offer
         # projected off it, so the writer does not write one (seed_offer_currency).
@@ -345,7 +354,7 @@ def seed_offer_currency_and_market(
             f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
             f"(product_key={product_key})"
         )
-    return column, market
+    return currency, market
 
 
 def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
@@ -696,8 +705,8 @@ def plan_attached_listing_offer_writes(
 
     Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n},
     "refused": [row detail for review]}. Status is `no_listing_offer` / `listing_offer_suppressed`
-    (nothing this seed may write: structural), `ambiguous_listing_seller`, `currency_not_read`,
-    or `planned` (possibly with zero writes; the caller reports why).
+    / `refused_currency` (nothing this seed may write: structural), `ambiguous_listing_seller`,
+    `currency_not_read`, or `planned` (possibly with zero writes; the caller reports why).
     """
     from services.catalog_enrichment_agent.ingestion import variant_own_price
 
@@ -716,9 +725,16 @@ def plan_attached_listing_offer_writes(
     if source == "refresh" and not currency_read:
         # The page named no currency and the reader filled in the market's. Not a reading.
         return {"status": "currency_not_read", "writes": [], "skips": {}, "refused": []}
+    # THE SEED'S OWN CURRENCY, AS THE READERS COMPUTE IT (PR controller review of #2657). This lane
+    # wrote whenever the column matched a row's currency: a seed whose column (USD) and page read (AUD)
+    # disagree re-priced and freshness-stamped its USD rows every night, rows every reader withholds.
+    # seed_currency_of carries the SQL's own answer on the sync path (the projected seed_currency), so
+    # a seed the readers cannot price is refused here too, and counted with the mirror lane's.
+    currency = seed_currency_of(seed)
+    if currency is None:
+        return {"status": "refused_currency", "writes": [], "skips": {}, "refused": []}
 
     ratio = max_ratio if max_ratio is not None else max_price_ratio()
-    currency = str(seed.get("price_currency") or "").strip().upper()
     all_variants_re_read = (
         source == "refresh" and str(seed.get("variant_refresh_status") or "") == "all_re_read"
     )
@@ -736,7 +752,7 @@ def plan_attached_listing_offer_writes(
         if vid in variant_prices:
             variant_refusals[vid] = "ambiguous_variant_identity"
             continue
-        own_currencies = {str(variant.get(k)).strip().upper() for k in ("price_currency", "currency")
+        own_currencies = {currency_code(variant.get(k)) for k in ("price_currency", "currency")
                           if variant.get(k)}
         if own_currencies and own_currencies != {currency}:
             variant_refusals[vid] = "variant_currency_mismatch"
@@ -759,10 +775,10 @@ def plan_attached_listing_offer_writes(
             # A generic listing read cannot supersede reviewed native-variant evidence.
             _skip("reviewed_price_repair")
             continue
-        if not currency or str(offer.get("currency") or "").strip().upper() != currency:
+        if currency_code(offer.get("currency")) != currency:
             _skip("currency_mismatch")
             continue
-        if offer.get("sku_currency") and str(offer["sku_currency"]).strip().upper() != currency:
+        if offer.get("sku_currency") and currency_code(offer["sku_currency"]) != currency:
             _skip("sku_currency_mismatch")
             continue
         if offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}":
@@ -817,10 +833,10 @@ async def sync_attached_listing_offers(
     plan = plan_attached_listing_offer_writes(
         seed, [dict(r) for r in rows or []], source=source, currency_read=currency_read
     )
-    if plan["status"] == "currency_not_read":
+    if plan["status"] in ("currency_not_read", "refused_currency"):
         logger.warning({
             "event": "external_offer_attached_refused",
-            "reason": "currency_not_read",
+            "reason": plan["status"],
             "seed_id": seed_id,
             "product_key": product_key,
         })

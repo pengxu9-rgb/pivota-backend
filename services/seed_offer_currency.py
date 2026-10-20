@@ -44,8 +44,13 @@ SEED_PROJECTED_OFFER_SOURCE_SYSTEMS = (
 )
 
 
-def _code(value: Any) -> Optional[str]:
-    """A currency the way the SQL reads one, `nullif(upper(trim(<text>)), '')`.
+def currency_code(value: Any) -> Optional[str]:
+    """A currency the way the SQL reads one, `nullif(upper(trim(<text>)), '')`. Public so every
+    writer compares and stores currencies exactly as the readers will read them.
+
+    Python's upper() and PostgreSQL's agree on ASCII but not everywhere else ('ß' upper-cases to 'SS'
+    in Python and stays 'ß' in Postgres). An ISO 4217 code is ASCII, so the only rows that can differ
+    are not currencies at all, and the readers refuse them either way.
 
     - trim() strips SPACES only, so a tab or a newline is kept, and "\tUSD" is not "USD", as in SQL.
     - A JSON number, boolean, array or object is text to `#>>` ('0', 'false', '["USD"]'). Such a
@@ -65,6 +70,9 @@ def _code(value: Any) -> Optional[str]:
         text = str(value)
     text = text.strip(" ").upper()
     return text or None
+
+
+_code = currency_code
 
 
 def _as_dict(value: Any) -> Mapping[str, Any]:
