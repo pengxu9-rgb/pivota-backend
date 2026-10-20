@@ -551,6 +551,7 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
     # Confidence must be NULL when price is — surfacing 0.6 confidence
     # on a missing-price row would be a lie.
     assert params["price_confidence"] is None
-    # Default currency falls back to USD so JOIN consumers don't choke
-    # on NULL string handling.
-    assert params["currency"] == "USD"
+    # No currency is ever defaulted (Peng 2026-10-19): an unpriced seed with no
+    # currency writes an unpriced offer with no currency, never a USD label.
+    assert params["currency"] is None
+    assert params["market"] == "US"

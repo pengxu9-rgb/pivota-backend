@@ -41,10 +41,11 @@ import os
 import re
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
+from services.seed_offer_currency import SeedOfferCurrencyRefused, seed_currency_of, snapshot_currency_of
 from services.storefront_currency import normalize_domain, plausible_domain
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ OFFER_MODE = "redirect"
 
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
-# no_mirror_product, synced, error -- and, for an attached seed with no mirror
+# no_mirror_product, synced, refused_currency, error -- and, for an attached seed with no mirror
 # (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
@@ -82,8 +83,13 @@ OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 # canonical for the listing it reads (none, or every one suppressed by a human or a quarantine). A night of these is the shape of the catalogue, not a failed write, so
 # the batch leaves them out of "a projection that should have written wrote nothing" -- on 09-27
 # `no_mirror_product` 2,220/2,220 failed the job while every one of them was this.
+#
+# `refused_currency` (2026-10-19) is one too: the seed states no currency (or market) it can vouch for
+# its amount in (services/seed_offer_currency), so the writer writes nothing rather than a default.
+# That is the seed's shape, not a failed write: 1,254 active seeds on 10-19, every night until a
+# read agrees with the column.
 OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
-    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed"}
+    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency"}
 )
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
@@ -290,6 +296,65 @@ MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_
 ))
 
 
+def seed_offer_currency_and_market(
+    product_key: str, row_dict: Dict[str, Any], amount: Optional[float]
+) -> Tuple[Optional[str], str]:
+    """The currency and market the mirror offer is written with: the seed's own, never a default.
+
+    Peng 2026-10-19: a market or currency is never defaulted. This writer used to bind
+    `price_currency or "USD"` and `market or "US"`; prod 2026-10-19 still serves USD mirror offers
+    stamped that way on seeds priced in SGD (nourwish.com, 23 serving products). So:
+
+      * no market on the seed: refused (the column's DEFAULT 'US' is not a declaration);
+      * an amount with no currency: refused, never labelled USD;
+      * an amount whose column currency disagrees with the page read (snapshot.price_currency): refused.
+        Either can be the wrong one (services/seed_offer_currency), so the amount has no known unit.
+
+    A refusal raises SeedOfferCurrencyRefused (a ValueError: every caller already logs and skips per
+    row; sync_offer_for_seed reports it as `refused_currency`). Nothing is written, and the offer
+    already stored is left alone. The readers (gateway search, agent_pdp_view) refuse a projected
+    offer whose currency is not the seed's. A seed with no amount writes an unpriced offer, carrying
+    the seed's currency only when its column and page read agree (or one is stated alone).
+
+    Public so the mirror's chain write can run it BEFORE its canonical-sku upsert, and a refused seed
+    leaves no half-written chain behind.
+    """
+    market = str(row_dict.get("market") or "").strip().upper()
+    if not market:
+        raise SeedOfferCurrencyRefused(
+            f"external_offer_dual_write: refusing offer write with no seed market (product_key={product_key})"
+        )
+    if amount is None:
+        return seed_currency_of(row_dict), market
+    column = str(row_dict.get("price_currency") or "").strip().upper() or None
+    if not column:
+        raise SeedOfferCurrencyRefused(
+            f"external_offer_dual_write: refusing a priced offer with no seed currency (product_key={product_key})"
+        )
+    page = snapshot_currency_of(row_dict)
+    if page and page != column:
+        raise SeedOfferCurrencyRefused(
+            f"external_offer_dual_write: refusing offer write: seed price_currency {column} disagrees "
+            f"with its page read {page} (product_key={product_key})"
+        )
+    if seed_currency_of(row_dict) is None:
+        # A seed_data or snapshot that is not an object hides the page read: the readers withhold
+        # any offer projected off it, so the writer does not write one (seed_offer_currency).
+        raise SeedOfferCurrencyRefused(
+            f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
+            f"(product_key={product_key})"
+        )
+    return column, market
+
+
+def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
+    raw_price = row_dict.get("price_amount")
+    try:
+        return float(raw_price) if raw_price is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
@@ -345,11 +410,8 @@ async def upsert_catalog_offer_from_seed_row(
     else:
         offer_type_value = None
         is_first_party_value = False
-    raw_price = row_dict.get("price_amount")
-    try:
-        list_price_value = float(raw_price) if raw_price is not None else None
-    except (TypeError, ValueError):
-        list_price_value = None
+    list_price_value = seed_offer_amount(row_dict)
+    currency_value, market_value = seed_offer_currency_and_market(product_key, row_dict, list_price_value)
     offer_payload = {
         "source": OFFER_SOURCE_SYSTEM,
         "destination_url": row_dict.get("destination_url"),
@@ -396,8 +458,8 @@ async def upsert_catalog_offer_from_seed_row(
             "channel": OFFER_CHANNEL,
             "availability": row_dict.get("availability"),
             "inventory_quantity": None,
-            "currency": row_dict.get("price_currency") or "USD",
-            "market": row_dict.get("market") or "US",
+            "currency": currency_value,
+            "market": market_value,
             "list_price": list_price_value,
             "merchant_effective_price": list_price_value,
             "estimated_best_price": list_price_value,
@@ -433,7 +495,9 @@ _SEED_OFFER_COLUMNS = (
     # Only what the attached lane reads of seed_data, never the whole document.
     "seed_data -> 'variants' AS seed_variants, "
     "seed_data -> 'snapshot' -> 'variants' AS snapshot_variants, "
-    "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status"
+    "seed_data -> 'snapshot' -> 'variant_refresh' ->> 'status' AS variant_refresh_status, "
+    # The page-read currency the offer writer checks the column against (services/seed_offer_currency).
+    "seed_data -> 'snapshot' ->> 'price_currency' AS snapshot_price_currency"
 )
 
 # ── the attached lane ────────────────────────────────────────────────────────────────────────────
@@ -849,10 +913,16 @@ async def sync_offer_for_seed(
             return {"seed_id": seed_id, "status": "no_mirror_product"}
 
         product_key = mirror["product_key"]
-        await upsert_catalog_offer_from_seed_row(
-            product_key, seed, merchant_id=mirror["merchant_id"],
-            price_read=price_was_read(attached_price_source, currency_read),
-        )
+        try:
+            await upsert_catalog_offer_from_seed_row(
+                product_key, seed, merchant_id=mirror["merchant_id"],
+                price_read=price_was_read(attached_price_source, currency_read),
+            )
+        except SeedOfferCurrencyRefused as refused:
+            # Not a failure: the seed states no currency (or market) for its amount, so nothing is
+            # written. Its own status, so refresh counters and readiness can tell it from an exception.
+            logger.warning({"event": "external_offer_dual_write_refused_currency", "seed_id": seed_id, "reason": str(refused)})
+            return {"seed_id": seed_id, "status": "refused_currency", "product_key": product_key, "error": str(refused)}
         return {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
     except Exception as exc:  # noqa: BLE001
         logger.warning({

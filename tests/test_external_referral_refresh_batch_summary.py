@@ -382,6 +382,17 @@ def test_the_listing_skips_count_as_structural(monkeypatch):
     assert summary["status"] == "success"
 
 
+def test_a_currency_refusal_counts_as_structural(monkeypatch):
+    """A seed with no currency it can vouch for (column and page read disagree: 1,254 active seeds on
+    2026-10-19) makes the writer write nothing rather than a default. That is the seed's shape, not a
+    projection that should have written, so a night of them beside real writes stays green."""
+    rows = [_structural(status="refused_currency") for _ in range(2)]
+    summary = _run(monkeypatch, rows + [_wrote() for _ in range(8)], limit=20)
+    assert summary["projection_structural_skips"] == 2
+    assert summary["projection_skips"] == {"refused_currency": 2}
+    assert summary["status"] == "success"
+
+
 def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
     """Structural skips leave the denominator; the rest still have to land something while
     prices move."""
@@ -413,7 +424,7 @@ def test_the_structural_share_rule_directly(monkeypatch):
     from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
 
     assert OFFER_SYNC_STRUCTURAL_SKIP_STATUSES == {
-        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed",
+        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency",
     }
     base = dict(failed=0, stopped_early=False, attempted_count=10, origin_reads=10,
                 price_changes=3, projections_attempted=10)
