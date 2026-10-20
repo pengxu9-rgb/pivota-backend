@@ -213,6 +213,31 @@ async def test_enrichment_rows_of_such_a_seed_keep_mains_behaviour(scoped_db, mo
     assert result["status"] == "synced" and result["offers_written"] == 3, result
 
 
+async def _read_sources(db):
+    rows = await db.fetch_all("SELECT offer_id, offer_payload->>'price_read_source' AS src FROM catalog_offers")
+    return {r["offer_id"]: r["src"] for r in rows}
+
+
+@pytest.mark.parametrize("source", ["refresh", "employee_edit"])
+async def test_the_lane_records_who_vouched_for_the_read(scoped_db, monkeypatch, source):
+    """Through the real lane, with migration 246's column present: every row the lane prices is dated AND
+    says who vouched for it; a row it does not price carries no marker."""
+    from services import external_offer_dual_write as mod
+
+    await _load(scoped_db)
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setattr(mod, "database", scoped_db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})  # re-probe: present
+    assert await mod.price_check_column_present() is True
+    result = await mod.sync_offer_for_seed(SEED_ID, attached_price_source=source, currency_read=True)
+    assert result["status"] == "synced", result
+    rows, sources = await _offers(scoped_db), await _read_sources(scoped_db)
+    for oid, row in rows.items():
+        assert sources[oid] == (source if row["touched"] else None), oid
+        assert row["checked"] == bool(row["touched"]), oid
+    assert sources["of_canon"] == source and rows["of_canon"]["checked"]
+
+
 async def test_variant_rows_hold_until_every_variant_was_re_read(scoped_db, monkeypatch):
     await _load(scoped_db, variant_refresh_status="not_all_re_read")
     result = await _sync(monkeypatch, scoped_db)
@@ -289,3 +314,25 @@ async def test_variant_currency_conflict_never_gets_a_fresh_price_clock(scoped_d
     assert result['offer_skips']['variant_currency_mismatch'] == 1
     row = (await _offers(scoped_db))['of_v2']
     assert float(row['list_price']) == 40 and not row['checked'] and not row['touched']
+
+
+@pytest.mark.parametrize("payload", ['"double-encoded"', '[1, 2]'])
+async def test_a_non_object_payload_passes_through_while_the_price_and_its_date_update(scoped_db, monkeypatch, payload):
+    """jsonb_set raises on a scalar or an array payload. The marker is written only on an object (or absent)
+    payload; any other shape passes through untouched, and the row is still re-priced and dated."""
+    from services import external_offer_dual_write as mod
+
+    await _load(scoped_db)
+    await scoped_db.execute(
+        "UPDATE catalog_offers SET offer_payload = CAST(:p AS jsonb) WHERE offer_id = 'of_canon'", {"p": payload})
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setattr(mod, "database", scoped_db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})  # re-probe: present
+    assert await mod.price_check_column_present() is True
+    result = await mod.sync_offer_for_seed(SEED_ID, attached_price_source="employee_edit", currency_read=True)
+    assert result["status"] == "synced", result
+    row = await scoped_db.fetch_one(
+        "SELECT list_price, price_checked_at IS NOT NULL AS checked, offer_payload::text AS payload,"
+        " jsonb_typeof(offer_payload) AS kind FROM catalog_offers WHERE offer_id = 'of_canon'")
+    assert float(row["list_price"]) == 22.7 and row["checked"]
+    assert row["kind"] in ("string", "array") and row["payload"] == payload

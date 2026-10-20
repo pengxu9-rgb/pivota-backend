@@ -314,7 +314,9 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
     assert result["status"] == "synced" and result["target"] == "attached"
     assert result["status"] in mod.OFFER_SYNC_WRITTEN_STATUSES
     assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD",
-                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}"}]
+                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
+                             # who vouched for the read (offer_payload.price_read_source)
+                             "read_source": "refresh"}]
     assert fake.executed == [], "the attached lane never upserts: it only prices existing rows"
 
 
@@ -527,3 +529,10 @@ def test_equivalent_numeric_and_gid_aliases_name_the_same_variant():
 def test_url_formatting_cannot_hide_a_conflicting_listing_claim(source_ref):
     seed=_seed();offer=_offer('other',source_ref=source_ref,payload_dest=None,payload_seed=seed['id'])
     assert _plan(seed,[offer])['status'] == 'no_listing_offer'
+
+
+def test_the_lane_refuses_an_unknown_price_source():
+    """jsonb_set is strict: a NULL or unknown marker must never reach the write (the check runs before any read)."""
+    for bad in (None, "", "crawl", "EMPLOYEE_EDIT"):
+        with pytest.raises(ValueError):
+            asyncio.run(mod.sync_attached_listing_offers({"id": "s", "attached_product_key": "pk"}, source=bad))

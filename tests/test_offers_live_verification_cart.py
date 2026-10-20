@@ -94,7 +94,8 @@ def _resolve(monkeypatch, client, row, *, reasons=("stale_snapshot",), tokens: O
     import routes.agent_shop_gateway as gateway
 
     async def fake_fetch_all(query: str, values=None):
-        if "FROM external_product_seeds" in str(query):
+        # The catalog-offers arm names external_product_seeds too (the seed-currency rule).
+        if "FROM external_product_seeds" in str(query) and "JOIN catalog_offers" not in str(query):
             return [row]
         return []
 

@@ -23,9 +23,11 @@ group lane's own Postgres gate's (tests/test_offers_resolve_group_siblings_postg
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -862,3 +864,199 @@ def test_an_unreadable_pool_fails_closed(schema_engine, monkeypatch, lines, pool
     assert _run(monkeypatch, body) == 0
     warm_line, next_line = lines.parsed
     assert next_line["skipped"] == {"pool_unknown": 1} and "error" not in next_line
+
+
+# ---------------------------------------------- arming: proof the shadow is alive with no traffic
+
+
+CACHE = EVENT + "_cache"
+
+
+async def _stop(task) -> None:
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+    await _drain()
+
+
+async def _until(predicate, timeout: float = 3.0) -> None:
+    deadline = time.perf_counter() + timeout
+    while not predicate() and time.perf_counter() < deadline:
+        await asyncio.sleep(0.02)
+
+
+def _refresh_statements(sent: List[Any]) -> List[Any]:
+    return [entry for entry in sent if "DISTINCT content_key" in entry[1]]
+
+
+def _timed_statements(monkeypatch, db, sink: List[Any]):
+    """Like `_count_statements`, with the time each statement was sent."""
+    for method in ("fetch_all", "fetch_one", "fetch_val", "execute"):
+        real = getattr(db, method)
+
+        def make(real):
+            async def run(query, values=None, *a, **k):
+                sink.append((time.perf_counter(), str(query)))
+                return await real(query, values, *a, **k)
+
+            return run
+
+        monkeypatch.setattr(db, method, make(real))
+
+
+@pytest.mark.parametrize("flag", [None, "0", "off", "1", "garbage"])
+def test_arming_starts_nothing_unless_the_mode_is_shadow(schema_engine, monkeypatch, lines, flag):
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS", 0.0)
+
+    async def body(h: _Harness):
+        if flag is None:
+            monkeypatch.delenv(FLAG, raising=False)
+        else:
+            monkeypatch.setenv(FLAG, flag)
+        sent: List[Any] = []
+        _timed_statements(monkeypatch, h.db, sent)
+        before = set(asyncio.all_tasks())
+        task = gateway.start_group_shadow_arming()
+        await asyncio.sleep(0.3)
+        return task, set(asyncio.all_tasks()) - before, sent
+
+    task, new_tasks, sent = _run(monkeypatch, body)
+    assert task is None and not new_tasks, "no task"
+    assert sent == [], "no query"
+    assert lines.all == [], "no line"
+
+
+def test_shadow_announces_itself_at_startup_with_keys_and_pool_state(schema_engine, monkeypatch, lines):
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS", 0.0)
+    monkeypatch.setenv(FLAG, "shadow")
+
+    async def body(h: _Harness):
+        sent: List[Any] = []
+        _timed_statements(monkeypatch, h.db, sent)
+        task = gateway.start_group_shadow_arming()
+        await _until(lambda: lines.events(CACHE))
+        await _stop(task)
+        return sent
+
+    sent = _run(monkeypatch, body)
+    [line] = lines.events(CACHE)
+    assert line["trigger"] == "startup" and line["mode"] == "shadow" and line["refreshed"] is True
+    assert line["keys"] == 1 and line["overflow"] is False and "error" not in line
+    assert isinstance(line["pool_free"], int) and line["pool_free"] > 0
+    assert line["in_flight"] == 1 and line["connected"] == 0  # logged by the refresh task, after its txn
+    assert line["skipped"] == {} and line["pid"] == os.getpid() and line["refresh_ms"] >= 0
+    assert len(_refresh_statements(sent)) == 1
+    assert lines.parsed == [], "arming logs the cache line only"
+
+
+def test_an_unreadable_pool_is_reported_unknown_and_nothing_is_read(schema_engine, monkeypatch, lines):
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS", 0.0)
+    monkeypatch.setenv(FLAG, "shadow")
+
+    class _Raises:
+        def __getattr__(self, name):
+            raise RuntimeError("pool is gone")
+
+    async def body(h: _Harness):
+        sent: List[Any] = []
+        _timed_statements(monkeypatch, h.db, sent)
+        backend = h.db._backend
+        real_pool = backend._pool
+        backend._pool = _Raises()
+        try:
+            task = gateway.start_group_shadow_arming()
+            await _until(lambda: lines.events(CACHE))
+            await _stop(task)
+        finally:
+            backend._pool = real_pool
+        return sent
+
+    sent = _run(monkeypatch, body)
+    [line] = lines.events(CACHE)
+    assert line["pool_free"] == "unknown" and line["refreshed"] is False and line["reason"] == "pool_unknown"
+    assert line["keys"] is None
+    assert sent == [], "fail closed: no query"
+
+
+def test_one_refresh_per_ttl_across_the_arming_loop_and_lazy_refreshes(schema_engine, monkeypatch, lines):
+    """TTL 1 s, the arming loop running, and resolved shadow requests every 0.15 s (each of which would
+    refresh a due key set lazily). Over ~2.6 s: about three refreshes, never two within a TTL, and one
+    cache line per refresh."""
+    import routes.agent_shop_gateway as gateway
+
+    ttl = 1.0
+    _rows(schema_engine, retailer_checked=_now())
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS", ttl)
+
+    async def body(h: _Harness):
+        sent: List[Any] = []
+        _timed_statements(monkeypatch, h.db, sent)
+        monkeypatch.setenv(FLAG, "shadow")
+        task = gateway.start_group_shadow_arming()
+        deadline = time.perf_counter() + 2.6
+        while time.perf_counter() < deadline:
+            _, bt = await h.call(RETAILER_SIG, flag="shadow")
+            await h.settle(bt)
+            await asyncio.sleep(0.15)
+        await _stop(task)
+        return sent
+
+    sent = _run(monkeypatch, body)
+    times = [t for t, _q in _refresh_statements(sent)]
+    assert 2 <= len(times) <= 4, times
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert min(gaps) >= ttl * 0.95, f"two key-set refreshes within one TTL: {gaps}"
+    cache_lines = lines.events(CACHE)
+    assert len(cache_lines) == len(times) and all(line["refreshed"] for line in cache_lines)
+    assert cache_lines[0]["trigger"] in ("startup", "request")
+
+
+def test_a_failed_arming_refresh_logs_its_error_and_backs_off(schema_engine, monkeypatch, lines):
+    import routes.agent_shop_gateway as gateway
+
+    _rows(schema_engine, retailer_checked=_now())
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(gateway, "OFFERS_RESOLVE_GROUP_SHADOW_CK_RETRY_SECONDS", 0.6)
+    monkeypatch.setattr(gateway, "_GROUP_SHADOW_RESOLVED_CKS_SQL", (
+        "SELECT content_key FROM no_such_table WHERE CAST(:kinds AS TEXT[]) IS NOT NULL"
+        " AND CAST(:strategies AS TEXT[]) IS NOT NULL LIMIT :limit"))
+    monkeypatch.setenv(FLAG, "shadow")
+
+    async def body(h: _Harness):
+        sent: List[Any] = []
+        _timed_statements(monkeypatch, h.db, sent)
+        task = gateway.start_group_shadow_arming()
+        await _until(lambda: lines.events(CACHE))
+        _, bt = await h.call(RETAILER_SIG, flag="shadow")
+        lazy_tasks = len(bt.tasks)  # inside the backoff: a request schedules no refresh either
+        await asyncio.sleep(1.0)
+        await _stop(task)
+        return sent, lazy_tasks
+
+    sent, lazy_tasks = _run(monkeypatch, body)
+    assert lazy_tasks == 0
+    cache_lines = lines.events(CACHE)
+    assert len(cache_lines) == 2, cache_lines  # t=0, then once the 0.6 s backoff has passed
+    assert all(line["refreshed"] is False and "UndefinedTable" in line["error"] for line in cache_lines)
+    times = [t for t, q in sent if "no_such_table" in q]
+    assert len(times) == 2 and times[1] - times[0] >= 0.6, times
+
+
+def test_main_lifespan_starts_the_arming_loop_and_cancels_it():
+    import inspect
+
+    import main
+
+    src = inspect.getsource(main.app_lifespan)
+    assert "start_group_shadow_arming()" in src and "group_shadow_armer.cancel()" in src
