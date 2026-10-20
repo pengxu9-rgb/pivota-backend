@@ -279,16 +279,18 @@ async def test_the_python_twin_agrees_with_the_sql_predicate_on_every_stored_sha
     twin = await _twin_verdicts(private_db)
     assert twin == sql
 
-    # #2652's own Python reading of a seed (the mirror writer's) and this twin agree on every shape
-    # as the driver hands it back, so the writer and the purchase path cannot drift apart.
-    from routes.agent_commerce_reap import _LISTING_SEEDS_SQL
-    from services.seed_offer_currency import seed_currency_of, stored_seed_currency
+    # Seed by seed, the twin's currency is the SQL's own (seed_currency_sql) over the row exactly as
+    # the purchase path reads it (_LISTING_SEEDS_SQL's columns, through this driver): a stronger check
+    # than the offer verdicts above, which a wrong currency that still disagrees would pass.
+    from services.seed_offer_currency import seed_currency_sql, stored_seed_currency
 
-    keys = [r["product_key"] for r in await private_db.fetch_all("SELECT DISTINCT product_key FROM catalog_offers")]
-    for key in keys:
-        for seed in await private_db.fetch_all(_LISTING_SEEDS_SQL, {"product_key": key}):
-            seed = dict(seed)
-            assert seed_currency_of(seed) == stored_seed_currency(seed), (key, seed)
+    rows = await private_db.fetch_all(
+        f"SELECT e.id, e.price_currency, e.seed_data, {seed_currency_sql('e')} AS sql_currency"
+        " FROM external_product_seeds e ORDER BY e.id")
+    assert rows
+    for row in rows:
+        stored = {"price_currency": row["price_currency"], "seed_data": row["seed_data"]}
+        assert stored_seed_currency(stored) == row["sql_currency"], (row["id"], stored)
     edges = {oid: kept for oid, kept in sql.items() if oid.startswith("edge_")}
     assert edges == {
         "edge_0": True, "edge_1": True, "edge_2": False, "edge_3": False, "edge_4": True, "edge_5": True,
