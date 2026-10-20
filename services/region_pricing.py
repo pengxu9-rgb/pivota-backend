@@ -164,7 +164,7 @@ def region_currency_predicate(region: str, *, alias: str = "co") -> str:
 
 
 def has_offer_priced_for_region_sql(
-    product_key_expr: str, region: str, *, alias: str = "co"
+    product_key_expr: str, region: str, *, alias: str = "co", extra_predicate: str = ""
 ) -> str:
     """``EXISTS`` over ``catalog_offers``: a real price for this product_key, in
     the currency `region` expects.
@@ -181,16 +181,22 @@ def has_offer_priced_for_region_sql(
     ``index_pipeline_state_service._HAS_US_OFFER_EXISTS`` has always emitted —
     asserted in tests/test_region_pricing.py so the two cannot drift while both
     names exist.
+
+    ``extra_predicate`` narrows further, ANDed after the currency conjunct (a literal SQL
+    fragment, as in ``priced_offer_exists_sql``). Empty, the output is unchanged.
     """
+    predicate = region_currency_predicate(region, alias=alias)
+    if extra_predicate:
+        predicate = f"{predicate}\n          AND {extra_predicate}"
     return priced_offer_exists_sql(
         product_key_expr,
         alias=alias,
-        extra_predicate=region_currency_predicate(region, alias=alias),
+        extra_predicate=predicate,
     )
 
 
 def has_offer_priced_for_any_region_sql(
-    product_key_expr: str, regions: "Sequence[str]", *, alias: str = "co"
+    product_key_expr: str, regions: "Sequence[str]", *, alias: str = "co", extra_predicate: str = ""
 ) -> str:
     """``EXISTS`` for ANY of `regions` — the OR of `has_offer_priced_for_region_sql`.
 
@@ -226,9 +232,11 @@ def has_offer_priced_for_any_region_sql(
             "an empty list would emit a predicate false for every row."
         )
     if len(ordered) == 1:
-        return has_offer_priced_for_region_sql(product_key_expr, ordered[0], alias=alias)
+        return has_offer_priced_for_region_sql(
+            product_key_expr, ordered[0], alias=alias, extra_predicate=extra_predicate
+        )
     return "(" + " OR ".join(
-        has_offer_priced_for_region_sql(product_key_expr, region, alias=alias)
+        has_offer_priced_for_region_sql(product_key_expr, region, alias=alias, extra_predicate=extra_predicate)
         for region in ordered
     ) + ")"
 
