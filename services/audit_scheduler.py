@@ -159,6 +159,8 @@ _JOB_RUN_DEADLINES = {
     "cafe24_reconciliation": 900,
     "audit_health_tick": 600,
     "catalog_onboard_queue_drain": 1500,
+    # hourly; a few hundred job rows plus one evidence read, then at most MAX_PER_RUN inserts
+    "retailer_ingest_weekly_reenqueue": 900,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
     # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
@@ -734,6 +736,24 @@ async def start_scheduler() -> None:
             replace_existing=True,
             misfire_grace_time=600,
             coalesce=True,
+        )
+
+        # Re-enqueue of every done retailer-ingest cohort before its last price read ages out, each with an
+        # explicit options.market (services/retailer_ingest/weekly_reenqueue.py). Hourly; a cohort is due
+        # when its last applied read is INTERVAL_HOURS old. OFF BY DEFAULT: the tick returns before touching
+        # the database unless RETAILER_INGEST_WEEKLY_REENQUEUE_ENABLED is set. Database-only (it crawls
+        # nothing), so it runs here rather than in the crawl-subnet drain, whose image is pinned and rolled
+        # by hand.
+        from jobs.retailer_ingest_weekly_reenqueue import run_retailer_ingest_weekly_reenqueue_tick
+        _add_job(
+            run_retailer_ingest_weekly_reenqueue_tick,
+            "cron",
+            minute=11,
+            id="retailer_ingest_weekly_reenqueue",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
         )
 
         # P2.2: drive queued audit_runs through the async lifecycle.
