@@ -30,6 +30,16 @@ def _binds(sql):
     return re.findall(r"(?<!:):([a-z_]+)", sql)
 
 
+def test_only_a_write_that_read_no_price_keeps_who_vouched():
+    """offer_payload.price_read_source survives the plain upserts and is dropped by the price-read ones."""
+    keep = "jsonb_build_object('price_read_source', catalog_offers.offer_payload->'price_read_source')"
+    for sql in (apply_mod._OFFER_UPSERT_SQL, apply_mod._OFFER_UPSERT_MARKET_SQL):
+        assert keep in sql
+    for sql in (apply_mod._OFFER_UPSERT_PRICE_READ_SQL, apply_mod._OFFER_UPSERT_MARKET_PRICE_READ_SQL):
+        assert "price_read_source" not in sql
+        assert "THEN catalog_offers.offer_payload\n                        ELSE EXCLUDED.offer_payload END" in sql
+
+
 def test_offer_sql_for_picks_by_market_and_vouch():
     plain, market = {"market": None}, {"market": "SG"}
     assert apply_mod._offer_sql_for(plain) is apply_mod._OFFER_UPSERT_SQL
@@ -79,3 +89,15 @@ def test_an_edited_hold_refuses_the_derivation():
         assert edited != apply_mod._OFFER_UPSERT_SQL
         with pytest.raises(RuntimeError, match="hold changed"):
             apply_mod._offer_upsert_sql_with_price_read(edited)
+
+
+def test_the_reviewed_price_hold_arm_comes_before_the_marker_keep_arm():
+    """The SGD-30 reviewed-price hold must win over keeping the price_read_source marker: in the reverse order a
+    stale replay would replace the reviewed payload and lose its review key."""
+    from services.catalog_enrichment_agent import apply
+
+    sql = apply._OFFER_UPSERT_SQL
+    start = sql.index("offer_payload = CASE")
+    hold = sql.index("meitu_sg_price_reviewed_0920", start)
+    keep = sql.index("offer_payload->'price_read_source' IS NOT NULL", start)
+    assert hold < keep

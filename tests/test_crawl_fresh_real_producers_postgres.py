@@ -151,6 +151,62 @@ async def test_an_employee_edit_through_the_real_lane_is_not_a_crawl_and_a_refre
     assert await _fresh(db) is True
 
 
+async def _offer_valid(database, now=None):
+    """The offer-level VALID read (the upserter's own fragment) of the one listing offer."""
+    from datetime import datetime, timezone
+
+    from services import catalog_row_trust_upserter as up
+
+    return await database.fetch_val(
+        f"SELECT ({up.CRAWL_OFFER_VALID_READ_SQL}) IS NOT NULL FROM catalog_offers co WHERE co.product_key = :pk",
+        {"pk": PK, "now": now or datetime.now(timezone.utc)})
+
+
+async def test_l5_the_attached_lane_s_source_decides_validity_through_the_chain(db, monkeypatch):
+    """L5, chained on the real writers: drain apply (declared) -> attached-lane write as
+    `employee_edit` (that offer is not VALID, the row is not fresh) -> a drain write that READ no
+    price keeps the marker with the stamp (#2658's keep arm), still not VALID -> attached-lane
+    `refresh` (VALID again, fresh) -> a later `employee_edit` -> a drain write that READ the price
+    drops the marker it no longer describes (VALID, fresh)."""
+    from services import external_offer_dual_write as mod
+
+    await _setup(db)
+    sku = _canonical_sku()["sku_key"]
+    us = {"market": "US"}
+    await _apply(db, _offers(sku_key=sku, market="US", currency="USD", options=us))
+    assert (await _offer_valid(db), await _fresh(db)) == (True, True)
+    monkeypatch.setattr(mod, "database", db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
+    seed = {"id": "seed:crawl-fresh-real", "attached_product_key": PK, "destination_url": DEST,
+            "price_amount": 21.0, "price_currency": "USD", "market": "US",
+            "seed_variants": None, "snapshot_variants": None, "variant_refresh_status": None}
+
+    async def attached(source, price):
+        result = await mod.sync_attached_listing_offers({**seed, "price_amount": price}, source=source,
+                                                        currency_read=True)
+        assert result["status"] == "synced", result
+        return await db.fetch_val("SELECT offer_payload->>'price_read_source' FROM catalog_offers"
+                                  " WHERE product_key = :pk", {"pk": PK})
+
+    assert await attached("employee_edit", 21.0) == "employee_edit"
+    assert (await _offer_valid(db), await _fresh(db)) == (False, False)
+    # a drain write that read no price: the stored stamp and its source stand together
+    await _apply(db, _offers(sku_key=sku, market="US", currency="USD", price=21.0, options=us), price_read=False)
+    assert (await _offer_valid(db), await _fresh(db)) == (False, False)
+    assert await attached("refresh", 22.0) == "refresh"
+    assert (await _offer_valid(db), await _fresh(db)) == (True, True)
+    assert await attached("employee_edit", 23.0) == "employee_edit"
+    assert await _fresh(db) is False
+    # a drain write that READ the price dated it itself: the old source no longer describes it
+    await _apply(db, _offers(sku_key=sku, market="US", currency="USD", price=24.0, options=us))
+    marker = await db.fetch_val("SELECT offer_payload->>'price_read_source' FROM catalog_offers"
+                                " WHERE product_key = :pk", {"pk": PK})
+    assert marker is None
+    assert (await _offer_valid(db), await _fresh(db)) == (True, True)
+    with pytest.raises(ValueError):
+        await mod.sync_attached_listing_offers(seed, source="crawl", currency_read=True)
+
+
 async def test_the_batch_clock_bounds_a_future_stamp(db):
     await _setup(db)
     sku = _canonical_sku()["sku_key"]
