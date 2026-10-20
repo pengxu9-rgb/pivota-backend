@@ -45,8 +45,15 @@ shadowing it), crawl-fresh at N, renderable. It is a census of the stored
 decision, so a row whose inputs moved since the last backfill pass is counted
 on its stored verdict.
 
+ROUND 2 additions: `backfill_coverage` (catalog_products vs the backfill cron's
+CATALOG_TRUST_BACKFILL_LIMIT default -- above it, rows the oldest-first pass
+never reaches keep their verdict); every summary, market and host line also
+carries the PER-MARKET rule (`would_flip_per_market_rule`, see
+SERVED_MARKET_CURRENCY_SQL) next to the max-any rule, the flips owed to an
+out-of-stock-only fresh offer, and projections for both rules.
+
 SAFETY. One READ ONLY transaction with SET LOCAL statement_timeout; it writes
-nothing and creates nothing: one row query plus two aggregates. Prints JSON
+nothing and creates nothing: one row query plus three aggregates. Prints JSON
 lines only. It carries no at-sign so it can be passed inline to
 scripts/ops/run_oneoff_job.sh (see its header), and it needs no crawl subnet
 (it reads the database only):
@@ -105,6 +112,27 @@ OFFER_CONJUNCTS_SQL = (
     f"           AND {OFFER_NOT_AFFILIATE_SQL}"
 )
 
+# ROUND 2, the PER-MARKET rule (what the next policy revision will ship): the
+# qualifying offer must ALSO be
+#   * declared for a SERVED market and priced in that market's currency
+#     (config/market_registry.json served markets; region_pricing's currencies);
+#   * not explicitly out of stock (offer_buyability.OFFER_UNAVAILABLE_AVAILABILITIES);
+#   * not dated by an employee price edit (offer_payload.price_read_source);
+#   * on a variant-scoped row (one with a live drain-lane variant offer), a
+#     VARIANT offer: the refresh dates `<pk>::canonical` even when it skipped the
+#     variants, so a canonical stamp alone proves nothing about them;
+# and the read must not be dated in the future (0 <= age <= N).
+SERVED_MARKET_CURRENCY_SQL = (
+    "(upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
+    " IN (('SG', 'SGD'), ('US', 'USD'))"
+)
+IN_STOCK_SQL = (
+    "lower(btrim(coalesce(co.availability, '')))"
+    " NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable')"
+)
+NOT_EMPLOYEE_EDIT_SQL = "coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit'"
+CANONICAL_SKU_SUFFIX = "::canonical"
+
 PRICE_CHECK_COLUMN_SQL = """
 SELECT EXISTS (
   SELECT 1 FROM pg_attribute
@@ -122,6 +150,17 @@ SELECT coalesce(nullif(upper(btrim(market)), ''), '(none)') AS market, count(*) 
   FROM external_product_seeds
  WHERE status = 'active'
  GROUP BY 1
+"""
+
+# How far the 6h backfill reaches (jobs/catalog_row_trust_backfill_cron: oldest
+# updated_at first, LIMIT CATALOG_TRUST_BACKFILL_LIMIT). One aggregate.
+BACKFILL_COVERAGE_SQL = """
+SELECT (SELECT count(*) FROM catalog_products) AS catalog_products,
+       count(*) AS trust_rows,
+       count(*) FILTER (WHERE 'CRAWL_FRESH' = ANY(crt.serving_reason_codes)) AS crawl_fresh_rows,
+       min(crt.updated_at) AS oldest_trust_write
+  FROM catalog_row_trust crt
+ WHERE crt.subject_type = 'product'
 """
 
 STILL_BLOCKING = {
@@ -149,17 +188,41 @@ SELECT cp.product_key,
        crt.identity_status,
        {seed_route_resolves_sql("cp")} AS renderable,
        rd.last_price_read_at,
-       rd.market_reads
+       rd.market_reads,
+       rd.last_in_stock_read_at,
+       rd.last_strict_read_at,
+       rd.strict_market_reads
   FROM catalog_products cp
   LEFT JOIN catalog_row_trust crt
     ON crt.subject_type = 'product'
    AND crt.subject_key = cp.product_key
+  CROSS JOIN LATERAL (
+    SELECT EXISTS (
+             SELECT 1 FROM catalog_offers cv
+              WHERE cv.product_key = cp.product_key
+                AND cv.sku_key IS DISTINCT FROM cp.product_key || '{CANONICAL_SKU_SUFFIX}'
+                AND cv.source_system = '{CRAWL_SOURCE_SYSTEM}'
+                AND cv.suppressed_at IS NULL
+           ) AS variant_scoped
+  ) vx
   LEFT JOIN LATERAL (
     SELECT max(m.last_read) AS last_price_read_at,
-           jsonb_object_agg(m.market, m.last_read) AS market_reads
+           jsonb_object_agg(m.market, m.last_read) AS market_reads,
+           max(m.last_in_stock) AS last_in_stock_read_at,
+           max(m.last_strict) AS last_strict_read_at,
+           jsonb_object_agg(m.market, m.last_strict) FILTER (WHERE m.last_strict IS NOT NULL)
+             AS strict_market_reads
       FROM (
         SELECT coalesce(nullif(upper(btrim(co.market)), ''), '(none)') AS market,
-               max(co.price_checked_at) AS last_read
+               max(co.price_checked_at) AS last_read,
+               max(co.price_checked_at) FILTER (WHERE {IN_STOCK_SQL}) AS last_in_stock,
+               max(co.price_checked_at) FILTER (
+                 WHERE {SERVED_MARKET_CURRENCY_SQL}
+                   AND {IN_STOCK_SQL}
+                   AND {NOT_EMPLOYEE_EDIT_SQL}
+                   AND (NOT vx.variant_scoped
+                        OR co.sku_key IS DISTINCT FROM cp.product_key || '{CANONICAL_SKU_SUFFIX}')
+               ) AS last_strict
           FROM catalog_offers co
          WHERE co.product_key = cp.product_key
            AND {OFFER_CONJUNCTS_SQL}
@@ -205,9 +268,23 @@ def is_fresh(last_read: Any, *, now: datetime, max_age_days: float) -> bool:
     return (now - ts).total_seconds() <= float(max_age_days) * DAY_SECONDS
 
 
+def is_fresh_strict(last_read: Any, *, now: datetime, max_age_days: float) -> bool:
+    """The round-2 freshness test: as is_fresh, but a stamp dated in the FUTURE
+    is stale, as relgraph_freshness_refresh treats it (0 <= age <= N)."""
+    ts = _to_datetime(last_read)
+    if ts is None:
+        return False
+    age = (now - ts).total_seconds()
+    return 0 <= age <= float(max_age_days) * DAY_SECONDS
+
+
 def age_days(last_read: Any, *, now: datetime) -> Optional[float]:
     ts = _to_datetime(last_read)
     return None if ts is None else (now - ts).total_seconds() / DAY_SECONDS
+
+
+def _non_negative(age: Optional[float]) -> Optional[float]:
+    return None if age is None or age < 0 else age
 
 
 def age_bucket(last_read: Any, *, now: datetime) -> str:
@@ -238,6 +315,9 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
     coverage_only = decision == "shadow" and not blocking
     renderable = row.get("renderable") is not False
     markets = _market_reads(row.get("market_reads"))
+    strict_markets = _market_reads(row.get("strict_market_reads"))
+    fresh_strict = is_fresh_strict(row.get("last_strict_read_at"), now=now, max_age_days=max_age_days)
+    would_flip = coverage_only and fresh and renderable
     return {
         "product_key": row["product_key"],
         "lane": row.get("lane") or "unlabelled",
@@ -252,7 +332,18 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
         # Could ever flip on a re-read: coverage is all that shadows it, it
         # renders, and it has at least one qualifying live offer to re-stamp.
         "candidate": coverage_only and renderable and bool(markets),
-        "would_flip": coverage_only and fresh and renderable,
+        "would_flip": would_flip,
+        # Round 2: the per-market rule (see SERVED_MARKET_CURRENCY_SQL).
+        # a future-dated stamp is stale under this rule, so it never ages in
+        "strict_age_days": _non_negative(age_days(row.get("last_strict_read_at"), now=now)),
+        "would_flip_strict": coverage_only and fresh_strict and renderable,
+        # flips under the max-any rule only because of an out-of-stock read
+        "would_flip_oos_only": would_flip and not is_fresh(
+            row.get("last_in_stock_read_at"), now=now, max_age_days=max_age_days),
+        "strict_fresh_markets": sorted(
+            m for m, ts in strict_markets.items()
+            if is_fresh_strict(ts, now=now, max_age_days=max_age_days)
+        ),
         "fresh_not_renderable": coverage_only and fresh and not renderable,
         "markets": sorted(markets) or ["(no live offer)"],
         "fresh_markets": sorted(
@@ -279,6 +370,7 @@ def project(
     *,
     max_age_days: float,
     nightly_probability: float,
+    age_field: str = "age_days",
 ) -> Dict[str, Dict[str, Any]]:
     """Expected would-flip count for days 0..7 under the three scenarios.
 
@@ -304,7 +396,7 @@ def project(
             nights = _reread_nights(day, max_age_days)
             total = 0.0
             for r in candidates:
-                if _fresh_by_aging(r["age_days"], day, max_age_days):
+                if _fresh_by_aging(r[age_field], day, max_age_days):
                     total += 1.0
                 elif scenario == "refresh_pro_rata":
                     total += 1.0 - (1.0 - p) ** nights
@@ -340,6 +432,7 @@ def summarize(
     refresh_per_night: int = DEFAULT_REFRESH_PER_NIGHT,
     seed_pool: Optional[int] = None,
     seed_pool_by_market: Optional[Dict[str, int]] = None,
+    backfill: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     rows = list(classified)
     pool_by_market = dict(seed_pool_by_market or {})
@@ -358,6 +451,8 @@ def summarize(
         "active_seeds_by_market": dict(sorted(pool_by_market.items())),
         "nightly_reread_probability": round(p, 5),
     }]
+    if backfill is not None:
+        lines.append({"kind": "backfill_coverage", **backfill})
 
     for lane in [ALL] + lanes:
         part = rows if lane == ALL else [r for r in rows if r["lane"] == lane]
@@ -376,6 +471,12 @@ def summarize(
             "shadow_coverage_only": sum(r["coverage_only_shadow"] for r in part),
             "candidates_any_age": sum(r["candidate"] for r in part),
             "would_flip": sum(r["would_flip"] for r in part),
+            # Round 2 asks: the per-market rule vs the max-any rule, and the
+            # flips owed only to an out-of-stock fresh offer.
+            "would_flip_max_any_rule": sum(r["would_flip"] for r in part),
+            "would_flip_per_market_rule": sum(r["would_flip_strict"] for r in part),
+            "would_flip_max_any_not_per_market": sum(r["would_flip"] and not r["would_flip_strict"] for r in part),
+            "would_flip_on_out_of_stock_only_offer": sum(r["would_flip_oos_only"] for r in part),
             "fresh_but_not_renderable": sum(r["fresh_not_renderable"] for r in part),
             "fresh_still_blocked_by_reason": dict(sorted(still_blocked.items())),
             # The same census at other N, so the window can be chosen on the numbers.
@@ -388,8 +489,10 @@ def summarize(
                 for _, days in AGE_BUCKETS
             },
         })
-        for scenario, result in project(part, max_age_days=max_age_days, nightly_probability=p).items():
-            lines.append({"kind": "projection", "lane": lane, "scenario": scenario, **result})
+        for rule, age_field in (("max_any", "age_days"), ("per_market", "strict_age_days")):
+            for scenario, result in project(part, max_age_days=max_age_days, nightly_probability=p,
+                                            age_field=age_field).items():
+                lines.append({"kind": "projection", "lane": lane, "rule": rule, "scenario": scenario, **result})
 
     for lane in [ALL] + lanes:
         part = rows if lane == ALL else [r for r in rows if r["lane"] == lane]
@@ -414,6 +517,8 @@ def summarize(
                 markets[(lane, m)]["shadow_coverage_only"] += int(r["coverage_only_shadow"])
             for m in r["fresh_markets"]:
                 markets[(lane, m)]["would_flip"] += int(r["would_flip"])
+            for m in r["strict_fresh_markets"]:
+                markets[(lane, m)]["would_flip_per_market_rule"] += int(r["would_flip_strict"])
     for lane, m in sorted(markets, key=lambda k: (k[0] != ALL, k)):
         lines.append({"kind": "by_market", "lane": lane, "market": m,
                       **dict(sorted(markets[(lane, m)].items()))})
@@ -424,11 +529,24 @@ def summarize(
         h["rows"] += 1
         h["shadow_coverage_only"] += int(r["coverage_only_shadow"])
         h["would_flip"] += int(r["would_flip"])
+        h["would_flip_per_market_rule"] += int(r["would_flip_strict"])
         h["fresh_still_blocked_by_reason"] += int(r["fresh"] and bool(r["blocking"]))
         h["fresh_not_renderable"] += int(r["fresh_not_renderable"])
     for key in sorted(hosts, key=lambda k: (k[0], -hosts[k]["would_flip"], -hosts[k]["rows"], k[1])):
         lines.append({"kind": "by_host", "lane": key[0], "host": key[1], **dict(sorted(hosts[key].items()))})
     return lines
+
+
+def backfill_limit_default() -> int:
+    """The cron's own default (jobs/catalog_row_trust_backfill_cron._DEFAULT_LIMIT),
+    read from the image; 50,000 if the image does not carry it. The prod service
+    may override it with CATALOG_TRUST_BACKFILL_LIMIT, which this job cannot see."""
+    try:
+        from jobs.catalog_row_trust_backfill_cron import _DEFAULT_LIMIT
+
+        return int(_DEFAULT_LIMIT)
+    except Exception:  # noqa: BLE001
+        return 50_000
 
 
 async def collect(
@@ -447,10 +565,22 @@ async def collect(
         now = _to_datetime(await conn.fetchval("SELECT now()"))
         raw = [dict(r) for r in await conn.fetch(census_sql())]
         pool_by_market = {str(r["market"]): int(r["seeds"]) for r in await conn.fetch(SEED_POOL_SQL)}
+        coverage = dict(await conn.fetchrow(BACKFILL_COVERAGE_SQL))
+    limit = backfill_limit_default()
+    env_limit = os.getenv("CATALOG_TRUST_BACKFILL_LIMIT")
+    backfill = {
+        "catalog_products": int(coverage["catalog_products"]),
+        "trust_rows": int(coverage["trust_rows"]),
+        "crawl_fresh_rows": int(coverage["crawl_fresh_rows"]),
+        "oldest_trust_write": coverage["oldest_trust_write"],
+        "backfill_limit_default": limit,
+        "backfill_limit_env_in_this_job": env_limit,
+        "over_default_limit": int(coverage["catalog_products"]) > limit,
+    }
     classified = [classify(r, now=now, max_age_days=max_age_days) for r in raw]
     return summarize(classified, now=now, max_age_days=max_age_days,
                      refresh_per_night=refresh_per_night, seed_pool=seed_pool,
-                     seed_pool_by_market=pool_by_market)
+                     seed_pool_by_market=pool_by_market, backfill=backfill)
 
 
 async def _main(argv: List[str]) -> int:

@@ -78,6 +78,19 @@ def test_classify_only_coverage_shadow_renderable_fresh_rows_flip():
     assert _row(1, identity_status="review_required")["would_flip"] is False
 
 
+def test_the_per_market_rule_treats_a_future_stamp_as_stale():
+    assert census.is_fresh_strict(NOW + timedelta(minutes=1), now=NOW, max_age_days=7) is False
+    assert census.is_fresh_strict(NOW, now=NOW, max_age_days=7) is True
+    assert census.is_fresh_strict(NOW - timedelta(days=7), now=NOW, max_age_days=7) is True
+    assert census.is_fresh_strict(NOW - timedelta(days=7, seconds=1), now=NOW, max_age_days=7) is False
+    assert census.is_fresh_strict(None, now=NOW, max_age_days=7) is False
+
+
+def test_census_file_carries_no_write_and_no_at_sign_after_round_two():
+    body = (_REPO / "scripts/census_retailer_crawl_fresh_trust.py").read_text()
+    assert "@" not in body
+
+
 def test_age_buckets_are_inclusive():
     assert _row(1)["bucket"] == "le_1d"
     assert _row(3)["bucket"] == "le_3d"

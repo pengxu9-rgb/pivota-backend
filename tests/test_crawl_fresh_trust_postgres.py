@@ -202,7 +202,8 @@ _N = [0]
 
 
 async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="https://shop.example.com/p/1",
-                 payload_link=None, suppressed=False, affiliate=False, market="US", currency="USD"):
+                 payload_link=None, suppressed=False, affiliate=False, market="US", currency="USD",
+                 availability="in_stock", variant=None, read_source=None):
     import json
 
     _N[0] += 1
@@ -210,14 +211,17 @@ async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="http
     payload = {"validated_at": "affiliate_feed:net" if affiliate else "2026-10-01"}
     if payload_link is not None:
         payload["destination_url"] = payload_link
+    if read_source is not None:
+        payload["price_read_source"] = read_source
     await db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, list_price,"
         " merchant_effective_price, currency, market, source_system, source_ref, offer_payload,"
-        " price_checked_at, suppressed_at)"
+        " price_checked_at, suppressed_at, availability)"
         " VALUES (:oid, :sku, :pk, 'merch_obs_0123456789abcdef', :p, :p, :cur, :mkt, :ss, :link,"
-        " CAST(:payload AS jsonb), :read_at, " + ("now()" if suppressed else "NULL") + ")",
-        {"oid": oid, "sku": f"{pk}::canonical", "pk": pk, "p": price, "cur": currency, "mkt": market,
-         "ss": source_system, "link": link, "payload": json.dumps(payload), "read_at": read_at},
+        " CAST(:payload AS jsonb), :read_at, " + ("now()" if suppressed else "NULL") + ", :avail)",
+        {"oid": oid, "sku": f"{pk}::v:{variant}" if variant else f"{pk}::canonical", "pk": pk,
+         "p": price, "cur": currency, "mkt": market, "ss": source_system, "link": link,
+         "payload": json.dumps(payload), "read_at": read_at, "avail": availability},
     )
     return oid
 
@@ -430,6 +434,12 @@ async def test_census_counts_by_lane_bucket_market_host(db):
     assert total["rows"] == 6  # the mirror row is not a drain-lane row
     assert total["by_decision"] == {"shadow": 6}
     assert total["would_flip"] == 2
+    assert total["would_flip_per_market_rule"] == 2
+    assert total["would_flip_on_out_of_stock_only_offer"] == 0
+    coverage = _by(lines, "backfill_coverage")[0]
+    assert coverage["catalog_products"] == 9 and coverage["trust_rows"] == 7
+    assert coverage["crawl_fresh_rows"] == 0
+    assert coverage["backfill_limit_default"] == 50000 and coverage["over_default_limit"] is False
     assert total["fresh_but_not_renderable"] == 1
     assert total["fresh_still_blocked_by_reason"] == {"non_canonical": 1}
     assert total["would_flip_if_n_days"] == {"1": 1, "3": 2, "7": 2, "14": 3}
@@ -458,7 +468,7 @@ async def test_census_counts_by_lane_bucket_market_host(db):
     assert hosts[("retailer", "other.example.com")]["fresh_not_renderable"] == 1
     assert hosts[("brand_official", "brand.example.com")]["would_flip"] == 1
 
-    proj = {line["scenario"]: line for line in _by(lines, "projection", lane="all")}
+    proj = {line["scenario"]: line for line in _by(lines, "projection", lane="all", rule="max_any")}
     # candidates: r_fresh, b_fresh, r_stale, b_never (renderable, coverage-only, with an offer)
     no = proj["no_reread"]["by_day"]
     assert no["0"] == 2 and no["5"] == 2 and no["6"] == 1 and no["7"] == 0
@@ -468,6 +478,53 @@ async def test_census_counts_by_lane_bucket_market_host(db):
     refresh = proj["refresh_pro_rata"]
     assert refresh["by_day"]["0"] == 2
     assert refresh["steady_state_round_robin"] == 4  # 7 * 0.25 >= 1
+
+
+async def test_census_per_market_rule_out_of_stock_and_variants(db):
+    """Round 2 (b) and (c): the per-market rule against the max-any rule."""
+    from scripts import census_retailer_crawl_fresh_trust as census
+    from services import catalog_row_trust_upserter as up
+
+    keys = {k: "ext:retailer:" + c * 32 for k, c in
+            (("ok", "1"), ("oos", "2"), ("cross", "3"), ("variant", "4"), ("future", "5"), ("edit", "6"),
+             ("cur", "7"))}
+    for pk in keys.values():
+        await _product(db, pk)
+    fresh, stale = NOW - timedelta(days=1), NOW - timedelta(days=20)
+    await _offer(db, keys["ok"], read_at=fresh, availability="in_stock")
+    # the only fresh offer is out of stock
+    await _offer(db, keys["oos"], read_at=fresh, availability="out_of_stock")
+    await _offer(db, keys["oos"], read_at=stale, availability="in_stock")
+    # fresh only in a non-served market; the US offer is weeks old
+    await _offer(db, keys["cross"], read_at=fresh, market="AU", currency="AUD")
+    await _offer(db, keys["cross"], read_at=stale)
+    # variant-scoped: the canonical row is fresh, the variant row is not
+    await _offer(db, keys["variant"], read_at=fresh)
+    await _offer(db, keys["variant"], read_at=stale, variant="111")
+    # dated in the future
+    await _offer(db, keys["future"], read_at=NOW + timedelta(days=2))
+    # dated by an employee price edit
+    await _offer(db, keys["edit"], read_at=fresh, read_source="employee_edit")
+    # US market, but priced in another currency
+    await _offer(db, keys["cur"], read_at=fresh, currency="SGD")
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()))
+
+    conn = await _asyncpg(_SCHEMA)
+    try:
+        lines = await census.collect(conn, max_age_days=7)
+    finally:
+        await conn.close()
+    total = _by(lines, "summary", lane="all")[0]
+    assert total["would_flip_max_any_rule"] == 7
+    assert total["would_flip_per_market_rule"] == 1
+    assert total["would_flip_max_any_not_per_market"] == 6
+    assert total["would_flip_on_out_of_stock_only_offer"] == 1
+    markets = {line["market"]: line for line in _by(lines, "by_market", lane="all")}
+    assert markets["US"]["would_flip_per_market_rule"] == 1
+    assert markets["AU"]["would_flip"] == 1 and markets["AU"].get("would_flip_per_market_rule", 0) == 0
+    proj = {(line["rule"], line["scenario"]): line for line in _by(lines, "projection", lane="all")}
+    assert proj[("max_any", "no_reread")]["by_day"]["0"] == 7
+    assert proj[("per_market", "no_reread")]["by_day"]["0"] == 1
 
 
 async def test_census_runs_read_only_with_a_statement_timeout(db):
@@ -486,6 +543,9 @@ async def test_census_runs_read_only_with_a_statement_timeout(db):
 
         async def fetchval(self, sql, *args):
             return await conn.fetchval(sql, *args)
+
+        async def fetchrow(self, sql, *args):
+            return await conn.fetchrow(sql, *args)
 
         async def fetch(self, sql, *args):
             if "LEFT JOIN LATERAL" in sql:
