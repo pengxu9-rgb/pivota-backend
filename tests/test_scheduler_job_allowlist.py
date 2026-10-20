@@ -27,6 +27,7 @@ MAIN_WORKER_JOB_IDS = [
     "store_lifecycle_reconciliation",
     "cafe24_reconciliation",
     "audit_health_tick", "audit_stability_canary", "catalog_onboard_queue_drain",
+    "retailer_ingest_weekly_reenqueue",
     "audit_run_worker_tick", "audit_run_lease_reaper", "audit_run_abandoned_reaper",
     "executor_run_worker_tick", "executor_run_lease_reaper", "verification_run_worker_tick",
     "verification_run_lease_reaper", "external_seed_catalog_materialization",

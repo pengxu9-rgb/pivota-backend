@@ -26,6 +26,17 @@ from services import seed_offer_currency as m
     ({"price_currency": "USD", "seed_data": {"snapshot": '{"price_currency": "USD"}'}}, None),  # snapshot as a JSON string
     ({"price_currency": "USD", "seed_data": '{"snapshot": {"price_amount": "1"}}'}, "USD"),  # jsonb as driver text
     ({"price_currency": "USD", "seed_data": None}, "USD"),
+    # A stated non-string currency is text to `#>>` ('0', 'false', '["USD"]'): it disagrees, never falls back.
+    ({"price_currency": "USD", "seed_data": {"snapshot": {"price_currency": 0}}}, None),
+    ({"price_currency": "USD", "seed_data": {"snapshot": {"price_currency": False}}}, None),
+    ({"price_currency": "USD", "seed_data": {"snapshot": {"price_currency": ["USD"]}}}, None),
+    # trim() strips SPACES only, as in SQL: a tab or newline keeps the codes apart.
+    ({"price_currency": "\tUSD", "seed_data": {"snapshot": {"price_currency": "USD"}}}, None),
+    ({"price_currency": "USD\n", "seed_data": {"snapshot": {"price_currency": "USD"}}}, None),
+    ({"price_currency": " usd ", "seed_data": {"snapshot": {"price_currency": "USD"}}}, "USD"),
+    # The SQL's own answer, when the caller projected it, is authoritative.
+    ({"price_currency": "USD", "snapshot_price_currency": None, "seed_currency": None}, None),
+    ({"price_currency": "USD", "snapshot_price_currency": None, "seed_currency": "USD"}, "USD"),
 ])
 def test_seed_currency_is_known_only_when_column_and_page_read_agree(seed, expected):
     assert m.seed_currency_of(seed) == expected

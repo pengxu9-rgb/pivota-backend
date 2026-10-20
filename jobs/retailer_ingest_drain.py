@@ -33,6 +33,17 @@ tick whose claim finds every lane busy (or only hosts already in flight) exits i
 
 It does nothing unless RETAILER_INGEST_DRAIN_ENABLED=1, so creating the job is not arming it.
 
+CLAIM WINDOW (RETAILER_INGEST_CLAIM_BLACKOUT_UTC, default 03:00-06:30, "off" to disable): the drain shares
+the one crawl NAT IP with the purchasability sweep (03:15-04:10Z) and the nightly refresh (05:15-06:10Z) and
+has no global pacer, so no stage may still be crawling when the window opens. A claim is refused inside the
+window AND within a lead before it: the longest stage this execution has run, at least the TASK TIMEOUT
+(--task-timeout / RETAILER_INGEST_TASK_TIMEOUT_SECONDS, 3600 s by default: no stage outlives its task) -- so
+with the default window and timeout the last claim is just before 02:00, and every lane's stage has ended by
+03:00. Raising the timeout moves the last claim earlier with it. A refused tick reports outcome `claim_window`
+(which ends the loop and still reports the lane's counts). The refusal happens before the claim statement,
+so no lease is taken and none can be stranded. The effective window is printed once per execution
+(`retailer_ingest_drain_config: `).
+
 Exit codes: 0 = a stage ran and was recorded (whatever its outcome) or nothing was due;
 1 = an unexpected error (recorded on the job as `failed`), so the execution fails and alerts.
 
@@ -47,6 +58,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from db.database import database
@@ -59,15 +71,38 @@ logger = logging.getLogger(__name__)
 SUMMARY_MARKER = "retailer_ingest_drain: "
 
 
+#: The outcome of a tick inside the claim window: nothing claimed, the loop ends.
+CLAIM_WINDOW = "claim_window"
+#: The Cloud Run task timeout (setup_scheduler.sh: 3600 s) when neither --task-timeout nor
+#: RETAILER_INGEST_TASK_TIMEOUT_SECONDS says otherwise. It is also the claim lead's floor: a stage runs at most
+#: this long, and one claimed at 02:5x would otherwise crawl through the 03:15 sweep.
+DEFAULT_TASK_TIMEOUT_SECONDS = 3600
+#: One line per execution, before any claim: the window this execution enforces.
+CONFIG_MARKER = "retailer_ingest_drain_config: "
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 async def drain_once(*, lease_seconds: int, max_leases: int = 1, db: Any = None,
-                     time_left_s: Optional[float] = None) -> Dict[str, Any]:
+                     time_left_s: Optional[float] = None, claim_blackout: Optional[tuple] = None,
+                     now: Optional[Callable[[], datetime]] = None, claim_lead_s: float = 0) -> Dict[str, Any]:
     """One stage, plus the lane's job counts by status on every execution -- including idle ones --
     so a store held for review raises a signal even while nothing is being claimed. `time_left_s`
     (seconds left in this task) reaches the stage, so an apply never starts a catalog write the task
-    timeout would cut short."""
+    timeout would cut short. Inside `claim_blackout`, or within `claim_lead_s` before it, nothing is
+    claimed (outcome `claim_window`)."""
     db = db or database
-    job = await ledger.claim_due_job(lease_seconds=lease_seconds, max_leases=max_leases, db=db)
-    summary = {"outcome": "idle"} if not job else await run_stage(job, db=db, time_left_s=time_left_s)
+    at = (now or _utcnow)()
+    if ledger.in_claim_blackout(at, claim_blackout, claim_lead_s):
+        summary: Dict[str, Any] = {"outcome": CLAIM_WINDOW,
+                                   "claim_window": ledger.format_claim_blackout(claim_blackout),
+                                   "claim_lead_s": int(claim_lead_s)}
+    else:
+        job = await ledger.claim_due_job(lease_seconds=lease_seconds, max_leases=max_leases, db=db,
+                                         blackout=claim_blackout, now=at, lead_s=claim_lead_s)
+        summary = {"outcome": "idle"} if not job else await run_stage(job, db=db, time_left_s=time_left_s)
     summary["jobs"] = await ledger.status_counts(db=db)
     return summary
 
@@ -79,8 +114,11 @@ LEASE_SLACK_SECONDS = 600
 
 async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
                      clock: Callable[[], float] = time.monotonic, report: Callable[[Dict[str, Any]], None] = None,
-                     task_timeout_seconds: int = 3600, max_leases: int = 1) -> List[Dict[str, Any]]:
-    """Stages back to back until nothing is due or the budget is spent. A budget of 0 is one stage.
+                     task_timeout_seconds: int = DEFAULT_TASK_TIMEOUT_SECONDS, max_leases: int = 1,
+                     claim_blackout: Optional[tuple] = None,
+                     now: Optional[Callable[[], datetime]] = None) -> List[Dict[str, Any]]:
+    """Stages back to back until nothing is due, the claim window opens, or the budget is spent. A budget
+    of 0 is one stage.
     A throttled crawl also ends the loop: the crawl NAT is being rate-limited, and the next store would
     draw the same 429s and spend its retry budget -- the next tick is the cool-down. An unexpected
     error propagates (run_stage has recorded it on the job) and ends the loop."""
@@ -94,7 +132,11 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
         # The time left in THIS task: the lease and the stage's catalog-write deadline both come from it.
         time_left = max(0.0, task_timeout_seconds - (began - start))
         lease = min(lease_seconds, int(time_left) + LEASE_SLACK_SECONDS)
-        summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db, time_left_s=time_left)
+        # No claim that could still be running when the window opens: the longest stage seen, and never less
+        # than the task timeout (the longest any stage can run).
+        summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db, time_left_s=time_left,
+                                   claim_blackout=claim_blackout, now=now,
+                                   claim_lead_s=max(longest, task_timeout_seconds))
         ended = clock()
         # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
         summary["duration_s"] = round(ended - began, 1)
@@ -105,7 +147,7 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
         # A stage starts only if one as long as the longest seen so far would still end inside the
         # budget: full-catalog crawls (#2296) and 30k-product scans make stages longer than 12 min,
         # and a stage the task timeout kills is failed as "may be partial".
-        if (summary.get("outcome") in ("idle", "crawl_throttled") or budget_seconds <= 0
+        if (summary.get("outcome") in ("idle", "crawl_throttled", CLAIM_WINDOW) or budget_seconds <= 0
                 or (ended - start) + longest >= budget_seconds):
             return summaries
 
@@ -120,7 +162,8 @@ def main() -> int:
     parser.add_argument("--budget", type=int, default=int(os.getenv("RETAILER_INGEST_DRAIN_BUDGET_SECONDS", "0")))
     # The Cloud Run task timeout (setup_scheduler.sh: 3600s); Cloud Run does not expose it to the task.
     parser.add_argument("--task-timeout", type=int,
-                        default=int(os.getenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS", "3600")))
+                        default=int(os.getenv("RETAILER_INGEST_TASK_TIMEOUT_SECONDS",
+                                              str(DEFAULT_TASK_TIMEOUT_SECONDS))))
     # Stages in flight across overlapping executions; never two at one host. 1 = one at a time.
     parser.add_argument("--max-leases", type=int, default=ledger.max_leases_from_env())
     args = parser.parse_args()
@@ -142,11 +185,18 @@ def main() -> int:
     except Exception:  # noqa: BLE001 -- a log line never blocks the drain
         pass
 
+    blackout = ledger.claim_blackout_from_env()
+    print(CONFIG_MARKER + json.dumps({"claim_window": ledger.format_claim_blackout(blackout),
+                                      "claim_lead_floor_s": args.task_timeout,
+                                      "max_leases": args.max_leases, "budget_s": args.budget}, sort_keys=True),
+          flush=True)
+
     async def _run() -> None:
         await database.connect()
         try:
             await drain_loop(lease_seconds=args.lease, budget_seconds=args.budget, report=report,
-                             task_timeout_seconds=args.task_timeout, max_leases=args.max_leases)
+                             task_timeout_seconds=args.task_timeout, max_leases=args.max_leases,
+                             claim_blackout=blackout)
         finally:
             await database.disconnect()
 

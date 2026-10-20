@@ -9754,7 +9754,9 @@ def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
     (`_group_shadow_answer`) so the shadow reads exactly the rows group mode would.
 
     Plus the seed-currency conjunct, read per call: "" with the reader kill switch
-    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off, so the statement is then the pre-rule one."""
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off. The conjunct is then dropped and rows and
+    plan match the pre-rule statement, but the text (and so its Query Insights digest) differs: the
+    guard's SQL comments stay in it."""
     _seed_currency_guard = seed_projected_offer_guard_and_sql(
         "o", "o.product_key", prefix="\n                       "
     )

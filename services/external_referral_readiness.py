@@ -242,6 +242,46 @@ def _max_structural_share() -> float:
         return _MAX_STRUCTURAL_SHARE_DEFAULT
 
 
+# A SPIKE IN CURRENCY REFUSALS (services/seed_offer_currency). A seed whose column and page read
+# disagree, or that states no currency, makes the offer writer write nothing (`refused_currency`, a
+# structural skip). On 2026-10-19 that was 1,254 of 26,950 active seeds, ~4.7%. A night sampling the
+# queue should refuse about that share of its ATTEMPTED projections: every attempted projection is one
+# seed, and both lanes (mirror and attached) refuse a seed with no currency of its own. The count is
+# a LOWER bound: the attached lane reports `refused_currency` only for a seed that reaches its
+# currency check (after no_listing_offer / listing_offer_suppressed / ambiguous_listing_seller /
+# currency_not_read) and whose live rows are all seed-projected; a seed with an enrichment row
+# beside its refused ones is reported as written, its refusals per row in `projection_offer_skips`. Twice it (10%) means reads started disagreeing with the
+# stored column (a geo-served storefront, an extractor regression), and those seeds silently stop
+# being priced. The structural-share rule cannot see it while the attached lane writes anything.
+# The minimum count keeps a tiny night (1 refusal in 5) from flapping.
+_MAX_REFUSED_CURRENCY_SHARE_DEFAULT = 0.10
+_MIN_REFUSED_CURRENCY_COUNT_DEFAULT = 20
+
+
+def _max_refused_currency_share() -> float:
+    """EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE; >= 1 disables the rule.
+
+    Clamped: a share <= 0 (or not a number) would degrade every night that refuses anything, and a
+    degraded run exits 1 and fails the Cloud Run execution, so it falls back to the default."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE") or "").strip()
+    try:
+        value = float(raw) if raw else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+    except ValueError:
+        return _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+    return value if math.isfinite(value) and value > 0 else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+
+
+def _min_refused_currency_count() -> int:
+    """EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT: below this many refusals the share is
+    noise. Clamped to >= 1 for the same reason as the share."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT") or "").strip()
+    try:
+        value = int(raw) if raw else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+    except ValueError:
+        return _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+    return value if value >= 1 else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+
+
 def batch_run_status(
     *,
     failed: int,
@@ -256,6 +296,7 @@ def batch_run_status(
     projections_written_attached: int = 0,
     candidate_count: int = 0,
     skipped_for_budget: int = 0,
+    projections_refused_currency: int = 0,
 ) -> str:
     """The run's health, as one word. Pure so it can be tested without a database.
 
@@ -312,6 +353,15 @@ def batch_run_status(
     # not have moved (so `price_changes` is 0) and the writer may still have blown up on
     # every row -- the error count was previously collected and read by nothing.
     if projections_attempted and projections_errored >= projections_attempted:
+        return "degraded"
+    # Refusals are structural (they leave the rules above alone) but a SPIKE of them is not the
+    # catalogue's shape: see _MAX_REFUSED_CURRENCY_SHARE_DEFAULT.
+    refused = max(0, projections_refused_currency)
+    if (
+        projections_attempted
+        and refused >= _min_refused_currency_count()
+        and refused / projections_attempted > _max_refused_currency_share()
+    ):
         return "degraded"
     return "success"
 
@@ -2542,6 +2592,7 @@ async def run_external_referral_refresh_batch(
         projections_written_attached=int(proj_writes.get("attached") or 0),
         candidate_count=len(candidate_seed_ids),
         skipped_for_budget=skipped_for_budget,
+        projections_refused_currency=int(proj_skips.get("refused_currency") or 0),
     )
     return {
         # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
@@ -2573,6 +2624,9 @@ async def run_external_referral_refresh_batch(
         # Skips with no offer row to write (a subset of `projection_skips`). The status rule
         # judges `projections_attempted - projection_structural_skips`, the ones that should write.
         "projection_structural_skips": proj_structural,
+        # Seeds whose offer the writer refused for want of a currency they can vouch for (a subset of
+        # the structural skips, counted on its own because a spike degrades the run).
+        "projections_refused_currency": int(proj_skips.get("refused_currency") or 0),
         # Written rows by target: `mirror` (the seed's mirror product) or `attached` (the
         # canonical's offer for the seed's listing).
         "projection_writes": dict(sorted(proj_writes.items())),

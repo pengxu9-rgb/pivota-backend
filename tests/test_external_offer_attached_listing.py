@@ -149,7 +149,67 @@ def test_the_sg_row_takes_an_sgd_read_in_its_own_currency():
 
 
 def test_a_seed_with_no_currency_writes_nothing():
+    """No currency the seed can vouch for: refused before any row is planned, and counted with the
+    mirror lane's refusals (`refused_currency` is a structural skip)."""
     plan = _plan(_seed(price_currency=None), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+def _projected(offer_id, source_system="variant_identity_backfill_v1", **kw):
+    row = _offer(offer_id, **kw)
+    row["source_system"] = source_system
+    return row
+
+
+# skintific.com's shape on the sync path: column USD, page read AUD (projected), and the readers'
+# own answer, projected: the seed states none.
+_DISAGREEING = {"price_currency": "USD", "snapshot_price_currency": "AUD", "seed_currency": None}
+
+
+@pytest.mark.parametrize("source_system", [
+    "external_product_seeds_mirror_v1", "variant_identity_backfill_v1", "variant_offer_projection_v1",
+])
+def test_rows_the_readers_withhold_are_not_repriced(source_system):
+    """PR controller review of #2657 (H1): a seed-projected row of a seed the readers cannot price was
+    re-priced and stamped fresh every night. Every live row is such a row here, so the seed is refused."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+def test_rows_another_writer_owns_keep_mains_behaviour():
+    """M2 of the #2657 review: the enrichment lane's listing rows are not judged by the reader guard,
+    so they are written as on main; whether to stop stamping them fresh is a separate decision."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", "catalog_enrichment_agent_v1")])
+    assert plan["status"] == "planned"
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+
+
+def test_a_mixed_listing_writes_only_the_rows_the_readers_serve():
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows)
+    assert plan["status"] == "planned"
+    assert [w["offer_id"] for w in plan["writes"]] == ["of_canon"]
+    assert plan["skips"] == {"refused_currency": 1}
+
+
+def test_an_agreeing_seed_writes_its_projected_rows():
+    plan = _plan(_seed(price_currency="USD", snapshot_price_currency="USD", seed_currency="USD"),
+                 [_projected("of_canon")])
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+
+
+def test_a_blank_column_writes_nothing_even_with_a_page_read():
+    """M1 of the #2657 review: main required a column currency, and a lone page read must not start
+    writing seeds this lane never wrote."""
+    for row in (_offer("of_canon", currency="AUD"), _projected("of_canon", currency="AUD")):
+        plan = _plan(_seed(price_currency=None, snapshot_price_currency="AUD", seed_currency="AUD", price_amount=56), [row])
+        assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+def test_a_row_currency_is_read_as_the_readers_read_it():
+    """'USD\t' is not 'USD' to SQL's trim() (spaces only), so the row is not this seed's currency."""
+    plan = _plan(_seed(), [_offer("of_canon", currency="USD\t")])
     assert plan["writes"] == [] and plan["skips"] == {"currency_mismatch": 1}
 
 
@@ -364,6 +424,30 @@ def test_an_employee_edit_is_not_bounded_and_moves_only_the_product_row():
     plan = _plan(_seed(price_amount=28.8), offers, source="employee_edit", currency_read=False)
     assert plan["writes"] == [{"offer_id": "of_canon", "price": 28.8, "currency": "USD"}]
     assert plan["skips"] == {"variant_not_edited": 1}
+
+
+def test_a_column_with_a_trailing_newline_no_longer_writes_an_enrichment_row():
+    """The ONE place enrichment rows leave main's behaviour (PR controller review of #2657, B6).
+    Main compared `.strip()`-ed codes, so a column of 'USD\\n' re-priced a USD row. The lane now
+    reads a code as SQL's trim() does (spaces only), as the readers do: 'USD\\n' is not 'USD', and
+    the row is a currency_mismatch, the withholding direction."""
+    plan = _plan(_seed(price_currency="USD\n"), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("planned", [], {"currency_mismatch": 1})
+
+
+def test_a_mixed_listings_refused_rows_are_logged(monkeypatch, caplog):
+    """The seed reports `synced` (its enrichment row wrote), so its refused projected rows would show
+    only in offer_skips: they get their own warning line (PR controller review of #2657)."""
+    import logging
+
+    fake = FakeDB(seed=_seed(**_DISAGREEING),
+                  offers=[_projected("of_canon", "catalog_enrichment_agent_v1"),
+                          _projected("of_copy", sku=f"{PK}::canonical")])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake)
+    assert (result["status"], result["offers_written"], result["offer_skips"]) == ("synced", 1, {"refused_currency": 1})
+    assert [u["offer_id"] for u in fake.updates] == ["of_canon"]
+    assert any("refused_currency" in str(r.msg) and "'rows_refused': 1" in str(r.msg) for r in caplog.records)
 
 
 def test_refused_rows_are_logged_for_review(monkeypatch, caplog):
