@@ -583,11 +583,14 @@ upsert "prod: relgraph-sync running over four hours" "$(policy \
   ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 14400s 14400s)"
 
 # RETIRED NAMES. upsert() replaces a policy by displayName, so a renamed policy would leave its old
-# one live and firing. Each old name is deleted here, after its successor above has been written.
-retire_policy() { # DISPLAY_NAME
-  set -- "$(environment_policy_name "$1")"
-  local old resp
-  for old in $(api GET alertPolicies | python3 -c '
+# one live and firing. Each old name is deleted here, after its successor above has been written, and
+# the run then re-lists to prove it: the old name gone, exactly one successor live. The listing goes
+# into a variable, NOT the for-list: a command substitution that fails in a for-list is just an empty
+# list, so a listing error would retire nothing and report success (2026-10-20 review).
+retire_policy() { # OLD_DISPLAY_NAME SUCCESSOR_DISPLAY_NAME
+  set -- "$(environment_policy_name "$1")" "$(environment_policy_name "$2")"
+  local olds old resp
+  olds="$(api GET alertPolicies | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 if not isinstance(d, dict) or "error" in d:
@@ -595,13 +598,26 @@ if not isinstance(d, dict) or "error" in d:
 for p in d.get("alertPolicies", []):
     if p.get("displayName") == sys.argv[1]:
         print(p["name"])
-' "$1"); do
+' "$1")" || { echo "!! retire $1: listing alert policies FAILED; nothing retired" >&2; exit 1; }
+  for old in $olds; do
     resp="$(api DELETE "${old#projects/*/}")"
     check "$resp" "retire $1"
     echo "   retired $1"
   done
+  api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("retire check: list policies FAILED: " + json.dumps(d)[:200])
+names = [p.get("displayName") for p in d.get("alertPolicies", [])]
+if sys.argv[1] in names:
+    sys.exit("retire check FAILED: " + sys.argv[1] + " is still live")
+if names.count(sys.argv[2]) != 1:
+    sys.exit("retire check FAILED: expected one " + sys.argv[2] + ", found %d" % names.count(sys.argv[2]))
+' "$1" "$2"
+  echo "   checked: $1 absent, $2 live"
 }
-retire_policy "prod: relgraph-sync running over two hours"
+retire_policy "prod: relgraph-sync running over two hours" "prod: relgraph-sync running over four hours"
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \
