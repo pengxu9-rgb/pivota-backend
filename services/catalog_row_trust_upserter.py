@@ -448,42 +448,57 @@ def crawl_fresh_days() -> float:
     return days
 
 
-# A "plain http(s) listing URL": the link a buyer is sent to (the same coalesce
-# and trim the gateway's offer reader uses for `servable`), starting http:// or
-# https:// and carrying no whitespace. An affiliate-feed offer is excluded by
-# provenance: its link is a network tracking URL, not the listing, and the drain
-# never read its price from the storefront.
+# THE LIVE-OFFER TEST, the same one the gateway's offer reader applies before it
+# serves an offer (routes/agent_shop_gateway `servable`, and the loops that keep
+# only a destination starting `http://` / `https://`): the payload link, else
+# source_ref, trimmed, starting http:// or https://. Round 4 spells it EXACTLY as
+# the reader does (round 3 also required no whitespace, so an offer the reader
+# serves could sit outside the class). A destination the readers never serve
+# (ftp:, a bare path, not a URL) is not live and neither dates nor blocks a row.
 CRAWL_OFFER_LINK_SQL = (
     "btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref),"
-    r" E' \t\n\r\f\v') ~ '^https?://\S+$'"
+    r" E' \t\n\r\f\v') ~ '^https?://'"
 )
+# An affiliate-feed offer's link is a network tracking URL, not the listing,
+# and the drain never read its price from the storefront: never a valid read.
 CRAWL_OFFER_NOT_AFFILIATE_SQL = (
     "coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'"
 )
 
 
-# ---- round 3 (2026-10-20): EVERY live offer fresh, in a DECLARED served market --
+# ---- round 4 (2026-10-20): EVERY live offer, fail closed --------------------------
 #
-# Trust stays per PRODUCT (catalog_row_trust has no market column), so the row
-# may go public only when NO surface of it shows a stale drain price. The input
-# is therefore the row's price-read date: the OLDEST valid read across EVERY
-# live offer of the qualifying class, NULL as soon as one of them has none.
+# Trust stays per PRODUCT (catalog_row_trust has no market column), and the
+# readers serve every live offer of a product to somebody: the buyer-currency
+# filter (routes/agent_shop_gateway._offers_in_buyer_currency) keeps offers by
+# currency only and, for a caller that declares no market, keeps them all;
+# copies the attached-listing lane priced (any source_system) and market
+# siblings serve beside the drain's. So the row may go public only when NO
+# offer any reader can show carries a price we cannot vouch for. The input is
+# the row's price-read date: the OLDEST valid read across EVERY live offer,
+# NULL as soon as one of them has none.
 #
-# THE QUALIFYING CLASS -- every live drain-lane offer a buyer in a served market
-# can be shown (crawl_offer_class_conjuncts):
-#   * written by the drain (source_system), unsuppressed and priced
-#     (services.priced_offer_sql, the SAME conjuncts every price gate uses);
-#   * linking to a plain http(s) listing URL, not an affiliate-feed link;
+# THE CLASS -- every LIVE offer on the row (crawl_offer_class_conjuncts):
+#   * unsuppressed and priced (services.priced_offer_sql, the SAME conjuncts
+#     every price gate uses);
+#   * linking to an http(s) destination (CRAWL_OFFER_LINK_SQL above).
+# Nothing else: ANY source_system, ANY market, ANY currency, affiliate offers
+# included. (Round 3 narrowed the class to drain-lane, non-affiliate offers in a
+# served market/currency pair, so an offer outside it neither dated nor blocked
+# the row -- while a no-market caller was still served its price.)
+#
+# A VALID READ of one class offer (CRAWL_OFFER_VALID_READ_SQL), ALL of:
+#   * written by the drain (source_system catalog_enrichment_agent_v1): no other
+#     writer's date is a storefront read this rule vouches for (a variant copy,
+#     a market sibling, a mirror row);
 #   * in a SERVED market priced in that market's currency
 #     (CRAWL_SERVED_MARKET_CURRENCY_PAIRS: config/market_registry.json's served
 #     markets x region_pricing's currencies -- the REGISTRY, not the env
 #     PIVOTA_SERVING_PRICING_REGIONS the serving index reads; the pair list is
 #     committed as config/crawl_fresh_served_markets.json for the twin to pin).
-#     An offer in a market we do not serve, or in the wrong currency, is not
-#     shown to anyone the trust decision is about, so it neither helps nor
-#     blocks.
-#
-# A VALID READ of one such offer (CRAWL_OFFER_VALID_READ_SQL):
+#     An offer in a market we do not serve, or in another currency than its
+#     market's, is still shown to a no-market caller, so it is never valid;
+#   * not an affiliate-feed offer;
 #   * dated by price_checked_at, not after the bound :now (a future stamp is
 #     stale -- per offer, so it can never mask a sibling either);
 #   * its market was DECLARED by the writer: offer_payload.declared_market equals
@@ -497,19 +512,25 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
 #   * not dated by an employee price edit (offer_payload.price_read_source =
 #     'employee_edit', the attached-listing lane's marker). A NULL source -- the
 #     drain apply, or any stamp from before the marker -- counts as a crawl.
+# So ONE live offer that is not the drain's, not in a served pair, priced in
+# the wrong currency, an affiliate offer, undeclared, unread, employee-edited or
+# future-dated makes the row NOT fresh (NULL): fail closed.
 #
 # THE ROW IS CRAWL-FRESH when it has at least one class offer, EVERY class offer
 # has a valid read, at least one class offer is not explicitly out of stock, and
 # the oldest of those reads is within N days (catalog_trust_policy.
 # is_crawl_fresh, judged against the SAME :now the statement was bound with).
-# "Every" settles the round-2 questions on its own terms:
-#   * cross-market: a fresh SG read no longer carries a stale US offer;
+#   * cross-market: a fresh SG read never carries a stale US offer;
 #   * variants: every live variant offer must be fresh, and `::canonical` too --
 #     the refresh dates `::canonical` even when it skipped variants
-#     (`variant_not_re_read`), which now simply leaves the row stale;
-#   * availability: the attached lane never updates availability, so an
-#     out-of-stock flag can be as old as the drain apply that wrote it; that is
-#     why it gates only "at least one in stock", never freshness.
+#     (`variant_not_re_read`), which simply leaves the row stale;
+#   * availability NEVER excuses an offer from freshness: an out-of-stock offer
+#     is in the class and needs its valid read like any other (the attached lane
+#     never updates availability, so its flag can be as old as the drain apply
+#     that wrote it). Availability only adds the "at least one in stock" test.
+#     That test runs over the whole class, which here is the same as over the
+#     VALID offers: a row with any non-valid class offer is NULL already, so
+#     whenever the date survives, every class offer is a valid one.
 CRAWL_DECLARED_MARKET_KEY = "declared_market"
 
 
@@ -549,8 +570,12 @@ CRAWL_OFFER_DECLARED_MARKET_SQL = (
     f"upper(btrim(coalesce(co.offer_payload->>'{CRAWL_DECLARED_MARKET_KEY}', '')))"
     " = upper(btrim(coalesce(co.market, '')))"
 )
+CRAWL_OFFER_DRAIN_SOURCE_SQL = f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"
 CRAWL_OFFER_VALID_READ_SQL = (
-    "CASE WHEN co.price_checked_at <= CAST(:now AS timestamptz)"
+    f"CASE WHEN {CRAWL_OFFER_DRAIN_SOURCE_SQL}"
+    f" AND {CRAWL_OFFER_SERVED_MARKET_SQL}"
+    f" AND {CRAWL_OFFER_NOT_AFFILIATE_SQL}"
+    " AND co.price_checked_at <= CAST(:now AS timestamptz)"
     f" AND {CRAWL_OFFER_DECLARED_MARKET_SQL}"
     f" AND {CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL}"
     " THEN co.price_checked_at END"
@@ -558,11 +583,11 @@ CRAWL_OFFER_VALID_READ_SQL = (
 
 
 def crawl_offer_class_conjuncts(product_key_expr: str) -> list[str]:
-    """The qualifying class for one row (see above). `product_key_expr` is SQL."""
+    """The class for one row: every live offer (see above). `product_key_expr` is SQL."""
     return (
-        [f"co.product_key = {product_key_expr}", f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"]
+        [f"co.product_key = {product_key_expr}"]
         + list(priced_offer_row_conjuncts(alias="co"))
-        + [CRAWL_OFFER_LINK_SQL, CRAWL_OFFER_NOT_AFFILIATE_SQL, CRAWL_OFFER_SERVED_MARKET_SQL]
+        + [CRAWL_OFFER_LINK_SQL]
     )
 
 
@@ -585,6 +610,9 @@ def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ")
 # key list rather than `product_key = ANY(:keys) GROUP BY`: measured on local PG
 # (100k products, 300k offers) the ANY form flips to a parallel SEQ SCAN of
 # catalog_offers at a backfill batch of 5,000 keys; the lateral stays index probes.
+# Round 4 widened the class (no source_system / market / affiliate conjunct in
+# the WHERE): the probe is still the product_key equality, and every other test
+# filters or aggregates that one key's offers.
 #
 # WHO DATES THESE OFFERS (every writer of price_checked_at that can reach a
 # catalog_enrichment_agent_v1 offer on an `ext:` row):
@@ -598,8 +626,10 @@ def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ")
 #   * scripts/backfill_offer_price_checked_at (one-off, fill-only): the seed's
 #     last_crawled_at, only where the offer's price IS that read's.
 # So "fresh" means "the listing page was read recently" (by the drain or by the
-# refresh), not "the drain re-crawled it". (`\S`, not a POSIX `[[:space:]]`
-# class: SQLAlchemy's text() would read `:space` as a bind parameter.)
+# refresh), not "the drain re-crawled it". The same lane also re-prices offers
+# other writers own (its offer read has no source_system filter, e.g. variant
+# copies): their dates are never valid reads, and such an offer, being live,
+# keeps the row NULL.
 #
 # ONE CLOCK. :now is bound from Python, once per batch, and the age is judged in
 # Python against that same value (round 3): SQL now() and the app clock can no
@@ -670,6 +700,15 @@ _CRAWL_FRESH_ROWS_ALL_SQL = (
 # (the product join finds nothing), so it is demoted directly. ROW_TOMBSTONED is
 # the vocabulary's word for "this catalog row no longer stands"; RETURNING, so
 # the count is of rows changed (databases' execute reports none).
+#
+# The outer WHERE re-states BOTH conditions on the row it updates. Under READ
+# COMMITTED a row the subquery picked that a concurrent writer changed is
+# re-checked (EvalPlanQual) against the outer quals on its NEW version, so a
+# trust row re-derived meanwhile (its catalog row re-created and re-upserted:
+# no longer CRAWL_FRESH) is left alone instead of tombstoned. The NOT EXISTS is
+# re-stated too; it reads the statement's snapshot, so on its own it cannot see
+# a catalog row committed after the statement began -- the reason-code recheck
+# is what covers that race once the upserter has re-derived the row.
 _CRAWL_FRESH_ORPHAN_DEMOTE_SQL = (
     "UPDATE catalog_row_trust crt\n"
     "   SET serving_decision = 'blocked',\n"
@@ -677,6 +716,8 @@ _CRAWL_FRESH_ORPHAN_DEMOTE_SQL = (
     "       source_lifecycle_state = 'tombstoned',\n"
     "       updated_at = now()\n"
     " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    "   AND NOT EXISTS (SELECT 1 FROM catalog_products cp WHERE cp.product_key = crt.subject_key)\n"
     "   AND crt.subject_key IN (\n"
     "     SELECT o.subject_key FROM catalog_row_trust o\n"
     "      WHERE o.subject_type = 'product'\n"

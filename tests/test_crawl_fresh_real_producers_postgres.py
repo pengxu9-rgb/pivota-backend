@@ -8,7 +8,9 @@ the employee-edit path are proved on what prod writes, not on a fixture's idea o
     rows, the drain's own stamp (retailer_ingest.pipeline.stamp_declared_market) marks the declared
     market, and the real apply (apply_ingest_plan(price_read=True)) dates the prices;
   * the attached-listing lane (external_offer_dual_write.sync_attached_listing_offers) re-prices the
-    listing row as an employee edit or a refresh read.
+    listing row as an employee edit or a refresh read;
+  * the drain's own stage (retailer_ingest.pipeline.run_stage -> _check, where the declared-market
+    stamp runs) applying onto Postgres, with and without an explicit options.market.
 
 Shares tests/test_sku_identity_upserts_postgres's fixture (tables from the models, rows cleaned by PK).
 """
@@ -158,3 +160,68 @@ async def test_the_batch_clock_bounds_a_future_stamp(db):
     assert await _fresh(db, now=stamped) is True
     assert await _fresh(db, now=(stamped + timedelta(days=7)).replace(tzinfo=None)) is True  # naive = UTC
     assert await _fresh(db, now=stamped + timedelta(days=7, seconds=1)) is False
+
+
+# ---------------------------------------------------------------------------
+# B2 through the drain itself: run_stage -> _check (where the stamp runs) ->
+# the real apply onto Postgres. The state machine's ledger, crawl and readback
+# are the pipeline suite's in-memory fixture (tests/services/
+# test_retailer_ingest_pipeline `env`); only the catalog write is real.
+# ---------------------------------------------------------------------------
+
+from services.catalog_enrichment_agent import apply as _apply_mod  # noqa: E402
+from tests.services.test_retailer_ingest_pipeline import env, job, run_flags  # noqa: E402,F401 -- fixture
+
+_REAL_APPLY_INGEST_PLAN = _apply_mod.apply_ingest_plan  # `env` replaces it with a fake
+
+
+async def _run_drain_apply(database, env, monkeypatch, **options):  # noqa: F811
+    from services.retailer_ingest import pipeline
+
+    seen = {}
+
+    async def real_apply(plan, **kw):
+        env.applied.append(plan)
+        seen["price_read"] = kw.get("price_read")
+        kw.update(db=database, primary_readiness=False)  # readiness is the fixture's to fake
+        return await _REAL_APPLY_INGEST_PLAN(plan, **kw)
+
+    async def group_ok(*args, **kwargs):
+        return True  # product_group_members' prod shape is not this fixture's; not under test here
+
+    monkeypatch.setattr(_apply_mod, "apply_ingest_plan", real_apply)
+    monkeypatch.setattr(_apply_mod, "_ensure_primary_retailer_group", group_ok)
+    await _with_price_check(database)
+    try:
+        out = await pipeline.run_stage(job("apply_due", **options), db=env.db)
+        assert (out["status"], out["outcome"]) == ("done", "applied"), (out, run_flags(env))
+        assert seen["price_read"] is True
+        checks = env.ledger.runs[sorted(env.ledger.runs)[-1]]["checks"]
+        keys = [p["product_key"] for p in env.applied[-1]["pdps"]]
+        rows = await database.fetch_all(
+            "SELECT product_key, market, offer_payload FROM catalog_offers WHERE product_key = ANY(:k)",
+            {"k": keys})
+    finally:
+        # The gate shares one database: remove exactly the rows this apply wrote.
+        keys = [p["product_key"] for plan in env.applied for p in plan["pdps"]]
+        for table in ("catalog_offers", "catalog_skus", "catalog_products"):
+            await database.execute(f"DELETE FROM {table} WHERE product_key = ANY(:k)", {"k": keys})
+        await database.execute("DELETE FROM external_product_seeds WHERE attached_product_key = ANY(:k)",
+                               {"k": keys})
+    assert rows, "the drain apply wrote no offer"
+    payloads = [json.loads(r["offer_payload"]) if isinstance(r["offer_payload"], str) else r["offer_payload"]
+                for r in rows]
+    return checks, [(r["market"], p) for r, p in zip(rows, payloads)]
+
+
+async def test_b2_the_drain_s_check_stamps_an_explicit_market_on_what_it_writes(db, env, monkeypatch):  # noqa: F811
+    checks, offers = await _run_drain_apply(db, env, monkeypatch, market="US")
+    assert checks["declared_market_offers"] == len(offers)
+    assert {(market, payload.get("declared_market")) for market, payload in offers} == {("US", "US")}
+
+
+async def test_b2_the_drain_s_check_stamps_nothing_without_an_explicit_market(db, env, monkeypatch):  # noqa: F811
+    checks, offers = await _run_drain_apply(db, env, monkeypatch)
+    assert checks["declared_market_offers"] == 0
+    assert {market for market, _ in offers} == {"US"}  # job_market()'s fallback, written but not declared
+    assert all("declared_market" not in payload for _, payload in offers)

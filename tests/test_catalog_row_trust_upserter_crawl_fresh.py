@@ -367,20 +367,40 @@ def test_the_statement_is_pinned():
         '  FROM unnest(CAST(:product_keys AS text[])) AS k(product_key)\n'
         ' CROSS JOIN LATERAL (\n'
         '   SELECT CASE WHEN count(*) > 0\n'
-        "                AND bool_and((CASE WHEN co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) IS NOT NULL)\n"
+        "                AND bool_and((CASE WHEN co.source_system = 'catalog_enrichment_agent_v1' AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, '')))) IN (('SG', 'SGD'), ('US', 'USD')) AND coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%' AND co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) IS NOT NULL)\n"
         "                AND bool_or(lower(btrim(coalesce(co.availability, ''))) NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable'))\n"
-        "               THEN min(CASE WHEN co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) END AS row_price_read_at\n"
+        "               THEN min(CASE WHEN co.source_system = 'catalog_enrichment_agent_v1' AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, '')))) IN (('SG', 'SGD'), ('US', 'USD')) AND coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%' AND co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) END AS row_price_read_at\n"
         '     FROM catalog_offers co\n'
         '    WHERE co.product_key = k.product_key\n'
-        "      AND co.source_system = 'catalog_enrichment_agent_v1'\n"
         '      AND co.suppressed_at IS NULL\n'
         '      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n'
-        "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref), E' \\t\\n\\r\\f\\v') ~ '^https?://\\S+$'\n"
-        "      AND coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'\n"
-        "      AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, '')))) IN (('SG', 'SGD'), ('US', 'USD'))\n"
+        "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref), E' \\t\\n\\r\\f\\v') ~ '^https?://'\n"
         ' ) r\n'
         ' WHERE r.row_price_read_at IS NOT NULL\n'
     )
+
+
+def test_the_class_is_every_live_offer_and_validity_carries_the_rest():
+    """Round 4, fail closed: the WHERE names no source, market, currency or
+    affiliate test -- those moved into the valid read, so an offer that fails
+    one is IN the class and makes the row NULL instead of being ignored."""
+    where = upserter.CRAWL_ROW_PRICE_READ_SQL.split(" WHERE co.product_key", 1)[1].split(" ) r", 1)[0]
+    for moved in (upserter.CRAWL_OFFER_DRAIN_SOURCE_SQL, upserter.CRAWL_OFFER_SERVED_MARKET_SQL,
+                  upserter.CRAWL_OFFER_NOT_AFFILIATE_SQL, "source_system", "co.market", "co.currency",
+                  "validated_at"):
+        assert moved not in where
+        assert moved in upserter.CRAWL_OFFER_VALID_READ_SQL
+    assert upserter.CRAWL_OFFER_LINK_SQL in where
+    assert "suppressed_at IS NULL" in where
+    # the reader's own servable test, exactly (routes/agent_shop_gateway's
+    # one-per-seller read spells it on alias `o`, wrapped over two lines)
+    import re
+
+    def norm(sql):
+        return re.sub(r"\s+", " ", sql)
+
+    gateway = (Path(__file__).resolve().parent.parent / "routes/agent_shop_gateway.py").read_text()
+    assert norm(upserter.CRAWL_OFFER_LINK_SQL.replace("co.", "o.")) + ") AS servable" in norm(gateway)
 
 
 def test_the_served_pairs_fixture_is_current():
@@ -429,6 +449,17 @@ def test_the_recheck_shares_the_input_statement_s_rule():
     assert "JOIN catalog_products cp ON cp.product_key = crt.subject_key" in upserter._CRAWL_FRESH_ROWS_ALL_SQL
     assert upserter.crawl_row_price_read_lateral_sql("k.product_key") in upserter.CRAWL_ROW_PRICE_READ_SQL
     assert "@> CAST(ARRAY['CRAWL_FRESH'] AS text[])" in upserter.CRAWL_FRESH_RECHECK_SQL
+
+
+def test_the_orphan_demote_re_checks_both_conditions_on_the_row_it_updates():
+    """Round 4: under EvalPlanQual only the OUTER quals are re-checked on a row a
+    concurrent writer changed (Postgres proof: test_crawl_fresh_trust_postgres)."""
+    sql = upserter._CRAWL_FRESH_ORPHAN_DEMOTE_SQL
+    outer = sql.split(" RETURNING", 1)[0].split("   AND crt.subject_key IN (", 1)[0]
+    assert "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n" in outer
+    assert ("   AND NOT EXISTS (SELECT 1 FROM catalog_products cp WHERE cp.product_key = crt.subject_key)\n"
+            in outer)
+    assert " WHERE crt.subject_type = 'product'\n" in outer
 
 
 # ---------------------------------------------------------------------------

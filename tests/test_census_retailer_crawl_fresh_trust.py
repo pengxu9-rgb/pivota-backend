@@ -44,6 +44,12 @@ def test_census_copies_are_pinned_to_their_originals():
     assert census.NOT_EMPLOYEE_EDIT_SQL == up.CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL
     assert census.DECLARED_MARKET_SQL == up.CRAWL_OFFER_DECLARED_MARKET_SQL
     assert census.VALID_READ_SQL == up.CRAWL_OFFER_VALID_READ_SQL.replace("CAST(:now AS timestamptz)", "now()")
+    # round 4: the class is every live offer, the source moved into the valid read
+    assert census.DRAIN_SOURCE_SQL == up.CRAWL_OFFER_DRAIN_SOURCE_SQL
+    assert census.CLASS_SQL == "\n           AND ".join(up.crawl_offer_class_conjuncts("k")[1:])
+    assert census.VALID_READ_ANY_MARKET_SQL == census.VALID_READ_SQL.replace(
+        f" AND {census.DECLARED_MARKET_SQL}", "")
+    assert census.DECLARED_MARKET_SQL not in census.VALID_READ_ANY_MARKET_SQL
     assert census.SERVED_MARKET_CURRENCY_PAIRS == up.CRAWL_SERVED_MARKET_CURRENCY_PAIRS
     for pk, ss in ((RETAILER, DRAIN), (BRAND, DRAIN), (OTHER, DRAIN), (RETAILER, "x"), ("ext", DRAIN)):
         assert census.is_crawl_listing(pk, ss) == policy.is_crawl_listing(
@@ -111,7 +117,10 @@ def _cls(*, n=1, valid=True, valid_any=True, stock=True, oldest=None, oldest_any
             "newest_valid_any_market": at(newest_any)}
 
 
-def _final_row(class_by_market, *, any_markets=None):
+def _final_row(class_by_market, *, any_markets=None, final=None, final_any=None, non_class=None):
+    """`class_by_market`: round 3's per-market aggregates; `final` / `final_any`:
+    the round-4 SQL row reads (age in days); `non_class`: live offers outside
+    round 3's class, by reason."""
     def at(age):
         return None if age is None else NOW - timedelta(days=age)
 
@@ -120,35 +129,78 @@ def _final_row(class_by_market, *, any_markets=None):
          "serving_decision": "shadow", "reason_codes": [], "identity_status": "unknown",
          "renderable": True, "last_price_read_at": at(1),
          "market_reads": {m: at(a) for m, a in (any_markets or {"US": 1}).items()},
-         "last_in_stock_read_at": at(1), "class_by_market": class_by_market},
+         "last_in_stock_read_at": at(1), "class_by_market": class_by_market,
+         "final_read_at": at(final), "final_read_any_market_at": at(final_any),
+         "live_non_class": non_class},
         now=NOW, max_age_days=7)
 
 
-def test_the_final_rule_needs_every_market_fresh_and_declared():
+def test_the_rule_is_the_sql_row_read():
+    """Round 4: the strict columns are the SQL read over every live offer, not
+    round 3's per-market class aggregates."""
+    row = _final_row({"US": _cls(oldest=1, oldest_any=1, newest_any=1)}, final=2, final_any=2)
+    assert row["would_flip_strict"] is True and row["strict_read_at"] == NOW - timedelta(days=2)
+    # round 3 would flip it; a live offer outside its class makes the SQL read NULL
+    row = _final_row({"US": _cls(oldest=1, oldest_any=1, newest_any=1)}, final=None, final_any=None,
+                     non_class={"affiliate": 1})
+    assert row["would_flip_strict"] is False and row["would_flip_round3"] is True
+    assert row["non_class_reasons"] == ["affiliate"]
+    # B2: undeclared -> only the any-market read
+    row = _final_row({}, final=None, final_any=1)
+    assert row["would_flip_strict"] is False and row["would_flip_any_market_declaration"] is True
+    assert _final_row({}, final=8, final_any=8)["would_flip_strict"] is False
+
+
+def test_the_round3_rule_needs_every_market_fresh_and_declared():
     ok = {"US": _cls(oldest=1, oldest_any=1, newest_any=1), "SG": _cls(oldest=2, oldest_any=2, newest_any=2)}
     row = _final_row(ok)
-    assert row["would_flip_strict"] is True and row["strict_read_at"] == NOW - timedelta(days=2)
+    assert row["would_flip_round3"] is True and row["round3_read_at"] == NOW - timedelta(days=2)
     stale_us = {"US": _cls(oldest=60, oldest_any=60, newest_any=60), "SG": _cls(oldest=0.1, oldest_any=0.1,
                                                                              newest_any=0.1)}
     row = _final_row(stale_us)
-    assert row["would_flip_strict"] is False
+    assert row["would_flip_round3"] is False
     assert row["fresh_in_one_market_stale_in_another"] is True
     undeclared = {"US": _cls(valid=False, oldest=None, oldest_any=1, newest_any=1)}
-    row = _final_row(undeclared)
-    assert row["would_flip_strict"] is False and row["would_flip_any_market_declaration"] is True
+    assert _final_row(undeclared)["would_flip_round3"] is False
     oos = {"US": _cls(stock=False, oldest=1, oldest_any=1, newest_any=1)}
-    assert _final_row(oos)["would_flip_strict"] is False
-    assert _final_row({})["would_flip_strict"] is False
-    assert _final_row({"US": _cls(n=0)})["would_flip_strict"] is False
+    assert _final_row(oos)["would_flip_round3"] is False
+    assert _final_row({})["would_flip_round3"] is False
+    assert _final_row({"US": _cls(n=0)})["would_flip_round3"] is False
     # a market with no class offer (not served) is ignored, its NULL aggregates included
     unserved = {"US": _cls(oldest=1, oldest_any=1, newest_any=1),
                 "AU": _cls(n=0, valid=None, valid_any=None, stock=None)}
-    assert _final_row(unserved)["would_flip_strict"] is True
+    assert _final_row(unserved)["would_flip_round3"] is True
     # one market where SOME class offer lacks a valid read sinks the row, even though its other
     # offers were read (so its oldest valid read is not NULL)
     one_bad = {"US": _cls(valid=False, oldest=1, oldest_any=1, newest_any=1),
                "SG": _cls(oldest=1, oldest_any=1, newest_any=1)}
-    assert _final_row(one_bad)["would_flip_strict"] is False
+    assert _final_row(one_bad)["would_flip_round3"] is False
+
+
+def test_the_non_class_counter_splits_by_reason_and_dedupes_the_total():
+    fresh3 = {"US": _cls(oldest=1, oldest_any=1, newest_any=1)}
+    rows = [
+        _final_row(fresh3, non_class={"affiliate": 2, "non_drain_source": 0}),
+        _final_row(fresh3, non_class={"non_drain_source": 1, "non_served_market": 1}),
+        _final_row(fresh3, non_class={"currency_mismatch": 1, "non_drain_source": 3, "affiliate": 1}),
+        # round 3 would not flip it (stale): never counted, whatever it carries
+        _final_row({"US": _cls(oldest=30, oldest_any=30, newest_any=30)}, non_class={"affiliate": 1}),
+        # round 3 flips, nothing outside its class: round 4 flips it too
+        _final_row(fresh3, final=1, final_any=1, non_class={"affiliate": 0}),
+        _final_row(fresh3, final=1, final_any=1),
+    ]
+    total = [line for line in census.summarize(rows, now=NOW, max_age_days=7, seed_pool_by_market={"US": 1})
+             if line["kind"] == "summary" and line["lane"] == "all"][0]
+    assert total["would_flip_round3_class_rule"] == 5
+    assert total["would_flip_per_market_rule"] == 2
+    assert total["would_flip_but_carries_live_non_class_offer"] == {
+        "affiliate": 2, "non_drain_source": 2, "non_served_market": 1, "currency_mismatch": 1, "total": 3}
+
+
+def test_the_non_class_reasons_are_the_four_asked_for():
+    assert list(census.NON_CLASS_REASON_SQL) == [
+        "affiliate", "non_drain_source", "non_served_market", "currency_mismatch"]
+    assert census.SERVED_MARKETS_SQL == "upper(btrim(coalesce(co.market, ''))) IN ('SG', 'US')"
 
 
 def test_row_read_at_and_cross_market_directly():
@@ -167,7 +219,7 @@ def test_row_read_at_and_cross_market_directly():
 
 
 def test_a_future_per_market_read_never_ages_in():
-    row = _final_row({"US": _cls(oldest=-2, oldest_any=-2, newest_any=-2)})
+    row = _final_row({"US": _cls(oldest=-2, oldest_any=-2, newest_any=-2)}, final=-2, final_any=-2)
     assert row["strict_age_days"] is None
     assert row["would_flip_strict"] is False
     out = census.project([row], max_age_days=7, nightly_probability=0.0, age_field="strict_age_days")
@@ -175,7 +227,8 @@ def test_a_future_per_market_read_never_ages_in():
 
 
 def test_per_market_flips_are_counted_only_in_their_strict_markets():
-    row = _final_row({"US": _cls(oldest=1, oldest_any=1, newest_any=1)}, any_markets={"US": 1, "AU": 1})
+    row = _final_row({"US": _cls(oldest=1, oldest_any=1, newest_any=1)}, any_markets={"US": 1, "AU": 1},
+                     final=1, final_any=1)
     assert row["would_flip_strict"] is True
     lines = census.summarize([row], now=NOW, max_age_days=7, seed_pool_by_market={"US": 10},
                              extras=[{"kind": "drain_job_markets", "jobs": 3}])

@@ -256,25 +256,96 @@ async def _trust(db, pk):
 # ---------------------------------------------------------------------------
 
 
-async def test_the_row_read_is_the_oldest_read_of_every_class_offer(db):
+async def test_the_row_read_is_the_oldest_read_of_every_live_offer(db):
     await _product(db, RETAILER)
     oldest = NOW - timedelta(days=3)
     await _offer(db, RETAILER, read_at=oldest)
     await _offer(db, RETAILER, read_at=NOW - timedelta(days=1), variant="1")
-    # Outside the class: they neither date the row nor block it.
+    # NOT LIVE -- no reader serves them (suppressed, unpriced, or a destination the
+    # gateway's `servable` test refuses): they neither date the row nor block it.
     await _offer(db, RETAILER, read_at=None, suppressed=True)
-    await _offer(db, RETAILER, read_at=None, source_system="shopify_markets_us_localization")
-    await _offer(db, RETAILER, read_at=None, affiliate=True)
+    await _offer(db, RETAILER, read_at=None, source_system="variant_identity_backfill_v1", suppressed=True)
     await _offer(db, RETAILER, read_at=None, link="ftp://shop.example.com/p/1")
-    await _offer(db, RETAILER, read_at=None, link="https://shop.example.com/p 1")
     await _offer(db, RETAILER, read_at=None, link="/p/1")
+    await _offer(db, RETAILER, read_at=None, link="HTTPS://shop.example.com/p/1")
     await _offer(db, RETAILER, read_at=None, price=0)
     await _offer(db, RETAILER, read_at=None, price=None)
     await _offer(db, RETAILER, read_at=None, link=None, payload_link="not a url")
-    await _offer(db, RETAILER, read_at=None, market="AU", currency="AUD")   # not a served market
-    await _offer(db, RETAILER, read_at=None, currency="SGD")                # wrong currency for US
-    await _offer(db, RETAILER, read_at=None, market="SG", currency="USD")   # wrong currency for SG
+    await _offer(db, RETAILER, read_at=None, market="AU", currency="AUD", suppressed=True)
     assert await _reads(db, [RETAILER]) == {RETAILER: oldest}
+
+
+# Round 4, fail closed: each of these is a LIVE offer a reader serves (a no-market
+# get_offers caller gets them all), so each is in the class -- and none is ever a
+# valid read, however fresh its stamp. One beside a fresh declared US/USD drain
+# offer makes the row NOT fresh. (Round 3 left every one of them outside the class.)
+_LIVE_NEVER_VALID = [
+    pytest.param(dict(market="AU", currency="AUD"), id="non_served_market"),
+    pytest.param(dict(market="US", currency="SGD"), id="us_priced_sgd"),
+    pytest.param(dict(market="SG", currency="USD"), id="sg_priced_usd"),
+    pytest.param(dict(source_system="shopify_markets_us_localization"), id="market_sibling"),
+    pytest.param(dict(source_system="variant_identity_backfill_v1", variant="9"), id="variant_copy"),
+    pytest.param(dict(affiliate=True), id="affiliate"),
+]
+
+
+@pytest.mark.parametrize("live", _LIVE_NEVER_VALID)
+async def test_a_live_offer_that_can_never_be_a_valid_read_makes_the_row_not_fresh(db, live):
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=2)}
+    # stamped an hour AFTER the drain read, declared, in stock: still never valid
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1), link="https://shop.example.com/p/2", **live)
+    assert await _reads(db, [RETAILER]) == {}
+
+
+async def test_a_live_link_the_reader_serves_is_in_the_class_even_with_a_space(db):
+    """The class uses the reader's own servable test (`^https?://` once trimmed),
+    so a link round 3 called not-a-listing but the reader serves is dated too."""
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    oid = await _offer(db, RETAILER, read_at=None, link="https://shop.example.com/p 1")
+    assert await _reads(db, [RETAILER]) == {}
+    await db.execute("UPDATE catalog_offers SET price_checked_at = :t WHERE offer_id = :o",
+                     {"t": NOW - timedelta(hours=3), "o": oid})
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=3)}
+
+
+async def test_an_out_of_stock_live_offer_still_needs_its_read(db):
+    """Availability never excuses an offer from freshness."""
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    await _offer(db, RETAILER, read_at=NOW - timedelta(days=60), availability="out_of_stock", variant="3")
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(days=60)}
+
+
+@pytest.mark.parametrize("stale", [
+    pytest.param(dict(market="AU", currency="AUD", link="https://shop.example.com/au/p"), id="au_drain_offer"),
+    pytest.param(dict(source_system="variant_identity_backfill_v1", variant="7"), id="variant_copy"),
+])
+async def test_the_reviewer_case_a_fresh_us_offer_does_not_carry_a_60_day_old_one(db, monkeypatch, stale):
+    """B1 (round 4): a fresh declared US/USD drain offer beside a live offer read 60
+    days ago that a no-market caller is served -- the row must not go public."""
+    from services import catalog_row_trust_upserter as up
+
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    # the control: alone, the fresh offer flips the row
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER])
+    assert (await _trust(db, RETAILER))["serving_decision"] == "public"
+    await _offer(db, RETAILER, read_at=NOW - timedelta(days=60), **stale)
+    assert await _reads(db, [RETAILER]) == {}
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER])
+    row = await _trust(db, RETAILER)
+    assert row["serving_decision"] == "shadow"
+    assert "CRAWL_FRESH" not in list(row["serving_reason_codes"])
+    # and the hourly recheck would have found it too
+    await db.execute("UPDATE catalog_row_trust SET serving_decision = 'public',"
+                     " serving_reason_codes = CAST(ARRAY['CRAWL_FRESH','PUBLIC_PASSTHROUGH'] AS text[])"
+                     " WHERE subject_key = :pk", {"pk": RETAILER})
+    assert await up.recheck_crawl_fresh_rows(db=db) == [RETAILER]
+    assert (await _trust(db, RETAILER))["serving_decision"] == "shadow"
 
 
 @pytest.mark.parametrize("bad", [
@@ -527,6 +598,71 @@ async def test_an_orphan_cannot_starve_the_recheck(db, monkeypatch):
     assert await up.recheck_crawl_fresh_rows(db=db, limit=1) == []
 
 
+async def test_the_orphan_demote_leaves_a_row_re_derived_while_it_waited(db):
+    """EvalPlanQual: the demote picked an orphan (snapshot: CRAWL_FRESH, no
+    catalog row), but a concurrent transaction re-created the catalog row and
+    re-derived the trust row first. The UPDATE re-checks its OUTER quals on the
+    new version, so it must leave that row alone."""
+    import asyncio
+
+    from services import catalog_row_trust_upserter as up
+
+    orphan = "ext:retailer:" + "9" * 32
+    await db.execute(
+        "INSERT INTO catalog_row_trust (subject_type, subject_key, product_key, source_lifecycle_state,"
+        " identity_status, freshness_state, serving_decision, serving_reason_codes, policy_version, updated_at)"
+        " VALUES ('product', :pk, :pk, 'active', 'unknown', 'fresh', 'public',"
+        " CAST(ARRAY['CRAWL_FRESH','PUBLIC_PASSTHROUGH'] AS text[]), 'c1.v0.9', now())", {"pk": orphan})
+    other = await _asyncpg(_SCHEMA)
+    tx = other.transaction()
+    await tx.start()
+    try:
+        await other.execute(
+            "UPDATE catalog_row_trust SET serving_decision = 'shadow',"
+            " serving_reason_codes = CAST(ARRAY['IDENTITY_CONFIDENCE_NULL'] AS text[])"
+            " WHERE subject_key = $1", orphan)
+        demote = asyncio.ensure_future(db.fetch_all(up._CRAWL_FRESH_ORPHAN_DEMOTE_SQL, {"limit": 10}))
+        for _ in range(100):  # until the demote waits on the row lock
+            waiting = await other.fetchval(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                " AND query LIKE 'UPDATE catalog_row_trust crt%'")
+            if waiting:
+                break
+            await asyncio.sleep(0.05)
+        assert waiting, "the demote never waited on the re-derived row"
+        assert not demote.done()
+        # the catalog row comes back in the same transaction (the upserter's re-derive)
+        await _product(_AsyncpgExec(other), orphan, seed=False, ips=False)
+        await tx.commit()
+    except BaseException:
+        await tx.rollback()
+        raise
+    finally:
+        demoted = await demote
+        await other.close()
+    assert demoted == []
+    row = await _trust(db, orphan)
+    assert (row["serving_decision"], list(row["serving_reason_codes"])) == ("shadow", ["IDENTITY_CONFIDENCE_NULL"])
+
+
+class _AsyncpgExec:
+    """`databases`-style execute(sql, {name: value}) over an asyncpg connection,
+    so _product can write inside another session's open transaction."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def execute(self, sql, values=None):
+        import re
+
+        names = []
+
+        def sub(m):
+            names.append(m.group(1))
+            return f"${len(names)}"
+        return await self.conn.execute(re.sub(r"(?<!:):([a-z_]+)", sub, sql), *[values[n] for n in names])
+
+
 async def test_a_failed_probe_inside_the_caller_s_transaction_is_absent_not_an_abort(db, monkeypatch):
     from services import catalog_row_trust_upserter as up
     from services import external_offer_dual_write as dw
@@ -770,6 +906,48 @@ async def test_census_per_market_rule_out_of_stock_and_variants(db):
     proj = {(line["rule"], line["scenario"]): line for line in _by(lines, "projection", lane="all")}
     assert proj[("max_any", "no_reread")]["by_day"]["0"] == 9
     assert proj[("per_market", "no_reread")]["by_day"]["0"] == 1
+
+
+async def test_census_sizes_round_four_by_reason(db):
+    """`would_flip_but_carries_live_non_class_offer`: rows round 3's class would
+    flip that carry a live offer round 4 refuses, per reason, and each row once."""
+    from scripts import census_retailer_crawl_fresh_trust as census
+    from services import catalog_row_trust_upserter as up
+
+    keys = {k: "ext:retailer:" + c * 32 for k, c in
+            (("clean", "a"), ("aff", "b"), ("copy", "c"), ("au", "d"), ("cur", "e"), ("multi", "f"),
+             ("stale", "0"))}
+    for pk in keys.values():
+        await _product(db, pk)
+    fresh, later = NOW - timedelta(days=1), NOW - timedelta(hours=1)
+    for name, pk in keys.items():
+        await _offer(db, pk, read_at=NOW - timedelta(days=20) if name == "stale" else fresh)
+    other = "https://shop.example.com/p/2"
+    await _offer(db, keys["aff"], read_at=later, affiliate=True, link=other)
+    await _offer(db, keys["copy"], read_at=later, source_system="variant_identity_backfill_v1", variant="2",
+                 link=other)
+    await _offer(db, keys["au"], read_at=later, market="AU", currency="AUD", link=other)
+    await _offer(db, keys["cur"], read_at=later, currency="SGD", link=other)
+    await _offer(db, keys["multi"], read_at=later, affiliate=True, link=other)
+    await _offer(db, keys["multi"], read_at=later, market="SG", currency="USD", link=other + "x")
+    await _offer(db, keys["multi"], read_at=later, market="AU", currency="USD", link=other + "y")
+    await _offer(db, keys["stale"], read_at=later, affiliate=True, link=other)  # round 3 would not flip it
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()))
+
+    conn = await _asyncpg(_SCHEMA)
+    try:
+        lines = await census.collect(conn, max_age_days=7)
+        db_now = await conn.fetchval("SELECT now()")
+    finally:
+        await conn.close()
+    total = _by(lines, "summary", lane="all")[0]
+    assert total["would_flip_round3_class_rule"] == 6
+    assert total["would_flip_per_market_rule"] == 1  # clean
+    assert total["would_flip_but_carries_live_non_class_offer"] == {
+        "affiliate": 2, "non_drain_source": 1, "non_served_market": 2, "currency_mismatch": 2, "total": 5}
+    # total = round 3's flips that round 4 refuses
+    assert total["would_flip_round3_class_rule"] - total["would_flip_per_market_rule"] == 5
+    assert await _reads(db, list(keys.values()), now=db_now) == {keys["clean"]: fresh}
 
 
 async def test_census_runs_read_only_with_a_statement_timeout(db):

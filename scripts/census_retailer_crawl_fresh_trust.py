@@ -1,32 +1,59 @@
 #!/usr/bin/env python3
 """READ-ONLY census: what CRAWL_FRESH would move, now and in steady state.
 
-The rule (services/catalog_trust_policy, switched by the upserter's
-CATALOG_TRUST_CRAWL_FRESH_ENABLED, default off): a drain-lane storefront crawl
-row -- source_system `catalog_enrichment_agent_v1`, product_key `ext:...`, i.e.
-the retailer listings (`ext:retailer:...`) AND the brand-official / curated
-canonicals -- is exempt from the identity COVERAGE gates
-(IDENTITY_CONFIDENCE_NULL, IDENTITY_LIVE_READ_DISABLED, the silent
-identity-'unknown' shadow) while at least one of its live drain-lane offers
-carries a listing price read (`catalog_offers.price_checked_at`, migration 246)
-no older than N days and links to a plain http(s) listing URL. Review,
-conflict, non-canonical and every blocked cause still win, and a PDP known not
-to render is never promoted.
+THE RULE (services/catalog_trust_policy + services/catalog_row_trust_upserter,
+switched by CATALOG_TRUST_CRAWL_FRESH_ENABLED, default off; round 4). A
+drain-lane storefront crawl row -- product_key `ext:...` written by
+`catalog_enrichment_agent_v1`, i.e. the retailer listings (`ext:retailer:...`)
+AND the brand-official / curated canonicals -- is exempt from the identity
+COVERAGE gates (IDENTITY_CONFIDENCE_NULL, IDENTITY_LIVE_READ_DISABLED, the
+silent identity-'unknown' shadow) while its price-read date is within N days:
+
+  * the CLASS is EVERY live offer on the row: unsuppressed, priced, linking to
+    an http(s) destination -- any source_system, market, currency, affiliate
+    offers included (CLASS_SQL);
+  * a VALID read of one needs ALL of: the drain wrote it, a served
+    (market, currency) pair, not an affiliate-feed offer, price_checked_at
+    (migration 246) no later than now, its market DECLARED by the writer
+    (offer_payload.declared_market = market), not an employee price edit
+    (VALID_READ_SQL);
+  * the row's read = the OLDEST valid read, and only when every class offer
+    has one and at least one class offer is not out of stock; else none.
+    Fresh when 0 <= age <= N.
+Review, conflict, non-canonical and every blocked cause still win, and a PDP
+known not to render is never promoted.
 
 It answers, BEFORE the switch flips, from the STORED catalog_row_trust rows (the
-6h backfill's last pass) plus one read of the offers, split by LANE (`retailer`
-= ext:retailer:, otherwise the row's enrichment_meta.source_role, e.g.
-`brand_official`; `unlabelled` when it has none):
+6h backfill's last pass) plus reads of the offers, split by LANE (`retailer` =
+ext:retailer:, otherwise the row's enrichment_meta.source_role, e.g.
+`brand_official`; `unlabelled` when it has none). Rule names in the output:
 
-  * summary         -- would flip shadow -> public at N, and at N = 1/3/7/14;
-  * by crawl age    -- newest qualifying price read: <=1d, <=3d, <=7d, <=14d,
-                       >14d, NULL (never read);
-  * by market       -- the markets of each row's fresh drain-lane offers;
-  * by host         -- catalog_products.source_domain;
-  * still blocked   -- fresh rows a reason the rule never lifts keeps out
-                       (review / conflict / non-canonical), and fresh rows whose
-                       PDP would not render;
-  * projection      -- the next 7 days, pure arithmetic over the rows read:
+  * `per_market` / `strict` = THE RULE above (round 4): would_flip_per_market_rule,
+    the per_market projections, the employee-edit and B2 columns;
+  * `round3_class` = round 3's narrower class (only live drain-lane,
+    non-affiliate offers in a served (market, currency) pair; the rest neither
+    dated nor blocked a row). Kept to size what round 4 costs:
+    `would_flip_but_carries_live_non_class_offer`, rows round 3 would flip that
+    carry a live offer round 4 refuses, by reason -- `affiliate`,
+    `non_drain_source`, `non_served_market` (a market we do not serve, any
+    currency), `currency_mismatch` (a served market priced in another currency
+    than its own, e.g. US/SGD) -- and `total`, each row once (a row can carry
+    several reasons);
+  * `max_any` = the round-1 rule (the newest read of any live drain-lane,
+    non-affiliate offer; a future stamp counted fresh), kept for the trend.
+
+Lines (JSON, one per line):
+  * params, served_market_currency, backfill_coverage (catalog_products vs the
+    backfill cron's CATALOG_TRUST_BACKFILL_LIMIT default), drain_job_markets
+    (how many drain jobs name options.market -- only their offers can be
+    declared), employee_edit_dry_run;
+  * summary per lane -- would flip shadow -> public under each rule, at N and
+    at N = 1/3/7/14 (max_any), B2's cost (`would_flip_lost_to_undeclared_market`),
+    B1 (`fresh_in_one_market_stale_in_another`), the out-of-stock-only flips,
+    rows still blocked or not renderable;
+  * by_age_bucket (newest max_any read: <=1d, <=3d, <=7d, <=14d, >14d, NULL),
+    by_market, by_host;
+  * projection -- the next 7 days, pure arithmetic over the rows read, per rule:
       no_reread         nothing re-reads anything: each row drops out the day
                         its read passes N;
       refresh_pro_rata  the paced external-referral refresh re-reads
@@ -34,8 +61,8 @@ It answers, BEFORE the switch flips, from the STORED catalog_row_trust rows (the
                         pro rata over --seed-pool (default: the active US seeds,
                         counted here); expected values;
       drain_weekly      the drain re-crawls every listing weekly: every row with
-                        a qualifying live offer is re-stamped within 7 days,
-                        evenly; expected values.
+                        a live offer is re-stamped within 7 days, evenly;
+                        expected values.
     Each with its steady state, so the switch is not flipped on a post-catch-up
     peak.
 
@@ -45,23 +72,9 @@ shadowing it), crawl-fresh at N, renderable. It is a census of the stored
 decision, so a row whose inputs moved since the last backfill pass is counted
 on its stored verdict.
 
-ROUND 3: the per-market columns now report the FINAL rule (every live offer of
-the qualifying class freshly read, its market declared; see VALID_READ_SQL),
-plus `would_flip_lost_to_undeclared_market` (what B2's declared-market
-requirement withholds today), `fresh_in_one_market_stale_in_another` (B1),
-`drain_job_markets` (how many drain jobs name options.market), an
-`employee_edit_dry_run`, and the `served_market_currency` pairs.
-
-ROUND 2 additions: `backfill_coverage` (catalog_products vs the backfill cron's
-CATALOG_TRUST_BACKFILL_LIMIT default -- above it, rows the oldest-first pass
-never reaches keep their verdict); every summary, market and host line also
-carries the PER-MARKET rule (`would_flip_per_market_rule`, see
-SERVED_MARKET_CURRENCY_SQL) next to the max-any rule, the flips owed to an
-out-of-stock-only fresh offer, and projections for both rules.
-
 SAFETY. One READ ONLY transaction with SET LOCAL statement_timeout; it writes
-nothing and creates nothing: one row query plus six small aggregates. Prints JSON
-lines only. It carries no at-sign so it can be passed inline to
+nothing and creates nothing: one row query plus a few small aggregates. Prints
+JSON lines only. It carries no at-sign so it can be passed inline to
 scripts/ops/run_oneoff_job.sh (see its header), and it needs no crawl subnet
 (it reads the database only):
 
@@ -69,12 +82,14 @@ scripts/ops/run_oneoff_job.sh (see its header), and it needs no crawl subnet
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_retailer_crawl_fresh_trust.py)" --days 3
 
 Self-contained on purpose: the deployed image may predate the rule, so the
-offer predicate below is a COPY of services/catalog_row_trust_upserter's, the
+offer fragments below are COPIES of services/catalog_row_trust_upserter's, the
 row predicate a copy of catalog_trust_policy.is_crawl_listing and the freshness
 test a copy of catalog_trust_policy.is_crawl_fresh.
-tests/test_crawl_fresh_trust_postgres.py pins every copy to its original. Only
-`seed_route_resolves_sql` (services/pdp_renderability, in every image since
-2026-07) is imported from the image.
+tests/test_census_retailer_crawl_fresh_trust.py pins every copy to its original
+and tests/test_crawl_fresh_trust_postgres.py pins the census's row read to the
+upserter's statement on the same rows. Only `seed_route_resolves_sql`
+(services/pdp_renderability, in every image since 2026-07) is imported from the
+image.
 """
 
 from __future__ import annotations
@@ -103,33 +118,27 @@ STATEMENT_TIMEOUT = "300s"
 # COPIES of services/catalog_row_trust_upserter's fragments (pinned by test).
 OFFER_LINK_SQL = (
     "btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref),"
-    r" E' \t\n\r\f\v') ~ '^https?://\S+$'"
+    r" E' \t\n\r\f\v') ~ '^https?://'"
 )
 OFFER_NOT_AFFILIATE_SQL = (
     "coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'"
 )
-# The upserter's statement minus `price_checked_at IS NOT NULL`, so a row with
-# live offers but no read on record still reports its markets; max() ignores
-# NULL exactly as that conjunct does.
-OFFER_CONJUNCTS_SQL = (
-    f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'\n"
-    "           AND co.suppressed_at IS NULL\n"
+DRAIN_SOURCE_SQL = f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"
+# THE CLASS (round 4): every live offer of the row -- the upserter's
+# crawl_offer_class_conjuncts minus the product_key join.
+CLASS_SQL = (
+    "co.suppressed_at IS NULL\n"
     "           AND coalesce(co.merchant_effective_price, co.list_price) > 0\n"
-    f"           AND {OFFER_LINK_SQL}\n"
+    f"           AND {OFFER_LINK_SQL}"
+)
+# The max-any (round-1) and round-3 aggregates read only live drain-lane,
+# non-affiliate offers; max() ignores a NULL read.
+OFFER_CONJUNCTS_SQL = (
+    f"{DRAIN_SOURCE_SQL}\n"
+    f"           AND {CLASS_SQL}\n"
     f"           AND {OFFER_NOT_AFFILIATE_SQL}"
 )
 
-# ROUND 3, the FINAL rule (what the policy ships; COPIES of
-# services/catalog_row_trust_upserter's CRAWL_OFFER_* fragments, pinned by
-# test -- the max-any columns keep reporting the round-1 rule). Per row:
-#   * the CLASS: every live drain offer above that is in a SERVED market priced
-#     in that market's currency (SERVED_MARKET_CURRENCY_SQL);
-#   * a VALID read of one: dated no later than now, its market DECLARED by the
-#     writer (offer_payload.declared_market = market), not an employee edit;
-#   * fresh when the class is not empty, EVERY class offer has a valid read, at
-#     least one is in stock, and the OLDEST valid read is within N (0 <= age <= N).
-# The census evaluates SQL now() inside its one transaction, where now() is the
-# transaction's start -- the same instant `SELECT now()` hands the Python side.
 SERVED_MARKET_CURRENCY_PAIRS = (("SG", "SGD"), ("US", "USD"))
 SERVED_MARKET_CURRENCY_SQL = (
     "(upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
@@ -144,18 +153,34 @@ DECLARED_MARKET_SQL = (
     "upper(btrim(coalesce(co.offer_payload->>'declared_market', '')))"
     " = upper(btrim(coalesce(co.market, '')))"
 )
+# A VALID read (round 4). The census evaluates SQL now() inside its one
+# transaction, where now() is the transaction's start -- the same instant
+# `SELECT now()` hands the Python side.
 VALID_READ_SQL = (
-    "CASE WHEN co.price_checked_at <= now()"
+    f"CASE WHEN {DRAIN_SOURCE_SQL}"
+    f" AND {SERVED_MARKET_CURRENCY_SQL}"
+    f" AND {OFFER_NOT_AFFILIATE_SQL}"
+    " AND co.price_checked_at <= now()"
     f" AND {DECLARED_MARKET_SQL}"
     f" AND {NOT_EMPLOYEE_EDIT_SQL}"
     " THEN co.price_checked_at END"
 )
 # The same read without the declared-market requirement, to size what B2 costs.
-VALID_READ_ANY_MARKET_SQL = (
-    "CASE WHEN co.price_checked_at <= now()"
-    f" AND {NOT_EMPLOYEE_EDIT_SQL}"
-    " THEN co.price_checked_at END"
+VALID_READ_ANY_MARKET_SQL = VALID_READ_SQL.replace(f" AND {DECLARED_MARKET_SQL}", "")
+
+# Why a live offer is outside round 3's class (each one makes a round-4 row
+# NULL). A served market priced in another currency is `currency_mismatch`; a
+# market we do not serve is `non_served_market` whatever its currency.
+SERVED_MARKETS_SQL = (
+    "upper(btrim(coalesce(co.market, '')))"
+    " IN (" + ", ".join(f"'{m}'" for m, _ in SERVED_MARKET_CURRENCY_PAIRS) + ")"
 )
+NON_CLASS_REASON_SQL = {
+    "affiliate": f"NOT ({OFFER_NOT_AFFILIATE_SQL})",
+    "non_drain_source": f"NOT coalesce({DRAIN_SOURCE_SQL}, FALSE)",
+    "non_served_market": f"NOT ({SERVED_MARKETS_SQL})",
+    "currency_mismatch": f"{SERVED_MARKETS_SQL} AND NOT ({SERVED_MARKET_CURRENCY_SQL})",
+}
 
 PRICE_CHECK_COLUMN_SQL = """
 SELECT EXISTS (
@@ -212,10 +237,13 @@ SELECT count(DISTINCT s.attached_product_key) AS rows_with_hand_edited_seed,
    AND cp.suppression_reason IS NULL
    AND s.status = 'active'
    AND s.price_amount IS NOT NULL
-   AND btrim(s.seed_data->'snapshot'->>'price_amount') ~ '^[0-9]+([.][0-9]+)?$'
    AND CAST(s.price_amount AS numeric)
-       <> CAST(btrim(s.seed_data->'snapshot'->>'price_amount') AS numeric)
+       <> CASE WHEN btrim(s.seed_data->'snapshot'->>'price_amount') ~ '^[0-9]+([.][0-9]+)?$'
+               THEN CAST(btrim(s.seed_data->'snapshot'->>'price_amount') AS numeric) END
 """
+# (The CASE, not a regex conjunct beside the CAST: Postgres does not promise to
+# evaluate AND left to right, so a malformed snapshot price must never reach
+# the CAST. A non-numeric snapshot compares NULL and is not counted.)
 
 STILL_BLOCKING = {
     "review_required": "IDENTITY_REVIEW_REQUIRED_LIVE_READ",
@@ -225,6 +253,11 @@ STILL_BLOCKING = {
 AGE_BUCKETS = (("le_1d", 1.0), ("le_3d", 3.0), ("le_7d", 7.0), ("le_14d", 14.0))
 DAY_SECONDS = 24 * 60 * 60
 ALL = "all"
+
+
+def _non_class_counts_sql() -> str:
+    return ", ".join(f"'{reason}', count(*) FILTER (WHERE {sql})"
+                     for reason, sql in NON_CLASS_REASON_SQL.items())
 
 
 def census_sql() -> str:
@@ -244,7 +277,10 @@ SELECT cp.product_key,
        rd.last_price_read_at,
        rd.market_reads,
        rd.last_in_stock_read_at,
-       rd.class_by_market
+       rd.class_by_market,
+       fr.final_read_at,
+       fr.final_read_any_market_at,
+       fr.live_non_class
   FROM catalog_products cp
   LEFT JOIN catalog_row_trust crt
     ON crt.subject_type = 'product'
@@ -279,6 +315,22 @@ SELECT cp.product_key,
          GROUP BY 1
       ) m
   ) rd ON TRUE
+  -- THE RULE (round 4): the upserter's row read over every live offer, plus
+  -- the live offers round 3's class left out, by reason.
+  LEFT JOIN LATERAL (
+    SELECT CASE WHEN count(*) > 0
+                 AND bool_and(({VALID_READ_SQL}) IS NOT NULL)
+                 AND bool_or({IN_STOCK_SQL})
+                THEN min({VALID_READ_SQL}) END AS final_read_at,
+           CASE WHEN count(*) > 0
+                 AND bool_and(({VALID_READ_ANY_MARKET_SQL}) IS NOT NULL)
+                 AND bool_or({IN_STOCK_SQL})
+                THEN min({VALID_READ_ANY_MARKET_SQL}) END AS final_read_any_market_at,
+           jsonb_build_object({_non_class_counts_sql()}) AS live_non_class
+      FROM catalog_offers co
+     WHERE co.product_key = cp.product_key
+       AND {CLASS_SQL}
+  ) fr ON TRUE
  WHERE cp.product_key LIKE '{CRAWL_LISTING_KEY_PREFIX}%'
    AND cp.source_system = '{CRAWL_SOURCE_SYSTEM}'
    AND cp.suppression_reason IS NULL
@@ -357,10 +409,10 @@ def _market_reads(raw: Any) -> Dict[str, Any]:
 
 
 def row_read_at(by_market: Dict[str, Dict[str, Any]], *, declared: bool) -> Optional[datetime]:
-    """The final rule's row read from the per-market class aggregates: None
-    unless the class is not empty, every class offer has a valid read and one
-    is in stock; else the OLDEST valid read. COPY of the upserter's
-    crawl_row_price_read_lateral_sql, over markets (pinned by a Postgres test)."""
+    """ROUND 3's row read from the per-market aggregates of its narrower class
+    (live drain-lane, non-affiliate offers in a served pair): None unless that
+    class is not empty, every offer in it has a valid read and one is in stock;
+    else the OLDEST valid read. The round-4 read is SQL (final_read_at)."""
     if not by_market:
         return None
     valid_key, oldest_key = (("all_valid", "oldest_valid") if declared
@@ -398,11 +450,18 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
     markets = _market_reads(row.get("market_reads"))
     by_market = {m: v for m, v in _market_reads(row.get("class_by_market")).items()
                  if isinstance(v, dict) and int(v.get("n") or 0) > 0}
-    final_read = row_read_at(by_market, declared=True)
-    any_market_read = row_read_at(by_market, declared=False)
+    # THE RULE (round 4): the SQL row read over every live offer.
+    final_read = _to_datetime(row.get("final_read_at"))
+    any_market_read = _to_datetime(row.get("final_read_any_market_at"))
     fresh_strict = is_fresh_strict(final_read, now=now, max_age_days=max_age_days)
     fresh_any_market = is_fresh_strict(any_market_read, now=now, max_age_days=max_age_days)
     would_flip = coverage_only and fresh and renderable
+    # Round 3's narrower class, and the live offers it left out (by reason).
+    round3_read = row_read_at(by_market, declared=True)
+    would_flip_round3 = coverage_only and renderable and is_fresh_strict(
+        round3_read, now=now, max_age_days=max_age_days)
+    live_non_class = _market_reads(row.get("live_non_class"))
+    non_class_reasons = sorted(r for r in NON_CLASS_REASON_SQL if int(live_non_class.get(r) or 0) > 0)
     return {
         "product_key": row["product_key"],
         "lane": row.get("lane") or "unlabelled",
@@ -418,13 +477,17 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
         # renders, and it has at least one qualifying live offer to re-stamp.
         "candidate": coverage_only and renderable and bool(markets),
         "would_flip": would_flip,
-        # Round 3: the final rule (see VALID_READ_SQL); its row read is never in
-        # the future (now() bounds it), and _non_negative keeps a stray one out.
+        # THE RULE (see VALID_READ_SQL); its row read is never in the future
+        # (now() bounds it), and _non_negative keeps a stray one out.
         "strict_read_at": final_read,
         "strict_age_days": _non_negative(age_days(final_read, now=now)),
         "would_flip_strict": coverage_only and fresh_strict and renderable,
         # the same rule without B2's declared-market requirement
         "would_flip_any_market_declaration": coverage_only and fresh_any_market and renderable,
+        # round 3's class, and the reasons its flip is refused now (empty: not refused)
+        "round3_read_at": round3_read,
+        "would_flip_round3": would_flip_round3,
+        "non_class_reasons": non_class_reasons if would_flip_round3 else [],
         # B1: fresh in one served market while another has a stale/unread live offer
         "fresh_in_one_market_stale_in_another": coverage_only and renderable
             and cross_market_stale(by_market, now=now, max_age_days=max_age_days),
@@ -575,6 +638,13 @@ def summarize(
                 r["would_flip_any_market_declaration"] and not r["would_flip_strict"] for r in part),
             # B1's case, sized without B2
             "fresh_in_one_market_stale_in_another": sum(r["fresh_in_one_market_stale_in_another"] for r in part),
+            # Round 4's cost: what round 3 would flip that a live offer outside
+            # its class now refuses, by reason; `total` counts each row once.
+            "would_flip_round3_class_rule": sum(r["would_flip_round3"] for r in part),
+            "would_flip_but_carries_live_non_class_offer": {
+                **{reason: sum(reason in r["non_class_reasons"] for r in part) for reason in NON_CLASS_REASON_SQL},
+                "total": sum(bool(r["non_class_reasons"]) for r in part),
+            },
             "would_flip_on_out_of_stock_only_offer": sum(r["would_flip_oos_only"] for r in part),
             "fresh_but_not_renderable": sum(r["fresh_not_renderable"] for r in part),
             "fresh_still_blocked_by_reason": dict(sorted(still_blocked.items())),
