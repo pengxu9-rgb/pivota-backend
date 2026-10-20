@@ -419,6 +419,14 @@ def test_a_nonsense_refusal_share_falls_back_to_the_default(monkeypatch, raw):
     assert _run(monkeypatch, rows, limit=300)["status"] == "success"
 
 
+@pytest.mark.parametrize("raw", ["0", "-1", "x"])
+def test_a_nonsense_minimum_refusal_count_falls_back_to_the_default(monkeypatch, raw):
+    """A minimum of 0 or below would let a single refusal on a tiny night trip the share rule."""
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT", raw)
+    rows = [_structural(status="refused_currency") for _ in range(5)] + [_wrote() for _ in range(5)]
+    assert _run(monkeypatch, rows, limit=10)["status"] == "success"
+
+
 async def _projected(monkeypatch, outcome):
     """One seed's projection counters from the REAL helper (routes/employee_products), given what
     sync_offer_for_seed returned, so the summary is fed exactly what production feeds it."""

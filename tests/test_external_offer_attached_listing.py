@@ -155,20 +155,62 @@ def test_a_seed_with_no_currency_writes_nothing():
     assert (plan["status"], plan["writes"]) == ("refused_currency", [])
 
 
-@pytest.mark.parametrize("over, status, writes", [
-    # skintific.com's shape on the sync path: column USD, page read AUD (projected).
-    ({"price_currency": "USD", "snapshot_price_currency": "AUD"}, "refused_currency", []),
-    # the readers' own answer, projected: the seed states none.
-    ({"price_currency": "USD", "snapshot_price_currency": None, "seed_currency": None}, "refused_currency", []),
-    # agreeing control: the USD row takes the seed's price.
-    ({"price_currency": "USD", "snapshot_price_currency": "USD", "seed_currency": "USD"}, "planned",
-     [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]),
+def _projected(offer_id, source_system="variant_identity_backfill_v1", **kw):
+    row = _offer(offer_id, **kw)
+    row["source_system"] = source_system
+    return row
+
+
+# skintific.com's shape on the sync path: column USD, page read AUD (projected), and the readers'
+# own answer, projected: the seed states none.
+_DISAGREEING = {"price_currency": "USD", "snapshot_price_currency": "AUD", "seed_currency": None}
+
+
+@pytest.mark.parametrize("source_system", [
+    "external_product_seeds_mirror_v1", "variant_identity_backfill_v1", "variant_offer_projection_v1",
 ])
-def test_the_attached_lane_writes_only_in_the_seeds_own_currency(over, status, writes):
-    """PR controller review of #2657: this lane compared only the column to each row, so a seed whose
-    column and page read disagree re-priced and freshness-stamped rows every reader withholds."""
-    plan = _plan(_seed(**over), [_offer("of_canon")])
-    assert (plan["status"], plan["writes"]) == (status, writes)
+def test_rows_the_readers_withhold_are_not_repriced(source_system):
+    """PR controller review of #2657 (H1): a seed-projected row of a seed the readers cannot price was
+    re-priced and stamped fresh every night. Every live row is such a row here, so the seed is refused."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+def test_rows_another_writer_owns_keep_mains_behaviour():
+    """M2 of the #2657 review: the enrichment lane's listing rows are not judged by the reader guard,
+    so they are written as on main; whether to stop stamping them fresh is a separate decision."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", "catalog_enrichment_agent_v1")])
+    assert plan["status"] == "planned"
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+
+
+def test_a_mixed_listing_writes_only_the_rows_the_readers_serve():
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows)
+    assert plan["status"] == "planned"
+    assert [w["offer_id"] for w in plan["writes"]] == ["of_canon"]
+    assert plan["skips"] == {"refused_currency": 1}
+
+
+def test_an_agreeing_seed_writes_its_projected_rows():
+    plan = _plan(_seed(price_currency="USD", snapshot_price_currency="USD", seed_currency="USD"),
+                 [_projected("of_canon")])
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+
+
+def test_a_blank_column_writes_nothing_even_with_a_page_read():
+    """M1 of the #2657 review: main required a column currency, and a lone page read must not start
+    writing seeds this lane never wrote."""
+    for row in (_offer("of_canon", currency="AUD"), _projected("of_canon", currency="AUD")):
+        plan = _plan(_seed(price_currency=None, snapshot_price_currency="AUD", seed_currency="AUD", price_amount=56), [row])
+        assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+def test_a_row_currency_is_read_as_the_readers_read_it():
+    """'USD\t' is not 'USD' to SQL's trim() (spaces only), so the row is not this seed's currency."""
+    plan = _plan(_seed(), [_offer("of_canon", currency="USD\t")])
+    assert plan["writes"] == [] and plan["skips"] == {"currency_mismatch": 1}
 
 
 @pytest.mark.parametrize("price", [None, 0, -1, "n/a"])

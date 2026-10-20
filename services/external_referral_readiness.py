@@ -246,8 +246,11 @@ def _max_structural_share() -> float:
 # disagree, or that states no currency, makes the offer writer write nothing (`refused_currency`, a
 # structural skip). On 2026-10-19 that was 1,254 of 26,950 active seeds, ~4.7%. A night sampling the
 # queue should refuse about that share of its ATTEMPTED projections: every attempted projection is one
-# seed, and both lanes (mirror and attached) refuse a seed with no currency of its own, so the
-# per-seed baseline and the per-attempt denominator measure the same thing. Twice it (10%) means reads started disagreeing with the
+# seed, and both lanes (mirror and attached) refuse a seed with no currency of its own. The count is
+# a LOWER bound: the attached lane reports `refused_currency` only for a seed that reaches its
+# currency check (after no_listing_offer / listing_offer_suppressed / ambiguous_listing_seller /
+# currency_not_read) and whose live rows are all seed-projected; a seed with an enrichment row
+# beside its refused ones is reported as written, its refusals per row in `projection_offer_skips`. Twice it (10%) means reads started disagreeing with the
 # stored column (a geo-served storefront, an extractor regression), and those seeds silently stop
 # being priced. The structural-share rule cannot see it while the attached lane writes anything.
 # The minimum count keeps a tiny night (1 refusal in 5) from flapping.
