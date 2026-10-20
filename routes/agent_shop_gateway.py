@@ -6565,7 +6565,9 @@ async def _handle_offers_resolve(
         _price_select, _price_order, _price_params = (
             await _catalog_price_freshness_sql() if _group_mode else ("", "", {})
         )
-        _seed_currency_guard = seed_projected_offer_guard_and_sql("o", "o.product_key")
+        _seed_currency_guard = seed_projected_offer_guard_and_sql(
+            "o", "o.product_key", prefix="\n                       "
+        )
         if _group_mode:
             # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
             _price_select += "\n                           o.sku_key AS sku_key,"
@@ -6675,16 +6677,16 @@ async def _handle_offers_resolve(
                        AND o.suppressed_at IS NULL
                        AND coalesce(o.merchant_effective_price, o.estimated_best_price,
                                     o.list_price) > 0
-                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
-                           IS NOT NULL
                        -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
-                       -- (services/seed_offer_currency, Peng 2026-10-19). Before the window
-                       -- above ranks, so a stale copy never holds a seller's slot: SKINTIFIC's
-                       -- set carried 20 USD 23.56 offers the variant backfill copied off a seed
-                       -- since re-read in AUD, and this arm would mint a link at that price.
-                       -- Correlated on the listing the offer prices; "" with the reader kill
-                       -- switch (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off.
-                       {_seed_currency_guard}
+                       -- (services/seed_offer_currency, Peng 2026-10-19), the conjunct after the
+                       -- next one. Before the window above ranks, so a stale copy never holds a
+                       -- seller's slot: SKINTIFIC's set carried 20 USD 23.56 offers the variant
+                       -- backfill copied off a seed since re-read in AUD, and this arm would mint
+                       -- a link at that price. Correlated on the listing the offer prices; nothing
+                       -- at all with the reader kill switch
+                       -- (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off.
+                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                           IS NOT NULL{_seed_currency_guard}
                       ) base
                       ) twins
                      -- THE PLACEHOLDER TWIN: every retailer row carries its product-level
