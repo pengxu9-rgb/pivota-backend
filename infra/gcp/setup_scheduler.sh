@@ -431,6 +431,24 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     ~1,400 newest rows; a targeted run of 45 anchors generated 344 candidates for 32 that had none.
 #     This applies to the recency anchors too.
 #   PREREQUISITE: a relgraph-sync image containing #2418 and its follow-up (the job is pinned by digest).
+# GLOBAL REVIEW BACKLOG (Peng 2026-10-20). The nightly reviewed only the labels its own build produced
+# (RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD defaults on) and only labels updated since the 24h selection
+# window (RELGRAPH_SYNC_CUTOFF defaults to it), ~1,000 a night, while 26,617 competitive_alternative
+# labels sat `generated` and unreviewed (census 2026-10-20). Prod only:
+#   RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false + RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z - review the
+#     global score-ordered generated queue. The cutoff feeds only the review step.
+#   RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative - the similar rail's backlog first
+#     (~3 nights); related_product (43,300 generated) after.
+#   RELGRAPH_SYNC_REVIEW_LIMIT=10000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=16 - PREREQUISITE: a gateway
+#     image whose review-limit cap is 10,000 at every layer (PIVOTA-Agent: cron, sync routine, routine
+#     job, review script; before it, each silently capped 10,000 at 5,000). 16 is the gateway's maximum.
+#     Measured at concurrency 8: ~1-1.7 s per review, so 10,000 is ~1.4-2.4 h at 16 plus the ~30-minute
+#     build. The step budget rises to 300 minutes and the task timeout to 21600s (6 h); with
+#     --max-retries 1 a wedged run can cost 12 h. The run's review error gate (max 25%) stops the step
+#     if the model provider throttles at 16. The "running over two hours" alert (setup_monitoring.sh)
+#     will fire on a normal night at this size until its threshold is raised with a monitoring reconcile.
+#   RELGRAPH_DB_DUTY_CYCLE=1 - set by hand on 2026-10-15 (PIVOTA-Agent #2444: duty-cycle pacing keeps the
+#     build's database streams at ~0.25 of the 2-vCPU primary); without it here a reconcile turns it off.
 # Staging keeps the 45-minute budget and none of these. --set-env-vars replaces the whole env, so the
 # live job must carry exactly these values before the next reconcile (set them with the same update).
 # Staging gets neither Vertex nor the write gates: GOOGLE_CLOUD_PROJECT follows $PROJECT, and the
@@ -438,7 +456,9 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 relgraph_sync_env(){
   local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
-    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=90,RELGRAPH_SYNC_REVIEW_LIMIT=2000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=8,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=300,RELGRAPH_SYNC_REVIEW_LIMIT=10000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=16,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false,RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z,RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative"
+    env="$env,RELGRAPH_DB_DUTY_CYCLE=1"
     env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
     env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
   else
@@ -452,7 +472,7 @@ relgraph_sync_env(){
 mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
   --set-env-vars "$(relgraph_sync_env)" \
-  --task-timeout 14400s \
+  --task-timeout 21600s \
   --command npm --args "run,relgraph:sync-routine:cron"
 
 echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
