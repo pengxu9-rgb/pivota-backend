@@ -25,6 +25,7 @@ from services.agent_decision_gates import (
 )
 from services.category_path_aliases import resolve as resolve_category_path
 from services.priced_offer_sql import priced_offer_exists_sql
+from services.seed_offer_currency import seed_currency_guard_enabled, seed_projected_offer_in_seed_currency_sql
 from services.region_pricing import (
     acquisition_market_offer_exists_sql,
     has_offer_priced_for_any_region_sql,
@@ -921,6 +922,75 @@ WHERE cp.content_key = ANY(:content_keys)
 ORDER BY cp.content_key, cp.updated_at DESC NULLS LAST, cp.product_key
 """
 
+# ── has_price / has_serving_region_offer under the seed-currency offer rule (FLAG, default OFF) ──
+#
+# Peng 2026-10-19: a price's currency is the buyer market's, never defaulted. An offer copied off a
+# seed (services/seed_offer_currency: the mirror, the variant backfill, the variant projection) is a
+# price only while an ACTIVE seed is attached to its listing and every active one is read in the
+# offer's currency. The agent_pdp_view offer read, gateway search and offers.resolve already refuse
+# the others. These two signals still count them, so a content_key whose only priced offers are such
+# copies stays serving_eligible with no price anyone will show.
+#
+# OFF BY DEFAULT, and flipping it is Peng's decision: it takes rows out of serving. Prod census
+# spccy5-1019b (2026-10-19, read-only): 49 serving content_keys hold only refused USD offers. With
+# the flag off every statement below is the one main sends, byte for byte.
+#
+# Postgres only. The SQLite test query (`_SINGLE_QUERY_SQLITE`) is not gated: the predicate is
+# Postgres SQL. Not gated either: has_us_offer (a stored fact about US currency, read only as the
+# fallback for has_serving_region_offer) and the trust policy's own priced_offer_exists_sql
+# (services/catalog_row_trust_upserter), which stays the looser of the two while this is on.
+SERVING_PRICE_SEED_CURRENCY_ENV = "SERVING_PRICE_REQUIRES_SEED_CURRENCY"
+
+
+def serving_price_requires_seed_currency() -> bool:
+    """SERVING_PRICE_REQUIRES_SEED_CURRENCY: has_price and has_serving_region_offer count only
+    offers that pass the seed-currency rule. Default off."""
+    return str(os.getenv(SERVING_PRICE_SEED_CURRENCY_ENV, "") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+# Correlated on the listing the offer prices (co.product_key = cp.product_key in both EXISTS).
+_SEED_CURRENCY_OFFER = seed_projected_offer_in_seed_currency_sql("co", "co.product_key")
+# Anchored on the column alias, not the bare EXISTS: with the served regions narrowed to one, the
+# serving-region EXISTS is the has_us_offer EXISTS character for character.
+_SEED_CURRENCY_GATED_COLUMNS = (
+    (
+        f"{_HAS_PRICE_EXISTS}      AS has_price,",
+        f"{priced_offer_exists_sql('cp.product_key', extra_predicate=_SEED_CURRENCY_OFFER)}      AS has_price,",
+    ),
+    (
+        f"{_HAS_SERVING_REGION_OFFER_EXISTS}      AS has_serving_region_offer,",
+        f"{has_offer_priced_for_any_region_sql('cp.product_key', serving_pricing_regions(), extra_predicate=_SEED_CURRENCY_OFFER)}"
+        "      AS has_serving_region_offer,",
+    ),
+)
+
+
+def _seed_currency_gated_query(query: str) -> str:
+    gated = query
+    for plain, narrowed in _SEED_CURRENCY_GATED_COLUMNS:
+        if gated.count(plain) != 1:
+            raise ValueError("an eligibility query lost the column the seed-currency rule narrows")
+        gated = gated.replace(plain, narrowed)
+    return gated
+
+
+_SEED_CURRENCY_GATED_QUERIES = {
+    query: _seed_currency_gated_query(query) for query in (_BATCH_QUERY, _SINGLE_QUERY, _MULTI_QUERY)
+}
+
+
+def eligibility_query(query: str) -> str:
+    """`query` (_BATCH_QUERY, _SINGLE_QUERY or _MULTI_QUERY) as this process should send it: itself,
+    or with has_price and has_serving_region_offer under the seed-currency rule when
+    SERVING_PRICE_REQUIRES_SEED_CURRENCY is on and the reader kill switch
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) is not off."""
+    if not serving_price_requires_seed_currency() or not seed_currency_guard_enabled():
+        return query
+    return _SEED_CURRENCY_GATED_QUERIES[query]
+
+
 _SINGLE_QUERY_SQLITE = f"""
 SELECT
     cp.content_key,
@@ -1170,7 +1240,7 @@ async def _fetch_eligibility_inputs(content_key: str, *, db: Any = None) -> List
     """Fetch the current eligibility signal rows for one content_key."""
     if not content_key:
         return []
-    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database(db) else _SINGLE_QUERY
+    query = _SINGLE_QUERY_SQLITE if _is_sqlite_database(db) else eligibility_query(_SINGLE_QUERY)
     rows = await (db or database).fetch_all(query, {"content_key": content_key})
     return [dict(row) for row in rows]
 
@@ -1192,7 +1262,7 @@ async def _fetch_eligibility_inputs_for_content_keys(
             grouped[key] = await _fetch_eligibility_inputs(key)
         return grouped
 
-    rows = await database.fetch_all(_MULTI_QUERY, {"content_keys": keys})
+    rows = await database.fetch_all(eligibility_query(_MULTI_QUERY), {"content_keys": keys})
     for row in rows or []:
         item = dict(row)
         key = str(item.get("content_key") or "").strip()

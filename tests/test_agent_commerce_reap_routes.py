@@ -284,7 +284,7 @@ async def _db():
             "CREATE TABLE external_product_seeds ("
             "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, "
             "destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
-            "seed_data TEXT)"
+            "seed_data TEXT, price_currency TEXT)"
         )
 
     for table in CATALOG_TABLES + ("buyer_identity_links", "shop_users"):
@@ -307,7 +307,7 @@ async def _db():
 #: The seed-table columns these tests write; a table left behind without one of them is set aside.
 _SEED_TABLE_COLUMNS = frozenset({
     "id", "status", "domain", "market", "destination_url", "canonical_url",
-    "attached_product_key", "attached_variant_id", "seed_data",
+    "attached_product_key", "attached_variant_id", "seed_data", "price_currency",
 })
 _SEED_TABLE_STASH = "external_product_seeds__stashed_by_reap_routes"
 
@@ -4035,11 +4035,13 @@ KRAVE_PLACEHOLDER = f"{KRAVE_PK}::canonical"
 KRAVE_REAL = f"{KRAVE_PK}::sku_3c1f0e9a7b2d4c6e8f01"
 
 
-async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_sku=True):
+async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_sku=True,
+                             seed_currency=None, page_currency=None):
     """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock, market 'US' (the mirror writer's
     column default) -- or [(sku_key, merchant_id, price, {column: value})] to override any of
     currency / market / availability / suppression_reason / suppressed_at. `market` is the seed's
-    and the Tier B verdict's; the buyer's market is the shipping country (`_krave_body`)."""
+    and the Tier B verdict's; the buyer's market is the shipping country (`_krave_body`).
+    `seed_currency` / `page_currency`: the seed's price_currency column and snapshot.price_currency."""
     await database.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, "
         "brand, category, product_type, source_domain, source_system, source_ref, seller_ref, "
@@ -4058,12 +4060,13 @@ async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_
         )
     for i, (sku_key, merchant_id, price, *extra) in enumerate(offers):
         cols = {"currency": "USD", "market": "US", "availability": "in_stock",
-                "suppression_reason": None, "suppressed_at": None, **(extra[0] if extra else {})}
+                "suppression_reason": None, "suppressed_at": None, "source_system": None,
+                **(extra[0] if extra else {})}
         await database.execute(
             "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, market, "
-            "merchant_effective_price, availability, suppression_reason, suppressed_at) VALUES "
-            "(:oid, :sk, :pk, :m, :currency, :market, :p, :availability, :suppression_reason, "
-            ":suppressed_at)",
+            "merchant_effective_price, availability, suppression_reason, suppressed_at, source_system) "
+            "VALUES (:oid, :sk, :pk, :m, :currency, :market, :p, :availability, :suppression_reason, "
+            ":suppressed_at, :source_system)",
             {"oid": f"off_krave_{i}", "sk": sku_key, "pk": KRAVE_PK, "m": merchant_id, "p": price,
              **cols},
         )
@@ -4078,13 +4081,15 @@ async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_
             "checked_at": datetime.now(timezone.utc).isoformat(),
         },
     }}
+    if page_currency is not None:
+        seed["snapshot"]["price_currency"] = page_currency
     await database.execute(
         "INSERT INTO external_product_seeds (id, status, domain, market, destination_url, "
-        "canonical_url, attached_product_key, attached_variant_id, seed_data) VALUES "
-        "(:id, 'active', :d, :mk, :dest, NULL, :pk, NULL, :sd)",
+        "canonical_url, attached_product_key, attached_variant_id, seed_data, price_currency) VALUES "
+        "(:id, 'active', :d, :mk, :dest, NULL, :pk, NULL, :sd, :ccy)",
         {"id": KRAVE_SEED, "d": KRAVE_DOMAIN, "mk": market,
          "dest": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal", "pk": KRAVE_PK,
-         "sd": json.dumps(seed)},
+         "sd": json.dumps(seed), "ccy": seed_currency},
     )
     await database.execute(
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
@@ -4196,6 +4201,54 @@ async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offe
     resp = await client.post(f"{BASE}/purchases", json=_krave_body())
     assert resp.status_code == 409 and _error(resp) == reason, resp.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+# ── an offer copied off a seed is a price only in that seed's currency (Peng 2026-10-19) ──────
+#
+# US search served SKINTIFIC's set at USD 23.56: 20 offers the variant backfill copied off
+# seed_data.variants, after the seed was re-read in AUD. This route reads the seller's offers
+# cheapest first, so the copy would have been the cart's price. services/seed_offer_currency.
+
+_BACKFILL = {"source_system": "variant_identity_backfill_v1"}
+_MIRRORED = {"source_system": "external_product_seeds_mirror_v1"}
+_MARKETS_READ = {"source_system": "shopify_markets_us_localization"}
+
+
+@pytest.mark.parametrize("seed_currency,page_currency,offers,expected", [
+    # skintific: the variant's USD 23.56 copy on a seed re-read in AUD; the mirror's AUD offer is
+    # no US price -> nothing prices the cart.
+    ("AUD", "AUD", [(KRAVE_REAL, KRAVE_MERCHANT, "23.56", _BACKFILL),
+                    (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "56.00", {"currency": "AUD", **_MIRRORED})],
+     "row_unpriced"),
+    # ... and with the store's own Shopify-Markets US read beside it, that read is the price
+    # although the copy is cheaper.
+    ("AUD", "AUD", [(KRAVE_REAL, KRAVE_MERCHANT, "23.56", _BACKFILL),
+                    (KRAVE_REAL, KRAVE_MERCHANT, "39.00", _MARKETS_READ)], 3900),
+    # nourwish: the mirror stamped USD on an SGD seed.
+    ("SGD", "SGD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "20.00", _MIRRORED)], "row_unpriced"),
+    # the column says USD (the writers' old default); the page was read in QAR.
+    ("USD", "QAR", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED)], "row_unpriced"),
+    # the placeholder's copies must agree only among the ones that are prices
+    ("USD", "USD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED),
+                    (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", _MIRRORED)], "row_price_ambiguous"),
+    # control: a USD seed's USD copies are its price
+    ("USD", "USD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED)], 2800),
+    ("USD", None, [(KRAVE_REAL, KRAVE_MERCHANT, "26.00", _BACKFILL)], 2600),
+])
+async def test_a_seed_copy_prices_the_cart_only_in_its_seeds_currency(
+    client, monkeypatch, seed_currency, page_currency, offers, expected
+):
+    await _seed_krave_mirror(offers=offers, seed_currency=seed_currency, page_currency=page_currency)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    price = expected if isinstance(expected, int) else None
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body(minor=price))
+    if price is None:
+        assert resp.status_code == 409 and _error(resp) == expected, resp.text
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+        return
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert purchase["our_price_minor"] == price and purchase["currency"] == "USD"
 
 
 @pytest.mark.parametrize("live_variant_count,offers,expected", [

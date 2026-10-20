@@ -309,7 +309,9 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
                     **_VERIFIED_DESTINATION,
                 }
             ]
-        if "FROM external_product_seeds" in q:
+        # The catalog-offers arm names external_product_seeds too (the seed-currency rule), and is
+        # no seed query.
+        if "FROM external_product_seeds" in q and "JOIN catalog_offers" not in q:
             raise AssertionError("broad external seed query should be skipped when attached prefetch succeeds")
         if "FROM products_cache" in q:
             return [
