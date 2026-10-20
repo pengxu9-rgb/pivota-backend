@@ -30,6 +30,16 @@ def _binds(sql):
     return re.findall(r"(?<!:):([a-z_]+)", sql)
 
 
+def test_only_a_write_that_read_no_price_keeps_who_vouched():
+    """offer_payload.price_read_source survives the plain upserts and is dropped by the price-read ones."""
+    keep = "jsonb_build_object('price_read_source', catalog_offers.offer_payload->'price_read_source')"
+    for sql in (apply_mod._OFFER_UPSERT_SQL, apply_mod._OFFER_UPSERT_MARKET_SQL):
+        assert keep in sql
+    for sql in (apply_mod._OFFER_UPSERT_PRICE_READ_SQL, apply_mod._OFFER_UPSERT_MARKET_PRICE_READ_SQL):
+        assert "price_read_source" not in sql
+        assert "THEN catalog_offers.offer_payload\n                        ELSE EXCLUDED.offer_payload END" in sql
+
+
 def test_offer_sql_for_picks_by_market_and_vouch():
     plain, market = {"market": None}, {"market": "SG"}
     assert apply_mod._offer_sql_for(plain) is apply_mod._OFFER_UPSERT_SQL

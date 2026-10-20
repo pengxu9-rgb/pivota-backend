@@ -552,6 +552,13 @@ _SEED_OFFER_COLUMNS = (
 # (R = EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO, default 3) is refused, counted and logged for a
 # human. An employee's edit is not bounded: correcting exactly such a 100x row is what it is for.
 ATTACHED_PRICE_SOURCES = frozenset({"refresh", "employee_edit"})
+# Where the attached lane records WHICH of those vouched for a price it dated: an offer_payload key
+# holding "refresh" (the served page was re-read from the origin) or "employee_edit" (a person set the
+# price). price_checked_at alone cannot say, and a reader that needs a storefront READ (a crawl), not
+# just a vouched price, tells the two apart by this key. Additive: nothing reads it to serve a price.
+# The ingest offer upsert keeps it across a write that read no price (services/catalog_enrichment_agent
+# /apply._OFFER_UPSERT_SQL) and drops it with a write that did (its own crawl dated the price).
+PRICE_READ_SOURCE_KEY = "price_read_source"
 
 
 def price_was_read(source: Optional[str], currency_read: bool) -> bool:
@@ -601,6 +608,9 @@ SET list_price = :price,
     estimated_best_price = :price,
     -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.
     price_checked_at = NOW(),
+    -- ...and says WHO vouched for it (PRICE_READ_SOURCE_KEY): `refresh` or `employee_edit`.
+    offer_payload = jsonb_set(COALESCE(offer_payload, CAST('{}' AS jsonb)), '{price_read_source}',
+                              to_jsonb(CAST(:read_source AS text))),
     updated_at = NOW()
 WHERE offer_id = :offer_id
   AND upper(trim(coalesce(currency, ''))) = :currency
@@ -839,7 +849,8 @@ async def sync_attached_listing_offers(
     )
     for write in plan["writes"]:
         read = next(o for o in rows if o["offer_id"] == write["offer_id"])
-        values = {**write, **{key: read[key] for key in ("read_offer", "read_sku", "read_product")}}
+        values = {**write, **{key: read[key] for key in ("read_offer", "read_sku", "read_product")},
+                  "read_source": source}
         # RETURNING, because `execute` reports no row count: a row the guard no longer matches
         # (currency moved, offer suppressed since the read) is a skip, not a write.
         if await database.fetch_one(update_sql, values):

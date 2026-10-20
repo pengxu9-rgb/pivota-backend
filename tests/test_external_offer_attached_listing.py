@@ -254,7 +254,9 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
     assert result["status"] == "synced" and result["target"] == "attached"
     assert result["status"] in mod.OFFER_SYNC_WRITTEN_STATUSES
     assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD",
-                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}"}]
+                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
+                             # who vouched for the read (offer_payload.price_read_source)
+                             "read_source": "refresh"}]
     assert fake.executed == [], "the attached lane never upserts: it only prices existing rows"
 
 

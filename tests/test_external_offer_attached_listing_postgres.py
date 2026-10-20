@@ -179,6 +179,31 @@ async def test_the_listing_rows_take_the_re_read_prices_and_nothing_else_moves(s
         assert not rows[oid]["checked"], oid
 
 
+async def _read_sources(db):
+    rows = await db.fetch_all("SELECT offer_id, offer_payload->>'price_read_source' AS src FROM catalog_offers")
+    return {r["offer_id"]: r["src"] for r in rows}
+
+
+@pytest.mark.parametrize("source", ["refresh", "employee_edit"])
+async def test_the_lane_records_who_vouched_for_the_read(scoped_db, monkeypatch, source):
+    """Through the real lane, with migration 246's column present: every row the lane prices is dated AND
+    says who vouched for it; a row it does not price carries no marker."""
+    from services import external_offer_dual_write as mod
+
+    await _load(scoped_db)
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setattr(mod, "database", scoped_db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})  # re-probe: present
+    assert await mod.price_check_column_present() is True
+    result = await mod.sync_offer_for_seed(SEED_ID, attached_price_source=source, currency_read=True)
+    assert result["status"] == "synced", result
+    rows, sources = await _offers(scoped_db), await _read_sources(scoped_db)
+    for oid, row in rows.items():
+        assert sources[oid] == (source if row["touched"] else None), oid
+        assert row["checked"] == bool(row["touched"]), oid
+    assert sources["of_canon"] == source and rows["of_canon"]["checked"]
+
+
 async def test_variant_rows_hold_until_every_variant_was_re_read(scoped_db, monkeypatch):
     await _load(scoped_db, variant_refresh_status="not_all_re_read")
     result = await _sync(monkeypatch, scoped_db)
