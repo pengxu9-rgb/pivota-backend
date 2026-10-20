@@ -54,7 +54,6 @@ from services.pdp_renderability import (
 )
 from services.priced_offer_sql import (
     priced_offer_exists_sql,
-    priced_offer_row_conjuncts,
 )
 
 
@@ -468,8 +467,14 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
 # NULL as soon as one of them has none.
 #
 # THE CLASS -- every LIVE offer on the row (crawl_offer_class_conjuncts):
-# unsuppressed and priced (services.priced_offer_sql, the SAME conjuncts every
-# price gate uses). Nothing else: ANY source_system, ANY market, ANY currency,
+# unsuppressed and priced the way the WIDEST reader prices an offer,
+# coalesce(merchant_effective_price, estimated_best_price, list_price) > 0
+# (CRAWL_OFFER_CLASS_PRICED_SQL; round 6). That is how the PDP view's normalize_offer,
+# offers.resolve's group/sibling read, the purchase reads and the budget path
+# price it, and the price mig 246's stamp-forgetting trigger watches -- wider
+# than the shared price gate (services.priced_offer_sql: mep, else list), which
+# would leave an offer priced only by estimated_best_price outside the class
+# while those readers serve it. Nothing else: ANY source_system, ANY market, ANY currency,
 # affiliate offers included, and ANY link. (Round 3 narrowed the class to
 # drain-lane, non-affiliate offers in a served market/currency pair, so an
 # offer outside it neither dated nor blocked the row -- while a no-market
@@ -578,10 +583,13 @@ CRAWL_OFFER_VALID_READ_SQL = (
 )
 
 
+CRAWL_OFFER_CLASS_PRICED_SQL = "coalesce(co.merchant_effective_price, co.estimated_best_price, co.list_price) > 0"
+
+
 def crawl_offer_class_conjuncts(product_key_expr: str) -> list[str]:
-    """The class for one row: every unsuppressed, priced offer, whatever its link
-    (see above). `product_key_expr` is SQL."""
-    return [f"co.product_key = {product_key_expr}"] + list(priced_offer_row_conjuncts(alias="co"))
+    """The class for one row: every unsuppressed offer any reader prices, whatever
+    its link (see above). `product_key_expr` is SQL."""
+    return [f"co.product_key = {product_key_expr}", "co.suppressed_at IS NULL", CRAWL_OFFER_CLASS_PRICED_SQL]
 
 
 def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ") -> str:

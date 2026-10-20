@@ -373,7 +373,7 @@ def test_the_statement_is_pinned():
         '     FROM catalog_offers co\n'
         '    WHERE co.product_key = k.product_key\n'
         '      AND co.suppressed_at IS NULL\n'
-        '      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n'
+        '      AND coalesce(co.merchant_effective_price, co.estimated_best_price, co.list_price) > 0\n'
         ' ) r\n'
         ' WHERE r.row_price_read_at IS NOT NULL\n'
     )
@@ -384,14 +384,39 @@ def test_the_class_is_every_unsuppressed_priced_offer_and_validity_carries_the_r
     nothing else. Source, market, currency and affiliate moved into the valid
     read, so an offer that fails one is IN the class and makes the row NULL."""
     where = upserter.CRAWL_ROW_PRICE_READ_SQL.split(" WHERE co.product_key", 1)[1].split(" ) r", 1)[0]
-    assert where.split("\n      AND ")[1:] == [
-        "co.suppressed_at IS NULL", "coalesce(co.merchant_effective_price, co.list_price) > 0\n"]
-    assert upserter.crawl_offer_class_conjuncts("k") == [
-        "co.product_key = k", "co.suppressed_at IS NULL", "coalesce(co.merchant_effective_price, co.list_price) > 0"]
+    priced = "coalesce(co.merchant_effective_price, co.estimated_best_price, co.list_price) > 0"
+    assert where.split("\n      AND ")[1:] == ["co.suppressed_at IS NULL", priced + "\n"]
+    assert upserter.crawl_offer_class_conjuncts("k") == ["co.product_key = k", "co.suppressed_at IS NULL", priced]
+    assert upserter.CRAWL_OFFER_CLASS_PRICED_SQL == priced
     for moved in (upserter.CRAWL_OFFER_DRAIN_SOURCE_SQL, upserter.CRAWL_OFFER_SERVED_MARKET_SQL,
                   upserter.CRAWL_OFFER_NOT_AFFILIATE_SQL):
         assert moved not in where
         assert moved in upserter.CRAWL_OFFER_VALID_READ_SQL
+
+
+def test_the_class_prices_an_offer_like_the_widest_reader():
+    """Round 6: mep, else estimated best, else list -- the price migration 246's
+    stamp-forgetting trigger watches and the PDP view / offers.resolve /
+    purchase readers serve; never the narrower shared gate (mep, else list)."""
+    from services.priced_offer_sql import priced_offer_price_expr
+
+    mig = (Path(__file__).resolve().parent.parent
+           / "db/migrations/246_catalog_offers_price_checked_at.sql").read_text()
+    assert "coalesce(merchant_effective_price, estimated_best_price, list_price)" in mig
+    assert upserter.CRAWL_OFFER_CLASS_PRICED_SQL.replace("co.", "").replace(" > 0", "") in mig
+    assert priced_offer_price_expr(alias="co") not in upserter.CRAWL_ROW_PRICE_READ_SQL
+
+
+def test_the_shared_price_gate_is_unchanged():
+    """The widening lives in CRAWL_OFFER_CLASS_PRICED_SQL only. The shared helper
+    builds row_has_priced_offer for OFFER_PRICE_MISSING, which deliberately leaves
+    out estimated_best_price (and the gateway pins that spelling)."""
+    from services.priced_offer_sql import priced_offer_exists_sql, priced_offer_row_conjuncts
+
+    assert priced_offer_row_conjuncts(alias="co") == (
+        "co.suppressed_at IS NULL", "coalesce(co.merchant_effective_price, co.list_price) > 0")
+    assert "estimated_best_price" not in priced_offer_exists_sql("cp.product_key")
+    assert priced_offer_exists_sql("cp.product_key") + " AS row_has_priced_offer" in upserter._PRODUCT_JOIN_SELECT
 
 
 def test_no_link_test_anywhere_in_the_rule():

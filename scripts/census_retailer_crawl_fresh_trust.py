@@ -2,17 +2,18 @@
 """READ-ONLY census: what CRAWL_FRESH would move, now and in steady state.
 
 THE RULE (services/catalog_trust_policy + services/catalog_row_trust_upserter,
-switched by CATALOG_TRUST_CRAWL_FRESH_ENABLED, default off; rounds 4-5). A
+switched by CATALOG_TRUST_CRAWL_FRESH_ENABLED, default off; rounds 4-6). A
 drain-lane storefront crawl row -- product_key `ext:...` written by
 `catalog_enrichment_agent_v1`, i.e. the retailer listings (`ext:retailer:...`)
 AND the brand-official / curated canonicals -- is exempt from the identity
 COVERAGE gates (IDENTITY_CONFIDENCE_NULL, IDENTITY_LIVE_READ_DISABLED, the
 silent identity-'unknown' shadow) while its price-read date is within N days:
 
-  * the CLASS is EVERY live offer on the row: unsuppressed and priced -- any
-    source_system, market, currency or link, affiliate offers included
-    (CLASS_SQL; round 5 dropped the link test, because not every reader tests
-    the link);
+  * the CLASS is EVERY live offer on the row: unsuppressed and priced the way
+    the widest reader prices it, coalesce(merchant_effective_price,
+    estimated_best_price, list_price) > 0 (round 6) -- any source_system,
+    market, currency or link, affiliate offers included (CLASS_SQL; round 5
+    dropped the link test, because not every reader tests the link);
   * a VALID read of one needs ALL of: the drain wrote it, a served
     (market, currency) pair, not an affiliate-feed offer, price_checked_at
     (migration 246) no later than now, its market DECLARED by the writer
@@ -40,7 +41,12 @@ ext:retailer:, otherwise the row's enrichment_meta.source_role, e.g.
     do not serve, any currency), `currency_mismatch` (a served market priced in
     another currency than its own, e.g. US/SGD), `unservable_link` (a link that
     is not http(s) -- '', a bare path, ftp: -- on an offer whose read is not
-    valid) -- and `total`, each row once (a row can carry several reasons);
+    valid) -- and `total`, each row once (a row can carry several reasons).
+    `would_flip_without_declared_market_but_carries_live_non_class_offer` is the
+    same split keyed to the counterfactual that waives ONLY the declared-market
+    requirement on both sides (`would_flip_round3_class_without_declared_market`
+    flips; total = those minus `would_flip_without_declared_market_requirement`),
+    so it reads before any drain job declares a market;
   * `max_any` = the round-1 rule (the newest read of any live drain-lane,
     non-affiliate offer; a future stamp counted fresh), kept for the trend.
 
@@ -129,14 +135,17 @@ OFFER_NOT_AFFILIATE_SQL = (
     "coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'"
 )
 DRAIN_SOURCE_SQL = f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"
-# THE CLASS (rounds 4-5): every unsuppressed, priced offer of the row -- the
-# upserter's crawl_offer_class_conjuncts minus the product_key join.
+# THE CLASS (rounds 4-6): every unsuppressed offer of the row any reader prices
+# (mep, else estimated best, else list) -- the upserter's
+# crawl_offer_class_conjuncts minus the product_key join.
 CLASS_SQL = (
     "co.suppressed_at IS NULL\n"
-    "           AND coalesce(co.merchant_effective_price, co.list_price) > 0"
+    "           AND coalesce(co.merchant_effective_price, co.estimated_best_price, co.list_price) > 0"
 )
 # The max-any (round-1) and round-3 aggregates read only live drain-lane,
-# non-affiliate offers with an http(s) link; max() ignores a NULL read.
+# non-affiliate offers with an http(s) link; max() ignores a NULL read. (Priced
+# as CLASS_SQL prices, so the round-3 counterfactual differs from the rule only
+# by the reasons below and each reason split's total is exact.)
 OFFER_CONJUNCTS_SQL = (
     f"{DRAIN_SOURCE_SQL}\n"
     f"           AND {CLASS_SQL}\n"
@@ -273,7 +282,33 @@ def _non_class_counts_sql() -> str:
         + [f"'unservable_link_n', count(*) FILTER (WHERE {UNSERVABLE_LINK_SQL})",
            f"'unservable_link_all_valid', bool_and(({VALID_READ_SQL}) IS NOT NULL)"
            f" FILTER (WHERE {UNSERVABLE_LINK_SQL})",
-           f"'unservable_link_oldest_valid', min({VALID_READ_SQL}) FILTER (WHERE {UNSERVABLE_LINK_SQL})"])
+           f"'unservable_link_oldest_valid', min({VALID_READ_SQL}) FILTER (WHERE {UNSERVABLE_LINK_SQL})",
+           # the same with the declared-market requirement waived
+           f"'unservable_link_all_valid_any_market', bool_and(({VALID_READ_ANY_MARKET_SQL}) IS NOT NULL)"
+           f" FILTER (WHERE {UNSERVABLE_LINK_SQL})",
+           f"'unservable_link_oldest_valid_any_market', min({VALID_READ_ANY_MARKET_SQL})"
+           f" FILTER (WHERE {UNSERVABLE_LINK_SQL})"])
+
+
+def _non_class_reasons(live_non_class: Dict[str, Any], *, declared: bool, now: datetime,
+                       max_age_days: float) -> List[str]:
+    """The reasons a row carries a live offer outside round 3's class that the rule
+    refuses. The four NON_CLASS_REASON_SQL offers are never valid; an offer behind
+    an unservable link refuses the row only without a valid read inside N (with
+    `declared` False, the declared-market requirement waived)."""
+    reasons = [r for r in NON_CLASS_REASON_SQL if int(live_non_class.get(r) or 0) > 0]
+    suffix = "" if declared else "_any_market"
+    if int(live_non_class.get("unservable_link_n") or 0) > 0 and not (
+            live_non_class.get("unservable_link_all_valid" + suffix) is True
+            and is_fresh_strict(live_non_class.get("unservable_link_oldest_valid" + suffix), now=now,
+                                max_age_days=max_age_days)):
+        reasons.append("unservable_link")
+    return reasons
+
+
+def _reason_split(rows: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+    return {**{reason: sum(reason in r[field] for r in rows) for reason in NON_CLASS_REASONS},
+            "total": sum(bool(r[field]) for r in rows)}
 
 
 def census_sql() -> str:
@@ -477,12 +512,12 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
     would_flip_round3 = coverage_only and renderable and is_fresh_strict(
         round3_read, now=now, max_age_days=max_age_days)
     live_non_class = _market_reads(row.get("live_non_class"))
-    non_class_reasons = [r for r in NON_CLASS_REASON_SQL if int(live_non_class.get(r) or 0) > 0]
-    if int(live_non_class.get("unservable_link_n") or 0) > 0 and not (
-            live_non_class.get("unservable_link_all_valid") is True
-            and is_fresh_strict(live_non_class.get("unservable_link_oldest_valid"), now=now,
-                                max_age_days=max_age_days)):
-        non_class_reasons.append("unservable_link")
+    non_class_reasons = _non_class_reasons(live_non_class, declared=True, now=now, max_age_days=max_age_days)
+    # The same, with ONLY the declared-market requirement waived on both sides.
+    would_flip_round3_any_market = coverage_only and renderable and is_fresh_strict(
+        row_read_at(by_market, declared=False), now=now, max_age_days=max_age_days)
+    non_class_reasons_any_market = _non_class_reasons(
+        live_non_class, declared=False, now=now, max_age_days=max_age_days)
     return {
         "product_key": row["product_key"],
         "lane": row.get("lane") or "unlabelled",
@@ -509,6 +544,8 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
         "round3_read_at": round3_read,
         "would_flip_round3": would_flip_round3,
         "non_class_reasons": non_class_reasons if would_flip_round3 else [],
+        "would_flip_round3_any_market_declaration": would_flip_round3_any_market,
+        "non_class_reasons_any_market": non_class_reasons_any_market if would_flip_round3_any_market else [],
         # B1: fresh in one served market while another has a stale/unread live offer
         "fresh_in_one_market_stale_in_another": coverage_only and renderable
             and cross_market_stale(by_market, now=now, max_age_days=max_age_days),
@@ -662,10 +699,15 @@ def summarize(
             # Round 4's cost: what round 3 would flip that a live offer outside
             # its class now refuses, by reason; `total` counts each row once.
             "would_flip_round3_class_rule": sum(r["would_flip_round3"] for r in part),
-            "would_flip_but_carries_live_non_class_offer": {
-                **{reason: sum(reason in r["non_class_reasons"] for r in part) for reason in NON_CLASS_REASONS},
-                "total": sum(bool(r["non_class_reasons"]) for r in part),
-            },
+            "would_flip_but_carries_live_non_class_offer": _reason_split(part, "non_class_reasons"),
+            # The same split keyed to the counterfactual that waives ONLY the
+            # declared-market requirement (on both sides), so it reads before any
+            # drain job declares a market. total = round-3-class flips minus the
+            # rule's flips, both without the requirement.
+            "would_flip_round3_class_without_declared_market": sum(
+                r["would_flip_round3_any_market_declaration"] for r in part),
+            "would_flip_without_declared_market_but_carries_live_non_class_offer": _reason_split(
+                part, "non_class_reasons_any_market"),
             "would_flip_on_out_of_stock_only_offer": sum(r["would_flip_oos_only"] for r in part),
             "fresh_but_not_renderable": sum(r["fresh_not_renderable"] for r in part),
             "fresh_still_blocked_by_reason": dict(sorted(still_blocked.items())),

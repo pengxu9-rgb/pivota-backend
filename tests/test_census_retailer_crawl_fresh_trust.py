@@ -214,6 +214,34 @@ def test_the_non_class_counter_splits_by_reason_and_dedupes_the_total():
         "unservable_link": 2, "total": 5}
 
 
+def test_the_declared_waived_split_reads_before_anything_is_declared():
+    """Nothing is declared yet, so round 3's flips (and the first split) are 0; the
+    second split waives ONLY the declared-market requirement on both sides."""
+    undeclared3 = {"US": _cls(valid=False, oldest=None, oldest_any=1, newest_any=1)}
+    stale_link = {"unservable_link_n": 1, "unservable_link_all_valid": False,
+                  "unservable_link_all_valid_any_market": True,
+                  "unservable_link_oldest_valid_any_market": (NOW - timedelta(days=30)).isoformat()}
+    fresh_link = {**stale_link, "unservable_link_oldest_valid_any_market": (NOW - timedelta(days=2)).isoformat()}
+    rows = [
+        _final_row(undeclared3, final_any=None, non_class={"affiliate": 1, "currency_mismatch": 1}),
+        _final_row(undeclared3, final_any=None, non_class=stale_link),
+        # undeclared bad-link offer, read 2 days ago: blocks the rule, not the waived one
+        _final_row(undeclared3, final_any=2, non_class=fresh_link),
+        _final_row(undeclared3, final_any=1),
+        # round 3 waived would not flip it: never counted
+        _final_row({"US": _cls(valid=False, oldest=None, oldest_any=30, newest_any=30)}, non_class={"affiliate": 1}),
+    ]
+    total = [line for line in census.summarize(rows, now=NOW, max_age_days=7, seed_pool_by_market={"US": 1})
+             if line["kind"] == "summary" and line["lane"] == "all"][0]
+    assert total["would_flip_round3_class_rule"] == 0
+    assert total["would_flip_but_carries_live_non_class_offer"]["total"] == 0
+    assert total["would_flip_round3_class_without_declared_market"] == 4
+    assert total["would_flip_without_declared_market_requirement"] == 2
+    assert total["would_flip_without_declared_market_but_carries_live_non_class_offer"] == {
+        "affiliate": 1, "non_drain_source": 0, "non_served_market": 0, "currency_mismatch": 1,
+        "unservable_link": 1, "total": 2}
+
+
 def test_the_non_class_reasons_are_the_five_asked_for():
     assert census.NON_CLASS_REASONS == (
         "affiliate", "non_drain_source", "non_served_market", "currency_mismatch", "unservable_link")

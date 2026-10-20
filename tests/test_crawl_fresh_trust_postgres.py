@@ -204,10 +204,12 @@ _N = [0]
 
 async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="https://shop.example.com/p/1",
                  payload_link=None, suppressed=False, affiliate=False, market="US", currency="USD",
-                 availability="in_stock", variant=None, read_source=None, declared=True):
+                 availability="in_stock", variant=None, read_source=None, declared=True, columns=None):
     """A HAND-BUILT offer row (the statement's own cases). `declared` stamps
     offer_payload.declared_market = market, as the drain does for an explicit
-    options.market; the real writers run in test_crawl_fresh_real_producers_postgres."""
+    options.market; the real writers run in test_crawl_fresh_real_producers_postgres.
+    `columns` overrides the price columns one by one (list_price,
+    merchant_effective_price, estimated_best_price)."""
     import json
 
     _N[0] += 1
@@ -221,12 +223,15 @@ async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="http
         payload["price_read_source"] = read_source
     await db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, list_price,"
-        " merchant_effective_price, currency, market, source_system, source_ref, offer_payload,"
-        " price_checked_at, suppressed_at, availability)"
-        " VALUES (:oid, :sku, :pk, 'merch_obs_0123456789abcdef', :p, :p, :cur, :mkt, :ss, :link,"
+        " merchant_effective_price, estimated_best_price, currency, market, source_system, source_ref,"
+        " offer_payload, price_checked_at, suppressed_at, availability)"
+        " VALUES (:oid, :sku, :pk, 'merch_obs_0123456789abcdef', :list, :mep, :ebp, :cur, :mkt, :ss, :link,"
         " CAST(:payload AS jsonb), :read_at, " + ("now()" if suppressed else "NULL") + ", :avail)",
         {"oid": oid, "sku": f"{pk}::v:{variant}" if variant else f"{pk}::canonical", "pk": pk,
-         "p": price, "cur": currency, "mkt": market, "ss": source_system, "link": link,
+         "list": (columns or {}).get("list_price", price),
+         "mep": (columns or {}).get("merchant_effective_price", price),
+         "ebp": (columns or {}).get("estimated_best_price"),
+         "cur": currency, "mkt": market, "ss": source_system, "link": link,
          "payload": json.dumps(payload), "read_at": read_at, "avail": availability},
     )
     return oid
@@ -292,6 +297,36 @@ async def test_a_stale_offer_behind_an_unservable_link_blocks_the_row(db, bad_li
     assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(days=60)}
     await db.execute("UPDATE catalog_offers SET price_checked_at = NULL WHERE offer_id = :o", {"o": oid})
     assert await _reads(db, [RETAILER]) == {}
+
+
+# Round 6: priced the way the widest reader prices an offer (mep, else estimated
+# best, else list). An offer priced ONLY by estimated_best_price is served by the
+# PDP view / offers.resolve / purchase readers, so it is in the class.
+_EBP_ONLY = [
+    pytest.param(dict(merchant_effective_price=None, list_price=None, estimated_best_price=15), id="list_null"),
+    pytest.param(dict(merchant_effective_price=None, list_price=0, estimated_best_price=15), id="list_zero"),
+]
+
+
+@pytest.mark.parametrize("columns", _EBP_ONLY)
+async def test_an_offer_priced_only_by_estimated_best_price_needs_its_read(db, columns):
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    oid = await _offer(db, RETAILER, read_at=None, variant="4", columns=columns)
+    assert await _reads(db, [RETAILER]) == {}  # no valid read: blocks the row
+    await db.execute("UPDATE catalog_offers SET price_checked_at = :t WHERE offer_id = :o",
+                     {"t": NOW - timedelta(hours=3), "o": oid})
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=3)}  # a valid read dates it
+
+
+async def test_an_offer_with_no_price_in_any_column_stays_outside(db):
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    await _offer(db, RETAILER, read_at=None, variant="5",
+                 columns=dict(merchant_effective_price=None, list_price=0, estimated_best_price=0))
+    await _offer(db, RETAILER, read_at=None, variant="6",
+                 columns=dict(merchant_effective_price=0, list_price=None, estimated_best_price=15))
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=2)}
 
 
 async def test_a_fresh_valid_read_behind_an_empty_link_still_dates_the_row(db):
@@ -944,12 +979,15 @@ async def test_census_sizes_round_four_by_reason(db):
 
     keys = {k: "ext:retailer:" + c * 32 for k, c in
             (("clean", "a"), ("aff", "b"), ("copy", "c"), ("au", "d"), ("cur", "e"), ("multi", "f"),
-             ("stale", "0"), ("badlink", "1"), ("badlink_read", "2"), ("badlink_unread", "3"))}
+             ("stale", "0"), ("badlink", "1"), ("badlink_read", "2"), ("badlink_unread", "3"),
+             ("undeclared", "4"), ("undeclared_aff", "5"), ("undeclared_ebp", "6"),
+             ("undeclared_badlink_read", "7"))}
     for pk in keys.values():
         await _product(db, pk)
     fresh, later = NOW - timedelta(days=1), NOW - timedelta(hours=1)
     for name, pk in keys.items():
-        await _offer(db, pk, read_at=NOW - timedelta(days=20) if name == "stale" else fresh)
+        await _offer(db, pk, read_at=NOW - timedelta(days=20) if name == "stale" else fresh,
+                     declared=not name.startswith("undeclared"))
     other = "https://shop.example.com/p/2"
     await _offer(db, keys["aff"], read_at=later, affiliate=True, link=other)
     await _offer(db, keys["copy"], read_at=later, source_system="variant_identity_backfill_v1", variant="2",
@@ -964,6 +1002,12 @@ async def test_census_sizes_round_four_by_reason(db):
     await _offer(db, keys["badlink"], read_at=NOW - timedelta(days=60), payload_link="", link=other)
     await _offer(db, keys["badlink_read"], read_at=later, link="/p/3")
     await _offer(db, keys["badlink_unread"], read_at=None, link=None)
+    # nothing declared: only the declared-waived split sees these
+    await _offer(db, keys["undeclared_aff"], read_at=later, affiliate=True, link=other, declared=False)
+    # an undeclared bad-link offer read an hour ago: refused only while the requirement stands
+    await _offer(db, keys["undeclared_badlink_read"], read_at=later, link="/p/9", declared=False)
+    await _offer(db, keys["undeclared_ebp"], read_at=None, link=other, variant="8", declared=False,
+                 columns=dict(merchant_effective_price=None, list_price=None, estimated_best_price=9))
     await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()))
 
     conn = await _asyncpg(_SCHEMA)
@@ -980,6 +1024,16 @@ async def test_census_sizes_round_four_by_reason(db):
         "unservable_link": 2, "total": 7}
     # total = round 3's flips that the rule refuses
     assert total["would_flip_round3_class_rule"] - total["would_flip_per_market_rule"] == 7
+    # the declared-waived split: undeclared, undeclared_aff and undeclared_badlink_read flip in
+    # round 3's class; the rule (waived) flips every round-3 flip without a reason, plus
+    # undeclared and undeclared_badlink_read
+    assert total["would_flip_round3_class_without_declared_market"] == 9 + 3
+    assert total["would_flip_without_declared_market_requirement"] == 2 + 2
+    waived = total["would_flip_without_declared_market_but_carries_live_non_class_offer"]
+    assert waived == {"affiliate": 3, "non_drain_source": 1, "non_served_market": 2, "currency_mismatch": 2,
+                      "unservable_link": 2, "total": 8}
+    assert waived["total"] == (total["would_flip_round3_class_without_declared_market"]
+                               - total["would_flip_without_declared_market_requirement"])
     assert await _reads(db, list(keys.values()), now=db_now) == {
         keys["clean"]: fresh, keys["badlink_read"]: fresh,
         keys["badlink"]: NOW - timedelta(days=60)}  # dated by its stale offer: not fresh
