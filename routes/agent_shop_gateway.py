@@ -10444,6 +10444,181 @@ def _group_shadow_compute(snap: Dict[str, Any], group: Dict[str, Any], rows: Lis
     }
 
 
+def _group_shadow_cache_line(*, trigger: str, refreshed: bool, refresh_ms: Optional[int] = None,
+                             reason: Optional[str] = None, error: Optional[str] = None,
+                             pool_free: Any = None) -> None:
+    """`offers_resolve_group_shadow_cache`: ONE line per key-set refresh (and per arming check that could
+    not refresh, with its `reason`), so the shadow's state is visible with no offers traffic at all.
+    Reads the skip counters WITHOUT resetting them (they still ride on the next shadow line)."""
+    if pool_free is None:
+        try:
+            from db.database import database
+
+            pool_free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            pool_free = None
+    cks = _GROUP_SHADOW_CKS.get("cks")
+    _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_cache", {
+        "trigger": trigger,
+        "mode": _group_seed_siblings_mode(),
+        "refreshed": refreshed,
+        "keys": len(cks) if cks is not None else None,
+        "overflow": bool(_GROUP_SHADOW_CKS.get("overflow")),
+        **({"refresh_ms": refresh_ms} if refresh_ms is not None else {}),
+        "pool_free": pool_free if pool_free is not None else "unknown",
+        "in_flight": len(_GROUP_SHADOW_IN_FLIGHT),
+        "connected": _GROUP_SHADOW_CONNECTED["n"],
+        "skipped": dict(_GROUP_SHADOW_SKIPS),
+        "pid": os.getpid(),
+        **({"reason": reason} if reason else {}),
+        **({"error": error} if error else {}),
+    })
+
+
+async def _group_shadow_refresh_cks(db: Any, reader: "_GroupShadowReader", is_pg: bool, *, trigger: str) -> None:
+    """Re-read the resolved key set (the caller holds `_GROUP_SHADOW_CKS["refreshing"]`), through the
+    shadow's reader: its own READ ONLY transaction, every statement under a server-side timeout. A
+    failure starts the retry backoff and is re-raised. Either way, one `_cache` line."""
+    started = time.perf_counter()
+    error: Optional[str] = None
+    try:
+        async with _group_shadow_transaction(db, is_pg):
+            ck_rows = await reader.fetch_all(_GROUP_SHADOW_RESOLVED_CKS_SQL, {
+                "kinds": list(RESOLVED_GROUP_KINDS), "strategies": list(RESOLVED_GROUP_STRATEGIES),
+                "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
+            })
+        cks = frozenset(str(_row_to_dict(r).get("content_key") or "") for r in ck_rows or []) - {""}
+        overflow = len(ck_rows or []) >= OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT
+        _GROUP_SHADOW_CKS.update(cks=cks, loaded_at=time.monotonic(), failed_at=None, overflow=overflow)
+        if overflow:
+            # ONCE per refresh, not per request: until a refresh reads fewer keys, every request skips.
+            _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_disabled", {
+                "reason": "overflow", "keys": len(ck_rows or []),
+                "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
+                "retry_after_seconds": OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS,
+            })
+    except BaseException as exc:
+        _GROUP_SHADOW_CKS["failed_at"] = time.monotonic()
+        error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        raise
+    finally:
+        _group_shadow_cache_line(trigger=trigger, refreshed=error is None,
+                                 refresh_ms=int((time.perf_counter() - started) * 1000), error=error)
+
+
+# ── ARMING: the shadow says it is alive with no offers traffic at all ──────────────────────────────
+#
+# The key set is refreshed LAZILY, from a shadow-mode request, so with no offers.resolve traffic it is
+# never read and nothing is logged -- which looks exactly like a shadow that skips everything (a pool
+# it cannot read, a cap that never frees). So in `shadow` mode ONLY, each worker process runs one
+# detached loop (`start_group_shadow_arming`, from main.app_lifespan): shortly after startup, and then
+# whenever the key set falls due (OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS), it refreshes it through
+# the SAME gated path -- fail-closed pool check, cap, its own task in a fresh contextvars.Context, READ
+# ONLY transaction, statement_timeout, the budget -- and the refresh logs its `_cache` line. A check
+# that cannot refresh logs the line with its `reason` instead. It IS the per-TTL refresh, not a second
+# one: it refreshes only a key set that is due (a lazy refresh that just ran pushes it back), and the
+# `refreshing` flag keeps the two from ever running together. Mode `on` does not use the key set, and
+# `off` starts nothing: no task, no query, no line.
+OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS = 5.0
+
+
+def _group_shadow_next_refresh_in() -> float:
+    """Seconds until the key set falls due (or its failure backoff ends), within [1, TTL]."""
+    now = time.monotonic()
+    cks = _GROUP_SHADOW_CKS.get("cks")
+    due = 0.0 if cks is None else _GROUP_SHADOW_CKS["loaded_at"] + OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS - now
+    failed_at = _GROUP_SHADOW_CKS.get("failed_at")
+    if failed_at is not None:
+        due = max(due, failed_at + OFFERS_RESOLVE_GROUP_SHADOW_CK_RETRY_SECONDS - now)
+    return min(max(due + 0.05, 1.0), OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS)
+
+
+async def _group_shadow_arm_refresh(trigger: str) -> None:
+    from db.database import database
+
+    is_pg = str(getattr(database, "url", "")).lower().startswith(("postgresql://", "postgres://"))
+    reader = _GroupShadowReader(database, deadline=time.perf_counter() + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS,
+                                is_pg=is_pg)
+    if _GROUP_SHADOW_CKS["refreshing"]:
+        return  # a lazy refresh is running and logs its own line
+    _GROUP_SHADOW_CKS["refreshing"] = True
+    try:
+        await _group_shadow_refresh_cks(database, reader, is_pg, trigger=trigger)
+    except Exception:  # noqa: BLE001 -- on the line already
+        pass
+    finally:
+        _GROUP_SHADOW_CKS["refreshing"] = False
+
+
+async def _group_shadow_arm_once(trigger: str) -> bool:
+    """One arming check. True when it ran a refresh, False when it could not (and logged why). Never
+    raises; never waits past the budget."""
+    try:
+        if _GROUP_SHADOW_CKS["refreshing"]:
+            return False
+        from db.database import database
+
+        try:
+            free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            free = None
+        if free is None:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="pool_unknown")
+            return False
+        if len(_GROUP_SHADOW_IN_FLIGHT) >= OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="cap", pool_free=free)
+            return False
+        not_yet_connected = max(0, len(_GROUP_SHADOW_IN_FLIGHT) - _GROUP_SHADOW_CONNECTED["n"])
+        if free - not_yet_connected <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="pool_busy", pool_free=free)
+            return False
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_group_shadow_arm_refresh(trigger), context=contextvars.Context())
+        _GROUP_SHADOW_IN_FLIGHT.add(task)  # counts against the cap and the reserve like any shadow
+        task.add_done_callback(lambda t: _group_shadow_task_done(t, {}))
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS + 0.1)
+        except asyncio.CancelledError:
+            task.cancel()  # shutdown: the refresh goes with the loop (its done callback still runs)
+            raise
+        if task not in done:
+            task.cancel()  # stays in the in-flight set until it has unwound; its line says CancelledError
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="arming_error",
+                                 error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        return False
+
+
+async def _group_shadow_arming_loop() -> None:
+    await asyncio.sleep(OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS)
+    trigger = "startup"
+    while True:
+        wait = None
+        try:
+            if _group_seed_siblings_mode() == "shadow" and _group_shadow_cache_verdict(set()) == "refresh":
+                if not await _group_shadow_arm_once(trigger):
+                    wait = OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS  # could not refresh: next try in a TTL
+            if wait is None:
+                wait = _group_shadow_next_refresh_in()
+        except Exception:  # noqa: BLE001
+            wait = OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS
+        trigger = "periodic"
+        await asyncio.sleep(wait)
+
+
+def start_group_shadow_arming() -> "Optional[asyncio.Task[Any]]":
+    """Called once per worker process from main.app_lifespan. In `shadow` mode: a detached arming loop,
+    in a fresh contextvars.Context (the caller cancels it at shutdown). Any other mode: None -- no
+    task, no query, no line. Never raises."""
+    try:
+        if _group_seed_siblings_mode() != "shadow":
+            return None
+        return asyncio.get_running_loop().create_task(_group_shadow_arming_loop(), context=contextvars.Context())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record: Dict[str, Any]) -> bool:
     """The shadow's reads and its comparison, filling `record`. True when there is a line to log
     (the group is RESOLVED), False when there is nothing to say. Raises on any failure; the caller
@@ -10460,24 +10635,7 @@ async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record:
             return False
         _GROUP_SHADOW_CKS["refreshing"] = True
         try:
-            async with _group_shadow_transaction(database, is_pg):
-                ck_rows = await reader.fetch_all(_GROUP_SHADOW_RESOLVED_CKS_SQL, {
-                    "kinds": list(RESOLVED_GROUP_KINDS), "strategies": list(RESOLVED_GROUP_STRATEGIES),
-                    "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
-                })
-            cks = frozenset(str(_row_to_dict(r).get("content_key") or "") for r in ck_rows or []) - {""}
-            overflow = len(ck_rows or []) >= OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT
-            _GROUP_SHADOW_CKS.update(cks=cks, loaded_at=time.monotonic(), failed_at=None, overflow=overflow)
-            if overflow:
-                # ONCE per refresh, not per request: until a refresh reads fewer keys, every request skips.
-                _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_disabled", {
-                    "reason": "overflow", "keys": len(ck_rows or []),
-                    "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
-                    "retry_after_seconds": OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS,
-                })
-        except BaseException:
-            _GROUP_SHADOW_CKS["failed_at"] = time.monotonic()
-            raise
+            await _group_shadow_refresh_cks(database, reader, is_pg, trigger="request")
         finally:
             _GROUP_SHADOW_CKS["refreshing"] = False
     verdict = _group_shadow_cache_verdict(keys)
