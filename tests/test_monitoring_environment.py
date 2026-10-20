@@ -280,12 +280,12 @@ def test_the_renamed_relgraph_occupancy_alert_retires_its_two_hour_predecessor(t
     after = run_script(tmp_path, env, repeat=True)
     names = [p["displayName"] for p in after["alertPolicies"]]
     assert old_name not in names
-    assert names.count(env + ": relgraph-sync running over four hours") == 1
+    assert names.count(env + ": relgraph-sync running over five hours") == 1
     assert len(after["alertPolicies"]) == count_before - 1
     deletes = [c for c in after["calls"] if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours"]
     assert len(deletes) == 1
     creates = [i for i, c in enumerate(after["calls"]) if c["method"] == "POST"
-               and (c["body"] or {}).get("displayName") == env + ": relgraph-sync running over four hours"]
+               and (c["body"] or {}).get("displayName") == env + ": relgraph-sync running over five hours"]
     retire = next(i for i, c in enumerate(after["calls"]) if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours")
     assert creates and creates[-1] < retire  # the successor exists before the old policy goes
 
@@ -305,7 +305,7 @@ def test_a_failed_policy_listing_aborts_the_retirement_instead_of_reporting_succ
     # A listing error inside the for-list was an empty loop: nothing retired, exit 0 (2026-10-20 review).
     _seed_two_hour_policy(tmp_path, env)
     after, proc = run_script(tmp_path, env, repeat=True, return_process=True,
-                             extra_env={"MONITORING_POLICY_LIST_FAIL_AFTER": env + ": relgraph-sync running over four hours"})
+                             extra_env={"MONITORING_POLICY_LIST_FAIL_AFTER": env + ": relgraph-sync running over five hours"})
     assert proc.returncode != 0
     assert "listing alert policies FAILED" in proc.stderr
     assert env + ": relgraph-sync running over two hours" in [p["displayName"] for p in after["alertPolicies"]]

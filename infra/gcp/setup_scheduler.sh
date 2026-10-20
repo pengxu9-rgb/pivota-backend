@@ -393,10 +393,10 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # ~37 minutes at today's caps either way.
 #
 # COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
-# {result=failed}, which fires only AFTER a task dies, and via "prod: relgraph-sync running over four
-# hours" (running_executions > 0 for 14400s; two hours until 2026-10-20), which catches a wedged or
-# chained run at ~4h instead of at the 6h task timeout (12h across the retry). A normal night is
-# ~1.9-2.9 h at the 2026-10-20 review size.
+# {result=failed}, which fires only AFTER a task dies, and via "prod: relgraph-sync running over five
+# hours" (running_executions > 0 for 18000s; two hours until 2026-10-20), which catches a wedged or
+# chained run at ~5h instead of at the 6h task timeout (12h across the retry). A normal night is
+# ~3.0-4.0 h at the 2026-10-20 review size (10,000 at concurrency 12).
 #
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
@@ -444,15 +444,17 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 #     labels of anchors with no served alternative first, one per anchor per round, then the covered
 #     anchors by score. Only 5,933 of the 26,617 generated alternatives sat on the 2,616 uncovered
 #     anchors; the score-ordered top 3,000 reached 440 of them, this order reaches all 2,616.
-#   RELGRAPH_SYNC_REVIEW_LIMIT=10000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=16 - PREREQUISITE: a gateway
+#   RELGRAPH_SYNC_REVIEW_LIMIT=10000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=12 - PREREQUISITE: a gateway
 #     image whose review-limit cap is 10,000 at every layer (PIVOTA-Agent: cron, sync routine, routine
 #     job, review script; before it, each silently capped 10,000 at 5,000). 16 is the gateway's maximum.
 #     Measured at concurrency 8: ~1-1.7 s per review, so 10,000 is ~1.4-2.4 h at 16 plus the ~30-minute
-#     build. The step budget rises to 300 minutes and the task timeout to 21600s (6 h); with
+#     build. CONCURRENCY 12, not 16 (Peng 2026-10-20): the first night at 16 (3,000 reviews, 2026-10-20)
+#     errored 10.3% against 1.5-3.2% at 8, so ~3.0-4.0 h a night at 12. The step budget rises to 300
+#     minutes (the review needs ~165-210) and the task timeout to 21600s (6 h); with
 #     --max-retries 1 a wedged run can cost 12 h. If the model provider throttles at 16, the review error
 #     gate (max 25%) fails the run only AFTER the step, reading the finished review; inside the step only
 #     the breaker on 8 consecutive transport errors stops it. The occupancy alert
-#     moves to four hours with this change (setup_monitoring.sh); reconcile monitoring with the env.
+#     moves to five hours with this change (setup_monitoring.sh); reconcile monitoring with the env.
 #   RELGRAPH_DB_DUTY_CYCLE=1 - set by hand on 2026-10-15 (PIVOTA-Agent #2444: duty-cycle pacing keeps the
 #     build's database streams at ~0.25 of the primary, 2 vCPU then, 4 since 2026-10-19); without it
 #     here a reconcile turns it off.
@@ -463,7 +465,7 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 relgraph_sync_env(){
   local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
   if [ "$ENV" = prod ]; then
-    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=300,RELGRAPH_SYNC_REVIEW_LIMIT=10000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=16,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=300,RELGRAPH_SYNC_REVIEW_LIMIT=10000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=12,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
     env="$env,RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false,RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z,RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative"
     env="$env,RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true"
     env="$env,RELGRAPH_DB_DUTY_CYCLE=1"

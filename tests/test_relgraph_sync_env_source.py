@@ -38,7 +38,7 @@ def test_prod_target_env():
 def test_prod_grows_coverage_with_bounded_review():
     env = env_function("prod", "true")
     assert env["RELGRAPH_SYNC_PRIORITIZE_UNCOVERED"] == "true"
-    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("10000", "16")
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("10000", "12")
     assert env["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "300"
     # The global generated backlog, alternatives first: unscoped, with a cutoff reaching back.
     assert (env["RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD"], env["RELGRAPH_SYNC_CUTOFF"]) == ("false", "2026-01-01T00:00:00Z")
