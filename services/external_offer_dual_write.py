@@ -853,6 +853,16 @@ async def sync_attached_listing_offers(
             "seed_id": seed_id,
             "product_key": product_key,
         })
+    elif plan["skips"].get("refused_currency"):
+        # A mixed listing: its seed-projected rows were refused beside rows that still write, so the
+        # seed reports `synced` and its refusals show only in offer_skips. Logged so they are seen.
+        logger.warning({
+            "event": "external_offer_attached_refused",
+            "reason": "refused_currency",
+            "seed_id": seed_id,
+            "product_key": product_key,
+            "rows_refused": plan["skips"]["refused_currency"],
+        })
     for refused in plan.get("refused") or []:
         # WARNING, not INFO: prod drops module-logger INFO. One line per refused row, for review.
         logger.warning({

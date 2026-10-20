@@ -424,6 +424,30 @@ def test_an_employee_edit_is_not_bounded_and_moves_only_the_product_row():
     assert plan["skips"] == {"variant_not_edited": 1}
 
 
+def test_a_column_with_a_trailing_newline_no_longer_writes_an_enrichment_row():
+    """The ONE place enrichment rows leave main's behaviour (PR controller review of #2657, B6).
+    Main compared `.strip()`-ed codes, so a column of 'USD\\n' re-priced a USD row. The lane now
+    reads a code as SQL's trim() does (spaces only), as the readers do: 'USD\\n' is not 'USD', and
+    the row is a currency_mismatch, the withholding direction."""
+    plan = _plan(_seed(price_currency="USD\n"), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("planned", [], {"currency_mismatch": 1})
+
+
+def test_a_mixed_listings_refused_rows_are_logged(monkeypatch, caplog):
+    """The seed reports `synced` (its enrichment row wrote), so its refused projected rows would show
+    only in offer_skips: they get their own warning line (PR controller review of #2657)."""
+    import logging
+
+    fake = FakeDB(seed=_seed(**_DISAGREEING),
+                  offers=[_projected("of_canon", "catalog_enrichment_agent_v1"),
+                          _projected("of_copy", sku=f"{PK}::canonical")])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake)
+    assert (result["status"], result["offers_written"], result["offer_skips"]) == ("synced", 1, {"refused_currency": 1})
+    assert [u["offer_id"] for u in fake.updates] == ["of_canon"]
+    assert any("refused_currency" in str(r.msg) and "'rows_refused': 1" in str(r.msg) for r in caplog.records)
+
+
 def test_refused_rows_are_logged_for_review(monkeypatch, caplog):
     import logging
 
