@@ -140,6 +140,15 @@ def test_the_final_rule_needs_every_market_fresh_and_declared():
     assert _final_row(oos)["would_flip_strict"] is False
     assert _final_row({})["would_flip_strict"] is False
     assert _final_row({"US": _cls(n=0)})["would_flip_strict"] is False
+    # a market with no class offer (not served) is ignored, its NULL aggregates included
+    unserved = {"US": _cls(oldest=1, oldest_any=1, newest_any=1),
+                "AU": _cls(n=0, valid=None, valid_any=None, stock=None)}
+    assert _final_row(unserved)["would_flip_strict"] is True
+    # one market where SOME class offer lacks a valid read sinks the row, even though its other
+    # offers were read (so its oldest valid read is not NULL)
+    one_bad = {"US": _cls(valid=False, oldest=1, oldest_any=1, newest_any=1),
+               "SG": _cls(oldest=1, oldest_any=1, newest_any=1)}
+    assert _final_row(one_bad)["would_flip_strict"] is False
 
 
 def test_row_read_at_and_cross_market_directly():
@@ -175,6 +184,10 @@ def test_per_market_flips_are_counted_only_in_their_strict_markets():
     assert markets["AU"].get("would_flip_per_market_rule", 0) == 0
     assert markets["AU"]["would_flip"] == 1
     assert {"kind": "drain_job_markets", "jobs": 3} in lines
+    stale = _final_row({"SG": _cls(oldest=30, oldest_any=30, newest_any=30)}, any_markets={"SG": 30})
+    stale_lines = census.summarize([stale], now=NOW, max_age_days=7, seed_pool_by_market={"US": 10})
+    sg = [line for line in stale_lines if line["kind"] == "by_market" and line["lane"] == "all"][0]
+    assert "would_flip_per_market_rule" not in sg  # only a row that flips names its markets
     assert {"kind": "served_market_currency", "pairs": [["SG", "SGD"], ["US", "USD"]]} in lines
 
 

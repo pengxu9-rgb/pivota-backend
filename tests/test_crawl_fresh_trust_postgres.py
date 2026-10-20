@@ -527,6 +527,20 @@ async def test_an_orphan_cannot_starve_the_recheck(db, monkeypatch):
     assert await up.recheck_crawl_fresh_rows(db=db, limit=1) == []
 
 
+async def test_a_failed_probe_inside_the_caller_s_transaction_is_absent_not_an_abort(db, monkeypatch):
+    from services import catalog_row_trust_upserter as up
+    from services import external_offer_dual_write as dw
+
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    monkeypatch.setattr(dw, "PRICE_CHECK_COLUMN_SQL", "SELECT no_such_column AS present FROM pg_class LIMIT 1")
+    async with db.transaction():
+        assert await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER]) == 1
+        assert await db.fetch_val("SELECT 1") == 1
+    assert (await _trust(db, RETAILER))["serving_decision"] == "shadow"
+
+
 async def test_a_failed_read_inside_the_caller_s_transaction_writes_flag_off_verdicts(db, monkeypatch):
     """Addition 5: fail closed per batch inside a SAVEPOINT -- the caller's
     transaction survives, the batch is written with flag-off verdicts."""
@@ -618,8 +632,9 @@ async def _census_fixture(db):
     snapshot = '{"snapshot": {"price_amount": "20.00"}}'
     await db.execute("UPDATE external_product_seeds SET price_amount = 25, seed_data = CAST(:sd AS jsonb)"
                      " WHERE attached_product_key = :pk", {"pk": keys["b_never"], "sd": snapshot})
-    await db.execute("UPDATE external_product_seeds SET price_amount = 20, seed_data = CAST(:sd AS jsonb)"
-                     " WHERE attached_product_key = :pk", {"pk": keys["r_fresh"], "sd": snapshot})
+    for unedited in ("r_fresh", "r_stale"):  # stored price == page read: not an edit
+        await db.execute("UPDATE external_product_seeds SET price_amount = 20, seed_data = CAST(:sd AS jsonb)"
+                         " WHERE attached_product_key = :pk", {"pk": keys[unedited], "sd": snapshot})
     await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()) + [OTHER])
     return keys
 

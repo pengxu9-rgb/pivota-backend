@@ -669,9 +669,13 @@ def test_the_boot_log_names_the_switch_and_n(monkeypatch):
     monkeypatch.setattr(ulog, "logger", Rec())
     _switch_on(monkeypatch, days=3)
     upserter.log_crawl_fresh_config("worker")
+    monkeypatch.delenv(upserter.CRAWL_FRESH_ENV)
+    upserter.log_crawl_fresh_config("web")
     assert lines == [
         "catalog_row_trust_crawl_fresh_config component=worker enabled=True days=3.0 "
-        "recheck_limit=20000 served_market_currency=SG:SGD,US:USD"
+        "recheck_limit=20000 served_market_currency=SG:SGD,US:USD",
+        "catalog_row_trust_crawl_fresh_config component=web enabled=False days=3.0 "
+        "recheck_limit=20000 served_market_currency=SG:SGD,US:USD",
     ]
 
 
