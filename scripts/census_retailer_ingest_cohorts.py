@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
-"""READ-ONLY census of the retailer-ingest cohorts the weekly re-enqueue would re-crawl.
+"""READ-ONLY census of the retailer-ingest cohorts the re-enqueue would re-crawl.
 
 Per cohort (db.retailer_ingest.scope_key, the key the open-job index is built on), one JSON line:
-its host, newest status, last done date, whether the latest done job names options.market, the market
-its last APPLIED run's evidence proves (and why not, when it does not), the market the re-enqueue would
-use (explicit first, then evidence, NEVER a default), whether its lineage is eligible (no failed /
-cancelled / nothing job after the latest done one), and the hours its last cycle took (the latest
-dry run that crawled -- clean or held -- plus the latest applied apply of the latest done job).
+  host, brand, jobs, newest status, lineage (eligible / open / no_done_job / <status>_lineage);
+  last_done_at, last_applied_at and its age in hours;
+  explicit_market (does the latest done job name options.market), ships_to_market (what that job's newest
+  applied run checked: true / false / null), evidence_market and evidence_unproven (what the run's evidence
+  shows, explicit or not), market + market_source (explicit first, then evidence, NEVER a default),
+  market_unproven + unproven_reason, ships_to_market_false (the re-enqueue skips the cohort whatever its
+  market), cycle_hours (the latest crawling dry run -- clean or held -- plus the latest applied apply).
+Then one line per host and one total line: counts of each of the above, the cycle hours of the cohorts the
+re-enqueue would re-crawl, those hours projected per week at the re-enqueue interval (--interval-hours,
+default 120: each cohort crawls 168 / interval times a week at most), and the lane hours a week leaves
+outside the drain's claim window and its one-hour lead (default 03:00-06:30, so 02:00-06:30).
 
-Then one line per host (cohorts, last done, explicit / evidence / market_unproven counts with the
-reasons, markets, projected weekly hours) and one total line, with the lane hours a week leaves outside
-the drain's claim window (RETAILER_INGEST_CLAIM_BLACKOUT_UTC, default 03:00-06:30).
-
-SAFETY. One READ ONLY transaction (REPEATABLE READ, so every query reads one snapshot) with SET LOCAL
-statement_timeout; it writes nothing and creates nothing: two queries. Prints JSON lines only. It carries
-no at-sign so it can be passed inline to scripts/ops/run_oneoff_job.sh, and it needs no crawl subnet:
+SAFETY. One READ ONLY transaction (REPEATABLE READ, so both queries read one snapshot) with SET LOCAL
+statement_timeout; it writes nothing and creates nothing. Prints JSON lines only. It carries no at-sign so
+it can be passed inline to scripts/ops/run_oneoff_job.sh, and it needs no crawl subnet:
 
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_retailer_ingest_cohorts.py)"
-    bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_retailer_ingest_cohorts.py)" --cohorts-only
+    bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_retailer_ingest_cohorts.py)" --hosts-only
 
-Self-contained on purpose: the deployed image may predate the re-enqueue, so the market derivation and
-the lineage rule below are COPIES of services/retailer_ingest/weekly_reenqueue.py's, pinned to it by
-tests/test_census_retailer_ingest_cohorts.py. Only db.retailer_ingest.scope_key (in every image since
-migration 234) is imported from the image.
+Self-contained on purpose: the deployed image may predate the re-enqueue, so the evidence reduction, the
+market rule and the lineage rule below are COPIES of services/retailer_ingest/weekly_reenqueue.py's,
+pinned to it by tests/test_census_retailer_ingest_cohorts.py. Only db.retailer_ingest.scope_key (in every
+image since migration 234) is imported from the image.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -42,36 +43,31 @@ if os.path.isdir("/app") and "/app" not in sys.path:
 
 STATEMENT_TIMEOUT = "120s"
 HOURS_PER_WEEK = 168
+DEFAULT_INTERVAL_HOURS = 120
 # COPIES (pinned by test): pipeline.INGEST_MARKETS and region_pricing's currency for each.
 INGEST_MARKET_CURRENCY = {"US": "USD", "AU": "AUD", "JP": "JPY", "SG": "SGD"}
 OPEN_STATUSES = ("queued", "apply_due", "held")
 TERMINAL_AFTER_DONE = ("failed", "cancelled", "nothing")
-DEFAULT_CLAIM_BLACKOUT_MINUTES = 210  # 03:00-06:30, the drain's default claim window
+SHIPS_TO_MARKET_FALSE = "ships_to_market_false"
+# The drain's default claim window (03:00-06:30) plus its one-hour claim lead.
+DEFAULT_CLAIM_BLOCKED_MINUTES = 210 + 60
 
 JOBS_SQL = """
     SELECT id, domain, brand, options, status, created_at, updated_at
     FROM retailer_ingest_jobs
 """
 
-# Per job: its newest applied run's evidence (a COPY of weekly_reenqueue._EVIDENCE_SQL's columns, pinned
-# by test) and the seconds of its latest crawling dry run and latest applied apply.
+# Per job: its newest applied run in finish_run's shape (a COPY of weekly_reenqueue._FACTS_SQL's columns,
+# pinned by test), when it finished, and the seconds of its latest crawling dry run and applied apply.
 RUNS_SQL = """
     WITH applied AS (
         SELECT DISTINCT ON (r.job_id)
                r.job_id,
-               r.crawl -> 'storefront' ->> 'currency' AS store_currency,
-               r.crawl -> 'presented_currency' AS presented,
-               r.checks -> 'storefront' ->> 'market' AS checked_market,
-               (SELECT count(*) FROM jsonb_array_elements(
-                    CASE WHEN jsonb_typeof(r.readback -> 'rows') = 'array' THEN r.readback -> 'rows'
-                         ELSE '[]'::jsonb END) e) AS readback_rows,
-               (SELECT count(*) FROM jsonb_array_elements(
-                    CASE WHEN jsonb_typeof(r.readback -> 'rows') = 'array' THEN r.readback -> 'rows'
-                         ELSE '[]'::jsonb END) e
-                 WHERE CASE WHEN jsonb_typeof(e -> 'offers') = 'number'
-                            THEN CAST(e ->> 'offers' AS numeric) > 0 ELSE false END
-                   AND e -> 'offers_in_currency' = e -> 'offers'
-                   AND e -> 'offers_in_market' = e -> 'offers') AS readback_rows_proven,
+               jsonb_build_object('storefront', r.crawl -> 'storefront',
+                              'presented_currency', r.crawl -> 'presented_currency') AS crawl,
+           jsonb_build_object('storefront', r.checks -> 'storefront') AS checks,
+           jsonb_build_object('rows', r.readback -> 'rows') AS readback,
+               r.finished_at AS applied_at,
                EXTRACT(EPOCH FROM (r.finished_at - r.started_at)) AS apply_s
         FROM retailer_ingest_runs r
         WHERE r.stage = 'apply' AND r.outcome = 'applied' AND r.finished_at IS NOT NULL
@@ -83,8 +79,8 @@ RUNS_SQL = """
         WHERE r.stage = 'dry_run' AND r.outcome IN ('clean', 'held') AND r.finished_at IS NOT NULL
         ORDER BY r.job_id, r.started_at DESC, r.id DESC
     )
-    SELECT coalesce(a.job_id, c.job_id) AS job_id, a.store_currency, a.presented, a.checked_market,
-           a.readback_rows, a.readback_rows_proven, a.apply_s, c.dry_run_s
+    SELECT coalesce(a.job_id, c.job_id) AS job_id, a.crawl, a.checks, a.readback, a.applied_at, a.apply_s,
+           c.dry_run_s
     FROM applied a FULL JOIN crawled c ON c.job_id = a.job_id
 """
 
@@ -107,9 +103,39 @@ def _options(value: Any) -> Dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _dict(value: Any) -> Dict[str, Any]:
+    value = _json(value)
+    return value if isinstance(value, dict) else {}
+
+
+def _count(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def fold_host(domain: Any) -> str:
     host = str(domain or "").strip().lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def evidence_from_run(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """COPY of weekly_reenqueue.evidence_from_run."""
+    if not run:
+        return None
+    crawl, checks, readback = _dict(run.get("crawl")), _dict(run.get("checks")), _dict(run.get("readback"))
+    storefront = _dict(checks.get("storefront"))
+    rows = readback.get("rows") if isinstance(readback.get("rows"), list) else []
+    proven = 0
+    for row in rows:
+        row = row if isinstance(row, dict) else {}
+        offers = _count(row.get("offers"))
+        if (offers is not None and offers > 0 and _count(row.get("offers_in_currency")) == offers
+                and _count(row.get("offers_in_market")) == offers):
+            proven += 1
+    return {"store_currency": _dict(crawl.get("storefront")).get("currency"),
+            "presented": crawl.get("presented_currency"),
+            "checked_market": storefront.get("market"),
+            "ships_to_market": storefront.get("ships_to_market"),
+            "readback_rows": len(rows), "readback_rows_proven": proven}
 
 
 def evidence_market(evidence: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
@@ -124,11 +150,12 @@ def evidence_market(evidence: Optional[Dict[str, Any]]) -> Tuple[Optional[str], 
         return None, "no_store_currency"
     if INGEST_MARKET_CURRENCY[checked] != store:
         return None, "currency_market_mismatch"
-    presented = _json(evidence.get("presented"))
-    presented = presented if isinstance(presented, dict) else {}
+    if evidence.get("ships_to_market") is not True:
+        return None, "ships_to_market_unproven"
+    presented = _dict(evidence.get("presented"))
     pages = presented.get("pages_by_currency")
     pages = {_norm(c): n for c, n in pages.items()} if isinstance(pages, dict) else {}
-    seen = {c for c, n in pages.items() if isinstance(n, int) and not isinstance(n, bool) and n > 0}
+    seen = {c for c, n in pages.items() if (_count(n) or 0) > 0}
     if not seen:
         return None, "presented_currency_absent"
     if seen != {store} or presented.get("unproven_values") or presented.get("problems"):
@@ -153,7 +180,9 @@ def derive_market(options: Dict[str, Any], evidence: Optional[Dict[str, Any]]) -
     return None, "", why
 
 
-def _at(value: Any) -> datetime:
+def _at(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
     if isinstance(value, str):
         value = datetime.fromisoformat(value)
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -174,8 +203,8 @@ def lineage(jobs: List[Dict[str, Any]]) -> Tuple[str, Optional[Dict[str, Any]]]:
     return "eligible", latest
 
 
-def cohort_lines(jobs: List[Dict[str, Any]], runs: Dict[str, Dict[str, Any]],
-                 scope_key: Any) -> List[Dict[str, Any]]:
+def cohort_lines(jobs: List[Dict[str, Any]], runs: Dict[str, Dict[str, Any]], scope_key: Any,
+                 now: datetime) -> List[Dict[str, Any]]:
     cohorts: Dict[str, List[Dict[str, Any]]] = {}
     for job in jobs:
         key = scope_key(str(job.get("domain") or ""), str(job.get("brand") or ""), _options(job.get("options")))
@@ -186,19 +215,26 @@ def cohort_lines(jobs: List[Dict[str, Any]], runs: Dict[str, Dict[str, Any]],
         state, done = lineage(members)
         line: Dict[str, Any] = {"kind": "cohort", "cohort": key, "host": fold_host(members[-1].get("domain")),
                                 "brand": members[-1].get("brand"), "jobs": len(members),
-                                "newest_status": members[-1].get("status"), "lineage": state,
-                                "slot": int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) % HOURS_PER_WEEK}
+                                "newest_status": members[-1].get("status"), "lineage": state}
+        applied = [_at(runs[j["id"]]["applied_at"]) for j in members
+                   if (runs.get(j["id"]) or {}).get("applied_at") is not None]
+        if applied:
+            line["last_applied_at"] = max(applied).isoformat()
+            line["applied_age_hours"] = round((now - max(applied)).total_seconds() / 3600.0, 1)
         if done is not None:
             options = _options(done.get("options"))
             run = runs.get(done["id"]) or {}
             # A job whose only run row is a dry run has no applied evidence (RUNS_SQL is a FULL JOIN).
-            evidence = run if run.get("readback_rows") is not None else None
+            evidence = evidence_from_run(run) if run.get("applied_at") is not None else None
             ev_market, ev_why = evidence_market(evidence)
             market, source, why = derive_market(options, evidence)
             seconds = sum(float(run.get(k) or 0) for k in ("dry_run_s", "apply_s"))
+            ships = (evidence or {}).get("ships_to_market")
             line.update({
                 "last_done_job_id": done["id"], "last_done_at": _at(done.get("updated_at") or done["created_at"]).isoformat(),
                 "explicit_market": options.get("market") not in (None, ""),
+                "ships_to_market": ships if isinstance(ships, bool) else None,
+                SHIPS_TO_MARKET_FALSE: ships is False,
                 "evidence_market": ev_market, "evidence_unproven": ev_why,
                 "market": market, "market_source": source or None, "market_unproven": market is None,
                 "unproven_reason": why, "cycle_hours": round(seconds / 3600.0, 3),
@@ -207,14 +243,17 @@ def cohort_lines(jobs: List[Dict[str, Any]], runs: Dict[str, Dict[str, Any]],
     return out
 
 
-def host_lines(cohorts: List[Dict[str, Any]], *, claim_blackout_minutes: int) -> List[Dict[str, Any]]:
+def host_lines(cohorts: List[Dict[str, Any]], *, interval_hours: int = DEFAULT_INTERVAL_HOURS,
+               claim_blocked_minutes: int = DEFAULT_CLAIM_BLOCKED_MINUTES) -> List[Dict[str, Any]]:
     hosts: Dict[str, List[Dict[str, Any]]] = {}
     for c in cohorts:
         hosts.setdefault(c["host"], []).append(c)
 
     def agg(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         done = [r for r in rows if r.get("last_done_job_id")]
-        recrawl = [r for r in done if r["lineage"] in ("eligible", "open") and not r["market_unproven"]]
+        recrawl = [r for r in done if r["lineage"] in ("eligible", "open") and not r["market_unproven"]
+                   and not r[SHIPS_TO_MARKET_FALSE]]
+        cycle = round(sum(r["cycle_hours"] for r in recrawl), 2)
         return {
             "cohorts": len(rows), "done_cohorts": len(done),
             "last_done_at": max((r["last_done_at"] for r in done), default=None),
@@ -222,19 +261,24 @@ def host_lines(cohorts: List[Dict[str, Any]], *, claim_blackout_minutes: int) ->
             "evidence_market": sum(1 for r in done if r["market_source"] == "evidence"),
             "market_unproven": sum(1 for r in done if r["market_unproven"]),
             "unproven_reasons": dict(sorted(Counter(r["unproven_reason"] for r in done if r["market_unproven"]).items())),
+            "ships_to_market": dict(sorted(Counter(str(r["ships_to_market"]).lower() for r in done).items())),
+            SHIPS_TO_MARKET_FALSE: sum(1 for r in done if r[SHIPS_TO_MARKET_FALSE]),
             "markets": dict(sorted(Counter(r["market"] for r in done if r["market"]).items())),
             "lineage": dict(sorted(Counter(r["lineage"] for r in rows).items())),
-            "projected_weekly_hours": round(sum(r["cycle_hours"] for r in recrawl), 2),
-            "unproven_weekly_hours": round(sum(r["cycle_hours"] for r in done if r["market_unproven"]), 2),
+            "recrawl_cohorts": len(recrawl),
+            "cycle_hours": cycle,
+            "projected_weekly_hours": round(cycle * HOURS_PER_WEEK / interval_hours, 2),
+            "unproven_cycle_hours": round(sum(r["cycle_hours"] for r in done if r["market_unproven"]), 2),
         }
     out = [{"kind": "host", "host": h, **agg(rows)} for h, rows in sorted(hosts.items())]
-    total = {"kind": "total", "hosts": len(hosts), **agg(cohorts)}
-    total["lane_hours_per_week_outside_claim_window"] = round(HOURS_PER_WEEK - 7 * claim_blackout_minutes / 60.0, 2)
+    total = {"kind": "total", "hosts": len(hosts), "interval_hours": interval_hours, **agg(cohorts)}
+    total["lane_hours_per_week_outside_claim_window"] = round(HOURS_PER_WEEK - 7 * claim_blocked_minutes / 60.0, 2)
     out.append(total)
     return out
 
 
-async def census(conn: Any, *, claim_blackout_minutes: int = DEFAULT_CLAIM_BLACKOUT_MINUTES) -> List[Dict[str, Any]]:
+async def census(conn: Any, *, interval_hours: int = DEFAULT_INTERVAL_HOURS,
+                 claim_blocked_minutes: int = DEFAULT_CLAIM_BLOCKED_MINUTES) -> List[Dict[str, Any]]:
     """Run the census on an asyncpg connection, inside its own READ ONLY transaction."""
     from db.retailer_ingest import scope_key
 
@@ -242,8 +286,8 @@ async def census(conn: Any, *, claim_blackout_minutes: int = DEFAULT_CLAIM_BLACK
         await conn.execute(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'")
         jobs = [dict(r) for r in await conn.fetch(JOBS_SQL)]
         runs = {r["job_id"]: dict(r) for r in await conn.fetch(RUNS_SQL)}
-    cohorts = cohort_lines(jobs, runs, scope_key)
-    return cohorts + host_lines(cohorts, claim_blackout_minutes=claim_blackout_minutes)
+    cohorts = cohort_lines(jobs, runs, scope_key, datetime.now(timezone.utc))
+    return cohorts + host_lines(cohorts, interval_hours=interval_hours, claim_blocked_minutes=claim_blocked_minutes)
 
 
 async def _main(argv: List[str]) -> int:
@@ -252,15 +296,19 @@ async def _main(argv: List[str]) -> int:
     parser = argparse.ArgumentParser(description="read-only census of retailer-ingest cohorts")
     parser.add_argument("--cohorts-only", action="store_true", help="print the cohort lines only")
     parser.add_argument("--hosts-only", action="store_true", help="print the host and total lines only")
-    parser.add_argument("--claim-blackout-minutes", type=int, default=DEFAULT_CLAIM_BLACKOUT_MINUTES)
+    parser.add_argument("--interval-hours", type=int, default=DEFAULT_INTERVAL_HOURS)
+    parser.add_argument("--claim-blocked-minutes", type=int, default=DEFAULT_CLAIM_BLOCKED_MINUTES)
     args = parser.parse_args(argv)
+    if not 1 <= args.interval_hours <= HOURS_PER_WEEK - 1:
+        parser.error("--interval-hours must be 1..167")
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
     if not url.startswith("postgres"):
         print(json.dumps({"kind": "error", "error": "DATABASE_URL must be Postgres"}))
         return 2
     conn = await asyncpg.connect(url)
     try:
-        lines = await census(conn, claim_blackout_minutes=args.claim_blackout_minutes)
+        lines = await census(conn, interval_hours=args.interval_hours,
+                             claim_blocked_minutes=args.claim_blocked_minutes)
     finally:
         await conn.close()
     for line in lines:

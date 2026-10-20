@@ -1,5 +1,7 @@
-"""The weekly re-enqueue: cohort selection, the once-a-week rule, the spread, the skip reasons, and the
-market derivation (explicit, then the run's evidence, then skipped -- never a default)."""
+"""The re-enqueue: cohort selection, the cadence on the age of the last applied read, the skip reasons
+(retired host, ships-to false, lineage), and the market derivation (explicit, then the run's evidence,
+then skipped -- never a default). The rules against the REAL producer's run JSON are in
+test_retailer_ingest_weekly_reenqueue_producer.py."""
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -10,7 +12,8 @@ import jobs.retailer_ingest_weekly_reenqueue as job
 from db import retailer_ingest as ledger
 from services.retailer_ingest import weekly_reenqueue as rq
 
-MONDAY = datetime(2026, 10, 19, tzinfo=timezone.utc)  # a Monday, 00:00Z: hour of week 0
+NOW = datetime(2026, 11, 2, 10, 11, tzinfo=timezone.utc)
+OLD = NOW - timedelta(days=10)
 DOMAIN = "shop.example.com"
 BASE = {"vendors": ["Example Brand"]}
 
@@ -19,44 +22,56 @@ def key_of(domain=DOMAIN, brand="Example Brand", options=None):
     return ledger.scope_key(domain, brand, dict(BASE if options is None else options))
 
 
-def at_slot(key, offset_h=0, weeks=2):
-    """An instant `offset_h` hours after the cohort's slot, `weeks` weeks after MONDAY."""
-    return MONDAY + timedelta(weeks=weeks, hours=rq.week_slot(key) + offset_h, minutes=11)
-
-
-def mk(job_id, *, status="done", created=None, options=None, domain=DOMAIN, brand="Example Brand", lease=None):
+def mk(job_id, *, status="done", created=None, read=None, options=None, domain=DOMAIN, brand="Example Brand",
+       lease=None):
     options = dict(BASE) if options is None else (options if isinstance(options, str) else dict(options))
-    return {"id": job_id, "domain": domain, "brand": brand, "options": options,
-            "status": status, "lease_until": lease, "created_at": created or MONDAY}
+    created = created or OLD - timedelta(hours=1)
+    if read is None and status == "done" and isinstance(created, datetime):
+        read = created + timedelta(hours=1)
+    return {"id": job_id, "domain": domain, "brand": brand, "options": options, "status": status,
+            "lease_until": lease, "created_at": created, "last_applied_at": read}
 
 
-def proven(market="US", currency="USD", **over):
-    """The evidence a clean applied run of a no-market job records."""
-    ev = {"store_currency": currency, "checked_market": market,
-          "presented": {"currencies": [currency], "pages_by_currency": {currency: 3}, "pages_without_cookie": 0,
-                        "problems": {}, "unproven_values": []},
-          "readback_rows": 4, "readback_rows_proven": 4}
-    ev.update(over)
-    return ev
+def run(market="US", currency="USD", ships=True, pages=None, rows=None, presented=True):
+    """An applied run in the shape ledger.finish_run stores (see the producer tests for the real one)."""
+    crawl = {"status": "complete", "storefront": {"currency": currency, "ships_to_countries": [market]}}
+    if presented:
+        crawl["presented_currency"] = {"currencies": [currency], "pages_by_currency": {currency: 3} if pages is None else pages,
+                                       "pages_without_cookie": 0, "problems": {}, "unproven_values": []}
+    storefront = {"currency": currency, "market": market}
+    if ships is not None:
+        storefront["ships_to_market"] = ships
+    rows = rows if rows is not None else [
+        {"product_key": "ext:retailer:a", "offers": 1, "offers_in_currency": 1, "offers_in_market": 1},
+        {"product_key": "ext:retailer:b", "offers": 2, "offers_in_currency": 2, "offers_in_market": 2}]
+    return {"crawl": crawl, "checks": {"storefront": storefront}, "readback": {"ok": True, "rows": rows}}
+
+
+def ev(**kw):
+    return rq.evidence_from_run(run(**kw))
 
 
 class FakeDB:
-    """The two reads and the enqueue INSERT, with migration 234's one-open-job-per-scope_key index."""
+    """The three reads and the enqueue INSERT, with migration 234's one-open-job-per-scope_key index."""
 
-    def __init__(self, jobs, evidence=None, now=None):
+    def __init__(self, jobs, runs=None, products=None):
         self.jobs = list(jobs)
-        self.evidence = dict(evidence or {})
-        self.now = now or MONDAY
-        self.inserts = []
-        self.evidence_reads = []
+        self.runs = dict(runs or {})
+        self.products = dict(products or {})
+        self.inserts, self.fact_reads, self.product_reads = [], [], []
+        self.now = NOW
 
     async def fetch_all(self, sql, values=None):
         if sql is rq._JOBS_SQL:
             hosts = set(values["hosts"])
             return [dict(j) for j in self.jobs if values["all_hosts"] or rq.fold_host(j["domain"]) in hosts]
-        if sql is rq._EVIDENCE_SQL:
-            self.evidence_reads.append(list(values["ids"]))
-            return [{"job_id": i, **self.evidence[i]} for i in values["ids"] if i in self.evidence]
+        if sql is rq._FACTS_SQL:
+            self.fact_reads.append(list(values["ids"]))
+            return [{"job_id": i, **{k: json.dumps(v) for k, v in self.runs[i].items()}}
+                    for i in values["ids"] if i in self.runs]
+        if sql is rq._RETIRED_SQL:
+            self.product_reads.append(list(values["keys"]))
+            return [{"product_key": k, **self.products[k]} for k in values["keys"] if k in self.products]
         raise AssertionError(f"unexpected read: {sql}")
 
     async def fetch_one(self, sql, values=None):
@@ -67,14 +82,14 @@ class FakeDB:
             return None
         row = {"id": values["id"], "domain": values["domain"], "brand": values["brand"],
                "options": json.loads(values["options"]), "status": "queued", "lease_until": None,
-               "created_at": self.now, "priority": values["priority"], "source": values["source"],
-               "scope_key": values["scope_key"]}
+               "created_at": self.now, "last_applied_at": None, "priority": values["priority"],
+               "source": values["source"], "scope_key": values["scope_key"]}
         self.jobs.append(row)
         self.inserts.append(row)
         return {"id": row["id"]}
 
 
-async def run(db, now, **kw):
+async def go(db, now=NOW, **kw):
     db.now = now
     return await rq.run_reenqueue(db=db, now=now, **kw)
 
@@ -84,88 +99,161 @@ def only(summary):
     return decision
 
 
-# ------------------------------------------------------------------ market derivation
+# ------------------------------------------------------------------ market derivation and the ships-to gate
 
 
-async def test_an_explicit_market_is_copied_onto_the_new_job_with_the_same_options():
-    options = {**BASE, "market": "SG", "exclude_handles": ["a-gift"], "only_category": "beauty/makeup"}
-    key = key_of(options=options)
-    db = FakeDB([mk("rij_done", options=options)])
-    summary = await run(db, at_slot(key))
+async def test_an_explicit_market_is_copied_with_the_ships_to_gate_and_the_same_key():
+    options = {**BASE, "market": "SG", "exclude_handles": ["a-gift"], "accepted_flags": ["k"],
+               "only_category": "beauty/makeup"}
+    db = FakeDB([mk("rij_done", options=options)], runs={"rij_done": run(market="SG", currency="SGD")})
+    summary = await go(db)
     (row,) = db.inserts
-    assert row["options"] == options
+    assert row["options"] == {**options, "require_ships_to_market": True}  # approvals carried, gate added
     assert row["source"] == "weekly_reenqueue:rij_done" and row["priority"] == 0
-    assert row["scope_key"] == key
+    assert row["scope_key"] == key_of(options=options)
     assert summary["enqueued"] == 1 and summary["market_source"] == {"explicit": 1}
-    assert db.evidence_reads == []  # an explicit market needs no evidence read
 
 
-async def test_without_an_explicit_market_the_runs_evidence_names_it_and_the_key_is_unchanged():
-    key = key_of()
-    db = FakeDB([mk("rij_done")], evidence={"rij_done": proven()})
-    summary = await run(db, at_slot(key))
+async def test_an_explicit_market_with_ships_unknown_is_still_queued_with_the_gate():
+    options = {**BASE, "market": "US"}
+    for runs in ({"rij_done": run(ships=None)}, {}):  # a run that cannot say, or no applied run at all
+        db = FakeDB([mk("rij_done", options=options)], runs=runs)
+        decision = only(await go(db))
+        assert decision["decision"] == "enqueue" and decision["options"]["require_ships_to_market"] is True
+
+
+async def test_any_cohort_whose_run_says_the_store_does_not_ship_there_is_skipped_before_the_market():
+    for options, runs in (({**BASE, "market": "US"}, run(ships=False)),        # explicit
+                          ({**BASE, "market": "DE"}, run(ships=False)),        # even an invalid market
+                          (BASE, run(ships=False))):                            # evidence
+        db = FakeDB([mk("rij_done", options=options)], runs={"rij_done": runs})
+        summary = await go(db)
+        assert only(summary)["reason"] == rq.SHIPS_TO_MARKET_FALSE and db.inserts == []
+        assert summary["named"][rq.SHIPS_TO_MARKET_FALSE][0]["prev_job_id"] == "rij_done"
+
+
+async def test_without_an_explicit_market_the_runs_evidence_names_us_and_gates_the_job():
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run()})
+    summary = await go(db)
     (row,) = db.inserts
-    assert row["options"] == {**BASE, "market": "US"}
-    assert row["scope_key"] == key  # "US" folds into the no-market key: the same cohort
+    assert row["options"] == {**BASE, "market": "US", "require_ships_to_market": True}
+    assert row["scope_key"] == key_of()
     assert only(summary)["market_source"] == "evidence"
-    assert db.evidence_reads == [["rij_done"]]
+    assert db.fact_reads == [["rij_done"]]
+
+
+async def test_a_shopify_markets_capture_is_queued_without_the_storefront_only_gate():
+    options = {"vendors": ["Example Brand"], "source": "shopify_markets", "market": "SG"}
+    db = FakeDB([mk("rij_cap", options=options)], runs={"rij_cap": run(market="SG", currency="SGD")})
+    decision = only(await go(db))
+    assert decision["decision"] == "enqueue" and "require_ships_to_market" not in decision["options"]
 
 
 @pytest.mark.parametrize("evidence, why", [
     (None, rq.NO_APPLIED_RUN),
-    (proven(checked_market=None), rq.NO_CHECKED_MARKET),
-    (proven(checked_market="DE"), rq.NO_CHECKED_MARKET),
-    (proven(store_currency=None), rq.NO_STORE_CURRENCY),
-    # a US-checked run whose store says SGD: the pair does not match
-    (proven(store_currency="SGD", presented={"pages_by_currency": {"SGD": 2}}), rq.CURRENCY_MARKET_MISMATCH),
-    (proven(presented=None), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented={"pages_by_currency": {}, "pages_without_cookie": 5}), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented={"pages_by_currency": {"USD": 0}}), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented={"pages_by_currency": {"USD": True}}), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented='{"pages_by_currency": []}'), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented="not json"), rq.PRESENTED_CURRENCY_ABSENT),
-    (proven(presented={"pages_by_currency": {"USD": 3, "QAR": 1}}), rq.PRESENTED_CURRENCY_MISMATCH),
-    (proven(presented={"pages_by_currency": {"QAR": 3}}), rq.PRESENTED_CURRENCY_MISMATCH),
-    (proven(presented={"pages_by_currency": {"USD": 3}, "unproven_values": ["QAR"]}), rq.PRESENTED_CURRENCY_MISMATCH),
-    (proven(presented={"pages_by_currency": {"USD": 3}, "problems": {"conflicting": 1}}),
-     rq.PRESENTED_CURRENCY_MISMATCH),
-    (proven(readback_rows=4, readback_rows_proven=3), rq.READBACK_UNPROVEN),
-    (proven(readback_rows=0, readback_rows_proven=0), rq.READBACK_UNPROVEN),
-    (proven(readback_rows=None, readback_rows_proven=None), rq.READBACK_UNPROVEN),
+    (ev(market=None), rq.NO_CHECKED_MARKET),
+    (ev(market="DE"), rq.NO_CHECKED_MARKET),
+    (ev(currency=None), rq.NO_STORE_CURRENCY),
+    ({**ev(), "store_currency": "SGD"}, rq.CURRENCY_MARKET_MISMATCH),
+    (ev(ships=None), rq.SHIPS_TO_MARKET_UNPROVEN),
+    (ev(ships=False), rq.SHIPS_TO_MARKET_UNPROVEN),
+    ({**ev(), "ships_to_market": "true"}, rq.SHIPS_TO_MARKET_UNPROVEN),   # only a real JSON true
+    (ev(presented=False), rq.PRESENTED_CURRENCY_ABSENT),
+    (ev(pages={}), rq.PRESENTED_CURRENCY_ABSENT),
+    (ev(pages={"USD": 0}), rq.PRESENTED_CURRENCY_ABSENT),
+    (ev(pages={"USD": True}), rq.PRESENTED_CURRENCY_ABSENT),
+    ({**ev(), "presented": "not json"}, rq.PRESENTED_CURRENCY_ABSENT),
+    ({**ev(), "presented": '{"pages_by_currency": []}'}, rq.PRESENTED_CURRENCY_ABSENT),
+    (ev(pages={"USD": 3, "QAR": 1}), rq.PRESENTED_CURRENCY_MISMATCH),
+    (ev(pages={"QAR": 3}), rq.PRESENTED_CURRENCY_MISMATCH),
+    ({**ev(), "presented": {"pages_by_currency": {"USD": 3}, "unproven_values": ["QAR"]}}, rq.PRESENTED_CURRENCY_MISMATCH),
+    ({**ev(), "presented": {"pages_by_currency": {"USD": 3}, "problems": {"x": 1}}}, rq.PRESENTED_CURRENCY_MISMATCH),
+    (ev(rows=[{"offers": 1, "offers_in_currency": 1, "offers_in_market": 1},
+              {"offers": 2, "offers_in_currency": 1, "offers_in_market": 2}]), rq.READBACK_UNPROVEN),
+    (ev(rows=[]), rq.READBACK_UNPROVEN),
 ])
-async def test_a_market_the_evidence_does_not_prove_is_skipped_never_defaulted(evidence, why):
-    key = key_of()
-    db = FakeDB([mk("rij_done")], evidence={} if evidence is None else {"rij_done": evidence})
-    summary = await run(db, at_slot(key))
-    assert db.inserts == []
+def test_evidence_that_does_not_show_the_market_is_unproven_never_defaulted(evidence, why):
+    assert rq.evidence_market(evidence) == (None, why)
+    assert rq.derive_market({}, evidence) == (None, "", why)
+
+
+async def test_a_market_the_evidence_does_not_show_is_skipped_and_named():
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run(presented=False)})
+    summary = await go(db)
     decision = only(summary)
-    assert (decision["reason"], decision["detail"]) == (rq.MARKET_UNPROVEN, why)
-    assert "market" not in decision
-    assert summary["market_unproven_detail"] == {why: 1}
-    assert summary["named"][rq.MARKET_UNPROVEN] == [{"host": DOMAIN, "brand": "Example Brand",
-                                                     "prev_job_id": "rij_done", "detail": why}]
+    assert (decision["reason"], decision["detail"]) == (rq.MARKET_UNPROVEN, rq.PRESENTED_CURRENCY_ABSENT)
+    assert "market" not in decision and db.inserts == []
+    assert summary["market_unproven_detail"] == {rq.PRESENTED_CURRENCY_ABSENT: 1}
+    assert summary["named"][rq.MARKET_UNPROVEN] == [{"host": DOMAIN, "brand": "Example Brand", "prev_job_id": "rij_done",
+                                                     "detail": rq.PRESENTED_CURRENCY_ABSENT}]
+    db = FakeDB([mk("rij_done")])  # no applied run at all
+    assert only(await go(db))["detail"] == rq.NO_APPLIED_RUN
 
 
-def test_evidence_with_lowercase_codes_and_a_json_string_payload_still_proves_its_market():
-    ev = proven(market="sg", currency="sgd",
-                presented=json.dumps({"pages_by_currency": {"sgd": 2}, "pages_without_cookie": 1}))
-    assert rq.evidence_market(ev) == ("SG", None)
-    assert rq.derive_market({}, ev) == ("SG", rq.MARKET_EVIDENCE, None)
+def test_the_readback_reduction_counts_only_whole_numeric_rows():
+    rows = [{"offers": 1, "offers_in_currency": 1, "offers_in_market": 1},
+            {"offers": 0, "offers_in_currency": 0, "offers_in_market": 0},           # no offer
+            {"offers": True, "offers_in_currency": True, "offers_in_market": True},  # not a number
+            {"offers": "1", "offers_in_currency": "1", "offers_in_market": "1"},
+            {"offers": 2, "offers_in_currency": 2, "offers_in_market": 1},           # not stamped the market
+            {"offers": 2, "offers_in_currency": 1, "offers_in_market": 2},           # not in the currency
+            "not a row"]
+    got = rq.evidence_from_run({"readback": {"rows": rows}})
+    assert (got["readback_rows"], got["readback_rows_proven"]) == (7, 1)
+    assert rq.evidence_from_run({"readback": {"rows": {"not": "a list"}}})["readback_rows"] == 0
+    assert rq.evidence_from_run(None) is None and rq.evidence_from_run({}) is None
+    text = {k: json.dumps(v) for k, v in run(market="sg", currency="sgd", pages={"sgd": 2}).items()}
+    assert rq.evidence_market(rq.evidence_from_run(text)) == ("SG", None)
 
 
 @pytest.mark.parametrize("market", ["DE", "XX", "usa"])
 def test_an_explicit_market_outside_the_ingest_markets_is_unproven_not_replaced(market):
-    assert rq.derive_market({"market": market}, proven()) == (None, "", rq.EXPLICIT_MARKET_INVALID)
+    assert rq.derive_market({"market": market}, ev()) == (None, "", rq.EXPLICIT_MARKET_INVALID)
 
 
 @pytest.mark.parametrize("market", [None, ""])
 def test_an_empty_explicit_market_falls_through_to_the_evidence(market):
-    assert rq.derive_market({"market": market}, proven()) == ("US", rq.MARKET_EVIDENCE, None)
+    assert rq.derive_market({"market": market}, ev()) == ("US", rq.MARKET_EVIDENCE, None)
     assert rq.derive_market({"market": market}, None) == (None, "", rq.NO_APPLIED_RUN)
 
 
 def test_an_explicit_market_wins_over_contradicting_evidence():
-    assert rq.derive_market({"market": " sg "}, proven()) == ("SG", rq.MARKET_EXPLICIT, None)
+    assert rq.derive_market({"market": " sg "}, ev()) == ("SG", rq.MARKET_EXPLICIT, None)
+
+
+# ------------------------------------------------------------------ retired hosts
+
+
+RETIRED = {"suppressed_at": NOW, "suppression_reason": "hand_retired_example", "has_active_seed": False,
+           "has_live_offer": False}
+
+
+@pytest.mark.parametrize("products, retired", [
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": RETIRED}, True),
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": {**RETIRED, "has_live_offer": True}}, False),
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": {**RETIRED, "has_active_seed": True}}, False),
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": {**RETIRED, "suppression_reason": None}}, False),
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": {**RETIRED, "suppression_reason": "stale_after_sync"}}, False),
+    ({"ext:retailer:a": RETIRED, "ext:retailer:b": {**RETIRED, "suppressed_at": None}}, False),
+    ({"ext:retailer:a": RETIRED}, False),  # a product missing from the catalog is no proof
+])
+async def test_a_cohort_whose_read_back_products_are_all_retired_is_skipped(products, retired):
+    db = FakeDB([mk("rij_done", options={**BASE, "market": "US"})], runs={"rij_done": run()}, products=products)
+    decision = only(await go(db))
+    assert (decision.get("reason") == rq.RETIRED_HOST) is retired
+    assert db.product_reads == [["ext:retailer:a", "ext:retailer:b"]]
+
+
+async def test_a_run_that_read_back_no_product_proves_no_retirement():
+    db = FakeDB([mk("rij_done", options={**BASE, "market": "US"})], runs={"rij_done": run(rows=[])})
+    assert only(await go(db))["decision"] == "enqueue" and db.product_reads == []
+    assert not rq.host_retired([], {})
+
+
+async def test_retirement_is_judged_before_the_market():
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run(presented=False)},
+                products={"ext:retailer:a": RETIRED, "ext:retailer:b": RETIRED})
+    assert only(await go(db))["reason"] == rq.RETIRED_HOST
 
 
 # ------------------------------------------------------------------ lineage and skip reasons
@@ -173,243 +261,247 @@ def test_an_explicit_market_wins_over_contradicting_evidence():
 
 @pytest.mark.parametrize("status", ["queued", "apply_due", "held"])
 async def test_a_cohort_with_an_open_job_is_skipped(status):
-    key = key_of()
-    db = FakeDB([mk("rij_old", created=MONDAY - timedelta(days=30)), mk("rij_open", status=status)],
-                evidence={"rij_old": proven()})
-    assert only(await run(db, at_slot(key)))["reason"] == rq.OPEN_JOB
-    assert db.inserts == []
+    db = FakeDB([mk("rij_old", created=NOW - timedelta(days=30)), mk("rij_open", status=status)],
+                runs={"rij_old": run()})
+    assert only(await go(db))["reason"] == rq.OPEN_JOB and db.inserts == []
 
 
 async def test_a_cohort_with_a_live_lease_is_skipped_and_an_expired_lease_is_not():
-    key = key_of()
-    now = at_slot(key)
-    db = FakeDB([mk("rij_done", lease=now + timedelta(minutes=5))], evidence={"rij_done": proven()})
-    assert only(await run(db, now))["reason"] == rq.LEASED
-    db = FakeDB([mk("rij_done", lease=now - timedelta(minutes=5))], evidence={"rij_done": proven()})
-    assert only(await run(db, now))["decision"] == "enqueue"
+    db = FakeDB([mk("rij_done", lease=NOW + timedelta(minutes=5))], runs={"rij_done": run()})
+    assert only(await go(db))["reason"] == rq.LEASED
+    db = FakeDB([mk("rij_done", lease=NOW - timedelta(minutes=5))], runs={"rij_done": run()})
+    assert only(await go(db))["decision"] == "enqueue"
 
 
 def test_a_naive_or_text_lease_is_read_as_utc():
-    now = MONDAY + timedelta(days=1)
-    assert rq.lineage_reason([mk("a", lease=(now + timedelta(minutes=1)).replace(tzinfo=None))], now)[0] == rq.LEASED
-    assert rq.lineage_reason([mk("a", lease=(now + timedelta(minutes=1)).isoformat())], now)[0] == rq.LEASED
-    assert rq.lineage_reason([mk("a", lease=now)], now)[0] is None
+    assert rq.lineage_reason([mk("a", lease=(NOW + timedelta(minutes=1)).replace(tzinfo=None))], NOW)[0] == rq.LEASED
+    assert rq.lineage_reason([mk("a", lease=(NOW + timedelta(minutes=1)).isoformat())], NOW)[0] == rq.LEASED
+    assert rq.lineage_reason([mk("a", lease=NOW)], NOW)[0] is None
 
 
 async def test_a_cohort_that_never_finished_is_skipped():
-    key = key_of()
-    db = FakeDB([mk("rij_f", status="failed")])
-    assert only(await run(db, at_slot(key)))["reason"] == rq.NO_DONE_JOB
+    assert only(await go(FakeDB([mk("rij_f", status="failed")])))["reason"] == rq.NO_DONE_JOB
 
 
 @pytest.mark.parametrize("status, reason", [("failed", rq.FAILED_LINEAGE), ("cancelled", rq.CANCELLED_LINEAGE),
                                             ("nothing", rq.NOTHING_LINEAGE)])
 async def test_a_lineage_that_ended_after_its_latest_done_job_is_skipped(status, reason):
-    key = key_of()
-    db = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=30)),
-                 mk("rij_end", status=status, created=MONDAY - timedelta(days=20))],
-                evidence={"rij_done": proven()})
-    decision = only(await run(db, at_slot(key)))
-    assert decision["reason"] == reason and decision["prev_job_id"] == "rij_done"
-    assert db.inserts == []
+    db = FakeDB([mk("rij_done", created=NOW - timedelta(days=30)),
+                 mk("rij_end", status=status, created=NOW - timedelta(days=20))], runs={"rij_done": run()})
+    decision = only(await go(db))
+    assert decision["reason"] == reason and decision["prev_job_id"] == "rij_done" and db.inserts == []
 
 
 async def test_a_later_done_job_reopens_a_failed_lineage():
-    key = key_of()
-    db = FakeDB([mk("rij_f", status="failed", created=MONDAY - timedelta(days=30)),
-                 mk("rij_c", status="cancelled", created=MONDAY - timedelta(days=25)),
-                 mk("rij_done", created=MONDAY - timedelta(days=20))],
-                evidence={"rij_done": proven()})
-    decision = only(await run(db, at_slot(key)))
+    db = FakeDB([mk("rij_f", status="failed", created=NOW - timedelta(days=30)),
+                 mk("rij_c", status="cancelled", created=NOW - timedelta(days=25)),
+                 mk("rij_done", created=NOW - timedelta(days=20))], runs={"rij_done": run()})
+    decision = only(await go(db))
     assert decision["decision"] == "enqueue" and decision["prev_job_id"] == "rij_done"
-    assert db.inserts[0]["source"] == "weekly_reenqueue:rij_done"
 
 
 async def test_the_options_of_the_latest_done_job_are_the_ones_copied():
     old = {**BASE, "market": "US", "max_products": 50}
     new = {**BASE, "market": "US", "max_products": 50, "exclude_handles": ["late-exclusion"]}
-    key = key_of(options=old)
-    assert key == key_of(options=new)  # an exclusion is bookkeeping, not scope
-    db = FakeDB([mk("rij_a", options=old, created=MONDAY - timedelta(days=30)),
-                 mk("rij_b", options=new, created=MONDAY - timedelta(days=20))])
-    await run(db, at_slot(key))
-    assert db.inserts[0]["options"] == new
+    assert key_of(options=old) == key_of(options=new)  # an exclusion is bookkeeping, not scope
+    db = FakeDB([mk("rij_a", options=old, created=NOW - timedelta(days=30)),
+                 mk("rij_b", options=new, created=NOW - timedelta(days=20))])
+    await go(db)
+    assert db.inserts[0]["options"] == {**new, "require_ships_to_market": True}
 
 
 async def test_an_excluded_host_is_skipped_whatever_its_spelling():
-    key = key_of(domain="www.shop.example.com")
-    db = FakeDB([mk("rij_done", domain="www.shop.example.com")], evidence={"rij_done": proven()})
-    decision = only(await run(db, at_slot(key), excluded={"shop.example.com"}))
-    assert decision["reason"] == rq.EXCLUDED_HOST and db.inserts == []
+    db = FakeDB([mk("rij_done", domain="www.shop.example.com")], runs={"rij_done": run()})
+    decision = only(await go(db, excluded={"shop.example.com"}))
+    assert decision["reason"] == rq.EXCLUDED_HOST and db.inserts == [] and db.fact_reads == []
 
 
-def test_excluded_hosts_and_the_run_cap_come_from_env(monkeypatch):
+def test_excluded_hosts_the_run_cap_and_the_interval_come_from_env(monkeypatch):
     monkeypatch.setenv(rq.EXCLUDED_HOSTS_ENV, " WWW.Shop.Example.com, other.example.com ,,")
     assert rq.excluded_hosts_from_env() == {"shop.example.com", "other.example.com"}
     monkeypatch.delenv(rq.EXCLUDED_HOSTS_ENV)
     assert rq.excluded_hosts_from_env() == set()
-    for raw, want in ((None, rq.DEFAULT_MAX_PER_RUN), ("", rq.DEFAULT_MAX_PER_RUN), ("3", 3), (" 1 ", 1),
-                      ("100", 100), ("0", rq.DEFAULT_MAX_PER_RUN), ("101", rq.DEFAULT_MAX_PER_RUN),
-                      ("-2", rq.DEFAULT_MAX_PER_RUN), ("lots", rq.DEFAULT_MAX_PER_RUN)):
-        if raw is None:
-            monkeypatch.delenv(rq.MAX_PER_RUN_ENV, raising=False)
-        else:
-            monkeypatch.setenv(rq.MAX_PER_RUN_ENV, raw)
+    for raw, want in ((None, 10), ("", 10), ("3", 3), (" 1 ", 1), ("100", 100), ("0", 10), ("101", 10),
+                      ("-2", 10), ("lots", 10)):
+        _set(monkeypatch, rq.MAX_PER_RUN_ENV, raw)
         assert rq.max_per_run_from_env() == want, raw
+    for raw, want in ((None, 120), ("", 120), ("96", 96), ("1", 1), ("167", 167), ("168", 167), ("500", 167),
+                      ("0", 120), ("-5", 120), ("weekly", 120)):
+        _set(monkeypatch, rq.INTERVAL_HOURS_ENV, raw)
+        assert rq.interval_hours_from_env() == want, raw
+    assert rq.DEFAULT_INTERVAL_HOURS == 120 and rq.MAX_INTERVAL_HOURS == rq.FRESHNESS_HOURS - 1 == 167
+
+
+def _set(monkeypatch, name, raw):
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
 
 
 async def test_options_the_validator_now_refuses_are_skipped():
     options = {**BASE, "market": "US", "retired_option": True}
-    key = key_of(options=options)
-    db = FakeDB([mk("rij_done", options=options)])
-    decision = only(await run(db, at_slot(key)))
+    decision = only(await go(FakeDB([mk("rij_done", options=options)])))
     assert decision["reason"] == rq.INVALID_OPTIONS and "retired_option" in decision["detail"]
-    assert summary_named(decision) and db.inserts == []
+    assert rq.summarize([decision], dry_run=False, now=NOW)["named"][rq.INVALID_OPTIONS]
 
 
-def summary_named(decision):
-    return rq.summarize([decision], dry_run=False, now=MONDAY)["named"][decision["reason"]]
-
-
-async def test_a_market_that_would_change_the_cohort_key_is_refused(monkeypatch):
-    key = key_of()
-    db = FakeDB([mk("rij_done")], evidence={"rij_done": proven(market="SG", currency="SGD",
-                                                                presented={"pages_by_currency": {"SGD": 1}})})
-    decision = only(await run(db, at_slot(key)))
-    # a no-market (US) cohort whose run was checked as SG cannot be renamed SG: that is another cohort
-    assert decision["reason"] == rq.SCOPE_CHANGED and db.inserts == []
+async def test_a_derived_market_that_would_change_the_cohort_key_is_refused(monkeypatch):
+    # The guard behind "neither addition is scope": no producer emits this, so force the market.
+    monkeypatch.setattr(rq, "derive_market", lambda options, evidence: ("SG", rq.MARKET_EVIDENCE, None))
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run()})
+    assert only(await go(db))["reason"] == rq.SCOPE_CHANGED and db.inserts == []
 
 
 async def test_an_insert_that_meets_a_job_opened_since_the_read_reports_exists():
-    key = key_of()
-    db = FakeDB([mk("rij_done")], evidence={"rij_done": proven()})
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run()})
 
     async def raced(sql, values=None):
         return None  # ON CONFLICT DO NOTHING: another run (or a human) queued it first
     db.fetch_one = raced
-    summary = await run(db, at_slot(key))
+    summary = await go(db)
     assert only(summary)["reason"] == rq.EXISTS and summary["enqueued"] == 0
 
 
-# ------------------------------------------------------------------ once a week, and the spread
+# ------------------------------------------------------------------ the cadence
 
 
-def test_the_slot_is_stable_and_spreads_cohorts_across_the_week():
-    assert rq.week_slot("rij:a.example.com:1") == rq.week_slot("rij:a.example.com:1")
-    slots = {rq.week_slot(f"rij:host{i}.example.com:{i}") for i in range(2000)}
-    assert slots == set(range(rq.HOURS_PER_WEEK))
-    counts = [0] * rq.HOURS_PER_WEEK
-    for i in range(16800):
-        counts[rq.week_slot(f"rij:h{i}.example.com:{i}")] += 1
-    assert max(counts) < 2 * min(counts)  # no hour carries twice another's load
+def test_due_on_the_age_of_the_last_read():
+    assert rq.due_reason(read_at=NOW - timedelta(hours=120), now=NOW, interval_hours=120) is None
+    assert rq.due_reason(read_at=NOW - timedelta(hours=119, minutes=59), now=NOW, interval_hours=120) == rq.NOT_DUE_RECENT
+    assert rq.due_reason(read_at=NOW - timedelta(hours=96), now=NOW, interval_hours=96) is None
 
 
-def test_hour_of_week_counts_from_monday_midnight_utc():
-    assert rq.hour_of_week(MONDAY) == 0
-    assert rq.hour_of_week(MONDAY + timedelta(days=6, hours=23, minutes=59)) == 167
-    assert rq.hour_of_week(MONDAY + timedelta(days=7)) == 0
-    # an aware non-UTC instant is converted first
-    assert rq.hour_of_week(datetime(2026, 10, 19, 1, 30, tzinfo=timezone(timedelta(hours=2)))) == 167
-    assert rq.floor_hour(datetime(2026, 10, 19, 1, 30, 5, 7, tzinfo=timezone(timedelta(hours=2)))) == \
-        datetime(2026, 10, 18, 23, tzinfo=timezone.utc)
-    # a half-hour zone: the hour is floored in UTC, not in the instant's own zone
-    assert rq.floor_hour(datetime(2026, 10, 19, 1, 50, tzinfo=timezone(timedelta(hours=5, minutes=30)))) == \
-        datetime(2026, 10, 18, 20, tzinfo=timezone.utc)
+def test_the_last_read_is_the_newest_applied_read_or_a_newer_job():
+    t = NOW - timedelta(days=9)
+    assert rq.last_read([mk("a", created=t, read=t + timedelta(hours=5))]) == t + timedelta(hours=5)
+    # a hand-queued run's applied read counts, whichever job of the cohort holds it
+    assert rq.last_read([mk("a", created=t, read=t + timedelta(hours=5)),
+                         mk("b", created=t + timedelta(days=2), read=t + timedelta(days=3))]) == t + timedelta(days=3)
+    # a done job with no applied run: its creation, so it is not due every hour
+    no_read = mk("a", created=t)
+    no_read["last_applied_at"] = None
+    assert rq.last_read([no_read]) == t
+    # a newer job of any status (e.g. a later failure) is newer than the read
+    assert rq.last_read([mk("a", created=t, read=t + timedelta(hours=1)),
+                         mk("b", status="failed", created=t + timedelta(days=1))]) == t + timedelta(days=1)
+    # text and naive timestamps are UTC
+    assert rq.last_read([{**mk("a", created=t), "created_at": t.replace(tzinfo=None).isoformat(),
+                          "last_applied_at": (t + timedelta(hours=2)).replace(tzinfo=None)}]) == t + timedelta(hours=2)
 
 
-@pytest.mark.parametrize("offset_h, due", [(-1, False), (0, True), (1, True), (23, True), (24, False), (100, False)])
-def test_a_cohort_is_due_only_in_the_window_after_its_slot(offset_h, due):
-    key = key_of()
-    now = at_slot(key, offset_h)
-    got = rq.due_reason(key=key, last_created=now - timedelta(days=30), now=now)
-    assert got == (None if due else rq.NOT_DUE_SLOT)
+@pytest.mark.parametrize("age_h, due", [(119, False), (120, True), (200, True)])
+async def test_a_cohort_is_queued_once_its_read_is_interval_old(age_h, due):
+    db = FakeDB([mk("rij_done", created=NOW - timedelta(days=30), read=NOW - timedelta(hours=age_h))],
+                runs={"rij_done": run()})
+    decision = only(await go(db))
+    assert (decision["decision"] == "enqueue") is due
+    if not due:
+        assert decision["reason"] == rq.NOT_DUE_RECENT and db.fact_reads == []
 
 
-def test_at_most_once_per_168_whole_hours():
-    key = key_of()
-    now = at_slot(key)
-    hour = rq.floor_hour(now)
-    assert rq.due_reason(key=key, last_created=hour - timedelta(hours=168), now=now) is None
-    assert rq.due_reason(key=key, last_created=hour - timedelta(hours=168) + timedelta(minutes=59), now=now) is None
-    assert rq.due_reason(key=key, last_created=hour - timedelta(hours=167), now=now) == rq.NOT_DUE_RECENT
-    assert rq.due_reason(key=key, last_created=hour - timedelta(hours=166, minutes=30), now=now) == rq.NOT_DUE_RECENT
-    # whole hours: a job created at hh:59 a week ago counts from hh:00, so the slot does not drift
-    assert rq.due_reason(key=key, last_created=hour - timedelta(hours=167, minutes=1), now=now) is None
-    assert rq.due_reason(key=key, last_created=now, now=now) == rq.NOT_DUE_RECENT
-
-
-async def test_the_newest_job_of_any_status_starts_the_week():
-    key = key_of()
-    now = at_slot(key)
-    db = FakeDB([mk("rij_done", created=now - timedelta(days=30)),
-                 mk("rij_done2", created=now - timedelta(days=3))], evidence={"rij_done2": proven()})
-    assert only(await run(db, now))["reason"] == rq.NOT_DUE_RECENT
-
-
-async def test_hourly_runs_queue_each_cohort_once_a_week_and_never_twice():
-    key = key_of()
-    db = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=30))], evidence={"rij_done": proven()})
-    week2 = at_slot(key)
-    assert (await run(db, week2))["enqueued"] == 1
-    assert only(await run(db, week2))["reason"] == rq.OPEN_JOB             # same hour, re-run: idempotent
-    assert only(await run(db, week2 + timedelta(hours=1)))["reason"] == rq.OPEN_JOB
-    db.jobs[-1]["status"] = "done"                                            # the drain finished it
-    db.evidence[db.jobs[-1]["id"]] = proven()
-    for hours in (1, 2, 23, 24, 100, 167):
-        assert only(await run(db, week2 + timedelta(hours=hours)))["reason"] in (rq.NOT_DUE_RECENT, rq.NOT_DUE_SLOT)
+async def test_hourly_runs_are_idempotent():
+    db = FakeDB([mk("rij_done", created=NOW - timedelta(days=30))], runs={"rij_done": run()})
+    assert (await go(db))["enqueued"] == 1
+    assert only(await go(db))["reason"] == rq.OPEN_JOB                    # the same hour again
+    assert only(await go(db, NOW + timedelta(hours=1)))["reason"] == rq.OPEN_JOB
+    queued = db.jobs[-1]
+    queued.update(status="done", last_applied_at=NOW + timedelta(hours=30))  # the drain finished it
+    db.runs[queued["id"]] = run()
+    for hours in (31, 60, 149):
+        assert only(await go(db, NOW + timedelta(hours=hours)))["reason"] == rq.NOT_DUE_RECENT
     assert len(db.inserts) == 1
-    week3 = week2 + timedelta(hours=168)
-    decision = only(await run(db, week3))
+    decision = only(await go(db, NOW + timedelta(hours=150)))
     assert decision["decision"] == "enqueue" and len(db.inserts) == 2
-    # the second one copies the first re-crawl's options, explicit market included
-    assert db.inserts[1]["options"] == {**BASE, "market": "US"}
+    # the second copies the first re-crawl's options, explicit market and gate included
+    assert db.inserts[1]["options"] == {**BASE, "market": "US", "require_ships_to_market": True}
     assert decision["market_source"] == "explicit"
 
 
-async def test_a_missed_tick_is_caught_up_inside_the_window():
-    key = key_of()
-    db = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=30))], evidence={"rij_done": proven()})
-    assert (await run(db, at_slot(key, offset_h=5)))["enqueued"] == 1
+class Drain:
+    """A drain that applies each queued job `latency` hours after it is queued."""
+
+    def __init__(self, db, latency):
+        self.db, self.latency, self.reads = db, latency, []
+
+    def tick(self, now):
+        for j in self.db.jobs:
+            if j["status"] == "queued" and j["created_at"] + timedelta(hours=self.latency) <= now:
+                j.update(status="done", last_applied_at=now)
+                self.db.runs[j["id"]] = run()
+                self.reads.append(now)
 
 
-async def test_a_run_cap_defers_the_cohorts_with_the_most_window_left():
-    jobs, keys = [], []
-    for i in range(30):
-        brand = f"Brand {i}"
-        opts = {"vendors": [brand]}
-        keys.append(ledger.scope_key(DOMAIN, brand, opts))
-        jobs.append(mk(f"rij_{i}", brand=brand, options={**opts, "market": "US"}, created=MONDAY - timedelta(days=30)))
-    now = MONDAY + timedelta(weeks=2, hours=150)
-    due = sorted((k for k in keys if (rq.hour_of_week(now) - rq.week_slot(k)) % 168 < rq.SLOT_WINDOW_HOURS),
-                 key=lambda k: (-((rq.hour_of_week(now) - rq.week_slot(k)) % 168), k))
-    assert len(due) >= 3, "the fixture needs at least three cohorts in the window"
+async def _simulate(latency, *, hand_runs=(), weeks=8, interval=rq.DEFAULT_INTERVAL_HOURS, start_read=None):
+    first = start_read or NOW - timedelta(hours=interval)
+    db = FakeDB([mk("rij_0", options={**BASE, "market": "US"}, created=first - timedelta(hours=1), read=first)])
+    drain = Drain(db, latency)
+    drain.reads.append(first)
+    hands = sorted(hand_runs)
+    for h in range(weeks * 168):
+        now = NOW + timedelta(hours=h)
+        while hands and hands[0] <= h:  # a hand-queued run: created and applied by an operator now
+            hands.pop(0)
+            db.jobs.append(mk(f"rij_hand_{h}", options={**BASE, "market": "US"}, created=now, read=now))
+            db.runs[db.jobs[-1]["id"]] = run()
+            drain.reads.append(now)
+        drain.tick(now)
+        await go(db, now, interval_hours=interval)
+    reads = sorted(drain.reads)
+    return max((b - a) for a, b in zip(reads, reads[1:])) / timedelta(hours=1), len(reads)
+
+
+@pytest.mark.parametrize("latency", [0, 1, 12, 24, 46])
+async def test_the_gap_between_applied_reads_stays_under_the_freshness_window(latency):
+    budget = rq.FRESHNESS_HOURS - rq.DEFAULT_INTERVAL_HOURS - 1
+    assert budget == 47
+    gap, reads = await _simulate(latency)
+    assert gap <= rq.DEFAULT_INTERVAL_HOURS + 1 + latency < rq.FRESHNESS_HOURS
+    assert reads >= 8  # it kept re-reading
+
+
+@pytest.mark.parametrize("hand_at", [(1,), (40,), (100, 101), (5, 200, 333)])
+async def test_a_hand_queued_run_never_stretches_the_gap(hand_at):
+    gap, _ = await _simulate(46, hand_runs=hand_at)
+    assert gap <= rq.DEFAULT_INTERVAL_HOURS + 1 + 46 < rq.FRESHNESS_HOURS
+
+
+async def test_a_drain_slower_than_the_budget_is_what_breaks_the_window():
+    # The documented limit, not a guarantee: past FRESHNESS - INTERVAL - 1 hours of drain latency, reads age out.
+    gap, _ = await _simulate(48)
+    assert gap >= rq.FRESHNESS_HOURS
+
+
+async def test_a_run_cap_queues_the_stalest_reads_first():
+    jobs = []
+    for i in range(6):
+        opts = {"vendors": [f"B{i}"], "market": "US"}
+        jobs.append(mk(f"rij_{i}", brand=f"B{i}", options=opts, created=NOW - timedelta(days=30),
+                       read=NOW - timedelta(hours=130 + 10 * ((i * 7) % 6))))
+    jobs.append(mk("rij_fresh", brand="Fresh", options={"vendors": ["Fresh"], "market": "US"},
+                   created=NOW - timedelta(days=30), read=NOW - timedelta(hours=2)))
     db = FakeDB(jobs)
-    summary = await run(db, now, max_per_run=2)
-    assert summary["enqueued"] == 2 and summary["skipped"][rq.RUN_CAP] == len(due) - 2
-    assert [r["scope_key"] for r in db.inserts] == due[:2]
+    summary = await go(db, max_per_run=2)
+    stalest = sorted(jobs[:6], key=lambda j: j["last_applied_at"])[:2]
+    assert [r["brand"] for r in db.inserts] == [j["brand"] for j in stalest]
+    assert summary["skipped"] == {rq.NOT_DUE_RECENT: 1, rq.RUN_CAP: 4}
 
 
-# ------------------------------------------------------------------ dry run, flag, summary
+# ------------------------------------------------------------------ dry run, flag, summary, CLI
 
 
 async def test_a_dry_run_writes_nothing_and_says_what_it_would_queue():
-    key = key_of()
-    db = FakeDB([mk("rij_done")], evidence={"rij_done": proven()})
-    summary = await run(db, at_slot(key), dry_run=True)
+    db = FakeDB([mk("rij_done")], runs={"rij_done": run()})
+    summary = await go(db, dry_run=True)
     assert db.inserts == [] and summary["would_enqueue"] == 1 and "enqueued" not in summary
     assert only(summary)["decision"] == "would_enqueue" and only(summary)["market"] == "US"
 
 
 async def test_a_dry_run_counts_against_the_cap_like_a_real_one():
-    jobs = []
-    for i in range(30):
-        jobs.append(mk(f"rij_{i}", brand=f"B{i}", options={"vendors": [f"B{i}"], "market": "US"},
-                       created=MONDAY - timedelta(days=30)))
-    now = MONDAY + timedelta(weeks=2, hours=150)
-    real = await run(FakeDB(jobs), now, max_per_run=1)
-    dry = await run(FakeDB(jobs), now, max_per_run=1, dry_run=True)
-    assert real["enqueued"] == dry["would_enqueue"] == 1
-    assert real["skipped"] == dry["skipped"]
+    jobs = [mk(f"rij_{i}", brand=f"B{i}", options={"vendors": [f"B{i}"], "market": "US"}) for i in range(5)]
+    real = await go(FakeDB(jobs), max_per_run=1)
+    dry = await go(FakeDB(jobs), max_per_run=1, dry_run=True)
+    assert real["enqueued"] == dry["would_enqueue"] == 1 and real["skipped"] == dry["skipped"]
 
 
 class Untouchable:
@@ -429,48 +521,25 @@ async def test_the_flag_off_tick_does_nothing(monkeypatch):
 async def test_the_flag_on_tick_runs_and_logs_one_warning_summary(monkeypatch, caplog, on):
     monkeypatch.setenv(rq.ENABLED_ENV, on)
     monkeypatch.delenv(rq.DRY_RUN_ENV, raising=False)
-    monkeypatch.setenv(rq.EXCLUDED_HOSTS_ENV, "other.example.com")
-    db = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=400))], evidence={"rij_done": proven()})
+    monkeypatch.setenv(rq.INTERVAL_HOURS_ENV, "96")
+    db = FakeDB([mk("rij_done", created=datetime.now(timezone.utc) - timedelta(days=400))], runs={"rij_done": run()})
     with caplog.at_level(logging.WARNING, logger=rq.__name__):
         summary = await job.run_retailer_ingest_weekly_reenqueue_tick(db=db)
     lines = [r for r in caplog.records if r.getMessage().startswith(rq.SUMMARY_MARKER)]
     assert len(lines) == 1 and lines[0].levelno == logging.WARNING
     logged = json.loads(lines[0].getMessage()[len(rq.SUMMARY_MARKER):])
-    assert logged["cohorts_seen"] == 1 and "decisions" not in logged
-    assert logged["enqueued"] + sum(logged["skipped"].values()) == 1
-    assert summary["dry_run"] is False
+    assert logged["cohorts_seen"] == 1 and "decisions" not in logged and logged["interval_hours"] == 96
+    assert logged["enqueued"] == 1 and summary["dry_run"] is False
+    assert logged["queued"] == [{"host": DOMAIN, "brand": "Example Brand", "market": "US",
+                                 "market_source": "evidence", "job_id": db.inserts[0]["id"]}]
 
 
-async def test_the_dry_run_env_makes_the_tick_write_nothing(monkeypatch, caplog):
+async def test_the_dry_run_env_makes_the_tick_write_nothing(monkeypatch):
     monkeypatch.setenv(rq.ENABLED_ENV, "1")
     monkeypatch.setenv(rq.DRY_RUN_ENV, "1")
-    key = key_of()
-    db = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=30))], evidence={"rij_done": proven()})
-    seen = {}
-    real_run = rq.run_reenqueue
-
-    async def fake_run(**kw):
-        seen.update(kw)
-        return await real_run(**{**kw, "now": at_slot(key)})
-    monkeypatch.setattr(rq, "run_reenqueue", fake_run)
-    with caplog.at_level(logging.WARNING, logger=rq.__name__):
-        summary = await job.run_retailer_ingest_weekly_reenqueue_tick(db=db)
-    assert seen["dry_run"] is True and db.inserts == [] and summary["would_enqueue"] == 1
-    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith(rq.SUMMARY_MARKER)]
-    logged = json.loads(line[len(rq.SUMMARY_MARKER):])
-    assert logged["queued"] == [{"host": DOMAIN, "brand": "Example Brand", "market": "US",
-                                 "market_source": "evidence", "job_id": None}]
-
-
-async def test_the_summary_counts_every_cohort_once_by_reason():
-    a, b, c = (f"Brand {x}" for x in "abc")
-    jobs = [mk("rij_a", brand=a, options={"vendors": [a]}, created=MONDAY - timedelta(days=30)),
-            mk("rij_b", brand=b, options={"vendors": [b]}, status="queued"),
-            mk("rij_c", brand=c, options={"vendors": [c], "market": "SG"}, created=MONDAY - timedelta(days=30))]
-    now = MONDAY + timedelta(weeks=3)
-    summary = await run(FakeDB(jobs), now)
-    assert summary["cohorts_seen"] == 3
-    assert summary["enqueued"] + sum(summary["skipped"].values()) == 3
+    db = FakeDB([mk("rij_done", created=datetime.now(timezone.utc) - timedelta(days=30))], runs={"rij_done": run()})
+    summary = await job.run_retailer_ingest_weekly_reenqueue_tick(db=db)
+    assert db.inserts == [] and summary["would_enqueue"] == 1 and summary["dry_run"] is True
 
 
 def test_the_cli_refuses_a_real_run_with_the_flag_off(monkeypatch, capsys):
@@ -486,11 +555,11 @@ def test_the_cli_refuses_a_real_run_with_the_flag_off(monkeypatch, capsys):
         job.main(["--now", "2026-10-21T10:00:00+00:00"])  # --now is for dry runs only
 
 
-def test_the_cli_dry_run_prints_one_line_per_cohort_and_the_summary(monkeypatch, capsys):
+@pytest.mark.parametrize("raw", ["2026-11-02T10:11", "2026-11-02T10:11:00+00:00", "2026-11-02T11:11:00+01:00"])
+def test_the_cli_dry_run_reads_now_as_utc_and_labels_its_lines(monkeypatch, capsys, raw):
     monkeypatch.delenv(rq.ENABLED_ENV, raising=False)
     import db.database as dbmod
-    key = key_of()
-    fake = FakeDB([mk("rij_done", created=MONDAY - timedelta(days=30))], evidence={"rij_done": proven()})
+    fake = FakeDB([mk("rij_done")], runs={"rij_done": run()})
 
     async def nothing():
         return None
@@ -498,10 +567,12 @@ def test_the_cli_dry_run_prints_one_line_per_cohort_and_the_summary(monkeypatch,
     monkeypatch.setattr(dbmod.database, "disconnect", nothing)
     monkeypatch.setattr(dbmod.database, "fetch_all", fake.fetch_all)
     monkeypatch.setattr(dbmod.database, "fetch_one", fake.fetch_one)
-    assert job.main(["--dry-run", "--host", "WWW.shop.example.com", "--now", at_slot(key).isoformat()]) == 0
+    assert job.main(["--dry-run", "--host", "WWW.shop.example.com", "--now", raw]) == 0
     first, last = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
-    assert first["decision"] == "would_enqueue" and "options" not in first
-    assert last["would_enqueue"] == 1 and "decisions" not in last and fake.inserts == []
+    assert first["kind"] == "decision" and first["decision"] == "would_enqueue" and "options" not in first
+    assert last["kind"] == "summary" and last["would_enqueue"] == 1 and "decisions" not in last
+    assert last["at"] == NOW.isoformat() and fake.inserts == []
+    assert job.parse_now("2026-11-02T10:11") == NOW
 
 
 # ------------------------------------------------------------------ cohort identity
@@ -509,7 +580,8 @@ def test_the_cli_dry_run_prints_one_line_per_cohort_and_the_summary(monkeypatch,
 
 def test_cohorts_group_by_scope_key_with_us_folded_and_other_markets_apart():
     jobs = [mk("a", options={**BASE}), mk("b", options={**BASE, "market": "US"}),
-            mk("c", options={**BASE, "market": "us"}), mk("d", options={**BASE, "market": "SG"}),
+            mk("c", options={**BASE, "market": "us", "require_ships_to_market": True}),
+            mk("d", options={**BASE, "market": "SG"}),
             mk("e", options=json.dumps({**BASE, "exclude_handles": ["x"]})),
             mk("f", domain="other.example.com")]
     groups = rq.group_cohorts(jobs)
@@ -517,14 +589,15 @@ def test_cohorts_group_by_scope_key_with_us_folded_and_other_markets_apart():
 
 
 def test_a_cohorts_jobs_are_ordered_by_creation_then_id():
-    t = MONDAY
+    t = NOW
     jobs = [mk("z", created=t), mk("b", created=t - timedelta(days=1)), mk("a", created=t),
-            mk("c", created=(t - timedelta(days=2)).replace(tzinfo=None)), mk("d", created=(t + timedelta(days=1)).isoformat())]
+            mk("c", created=(t - timedelta(days=2)).replace(tzinfo=None)),
+            mk("d", created=(t + timedelta(days=1)).isoformat())]
     (group,) = rq.group_cohorts(jobs).values()
     assert [j["id"] for j in group] == ["c", "b", "a", "z", "d"]
 
 
-def test_unreadable_options_are_an_empty_scope_not_a_crash():
+def test_unreadable_values_are_empty_not_a_crash():
     assert rq._options("{not json") == {} and rq._options(None) == {} and rq._options([1]) == {}
-    assert rq._json("{not json") is None and rq._json({"a": 1}) == {"a": 1}
+    assert rq._json("{not json") is None and rq._json({"a": 1}) == {"a": 1} and rq._dict("[1]") == {}
     assert rq.fold_host(" WWW.Example.COM ") == "example.com" and rq.fold_host(None) == ""

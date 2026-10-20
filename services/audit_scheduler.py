@@ -738,11 +738,12 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
-        # Weekly re-enqueue of every done retailer-ingest cohort, each with an explicit options.market
-        # (services/retailer_ingest/weekly_reenqueue.py). Hourly; each cohort is due once a week in its
-        # own hash-spread slot. OFF BY DEFAULT: the tick returns before touching the database unless
-        # RETAILER_INGEST_WEEKLY_REENQUEUE_ENABLED is set. Database-only (it crawls nothing), so it runs
-        # here rather than in the crawl-subnet drain, whose image is pinned and rolled by hand.
+        # Re-enqueue of every done retailer-ingest cohort before its last price read ages out, each with an
+        # explicit options.market (services/retailer_ingest/weekly_reenqueue.py). Hourly; a cohort is due
+        # when its last applied read is INTERVAL_HOURS old. OFF BY DEFAULT: the tick returns before touching
+        # the database unless RETAILER_INGEST_WEEKLY_REENQUEUE_ENABLED is set. Database-only (it crawls
+        # nothing), so it runs here rather than in the crawl-subnet drain, whose image is pinned and rolled
+        # by hand.
         from jobs.retailer_ingest_weekly_reenqueue import run_retailer_ingest_weekly_reenqueue_tick
         _add_job(
             run_retailer_ingest_weekly_reenqueue_tick,
