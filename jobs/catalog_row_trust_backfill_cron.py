@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_LIMIT = 50_000
 _DEFAULT_DRIFT_ALERT_THRESHOLD = 50
+# The schedule's period (services/audit_scheduler: hour="*/6"). The CRAWL_FRESH
+# recheck looks this far ahead, so a row that ages out before the next tick is
+# re-derived on that tick at the latest.
+_TICK_HOURS = 6.0
 _ENV_ENABLED = "CATALOG_TRUST_BACKFILL_ENABLED"
 _ENV_LIMIT = "CATALOG_TRUST_BACKFILL_LIMIT"
 _ENV_DRIFT_THRESHOLD = "CATALOG_TRUST_DRIFT_ALERT_THRESHOLD"
@@ -74,7 +78,28 @@ async def run_catalog_row_trust_backfill_tick() -> None:
     limit = _limit()
     try:
         from db.database import database
-        from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many
+        from services.catalog_row_trust_upserter import (
+            recheck_crawl_fresh_rows,
+            upsert_catalog_row_trust_many,
+        )
+
+        # CRAWL_FRESH decay recheck FIRST (services/catalog_row_trust_upserter,
+        # round 2). The pass below cannot be trusted to reach a row that went
+        # public on a crawl read: it is oldest-updated_at first and the UPSERT
+        # only writes on a change, so an unchanged catalog keeps its head of
+        # queue and, above `limit` rows, a flipped row is never re-derived when
+        # its read ages out. Its own try: a failed recheck must not cost the
+        # pass, and the pass must not hide a failed recheck.
+        rechecked: set = set()
+        try:
+            rechecked = set(await recheck_crawl_fresh_rows(db=database, lead_hours=_TICK_HOURS))
+            if rechecked:
+                logger.warning(
+                    "catalog_trust_backfill: re-derived %d CRAWL_FRESH rows ahead of the pass",
+                    len(rechecked),
+                )
+        except Exception:
+            logger.exception("catalog_trust_backfill: CRAWL_FRESH recheck failed")
 
         # Fetch up to `limit` product_keys from catalog_products ordered by
         # the rows least-recently touched in catalog_row_trust (or never
@@ -89,7 +114,9 @@ async def run_catalog_row_trust_backfill_tick() -> None:
             LIMIT :limit
         """
         rows = await database.fetch_all(_FETCH_SQL, {"limit": limit})
-        product_keys = [r["product_key"] for r in rows if r["product_key"]]
+        product_keys = [
+            r["product_key"] for r in rows if r["product_key"] and r["product_key"] not in rechecked
+        ]
         if not product_keys:
             logger.info("catalog_trust_backfill: no product_keys found; nothing to do")
             return

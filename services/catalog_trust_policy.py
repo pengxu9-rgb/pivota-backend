@@ -166,7 +166,10 @@ POLICY_VERSION = "c1.v0.9"
 #     exemption actually suppressed one of those gates, so a row that was public
 #     on its own identity keeps byte-identical reason codes. It never suppresses
 #     IDENTITY_REVIEW_REQUIRED_LIVE_READ, IDENTITY_CONFLICT,
-#     NON_CANONICAL_DUPLICATE or any blocked cause. See the
+#     NON_CANONICAL_DUPLICATE or any blocked cause, and it is not applied at
+#     all to a row one of those keeps shadow (so it never rewrites one), nor to
+#     an identity listing whose status is a verdict rather than a gap (see
+#     CRAWL_FRESH_COVERAGE_GAP_STATUSES). See the
 #     ``crawl_fresh`` input in derive_trust for the input contract and
 #     the reason it carries no flag of its own.
 #
@@ -388,6 +391,13 @@ CRAWL_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 # CATALOG_TRUST_CRAWL_FRESH_DAYS); the policy only ever sees the
 # resulting boolean.
 CRAWL_FRESH_DEFAULT_DAYS = 7
+# Round 2 (2026-10-20): the raw pdp_identity_listing.identity_status values that
+# mean "identity not established YET" -- a coverage gap the crawl may stand in
+# for. A row with NO identity listing is the other gap. Every other status
+# _derive_identity folds into 'unknown' (e.g. a 'rejected' listing) is a
+# verdict, not a gap, and CRAWL_FRESH never lifts it. Compared trimmed and
+# lower-cased.
+CRAWL_FRESH_COVERAGE_GAP_STATUSES = frozenset({"", "unknown"})
 
 
 def is_crawl_listing(product: Optional[Mapping[str, Any]]) -> bool:
@@ -412,11 +422,13 @@ def is_crawl_fresh(
     """Was the listing's price read within ``max_age_days`` of ``now``?
 
     ``last_price_read_at`` is the newest ``catalog_offers.price_checked_at``
-    among the row's live drain-lane offers (the upserter's
-    CRAWL_LAST_PRICE_READ_SQL). NULL / unparseable = never read = not
-    fresh. The bound is INCLUSIVE (age == N days is fresh), and a stamp ahead of
-    ``now`` (clock skew between the DB and this process) counts as fresh: it was
-    read, recently. Twin: the same comparison, in seconds, inclusive.
+    among the row's qualifying offers (the upserter's
+    CRAWL_LAST_PRICE_READ_SQL). NULL / unparseable = never read = not fresh.
+    Fresh iff 0 <= age <= N days, in seconds, INCLUSIVE at both ends. A stamp
+    dated AFTER ``now`` is STALE (round 2): a future date is not a read anyone
+    can vouch for, and scripts/ops/relgraph_freshness_refresh treats it the
+    same way (`price_checked_at BETWEEN now() - window AND now()`). Twin: the
+    same comparison.
     """
     ts = _to_datetime(last_price_read_at)
     if ts is None:
@@ -425,7 +437,8 @@ def is_crawl_fresh(
         return False
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    return (now - ts).total_seconds() <= float(max_age_days) * 24 * 60 * 60
+    age_seconds = (now - ts).total_seconds()
+    return 0 <= age_seconds <= float(max_age_days) * 24 * 60 * 60
 
 
 # ---- Public API ------------------------------------------------------------
@@ -538,6 +551,11 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         row_has_priced_offer=row_has_priced_offer,
         row_is_elected_canonical=row_is_elected_canonical,
         crawl_fresh=crawl_fresh,
+        identity_is_coverage_gap=(
+            identity is None
+            or str(_get(identity, "identity_status") or "").strip().lower()
+            in CRAWL_FRESH_COVERAGE_GAP_STATUSES
+        ),
         reasons=reasons,
     )
 
@@ -873,6 +891,7 @@ def _derive_serving_decision(
     row_has_priced_offer: Optional[bool] = None,
     row_is_elected_canonical: Optional[bool] = None,
     crawl_fresh: Optional[bool] = None,
+    identity_is_coverage_gap: bool = False,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -1060,19 +1079,32 @@ def _derive_serving_decision(
     # the window is exempt from the same COVERAGE
     # gates, for as long as it stays fresh. Only for rows the source tiers above
     # do NOT already exempt, so first-party and observed-seller rows keep their
-    # exact reason codes. Three conjuncts, all required:
+    # exact reason codes. All required:
     #   * the explicit True input (the upserter supplies it only when switched
     #     on; False/None = today's gates);
     #   * the row really is a drain-lane crawl row (is_crawl_listing) — the input is
     #     never trusted alone, a producer bug must not exempt another lane;
     #   * its PDP is not KNOWN to be unrenderable (`is not False`: tri-state,
     #     None = not computed). Independent of CATALOG_TRUST_RENDERABLE_GATE: a
-    #     coverage exemption must never be what newly promotes a page that 500s.
+    #     coverage exemption must never be what newly promotes a page that 500s;
+    #   * round 2: the identity question is a GAP, not a verdict -- 'approved'
+    #     (its confidence / live-read gaps are coverage), or 'unknown' only when
+    #     there is no listing or its raw status is in
+    #     CRAWL_FRESH_COVERAGE_GAP_STATUSES. A 'rejected' (or any other
+    #     unrecognised) listing status is never lifted;
+    #   * round 2: nothing ELSE keeps the row shadow. A row that stays shadow
+    #     as a NON_CANONICAL_DUPLICATE (or under review) gets no exemption at
+    #     all, so switching the rule on rewrites none of its reason codes.
     is_crawl_fresh_exempt = (
         not is_source_coverage_exempt
         and crawl_fresh is True
         and is_crawl_listing(product)
         and pdp_route_resolvable is not False
+        and (
+            identity_decision["status"] == "approved"
+            or (identity_decision["status"] == "unknown" and identity_is_coverage_gap)
+        )
+        and row_is_elected_canonical is not False
     )
     is_identity_coverage_exempt = (
         is_source_coverage_exempt or is_crawl_fresh_exempt
@@ -1220,6 +1252,7 @@ __all__ = [
     "VALID_SUBJECT_TYPES",
     "FRESH_MAX_AGE_SECONDS",
     "STALE_MAX_AGE_SECONDS",
+    "CRAWL_FRESH_COVERAGE_GAP_STATUSES",
     "CRAWL_FRESH_DEFAULT_DAYS",
     "CRAWL_LISTING_KEY_PREFIX",
     "CRAWL_SOURCE_SYSTEM",

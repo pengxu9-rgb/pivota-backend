@@ -368,12 +368,165 @@ def test_the_statement_is_pinned():
         "      AND co.suppressed_at IS NULL\n"
         "      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n"
         "      AND co.price_checked_at IS NOT NULL\n"
+        "      AND co.price_checked_at <= now()\n"
         "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref),"
         " E' \\t\\n\\r\\f\\v') ~ '^https?://\\S+$'\n"
         "      AND coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'\n"
+        "      AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
+        " IN (('SG', 'SGD'), ('US', 'USD'))\n"
+        "      AND lower(btrim(coalesce(co.availability, '')))"
+        " NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable')\n"
+        "      AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit'\n"
+        "      AND (co.sku_key IS DISTINCT FROM k.product_key || '::canonical'"
+        " OR NOT EXISTS (SELECT 1 FROM catalog_offers cv WHERE cv.product_key = k.product_key"
+        " AND cv.sku_key IS DISTINCT FROM k.product_key || '::canonical'"
+        " AND cv.source_system = 'catalog_enrichment_agent_v1' AND cv.suppressed_at IS NULL))\n"
         " ) r\n"
         " WHERE r.last_price_read_at IS NOT NULL\n"
     )
+
+
+def test_the_market_and_stock_fragments_come_from_the_registries():
+    from services.market_registry import served_markets
+    from services.offer_buyability import OFFER_UNAVAILABLE_AVAILABILITIES
+    from services.region_pricing import pricing_currency_for_region
+
+    for market in served_markets():
+        assert f"('{market}', '{pricing_currency_for_region(market)}')" in upserter.CRAWL_OFFER_SERVED_MARKET_SQL
+    for value in OFFER_UNAVAILABLE_AVAILABILITIES:
+        assert f"'{value}'" in upserter.CRAWL_OFFER_IN_STOCK_SQL
+
+
+def test_the_read_source_key_is_the_writer_s():
+    from services.external_offer_dual_write import ATTACHED_LISTING_OFFER_UPDATE_SQL, PRICE_READ_SOURCE_KEY
+
+    assert upserter.CRAWL_PRICE_READ_SOURCE_KEY == PRICE_READ_SOURCE_KEY == "price_read_source"
+    assert "'{price_read_source}'" in ATTACHED_LISTING_OFFER_UPDATE_SQL
+    assert ":read_source" in ATTACHED_LISTING_OFFER_UPDATE_SQL
+
+
+def test_the_recheck_shares_the_input_statement_s_rule():
+    inner = upserter.crawl_last_price_read_lateral_sql("crt.subject_key")
+    assert inner in upserter.CRAWL_FRESH_RECHECK_SQL
+    assert upserter.crawl_last_price_read_lateral_sql("k.product_key") in upserter.CRAWL_LAST_PRICE_READ_SQL
+    assert "@> CAST(ARRAY['CRAWL_FRESH'] AS text[])" in upserter.CRAWL_FRESH_RECHECK_SQL
+
+
+# ---------------------------------------------------------------------------
+# Round 2: the decay recheck
+# ---------------------------------------------------------------------------
+
+
+class RecheckFakeDb(CrawlFakeDb):
+    def __init__(self, *, expiring=(), all_crawl_fresh=(), **kw):
+        super().__init__(**kw)
+        self.expiring = list(expiring)
+        self.all_crawl_fresh = list(all_crawl_fresh)
+
+    async def fetch_all(self, query, values=None):
+        if query == upserter.CRAWL_FRESH_RECHECK_SQL:
+            self.queries.append((query, dict(values or {})))
+            assert self.column_present
+            return [{"subject_key": k} for k in self.expiring]
+        if query == upserter._CRAWL_FRESH_ROWS_ALL_SQL:
+            self.queries.append((query, dict(values or {})))
+            return [{"subject_key": k} for k in self.all_crawl_fresh]
+        return await super().fetch_all(query, values)
+
+
+async def test_recheck_on_selects_the_rows_that_may_age_out_and_re_derives_them(monkeypatch):
+    _switch_on(monkeypatch, days=7)
+    db = RecheckFakeDb(expiring=[RETAILER_PK], joined_rows=[retailer_row()],
+                       reads={RETAILER_PK: NOW - timedelta(days=8)})
+    keys = await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW)
+    assert keys == [RETAILER_PK]
+    sent = db.sent(upserter.CRAWL_FRESH_RECHECK_SQL)
+    assert sent == [{"cutoff": NOW - timedelta(days=7) + timedelta(hours=6), "limit": 20_000}]
+    assert db.written()[RETAILER_PK]["serving_decision"] == "shadow"
+
+
+async def test_recheck_off_re_derives_every_crawl_fresh_row(monkeypatch):
+    db = RecheckFakeDb(all_crawl_fresh=[RETAILER_PK], joined_rows=[retailer_row()],
+                       reads={RETAILER_PK: NOW})
+    keys = await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW, limit=5)
+    assert keys == [RETAILER_PK]
+    assert db.sent(upserter._CRAWL_FRESH_ROWS_ALL_SQL) == [{"limit": 5}]
+    assert db.sent(upserter.CRAWL_FRESH_RECHECK_SQL) == []
+    # switched off -> back to today's decision
+    assert db.written()[RETAILER_PK]["serving_decision"] == "shadow"
+
+
+async def test_recheck_without_the_246_column_falls_back_to_every_row(monkeypatch):
+    _switch_on(monkeypatch)
+    db = RecheckFakeDb(all_crawl_fresh=[], joined_rows=[], column_present=False)
+    assert await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW) == []
+    assert db.sent(upserter.CRAWL_FRESH_RECHECK_SQL) == []
+    assert db.executes == []
+
+
+@pytest.mark.parametrize("raw,limit", [("", 20_000), ("50", 50), ("0", 20_000), ("x", 20_000), ("-3", 20_000)])
+def test_recheck_limit(monkeypatch, raw, limit):
+    monkeypatch.setenv(upserter.CRAWL_FRESH_RECHECK_LIMIT_ENV, raw)
+    assert upserter.crawl_fresh_recheck_limit() == limit
+
+
+async def test_the_cron_rechecks_first_and_leaves_those_keys_out_of_its_pass(monkeypatch):
+    from jobs import catalog_row_trust_backfill_cron as cron
+
+    calls = []
+
+    async def fake_recheck(*, db, lead_hours, **kw):
+        calls.append(("recheck", lead_hours))
+        return ["pk_a"]
+
+    async def fake_many(*, db, product_keys, **kw):
+        calls.append(("many", list(product_keys)))
+        return len(product_keys)
+
+    class Db:
+        async def fetch_all(self, sql, values=None):
+            calls.append(("fetch", values))
+            return [{"product_key": k} for k in ("pk_a", "pk_b")]
+
+        async def fetch_one(self, sql, values=None):
+            return {"missing": 0}
+
+    import db.database as dbmod
+
+    monkeypatch.setattr(dbmod, "database", Db())
+    monkeypatch.setattr(upserter, "recheck_crawl_fresh_rows", fake_recheck)
+    monkeypatch.setattr(upserter, "upsert_catalog_row_trust_many", fake_many)
+    await cron.run_catalog_row_trust_backfill_tick()
+    assert calls[0] == ("recheck", 6.0)
+    assert ("many", ["pk_b"]) in calls
+
+
+async def test_a_failed_recheck_does_not_cost_the_pass(monkeypatch):
+    from jobs import catalog_row_trust_backfill_cron as cron
+
+    calls = []
+
+    async def failing_recheck(**kw):
+        raise RuntimeError("boom")
+
+    async def fake_many(*, db, product_keys, **kw):
+        calls.append(list(product_keys))
+        return len(product_keys)
+
+    class Db:
+        async def fetch_all(self, sql, values=None):
+            return [{"product_key": "pk_a"}]
+
+        async def fetch_one(self, sql, values=None):
+            return {"missing": 0}
+
+    import db.database as dbmod
+
+    monkeypatch.setattr(dbmod, "database", Db())
+    monkeypatch.setattr(upserter, "recheck_crawl_fresh_rows", failing_recheck)
+    monkeypatch.setattr(upserter, "upsert_catalog_row_trust_many", fake_many)
+    await cron.run_catalog_row_trust_backfill_tick()
+    assert calls == [["pk_a"]]
 
 
 def test_the_statement_binds_only_the_key_list():

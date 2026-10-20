@@ -112,7 +112,9 @@ OFFER_CONJUNCTS_SQL = (
     f"           AND {OFFER_NOT_AFFILIATE_SQL}"
 )
 
-# ROUND 2, the PER-MARKET rule (what the next policy revision will ship): the
+# ROUND 2, the PER-MARKET rule (what the policy ships since round 2; COPIES of
+# services/catalog_row_trust_upserter's CRAWL_OFFER_* fragments, pinned by
+# test -- the max-any columns keep reporting the round-1 rule): the
 # qualifying offer must ALSO be
 #   * declared for a SERVED market and priced in that market's currency
 #     (config/market_registry.json served markets; region_pricing's currencies);
@@ -217,7 +219,8 @@ SELECT cp.product_key,
                max(co.price_checked_at) AS last_read,
                max(co.price_checked_at) FILTER (WHERE {IN_STOCK_SQL}) AS last_in_stock,
                max(co.price_checked_at) FILTER (
-                 WHERE {SERVED_MARKET_CURRENCY_SQL}
+                 WHERE co.price_checked_at <= now()
+                   AND {SERVED_MARKET_CURRENCY_SQL}
                    AND {IN_STOCK_SQL}
                    AND {NOT_EMPLOYEE_EDIT_SQL}
                    AND (NOT vx.variant_scoped
@@ -260,8 +263,8 @@ def is_crawl_listing(product_key: Any, source_system: Any) -> bool:
 
 
 def is_fresh(last_read: Any, *, now: datetime, max_age_days: float) -> bool:
-    """COPY of catalog_trust_policy.is_crawl_fresh: inclusive bound, a stamp
-    ahead of `now` is fresh, no read is not fresh."""
+    """The ROUND-1 freshness test (the max-any columns): inclusive bound, a
+    stamp ahead of `now` is fresh, no read is not fresh."""
     ts = _to_datetime(last_read)
     if ts is None:
         return False
@@ -269,8 +272,9 @@ def is_fresh(last_read: Any, *, now: datetime, max_age_days: float) -> bool:
 
 
 def is_fresh_strict(last_read: Any, *, now: datetime, max_age_days: float) -> bool:
-    """The round-2 freshness test: as is_fresh, but a stamp dated in the FUTURE
-    is stale, as relgraph_freshness_refresh treats it (0 <= age <= N)."""
+    """COPY of catalog_trust_policy.is_crawl_fresh (round 2): as is_fresh, but a
+    stamp dated in the FUTURE is stale, as relgraph_freshness_refresh treats it
+    (0 <= age <= N)."""
     ts = _to_datetime(last_read)
     if ts is None:
         return False

@@ -34,9 +34,15 @@ def test_census_copies_are_pinned_to_their_originals():
     for hours in (-1, 0, 1, 23, 24, 25, 72, 167, 168, 169, 400):
         for days in (0.5, 1, 3, 7, 14):
             ts = now - timedelta(hours=hours)
-            assert census.is_fresh(ts, now=now, max_age_days=days) == policy.is_crawl_fresh(
+            assert census.is_fresh_strict(ts, now=now, max_age_days=days) == policy.is_crawl_fresh(
                 ts, now=now, max_age_days=days)
-    assert census.is_fresh(None, now=now, max_age_days=7) is policy.is_crawl_fresh(None, now=now, max_age_days=7)
+    assert census.is_fresh_strict(None, now=now, max_age_days=7) is policy.is_crawl_fresh(
+        None, now=now, max_age_days=7)
+    # round 2's per-market fragments
+    assert census.SERVED_MARKET_CURRENCY_SQL == up.CRAWL_OFFER_SERVED_MARKET_SQL
+    assert census.IN_STOCK_SQL == up.CRAWL_OFFER_IN_STOCK_SQL
+    assert census.NOT_EMPLOYEE_EDIT_SQL == up.CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL
+    assert census.CANONICAL_SKU_SUFFIX == up.CRAWL_CANONICAL_SKU_SUFFIX
     for pk, ss in ((RETAILER, DRAIN), (BRAND, DRAIN), (OTHER, DRAIN), (RETAILER, "x"), ("ext", DRAIN)):
         assert census.is_crawl_listing(pk, ss) == policy.is_crawl_listing(
             {"product_key": pk, "source_system": ss})
@@ -84,6 +90,47 @@ def test_the_per_market_rule_treats_a_future_stamp_as_stale():
     assert census.is_fresh_strict(NOW - timedelta(days=7), now=NOW, max_age_days=7) is True
     assert census.is_fresh_strict(NOW - timedelta(days=7, seconds=1), now=NOW, max_age_days=7) is False
     assert census.is_fresh_strict(None, now=NOW, max_age_days=7) is False
+
+
+def test_the_max_any_columns_keep_the_round_one_clock():
+    """The max-any columns report the round-1 rule: inclusive bound, and a
+    future stamp counted fresh (which is what round 2 corrected)."""
+    assert census.is_fresh(NOW - timedelta(days=7), now=NOW, max_age_days=7) is True
+    assert census.is_fresh(NOW - timedelta(days=7, seconds=1), now=NOW, max_age_days=7) is False
+    assert census.is_fresh(NOW + timedelta(days=3), now=NOW, max_age_days=7) is True
+
+
+def _strict_row(*, strict_age=None, strict_markets=None, any_markets=None):
+    def at(age):
+        return None if age is None else NOW - timedelta(days=age)
+
+    return census.classify(
+        {"product_key": "k_strict", "lane": "retailer", "host": "shop.example.com",
+         "serving_decision": "shadow", "reason_codes": [], "identity_status": "unknown",
+         "renderable": True, "last_price_read_at": at(1),
+         "market_reads": {m: at(a) for m, a in (any_markets or {"US": 1}).items()},
+         "last_in_stock_read_at": at(1),
+         "last_strict_read_at": at(strict_age),
+         "strict_market_reads": {m: at(a) for m, a in (strict_markets or {}).items()}},
+        now=NOW, max_age_days=7)
+
+
+def test_a_future_per_market_read_never_ages_in():
+    row = _strict_row(strict_age=-2, strict_markets={"US": -2})
+    assert row["strict_age_days"] is None
+    assert row["would_flip_strict"] is False
+    out = census.project([row], max_age_days=7, nightly_probability=0.0, age_field="strict_age_days")
+    assert out["no_reread"]["by_day"]["0"] == 0
+
+
+def test_per_market_flips_are_counted_only_in_their_strict_markets():
+    row = _strict_row(strict_age=1, strict_markets={"US": 1}, any_markets={"US": 1, "AU": 1})
+    assert row["would_flip_strict"] is True
+    lines = census.summarize([row], now=NOW, max_age_days=7, seed_pool_by_market={"US": 10})
+    markets = {line["market"]: line for line in lines if line["kind"] == "by_market" and line["lane"] == "all"}
+    assert markets["US"]["would_flip_per_market_rule"] == 1
+    assert markets["AU"].get("would_flip_per_market_rule", 0) == 0
+    assert markets["AU"]["would_flip"] == 1
 
 
 def test_census_file_carries_no_write_and_no_at_sign_after_round_two():

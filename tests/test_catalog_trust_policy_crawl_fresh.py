@@ -170,11 +170,12 @@ def test_fresh_listing_with_approved_but_null_confidence_goes_public():
     assert not COVERAGE_CODES & set(out["serving_reason_codes"])
 
 
-def test_fresh_listing_with_an_unknown_status_and_a_confidence_goes_public():
-    """The silent shadow: status neither approved nor review, confidence set ->
-    shadow today with NO reason code. The exemption covers it, and the trace
+@pytest.mark.parametrize("raw_status", ["unknown", " UNKNOWN ", "", None])
+def test_fresh_listing_with_a_gap_status_and_a_confidence_goes_public(raw_status):
+    """The silent shadow: a listing whose status is still a GAP, confidence set
+    -> shadow today with NO reason code. The exemption covers it, and the trace
     code is what tells the two apart afterwards."""
-    ident = identity(identity_status="pending", identity_confidence=0.4)
+    ident = identity(identity_status=raw_status, identity_confidence=0.4)
     today = derive(identity=ident)
     assert today["serving_decision"] == "shadow"
     assert not COVERAGE_CODES & set(today["serving_reason_codes"])
@@ -184,6 +185,24 @@ def test_fresh_listing_with_an_unknown_status_and_a_confidence_goes_public():
         REASON_CODES.CRAWL_FRESH,
         REASON_CODES.PUBLIC_PASSTHROUGH,
     ]
+
+
+@pytest.mark.parametrize("raw_status", ["rejected", "pending", "resolved", "unverified"])
+@pytest.mark.parametrize("confidence", [0.2, None])
+def test_a_listing_status_that_is_a_verdict_is_never_lifted(raw_status, confidence):
+    """Round 2: _derive_identity folds every unrecognised status into 'unknown';
+    only the GAP statuses are a coverage question. A 'rejected' listing at 0.2
+    went public under round 1."""
+    ident = identity(identity_status=raw_status, identity_confidence=confidence)
+    today = derive(identity=ident)
+    assert today["serving_decision"] == "shadow"
+    assert derive(identity=ident, crawl_fresh=True) == today
+
+
+def test_the_gap_statuses_are_pinned():
+    from services.catalog_trust_policy import CRAWL_FRESH_COVERAGE_GAP_STATUSES
+
+    assert CRAWL_FRESH_COVERAGE_GAP_STATUSES == frozenset({"", "unknown"})
 
 
 def test_fresh_listing_public_on_its_own_identity_gets_no_new_code():
@@ -248,15 +267,15 @@ def test_identity_conflict_still_blocks():
     assert out == derive(identity=ident)
 
 
-def test_non_canonical_duplicate_still_shadows():
-    out = derive(row_is_elected_canonical=False, crawl_fresh=True)
+@pytest.mark.parametrize("ident", [None, identity(live_read_enabled=False)])
+def test_non_canonical_duplicate_still_shadows_and_is_not_rewritten(ident):
+    """Round 2: a row that stays shadow as a duplicate gets no exemption at all,
+    so its reason codes are exactly today's and the flip writes nothing."""
+    out = derive(identity=ident, row_is_elected_canonical=False, crawl_fresh=True)
     assert out["serving_decision"] == "shadow"
-    # The coverage gate was lifted (hence the trace code); the duplicate gate
-    # was not, and it alone keeps the row out of public.
-    assert out["serving_reason_codes"] == [
-        REASON_CODES.CRAWL_FRESH,
-        REASON_CODES.NON_CANONICAL_DUPLICATE,
-    ]
+    assert REASON_CODES.NON_CANONICAL_DUPLICATE in out["serving_reason_codes"]
+    assert REASON_CODES.CRAWL_FRESH not in out["serving_reason_codes"]
+    assert out == derive(identity=ident, row_is_elected_canonical=False)
 
 
 def test_the_elected_canonical_goes_public():
@@ -478,7 +497,8 @@ def test_without_a_true_input_every_decision_is_identical(product, ident, electe
     if fresh != absent:
         assert absent["serving_decision"] == "shadow"
         assert REASON_CODES.CRAWL_FRESH in fresh["serving_reason_codes"]
-        assert fresh["serving_decision"] in {"shadow", "public"}
+        # round 2: the exemption applies only when it makes the row public
+        assert fresh["serving_decision"] == "public"
 
 
 # ---------------------------------------------------------------------------
@@ -513,8 +533,8 @@ def test_listing_predicate():
         (timedelta(days=4, seconds=1), 4, False),
         (timedelta(hours=12), 0.5, True),
         (timedelta(hours=12, seconds=1), 0.5, False),
-        (timedelta(minutes=-5), 7, True),  # a stamp slightly ahead of `now`
-        (timedelta(days=-10), 7, True),  # ahead by more than N: still a read, still fresh
+        (timedelta(seconds=-1), 7, False),  # round 2: a stamp ahead of `now` is stale
+        (timedelta(days=-10), 7, False),
     ],
 )
 def test_freshness_window(age, days, fresh):

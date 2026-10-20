@@ -279,6 +279,38 @@ async def test_the_statement_answers_only_for_the_keys_asked_and_omits_unread_ro
     assert await _reads(db, [RETAILER_2, BRAND]) == {BRAND: NOW - timedelta(days=2)}
 
 
+async def test_round_two_the_statement_counts_only_per_market_in_stock_crawl_reads(db):
+    await _product(db, RETAILER)
+    good = NOW - timedelta(days=4)
+    await _offer(db, RETAILER, read_at=good)                              # US / USD, in stock
+    await _offer(db, RETAILER, read_at=NOW, market="AU", currency="AUD")  # not a served market
+    await _offer(db, RETAILER, read_at=NOW, currency="SGD")               # wrong currency for US
+    await _offer(db, RETAILER, read_at=NOW, market="SG", currency="USD")  # wrong currency for SG
+    await _offer(db, RETAILER, read_at=NOW, availability="out_of_stock")
+    await _offer(db, RETAILER, read_at=NOW, availability=" Sold_Out ")
+    await _offer(db, RETAILER, read_at=NOW, read_source="employee_edit")
+    await _offer(db, RETAILER, read_at=NOW + timedelta(hours=1))          # dated in the future
+    assert await _reads(db, [RETAILER]) == {RETAILER: good}
+    # a refresh read and a lower-case served market both count
+    newer = NOW - timedelta(days=2)
+    await _offer(db, RETAILER, read_at=newer, read_source="refresh", market=" sg ", currency="sgd")
+    assert await _reads(db, [RETAILER]) == {RETAILER: newer}
+
+
+async def test_round_two_a_canonical_stamp_proves_nothing_on_a_variant_row(db):
+    await _product(db, RETAILER)
+    await _product(db, RETAILER_2)
+    variant_read = NOW - timedelta(days=12)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))            # ::canonical, fresh
+    await _offer(db, RETAILER, read_at=variant_read, variant="111")         # the variant, old
+    await _offer(db, RETAILER_2, read_at=NOW - timedelta(hours=1))          # single-variant row
+    assert await _reads(db, [RETAILER, RETAILER_2]) == {
+        RETAILER: variant_read, RETAILER_2: NOW - timedelta(hours=1)}
+    # a suppressed variant does not make the row variant-scoped
+    await db.execute("UPDATE catalog_offers SET suppressed_at = now() WHERE sku_key LIKE '%::v:111'")
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=1)}
+
+
 async def test_a_price_moved_without_a_read_forgets_the_stamp_so_nothing_is_sticky(db):
     await _product(db, RETAILER)
     old = NOW - timedelta(days=5)
@@ -343,6 +375,94 @@ async def test_end_to_end_without_the_246_column_nothing_breaks_and_nothing_move
     async with db.transaction():
         assert await up.upsert_catalog_row_trust(db=db, product_key=RETAILER) is True
         assert (await _trust(db, RETAILER))["serving_decision"] == "shadow"
+
+
+async def _tick(monkeypatch, db, limit):
+    import db.database as dbmod
+    from jobs import catalog_row_trust_backfill_cron as cron
+
+    monkeypatch.setattr(dbmod, "database", db)
+    monkeypatch.setenv("CATALOG_TRUST_BACKFILL_LIMIT", str(limit))
+    await cron.run_catalog_row_trust_backfill_tick()
+
+
+async def _decay_fixture(db, monkeypatch):
+    from services import catalog_row_trust_upserter as up
+
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    await _product(db, RETAILER)
+    oid = await _offer(db, RETAILER, read_at=NOW - timedelta(days=2))
+    older = [f"ext:retailer:{i:032d}" for i in range(4)]
+    for pk in older:
+        await _product(db, pk, seed=False)
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER] + older)
+    assert list((await _trust(db, RETAILER))["serving_reason_codes"]) == ["CRAWL_FRESH", "PUBLIC_PASSTHROUGH"]
+    # Four rows the oldest-first pass reaches before it, with LIMIT 2.
+    await db.execute("UPDATE catalog_row_trust SET updated_at = now() - interval '30 days'"
+                     " WHERE subject_key <> :pk", {"pk": RETAILER})
+    # The read ages out.
+    await db.execute("UPDATE catalog_offers SET price_checked_at = now() - interval '8 days'"
+                     " WHERE offer_id = :o", {"o": oid})
+    return older
+
+
+async def test_round_two_an_expired_crawl_fresh_row_returns_to_shadow_on_the_next_tick(db, monkeypatch):
+    await _decay_fixture(db, monkeypatch)
+    await _tick(monkeypatch, db, limit=2)
+    row = await _trust(db, RETAILER)
+    assert row["serving_decision"] == "shadow"
+    assert list(row["serving_reason_codes"]) == ["IDENTITY_CONFIDENCE_NULL"]
+
+
+async def test_round_two_without_the_recheck_the_expired_row_would_stay_public(db, monkeypatch):
+    """The control: the defect the recheck closes, on the same fixture."""
+    from services import catalog_row_trust_upserter as up
+
+    await _decay_fixture(db, monkeypatch)
+
+    async def no_recheck(**kw):
+        return []
+
+    monkeypatch.setattr(up, "recheck_crawl_fresh_rows", no_recheck)
+    await _tick(monkeypatch, db, limit=2)
+    assert (await _trust(db, RETAILER))["serving_decision"] == "public"
+
+
+async def test_round_two_switching_off_rolls_every_crawl_fresh_row_back_on_the_next_tick(db, monkeypatch):
+    from services import catalog_row_trust_upserter as up
+
+    await _decay_fixture(db, monkeypatch)
+    await db.execute("UPDATE catalog_offers SET price_checked_at = now() - interval '1 day'")
+    monkeypatch.delenv(up.CRAWL_FRESH_ENV)
+    await _tick(monkeypatch, db, limit=2)
+    assert (await _trust(db, RETAILER))["serving_decision"] == "shadow"
+
+
+async def test_round_two_a_row_whose_qualifying_offer_went_away_is_rechecked(db, monkeypatch):
+    """No qualifying read at all (the fresh offer was suppressed after the flip)
+    is the other way a row ages out: it must be picked up too."""
+    from services import catalog_row_trust_upserter as up
+
+    await _product(db, RETAILER)
+    oid = await _offer(db, RETAILER, read_at=NOW - timedelta(days=1))
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER])
+    assert (await _trust(db, RETAILER))["serving_decision"] == "public"
+    await db.execute("UPDATE catalog_offers SET suppressed_at = now() WHERE offer_id = :o", {"o": oid})
+    assert await up.recheck_crawl_fresh_rows(db=db, lead_hours=6) == [RETAILER]
+    assert (await _trust(db, RETAILER))["serving_decision"] != "public"
+
+
+async def test_round_two_a_still_fresh_row_is_not_rechecked(db, monkeypatch):
+    from services import catalog_row_trust_upserter as up
+
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(days=1))
+    await _product(db, RETAILER_2)
+    await _offer(db, RETAILER_2, read_at=NOW - timedelta(days=6, hours=20))  # ages out within a tick
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER, RETAILER_2])
+    assert await up.recheck_crawl_fresh_rows(db=db, lead_hours=6) == [RETAILER_2]
 
 
 async def test_the_column_probe_answers_both_ways(db, db_no_246):
@@ -582,11 +702,22 @@ async def test_census_last_read_equals_the_upserter_statement(db):
     keys = await _census_fixture(db)
     await _offer(db, keys["r_stale"], read_at=NOW, affiliate=True)
     await _offer(db, keys["r_stale"], read_at=NOW, suppressed=True)
+    # round 2 exclusions, each NEWER than the row's qualifying read
+    await _offer(db, keys["r_fresh"], read_at=NOW, market="AU", currency="AUD")
+    await _offer(db, keys["r_fresh"], read_at=NOW, currency="SGD")
+    await _offer(db, keys["r_fresh"], read_at=NOW, availability="out_of_stock")
+    await _offer(db, keys["r_fresh"], read_at=NOW, read_source="employee_edit")
+    await _offer(db, keys["r_dup"], read_at=NOW + timedelta(days=1))
+    await _offer(db, keys["b_fresh"], read_at=NOW - timedelta(days=9), variant="9")
+    # a SUPPRESSED variant does not make r_fresh variant-scoped
+    await _offer(db, keys["r_fresh"], read_at=None, variant="5", suppressed=True)
     expected = await _reads(db, list(keys.values()))
     conn = await _asyncpg(_SCHEMA)
     try:
-        rows = {r["product_key"]: r["last_price_read_at"] for r in await conn.fetch(census.census_sql())}
+        rows = {r["product_key"]: r["last_strict_read_at"] for r in await conn.fetch(census.census_sql())}
     finally:
         await conn.close()
     assert set(rows) == set(keys.values())
     assert {k: v for k, v in rows.items() if v is not None} == expected
+    assert expected[keys["r_fresh"]] == NOW - timedelta(days=1, hours=20)
+    assert keys["b_fresh"] in expected  # its variant row (9 days old) is the read now

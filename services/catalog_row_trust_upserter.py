@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from services.catalog_trust_policy import (
@@ -461,6 +461,103 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
     "coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'"
 )
 
+
+# ---- round 2 (2026-10-20): the PER-MARKET rule ------------------------------
+#
+# Trust stays per PRODUCT (catalog_row_trust has no market column); the row is
+# crawl-fresh when it is fresh in AT LEAST ONE served market, priced in that
+# market's currency. Serving is per-market downstream (the offer readers filter
+# to the buyer's currency), so a row fresh only in SG and promoted on that read
+# still shows US buyers its own, older US offer. How many rows that is: the
+# census's `would_flip_per_market_rule` vs `would_flip_max_any_rule`. If it is
+# material, a per-market trust model is the follow-up, not a wider rule here.
+#
+# A qualifying offer, on top of the round-1 conjuncts, is:
+#   * declared for a SERVED market (config/market_registry.json) and priced in
+#     that market's currency (region_pricing) -- one fresh offer in a market we
+#     do not serve, or in the wrong currency, no longer counts;
+#   * not explicitly out of stock (offer_buyability's unavailable vocabulary);
+#   * not dated by an employee price edit: the attached-listing lane records
+#     who vouched for the read in offer_payload.price_read_source, and only a
+#     storefront read (the drain apply, which records nothing, or the refresh)
+#     is a crawl;
+#   * on a VARIANT-SCOPED row (one with a live drain-lane variant offer), a
+#     variant offer: the refresh dates `<pk>::canonical` even when it skipped
+#     the variants (`variant_not_re_read`), so a canonical stamp alone says
+#     nothing about what the buyer will pick;
+#   * not dated in the future (`<= now()`): a future stamp is stale, per offer,
+#     so it can never mask a real read on a sibling offer either.
+def _served_market_currency_pairs() -> list[tuple[str, str]]:
+    from services.market_registry import served_markets
+    from services.region_pricing import pricing_currency_for_region
+
+    return sorted((m, pricing_currency_for_region(m)) for m in served_markets())
+
+
+CRAWL_OFFER_SERVED_MARKET_SQL = (
+    "(upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
+    " IN (" + ", ".join(f"('{m}', '{c}')" for m, c in _served_market_currency_pairs()) + ")"
+)
+
+
+def _unavailable_availabilities() -> list[str]:
+    from services.offer_buyability import OFFER_UNAVAILABLE_AVAILABILITIES
+
+    return sorted(OFFER_UNAVAILABLE_AVAILABILITIES)
+
+
+CRAWL_OFFER_IN_STOCK_SQL = (
+    "lower(btrim(coalesce(co.availability, '')))"
+    " NOT IN (" + ", ".join(f"'{a}'" for a in _unavailable_availabilities()) + ")"
+)
+# The key services/external_offer_dual_write writes (PRICE_READ_SOURCE_KEY there;
+# pinned equal by test) and the one source that is not a crawl.
+CRAWL_PRICE_READ_SOURCE_KEY = "price_read_source"
+CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL = (
+    f"coalesce(co.offer_payload->>'{CRAWL_PRICE_READ_SOURCE_KEY}', '') <> 'employee_edit'"
+)
+CRAWL_CANONICAL_SKU_SUFFIX = "::canonical"
+
+
+def crawl_offer_variant_sql(product_key_expr: str) -> str:
+    """The variant conjunct for one row: a canonical offer counts only when the
+    row has no live drain-lane variant offer. `product_key_expr` is SQL."""
+    canonical = f"{product_key_expr} || '{CRAWL_CANONICAL_SKU_SUFFIX}'"
+    return (
+        f"(co.sku_key IS DISTINCT FROM {canonical}"
+        " OR NOT EXISTS (SELECT 1 FROM catalog_offers cv"
+        f" WHERE cv.product_key = {product_key_expr}"
+        f" AND cv.sku_key IS DISTINCT FROM {canonical}"
+        f" AND cv.source_system = '{CRAWL_SOURCE_SYSTEM}'"
+        " AND cv.suppressed_at IS NULL))"
+    )
+
+
+def crawl_last_price_read_lateral_sql(product_key_expr: str, indent: str = "   ") -> str:
+    """The newest qualifying read for one row, as the body of a LATERAL. Shared
+    by the input statement and the backfill cron's recheck so they cannot
+    disagree about which rows are fresh."""
+    conjuncts = (
+        [f"co.product_key = {product_key_expr}", f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"]
+        + list(priced_offer_row_conjuncts(alias="co"))
+        + [
+            "co.price_checked_at IS NOT NULL",
+            "co.price_checked_at <= now()",
+            CRAWL_OFFER_LINK_SQL,
+            CRAWL_OFFER_NOT_AFFILIATE_SQL,
+            CRAWL_OFFER_SERVED_MARKET_SQL,
+            CRAWL_OFFER_IN_STOCK_SQL,
+            CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL,
+            crawl_offer_variant_sql(product_key_expr),
+        ]
+    )
+    where = f"\n{indent}   AND ".join(conjuncts)
+    return (
+        f"{indent}SELECT max(co.price_checked_at) AS last_price_read_at\n"
+        f"{indent}  FROM catalog_offers co\n"
+        f"{indent} WHERE {where}\n"
+    )
+
 # The newest listing price read per drain-lane row. One indexed probe per key
 # (idx_catalog_offers_product_key), as a LATERAL over the key list rather than
 # `product_key = ANY(:keys) GROUP BY`: measured on local PG (100k products, 300k
@@ -487,25 +584,98 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
 # So "fresh" means "the listing page was read recently" (by the drain or by the
 # refresh), not "the drain re-crawled it". The mirror upsert and the
 # shopify_markets siblings also stamp, but under other source_systems, which
-# this statement does not read. (`\S`, not a POSIX `[[:space:]]` class: SQLAlchemy's text()
-# would read the `:space` in that spelling as a bind parameter.) No time predicate in SQL: the age is judged in Python against
-# the derivation's own `now` (catalog_trust_policy.is_crawl_fresh), so
-# a DB clock and an app clock can never disagree about one row.
+# this statement does not read; and since round 2 an employee edit is not a
+# crawl either (CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL). (`\S`, not a POSIX
+# `[[:space:]]` class: SQLAlchemy's text() would read the `:space` in that
+# spelling as a bind parameter.) The only clock in SQL is `<= now()`, which
+# drops future-dated stamps per offer; the AGE is judged in Python against the
+# derivation's own `now` (catalog_trust_policy.is_crawl_fresh).
 CRAWL_LAST_PRICE_READ_SQL = (
     "SELECT k.product_key, r.last_price_read_at\n"
     "  FROM unnest(CAST(:product_keys AS text[])) AS k(product_key)\n"
     " CROSS JOIN LATERAL (\n"
-    "   SELECT max(co.price_checked_at) AS last_price_read_at\n"
-    "     FROM catalog_offers co\n"
-    "    WHERE co.product_key = k.product_key\n"
-    f"      AND co.source_system = '{CRAWL_SOURCE_SYSTEM}'\n"
-    + "".join(f"      AND {c}\n" for c in priced_offer_row_conjuncts(alias="co"))
-    + "      AND co.price_checked_at IS NOT NULL\n"
-    f"      AND {CRAWL_OFFER_LINK_SQL}\n"
-    f"      AND {CRAWL_OFFER_NOT_AFFILIATE_SQL}\n"
-    " ) r\n"
+    + crawl_last_price_read_lateral_sql("k.product_key")
+    + " ) r\n"
     " WHERE r.last_price_read_at IS NOT NULL\n"
 )
+
+
+# ---- round 2: the decay recheck the backfill cron runs first ----------------
+#
+# A CRAWL_FRESH row stays public only until something re-derives it after its
+# read ages past N. The 6h cron's oldest-first pass cannot be that something:
+# the UPSERT writes only on a verdict change, so unchanged rows keep old
+# updated_at values and stay at the head of the queue while a freshly flipped
+# row goes to the back; above CATALOG_TRUST_BACKFILL_LIMIT catalog rows it is
+# never reached again. So each tick first re-derives, bounded and through the
+# GIN index on serving_reason_codes (mig 136):
+#   * switch ON: the CRAWL_FRESH rows whose newest qualifying read is missing or
+#     older than `cutoff` (= now - (N - one tick)), i.e. every row that may age
+#     out before the next tick;
+#   * switch OFF: EVERY CRAWL_FRESH row, so turning the switch off rolls the
+#     rule back within one tick (and is a no-op read while none exist).
+CRAWL_FRESH_RECHECK_LIMIT_ENV = "CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT"
+CRAWL_FRESH_RECHECK_DEFAULT_LIMIT = 20_000
+CRAWL_FRESH_RECHECK_SQL = (
+    "SELECT crt.subject_key\n"
+    "  FROM catalog_row_trust crt\n"
+    "  LEFT JOIN LATERAL (\n"
+    + crawl_last_price_read_lateral_sql("crt.subject_key")
+    + "  ) r ON TRUE\n"
+    " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    "   AND (r.last_price_read_at IS NULL\n"
+    "        OR r.last_price_read_at < CAST(:cutoff AS timestamptz))\n"
+    " ORDER BY crt.updated_at ASC NULLS FIRST, crt.subject_key\n"
+    " LIMIT :limit\n"
+)
+# Presence only -- the switched-off rollback must not depend on migration 246.
+_CRAWL_FRESH_ROWS_ALL_SQL = (
+    "SELECT crt.subject_key\n"
+    "  FROM catalog_row_trust crt\n"
+    " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    " ORDER BY crt.updated_at ASC NULLS FIRST, crt.subject_key\n"
+    " LIMIT :limit\n"
+)
+
+
+def crawl_fresh_recheck_limit() -> int:
+    raw = (os.getenv(CRAWL_FRESH_RECHECK_LIMIT_ENV) or "").strip()
+    try:
+        value = int(raw) if raw else CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+    except ValueError:
+        return CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+    return value if value > 0 else CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+
+
+async def recheck_crawl_fresh_rows(
+    *,
+    db: Any,
+    lead_hours: float,
+    now: Optional[datetime] = None,
+    limit: Optional[int] = None,
+) -> list[str]:
+    """Re-derive the CRAWL_FRESH rows that may have aged out (see above).
+
+    Returns the keys re-derived, so the caller can leave them out of its own
+    pass. Raises on a failed read, like the cron's own fetch; the cron logs it.
+    """
+    now_value = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    bound = int(limit) if limit else crawl_fresh_recheck_limit()
+    if crawl_fresh_enabled() and await _price_check_column_present(db):
+        cutoff = now_value - timedelta(days=crawl_fresh_days()) + timedelta(hours=float(lead_hours))
+        rows = await _fetch_all(
+            db, CRAWL_FRESH_RECHECK_SQL,
+            {"cutoff": cutoff, "limit": bound},
+        )
+    else:
+        rows = await _fetch_all(db, _CRAWL_FRESH_ROWS_ALL_SQL, {"limit": bound})
+    keys = [str(_row_get(r, "subject_key")) for r in rows if _row_get(r, "subject_key")]
+    if keys:
+        await upsert_catalog_row_trust_many(db=db, product_keys=keys, now=now_value)
+    return keys
+
 
 
 _QUARANTINE_SELECT_SQL = """
@@ -1038,6 +1208,9 @@ async def _execute(db: Any, sql: str, values: Mapping[str, Any]) -> Any:
 
 
 __all__ = [
+    "CRAWL_FRESH_RECHECK_SQL",
+    "crawl_last_price_read_lateral_sql",
+    "recheck_crawl_fresh_rows",
     "CRAWL_FRESH_ENV",
     "CRAWL_FRESH_DAYS_ENV",
     "CRAWL_LAST_PRICE_READ_SQL",
