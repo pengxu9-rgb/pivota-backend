@@ -184,8 +184,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
         FROM catalog_offers o
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
         WHERE o.product_key = ANY(:keys)
-          AND o.suppressed_at IS NULL
-          {seed_projected_offer_guard_and_sql("o", "o.product_key")}
+          AND o.suppressed_at IS NULL{seed_projected_offer_guard_and_sql("o", "o.product_key")}
         """,
         {"keys": product_keys},
     )

@@ -453,6 +453,9 @@ async def test_a_priced_seed_writes_its_own_currency_and_market(monkeypatch):
     ({"price_currency": "USD", "snapshot_price_currency": "AUD"}, "disagrees with its page read AUD"),
     # the mirror script's shape: the whole seed_data, column USD over a page read in QAR.
     ({"price_currency": "USD", "seed_data": {"snapshot": {"price_currency": "QAR"}}}, "disagrees with its page read QAR"),
+    # a payload that hides the page read: the readers withhold its projections, so none is written.
+    ({"price_currency": "USD", "seed_data": {"snapshot": '{"price_currency": "USD"}'}}, "hides its page read"),
+    ({"price_currency": "USD", "seed_data": [1, 2]}, "hides its page read"),
 ])
 async def test_a_priced_seed_without_its_own_currency_or_market_is_refused(monkeypatch, over, reason):
     fake = FakeDB()
