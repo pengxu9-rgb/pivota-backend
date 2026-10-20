@@ -157,6 +157,18 @@ POLICY_VERSION = "c1.v0.9"
 #     exist to verify scraped third-party content) don't apply. Emitted for
 #     ``product.merchant_id != 'external_seed'`` when identity is missing or
 #     low-info.
+#   CRAWL_FRESH — 2026-10-20. A drain-lane storefront crawl row (see
+#     is_crawl_listing: retailer listings AND brand-official / curated rows)
+#     whose listing price was re-read within the freshness window, so the
+#     identity-COVERAGE gates
+#     (IDENTITY_CONFIDENCE_NULL, IDENTITY_LIVE_READ_DISABLED, the silent
+#     identity-'unknown' shadow) did not shadow it. Emitted ONLY when the
+#     exemption actually suppressed one of those gates, so a row that was public
+#     on its own identity keeps byte-identical reason codes. It never suppresses
+#     IDENTITY_REVIEW_REQUIRED_LIVE_READ, IDENTITY_CONFLICT,
+#     NON_CANONICAL_DUPLICATE or any blocked cause. See the
+#     ``crawl_fresh`` input in derive_trust for the input contract and
+#     the reason it carries no flag of its own.
 #
 # Blocked (no public surface):
 #   TEST_MERCHANT_EXCLUDED           — 2026-07-27. merchant_id is a known rig
@@ -252,6 +264,7 @@ class _ReasonCodes:
     IDENTITY_CONFIDENCE_NULL = "IDENTITY_CONFIDENCE_NULL"
     IDENTITY_LIVE_READ_DISABLED = "IDENTITY_LIVE_READ_DISABLED"
     IDENTITY_NOT_APPLICABLE_FIRST_PARTY = "IDENTITY_NOT_APPLICABLE_FIRST_PARTY"
+    CRAWL_FRESH = "CRAWL_FRESH"
     FRESHNESS_UNVERIFIED = "FRESHNESS_UNVERIFIED"
 
     SOURCE_QUARANTINED = "SOURCE_QUARANTINED"
@@ -351,6 +364,70 @@ FRESH_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 STALE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 
+# ---- Drain-lane crawl rows (CRAWL_FRESH) -----------------------------------
+#
+# A drain-lane crawl row is a catalog row the storefront-crawl writer built.
+# Both conjuncts are exact row facts the upserter's join already selects:
+#   * source_system is that writer, ``catalog_enrichment_agent_v1``
+#     (services/catalog_enrichment_agent/ingestion.AGENT_VERSION);
+#   * product_key starts with ``ext:`` — the writer's key space. It covers the
+#     retailer listings (``ext:retailer:<digest of the listing URL>``) AND the
+#     brand-official / curated canonicals (``ext:<slug>::<digest>``), which are
+#     external-seed content but not observed sellers, so the source tiers below
+#     never exempted them either.
+# The predicate alone grants nothing: CRAWL_FRESH also needs a recent price
+# READ on one of the row's own live offers (catalog_offers.price_checked_at,
+# stamped only by a writer that read the listing page), which is what makes the
+# wide key space safe.
+# Twin: PIVOTA-Agent's catalogTrustPolicy must spell both constants and the
+# predicate byte-identically.
+CRAWL_LISTING_KEY_PREFIX = "ext:"
+CRAWL_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
+# Default N for "crawl-fresh": the listing's price was read within the last N
+# days. The upserter resolves the effective N (env
+# CATALOG_TRUST_CRAWL_FRESH_DAYS); the policy only ever sees the
+# resulting boolean.
+CRAWL_FRESH_DEFAULT_DAYS = 7
+
+
+def is_crawl_listing(product: Optional[Mapping[str, Any]]) -> bool:
+    """Is this catalog row a drain-lane storefront crawl row (retailer listing,
+    brand-official or curated)? Exact, case-sensitive, no trimming."""
+    if product is None:
+        return False
+    product_key = str(_get(product, "product_key") or "")
+    source_system = str(_get(product, "source_system") or "")
+    return (
+        product_key.startswith(CRAWL_LISTING_KEY_PREFIX)
+        and source_system == CRAWL_SOURCE_SYSTEM
+    )
+
+
+def is_crawl_fresh(
+    last_price_read_at: Any,
+    *,
+    now: datetime,
+    max_age_days: float,
+) -> bool:
+    """Was the listing's price read within ``max_age_days`` of ``now``?
+
+    ``last_price_read_at`` is the newest ``catalog_offers.price_checked_at``
+    among the row's live drain-lane offers (the upserter's
+    CRAWL_LAST_PRICE_READ_SQL). NULL / unparseable = never read = not
+    fresh. The bound is INCLUSIVE (age == N days is fresh), and a stamp ahead of
+    ``now`` (clock skew between the DB and this process) counts as fresh: it was
+    read, recently. Twin: the same comparison, in seconds, inclusive.
+    """
+    ts = _to_datetime(last_price_read_at)
+    if ts is None:
+        return False
+    if not isinstance(now, datetime):
+        return False
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now - ts).total_seconds() <= float(max_age_days) * 24 * 60 * 60
+
+
 # ---- Public API ------------------------------------------------------------
 
 
@@ -403,6 +480,24 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
     # False = a sibling holds the canonical URL, None = no election exists.
     raw_elected = inputs.get("row_is_elected_canonical")
     row_is_elected_canonical = None if raw_elected is None else bool(raw_elected)
+    # CRAWL_FRESH input (2026-10-20). Tri-state like the three above,
+    # but only an explicit True ACTS: True = this drain-lane crawl row's
+    # listing price was read within the window; False = it was not (stale
+    # or never); None/absent = not computed. False and None are deliberately the
+    # SAME decision -- today's gates -- so a stale listing falls back to shadow
+    # on its next recompute and nothing is sticky.
+    #
+    # NO FLAG IS READ HERE, on purpose. catalog_row_trust is shared state written
+    # by this service AND the PIVOTA-Agent twin, and an env read inside the pure
+    # policy is the per-service split CATALOG_TRUST_RENDERABLE_GATE warns about.
+    # The switch (CATALOG_TRUST_CRAWL_FRESH_ENABLED) lives in the
+    # upserter that BUILDS inputs: switched off, the upserter never supplies this
+    # key, so every decision, every reason code and POLICY_VERSION are
+    # byte-identical to c1.v0.9 -- which is also why the version does not bump
+    # (see the versioning note at the top: no row can observe the change until
+    # the switch flips, and it must flip on BOTH services in one operation).
+    raw_crawl_fresh = inputs.get("crawl_fresh")
+    crawl_fresh = None if raw_crawl_fresh is None else bool(raw_crawl_fresh)
     raw_quarantines = inputs.get("active_quarantines") or []
     active_quarantines = list(raw_quarantines) if isinstance(raw_quarantines, Iterable) else []
 
@@ -442,6 +537,7 @@ def derive_trust(inputs: Mapping[str, Any]) -> dict[str, Any]:
         pdp_route_resolvable=pdp_route_resolvable,
         row_has_priced_offer=row_has_priced_offer,
         row_is_elected_canonical=row_is_elected_canonical,
+        crawl_fresh=crawl_fresh,
         reasons=reasons,
     )
 
@@ -776,6 +872,7 @@ def _derive_serving_decision(
     pdp_route_resolvable: Optional[bool] = None,
     row_has_priced_offer: Optional[bool] = None,
     row_is_elected_canonical: Optional[bool] = None,
+    crawl_fresh: Optional[bool] = None,
     reasons: list[str],
 ) -> dict[str, Any]:
     # Offer-specific block: suppressed offers never surface.
@@ -955,8 +1052,30 @@ def _derive_serving_decision(
         str(_get(product, "seed_kind") or "").strip().lower() if product is not None else ""
     )
     is_observed_seller_exempt = is_observed_seller and _seed_kind != "cross"
-    is_identity_coverage_exempt = product is not None and (
+    is_source_coverage_exempt = product is not None and (
         not is_external_seed_content or is_observed_seller_exempt
+    )
+    # CRAWL_FRESH (2026-10-20): a drain-lane crawl row (retailer listing or
+    # brand-official / curated canonical) whose listing price was read within
+    # the window is exempt from the same COVERAGE
+    # gates, for as long as it stays fresh. Only for rows the source tiers above
+    # do NOT already exempt, so first-party and observed-seller rows keep their
+    # exact reason codes. Three conjuncts, all required:
+    #   * the explicit True input (the upserter supplies it only when switched
+    #     on; False/None = today's gates);
+    #   * the row really is a drain-lane crawl row (is_crawl_listing) — the input is
+    #     never trusted alone, a producer bug must not exempt another lane;
+    #   * its PDP is not KNOWN to be unrenderable (`is not False`: tri-state,
+    #     None = not computed). Independent of CATALOG_TRUST_RENDERABLE_GATE: a
+    #     coverage exemption must never be what newly promotes a page that 500s.
+    is_crawl_fresh_exempt = (
+        not is_source_coverage_exempt
+        and crawl_fresh is True
+        and is_crawl_listing(product)
+        and pdp_route_resolvable is not False
+    )
+    is_identity_coverage_exempt = (
+        is_source_coverage_exempt or is_crawl_fresh_exempt
     )
 
     if identity_decision["status"] == "review_required":
@@ -967,14 +1086,29 @@ def _derive_serving_decision(
         and identity_decision["confidence"] is None
     )
     if missing_confidence:
-        if is_identity_coverage_exempt:
+        if is_source_coverage_exempt:
             reasons.append(REASON_CODES.IDENTITY_NOT_APPLICABLE_FIRST_PARTY)
-        else:
+        elif not is_crawl_fresh_exempt:
             reasons.append(REASON_CODES.IDENTITY_CONFIDENCE_NULL)
 
-    if identity_decision["status"] == "approved" and identity_decision["live_read"] is False:
+    live_read_disabled = (
+        identity_decision["status"] == "approved"
+        and identity_decision["live_read"] is False
+    )
+    if live_read_disabled:
         if not is_identity_coverage_exempt:
             reasons.append(REASON_CODES.IDENTITY_LIVE_READ_DISABLED)
+
+    # The trace code, emitted only where the exemption actually suppressed a
+    # coverage gate. A fresh listing that is public on its own identity
+    # (approved, confidence set, live read on) gets no new code, so switching
+    # the rule on rewrites no row whose decision it does not change.
+    if is_crawl_fresh_exempt and (
+        missing_confidence
+        or live_read_disabled
+        or identity_decision["status"] == "unknown"
+    ):
+        reasons.append(REASON_CODES.CRAWL_FRESH)
 
     # c1.v0.7: a row that is not its content_key's elected canonical is a
     # duplicate of a sibling that holds the public URL. It shadows — see the
@@ -1086,6 +1220,11 @@ __all__ = [
     "VALID_SUBJECT_TYPES",
     "FRESH_MAX_AGE_SECONDS",
     "STALE_MAX_AGE_SECONDS",
+    "CRAWL_FRESH_DEFAULT_DAYS",
+    "CRAWL_LISTING_KEY_PREFIX",
+    "CRAWL_SOURCE_SYSTEM",
     "derive_trust",
+    "is_crawl_fresh",
+    "is_crawl_listing",
     "TrustOutput",
 ]
