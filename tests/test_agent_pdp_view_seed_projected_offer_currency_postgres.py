@@ -47,7 +47,8 @@ ARRAY = "prod::merch_obs_arr::external_seed::ext_array_seed_data"
 NOSRC = "prod::merch_obs_nosrc::external_seed::ext_no_source"
 GBP = "prod::merch_obs_gbp::external_seed::ext_col_usd_page_gbp"
 BLANKS = "prod::merch_obs_blank::external_seed::ext_blank_both"
-KEYS = [SKIN, NOUR, SGOK, COLONLY, NOCCY, INACTIVE, QAR, UPPER, ORPHAN, STRSNAP, TWOSEEDS, LOWER, ARRAY, NOSRC, GBP, BLANKS]
+TILDE = "prod::merch_obs_tilde::external_seed::ext_tilde_page"
+KEYS = [SKIN, NOUR, SGOK, COLONLY, NOCCY, INACTIVE, QAR, UPPER, ORPHAN, STRSNAP, TWOSEEDS, LOWER, ARRAY, NOSRC, GBP, BLANKS, TILDE]
 
 
 def _private_url() -> str:
@@ -177,6 +178,10 @@ def _build(url: str) -> None:
             offer("gbp_copied", GBP, "GBP", 26, "external_product_seeds_mirror_v1", market="GB")
             offer("gbp_markets", GBP, "USD", 25, "us_market_capture")
             seed("eps_gbp", GBP, "USD", {"snapshot": {"price_currency": "GBP"}})
+            # A page read of literally '~' is a stated (nonsense) currency, not "no page read": the
+            # SQL's no-page-read sentinel must be a value no read can produce ('' after nullif).
+            offer("tilde_usd", TILDE, "USD", 23, "external_product_seeds_mirror_v1")
+            seed("eps_tilde", TILDE, "USD", {"snapshot": {"price_currency": "~"}})
             # No currency on the copied row AND none on its seed: two blanks are not an agreement.
             offer("blank_copied", BLANKS, None, 24, "external_product_seeds_mirror_v1")
             seed("eps_blank", BLANKS, None, {"snapshot": {"price_amount": "24"}})

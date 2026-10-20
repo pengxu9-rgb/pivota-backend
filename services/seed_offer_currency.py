@@ -44,9 +44,35 @@ SEED_PROJECTED_OFFER_SOURCE_SYSTEMS = (
 )
 
 
-def _code(value: Any) -> Optional[str]:
-    text = str(value or "").strip().upper()
+def currency_code(value: Any) -> Optional[str]:
+    """A currency the way the SQL reads one, `nullif(upper(trim(<text>)), '')`. Public so every
+    writer compares and stores currencies exactly as the readers will read them.
+
+    Python's upper() and PostgreSQL's agree on ASCII but not everywhere else ('ß' upper-cases to 'SS'
+    in Python and stays 'ß' in Postgres). An ISO 4217 code is ASCII, so the only rows that can differ
+    are not currencies at all, and the readers refuse them either way.
+
+    - trim() strips SPACES only, so a tab or a newline is kept, and "\tUSD" is not "USD", as in SQL.
+    - A JSON number, boolean, array or object is text to `#>>` ('0', 'false', '["USD"]'). Such a
+      currency is stated, not absent, so it disagrees with the offer and nothing falls back to the
+      column."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        text = "true" if value else "false"
+    elif isinstance(value, (int, float)):
+        text = json.dumps(value)
+    elif isinstance(value, (list, dict)):
+        text = json.dumps(value)
+    elif isinstance(value, bytes):
+        text = value.decode("utf-8", "replace")
+    else:
+        text = str(value)
+    text = text.strip(" ").upper()
     return text or None
+
+
+_code = currency_code
 
 
 def _as_dict(value: Any) -> Mapping[str, Any]:
@@ -98,6 +124,11 @@ def seed_currency_of(seed: Mapping[str, Any]) -> Optional[str]:
     """The seed's own currency: its column and its page read when they agree, whichever is stated
     when only one is, and None when they disagree, neither is stated, or the payload hides the page
     read (the same answer as seed_currency_sql)."""
+    if "seed_currency" in seed:
+        # The SQL's own answer (seed_currency_sql), projected by the caller: authoritative, because
+        # only the SQL sees the jsonb types a driver flattens (a snapshot stored as a JSON string, an
+        # array seed_data). The sync path projects it (external_offer_dual_write._SEED_OFFER_COLUMNS).
+        return _code(seed.get("seed_currency"))
     column = _code(seed.get("price_currency"))
     page = snapshot_currency_of(seed)
     if column and page and column != page:
@@ -120,15 +151,16 @@ def seed_currency_sql(alias: str) -> str:
     ONE detoast of seed_data on the common path: seed_data is ~25 KB and TOASTed, and every reference
     re-detoasts it (a four-reference form cost +30-35% on scoped recall, spccy6/7-1019). A simple CASE
     evaluates its test once, `#>>` yields NULL through a non-object, and only a seed with no snapshot
-    currency pays the type checks."""
+    currency pays the type checks. The no-page-read sentinel is '', which neither side can equal: both are
+    nullif(..., ''), as in the gateway (PIVOTA-Agent#2467, f071754a8)."""
     column = f"nullif(upper(trim({alias}.price_currency)), '')"
     page = f"nullif(upper(trim({alias}.seed_data#>>'{{snapshot,price_currency}}')), '')"
     snapshot = f"{alias}.seed_data->'snapshot'"
     return (
         f"(CASE WHEN {column} IS NULL THEN {page}"
-        f" ELSE (CASE coalesce({page}, '~')"
+        f" ELSE (CASE coalesce({page}, '')"
         f" WHEN {column} THEN {column}"
-        f" WHEN '~' THEN (CASE WHEN {alias}.seed_data IS NULL"
+        f" WHEN '' THEN (CASE WHEN {alias}.seed_data IS NULL"
         f" OR (jsonb_typeof({alias}.seed_data) IN ('object', 'null')"
         f" AND ({snapshot} IS NULL OR jsonb_typeof({snapshot}) IN ('object', 'null')))"
         f" THEN {column} END)"
@@ -191,62 +223,17 @@ def seed_projected_offer_guard_and_sql(
 # dialects, so both gates test the statement production sends. The predicate above is Postgres
 # SQL (jsonb_typeof, #>>). So that route selects each offer's source_system, reads the listing's
 # seeds as stored, and asks `offer_priced_in_seed_currency` below. It is a twin of
-# `seed_projected_offer_in_seed_currency_sql`, case for case, over the row AS STORED (which
-# `seed_currency_of` is not: it reads a non-object seed_data as an empty one), and
-# tests/test_purchase_path_seed_offer_currency_postgres.py runs both over the same rows.
+# `seed_projected_offer_in_seed_currency_sql`, case for case, over the row AS STORED, and
+# tests/test_purchase_path_seed_offer_currency_postgres.py runs both over the same rows. The seed's
+# currency is `seed_currency_of`, the one Python reading the writers use too (#2657), so the writer
+# and the purchase path cannot drift apart.
 # ---------------------------------------------------------------------------------------------
 
-_MISSING = object()
-
-
-def _sql_code(value: Any) -> Optional[str]:
-    """nullif(upper(trim(value)), ''): Postgres' trim() strips spaces only."""
-    if value is None:
-        return None
-    return str(value).strip(" ").upper() or None
-
-
-def _jsonb_text(value: Any) -> Optional[str]:
-    """What `#>>` returns for a JSON value: a string as itself, a scalar as its JSON text."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return json.dumps(value)
-
-
-def _stored_json(value: Any) -> Any:
-    """A stored jsonb/JSON column as read (JSON text on asyncpg and SQLite, or a decoded value).
-    _MISSING when it is text that is not JSON, which a jsonb column cannot hold."""
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode("utf-8", "replace")
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (TypeError, ValueError):
-            return _MISSING
-    return value
-
-
 def stored_seed_currency(seed: Mapping[str, Any]) -> Optional[str]:
-    """`seed_currency_sql` for a seed row as stored: `price_currency` and `seed_data` as read.
-
-    The column and the page read (snapshot.price_currency) when they agree, whichever is stated
-    when only one is, None when they disagree. With the column stated and no page currency, a
-    seed_data or snapshot that is not a JSON object (or JSON null) states none."""
-    column = _sql_code(seed.get("price_currency"))
-    data = _stored_json(seed.get("seed_data"))
-    snapshot = data.get("snapshot") if isinstance(data, Mapping) else None
-    page = _sql_code(_jsonb_text(snapshot.get("price_currency"))) if isinstance(snapshot, Mapping) else None
-    if column is None:
-        return page
-    if page is not None:
-        return column if page == column else None
-    if data is None:
-        return column
-    if not isinstance(data, Mapping):
-        return None
-    return column if snapshot is None or isinstance(snapshot, Mapping) else None
+    """`seed_currency_sql` for a seed row as stored: `seed_currency_of` over its `price_currency`
+    and `seed_data` alone, so a projected `seed_currency` or `snapshot_price_currency` on the row
+    cannot stand in for what is stored."""
+    return seed_currency_of({"price_currency": seed.get("price_currency"), "seed_data": seed.get("seed_data")})
 
 
 def is_seed_projected_offer(offer: Mapping[str, Any]) -> bool:

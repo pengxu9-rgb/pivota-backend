@@ -99,6 +99,30 @@ async def test_an_unvouched_write_keeps_a_read_of_the_same_price_and_clears_it_w
     assert (await _offer(db, offer_id))["price_checked_at"] is None
 
 
+async def _source(database, offer_id):
+    return await database.fetch_val(
+        "SELECT offer_payload->>'price_read_source' FROM catalog_offers WHERE offer_id = :id", {"id": offer_id})
+
+
+@pytest.mark.parametrize("batch", [False, True])
+async def test_a_write_that_read_no_price_keeps_who_vouched_and_a_read_drops_it(db, batch):
+    """offer_payload.price_read_source (the attached lane's marker) belongs to the stored stamp: a plan that
+    read no price leaves both standing; a crawl that read the price dates it itself, so the marker goes."""
+    await _with_price_check(db)
+    await _seed_product(db)
+    offer_id = await _write(db, batch=batch, price_read=True)
+    await db.execute(
+        "UPDATE catalog_offers SET offer_payload = jsonb_set(offer_payload, '{price_read_source}',"
+        " to_jsonb(CAST('employee_edit' AS text))) WHERE offer_id = :id", {"id": offer_id})
+    await _write(db, batch=batch, price_read=False)
+    assert await _source(db, offer_id) == "employee_edit"
+    await _write(db, batch=batch, price_read=False, price=24.0)  # still no read: the marker stays
+    assert await _source(db, offer_id) == "employee_edit"
+    await _write(db, batch=batch, price_read=True)
+    assert await _source(db, offer_id) is None
+    assert _recent((await _offer(db, offer_id))["price_checked_at"])
+
+
 async def test_without_the_column_a_vouched_apply_writes_the_pre_246_statement(db, monkeypatch):
     """A database that has not healed the column yet: the vouch is dropped, the offer is still written."""
     import services.catalog_enrichment_agent.apply as apply_mod
