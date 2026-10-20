@@ -29,6 +29,7 @@ from db.database import database
 from services.catalog_identity import validated_source_gtin
 from services.claim_safety import ensure_category_disclaimers
 from services.offer_buyability import availability_is_known_unavailable
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
@@ -161,11 +162,19 @@ async def fetch_skus_for_keys(product_keys: List[str], *, db: Any = None) -> Lis
 
 
 async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> List[Dict[str, Any]]:
+    """The live offers of a content_key's listings, minus the ones that are not prices.
+
+    An offer copied off a seed (services/seed_offer_currency) is a price only in that seed's own
+    currency: on 2026-10-19 this view served SKINTIFIC's set with five USD 23.56 offers that the
+    variant backfill had copied off seed_data.variants, while the seed itself had been re-read in
+    AUD. The same rule bounds the gateway's search offers, so a PDP and a search card cannot
+    disagree on whether a row is a price. Kill switch: CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD=off
+    (default on, read per call), the gateway's own name."""
     if not product_keys:
         return []
     read_db = db or database
     rows = await read_db.fetch_all(
-        """
+        f"""
         SELECT
           o.offer_id, o.sku_key, o.product_key, o.merchant_id,
           o.availability, o.currency, o.list_price,
@@ -175,7 +184,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
         FROM catalog_offers o
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
         WHERE o.product_key = ANY(:keys)
-          AND o.suppressed_at IS NULL
+          AND o.suppressed_at IS NULL{seed_projected_offer_guard_and_sql("o", "o.product_key")}
         """,
         {"keys": product_keys},
     )

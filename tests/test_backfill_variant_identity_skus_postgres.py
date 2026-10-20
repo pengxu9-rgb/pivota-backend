@@ -399,6 +399,16 @@ async def test_a_currency_disagreement_is_refused(db):
     assert report["skus"] == 0 and report["skipped_currency_disagrees_with_offer"] == 1
 
 
+async def test_a_price_nobody_stated_a_currency_for_gets_no_row(db):
+    """Never a USD default (Peng 2026-10-19): this used to write `vcur or offer_currency or "USD"`.
+    A variant price with no currency, on an offer with none, is not a price."""
+    await _seed(db, variants=[_variant(currency=None)], offers=[{"currency": None}])
+    report = await _run()
+    assert report["skus"] == 0 and report["skipped_no_currency"] == 1
+    assert await db.fetch_val("SELECT count(*) FROM catalog_offers WHERE source_system=:s",
+                              {"s": "variant_identity_backfill_v1"}) == 0
+
+
 async def test_a_priceless_variant_gets_no_row_at_all(db):
     await _seed(db, variants=[_variant(price_amount=None, price=None)], offers=[{}])
     report = await _run()
