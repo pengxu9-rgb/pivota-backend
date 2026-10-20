@@ -448,17 +448,6 @@ def crawl_fresh_days() -> float:
     return days
 
 
-# THE LIVE-OFFER TEST, the same one the gateway's offer reader applies before it
-# serves an offer (routes/agent_shop_gateway `servable`, and the loops that keep
-# only a destination starting `http://` / `https://`): the payload link, else
-# source_ref, trimmed, starting http:// or https://. Round 4 spells it EXACTLY as
-# the reader does (round 3 also required no whitespace, so an offer the reader
-# serves could sit outside the class). A destination the readers never serve
-# (ftp:, a bare path, not a URL) is not live and neither dates nor blocks a row.
-CRAWL_OFFER_LINK_SQL = (
-    "btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref),"
-    r" E' \t\n\r\f\v') ~ '^https?://'"
-)
 # An affiliate-feed offer's link is a network tracking URL, not the listing,
 # and the drain never read its price from the storefront: never a valid read.
 CRAWL_OFFER_NOT_AFFILIATE_SQL = (
@@ -466,7 +455,7 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
 )
 
 
-# ---- round 4 (2026-10-20): EVERY live offer, fail closed --------------------------
+# ---- rounds 4-5 (2026-10-20): EVERY live offer, fail closed -----------------------
 #
 # Trust stays per PRODUCT (catalog_row_trust has no market column), and the
 # readers serve every live offer of a product to somebody: the buyer-currency
@@ -479,13 +468,20 @@ CRAWL_OFFER_NOT_AFFILIATE_SQL = (
 # NULL as soon as one of them has none.
 #
 # THE CLASS -- every LIVE offer on the row (crawl_offer_class_conjuncts):
-#   * unsuppressed and priced (services.priced_offer_sql, the SAME conjuncts
-#     every price gate uses);
-#   * linking to an http(s) destination (CRAWL_OFFER_LINK_SQL above).
-# Nothing else: ANY source_system, ANY market, ANY currency, affiliate offers
-# included. (Round 3 narrowed the class to drain-lane, non-affiliate offers in a
-# served market/currency pair, so an offer outside it neither dated nor blocked
-# the row -- while a no-market caller was still served its price.)
+# unsuppressed and priced (services.priced_offer_sql, the SAME conjuncts every
+# price gate uses). Nothing else: ANY source_system, ANY market, ANY currency,
+# affiliate offers included, and ANY link. (Round 3 narrowed the class to
+# drain-lane, non-affiliate offers in a served market/currency pair, so an
+# offer outside it neither dated nor blocked the row -- while a no-market
+# caller was still served its price.)
+#   * No link test (round 5): the readers do not all test the link. The
+#     gateway's offer read keeps only an http(s) destination, but the canonical
+#     PDP's own-money read (PIVOTA-Agent canonicalPdpOwnMoney) needs only a
+#     public row and serves the price of an offer whose destination is '' or a
+#     bare path. So an unservable link never takes an offer out of the class:
+#     it must carry a valid read like any other, or the row is not fresh. The
+#     link is not part of VALID either -- a drain offer with a bad link whose
+#     price was read is still a read.
 #
 # A VALID READ of one class offer (CRAWL_OFFER_VALID_READ_SQL), ALL of:
 #   * written by the drain (source_system catalog_enrichment_agent_v1): no other
@@ -583,12 +579,9 @@ CRAWL_OFFER_VALID_READ_SQL = (
 
 
 def crawl_offer_class_conjuncts(product_key_expr: str) -> list[str]:
-    """The class for one row: every live offer (see above). `product_key_expr` is SQL."""
-    return (
-        [f"co.product_key = {product_key_expr}"]
-        + list(priced_offer_row_conjuncts(alias="co"))
-        + [CRAWL_OFFER_LINK_SQL]
-    )
+    """The class for one row: every unsuppressed, priced offer, whatever its link
+    (see above). `product_key_expr` is SQL."""
+    return [f"co.product_key = {product_key_expr}"] + list(priced_offer_row_conjuncts(alias="co"))
 
 
 def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ") -> str:
@@ -610,9 +603,9 @@ def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ")
 # key list rather than `product_key = ANY(:keys) GROUP BY`: measured on local PG
 # (100k products, 300k offers) the ANY form flips to a parallel SEQ SCAN of
 # catalog_offers at a backfill batch of 5,000 keys; the lateral stays index probes.
-# Round 4 widened the class (no source_system / market / affiliate conjunct in
-# the WHERE): the probe is still the product_key equality, and every other test
-# filters or aggregates that one key's offers.
+# Rounds 4-5 widened the class (no source_system / market / affiliate / link
+# conjunct in the WHERE): the probe is still the product_key equality, and every
+# other test filters or aggregates that one key's offers.
 #
 # WHO DATES THESE OFFERS (every writer of price_checked_at that can reach a
 # catalog_enrichment_agent_v1 offer on an `ext:` row):

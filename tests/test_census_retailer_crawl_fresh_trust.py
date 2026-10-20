@@ -25,7 +25,16 @@ def test_census_copies_are_pinned_to_their_originals():
     from services import catalog_row_trust_upserter as up
     from services import catalog_trust_policy as policy
 
-    assert census.OFFER_LINK_SQL == up.CRAWL_OFFER_LINK_SQL
+    # the gateway offer reader's own servable test (routes/agent_shop_gateway's one-per-seller
+    # read spells it on alias `o`, wrapped over two lines); round 5 took it out of the rule
+    import re
+
+    def norm(sql):
+        return re.sub(r"\s+", " ", sql)
+
+    gateway = (_REPO / "routes/agent_shop_gateway.py").read_text()
+    assert norm(census.OFFER_LINK_SQL.replace("co.", "o.")) + ") AS servable" in norm(gateway)
+    assert census.OFFER_LINK_SQL not in census.CLASS_SQL and "destination_url" not in census.CLASS_SQL
     assert census.OFFER_NOT_AFFILIATE_SQL == up.CRAWL_OFFER_NOT_AFFILIATE_SQL
     assert census.CRAWL_LISTING_KEY_PREFIX == policy.CRAWL_LISTING_KEY_PREFIX
     assert census.CRAWL_SOURCE_SYSTEM == policy.CRAWL_SOURCE_SYSTEM
@@ -183,6 +192,13 @@ def test_the_non_class_counter_splits_by_reason_and_dedupes_the_total():
         _final_row(fresh3, non_class={"affiliate": 2, "non_drain_source": 0}),
         _final_row(fresh3, non_class={"non_drain_source": 1, "non_served_market": 1}),
         _final_row(fresh3, non_class={"currency_mismatch": 1, "non_drain_source": 3, "affiliate": 1}),
+        # an unservable link counts only without a valid read inside N
+        _final_row(fresh3, non_class={"unservable_link_n": 1, "unservable_link_all_valid": False}),
+        _final_row(fresh3, non_class={"unservable_link_n": 2, "unservable_link_all_valid": True,
+                                      "unservable_link_oldest_valid": (NOW - timedelta(days=60)).isoformat()}),
+        _final_row(fresh3, final=1, final_any=1,
+                   non_class={"unservable_link_n": 1, "unservable_link_all_valid": True,
+                              "unservable_link_oldest_valid": (NOW - timedelta(days=1)).isoformat()}),
         # round 3 would not flip it (stale): never counted, whatever it carries
         _final_row({"US": _cls(oldest=30, oldest_any=30, newest_any=30)}, non_class={"affiliate": 1}),
         # round 3 flips, nothing outside its class: round 4 flips it too
@@ -191,15 +207,17 @@ def test_the_non_class_counter_splits_by_reason_and_dedupes_the_total():
     ]
     total = [line for line in census.summarize(rows, now=NOW, max_age_days=7, seed_pool_by_market={"US": 1})
              if line["kind"] == "summary" and line["lane"] == "all"][0]
-    assert total["would_flip_round3_class_rule"] == 5
-    assert total["would_flip_per_market_rule"] == 2
+    assert total["would_flip_round3_class_rule"] == 8
+    assert total["would_flip_per_market_rule"] == 3
     assert total["would_flip_but_carries_live_non_class_offer"] == {
-        "affiliate": 2, "non_drain_source": 2, "non_served_market": 1, "currency_mismatch": 1, "total": 3}
+        "affiliate": 2, "non_drain_source": 2, "non_served_market": 1, "currency_mismatch": 1,
+        "unservable_link": 2, "total": 5}
 
 
-def test_the_non_class_reasons_are_the_four_asked_for():
-    assert list(census.NON_CLASS_REASON_SQL) == [
-        "affiliate", "non_drain_source", "non_served_market", "currency_mismatch"]
+def test_the_non_class_reasons_are_the_five_asked_for():
+    assert census.NON_CLASS_REASONS == (
+        "affiliate", "non_drain_source", "non_served_market", "currency_mismatch", "unservable_link")
+    assert census.UNSERVABLE_LINK_SQL == f"NOT coalesce({census.OFFER_LINK_SQL}, FALSE)"
     assert census.SERVED_MARKETS_SQL == "upper(btrim(coalesce(co.market, ''))) IN ('SG', 'US')"
 
 

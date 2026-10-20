@@ -374,33 +374,35 @@ def test_the_statement_is_pinned():
         '    WHERE co.product_key = k.product_key\n'
         '      AND co.suppressed_at IS NULL\n'
         '      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n'
-        "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref), E' \\t\\n\\r\\f\\v') ~ '^https?://'\n"
         ' ) r\n'
         ' WHERE r.row_price_read_at IS NOT NULL\n'
     )
 
 
-def test_the_class_is_every_live_offer_and_validity_carries_the_rest():
-    """Round 4, fail closed: the WHERE names no source, market, currency or
-    affiliate test -- those moved into the valid read, so an offer that fails
-    one is IN the class and makes the row NULL instead of being ignored."""
+def test_the_class_is_every_unsuppressed_priced_offer_and_validity_carries_the_rest():
+    """Rounds 4-5, fail closed: the WHERE is the key, unsuppressed and priced --
+    nothing else. Source, market, currency and affiliate moved into the valid
+    read, so an offer that fails one is IN the class and makes the row NULL."""
     where = upserter.CRAWL_ROW_PRICE_READ_SQL.split(" WHERE co.product_key", 1)[1].split(" ) r", 1)[0]
+    assert where.split("\n      AND ")[1:] == [
+        "co.suppressed_at IS NULL", "coalesce(co.merchant_effective_price, co.list_price) > 0\n"]
+    assert upserter.crawl_offer_class_conjuncts("k") == [
+        "co.product_key = k", "co.suppressed_at IS NULL", "coalesce(co.merchant_effective_price, co.list_price) > 0"]
     for moved in (upserter.CRAWL_OFFER_DRAIN_SOURCE_SQL, upserter.CRAWL_OFFER_SERVED_MARKET_SQL,
-                  upserter.CRAWL_OFFER_NOT_AFFILIATE_SQL, "source_system", "co.market", "co.currency",
-                  "validated_at"):
+                  upserter.CRAWL_OFFER_NOT_AFFILIATE_SQL):
         assert moved not in where
         assert moved in upserter.CRAWL_OFFER_VALID_READ_SQL
-    assert upserter.CRAWL_OFFER_LINK_SQL in where
-    assert "suppressed_at IS NULL" in where
-    # the reader's own servable test, exactly (routes/agent_shop_gateway's
-    # one-per-seller read spells it on alias `o`, wrapped over two lines)
-    import re
 
-    def norm(sql):
-        return re.sub(r"\s+", " ", sql)
 
-    gateway = (Path(__file__).resolve().parent.parent / "routes/agent_shop_gateway.py").read_text()
-    assert norm(upserter.CRAWL_OFFER_LINK_SQL.replace("co.", "o.")) + ") AS servable" in norm(gateway)
+def test_no_link_test_anywhere_in_the_rule():
+    """Round 5: not every reader tests the link (the canonical PDP's own-money read
+    serves an offer whose destination is '' or a bare path), so the link neither
+    takes an offer out of the class nor decides whether its read is valid."""
+    for sql in (upserter.CRAWL_ROW_PRICE_READ_SQL, upserter.CRAWL_FRESH_RECHECK_SQL,
+                upserter.CRAWL_OFFER_VALID_READ_SQL):
+        for token in ("destination_url", "source_ref", "https?", "http"):
+            assert token not in sql, (token, sql[:60])
+    assert not hasattr(upserter, "CRAWL_OFFER_LINK_SQL")
 
 
 def test_the_served_pairs_fixture_is_current():

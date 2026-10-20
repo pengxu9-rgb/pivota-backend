@@ -261,18 +261,47 @@ async def test_the_row_read_is_the_oldest_read_of_every_live_offer(db):
     oldest = NOW - timedelta(days=3)
     await _offer(db, RETAILER, read_at=oldest)
     await _offer(db, RETAILER, read_at=NOW - timedelta(days=1), variant="1")
-    # NOT LIVE -- no reader serves them (suppressed, unpriced, or a destination the
-    # gateway's `servable` test refuses): they neither date the row nor block it.
+    # NOT LIVE -- suppressed or unpriced: no reader serves a price for them, so they
+    # neither date the row nor block it, whatever their link.
     await _offer(db, RETAILER, read_at=None, suppressed=True)
     await _offer(db, RETAILER, read_at=None, source_system="variant_identity_backfill_v1", suppressed=True)
-    await _offer(db, RETAILER, read_at=None, link="ftp://shop.example.com/p/1")
-    await _offer(db, RETAILER, read_at=None, link="/p/1")
-    await _offer(db, RETAILER, read_at=None, link="HTTPS://shop.example.com/p/1")
-    await _offer(db, RETAILER, read_at=None, price=0)
-    await _offer(db, RETAILER, read_at=None, price=None)
-    await _offer(db, RETAILER, read_at=None, link=None, payload_link="not a url")
+    await _offer(db, RETAILER, read_at=None, price=0, link="ftp://shop.example.com/p/1")
+    await _offer(db, RETAILER, read_at=None, price=None, link="/p/1")
     await _offer(db, RETAILER, read_at=None, market="AU", currency="AUD", suppressed=True)
     assert await _reads(db, [RETAILER]) == {RETAILER: oldest}
+
+
+# Round 5: the link never takes a priced offer out of the class. The canonical PDP's
+# own-money read serves a public row's offer price without testing its link, so a
+# stale offer behind an unservable link must block the row like any other.
+_UNSERVABLE_LINKS = [
+    pytest.param(dict(payload_link="", link="https://shop.example.com/p/2"), id="empty_destination_over_https_ref"),
+    pytest.param(dict(link="/p/2"), id="bare_path"),
+    pytest.param(dict(link="ftp://shop.example.com/p/2"), id="ftp"),
+    pytest.param(dict(link=None, payload_link="not a url"), id="not_a_url"),
+    pytest.param(dict(link="HTTPS://shop.example.com/p/2"), id="upper_case_scheme"),
+    pytest.param(dict(link=None), id="no_link_at_all"),
+]
+
+
+@pytest.mark.parametrize("bad_link", _UNSERVABLE_LINKS)
+async def test_a_stale_offer_behind_an_unservable_link_blocks_the_row(db, bad_link):
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    oid = await _offer(db, RETAILER, read_at=NOW - timedelta(days=60), variant="2", **bad_link)
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(days=60)}
+    await db.execute("UPDATE catalog_offers SET price_checked_at = NULL WHERE offer_id = :o", {"o": oid})
+    assert await _reads(db, [RETAILER]) == {}
+
+
+async def test_a_fresh_valid_read_behind_an_empty_link_still_dates_the_row(db):
+    """The link is not part of VALID: the drain read the price, so it counts."""
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1), payload_link="",
+                 link="https://shop.example.com/p/1")
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=1)}
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=3), link="/p/3", variant="3")
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=3)}
 
 
 # Round 4, fail closed: each of these is a LIVE offer a reader serves (a no-market
@@ -299,9 +328,8 @@ async def test_a_live_offer_that_can_never_be_a_valid_read_makes_the_row_not_fre
     assert await _reads(db, [RETAILER]) == {}
 
 
-async def test_a_live_link_the_reader_serves_is_in_the_class_even_with_a_space(db):
-    """The class uses the reader's own servable test (`^https?://` once trimmed),
-    so a link round 3 called not-a-listing but the reader serves is dated too."""
+async def test_a_link_with_a_space_is_in_the_class(db):
+    """No link ever takes a priced offer out of the class (round 5)."""
     await _product(db, RETAILER)
     await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
     oid = await _offer(db, RETAILER, read_at=None, link="https://shop.example.com/p 1")
@@ -402,7 +430,7 @@ async def test_the_statement_binds_one_clock(db):
     assert await _reads(db, [RETAILER], now=read) == {RETAILER: read}
 
 
-async def test_the_statement_reads_the_payload_link_first_and_trims_it(db):
+async def test_a_garbage_source_ref_under_a_valid_read_dates_the_row(db):
     await _product(db, RETAILER)
     await _offer(db, RETAILER, read_at=NOW, link="garbage", payload_link="  https://shop.example.com/p/2 \n")
     assert await _reads(db, [RETAILER]) == {RETAILER: NOW}
@@ -916,7 +944,7 @@ async def test_census_sizes_round_four_by_reason(db):
 
     keys = {k: "ext:retailer:" + c * 32 for k, c in
             (("clean", "a"), ("aff", "b"), ("copy", "c"), ("au", "d"), ("cur", "e"), ("multi", "f"),
-             ("stale", "0"))}
+             ("stale", "0"), ("badlink", "1"), ("badlink_read", "2"), ("badlink_unread", "3"))}
     for pk in keys.values():
         await _product(db, pk)
     fresh, later = NOW - timedelta(days=1), NOW - timedelta(hours=1)
@@ -932,6 +960,10 @@ async def test_census_sizes_round_four_by_reason(db):
     await _offer(db, keys["multi"], read_at=later, market="SG", currency="USD", link=other + "x")
     await _offer(db, keys["multi"], read_at=later, market="AU", currency="USD", link=other + "y")
     await _offer(db, keys["stale"], read_at=later, affiliate=True, link=other)  # round 3 would not flip it
+    # an unservable link: blocks when its read is not valid, not when it is
+    await _offer(db, keys["badlink"], read_at=NOW - timedelta(days=60), payload_link="", link=other)
+    await _offer(db, keys["badlink_read"], read_at=later, link="/p/3")
+    await _offer(db, keys["badlink_unread"], read_at=None, link=None)
     await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()))
 
     conn = await _asyncpg(_SCHEMA)
@@ -941,13 +973,16 @@ async def test_census_sizes_round_four_by_reason(db):
     finally:
         await conn.close()
     total = _by(lines, "summary", lane="all")[0]
-    assert total["would_flip_round3_class_rule"] == 6
-    assert total["would_flip_per_market_rule"] == 1  # clean
+    assert total["would_flip_round3_class_rule"] == 9
+    assert total["would_flip_per_market_rule"] == 2  # clean, badlink_read
     assert total["would_flip_but_carries_live_non_class_offer"] == {
-        "affiliate": 2, "non_drain_source": 1, "non_served_market": 2, "currency_mismatch": 2, "total": 5}
-    # total = round 3's flips that round 4 refuses
-    assert total["would_flip_round3_class_rule"] - total["would_flip_per_market_rule"] == 5
-    assert await _reads(db, list(keys.values()), now=db_now) == {keys["clean"]: fresh}
+        "affiliate": 2, "non_drain_source": 1, "non_served_market": 2, "currency_mismatch": 2,
+        "unservable_link": 2, "total": 7}
+    # total = round 3's flips that the rule refuses
+    assert total["would_flip_round3_class_rule"] - total["would_flip_per_market_rule"] == 7
+    assert await _reads(db, list(keys.values()), now=db_now) == {
+        keys["clean"]: fresh, keys["badlink_read"]: fresh,
+        keys["badlink"]: NOW - timedelta(days=60)}  # dated by its stale offer: not fresh
 
 
 async def test_census_runs_read_only_with_a_statement_timeout(db):
