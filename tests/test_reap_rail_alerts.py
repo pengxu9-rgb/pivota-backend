@@ -1229,7 +1229,7 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
     # is written, never what is written. Before that move this read `^upsert "` alone.
     nine = {
         "prod: host is down", "prod: TLS certificate expiring", "prod: load balancer 5xx",
-        "prod: Cloud Run job failing", "prod: relgraph-sync running over two hours",
+        "prod: Cloud Run job failing", "prod: relgraph-sync running over four hours",
         "prod: Cloud SQL connections high", "prod: database pool exhausted",
         "prod: retailer ingest held for review", "prod: retailer ingest job failed",
     }
@@ -1246,4 +1246,7 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
         ).stdout
     assert set(rendered) == nine, sorted(rendered)
     digest = hashlib.sha256(json.dumps(rendered, sort_keys=True).encode()).hexdigest()
-    assert digest == "9ff583df92b8d4a70c771356c6ec7bc4b6336f17c50a907ab4f323beca2b3186"
+    # 2026-10-20: re-pinned for ONE deliberate change, "relgraph-sync running over two hours" renamed to
+    # "... four hours" with a 14400s duration (10,000-review nightlies). The other eight render
+    # byte-identically to the previous pin (9ff583df...).
+    assert digest == "78ae997c38265784d3e5e92331cf84ce0a51a6607eef4592619fd2b13c1549cf"

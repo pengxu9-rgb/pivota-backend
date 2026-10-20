@@ -44,15 +44,16 @@ def test_lb_ratio_matches_live_condition_and_policy_wiring_exactly():
 
 
 def test_relgraph_occupancy_alert_shape_and_current_sizing():
-    policy = generated_policies()['prod: relgraph-sync running over two hours']
+    policy = generated_policies()['prod: relgraph-sync running over four hours']
     condition = policy['conditions'][0]['conditionThreshold']
     assert condition == {
         'filter': 'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"',
         'aggregations': [{'alignmentPeriod': '300s', 'perSeriesAligner': 'ALIGN_MAX',
                           'crossSeriesReducer': 'REDUCE_SUM', 'groupByFields': ['resource.label.job_name']}],
-        'comparison': 'COMPARISON_GT', 'thresholdValue': 0, 'duration': '7200s', 'trigger': {'count': 1},
+        'comparison': 'COMPARISON_GT', 'thresholdValue': 0, 'duration': '14400s', 'trigger': {'count': 1},
     }
-    for phrase in ['~37 minutes', '45 minutes', '14400s', 'max-retries 1', 'continuous occupancy of two hours']:
+    # 2026-10-20: a 10,000-review nightly runs ~1.9-2.9 h; four hours warns before the 21600s timeout.
+    for phrase in ['~1.9-2.9 hours', '300 minutes', '21600s', 'max-retries 1', 'continuous occupancy of four hours']:
         assert phrase in policy['documentation']['content']
     assert policy['notificationChannels'] == LIVE[0]['notificationChannels']
 

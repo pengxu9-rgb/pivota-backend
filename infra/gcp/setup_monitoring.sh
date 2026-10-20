@@ -571,13 +571,37 @@ upsert "prod: Cloud Run job failing" "$(policy \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
-# This is continuous job occupancy (running_executions > 0 for 2h), not per-execution age: one wedged
+# This is continuous job occupancy (running_executions > 0 for 4h), not per-execution age: one wedged
 # run or runs chained back to back both fire it; two short overlapping runs do not.
-upsert "prod: relgraph-sync running over two hours" "$(policy \
-  "prod: relgraph-sync running over two hours" \
-  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of two hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
+# FOUR HOURS since 2026-10-20 (was two): the nightly now reviews up to 10,000 labels at concurrency 16
+# (setup_scheduler.sh relgraph_sync_env), ~1.9-2.9 h a normal night, so two hours would page every
+# night. Four still warns two hours before the 21600s task timeout ends a wedged attempt.
+upsert "prod: relgraph-sync running over four hours" "$(policy \
+  "prod: relgraph-sync running over four hours" \
+  "relgraph-sync has running executions continuously for four hours. The daily run reviews up to 10,000 labels at concurrency 16 and takes ~1.9-2.9 hours (build ~30 minutes, review ~1.4-2.4 hours); the inner step timeout is 300 minutes. Task timeout is 21600s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of four hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
   'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
-  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 7200s 14400s)"
+  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 14400s 14400s)"
+
+# RETIRED NAMES. upsert() replaces a policy by displayName, so a renamed policy would leave its old
+# one live and firing. Each old name is deleted here, after its successor above has been written.
+retire_policy() { # DISPLAY_NAME
+  set -- "$(environment_policy_name "$1")"
+  local old resp
+  for old in $(api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
+for p in d.get("alertPolicies", []):
+    if p.get("displayName") == sys.argv[1]:
+        print(p["name"])
+' "$1"); do
+    resp="$(api DELETE "${old#projects/*/}")"
+    check "$resp" "retire $1"
+    echo "   retired $1"
+  done
+}
+retire_policy "prod: relgraph-sync running over two hours"
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \

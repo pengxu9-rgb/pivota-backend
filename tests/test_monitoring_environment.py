@@ -256,3 +256,28 @@ def test_a_metric_that_becomes_visible_within_the_budget_is_waited_for(tmp_path)
     # Every metric this script creates is read by some policy ("went silent" reads the report metric through
     # PromQL), so each was really rejected once and really waited for.
     assert state["rejected"] == {m: 1 for m in SCRIPT_METRICS.split(",")}
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+def test_the_renamed_relgraph_occupancy_alert_retires_its_two_hour_predecessor(tmp_path, env):
+    # upsert() replaces by displayName: without the retirement the old two-hour policy would stay live
+    # and page on every 10,000-review night (2026-10-20).
+    run_script(tmp_path, env)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text())
+    project = "pivota-staging" if env == "staging" else "pivota-prod"
+    old_name = env + ": relgraph-sync running over two hours"
+    state["alertPolicies"].append({"name": "projects/" + project + "/alertPolicies/legacy-two-hours", "displayName": old_name})
+    state_path.write_text(json.dumps(state))
+    count_before = len(state["alertPolicies"])
+    after = run_script(tmp_path, env, repeat=True)
+    names = [p["displayName"] for p in after["alertPolicies"]]
+    assert old_name not in names
+    assert names.count(env + ": relgraph-sync running over four hours") == 1
+    assert len(after["alertPolicies"]) == count_before - 1
+    deletes = [c for c in after["calls"] if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours"]
+    assert len(deletes) == 1
+    creates = [i for i, c in enumerate(after["calls"]) if c["method"] == "POST"
+               and (c["body"] or {}).get("displayName") == env + ": relgraph-sync running over four hours"]
+    retire = next(i for i, c in enumerate(after["calls"]) if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours")
+    assert creates and creates[-1] < retire  # the successor exists before the old policy goes
