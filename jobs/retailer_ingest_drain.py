@@ -35,11 +35,13 @@ It does nothing unless RETAILER_INGEST_DRAIN_ENABLED=1, so creating the job is n
 
 CLAIM WINDOW (RETAILER_INGEST_CLAIM_BLACKOUT_UTC, default 03:00-06:30, "off" to disable): the drain shares
 the one crawl NAT IP with the purchasability sweep (03:15-04:10Z) and the nightly refresh (05:15-06:10Z) and
-has no global pacer, so no NEW stage is claimed inside the window (outcome `claim_window`, which ends the
-loop and still reports the lane's counts). A stage claimed before the window runs to its end. The refusal
-happens before the claim statement, so no lease is taken and none can be stranded. A stage claimed just
-before the window may run up to the task timeout into it: move the start earlier to keep stages out of the
-sweep entirely.
+has no global pacer, so no stage may still be crawling when the window opens. A claim is refused inside the
+window AND within a lead before it: the longest stage this execution has run, at least
+CLAIM_LEAD_FLOOR_SECONDS (an hour, the task timeout) -- so with the default window the last claim is just
+before 02:00, and every lane's stage has ended by 03:00. A refused tick reports outcome `claim_window`
+(which ends the loop and still reports the lane's counts). The refusal happens before the claim statement,
+so no lease is taken and none can be stranded. The effective window is printed once per execution
+(`retailer_ingest_drain_config: `).
 
 Exit codes: 0 = a stage ran and was recorded (whatever its outcome) or nothing was due;
 1 = an unexpected error (recorded on the job as `failed`), so the execution fails and alerts.
@@ -70,6 +72,11 @@ SUMMARY_MARKER = "retailer_ingest_drain: "
 
 #: The outcome of a tick inside the claim window: nothing claimed, the loop ends.
 CLAIM_WINDOW = "claim_window"
+#: A claim must leave at least this long before the window opens: the longest a stage runs is the task
+#: timeout (3600 s), and a stage claimed at 02:5x would otherwise crawl through the 03:15 sweep.
+CLAIM_LEAD_FLOOR_SECONDS = 3600
+#: One line per execution, before any claim: the window this execution enforces.
+CONFIG_MARKER = "retailer_ingest_drain_config: "
 
 
 def _utcnow() -> datetime:
@@ -78,19 +85,21 @@ def _utcnow() -> datetime:
 
 async def drain_once(*, lease_seconds: int, max_leases: int = 1, db: Any = None,
                      time_left_s: Optional[float] = None, claim_blackout: Optional[tuple] = None,
-                     now: Optional[Callable[[], datetime]] = None) -> Dict[str, Any]:
+                     now: Optional[Callable[[], datetime]] = None, claim_lead_s: float = 0) -> Dict[str, Any]:
     """One stage, plus the lane's job counts by status on every execution -- including idle ones --
     so a store held for review raises a signal even while nothing is being claimed. `time_left_s`
     (seconds left in this task) reaches the stage, so an apply never starts a catalog write the task
-    timeout would cut short. Inside `claim_blackout` nothing is claimed (outcome `claim_window`)."""
+    timeout would cut short. Inside `claim_blackout`, or within `claim_lead_s` before it, nothing is
+    claimed (outcome `claim_window`)."""
     db = db or database
     at = (now or _utcnow)()
-    if ledger.in_claim_blackout(at, claim_blackout):
+    if ledger.in_claim_blackout(at, claim_blackout, claim_lead_s):
         summary: Dict[str, Any] = {"outcome": CLAIM_WINDOW,
-                                   "claim_window": ledger.format_claim_blackout(claim_blackout)}
+                                   "claim_window": ledger.format_claim_blackout(claim_blackout),
+                                   "claim_lead_s": int(claim_lead_s)}
     else:
         job = await ledger.claim_due_job(lease_seconds=lease_seconds, max_leases=max_leases, db=db,
-                                         blackout=claim_blackout, now=at)
+                                         blackout=claim_blackout, now=at, lead_s=claim_lead_s)
         summary = {"outcome": "idle"} if not job else await run_stage(job, db=db, time_left_s=time_left_s)
     summary["jobs"] = await ledger.status_counts(db=db)
     return summary
@@ -121,8 +130,10 @@ async def drain_loop(*, lease_seconds: int, budget_seconds: int, db: Any = None,
         # The time left in THIS task: the lease and the stage's catalog-write deadline both come from it.
         time_left = max(0.0, task_timeout_seconds - (began - start))
         lease = min(lease_seconds, int(time_left) + LEASE_SLACK_SECONDS)
+        # No claim that could still be running when the window opens: the longest stage seen, an hour at least.
         summary = await drain_once(lease_seconds=lease, max_leases=max_leases, db=db, time_left_s=time_left,
-                                   claim_blackout=claim_blackout, now=now)
+                                   claim_blackout=claim_blackout, now=now,
+                                   claim_lead_s=max(longest, CLAIM_LEAD_FLOOR_SECONDS))
         ended = clock()
         # Logged per stage so the budget/timeout margin can be tuned from data, not guessed.
         summary["duration_s"] = round(ended - began, 1)
@@ -161,12 +172,18 @@ def main() -> int:
         # One greppable line per STAGE (the held/failed log metrics count lines), printed as it ends.
         print(SUMMARY_MARKER + json.dumps(summary, default=str, sort_keys=True), flush=True)
 
+    blackout = ledger.claim_blackout_from_env()
+    print(CONFIG_MARKER + json.dumps({"claim_window": ledger.format_claim_blackout(blackout),
+                                      "claim_lead_floor_s": CLAIM_LEAD_FLOOR_SECONDS,
+                                      "max_leases": args.max_leases, "budget_s": args.budget}, sort_keys=True),
+          flush=True)
+
     async def _run() -> None:
         await database.connect()
         try:
             await drain_loop(lease_seconds=args.lease, budget_seconds=args.budget, report=report,
                              task_timeout_seconds=args.task_timeout, max_leases=args.max_leases,
-                             claim_blackout=ledger.claim_blackout_from_env())
+                             claim_blackout=blackout)
         finally:
             await database.disconnect()
 
