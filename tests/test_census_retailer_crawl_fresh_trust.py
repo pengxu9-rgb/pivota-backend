@@ -42,7 +42,9 @@ def test_census_copies_are_pinned_to_their_originals():
     assert census.SERVED_MARKET_CURRENCY_SQL == up.CRAWL_OFFER_SERVED_MARKET_SQL
     assert census.IN_STOCK_SQL == up.CRAWL_OFFER_IN_STOCK_SQL
     assert census.NOT_EMPLOYEE_EDIT_SQL == up.CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL
-    assert census.CANONICAL_SKU_SUFFIX == up.CRAWL_CANONICAL_SKU_SUFFIX
+    assert census.DECLARED_MARKET_SQL == up.CRAWL_OFFER_DECLARED_MARKET_SQL
+    assert census.VALID_READ_SQL == up.CRAWL_OFFER_VALID_READ_SQL.replace("CAST(:now AS timestamptz)", "now()")
+    assert census.SERVED_MARKET_CURRENCY_PAIRS == up.CRAWL_SERVED_MARKET_CURRENCY_PAIRS
     for pk, ss in ((RETAILER, DRAIN), (BRAND, DRAIN), (OTHER, DRAIN), (RETAILER, "x"), ("ext", DRAIN)):
         assert census.is_crawl_listing(pk, ss) == policy.is_crawl_listing(
             {"product_key": pk, "source_system": ss})
@@ -100,23 +102,63 @@ def test_the_max_any_columns_keep_the_round_one_clock():
     assert census.is_fresh(NOW + timedelta(days=3), now=NOW, max_age_days=7) is True
 
 
-def _strict_row(*, strict_age=None, strict_markets=None, any_markets=None):
+def _cls(*, n=1, valid=True, valid_any=True, stock=True, oldest=None, oldest_any=None, newest_any=None):
+    def at(age):
+        return None if age is None else (NOW - timedelta(days=age)).isoformat()
+
+    return {"n": n, "all_valid": valid, "all_valid_any_market": valid_any, "any_in_stock": stock,
+            "oldest_valid": at(oldest), "oldest_valid_any_market": at(oldest_any),
+            "newest_valid_any_market": at(newest_any)}
+
+
+def _final_row(class_by_market, *, any_markets=None):
     def at(age):
         return None if age is None else NOW - timedelta(days=age)
 
     return census.classify(
-        {"product_key": "k_strict", "lane": "retailer", "host": "shop.example.com",
+        {"product_key": "k_final", "lane": "retailer", "host": "shop.example.com",
          "serving_decision": "shadow", "reason_codes": [], "identity_status": "unknown",
          "renderable": True, "last_price_read_at": at(1),
          "market_reads": {m: at(a) for m, a in (any_markets or {"US": 1}).items()},
-         "last_in_stock_read_at": at(1),
-         "last_strict_read_at": at(strict_age),
-         "strict_market_reads": {m: at(a) for m, a in (strict_markets or {}).items()}},
+         "last_in_stock_read_at": at(1), "class_by_market": class_by_market},
         now=NOW, max_age_days=7)
 
 
+def test_the_final_rule_needs_every_market_fresh_and_declared():
+    ok = {"US": _cls(oldest=1, oldest_any=1, newest_any=1), "SG": _cls(oldest=2, oldest_any=2, newest_any=2)}
+    row = _final_row(ok)
+    assert row["would_flip_strict"] is True and row["strict_read_at"] == NOW - timedelta(days=2)
+    stale_us = {"US": _cls(oldest=60, oldest_any=60, newest_any=60), "SG": _cls(oldest=0.1, oldest_any=0.1,
+                                                                             newest_any=0.1)}
+    row = _final_row(stale_us)
+    assert row["would_flip_strict"] is False
+    assert row["fresh_in_one_market_stale_in_another"] is True
+    undeclared = {"US": _cls(valid=False, oldest=None, oldest_any=1, newest_any=1)}
+    row = _final_row(undeclared)
+    assert row["would_flip_strict"] is False and row["would_flip_any_market_declaration"] is True
+    oos = {"US": _cls(stock=False, oldest=1, oldest_any=1, newest_any=1)}
+    assert _final_row(oos)["would_flip_strict"] is False
+    assert _final_row({})["would_flip_strict"] is False
+    assert _final_row({"US": _cls(n=0)})["would_flip_strict"] is False
+
+
+def test_row_read_at_and_cross_market_directly():
+    assert census.row_read_at({}, declared=True) is None
+    m = {"US": _cls(oldest=3, oldest_any=3), "SG": _cls(oldest=1, oldest_any=1)}
+    assert census.row_read_at(m, declared=True) == NOW - timedelta(days=3)
+    m["SG"]["oldest_valid"] = None
+    assert census.row_read_at(m, declared=True) is None
+    assert census.row_read_at(m, declared=False) == NOW - timedelta(days=3)
+    one = {"US": _cls(oldest_any=1, newest_any=1)}
+    assert census.cross_market_stale(one, now=NOW, max_age_days=7) is False
+    both_fresh = {"US": _cls(oldest_any=1, newest_any=1), "SG": _cls(oldest_any=2, newest_any=2)}
+    assert census.cross_market_stale(both_fresh, now=NOW, max_age_days=7) is False
+    unread = {"US": _cls(valid_any=False, oldest_any=None, newest_any=None), "SG": _cls(oldest_any=1, newest_any=1)}
+    assert census.cross_market_stale(unread, now=NOW, max_age_days=7) is True
+
+
 def test_a_future_per_market_read_never_ages_in():
-    row = _strict_row(strict_age=-2, strict_markets={"US": -2})
+    row = _final_row({"US": _cls(oldest=-2, oldest_any=-2, newest_any=-2)})
     assert row["strict_age_days"] is None
     assert row["would_flip_strict"] is False
     out = census.project([row], max_age_days=7, nightly_probability=0.0, age_field="strict_age_days")
@@ -124,13 +166,16 @@ def test_a_future_per_market_read_never_ages_in():
 
 
 def test_per_market_flips_are_counted_only_in_their_strict_markets():
-    row = _strict_row(strict_age=1, strict_markets={"US": 1}, any_markets={"US": 1, "AU": 1})
+    row = _final_row({"US": _cls(oldest=1, oldest_any=1, newest_any=1)}, any_markets={"US": 1, "AU": 1})
     assert row["would_flip_strict"] is True
-    lines = census.summarize([row], now=NOW, max_age_days=7, seed_pool_by_market={"US": 10})
+    lines = census.summarize([row], now=NOW, max_age_days=7, seed_pool_by_market={"US": 10},
+                             extras=[{"kind": "drain_job_markets", "jobs": 3}])
     markets = {line["market"]: line for line in lines if line["kind"] == "by_market" and line["lane"] == "all"}
     assert markets["US"]["would_flip_per_market_rule"] == 1
     assert markets["AU"].get("would_flip_per_market_rule", 0) == 0
     assert markets["AU"]["would_flip"] == 1
+    assert {"kind": "drain_job_markets", "jobs": 3} in lines
+    assert {"kind": "served_market_currency", "pairs": [["SG", "SGD"], ["US", "USD"]]} in lines
 
 
 def test_census_file_carries_no_write_and_no_at_sign_after_round_two():

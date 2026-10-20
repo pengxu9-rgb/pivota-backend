@@ -11,6 +11,7 @@ in tests/test_crawl_fresh_trust_postgres.py.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -73,7 +74,8 @@ class CrawlFakeDb:
     """The product join, the quarantine list, the 246 column probe and the
     freshness statement, each recognised by text the real statement carries."""
 
-    def __init__(self, *, joined_rows, reads=None, column_present=True):
+    def __init__(self, *, joined_rows, reads=None, column_present=True, read_fails=False):
+        self.read_fails = read_fails
         self.joined_rows = list(joined_rows)
         self.reads = dict(reads or {})
         self.column_present = column_present
@@ -93,11 +95,14 @@ class CrawlFakeDb:
         self.queries.append((query, values))
         if "FROM catalog_source_quarantine" in query:
             return []
-        if query == upserter.CRAWL_LAST_PRICE_READ_SQL:
+        if query == upserter.CRAWL_ROW_PRICE_READ_SQL:
             assert self.column_present, "the statement naming price_checked_at was sent to a DB without it"
+            if self.read_fails:
+                raise RuntimeError("the freshness read failed")
+            assert values["now"].tzinfo is not None, "the batch clock must be UTC-aware"
             keys = values["product_keys"]
             return [
-                {"product_key": k, "last_price_read_at": self.reads[k]}
+                {"product_key": k, "row_price_read_at": self.reads[k]}
                 for k in keys
                 if self.reads.get(k) is not None
             ]
@@ -112,6 +117,9 @@ class CrawlFakeDb:
 
     def sent(self, sql):
         return [v for q, v in self.queries if q == sql]
+
+    def keys_sent(self):
+        return [v["product_keys"] for v in self.sent(upserter.CRAWL_ROW_PRICE_READ_SQL)]
 
     def written(self):
         return {v["subject_key"]: v for _, v in self.executes}
@@ -139,7 +147,7 @@ async def test_off_sends_no_extra_statement_and_writes_today_s_decision():
     assert params["serving_decision"] == "shadow"
     assert params["serving_reason_codes"] == [REASON_CODES.IDENTITY_CONFIDENCE_NULL]
     assert db.sent(PRICE_CHECK_COLUMN_SQL) == []
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == []
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL) == []
 
 
 @pytest.mark.parametrize("value", ["", "0", "false", "off", "no", "enabled", "2"])
@@ -177,7 +185,8 @@ async def test_on_a_fresh_listing_is_written_public_with_the_trace_code(monkeypa
         REASON_CODES.CRAWL_FRESH,
         REASON_CODES.PUBLIC_PASSTHROUGH,
     ]
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == [{"product_keys": [RETAILER_PK]}]
+    assert db.keys_sent() == [[RETAILER_PK]]
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL)[0]["now"] == NOW
 
 
 async def test_on_a_stale_listing_is_today_s_decision(monkeypatch):
@@ -198,7 +207,7 @@ async def test_on_without_the_246_column_nothing_names_it_and_nothing_moves(monk
     _switch_on(monkeypatch)
     db = CrawlFakeDb(joined_rows=[retailer_row()], reads={RETAILER_PK: NOW}, column_present=False)
     assert await _write_one(db) == off
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == []
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL) == []
 
 
 async def test_on_a_failed_column_probe_reads_as_absent(monkeypatch):
@@ -213,7 +222,7 @@ async def test_on_a_failed_column_probe_reads_as_absent(monkeypatch):
     db = ProbeFails(joined_rows=[retailer_row()], reads={RETAILER_PK: NOW})
     params = await _write_one(db)
     assert params["serving_decision"] == "shadow"
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == []
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL) == []
 
 
 async def test_on_a_batch_with_no_retailer_listing_sends_nothing_extra(monkeypatch):
@@ -221,7 +230,7 @@ async def test_on_a_batch_with_no_retailer_listing_sends_nothing_extra(monkeypat
     db = CrawlFakeDb(joined_rows=[make_joined_row()])
     await _write_one(db, pk="pk_internal_1")
     assert db.sent(PRICE_CHECK_COLUMN_SQL) == []
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == []
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL) == []
 
 
 async def test_a_fresh_brand_official_row_is_written_public_with_the_same_code(monkeypatch):
@@ -253,9 +262,7 @@ async def test_on_only_drain_lane_rows_are_looked_up_and_only_they_get_the_input
                                               "ext:mirror-slug::0123abcd": NOW})
     fresh = await upserter._crawl_fresh_by_key(db, rows, NOW)
     assert fresh == {RETAILER_PK: True, OTHER_RETAILER_PK: False, BRAND_PK: True}
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == [
-        {"product_keys": sorted([RETAILER_PK, OTHER_RETAILER_PK, BRAND_PK])}
-    ]
+    assert db.keys_sent() == [sorted([RETAILER_PK, OTHER_RETAILER_PK, BRAND_PK])]
 
 
 @pytest.mark.parametrize("days,age_days,decision", [(3, 4, "shadow"), (5, 4, "public"), (4, 4, "public")])
@@ -308,10 +315,7 @@ async def test_bulk_path_asks_once_per_batch(monkeypatch):
     await upserter.upsert_catalog_row_trust_many(
         db=db, product_keys=[RETAILER_PK, OTHER_RETAILER_PK], now=NOW, limit=1
     )
-    assert db.sent(upserter.CRAWL_LAST_PRICE_READ_SQL) == [
-        {"product_keys": [RETAILER_PK]},
-        {"product_keys": [OTHER_RETAILER_PK]},
-    ]
+    assert db.keys_sent() == [[RETAILER_PK], [OTHER_RETAILER_PK]]
 
 
 async def test_quarantine_refresh_path(monkeypatch):
@@ -357,33 +361,46 @@ async def test_primary_readiness_and_the_cron_reach_the_upserter_entry_points():
 
 
 def test_the_statement_is_pinned():
-    assert upserter.CRAWL_LAST_PRICE_READ_SQL == (
-        "SELECT k.product_key, r.last_price_read_at\n"
-        "  FROM unnest(CAST(:product_keys AS text[])) AS k(product_key)\n"
-        " CROSS JOIN LATERAL (\n"
-        "   SELECT max(co.price_checked_at) AS last_price_read_at\n"
-        "     FROM catalog_offers co\n"
-        "    WHERE co.product_key = k.product_key\n"
+    """Byte for byte: the PIVOTA-Agent twin copies this statement."""
+    assert upserter.CRAWL_ROW_PRICE_READ_SQL == (
+        'SELECT k.product_key, r.row_price_read_at\n'
+        '  FROM unnest(CAST(:product_keys AS text[])) AS k(product_key)\n'
+        ' CROSS JOIN LATERAL (\n'
+        '   SELECT CASE WHEN count(*) > 0\n'
+        "                AND bool_and((CASE WHEN co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) IS NOT NULL)\n"
+        "                AND bool_or(lower(btrim(coalesce(co.availability, ''))) NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable'))\n"
+        "               THEN min(CASE WHEN co.price_checked_at <= CAST(:now AS timestamptz) AND upper(btrim(coalesce(co.offer_payload->>'declared_market', ''))) = upper(btrim(coalesce(co.market, ''))) AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit' THEN co.price_checked_at END) END AS row_price_read_at\n"
+        '     FROM catalog_offers co\n'
+        '    WHERE co.product_key = k.product_key\n'
         "      AND co.source_system = 'catalog_enrichment_agent_v1'\n"
-        "      AND co.suppressed_at IS NULL\n"
-        "      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n"
-        "      AND co.price_checked_at IS NOT NULL\n"
-        "      AND co.price_checked_at <= now()\n"
-        "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref),"
-        " E' \\t\\n\\r\\f\\v') ~ '^https?://\\S+$'\n"
+        '      AND co.suppressed_at IS NULL\n'
+        '      AND coalesce(co.merchant_effective_price, co.list_price) > 0\n'
+        "      AND btrim(coalesce(co.offer_payload->>'destination_url', co.source_ref), E' \\t\\n\\r\\f\\v') ~ '^https?://\\S+$'\n"
         "      AND coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'\n"
-        "      AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
-        " IN (('SG', 'SGD'), ('US', 'USD'))\n"
-        "      AND lower(btrim(coalesce(co.availability, '')))"
-        " NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable')\n"
-        "      AND coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit'\n"
-        "      AND (co.sku_key IS DISTINCT FROM k.product_key || '::canonical'"
-        " OR NOT EXISTS (SELECT 1 FROM catalog_offers cv WHERE cv.product_key = k.product_key"
-        " AND cv.sku_key IS DISTINCT FROM k.product_key || '::canonical'"
-        " AND cv.source_system = 'catalog_enrichment_agent_v1' AND cv.suppressed_at IS NULL))\n"
-        " ) r\n"
-        " WHERE r.last_price_read_at IS NOT NULL\n"
+        "      AND (upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, '')))) IN (('SG', 'SGD'), ('US', 'USD'))\n"
+        ' ) r\n'
+        ' WHERE r.row_price_read_at IS NOT NULL\n'
     )
+
+
+def test_the_served_pairs_fixture_is_current():
+    import json
+
+    from scripts.generate_crawl_fresh_served_markets import served_markets_json
+
+    committed = (Path(__file__).resolve().parent.parent / "config/crawl_fresh_served_markets.json").read_text()
+    assert committed == served_markets_json()
+    pairs = json.loads(committed)["served_market_currency"]
+    assert [tuple(p) for p in pairs] == list(upserter.CRAWL_SERVED_MARKET_CURRENCY_PAIRS)
+    assert upserter.CRAWL_SERVED_MARKET_CURRENCY_PAIRS == (("SG", "SGD"), ("US", "USD"))
+
+
+def test_the_declared_market_key_is_the_drain_s():
+    from services.retailer_ingest.pipeline import DECLARED_MARKET_KEY
+
+    assert upserter.CRAWL_DECLARED_MARKET_KEY == DECLARED_MARKET_KEY == "declared_market"
+    assert "offer_payload->>'declared_market'" in upserter.CRAWL_OFFER_DECLARED_MARKET_SQL
+    assert upserter.CRAWL_OFFER_DECLARED_MARKET_SQL in upserter.CRAWL_OFFER_VALID_READ_SQL
 
 
 def test_the_market_and_stock_fragments_come_from_the_registries():
@@ -406,9 +423,11 @@ def test_the_read_source_key_is_the_writer_s():
 
 
 def test_the_recheck_shares_the_input_statement_s_rule():
-    inner = upserter.crawl_last_price_read_lateral_sql("crt.subject_key")
+    inner = upserter.crawl_row_price_read_lateral_sql("crt.subject_key")
     assert inner in upserter.CRAWL_FRESH_RECHECK_SQL
-    assert upserter.crawl_last_price_read_lateral_sql("k.product_key") in upserter.CRAWL_LAST_PRICE_READ_SQL
+    assert "JOIN catalog_products cp ON cp.product_key = crt.subject_key" in upserter.CRAWL_FRESH_RECHECK_SQL
+    assert "JOIN catalog_products cp ON cp.product_key = crt.subject_key" in upserter._CRAWL_FRESH_ROWS_ALL_SQL
+    assert upserter.crawl_row_price_read_lateral_sql("k.product_key") in upserter.CRAWL_ROW_PRICE_READ_SQL
     assert "@> CAST(ARRAY['CRAWL_FRESH'] AS text[])" in upserter.CRAWL_FRESH_RECHECK_SQL
 
 
@@ -418,12 +437,16 @@ def test_the_recheck_shares_the_input_statement_s_rule():
 
 
 class RecheckFakeDb(CrawlFakeDb):
-    def __init__(self, *, expiring=(), all_crawl_fresh=(), **kw):
+    def __init__(self, *, expiring=(), all_crawl_fresh=(), orphans=(), **kw):
         super().__init__(**kw)
+        self.orphans = list(orphans)
         self.expiring = list(expiring)
         self.all_crawl_fresh = list(all_crawl_fresh)
 
     async def fetch_all(self, query, values=None):
+        if query == upserter._CRAWL_FRESH_ORPHAN_DEMOTE_SQL:
+            self.queries.append((query, dict(values or {})))
+            return [{"subject_key": k} for k in self.orphans]
         if query == upserter.CRAWL_FRESH_RECHECK_SQL:
             self.queries.append((query, dict(values or {})))
             assert self.column_present
@@ -434,21 +457,22 @@ class RecheckFakeDb(CrawlFakeDb):
         return await super().fetch_all(query, values)
 
 
-async def test_recheck_on_selects_the_rows_that_may_age_out_and_re_derives_them(monkeypatch):
+async def test_recheck_on_selects_the_rows_that_have_aged_out_and_re_derives_them(monkeypatch):
     _switch_on(monkeypatch, days=7)
     db = RecheckFakeDb(expiring=[RETAILER_PK], joined_rows=[retailer_row()],
                        reads={RETAILER_PK: NOW - timedelta(days=8)})
-    keys = await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW)
+    keys = await upserter.recheck_crawl_fresh_rows(db=db, now=NOW)
     assert keys == [RETAILER_PK]
     sent = db.sent(upserter.CRAWL_FRESH_RECHECK_SQL)
-    assert sent == [{"cutoff": NOW - timedelta(days=7) + timedelta(hours=6), "limit": 20_000}]
+    assert sent == [{"cutoff": NOW - timedelta(days=7), "now": NOW, "limit": 20_000}]
+    assert db.sent(upserter._CRAWL_FRESH_ORPHAN_DEMOTE_SQL) == [{"limit": 20_000}]
     assert db.written()[RETAILER_PK]["serving_decision"] == "shadow"
 
 
 async def test_recheck_off_re_derives_every_crawl_fresh_row(monkeypatch):
     db = RecheckFakeDb(all_crawl_fresh=[RETAILER_PK], joined_rows=[retailer_row()],
                        reads={RETAILER_PK: NOW})
-    keys = await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW, limit=5)
+    keys = await upserter.recheck_crawl_fresh_rows(db=db, now=NOW, limit=5)
     assert keys == [RETAILER_PK]
     assert db.sent(upserter._CRAWL_FRESH_ROWS_ALL_SQL) == [{"limit": 5}]
     assert db.sent(upserter.CRAWL_FRESH_RECHECK_SQL) == []
@@ -459,7 +483,7 @@ async def test_recheck_off_re_derives_every_crawl_fresh_row(monkeypatch):
 async def test_recheck_without_the_246_column_falls_back_to_every_row(monkeypatch):
     _switch_on(monkeypatch)
     db = RecheckFakeDb(all_crawl_fresh=[], joined_rows=[], column_present=False)
-    assert await upserter.recheck_crawl_fresh_rows(db=db, lead_hours=6, now=NOW) == []
+    assert await upserter.recheck_crawl_fresh_rows(db=db, now=NOW) == []
     assert db.sent(upserter.CRAWL_FRESH_RECHECK_SQL) == []
     assert db.executes == []
 
@@ -475,8 +499,8 @@ async def test_the_cron_rechecks_first_and_leaves_those_keys_out_of_its_pass(mon
 
     calls = []
 
-    async def fake_recheck(*, db, lead_hours, **kw):
-        calls.append(("recheck", lead_hours))
+    async def fake_recheck(*, db, **kw):
+        calls.append(("recheck", kw))
         return ["pk_a"]
 
     async def fake_many(*, db, product_keys, **kw):
@@ -497,7 +521,7 @@ async def test_the_cron_rechecks_first_and_leaves_those_keys_out_of_its_pass(mon
     monkeypatch.setattr(upserter, "recheck_crawl_fresh_rows", fake_recheck)
     monkeypatch.setattr(upserter, "upsert_catalog_row_trust_many", fake_many)
     await cron.run_catalog_row_trust_backfill_tick()
-    assert calls[0] == ("recheck", 6.0)
+    assert calls[0] == ("recheck", {})
     assert ("many", ["pk_b"]) in calls
 
 
@@ -532,4 +556,130 @@ async def test_a_failed_recheck_does_not_cost_the_pass(monkeypatch):
 def test_the_statement_binds_only_the_key_list():
     from sqlalchemy import text
 
-    assert set(text(upserter.CRAWL_LAST_PRICE_READ_SQL)._bindparams) == {"product_keys"}
+    assert set(text(upserter.CRAWL_ROW_PRICE_READ_SQL)._bindparams) == {"product_keys", "now"}
+    assert set(text(upserter.CRAWL_FRESH_RECHECK_SQL)._bindparams) == {"cutoff", "now", "limit"}
+
+
+# ---------------------------------------------------------------------------
+# Round 3
+# ---------------------------------------------------------------------------
+
+
+async def test_a_failed_freshness_read_fails_closed_and_still_writes_the_batch(monkeypatch, caplog):
+    """Flag-off verdicts for the batch, the event logged, nothing raised (the twin does the same)."""
+    import logging
+
+    off = await _write_one(CrawlFakeDb(joined_rows=[retailer_row()]))
+    _switch_on(monkeypatch)
+    db = CrawlFakeDb(joined_rows=[retailer_row()], reads={RETAILER_PK: NOW}, read_fails=True)
+    with caplog.at_level(logging.WARNING, logger=upserter.logger.name):
+        assert await _write_one(db) == off
+    assert any("catalog_row_trust_crawl_fresh_read_failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failed_probe_fails_closed_too(monkeypatch):
+    _switch_on(monkeypatch)
+
+    class ProbeBoom(CrawlFakeDb):
+        async def fetch_one(self, query, values=None):
+            if query == PRICE_CHECK_COLUMN_SQL:
+                raise RuntimeError("boom")
+            return await super().fetch_one(query, values)
+
+    fresh = await upserter._crawl_fresh_by_key(ProbeBoom(joined_rows=[]), [retailer_row()], NOW)
+    assert fresh is None
+
+
+async def test_a_naive_clock_is_read_as_utc(monkeypatch):
+    _switch_on(monkeypatch)
+    db = CrawlFakeDb(joined_rows=[retailer_row()], reads={RETAILER_PK: NOW - timedelta(days=1)})
+    fresh = await upserter._crawl_fresh_by_key(db, [retailer_row()], NOW.replace(tzinfo=None))
+    assert fresh == {RETAILER_PK: True}
+    assert db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL)[0]["now"] == NOW
+
+
+async def test_each_batch_binds_its_own_clock(monkeypatch):
+    _switch_on(monkeypatch)
+    db = _paths_db()
+    await upserter.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER_PK, OTHER_RETAILER_PK], limit=1)
+    clocks = [v["now"] for v in db.sent(upserter.CRAWL_ROW_PRICE_READ_SQL)]
+    assert len(clocks) == 2 and clocks[0] <= clocks[1] and all(c.tzinfo is not None for c in clocks)
+
+
+def test_the_recheck_clock_is_utc_aware():
+    assert upserter._utc(NOW.replace(tzinfo=None)) == NOW
+    assert upserter._utc(None).tzinfo is not None
+
+
+async def test_orphans_are_demoted_and_a_failed_batch_is_not_reported_as_rechecked(monkeypatch):
+    _switch_on(monkeypatch)
+    db = RecheckFakeDb(expiring=[RETAILER_PK, "ext:retailer:gone"], orphans=["ext:retailer:orphan"],
+                       joined_rows=[retailer_row()], reads={})
+    keys = await upserter.recheck_crawl_fresh_rows(db=db, now=NOW)
+    # "ext:retailer:gone" has no catalog row in the fake: not written, not reported
+    assert keys == [RETAILER_PK]
+
+
+async def test_the_written_keys_out_param(monkeypatch):
+    db = _paths_db()
+    written = []
+    await upserter.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER_PK, "nope"], written_keys=written)
+    assert written == [RETAILER_PK]
+
+
+async def test_the_hourly_tick_runs_the_recheck_and_honours_the_backfill_switch(monkeypatch):
+    from jobs import catalog_row_trust_backfill_cron as cron
+
+    calls = []
+
+    async def fake_recheck(*, db, **kw):
+        calls.append(db)
+        return []
+
+    import db.database as dbmod
+
+    monkeypatch.setattr(dbmod, "database", object())
+    monkeypatch.setattr(upserter, "recheck_crawl_fresh_rows", fake_recheck)
+    await cron.run_catalog_row_trust_crawl_fresh_recheck_tick()
+    assert len(calls) == 1
+    monkeypatch.setenv("CATALOG_TRUST_BACKFILL_ENABLED", "false")
+    await cron.run_catalog_row_trust_crawl_fresh_recheck_tick()
+    assert len(calls) == 1
+
+
+def test_the_hourly_recheck_is_scheduled():
+    import inspect
+
+    from services import audit_scheduler
+
+    source = inspect.getsource(audit_scheduler)
+    assert 'id="catalog_row_trust_crawl_fresh_recheck"' in source
+    assert "run_catalog_row_trust_crawl_fresh_recheck_tick" in source
+
+
+def test_the_boot_log_names_the_switch_and_n(monkeypatch):
+    import utils.logger as ulog
+
+    lines = []
+
+    class Rec:
+        def warning(self, msg, *args):
+            lines.append(msg % args)
+
+    monkeypatch.setattr(ulog, "logger", Rec())
+    _switch_on(monkeypatch, days=3)
+    upserter.log_crawl_fresh_config("worker")
+    assert lines == [
+        "catalog_row_trust_crawl_fresh_config component=worker enabled=True days=3.0 "
+        "recheck_limit=20000 served_market_currency=SG:SGD,US:USD"
+    ]
+
+
+def test_the_boot_log_is_wired_into_every_runtime():
+    import inspect
+
+    import jobs.retailer_ingest_drain as drain
+
+    assert 'log_crawl_fresh_config("retailer_ingest_drain")' in inspect.getsource(drain)
+    main_source = (Path(__file__).resolve().parent.parent / "main.py").read_text()
+    assert "log_crawl_fresh_config(" in main_source

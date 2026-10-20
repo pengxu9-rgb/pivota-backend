@@ -421,9 +421,10 @@ def is_crawl_fresh(
 ) -> bool:
     """Was the listing's price read within ``max_age_days`` of ``now``?
 
-    ``last_price_read_at`` is the newest ``catalog_offers.price_checked_at``
-    among the row's qualifying offers (the upserter's
-    CRAWL_LAST_PRICE_READ_SQL). NULL / unparseable = never read = not fresh.
+    ``last_price_read_at`` is the row's price-read date: since round 3 the
+    OLDEST valid read across EVERY live offer of the qualifying class (the
+    upserter's CRAWL_ROW_PRICE_READ_SQL), NULL as soon as one has none.
+    NULL / unparseable = not fresh.
     Fresh iff 0 <= age <= N days, in seconds, INCLUSIVE at both ends. A stamp
     dated AFTER ``now`` is STALE (round 2): a future date is not a read anyone
     can vouch for, and scripts/ops/relgraph_freshness_refresh treats it the

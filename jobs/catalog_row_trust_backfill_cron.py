@@ -31,10 +31,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_LIMIT = 50_000
 _DEFAULT_DRIFT_ALERT_THRESHOLD = 50
-# The schedule's period (services/audit_scheduler: hour="*/6"). The CRAWL_FRESH
-# recheck looks this far ahead, so a row that ages out before the next tick is
-# re-derived on that tick at the latest.
-_TICK_HOURS = 6.0
 _ENV_ENABLED = "CATALOG_TRUST_BACKFILL_ENABLED"
 _ENV_LIMIT = "CATALOG_TRUST_BACKFILL_LIMIT"
 _ENV_DRIFT_THRESHOLD = "CATALOG_TRUST_DRIFT_ALERT_THRESHOLD"
@@ -83,16 +79,18 @@ async def run_catalog_row_trust_backfill_tick() -> None:
             upsert_catalog_row_trust_many,
         )
 
-        # CRAWL_FRESH decay recheck FIRST (services/catalog_row_trust_upserter,
-        # round 2). The pass below cannot be trusted to reach a row that went
-        # public on a crawl read: it is oldest-updated_at first and the UPSERT
-        # only writes on a change, so an unchanged catalog keeps its head of
-        # queue and, above `limit` rows, a flipped row is never re-derived when
-        # its read ages out. Its own try: a failed recheck must not cost the
-        # pass, and the pass must not hide a failed recheck.
+        # CRAWL_FRESH decay recheck FIRST (services/catalog_row_trust_upserter).
+        # The pass below cannot be trusted to reach a row that went public on a
+        # crawl read: it is oldest-updated_at first and the UPSERT only writes
+        # on a change, so an unchanged catalog keeps its head of queue and,
+        # above `limit` rows, a flipped row is never re-derived when its read
+        # ages out. The hourly tick below runs the same recheck; this one keeps
+        # the 6h pass from re-deriving those keys twice. Its own try: a failed
+        # recheck must not cost the pass, and the pass must not hide a failed
+        # recheck. Only keys the recheck actually WROTE leave the pass.
         rechecked: set = set()
         try:
-            rechecked = set(await recheck_crawl_fresh_rows(db=database, lead_hours=_TICK_HOURS))
+            rechecked = set(await recheck_crawl_fresh_rows(db=database))
             if rechecked:
                 logger.warning(
                     "catalog_trust_backfill: re-derived %d CRAWL_FRESH rows ahead of the pass",
@@ -155,3 +153,24 @@ async def run_catalog_row_trust_backfill_tick() -> None:
             )
     except Exception:
         logger.exception("catalog_trust_backfill: tick failed")
+
+
+async def run_catalog_row_trust_crawl_fresh_recheck_tick() -> None:
+    """Hourly (services/audit_scheduler, minute 47): the CRAWL_FRESH decay recheck
+    alone, so an expired row is re-derived within the hour instead of the 6h
+    tick. Paused with the backfill (CATALOG_TRUST_BACKFILL_ENABLED): decay is
+    then stopped too -- see the bound in services/catalog_row_trust_upserter."""
+    if not _is_enabled():
+        logger.debug("catalog_trust_crawl_fresh_recheck: disabled via %s", _ENV_ENABLED)
+        return
+    try:
+        from db.database import database
+        from services.catalog_row_trust_upserter import recheck_crawl_fresh_rows
+
+        rechecked = await recheck_crawl_fresh_rows(db=database)
+        if rechecked:
+            logger.warning(
+                "catalog_trust_crawl_fresh_recheck: re-derived %d CRAWL_FRESH rows", len(rechecked)
+            )
+    except Exception:
+        logger.exception("catalog_trust_crawl_fresh_recheck: tick failed")

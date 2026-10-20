@@ -46,8 +46,9 @@ CREATE TABLE external_product_seeds (
   id text, external_product_id text, attached_product_key text, status text,
   seed_kind text, merchant_id text, source text, product_key text,
   source_product_id text, domain text, title text, seed_data jsonb, market text,
-  created_at timestamptz, updated_at timestamptz
+  created_at timestamptz, updated_at timestamptz, price_amount double precision
 );
+CREATE TABLE retailer_ingest_jobs (id text PRIMARY KEY, domain text, brand text, options jsonb);
 CREATE TABLE index_pipeline_state (
   content_key text PRIMARY KEY, serving_eligible boolean, index_eligible boolean,
   pipeline_stage text, blocker_code text, blocker_detail text,
@@ -142,7 +143,7 @@ async def _connect(schema):
 
     db = databases.Database(_url(), server_settings={"search_path": schema})
     await db.connect()
-    for table in ("catalog_offers", "catalog_products", "external_product_seeds",
+    for table in ("catalog_offers", "catalog_products", "external_product_seeds", "retailer_ingest_jobs",
                   "index_pipeline_state", "content_canonical_election", "pdp_identity_listing",
                   "catalog_row_trust", "catalog_source_quarantine"):
         await db.execute(f"DELETE FROM {table}")
@@ -203,12 +204,17 @@ _N = [0]
 
 async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="https://shop.example.com/p/1",
                  payload_link=None, suppressed=False, affiliate=False, market="US", currency="USD",
-                 availability="in_stock", variant=None, read_source=None):
+                 availability="in_stock", variant=None, read_source=None, declared=True):
+    """A HAND-BUILT offer row (the statement's own cases). `declared` stamps
+    offer_payload.declared_market = market, as the drain does for an explicit
+    options.market; the real writers run in test_crawl_fresh_real_producers_postgres."""
     import json
 
     _N[0] += 1
     oid = f"offer_{_N[0]}"
     payload = {"validated_at": "affiliate_feed:net" if affiliate else "2026-10-01"}
+    if declared:
+        payload["declared_market"] = market
     if payload_link is not None:
         payload["destination_url"] = payload_link
     if read_source is not None:
@@ -226,11 +232,17 @@ async def _offer(db, pk, *, read_at, source_system=DRAIN, price=20.0, link="http
     return oid
 
 
-async def _reads(db, keys):
-    from services.catalog_row_trust_upserter import CRAWL_LAST_PRICE_READ_SQL
+async def _reads(db, keys, now=None):
+    from services.catalog_row_trust_upserter import CRAWL_ROW_PRICE_READ_SQL
 
-    rows = await db.fetch_all(CRAWL_LAST_PRICE_READ_SQL, {"product_keys": keys})
-    return {r["product_key"]: r["last_price_read_at"] for r in rows}
+    rows = await db.fetch_all(CRAWL_ROW_PRICE_READ_SQL, {"product_keys": keys, "now": now or _db_now()})
+    return {r["product_key"]: r["row_price_read_at"] for r in rows}
+
+
+def _db_now():
+    from datetime import datetime as _dt
+
+    return _dt.now(timezone.utc)
 
 
 async def _trust(db, pk):
@@ -244,23 +256,79 @@ async def _trust(db, pk):
 # ---------------------------------------------------------------------------
 
 
-async def test_the_statement_takes_the_newest_qualifying_read_only(db):
+async def test_the_row_read_is_the_oldest_read_of_every_class_offer(db):
     await _product(db, RETAILER)
-    newest = NOW - timedelta(days=1)
-    await _offer(db, RETAILER, read_at=NOW - timedelta(days=3))
-    await _offer(db, RETAILER, read_at=newest)
-    # Each of these is NEWER and must be ignored:
-    await _offer(db, RETAILER, read_at=NOW, suppressed=True)
-    await _offer(db, RETAILER, read_at=NOW, source_system="shopify_markets_us_localization")
-    await _offer(db, RETAILER, read_at=NOW, affiliate=True)
-    await _offer(db, RETAILER, read_at=NOW, link="ftp://shop.example.com/p/1")
-    await _offer(db, RETAILER, read_at=NOW, link="https://shop.example.com/p 1")
-    await _offer(db, RETAILER, read_at=NOW, link="/p/1")
-    await _offer(db, RETAILER, read_at=NOW, price=0)
-    await _offer(db, RETAILER, read_at=NOW, price=None)
-    await _offer(db, RETAILER, read_at=NOW, link=None, payload_link="not a url")
-    await _offer(db, RETAILER, read_at=None)
-    assert await _reads(db, [RETAILER]) == {RETAILER: newest}
+    oldest = NOW - timedelta(days=3)
+    await _offer(db, RETAILER, read_at=oldest)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(days=1), variant="1")
+    # Outside the class: they neither date the row nor block it.
+    await _offer(db, RETAILER, read_at=None, suppressed=True)
+    await _offer(db, RETAILER, read_at=None, source_system="shopify_markets_us_localization")
+    await _offer(db, RETAILER, read_at=None, affiliate=True)
+    await _offer(db, RETAILER, read_at=None, link="ftp://shop.example.com/p/1")
+    await _offer(db, RETAILER, read_at=None, link="https://shop.example.com/p 1")
+    await _offer(db, RETAILER, read_at=None, link="/p/1")
+    await _offer(db, RETAILER, read_at=None, price=0)
+    await _offer(db, RETAILER, read_at=None, price=None)
+    await _offer(db, RETAILER, read_at=None, link=None, payload_link="not a url")
+    await _offer(db, RETAILER, read_at=None, market="AU", currency="AUD")   # not a served market
+    await _offer(db, RETAILER, read_at=None, currency="SGD")                # wrong currency for US
+    await _offer(db, RETAILER, read_at=None, market="SG", currency="USD")   # wrong currency for SG
+    assert await _reads(db, [RETAILER]) == {RETAILER: oldest}
+
+
+@pytest.mark.parametrize("bad", [
+    dict(read_at=None),                                        # never read
+    dict(read_at=NOW - timedelta(hours=1), read_source="employee_edit"),
+    dict(read_at=NOW + timedelta(hours=1)),                    # dated in the future
+    dict(read_at=NOW - timedelta(hours=1), declared=False),    # market defaulted, not declared
+    dict(read_at=NOW - timedelta(hours=1), market="SG", currency="SGD", declared=False),
+])
+async def test_one_class_offer_without_a_valid_read_makes_the_row_unread(db, bad):
+    """B1/B2/clock: one live served-market offer without a valid read -- whatever
+    its market -- and the row has no read at all."""
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2))
+    await _offer(db, RETAILER, link="https://shop.example.com/p/2", **bad)
+    assert await _reads(db, [RETAILER]) == {}
+
+
+async def test_a_fresh_market_does_not_carry_a_stale_one(db):
+    """B1: an SG read 2h old next to a US read 60 days old dates the row 60 days."""
+    await _product(db, RETAILER)
+    stale = NOW - timedelta(days=60)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2), market="SG", currency="SGD")
+    await _offer(db, RETAILER, read_at=stale, link="https://shop.example.com/p/2")
+    assert await _reads(db, [RETAILER]) == {RETAILER: stale}
+
+
+async def test_at_least_one_class_offer_must_be_in_stock(db):
+    await _product(db, RETAILER)
+    oid = await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1), availability="out_of_stock")
+    assert await _reads(db, [RETAILER]) == {}
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=2), availability=" In_Stock ", variant="2")
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=2)}
+    await db.execute("UPDATE catalog_offers SET availability = ' Sold_Out ' WHERE offer_id <> :o", {"o": oid})
+    assert await _reads(db, [RETAILER]) == {}
+
+
+async def test_a_stale_variant_makes_the_row_stale_and_a_suppressed_one_does_not(db):
+    await _product(db, RETAILER)
+    variant_read = NOW - timedelta(days=12)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))           # ::canonical, fresh
+    oid = await _offer(db, RETAILER, read_at=variant_read, variant="111")  # the variant, old
+    assert await _reads(db, [RETAILER]) == {RETAILER: variant_read}
+    await db.execute("UPDATE catalog_offers SET suppressed_at = now() WHERE offer_id = :o", {"o": oid})
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=1)}
+
+
+async def test_the_statement_binds_one_clock(db):
+    """:now decides 'future', not the database clock."""
+    await _product(db, RETAILER)
+    read = NOW - timedelta(hours=1)
+    await _offer(db, RETAILER, read_at=read)
+    assert await _reads(db, [RETAILER], now=read - timedelta(seconds=1)) == {}
+    assert await _reads(db, [RETAILER], now=read) == {RETAILER: read}
 
 
 async def test_the_statement_reads_the_payload_link_first_and_trims_it(db):
@@ -279,46 +347,13 @@ async def test_the_statement_answers_only_for_the_keys_asked_and_omits_unread_ro
     assert await _reads(db, [RETAILER_2, BRAND]) == {BRAND: NOW - timedelta(days=2)}
 
 
-async def test_round_two_the_statement_counts_only_per_market_in_stock_crawl_reads(db):
-    await _product(db, RETAILER)
-    good = NOW - timedelta(days=4)
-    await _offer(db, RETAILER, read_at=good)                              # US / USD, in stock
-    await _offer(db, RETAILER, read_at=NOW, market="AU", currency="AUD")  # not a served market
-    await _offer(db, RETAILER, read_at=NOW, currency="SGD")               # wrong currency for US
-    await _offer(db, RETAILER, read_at=NOW, market="SG", currency="USD")  # wrong currency for SG
-    await _offer(db, RETAILER, read_at=NOW, availability="out_of_stock")
-    await _offer(db, RETAILER, read_at=NOW, availability=" Sold_Out ")
-    await _offer(db, RETAILER, read_at=NOW, read_source="employee_edit")
-    await _offer(db, RETAILER, read_at=NOW + timedelta(hours=1))          # dated in the future
-    assert await _reads(db, [RETAILER]) == {RETAILER: good}
-    # a refresh read and a lower-case served market both count
-    newer = NOW - timedelta(days=2)
-    await _offer(db, RETAILER, read_at=newer, read_source="refresh", market=" sg ", currency="sgd")
-    assert await _reads(db, [RETAILER]) == {RETAILER: newer}
-
-
-async def test_round_two_a_canonical_stamp_proves_nothing_on_a_variant_row(db):
-    await _product(db, RETAILER)
-    await _product(db, RETAILER_2)
-    variant_read = NOW - timedelta(days=12)
-    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))            # ::canonical, fresh
-    await _offer(db, RETAILER, read_at=variant_read, variant="111")         # the variant, old
-    await _offer(db, RETAILER_2, read_at=NOW - timedelta(hours=1))          # single-variant row
-    assert await _reads(db, [RETAILER, RETAILER_2]) == {
-        RETAILER: variant_read, RETAILER_2: NOW - timedelta(hours=1)}
-    # a suppressed variant does not make the row variant-scoped
-    await db.execute("UPDATE catalog_offers SET suppressed_at = now() WHERE sku_key LIKE '%::v:111'")
-    assert await _reads(db, [RETAILER]) == {RETAILER: NOW - timedelta(hours=1)}
-
-
 async def test_a_price_moved_without_a_read_forgets_the_stamp_so_nothing_is_sticky(db):
     await _product(db, RETAILER)
-    old = NOW - timedelta(days=5)
-    await _offer(db, RETAILER, read_at=old)
     oid = await _offer(db, RETAILER, read_at=NOW)
+    assert await _reads(db, [RETAILER]) == {RETAILER: NOW}
     await db.execute("UPDATE catalog_offers SET list_price = 25, merchant_effective_price = 25"
                      " WHERE offer_id = :o", {"o": oid})
-    assert await _reads(db, [RETAILER]) == {RETAILER: old}
+    assert await _reads(db, [RETAILER]) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -449,20 +484,66 @@ async def test_round_two_a_row_whose_qualifying_offer_went_away_is_rechecked(db,
     await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER])
     assert (await _trust(db, RETAILER))["serving_decision"] == "public"
     await db.execute("UPDATE catalog_offers SET suppressed_at = now() WHERE offer_id = :o", {"o": oid})
-    assert await up.recheck_crawl_fresh_rows(db=db, lead_hours=6) == [RETAILER]
+    assert await up.recheck_crawl_fresh_rows(db=db) == [RETAILER]
     assert (await _trust(db, RETAILER))["serving_decision"] != "public"
 
 
-async def test_round_two_a_still_fresh_row_is_not_rechecked(db, monkeypatch):
+async def test_only_rows_that_have_aged_out_are_rechecked(db, monkeypatch):
     from services import catalog_row_trust_upserter as up
 
     await _product(db, RETAILER)
-    await _offer(db, RETAILER, read_at=NOW - timedelta(days=1))
+    await _offer(db, RETAILER, read_at=NOW - timedelta(days=6, hours=20))  # still inside N
     await _product(db, RETAILER_2)
-    await _offer(db, RETAILER_2, read_at=NOW - timedelta(days=6, hours=20))  # ages out within a tick
+    oid = await _offer(db, RETAILER_2, read_at=NOW - timedelta(days=1))
     monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
     await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER, RETAILER_2])
-    assert await up.recheck_crawl_fresh_rows(db=db, lead_hours=6) == [RETAILER_2]
+    await db.execute("UPDATE catalog_offers SET price_checked_at = now() - interval '7 days 1 hour'"
+                     " WHERE offer_id = :o", {"o": oid})
+    assert await up.recheck_crawl_fresh_rows(db=db) == [RETAILER_2]
+    assert (await _trust(db, RETAILER))["serving_decision"] == "public"
+    assert (await _trust(db, RETAILER_2))["serving_decision"] == "shadow"
+
+
+async def test_an_orphan_cannot_starve_the_recheck(db, monkeypatch):
+    """A CRAWL_FRESH trust row whose catalog row is gone is demoted directly and
+    never holds a slot: with limit=1 the live expired row is still re-derived."""
+    from services import catalog_row_trust_upserter as up
+
+    await _decay_fixture(db, monkeypatch)
+    orphan = "ext:retailer:" + "f" * 32
+    await db.execute(
+        "INSERT INTO catalog_row_trust (subject_type, subject_key, product_key, source_lifecycle_state,"
+        " identity_status, freshness_state, serving_decision, serving_reason_codes, policy_version, updated_at)"
+        " VALUES ('product', :pk, :pk, 'active', 'unknown', 'fresh', 'public',"
+        " CAST(ARRAY['CRAWL_FRESH','PUBLIC_PASSTHROUGH'] AS text[]), 'c1.v0.9', now() - interval '90 days')",
+        {"pk": orphan})
+    assert await up.recheck_crawl_fresh_rows(db=db, limit=1) == [RETAILER]
+    row = await db.fetch_one("SELECT serving_decision, serving_reason_codes, source_lifecycle_state"
+                             " FROM catalog_row_trust WHERE subject_key = :pk", {"pk": orphan})
+    assert (row["serving_decision"], list(row["serving_reason_codes"]), row["source_lifecycle_state"]) == (
+        "blocked", ["ROW_TOMBSTONED"], "tombstoned")
+    assert (await _trust(db, RETAILER))["serving_decision"] == "shadow"
+    # and the switched-off rollback is not starved by it either
+    assert await up.recheck_crawl_fresh_rows(db=db, limit=1) == []
+
+
+async def test_a_failed_read_inside_the_caller_s_transaction_writes_flag_off_verdicts(db, monkeypatch):
+    """Addition 5: fail closed per batch inside a SAVEPOINT -- the caller's
+    transaction survives, the batch is written with flag-off verdicts."""
+    from services import catalog_row_trust_upserter as up
+
+    await _product(db, RETAILER)
+    await _offer(db, RETAILER, read_at=NOW - timedelta(hours=1))
+    monkeypatch.setenv(up.CRAWL_FRESH_ENV, "1")
+    monkeypatch.setattr(up, "CRAWL_ROW_PRICE_READ_SQL",
+                        up.CRAWL_ROW_PRICE_READ_SQL.replace("co.price_checked_at", "co.no_such_column", 1))
+    async with db.transaction():
+        assert await up.upsert_catalog_row_trust_many(db=db, product_keys=[RETAILER]) == 1
+        # the outer transaction is still usable
+        assert await db.fetch_val("SELECT 1") == 1
+    row = await _trust(db, RETAILER)
+    assert row["serving_decision"] == "shadow"
+    assert list(row["serving_reason_codes"]) == ["IDENTITY_CONFIDENCE_NULL"]
 
 
 async def test_the_column_probe_answers_both_ways(db, db_no_246):
@@ -527,6 +608,18 @@ async def _census_fixture(db):
     await db.execute("INSERT INTO external_product_seeds (id, status, market) VALUES"
                      " ('pool_1', 'active', 'US'), ('pool_2', 'active', 'us'), ('pool_3', 'inactive', 'US'),"
                      " ('pool_4', 'active', 'SG')")
+    # B2's trade-off: drain jobs with and without an explicit market
+    await db.execute("INSERT INTO retailer_ingest_jobs (id, domain, brand, options) VALUES"
+                     " ('j1', 'shop.example.com', 'x', CAST('{}' AS jsonb)),"
+                     " ('j2', 'shop.example.com', 'y', CAST(:us AS jsonb)),"
+                     " ('j3', 'brand.example.com', 'z', CAST(:sg AS jsonb))",
+                     {"us": '{"market": "US"}', "sg": '{"market": "SG"}'})
+    # employee-edit dry run: b_never's seed price was set by hand (it differs from the page read)
+    snapshot = '{"snapshot": {"price_amount": "20.00"}}'
+    await db.execute("UPDATE external_product_seeds SET price_amount = 25, seed_data = CAST(:sd AS jsonb)"
+                     " WHERE attached_product_key = :pk", {"pk": keys["b_never"], "sd": snapshot})
+    await db.execute("UPDATE external_product_seeds SET price_amount = 20, seed_data = CAST(:sd AS jsonb)"
+                     " WHERE attached_product_key = :pk", {"pk": keys["r_fresh"], "sd": snapshot})
     await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()) + [OTHER])
     return keys
 
@@ -556,6 +649,15 @@ async def test_census_counts_by_lane_bucket_market_host(db):
     assert total["would_flip"] == 2
     assert total["would_flip_per_market_rule"] == 2
     assert total["would_flip_on_out_of_stock_only_offer"] == 0
+    jobs = _by(lines, "drain_job_markets")[0]
+    assert (jobs["jobs"], jobs["jobs_with_explicit_market"]) == (3, 2)
+    assert jobs["by_market"] == {"(default)": {"jobs": 1, "hosts": 1}, "US": {"jobs": 1, "hosts": 1},
+                                 "SG": {"jobs": 1, "hosts": 1}}
+    edited = _by(lines, "employee_edit_dry_run")[0]
+    assert (edited["rows_with_hand_edited_seed"], edited["hand_edited_seeds"]) == (1, 1)
+    assert _by(lines, "served_market_currency")[0]["pairs"] == [["SG", "SGD"], ["US", "USD"]]
+    assert total["would_flip_lost_to_undeclared_market"] == 0
+    assert total["fresh_in_one_market_stale_in_another"] == 0
     coverage = _by(lines, "backfill_coverage")[0]
     assert coverage["catalog_products"] == 9 and coverage["trust_rows"] == 7
     assert coverage["crawl_fresh_rows"] == 0
@@ -601,13 +703,13 @@ async def test_census_counts_by_lane_bucket_market_host(db):
 
 
 async def test_census_per_market_rule_out_of_stock_and_variants(db):
-    """Round 2 (b) and (c): the per-market rule against the max-any rule."""
+    """The final per-market rule against the max-any rule, B1 and B2 sized."""
     from scripts import census_retailer_crawl_fresh_trust as census
     from services import catalog_row_trust_upserter as up
 
     keys = {k: "ext:retailer:" + c * 32 for k, c in
             (("ok", "1"), ("oos", "2"), ("cross", "3"), ("variant", "4"), ("future", "5"), ("edit", "6"),
-             ("cur", "7"))}
+             ("cur", "7"), ("b1", "8"), ("undeclared", "9"))}
     for pk in keys.values():
         await _product(db, pk)
     fresh, stale = NOW - timedelta(days=1), NOW - timedelta(days=20)
@@ -627,6 +729,11 @@ async def test_census_per_market_rule_out_of_stock_and_variants(db):
     await _offer(db, keys["edit"], read_at=fresh, read_source="employee_edit")
     # US market, but priced in another currency
     await _offer(db, keys["cur"], read_at=fresh, currency="SGD")
+    # B1: fresh in SG, a stale live US offer
+    await _offer(db, keys["b1"], read_at=fresh, market="SG", currency="SGD")
+    await _offer(db, keys["b1"], read_at=stale, link="https://shop.example.com/p/2")
+    # B2: fresh, but its market was defaulted, not declared
+    await _offer(db, keys["undeclared"], read_at=fresh, declared=False)
     await up.upsert_catalog_row_trust_many(db=db, product_keys=list(keys.values()))
 
     conn = await _asyncpg(_SCHEMA)
@@ -635,15 +742,18 @@ async def test_census_per_market_rule_out_of_stock_and_variants(db):
     finally:
         await conn.close()
     total = _by(lines, "summary", lane="all")[0]
-    assert total["would_flip_max_any_rule"] == 7
+    assert total["would_flip_max_any_rule"] == 9
     assert total["would_flip_per_market_rule"] == 1
-    assert total["would_flip_max_any_not_per_market"] == 6
+    assert total["would_flip_max_any_not_per_market"] == 8
     assert total["would_flip_on_out_of_stock_only_offer"] == 1
+    assert total["would_flip_without_declared_market_requirement"] == 2
+    assert total["would_flip_lost_to_undeclared_market"] == 1
+    assert total["fresh_in_one_market_stale_in_another"] == 1
     markets = {line["market"]: line for line in _by(lines, "by_market", lane="all")}
     assert markets["US"]["would_flip_per_market_rule"] == 1
     assert markets["AU"]["would_flip"] == 1 and markets["AU"].get("would_flip_per_market_rule", 0) == 0
     proj = {(line["rule"], line["scenario"]): line for line in _by(lines, "projection", lane="all")}
-    assert proj[("max_any", "no_reread")]["by_day"]["0"] == 7
+    assert proj[("max_any", "no_reread")]["by_day"]["0"] == 9
     assert proj[("per_market", "no_reread")]["by_day"]["0"] == 1
 
 
@@ -711,13 +821,16 @@ async def test_census_last_read_equals_the_upserter_statement(db):
     await _offer(db, keys["b_fresh"], read_at=NOW - timedelta(days=9), variant="9")
     # a SUPPRESSED variant does not make r_fresh variant-scoped
     await _offer(db, keys["r_fresh"], read_at=None, variant="5", suppressed=True)
-    expected = await _reads(db, list(keys.values()))
     conn = await _asyncpg(_SCHEMA)
     try:
-        rows = {r["product_key"]: r["last_strict_read_at"] for r in await conn.fetch(census.census_sql())}
+        db_now = await conn.fetchval("SELECT now()")
+        rows = {r["product_key"]: census.classify(dict(r), now=db_now, max_age_days=7)["strict_read_at"]
+                for r in await conn.fetch(census.census_sql())}
     finally:
         await conn.close()
+    expected = await _reads(db, list(keys.values()), now=db_now)
     assert set(rows) == set(keys.values())
     assert {k: v for k, v in rows.items() if v is not None} == expected
-    assert expected[keys["r_fresh"]] == NOW - timedelta(days=1, hours=20)
-    assert keys["b_fresh"] in expected  # its variant row (9 days old) is the read now
+    # r_fresh: its out-of-stock and employee-edited offers are in the class, so it has no read
+    assert keys["r_fresh"] not in expected
+    assert expected[keys["b_fresh"]] == NOW - timedelta(days=9)  # every class offer counts

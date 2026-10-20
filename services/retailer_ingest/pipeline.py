@@ -338,6 +338,41 @@ def job_market(options: Optional[Dict[str, Any]]) -> str:
     return normalize_region((options or {}).get("market") or DEFAULT_MARKET)
 
 
+#: offer_payload key: the buyer market a drain job DECLARED explicitly (options.market), stamped on its
+#: offers by stamp_declared_market. catalog_offers.market is NOT NULL DEFAULT 'US' (mig 149) and job_market()
+#: falls back to DEFAULT_MARKET, so neither column nor fallback says the market was declared; this key does.
+#: Read by services/catalog_row_trust_upserter (CRAWL_DECLARED_MARKET_KEY, pinned equal by test): only an
+#: offer whose declared market equals its market column is a crawl read CRAWL_FRESH may count.
+DECLARED_MARKET_KEY = "declared_market"
+
+
+def stamp_declared_market(plan: Dict[str, Any], options: Optional[Dict[str, Any]]) -> int:
+    """Stamp offer_payload.declared_market on every planned offer the writer declared for the job's EXPLICIT
+    options.market (validate_options has normalized it). Never the DEFAULT_MARKET fallback: a job queued
+    without options.market stamps nothing, so its offers are not counted as declared until a job that
+    names its market re-crawls them. Only an offer whose own `market` is that market is stamped. Returns
+    the count. Mutates the plan in place; the payload keeps its type (JSON text or dict)."""
+    import json as _json
+
+    declared = (options or {}).get("market")
+    if not declared:
+        return 0
+    from services.region_pricing import normalize_region
+    market = normalize_region(declared)
+    stamped = 0
+    for offer in plan.get("offers") or []:
+        if normalize_region(offer.get("market") or "") != market:
+            continue
+        raw = offer.get("offer_payload")
+        payload = _json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        if not isinstance(payload, dict):
+            continue
+        payload[DECLARED_MARKET_KEY] = market
+        offer["offer_payload"] = _json.dumps(payload) if isinstance(raw, str) else payload
+        stamped += 1
+    return stamped
+
+
 def job_currency(options: Optional[Dict[str, Any]]) -> str:
     """The currency the job's store and offers must be in: its market's (services.region_pricing).
     validate_options refuses a require_currency that says anything else."""
@@ -1007,6 +1042,8 @@ async def _check(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Dict[str
     checks["flags"] = {"block": len([f for f in flags if f["severity"] == detectors.BLOCK]),
                        "info": len([f for f in flags if f["severity"] == detectors.INFO]),
                        "blocking_after_approval": len(blocking)}
+    # Last, after every check read the plan: the declared-market stamp is provenance, never an input to them.
+    checks["declared_market_offers"] = stamp_declared_market(plan, o)
     return {"plan": plan, "inspection": inspection, "checks": checks, "flags": flags, "blocking": blocking,
             "fold_supersede_entries": carry.get("fold_supersede_entries") or [],
             "fold_offer_expected": carry.get("fold_offer_expected") or {},

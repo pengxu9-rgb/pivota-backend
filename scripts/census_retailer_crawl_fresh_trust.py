@@ -45,6 +45,13 @@ shadowing it), crawl-fresh at N, renderable. It is a census of the stored
 decision, so a row whose inputs moved since the last backfill pass is counted
 on its stored verdict.
 
+ROUND 3: the per-market columns now report the FINAL rule (every live offer of
+the qualifying class freshly read, its market declared; see VALID_READ_SQL),
+plus `would_flip_lost_to_undeclared_market` (what B2's declared-market
+requirement withholds today), `fresh_in_one_market_stale_in_another` (B1),
+`drain_job_markets` (how many drain jobs name options.market), an
+`employee_edit_dry_run`, and the `served_market_currency` pairs.
+
 ROUND 2 additions: `backfill_coverage` (catalog_products vs the backfill cron's
 CATALOG_TRUST_BACKFILL_LIMIT default -- above it, rows the oldest-first pass
 never reaches keep their verdict); every summary, market and host line also
@@ -53,7 +60,7 @@ SERVED_MARKET_CURRENCY_SQL) next to the max-any rule, the flips owed to an
 out-of-stock-only fresh offer, and projections for both rules.
 
 SAFETY. One READ ONLY transaction with SET LOCAL statement_timeout; it writes
-nothing and creates nothing: one row query plus three aggregates. Prints JSON
+nothing and creates nothing: one row query plus six small aggregates. Prints JSON
 lines only. It carries no at-sign so it can be passed inline to
 scripts/ops/run_oneoff_job.sh (see its header), and it needs no crawl subnet
 (it reads the database only):
@@ -112,18 +119,18 @@ OFFER_CONJUNCTS_SQL = (
     f"           AND {OFFER_NOT_AFFILIATE_SQL}"
 )
 
-# ROUND 2, the PER-MARKET rule (what the policy ships since round 2; COPIES of
+# ROUND 3, the FINAL rule (what the policy ships; COPIES of
 # services/catalog_row_trust_upserter's CRAWL_OFFER_* fragments, pinned by
-# test -- the max-any columns keep reporting the round-1 rule): the
-# qualifying offer must ALSO be
-#   * declared for a SERVED market and priced in that market's currency
-#     (config/market_registry.json served markets; region_pricing's currencies);
-#   * not explicitly out of stock (offer_buyability.OFFER_UNAVAILABLE_AVAILABILITIES);
-#   * not dated by an employee price edit (offer_payload.price_read_source);
-#   * on a variant-scoped row (one with a live drain-lane variant offer), a
-#     VARIANT offer: the refresh dates `<pk>::canonical` even when it skipped the
-#     variants, so a canonical stamp alone proves nothing about them;
-# and the read must not be dated in the future (0 <= age <= N).
+# test -- the max-any columns keep reporting the round-1 rule). Per row:
+#   * the CLASS: every live drain offer above that is in a SERVED market priced
+#     in that market's currency (SERVED_MARKET_CURRENCY_SQL);
+#   * a VALID read of one: dated no later than now, its market DECLARED by the
+#     writer (offer_payload.declared_market = market), not an employee edit;
+#   * fresh when the class is not empty, EVERY class offer has a valid read, at
+#     least one is in stock, and the OLDEST valid read is within N (0 <= age <= N).
+# The census evaluates SQL now() inside its one transaction, where now() is the
+# transaction's start -- the same instant `SELECT now()` hands the Python side.
+SERVED_MARKET_CURRENCY_PAIRS = (("SG", "SGD"), ("US", "USD"))
 SERVED_MARKET_CURRENCY_SQL = (
     "(upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
     " IN (('SG', 'SGD'), ('US', 'USD'))"
@@ -133,7 +140,22 @@ IN_STOCK_SQL = (
     " NOT IN ('out_of_stock', 'outofstock', 'sold_out', 'soldout', 'unavailable')"
 )
 NOT_EMPLOYEE_EDIT_SQL = "coalesce(co.offer_payload->>'price_read_source', '') <> 'employee_edit'"
-CANONICAL_SKU_SUFFIX = "::canonical"
+DECLARED_MARKET_SQL = (
+    "upper(btrim(coalesce(co.offer_payload->>'declared_market', '')))"
+    " = upper(btrim(coalesce(co.market, '')))"
+)
+VALID_READ_SQL = (
+    "CASE WHEN co.price_checked_at <= now()"
+    f" AND {DECLARED_MARKET_SQL}"
+    f" AND {NOT_EMPLOYEE_EDIT_SQL}"
+    " THEN co.price_checked_at END"
+)
+# The same read without the declared-market requirement, to size what B2 costs.
+VALID_READ_ANY_MARKET_SQL = (
+    "CASE WHEN co.price_checked_at <= now()"
+    f" AND {NOT_EMPLOYEE_EDIT_SQL}"
+    " THEN co.price_checked_at END"
+)
 
 PRICE_CHECK_COLUMN_SQL = """
 SELECT EXISTS (
@@ -165,6 +187,36 @@ SELECT (SELECT count(*) FROM catalog_products) AS catalog_products,
  WHERE crt.subject_type = 'product'
 """
 
+# B2's trade-off: how many drain jobs name their market explicitly (only their
+# offers can be declared). Guarded: a database without the table reports none.
+DRAIN_JOB_MARKETS_SQL = """
+SELECT coalesce(upper(btrim(options->>'market')), '(default)') AS market,
+       count(*) AS jobs,
+       count(DISTINCT domain) AS hosts
+  FROM retailer_ingest_jobs
+ GROUP BY 1
+"""
+DRAIN_JOBS_TABLE_SQL = "SELECT to_regclass('retailer_ingest_jobs') IS NOT NULL AS present"
+
+# Dry run for the employee-edit gap: a stamp written before the attached lane
+# recorded price_read_source cannot say who vouched. An attached seed whose
+# stored price differs from its last page read was edited by hand; count the
+# drain rows behind such seeds.
+EDITED_SEED_ROWS_SQL = f"""
+SELECT count(DISTINCT s.attached_product_key) AS rows_with_hand_edited_seed,
+       count(*) AS hand_edited_seeds
+  FROM external_product_seeds s
+  JOIN catalog_products cp ON cp.product_key = s.attached_product_key
+ WHERE cp.product_key LIKE '{CRAWL_LISTING_KEY_PREFIX}%'
+   AND cp.source_system = '{CRAWL_SOURCE_SYSTEM}'
+   AND cp.suppression_reason IS NULL
+   AND s.status = 'active'
+   AND s.price_amount IS NOT NULL
+   AND btrim(s.seed_data->'snapshot'->>'price_amount') ~ '^[0-9]+([.][0-9]+)?$'
+   AND CAST(s.price_amount AS numeric)
+       <> CAST(btrim(s.seed_data->'snapshot'->>'price_amount') AS numeric)
+"""
+
 STILL_BLOCKING = {
     "review_required": "IDENTITY_REVIEW_REQUIRED_LIVE_READ",
     "conflict": "IDENTITY_CONFLICT",
@@ -192,40 +244,35 @@ SELECT cp.product_key,
        rd.last_price_read_at,
        rd.market_reads,
        rd.last_in_stock_read_at,
-       rd.last_strict_read_at,
-       rd.strict_market_reads
+       rd.class_by_market
   FROM catalog_products cp
   LEFT JOIN catalog_row_trust crt
     ON crt.subject_type = 'product'
    AND crt.subject_key = cp.product_key
-  CROSS JOIN LATERAL (
-    SELECT EXISTS (
-             SELECT 1 FROM catalog_offers cv
-              WHERE cv.product_key = cp.product_key
-                AND cv.sku_key IS DISTINCT FROM cp.product_key || '{CANONICAL_SKU_SUFFIX}'
-                AND cv.source_system = '{CRAWL_SOURCE_SYSTEM}'
-                AND cv.suppressed_at IS NULL
-           ) AS variant_scoped
-  ) vx
   LEFT JOIN LATERAL (
     SELECT max(m.last_read) AS last_price_read_at,
            jsonb_object_agg(m.market, m.last_read) AS market_reads,
            max(m.last_in_stock) AS last_in_stock_read_at,
-           max(m.last_strict) AS last_strict_read_at,
-           jsonb_object_agg(m.market, m.last_strict) FILTER (WHERE m.last_strict IS NOT NULL)
-             AS strict_market_reads
+           jsonb_object_agg(m.market, jsonb_build_object(
+             'n', m.n_class, 'all_valid', m.all_valid, 'all_valid_any_market', m.all_valid_any_market,
+             'any_in_stock', m.any_in_stock, 'oldest_valid', m.oldest_valid,
+             'oldest_valid_any_market', m.oldest_valid_any_market,
+             'newest_valid_any_market', m.newest_valid_any_market)) AS class_by_market
       FROM (
         SELECT coalesce(nullif(upper(btrim(co.market)), ''), '(none)') AS market,
                max(co.price_checked_at) AS last_read,
                max(co.price_checked_at) FILTER (WHERE {IN_STOCK_SQL}) AS last_in_stock,
-               max(co.price_checked_at) FILTER (
-                 WHERE co.price_checked_at <= now()
-                   AND {SERVED_MARKET_CURRENCY_SQL}
-                   AND {IN_STOCK_SQL}
-                   AND {NOT_EMPLOYEE_EDIT_SQL}
-                   AND (NOT vx.variant_scoped
-                        OR co.sku_key IS DISTINCT FROM cp.product_key || '{CANONICAL_SKU_SUFFIX}')
-               ) AS last_strict
+               count(*) FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS n_class,
+               bool_and(({VALID_READ_SQL}) IS NOT NULL)
+                 FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS all_valid,
+               bool_and(({VALID_READ_ANY_MARKET_SQL}) IS NOT NULL)
+                 FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS all_valid_any_market,
+               bool_or({IN_STOCK_SQL}) FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS any_in_stock,
+               min({VALID_READ_SQL}) FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS oldest_valid,
+               min({VALID_READ_ANY_MARKET_SQL})
+                 FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS oldest_valid_any_market,
+               max({VALID_READ_ANY_MARKET_SQL})
+                 FILTER (WHERE {SERVED_MARKET_CURRENCY_SQL}) AS newest_valid_any_market
           FROM catalog_offers co
          WHERE co.product_key = cp.product_key
            AND {OFFER_CONJUNCTS_SQL}
@@ -309,6 +356,36 @@ def _market_reads(raw: Any) -> Dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
+def row_read_at(by_market: Dict[str, Dict[str, Any]], *, declared: bool) -> Optional[datetime]:
+    """The final rule's row read from the per-market class aggregates: None
+    unless the class is not empty, every class offer has a valid read and one
+    is in stock; else the OLDEST valid read. COPY of the upserter's
+    crawl_row_price_read_lateral_sql, over markets (pinned by a Postgres test)."""
+    if not by_market:
+        return None
+    valid_key, oldest_key = (("all_valid", "oldest_valid") if declared
+                             else ("all_valid_any_market", "oldest_valid_any_market"))
+    if not all(v.get(valid_key) is True for v in by_market.values()):
+        return None
+    if not any(v.get("any_in_stock") is True for v in by_market.values()):
+        return None
+    reads = [_to_datetime(v.get(oldest_key)) for v in by_market.values()]
+    if any(r is None for r in reads):
+        return None
+    return min(reads)
+
+
+def cross_market_stale(by_market: Dict[str, Dict[str, Any]], *, now: datetime, max_age_days: float) -> bool:
+    """B1's case, without B2: some served market has a fresh valid read while
+    ANOTHER has a live class offer that is unread, invalid or stale."""
+    fresh_somewhere = {m for m, v in by_market.items()
+                       if is_fresh_strict(v.get("newest_valid_any_market"), now=now, max_age_days=max_age_days)}
+    stale_somewhere = {m for m, v in by_market.items()
+                       if not (v.get("all_valid_any_market") is True and is_fresh_strict(
+                           v.get("oldest_valid_any_market"), now=now, max_age_days=max_age_days))}
+    return any(a != b for a in fresh_somewhere for b in stale_somewhere)
+
+
 def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict[str, Any]:
     decision = row.get("serving_decision") or "no_trust_row"
     reasons = set(row.get("reason_codes") or [])
@@ -319,8 +396,12 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
     coverage_only = decision == "shadow" and not blocking
     renderable = row.get("renderable") is not False
     markets = _market_reads(row.get("market_reads"))
-    strict_markets = _market_reads(row.get("strict_market_reads"))
-    fresh_strict = is_fresh_strict(row.get("last_strict_read_at"), now=now, max_age_days=max_age_days)
+    by_market = {m: v for m, v in _market_reads(row.get("class_by_market")).items()
+                 if isinstance(v, dict) and int(v.get("n") or 0) > 0}
+    final_read = row_read_at(by_market, declared=True)
+    any_market_read = row_read_at(by_market, declared=False)
+    fresh_strict = is_fresh_strict(final_read, now=now, max_age_days=max_age_days)
+    fresh_any_market = is_fresh_strict(any_market_read, now=now, max_age_days=max_age_days)
     would_flip = coverage_only and fresh and renderable
     return {
         "product_key": row["product_key"],
@@ -337,17 +418,20 @@ def classify(row: Dict[str, Any], *, now: datetime, max_age_days: float) -> Dict
         # renders, and it has at least one qualifying live offer to re-stamp.
         "candidate": coverage_only and renderable and bool(markets),
         "would_flip": would_flip,
-        # Round 2: the per-market rule (see SERVED_MARKET_CURRENCY_SQL).
-        # a future-dated stamp is stale under this rule, so it never ages in
-        "strict_age_days": _non_negative(age_days(row.get("last_strict_read_at"), now=now)),
+        # Round 3: the final rule (see VALID_READ_SQL); its row read is never in
+        # the future (now() bounds it), and _non_negative keeps a stray one out.
+        "strict_read_at": final_read,
+        "strict_age_days": _non_negative(age_days(final_read, now=now)),
         "would_flip_strict": coverage_only and fresh_strict and renderable,
+        # the same rule without B2's declared-market requirement
+        "would_flip_any_market_declaration": coverage_only and fresh_any_market and renderable,
+        # B1: fresh in one served market while another has a stale/unread live offer
+        "fresh_in_one_market_stale_in_another": coverage_only and renderable
+            and cross_market_stale(by_market, now=now, max_age_days=max_age_days),
         # flips under the max-any rule only because of an out-of-stock read
         "would_flip_oos_only": would_flip and not is_fresh(
             row.get("last_in_stock_read_at"), now=now, max_age_days=max_age_days),
-        "strict_fresh_markets": sorted(
-            m for m, ts in strict_markets.items()
-            if is_fresh_strict(ts, now=now, max_age_days=max_age_days)
-        ),
+        "strict_fresh_markets": sorted(by_market) if fresh_strict else [],
         "fresh_not_renderable": coverage_only and fresh and not renderable,
         "markets": sorted(markets) or ["(no live offer)"],
         "fresh_markets": sorted(
@@ -437,6 +521,7 @@ def summarize(
     seed_pool: Optional[int] = None,
     seed_pool_by_market: Optional[Dict[str, int]] = None,
     backfill: Optional[Dict[str, Any]] = None,
+    extras: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     rows = list(classified)
     pool_by_market = dict(seed_pool_by_market or {})
@@ -455,8 +540,11 @@ def summarize(
         "active_seeds_by_market": dict(sorted(pool_by_market.items())),
         "nightly_reread_probability": round(p, 5),
     }]
+    lines.append({"kind": "served_market_currency",
+                  "pairs": [list(pair) for pair in SERVED_MARKET_CURRENCY_PAIRS]})
     if backfill is not None:
         lines.append({"kind": "backfill_coverage", **backfill})
+    lines.extend(extras or [])
 
     for lane in [ALL] + lanes:
         part = rows if lane == ALL else [r for r in rows if r["lane"] == lane]
@@ -480,6 +568,13 @@ def summarize(
             "would_flip_max_any_rule": sum(r["would_flip"] for r in part),
             "would_flip_per_market_rule": sum(r["would_flip_strict"] for r in part),
             "would_flip_max_any_not_per_market": sum(r["would_flip"] and not r["would_flip_strict"] for r in part),
+            # B2's cost: flips the declared-market requirement withholds today
+            "would_flip_without_declared_market_requirement": sum(
+                r["would_flip_any_market_declaration"] for r in part),
+            "would_flip_lost_to_undeclared_market": sum(
+                r["would_flip_any_market_declaration"] and not r["would_flip_strict"] for r in part),
+            # B1's case, sized without B2
+            "fresh_in_one_market_stale_in_another": sum(r["fresh_in_one_market_stale_in_another"] for r in part),
             "would_flip_on_out_of_stock_only_offer": sum(r["would_flip_oos_only"] for r in part),
             "fresh_but_not_renderable": sum(r["fresh_not_renderable"] for r in part),
             "fresh_still_blocked_by_reason": dict(sorted(still_blocked.items())),
@@ -570,6 +665,20 @@ async def collect(
         raw = [dict(r) for r in await conn.fetch(census_sql())]
         pool_by_market = {str(r["market"]): int(r["seeds"]) for r in await conn.fetch(SEED_POOL_SQL)}
         coverage = dict(await conn.fetchrow(BACKFILL_COVERAGE_SQL))
+        extras: List[Dict[str, Any]] = []
+        if await conn.fetchval(DRAIN_JOBS_TABLE_SQL):
+            jobs = [dict(r) for r in await conn.fetch(DRAIN_JOB_MARKETS_SQL)]
+            explicit = [j for j in jobs if j["market"] != "(default)"]
+            extras.append({
+                "kind": "drain_job_markets",
+                "jobs": sum(int(j["jobs"]) for j in jobs),
+                "jobs_with_explicit_market": sum(int(j["jobs"]) for j in explicit),
+                "by_market": {j["market"]: {"jobs": int(j["jobs"]), "hosts": int(j["hosts"])} for j in jobs},
+            })
+        edited = dict(await conn.fetchrow(EDITED_SEED_ROWS_SQL))
+        extras.append({"kind": "employee_edit_dry_run",
+                       "rows_with_hand_edited_seed": int(edited["rows_with_hand_edited_seed"] or 0),
+                       "hand_edited_seeds": int(edited["hand_edited_seeds"] or 0)})
     limit = backfill_limit_default()
     env_limit = os.getenv("CATALOG_TRUST_BACKFILL_LIMIT")
     backfill = {
@@ -584,7 +693,7 @@ async def collect(
     classified = [classify(r, now=now, max_age_days=max_age_days) for r in raw]
     return summarize(classified, now=now, max_age_days=max_age_days,
                      refresh_per_night=refresh_per_night, seed_pool=seed_pool,
-                     seed_pool_by_market=pool_by_market, backfill=backfill)
+                     seed_pool_by_market=pool_by_market, backfill=backfill, extras=extras)
 
 
 async def _main(argv: List[str]) -> int:

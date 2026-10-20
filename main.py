@@ -929,6 +929,15 @@ async def startup_event():
     # accepted requests but no worker tick ever drained the queue.
     # Log the exception with traceback so the boot-time failure is
     # visible in logs while preserving the best-effort contract.
+    # The effective CRAWL_FRESH switch and N, once per boot at WARNING (web and
+    # worker both run this startup), so a flip can be verified from the logs.
+    try:
+        from config.platform import service_name as _crawl_fresh_service_name
+        from services.catalog_row_trust_upserter import log_crawl_fresh_config
+        log_crawl_fresh_config(_crawl_fresh_service_name() or "web")
+    except Exception:  # noqa: BLE001 -- a log line never blocks boot
+        pass
+
     try:
         from services.audit_scheduler import start_scheduler
         await start_scheduler()
