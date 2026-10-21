@@ -594,6 +594,14 @@ def classify_product(product: Dict[str, Any], offers: List[Dict[str, Any]], seed
                 "offer_amount": own_amount(rows[0]) if rows else None,
                 "price_checked_age_d": _age_days(checked, now),
             })
+    # A one-variant page whose stored variant price is not the seed column the refresh re-read: the
+    # refresh reconciled seed_data.variants (whenever that key is a list, even an empty one), the page
+    # reads snapshot.variants first (routes/employee_products._refresh_external_seed_by_id ~6249).
+    column = _num((seed or {}).get("price_amount"))
+    if (not own_lane and len(variants) == 1 and sample and sample[0]["stored"] is not None
+            and column is not None and abs(sample[0]["stored"] - column) >= 0.005):
+        counts["single_variant_price_differs_from_seed_column"] += 1
+    out["seed_variants_len"] = len(_json_list((seed or {}).get("variants"))) if seed else None
     out["variant_counts"] = dict(sorted(counts.items()))
     out["sample"] = sample
 
@@ -648,7 +656,8 @@ def verdict(line: Dict[str, Any]) -> str:
         return "stored_is_compare_at"
     if counts.get("minor_unit_divided"):
         return "minor_unit_division"
-    if counts.get("snapshot_shadows_different_variants_price"):
+    if counts.get("snapshot_shadows_different_variants_price") or counts.get(
+            "single_variant_price_differs_from_seed_column"):
         return "stale_snapshot_variant_price"
     flags = line.get("offer_flags") or {}
     if line.get("variant_source") == "products_cache":

@@ -127,6 +127,10 @@ def test_a_seed_page_reads_the_snapshot_list_first():
     line = _classify(product, [], seed)
     assert line["variant_source"] == "snapshot" and line["sample"][0]["stored"] == 24.0
     assert line["verdict"] == "stale_snapshot_variant_price"
+    # the refresh re-read the column (and reconciled an EMPTY top-level list); the snapshot list kept $28
+    column_moved = _classify(product, [], _seed([], snapshot=[{"variant_id": "11111111", "price": 28}], price_amount=32.0))
+    assert column_moved["variant_counts"]["single_variant_price_differs_from_seed_column"] == 1
+    assert column_moved["seed_variants_len"] == 0 and column_moved["verdict"] == "stale_snapshot_variant_price"
     minor = _classify(product, [], _seed([{"variant_id": "11111111", "price": "2400"}]))
     assert minor["verdict"] == "minor_unit_division" and minor["sample"][0]["stored"] == 24.0
 
