@@ -53,6 +53,7 @@ def _schema():
     if not any(m in dbname for m in _SAFE_DB_MARKERS):
         pytest.skip(f"refusing to create a scratch schema in database {dbname!r} -- throwaway only")
     import db.catalog  # noqa: F401
+    import db.products  # noqa: F401  (products_cache)
     from sqlalchemy import create_engine, text
 
     from db.database import metadata
@@ -65,7 +66,7 @@ def _schema():
     admin.dispose()
     engine = create_engine(_url(), connect_args={"options": f"-csearch_path={_SCHEMA}"})
     metadata.create_all(engine, tables=[metadata.tables[t] for t in (
-        "catalog_merchants", "catalog_products", "catalog_skus", "catalog_offers")])
+        "catalog_merchants", "catalog_products", "catalog_skus", "catalog_offers", "products_cache")])
     with engine.begin() as conn:
         conn.execute(text(_SEEDS_DDL))
         for name in ("136_catalog_row_trust.sql", "246_catalog_offers_price_checked_at.sql"):
@@ -146,9 +147,10 @@ async def test_the_census_runs_read_only_on_postgres():
         lines = await census.census(Spy(), [HOST])
         assert opened == [{"readonly": True, "isolation": "repeatable_read"}]
         assert statements[0] == f"SET LOCAL statement_timeout = '{census.STATEMENT_TIMEOUT}'"
-        assert statements[2:] == list(census.READ_STATEMENTS)
+        # no connected-merchant row, so no products_cache read
+        assert statements[2:] == list(census.READ_STATEMENTS[:3])
         (params,) = [ln for ln in lines if ln["kind"] == "params"]
-        assert params["rows"] == {"products": 1, "offers": 2, "seeds": 1}
+        assert params["rows"] == {"products": 1, "offers": 2, "seeds": 1, "caches": 0}
         (product,) = [ln for ln in lines if ln["kind"] == "product"]
         assert product["own_money_rows"] == 1
         assert product["own_offer_refusals"] == {"not_in_stock": 1}
@@ -163,5 +165,36 @@ async def test_the_census_runs_read_only_on_postgres():
         assert all(t.startswith(census.CENSUS_MARKER) for t in census.render(lines))
         # the transaction wrote nothing (read-only would have refused it anyway)
         assert await conn.fetchval("SELECT count(*) FROM catalog_offers") == 2
+    finally:
+        await conn.close()
+
+
+async def test_signature_mode_reads_a_connected_merchants_cache_row():
+    import asyncpg
+
+    sig = "sig_censusconnected1"
+    conn = await asyncpg.connect(_url(), server_settings={"search_path": _SCHEMA})
+    try:
+        # A connected merchant's row carries no source_domain: only --signatures can find it.
+        await conn.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title,"
+            " source_system, sync_status, pivota_signature_id)"
+            " VALUES ('merch_census::shopify::777', 'merch_census', 'shopify', '777', 'Toner',"
+            " 'shopify_sync', 'live', $1)", sig)
+        product_data = {"id": "777", "currency": "USD",
+                        "variants": [{"id": "33333333", "price": "28.00", "compare_at_price": "35.00"}]}
+        await conn.execute(
+            "INSERT INTO products_cache (merchant_id, platform, platform_product_id, product_data, cached_at,"
+            " expires_at) VALUES ('merch_census', 'shopify', '777', $1::json, now() - interval '2 days',"
+            " now() - interval '1 day')", json.dumps(product_data))
+        assert not [ln for ln in await census.census(conn, [HOST]) if ln.get("sig") == sig]
+        lines = await census.census(conn, [HOST], signatures=[sig])
+        (params,) = [ln for ln in lines if ln["kind"] == "params"]
+        assert params["rows"]["caches"] == 1 and params["hosts"] == ["(no source_domain)"]
+        (product,) = [ln for ln in lines if ln["kind"] == "product"]
+        assert product["variant_source"] == "products_cache" and product["sample"][0]["stored"] == 28.0
+        assert product["sample"][0]["compare_at"] == 35.0
+        assert product["cache"]["expired"] is True
+        assert product["verdict"] == "priced_from_expired_cache"
     finally:
         await conn.close()

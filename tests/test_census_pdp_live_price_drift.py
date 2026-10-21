@@ -18,7 +18,7 @@ def test_the_script_can_be_passed_inline():
     assert "@" not in text
     assert "readonly=True" in text and "SET LOCAL statement_timeout" in text
     assert census.STATEMENT_TIMEOUT == "30s"
-    for sql in census.READ_STATEMENTS:
+    for sql in census.ALL_READ_STATEMENTS:
         assert not re.search(r"\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TRUNCATE|GRANT)\b", sql, re.I)
 
 
@@ -141,5 +141,20 @@ def test_host_lines_add_up():
     assert host["variant_counts"]["readable"] == 2
 
 
-def test_hosts_are_parsed_bare():
+def test_hosts_and_signatures_are_parsed_strictly():
     assert census.parse_hosts("www.Heimish.us, tocobo.us,,bad host") == ["heimish.us", "tocobo.us"]
+    assert census.parse_signatures("sig_0091ec42677c4a05, SIG_0091EC42677C4A05,sig_x,'; drop") == [
+        "sig_0091ec42677c4a05"]
+
+
+def test_a_connected_merchant_page_is_priced_from_its_cache_row():
+    product = _product(platform="shopify", source_system="shopify_sync", merchant_id="merch_1")
+    cache = {"variants": [{"variant_id": "11111111", "price": "28.00", "compare_at": "28.00"}],
+             "currency": "USD", "cached_at": NOW - timedelta(days=2), "expires_at": NOW - timedelta(days=1)}
+    line = census.classify_product(product, [], None, "none", now=NOW, stale_days=7, cache=cache)
+    assert line["variant_source"] == "products_cache" and line["sample"][0]["stored"] == 28.0
+    assert line["cache"]["expired"] is True
+    assert line["verdict"] == "stored_is_compare_at"
+    cache["variants"][0].pop("compare_at")
+    again = census.classify_product(product, [], None, "none", now=NOW, stale_days=7, cache=cache)
+    assert again["verdict"] == "priced_from_expired_cache"

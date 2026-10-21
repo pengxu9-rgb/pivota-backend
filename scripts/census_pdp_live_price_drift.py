@@ -36,6 +36,8 @@ WHAT THE PAGE STORES, per lane (gateway at 04f819f4a):
     pricing.current.amount, through normalizeExternalSeedPrice (an integer >= 1000 in a non-zero-decimal
     currency, on a beauty-worded title/url, is divided by 100). Outside the enrichment lane this IS the
     compared stored amount.
+  * A connected merchant's page (not platform external_seed, no seed): the newest products_cache row of
+    (merchant_id, platform_product_id = source_product_id), its variants priced as cached.
 
 No crawled lane stores a compare-at: every external writer sets list_price = merchant_effective_price =
 estimated_best_price = the read price, and no writer puts compare_at_price on a seed variant. The census
@@ -53,14 +55,20 @@ OUTPUT. CENSUS_MARKER + one JSON object per line:
   * one `product` line per signature row (capped by --max-products-per-host): verdict, counts and the first
     variants' stored amounts, to join offline with the log's per-product price_changed history.
 
+--signatures sig_a,sig_b reads THOSE PDPs' rows (pivota_signature_id, indexed) instead of the hosts' --
+for a host whose rows carry another source_domain or none (a connected merchant's); host lines then group
+by the domain the rows carry.
+
 SAFETY. One READ ONLY transaction (REPEATABLE READ, one snapshot) with SET LOCAL statement_timeout = 30s;
-it writes nothing, creates nothing, calls no merchant and no agent tool. Three reads: the signature rows of
-the hosts (one pass over catalog_products: there is no source_domain index), their offers (by
-product_key, indexed) and their seeds (by external_product_id / attached_product_key, indexed; seed_data is
-detoasted ONCE per seed). It carries no at-sign so it can be passed inline:
+it writes nothing, creates nothing, calls no merchant and no agent tool. Up to four reads: the signature
+rows of the hosts (one pass over catalog_products: there is no source_domain index; by signature, an index
+read), their offers (by product_key, indexed), their seeds (by external_product_id /
+attached_product_key, indexed; seed_data is detoasted ONCE per seed) and, for connected-merchant rows
+only, their products_cache rows (by merchant_id + platform_product_id, indexed). It carries no at-sign so it can be passed inline:
 
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_pdp_live_price_drift.py)"
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_pdp_live_price_drift.py)" --hosts heimish.us,tocobo.us
+    bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/census_pdp_live_price_drift.py)" --signatures sig_a,sig_b
 
 Self-contained on purpose (the gateway is another repo): the own-seller SQL, the own-money rules and the
 variant id rules are COPIES of PIVOTA-Agent 04f819f4a (src/services/canonicalOwnOfferSellerSql.js,
@@ -151,17 +159,24 @@ OWN_SELLER_SQL = """(
     )
   )"""
 
-# The signature rows (PDP-reachable products) of the hosts. No source_domain index: one pass.
-PRODUCTS_SQL = """
+_PRODUCT_COLUMNS = """
 SELECT cp.product_key, cp.merchant_id, cp.platform, cp.source_system, cp.source_product_id,
-       cp.pivota_signature_id, regexp_replace(lower(cp.source_domain), '^www[.]', '') AS host,
+       cp.pivota_signature_id,
+       coalesce(regexp_replace(lower(cp.source_domain), '^www[.]', ''), '(no source_domain)') AS host,
        cp.canonical_url, cp.title, cp.sync_status, cp.suppression_reason,
        (cp.suppressed_at IS NOT NULL) AS product_suppressed,
        t.serving_decision, cp.updated_at
 FROM catalog_products cp
-LEFT JOIN catalog_row_trust t ON t.subject_type = 'product' AND t.subject_key = cp.product_key
+LEFT JOIN catalog_row_trust t ON t.subject_type = 'product' AND t.subject_key = cp.product_key"""
+# The signature rows (PDP-reachable products) of the hosts. No source_domain index: one pass.
+PRODUCTS_SQL = _PRODUCT_COLUMNS + """
 WHERE regexp_replace(lower(cp.source_domain), '^www[.]', '') = ANY($1::text[])
   AND cp.pivota_signature_id IS NOT NULL
+"""
+# --signatures: the rows of the named PDPs (indexed on pivota_signature_id), whatever domain they carry --
+# a connected merchant's rows can carry none.
+PRODUCTS_BY_SIGNATURE_SQL = _PRODUCT_COLUMNS + """
+WHERE cp.pivota_signature_id = ANY($1::text[])
 """
 
 # Every offer of those products, with each own-money gate as its own column.
@@ -226,7 +241,21 @@ WHERE eps.status = 'active'
   AND (eps.external_product_id = ANY($1::text[]) OR eps.attached_product_key = ANY($2::text[]))
 """
 
-READ_STATEMENTS = (PRODUCTS_SQL, OFFERS_SQL, SEEDS_SQL)
+# A connected merchant's PDP is built from its products_cache row (gateway server.js ~5240: merchant_id +
+# platform_product_id, newest cached_at; the gateway also reads an expired row as a stale fallback).
+# product_data is JSON: cast once per row.
+CACHE_SQL = f"""
+SELECT pc.merchant_id, pc.platform_product_id, pc.cached_at, pc.expires_at,
+       coalesce(d.pd->>'currency', d.pd->'price'->>'currency') AS currency,
+       {_variant_list_sql("d.pd->'variants'")} AS variants
+FROM products_cache pc
+CROSS JOIN LATERAL (SELECT pc.product_data::jsonb AS pd OFFSET 0) d
+WHERE (pc.merchant_id, pc.platform_product_id) IN (
+  SELECT m, p FROM unnest($1::text[], $2::text[]) AS w(m, p))
+"""
+
+READ_STATEMENTS = (PRODUCTS_SQL, OFFERS_SQL, SEEDS_SQL, CACHE_SQL)
+ALL_READ_STATEMENTS = READ_STATEMENTS + (PRODUCTS_BY_SIGNATURE_SQL,)
 
 
 # ---------------------------------------------------------------------------------------------- copies
@@ -446,7 +475,8 @@ def variant_page_id(variant: Dict[str, Any], product_id: str, index: int) -> str
 
 
 def classify_product(product: Dict[str, Any], offers: List[Dict[str, Any]], seed: Optional[Dict[str, Any]],
-                     seed_route: str, *, now: datetime, stale_days: float) -> Dict[str, Any]:
+                     seed_route: str, *, now: datetime, stale_days: float,
+                     cache: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One product's verdict: what the page stores per variant and which variants the live read would
     count as changed whatever the merchant answers."""
     product_key = str(product["product_key"])
@@ -482,12 +512,18 @@ def classify_product(product: Dict[str, Any], offers: List[Dict[str, Any]], seed
     out["own_money_rows"] = len(eligible)
 
     # --- the page's variants
-    variants, variant_source = page_variants(seed) if seed else ([], "no_seed")
+    if seed:
+        variants, variant_source = page_variants(seed)
+    elif cache:
+        # A connected merchant's page: the cached StandardProduct's variants, priced as stored.
+        variants, variant_source = _json_list(cache.get("variants")), "products_cache"
+    else:
+        variants, variant_source = [], "no_seed"
     out["variant_source"] = variant_source
     out["variants"] = len(variants)
     title = str(product.get("title") or "")
     urls = " ".join(str(x or "") for x in (product.get("canonical_url"),))
-    seed_currency = str((seed or {}).get("price_currency") or "").upper() or None
+    seed_currency = str((seed or {}).get("price_currency") or (cache or {}).get("currency") or "").upper() or None
     ids = [variant_page_id(v, product_id, i) for i, v in enumerate(variants)]
     product_grain = (not variants) or (len(variants) == 1 and ids[0] in (product_id, f"{product_id}::canonical"))
 
@@ -524,7 +560,8 @@ def classify_product(product: Dict[str, Any], offers: List[Dict[str, Any]], seed
         raw_price = _json_value(variant.get("price"))
         seed_amount = normalize_amount(raw_price)
         currency = str(variant.get("currency") or seed_currency or "").upper() or None
-        divides = minor_unit_rule_fires(raw_price, seed_amount, currency, " ".join((title, str(variant.get("title") or ""), urls)))
+        divides = seed is not None and minor_unit_rule_fires(
+            raw_price, seed_amount, currency, " ".join((title, str(variant.get("title") or ""), urls)))
         seed_page_amount = seed_amount / 100 if divides else seed_amount
         if own_lane:
             stored = None if page_unavailable else (money.get(CANONICAL_PRODUCT) if product_grain else money.get(vid))
@@ -590,6 +627,10 @@ def classify_product(product: Dict[str, Any], offers: List[Dict[str, Any]], seed
             "last_crawled_age_d": _age_days(seed.get("last_crawled_at"), now),
             "compare_at": _json_value(seed.get("seed_compare_at")),
         }
+    if cache:
+        out["cache"] = {"cached_age_d": _age_days(cache.get("cached_at"), now),
+                        "expired": bool(cache.get("expires_at") and _age_days(cache["expires_at"], now) > 0),
+                        "currency": cache.get("currency")}
     out["verdict"] = verdict(out)
     return out
 
@@ -610,6 +651,8 @@ def verdict(line: Dict[str, Any]) -> str:
     if counts.get("snapshot_shadows_different_variants_price"):
         return "stale_snapshot_variant_price"
     flags = line.get("offer_flags") or {}
+    if line.get("variant_source") == "products_cache":
+        return "priced_from_expired_cache" if (line.get("cache") or {}).get("expired") else "priced_from_merchant_cache"
     if line.get("own_money_lane") and (flags.get("price_checked_at_null") or flags.get("price_checked_at_stale")):
         return "priced_from_stale_or_unread_offer"
     if not line.get("own_money_lane") and (line.get("seed") or {}).get("last_crawled_age_d") is not None \
@@ -659,16 +702,25 @@ def host_lines(products: List[Dict[str, Any]], hosts: Iterable[str]) -> List[Dic
 
 
 async def census(conn: Any, hosts: List[str], *, stale_days: float = DEFAULT_STALE_DAYS,
-                 max_products_per_host: int = DEFAULT_MAX_PRODUCTS_PER_HOST) -> List[Dict[str, Any]]:
-    """Run the census on an asyncpg connection, inside its own READ ONLY transaction."""
+                 max_products_per_host: int = DEFAULT_MAX_PRODUCTS_PER_HOST,
+                 signatures: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Run the census on an asyncpg connection, inside its own READ ONLY transaction. With `signatures`,
+    the products are those PDPs' rows (whatever domain they carry) instead of the hosts'."""
     async with conn.transaction(readonly=True, isolation="repeatable_read"):
         await conn.execute(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'")
         now = await conn.fetchval("SELECT now()")
-        products = [dict(r) for r in await conn.fetch(PRODUCTS_SQL, hosts)]
+        if signatures:
+            products = [dict(r) for r in await conn.fetch(PRODUCTS_BY_SIGNATURE_SQL, signatures)]
+        else:
+            products = [dict(r) for r in await conn.fetch(PRODUCTS_SQL, hosts)]
         keys = sorted({p["product_key"] for p in products})
         epids = sorted({str(p["source_product_id"]) for p in products if p.get("source_product_id")})
+        pairs = sorted({(str(p["merchant_id"]), str(p["source_product_id"])) for p in products
+                        if p.get("platform") != EXTERNAL_SEED_PLATFORM and p.get("source_product_id")})
         offers = [dict(r) for r in await conn.fetch(OFFERS_SQL, keys)] if keys else []
         seeds = [dict(r) for r in await conn.fetch(SEEDS_SQL, epids, keys)] if keys else []
+        caches = ([dict(r) for r in await conn.fetch(CACHE_SQL, [m for m, _ in pairs], [p for _, p in pairs])]
+                  if pairs else [])
     offers_by_key = defaultdict(list)
     for offer in offers:
         offers_by_key[offer["product_key"]].append(offer)
@@ -678,13 +730,21 @@ async def census(conn: Any, hosts: List[str], *, stale_days: float = DEFAULT_STA
             by_epid[str(seed["external_product_id"])].append(seed)
         if seed.get("attached_product_key"):
             by_attached[str(seed["attached_product_key"])].append(seed)
+    newest_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    floor = datetime.min
+    for row in sorted(caches, key=lambda r: r.get("cached_at") or floor, reverse=True):
+        newest_cache.setdefault((str(row["merchant_id"]), str(row["platform_product_id"])), row)
     lines = []
     for product in sorted(products, key=lambda p: (p["host"], str(p["pivota_signature_id"]), p["product_key"])):
         seed, route = pick_seed(product, by_epid, by_attached)
+        cache = newest_cache.get((str(product["merchant_id"]), str(product.get("source_product_id") or "")))
         lines.append(classify_product(product, offers_by_key.get(product["product_key"], []), seed, route,
-                                      now=now, stale_days=stale_days))
-    params = {"kind": "params", "hosts": hosts, "now": now, "stale_days": stale_days,
-              "rows": {"products": len(products), "offers": len(offers), "seeds": len(seeds)}}
+                                      now=now, stale_days=stale_days, cache=cache))
+    if signatures:
+        hosts = sorted({line["host"] for line in lines})
+    params = {"kind": "params", "hosts": hosts, "signatures": len(signatures or []), "now": now,
+              "stale_days": stale_days,
+              "rows": {"products": len(products), "offers": len(offers), "seeds": len(seeds), "caches": len(caches)}}
     printed: List[Dict[str, Any]] = []
     per_host = Counter()
     for line in lines:
@@ -708,6 +768,15 @@ def parse_hosts(raw: str) -> List[str]:
     return hosts
 
 
+def parse_signatures(raw: str) -> List[str]:
+    out = []
+    for part in raw.split(","):
+        sig = part.strip().lower()
+        if re.fullmatch(r"sig_[a-z0-9]{8,64}", sig) and sig not in out:
+            out.append(sig)
+    return out
+
+
 async def _main(argv: List[str]) -> int:
     import asyncpg
 
@@ -715,11 +784,16 @@ async def _main(argv: List[str]) -> int:
     parser.add_argument("--hosts", default=",".join(DEFAULT_HOSTS), help="comma-separated merchant hosts")
     parser.add_argument("--stale-days", type=float, default=DEFAULT_STALE_DAYS)
     parser.add_argument("--max-products-per-host", type=int, default=DEFAULT_MAX_PRODUCTS_PER_HOST)
+    parser.add_argument("--signatures", default="",
+                        help="comma-separated sig_ ids: census those PDPs' rows instead of the hosts'")
     parser.add_argument("--hosts-only", action="store_true", help="print the params and host lines only")
     args = parser.parse_args(argv)
     hosts = parse_hosts(args.hosts)
     if not hosts:
         parser.error("--hosts names no valid host")
+    signatures = parse_signatures(args.signatures)
+    if args.signatures and not signatures:
+        parser.error("--signatures names no valid sig_ id")
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
     if not url.startswith("postgres"):
         print(CENSUS_MARKER + json.dumps({"kind": "error", "error": "DATABASE_URL must be Postgres"}))
@@ -727,7 +801,7 @@ async def _main(argv: List[str]) -> int:
     conn = await asyncpg.connect(url)
     try:
         lines = await census(conn, hosts, stale_days=args.stale_days,
-                             max_products_per_host=args.max_products_per_host)
+                             max_products_per_host=args.max_products_per_host, signatures=signatures or None)
     finally:
         await conn.close()
     for text in render(lines, hosts_only=args.hosts_only):
