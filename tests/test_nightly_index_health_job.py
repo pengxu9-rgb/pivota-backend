@@ -282,6 +282,12 @@ _NOT_A_PRODUCT_TITLES = [
     "Pre-Order Deposit",
     "Deposit",
     "Deposit for Custom Order",
+    "Deposit - $50",
+    "Deposit: Custom Order",
+    "Deposit - For Bridal Makeup",
+    "Store Credit",
+    "Tip Jar",
+    "$25 Gift Card",
 ]
 
 
@@ -319,6 +325,19 @@ _REAL_PRODUCTS_NEAR_NON_PRODUCT_WORDS = [
     "Route 66 Eau de Parfum",
     "Buy One, Donate One Lip Balm",
     "Deposit Only Hair Color",
+    "Deposit-Only Color Gloss",
+    "Deposit (Color Mask) Red",
+    # Charity editions and add-on donations are products.
+    "Lip Gloss + $1 Donation",
+    "Pink Lip Balm (Donation Edition)",
+    "Ocean Donation Edition Sunscreen",
+    # A gift card ACCESSORY, and a word that starts with "card".
+    "Gift Card Holder Pouch",
+    "Gift Cards Holders Set",
+    "Gift Cardigan Scent Candle",
+    # Word boundaries: "rose voucher" holds "e voucher", "creditcard" holds "credit".
+    "Rose Voucher Balm",
+    "Store Creditcard Holder",
 ]
 
 
@@ -335,17 +354,34 @@ def test_non_product_listing_rule_leaves_real_products_alone(title):
 
 
 @pytest.mark.parametrize(
-    "product_type", ["Donation", "Gift Card", "gift_card", "Gift Cards", "e-gift card", "Insurance", "Tip"],
+    "product_type", ["Donation", "Gift Card", "gift_card", "Gift Cards", "e-gift card", "Insurance", "  Gift Card  "],
 )
 def test_non_product_type_blocks_a_plainly_titled_listing(product_type):
     row = _full_row(product_type=product_type, pdp_title="Clara Lionel", seed_title="Clara Lionel")
     assert _is_non_core_product(row, seed_title="Clara Lionel") is True
 
 
-@pytest.mark.parametrize("product_type", [None, "", "Gift Set", "Gifts", "makeup", "Beauty Product", "Tools"])
+@pytest.mark.parametrize(
+    "product_type", [None, "", "Gift Set", "Gifts", "makeup", "Beauty Product", "Tools", "Tips", "tip"],
+)
 def test_merchandise_product_types_do_not_block(product_type):
-    row = _full_row(product_type=product_type)
-    assert _is_non_core_product(row, seed_title="Test product") is False
+    """"Tips" / "tip" is how nail stores file press-on and Gel-X tips ("Gel-X Sculpted Almond",
+    "Nail Tip Glue")."""
+    row = _full_row(product_type=product_type, pdp_title="Gel-X Sculpted Almond", seed_title="Gel-X Sculpted Almond")
+    assert _is_non_core_product(row, seed_title="Gel-X Sculpted Almond") is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/collections/donations/products/lip-balm",
+        "https://example.com/collections/order-protection/products/lip-balm",
+        "https://example.com/products/gift-voucher-lip-balm",
+    ],
+)
+def test_the_new_listing_words_are_read_from_titles_not_the_url(url):
+    row = _full_row(seed_title="Lip Balm", pdp_title="Lip Balm", canonical_url=url)
+    assert _is_non_core_product(row, seed_title="Lip Balm") is False
 
 
 def test_title_start_words_are_read_per_title_not_across_the_joined_text():

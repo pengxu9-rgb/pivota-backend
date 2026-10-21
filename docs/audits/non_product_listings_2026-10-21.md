@@ -20,19 +20,19 @@ as a `competitive_alternative` candidate for 8 anchors.
 
 The Clara Lionel listing is **not** live in the catalog. Its `catalog_products` row is `sync_status = 'stale'`, with blocker `not_live`, `pdp_will_render = false` and trust `blocked`. Its seed `eps_96e8c7f8d3104b6b8c70382a` is **active** and was refreshed on 2026-10-20 05:47Z. The active seed is what put it in front of the relationship graph (section 3). A refresh that flips the row back to `live` would have served it: no rule named donations.
 
-Live, unsuppressed rows by domain (merchant):
+Live, unsuppressed rows by domain:
 
-| domain | merchant | n | titles |
-|---|---|---|---|
-| blindbarber.com | merch_obs_f90122172d141c2d | 4 | Add-on Donation, Round Up Donation, GiftCard, SavedBy Package Protection |
-| fentybeauty.com | merch_obs_e1cf1ca8ef133606 | 2 | Fenty Beauty E-Gift Cards, Shipping Protection (+ the stale Clara Lionel donation) |
-| tartecosmetics.com | merch_obs_4a586a53cd1571d6 | 2 | **Heart To Tarte Donation**, tarte gift card |
-| iliabeauty.com | merch_obs_7bbf6f05e8a9e07d | 2 | Gift card, Delivery Guarantee |
-| tower28beauty.com | merch_obs_f11e36679c3c61ca | 2 | $10 Gift Card, Gift Card |
-| us.comfortzoneskin.com | merch_obs_5a99644d0e8fbed5 | 3 | Birthday / Holiday / plain E-Gift Card |
-| poopourri.com | merch_obs_c33423d5f0c28101 | 3 | e-Gift Cards |
-| manyo.us | merch_obs_4455f3e5579f1fe3 | 2 | E-Gift Card, Shipping Protection by Route |
-| one each | | 16 | gift cards: 786cosmetics, flowerbeauty, glossier, intelligentchange, kyliecosmetics, lav-kids, maccosmetics, saiehello, tirtir, tonymoly, lapoem, paulmitchell, rovectin, tangleangel, a pivota-research test store; Shipping Protection: purito-seoul |
+| domain | n | titles |
+|---|---|---|
+| blindbarber.com | 4 | Add-on Donation, Round Up Donation, GiftCard, SavedBy Package Protection |
+| fentybeauty.com | 2 | Fenty Beauty E-Gift Cards, Shipping Protection (+ the stale Clara Lionel donation) |
+| tartecosmetics.com | 2 | **Heart To Tarte Donation**, tarte gift card |
+| iliabeauty.com | 2 | Gift card, Delivery Guarantee |
+| tower28beauty.com | 2 | $10 Gift Card, Gift Card |
+| us.comfortzoneskin.com | 3 | Birthday / Holiday / plain E-Gift Card |
+| poopourri.com | 3 | e-Gift Cards |
+| manyo.us | 2 | E-Gift Card, Shipping Protection by Route |
+| one each | 16 | gift cards: 786cosmetics, flowerbeauty, glossier, intelligentchange, kyliecosmetics, lav-kids, maccosmetics, saiehello, tirtir, tonymoly, lapoem, paulmitchell, rovectin, tangleangel, a pivota-research test store; Shipping Protection: purito-seoul |
 
 The census found no tip and no deposit listings. The rule still names them, matched narrowly (section 2).
 
@@ -52,7 +52,7 @@ The **ingest lanes** have no shared non-product filter. Each keeps its own word 
 - gratuity and tip jars;
 - booking / pre-order / appointment / reservation / security deposits.
 
-These are searched across the joined titles and URL. "Donate ...", "Tip", "Add a Tip" and "Deposit [for ...]" count only at the start of a single title, so "Q-Tip", "Fingertip", "Colour Deposit Mask" and "proceeds donated" stay products. The rule also reads `cp.product_type`, which is now selected by every eligibility query, and blocks it when it is exactly a gift card, donation, insurance, tip or deposit type.
+These are read from each title on its own, never from the URL, so a real product filed under `/collections/donations/` stays a product. A charity edition ("Pink Lip Balm (Donation Edition)") and an add-on donation ("Lip Gloss + $1 Donation") are products too. "Donate ...", "Tip", "Add a Tip" and "Deposit" / "Deposit for ..." / "Deposit - $50" count only at the start of a title, so "Q-Tip", "Fingertip", "Colour Deposit Mask", "Deposit-Only Color Gloss" and "proceeds donated" stay products. The rule also reads `cp.product_type`, which is now selected by every eligibility query, and blocks it when it is exactly a gift card, donation, insurance, protection or deposit type. "Tips" isn't on that list, because nail stores file press-on tips under it. Separately, the existing gift-card patterns stop catching gift card holders, cases, wallets and sleeves, and "Gift Cardigan" scents; no prod row is affected by that.
 
 The full rule was then replayed in prod over **all 26,907 live, unsuppressed catalog rows**:
 
@@ -77,27 +77,9 @@ Labels name these listings by `product:<seed id>` or `product:<signature>`. Acro
 
 None of them is approved, verified or served. As an anchor, there are another 26 `generated` and 5 `prefilter_rejected` labels, on Clara Lionel and Pixi E-Gift Card 25.
 
-The gateway relationship graph (PIVOTA-Agent, origin/main) behaves as follows:
+Suppressing a listing in the catalog doesn't rewrite the labels already generated for it, and an active seed can keep proposing the listing until the seed is deactivated. Both are handled outside this PR:
 
-- **Generation.** Candidates come from several lanes:
-  - The **active-seed** lane (`productRelationshipGraphSources.js`) reads `external_product_seeds.status = 'active'` with no catalog join. This is the Clara Lionel path.
-  - **products_cache** reads with no catalog join.
-  - **Affected anchors** reads with no suppression filter.
-  - **Target recall** is the only lane that requires `suppressed_at IS NULL`, `sync_status = 'live'` and `pdp_will_render`.
-  - The one title filter, `isOutOfScopeBeautyProduct`, covers apparel and merch only.
-- **Review.** It picks up `label_state = 'generated'` rows with no catalog check. The serving guard it applies reads only the stored snapshot.
-- **Serving.** `product_relationship_edges` is a view over approved, unexpired labels. The read path has no join to `catalog_products` or `index_pipeline_state`. Nothing moves a label when its product is suppressed; an approved edge serves until `expires_at` (45 d AI, 90 d human).
+- **Existing labels:** on 2026-10-21 ~01:00Z, with Peng's go, the relationship-graph owner moved all 46 `generated` labels on these four listings to `needs_evidence`, flagged `non_product_listing` (run `relgraph_nonproduct_20261021T0100`, undoable by run id). A read-back shows none left `generated`; the 15 `prefilter_rejected` labels are untouched.
+- **New candidates:** a PIVOTA-Agent change makes relationship-graph candidates respect the catalog's serving gate.
 
-**So suppressing these listings does not remove their labels.**
-
-- **Catalog-only suppression** (`suppressed_at`, or this rule) keeps them out of target recall. Target recall already excludes them, since `pdp_will_render` is false. The seed lane keeps proposing them while their seeds stay active.
-- **Seed deactivation** (what `withdraw_catalog_rows.py` does) stops new candidates.
-- **The existing 17 generated `competitive_alternative` labels on Clara Lionel stay in the review queue.** If tonight's nightly review approves them (10,000 labels, uncovered-first), they would serve.
-
-Closing this structurally belongs in the gateway:
-
-- the seed and baseline lanes should require the attached catalog row to pass the serving gate;
-- the review should skip candidates that fail it;
-- the serving read should drop edges whose candidate no longer passes.
-
-Clearing the existing labels is a prod write to `relationship_candidate_labels` and needs Peng's go.
+Follow-ups this census does not cover: non-English gift-card and donation titles (기프트카드, 寄付, 礼品卡, Gutschein, bon cadeau), and protection apps listed as products under other names (Extend, Seel, EcoCart, Navidium, Corso).

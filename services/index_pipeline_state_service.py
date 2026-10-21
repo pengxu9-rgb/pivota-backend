@@ -89,7 +89,7 @@ _NON_CORE_PRODUCT_RE = re.compile(
     r"\b(?:"
     r"sample\s+(?:card|vial|pack|sachet)|"
     r"deluxe\s+sample|"
-    r"gift\s+card|e\s*gift\s+card|"
+    r"gift\s+card(?!s?\s+(?:holder|case|wallet|sleeve)s?\b)|e\s*gift\s+card|"
     r"shipping\s+protection|route\s+package\s+protection|delivery\s+protection|"
     r"(?:decal|enamel)\s+stickers?|tirtir\s+stickers?|packette|"
     r"gwp|gift\s+with\s+purchase|free\s+gift|"
@@ -101,7 +101,8 @@ _NON_CORE_PRODUCT_RE = re.compile(
 _NON_CORE_COMPACT_RE = re.compile(
     r"(?:"
     r"samplecard|samplevial|deluxesample|"
-    r"giftcard|egiftcard|"
+    # Not "giftcardholder" / "giftcardigan": a holder, case or cardigan-scented candle is merchandise.
+    r"giftcard(?!igan|s?(?:holder|case|wallet|sleeve))|"
     r"shippingprotection|deliveryprotection|packageprotection|"
     r"narvardeliveryprotection|"
     r"packette"
@@ -116,11 +117,14 @@ _NON_CORE_COMPACT_RE = re.compile(
 # the relationship graph as a competitive alternative to 8 anchors. Same blocker code as the rest,
 # deliberately: every reader of `non_core_product` (the retailer-ingest readback, the image repair,
 # the serving-status copy) already treats it as "not a product", and a new code would be invisible
-# to all of them. Searched across the joined titles + URL like the lists above. Calibrated against
-# every catalog_products and external_product_seeds row in prod: 66 + 58 matches, no real product.
+# to all of them. Calibrated against every catalog_products and external_product_seeds row in prod:
+# 66 + 58 matches, no real product.
+#
+# These read each TITLE on its own, never the URL: a real product filed under /collections/donations/
+# or /collections/order-protection/ is still a product, and one title's last word next to another's
+# first is not a phrase.
 _NON_PRODUCT_LISTING_RE = re.compile(
     r"\b(?:"
-    r"donations?|"
     r"gift\s+(?:certificate|voucher)s?|e\s*vouchers?|store\s+credit|"
     r"(?:shipping|package|delivery|order|parcel|shipment)\s+(?:protection|insurance|guarantee)|"
     r"route\s+(?:shipping\s+)?(?:insurance|protection)|"
@@ -130,25 +134,31 @@ _NON_PRODUCT_LISTING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A donation listing, read on the raw title. A charity EDITION of a product ("Pink Lip Balm (Donation
+# Edition)") and a product with a donation added on ("Lip Gloss + $1 Donation") are products.
+_DONATION_RE = re.compile(r"\bdonations?\b(?!\s+edition\b)", re.IGNORECASE)
+_DONATION_ADD_ON_RE = re.compile(r"\+\s*\$?\s*\d+(?:[.,]\d+)?\s*donations?\b", re.IGNORECASE)
+
 # Words that mean "not a product" only when they ARE the listing ("Donate To The ...", "Tip",
-# "Add a Tip", "Deposit for ..."). Matched at the START of ONE title, never across the joined text:
-# "Q-Tip Precision Swabs", "Fingertip Blender", "Proceeds Donated To ..." and "Colour Deposit Mask"
-# are products.
+# "Add a Tip", "Deposit", "Deposit for ...", "Deposit - $50"). Matched at the START of ONE title:
+# "Q-Tip Precision Swabs", "Fingertip Blender", "Proceeds Donated To ...", "Colour Deposit Mask",
+# "Deposit-Only Color Gloss" and "Deposit (Color Mask) Red" are products.
 _NON_PRODUCT_TITLE_START_RE = re.compile(
     r"^\W*(?:"
     r"donate\b|"
-    r"deposit\s*(?:$|[-:(]|for\b)|"
+    r"deposit\s*(?:$|for\b|[:(-]\s*(?:for\b|custom\b|booking\b|\$|\d))|"
     r"(?:add\s+(?:a\s+)?)?tips?\W*$"
     r")",
     re.IGNORECASE,
 )
 
 # catalog_products.product_type as the merchant set it, separators folded to one space. Exact values
-# only: a type of "Gift Set" or "Gifts" is merchandise.
+# only: a type of "Gift Set" or "Gifts" is merchandise, and so is "Tips" -- nail stores file press-on
+# and Gel-X tips under it (the titles still catch a "Tip" / "Add a Tip" listing).
 _NON_PRODUCT_TYPES = frozenset({
     "gift card", "gift cards", "giftcard", "giftcards", "e gift card", "e gift cards", "egift card",
     "gift certificate", "gift voucher", "donation", "donations", "insurance", "shipping protection",
-    "package protection", "tip", "tips", "gratuity", "deposit",
+    "package protection", "gratuity", "deposit",
 })
 
 
@@ -223,9 +233,18 @@ def _is_non_core_product(row: Dict[str, Any], *, seed_title: str) -> bool:
     return bool(
         _NON_CORE_PRODUCT_RE.search(normalized)
         or _NON_CORE_COMPACT_RE.search(compact)
-        or _NON_PRODUCT_LISTING_RE.search(normalized)
-        or any(_NON_PRODUCT_TITLE_START_RE.search(str(t or "")) for t in titles)
+        or any(_is_non_product_title(str(t or "")) for t in titles)
         or product_type in _NON_PRODUCT_TYPES
+    )
+
+
+def _is_non_product_title(title: str) -> bool:
+    """One title names a listing that is not merchandise (see _NON_PRODUCT_LISTING_RE)."""
+    normalized = re.sub(r"[^a-z0-9%]+", " ", title.lower())
+    return bool(
+        _NON_PRODUCT_LISTING_RE.search(normalized)
+        or (_DONATION_RE.search(title) and not _DONATION_ADD_ON_RE.search(title))
+        or _NON_PRODUCT_TITLE_START_RE.search(title)
     )
 
 
