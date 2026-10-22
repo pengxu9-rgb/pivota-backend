@@ -9,7 +9,8 @@ module EXECUTES the store against Postgres.
     DATABASE_URL=postgresql://localhost/pivota_dialect_check \\
         pytest tests/test_mvp_idempotency_store_postgres.py
 
-Every row this file writes uses a `pgtest_idem_<uuid>` scope, and put()'s cleanup
+Every row this file writes uses a `pgtest_idem_<uuid>` scope (or, for the
+never-expiring `refund` scope, a `pgtest_idem_<uuid>` key), and put()'s cleanup
 is scoped, so it never touches another file's rows in the shared gate database.
 
 Never point this at prod.
@@ -54,6 +55,11 @@ async def _db(monkeypatch: pytest.MonkeyPatch):
     yield database
     await database.execute(
         "DELETE FROM mvp_idempotency_keys WHERE scope LIKE :p",
+        {"p": f"{_SCOPE_PREFIX}%"},
+    )
+    # The refund tests must use the real `refund` scope; their KEYS carry the prefix.
+    await database.execute(
+        "DELETE FROM mvp_idempotency_keys WHERE scope = 'refund' AND idem_key LIKE :p",
         {"p": f"{_SCOPE_PREFIX}%"},
     )
     PostgresIdempotencyStore._table_ensured = False
@@ -193,3 +199,46 @@ async def test_cleanup_is_bounded_per_put(_db) -> None:
 
     await store.put(scope=scope, key="new2", value={})
     assert await _keys(_db, scope) == {"new1", "new2"}
+
+
+def _key() -> str:
+    return f"{_SCOPE_PREFIX}{uuid.uuid4().hex[:12]}"
+
+
+async def test_old_refund_record_is_still_returned_and_still_blocks_a_replay(_db) -> None:
+    """process_refund's only replay guard is this store; it must not expire."""
+    from mvp.idempotency import PostgresIdempotencyStore
+
+    store = PostgresIdempotencyStore()
+    key = _key()
+    await store.put(scope="refund", key=key, value={"refund_id": "re_original"})
+    await _age(_db, "refund", key, days=40)
+
+    got = await store.get(scope="refund", key=key)
+    assert got is not None and got.value == {"refund_id": "re_original"}
+
+    replay = await store.put(scope="refund", key=key, value={"refund_id": "re_second"})
+    assert replay.value == {"refund_id": "re_original"}
+    row = await _db.fetch_one(
+        "SELECT value_json::text AS v, created_at FROM mvp_idempotency_keys "
+        "WHERE scope = 'refund' AND idem_key = :key",
+        {"key": key},
+    )
+    assert "re_original" in row["v"]
+    assert row["created_at"] < datetime.now(timezone.utc) - timedelta(days=39)
+
+
+async def test_refund_put_never_cleans_up_old_refund_rows(_db) -> None:
+    from mvp.idempotency import PostgresIdempotencyStore
+
+    old_keys = {_key() for _ in range(3)}
+    for key in old_keys:
+        await _seed(_db, "refund", key, days_old=60)
+
+    await PostgresIdempotencyStore().put(scope="refund", key=_key(), value={"v": 1})
+
+    rows = await _db.fetch_all(
+        "SELECT idem_key FROM mvp_idempotency_keys WHERE scope = 'refund' AND idem_key LIKE :p",
+        {"p": f"{_SCOPE_PREFIX}%"},
+    )
+    assert old_keys <= {r["idem_key"] for r in rows}

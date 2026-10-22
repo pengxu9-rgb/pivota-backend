@@ -13,7 +13,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mvp import idempotency as idem_mod
-from mvp.idempotency import PostgresIdempotencyStore, idempotency_cutoff, idempotency_ttl_days
+from mvp.idempotency import (
+    NO_EXPIRY_SCOPES,
+    PostgresIdempotencyStore,
+    idempotency_cutoff,
+    idempotency_ttl_days,
+    scope_cutoff,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -84,7 +90,7 @@ async def test_get_filters_on_the_cutoff(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("MVP_IDEMPOTENCY_TTL_DAYS", "3")
     before = datetime.now(timezone.utc)
 
-    assert await PostgresIdempotencyStore().get(scope="refund", key="k1") is None
+    assert await PostgresIdempotencyStore().get(scope="order_create", key="k1") is None
 
     [(kind, sql, values)] = db.dml()
     assert kind == "fetch_one"
@@ -111,19 +117,52 @@ async def test_put_overwrites_only_expired_and_runs_bounded_scoped_cleanup(
     assert "DELETE FROM mvp_idempotency_keys" in cleanup[1]
     assert "scope = :scope AND created_at < :cutoff" in cleanup[1]
     assert "LIMIT :batch" in cleanup[1]
+    assert "FOR UPDATE SKIP LOCKED" in cleanup[1]
     assert cleanup[2]["scope"] == "order_create"
     assert cleanup[2]["batch"] == idem_mod.EXPIRED_CLEANUP_BATCH == 100
     # One cutoff for the whole put: the overwrite and the cleanup agree on "expired".
     assert cleanup[2]["cutoff"] == insert[2]["cutoff"]
 
+    # The read-back uses the upsert's cutoff, not a freshly computed one.
     assert reread[0] == "fetch_one"
+    assert "created_at >= :cutoff" in reread[1]
+    assert reread[2]["cutoff"] == insert[2]["cutoff"]
 
 
 async def test_cleanup_failure_never_fails_the_put(monkeypatch: pytest.MonkeyPatch) -> None:
     db = _RecordingDb(fail_cleanup=True)
     monkeypatch.setattr(PostgresIdempotencyStore, "_try_get_db", lambda self: db)
 
-    rec = await PostgresIdempotencyStore().put(scope="refund", key="k2", value={"ok": True})
+    rec = await PostgresIdempotencyStore().put(scope="brief_build", key="k2", value={"ok": True})
 
     assert rec.value == {"ok": True}
     assert any("DELETE FROM mvp_idempotency_keys" in c[1] for c in db.calls)
+
+
+def test_refund_scope_never_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert "refund" in NO_EXPIRY_SCOPES
+    assert scope_cutoff("refund") is None
+    monkeypatch.setenv("MVP_IDEMPOTENCY_TTL_DAYS", "1")
+    assert scope_cutoff("refund") is None
+    assert scope_cutoff("order_create") is not None
+    assert scope_cutoff("brief_build") is not None
+
+
+async def test_refund_get_has_no_cutoff_and_put_never_overwrites_or_cleans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = _RecordingDb()
+    monkeypatch.setattr(PostgresIdempotencyStore, "_try_get_db", lambda self: db)
+    store = PostgresIdempotencyStore()
+
+    assert await store.get(scope="refund", key="r1") is None
+    await store.put(scope="refund", key="r1", value={"refund_id": "re_1"})
+
+    get_call, insert, reread = db.dml()
+    for kind, sql, values in (get_call, reread):
+        assert kind == "fetch_one"
+        assert "created_at" not in sql.split("FROM", 1)[1]
+        assert "cutoff" not in values
+    assert "ON CONFLICT (scope, idem_key) DO NOTHING" in insert[1]
+    assert "DO UPDATE" not in insert[1]
+    assert not any("DELETE FROM" in c[1] for c in db.calls)
