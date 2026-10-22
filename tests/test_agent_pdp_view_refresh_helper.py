@@ -174,7 +174,11 @@ async def test_refresh_returns_false_when_no_products(monkeypatch: pytest.Monkey
         "ck-missing", refresh_source="catalog_sync", db=db
     )
     assert built is False
-    assert db.executes == []
+    assert db.executes == []  # no upsert
+    # Nothing built -> the guarded reap runs (its predicate is exercised on real
+    # Postgres in tests/test_agent_pdp_view_unbuildable_reap_postgres.py).
+    assert db.fetch_ones[-1]["sql"] == apv._DELETE_IF_UNBUILDABLE_SQL
+    assert db.fetch_ones[-1]["params"] == {"content_key": "ck-missing"}
 
 
 @pytest.mark.asyncio
@@ -195,7 +199,9 @@ async def test_refresh_returns_false_when_row_too_thin(monkeypatch: pytest.Monke
         "ck-2", refresh_source="catalog_sync", db=db
     )
     assert built is False
-    assert db.executes == []
+    assert db.executes == []  # no upsert
+    assert db.fetch_ones[-1]["sql"] == apv._DELETE_IF_UNBUILDABLE_SQL
+    assert db.fetch_ones[-1]["params"] == {"content_key": "ck-2"}
 
 
 # ── B① write-triggered enrichment propagation ──────────────────────────────
