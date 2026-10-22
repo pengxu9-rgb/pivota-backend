@@ -67,7 +67,7 @@ LIMIT :limit
 """
 
 OFFERS_SQL = """
-SELECT o.offer_id, o.product_key, o.sku_key, o.merchant_id, o.currency, o.source_ref,
+SELECT o.offer_id, o.product_key, o.sku_key, o.merchant_id, o.currency, o.source_ref, o.source_system,
        o.list_price, o.merchant_effective_price, o.estimated_best_price, o.price_checked_at,
        o.offer_payload ->> 'destination_url' AS payload_destination_url,
        o.offer_payload ->> 'external_seed_id' AS payload_seed_id,

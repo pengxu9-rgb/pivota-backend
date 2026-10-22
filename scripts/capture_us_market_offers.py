@@ -85,8 +85,8 @@ Usage
   python3 scripts/capture_us_market_offers.py --apply --domain palmofferonia.com
 
 THROUGH THE JOB RUNNER, PASS SUBNET=pivota-crawl. This script fetches `/`, `/localization`,
-`/cart.js` and `/products/<handle>.js` from 36 merchant storefronts at REQUEST_GAP_SECONDS=0.6,
-which is close to the shape that was measured tripping a cross-domain IP-level 429 lasting ~15
+`/cart.js` and `/products/<handle>.js` from 36 merchant storefronts (once at a 0.6 s gap; now through
+crawl_politeness at >= 1 s per host), and that once was close to the shape that was measured tripping a cross-domain IP-level 429 lasting ~15
 minutes (~50 requests over 37 Cloudflare-fronted domains in about a minute). prod's `default`
 subnet egresses from 8.231.167.230, the address given to payment partners for allowlisting, and
 NAT port exhaustion is per-IP — so a burst here can starve payment egress even with clean
@@ -120,6 +120,7 @@ from services.catalog_offer_writer_guard import (  # noqa: E402
 from services.external_offer_dual_write import (  # noqa: E402
     derive_mirror_sku_key,
 )
+from services.seed_offer_currency import SEED_PROJECTED_OFFER_SOURCE_SYSTEMS  # noqa: E402
 from services.variant_identity import PRODUCT_DERIVED  # noqa: E402
 
 REFRESH_SOURCE = "us_market_offer_capture"
@@ -132,11 +133,24 @@ OFFER_ID_PREFIX = "offer:us_market:"
 #: are progress, not the result); this line is the result.
 REPORT_BEGIN = "USMKTREPORT>>>"
 REPORT_END = "<<<USMKTREPORT"
-REQUEST_GAP_SECONDS = 0.6
+# PACING IS THE SHARED CRAWL GATE, not a local sleep (PR controller review of #2666): every request
+# goes through services/crawl_politeness.before_request -- robots.txt, the per-host floor
+# (CRAWL_MIN_INTERVAL_SECONDS, default 1 s; this script used 0.6 s), the process-wide crawl pacer, and
+# the shared Shopify-edge budget when CRAWL_SHOPIFY_EDGE_PACER_ENABLED is on.
+USER_AGENT = "Mozilla/5.0 (compatible; PivotaBot/1.0)"
+#: Fetching storefronts from anywhere but the crawl subnet is refused, dry run included (a dry run
+#: fetches every store too). scripts/ops/run_oneoff_job.sh exports the subnet it ran the job on.
+CRAWL_SUBNET = "pivota-crawl"
+EGRESS_SUBNET_ENV = "PIVOTA_EGRESS_SUBNET"
 # Re-verify the session is still presenting USD every N product reads; a
 # decayed localization cookie would silently relabel home-currency prices as
 # USD — the exact defect class (#1636/#1642) this lane must never reintroduce.
-SESSION_RECHECK_EVERY = 25
+#
+# A LIMIT, NOT A PROOF: a session that flips USD -> home currency -> USD between two checks prices the
+# reads in between in the home currency and both checks still pass. Nothing in /products/<h>.js says
+# which currency it is in, so the window is what bounds the damage; 10 keeps it to at most nine reads
+# for one extra /cart.js per ten products (was 25).
+SESSION_RECHECK_EVERY = 10
 
 # Blocked products with a foreign-priced offer, one row per (product, domain).
 # canonical_url supplies the Shopify handle (its final path segment).
@@ -164,6 +178,127 @@ CANDIDATES_SQL = """
       AND cp.canonical_url IS NOT NULL
     ORDER BY co.source_domain, cp.product_key
 """
+
+# THE SAME CAPTURE FOR A NAMED SET OF SEEDS (--seed-ids), for a cohort CANDIDATES_SQL cannot see.
+# 2026-10-22 (rr1020 / usmkt1022): 108 active US-filed seeds on four storefronts whose pages read
+# EUR/GBP while their column says USD (the writers' old `or "USD"` default). Their offers are labelled
+# USD, so the no_us_offer blocker and the foreign-offer filter above never select them; every reader
+# withholds their copied offers (#2652/#2657). The stores DO quote US buyers real USD prices via
+# Shopify Markets (usmkt1022: all four `us_usd_price`), so this lane can write the honest sibling.
+# One row per (attached product, seed domain); the domain is the SEED's, and select_capturable still
+# refuses a product whose canonical_url is on another host, so a seed attached to another store's
+# canonical product is skipped (domain_mismatch), never priced from the wrong store.
+SEED_CANDIDATES_SQL = """
+    SELECT DISTINCT cp.content_key, cp.product_key, cp.merchant_id,
+           cp.canonical_url, lower(trim(eps.domain)) AS source_domain
+    FROM external_product_seeds eps
+    JOIN catalog_products cp ON cp.product_key = eps.attached_product_key
+    WHERE eps.id = ANY(:seed_ids)
+      AND lower(trim(coalesce(eps.status, ''))) = 'active'
+      AND cp.suppressed_at IS NULL
+      AND cp.suppression_reason IS NULL
+      AND cp.content_key IS NOT NULL
+      AND nullif(trim(eps.domain), '') IS NOT NULL
+      AND cp.canonical_url IS NOT NULL
+    ORDER BY 5, cp.product_key
+"""
+
+#: Why each named seed id did or did not reach SEED_CANDIDATES_SQL, so a run says which of its ids
+#: it never priced (a retired seed, an unattached one, an id that does not exist) instead of a
+#: smaller plan that reads as "nothing else to capture".
+SEED_MATCH_SQL = """
+    SELECT ids.id,
+           CASE WHEN eps.id IS NULL THEN 'missing'
+                WHEN lower(trim(coalesce(eps.status, ''))) <> 'active' THEN 'not_active'
+                WHEN eps.attached_product_key IS NULL THEN 'unattached'
+                WHEN nullif(trim(eps.domain), '') IS NULL THEN 'no_domain'
+                WHEN cp.product_key IS NULL THEN 'product_missing'
+                WHEN cp.suppressed_at IS NOT NULL OR cp.suppression_reason IS NOT NULL
+                  THEN 'product_suppressed'
+                WHEN cp.content_key IS NULL THEN 'no_content_key'
+                WHEN cp.canonical_url IS NULL THEN 'no_canonical_url'
+                ELSE 'matched' END AS outcome
+    FROM unnest(CAST(:seed_ids AS text[])) AS ids(id)
+    LEFT JOIN external_product_seeds eps ON eps.id = ids.id
+    LEFT JOIN catalog_products cp ON cp.product_key = eps.attached_product_key
+    ORDER BY ids.id
+"""
+
+# ONE LIVE OFFER PER SHELF (PR controller review of #2666). The US offer this lane writes sits on
+# (sku_key, 'external_referral', 'US'), the shelf the mirror's canonical offer for the same product
+# already holds -- for the --seed-ids cohort, mislabelled as USD. Two live rows there turn
+# `duplicate_offers_per_sku_channel_market` (threshold 0) red, and the reconciler keeps the most
+# recently UPDATED row, so the next mirror touch would retire the honest USD row as duplicate_offer.
+# So --seed-ids plans the shelf: a live SEED-PROJECTED sibling (services/seed_offer_currency: a copy
+# of the seed's money, which every reader already withholds for these seeds) is retired in the SAME
+# transaction as the US offer is written; any other live sibling refuses the product.
+SHELF_SIBLINGS_SQL = """
+    SELECT co.offer_id, co.sku_key, co.source_system
+      FROM catalog_offers co
+     WHERE co.sku_key = ANY(:sku_keys)
+       AND co.channel = 'external_referral'
+       AND co.market = 'US'
+       AND co.suppressed_at IS NULL
+       AND co.offer_id <> ALL(:offer_ids)
+"""
+
+RETIRE_SUPERSEDED_SQL = """
+    UPDATE catalog_offers
+       SET suppressed_at = NOW(),
+           suppression_reason = 'superseded_by_us_market_capture',
+           suppression_metadata = coalesce(suppression_metadata, '{}'::jsonb)
+               || jsonb_build_object('superseded_by', CAST(:offer_id AS text)),
+           updated_at = NOW()
+     WHERE offer_id = ANY(:retire_offer_ids)
+       AND sku_key = CAST(:sku_key AS text)
+       AND suppressed_at IS NULL
+       AND source_system = ANY(:projected_systems)
+    RETURNING offer_id
+"""
+
+
+def require_crawl_egress() -> None:
+    """Refuse to fetch a storefront from anywhere but the crawl subnet (dry run included)."""
+    subnet = os.environ.get(EGRESS_SUBNET_ENV)
+    if subnet != CRAWL_SUBNET:
+        raise SystemExit(
+            f"refusing to fetch storefronts: {EGRESS_SUBNET_ENV}={subnet!r}, not {CRAWL_SUBNET!r}. "
+            f"Run through scripts/ops/run_oneoff_job.sh with SUBNET={CRAWL_SUBNET} (a laptop or the "
+            f"payment subnet's address must never crawl a merchant)."
+        )
+
+
+def plan_shelf(planned: List[Dict[str, Any]], siblings: List[Dict[str, Any]],
+               projected_systems: Tuple[str, ...]) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    """Attach to each planned row the live seed-projected siblings it retires, and refuse a row whose
+    shelf holds any other live offer. Returns (writable rows, [(product_key, reason)])."""
+    by_sku: Dict[str, List[Dict[str, Any]]] = {}
+    for sib in siblings:
+        by_sku.setdefault(sib["sku_key"], []).append(sib)
+    keep: List[Dict[str, Any]] = []
+    refused: List[Tuple[str, str]] = []
+    for row in planned:
+        sibs = by_sku.get(row["sku_key"], [])
+        if any(str(s.get("source_system") or "") not in projected_systems for s in sibs):
+            refused.append((row["product_key"], "offers_refused_shelf_taken"))
+            continue
+        keep.append({**row, "retire_offer_ids": sorted(s["offer_id"] for s in sibs)})
+    return keep, refused
+
+
+def parse_seed_ids(raw: Optional[str]) -> Optional[List[str]]:
+    """`--seed-ids`: comma- or whitespace-separated ids, or `@path` to a file of them. None when the
+    flag was not given; an empty list is an error (a run that selects nothing proves nothing)."""
+    if raw is None:
+        return None
+    if raw.startswith("@"):
+        with open(raw[1:], encoding="utf-8") as fh:
+            raw = fh.read()
+    ids = sorted({part for part in raw.replace(",", " ").split() if part})
+    if not ids:
+        raise ValueError("--seed-ids named no seed")
+    return ids
+
 
 #: The products among a planned batch that are SUPPRESSED. CANDIDATES_SQL
 #: already excludes them, but minutes of HTTP probing separate that scan from
@@ -433,8 +568,15 @@ def plan_offer(candidate: Dict[str, Any], price_cents: int,
     }
 
 
+async def _paced(url: str) -> None:
+    from services import crawl_politeness
+
+    await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=0)
+
+
 async def _fetch_json(client: Any, url: str) -> Optional[Any]:
     try:
+        await _paced(url)
         resp = await client.get(url)
         if resp.status_code != 200:
             return None
@@ -447,7 +589,9 @@ async def establish_us_session(client: Any, domain: str) -> bool:
     """Localize the session to the US market and PROVE it took effect: the
     positive signal is /cart.js reporting USD, never the POST's status."""
     try:
+        await _paced(f"https://{domain}/")
         await client.get(f"https://{domain}/")
+        await _paced(f"https://{domain}/localization")
         await client.post(
             f"https://{domain}/localization",
             files={
@@ -494,7 +638,7 @@ async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
 
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=20.0,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; PivotaBot/1.0)"},
+        headers={"User-Agent": USER_AGENT},
     ) as client:
         if not await establish_us_session(client, domain):
             return {"domain": domain, "us_market": False,
@@ -508,7 +652,6 @@ async def capture_domain(domain: str, candidates: List[Dict[str, Any]],
                 continue
             pjs = await _fetch_json(
                 client, f"https://{domain}/products/{handle}.js")
-            await asyncio.sleep(REQUEST_GAP_SECONDS)
             if not pjs:
                 skipped.append((c["product_key"], "product_js_unavailable"))
                 continue
@@ -678,16 +821,27 @@ async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     written = 0
+    retired = 0
     not_written: List[str] = []
     republish_failed: List[str] = []
     for row in planned:
-        params = {k: v for k, v in row.items() if k != "content_key"}
+        params = {k: v for k, v in row.items() if k not in ("content_key", "retire_offer_ids")}
         # `fetch_val` for the RETURNING, not `execute`: the statement's SELECT
         # source can legitimately yield NO ROW (the product was retired or
         # re-keyed during the probe), and `databases` + asyncpg reports no
         # rowcount, so an unconditional `written += 1` beside an `execute()` is a
         # count of ATTEMPTS being reported as a count of WRITES.
-        landed = await database.fetch_val(OFFER_UPSERT_SQL, params)
+        # ONE TRANSACTION with the shelf's retirement: the honest US row and the mislabelled sibling it
+        # supersedes never both stand live, and never neither (--seed-ids; see SHELF_SIBLINGS_SQL).
+        async with database.transaction():
+            landed = await database.fetch_val(OFFER_UPSERT_SQL, params)
+            if landed is not None and row.get("retire_offer_ids"):
+                gone = await database.fetch_all(RETIRE_SUPERSEDED_SQL, {
+                    "offer_id": row["offer_id"], "sku_key": row["sku_key"],
+                    "retire_offer_ids": row["retire_offer_ids"],
+                    "projected_systems": list(SEED_PROJECTED_OFFER_SOURCE_SYSTEMS),
+                })
+                retired += len(gone or [])
         if landed is None:
             not_written.append(row["product_key"])
             print(f"  [SKIP] no live product row at write time for "
@@ -703,15 +857,31 @@ async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
             republish_failed.append(row["content_key"])
             print(f"  [WARN] republish failed for {row['content_key']}: "
                   f"{type(exc).__name__}: {str(exc)[:80]}", flush=True)
-    return {"written": written, "republish_failed": republish_failed,
+    return {"written": written, "retired": retired, "republish_failed": republish_failed,
             "not_written": not_written}
 
 
 async def _drive(apply: bool, only_domain: Optional[str],
-                 limit: Optional[int]) -> int:
+                 limit: Optional[int], seed_ids: Optional[List[str]] = None) -> int:
+    require_crawl_egress()
+    seed_match: Dict[str, Any] = {}
     await database.connect()
     try:
-        rows = [dict(r) for r in await database.fetch_all(CANDIDATES_SQL)]
+        if seed_ids is None:
+            rows = [dict(r) for r in await database.fetch_all(CANDIDATES_SQL)]
+        else:
+            rows = [dict(r) for r in await database.fetch_all(SEED_CANDIDATES_SQL, {"seed_ids": seed_ids})]
+            outcomes = [dict(r) for r in await database.fetch_all(SEED_MATCH_SQL, {"seed_ids": seed_ids})]
+            unmatched = [o for o in outcomes if o["outcome"] != "matched"]
+            by_reason: Dict[str, int] = {}
+            for o in unmatched:
+                by_reason[o["outcome"]] = by_reason.get(o["outcome"], 0) + 1
+            seed_match = {
+                "seed_ids_matched": len(outcomes) - len(unmatched),
+                "seed_ids_unmatched": by_reason,
+                "seed_ids_unmatched_first": [(o["id"], o["outcome"]) for o in unmatched[:5]],
+            }
+            print(f"seed ids: {seed_match}", flush=True)
     finally:
         await database.disconnect()
 
@@ -751,6 +921,9 @@ async def _drive(apply: bool, only_domain: Optional[str],
         "writer": SOURCE_SYSTEM,
         "batch_id": audit.batch_id,
         "applied": 1 if apply else 0,
+        "cohort": "no_us_offer" if seed_ids is None else "seed_ids",
+        "seed_ids": None if seed_ids is None else len(seed_ids),
+        **seed_match,
         "candidates": len(rows),
         "domains": len(by_domain),
         "pre_skipped": pre_reasons,
@@ -762,6 +935,17 @@ async def _drive(apply: bool, only_domain: Optional[str],
     # class of lie as a dropped report line.
     await database.connect()
     try:
+        if seed_ids is not None and all_planned:
+            # The shelf, read in BOTH modes, so the dry run shows exactly what --apply retires.
+            siblings = [dict(r) for r in await database.fetch_all(SHELF_SIBLINGS_SQL, {
+                "sku_keys": sorted({r["sku_key"] for r in all_planned}),
+                "offer_ids": sorted({r["offer_id"] for r in all_planned}),
+            })]
+            all_planned, shelf_refused = plan_shelf(all_planned, siblings, SEED_PROJECTED_OFFER_SOURCE_SYSTEMS)
+            report["offers_refused_shelf_taken"] = len(shelf_refused)
+            report["shelf_retire_planned"] = sum(len(r["retire_offer_ids"]) for r in all_planned)
+            for product_key, _ in shelf_refused[:5]:
+                print(f"  [SHELF] another live offer holds the US shelf of {product_key[:60]}", flush=True)
         writable, sku_counts = await ensure_skus_for_planned(
             all_planned, apply=apply, batch_id=audit.batch_id
         )
@@ -774,6 +958,7 @@ async def _drive(apply: bool, only_domain: Optional[str],
         else:
             summary = await apply_offers(writable)
             report["written"] = summary["written"]
+            report["superseded_retired"] = summary["retired"]
             report["not_written"] = len(summary["not_written"])
             report["republish_failed"] = len(summary["republish_failed"])
             report["republish_failed_keys"] = summary["republish_failed"][:5]
@@ -812,10 +997,17 @@ def main() -> int:
     p.add_argument("--domain", help="capture only this source_domain")
     p.add_argument("--limit", type=int, default=None,
                    help="cap the number of captured products")
+    p.add_argument("--seed-ids", default=None,
+                   help="capture the attached products of these seeds instead of the no_us_offer "
+                        "cohort: comma/space separated ids, or @file")
     args = p.parse_args()
     if args.limit is not None and args.limit <= 0:
         p.error("--limit must be a positive integer")
-    return asyncio.run(_drive(args.apply, args.domain, args.limit))
+    try:
+        seed_ids = parse_seed_ids(args.seed_ids)
+    except (OSError, ValueError) as exc:
+        p.error(str(exc))
+    return asyncio.run(_drive(args.apply, args.domain, args.limit, seed_ids))
 
 
 if __name__ == "__main__":
