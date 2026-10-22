@@ -601,6 +601,9 @@ def _collect_us_market_capture() -> List[Tuple[str, str]]:
             "CANDIDATES_SQL", "OFFER_UPSERT_SQL",
             # --seed-ids (2026-10-22): the named-seed cohort; `= ANY(:seed_ids)` on a text array.
             "SEED_CANDIDATES_SQL",
+            # Review of #2666: which named ids matched (unnest of a text[] bind), the US shelf, and the
+            # in-transaction retirement of the mislabelled sibling (jsonb || jsonb_build_object).
+            "SEED_MATCH_SQL", "SHELF_SIBLINGS_SQL", "RETIRE_SUPERSEDED_SQL",
             # The SKU precondition, added when this lane was found to have
             # minted 529 live orphan offers. MINT_CANONICAL_SKU_SQL is an
             # INSERT ... SELECT with an ON CONFLICT on a FOUR-column index and a
@@ -830,7 +833,7 @@ _MIN_STATEMENTS = {
     "scripts/report_agent_depth_scorecard.py": 6,
     "scripts/report_inci_ingestion_quality.py": 6,
     "scripts/reattribute_orphaned_enrichment.py": 8,
-    "scripts/capture_us_market_offers.py": 6,
+    "scripts/capture_us_market_offers.py": 9,
     "scripts/reconcile_catalog_offers.py": 8,
     "scripts/dispose_sentinel_orphans.py": 8,
     "scripts/report_quality_scale_population.py": 5,

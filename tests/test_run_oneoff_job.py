@@ -387,7 +387,24 @@ def test_the_database_guardrails_are_resupplied(tmp_path: Path) -> None:
 def test_env_vars_are_overridable(tmp_path: Path) -> None:
     r = run(tmp_path, ["scripts/x.py"], ENV_VARS="FOO=bar")
 
-    assert r.flag(r.call("run", "jobs", "create"), "--set-env-vars") == "FOO=bar"
+    assert r.flag(r.call("run", "jobs", "create"), "--set-env-vars") == "FOO=bar,PIVOTA_EGRESS_SUBNET=default"
+
+
+def test_the_job_is_told_which_subnet_it_runs_on(tmp_path: Path) -> None:
+    """scripts/capture_us_market_offers.py refuses to fetch a storefront unless PIVOTA_EGRESS_SUBNET is
+    pivota-crawl, so the runner must export the subnet it actually passes to --subnet."""
+    def env_of(name: str, **env: str) -> str:
+        d = tmp_path / name
+        d.mkdir()
+        r = run(d, ["scripts/x.py"], **env)
+        create = r.call("run", "jobs", "create")
+        assert r.flag(create, "--subnet") == env.get("SUBNET", "default")
+        return r.flag(create, "--set-env-vars")
+
+    assert env_of("crawl", SUBNET="pivota-crawl").endswith(",PIVOTA_EGRESS_SUBNET=pivota-crawl")
+    assert env_of("plain").endswith(",PIVOTA_EGRESS_SUBNET=default")
+    # An empty ENV_VARS falls back to the guardrail default, and the subnet still rides along.
+    assert env_of("empty", ENV_VARS="", SUBNET="pivota-crawl").startswith("PIVOTA_ENV=production,")
 
 
 def test_help_prints_usage_without_touching_production(tmp_path: Path) -> None:

@@ -106,6 +106,9 @@ JOB_PREFIX="${JOB_PREFIX:-oneoff}"
 # from a one-off job at all.
 NETWORK="${NETWORK:-default}"
 SUBNET="${SUBNET:-default}"
+# The job is TOLD which subnet it runs on (PIVOTA_EGRESS_SUBNET, appended to ENV_VARS), so a script
+# that crawls merchants can refuse to start anywhere else -- scripts/capture_us_market_offers.py does.
+# Nothing else inside the container can tell which NAT it leaves by.
 
 # Print the whole header comment, however long it grows. A hardcoded line range
 # silently truncates the moment the header changes — which it already has once.
@@ -181,7 +184,7 @@ gcloud run jobs create "$JOB" --project "$PROJECT" --region "$REGION" \
   --service-account "$SERVICE_ACCOUNT" \
   --network "$NETWORK" --subnet "$SUBNET" --vpc-egress all-traffic \
   --set-secrets "$SECRETS" \
-  --set-env-vars "$ENV_VARS" \
+  --set-env-vars "${ENV_VARS:+$ENV_VARS,}PIVOTA_EGRESS_SUBNET=$SUBNET" \
   --max-retries 0 --task-timeout "$TASK_TIMEOUT" \
   --command "$COMMAND" --args="^$DELIM^$JOINED" \
   --quiet >/dev/null 2>"$ERRLOG" || {
