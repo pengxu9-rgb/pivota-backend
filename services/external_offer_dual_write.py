@@ -46,6 +46,7 @@ from typing import Any, Dict, Optional, Tuple
 from db.database import database
 from services.offer_seller_identity import host_from_url, is_known_retailer
 from services.seed_offer_currency import (
+    SEED_PROJECTED_OFFER_SOURCE_SYSTEMS,
     SeedOfferCurrencyRefused,
     currency_code,
     seed_currency_of,
@@ -750,15 +751,20 @@ def plan_attached_listing_offer_writes(
     currency = currency_code(seed.get("price_currency"))
     if not currency:
         return {"status": "refused_currency", "writes": [], "skips": {}, "refused": []}
-    # A SEED THAT STATES NO CURRENCY OF ITS OWN RE-PRICES NOTHING. Its column (USD) and page read (AUD)
-    # disagree, or its payload hides the page read (seed_currency_of carries the SQL's answer on the
-    # sync path), so no amount it holds can be vouched for in any currency. #2657 refused its
-    # SEED-PROJECTED rows, which every reader withholds; Peng 2026-10-22 extended that to every row,
-    # the enrichment lane's served listing rows included: re-pricing them from the column and stamping
-    # them freshly checked every night vouched for a price whose currency nobody can state (us.oiolab.co:
-    # column USD, page EUR, same amount). The rows are NOT suppressed: they keep their last price and
-    # their price_checked_at ages, so the freshness gates decide what a buyer sees.
-    if seed_currency_of(seed) is None:
+    # A SEED THAT STATES NO CURRENCY OF ITS OWN: its column (USD) and page read (AUD) disagree, or its
+    # payload hides the page read (seed_currency_of carries the SQL's answer on the sync path).
+    #   * Its SEED-PROJECTED rows, which every reader withholds, are never re-priced (#2657).
+    #   * A READ (`refresh`, and any source but an employee edit) re-prices nothing: no amount it holds can
+    #     be vouched for in any currency (Peng 2026-10-22). The nightly refresh already projects only a
+    #     read in the column's currency, so this is a guard against a read that reaches here anyway (a
+    #     whitespace-only disagreement, a concurrent write), not a change to tonight's writes.
+    #   * An explicit EMPLOYEE EDIT (`employee_edit`) is a person vouching for the column's currency and
+    #     amount: it re-prices and stamps the listing rows another writer owns as on main, attributed
+    #     `price_read_source = employee_edit` (Peng 2026-10-22). Otherwise a human has no way to correct
+    #     such a listing (setting the column to the page's currency turns every row into a mismatch).
+    # Refused rows are NOT suppressed: they keep their last price and their price_checked_at ages.
+    seed_states_currency = seed_currency_of(seed) is not None
+    if not seed_states_currency and source != "employee_edit":
         return {"status": "refused_currency", "writes": [], "skips": {"refused_currency": len(live)}, "refused": []}
 
     ratio = max_ratio if max_ratio is not None else max_price_ratio()
@@ -798,6 +804,9 @@ def plan_attached_listing_offer_writes(
         skips[reason] = skips.get(reason, 0) + 1
 
     for offer in live:
+        if not seed_states_currency and str(offer.get("source_system") or "") in SEED_PROJECTED_OFFER_SOURCE_SYSTEMS:
+            _skip("refused_currency")
+            continue
         if offer.get("price_repaired"):
             # A generic listing read cannot supersede reviewed native-variant evidence.
             _skip("reviewed_price_repair")
@@ -835,6 +844,9 @@ def plan_attached_listing_offer_writes(
                             "current": current, "read": price, "currency": currency})
             continue
         writes.append({"offer_id": offer["offer_id"], "price": price, "currency": currency})
+    if not writes and skips and set(skips) == {"refused_currency"}:
+        # Every live row was one the readers withhold: the seed itself is refused, and counted so.
+        return {"status": "refused_currency", "writes": [], "skips": skips, "refused": refused}
     return {"status": "planned", "writes": writes, "skips": skips, "refused": refused}
 
 
@@ -869,6 +881,17 @@ async def sync_attached_listing_offers(
             "reason": plan["status"],
             "seed_id": seed_id,
             "product_key": product_key,
+            "rows_refused": int((plan.get("skips") or {}).get("refused_currency") or 0),
+        })
+    elif plan["skips"].get("refused_currency"):
+        # An employee edit of a seed that states no currency: its seed-projected rows were refused
+        # beside rows that still write, so the seed reports `synced`. Logged so they are seen.
+        logger.warning({
+            "event": "external_offer_attached_refused",
+            "reason": "refused_currency",
+            "seed_id": seed_id,
+            "product_key": product_key,
+            "rows_refused": plan["skips"]["refused_currency"],
         })
     for refused in plan.get("refused") or []:
         # WARNING, not INFO: prod drops module-logger INFO. One line per refused row, for review.

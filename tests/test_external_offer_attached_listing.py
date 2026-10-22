@@ -177,18 +177,43 @@ def test_rows_the_readers_withhold_are_not_repriced(source_system):
 
 
 @pytest.mark.parametrize("source_system", ["catalog_enrichment_agent_v1", "variant_identity_backfill_v1", None])
-def test_every_row_of_a_seed_with_no_currency_is_refused(source_system):
-    """Peng 2026-10-22, after #2657 (M2): the enrichment lane's served listing rows are refused too. They
-    were re-priced from the column and stamped fresh every night for a seed whose currency nobody can
-    state (us.oiolab.co: column USD, page EUR). Whoever wrote the row, nothing is re-priced."""
-    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)])
+def test_a_read_reprices_no_row_of_a_seed_with_no_currency(source_system):
+    """Peng 2026-10-22, after #2657 (M2): a READ of a seed whose currency nobody can state (us.oiolab.co:
+    column USD, page EUR) re-prices no row, whoever wrote it."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)], source="refresh")
     assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
 
 
-def test_a_mixed_listing_is_refused_whole():
+def test_an_employee_edit_reprices_the_rows_another_writer_owns():
+    """Peng 2026-10-22: an explicit employee edit is a person vouching for the column's currency and
+    amount, so it re-prices the listing's enrichment row as on main; the seed-projected row stays refused
+    (#2657). The same seed under a refresh writes nothing (above)."""
     rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
             _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows, source="employee_edit", currency_read=False)
+    assert plan["status"] == "planned"
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+    assert plan["skips"] == {"refused_currency": 1}
+
+
+def test_an_employee_edit_never_reprices_seed_projected_rows():
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_copy")], source="employee_edit", currency_read=False)
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+def test_the_refusal_counts_live_rows_only():
+    """A suppressed row of the listing is not one the lane would have written, so it is not counted
+    as refused (PR controller review of #2665, M10)."""
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _offer("of_gone", sku=f"{PK}::v:47761881301179", vid="47761881301179", suppressed=True)]
     plan = _plan(_seed(**_DISAGREEING), rows)
+    assert (plan["status"], plan["skips"]) == ("refused_currency", {"refused_currency": 1})
+
+
+def test_a_mixed_listing_is_refused_whole_by_a_read():
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows, source="refresh")
     assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 2})
 
 
@@ -433,6 +458,19 @@ def test_a_column_with_a_trailing_newline_no_longer_writes_an_enrichment_row():
     assert (plan["status"], plan["writes"], plan["skips"]) == ("planned", [], {"currency_mismatch": 1})
 
 
+def test_an_employee_edits_refused_rows_are_logged(monkeypatch, caplog):
+    import logging
+
+    fake = FakeDB(seed=_seed(**_DISAGREEING),
+                  offers=[_projected("of_canon", "catalog_enrichment_agent_v1"),
+                          _projected("of_copy", sku=f"{PK}::canonical")])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake, source="employee_edit", currency_read=False)
+    assert (result["status"], result["offers_written"], result["offer_skips"]) == ("synced", 1, {"refused_currency": 1})
+    assert [u["offer_id"] for u in fake.updates] == ["of_canon"]
+    assert any("refused_currency" in str(r.msg) and "'rows_refused': 1" in str(r.msg) for r in caplog.records)
+
+
 def test_a_refused_seed_is_logged_and_stamps_nothing(monkeypatch, caplog):
     """Through the real sync: a mixed listing of a seed with no currency of its own writes no row,
     enrichment row included, and the refusal gets its warning line."""
@@ -447,7 +485,7 @@ def test_a_refused_seed_is_logged_and_stamps_nothing(monkeypatch, caplog):
     assert result["status"] in mod.OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
     assert fake.updates == []
     assert any("external_offer_attached_refused" in str(r.msg) and "refused_currency" in str(r.msg)
-               for r in caplog.records)
+               and "'rows_refused': 2" in str(r.msg) for r in caplog.records)
 
 
 def test_refused_rows_are_logged_for_review(monkeypatch, caplog):

@@ -149,13 +149,13 @@ async def _offers(db):
     return {r["offer_id"]: dict(r) for r in rows}
 
 
-async def _sync(monkeypatch, db):
+async def _sync(monkeypatch, db, source="refresh"):
     from services import external_offer_dual_write as mod
 
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     monkeypatch.setattr(mod, "database", db)
     monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
-    return await mod.sync_offer_for_seed(SEED_ID, attached_price_source="refresh", currency_read=True)
+    return await mod.sync_offer_for_seed(SEED_ID, attached_price_source=source, currency_read=source == "refresh")
 
 
 async def test_the_listing_rows_take_the_re_read_prices_and_nothing_else_moves(scoped_db, monkeypatch):
@@ -201,21 +201,34 @@ async def test_a_seed_the_readers_cannot_price_reprices_and_stamps_nothing(scope
         assert not rows[oid]["touched"] and not rows[oid]["checked"], oid
 
 
-async def test_enrichment_rows_of_such_a_seed_are_refused_too(scoped_db, monkeypatch):
-    """Peng 2026-10-22, after #2657 (M2): the enrichment lane's rows (this fixture's own shape) of a seed
-    whose column and page read disagree are no longer re-priced or stamped freshly checked. They keep
-    their last price; nothing is suppressed."""
+_AUD_PAGE = "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{snapshot,price_currency}', '\"AUD\"') WHERE id = :id"
+
+
+async def test_a_read_of_such_a_seed_reprices_no_enrichment_row(scoped_db, monkeypatch):
+    """Peng 2026-10-22, after #2657 (M2): a refresh of a seed whose column and page read disagree
+    re-prices and stamps none of the enrichment lane's rows (this fixture's own shape). Nothing is
+    suppressed: every row keeps its last price."""
     await _load(scoped_db)
     before = await _offers(scoped_db)
-    await scoped_db.execute(
-        "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{snapshot,price_currency}', '\"AUD\"') WHERE id = :id",
-        {"id": SEED_ID})
-    result = await _sync(monkeypatch, scoped_db)
+    await scoped_db.execute(_AUD_PAGE, {"id": SEED_ID})
+    result = await _sync(monkeypatch, scoped_db, source="refresh")
     assert result["status"] == "refused_currency", result
     rows = await _offers(scoped_db)
     for oid, row in rows.items():
         assert not row["touched"] and not row["checked"], oid
         assert float(row["list_price"]) == float(before[oid]["list_price"]), oid
+
+
+async def test_an_employee_edit_of_the_same_seed_reprices_them_as_main(scoped_db, monkeypatch):
+    """Peng 2026-10-22: the same seed under an explicit employee edit re-prices and stamps the enrichment
+    lane's product row, attributed `price_read_source = employee_edit`."""
+    await _load(scoped_db)
+    await scoped_db.execute(_AUD_PAGE, {"id": SEED_ID})
+    result = await _sync(monkeypatch, scoped_db, source="employee_edit")
+    assert result["status"] == "synced" and result["offers_written"] >= 1, result
+    rows, sources = await _offers(scoped_db), await _read_sources(scoped_db)
+    assert rows["of_canon"]["touched"] and rows["of_canon"]["checked"]
+    assert sources["of_canon"] == "employee_edit"
 
 
 async def _read_sources(db):
