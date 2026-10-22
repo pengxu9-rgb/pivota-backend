@@ -201,16 +201,21 @@ async def test_a_seed_the_readers_cannot_price_reprices_and_stamps_nothing(scope
         assert not rows[oid]["touched"] and not rows[oid]["checked"], oid
 
 
-async def test_enrichment_rows_of_such_a_seed_keep_mains_behaviour(scoped_db, monkeypatch):
-    """M2 of the #2657 review: rows the enrichment lane wrote are not judged by the reader guard, so a
-    seed whose column and page read disagree still re-prices them as on main. Whether to stop stamping
-    those fresh is a decision about served offers, kept out of this change."""
+async def test_enrichment_rows_of_such_a_seed_are_refused_too(scoped_db, monkeypatch):
+    """Peng 2026-10-22, after #2657 (M2): the enrichment lane's rows (this fixture's own shape) of a seed
+    whose column and page read disagree are no longer re-priced or stamped freshly checked. They keep
+    their last price; nothing is suppressed."""
     await _load(scoped_db)
+    before = await _offers(scoped_db)
     await scoped_db.execute(
         "UPDATE external_product_seeds SET seed_data = jsonb_set(seed_data, '{snapshot,price_currency}', '\"AUD\"') WHERE id = :id",
         {"id": SEED_ID})
     result = await _sync(monkeypatch, scoped_db)
-    assert result["status"] == "synced" and result["offers_written"] == 3, result
+    assert result["status"] == "refused_currency", result
+    rows = await _offers(scoped_db)
+    for oid, row in rows.items():
+        assert not row["touched"] and not row["checked"], oid
+        assert float(row["list_price"]) == float(before[oid]["list_price"]), oid
 
 
 async def _read_sources(db):
