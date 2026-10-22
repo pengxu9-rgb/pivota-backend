@@ -2,9 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Protocol
+
+logger = logging.getLogger(__name__)
+
+# Records in mvp_idempotency_keys are response snapshots: order_create rows carry
+# PSP client_secrets, Checkout Session ids and buyer emails. They are only useful
+# for replaying a retried request, so they expire. MVP_IDEMPOTENCY_TTL_DAYS is
+# read on every call (no restart needed), clamped to [1, 30]; anything that is
+# not an integer falls back to the default.
+MVP_IDEMPOTENCY_TTL_DAYS_ENV = "MVP_IDEMPOTENCY_TTL_DAYS"
+DEFAULT_IDEMPOTENCY_TTL_DAYS = 7
+MIN_IDEMPOTENCY_TTL_DAYS = 1
+MAX_IDEMPOTENCY_TTL_DAYS = 30
+# Upper bound on expired rows one put() deletes for its scope, so the cleanup
+# never turns a request into a bulk purge.
+EXPIRED_CLEANUP_BATCH = 100
+
+
+def idempotency_ttl_days() -> int:
+    raw = (os.getenv(MVP_IDEMPOTENCY_TTL_DAYS_ENV) or "").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        return DEFAULT_IDEMPOTENCY_TTL_DAYS
+    return max(MIN_IDEMPOTENCY_TTL_DAYS, min(MAX_IDEMPOTENCY_TTL_DAYS, days))
+
+
+def idempotency_cutoff(now: Optional[datetime] = None) -> datetime:
+    """Rows created before this instant are expired.
+
+    Computed in Python and bound as a parameter, rather than written as
+    `now() - make_interval(...)`, so the SQL stays portable across dialects.
+    """
+    base = now or datetime.now(timezone.utc)
+    return base - timedelta(days=idempotency_ttl_days())
 
 
 @dataclass(frozen=True)
@@ -80,8 +116,9 @@ class PostgresIdempotencyStore:
             SELECT scope, idem_key, value_json, created_at
             FROM mvp_idempotency_keys
             WHERE scope = :scope AND idem_key = :key
+              AND created_at >= :cutoff
             """,
-            {"scope": scope, "key": key},
+            {"scope": scope, "key": key, "cutoff": idempotency_cutoff()},
         )
         if not row:
             return None
@@ -112,15 +149,58 @@ class PostgresIdempotencyStore:
         if db is None:
             raise RuntimeError("DATABASE_URL not configured; PostgresIdempotencyStore unavailable")
         await self._ensure_table(db)
+        cutoff = idempotency_cutoff()
+        # A fresh row with the same (scope, key) wins: DO UPDATE's WHERE is false
+        # for it, so nothing changes and the get() below returns the ORIGINAL
+        # record (the idempotent replay). An EXPIRED row is overwritten in the
+        # same statement, so a stale snapshot can never block a new record.
         await db.execute(
             """
             INSERT INTO mvp_idempotency_keys (scope, idem_key, value_json)
             VALUES (:scope, :key, CAST(:value_json AS jsonb))
-            ON CONFLICT (scope, idem_key) DO NOTHING
+            ON CONFLICT (scope, idem_key) DO UPDATE
+              SET value_json = EXCLUDED.value_json,
+                  created_at = CURRENT_TIMESTAMP
+              WHERE mvp_idempotency_keys.created_at < :cutoff
             """,
-            {"scope": scope, "key": key, "value_json": json.dumps(value, ensure_ascii=False)},
+            {
+                "scope": scope,
+                "key": key,
+                "value_json": json.dumps(value, ensure_ascii=False),
+                "cutoff": cutoff,
+            },
         )
+        await self._delete_expired_best_effort(db, scope=scope, cutoff=cutoff)
         rec = await self.get(scope=scope, key=key)
         if rec:
             return rec
         return IdempotencyRecord(scope=scope, key=key, created_at=datetime.now(timezone.utc), value=value)
+
+    async def _delete_expired_best_effort(self, db, *, scope: str, cutoff: datetime) -> None:
+        """Opportunistic, bounded cleanup of this scope's expired rows.
+
+        `DELETE ... LIMIT` is not Postgres, so the bound lives in a subselect on
+        the primary key (portable to SQLite too). The subselect walks
+        idx_mvp_idem_scope_time (scope, created_at DESC). Concurrent puts may pick
+        the same ids; the loser deletes nothing. A failure here never fails the
+        put: the record is already written.
+        """
+        try:
+            await db.execute(
+                """
+                DELETE FROM mvp_idempotency_keys
+                WHERE id IN (
+                  SELECT id FROM mvp_idempotency_keys
+                  WHERE scope = :scope AND created_at < :cutoff
+                  ORDER BY created_at
+                  LIMIT :batch
+                )
+                """,
+                {"scope": scope, "cutoff": cutoff, "batch": EXPIRED_CLEANUP_BATCH},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mvp_idempotency expired-row cleanup failed scope=%s error=%s",
+                scope,
+                type(exc).__name__,
+            )
