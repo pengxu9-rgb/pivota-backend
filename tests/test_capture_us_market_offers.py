@@ -164,3 +164,24 @@ def test_plan_offer_does_not_carry_a_merchant_and_its_binds_match_the_statement(
     named = set(re.findall(r"(?<!:):([a-zA-Z_][a-zA-Z0-9_]*)", OFFER_UPSERT_SQL))
     assert named == set(row), (
         f"bind mismatch: SQL names {sorted(named)}, plan_offer gives {sorted(row)}")
+
+
+def test_seed_ids_parse_commas_spaces_and_a_file(tmp_path) -> None:
+    from scripts.capture_us_market_offers import parse_seed_ids
+
+    assert parse_seed_ids(None) is None
+    assert parse_seed_ids("eps_b, eps_a eps_b") == ["eps_a", "eps_b"]
+    f = tmp_path / "ids.txt"
+    f.write_text("eps_c\neps_a\n\n")
+    assert parse_seed_ids(f"@{f}") == ["eps_a", "eps_c"]
+
+
+def test_seed_ids_that_name_nothing_are_refused() -> None:
+    """A run that selects no seed would print an empty plan that reads as 'nothing to capture'."""
+    import pytest
+
+    from scripts.capture_us_market_offers import parse_seed_ids
+
+    for raw in ("", " , ", "\n"):
+        with pytest.raises(ValueError):
+            parse_seed_ids(raw)

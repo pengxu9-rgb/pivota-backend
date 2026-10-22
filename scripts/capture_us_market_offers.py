@@ -165,6 +165,43 @@ CANDIDATES_SQL = """
     ORDER BY co.source_domain, cp.product_key
 """
 
+# THE SAME CAPTURE FOR A NAMED SET OF SEEDS (--seed-ids), for a cohort CANDIDATES_SQL cannot see.
+# 2026-10-22 (rr1020 / usmkt1022): 108 active US-filed seeds on four storefronts whose pages read
+# EUR/GBP while their column says USD (the writers' old `or "USD"` default). Their offers are labelled
+# USD, so the no_us_offer blocker and the foreign-offer filter above never select them; every reader
+# withholds their copied offers (#2652/#2657). The stores DO quote US buyers real USD prices via
+# Shopify Markets (usmkt1022: all four `us_usd_price`), so this lane can write the honest sibling.
+# One row per (attached product, seed domain); the domain is the SEED's, and select_capturable still
+# refuses a product whose canonical_url is on another host, so a seed attached to another store's
+# canonical product is skipped (domain_mismatch), never priced from the wrong store.
+SEED_CANDIDATES_SQL = """
+    SELECT DISTINCT cp.content_key, cp.product_key, cp.merchant_id,
+           cp.canonical_url, eps.domain AS source_domain
+    FROM external_product_seeds eps
+    JOIN catalog_products cp ON cp.product_key = eps.attached_product_key
+    WHERE eps.id = ANY(:seed_ids)
+      AND lower(trim(coalesce(eps.status, ''))) = 'active'
+      AND cp.suppressed_at IS NULL
+      AND eps.domain IS NOT NULL
+      AND cp.canonical_url IS NOT NULL
+    ORDER BY eps.domain, cp.product_key
+"""
+
+
+def parse_seed_ids(raw: Optional[str]) -> Optional[List[str]]:
+    """`--seed-ids`: comma- or whitespace-separated ids, or `@path` to a file of them. None when the
+    flag was not given; an empty list is an error (a run that selects nothing proves nothing)."""
+    if raw is None:
+        return None
+    if raw.startswith("@"):
+        with open(raw[1:], encoding="utf-8") as fh:
+            raw = fh.read()
+    ids = sorted({part for part in raw.replace(",", " ").split() if part})
+    if not ids:
+        raise ValueError("--seed-ids named no seed")
+    return ids
+
+
 #: The products among a planned batch that are SUPPRESSED. CANDIDATES_SQL
 #: already excludes them, but minutes of HTTP probing separate that scan from
 #: the write and a nightly retirement lane runs in between — the same race that
@@ -708,10 +745,13 @@ async def apply_offers(planned: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 async def _drive(apply: bool, only_domain: Optional[str],
-                 limit: Optional[int]) -> int:
+                 limit: Optional[int], seed_ids: Optional[List[str]] = None) -> int:
     await database.connect()
     try:
-        rows = [dict(r) for r in await database.fetch_all(CANDIDATES_SQL)]
+        if seed_ids is None:
+            rows = [dict(r) for r in await database.fetch_all(CANDIDATES_SQL)]
+        else:
+            rows = [dict(r) for r in await database.fetch_all(SEED_CANDIDATES_SQL, {"seed_ids": seed_ids})]
     finally:
         await database.disconnect()
 
@@ -751,6 +791,8 @@ async def _drive(apply: bool, only_domain: Optional[str],
         "writer": SOURCE_SYSTEM,
         "batch_id": audit.batch_id,
         "applied": 1 if apply else 0,
+        "cohort": "no_us_offer" if seed_ids is None else "seed_ids",
+        "seed_ids": None if seed_ids is None else len(seed_ids),
         "candidates": len(rows),
         "domains": len(by_domain),
         "pre_skipped": pre_reasons,
@@ -812,10 +854,17 @@ def main() -> int:
     p.add_argument("--domain", help="capture only this source_domain")
     p.add_argument("--limit", type=int, default=None,
                    help="cap the number of captured products")
+    p.add_argument("--seed-ids", default=None,
+                   help="capture the attached products of these seeds instead of the no_us_offer "
+                        "cohort: comma/space separated ids, or @file")
     args = p.parse_args()
     if args.limit is not None and args.limit <= 0:
         p.error("--limit must be a positive integer")
-    return asyncio.run(_drive(args.apply, args.domain, args.limit))
+    try:
+        seed_ids = parse_seed_ids(args.seed_ids)
+    except (OSError, ValueError) as exc:
+        p.error(str(exc))
+    return asyncio.run(_drive(args.apply, args.domain, args.limit, seed_ids))
 
 
 if __name__ == "__main__":
