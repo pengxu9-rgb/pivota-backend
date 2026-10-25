@@ -571,13 +571,56 @@ upsert "prod: Cloud Run job failing" "$(policy \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
-# This is continuous job occupancy (running_executions > 0 for 2h), not per-execution age: one wedged
+# This is continuous job occupancy (running_executions > 0 for 5h), not per-execution age: one wedged
 # run or runs chained back to back both fire it; two short overlapping runs do not.
-upsert "prod: relgraph-sync running over two hours" "$(policy \
-  "prod: relgraph-sync running over two hours" \
-  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of two hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
+# FIVE HOURS since 2026-10-20 (was two; Peng): the nightly reviews up to 10,000 labels at concurrency
+# 12 (setup_scheduler.sh relgraph_sync_env). Measured 2026-10-20: 3,000 at 16 in ~37 minutes after a
+# ~31-minute build, so 10,000 at 12 is ~3.0-4.0 h a normal night and four hours left ~40 minutes of
+# margin. Five still warns an hour before the 21600s task timeout ends a wedged attempt.
+upsert "prod: relgraph-sync running over five hours" "$(policy \
+  "prod: relgraph-sync running over five hours" \
+  "relgraph-sync has running executions continuously for five hours. The daily run reviews up to 10,000 labels at concurrency 12 and takes ~3.0-4.0 hours (build ~30 minutes, review ~2.5-3.5 hours); the inner step timeout is 300 minutes. Task timeout is 21600s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of five hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
   'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
-  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 7200s 14400s)"
+  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 18000s 18000s)"
+
+# RETIRED NAMES. upsert() replaces a policy by displayName, so a renamed policy would leave its old
+# one live and firing. Each old name is deleted here, after its successor above has been written, and
+# the run then re-lists to prove it: the old name gone, exactly one successor live. The listing goes
+# into a variable, NOT the for-list: a command substitution that fails in a for-list is just an empty
+# list, so a listing error would retire nothing and report success (2026-10-20 review).
+retire_policy() { # OLD_DISPLAY_NAME SUCCESSOR_DISPLAY_NAME
+  set -- "$(environment_policy_name "$1")" "$(environment_policy_name "$2")"
+  local olds old resp
+  olds="$(api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
+for p in d.get("alertPolicies", []):
+    if p.get("displayName") == sys.argv[1]:
+        print(p["name"])
+' "$1")" || { echo "!! retire $1: listing alert policies FAILED; nothing retired" >&2; exit 1; }
+  for old in $olds; do
+    resp="$(api DELETE "${old#projects/*/}")"
+    check "$resp" "retire $1"
+    echo "   retired $1"
+  done
+  api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("retire check: list policies FAILED: " + json.dumps(d)[:200])
+names = [p.get("displayName") for p in d.get("alertPolicies", [])]
+if sys.argv[1] in names:
+    sys.exit("retire check FAILED: " + sys.argv[1] + " is still live")
+if names.count(sys.argv[2]) != 1:
+    sys.exit("retire check FAILED: expected one " + sys.argv[2] + ", found %d" % names.count(sys.argv[2]))
+' "$1" "$2"
+  echo "   checked: $1 absent, $2 live"
+}
+retire_policy "prod: relgraph-sync running over two hours" "prod: relgraph-sync running over five hours"
+# The four-hour name lived only in this change's review (never reconciled); retired in case a run wrote it.
+retire_policy "prod: relgraph-sync running over four hours" "prod: relgraph-sync running over five hours"
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \
