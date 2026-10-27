@@ -8,6 +8,35 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE = json.loads((ROOT / 'tests/fixtures/live_monitoring_policies_2026_09_30.json').read_text())
+LB_NAME = 'prod: load balancer 5xx'
+LB_GROUP = '(project_id, forwarding_rule_name, backend_target_name)'
+LB_QUERY = (
+    f'sum by {LB_GROUP} (rate(loadbalancing_googleapis_com:https_request_count'
+    '{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / '
+    f'sum by {LB_GROUP} (rate(loadbalancing_googleapis_com:https_request_count'
+    '{monitored_resource="https_lb_rule"}[10m])) > 0.01'
+)
+LB_SUBJECT = ('LB 5xx >1%: ${metric_or_resource.label.project_id} / '
+              '${metric_or_resource.label.forwarding_rule_name} / '
+              '${metric_or_resource.label.backend_target_name}')
+LB_DOC = (
+    'The external load balancer/backend is returning more than 1% 5xx over a rolling 10-minute window, '
+    'sustained for 10 minutes. Project: ${metric_or_resource.label.project_id}; forwarding rule: '
+    '${metric_or_resource.label.forwarding_rule_name}; backend: ${metric_or_resource.label.backend_target_name}. '
+    'Inspect load-balancer request logs and the corresponding service request/error logs. A revision '
+    'that will not start, database saturation, or an unhandled exception can cause this user-visible '
+    'failure. An unassigned backend can indicate an edge routing failure.'
+)
+
+
+def reviewed_policy(live):
+    """Keep the historical readback intact; permit only the reviewed LB identity/severity change."""
+    expected = json.loads(json.dumps(live))
+    if expected['displayName'] == LB_NAME:
+        expected['severity'] = 'ERROR'
+        expected['documentation'].update(content=LB_DOC, subject=LB_SUBJECT)
+        expected['conditions'][0]['conditionPrometheusQueryLanguage']['query'] = LB_QUERY
+    return expected
 
 
 def generated_policies():
@@ -35,12 +64,16 @@ def clean_condition(condition):
     return condition
 
 
-def test_lb_ratio_matches_live_condition_and_policy_wiring_exactly():
-    live = next(p for p in LIVE if p['displayName'] == 'prod: load balancer 5xx')
+def test_lb_ratio_retains_backend_identity_and_preserves_threshold_and_wiring():
+    live = reviewed_policy(next(p for p in LIVE if p['displayName'] == LB_NAME))
     generated = generated_policies()[live['displayName']]
     assert generated['conditions'] == [clean_condition(c) for c in live['conditions']]
-    for key in ['documentation', 'notificationChannels', 'combiner', 'alertStrategy', 'displayName']:
+    for key in ['documentation', 'notificationChannels', 'combiner', 'alertStrategy', 'displayName', 'severity']:
         assert generated[key] == live[key]
+    # The matching grouping is required on numerator AND denominator. No volume gate or backend
+    # filter may hide a low-traffic failure or a failure before a backend is assigned.
+    condition = generated['conditions'][0]['conditionPrometheusQueryLanguage']
+    assert condition == {'query': LB_QUERY, 'duration': '600s', 'evaluationInterval': '60s'}
 
 
 def test_relgraph_occupancy_alert_shape_and_current_sizing():
@@ -76,13 +109,14 @@ def test_every_field_the_upsert_writes_matches_live_for_every_policy():
     # omits would be wiped by the delete+create, and must fail here first.
     generated = generated_policies()
     for live in LIVE:
-        assert comparable_policy(generated[live['displayName']]) == comparable_policy(live), live['displayName']
+        assert comparable_policy(generated[live['displayName']]) == comparable_policy(reviewed_policy(live)), live['displayName']
 
 
 def test_every_live_policy_is_compared_and_only_reported_drift_remains():
     generated = generated_policies()
     drifts = {}
     for live in LIVE:
+        live = reviewed_policy(live)
         name = live['displayName']
         conditions = [clean_condition(c) for c in live['conditions']]
         if conditions != generated[name]['conditions']:
