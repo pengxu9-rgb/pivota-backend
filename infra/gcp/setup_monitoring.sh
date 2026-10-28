@@ -443,11 +443,22 @@ print(json.dumps({
 # metric this script created seconds ago may not have one yet; with the check off the policy is
 # accepted, evaluates to nothing until the metric exists, and to data after. Use it only for a
 # metric this script creates, and keep the name under test: the API will no longer catch a typo.
-promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE [RENOTIFY [NEW_METRIC]]
+# Optional trailing SEVERITY= and SUBJECT= arguments affect only the policy that opts in.
+# A subject can name the labels retained by a PromQL aggregation instead of relying on the
+# default resource display name (which is missing for an ungrouped PromQL sum).
+promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE [RENOTIFY [NEW_METRIC]] [SEVERITY=...] [SUBJECT=...]
   python3 -c '
 import json, sys
 args = sys.argv[1:]
 channel = args.pop()
+metadata = {}
+while args and args[-1].startswith(("SEVERITY=", "SUBJECT=")):
+    key, value = args.pop().split("=", 1)
+    if key in metadata or not value:
+        sys.exit("promql_policy: duplicate or empty " + key)
+    metadata[key] = value
+if "SEVERITY" in metadata and metadata["SEVERITY"] not in {"WARNING", "ERROR", "CRITICAL"}:
+    sys.exit("promql_policy: unsupported severity " + repr(metadata["SEVERITY"]))
 (name, condition_name, doc, query, duration, evaluation_interval, autoclose) = args[:7]
 condition = {"query": query, "duration": duration, "evaluationInterval": evaluation_interval}
 strategy = {"autoClose": autoclose}
@@ -458,7 +469,7 @@ if len(args) > 8:
     if args[8] != "NEW_METRIC":
         sys.exit("promql_policy: the ninth argument can only be NEW_METRIC, got " + repr(args[8]))
     condition["disableMetricValidation"] = True
-print(json.dumps({
+body = {
   "displayName": name,
   "documentation": {"content": doc, "mimeType": "text/markdown"},
   "combiner": "OR",
@@ -466,7 +477,12 @@ print(json.dumps({
     "displayName": condition_name,
     "conditionPrometheusQueryLanguage": condition}],
   "notificationChannels": [channel],
-  "alertStrategy": strategy}))' "$@" "$CHANNEL"
+  "alertStrategy": strategy}
+if "SEVERITY" in metadata:
+    body["severity"] = metadata["SEVERITY"]
+if "SUBJECT" in metadata:
+    body["documentation"]["subject"] = metadata["SUBJECT"]
+print(json.dumps(body))' "$@" "$CHANNEL"
 }
 
 # A policy over a log metric THIS RUN may have created seconds ago. Monitoring rejects such a
@@ -555,14 +571,17 @@ upsert "prod: TLS certificate expiring" "$(policy \
   ALIGN_MIN REDUCE_MIN resource.label.host COMPARISON_LT 14 3600s 3600s 86400s)"
 fi
 
-# Preserve the 2026-09-25 hand-edited ratio: absolute error rate does not track changing traffic.
-# upsert deletes/re-creates by displayName, so reconciling a new policy must not revert this one.
+# Preserve the 1% ratio and 10-minute windows as traffic changes. Retain LB/backend identity on
+# BOTH sides of the ratio: a project-wide sum hid which backend failed and let healthy backends
+# dilute it. On 2026-10-27 that also produced a notification "on __missing__" with no severity.
+# Keep edge failures with an unassigned backend in scope; do not filter backend_target_name.
 upsert "prod: load balancer 5xx" "$(promql_policy \
   "prod: load balancer 5xx" \
   "LB 5xx ratio > 1% over 10m" \
-  "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception." \
-  'sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule"}[10m])) > 0.01' \
-  600s 60s 3600s)"
+  'The external load balancer/backend is returning more than 1% 5xx over a rolling 10-minute window, sustained for 10 minutes. Project: ${metric_or_resource.label.project_id}; forwarding rule: ${metric_or_resource.label.forwarding_rule_name}; backend: ${metric_or_resource.label.backend_target_name}. Inspect load-balancer request logs and the corresponding service request/error logs. A revision that will not start, database saturation, or an unhandled exception can cause this user-visible failure. An unassigned backend can indicate an edge routing failure.' \
+  'sum by (project_id, forwarding_rule_name, backend_target_name) (rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / sum by (project_id, forwarding_rule_name, backend_target_name) (rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule"}[10m])) > 0.01' \
+  600s 60s 3600s SEVERITY=ERROR \
+  'SUBJECT=LB 5xx >1%: ${metric_or_resource.label.project_id} / ${metric_or_resource.label.forwarding_rule_name} / ${metric_or_resource.label.backend_target_name}')"
 
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
