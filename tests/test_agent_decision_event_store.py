@@ -2,6 +2,8 @@ from typing import Any
 
 import pytest
 
+from asyncpg.exceptions import StringDataRightTruncationError
+
 from services import agent_decision_event_store as store
 
 
@@ -183,7 +185,7 @@ class _FakeDb:
     async def execute(self, query: str, values: dict[str, Any]) -> None:
         key = values.get("exposure_id") or values.get("candidate_id")
         if key in self.bad:
-            raise ValueError("value too long for type character varying(40)")
+            raise StringDataRightTruncationError("value too long for type character varying(40)")
         if key not in self.inserted:  # ON CONFLICT DO NOTHING
             self.inserted.append(key)
 
@@ -345,3 +347,116 @@ async def test_the_flush_worker_runs_in_a_fresh_context(monkeypatch: pytest.Monk
     monkeypatch.setattr(store, "_WORKER", None)
     store._ensure_worker()
     assert spawned == ["agent_decision_event_flush"]
+
+
+
+# --- adversarial review r3 -----------------------------------------------------------------------
+
+class _DownDb:
+    def __init__(self, exc: Exception, *, fail_after: int = 0) -> None:
+        self.exc = exc
+        self.calls = 0
+        self.fail_after = fail_after
+        self.inserted: list[str] = []
+
+    async def execute_many(self, query: str, rows: list[dict[str, Any]]) -> None:
+        self.calls += 1
+        raise StringDataRightTruncationError("too long") if self.fail_after else self.exc
+
+    async def execute(self, query: str, values: dict[str, Any]) -> None:
+        self.calls += 1
+        if len(self.inserted) >= self.fail_after:
+            raise self.exc
+        self.inserted.append(values["exposure_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_database_failure_is_reported_once_and_not_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _DownDb(TimeoutError("pool checkout"))
+    reports: list[dict[str, Any]] = []
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: reports.append(kw))
+    rows = [{"exposure_id": f"e{i}"} for i in range(100)]
+
+    lost = await store._write_many("exposures", {"decision_id": "d", "rows": rows})
+
+    assert db.calls == 1  # not 101: replaying would repeat the pool wait once per row
+    assert lost == 100 and len(reports) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_database_going_away_mid_replay_stops_the_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _DownDb(ConnectionError("gone"), fail_after=2)
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: None)
+    rows = [{"exposure_id": f"e{i}"} for i in range(10)]
+
+    lost = await store._write_many("exposures", {"decision_id": "d", "rows": rows})
+
+    assert db.inserted == ["e0", "e1"]
+    assert db.calls == 1 + 3  # the batch, two rows, then the failing row: no further attempts
+    assert lost == 8
+
+
+@pytest.mark.asyncio
+async def test_write_slate_rows_counts_row_losses_and_raises_on_database_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: None)
+    db = _FakeDb(bad={"x1"})
+    monkeypatch.setattr(store, "database", db)
+    rows = [{"candidate_id": f"c{i}", "exposure_id": f"x{i}", "position": i} for i in range(3)]
+    assert await store.write_slate_rows("d", rows) == 1
+    assert sorted(db.inserted) == ["c0", "c1", "c2", "x0", "x2"]
+
+    monkeypatch.setattr(store, "database", _DownDb(ConnectionError("down")))
+    with pytest.raises(ConnectionError):
+        await store.write_slate_rows("d", rows)
+
+
+@pytest.mark.asyncio
+async def test_identity_lookups_give_up_at_the_deadline(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import asyncio as _asyncio
+
+    class _Slow:
+        async def fetch_all(self, *a: Any, **k: Any) -> list[Any]:
+            await _asyncio.sleep(5)
+            return []
+
+    monkeypatch.setattr(store, "database", _Slow())
+    monkeypatch.setenv("DECISION_LEDGER_RESOLVE_TIMEOUT_SECONDS", "0.1")
+    rows = [{"product_key": "pk_1"}]
+    started = _asyncio.get_running_loop().time()
+    with caplog.at_level("WARNING", logger=store.logger.name):
+        await store.resolve_card_identities(rows)
+    assert _asyncio.get_running_loop().time() - started < 1.0
+    assert rows == [{"product_key": "pk_1"}]
+    assert any("agent_decision_event_store.read_failed" in r.getMessage() for r in caplog.records)
+    assert not any("write_failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_at_most_two_identity_lookups_run_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio as _asyncio
+
+    state = {"now": 0, "peak": 0}
+
+    class _Counting:
+        async def fetch_all(self, *a: Any, **k: Any) -> list[Any]:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            await _asyncio.sleep(0.02)
+            state["now"] -= 1
+            return []
+
+    monkeypatch.setattr(store, "database", _Counting())
+    await _asyncio.gather(*(store.resolve_card_identities([{"product_key": f"pk{i}"}]) for i in range(8)))
+    assert state["peak"] == 2
+
+
+@pytest.mark.asyncio
+async def test_checkout_decisions_get_the_same_column_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    enqueued = _capture(monkeypatch)
+    await store.record_checkout_decision(
+        checkout_decision_id="chk-1", content_key=LONG_PRODUCT_KEY, catalog_offer_id="of:catalog_offer:off_7")
+    await store.record_checkout_decision(checkout_decision_id="chk-2", content_key=CK, catalog_offer_id="of:internal_checkout:m:p:v")
+    assert [(p["content_key"], p["catalog_offer_id"]) for _, p in enqueued] == [
+        (None, "off_7"), (CK, "of:internal_checkout:m:p:v")]
