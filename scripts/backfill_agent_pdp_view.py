@@ -38,7 +38,10 @@ script refuses to start without it. A row rebuilt without the flag carries no
 market_prices, and the upsert bumps refreshed_at past market_prices_refreshed_at,
 so readers retire the row's summary and a non-USD buyer falls back to the row's
 own (modal-currency) prices. One-off jobs (scripts/ops/run_oneoff_job.sh) inherit
-no env from web, so pass the flag in the job's ENV_VARS.
+no env from web, so append the flag to the script's default ENV_VARS. A caller's
+ENV_VARS replaces that default wholesale, so passing the flag alone would drop
+PIVOTA_ENV and the DB timeouts:
+  ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,AGENT_PDP_VIEW_MARKET_PRICES=on
 
 Dry-run over the enriched cohort (what workstream 1 wants):
   AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0

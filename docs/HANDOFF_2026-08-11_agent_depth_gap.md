@@ -93,7 +93,9 @@ Entry point: `services/agent_pdp_view_assembler.py`
 delegates to a `build_agent_pdp_view_row` primitive and takes
 `--scope enriched`. (Since 2026-10-29 every scope refuses to run without
 `AGENT_PDP_VIEW_MARKET_PRICES=on`: a flagless rebuild retires the row's
-market_prices summary. One-off jobs carry no env; pass it in ENV_VARS.)
+market_prices summary. One-off jobs carry no env; APPEND it to
+`run_oneoff_job.sh`'s default ENV_VARS, which a caller's value replaces wholesale:
+`ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,DB_COMMAND_TIMEOUT_SECONDS=600,AGENT_PDP_VIEW_MARKET_PRICES=on`.)
 
 ### 2. INCI ingestion — biggest content-depth jump available
 
