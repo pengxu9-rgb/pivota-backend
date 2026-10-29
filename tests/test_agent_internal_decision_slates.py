@@ -265,7 +265,6 @@ def test_rejects_oversized_or_malformed_slates(
         {"merchant_id": "m9"},
         {"channel": "acp"},
         {"protocol": "ucp_session"},
-        {"request_id": "req-2"},
         {"primary_path": "upstream"},
         {"cards": [{"position": 0, "product_id": "p0", "merchant_id": "merch_1", "product_key": "pk_known",
                     "offer_id": "of:catalog_offer:off_1", "platform": "shopify", "source": "beauty_direct",
@@ -346,3 +345,24 @@ def test_offer_id_kept_counts_only_ids_the_store_will_write(client: TestClient, 
     cards = [{"position": 0, "product_id": "p0", "offer_id": "o" * 300},
              {"position": 1, "product_id": "p1", "offer_id": "of:catalog_offer:off_1"}]
     assert client.post(URL, json=_slate(cards=cards), headers=HEADERS).json()["offer_id_kept"] == 1
+
+
+
+# --- controller review of #2673 ------------------------------------------------------------------
+
+def test_a_resend_with_a_new_request_id_is_the_same_slate(client: TestClient, calls: Dict[str, Any]) -> None:
+    # the gateway mints a request id per HTTP attempt; a resend after a 503 carries a new one
+    assert client.post(URL, json=_slate(request_id="attempt-1"), headers=HEADERS).status_code == 202
+    response = client.post(URL, json=_slate(request_id="attempt-2"), headers=HEADERS)
+    assert response.status_code == 200 and response.json()["replayed"] is True
+    assert calls["claims"][0]["agent_context"]["request_id"] == "attempt-1"
+
+
+def test_a_nul_in_the_decision_id_is_refused_not_stripped(client: TestClient, calls: Dict[str, Any]) -> None:
+    assert client.post(URL, json=_slate(decision_id="gw:x\u0000y"), headers=HEADERS).status_code == 422
+    assert calls["claims"] == []
+
+
+def test_a_numeric_slate_merchant_id_is_coerced(client: TestClient, calls: Dict[str, Any]) -> None:
+    assert client.post(URL, json=_slate(merchant_id=789), headers=HEADERS).status_code == 202
+    assert calls["claims"][0]["merchant_id"] == "789"

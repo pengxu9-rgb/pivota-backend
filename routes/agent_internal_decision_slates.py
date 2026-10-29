@@ -81,7 +81,7 @@ class SlateCard(BaseModel):
 
 
 class DecisionSlate(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
 
     # Required: a minted id would make every retry a new decision. "gw:" + up to 61 id characters
     # (agent_decision_events.decision_id is VARCHAR(64), migration 140).
@@ -97,7 +97,11 @@ class DecisionSlate(BaseModel):
     primary_path: Optional[str] = Field(default=None, max_length=64)
     cards: List[SlateCard] = Field(default_factory=list, max_length=MAX_CARDS)
 
-    _no_nul = field_validator("*", mode="before")(_strip_nul)
+    # Not decision_id: a NUL there must fail the gw: pattern, not be stripped into a different id.
+    _no_nul = field_validator(
+        "surface", "channel", "protocol", "merchant_id", "agent_id", "query", "market", "request_id",
+        "primary_path", mode="before",
+    )(_strip_nul)
 
 
 def _ingest_enabled() -> None:
@@ -159,11 +163,13 @@ def _positions(cards: List[SlateCard]) -> List[int]:
 
 
 def _fingerprint(slate: DecisionSlate, positions: List[int]) -> str:
-    """The whole validated request except decision_id: every slate field and every card field, the
-    cards in position order with positions applied. An omitted field and an explicit null validate
-    to the same model, so they fingerprint alike; any other difference (query, market, a card's
-    stock...) is a different request and gets a 409 rather than being dropped as a "replay"."""
-    body = slate.model_dump(mode="json", exclude={"decision_id", "cards"})
+    """The whole validated request except decision_id and request_id: every other slate field and
+    every card field, the cards in position order with positions applied. An omitted field and an
+    explicit null validate to the same model, so they fingerprint alike; any other difference
+    (query, market, a card's stock...) is a different request and gets a 409 rather than being
+    dropped as a "replay". request_id is left out because the gateway mints one per HTTP attempt,
+    so a resend after a 503 carries a new one; the stored one is the first attempt's."""
+    body = slate.model_dump(mode="json", exclude={"decision_id", "request_id", "cards"})
     cards = []
     for pos, card in sorted(zip(positions, slate.cards), key=lambda pair: pair[0]):
         dumped = card.model_dump(mode="json")

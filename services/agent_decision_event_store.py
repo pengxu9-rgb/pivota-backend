@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import uuid
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from db._jsonb_safe import _json_safe
 from db.database import database
@@ -46,6 +46,20 @@ try:  # Row-level failures: one row's value or constraint, not the database. Onl
     _ROW_LEVEL_ERRORS: Tuple[type, ...] = (_PgDataError, _PgIntegrityError)
 except ImportError:  # pragma: no cover - asyncpg is a hard dependency in every deployed image
     _ROW_LEVEL_ERRORS = ()
+
+try:  # The connection, not the database, went away: Cloud SQL failover/maintenance, a terminated
+    # backend (AdminShutdownError), a statement_timeout (QueryCanceledError), a dropped socket.
+    # Worth ONE more try on a fresh checkout. PoolCheckoutTimeout is a TimeoutError, not a
+    # ConnectionError, so an exhausted pool is not in here and still costs one wait, not two.
+    from asyncpg import InterfaceError as _PgInterfaceError
+    from asyncpg.exceptions import OperatorInterventionError as _PgOperatorIntervention
+    from asyncpg.exceptions import PostgresConnectionError as _PgConnectionError
+
+    _CONNECTION_ERRORS: Tuple[type, ...] = (
+        _PgConnectionError, _PgInterfaceError, _PgOperatorIntervention, ConnectionError,
+    )
+except ImportError:  # pragma: no cover
+    _CONNECTION_ERRORS = (ConnectionError,)
 _OFFER_ID_MAX = 255  # catalog_offer_id VARCHAR(255) on every ledger table (migration 140)
 
 
@@ -421,25 +435,40 @@ def extract_order_decision_linkage(metadata: Any) -> Dict[str, Optional[str]]:
     }
 
 
+async def _once_more_on_connection_loss(call: Callable[[], Awaitable[Any]]) -> Any:
+    """Run call(); if the connection was lost, run it once more (each call checks out a fresh pool
+    connection). A second failure propagates."""
+    try:
+        return await call()
+    except _CONNECTION_ERRORS:
+        return await call()
+
+
 async def _write_many(op: str, payload: Dict[str, Any], *, raise_systemic: bool = False) -> int:
-    """Insert a batch; return how many rows were lost.
+    """Insert a batch; return how many rows were not confirmed written.
 
     execute_many runs one INSERT per row with no transaction, so on a ROW-LEVEL error (a value or a
     constraint: asyncpg DataError / IntegrityConstraintViolationError) the rows before the failing
     one are already in, and the batch is replayed row by row (ON CONFLICT DO NOTHING keeps that
     idempotent) so one bad card loses only itself.
 
-    Any other error (pool checkout, connection, timeout) is about the database, not a row: it is
-    reported once and NOT replayed. Replaying it would repeat the same wait once per row and stall
-    the single flush worker while the shared queue overflows. The worker counts the batch lost;
-    write_slate_rows (raise_systemic=True) re-raises so its caller can ask the client to retry.
+    A LOST CONNECTION (failover, terminated backend, statement_timeout) gets the same statement once
+    more on a fresh checkout: the batch resent whole (the rows that landed are no-ops), or the one
+    row during a replay. Without it a backend killed mid-batch kept 5 of 20 rows.
+
+    Anything else (pool checkout timeout, a second connection loss) is about the database, not a
+    row: reported once and NOT replayed. Replaying it would repeat the same wait once per row and
+    stall the single flush worker while the shared queue overflows. The worker then counts every row
+    of the batch as not confirmed (some may have landed; nobody can tell without the database);
+    write_slate_rows (raise_systemic=True) re-raises so its caller can ask the client to resend.
 
     NEVER call this inside a transaction: the first failing INSERT aborts it, every replayed row
     then fails, and the rollback discards the rows that did land (0 rows on real PG). The flush
     worker runs in a fresh context (spawn_isolated in _ensure_worker), so it holds none."""
     rows = payload["rows"]
+    sql = _sql(op)
     try:
-        await database.execute_many(_sql(op), rows)
+        await _once_more_on_connection_loss(lambda: database.execute_many(sql, rows))
         return 0
     except _ROW_LEVEL_ERRORS:
         pass
@@ -452,12 +481,13 @@ async def _write_many(op: str, payload: Dict[str, Any], *, raise_systemic: bool 
     last_exc: Optional[Exception] = None
     for idx, row in enumerate(rows):
         try:
-            await database.execute(_sql(op), row)
+            await _once_more_on_connection_loss(lambda row=row: database.execute(sql, row))
         except _ROW_LEVEL_ERRORS as exc:
             failed += 1
             last_exc = exc
         except Exception as exc:  # noqa: BLE001 - the database went away mid-replay: stop
-            _report(exc, op=op, payload=payload, rows=len(rows), failed_rows=None)
+            # rows before idx are in or counted in `failed`; idx and after were never written
+            _report(exc, op=op, payload=payload, rows=len(rows), failed_rows=failed + (len(rows) - idx))
             if raise_systemic:
                 raise
             return failed + (len(rows) - idx)

@@ -394,7 +394,8 @@ async def test_the_database_going_away_mid_replay_stops_the_replay(monkeypatch: 
     lost = await store._write_many("exposures", {"decision_id": "d", "rows": rows})
 
     assert db.inserted == ["e0", "e1"]
-    assert db.calls == 1 + 3  # the batch, two rows, then the failing row: no further attempts
+    # the batch, two rows, then the failing row twice (a lost connection gets one fresh try): no more
+    assert db.calls == 1 + 2 + 2
     assert lost == 8
 
 
@@ -460,3 +461,165 @@ async def test_checkout_decisions_get_the_same_column_guards(monkeypatch: pytest
     await store.record_checkout_decision(checkout_decision_id="chk-2", content_key=CK, catalog_offer_id="of:internal_checkout:m:p:v")
     assert [(p["content_key"], p["catalog_offer_id"]) for _, p in enqueued] == [
         (None, "off_7"), (CK, "of:internal_checkout:m:p:v")]
+
+
+
+# --- controller review of #2673 ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_fk_violation_is_row_level_and_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from asyncpg.exceptions import ForeignKeyViolationError
+
+    class _FkDb(_FakeDb):
+        async def execute(self, query: str, values: dict[str, Any]) -> None:
+            if values.get("exposure_id") == "e1":
+                raise ForeignKeyViolationError("insert or update violates foreign key constraint")
+            await super().execute(query, values)
+
+    db = _FkDb(bad=set())
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: None)
+    rows = [{"exposure_id": f"e{i}"} for i in range(4)]
+    assert await store._write_many("exposures", {"decision_id": "d", "rows": rows}) == 1
+    assert db.inserted == ["e0", "e2", "e3"]
+
+
+class _FlakyDb:
+    """The connection dies once (a failover / terminated backend), then the database is fine."""
+
+    def __init__(self, first: Exception) -> None:
+        self.first: Exception | None = first
+        self.calls = 0
+        self.inserted: list[str] = []
+
+    async def execute_many(self, query: str, rows: list[dict[str, Any]]) -> None:
+        self.calls += 1
+        if self.first is not None:
+            exc, self.first = self.first, None
+            self.inserted.extend(r["exposure_id"] for r in rows[:5])  # some rows landed first
+            raise exc
+        for row in rows:
+            if row["exposure_id"] not in self.inserted:
+                self.inserted.append(row["exposure_id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_name", ["ConnectionDoesNotExistError", "AdminShutdownError", "QueryCanceledError", "InterfaceError"])
+async def test_a_lost_connection_resends_the_batch_once(monkeypatch: pytest.MonkeyPatch, exc_name: str) -> None:
+    import asyncpg
+    import asyncpg.exceptions as pg
+
+    exc_type = getattr(pg, exc_name, None) or getattr(asyncpg, exc_name)
+    db = _FlakyDb(exc_type("connection lost"))
+    reports: list[Any] = []
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: reports.append(kw))
+    rows = [{"exposure_id": f"e{i}"} for i in range(20)]
+
+    assert await store._write_many("exposures", {"decision_id": "d", "rows": rows}) == 0
+    assert db.calls == 2 and sorted(db.inserted) == sorted(r["exposure_id"] for r in rows)
+    assert reports == []
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_pool_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    from utils.transient_errors import PoolCheckoutTimeout
+
+    db = _DownDb(PoolCheckoutTimeout("no free connection"))
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: None)
+    rows = [{"exposure_id": f"e{i}"} for i in range(10)]
+    assert await store._write_many("exposures", {"decision_id": "d", "rows": rows}) == 10
+    assert db.calls == 1  # one pool wait, not two
+
+
+@pytest.mark.asyncio
+async def test_a_second_connection_loss_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _DownDb(ConnectionError("still gone"))
+    monkeypatch.setattr(store, "database", db)
+    monkeypatch.setattr(store, "_report", lambda exc, **kw: None)
+    with pytest.raises(ConnectionError):
+        await store._write_many("exposures", {"decision_id": "d", "rows": [{"exposure_id": "e0"}]}, raise_systemic=True)
+    assert db.calls == 2
+
+
+def test_the_lookup_deadline_defaults_to_two_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DECISION_LEDGER_RESOLVE_TIMEOUT_SECONDS", raising=False)
+    assert store._resolve_timeout_seconds() == 2.0
+    monkeypatch.setenv("DECISION_LEDGER_RESOLVE_TIMEOUT_SECONDS", "junk")
+    assert store._resolve_timeout_seconds() == 2.0
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_covers_waiting_for_the_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both slots held by someone with no deadline of their own: a lookup that only timed its query
+    # (not its wait for a slot) would wait as long as they hold, under pool pressure indefinitely.
+    import asyncio as _asyncio
+
+    class _Instant:
+        async def fetch_all(self, *a: Any, **k: Any) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(store, "database", _Instant())
+    monkeypatch.setenv("DECISION_LEDGER_RESOLVE_TIMEOUT_SECONDS", "0.2")
+    semaphore = store._resolve_semaphore()
+    await semaphore.acquire()
+    await semaphore.acquire()
+    try:
+        started = _asyncio.get_running_loop().time()
+        with pytest.raises(_asyncio.TimeoutError):
+            # the outer 2 s bound only keeps a regression from hanging the suite
+            await _asyncio.wait_for(store._bounded_fetch("q", {}, name="waiter"), 2.0)
+        assert _asyncio.get_running_loop().time() - started < 0.5
+    finally:
+        semaphore.release()
+        semaphore.release()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_query_holding_a_slot_still_meets_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio as _asyncio
+
+    release = _asyncio.Event()
+
+    class _Held:
+        async def fetch_all(self, *a: Any, **k: Any) -> list[Any]:
+            await release.wait()
+            return []
+
+    monkeypatch.setattr(store, "database", _Held())
+    monkeypatch.setenv("DECISION_LEDGER_RESOLVE_TIMEOUT_SECONDS", "0.2")
+    started = _asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(_asyncio.TimeoutError):
+            await _asyncio.wait_for(store._bounded_fetch("q", {}, name="slow"), 2.0)  # 2 s: hang guard only
+        assert _asyncio.get_running_loop().time() - started < 0.5
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_lookups_run_in_a_fresh_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # databases 0.7 parks its Connection in a ContextVar; a lookup that inherited the search
+    # request's context would share that request's connection.
+    import contextvars
+
+    probe: contextvars.ContextVar[str] = contextvars.ContextVar("probe", default="fresh")
+    seen: list[str] = []
+
+    class _Peek:
+        async def fetch_all(self, *a: Any, **k: Any) -> list[Any]:
+            seen.append(probe.get())
+            return []
+
+    monkeypatch.setattr(store, "database", _Peek())
+    probe.set("inherited-from-the-request")
+    await store.resolve_card_identities([{"product_key": "pk_1"}])
+    assert seen == ["fresh"]
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_content_key_must_be_a_real_one_even_if_it_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    enqueued = _capture(monkeypatch)
+    await store.record_checkout_decision(checkout_decision_id="chk-3", content_key="pk_short_but_not_a_ck")
+    assert enqueued[0][1]["content_key"] is None
