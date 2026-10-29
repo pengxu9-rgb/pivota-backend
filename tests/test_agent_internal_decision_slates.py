@@ -20,7 +20,7 @@ HEADERS = {"X-Internal-Key": KEY}
 def calls(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
     """A fake store with the claim semantics of the real one: first claim of an id wins, later
     claims get the stored row back."""
-    seen: Dict[str, Any] = {"claims": [], "candidates": [], "exposures": [], "decisions": {}}
+    seen: Dict[str, Any] = {"claims": [], "candidates": [], "exposures": [], "decisions": {}, "lose": 0}
 
     async def fake_resolve(rows: List[Dict[str, Any]]) -> None:
         for row in rows:
@@ -36,16 +36,18 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
             return None
         return stored
 
-    async def fake_candidates(decision_id: str, rows: List[Dict[str, Any]]) -> None:
+    async def fake_write(decision_id: str, rows: List[Dict[str, Any]]) -> int:
+        if not rows:  # the real store writes nothing for an empty slate
+            return 0
+        if isinstance(seen["lose"], Exception):
+            raise seen["lose"]
         seen["candidates"].append((decision_id, rows))
-
-    async def fake_exposures(decision_id: str, rows: List[Dict[str, Any]]) -> None:
         seen["exposures"].append((decision_id, rows))
+        return int(seen["lose"])
 
     monkeypatch.setattr(module, "resolve_card_identities", fake_resolve)
     monkeypatch.setattr(module, "claim_decision_event", fake_claim)
-    monkeypatch.setattr(module, "record_decision_candidates", fake_candidates)
-    monkeypatch.setattr(module, "record_exposure_events", fake_exposures)
+    monkeypatch.setattr(module, "write_slate_rows", fake_write)
     monkeypatch.setenv("AGENT_AUTH_INTROSPECT_INTERNAL_KEY", KEY)
     monkeypatch.setenv("DECISION_SLATES_INGEST_ENABLED", "true")
     return seen
@@ -107,7 +109,8 @@ def test_records_the_slate_through_the_store(client: TestClient, calls: Dict[str
 
     assert response.status_code == 202
     assert response.json() == {
-        "decision_id": "gw:dec-1", "replayed": False, "cards": 2, "content_key_resolved": 1, "offer_id_kept": 1}
+        "decision_id": "gw:dec-1", "replayed": False, "cards": 2, "rows_lost": 0,
+        "content_key_resolved": 1, "offer_id_kept": 1}
 
     claim = calls["claims"][0]
     assert claim["decision_id"] == "gw:dec-1"
@@ -125,7 +128,7 @@ def test_records_the_slate_through_the_store(client: TestClient, calls: Dict[str
     assert [r["position"] for r in exposures] == [0, 1]
     assert exposures[0]["offer_id"] == "of:catalog_offer:off_1"
     assert exposures[1]["eligibility_flags"]["product_key"] == "pk_unknown"
-    assert calls["candidates"][0][1] is exposures  # one row set, two tables
+    assert calls["candidates"][0][1] is exposures  # one row set, written to both tables before the answer
 
 
 def test_decision_id_is_required(client: TestClient, calls: Dict[str, Any]) -> None:
@@ -218,12 +221,17 @@ def test_duplicate_positions_are_refused(client: TestClient, calls: Dict[str, An
     assert calls["claims"] == []
 
 
-def test_a_card_without_a_position_puts_every_card_on_its_index(client: TestClient, calls: Dict[str, Any]) -> None:
-    cards = [{"position": 1, "product_id": "p0"}, {"product_id": "p1"}]  # explicit 1 + fallback 1 collided before
+def test_mixed_explicit_and_missing_positions_are_refused(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"position": 1, "product_id": "p0"}, {"product_id": "p1"}]
+    response = client.post(URL, json=_slate(cards=cards), headers=HEADERS)
+    assert (response.status_code, response.json()["detail"]["error"]) == (422, "MIXED_POSITIONS")
+    assert calls["claims"] == []
+
+
+def test_cards_without_positions_take_their_list_index(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"product_id": "p0"}, {"product_id": "p1"}]
     assert client.post(URL, json=_slate(cards=cards), headers=HEADERS).status_code == 202
-    rows = calls["exposures"][0][1]
-    assert [r["position"] for r in rows] == [0, 1]
-    assert len({r["exposure_id"] for r in rows}) == 2
+    assert [r["position"] for r in calls["exposures"][0][1]] == [0, 1]
 
 
 def test_an_empty_slate_records_the_decision_only(client: TestClient, calls: Dict[str, Any]) -> None:
@@ -245,3 +253,96 @@ def test_rejects_oversized_or_malformed_slates(
 ) -> None:
     assert client.post(URL, json=_slate(**overrides), headers=HEADERS).status_code == 422
     assert calls["claims"] == []
+
+
+# --- adversarial review r3 -----------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        {"query": "something else"},
+        {"market": "JP"},
+        {"merchant_id": "m9"},
+        {"channel": "acp"},
+        {"protocol": "ucp_session"},
+        {"request_id": "req-2"},
+        {"primary_path": "upstream"},
+        {"cards": [{"position": 0, "product_id": "p0", "merchant_id": "merch_1", "product_key": "pk_known",
+                    "offer_id": "of:catalog_offer:off_1", "platform": "shopify", "source": "beauty_direct",
+                    "in_stock": False},
+                   {"position": 1, "product_id": "p1", "merchant_id": "merch_2", "product_key": "pk_unknown"}]},
+    ],
+)
+def test_any_difference_in_the_request_is_a_conflict_not_a_replay(
+    client: TestClient, calls: Dict[str, Any], second: Dict[str, Any]
+) -> None:
+    assert client.post(URL, json=_slate(), headers=HEADERS).status_code == 202
+    assert client.post(URL, json=_slate(**second), headers=HEADERS).status_code == 409
+    assert len(calls["exposures"]) == 1
+
+
+def test_two_empty_searches_under_one_id_are_a_conflict(client: TestClient, calls: Dict[str, Any]) -> None:
+    assert client.post(URL, json=_slate(cards=[], query="q1"), headers=HEADERS).status_code == 202
+    assert client.post(URL, json=_slate(cards=[], query="q2"), headers=HEADERS).status_code == 409
+
+
+def test_a_database_failure_is_a_503_and_the_resend_fills_the_slate(client: TestClient, calls: Dict[str, Any]) -> None:
+    calls["lose"] = ConnectionError("pool checkout timed out")
+    response = client.post(URL, json=_slate(), headers=HEADERS)
+    assert (response.status_code, response.json()["detail"]["error"]) == (503, "LEDGER_UNAVAILABLE")
+    assert calls["exposures"] == []
+
+    calls["lose"] = 0
+    resend = client.post(URL, json=_slate(), headers=HEADERS)
+    assert resend.status_code == 200 and resend.json()["replayed"] is True
+    assert len(calls["exposures"][0][1]) == 2
+
+
+def test_rows_lost_to_row_level_errors_are_reported(client: TestClient, calls: Dict[str, Any]) -> None:
+    calls["lose"] = 1
+    response = client.post(URL, json=_slate(), headers=HEADERS)
+    assert response.status_code == 202 and response.json()["rows_lost"] == 1
+
+
+def test_a_failing_claim_is_a_503_and_an_unstorable_value_a_422(
+    client: TestClient, calls: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncpg.exceptions as pg
+
+    async def down(**kwargs: Any) -> None:
+        raise ConnectionError("db down")
+
+    async def unstorable(**kwargs: Any) -> None:
+        raise pg.UntranslatableCharacterError("unsupported Unicode escape sequence")
+
+    monkeypatch.setattr(module, "claim_decision_event", down)
+    assert client.post(URL, json=_slate(), headers=HEADERS).status_code == 503
+    monkeypatch.setattr(module, "claim_decision_event", unstorable)
+    assert client.post(URL, json=_slate(), headers=HEADERS).status_code == 422
+    assert calls["exposures"] == []
+
+
+def test_nul_characters_are_stripped_before_they_reach_postgres(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"position": 0, "product_id": "p\u00000", "product_key": "pk\u0000x"}]
+    body = _slate(query="a\u0000b", surface="gateway.\u0000fpm", agent_id="ag\u0000ent", cards=cards)
+    assert client.post(URL, json=body, headers=HEADERS).status_code == 202
+    claim = calls["claims"][0]
+    assert (claim["surface"], claim["agent_context"]["query"], claim["agent_context"]["agent_id"]) == (
+        "gateway.fpm", "ab", "agent")
+    row = calls["exposures"][0][1][0]
+    assert row["product_key"] == "pkx" and row["eligibility_flags"]["product_id"] == "p0"
+
+
+def test_numeric_ids_and_the_catalog_offer_id_spelling_are_accepted(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"position": 0, "product_id": 123, "merchant_id": 456, "catalog_offer_id": "of:catalog_offer:off_9"}]
+    response = client.post(URL, json=_slate(cards=cards), headers=HEADERS)
+    assert response.status_code == 202
+    row = calls["exposures"][0][1][0]
+    assert row["eligibility_flags"]["product_id"] == "123" and row["eligibility_flags"]["merchant_id"] == "456"
+    assert row["offer_id"] == "of:catalog_offer:off_9"
+
+
+def test_offer_id_kept_counts_only_ids_the_store_will_write(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"position": 0, "product_id": "p0", "offer_id": "o" * 300},
+             {"position": 1, "product_id": "p1", "offer_id": "of:catalog_offer:off_1"}]
+    assert client.post(URL, json=_slate(cards=cards), headers=HEADERS).json()["offer_id_kept"] == 1
