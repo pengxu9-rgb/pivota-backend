@@ -35,6 +35,16 @@ _SPEC = {
 _SQL: Dict[str, str] = {}
 _CATALOG_OFFER_PREFIX = "of:catalog_offer:"
 _OFFER_ID_MAX = 255  # catalog_offer_id VARCHAR(255) on every ledger table (migration 140)
+# agent_decision_funnel_links' optional foreign keys (all ON DELETE SET NULL in migration 140): a
+# value that joins nothing is nulled rather than losing the link. decision_id is not in here.
+_LINK_OPTIONAL_REFS = ("exposure_id", "checkout_decision_id", "content_key", "catalog_offer_id",
+                       "commerce_attribution_edge_id")
+
+try:
+    from asyncpg.exceptions import ForeignKeyViolationError as _FK_VIOLATION
+except ImportError:  # pragma: no cover - asyncpg is a hard dependency in every deployed image
+    class _FK_VIOLATION(Exception):  # type: ignore[no-redef]
+        pass
 
 
 def _json_param(value: Any) -> Optional[str]:
@@ -288,10 +298,14 @@ async def record_funnel_link(
         return ""
     link_id = link_id or str(uuid.uuid4())
     protocol = validate_protocol(protocol)
+    # Same column guards as the slate rows: these come from order metadata, and both columns are
+    # foreign keys here, so a prefixed offer id or a product_key-as-content_key failed the whole
+    # link. A value that passes and still joins nothing is nulled at write time (_write_funnel_link).
+    refs = {"content_key": content_key, "catalog_offer_id": catalog_offer_id}
     await _enqueue("funnel_link", {
         "link_id": link_id, "decision_id": decision_id, "funnel_event_id": funnel_event_id,
         "exposure_id": exposure_id, "checkout_decision_id": checkout_decision_id,
-        "content_key": content_key, "catalog_offer_id": catalog_offer_id,
+        "content_key": _row_content_key(refs), "catalog_offer_id": _row_offer_id(refs),
         "commerce_attribution_edge_id": commerce_attribution_edge_id, "merchant_id": merchant_id,
         "protocol": protocol, "attribution_model": attribution_model,
         "attribution_window_seconds": attribution_window_seconds,
@@ -375,12 +389,52 @@ async def _write_many(op: str, payload: Dict[str, Any]) -> None:
         _report(last_exc, op=op, payload=payload, rows=len(rows), failed_rows=failed)
 
 
+def _fk_column(exc: Exception) -> Optional[str]:
+    """The column a ForeignKeyViolationError names: its detail reads 'Key (col)=(value) is not
+    present in table ...'; the default constraint name '<table>_<col>_fkey' is the fallback."""
+    detail = str(getattr(exc, "detail", "") or "")
+    if detail.startswith("Key (") and ")=" in detail:
+        return detail[len("Key ("):detail.index(")=")]
+    constraint = str(getattr(exc, "constraint_name", "") or "")
+    return next((col for col in _LINK_OPTIONAL_REFS if constraint == f"agent_decision_funnel_links_{col}_fkey"), None)
+
+
+async def _write_funnel_link(payload: Dict[str, Any]) -> None:
+    """Insert one funnel link; on a foreign-key miss in an optional reference, null that column and
+    insert again, so a stale or synthetic id loses only itself, not the order -> decision edge.
+
+    Each retry nulls a different column, so this ends within len(_LINK_OPTIONAL_REFS) + 1 tries. A
+    miss on decision_id (ON DELETE RESTRICT: the link is about it) or funnel_event_id (NOT NULL), and
+    any other error, propagates to the flush loop, which reports it."""
+    row = dict(payload)
+    nulled: List[str] = []
+    while True:
+        try:
+            await database.execute(_sql("funnel_link"), row)
+            break
+        except _FK_VIOLATION as exc:
+            column = _fk_column(exc)
+            if column not in _LINK_OPTIONAL_REFS or row.get(column) is None:
+                raise
+            row[column] = None
+            nulled.append(column)
+    if nulled:
+        # the countable record (ids and column names only, never values)
+        logger.warning(json.dumps({
+            "event": "agent_decision_event_store.funnel_link_refs_nulled", "op": "funnel_link",
+            "decision_id": row.get("decision_id"), "funnel_event_id": row.get("funnel_event_id"),
+            "columns": nulled,
+        }, default=str))
+
+
 async def _flush_loop(queue: asyncio.Queue[Tuple[str, Dict[str, Any]]]) -> None:
     while True:
         op, payload = await queue.get()
         try:
             if op in _MANY:
                 await _write_many(op, payload)
+            elif op == "funnel_link":
+                await _write_funnel_link(payload)
             else:
                 await database.execute(_sql(op), payload)
         except Exception as exc:  # noqa: BLE001
