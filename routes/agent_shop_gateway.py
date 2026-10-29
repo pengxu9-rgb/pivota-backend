@@ -7835,7 +7835,8 @@ def _record_gateway_decision_events(
                     # in the background (resolve_card_identities), never
                     # written as one: it overflows the VARCHAR(40) column.
                     "content_key": product.get("content_key"),
-                    "product_key": product.get("product_key") or product.get("attached_product_key"),
+                    "product_key": product.get("product_key"),
+                    "attached_product_key": product.get("attached_product_key"),
                     "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
                     "position": idx,
                     "eligibility_flags": {

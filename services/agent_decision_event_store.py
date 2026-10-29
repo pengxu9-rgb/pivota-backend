@@ -70,6 +70,16 @@ def _row_offer_id(row: Dict[str, Any]) -> Optional[str]:
     return value if value and len(value) <= _OFFER_ID_MAX else None
 
 
+def _row_product_keys(row: Dict[str, Any]) -> List[str]:
+    """The card's product_key, then its attached_product_key (external-seed cards), in that order."""
+    keys: List[str] = []
+    for name in ("product_key", "attached_product_key"):
+        key = str(row.get(name) or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 async def resolve_card_identities(rows: List[Dict[str, Any]]) -> None:
     """Fill each card row's content_key from catalog_products by product_key, and drop a catalog
     offer id that is not in catalog_offers, in place. Two primary-key lookups per slate; run it in
@@ -82,8 +92,7 @@ async def resolve_card_identities(rows: List[Dict[str, Any]]) -> None:
 
     cards = [row for row in rows if isinstance(row, dict)]
     product_keys = sorted({
-        str(row.get("product_key") or "").strip() for row in cards
-        if not is_content_key(row.get("content_key")) and str(row.get("product_key") or "").strip()
+        key for row in cards if not is_content_key(row.get("content_key")) for key in _row_product_keys(row)
     })
     offer_ids = sorted({
         offer_id for offer_id in (_row_offer_id(row) for row in cards)
@@ -98,7 +107,7 @@ async def resolve_card_identities(rows: List[Dict[str, Any]]) -> None:
             by_product = {r["product_key"]: r["content_key"] for r in found if is_content_key(r["content_key"])}
             for row in cards:
                 if not is_content_key(row.get("content_key")):
-                    key = by_product.get(str(row.get("product_key") or "").strip())
+                    key = next((by_product[k] for k in _row_product_keys(row) if k in by_product), None)
                     if key:
                         row["content_key"] = key
         if offer_ids:
@@ -171,14 +180,59 @@ async def record_decision_event(
     attribution_model: str = "last_agent_decision_v1", attribution_window_seconds: int = 2592000,
 ) -> str:
     decision_id = decision_id or str(uuid.uuid4())
-    protocol = validate_protocol(protocol)
-    await _enqueue("decision", {
+    await _enqueue("decision", _decision_payload(
+        decision_id=decision_id, merchant_id=merchant_id, brand_id=brand_id, surface=surface,
+        channel=channel, agent_context=agent_context, protocol=protocol,
+        attribution_model=attribution_model, attribution_window_seconds=attribution_window_seconds,
+    ))
+    return decision_id
+
+
+def _decision_payload(
+    *, decision_id: str, merchant_id: Optional[str], brand_id: Optional[str], surface: Optional[str],
+    channel: Optional[str], agent_context: Optional[Dict[str, Any]], protocol: str,
+    attribution_model: str, attribution_window_seconds: int,
+) -> Dict[str, Any]:
+    return {
         "decision_id": decision_id, "merchant_id": merchant_id, "brand_id": brand_id,
         "surface": surface, "channel": channel, "agent_context": _json_param(agent_context),
-        "protocol": protocol, "attribution_model": attribution_model,
+        "protocol": validate_protocol(protocol), "attribution_model": attribution_model,
         "attribution_window_seconds": attribution_window_seconds,
-    })
-    return decision_id
+    }
+
+
+async def claim_decision_event(
+    *, decision_id: str, merchant_id: Optional[str] = None, brand_id: Optional[str] = None,
+    surface: Optional[str] = None, channel: Optional[str] = None,
+    agent_context: Optional[Dict[str, Any]] = None, protocol: str = DEFAULT_PROTOCOL,
+    attribution_model: str = "last_agent_decision_v1", attribution_window_seconds: int = 2592000,
+) -> Optional[Dict[str, Any]]:
+    """Write the decision row NOW, not through the queue, for a caller that must refuse a reused
+    decision_id (the gateway slate ingest). One INSERT ... ON CONFLICT DO NOTHING RETURNING, so two
+    racing calls cannot both win. Returns None when this call created the row, else the existing
+    row as {"surface", "agent_context"} for the caller to compare."""
+    payload = _decision_payload(
+        decision_id=decision_id, merchant_id=merchant_id, brand_id=brand_id, surface=surface,
+        channel=channel, agent_context=agent_context, protocol=protocol,
+        attribution_model=attribution_model, attribution_window_seconds=attribution_window_seconds,
+    )
+    created = await database.fetch_one(_sql("decision") + " RETURNING decision_id", payload)
+    if created is not None:
+        return None
+    existing = await database.fetch_one(
+        "SELECT surface, agent_context FROM agent_decision_events WHERE decision_id = :decision_id",
+        {"decision_id": decision_id},
+    )
+    context = existing["agent_context"] if existing is not None else None
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except Exception:  # noqa: BLE001
+            context = None
+    return {
+        "surface": existing["surface"] if existing is not None else None,
+        "agent_context": context if isinstance(context, dict) else {},
+    }
 
 
 async def record_decision_candidates(decision_id: str, rows: Iterable[Dict[str, Any]]) -> None:
@@ -306,6 +360,9 @@ async def _write_many(op: str, payload: Dict[str, Any]) -> None:
     # execute_many runs one INSERT per row with no transaction, so the rows before the failing one
     # are already in. Replay row by row (ON CONFLICT DO NOTHING keeps that idempotent) so one bad
     # card loses only itself, not the whole slate.
+    # NEVER call this inside a transaction: the first failing INSERT aborts it, every replayed row
+    # then fails, and the rollback discards the rows that did land (0 rows on real PG). The flush
+    # worker runs in a fresh context (spawn_isolated in _ensure_worker), so it holds none.
     failed = 0
     last_exc: Optional[Exception] = None
     for row in rows:

@@ -275,3 +275,73 @@ async def test_resolve_card_identities_is_fail_soft(monkeypatch: pytest.MonkeyPa
     await store.resolve_card_identities(rows)
     assert rows == [{"product_key": "pk_1", "offer_id": "off_1"}]
     assert reports == ["resolve_card_identities"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_tries_the_attached_product_key_when_the_product_key_misses(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _FakeDb(bad=set(), fetch={"catalog_products": [{"product_key": "seed_attached", "content_key": CK}]})
+    monkeypatch.setattr(store, "database", db)
+    rows = [{"product_key": "pk_not_in_catalog", "attached_product_key": "seed_attached"}]
+    await store.resolve_card_identities(rows)
+    assert rows[0]["content_key"] == CK
+    product_query = next(v for q, v in db.fetch_calls if "catalog_products" in q)
+    assert product_query["keys"] == ["pk_not_in_catalog", "seed_attached"]
+
+
+class _ClaimDb:
+    """INSERT ... ON CONFLICT DO NOTHING RETURNING: a row back only for the first insert of an id."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.queries: list[str] = []
+
+    async def fetch_one(self, query: str, values: dict[str, Any]) -> Any:
+        self.queries.append(query)
+        if query.startswith("INSERT"):
+            if values["decision_id"] in self.rows:
+                return None
+            self.rows[values["decision_id"]] = values
+            return {"decision_id": values["decision_id"]}
+        row = self.rows.get(values["decision_id"])
+        return None if row is None else {"surface": row["surface"], "agent_context": row["agent_context"]}
+
+
+@pytest.mark.asyncio
+async def test_claim_decision_event_wins_once_and_returns_the_stored_row_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = _ClaimDb()
+    monkeypatch.setattr(store, "database", db)
+
+    first = await store.claim_decision_event(decision_id="dec-1", surface="gw", agent_context={"slate_fingerprint": "f1"})
+    second = await store.claim_decision_event(decision_id="dec-1", surface="other", agent_context={"slate_fingerprint": "f2"})
+
+    assert first is None
+    # agent_context comes back parsed from its stored JSON text, and the first write is kept
+    assert second == {"surface": "gw", "agent_context": {"slate_fingerprint": "f1"}}
+    assert db.queries[0].startswith("INSERT INTO agent_decision_events")
+    assert db.queries[0].endswith("ON CONFLICT (decision_id) DO NOTHING RETURNING decision_id")
+
+
+@pytest.mark.asyncio
+async def test_the_flush_worker_runs_in_a_fresh_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # _write_many's row-by-row replay must never run inside a transaction (real PG: the first
+    # failing INSERT aborts it and the rollback leaves 0 rows). The worker gets a fresh context,
+    # so it never inherits a caller's databases Connection or transaction.
+    import services.scheduler_job_runner as runner
+
+    spawned: list[str] = []
+
+    def fake_spawn_isolated(coro: Any, *, name: str | None = None) -> Any:
+        spawned.append(name or "")
+        coro.close()
+
+        class _Done:
+            def done(self) -> bool:
+                return False
+
+        return _Done()
+
+    monkeypatch.setattr(runner, "spawn_isolated", fake_spawn_isolated)
+    monkeypatch.setattr(store, "_QUEUE", None)
+    monkeypatch.setattr(store, "_WORKER", None)
+    store._ensure_worker()
+    assert spawned == ["agent_decision_event_flush"]
