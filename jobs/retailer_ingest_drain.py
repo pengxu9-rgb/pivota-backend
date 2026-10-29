@@ -176,6 +176,15 @@ def main() -> int:
         # One greppable line per STAGE (the held/failed log metrics count lines), printed as it ends.
         print(SUMMARY_MARKER + json.dumps(summary, default=str, sort_keys=True), flush=True)
 
+    # The effective CRAWL_FRESH switch and N, once per execution at WARNING: the
+    # drain's apply recomputes trust (primary readiness), so a flip must be
+    # verifiable from this job's logs too.
+    try:
+        from services.catalog_row_trust_upserter import log_crawl_fresh_config
+        log_crawl_fresh_config("retailer_ingest_drain")
+    except Exception:  # noqa: BLE001 -- a log line never blocks the drain
+        pass
+
     blackout = ledger.claim_blackout_from_env()
     print(CONFIG_MARKER + json.dumps({"claim_window": ledger.format_claim_blackout(blackout),
                                       "claim_lead_floor_s": args.task_timeout,

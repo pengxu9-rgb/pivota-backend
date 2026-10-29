@@ -147,6 +147,8 @@ _JOB_RUN_DEADLINES = {
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
     "catalog_row_trust_backfill": 7200,
+    # hourly CRAWL_FRESH decay recheck (bounded; under the next run's start)
+    "catalog_row_trust_crawl_fresh_recheck": 1800,
     "agent_pdp_view_reconcile": 7200,
     "pdp_will_render_reconcile": 7200,
     # monthly money crons (external calls, must never wedge silently)
@@ -1192,6 +1194,7 @@ async def start_scheduler() -> None:
 
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
         )
         _add_job(
             run_catalog_row_trust_backfill_tick,
@@ -1201,6 +1204,19 @@ async def start_scheduler() -> None:
             id="catalog_row_trust_backfill",
             replace_existing=True,
             misfire_grace_time=1800,  # fire up to 30min late (post-restart) not skip
+            coalesce=True,
+            max_instances=1,
+        )
+        # CRAWL_FRESH decay recheck (services/catalog_row_trust_upserter), hourly:
+        # a crawl-fresh row whose read aged past N is re-derived within the hour.
+        # A bounded GIN-index read that writes nothing while no row carries the code.
+        _add_job(
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
+            "cron",
+            minute=47,
+            id="catalog_row_trust_crawl_fresh_recheck",
+            replace_existing=True,
+            misfire_grace_time=1800,
             coalesce=True,
             max_instances=1,
         )

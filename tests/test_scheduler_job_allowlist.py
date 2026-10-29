@@ -35,6 +35,7 @@ MAIN_WORKER_JOB_IDS = [
     "agent_share_accrual_daily", "gmv_invoice_credit_daily", "invoice_generation_monthly",
     "partner_settlement_monthly", "settlement_file_generate", "settlement_file_transfer",
     "catalog_invariant_sweep", "pdp_scope_backfill", "catalog_row_trust_backfill",
+    "catalog_row_trust_crawl_fresh_recheck",
     "agent_pdp_view_reconcile", "pdp_will_render_reconcile", "quality_backfill_drain_tick",
     "catalog_import_drain_tick", "catalog_import_stale_reaper", "catalog_sync_drain_tick",
     "catalog_sync_stale_reaper", "payment_reconcile_tick", "merchant_order_sync_worker_tick",
