@@ -7813,6 +7813,7 @@ def _record_gateway_decision_events(
             record_decision_candidates,
             record_decision_event,
             record_exposure_events,
+            resolve_card_identities,
         )
         from services.protocols import derive_protocol_for_surface
 
@@ -7830,12 +7831,12 @@ def _record_gateway_decision_events(
                     # external-seed cards carry catalog identity under
                     # attached_product_key; connected/pivot mainline cards
                     # don't emit a top-level content_key yet (Phase-2 card
-                    # mapping) — captured here best-effort, NULL otherwise.
-                    "content_key": (
-                        product.get("content_key")
-                        or product.get("product_key")
-                        or product.get("attached_product_key")
-                    ),
+                    # mapping). The product_key is mapped to its content_key
+                    # in the background (resolve_card_identities), never
+                    # written as one: it overflows the VARCHAR(40) column.
+                    "content_key": product.get("content_key"),
+                    "product_key": product.get("product_key"),
+                    "attached_product_key": product.get("attached_product_key"),
                     "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
                     "position": idx,
                     "eligibility_flags": {
@@ -7864,6 +7865,7 @@ def _record_gateway_decision_events(
                         **(extra_context or {}),
                     },
                 )
+                await resolve_card_identities(rows)
                 await record_decision_candidates(decision_id, rows)
                 await record_exposure_events(decision_id, rows)
             except Exception:
