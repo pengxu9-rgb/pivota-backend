@@ -561,6 +561,77 @@ async def test_the_scope_refuses_to_run_with_the_write_flag_off() -> None:
         ))
 
 
+class _UntouchableDb:
+    """A database the refusal must never reach: not connected, and any use fails the test."""
+
+    is_connected = False
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the backfill touched the database ({name}) before refusing")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply", [True, False])
+@pytest.mark.parametrize("scope", ["all", "enriched"])
+async def test_the_rebuild_scopes_refuse_to_run_with_the_market_prices_flag_off(monkeypatch, scope, apply) -> None:
+    # 'all' (the default) and 'enriched' rebuild rows through the plain upsert: run flagless
+    # (a one-off job carries no env) each row loses market_prices and refreshed_at moves past
+    # market_prices_refreshed_at, so every summary they touch is retired.
+    import argparse
+
+    import scripts.backfill_agent_pdp_view as backfill
+
+    monkeypatch.setattr(backfill, "database", _UntouchableDb())
+    with pytest.raises(SystemExit, match=f"--scope {scope} needs AGENT_PDP_VIEW_MARKET_PRICES=on"):
+        await backfill._drive(argparse.Namespace(
+            apply=apply, scope=scope, limit=3, offset=0, after="", sleep=0.0,
+        ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply", [True, False])
+async def test_every_scope_refuses_before_reading_a_key_with_the_flag_off(monkeypatch, apply) -> None:
+    # A scope added to SCOPES later gets the refusal without anyone listing it here.
+    import argparse
+
+    import scripts.backfill_agent_pdp_view as backfill
+
+    monkeypatch.setattr(backfill, "database", _UntouchableDb())
+    for scope in backfill.SCOPES:
+        with pytest.raises(SystemExit, match="AGENT_PDP_VIEW_MARKET_PRICES=on"):
+            await backfill._drive(argparse.Namespace(
+                apply=apply, scope=scope, limit=3, offset=0, after="", sleep=0.0,
+            ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["all", "enriched"])
+async def test_the_rebuild_scopes_run_and_write_the_summary_with_the_flag_on(monkeypatch, scope) -> None:
+    import argparse
+
+    import scripts.backfill_agent_pdp_view as backfill
+
+    monkeypatch.setenv(assembler.MARKET_PRICES_FLAG_ENV, "on")
+    db = _BackfillDb(["ck_a"])
+    monkeypatch.setattr(backfill, "database", db)
+    upserted: List[Dict[str, Any]] = []
+
+    async def build(content_key, *, refresh_source):
+        return {**_assemble(MIXED), "content_key": content_key}
+
+    async def upsert(_db, row):
+        upserted.append(row)
+
+    monkeypatch.setattr(backfill, "build_agent_pdp_view_row", build)
+    monkeypatch.setattr(backfill, "execute_agent_pdp_view_upsert", upsert)
+    report = await backfill._drive(argparse.Namespace(
+        apply=True, scope=scope, limit=3, offset=0, after="", sleep=0.0,
+    ))
+    assert report["outcome_counts"]["rows_upserted"] == 1
+    assert [r["content_key"] for r in upserted] == ["ck_a"]
+    assert upserted[0]["market_prices"] is not None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("apply", [True, False])
 async def test_the_seller_count_scope_refuses_to_run_with_the_market_prices_flag_off(apply) -> None:
