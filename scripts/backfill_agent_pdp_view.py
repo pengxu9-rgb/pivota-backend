@@ -233,11 +233,14 @@ def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
 # ---------------------------------------------------------------------
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.scope == "market_prices_missing" and not market_prices_enabled():
+    if args.scope in ("market_prices_missing", "seller_count_missing") and not market_prices_enabled():
         # Without the flag the assembled row carries no market_prices, the
         # upsert leaves the column NULL, and the next pass selects the same keys.
+        # seller_count_missing selects every unbuilt row, so a flagless run would also
+        # rebuild the whole view without market_prices and bump refreshed_at, leaving
+        # every market entry stale (a non-USD buyer then reads the row's own prices).
         raise SystemExit(
-            "--scope market_prices_missing needs AGENT_PDP_VIEW_MARKET_PRICES=on"
+            f"--scope {args.scope} needs AGENT_PDP_VIEW_MARKET_PRICES=on"
         )
     if not getattr(database, "is_connected", False):
         await database.connect()
