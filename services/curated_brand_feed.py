@@ -40,6 +40,13 @@ from services import storefront_currency
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness, shopify_edge_pacer
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+# Re-exported: the measured brand families and the brand comparison key live in a module with no I/O
+# imports (services/brand_spelling.py) so pure matchers can use them without importing this one.
+from services.brand_spelling import (  # noqa: F401 - re-exported names
+    RETAILER_BRAND_CANONICAL,
+    RETAILER_BRAND_SPELLINGS,
+    brand_key as _brand_key,
+)
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -965,6 +972,21 @@ _INLINE_TAGS = frozenset({
 })
 # Sub/superscripts attach to their base: H<sub>2</sub>O, vitamin B<sub>5</sub>, 10<sup>th</sup>.
 _ATTACHED_TAGS = frozenset({"sub", "sup"})
+# A NUMERIC sub/superscript keeps its position: rendered as the Unicode sub/superscript characters,
+# still attached. Flattened to plain digits, a footnote marker glued to its word reads as part of it --
+# "Ceramide<sup>1</sup>" became "Ceramide1", "week<sup>3</sup>." became "week3." -- and a formula lost
+# its subscript. Now: "Ceramide\u00b9", "week\u00b3.", "H\u2082O", "m\u00b2", "10\u2076". Only content
+# that is digits (with + - = ( ) and a minus sign), or a comma list of such ("1, 2" keeps its ", "),
+# is converted; anything else -- "10<sup>th</sup>", "<sup>*</sup>", "<sup>TM</sup>", a letter -- is
+# attached as before. Tags nested inside ("<sup><span>1</span></sup>") are looked through.
+_SCRIPT_TAG_RE = re.compile(r"(?is)<\s*(sup|sub)\b[^<>]*>(.{0,200}?)<\s*/\s*\1\s*>")
+_SCRIPT_CONTENT_RE = re.compile(r"[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*(?:, *[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*)*")
+_SUPERSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e\u207b")
+_SUBSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e\u208b")
+# Every character a numeric sub/superscript can become: a safety cue right before one is still a cue.
+SCRIPT_NUMERAL_CHARS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e" \
+                       "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e"
+_SCRIPT_NUMERAL_RE = re.compile(f"[{SCRIPT_NUMERAL_CHARS}]")
 _TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][A-Za-z0-9]*)")
 # A tag-shaped token in text that has already been unescaped: a letter right after `<` or `</`,
 # and (checked in `_escaped_tag_replacement`) a real HTML element name. Narrower than _HTML_TAG_RE
@@ -998,6 +1020,22 @@ def _tag_replacement(m: "re.Match[str]") -> str:
     if tag in _INLINE_TAGS:
         return _INLINE_CLOSE_MARK if re.match(r"<\s*/", m.group(0)) else _INLINE_MARK
     return "\n"
+
+
+def _script_numeral(m: "re.Match[str]") -> str:
+    """A numeric <sup>/<sub> -> its Unicode characters between attached marks (no gap either side);
+    any other one is left for the tag pass, which attaches it as before. Converted only when nothing
+    in it could be a separator: no whitespace but the spaces after a list comma (kept: "1, 2" keeps
+    its ", ", so "1 2" never reads as twelve), and no tag but an inline one (a block break inside a
+    malformed sup is still a break)."""
+    inner = m.group(2)
+    if any(name.lower() not in _INLINE_TAGS for name in _TAG_NAME_RE.findall(inner)):
+        return m.group(0)
+    content = html.unescape(_HTML_TAG_RE.sub("", inner))
+    if not _SCRIPT_CONTENT_RE.fullmatch(content):
+        return m.group(0)
+    table = _SUPERSCRIPT if m.group(1).lower() == "sup" else _SUBSCRIPT
+    return _ATTACHED_MARK + content.translate(table) + _ATTACHED_MARK
 
 
 def _escaped_tag_replacement(m: "re.Match[str]") -> str:
@@ -1220,8 +1258,9 @@ _SAFETY_CUE_RE = re.compile(
 
 
 def is_safety_text(sentence: str) -> bool:
-    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction)."""
-    return bool(_SAFETY_CUE_RE.search(sentence or ""))
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction).
+    A sub/superscript numeral is a word boundary here: "avoid the eyes\u00b9" carries "eyes"."""
+    return bool(_SAFETY_CUE_RE.search(_SCRIPT_NUMERAL_RE.sub(" ", sentence or "")))
 
 
 def _without_boilerplate(sentence: str) -> Optional[str]:
@@ -1276,6 +1315,7 @@ def _strip_markup(body_html: str) -> str:
     text = _MARK_RUN_RE.sub("", str(body_html))
     for round_no in range(_UNESCAPE_ROUNDS):
         text = _HTML_BLOCK_RE.sub("\n", text)
+        text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
         # Raw markup: every `<...>` is a tag. After an unescape, only a tag-SHAPED token is.
         text = (_HTML_TAG_RE.sub(_tag_replacement, text) if round_no == 0
                 else _TAG_LIKE_RE.sub(_escaped_tag_replacement, text))
@@ -1284,6 +1324,7 @@ def _strip_markup(body_html: str) -> str:
             break
         text = unescaped
     text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
     text = _TAG_LIKE_RE.sub(_escaped_tag_replacement, text)
     return _MARK_RUN_RE.sub(_inline_gap, text)
 
@@ -2103,22 +2144,6 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _brand_key(value: Optional[str]) -> str:
-    """Alphanumeric-only comparison form of a brand/vendor label.
-
-    Tighter than `_vendor_token` (which only casefolds) because the comparison here is
-    "are these two labels the same BRAND", and the spellings that must compare equal
-    differ by punctuation and spacing: `A'PIEU`/`Apieu`, `MISSHA US`/`Missha`.
-    `_vendor_token` is left alone — it backs `filter_products_by_vendor`, where exact
-    selection is the point and loose matching is the documented hazard.
-
-    "&" is read as "and" before stripping: us.sandandsky.com publishes both `Sand & Sky US`
-    and `Sand and Sky INT` (measured 2026-09-26), which stripped to `sandskyus` and
-    `sandandskyint` and so could never be one brand under any job brand.
-    """
-    return "".join(c for c in str(value or "").casefold().replace("&", "and") if c.isalnum())
-
-
 # A FIRST host label that names a region or a storefront role, not the store: us.sandandsky.com,
 # us.frankbody.com, us.koraorganics.com (measured 2026-09-26), www./shop./store. hosts. The store's
 # own name is the next label. Not stripped when the next label is a public second level
@@ -2134,174 +2159,6 @@ def _store_host_label(domain: Optional[str]) -> str:
            and labels[1] not in _PUBLIC_SECOND_LEVEL_LABELS):
         labels = labels[1:]
     return _brand_key(labels[0])
-
-
-# MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
-# vendor is written under the operator's --brand only when the two are the SAME brand; exact
-# alphanumeric equality decides that everywhere except here. Containment cannot: it would merge
-# "Purito" with "Purito Seoul" (a rename -- correct) and equally "A'PIEU" with "A'PIEU Plus"
-# (a distinct vendor -- tests/services/test_retailer_adversarial_acceptance.py pins that it is
-# NOT overridden). So each family is listed, with the evidence that it is one brand.
-#
-# Measured 2026-09-18 over every vendor at eyurs.com, ohlolly.com and sokoglam.com: these are
-# the ONLY cross-host spellings that exact equality leaves split.
-RETAILER_BRAND_SPELLINGS = {
-    # Manyo Factory renamed to ma:nyo: sokoglam "MANYO FACTORY", ohlolly "ma:nyo", eyurs "manyo".
-    "manyofactory": "manyo",
-    "manyo": "manyo",
-    # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
-    "puritoseoul": "purito",
-    "purito": "purito",
-    # US top-100 wave, measured 2026-09-24 (prod catalog_products + store vendors). A store's spelling
-    # of a prestige brand is a different brand key otherwise -- words (Tom Ford / Tom Ford Beauty,
-    # Christian Dior / Dior, Yves Saint Laurent / YSL) or ACCENTS, which _brand_key and
-    # normalize_brand both keep (perfumania "Lancome" vs the catalog's "Lancôme").
-    "tomford": "tomford", "tomfordbeauty": "tomford",                        # tomfordbeauty.com 145 rows
-    "dior": "dior", "christiandior": "dior", "diorbeauty": "dior",           # perfumania "Christian Dior"
-    "ysl": "ysl", "yslbeauty": "ysl", "yvessaintlaurent": "ysl", "yvessaintlaurentbeauty": "ysl",
-    "jomalone": "jomalone", "jomalonelondon": "jomalone",                    # bluemercury "Jo Malone London"
-    "lancome": "lancome", "lancôme": "lancome",
-    "esteelauder": "esteelauder", "estéelauder": "esteelauder",
-    "kiehls": "kiehls", "kiehlssince1851": "kiehls",
-    "dolceandgabbana": "dolcegabbana", "dolcegabbana": "dolcegabbana",
-    "lorealparis": "lorealparis", "loréalparis": "lorealparis",
-    "tresemme": "tresemme", "tresemmé": "tresemme",
-    "avene": "avene", "avène": "avene",                                      # bluemercury Avène, bigelow Avene
-    "kerastase": "kerastase", "kérastase": "kerastase",
-    # Measured 2026-09-24 over every vendor at 400+ Japanese/Australian beauty storefronts (JP/AU
-    # coverage census): the same maker spelt with and without its accent. `_brand_key` keeps accented
-    # letters (isalnum), and so does normalize_brand, so each spelling below was a separate brand
-    # identity -- e.g. "Kose" at ichibanm.com (26), goodsania.com (185) vs "Kosé" at japanesetaste.com
-    # (47), japanwithlovestore.com (93). Generic-word names that happen to split the same way
-    # ("Elegance"/"Elégance", "Naive"/"Naïve") are deliberately NOT listed: an unrelated vendor
-    # called "Elegance" would be relabelled.
-    "kose": "kose", "kosé": "kose",
-    "biore": "biore", "bioré": "biore",
-    "curel": "curel", "curél": "curel",
-    # Decorté was "Cosme Decorté" until 2020: a rename sold under both names (sasa.com "Cosme Decorte",
-    # wafuu.com "COSME DECORTÉ", ichibanm.com "Decorte", decortecosmetics.com "Decorté").
-    "decorte": "decorte", "decorté": "decorte", "cosmedecorte": "decorte", "cosmedecorté": "decorte",
-    # sasa.com and nanamall.com shorten it to "Cle de Peau" / "Clé de Peau".
-    "cledepeaubeaute": "cledepeaubeaute", "clédepeaubeauté": "cledepeaubeaute",
-    "cledepeau": "cledepeaubeaute", "clédepeau": "cledepeaubeaute",
-    "naturaglace": "naturaglace", "naturaglacé": "naturaglace",
-    "visee": "visee", "visée": "visee",
-    "fiancee": "fiancee", "fiancée": "fiancee",
-    # lamourlife.com writes the Roman-numeral character "SK-Ⅱ" (U+2161), which casefolds to "ⅱ".
-    "skii": "skii", "skⅱ": "skii",
-    # AU: the brand's own store says "Lük Beautifood"; five US retailers say "Luk Beautifood".
-    "lukbeautifood": "lukbeautifood", "lükbeautifood": "lukbeautifood",
-    # wet n wild's own store (www.wetnwildbeauty.com, read 2026-09-26) files 500 of its 580 products
-    # under the CORPORATE vendor "Markwins WNW" (Markwins Beauty Brands owns wet n wild; WNW = wet n
-    # wild) and the other 80 under "wet n wild Beauty". Without this family a brand_official crawl
-    # branded 500 products "Markwins WNW" and the domain review held the job (the store's name does
-    # not start with "Markwins WNW"). Markwins' OTHER labels (e.g. "Markwins Physicians Formula") are
-    # deliberately not listed: only the WNW code names this brand.
-    "wetnwild": "wetnwild", "wetnwildbeauty": "wetnwild", "markwinswnw": "wetnwild",
-    # ETUDE HOUSE renamed to ETUDE (2023) and retailers sell under both, measured in prod 2026-09-28: 293 retailer
-    # rows "ETUDE HOUSE" (luxiface.com 129, holiholic.com 106, openthebeauty.com 28, ...) against 184 "ETUDE" /
-    # "Etude" (dodoskin.com 77, moidaus.com 33, kbeautymakeup.com 24, ...) -- one product at two retailers never
-    # grouped. The existing rows were relabelled FIRST (scripts/relabel_retailer_brand.py, run relabel_07651af59606,
-    # 2026-09-29: 303 rows, 0 held; a re-crawl never updates a stored brand) -- this family must not reach the drain
-    # while an old-spelling row is live, or intake re-keys that row into the new key's group and apply refuses it.
-    "etudehouse": "etude", "etude": "etude",
-    # _brand_key keeps accents (isalnum), so the accented spellings are keys of their own (review of #2440).
-    "étudehouse": "etude", "étude": "etude",
-    # K-beauty / US wave, measured in prod 2026-09-30 over the 13,337 rows ingested 09-23..09-29: each brand
-    # below was stored under two or three spellings that differ ONLY in case (normalize_brand lowercases, so
-    # every spelling of one brand already shares a content_key -- these families move no identity, and so,
-    # unlike ETUDE, may reach the drain before the old rows are relabelled). The vendor's case decided the
-    # display brand: dodoskin.com/holiholic.com "MISSHA" (413 retailer rows) vs misshaus.com "Missha" (149);
-    # eyurs.com "ROUND LAB" vs roundlab.com "Round Lab"; skin1004.com itself writes both "SKIN1004" and
-    # "Skin1004"; cocomo.sg "ANUA"/"ISNTREE"/"GENABELLE"/"MOLVANY"/"ARENCIA". "Centellian 24" (one merchant
-    # row, not a crawl lane) splits by a space; the crawl lanes only ever wrote "Centellian24"/"CENTELLIAN24",
-    # so that family moves no stored crawl row's identity either.
-    # NOT here yet, because they DO move identity (see services/brand_relabel.py ORDER): "O HUI (오휘)" /
-    # "Jung Saem Mool" (smkoreabeauty.com retailer rows -- relabel first), "APIEU" (misshaus.com brand rows --
-    # the product_key moves too), "Supergoop" (supergoop.com brand rows -- no relabel tool reaches them).
-    "missha": "missha", "mixsoon": "mixsoon", "roundlab": "roundlab", "anua": "anua", "arencia": "arencia",
-    "skin1004": "skin1004", "medicube": "medicube", "beautyofjoseon": "beautyofjoseon",
-    "theordinary": "theordinary", "isntree": "isntree", "centellian24": "centellian24",
-    "makeupforever": "makeupforever", "genabelle": "genabelle", "maybelline": "maybelline",
-    "bobbibrown": "bobbibrown", "molvany": "molvany", "byterry": "byterry",
-    # Identity-changing, added only AFTER its rows were relabelled (services/brand_relabel.py ORDER): smkoreabeauty.com
-    # wrote "Jung Saem Mool" (5 retailer rows; normalize_brand keeps the spaces, so its content_key differed from
-    # jsmbeauty.sg's "JUNGSAEMMOOL"). Relabelled by scripts/relabel_retailer_brand.py --family jungsaemmool (run id
-    # in this change's PR); a re-crawl now writes "JUNGSAEMMOOL" onto the relabelled key instead of the old one.
-    "jungsaemmool": "jungsaemmool",
-    # Same ORDER: smkoreabeauty.com wrote "O HUI (오휘)" on 20 retailer rows (_brand_key keeps the Hangul, so its key
-    # differs from "O HUI"). 18 were relabelled (relabel_retailer_brand.py --family ohui, run relabel_fad2cefd5223);
-    # the 2 the relabel held -- a 2-piece and a 3-piece Extreme White set sharing one GTIN, hence one content_key --
-    # were withdrawn first (withdraw_catalog_rows.py, reason ohui_set_gtin_collision). Neither had a product group,
-    # so a re-crawl that re-keys them cannot trip _ensure_primary_retailer_group.
-    "ohui": "ohui", "ohui오휘": "ohui",
-}
-# The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
-# --brand. content_key is
-# built from normalize_brand(brand), which keeps punctuation ("ma:nyo" != "manyo"), so writing
-# the operator's string would still split a family whenever two runs spelled --brand
-# differently. The canonical spelling is the one the catalog ALREADY carries, measured in prod
-# 2026-09-18: 78 brand-official rows as "Ma:nyo" (manyo.us), and "Purito SEOUL"
-# (purito-seoul.com). Any other spelling would split retailer rows from those.
-RETAILER_BRAND_CANONICAL = {
-    "manyo": "Ma:nyo",
-    "purito": "Purito SEOUL",
-    # The catalog's own spelling, measured 2026-09-24 (rows): Tom Ford Beauty 145 (vs "Tom Ford" 4),
-    # Dior 23, YSL 6, Jo Malone 4, Lancôme 12, Estée Lauder 14 (vs "Estee Lauder" 2), Kiehl's Since
-    # 1851 10, Dolce and Gabbana 38 (vs "Dolce & Gabbana" 1), L'Oreal Paris 12. No rows yet for
-    # TRESemmé, Avène, Kérastase: the brand's own spelling.
-    "tomford": "Tom Ford Beauty",
-    "dior": "Dior",
-    "ysl": "YSL",
-    "jomalone": "Jo Malone",
-    "lancome": "Lancôme",
-    "esteelauder": "Estée Lauder",
-    "kiehls": "Kiehl's Since 1851",
-    "dolcegabbana": "Dolce and Gabbana",
-    "lorealparis": "L'Oreal Paris",
-    "tresemme": "TRESemmé",
-    "avene": "Avène",
-    "kerastase": "Kérastase",
-    # 2026-09-24: prod carried none of these as a brand (only two seed-mirror rows, "Biore UV" and
-    # "Clé de Peau"), so each family is written as the maker's own spelling on its own storefront.
-    "kose": "Kosé",
-    "biore": "Bioré",
-    "curel": "Curél",
-    "decorte": "Decorté",
-    "cledepeaubeaute": "Clé de Peau Beauté",
-    "naturaglace": "Naturaglacé",
-    "visee": "Visée",
-    "fiancee": "Fiancée",
-    "skii": "SK-II",
-    # The brand's own lowercase spelling, as on wetnwildbeauty.com.
-    "wetnwild": "wet n wild",
-    "lukbeautifood": "Lük Beautifood",
-    # The brand's own current name (etude.com). Every family member is relabelled to it (see the spellings note).
-    "etude": "ETUDE",
-    # 2026-09-30 wave. Rule: the spelling the catalog already carries on the rows the retailer relabel tool
-    # cannot reach (brand-official / merchant rows, not ext:retailer:), so repairing the existing rows is the
-    # reviewed relabel of retailer rows alone. Rows per spelling outside ext:retailer: in parentheses. It
-    # agrees with the brand's own styling where that is clear (SKIN1004, The Ordinary, Beauty of Joseon).
-    "missha": "Missha",                     # misshaus.com 149 (vs "MISSHA" 0; 413 retailer rows)
-    "mixsoon": "Mixsoon",                   # 225 (vs "MIXSOON" 4, mixsoon.us)
-    "roundlab": "Round Lab",                # roundlab.com 88 (vs "ROUND LAB" 42)
-    "anua": "Anua",                         # anua.com/anua.us 86 (vs "ANUA" 6, all suppressed)
-    "arencia": "Arencia",                   # 126 (vs "ARENCIA" 21)
-    "skin1004": "SKIN1004",                 # skin1004.com 93 (vs "Skin1004" 48)
-    "medicube": "MEDICUBE",                 # 66 (vs "Medicube" 17, medicube.us)
-    "beautyofjoseon": "Beauty of Joseon",   # beautyofjoseon.com 103 (vs "BEAUTY OF JOSEON" 2, suppressed)
-    "theordinary": "The Ordinary",          # 109 (vs "the ordinary" 5)
-    "isntree": "Isntree",                   # isntree-global.com 58 (vs "ISNTREE" 5, suppressed)
-    "centellian24": "Centellian24",         # centellian24usa.com 106 (vs "Centellian 24" 1, "CENTELLIAN24" 1)
-    "makeupforever": "MAKE UP FOR EVER",    # makeupforever.sg 74 (vs "Make Up For Ever" 0; 4 retailer rows)
-    "genabelle": "Genabelle",               # 31 (vs "GENABELLE" 8, suppressed)
-    "maybelline": "Maybelline",             # 25 (vs "MAYBELLINE" 0; 12 retailer rows)
-    "bobbibrown": "Bobbi Brown",            # 9 (vs "BOBBI BROWN" 0; 17 retailer rows)
-    "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
-    "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
-    "jungsaemmool": "JUNGSAEMMOOL",         # jsmbeauty.sg 171 (vs smkoreabeauty.com "Jung Saem Mool" 5, relabelled)
-    "ohui": "O HUI",                        # 409 retailer rows (vs smkoreabeauty.com "O HUI (오휘)" 20: 18 relabelled, 2 withdrawn)
-}
 
 
 def _retailer_brand_family(key: str) -> Optional[str]:
@@ -3240,6 +3097,19 @@ def shopify_product_to_record(
             if _src:
                 image = {"src": _src}
                 break
+    # The product's OWN structured gallery: its `images[].src` in feed order (normalised by
+    # ingestion.structured_image_gallery, which ingestion applies again), carried so the row owns its
+    # gallery instead of borrowing a page scrape's. Kept only when its first image IS the row image
+    # above, so nothing reorders; otherwise (no product images, the variant-swatch fallback, a first
+    # image that is not http(s), a single image that adds nothing to the row image) the record carries
+    # none and is what it was. A fold base keeps its own images only: images the fold adopted from folded
+    # children are other listings' pictures, and each folded variant keeps its own image_url below.
+    # Behind ingestion.STRUCTURED_GALLERY_FLAG (default off): off, every record is what it always was.
+    from services.catalog_enrichment_agent.ingestion import structured_gallery_enabled, structured_image_gallery
+    image_urls = (structured_image_gallery(_image_srcs(product))
+                  if structured_gallery_enabled() and not product.get(FOLDED_IMAGES_KEY) else [])
+    if len(image_urls) < 2 or image_urls[0] != str(image.get("src") or "").strip():
+        image_urls = []
     # A line with multiple native variants is not one physical item, just as a
     # folded shade line is not. Never promote the first variant's GTIN to Tier-0
     # PDP identity: array order and stock/price changes must not change identity.
@@ -3386,6 +3256,8 @@ def shopify_product_to_record(
             # defaulted here: direct ingestion also refuses an unknown currency.
             "currency": currency,
             "variants": pdp_variants,
+            # Omitted when empty, so a product without a gallery builds the record it always did.
+            **({"image_urls": image_urls} if image_urls else {}),
         },
         "offers": [
             {
@@ -3435,6 +3307,10 @@ def shopify_product_to_record(
 _SHADE_SEP = " - "
 FOLDED_FROM_KEY = "_folded_from_handle"
 FOLDED_INTO_KEY = "_folded_shades"
+#: Set on a fold base whose `images` the fold ADOPTED from its folded children (the base had none of its
+#: own). Those are other listings' pictures: the base's row image comes from them as before, but they are
+#: not the base's gallery (shopify_product_to_record).
+FOLDED_IMAGES_KEY = "_images_adopted_from_folded"
 # A suffix that names a merchandising state, not a shade. tarte sells "<line> - <X>
 # charm" as separate $10 accessories and stila suffixes "- Last Chance"/"- Limited
 # Edition" onto whole palettes; folding those makes an accessory a "shade" of the
@@ -3604,6 +3480,7 @@ def fold_shade_listings(products: List[Dict[str, Any]], *,
                         adopted.append({"src": src})
             if adopted:
                 base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
                 report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(shades)
@@ -4043,6 +3920,7 @@ def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[
                         adopted.append({"src": src})
             if adopted:
                 base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
                 report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(added)

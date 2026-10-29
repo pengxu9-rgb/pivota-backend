@@ -37,9 +37,17 @@ LIVE_PROD_ENV = {
     "RELGRAPH_SYNC_APPLY_REVIEW": "true",
     "RELGRAPH_SYNC_ALLOW_WRITES": "true",
     "RELGRAPH_SYNC_CONFIRM": "APPLY_RELGRAPH_SYNC_ROUTINE",
-    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "90",
-    "RELGRAPH_SYNC_REVIEW_LIMIT": "2000",
-    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "6",
+    # 2026-10-20 (Peng): 10,000 global-backlog reviews a night at concurrency 12 (16 errored 10.3%).
+    "RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES": "300",
+    "RELGRAPH_SYNC_REVIEW_LIMIT": "10000",
+    "RELGRAPH_SYNC_REVIEW_CONCURRENCY": "12",
+    "RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD": "false",
+    "RELGRAPH_SYNC_CUTOFF": "2026-01-01T00:00:00Z",
+    "RELGRAPH_SYNC_REVIEW_RELATION_TYPES": "competitive_alternative",
+    # 2026-10-20 (Peng, PIVOTA-Agent #2471): review anchors with no served alternative first.
+    "RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST": "true",
+    # 2026-10-15: duty-cycle pacing (PIVOTA-Agent #2444), set by hand until 2026-10-20.
+    "RELGRAPH_DB_DUTY_CYCLE": "1",
     "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED": "true",
     # 2026-10-13: the uncovered backfill (PIVOTA-Agent #2418) and per-anchor target recall.
     "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT": "200",
@@ -114,7 +122,7 @@ def test_review_limit_rises_only_with_concurrency_and_anchor_caps_stay_default(t
     # labels) is ~54 of the 90-minute step. The anchor caps stay at the image defaults: the gateway cron
     # widens the build limit by the backfill itself.
     env = _relgraph_sync_env(_reconcile(tmp_path, "prod", {})[0])
-    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "6")
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("10000", "12")
     for cap in ("RELGRAPH_SYNC_LIMIT", "RELGRAPH_SYNC_SELECT_LIMIT"):
         assert cap not in env
 
@@ -144,3 +152,12 @@ def test_a_malformed_switch_is_refused(tmp_path, value):
     calls, proc = _reconcile(tmp_path, "prod", {"RELGRAPH_SYNC_WRITES": value}, expect_rc=2)
     assert "RELGRAPH_SYNC_WRITES must be" in proc.stderr
     assert calls == []
+
+
+def test_relgraph_sync_task_timeout_covers_a_10k_review_night(tmp_path):
+    # 10,000 reviews at concurrency 12 (~2.5-3.5 h) plus the ~30-minute build exceed the old 14400s.
+    calls, _ = _reconcile(tmp_path, "prod", {})
+    lines = [c for c in calls if c.startswith("run jobs ") and c.split()[3] == "relgraph-sync" and "--task-timeout" in c.split()]
+    assert len(lines) == 1, lines
+    tokens = lines[0].split()
+    assert tokens[len(tokens) - 1 - tokens[::-1].index("--task-timeout") + 1] == "21600s"

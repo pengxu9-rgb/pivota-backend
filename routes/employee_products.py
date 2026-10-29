@@ -7,7 +7,7 @@ content-key catalogue endpoints below, whose offers come from
 ``catalog_offers``.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 import asyncio
 import csv
 import io
@@ -33,9 +33,12 @@ from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
 from utils.auth import get_current_employee, require_employee_permissions
 
+from services import crawl_global_pacer
 from services import external_seed_destination_liveness as destination_liveness
+from services import market_registry
 from services import seed_served_url
 from services.external_offers_service import (
+    IMAGE_URLS_SCOPE_DECLARED,
     ExternalOfferUnavailable,
     resolve_external_offer,
     seed_variants_from_evidence,
@@ -77,6 +80,7 @@ from services.pci_kb_scope_review import (
     summarize_filtered_queue,
 )
 from db.reviews_center import product_reviews
+from services.region_pricing import foreign_seed_currencies, seed_storable_currencies
 from services.reviews_service import GLOBAL_IMPORT_MERCHANT_ID, build_product_key, build_sku_key
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -850,6 +854,176 @@ def _distinct_variant_ids(variants: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+# The EXTENDED shade fold's stamp on a seed variant whose "url" is the listing it was taken from
+# (ingestion.SEED_VARIANT_URL_SOURCE; spelled here so this route imports no ingestion code, as
+# routes/agent_shop_gateway does; a test pins the two). Other writers store a variant "url" too
+# (a ?variant= link on the seed's own page), so a bare url protects nothing.
+_FOLD_URL_SOURCE = "shade_fold_listing"
+
+
+def _is_protected_seed_variant(variant: Dict[str, Any]) -> bool:
+    """A stored variant a WRITER vouched for: the drain's `merchant_issued` provenance, or the shade
+    fold's own listing url. Bare digits are not enough -- the extractor names a read variant by its
+    `sku`, `productID` or `gtin13`, so a page read stores digits too, and freezing those would stop
+    the refresh correcting its own earlier read."""
+    return (
+        variant.get("variant_id_provenance") == "merchant_issued"
+        or variant.get("url_source") == _FOLD_URL_SOURCE
+    )
+
+
+def _writer_stamps(variant: Dict[str, Any]) -> Dict[str, Any]:
+    """The protected variant's stamps a page read cannot reproduce, and nothing else."""
+    out: Dict[str, Any] = {}
+    if variant.get("variant_id_provenance") == "merchant_issued":
+        out["variant_id_provenance"] = "merchant_issued"
+    if variant.get("url_source") == _FOLD_URL_SOURCE and variant.get("url"):
+        out.update(url=variant["url"], url_source=_FOLD_URL_SOURCE)
+    return out
+
+
+def _variant_identity_keys(variant: Dict[str, Any]) -> set:
+    native = _native_refresh_variant_ids(variant)
+    if native:
+        return native
+    raw = variant.get("variant_id") or variant.get("variantId") or variant.get("id")
+    return {str(raw).strip()} if raw not in (None, "") and str(raw).strip() else set()
+
+
+def _incoming_keeps_protected_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> bool:
+    """True unless replacing `existing` with `incoming` would drop a protected variant.
+
+    A page read names variants by whatever its JSON-LD carries: the merchant SKU code, or the
+    offer `@id` (`/products/<handle>?variant=<id>#offer`). The retailer-ingest drain stores the
+    merchant's own Shopify ids, and the SKUs, offers and gateway PDP are keyed by them. Measured
+    2026-10-13: the nightly refresh replaced such seeds with the page's ids because the page also
+    lists a product-level offer (one id more), and the PDP then matched none of its SKUs and
+    served no price. Each protected variant must reappear in `incoming` under the same id.
+
+    A protected variant with NO id cannot be named by any read, so it does not count: holding the
+    list for it would refuse every replacement forever, and since no read can re-price it the
+    refresh would also call the seed stale every night."""
+    protected = [_variant_identity_keys(v) for v in existing if _is_protected_seed_variant(v)]
+    if not protected:
+        return True
+    incoming_keys = set().union(*(_variant_identity_keys(v) for v in incoming)) if incoming else set()
+    # A nameless variant's empty key set is a subset of any read's: it never holds the list.
+    return all(keys <= incoming_keys for keys in protected)
+
+
+def _adopt_seed_variants(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """`incoming`, with each protected stored variant's stamps carried onto the incoming variant of
+    the same id (a page read never carries them, and dropping them would demote the id). Price,
+    stock and currency always come from the read."""
+    stamps: Dict[str, Dict[str, Any]] = {}
+    for v in existing:
+        if _is_protected_seed_variant(v):
+            for key in _variant_identity_keys(v):
+                stamps[key] = _writer_stamps(v)
+    out: List[Dict[str, Any]] = []
+    for v in incoming:
+        carried = next((stamps[k] for k in _variant_identity_keys(v) if k in stamps), None)
+        out.append({**v, **carried} if carried else v)
+    return out
+
+
+def _stated_variant_currencies(variants: List[Dict[str, Any]]) -> set:
+    return {
+        str(v.get(k)).strip().upper()
+        for v in variants or []
+        if isinstance(v, dict)
+        for k in ("price_currency", "currency")
+        if v.get(k) and str(v.get(k)).strip()
+    }
+
+
+def _foreign_variant_currencies(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], row_currency: Optional[str]
+) -> List[str]:
+    """The currencies `incoming` (a page read's variants) states that this seed may not adopt.
+
+    A page read's variants carry the currency the PAGE was served in, and a store can geo-serve
+    another market's page to the crawler. Probed 2026-10-13: a US/USD seed that read a CAD-priced
+    page stored CAD variant prices. The offer dual-write refused the offer, but the seed kept them,
+    and the builders price offers from its variants. The rule is region_pricing's
+    `foreign_seed_currencies`: the row's currency holds when it is storable, else the stored
+    variants' currencies do."""
+    return foreign_seed_currencies(
+        _stated_variant_currencies(incoming), row=row_currency, stored=_stated_variant_currencies(existing)
+    )
+
+
+def _foreign_refresh_variant_currencies(
+    *, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]], row_currency: Optional[str]
+) -> List[str]:
+    """The refresh's stricter form: a scraped read never moves a seed off its ROW currency.
+
+    The refresh refuses a row currency change (`skipped_currency_mismatch`, below), because a misread
+    currency is likelier than a merchant changing one: a KRW row read as "USD" would otherwise be
+    restated as $22,000. Variants follow the row, or the two disagree after the refresh (row CAD,
+    variants USD). So a row with a currency takes only reads in it, and only when it is storable: a
+    CAD row (a create from a geo-served page) takes nothing, or its first refresh would store the
+    CAD variants the create refused. A row with none falls to the shared rule, held to its stored
+    variants. Changing a seed's currency is left to an employee's re-create, which applies the
+    full rule."""
+    row = str(row_currency or "").strip().upper()
+    if not row:
+        return _foreign_variant_currencies(existing=existing, incoming=incoming, row_currency=None)
+    return sorted(_stated_variant_currencies(incoming) - ({row} & seed_storable_currencies()))
+
+
+def _read_heals_stored_currency(*, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> bool:
+    """True when a read the currency gate admitted should REPLACE stored variants priced in another
+    currency, though it is no richer than them.
+
+    The adoption rules replace a list only with a richer read, and the reconcile never re-prices
+    across currencies, so variants an earlier read left in CAD stayed CAD under a USD read of the
+    same sizes. The read must name every stored variant: replacing a list it does not cover would
+    drop sizes (a stored variant with no id is never covered), and #2601's protected variants are
+    among those it must name."""
+    read_currencies = _stated_variant_currencies(incoming)
+    if not read_currencies or not (_stated_variant_currencies(existing) - read_currencies):
+        return False
+    named = set().union(*(_variant_identity_keys(v) for v in incoming))
+    # A stored variant with no id cannot be named by any read, so the read does not cover it.
+    return all((keys := _variant_identity_keys(v)) and keys <= named for v in existing)
+
+
+def _refuse_unstorable_employee_variants(
+    variants: Optional[List[Dict[str, Any]]],
+    *,
+    stored_variants: List[Dict[str, Any]],
+    row_currency: Optional[str],
+) -> None:
+    """An employee may set a seed's variants by hand, and may change its currency so (the sticky
+    rule binds a scraped read, not a person), but may not BRING IN a currency no seed may store, nor
+    a second one. The preview hands the UI the page read's variants, so a geo-served read could
+    otherwise round-trip through the form.
+
+    Only a currency the seed does not already hold counts. Both portal editors send the whole stored
+    list back on every save, so refusing what is already stored would make a seed priced in GBP, or
+    left in CAD by an earlier read, uneditable: even disabling it would fail.
+
+    A seed's currency is its ROW's: the nightly refresh holds variants to it and heals variants priced
+    otherwise. An employee moving the variants to another currency moves `price_currency` with them."""
+    stated = _stated_variant_currencies(variants or [])
+    held = _stated_variant_currencies(stored_variants) | {str(row_currency or "").strip().upper()}
+    brought = stated - held
+    if not brought:
+        return
+    refused = sorted(brought) if len(stated) > 1 else sorted(brought - seed_storable_currencies())
+    if refused:
+        raise HTTPException(status_code=422, detail=f"VARIANT_CURRENCY_NOT_STORABLE:{','.join(refused)}")
+
+
+def _variant_adoption_refusal(foreign_currencies: List[str]) -> Optional[Dict[str, Any]]:
+    return {"reason": "currency_not_the_seeds", "currencies": foreign_currencies} if foreign_currencies else None
+
+
 def _should_overwrite_seed_variants(
     *,
     existing: List[Dict[str, Any]],
@@ -860,6 +1034,8 @@ def _should_overwrite_seed_variants(
         return False
     if not existing:
         return True
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
+        return False
 
     existing_score = _best_variant_title_score(existing, product_title)
     incoming_score = _best_variant_title_score(incoming, product_title)
@@ -902,6 +1078,92 @@ def _seed_variant_description_map(variants: List[Dict[str, Any]]) -> Dict[str, s
     return out
 
 
+# `description_source` values (see services.external_offers_service._extract_from_html) whose text
+# the refresh never stores as a seed's description: og/meta description tags are SEO copy.
+_REFUSED_DESCRIPTION_SOURCES = frozenset({"meta"})
+
+# Who wrote `seed_data.image_urls`. The refresh stamps a gallery it writes as a page read; a
+# gallery any other writer stamped (e.g. the drain's "storefront_products_json") is never replaced
+# by a page read. Unstamped galleries (written before the stamp) follow the page-read rule.
+SEED_IMAGE_URLS_SOURCE_KEY = "image_urls_source"
+SEED_IMAGE_URLS_SOURCE_PAGE_READ = "page_read"
+# A gallery an employee set (PATCH, or seed creation's own `image_urls`): no page read replaces it.
+SEED_IMAGE_URLS_SOURCE_EMPLOYEE = "employee"
+# Where a seed's stored description came from, when a page read wrote it ("jsonld" | "page_long" |
+# "meta" | "unknown"). "meta"/"unknown" text is fill-only: real copy from a later read replaces it.
+SEED_DESCRIPTION_SOURCE_KEY = "description_source"
+_FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
+# Copy an employee supplied (creation body, CSV import): never upgraded by a page read.
+SEED_DESCRIPTION_SOURCE_EMPLOYEE = "employee"
+
+
+def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
+    """The gallery and description a page read may give a seed, by where they came from.
+
+    - `image_urls` is the read's gallery only when the snapshot marks it as the images the page
+      DECLARES as the product's (`image_urls_scope`). A snapshot written before the extractor
+      split them holds every image the page rendered -- nav tiles, banners, Instagram posts --
+      and gives no gallery; `gallery_declared` says which.
+    - `description` is the page's real copy (JSON-LD or its long-description block), with its
+      `description_source`. og/meta description text (SEO copy), or text whose source a snapshot
+      from before the split never recorded, is never `description`: it is `fill_only_description`,
+      which may fill a seed that has NO description and nothing else (Peng 2026-10-15), and
+      `description_refused_source` names why ("meta" | "unknown").
+    - `meta_description` is the page's own meta text, so a seed already storing that exact SEO
+      line can be upgraded to real copy.
+    One function for the refresh, seed creation and the creation preview, so all three store
+    (or show) the same thing."""
+    out: Dict[str, Any] = {
+        "image_urls": [],
+        "gallery_declared": False,
+        "description": None,
+        "description_source": None,
+        "fill_only_description": None,
+        "description_refused_source": None,
+        "meta_description": None,
+    }
+    if not isinstance(evidence, dict):
+        return out
+    out["gallery_declared"] = evidence.get("image_urls_scope") == IMAGE_URLS_SCOPE_DECLARED
+    raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
+    if out["gallery_declared"] and isinstance(raw_images, list):
+        cleaned = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
+        out["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
+    raw_meta = evidence.get("meta_description")
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        out["meta_description"] = raw_meta.strip()
+    raw_desc = evidence.get("description")
+    if isinstance(raw_desc, str) and raw_desc.strip():
+        source = str(evidence.get("description_source") or "").strip() or None
+        if source is None or source in _REFUSED_DESCRIPTION_SOURCES:
+            refused = source or "unknown"
+            out["description_refused_source"] = refused
+            out["fill_only_description"] = raw_desc.strip()
+            if refused in _REFUSED_DESCRIPTION_SOURCES and not out["meta_description"]:
+                out["meta_description"] = raw_desc.strip()
+        else:
+            out["description"] = raw_desc.strip()
+            out["description_source"] = source
+    return out
+
+
+def _seed_description_is_upgradable(seed_data: Dict[str, Any], meta_description: Optional[str]) -> bool:
+    """May a page read's real copy replace the seed's stored description? Only SEO copy a page read
+    put there -- tagged fill-only, or exactly the page's own meta line -- and never an employee's
+    own description (`manual_overrides.description`)."""
+    existing = str(seed_data.get("description") or "").strip()
+    if not existing:
+        return False
+    if _ensure_json_obj(seed_data.get("manual_overrides")).get("description"):
+        return False
+    source = seed_data.get(SEED_DESCRIPTION_SOURCE_KEY)
+    if source == SEED_DESCRIPTION_SOURCE_EMPLOYEE:
+        return False
+    if source in _FILL_ONLY_DESCRIPTION_SOURCES:
+        return True
+    return bool(meta_description) and existing == meta_description
+
+
 def _should_replace_localized_copy(
     *,
     existing_text: Optional[str],
@@ -942,6 +1204,8 @@ def _should_replace_seed_variant_content(
     refreshed_canonical_url: Optional[str],
 ) -> bool:
     if not incoming:
+        return False
+    if not _incoming_keeps_protected_variants(existing=existing, incoming=incoming):
         return False
     existing_map = _seed_variant_description_map(existing)
     incoming_map = _seed_variant_description_map(incoming)
@@ -1397,6 +1661,33 @@ def _normalize_market(market: Optional[str]) -> str:
     return m or "US"
 
 
+def _seed_market_refusal(market: Optional[str]) -> Optional[str]:
+    """Why a seed may not be filed under `market`, or None when it may.
+
+    The seed writers (create, storefront backfill, CSV import, edit) file a seed under the market the
+    request DECLARES, and only one the market registry lets us ingest (ADR-026 decision 2: an `off`
+    market is unknown to ingestion; an unlisted one raises). A missing market is refused, never read as
+    US, and a market is never inferred from a currency (ADR-026 decision 1): the storefront backfill
+    used to file EUR-priced seeds under a market no registry lists."""
+    code = market_registry.normalize_market(market)
+    if not code:
+        return "MARKET_REQUIRED"
+    entry = market_registry.market_or_none(code)
+    if entry is None:
+        return f"UNKNOWN_MARKET:{code}"
+    if not entry["ingest"]:
+        return f"MARKET_NOT_INGESTED:{code}"
+    return None
+
+
+def _declared_seed_market(market: Optional[str]) -> str:
+    """The declared seed market, normalized; a 400 for any market `_seed_market_refusal` refuses."""
+    refusal = _seed_market_refusal(market)
+    if refusal is not None:
+        raise HTTPException(status_code=400, detail=refusal)
+    return market_registry.normalize_market(market)
+
+
 def _normalize_tool(tool: Optional[str]) -> str:
     t = str(tool or "").strip()
     return t or "*"
@@ -1616,6 +1907,9 @@ class UpdateExternalSeedRequest(BaseModel):
     description: Optional[str] = None
     image_url: Optional[str] = None
     image_urls: Optional[List[str]] = None
+    # Who `image_urls` comes from: an employee (the default) or a page read (the ops refresh
+    # script). A page read never replaces a gallery another writer stamped.
+    image_urls_source: Optional[Literal["employee", "page_read"]] = None
     product_id: Optional[str] = None
     brand: Optional[str] = None
     category: Optional[str] = None
@@ -1725,14 +2019,6 @@ def _normalize_seed_availability(raw: Any) -> Optional[str]:
     if canonical is not None:
         return canonical
     return s.lower().replace(" ", "_")
-
-
-_CURRENCY_TO_REFERRAL_MARKET = {
-    "USD": "US",
-    "SGD": "SG",
-    "JPY": "JP",
-    "EUR": "EU-DE",
-}
 
 
 def _extract_storefront_handle(product_data: Dict[str, Any]) -> Optional[str]:
@@ -1851,27 +2137,15 @@ def _build_storefront_seed_variants(
     ]
 
 
-def _infer_storefront_referral_market(candidates: List[Dict[str, Any]], explicit_market: Optional[str]) -> str:
-    if explicit_market:
-        return _normalize_market(explicit_market)
-    counts: Dict[str, int] = {}
-    for candidate in candidates:
-        currency = str(candidate.get("price_currency") or "").strip().upper()
-        market = _CURRENCY_TO_REFERRAL_MARKET.get(currency)
-        if not market:
-            continue
-        counts[market] = int(counts.get(market) or 0) + 1
-    if not counts:
-        return "US"
-    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
-
-
 async def _fetch_storefront_referral_seed_candidates(
     *,
     merchant_id: str,
     limit: int,
-    market: Optional[str],
+    market: str,
 ) -> Dict[str, Any]:
+    """`market` is the caller's DECLARED market (`_declared_seed_market`), stamped on every candidate.
+    It is never read off the candidates' currency (ADR-026 decision 1)."""
+    market = _declared_seed_market(market)
     matched_domains = await get_merchant_referral_domains(merchant_id)
     primary_domain = matched_domains[0] if matched_domains else None
     if not primary_domain:
@@ -1879,7 +2153,7 @@ async def _fetch_storefront_referral_seed_candidates(
             "merchant_id": merchant_id,
             "matched_domains": matched_domains,
             "primary_domain": None,
-            "market": _normalize_market(market),
+            "market": market,
             "candidates": [],
         }
 
@@ -1959,16 +2233,15 @@ async def _fetch_storefront_referral_seed_candidates(
         if len(candidates) >= int(limit or 50):
             break
 
-    resolved_market = _infer_storefront_referral_market(candidates, market)
     for candidate in candidates:
-        candidate["market"] = resolved_market
+        candidate["market"] = market
         candidate["external_product_id"] = _stable_external_product_id(candidate["storefront_url"])
 
     return {
         "merchant_id": merchant_id,
         "matched_domains": matched_domains,
         "primary_domain": primary_domain,
-        "market": resolved_market,
+        "market": market,
         "candidates": candidates,
     }
 
@@ -1998,18 +2271,10 @@ async def _derive_seed_seller_columns(
     )
 
 
-async def _upsert_storefront_referral_seed_candidate(
-    candidate: Dict[str, Any],
-    *,
-    employee_id: Optional[str],
-) -> Dict[str, Any]:
-    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
-    storefront_url = str(candidate.get("storefront_url") or "").strip()
-    external_product_id = str(candidate.get("external_product_id") or "").strip()
-    market = _normalize_market(candidate.get("market"))
-    tool = "*"
-
-    existing_row = await database.fetch_one(
+async def _existing_storefront_referral_seed(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The active seed a storefront backfill candidate would update, matched by product key or URL in
+    ANY market partition; None when the backfill would create one."""
+    row = await database.fetch_one(
         """
         SELECT *
         FROM external_product_seeds
@@ -2024,11 +2289,26 @@ async def _upsert_storefront_referral_seed_candidate(
         LIMIT 1
         """,
         {
-            "attached_product_key": attached_product_key,
-            "external_product_id": external_product_id,
-            "canonical_url": storefront_url,
+            "attached_product_key": str(candidate.get("attached_product_key") or "").strip(),
+            "external_product_id": str(candidate.get("external_product_id") or "").strip(),
+            "canonical_url": str(candidate.get("storefront_url") or "").strip(),
         },
     )
+    return dict(row) if row else None
+
+
+async def _upsert_storefront_referral_seed_candidate(
+    candidate: Dict[str, Any],
+    *,
+    employee_id: Optional[str],
+) -> Dict[str, Any]:
+    attached_product_key = str(candidate.get("attached_product_key") or "").strip()
+    storefront_url = str(candidate.get("storefront_url") or "").strip()
+    external_product_id = str(candidate.get("external_product_id") or "").strip()
+    market = _declared_seed_market(candidate.get("market"))
+    tool = "*"
+
+    existing_row = await _existing_storefront_referral_seed(candidate)
 
     seed_data = {
         "external_product_id": external_product_id,
@@ -2122,11 +2402,13 @@ async def _upsert_storefront_referral_seed_candidate(
                     "title": row.get("title") or candidate.get("title"),
                 }
 
+        # The row keeps the market it is filed under: a backfill refreshes a seed, it never re-files
+        # one (the existing row is matched by product key or URL in ANY market). Moving a seed to
+        # another market partition is a reviewed repair, not a side effect of re-running a backfill.
         await _execute_seed_data_stmt(
             """
             UPDATE external_product_seeds
             SET external_product_id = :external_product_id,
-                market = :market,
                 tool = :tool,
                 utm_template = :utm_template,
                 partner_type = :partner_type,
@@ -2148,11 +2430,12 @@ async def _upsert_storefront_referral_seed_candidate(
             WHERE id = :id
             """,
             {
-                **values,
+                **{k: v for k, v in values.items() if k != "market"},
                 "id": row.get("id"),
             },
         )
         seed_id = str(row.get("id") or "").strip()
+        market = str(row.get("market") or "")
         action = "updated"
     else:
         seed_id = _seed_id()
@@ -2218,6 +2501,7 @@ async def _upsert_storefront_referral_seed_candidate(
     return {
         "action": action,
         "seed_id": seed_id,
+        "market": market,
         "external_product_id": external_product_id,
         "attached_product_key": attached_product_key,
         "canonical_url": storefront_url,
@@ -2230,7 +2514,7 @@ async def _run_external_seed_import_task(
     task_id: str,
     csv_text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> None:
@@ -2352,11 +2636,17 @@ async def import_external_seeds_csv(
     req: Request,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_employee),
-    market: str = Query("US"),
+    # The market for rows that carry no `market` column. Optional (a sheet may declare every row's),
+    # never defaulted: a row with neither is refused (`_seed_market_refusal`).
+    market: Optional[str] = Query(None),
     tool: str = Query("*"),
     mode: str = Query("upsert"),
     async_import: bool = Query(False, alias="async"),
 ) -> ExternalSeedsCsvImportResponse:
+    if str(market or "").strip():
+        market = _declared_seed_market(market)
+    else:
+        market = None
     raw = await req.body()
     text = raw.decode("utf-8", errors="replace")
     if not text.strip():
@@ -2382,7 +2672,8 @@ async def import_external_seeds_csv(
             """,
             {
                 "id": task_id,
-                "market": _normalize_market(market),
+                # NOT NULL column; '' = no sheet-wide market (every row declares its own).
+                "market": market or "",
                 "tool": _normalize_tool(tool),
                 "mode": str(mode or "upsert").strip().lower(),
                 "created_by_employee_id": created_by,
@@ -2415,7 +2706,7 @@ async def _import_external_seeds_csv_text(
     *,
     text: str,
     current_user: dict,
-    market: str,
+    market: Optional[str],
     tool: str,
     mode: str,
 ) -> ExternalSeedsCsvImportResponse:
@@ -2437,7 +2728,8 @@ async def _import_external_seeds_csv_text(
     if not text.strip():
         raise HTTPException(status_code=400, detail="EMPTY_CSV")
 
-    default_market = _normalize_market(market)
+    # No US fallback: a row files under its own `market` column or this declared one, else it is refused.
+    default_market = market_registry.normalize_market(market)
     default_tool = _normalize_tool(tool)
     mode_norm = str(mode or "upsert").strip().lower()
     if mode_norm not in ("create", "upsert"):
@@ -2465,6 +2757,9 @@ async def _import_external_seeds_csv_text(
         # Example: Tom Ford export CSV.
         groups: Dict[str, Dict[str, Any]] = {}
         group_meta: Dict[str, Dict[str, Any]] = {}
+        # Products with a variant row whose market was refused: the whole product is held, since
+        # importing only the rows that did declare a market would file it with variants missing.
+        market_refused_product_urls: set[str] = set()
 
         for idx, row in enumerate(reader, start=2):
             try:
@@ -2475,7 +2770,11 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_PRODUCT_URL")
                 product_url = _normalize_seed_url_for_id(_require_http_url(product_url_raw))
 
-                row_market = _normalize_market(nrow.get("market") or default_market)
+                row_market_refusal = _seed_market_refusal(nrow.get("market") or default_market)
+                if row_market_refusal is not None:
+                    market_refused_product_urls.add(product_url)
+                    raise ValueError(row_market_refusal)
+                row_market = market_registry.normalize_market(nrow.get("market") or default_market)
                 row_tool = _normalize_tool(nrow.get("tool") or default_tool)
 
                 product_title = str(nrow.get("product_title") or nrow.get("title") or "").strip() or None
@@ -2594,6 +2893,8 @@ async def _import_external_seeds_csv_text(
 
                 if not external_product_id or not dest:
                     raise ValueError("INVALID_GROUP")
+                if dest in market_refused_product_urls:
+                    raise ValueError(f"VARIANT_ROW_MARKET_REFUSED:{dest}")
 
                 # Deduplicate + sort variants so primary price is stable (min price first).
                 seen_variant_ids: set[str] = set()
@@ -2695,10 +2996,12 @@ async def _import_external_seeds_csv_text(
                         seed_data["brand"] = brand
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if image_urls:
                         seed_data["image_urls"] = image_urls
+                        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
                     if availability is not None:
                         seed_data["availability"] = availability
                     if variants:
@@ -2756,8 +3059,10 @@ async def _import_external_seeds_csv_text(
                     "title": title,
                     "brand": brand,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "image_urls": image_urls,
+                    **({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE} if image_urls else {}),
                     "availability": availability,
                     "variants": variants,
                     "disclosure_text": DEFAULT_DISCLOSURE_TEXT,
@@ -2833,7 +3138,7 @@ async def _import_external_seeds_csv_text(
                     raise ValueError("MISSING_DESTINATION_URL")
                 dest = _normalize_seed_url_for_id(_require_http_url(destination_url))
 
-                row_market = _normalize_market(row.get("market") or default_market)
+                row_market = _declared_seed_market(row.get("market") or default_market)
                 row_tool = _normalize_tool(row.get("tool") or default_tool)
 
                 title = str(row.get("title") or "").strip() or None
@@ -2937,6 +3242,7 @@ async def _import_external_seeds_csv_text(
                         seed_data["title"] = title
                     if description is not None:
                         seed_data["description"] = description
+                        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = SEED_DESCRIPTION_SOURCE_EMPLOYEE
                     if image_url is not None:
                         seed_data["image_url"] = image_url
                     if availability is not None:
@@ -3027,6 +3333,7 @@ async def _import_external_seeds_csv_text(
                     "external_product_id": external_product_id,
                     "title": title,
                     "description": description,
+                    **({SEED_DESCRIPTION_SOURCE_KEY: SEED_DESCRIPTION_SOURCE_EMPLOYEE} if description else {}),
                     "image_url": image_url,
                     "availability": availability,
                     "utm_template": utm_template,
@@ -3162,12 +3469,9 @@ async def preview_external_seed(
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list):
             variants = raw_variants
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        image_urls = content["image_urls"]
+        description = content["description"]
 
     return {
         "status": "success",
@@ -3535,14 +3839,32 @@ async def backfill_storefront_external_seeds(
     merchant_id = str(body.merchant_id or "").strip()
     if not merchant_id:
         raise HTTPException(status_code=400, detail="MERCHANT_ID_REQUIRED")
+    # Declared, never read off the storefront's prices (ADR-026 decision 1).
+    market = _declared_seed_market(body.market)
 
     candidate_bundle = await _fetch_storefront_referral_seed_candidates(
         merchant_id=merchant_id,
         limit=body.limit,
-        market=body.market,
+        market=market,
     )
     candidates = list(candidate_bundle.get("candidates") or [])
     if body.dry_run:
+        preview_items: List[Dict[str, Any]] = []
+        for candidate in candidates[:20]:
+            existing = await _existing_storefront_referral_seed(candidate)
+            preview_items.append(
+                {
+                    "action": "preview",
+                    # An existing seed keeps the market it is filed under (the real run never
+                    # re-files it); only a new one takes the declared market.
+                    "market": str(existing.get("market") or "") if existing else market,
+                    "existing_seed_id": existing.get("id") if existing else None,
+                    "attached_product_key": candidate.get("attached_product_key"),
+                    "canonical_url": candidate.get("storefront_url"),
+                    "title": candidate.get("title"),
+                    "external_product_id": candidate.get("external_product_id"),
+                }
+            )
         return {
             "status": "success",
             "merchant_id": merchant_id,
@@ -3554,16 +3876,7 @@ async def backfill_storefront_external_seeds(
             "created": 0,
             "updated": 0,
             "skipped": 0,
-            "items": [
-                {
-                    "action": "preview",
-                    "attached_product_key": candidate.get("attached_product_key"),
-                    "canonical_url": candidate.get("storefront_url"),
-                    "title": candidate.get("title"),
-                    "external_product_id": candidate.get("external_product_id"),
-                }
-                for candidate in candidates[:20]
-            ],
+            "items": preview_items,
         }
 
     employee_id = _employee_id_from_user(current_user)
@@ -3880,7 +4193,7 @@ async def create_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    market = _normalize_market(body.market)
+    market = _declared_seed_market(body.market)
     tool = _normalize_tool(body.tool)
     dest = _require_http_url(body.destination_url)
 
@@ -3914,15 +4227,12 @@ async def create_external_seed(
     snap_image_urls: list[str] = []
     snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
+    content = _snapshot_evidence_content(None)
     evidence = getattr(snapshot, "evidence", None) if snapshot else None
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("imageUrls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
+        content = _snapshot_evidence_content(evidence)
+        snap_image_urls = content["image_urls"]
+        snap_description = content["description"]
         snap_variants = seed_variants_from_evidence(evidence)
 
     match_url = canonical_url or dest
@@ -3952,6 +4262,11 @@ async def create_external_seed(
     # Merge: employee-provided fields override snapshot-derived values.
     title = (body.title or "").strip() or snap_title
     description = (body.description or "").strip() or snap_description
+    # Where `description` came from, and SEO copy that may only fill an empty one (Peng 2026-10-15).
+    description_origin = (
+        SEED_DESCRIPTION_SOURCE_EMPLOYEE if (body.description or "").strip() else (content["description_source"] if snap_description else None)
+    )
+    fill_only_description = content["fill_only_description"]
     image_url = (body.image_url or "").strip() or snap_image_url
     if not image_url and body.image_urls:
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
@@ -3962,10 +4277,44 @@ async def create_external_seed(
         image_url = snap_image_urls[0]
     price_amount = body.price_amount if body.price_amount is not None else snap_price_amount
     price_currency = (body.price_currency or "").strip() or snap_price_currency
+    # A PAGE READ IN ANOTHER MARKET'S CURRENCY IS NOT THIS SEED'S PRICE. A store can geo-serve
+    # another market's page to the crawler, so a seed created from a CAD read stored a CAD row
+    # price. The rule is `foreign_seed_currencies` (region_pricing), shared with variant adoption
+    # and the refresh: a served or acquisition market's currency only, and a re-created seed keeps
+    # the storable currency it is already priced in. It never compares against `market`, which is
+    # a read partition, not the seed's currency (ADR-026). On refusal neither the snapshot's amount
+    # nor its currency is taken; a field the employee stated in the body stands (not validated, by
+    # the owner's decision). A re-create then keeps the row's stored values (below); a new seed
+    # leaves them NULL.
+    existing_dict = dict(existing_row) if existing_row else {}
+    snapshot_price_refused: Optional[Dict[str, Any]] = None
+    refused_currencies = foreign_seed_currencies(
+        [snap_price_currency],
+        row=existing_dict.get("price_currency"),
+        stored=_stated_variant_currencies(_seed_variants(_ensure_json_obj(existing_dict.get("seed_data")))),
+    )
+    if refused_currencies:
+        if body.price_amount is None:
+            price_amount = None
+        if not (body.price_currency or "").strip():
+            price_currency = None
+        snapshot_price_refused = {
+            "reason": "currency_not_storable_for_this_seed",
+            "currencies": refused_currencies,
+            "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
+        }
     availability = (body.availability or "").strip() or snap_availability
     utm_template = (body.utm_template or "").strip() or None
     partner_type = (body.partner_type or "").strip() or None
     disclosure_text = (body.disclosure_text or "").strip() or DEFAULT_DISCLOSURE_TEXT
+
+    held_row = dict(existing_row) if existing_row else {}
+    _refuse_unstorable_employee_variants(
+        body.variants,
+        stored_variants=_seed_variants(_ensure_json_obj(held_row.get("seed_data"))),
+        row_currency=held_row.get("price_currency"),
+    )
+    variant_adoption_refused: Optional[Dict[str, Any]] = None
 
     if existing_row:
         row = dict(existing_row)
@@ -4015,13 +4364,26 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
-        seed_data["description"] = description
+        if description and (
+            description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
+            or not str(seed_data.get("description") or "").strip()
+            or _seed_description_is_upgradable(seed_data, content["meta_description"])
+        ):
+            seed_data["description"] = description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = description_origin
+        elif not str(seed_data.get("description") or "").strip() and fill_only_description:
+            seed_data["description"] = fill_only_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
+        # (A read with no usable copy never wipes the seed's own description.)
         seed_data["image_url"] = image_url
         if body.image_urls is not None:
             cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
             seed_data["image_urls"] = _dedupe_seed_image_urls(cleaned, limit=20)
-        elif snap_image_urls:
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+        elif snap_image_urls and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ):
+            # As the refresh: never over a gallery another writer stamped.
             seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
         seed_data["availability"] = availability
         seed_data["utm_template"] = utm_template
         seed_data["partner_type"] = partner_type
@@ -4042,12 +4404,27 @@ async def create_external_seed(
         )
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
+            seed_data["snapshot"].pop("description_refused_source", None)
+        elif content["description_refused_source"]:
+            # The page's only copy is SEO (or unknown) text: an older snapshot's SEO line must not
+            # stay `snapshot.description`, which the gateway serves first (review of #2621).
+            seed_data["snapshot"]["description"] = None
+            seed_data["snapshot"]["description_refused_source"] = content["description_refused_source"]
         if body.variants is not None and body.variants:
             seed_data["variants"] = body.variants
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
-            if _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
-                seed_data["variants"] = snap_variants
+            variant_adoption_refused = _variant_adoption_refusal(
+                _foreign_variant_currencies(
+                    existing=existing_variants, incoming=snap_variants, row_currency=row.get("price_currency")
+                )
+            )
+            if variant_adoption_refused:
+                pass
+            elif _should_overwrite_seed_variants(existing=existing_variants, incoming=snap_variants, product_title=title):
+                seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
+            elif _read_heals_stored_currency(existing=existing_variants, incoming=snap_variants):
+                seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=snap_variants)
             elif not existing_variants:
                 seed_data["variants"] = snap_variants
 
@@ -4127,6 +4504,10 @@ async def create_external_seed(
     else:
         seed_id = _seed_id()
         external_product_id = _stable_external_product_id(match_url)
+        if snap_variants and not body.variants:
+            variant_adoption_refused = _variant_adoption_refusal(
+                _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
+            )
         seed_data: Dict[str, Any] = {
             "external_product_id": external_product_id,
             "merchant_display_name": (body.merchant_display_name or "").strip() or None,
@@ -4134,13 +4515,23 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
-            "description": description,
+            "description": description or fill_only_description,
+            **(
+                {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
+                if (description or fill_only_description)
+                else {}
+            ),
             "image_url": image_url,
             "image_urls": [str(u).strip() for u in (body.image_urls or []) if isinstance(u, str) and str(u).strip()]
             if body.image_urls is not None
             else snap_image_urls,
+            **(
+                {SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_EMPLOYEE}
+                if body.image_urls is not None
+                else ({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_PAGE_READ} if snap_image_urls else {})
+            ),
             "availability": availability,
-            "variants": body.variants or (snap_variants or []),
+            "variants": body.variants or ([] if variant_adoption_refused else (snap_variants or [])),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -4254,7 +4645,10 @@ async def create_external_seed(
             },
             "variants": _seed_variants(seed_data),
         },
+        "snapshot_price_refused": snapshot_price_refused,
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
+        # The page's variants, when they were priced in a currency this seed may not store.
+        "variant_adoption_refused": variant_adoption_refused,
     }
 
 
@@ -4456,11 +4850,16 @@ async def update_external_seed(
     if body.image_url is not None:
         seed_data["image_url"] = body.image_url
         seed_data["snapshot"]["image_url"] = body.image_url
-    if body.image_urls is not None:
+    gallery_source = body.image_urls_source or SEED_IMAGE_URLS_SOURCE_EMPLOYEE
+    if body.image_urls is not None and not (
+        gallery_source == SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) not in (None, SEED_IMAGE_URLS_SOURCE_PAGE_READ)
+    ):
         cleaned = [str(u).strip() for u in body.image_urls if isinstance(u, str) and str(u).strip()]
         deduped = _dedupe_seed_image_urls(cleaned, limit=20)
         seed_data["image_urls"] = deduped
         seed_data["snapshot"]["image_urls"] = deduped
+        seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = gallery_source
         if body.image_url is None and deduped:
             seed_data["image_url"] = deduped[0]
     if body.availability is not None:
@@ -4472,6 +4871,9 @@ async def update_external_seed(
     if body.category is not None:
         seed_data["category"] = body.category
     if body.variants is not None:
+        _refuse_unstorable_employee_variants(
+            body.variants, stored_variants=_seed_variants(seed_data), row_currency=row.get("price_currency")
+        )
         seed_data["variants"] = body.variants
     if body.utm_template is not None:
         seed_data["utm_template"] = (body.utm_template or "").strip() or None
@@ -4487,8 +4889,10 @@ async def update_external_seed(
         updates["external_product_id"] = external_product_id
         set_clauses.append("external_product_id = :external_product_id")
 
-    if body.market is not None:
-        updates["market"] = _normalize_market(body.market)
+    # Only a market CHANGE is guarded: the editors send the stored market back with every save, and
+    # a seed already filed under a market the guard refuses (pre-registry rows) must stay editable.
+    if body.market is not None and market_registry.normalize_market(body.market) != market_registry.normalize_market(row.get("market")):
+        updates["market"] = _declared_seed_market(body.market)
         set_clauses.append("market = :market")
     if body.tool is not None:
         updates["tool"] = _normalize_tool(body.tool)
@@ -4743,6 +5147,128 @@ def _seed_variant_identifiers(variant: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _read_variant_link(read_variant: Dict[str, Any]) -> Optional[str]:
+    """The Shopify variant a READ variant's offer links to, if the extractor read one.
+
+    A Shopify storefront's JSON-LD names a size offer only by `@id`
+    "/products/<handle>?variant=<digits>#offer", so its key is that string, while the
+    retailer-ingest drain stores the merchant's numeric variant id; the extractor reads the digits
+    into `offer_shopify_variant_id` (`services/external_offers_service._offer_shopify_variant_id`,
+    only off a link to the page's own product). Matching on them is still exact equality on a
+    merchant-issued id. The link joins the MATCH only: the native-id guards in the reconcile still
+    see the read variant's key alone, so a digit-shaped `sku` beside a link is not "two ids".
+    """
+    linked = str(read_variant.get("offer_shopify_variant_id") or "").strip()
+    return linked or None
+
+
+def _variant_id_spellings(raw: Any) -> List[str]:
+    """The canonical spellings of ONE variant id: the `?variant=` digits a link-shaped id names
+    (`url_named_variant_id`; "" for a selling-plan link) and the bare digits of a `gid://` id
+    (`canonical_variant_id`). Empty for anything else -- a SKU or a barcode has no other spelling.
+
+    A LINK'S `?variant=` IS ITS SPELLING ONLY WHEN IT CANNOT BE ANOTHER STORE'S (delta review of
+    #2634). The link a seed stores is either relative -- the JSON-LD `@id` "/products/h?variant=N#offer"
+    of the seed's own page, so its own store -- or absolute, possibly on another host (a related
+    product, a marketplace copy); and the reconcile does not know the seed's host. So an absolute
+    link's digits count only when they have Shopify-variant length (8+ digits, like
+    `_native_refresh_variant_ids`): Shopify variant ids are global database ids, so a value that
+    long names one variant whatever host carries it, while a short `?variant=1001` on
+    other-store.com would match a SKU "1001" on this page by coincidence.
+    """
+    from services.handover_variant_identity import canonical_variant_id, url_named_variant_id
+
+    text = str(raw or "").strip()
+    named = url_named_variant_id(text)
+    relative = text.startswith("/") and not text.startswith("//")
+    if named and not relative and len(named) < 8:
+        named = ""
+    out: List[str] = []
+    for spelled in (named, canonical_variant_id(text)):
+        if spelled and spelled != text and spelled not in out:
+            out.append(spelled)
+    return out
+
+
+def _seed_variant_match_ids(variant: Dict[str, Any]) -> List[str]:
+    """`_seed_variant_identifiers` plus each one's canonical spellings (`_variant_id_spellings`).
+
+    Review of #2634. A stored list keyed by the JSON-LD `@id` link
+    ("/products/h?variant=111#offer") never met a read keyed by the bare digits "111" -- what the
+    extractor keys a url-only offer by, and what a fold of the two keeps -- so it was never re-read
+    again, nor was a list a repair re-keyed to the `@id` spelling. Each spelling is still an exact
+    id the stored entry names, and the reconcile's ambiguity rules apply to the union: a stored
+    entry whose spellings name two read offers names neither.
+    """
+    out = list(_seed_variant_identifiers(variant))
+    for ident in list(out):
+        for spelled in _variant_id_spellings(ident):
+            if spelled not in out:
+                out.append(spelled)
+    return out
+
+
+def _read_variant_bridges(read_variant: Dict[str, Any]) -> List[str]:
+    """Every id OTHER than its key that a read variant can be matched on: its link
+    (`_read_variant_link`), the `sku` the extractor keeps beside a folded entry's key, and the bare
+    digits of a `gid://` key. NOT the `?variant=` a link-shaped key spells: the extractor marks a
+    link's variant only when the link is on the page's OWN product (`offer_shopify_variant_id`),
+    and a `?variant=` on another product's link must not match. The `barcode` is a separate
+    bridge (`_read_variant_barcode`).
+
+    Review of #2634. The extractor keeps ONE entry for a variant the page lists twice (by its
+    link, and by a node carrying its SKU), keyed by the link. A seed adopted from an older read
+    stores the SKU as the variant's id, and matching on the key alone stopped re-reading it. Like
+    the link, these only FILL A GAP the keys leave, under the same uniqueness rules: still exact
+    equality on an identifier the page states.
+    """
+    out: List[str] = []
+    from services.outbound_links_service import extract_shopify_numeric_variant_id
+
+    key = _seed_variant_key(read_variant)
+    gid_digits = extract_shopify_numeric_variant_id(key)
+    for raw in (_read_variant_link(read_variant), read_variant.get("sku"), gid_digits if gid_digits != key else None):
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        text = str(raw).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _read_variant_barcode(read_variant: Dict[str, Any]) -> Optional[str]:
+    """The barcode the extractor keeps on a read variant (it is no longer ever the key), which a
+    seed adopted from an older read may store as the variant's id."""
+    raw = read_variant.get("barcode")
+    text = str(raw).strip() if raw is not None and not isinstance(raw, (dict, list, bool)) else ""
+    return text or None
+
+
+def _titles_agree(stored: Dict[str, Any], read: Dict[str, Any], product_title: Optional[str]) -> bool:
+    """May a BARCODE bridge pair these two? A barcode is not unique across a store's shades (a
+    shared barcode is a merchant's data error, but a common one): a stored shade missing from the
+    read must not take its sibling's price and stock through it. They agree when either title is
+    empty or just the product's name, or both name the same thing. Review of #2634."""
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    a, b, product = norm(stored.get("title")), norm(read.get("title")), norm(product_title)
+    return not a or not b or a == b or (bool(product) and product in (a, b))
+
+
+def _canonical_native_variant_ids(variant: Dict[str, Any]) -> set:
+    """`_native_refresh_variant_ids` plus the `?variant=` a link-shaped id names: the reconcile's
+    "is this the same native variant" checks must not miss a stored `@id` spelling of one."""
+    from services.handover_variant_identity import url_named_variant_id
+
+    out = set(_native_refresh_variant_ids(variant))
+    for key in ("variant_id", "id", "shopify_variant_id"):
+        named = url_named_variant_id(variant.get(key))
+        if named:
+            out.add(named)
+    return out
+
+
 def _seed_variant_stored_price(variant: Dict[str, Any]) -> Any:
     """The price the serving builders read off a stored variant, same precedence."""
     for key in ("price_amount", "price", "amount", "value", "list_price"):
@@ -4789,6 +5315,19 @@ def _page_names_one_value(census: Dict[str, Any]) -> bool:
     return max(int(census.get("offers") or 0), int(census.get("data_attr_skus") or 0)) <= 1
 
 
+def _read_offer_money(rv: Dict[str, Any]) -> Tuple[Optional[float], Optional[str]]:
+    """A read offer's own amount (rounded to cents) and stated currency; None where it states none."""
+    amount = _as_price(rv.get("price_amount"))
+    cur = str(rv.get("price_currency") or rv.get("currency") or "").strip().upper() or None
+    return (round(amount, 2) if amount is not None else None, cur)
+
+
+def _read_offer_money_disagrees(a: Tuple[Optional[float], Optional[str]], b: Tuple[Optional[float], Optional[str]]) -> bool:
+    """Two listings of one variant contradict when both state an amount, or both a currency, that differ.
+    A listing that states nothing does not contradict one that does."""
+    return (a[0] is not None and b[0] is not None and a[0] != b[0]) or (a[1] is not None and b[1] is not None and a[1] != b[1])
+
+
 def _reconcile_seed_variants_with_read(
     stored: List[Dict[str, Any]],
     read: List[Dict[str, Any]],
@@ -4797,6 +5336,8 @@ def _reconcile_seed_variants_with_read(
     product_currency: Optional[str],
     product_availability: Optional[str],
     census: Optional[Dict[str, Any]],
+    refused_currencies: Iterable[str] = (),
+    product_title: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Write what this refresh re-read into the STORED variants the builders serve.
 
@@ -4814,9 +5355,10 @@ def _reconcile_seed_variants_with_read(
     hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
 
     WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
-      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`: one read variant
-        carries the id, no other stored variant claims it, and the extractor saw no other offer
-        under that id) to an offer that is not an AggregateOffer. Its price is taken only when
+      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`; failing any key
+        match, the offer's link, `_read_variant_link`: one read variant carries the id, no
+        other stored variant claims it, and the extractor saw no other offer under that id) to
+        an offer that is not an AggregateOffer. Its price is taken only when
         it is that offer's own `price` (not a range bound), positive, finite, and in a
         currency the offer itself states that matches the variant's; its stock whenever the
         page stated one;
@@ -4837,13 +5379,23 @@ def _reconcile_seed_variants_with_read(
 
     read_by_id: Dict[str, List[int]] = {}
     read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
-    read_native = set().union(*(_native_refresh_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_native = set().union(*(_canonical_native_variant_ids(rv) for rv in read_variants)) if read_variants else set()
     read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
                        for k in ("price_currency", "currency") if rv.get(k)}
+    read_by_link: Dict[str, List[int]] = {}
+    read_by_barcode: Dict[str, List[int]] = {}
     for pos, rv in enumerate(read_variants):
         key = _seed_variant_key(rv)
         if key and not _POSITIONAL_OFFER_ID.match(key):
             read_by_id.setdefault(key, []).append(pos)
+        for bridge in _read_variant_bridges(rv):
+            read_by_link.setdefault(bridge, []).append(pos)
+        barcode = _read_variant_barcode(rv)
+        if barcode:
+            read_by_barcode.setdefault(barcode, []).append(pos)
+    # An id the page itself states as a BARCODE is not a native variant id, wherever a stored
+    # variant carries it (a seed adopted from an older read stores it as `variant_id`).
+    read_barcodes = {str(rv["barcode"]).strip() for rv in read_variants if rv.get("barcode")}
 
     # Which read offer each stored variant names, through ANY of its own identifiers. A read
     # offer two stored variants both claim is ambiguous for both.
@@ -4852,18 +5404,63 @@ def _reconcile_seed_variants_with_read(
     for v in stored:
         named = {
             read_by_id[i][0]
-            for i in _seed_variant_identifiers(v)
+            for i in _seed_variant_match_ids(v)
             if len(read_by_id.get(i) or []) == 1
         }
         pos = next(iter(named)) if len(named) == 1 else None
         claims.append(pos)
         if pos is not None:
             claimants[pos] = claimants.get(pos, 0) + 1
+    # THE OFFER'S LINK ONLY FILLS A GAP the keys leave: a stored variant none of whose ids is any
+    # read key, matched to an offer no stored variant claimed by key. So a link can add a re-read
+    # and never take one away. Prod census 2026-10-14: pages listing one variant twice -- once
+    # by its link, once with the variant id as `sku` -- matched on the `sku` before; indexing the
+    # link beside the keys made that id two offers and dropped the re-read.
+    key_claimed = set(claimants)
+    for idx, v in enumerate(stored):
+        ids = _seed_variant_match_ids(v)
+        if claims[idx] is not None or any(i in read_by_id for i in ids):
+            continue
+        named = {
+            read_by_link[i][0]
+            for i in ids
+            if len(read_by_link.get(i) or []) == 1 and read_by_link[i][0] not in key_claimed
+        } | {
+            read_by_barcode[i][0]
+            for i in ids
+            if len(read_by_barcode.get(i) or []) == 1 and read_by_barcode[i][0] not in key_claimed
+            and _titles_agree(v, read_variants[read_by_barcode[i][0]], product_title)
+        }
+        if len(named) == 1:
+            claims[idx] = pos = next(iter(named))
+            claimants[pos] = claimants.get(pos, 0) + 1
+    # A PAGE THAT PRICES ONE VARIANT TWICE, AND DISAGREES WITH ITSELF, RE-READ NOTHING FOR IT (review
+    # of #2631). The prod shape above -- V50 by its link and by `sku=V50` -- usually repeats one price;
+    # when the two say 85 and 70, taking the key's 70 and stamping the seed fresh vouches for a price
+    # the page itself disputes. Before the link filled the siblings' gaps that was masked (they stayed
+    # not re-read, so the stamp popped). Agreeing listings keep the match.
+    for idx, v in enumerate(stored):
+        pos = claims[idx]
+        if pos is None:
+            continue
+        mine = _read_offer_money(read_variants[pos])
+        if any(
+            other != pos and _read_offer_money_disagrees(mine, _read_offer_money(read_variants[other]))
+            for i in _seed_variant_match_ids(v)
+            for other in (read_by_link.get(i) or []) + (read_by_barcode.get(i) or [])
+        ):
+            claims[idx] = None
 
     product_cur = (str(product_currency or "").strip().upper() or None)
+    refused = {str(c).strip().upper() for c in refused_currencies or () if c}
     single = len(stored) == 1
+    # `plans_only`: every offer the page listed was a subscription plan, so `offers` is 0 and the
+    # product price is og:price -- some variant's -- not a value the page vouches is the only one.
+    # `orphan_plan_variants`: a dropped plan named a variant no remaining offer names, so the page
+    # sells more than its remaining offers; "one offer left" no longer means "one value".
     census_ok = isinstance(census, dict) and not (
         census.get("aggregate") or census.get("truncated") or census.get("data_attr_duplicate_ids")
+        or census.get("plans_only") or census.get("orphan_plan_variants")
     )
     single_takes_price = (
         single
@@ -4904,7 +5501,7 @@ def _reconcile_seed_variants_with_read(
         # An agreeing product price cannot override an explicit different native variant ID.
         # Normalize Shopify numeric/GID aliases; merchant SKU codes may still bridge a stored
         # numeric ID through the existing identifier match or the single-product fallback.
-        stored_native = _native_refresh_variant_ids(v)
+        stored_native = _canonical_native_variant_ids(v) - read_barcodes
         fallback_identity_ok = len(stored_native) <= 1 and not (
             stored_native and read_native and read_native != stored_native
         )
@@ -4912,6 +5509,8 @@ def _reconcile_seed_variants_with_read(
         read_codes = {_seed_variant_key(rv) for rv in read_variants
                       if _seed_variant_key(rv) and not _POSITIONAL_OFFER_ID.match(_seed_variant_key(rv))
                       and not _native_refresh_variant_ids(rv)}
+        # A SKU the extractor kept beside a folded entry's link key is a code the page states too.
+        read_codes |= {str(rv["sku"]).strip() for rv in read_variants if rv.get("sku")}
         if stored_codes and read_codes and not stored_codes.intersection(read_codes):
             fallback_identity_ok = False
         stored_currencies = {str(v[k]).strip().upper() for k in ("price_currency", "currency") if v.get(k)}
@@ -4926,7 +5525,7 @@ def _reconcile_seed_variants_with_read(
         pos = claims[idx]
         if pos is not None and claimants.get(pos) == 1:
             rv = read_variants[pos]
-            rv_native = _native_refresh_variant_ids(rv)
+            rv_native = _canonical_native_variant_ids(rv)
             per_variant = (
                 not rv.get("id_collided") and not rv.get("offer_aggregate")
                 and len(stored_native) <= 1 and len(rv_native) <= 1
@@ -4956,6 +5555,10 @@ def _reconcile_seed_variants_with_read(
             new_amount, new_cur = product_amount, product_cur
         if single_takes_availability and fallback_identity_ok and new_avail is None:
             new_avail = product_availability
+        # A price in a currency the refresh's gate refused is not taken, whichever arm read it: a
+        # stored variant that states no currency would otherwise take the read's CAD.
+        if new_amount is not None and str(new_cur or "").strip().upper() in refused:
+            new_amount, new_cur = None, None
 
         before = dict(v)
         if new_amount is not None:
@@ -5251,6 +5854,12 @@ async def _refresh_external_seed_by_id(
             "domain": report_host or None,
             "destination_refresh": destination_refresh,
         }
+    except crawl_global_pacer.GlobalPaceStopped:
+        # NOT AN ATTEMPT (review M1, 2026-10-17): the run's global pacer refused to send the request
+        # (the IP breaker's final trip, or the budget ending). Stamping it would push a row nobody
+        # read behind every other row; it propagates unstamped, and the batch counts it with the
+        # rows it deferred (`skipped_for_ip_throttle` / `skipped_for_budget`).
+        raise
     except Exception as exc:
         # We never reached the origin (timeout, TLS, DNS, robots). That is NOT evidence about
         # the product, so no observation is recorded and the failure streak does not move.
@@ -5269,19 +5878,26 @@ async def _refresh_external_seed_by_id(
     snap_price_currency = getattr(snapshot, "price_currency", None) if snapshot else None
     snap_availability = getattr(snapshot, "availability", None) if snapshot else None
 
-    snap_image_urls: list[str] = []
-    snap_description: Optional[str] = None
     snap_variants: Optional[List[Dict[str, Any]]] = None
     snap_variant_census: Optional[Dict[str, Any]] = None
+    # Gallery and copy by where they came from (`_snapshot_evidence_content`). An undeclared
+    # gallery (a snapshot from before the extractor split them) leaves the stored one as is; an
+    # og/meta description is refused, because the gateway serves `snapshot.description` AHEAD of
+    # the seed's own description and that hid the real copy (us.laneige.com Lip Sleeping Mask,
+    # 2026-10-14).
     evidence = getattr(snapshot, "evidence", None)
+    content = _snapshot_evidence_content(evidence)
+    # DID THIS FETCH READ THE PRODUCT PAGE WE SERVE? A bot challenge ("Just a moment..."), a 301
+    # onto a collection or another handle, or a cached snapshot returned after a failure all
+    # declare nothing about THIS product: none of them may clear a gallery, upgrade a description
+    # or fill one with SEO copy (final review of #2621). The same pure check the freshness stamp
+    # and liveness verdict below use.
+    _, page_read_is_the_product = _read_the_served_product(row, dest, observed)
+    gallery_declared = content["gallery_declared"]
+    snap_image_urls = content["image_urls"]
+    snap_description = content["description"]
+    description_refused_source = content["description_refused_source"]
     if isinstance(evidence, dict):
-        raw_images = evidence.get("image_urls") or evidence.get("images")
-        if isinstance(raw_images, list):
-            snap_image_urls = [str(u).strip() for u in raw_images if isinstance(u, str) and str(u).strip()]
-            snap_image_urls = _dedupe_seed_image_urls(snap_image_urls, limit=20)
-        raw_desc = evidence.get("description")
-        if isinstance(raw_desc, str) and raw_desc.strip():
-            snap_description = raw_desc.strip()
         raw_variants = evidence.get("variants")
         if isinstance(raw_variants, list) and raw_variants:
             snap_variants = [v for v in raw_variants if isinstance(v, dict)]
@@ -5324,7 +5940,6 @@ async def _refresh_external_seed_by_id(
             "title": snap_title,
             "description": snap_description,
             "image_url": snap_image_url,
-            "image_urls": snap_image_urls,
             "price_amount": snap_price_amount,
             "price_currency": snap_price_currency,
             "availability": snap_availability,
@@ -5337,6 +5952,13 @@ async def _refresh_external_seed_by_id(
             or _to_iso(datetime.now(timezone.utc)),
         }
     )
+    # A gallery is replaced only by a declared one; an undeclared read leaves the stored one as is.
+    if gallery_declared:
+        seed_data["snapshot"]["image_urls"] = snap_image_urls
+    if description_refused_source:
+        seed_data["snapshot"]["description_refused_source"] = description_refused_source
+    else:
+        seed_data["snapshot"].pop("description_refused_source", None)
     # Only overwrite curated fields if they are missing.
     if _should_replace_localized_copy(
         existing_text=seed_data.get("description"),
@@ -5348,20 +5970,57 @@ async def _refresh_external_seed_by_id(
         seed_data["description"] = snap_description
     if not seed_data.get("title"):
         seed_data["title"] = snap_title
+    if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
+        seed_data, content["meta_description"]
+    ):
+        # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
+        seed_data["description"] = snap_description
+        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
     if not seed_data.get("description"):
         if snap_description:
             seed_data["description"] = snap_description
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
+        elif page_read_is_the_product and content["fill_only_description"]:
+            # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
+            # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+            # `snapshot.description`, which the gateway serves ahead of the seed's own.
+            seed_data["description"] = content["fill_only_description"]
+            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
     if not seed_data.get("image_url"):
         seed_data["image_url"] = snap_image_url
-    if snap_image_urls:
-        seed_data["image_urls"] = snap_image_urls
+    # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
+    # gallery another writer stamped: a storefront's own structured gallery (the drain's
+    # products.json `images[]`) is the product's, and a page read's one or two declared images
+    # would replace it.
+    if page_read_is_the_product and seed_data.get(SEED_IMAGE_URLS_SOURCE_KEY) in (
+        None, SEED_IMAGE_URLS_SOURCE_PAGE_READ
+    ):
+        if snap_image_urls:
+            seed_data["image_urls"] = snap_image_urls
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
+        elif gallery_declared and seed_data.get("image_urls"):
+            # The page declares NO gallery: what the seed stores came from an older read of every
+            # image the page rendered (nav tiles, banners). Cleared, so it is corrected rather than
+            # kept forever; the seed's `image_url` stays (review of #2621).
+            seed_data["image_urls"] = []
+            seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
     if not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
-    if adoptable_variants:
+    # The currencies the stored variants are priced in BEFORE this read is adopted (the adoption may
+    # replace them with the read's): an empty row currency below is filled only in one of them.
+    stored_variant_currencies = _stated_variant_currencies(_seed_variants(seed_data))
+    foreign_currencies = _foreign_refresh_variant_currencies(
+        existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
+    )
+    # Keep the stored variants; the reconcile below is barred from these currencies too.
+    variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
+    if variant_adoption_refused:
+        pass
+    elif adoptable_variants:
         existing_variants = _seed_variants(seed_data)
         product_title = seed_data.get("title") or snap_title
         if _should_overwrite_seed_variants(existing=existing_variants, incoming=adoptable_variants, product_title=product_title):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif _should_replace_seed_variant_content(
             existing=existing_variants,
             incoming=adoptable_variants,
@@ -5369,7 +6028,9 @@ async def _refresh_external_seed_by_id(
             previous_canonical_url=previous_canonical_url,
             refreshed_canonical_url=canonical_url,
         ):
-            seed_data["variants"] = adoptable_variants
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
+        elif _read_heals_stored_currency(existing=existing_variants, incoming=adoptable_variants):
+            seed_data["variants"] = _adopt_seed_variants(existing=existing_variants, incoming=adoptable_variants)
         elif not existing_variants:
             seed_data["variants"] = adoptable_variants
 
@@ -5463,6 +6124,16 @@ async def _refresh_external_seed_by_id(
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_incomplete_pair"
     elif prev_currency is not None and fresh_currency != prev_currency:
+        # A scraped read never redenominates a stored price, not even to heal a currency off the
+        # registry: a misread currency is far likelier than a merchant changing one (a KRW page
+        # once arrived as a USD amount). A seed stuck in such a currency heals on re-create.
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "skipped_currency_mismatch"
+    elif prev_currency is None and foreign_seed_currencies([fresh_currency], stored=stored_variant_currencies):
+        # An empty row currency is filled only under the shared seed-currency rule
+        # (region_pricing.foreign_seed_currencies): a served or acquisition market's currency, and
+        # the one the stored variants are priced in when they state one. It used to fill from any
+        # read, so a geo-served CAD page priced a US-filed seed in CAD (reported `filled`).
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_currency_mismatch"
     else:
@@ -5591,6 +6262,8 @@ async def _refresh_external_seed_by_id(
             product_currency=next_currency,
             product_availability=fresh_availability,
             census=snap_variant_census,
+            refused_currencies=foreign_currencies,
+            product_title=seed_data.get("title") or snap_title,
         )
         if reconciled:
             served_container["variants"] = reconciled
@@ -5613,11 +6286,14 @@ async def _refresh_external_seed_by_id(
                 "at": _to_iso(datetime.now(timezone.utc)),
                 "replaced": variant_refresh["replaced"][:50],
             }
-    if read_the_served_product and price_re_read:
-        if variant_refresh.get("not_re_read_count"):
-            seed_data["snapshot"].pop("extracted_at", None)
-        else:
+    if read_the_served_product:
+        if price_re_read and not variant_refresh.get("not_re_read_count"):
             seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+        elif price_re_read or price_status.startswith("skipped_") or variant_refresh.get("not_re_read_count"):
+            # A price this run refused to take (a CAD read of a USD row is `skipped_currency_mismatch`),
+            # or a stored variant it did not re-read: the stamp an earlier refresh left behind would
+            # vouch for values nobody re-read tonight.
+            seed_data["snapshot"].pop("extracted_at", None)
 
     served_canonical, served_domain = _next_served_canonical(
         row,
@@ -5742,6 +6418,8 @@ async def _refresh_external_seed_by_id(
         "seed_data": seed_data,
         # The page's title, when it was a variant's option label and was not written.
         "snapshot_title_refused": snapshot_title_refused,
+        # The page's variants, when they were priced in a currency this seed may not store.
+        "variant_adoption_refused": variant_adoption_refused,
         # DID THIS "SUCCESS" ACTUALLY CONTACT THE ORIGIN? Often not, and the status alone
         # cannot say. `resolve_external_offer` honours `raise_on_unavailable` ONLY in its
         # `except ExternalOfferUnavailable` arm; anything else — a timeout, TLS, robots, and

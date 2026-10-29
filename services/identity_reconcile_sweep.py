@@ -95,11 +95,15 @@ GAUGES_SQL = {
 # The predicate is the engine's (identity_resolution.A_LOSER_IS_SERVED_SQL): apply re-checks it, so a
 # proposal approved before this guard, or whose served row moved after approval, is held there too.
 _A_LOSER_IS_SERVED = A_LOSER_IS_SERVED_SQL
+# The allowlist is mechanical DEDUP only: `kind = 'suppress_dup'` as well as the strategy, so a
+# proposal of another kind written under an allowlisted strategy name (a merge_content_key, say) is
+# never auto-approved here (M3 review).
 
 APPROVE_ALLOWLIST_SQL = """
 UPDATE identity_resolution_proposals p
 SET status = 'approved', decided_by = 'sweep_auto_allowlist', decided_at = NOW()
 WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
+  AND p.kind = 'suppress_dup'
   AND NOT EXISTS (""" + _A_LOSER_IS_SERVED + """)
 RETURNING p.proposal_id
 """
@@ -107,6 +111,7 @@ RETURNING p.proposal_id
 HELD_AUTO_APPROVE_SQL = """
 SELECT count(*) AS n FROM identity_resolution_proposals p
 WHERE p.status = 'proposed' AND p.strategy = ANY($1::text[])
+  AND p.kind = 'suppress_dup'
   AND EXISTS (""" + _A_LOSER_IS_SERVED + """)
 """
 

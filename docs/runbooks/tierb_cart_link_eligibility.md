@@ -17,7 +17,8 @@ The lane remains **dark** while the Reap cart-link dial is off or its quote fiel
 
 ## The egress rule (read this first)
 
-**This job must only ever run from the crawl subnet `pivota-crawl` (NAT 34.82.199.35).** Never
+**This job must only ever run from the crawl subnet `pivota-crawl` (NAT 136.67.250.98,
+`pivota-crawl-egress-ip-2`, since 2026-10-16; before that 34.82.199.35, kept reserved for rollback).** Never
 from `worker`, `web` or any job on the `default` subnet: their egress is 8.231.167.230, **the
 address payment partners allowlist**. NAT port exhaustion is per-IP, and ~50 requests over 37
 Cloudflare-fronted domains in ~1 minute once tripped a cross-domain, IP-level 429 for ~15

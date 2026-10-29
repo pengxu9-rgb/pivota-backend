@@ -29,6 +29,7 @@ from db.database import database
 from services.catalog_identity import validated_source_gtin
 from services.claim_safety import ensure_category_disclaimers
 from services.offer_buyability import availability_is_known_unavailable
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
@@ -161,11 +162,19 @@ async def fetch_skus_for_keys(product_keys: List[str], *, db: Any = None) -> Lis
 
 
 async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> List[Dict[str, Any]]:
+    """The live offers of a content_key's listings, minus the ones that are not prices.
+
+    An offer copied off a seed (services/seed_offer_currency) is a price only in that seed's own
+    currency: on 2026-10-19 this view served SKINTIFIC's set with five USD 23.56 offers that the
+    variant backfill had copied off seed_data.variants, while the seed itself had been re-read in
+    AUD. The same rule bounds the gateway's search offers, so a PDP and a search card cannot
+    disagree on whether a row is a price. Kill switch: CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD=off
+    (default on, read per call), the gateway's own name."""
     if not product_keys:
         return []
     read_db = db or database
     rows = await read_db.fetch_all(
-        """
+        f"""
         SELECT
           o.offer_id, o.sku_key, o.product_key, o.merchant_id,
           o.availability, o.currency, o.list_price,
@@ -175,7 +184,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
         FROM catalog_offers o
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
         WHERE o.product_key = ANY(:keys)
-          AND o.suppressed_at IS NULL
+          AND o.suppressed_at IS NULL{seed_projected_offer_guard_and_sql("o", "o.product_key")}
         """,
         {"keys": product_keys},
     )
@@ -847,6 +856,14 @@ def read_image_urls(payload: Any) -> List[str]:
     upstream shapes vary (Shopify nests under .images[].src, Wix has
     .media, our external seeds drop a flat array). Try the common ones.
     """
+    # `fetch_products_for_key` reads rows with raw SQL, and through `databases` + asyncpg a JSONB
+    # column arrives as its TEXT (no JSON codec is registered). A str here is that text; read it,
+    # or every row reads as "no gallery of its own".
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return []
     if not isinstance(payload, dict):
         return []
     found: List[str] = []
@@ -910,6 +927,7 @@ def aggregate_offers(
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
     seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[
     Optional[str],
     Optional[Decimal],
@@ -919,15 +937,20 @@ def aggregate_offers(
 ]:
     """Compute price aggregates + top-N offers. Stable ordering:
     sellable before known-unavailable, then primary merchant first, then
-    price ASC, then merchant_id ASC — all applied BEFORE the top-N cut.
+    price ASC, then merchant_id ASC — all applied BEFORE the top-N cut, which
+    takes one offer per SELLER first (`_top_offers`).
 
     `seller_trust_by_id` (W8): the outcome-derived per-merchant trust envelope,
     injected onto each offer like `url` is. Absent/None → offers carry no trust
     key (the honest empty state — no transacted outcomes, no claim).
+
+    `listing_host_by_product_key`: each catalog row's own host, the second half
+    of an offer's seller (`_offer_seller_key`). Absent: the seller is the merchant.
     """
-    normalized = _normalized_offers(
+    pairs = _normalized_offer_pairs(
         offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
     )
+    normalized = [n for _, n in pairs]
 
     if not normalized:
         return None, None, None, 0, []
@@ -965,8 +988,9 @@ def aggregate_offers(
     # defect, not a preference (The Ordinary out of stock over ulta.com in stock at the same
     # $19; COSRX out of stock at $15 over stylekorean in stock at $6.30). The best_offer
     # companion to #2218 (PIVOTA-Agent#2240, offersToSignals) makes the same call. The primary still leads WITHIN its
-    # stock group, and can only leave the stored set when it is unavailable and at least N
-    # sellable offers exist — 0 rows in prod that day. No reader of these offers (backend,
+    # stock group, and can only leave the stored set when it is unavailable and at least N other
+    # sellers can sell (since the per-seller cut; "N sellable offers" before it) — 0 rows in prod
+    # on 2026-09-18. No reader of these offers (backend,
     # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
     # and price_max still cover every offer, unavailable ones included.
     #
@@ -977,21 +1001,22 @@ def aggregate_offers(
     # offer's `availability` is what catalog_sync wrote from the gate's own stock verdict
     # (standard_variant_in_stock: `available` first, then quantity), so an untracked or
     # keep-selling variant is in_stock here and a sold-out one is not.
-    top = sorted(normalized, key=_offer_sort_key)[:OFFER_TOP_N]
+    top = _top_offers(pairs, listing_host_by_product_key, currency)
     return currency, price_min, price_max, len(normalized), top
 
 
-def _normalized_offers(
+def _normalized_offer_pairs(
     offers: List[Dict[str, Any]],
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
     seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
-    """normalize_offer over every row, with the url and seller_trust injected.
-    The one projection both aggregate_offers and build_market_prices read, so
-    the per-market summaries can never describe a different offer set."""
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """(catalog_offers row, normalize_offer of it) for every priced row, with the url and
+    seller_trust injected. The one projection both aggregate_offers and build_market_prices read,
+    so the per-market summaries can never describe a different offer set. The row rides along
+    for the top-N cut, which needs its product_key and sku_key; only the projection is stored."""
     trust_by_id = seller_trust_by_id or {}
-    normalized: List[Dict[str, Any]] = []
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for o in offers:
         n = normalize_offer(o, primary_merchant_id)
         if not n:
@@ -1001,8 +1026,115 @@ def _normalized_offers(
         trust = trust_by_id.get(merchant_id)
         if trust:
             n["seller_trust"] = trust
-        normalized.append(n)
-    return normalized
+        pairs.append((o, n))
+    return pairs
+
+
+# THE TOP-N CUT IS PER SELLER. `offers` exists to show who sells the product, and the cut used to
+# count OFFERS: a product's offers are per variant, and every retailer row also carries its
+# product-level `<product_key>::canonical` placeholder offer beside its per-variant one. So after
+# the first cross-merchant (M4) apply on 2026-10-18, 9 of the 28 merged content_keys stored only 2-3
+# of their 4-5 stores -- ck_0dc56bdd (O HUI Age Recovery Eye Cream 25 ml) stored kbeautymakeup x2
+# and nanasbeautyholic x3, the two cheapest sellers' offers and their twins.
+#
+# So, before the cut:
+#   1. A PLACEHOLDER TWIN goes: a `::canonical` offer whose own row states a per-variant offer OF THE
+#      SAME SELLER in the same market and currency. The variant offer is the exact variant -- its
+#      price and its stock (a sold-out variant beside an in-stock placeholder is sold out); the
+#      placeholder repeats the listing at product level. The seller is part of the key because
+#      scripts/attach_retailer_offer.py hangs ANOTHER retailer's offer on an existing product as
+#      `<product_key>::canonical`: that is the retailer's only offer, not a twin. A placeholder with
+#      no such sibling is its row's only offer there and stays.
+#   2. ONE OFFER PER SELLER until OFFER_TOP_N sellers are in. A seller is represented by the offer the
+#      buy pick (offer_buyability.annotate_offer_buyability) would take from it: in the row's
+#      currency, then not known unavailable, then explicitly in stock, then cheapest. The stored
+#      order alone would compare raw amounts across currencies and rank `unknown` stock with in
+#      stock, so a cheaper GBP or unknown-stock offer could stand for a seller and its in-stock offer
+#      in the row's currency be cut. Sellers enter in the stored order of those offers.
+#   3. Remaining slots, in the stored order (_offer_sort_key): a seller's further offers (its other
+#      shades, sizes or currencies).
+# The kept offers keep the stored order. One seller, or at most N offers once the twins are gone:
+# the same offers as before. offer_count, price_min and price_max still read every priced offer.
+_PLACEHOLDER_SKU_SUFFIX = "::canonical"
+
+
+def _offer_seller_key(
+    row: Dict[str, Any], listing_host_by_product_key: Optional[Dict[str, Optional[str]]], index: int
+) -> Tuple[str, str]:
+    """WHO SELLS this offer: its merchant on its listing's host. The merchant alone is not enough --
+    the retired `external_seed` bucket put every seed-mirrored store under one merchant_id -- and the
+    host alone is not either (two brands on one host are two observed sellers, ADR-009 D2). A row
+    with no merchant and no known host is a seller of its own, never merged with another."""
+    merchant = str(row.get("merchant_id") or "").strip()
+    product_key = str(row.get("product_key") or "").strip()
+    host = (listing_host_by_product_key or {}).get(product_key) or ""
+    if not merchant and not host:
+        return ("", f"offer-{index}")
+    return (merchant, host)
+
+
+def _twin_group(row: Dict[str, Any], seller: Tuple[str, str]) -> Tuple[Any, ...]:
+    return (
+        seller,
+        str(row.get("product_key") or "").strip(),
+        str(row.get("market") or "").strip().upper(),
+        str(row.get("currency") or "").strip().upper(),
+    )
+
+
+def _is_placeholder_offer(row: Dict[str, Any]) -> bool:
+    return str(row.get("sku_key") or "").strip().endswith(_PLACEHOLDER_SKU_SUFFIX)
+
+
+def _top_offers(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
+    currency: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The stored top-N (see THE TOP-N CUT IS PER SELLER above), in the stored order. `currency` is
+    the row's (aggregate_offers' modal currency); None when every offer shares one."""
+    from services.offer_buyability import IN_STOCK_AVAILABILITY
+
+    ranked = sorted(pairs, key=lambda pair: _offer_sort_key(pair[1]))
+    keyed = [
+        (row, n, _offer_seller_key(row, listing_host_by_product_key, index))
+        for index, (row, n) in enumerate(ranked)
+    ]
+    variant_groups = {_twin_group(row, seller) for row, _, seller in keyed if not _is_placeholder_offer(row)}
+    kept = [
+        (n, seller) for row, n, seller in keyed
+        if not (_is_placeholder_offer(row) and _twin_group(row, seller) in variant_groups)
+    ]
+
+    def representative_rank(index: int) -> Tuple[int, int, int, float, int]:
+        n = kept[index][0]
+        return (
+            1 if currency is not None and n.get("currency") != currency else 0,
+            1 if availability_is_known_unavailable(n.get("availability")) else 0,
+            0 if str(n.get("availability") or "").strip().lower() in IN_STOCK_AVAILABILITY else 1,
+            float(n.get("price") or 0.0),
+            index,
+        )
+
+    representative: Dict[Tuple[str, str], int] = {}
+    for index, (_, seller) in enumerate(kept):
+        if seller not in representative or representative_rank(index) < representative_rank(representative[seller]):
+            representative[seller] = index
+    picked = sorted(representative.values())[:OFFER_TOP_N]
+    chosen = set(picked)
+    picked += [index for index in range(len(kept)) if index not in chosen][: max(0, OFFER_TOP_N - len(picked))]
+    return [kept[index][0] for index in sorted(picked)]
+
+
+def listing_hosts(products: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """{product_key: the row's own host} -- its source_domain, else its canonical URL's host."""
+    from services.offer_seller_identity import host_from_url, normalize_host
+
+    return {
+        str(p.get("product_key")): normalize_host(p.get("source_domain")) or host_from_url(p.get("canonical_url"))
+        for p in products
+        if p.get("product_key")
+    }
 
 
 def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
@@ -1043,8 +1175,8 @@ def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
 #     Never offers.market, a DEFAULT 'US' most writers never set.
 #   * No conversion: an entry only compares amounts in its own currency.
 #   * offer_count counts every such offer, unavailable ones included, like the
-#     row-level offer_count; `offers` is that currency's top OFFER_TOP_N in the
-#     stored order (_offer_sort_key), the same offer dicts `offers` carries.
+#     row-level offer_count; `offers` is that currency's top OFFER_TOP_N, one per
+#     seller first (_top_offers), in the stored order (_offer_sort_key).
 #   * {"version": 1, "currencies": {}} = computed, no priced offer.
 #
 # STALENESS. A writer without the flag (an old image, a one-off with no env,
@@ -1089,27 +1221,25 @@ def build_market_prices(
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
     seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """The per-currency price summary (contract above). Pure, and independent of
     process environment."""
-    normalized = sorted(
-        _normalized_offers(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id),
-        key=_offer_sort_key,
-    )
-    by_currency: Dict[str, List[Dict[str, Any]]] = {}
-    for n in normalized:
+    pairs = _normalized_offer_pairs(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id)
+    by_currency: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    for row, n in pairs:
         code = str(n.get("currency") or "").strip().upper()
         if _ISO_CURRENCY_RE.match(code):
-            by_currency.setdefault(code, []).append(n)
+            by_currency.setdefault(code, []).append((row, n))
     currencies: Dict[str, Dict[str, Any]] = {}
     for code in sorted(by_currency):
         in_currency = by_currency[code]
-        prices = [Decimal(str(n["price"])) for n in in_currency]
+        prices = [Decimal(str(n["price"])) for _, n in in_currency]
         currencies[code] = {
             "price_min": float(min(prices)),
             "price_max": float(max(prices)),
             "offer_count": len(in_currency),
-            "offers": in_currency[:OFFER_TOP_N],
+            "offers": _top_offers(in_currency, listing_host_by_product_key),
         }
     return {"version": MARKET_PRICES_VERSION, "currencies": currencies}
 
@@ -1575,10 +1705,14 @@ def assemble_row(
     )
 
     image_urls = read_image_urls(canonical.get("product_payload"))
+    # The seed's gallery is a page read; it FILLS a product that carries no gallery of its own and
+    # is never appended to one that does. Appended, a page read's nav tiles and promo crops landed
+    # after the merchant's own images (us.laneige.com, cocomo.sg, 2026-10-14).
+    owns_gallery = bool(image_urls)
     if image_url and image_url not in image_urls:
         image_urls.insert(0, image_url)
     seed_images = seed_data.get("image_urls") if isinstance(seed_data, dict) else None
-    if isinstance(seed_images, list):
+    if not owns_gallery and isinstance(seed_images, list):
         for u in seed_images:
             if isinstance(u, str) and u.strip() and u.strip() not in image_urls:
                 image_urls.append(u.strip())
@@ -1602,11 +1736,12 @@ def assemble_row(
         if mid and mid not in merchant_url_by_id:
             merchant_url_by_id[mid] = p.get("canonical_url")
 
+    hosts = listing_hosts(products)
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
-        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
+        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts
     )
     market_prices = (
-        build_market_prices(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id)
+        build_market_prices(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts)
         if market_prices_enabled()
         else None
     )

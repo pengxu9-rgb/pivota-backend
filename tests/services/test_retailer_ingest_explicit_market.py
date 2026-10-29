@@ -24,7 +24,7 @@ from services import curated_brand_feed as feed, storefront_currency
 from services.catalog_enrichment_agent import apply as writer
 from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
 from services.retailer_ingest import pipeline
-from tests.services.test_retailer_ingest_pipeline import env, job  # noqa: F401 -- the state-machine fixture
+from tests.services.test_retailer_ingest_pipeline import env, job, run_flags  # noqa: F401 -- the state-machine fixture
 
 _REAL_APPLY = writer.apply_ingest_plan  # the env fixture replaces both with fakes; one test needs the real ones
 from services.catalog_enrichment_agent.primary_ingestion import require_primary_apply as _REAL_REQUIRE_APPLY  # noqa: E402
@@ -95,7 +95,7 @@ async def test_a_market_outside_the_allowlist_is_refused_before_any_crawl(env): 
 
 
 async def test_an_explicit_us_job_runs_like_one_without_a_market(env):  # noqa: F811
-    assert (await pipeline.run_stage(job(market="US"), db=env.db))["status"] == "apply_due"
+    assert (await pipeline.run_stage(job(market="US"), db=env.db))["status"] == "apply_due", run_flags(env)
     out = await pipeline.run_stage(job("apply_due", market="us"), db=env.db)
     assert out["status"] == "done"
 
@@ -182,7 +182,7 @@ async def test_the_apply_fails_its_readback_on_a_wrong_market_stamp(env):  # noq
                  "offers_in_currency": 1, "offers_in_market": 0} for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed"), run_flags(env)
     assert "stamped market US: 0" in env.ledger.transitions[-1]["reason"]
 
 
@@ -561,7 +561,7 @@ def test_every_written_brand_needs_its_own_proof():
 async def test_a_tier_b_store_advances_without_a_human_and_says_why(env, monkeypatch):  # noqa: F811
     j = _crawl_with(env, monkeypatch, BRAND_US, domain="brand-store.example.com", brand="Example Brand")
     out = await pipeline.run_stage(j, db=env.db)
-    assert (out["status"], out["outcome"]) == ("apply_due", "clean")
+    assert (out["status"], out["outcome"]) == ("apply_due", "clean"), run_flags(env)
     evidence = list(env.ledger.runs.values())[-1]["checks"]["brand_official_evidence"]
     assert evidence["brands"]["example brand"]["tier"] == "B"
     assert evidence["brands"]["example brand"]["myshopify_domain"] == "example-brand.myshopify.com"
@@ -580,7 +580,7 @@ async def test_a_store_that_fails_tier_b_is_held_as_before(env, monkeypatch):  #
 async def test_a_second_brand_us_store_advances_on_tier_b(env, monkeypatch):  # noqa: F811
     j = _crawl_with(env, monkeypatch, OTHER_US, domain="other-store.example.com", brand="Other Brand",
                     vendor="Other Brand US")  # the store's own vendor carries the market; the job brand wins
-    assert (await pipeline.run_stage(j, db=env.db))["status"] == "apply_due"
+    assert (await pipeline.run_stage(j, db=env.db))["status"] == "apply_due", run_flags(env)
 
 
 # ------------------------------------------------------------------ 5. canonical-owner guard
@@ -845,7 +845,7 @@ async def test_a_us_job_over_rows_another_brand_host_holds_ends_done(env, monkey
     monkeypatch.setattr(pr, "materialize_primary_readiness", readiness)
 
     out = await pipeline.run_stage(j, db=db)
-    assert (out["status"], out["outcome"]) == ("done", "applied"), env.ledger.transitions[-1]
+    assert (out["status"], out["outcome"]) == ("done", "applied"), (env.ledger.transitions[-1], run_flags(env))
     assert db.written("catalog_products")[0]["canonical_url"].startswith("https://us.frankbody.com/")
 
 
@@ -860,3 +860,18 @@ async def test_the_pipeline_hands_the_jobs_market_to_the_apply(env, monkeypatch)
     monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
     await pipeline.run_stage(job("apply_due"), db=env.db)
     assert seen == ["US"]
+
+
+async def test_the_pipeline_vouches_for_the_prices_its_storefront_apply_read(env, monkeypatch):  # noqa: F811
+    """The apply stage crawled the store in this execution, so its offers may date their prices
+    (`apply_ingest_plan(price_read=True)` -> catalog_offers.price_checked_at, migration 246)."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    seen = []
+    real = apply_mod.apply_ingest_plan
+
+    async def spy(plan, **kw):
+        seen.append(kw.get("price_read"))
+        return await real(plan, **kw)
+    monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
+    await pipeline.run_stage(job("apply_due"), db=env.db)
+    assert seen == [True]

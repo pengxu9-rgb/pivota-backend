@@ -413,15 +413,21 @@ async def _plan_with_current_listings(records: List[Dict[str, Any]], *, market: 
                                      allow_moves: Any = ()) -> Dict[str, Any]:
     """The plan, made with the listing each of its rows names today (apply.plan_with_current_listings), read
     through the SELECT-only preflight handle. Without a Postgres catalog, or when the read fails, the plan is
-    made without them and `current_listings.status` says so -- the drain holds on that (it cannot see a move)."""
-    from services.catalog_enrichment_agent.apply import content_keys_of, plan_with_current_listings
+    made without them and `current_listings.status` says so -- the drain holds on that (it cannot see a move).
+    `listing_spellings.status` says the same of the `ext:retailer:` rows' stored host spelling (the drain holds
+    on that too: it cannot see a re-crawl under the other `www.` spelling). A plan with no row of a kind is
+    `not_applicable` for it, read or not."""
+    from services.catalog_enrichment_agent.apply import content_keys_of, plan_with_current_listings, retailer_keys_of
+
+    def unread(plan: Dict[str, Any], status: Dict[str, Any]) -> Dict[str, Any]:
+        return {**plan, **{name: status if keys_of(plan) else {"status": "not_applicable"}
+                           for name, keys_of in (("current_listings", content_keys_of),
+                                                 ("listing_spellings", retailer_keys_of))}}
 
     records = list(records)
     database, reason = _preflight_database()
     if database is None:
-        plan = ingest_validated_jsonl(records, market=market)
-        status = {"status": "unchecked", "reason": reason} if content_keys_of(plan) else {"status": "not_applicable"}
-        return {**plan, "current_listings": status}
+        return unread(ingest_validated_jsonl(records, market=market), {"status": "unchecked", "reason": reason})
     connected_here = False
     try:
         if not getattr(database, "is_connected", False):
@@ -430,8 +436,8 @@ async def _plan_with_current_listings(records: List[Dict[str, Any]], *, market: 
         return await plan_with_current_listings(records, db=_SelectOnlyHandle(database), market=market,
                                                 allow_moves=allow_moves)
     except Exception as exc:  # noqa: BLE001 -- reported; the class only (a driver error can quote its URL)
-        return {**ingest_validated_jsonl(records, market=market),
-                "current_listings": {"status": "error", "error": type(exc).__name__}}
+        return unread(ingest_validated_jsonl(records, market=market),
+                      {"status": "error", "error": type(exc).__name__})
     finally:
         if connected_here and getattr(database, "is_connected", False):
             await database.disconnect()
@@ -714,11 +720,18 @@ async def _run(args: argparse.Namespace) -> int:
             print(json.dumps({"error": "current_listings_unread", "current_listings": plan["current_listings"]}),
                   file=sys.stderr)
             return 2
+        if args.apply and (plan.get("listing_spellings") or {}).get("status") in ("unchecked", "error"):
+            print(json.dumps({"error": "listing_spellings_unread", "listing_spellings": plan["listing_spellings"]}),
+                  file=sys.stderr)
+            return 2
     else:
         plan = ingest_validated_jsonl(all_records)
         plan["current_listings"] = {"status": "unchecked",
                                     "hint": "pass --check-current-listings (a SELECT on catalog_products)"}
     print("current listings: " + json.dumps(plan.get("current_listings"), sort_keys=True))
+    if plan.get("listing_spellings"):
+        print("listing spellings: " + json.dumps(plan["listing_spellings"], sort_keys=True)
+              + f" respelled={len(plan.get('listing_respellings') or [])}")
     print(
         f"plan: pdps={len(plan.get('pdps') or [])} skus={len(plan.get('skus') or [])} "
         f"offers={len(plan.get('offers') or [])} seeds={len(plan.get('seeds') or [])} "

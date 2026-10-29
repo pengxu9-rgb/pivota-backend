@@ -14,6 +14,7 @@ Path: POST /agent/shop/v1/invoke
 """
 
 import asyncio
+import contextvars
 import copy
 from dataclasses import replace
 import hashlib
@@ -26,8 +27,8 @@ import unicodedata
 import mimetypes
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple, get_args
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, get_args
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -40,6 +41,12 @@ from services.seed_variant_options import seed_variant_options_as_mapping
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
+    LIVE_VERIFICATION_KEY,
+    LIVE_VERIFICATION_REQUIRED,
+    STOCK_DECLINE_KEY,
+    STOCK_OUT_OF_STOCK,
+    VARIANT_DECLINE_KEY,
+    VARIANT_NOT_NAMED,
     could_upgrade_at_click_time,
 )
 import db.merchant_purchasability as merchant_purchasability
@@ -64,6 +71,7 @@ from services.test_merchant_policy import (
     get_excluded_merchant_ids,
     filter_out_test_merchants,
 )
+from services import market_registry
 from services.external_seed_stock import seed_stock, seed_variant_stock_fields
 from services.external_seed_search import (
     SEED_SERVING_CURRENCY_CLAUSE,
@@ -77,6 +85,7 @@ from services.pivot_query_service import (
     search_pivot_catalog,
 )
 from services.query_semantic_class import classify_query_semantic_class
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.canonical_search_query import prepare_canonical_search_query
 from services.similarity_service import (
     SimilarityService,
@@ -98,6 +107,7 @@ from services.outbound_links_service import (
     apply_utm,
     append_referral_click_param,
     append_shopify_cart_click_attribute,
+    append_shopify_cart_country,
     extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
@@ -113,13 +123,20 @@ from services.outbound_links_service import (
 )
 from services import checkout_preflight
 from services import live_offer_verification
+from services import offer_live_verification
 from services.handover_variant_identity import (
     HandoverVariant,
     HandoverVariantResolver,
     canonical_variant_id,
+    entry_is_the_sole_variant_read_again,
     handover_coverage_fields,
     handover_coverage_message,
     names_a_merchant_issued_variant,
+    namers_agree_on_price,
+    stored_entry_answers_to,
+    stored_entry_claimed_variant_ids,
+    stored_entry_variant_ids,
+    url_named_variant_id,
 )
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
@@ -3098,8 +3115,78 @@ class OffersResolvePayload(BaseModel):
         alias="commerceSurface",
         description="Serving surface eligibility policy (agent_api | ucp | acp)",
     )
+    # OPT-IN, for a caller that verifies offers live with the merchant before serving them (the
+    # gateway's get_offers under UCP_LIVE_OFFER_READ=enforce). A seed gated ONLY for freshness is then
+    # returned flagged `requires_live_verification` instead of dropped. Absent: unchanged.
+    include_live_verification_offers: bool = Field(
+        False,
+        alias="includeLiveVerificationOffers",
+        description="Return freshness-gated seed offers flagged requires_live_verification",
+    )
+    # The gateway's SIGNED live reads of offers a first pass returned flagged (contract 2026-10-15,
+    # services/offer_live_verification). A token that verifies and matches one flagged offer
+    # unlocks that offer's normal cart path at the live price, for this answer only. Read only with
+    # `include_live_verification_offers`; at most MAX_TOKENS are read, each at most MAX_TOKEN_CHARS.
+    # Deliberately lenient in shape: a bad assertion is ignored and counted, never a failed request.
+    live_verifications: Optional[List[Any]] = Field(
+        None,
+        alias="liveVerifications",
+        description="Gateway-signed live verifications of flagged offers (internal)",
+    )
+    # ADR-025: a dry run (the gateway's GET_OFFERS_LIVE_CART=shadow second pass) answers identically
+    # but records NO issued clicks -- its links are never handed to anyone.
+    live_verifications_dry_run: bool = Field(
+        False,
+        alias="liveVerificationsDryRun",
+        description="Answer identically, record no issued clicks (internal)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+#: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
+#: gated for these alone may be returned to an opted-in caller that re-reads it live; any other
+#: reason (locale/market or currency mismatch, zero variants) still drops it.
+_FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS = frozenset(
+    {"stale_snapshot", "destination_stale", "destination_never_verified"}
+)
+
+
+def _live_lookup_variant_id(entry: Any) -> Optional[str]:
+    """The ONE merchant variant id a stored seed entry CLAIMS (variant_id, variantId, id,
+    shopify_variant_id, source_variant_id -- a JSON-LD @id's `?variant=N` included -- plus its own
+    `url`'s `variant=`), or None when it claims none or several. Never `sku`: on this corpus an
+    8+-digit sku is routinely a barcode, which would either name a wrong id or make a real one
+    ambiguous (review of #2629)."""
+    if not isinstance(entry, dict):
+        return None
+    ids = set(stored_entry_claimed_variant_ids(entry))
+    named = url_named_variant_id(entry.get("url"))
+    if named:
+        ids.add(named)
+    ids = sorted(i for i in ids if i.isdigit())
+    return ids[0] if len(ids) == 1 else None
+
+
+def _stale_variant_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A flagged offer's variant options with nothing the stale read says claimed: no `in_stock`, and
+    each stated price marked `price_stale`."""
+    out = []
+    for opt in options or []:
+        if not isinstance(opt, dict):
+            continue
+        clean = {k: v for k, v in opt.items() if k != "in_stock"}
+        if "price" in clean:
+            clean["price_stale"] = True
+        out.append(clean)
+    return out
+
+
+def _live_verification_returned_of(offers: List[Dict[str, Any]]) -> Dict[str, int]:
+    """What an opted-in caller actually receives: flagged offers in the FINAL list, and their seeds."""
+    flagged = [o for o in offers or [] if isinstance(o, dict) and o.get("requires_live_verification")]
+    seeds = {((o.get("source") or {}).get("seed_id")) for o in flagged}
+    return {"seeds": len({s for s in seeds if s}), "offers": len(flagged)}
 
 
 def _normalize_find_products_payload(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3162,7 +3249,10 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
             product[key] = payload.get(key)
 
     normalized: Dict[str, Any] = {"product": product}
-    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface"):
+    for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
+                "include_live_verification_offers", "includeLiveVerificationOffers",
+                "live_verifications", "liveVerifications",
+                "live_verifications_dry_run", "liveVerificationsDryRun"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -3464,6 +3554,97 @@ def _seed_offer_variant_id(v: Dict[str, Any]) -> str:
     return str(raw).strip()
 
 
+def _representative_seed_variant(
+    variants: List[Dict[str, Any]], row: Dict[str, Any], seed_data: Dict[str, Any], stock: Any
+) -> Optional[Dict[str, Any]]:
+    """The variant a seller listing's single offer stands for: the variant the seed is attached
+    to while it is in stock, else the first one the seed's stock rule calls in stock, else the
+    attached one, else the first. None for a listing with no stored variants (its offer is
+    product-level, as before).
+
+    The attached variant is found as `_attached_variant_is_this_offer` finds it: the ONE shared
+    reader (`stored_entry_answers_to`, #2627 -- every identity key canonically, and the `variant=` a
+    JSON-LD `@id` names), and only while the entries naming it agree on its price
+    (`namers_agree_on_price`): entries naming one variant at $19 and $29 name neither. Whether
+    that entry's offer may then carry the attached cart is still that rule's decision, made per
+    offer in `_external_seed_redirect_identity`; this only chooses which variant the listing's
+    one offer is. A sold-out attached variant does not make an in-stock listing look sold out."""
+    if not variants:
+        return None
+    attached = canonical_variant_id(
+        str(row.get("attached_variant_id") or seed_data.get("attached_variant_id") or "").strip()
+    )
+    attached_entry = None
+    if attached:
+        answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, attached)]
+        if answering and namers_agree_on_price(variants, attached):
+            attached_entry = answering[0]
+
+    def _in_stock(v: Dict[str, Any]) -> bool:
+        return seed_variant_stock_fields(v.get("availability"), stock).get("in_stock") is True
+
+    if attached_entry is not None and _in_stock(attached_entry):
+        return attached_entry
+    for v in variants:
+        if _in_stock(v):
+            return v
+    return attached_entry if attached_entry is not None else variants[0]
+
+
+# The most variants one offer lists (a foundation range can run past 50 shades).
+_MAX_VARIANT_OPTIONS = 60
+
+
+def _seed_variant_option_entries(variants: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], str]]:
+    """(stored entry, option id) for each option `_seed_variant_options_summary` lists, in its order."""
+    out: List[Tuple[Dict[str, Any], str]] = []
+    for v in variants:
+        if len(out) >= _MAX_VARIANT_OPTIONS:
+            break
+        vid = _seed_offer_variant_id(v)
+        if vid:
+            out.append((v, vid))
+    return out
+
+
+def _live_verified_variant_options(
+    variants: List[Dict[str, Any]], options: List[Dict[str, Any]], claims: Any
+) -> List[Dict[str, Any]]:
+    """An offer a gateway live read unlocked: the options whose stored entry is the verified variant
+    (`_live_lookup_variant_id` == claims.vid) carry the live price and stock; every other option is
+    the same stale read as on a flagged offer (`_stale_variant_options`)."""
+    out: List[Dict[str, Any]] = []
+    for (entry, _vid), opt in zip(_seed_variant_option_entries(variants), options or []):
+        if _live_lookup_variant_id(entry) == claims.vid:
+            live = {k: v for k, v in opt.items() if k not in ("in_stock", "price_stale")}
+            live.update(price=claims.a, currency=claims.c, in_stock=claims.av)
+            out.append(live)
+        else:
+            out.extend(_stale_variant_options([opt]))
+    return out
+
+
+def _seed_variant_options_summary(
+    variants: List[Dict[str, Any]], stock: Any, *, fallback_currency: Optional[str]
+) -> List[Dict[str, Any]]:
+    """One listing's options as an agent chooses among them: id, label, price, stock. No links:
+    a link is minted only for the variant a caller names (`product.sku_id`), so this list costs
+    no clicks and records no issued links (ADR-025). At most `_MAX_VARIANT_OPTIONS` entries; the
+    offer's `variant_count` says how many there are."""
+    out: List[Dict[str, Any]] = []
+    for v, vid in _seed_variant_option_entries(variants):
+        amount, currency = _extract_price_currency_from_variant(v, fallback_currency=fallback_currency)
+        entry: Dict[str, Any] = {"variant_id": vid, "title": v.get("title") or None}
+        if amount is not None:
+            entry["price"] = amount
+            entry["currency"] = currency
+        in_stock = seed_variant_stock_fields(v.get("availability"), stock).get("in_stock")
+        if in_stock is not None:
+            entry["in_stock"] = in_stock
+        out.append(entry)
+    return out
+
+
 def _seed_variant_identity_claim(v: Dict[str, Any]) -> str:
     """The subset of `_seed_offer_variant_id`'s chain that CLAIMS to be a variant id.
 
@@ -3562,6 +3743,106 @@ def _expand_ref_aliases(raw_ref: Optional[str]) -> List[str]:
         _add(raw.rstrip("/").split("/")[-1])
 
     return aliases[:20]
+
+
+# A ref that is an id minted by a hash or a uuid: a Pivota signature (sig_ + 32 hex), content key
+# (ck_ + 32 hex), identity proposal (irp_ + 32 hex), external seed id (ext_ + 24 hex), or a uuid.
+# A product title never contains one, so offers.resolve's fuzzy seed lookup skips its title arm
+# for these. Exact lengths, not bare prefixes: `_` is a LIKE wildcard, so a loose "ck_100" would
+# turn into %ck_100% and match the title "Pack 100ml".
+_ID_SHAPED_REF_RE = re.compile(
+    r"(?:sig_[0-9a-f]{32}|ck_[0-9a-f]{32}|irp_[0-9a-f]{32}|ext_[0-9a-f]{24}"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+def _is_id_shaped_ref(ref: str) -> bool:
+    return bool(_ID_SHAPED_REF_RE.fullmatch(str(ref or "").strip()))
+
+
+def _fuzzy_seed_ref_clauses(
+    product_id_aliases: List[str], sku_id_aliases: List[str]
+) -> Tuple[List[str], Dict[str, Any]]:
+    """The WHERE conjuncts and binds of offers.resolve's external_seed_by_fuzzy_ref statement.
+
+    Every LIKE arm is spelled the way prod's hand-built trigram GINs are keyed
+    (idx_eps_active_any_*_trgm, `gin (lower(<col>) gin_trgm_ops) WHERE status = 'active'`;
+    db/migrations/270_external_seed_active_any_trgm_indexes.sql.disabled), so each arm is a bitmap
+    probe and not a scan. The statement used to read LOWER(COALESCE(title,'')), which matches no
+    index: every call scanned the whole table (6.7-7.3 s measured on prod 2026-10-19) and timed out
+    under the 1.2 s seed budget. Dropping the COALESCE returns the same rows: a NULL column makes
+    its arm NULL instead of matching '', and '' matches '%<alias>%' only when the alias is all '%',
+    a pattern the seed_data arm (NOT NULL) of the same alias already matches on every row.
+
+    An id-shaped ref (`_is_id_shaped_ref`) skips the title arm. Its url and seed_data arms stay:
+    an ext_ id or a uuid does appear in OTHER seeds' seed_data and urls (copied attached keys,
+    Wix product ids), and with the index those arms cost a probe.
+    """
+    clauses: List[str] = []
+    params: Dict[str, Any] = {}
+    if product_id_aliases:
+        pid_clause: List[str] = []
+        for idx, pid_alias in enumerate(product_id_aliases[:8]):
+            pid_key = f"pid_{idx}"
+            like_key = f"pid_like_{idx}"
+            params[pid_key] = pid_alias
+            params[like_key] = f"%{_safe_lower(pid_alias)}%"
+            arms = [f"external_product_id = :{pid_key}"]
+            if not _is_id_shaped_ref(pid_alias):
+                arms.append(f"LOWER(title) LIKE :{like_key}")
+            arms += [
+                f"LOWER(canonical_url) LIKE :{like_key}",
+                f"LOWER(destination_url) LIKE :{like_key}",
+                f"LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}",
+            ]
+            pid_clause.append("(" + " OR ".join(arms) + ")")
+        clauses.append("(" + " OR ".join(pid_clause) + ")")
+    if sku_id_aliases:
+        sku_clause: List[str] = []
+        for idx, sku_alias in enumerate(sku_id_aliases[:8]):
+            key = f"sku_like_{idx}"
+            params[key] = f"%{_safe_lower(sku_alias)}%"
+            sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
+        clauses.append("(" + " OR ".join(sku_clause) + ")")
+    return clauses, params
+
+
+# A term the identity retry may send to the trigram indexes: two or more words of lower-case ASCII
+# letters and digits, single-spaced -- a multi-word `_normalize_offer_title` output.
+_IDENTITY_INDEXED_TERM_RE = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)+")
+
+
+def _identity_title_arm(key: str, term: str) -> str:
+    """One title term's arm of offers.resolve's external_seed_by_internal_identity statement.
+
+    main read `LOWER(COALESCE(title,'')) LIKE :t OR LOWER(COALESCE(seed_data->>'title','')) LIKE :t`,
+    and neither side matched an index, so every identity retry scanned the whole seed table. For a
+    multi-word term (`_IDENTITY_INDEXED_TERM_RE`) each side is spelled as an index is keyed, both
+    WHERE status = 'active':
+      - `LOWER(title)`: prod's `idx_eps_active_any_title_trgm` (migration 270). A NULL title makes
+        the arm NULL instead of `'' LIKE '%<term>%'`, which is false for a term with a letter or
+        digit, so the rows are the same.
+      - `LOWER(COALESCE(seed_data->>'title',''))`: main's own expression, unchanged, which
+        `idx_eps_active_any_seed_title_trgm` (migration 271, built out of band) is keyed on. Until it
+        is built the statement plans as main's did.
+
+    A ONE-word term (the brand-stripped "toner" of "COSRX Toner", "serum", "cream") keeps main's
+    arm, and with it the whole statement keeps main's plan: one unindexed OR arm makes it a parallel
+    Seq Scan, exactly as before. Such a word can sit in a large share of seed titles, and a bitmap
+    scan over most of the table rechecks every OR arm and the brand filter row by row, detoasting
+    seed_data, on one process; on a table where the word is in every title that was 2.5-7x main's
+    time (controller review of be#2650). Migration 271's expression statistics let a CUSTOM plan see
+    that a common multi-word term is common and choose main's scan itself; a GENERIC plan (asyncpg
+    prepares, and Postgres may keep a plan built without the binds) cannot, and the word count is
+    the guard that does not depend on the plan.
+
+    An indexed prefilter on seed_data::text was tried and rejected: a common title word's trigrams
+    sit in nearly every 25 KB seed_data text, and rechecking those rows cost 6.3 s for 8 terms where
+    main's scan cost 0.8 s.
+    """
+    title = "LOWER(title)" if _IDENTITY_INDEXED_TERM_RE.fullmatch(term or "") else "LOWER(COALESCE(title,''))"
+    return f"({title} LIKE :{key} OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key})"
 
 
 def _offers_scope_or_none(raw: Any) -> Optional[str]:
@@ -4355,12 +4636,7 @@ async def _handle_offers_resolve(
         for idx, term in enumerate(title_terms):
             key = f"identity_title_{idx}"
             params[key] = f"%{term}%"
-            title_clauses.append(
-                "("
-                f"LOWER(COALESCE(title,'')) LIKE :{key}"
-                f" OR LOWER(COALESCE(seed_data->>'title','')) LIKE :{key}"
-                ")"
-            )
+            title_clauses.append(_identity_title_arm(key, term))
 
         brand_clause = "TRUE"
         if brand_terms:
@@ -4538,6 +4814,12 @@ async def _handle_offers_resolve(
     _preflight_stats: Dict[str, int] = {"candidates": 0, "gated": 0, "cart_prefilled": 0,
                                         "asked": 0, "memo_hits": 0, "skipped_by_budget": 0,
                                         "degraded_to_referral": 0}
+    # Carts withheld because the offer's OWN stock claim is out of stock. Its own counter, not a
+    # `_preflight_stats` key: the preflight coverage fields are computed from that dict.
+    _stock_stats: Dict[str, int] = {"declined": 0}
+    # Named-variant carts withheld as another variant's (`_cart_is_the_named_offer`). Same reason
+    # for its own dict.
+    _variant_stats: Dict[str, int] = {"declined": 0}
     # ONE resolver for the WHOLE request, for the same reason the budget and the memo are one:
     # `_append_external_offers_from_seed_rows` is called from three sites, and a resolver built
     # per call would re-ask for product keys the previous call already loaded. It holds only a
@@ -4547,8 +4829,35 @@ async def _handle_offers_resolve(
     # and its dial is read once. Keyed on the REQUEST's market (`market_hint`), never a row's —
     # the same provenance `market_observed` below is decided by.
     _cart_purchasability = _CartPurchasabilityGate(market_hint)
+    # THE BUYER'S CURRENCY, at the source as well as before the final cut (see
+    # `_offers_in_buyer_currency`): the seed lane stops at `limit`, so a foreign-currency seed
+    # offer that is only filtered afterwards has already taken a slot from one in the buyer's
+    # currency -- and has had a link minted for it. None when no market is declared.
+    _buyer_currency = _declared_buyer_currency(market_hint)
+    _buyer_currency_dropped: Dict[str, int] = {}
+    _live_verification_opt_in = bool(getattr(payload, "include_live_verification_offers", False))
+    # The gateway's signed live reads (services/offer_live_verification), verified ONCE per request.
+    # Inert without the opt-in, and without OFFER_LIVE_VERIFICATION_SECRET (every token `no_secret`).
+    _live_assertions = offer_live_verification.LiveVerificationLedger.from_tokens(
+        getattr(payload, "live_verifications", None) or [],
+        opt_in=_live_verification_opt_in,
+        now=time.time(),
+        secrets=offer_live_verification.live_verification_secrets() if _live_verification_opt_in else (),
+    )
+    # A DRY RUN is only a live-verification second pass's: honoured only alongside tokens, so a
+    # public caller cannot use the flag to suppress its own ADR-025 issuance.
+    _live_dry_run = bool(getattr(payload, "live_verifications_dry_run", False)) and bool(_live_assertions.entries)
+    # Every seed row any lane has already put through the gates below, so the group-sibling lane
+    # (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS) never gates one twice. Written, never read, when off.
+    _considered_seed_ids: set[str] = set()
+    # One open-recovery-task read per MERCHANT per request, not per seed row: it decorates the link
+    # only, and a group's seeds repeat merchants.
+    _recovery_tasks_memo: Dict[str, List[Dict[str, Any]]] = {}
+    _sibling_lane: Dict[str, Any] = {"deadline_hit": False, "no_named_variant": 0}
 
-    async def _append_external_offers_from_seed_rows(seed_rows: List[Any]) -> None:
+    async def _append_external_offers_from_seed_rows(
+        seed_rows: List[Any], *, sibling: bool = False, deadline: Optional[float] = None,
+    ) -> None:
         # ONE statement for every product key this batch is about to hand over, BEFORE the
         # loop. Inside the loop it would be a query per card, which is the shape the
         # `list_open_recovery_tasks` note below already had to be corrected for.
@@ -4557,12 +4866,19 @@ async def _handle_offers_resolve(
             for r in seed_rows
         )
         for row in seed_rows:
+            if deadline is not None and time.perf_counter() >= deadline:
+                _sibling_lane["deadline_hit"] = True
+                return
             row_dict = _row_to_dict(row)
+            _considered_seed_ids.add(str(row_dict.get("id") or "").strip())
             blocked, gate_status = await should_block_external_referral_runtime(
                 row_dict,
                 matched_via="agent_shop_gateway",
             )
             if blocked:
+                _live_assertions.note(
+                    str(row_dict.get("id") or "").strip(), offer_live_verification.OFFER_BLOCKED
+                )
                 mapping_candidates.append(
                     _conf(
                         "external_seed",
@@ -4576,7 +4892,23 @@ async def _handle_offers_resolve(
                 )
                 continue
             live_verification_reasons = external_referral_live_verification_reasons(gate_status)
-            if live_verification_reasons:
+            # An OPTED-IN caller re-reads the offer live before serving it, so a seed gated only for
+            # freshness is returned to it flagged -- no cart, no stock claim, its stored price
+            # marked stale -- instead of dropped. ~45% of active US seeds fail a 7-day clock
+            # (census 2026-10-15); a multi-variant seed can never pass `stale_snapshot` from a page
+            # read, which lists one offer. Every other caller, and every other reason, unchanged.
+            requires_live_verification: Optional[List[str]] = None
+            if (
+                live_verification_reasons
+                and _live_verification_opt_in
+                and set(live_verification_reasons) <= _FRESHNESS_ONLY_LIVE_VERIFICATION_REASONS
+            ):
+                requires_live_verification = list(live_verification_reasons)
+            elif live_verification_reasons:
+                # Never unlocked: a market, currency or variant gate is not a freshness question.
+                _live_assertions.note(
+                    str(row_dict.get("id") or "").strip(), offer_live_verification.NOT_FRESHNESS_ONLY
+                )
                 # Recall can return a referral-only card, but offer resolution
                 # cannot synthesize commerce facts before a live merchant check.
                 mapping_candidates.append(
@@ -4591,6 +4923,11 @@ async def _handle_offers_resolve(
                     )
                 )
                 continue
+            else:
+                # A fresh seed already gets its cart; an assertion has nothing to unlock.
+                _live_assertions.note(
+                    str(row_dict.get("id") or "").strip(), offer_live_verification.OFFER_NOT_FLAGGED
+                )
             seed_data = _ensure_seed_data_obj(row_dict.get("seed_data"))
             variants = _seed_variants(seed_data)
 
@@ -4600,11 +4937,24 @@ async def _handle_offers_resolve(
                     vid = _seed_offer_variant_id(v)
                     if vid and vid == sku_id:
                         matched_variants.append(v)
-            else:
-                matched_variants = variants[: min(12, max(1, limit))]
-
-            if not matched_variants:
-                matched_variants = [{}]
+                if not matched_variants:
+                    # THE SAME VARIANT, SPELLED DIFFERENTLY. Most stored entries carry the JSON-LD
+                    # offer @id (`/products/x?variant=N#offer`) as their id, and a caller names the
+                    # variant by N (or as a gid) -- a string match missed it, so a correct offer came
+                    # back `variant_match: fallback` and the gateway's exact-only filter dropped it.
+                    # Canonically, through the one shared reader -- and, as #2627's rule for the
+                    # attached id, only while the entries naming it agree on its price: two entries
+                    # naming one variant at $19 and $29 cannot say which price the caller gets
+                    # (PR controller, review of #2628). Agreeing duplicates are ONE variant.
+                    answering = [v for v in variants if isinstance(v, dict) and stored_entry_answers_to(v, sku_id)]
+                    if answering and namers_agree_on_price(variants, sku_id):
+                        matched_variants = answering[:1]
+                if sibling and not matched_variants:
+                    # A SIBLING LISTING THAT DOES NOT STORE THE NAMED VARIANT ships nothing. Its
+                    # fallback would be the listing at its row price under the caller's sku_id --
+                    # another listing's id on a price for a variant nobody showed it sells.
+                    _sibling_lane["no_named_variant"] += 1
+                    continue
 
             destination_url = row_dict.get("destination_url") or seed_data.get("destination_url") or ""
             canonical_url = row_dict.get("canonical_url") or seed_data.get("canonical_url") or destination_url
@@ -4627,6 +4977,38 @@ async def _handle_offers_resolve(
             # offer. It also read anything outside three spellings ("unknown", "Out of stock",
             # schema.org URLs) as in stock.
             _seed_stock = seed_stock(row_dict, seed_data)
+
+            # ONE OFFER PER SELLER LISTING when the caller names no variant. This op compares
+            # SELLERS; a listing's shades and sizes are one seller's options, not competing
+            # offers. It used to fan out `variants[:min(12, limit)]`, so a single-seller blush
+            # came back as five "offers" -- five shades of rarebeauty.com -- and the gateway's
+            # `best_offer` was whichever shade happened to be first (live 2026-10-14). The one
+            # offer carries the seed's own variant (`_representative_seed_variant`) for its cart
+            # link, and every variant as `variants` so the agent can see the options and name one
+            # (`product.sku_id`) for its link. A named variant still gets exactly that variant.
+            variant_options: Optional[List[Dict[str, Any]]] = None
+            variant_count = 0
+            if not sku_id:
+                representative = _representative_seed_variant(variants, row_dict, seed_data, _seed_stock)
+                matched_variants = [representative] if representative is not None else []
+                if len(variants) > 1:
+                    variant_count = sum(1 for v in variants if _seed_offer_variant_id(v))
+                    variant_options = _seed_variant_options_summary(
+                        variants,
+                        _seed_stock,
+                        fallback_currency=_observed_currency(
+                            row_dict.get("price_currency"), seed_data.get("price_currency")
+                        ),
+                    )
+
+            # WHAT A NAMED VARIANT GOT. `exact`: the caller's sku_id is one of this listing's stored variants,
+            # so the offer IS that variant (with or without a cart). `fallback`: it is not, and the offer below
+            # is the listing at its row price, selling no particular variant. The gateway keeps only `exact`
+            # offers for a named variant (PIVOTA-Agent #2438); without this it could only trust a cart, and a
+            # sold-out, non-Shopify or referral-only seller of the variant has none.
+            variant_match = ("exact" if matched_variants else "fallback") if sku_id else None
+            if not matched_variants:
+                matched_variants = [{}]
 
             # ONCE per seed, not once per variant. This is an agent-facing
             # resolve path and matched_variants can be long; a lookup inside
@@ -4655,7 +5037,9 @@ async def _handle_offers_resolve(
             # try around the derivation is what turned a programming error
             # into silence last time.
             _open_recovery_tasks: List[Dict[str, Any]] = []
-            if _seed_merchant_id:
+            if _seed_merchant_id in _recovery_tasks_memo:
+                _open_recovery_tasks = _recovery_tasks_memo[_seed_merchant_id]
+            elif _seed_merchant_id:
                 try:
                     from db.merchant_tasks import list_open_recovery_tasks
 
@@ -4672,10 +5056,14 @@ async def _handle_offers_resolve(
                     # through click_id -> commerce_interactions row, so this
                     # costs a shortcut, never a sale.
                     _open_recovery_tasks = []
+                _recovery_tasks_memo[_seed_merchant_id] = _open_recovery_tasks
 
             for v in matched_variants:
                 vid = _seed_offer_variant_id(v) or (sku_id or "∅")
                 offer_id = f"of:external_seed:{seed_id}:{vid}"
+                # PER OFFER: a gateway live read may unlock this one offer (below), never its siblings.
+                offer_requires_live_verification = requires_live_verification
+                live_claims: Optional[offer_live_verification.LiveVerificationClaims] = None
                 if offer_id in seen_external_offer_ids:
                     continue
                 seen_external_offer_ids.add(offer_id)
@@ -4692,6 +5080,10 @@ async def _handle_offers_resolve(
                 )
                 if price_amount is None:
                     price_amount = _coerce_float(row_dict.get("price_amount") or seed_data.get("price_amount") or 0) or 0.0
+                if _buyer_currency and str(currency or "").strip().upper() != _buyer_currency:
+                    _dropped_key = str(currency or "").strip().upper() or "none"
+                    _buyer_currency_dropped[_dropped_key] = _buyer_currency_dropped.get(_dropped_key, 0) + 1
+                    continue
 
                 # The variant's own signal only while the fresh column does not contradict the
                 # stored variants; otherwise the seed's claim. None = unknown, and an unknown
@@ -4716,13 +5108,42 @@ async def _handle_offers_resolve(
                     # NARROWER on purpose — see `_seed_variant_identity_claim`. A SKU may match
                     # a candidate; it may not refuse one.
                     named_variant_id=_seed_variant_identity_claim(v),
+                    # The stored entry this offer IS (by object): an id-less entry on a
+                    # multi-variant seed is not "product grain" (final review of #2622). The `[{}]`
+                    # fallback of an unmatched name is no stored entry: it keeps the named path,
+                    # which #2628's `_cart_is_the_named_offer` already guards.
+                    offer_variant=v if v else None,
                 )
                 redirect_identity = _external_seed_redirect_identity(
                     row=row_dict,
                     seed_data=seed_data,
                     offer_variant_id=_seed_offer_variant_id(v) or None,
                     handover=_handover,
+                    # THE ENTRY ITSELF, so the attached-variant rule identifies this offer by
+                    # object, not by an id string two stored variants may share or both lack.
+                    offer_variant=v,
                 )
+                # A NAMED VARIANT'S CART IS ITS OWN, OR THERE IS NONE. Every cart source above
+                # can answer for the PRODUCT -- the operator's seed-wide `attached_variant_id`,
+                # a sole catalog row, a sole stamped snapshot entry -- and a name no stored entry
+                # backs reaches them as the `[{}]` fallback, i.e. as a product-grain offer with
+                # no id to refuse on. Adversarial review of #2622 (2026-10-14): `sku_id=...002`
+                # answered `cart_url=/cart/...000:1` beside `variant_match: exact`; #2623 closed
+                # the stored-sibling road, the fallback road stayed open. So, once, after all of
+                # them: with a variant named, the cart id must be one of THIS offer's own ids
+                # (`_named_offer_own_ids`), else the offer ships as a referral, signed so the
+                # warm lane cannot rebuild a cart at click time (its rebuild names no variant).
+                # The preflight below then asks about the cart we would hand over, not another
+                # variant's id. No variant named: untouched.
+                _variant_declined = bool(sku_id) and not _cart_is_the_named_offer(
+                    redirect_identity.get("cart_variant_id"),
+                    seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                )
+                if _variant_declined:
+                    _variant_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
                 # PREFLIGHT — wherever we can NAME the variant, and ONCE per distinct question.
                 #
                 # #2151 MOVED THIS GATE OFF `cart_variant_id`, and the move is the point of the
@@ -4768,6 +5189,72 @@ async def _handle_offers_resolve(
                 # that ships prefilled carts today. The union restores it and keeps the
                 # widening.
                 _handover_id = _handover.variant_id if _handover is not None else None
+                if sku_id and not _cart_is_the_named_offer(
+                    _handover_id, seed_data=seed_data, offer_variant=v, named_variant_id=sku_id,
+                    product_key=_handover_product_key(row_dict, seed_data),
+                    product_id=_seed_source_product_id(row_dict, seed_data),
+                ):
+                    _handover_id = None
+                # A GATEWAY LIVE READ UNLOCKS A FLAGGED OFFER (services/offer_live_verification).
+                # Only an offer this answer would return flagged for freshness alone, and only by a
+                # verified token naming this seed, the id the flag would ask the caller to look up
+                # (`lookup_variant_id`, the named variant's entry when a sku_id is named), the
+                # declared market and its currency (the offer's own) -- and, when the normal path
+                # would build a cart, a cart on that same id: the read vouches for `vid` alone.
+                # Then, for THIS answer only, the offer is unflagged at the live price and stock and
+                # the normal cart path below runs unchanged: preflight, stock decline,
+                # purchasability gate, `cart_country` pin. Anything else leaves it flagged, as before.
+                # (Here, after `_handover_id`, so the fallback below can defer to it.)
+                if offer_requires_live_verification:
+                    live_claims = _live_assertions.match(
+                        seed_id,
+                        lookup_variant_id=_live_lookup_variant_id(v),
+                        market=market_hint,
+                        buyer_currency=_buyer_currency,
+                        offer_currency=currency,
+                        cart_variant_id=redirect_identity.get("cart_variant_id"),
+                        # The stores this offer is: the cart's host, and the merchant_domain it
+                        # publishes (computed as `offer_spec` computes it below).
+                        offer_hosts=(
+                            redirect_identity.get("shop_domain") or str(canonical_url or destination_url),
+                            redirect_identity.get("shop_domain")
+                            or row_dict.get("domain")
+                            or seed_data.get("domain")
+                            or str(canonical_url or destination_url),
+                        ),
+                    )
+                    if live_claims is not None:
+                        offer_requires_live_verification = None
+                        price_amount = live_claims.a
+                        in_stock = live_claims.av
+                        # NO CART IDENTITY ON THE NORMAL PATH: the read's own `vid` is the cart
+                        # variant. It is merchant-authoritative -- the gateway looked up
+                        # gid://shopify/ProductVariant/<vid> on the store's own UCP endpoint, checked
+                        # the answer's handle is this offer's product and its currency the market's.
+                        # Stronger than a catalog row or a seed stamp, but only for the STORE it read:
+                        # a variant id is per Shopify store, so `h` must be the host the cart is built
+                        # on. Never over another id the normal path names (the hand-over resolver's;
+                        # a different cart id was already refused above), never a cart the storefront
+                        # cannot take (`resolve_cart_permalink`, so `execution_spec.variant_id` stays
+                        # null exactly when `cart_url` is), and for a named variant only its own id.
+                        # The read is Shopify evidence for `h`, for this offer only
+                        # (`_live_cart_identity`). The cart path below then runs unchanged on it.
+                        _live_identity = _live_cart_identity(
+                            live_claims,
+                            redirect_identity=redirect_identity,
+                            destination_url=str(canonical_url or destination_url),
+                            handover_variant_id=_handover_id,
+                        )
+                        if _live_identity is not None and (
+                            not sku_id
+                            or _cart_is_the_named_offer(
+                                live_claims.vid, seed_data=seed_data, offer_variant=v,
+                                named_variant_id=sku_id,
+                                product_key=_handover_product_key(row_dict, seed_data),
+                                product_id=_seed_source_product_id(row_dict, seed_data),
+                            )
+                        ):
+                            redirect_identity = _live_identity
                 _cart_vid = redirect_identity.get("cart_variant_id")
                 # The id the gate asks about: the resolved one when we have it, otherwise the
                 # one the buyer would actually be handed. Never both, never None while a cart
@@ -4794,7 +5281,18 @@ async def _handle_offers_resolve(
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
-                if _gate_vid and checkout_preflight.is_enabled():
+                # A FLAGGED offer gets no cart (below), so it is never a hand-over to preflight: asking
+                # would spend the shared budget a later fresh offer's cart needs (review of #2629).
+                # A DRY RUN (the gateway's shadow second pass, never handed out) spends no merchant
+                # egress and writes no observation row -- unless the preflight is ENFORCING, where it
+                # changes the answer and the dry run must answer identically. Off or shadow, it never
+                # changes what a buyer is handed, so skipping it changes nothing but its coverage.
+                if (
+                    _gate_vid
+                    and not offer_requires_live_verification
+                    and checkout_preflight.is_enabled()
+                    and not (_live_dry_run and checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE)
+                ):
                     _preflight_stats["gated"] += 1
                     _q = (str(canonical_url or destination_url), str(_gate_vid))
                     if _q in _preflight_memo:
@@ -4855,6 +5353,29 @@ async def _handle_offers_resolve(
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
+                # THE OFFER'S OWN STOCK — no cart for an item this same answer calls sold out.
+                # `in_stock` above is what this offer PUBLISHES; with no check here a seed whose
+                # fresh column said out_of_stock shipped `in_stock: false` beside a prefilled
+                # `cart_permalink` (prod 2026-10-14, tangleangel_gb_6826386948176, market GB):
+                # the preflight is shadow-only and the purchasability gate is about the merchant
+                # x market, so nothing between the two ever read the item's stock. Only an
+                # explicit False declines; unknown (None) keeps the cart, the asymmetry every
+                # serving gate here applies (`services/external_seed_stock`). A decline takes the
+                # purchasability road: null the cart id before the mint, so the mint, the
+                # published spec and `cart_prefilled` all follow from the one value, and sign it
+                # into the token so the warm lane cannot rebuild the cart at click time. It runs
+                # BEFORE the purchasability gate so a cart that will not be built never asks the
+                # fact table.
+                _stock_declined = in_stock is False and bool(redirect_identity.get("cart_variant_id"))
+                if _stock_declined:
+                    _stock_stats["declined"] += 1
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+                if offer_requires_live_verification:
+                    # NOTHING the stale read says is claimed: no cart (a cart is a claim that this
+                    # variant is buyable at this price now), no stock flag. The caller verifies live.
+                    in_stock = None
+                    redirect_identity = {**redirect_identity, "cart_variant_id": None}
+
                 # MERCHANT PURCHASABILITY — would this cart land a buyer on a store the fact
                 # says cannot take their card in this market? Asked on the cart the mint WOULD
                 # build (the same `resolve_cart_permalink` it calls, on the same inputs), so a
@@ -4878,6 +5399,16 @@ async def _handle_offers_resolve(
                 # merchant's order, and on the `cart_url` / `pdp_url` we publish below — if the
                 # builder minted its own, the agent's lane and the /r hop would be two different
                 # clicks and the order-side join would silently split.
+                # A NAMED VARIANT'S LINK NEVER BECOMES A GUESSED CART AT CLICK TIME. Whatever left
+                # it without a cart -- the guard above, no resolvable id for that variant (the common
+                # case), a preflight refusal, the stock or purchasability gate -- the warm lane would
+                # upgrade the PDP into a cart built from the product handle alone, i.e. for whichever
+                # variant the storefront picks (`resolve_warm_handoff` sends no variant and can send
+                # none). Review of this change found that road open for every cartless named offer,
+                # not only the ones the guard declined. Product-grain links (no `sku_id`) keep the
+                # lane: the buyer has not chosen, which is what it was built for.
+                _named_without_cart = bool(sku_id) and not redirect_identity.get("cart_variant_id")
+
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -4900,6 +5431,14 @@ async def _handle_offers_resolve(
                         **({"skuId": sku_id} if sku_id else {}),
                         **({"productId": product_id} if product_id else {}),
                         **({PURCHASABILITY_TIER_KEY: _purchasability_tier} if _purchasability_tier else {}),
+                        **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if _stock_declined else {}),
+                        # Flagged offers: the warm lane must not build the cart the mint withheld.
+                        **(
+                            {LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED}
+                            if offer_requires_live_verification
+                            else {}
+                        ),
+                        **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -4910,6 +5449,8 @@ async def _handle_offers_resolve(
                     seller_ref=redirect_identity["seller_ref"],
                     seed_kind=redirect_identity["seed_kind"],
                     issued_clicks=_issued_clicks,
+                    # The BUYER's market (the request's), never the row's listing market.
+                    cart_country=market_hint,
                 )
                 if not redirect_url:
                     continue
@@ -4941,6 +5482,9 @@ async def _handle_offers_resolve(
                     cart_variant_id=redirect_identity.get("cart_variant_id"),
                     click_id=stable_click_id,
                     recovery_key=_recovery_key,
+                    # The SAME pin `_make_external_redirect_url` applied to the link it signed,
+                    # from the same two inputs, so the published cart is the signed destination.
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -4957,6 +5501,9 @@ async def _handle_offers_resolve(
                     # from the very token the click will carry.
                     redirect_url=redirect_url,
                     purchasability_tier=_purchasability_tier,
+                    stock_declined=_stock_declined,
+                    live_verification_required=bool(offer_requires_live_verification),
+                    variant_declined=_named_without_cart,
                 )
 
                 offer_spec = {
@@ -5030,6 +5577,20 @@ async def _handle_offers_resolve(
                         "join_mode": composed_spec["join_mode"],
                     },
                 }
+                if (
+                    live_claims is not None
+                    and live_claims.av
+                    and _cart_pinned_to(composed_spec["cart_url"], live_claims.m)
+                ):
+                    # The item total the gateway's live read just quoted (`apply_verdicts` shape), so
+                    # an agent can abort on a mismatch. Item total for quantity 1, never a landed
+                    # cost; valid for the verified-total window from the moment of the read. ONLY
+                    # beside a cart that survived every gate (preflight, stock, purchasability) and is
+                    # pinned to the read's market: the total is a claim about THAT checkout.
+                    offer_spec["expected_item_total"] = live_claims.a
+                    offer_spec["expected_currency"] = live_claims.c
+                    offer_spec["expected_quantity"] = 1
+                    offer_spec["expected_total_expires_at"] = live_claims.expected_total_expires_at
 
                 title = (
                     v.get("title")
@@ -5142,11 +5703,45 @@ async def _handle_offers_resolve(
                         "execution_spec": offer_spec,
                         "internal_checkout_items": None,
                         "confidence": confidence,
+                        **(
+                            {
+                                "variant_count": variant_count,
+                                # A flagged offer's options are the same stale read: no stock claim,
+                                # prices marked stale (the caller's live read replaces what it reads).
+                                "variants": (
+                                    _stale_variant_options(variant_options)
+                                    if offer_requires_live_verification
+                                    else _live_verified_variant_options(variants, variant_options, live_claims)
+                                    if live_claims is not None
+                                    else variant_options
+                                ),
+                            }
+                            if variant_options
+                            else {}
+                        ),
+                        **(
+                            {
+                                "requires_live_verification": {
+                                    "reasons": offer_requires_live_verification,
+                                    # The stored price is the last page read's, older than 7 days
+                                    # or never stamped: shown only after a live read confirms it.
+                                    "price_stale": True,
+                                    # The id the caller's live read looks up (the offer has no
+                                    # cart, so `execution_spec.variant_id` is null): the offer's
+                                    # own stored variant, when it names exactly one.
+                                    "lookup_variant_id": _live_lookup_variant_id(v),
+                                },
+                            }
+                            if offer_requires_live_verification
+                            else {}
+                        ),
+                        **({"live_verification": live_claims.published()} if live_claims is not None else {}),
                         "source": {
                             "type": "external_seed",
                             "seed_id": seed_id,
                             "external_product_id": row_dict.get("external_product_id") or seed_data.get("external_product_id"),
                             "variant_id": vid,
+                            **({"variant_match": variant_match} if variant_match else {}),
                             "title": title,
                             "image_url": _seed_image_url(row_dict, seed_data),
                             "canonical_url": canonical_url,
@@ -5155,7 +5750,8 @@ async def _handle_offers_resolve(
                         },
                     }
                 )
-                if len(external_offers) >= limit:
+                # Only offers that need no live check fill the lane: a flagged one may yet be withheld.
+                if sum(1 for o in external_offers if not o.get("requires_live_verification")) >= limit:
                     return
 
     # 1) External offers from external seeds (affiliate outbound)
@@ -5286,31 +5882,10 @@ async def _handle_offers_resolve(
                 if seed_rows:
                     query_label = "external_seed_by_canonical_attached_prefetch"
 
-        if not seed_rows and product_id_aliases:
-            pid_clause: List[str] = []
-            for idx, pid_alias in enumerate(product_id_aliases[:8]):
-                pid_key = f"pid_{idx}"
-                like_key = f"pid_like_{idx}"
-                params[pid_key] = pid_alias
-                params[like_key] = f"%{_safe_lower(pid_alias)}%"
-                pid_clause.append(
-                    "("
-                    f"external_product_id = :{pid_key}"
-                    f" OR LOWER(COALESCE(title,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(canonical_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(COALESCE(destination_url,'')) LIKE :{like_key}"
-                    f" OR LOWER(CAST(seed_data AS TEXT)) LIKE :{like_key}"
-                    ")"
-                )
-            where_clauses.append("(" + " OR ".join(pid_clause) + ")")
-
-        if not seed_rows and sku_id_aliases:
-            sku_clause: List[str] = []
-            for idx, sku_alias in enumerate(sku_id_aliases[:8]):
-                key = f"sku_like_{idx}"
-                params[key] = f"%{_safe_lower(sku_alias)}%"
-                sku_clause.append(f"LOWER(CAST(seed_data AS TEXT)) LIKE :{key}")
-            where_clauses.append("(" + " OR ".join(sku_clause) + ")")
+        if not seed_rows:
+            fuzzy_clauses, fuzzy_params = _fuzzy_seed_ref_clauses(product_id_aliases, sku_id_aliases)
+            where_clauses += fuzzy_clauses
+            params.update(fuzzy_params)
 
         if not seed_rows and len(where_clauses) == 1:
             return {
@@ -5934,6 +6509,83 @@ async def _handle_offers_resolve(
                 query="external_seed_by_internal_identity",
             )
 
+    # GROUP SIBLINGS (cross-merchant matching M2, OFFERS_RESOLVE_GROUP_SEED_SIBLINGS, default OFF).
+    # The catalog arm below widens a listing id to every listing on its content_key, but sources
+    # only `retailer` offers; a brand's offer reaches this answer through the SEED lane, which
+    # resolves the ONE row the caller named. So a retailer listing's id returned the retailer
+    # siblings and no brand. For a RESOLVED group only (`_fetch_resolved_group`: listings proven to
+    # be the same item), this runs the seed lane's own lookups for the other resolved listings and
+    # hands the rows to the SAME `_append_external_offers_from_seed_rows`, so each faces every gate a
+    # direct seed does. An unresolved group -- a brand+title collision -- is answered as before.
+    _group_mode = False
+    _resolved_product_keys: set = set()
+    _matched_catalog_offers: set = set()
+    _matched_seeds: Dict[str, set] = {}
+    _seed_variants_now: Dict[str, List[Dict[str, Any]]] = {}
+    _catalog_sku_keys: Dict[str, Optional[str]] = {}
+    _defaulted_currency_ids: set = set()
+    # Read ONCE per request: "on" runs the lane below; "shadow" answers exactly as "off" and, for a
+    # resolved group only, works out the group answer AFTER this response is built
+    # (`_schedule_group_shadow`, at the return). `_shadow_cks` collects the content keys this
+    # request's own reads already named, so the shadow's resolved-group gate costs no query.
+    _group_flag = _group_seed_siblings_mode()
+    _shadow_cks: set = set()
+    if _group_flag == "on" and not merchant_scope:
+        sibling_started = time.perf_counter()
+        sibling_deadline = sibling_started + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS
+        try:
+            group = await _fetch_resolved_group(
+                database,
+                aliases=[a for a in (product_id_aliases + sku_id_aliases) if a],
+                market_hint=market_hint,
+                deadline=sibling_deadline,
+            )
+            _group_mode = len(group["resolved"]) >= 2
+            if _group_mode:
+                _resolved_product_keys = {str(m["product_key"]) for m in group["resolved"]}
+                _matched_catalog_offers = set(group["matched_offers"])
+                _matched_seeds = dict(group["matched_seeds"])
+                # Each seed's stored variants NOW: a seed matched as a whole (variant_id null) stays
+                # comparable only while it is still one sellable unit, and a named match is read
+                # against the stored entry under every spelling the seed lane reads.
+                _seed_variants_now = {
+                    str(r.get("id") or ""): _seed_variants(_ensure_seed_data_obj(r.get("seed_data")))
+                    for r in group["rows"]
+                }
+                held_hosts: set = set()
+                for prior in external_offers:
+                    held_hosts |= _offer_hosts(prior)
+                to_gate, skipped = _sibling_rows_to_gate(
+                    group["rows"], considered=_considered_seed_ids, held_hosts=held_hosts,
+                )
+                prior_count = len(external_offers)
+                await _append_external_offers_from_seed_rows(to_gate, sibling=True, deadline=sibling_deadline)
+                deduped = _dedupe_sibling_offers_by_host(external_offers, prior_count)
+                _record_source(
+                    source="external_product_seeds_group_siblings",
+                    status="ok" if to_gate else "empty",
+                    reason_code="ok" if to_gate else "no_candidates",
+                    source_started=sibling_started,
+                    row_count=len(group["rows"]),
+                    query="external_seed_by_resolved_group",
+                    extra={"members": len(group["members"]), "resolved": len(group["resolved"]),
+                           "gated": len(to_gate), "skipped": skipped, "deduped": deduped,
+                           "emitted": len(external_offers) - prior_count,
+                           **({"no_named_variant": _sibling_lane["no_named_variant"]}
+                              if _sibling_lane["no_named_variant"] else {}),
+                           **({"deadline_hit": True} if _sibling_lane["deadline_hit"] else {})},
+                )
+        except Exception as e:
+            logger.info("offers.resolve.external.group_siblings.failed", extra={"error": str(e)})
+            _record_source(
+                source="external_product_seeds_group_siblings",
+                status="error",
+                reason_code=_classify_db_reason_code(e),
+                source_started=sibling_started,
+                error=type(e).__name__,
+                query="external_seed_by_resolved_group",
+            )
+
     # CATALOG OFFERS — the third source, and the one that holds the retailer competition.
     #
     # WHAT WAS DARK. This handler sources internal offers from `products_cache` and external
@@ -5989,89 +6641,30 @@ async def _handle_offers_resolve(
     try:
         ident_aliases = [a for a in (product_id_aliases + sku_id_aliases) if a]
         catalog_rows = []
+        # FRESH PRICE FIRST, in a merged group only (see `_catalog_price_freshness_sql`): empty
+        # fragments and no extra bind otherwise, so every other statement is the one main sends.
+        _price_select, _price_order, _price_params = (
+            await _catalog_price_freshness_sql() if _group_mode else ("", "", {})
+        )
+        if _group_mode:
+            # The offer's SKU, so a verdict's (offer_id, sku_key) pair can be checked whole.
+            _price_select += "\n                           o.sku_key AS sku_key,"
         if ident_aliases:
             catalog_rows = await asyncio.wait_for(
                 database.fetch_all(
-                    """
-                    SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
-                           o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
-                           o.price_confidence, o.updated_at,
-                           coalesce(o.merchant_effective_price, o.estimated_best_price,
-                                    o.list_price) AS price_amount,
-                           coalesce(o.offer_payload->>'destination_url', o.source_ref)
-                               AS destination_url,
-                           m.merchant_name AS merchant_name,
-                           p.content_key AS content_key
-                      FROM catalog_products p
-                      JOIN catalog_offers o ON o.product_key = p.product_key
-                      LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
-                     WHERE p.product_key IN (
-                           SELECT d.product_key FROM catalog_products d
-                            WHERE d.pivota_signature_id = ANY(:aliases)
-                               OR d.content_key = ANY(:aliases)
-                               OR d.product_key = ANY(:aliases)
-                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
-                           -- widens to every listing sharing its content_key, so asking by
-                           -- ANY seller's listing returns every seller of the product — the
-                           -- same set a `ck_` id already returns. Without this the second
-                           -- retailer is reachable only by a content_key that search, the PDP
-                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
-                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
-                           -- The anchor must itself be live: a withdrawn listing id answers
-                           -- nothing, exactly as it did before this widening.
-                           UNION
-                           SELECT s.product_key
-                             FROM catalog_products a
-                             JOIN catalog_products s ON s.content_key = a.content_key
-                            WHERE (a.pivota_signature_id = ANY(:aliases)
-                                   OR a.product_key = ANY(:aliases))
-                              AND a.content_key IS NOT NULL
-                              AND a.suppressed_at IS NULL
-                              AND a.suppression_reason IS NULL)
-                       -- The PRODUCT's own suppression, not just the offer's. Every serving
-                       -- read in services/pivot_query_service.py applies this pair, and
-                       -- scripts/withdraw_catalog_rows.py takes a product down by setting
-                       -- exactly these — so without it a withdrawn product still ships its
-                       -- retailer offer here, and the takedown silently misses this lane.
-                       AND p.suppressed_at IS NULL
-                       AND p.suppression_reason IS NULL
-                       -- Market, mirroring the seed lane at the attached-ref query above.
-                       -- Latent today (the gateway sends no market and the retailer ingest
-                       -- writes 'US'), and live the moment a caller passes market=KR.
-                       AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
-                       AND o.offer_type = 'retailer'
-                       AND o.offer_mode = 'redirect'
-                       AND o.suppressed_at IS NULL
-                       AND coalesce(o.merchant_effective_price, o.estimated_best_price,
-                                    o.list_price) > 0
-                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
-                           IS NOT NULL
-                     -- IN STOCK FIRST, then price, and BEFORE the LIMIT. Price alone put
-                     -- eyurs.com $13 out_of_stock ahead of sokoglam.com $19.50 in_stock (prod,
-                     -- 2026-09-18), and because the LIMIT cuts this list it could also drop
-                     -- the only in-stock seller for cheaper ones that cannot sell — measured
-                     -- the same day on 6 content_keys at limit 1 or 2. Unknown ranks with in
-                     -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
-                     -- order matches the `in_stock` flag computed below. `offer_id` makes a
-                     -- price tie cut the same way every time.
-                     -- The btrim set is the common ASCII whitespace (space, tab, newline,
-                     -- CR, FF, VT), so a tab- or newline-padded value sorts the way its flag
-                     -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
-                     -- (NBSP); a value padded with those would still sort as sellable while
-                     -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
-                     ORDER BY (lower(btrim(coalesce(o.availability, ''),
-                                           E' \t\n\r\f\v'))
-                               = ANY(:unavailable)) ASC,
-                              price_amount ASC,
-                              o.offer_id ASC
-                     LIMIT :limit
-                    """,
+                    # The statement text is built by `_catalog_offers_statement`, which the group
+                    # shadow (`_group_shadow_answer`) sends too: one statement, never two copies.
+                    _catalog_offers_statement(_price_select, _price_order),
                     {"aliases": ident_aliases, "limit": max(limit, 1),
                      "market": market_hint,
-                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES)},
+                     "buyer_currency": _declared_buyer_currency(market_hint),
+                     "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+                     **_price_params},
                 ),
                 timeout=min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0),
             )
+            if _group_flag == "shadow":
+                _shadow_cks.update(str(_row_to_dict(row).get("content_key") or "") for row in catalog_rows or [])
 
         # Hosts the seed lane already claimed. Read from `source`, which carries the raw
         # destination — `affiliate_url` is a signed /r link and every one of them shares OUR
@@ -6140,60 +6733,12 @@ async def _handle_offers_resolve(
             if not redirect_url:
                 unattributed += 1
 
-            availability = str(r.get("availability") or "").strip() or None
-            price_amount = r.get("price_amount")
-            external_offers.append(
-                {
-                    "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
-                    # Both spellings — see SHAPE above.
-                    "merchant_id": offer_merchant,
-                    "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
-                    "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
-                    "price": float(price_amount) if price_amount is not None else None,
-                    "currency": str(r.get("currency") or "USD").strip() or "USD",
-                    "availability": availability,
-                    "in_stock": not availability_is_known_unavailable(availability),
-                    "url": destination,
-                    "purchase_route": "affiliate_outbound",
-                    # NEVER the raw destination under this key. `affiliate_url` MEANS an
-                    # attributed `/r` link: the gateway's sanitizer only passes it verbatim
-                    # when it matches the signed-token shape, and everything else goes
-                    # through the normal scrub — so an unsigned value here is both a
-                    # mislabel and liable to be rewritten. `_make_external_redirect_url`
-                    # declines for exactly one reachable reason, an allowlist refusal, and
-                    # that is a serving decision: the offer stays visible under `url`, the
-                    # signed key stays honest at None, and the shortfall is counted.
-                    "affiliate_url": redirect_url,
-                    # UNKNOWN, stated as such. A retailer destination is a product page as far
-                    # as we know; `null` is the vocabulary's "we do not know", and claiming
-                    # `false` would license an agent to tell a buyer what they will land on.
-                    "cart_prefilled": None,
-                    "internal_checkout_items": None,
-                    # PRODUCT grain, like the seed lane's own 0.8. The identity match is
-                    # exact, but a retailer offer names a product page, not a variant — and
-                    # 1.0 is what this handler reserves for a SKU-level match. Claiming it
-                    # here would outrank a seed offer that really did match a variant.
-                    "confidence": 0.8,
-                    **({"price_confidence": r.get("price_confidence")}
-                       if r.get("price_confidence") is not None else {}),
-                    **({"updated_at": r.get("updated_at")}
-                       if r.get("updated_at") is not None else {}),
-                    "source": {
-                        "type": "catalog_offer",
-                        "offer_id": str(r.get("offer_id") or ""),
-                        "product_key": str(r.get("product_key") or ""),
-                        "content_key": str(r.get("content_key") or ""),
-                        "merchant_id": offer_merchant,
-                        # `live_offer_verification._target` reads
-                        # `source.canonical_url or source.destination_url`; without one of
-                        # them every offer from this arm is UNVERIFIED "no_verifiable_url".
-                        "destination_url": destination,
-                        "offer_type": str(r.get("offer_type") or ""),
-                        "is_first_party": bool(r.get("is_first_party")),
-                        "readiness_tier": str(r.get("readiness_tier") or ""),
-                    },
-                }
-            )
+            if _group_mode:
+                _catalog_sku_keys[f"of:catalog_offer:{r.get('offer_id')}"] = r.get("sku_key")
+            if _group_mode and not str(r.get("currency") or "").strip():
+                # The row states no currency, so none ships below: no best price on it.
+                _defaulted_currency_ids.add(f"of:catalog_offer:{r.get('offer_id')}")
+            external_offers.append(_catalog_offer_entry(r, group_mode=_group_mode, redirect_url=redirect_url))
             if catalog_rows:
                 mapping_candidates.append(
                     _conf(
@@ -6229,12 +6774,43 @@ async def _handle_offers_resolve(
             query="catalog_offers_by_canonical_identity",
         )
 
+    if _group_mode:
+        _mark_price_stale(external_offers)
     # T2-4 (decision #3 — index neutrality): rank internal (buy-here) and external (referred)
     # offers MERIT-FIRST in one list, never by integration status (was: internal-first block).
     offers = _rank_offers_merit_first(internal_offers + external_offers)
+    # FLAGGED OFFERS LAST. One flagged `requires_live_verification` is served only if the caller's live
+    # read verifies it, and not every store can be read: ahead of a fresh offer it could take the slot
+    # that fresh offer would have filled and leave the buyer nothing (review of #2629). Stable, so
+    # the merit order holds within each half.
+    offers = [o for o in offers if not o.get("requires_live_verification")] + [
+        o for o in offers if o.get("requires_live_verification")
+    ]
+    # THE BUYER'S CURRENCY, BEFORE THE CUT. With a declared market, an offer priced in another
+    # currency (a GBP or KRW seed, an SGD sibling) is not an offer this buyer can take at that
+    # price, and ranking compares raw amounts across currencies. Filtering after `limit` let
+    # foreign rows take the slots and left the buyer fewer offers than exist; the gateway filters
+    # its projection too (PIVOTA-Agent#2435) but can only see what survived this cut. An offer
+    # with no currency is withheld under a declared market, as the gateway does. No market
+    # declared: nothing changes. A market the registry does not list: nothing changes either --
+    # that is not this filter's question (see market_registry).
+    offers, buyer_currency_filtered = _offers_in_buyer_currency(offers, market_hint)
+    for _code, _n in _buyer_currency_dropped.items():
+        buyer_currency_filtered[_code] = buyer_currency_filtered.get(_code, 0) + _n
     # HOST-DIVERSE, not merely top-N — see _host_diverse_head. A plain [:limit] lets one seller's
     # variant fan-out truncate away every competing merchant, which is the one thing this op is for.
-    offers = _host_diverse_head(offers, limit)
+    # Fresh offers fill the head first; FLAGGED ones (served only if the caller's live read verifies
+    # them) only fill what is left -- the head's one-per-host pass would otherwise let a flagged
+    # offer on a new host take a second fresh offer's slot (review round 2 of #2629).
+    _fresh = [o for o in offers if not o.get("requires_live_verification")]
+    _flagged = [o for o in offers if o.get("requires_live_verification")]
+    if _group_mode:
+        # A MERGED GROUP RANKS FRESH PRICES FIRST: a `price_stale` offer (a catalog price never
+        # read, or read over 7 days ago) keeps its place in the list, behind every fresh one.
+        _fresh = [o for o in _fresh if not o.get("price_stale")] + [o for o in _fresh if o.get("price_stale")]
+    offers = _host_diverse_head(_fresh, limit)
+    if _flagged and len(offers) < limit:
+        offers = offers + _host_diverse_head(_flagged, limit - len(offers))
 
     # LIVE VERIFICATION (audit item 6). Ranking decides WHICH offers we would hand over; this
     # decides whether the top few are still true. It runs AFTER the truncation on purpose — the
@@ -6260,6 +6836,10 @@ async def _handle_offers_resolve(
             offers = live_offer_verification.apply_verdicts(offers, verdicts)
         except Exception as exc:  # noqa: BLE001
             logger.warning("live offer verification failed; serving unverified: %s", exc)
+    if _group_mode:
+        # FRESH AHEAD OF STALE in what ships (contract line 5): the host-diverse head can lift a stale
+        # offer on a new host above a fresh second offer of a held one, and verification reorders.
+        offers = [o for o in offers if not o.get("price_stale")] + [o for o in offers if o.get("price_stale")]
 
     # ADR-025 D1: record the click ids of the links this response ACTUALLY hands out, with the
     # agent they were issued to. Here, after every lane (including the retry lanes and the
@@ -6268,7 +6848,36 @@ async def _handle_offers_resolve(
     # FAIL OPEN: a failed write is logged and the links are served anyway; losing a click record
     # must never take down search. `/r` still records a click on a link whose issue was lost (as
     # a legacy row, issued_at NULL), so the funnel under-counts issues, never clicks.
-    await _issue_served_clicks(_issued_clicks, offers, caller_api_key, caller_assertion)
+    #
+    # A LIVE-VERIFICATION SECOND PASS issues only what the gateway can adopt from it. The gateway
+    # re-asks with `live_verifications` and takes ONLY the offers this answer unlocked (they carry
+    # `live_verification`); every other link in the answer is never handed to anyone, so recording it
+    # as issued would be a phantom row. And a dry run (the gateway's shadow mode) adopts nothing.
+    # Keyed on tokens SENT, not accepted: when none is accepted (no secret mid-rollout, a rotation
+    # mismatch, expiry, a host/market/currency mismatch) the gateway serves its FIRST pass, so not one
+    # link of this answer is handed out. (In `on` mode each adopted offer still leaves one first-pass
+    # issued row whose link was replaced: inherent to the two-pass design.)
+    if _live_dry_run:
+        _issuable_offers: List[Dict[str, Any]] = []
+    elif _live_assertions.entries:
+        _issuable_offers = [o for o in offers if isinstance(o, dict) and o.get("live_verification")]
+    else:
+        _issuable_offers = offers
+    await _issue_served_clicks(_issued_clicks, _issuable_offers, caller_api_key, caller_assertion)
+    # BEST PRICE in a resolved group: the COMPARABLE set (`_price_comparable_offers`), each member
+    # marked `price_comparable: true`, and the cheapest of it. Nothing marked outside a group.
+    _best_price = None
+    if _group_mode:
+        _comparable = _price_comparable_offers(
+            offers, market_hint=market_hint, named_variant=bool(sku_id),
+            resolved_product_keys=_resolved_product_keys,
+            matched_catalog_offers=_matched_catalog_offers, catalog_sku_keys=_catalog_sku_keys,
+            matched_seeds=_matched_seeds, seed_variants=_seed_variants_now,
+            defaulted_currency_ids=_defaulted_currency_ids,
+        )
+        for _offer in _comparable:
+            _offer["price_comparable"] = True
+        _best_price = _best_price_of(offers, _comparable)
 
     # RECONCILE resolution_mode AGAINST WHAT ACTUALLY SHIPS. Everything above describes
     # what we RESOLVED; `offers` is what the caller RECEIVES, and the two diverge twice:
@@ -6424,6 +7033,10 @@ async def _handle_offers_resolve(
         " purchasability asked=%d declined=%d" % (
             _cart_purchasability.stats["asked"], _cart_purchasability.stats["declined"],
         ) if _cart_purchasability.stats["declined"] or _cart_purchasability.stats["asked"] else ""
+    ) + (
+        " stock_declined=%d" % _stock_stats["declined"] if _stock_stats["declined"] else ""
+    ) + (
+        " variant_declined=%d" % _variant_stats["declined"] if _variant_stats["declined"] else ""
     )
     logger.info(
         _summary_msg,
@@ -6445,8 +7058,20 @@ async def _handle_offers_resolve(
             **_handover_fields,
         },
     )
+    if _live_assertions.entries:
+        # `utils.logger` ("pivota"): a plain module logger's INFO never reaches prod logs.
+        from utils.logger import logger as _pivota_logger
 
-    return {
+        _pivota_logger.info(
+            "offers_resolve_live_verification_assertions %s",
+            json.dumps(
+                {"product_id": product_id, "sku_id": sku_id, "market": market_hint,
+                 **_live_assertions.counts()},
+                sort_keys=True,
+            ),
+        )
+
+    _response = {
         "status": "success",
         "input": {"product_id": product_id, "sku_id": sku_id},
         "commerce_surface": commerce_surface,
@@ -6456,6 +7081,7 @@ async def _handle_offers_resolve(
         "substitution_reason_codes": substitution_reason_codes,
         "offers": offers,
         "offers_count": len(offers),
+        **({"best_price_offer_id": _best_price["offer_id"]} if _group_mode else {}),
         **({"canonical_product_ref": canonical_ref} if canonical_ref else {}),
         "mapping": {
             "canonical_ref": canonical_ref,
@@ -6494,8 +7120,48 @@ async def _handle_offers_resolve(
             "resolution_mode": resolution_mode,
             "substitution_reason_codes": substitution_reason_codes,
             "servable_reason_codes": surface_not_servable_reason_codes,
+            **(
+                {"buyer_currency_filtered": buyer_currency_filtered}
+                if buyer_currency_filtered
+                else {}
+            ),
+            **({"best_price": _best_price} if _group_mode else {}),
+            # Opted-in callers only: how many freshness-gated seeds (and their offers) came back
+            # flagged `requires_live_verification` instead of being dropped.
+            **(
+                {"live_verification_returned": _live_verification_returned_of(offers)}
+                if _live_verification_opt_in
+                else {}
+            ),
+            # Callers that sent gateway live verifications: what became of each.
+            **(
+                {"live_verification_assertions": _live_assertions.public_counts()}
+                if _live_assertions.entries
+                else {}
+            ),
         },
     }
+    # GROUP SHADOW (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS=shadow). `_response` is the off answer and is
+    # returned untouched. This only SCHEDULES: the work runs after the response has been sent, on a
+    # connection of its own (`_run_group_shadow`), and a request whose content keys name no resolved
+    # group schedules nothing and sends no query. A merchant-scoped call is never widened, so it
+    # has no group answer to compare.
+    if _group_flag == "shadow" and not merchant_scope:
+        _schedule_group_shadow(
+            background_tasks,
+            product_id=product_id,
+            sku_id=sku_id,
+            market_hint=market_hint,
+            limit=limit,
+            aliases=[a for a in (product_id_aliases + sku_id_aliases) if a],
+            content_keys=_shadow_cks,
+            served=offers,
+            internal=internal_offers,
+            external=external_offers,
+            considered_seed_ids=_considered_seed_ids,
+        )
+    return _response
+
 
 class ProductRef(BaseModel):
     merchant_id: str
@@ -8547,6 +9213,1598 @@ def _offer_destination_host(url: Optional[str]) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _declared_buyer_currency(market_hint: Optional[str]) -> Optional[str]:
+    """The currency of the market the caller declared, or None when it declared none or the
+    market registry does not list it (then no currency rule applies)."""
+    if not market_hint:
+        return None
+    entry = market_registry.market_or_none(market_hint)
+    return str((entry or {}).get("currency") or "").strip().upper() or None
+
+
+def _offers_in_buyer_currency(
+    offers: List[Dict[str, Any]], market_hint: Optional[str]
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """(offers priced in the declared market's currency, {dropped currency: count}).
+
+    Unchanged when no market is declared or the registry does not list it."""
+    expected = _declared_buyer_currency(market_hint)
+    if not expected:
+        return offers, {}
+    kept: List[Dict[str, Any]] = []
+    dropped: Dict[str, int] = {}
+    for offer in offers:
+        currency = str((offer or {}).get("currency") or "").strip().upper()
+        if currency == expected:
+            kept.append(offer)
+        else:
+            key = currency or "none"
+            dropped[key] = dropped.get(key, 0) + 1
+    return kept, dropped
+
+
+# ── offers.resolve over a RESOLVED content_key group (cross-merchant matching M2) ──────────────
+#
+# OFF by default (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS). Read per request, so it flips without a
+# restart. With it off -- or on, for a product whose group is not RESOLVED -- the handler returns
+# the bytes it did before.
+#
+# A content_key is sha(brand::title::gtin) and deliberately non-unique: two listings sharing one are
+# a brand+title (or GTIN) collision, not a judgement that they sell the same item -- a 30 ml and a
+# 100 ml of one title land on one key. So sharing a key proves nothing about size, and comparing
+# their prices would call a mini the "best price". A group is RESOLVED, member by member, only on
+# evidence that the listings are the same item, and in phase 1 there is ONE kind of evidence: the
+# MATCHER's verdict. A listing is resolved only when an APPLIED (not reverted) identity-engine move
+# of the cross_merchant_same_size strategy joined it AND that proposal carries a valid
+# `evidence.matcher_verdict` (`_valid_matcher_verdict`: same_size true, a tier, a parsed size, the
+# matched offers). Raw GTIN equality is NOT evidence here: a GTIN is reused across shades and sizes
+# (an OPI lacquer key carries Big Apple Red and Malaga Wine), and the matcher's T0a tier already
+# judges a GTIN with its pollution, validity and same-size checks -- get_offers trusts the verdict.
+# Only resolved listings are siblings; a call naming an unresolved listing is answered as before.
+OFFERS_RESOLVE_GROUP_SEED_SIBLINGS_ENV = "OFFERS_RESOLVE_GROUP_SEED_SIBLINGS"
+# At most this many listings of one content_key are read. Phase 1 merges same-size listings under ONE
+# brand anchor (star topology) and a real group has a handful of hosts; 25 is several times that,
+# while a degenerate key (a placeholder title on hundreds of rows) cannot fan out. The named listing
+# sorts first, so the cut never drops the caller's own row.
+OFFERS_RESOLVE_GROUP_SIBLING_LIMIT = 25
+# Sibling seed rows put through the gates per request, and per destination host. Every gated row can
+# cost a recovery-task read, a preflight and a mint, so the lane is bounded in rows AND in time.
+OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT = 25
+OFFERS_RESOLVE_GROUP_SIBLING_SEEDS_PER_HOST = 2
+# The whole lane's wall clock. Past it, the lane serves what it has and says so (`deadline_hit`).
+OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS = 1.5
+# The strategy name is the engine's (be#2637 adds CROSS_MERCHANT_SAME_SIZE and reserves it for M4);
+# read from there when present so the two can never drift, the literal until then.
+try:
+    from services.identity_resolution import CROSS_MERCHANT_SAME_SIZE as _CROSS_MERCHANT_SAME_SIZE
+except ImportError:  # be#2637 not on this base yet
+    _CROSS_MERCHANT_SAME_SIZE = "cross_merchant_same_size"
+RESOLVED_GROUP_STRATEGIES = (_CROSS_MERCHANT_SAME_SIZE,)
+RESOLVED_GROUP_KINDS = ("attach_membership", "merge_content_key")
+
+
+def _group_seed_siblings_mode() -> str:
+    """"off" | "on" | "shadow", read per request.
+
+    on     -- 1 / true / yes / on (the values `_env_bool` reads as true, unchanged).
+    shadow -- the response is the OFF response, byte for byte; after it is built, a resolved group's
+              group-mode best price is computed off the request path and logged
+              (`_schedule_group_shadow`).
+    off    -- unset, 0 / false / no / off, and ANY other value: an unrecognised spelling is never
+              read as on (as `_env_bool`'s default was) and never as shadow."""
+    raw = (os.getenv(OFFERS_RESOLVE_GROUP_SEED_SIBLINGS_ENV) or "").strip().lower()
+    if raw == "shadow":
+        return "shadow"
+    if raw in {"1", "true", "yes", "on"}:
+        return "on"
+    return "off"
+
+
+def _remaining_timeout(deadline: float, cap: float) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise asyncio.TimeoutError("group sibling budget spent")
+    return max(0.05, min(cap, remaining))
+
+
+_MATCHER_TIERS = frozenset({"T0a", "T0b", "T0c"})
+_MATCHER_SIZE_UNITS = frozenset({"ml", "g", "count"})
+
+
+def _per_variant_sku_key(value: Any) -> bool:
+    """A catalog_skus key that names ONE variant: it contains ingestion.VARIANT_SKU_INFIX (`::v:`;
+    the promoter's `::v::` contains it too) and is never the one-per-product `<pk>::canonical`
+    placeholder (ingestion.SKU_SUFFIX) the mirror and the canonical lane hang a product-grain offer
+    on. Exactly be#2637's `is_variant_sku_key`."""
+    from services.catalog_enrichment_agent.ingestion import SKU_SUFFIX, VARIANT_SKU_INFIX
+
+    return isinstance(value, str) and bool(value.strip()) and VARIANT_SKU_INFIX in value and not value.endswith(SKU_SUFFIX)
+
+
+def _sku_key_on_moved_listing(sku_key: Any, moved_product_keys: Sequence[str]) -> bool:
+    """`sku_key` is `<one of the moved product keys>::v:<non-empty variant>` (the promoter's `::v::`
+    included): a matched offer is a variant of a row the proposal really moves, never another
+    product's SKU and never an empty variant part. Exactly be#2637's `sku_key_on_moved_listing`."""
+    from services.catalog_enrichment_agent.ingestion import VARIANT_SKU_INFIX
+
+    if not _per_variant_sku_key(sku_key):
+        return False
+    for pk in moved_product_keys:
+        prefix = f"{pk}{VARIANT_SKU_INFIX}"
+        if sku_key.startswith(prefix) and sku_key[len(prefix):].lstrip(":").strip():
+            return True
+    return False
+
+
+def _proposal_moved_keys(kind: Optional[str], evidence: Dict[str, Any]) -> List[str]:
+    """The product keys a membership proposal MOVES, from its evidence as the engine writes it:
+    attach_membership -> `listing_product_key`; merge_content_key -> `from_product_keys` (a list;
+    the jsonb column may arrive as text). Exactly be#2637's `_moved_product_keys`."""
+    if kind == "attach_membership":
+        keys = [evidence.get("listing_product_key")]
+    elif kind == "merge_content_key":
+        moved = evidence.get("from_product_keys")
+        if isinstance(moved, str):
+            try:
+                moved = json.loads(moved)
+            except ValueError:
+                moved = None
+        keys = list(moved) if isinstance(moved, (list, tuple)) else []
+    else:
+        keys = []
+    return [k for k in keys if isinstance(k, str) and k.strip()]
+
+
+def _valid_matcher_verdict(kind: Optional[str], verdict: Any,
+                           moved_product_keys: Sequence[str] = ()) -> bool:
+    """Is `verdict` a valid same-size matcher verdict (contract v3) for a proposal of `kind`?
+
+    THE SAME RULE as be#2637's shared validator (services/identity_resolution
+    .validate_matcher_verdict(kind, evidence, strategy) -> problems), kept here so this PR does not
+    depend on that one merging first; tests/test_offers_resolve_group_siblings.py pins both to one
+    case list. M4 writes the verdict and #2637 reserves its strategy, so only the matcher can
+    produce it:
+      strategy 'cross_merchant_same_size'; same_size exactly true; rule_version non-empty;
+      tier T0a | T0b | T0c; size {value: a number > 0, unit: ml | g | count, pack: an integer >= 1};
+      matched_offers: a NON-EMPTY list of {offer_id, sku_key}, each a non-empty string and the
+        sku_key a PER-VARIANT one of a row the proposal MOVES (`_sku_key_on_moved_listing` against
+        `moved_product_keys`, `_proposal_moved_keys`) -- the matched size's offers. The pin is
+        (offer_id, sku_key); price, currency, size and market on an offer are INFORMATIONAL and never
+        read here;
+      matched_seeds: a list (may be empty) of {seed_id: non-empty string, variant_id: string|null};
+      merge_content_key also needs from_key_single_size exactly true.
+    (The proposal's own `evidence.proposer` is checked beside it, in `_matcher_verdict`.)"""
+    if isinstance(verdict, str):
+        try:
+            verdict = json.loads(verdict)
+        except ValueError:
+            return False
+    if not isinstance(verdict, dict):
+        return False
+    size = verdict.get("size")
+    offers = verdict.get("matched_offers")
+    seeds = verdict.get("matched_seeds")
+    number = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool)  # noqa: E731
+    text = lambda x: isinstance(x, str) and bool(x.strip())  # noqa: E731
+    return bool(
+        verdict.get("strategy") == _CROSS_MERCHANT_SAME_SIZE
+        and verdict.get("same_size") is True
+        and text(verdict.get("rule_version"))
+        and verdict.get("tier") in _MATCHER_TIERS
+        and isinstance(size, dict)
+        and number(size.get("value")) and size["value"] > 0
+        and size.get("unit") in _MATCHER_SIZE_UNITS
+        and isinstance(size.get("pack"), int) and not isinstance(size.get("pack"), bool) and size["pack"] >= 1
+        and isinstance(offers, list) and offers
+        and all(isinstance(o, dict) and text(o.get("offer_id"))
+                and _sku_key_on_moved_listing(o.get("sku_key"), moved_product_keys) for o in offers)
+        and isinstance(seeds, list)
+        and all(isinstance(e, dict) and text(e.get("seed_id"))
+                and (e.get("variant_id") is None or text(e.get("variant_id"))) for e in seeds)
+        and (kind != "merge_content_key" or verdict.get("from_key_single_size") is True)
+    )
+
+
+def _matcher_verdict(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The proposal's `evidence.matcher_verdict` as a dict, when the proposal was written by the
+    strategy's own module (`evidence.proposer`) and the verdict is valid (`_valid_matcher_verdict`)."""
+    if p.get("proposer") != _CROSS_MERCHANT_SAME_SIZE:
+        return None
+    v = p.get("matcher_verdict")
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            return None
+    return v if _valid_matcher_verdict(p.get("kind"), v, _proposal_moved_keys(p.get("kind"), p)) else None
+
+
+def _resolved_group_members(
+    members: List[Dict[str, Any]], proposals: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], set, Dict[str, set]]:
+    """(the members a valid matcher verdict joined, the (offer_id, sku_key) pairs those verdicts
+    matched, {seed_id: the variant ids matched, None = the seed's one variant}).
+
+    ONE SIZE PER KEY: when the valid verdicts on a content_key disagree on (value, unit, pack), that
+    key resolves NOTHING -- two "same size" verdicts of different sizes cannot both be the group.
+    When the call named a listing (`is_anchor`), that listing must itself be resolved, and only its
+    content_key's resolved members count -- an unresolved listing that collides onto a resolved
+    key does not inherit the group. A bare content_key names no listing: its resolved members."""
+    engine: Dict[str, set] = {}
+    sizes: Dict[str, set] = {}
+    offers: Dict[str, set] = {}
+    seeds: Dict[str, Dict[str, set]] = {}
+    for p in proposals:
+        verdict = _matcher_verdict(p)
+        if verdict is None:
+            continue
+        ck = str(p.get("content_key") or "")
+        size = verdict["size"]
+        sizes.setdefault(ck, set()).add((float(size["value"]), size["unit"], int(size["pack"])))
+        engine.setdefault(ck, set()).update(_proposal_joined_keys(p))
+        offers.setdefault(ck, set()).update((o["offer_id"].strip(), o["sku_key"].strip()) for o in verdict["matched_offers"])
+        for e in verdict["matched_seeds"]:
+            seeds.setdefault(ck, {}).setdefault(e["seed_id"].strip(), set()).add(
+                e["variant_id"].strip() if isinstance(e.get("variant_id"), str) else None
+            )
+    one_size = {ck for ck, found in sizes.items() if len(found) == 1}
+    resolved = [m for m in members
+                if str(m.get("content_key") or "") in one_size
+                and str(m.get("product_key")) in engine.get(str(m.get("content_key") or ""), set())]
+    anchors = [m for m in members if m.get("is_anchor")]
+    if anchors:
+        anchor_keys = {str(m.get("content_key")) for m in resolved if m.get("is_anchor")}
+        resolved = [m for m in resolved if str(m.get("content_key")) in anchor_keys]
+    keys = {str(m.get("content_key") or "") for m in resolved}
+    matched_offers = set().union(*(offers.get(ck, set()) for ck in keys)) if keys else set()
+    matched_seeds: Dict[str, set] = {}
+    for ck in keys:
+        for seed_id, vids in seeds.get(ck, {}).items():
+            matched_seeds.setdefault(seed_id, set()).update(vids)
+    return resolved, matched_offers, matched_seeds
+
+
+def _proposal_joined_keys(p: Dict[str, Any]) -> set:
+    """The listings an applied move joined, read from the proposal's EVIDENCE as the engine writes it
+    (services/identity_resolution, be#2637): attach_membership -> `listing_product_key` + the keeper;
+    merge_content_key -> `from_product_keys` + the keeper. Nothing else counts."""
+    keys: set = set()
+    keeper = str(p.get("keeper_product_key") or "").strip()
+    if p.get("kind") == "attach_membership":
+        keys.add(str(p.get("listing_product_key") or "").strip())
+    elif p.get("kind") == "merge_content_key":
+        moved = p.get("from_product_keys")
+        if isinstance(moved, str):
+            try:
+                moved = json.loads(moved)
+            except ValueError:
+                moved = None
+        keys.update(str(k).strip() for k in (moved if isinstance(moved, list) else []))
+    keys.discard("")
+    return keys | {keeper} if keys and keeper else set()
+
+
+def _seed_row_host(row: Dict[str, Any]) -> str:
+    return (
+        _offer_destination_host(row.get("canonical_url"))
+        or _offer_destination_host(row.get("destination_url"))
+        or _offer_destination_host(f"https://{row.get('domain')}" if row.get("domain") else None)
+    )
+
+
+async def _fetch_resolved_group(
+    db: Any,
+    *,
+    aliases: List[str],
+    market_hint: Optional[str],
+    deadline: float,
+) -> Dict[str, Any]:
+    """{members, resolved, matched_offers, matched_seeds, rows}: the caller's content_key group, its
+    RESOLVED members, the catalog offers and seeds their matcher verdicts matched, and the
+    active seeds of those members (the seed lane's three joins -- `source_ref`, `source_product_id`
+    = `external_product_id`, `attached_product_key` -- plus its status, quarantine and, as the
+    identity and fuzzy fallbacks do, the buyer market's serving currency: a caller with no market is
+    a US buyer, and a seed it never named must not set its currency)."""
+    out: Dict[str, Any] = {"members": [], "resolved": [], "rows": [], "matched_offers": set(), "matched_seeds": {}}
+    if not aliases:
+        return out
+    cap = min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0)
+    out["members"] = members = [
+        _row_to_dict(r)
+        for r in (
+            await asyncio.wait_for(
+                db.fetch_all(
+                    """
+                    SELECT s.product_key, s.source_ref, s.source_product_id, s.content_key,
+                           (s.pivota_signature_id = ANY(:aliases)
+                            OR s.product_key = ANY(:aliases)) AS is_anchor
+                      FROM catalog_products s
+                     WHERE s.content_key IN (
+                           SELECT a.content_key FROM catalog_products a
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases)
+                                   OR a.content_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)
+                       AND s.suppressed_at IS NULL
+                       AND s.suppression_reason IS NULL
+                     ORDER BY (s.pivota_signature_id = ANY(:aliases)
+                               OR s.product_key = ANY(:aliases)) DESC,
+                              s.product_key ASC
+                     LIMIT :limit
+                    """,
+                    {"aliases": aliases[:16], "limit": OFFERS_RESOLVE_GROUP_SIBLING_LIMIT},
+                ),
+                timeout=_remaining_timeout(deadline, cap),
+            )
+            or []
+        )
+    ]
+    if len(members) < 2:
+        return out
+    try:
+        proposals = [
+            _row_to_dict(r)
+            for r in (
+                await asyncio.wait_for(
+                    db.fetch_all(
+                        """
+                        SELECT content_key, kind, keeper_product_key,
+                               evidence->>'listing_product_key' AS listing_product_key,
+                               evidence->'from_product_keys' AS from_product_keys,
+                               evidence->'matcher_verdict' AS matcher_verdict,
+                               evidence->>'proposer' AS proposer
+                          FROM identity_resolution_proposals
+                         WHERE content_key = ANY(:cks)
+                           AND status = 'applied'
+                           AND kind = ANY(:kinds)
+                           AND strategy = ANY(:strategies)
+                         ORDER BY applied_at DESC NULLS LAST, proposal_id ASC
+                         LIMIT 200
+                        """,
+                        {"cks": sorted({str(m["content_key"]) for m in members if m.get("content_key")}),
+                         "kinds": list(RESOLVED_GROUP_KINDS), "strategies": list(RESOLVED_GROUP_STRATEGIES)},
+                    ),
+                    timeout=_remaining_timeout(deadline, cap),
+                )
+                or []
+            )
+        ]
+    except Exception as e:  # noqa: BLE001 -- no engine evidence read is "not engine-resolved"
+        logger.info("offers.resolve.group_siblings.proposals_unread", extra={"error": type(e).__name__})
+        proposals = []
+    resolved, out["matched_offers"], out["matched_seeds"] = _resolved_group_members(members, proposals)
+    out["resolved"] = resolved
+    serving_currency = seed_serving_currency(market_hint)
+    if len(resolved) < 2 or serving_currency is None:
+        return out
+
+    def _vals(key: str) -> List[str]:
+        return sorted({str(m.get(key) or "").strip() for m in resolved} - {""})
+
+    rows = await asyncio.wait_for(
+        db.fetch_all(
+            f"""
+            SELECT *
+              FROM external_product_seeds
+             WHERE status = 'active'
+               AND (id = ANY(:seed_ids)
+                    OR external_product_id = ANY(:external_ids)
+                    OR attached_product_key = ANY(:product_keys))
+               AND {SEED_SERVING_CURRENCY_CLAUSE}
+             {_seed_quarantine_clause()}
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT :limit
+            """,
+            {
+                # "" pads an empty arm with a typed, match-nothing value, as the sig lane does.
+                "seed_ids": _vals("source_ref") or [""],
+                "external_ids": _vals("source_product_id") or [""],
+                "product_keys": _vals("product_key") or [""],
+                "serving_currency": serving_currency,
+                "limit": 2 * OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT,
+            },
+        ),
+        timeout=_remaining_timeout(deadline, cap),
+    )
+    out["rows"] = [_row_to_dict(r) for r in rows or []]
+    return out
+
+
+def _sibling_rows_to_gate(rows: List[Dict[str, Any]], *, considered: set, held_hosts: set) -> Tuple[List[Dict[str, Any]], int]:
+    """(rows worth gating, how many were skipped). BEFORE any offer or link is minted: a row another
+    lane already gated, a row whose host an earlier offer already holds, a host's third row, and
+    everything past the lane's row cap are skipped."""
+    kept: List[Dict[str, Any]] = []
+    per_host: Dict[str, int] = {}
+    for row in rows:
+        if str(row.get("id") or "").strip() in considered:
+            continue
+        host = _seed_row_host(row)
+        if host and host in held_hosts:
+            continue
+        if host and per_host.get(host, 0) >= OFFERS_RESOLVE_GROUP_SIBLING_SEEDS_PER_HOST:
+            continue
+        per_host[host] = per_host.get(host, 0) + 1
+        kept.append(row)
+        if len(kept) >= OFFERS_RESOLVE_GROUP_SIBLING_SEED_LIMIT:
+            break
+    return kept, len(rows) - len(kept)
+
+
+def _offer_hosts(offer: Dict[str, Any]) -> set:
+    """Every destination host an offer names: the catalog arm's three dedupe keys, plus `url`."""
+    src = offer.get("source") or {}
+    hosts = {
+        _offer_destination_host(offer.get("url")),
+        _offer_destination_host(src.get("canonical_url")),
+        _offer_destination_host(src.get("destination_url")),
+        _offer_destination_host(f"https://{src.get('domain')}" if src.get("domain") else None),
+    }
+    return hosts - {""}
+
+
+def _dedupe_sibling_offers_by_host(offers: List[Dict[str, Any]], first_new: int) -> int:
+    """Drop, in place, every offer from `first_new` on whose host an earlier offer already holds.
+
+    ONE OFFER PER MERCHANT. Rows on a held host are skipped before they are gated
+    (`_sibling_rows_to_gate`); this settles the siblings among themselves, where the gate's verdict
+    decides: a FRESH offer beats a `requires_live_verification` one on the same host. Every new
+    offer is marked `source.reached_via`. Returns how many were dropped."""
+    held: set = set()
+    for prior in offers[:first_new]:
+        held |= _offer_hosts(prior)
+    new = offers[first_new:]
+    kept_ids: set = set()
+    for offer in [o for o in new if not o.get("requires_live_verification")] + [
+        o for o in new if o.get("requires_live_verification")
+    ]:
+        hosts = _offer_hosts(offer)
+        if hosts & held:
+            continue
+        held |= hosts
+        kept_ids.add(id(offer))
+    kept = [o for o in new if id(o) in kept_ids]
+    for offer in kept:
+        if isinstance(offer.get("source"), dict):
+            offer["source"]["reached_via"] = "content_key_group"
+    offers[first_new:] = kept
+    return len(new) - len(kept)
+
+
+def _catalog_offer_entry(r: Dict[str, Any], *, group_mode: bool, redirect_url: Optional[str]) -> Dict[str, Any]:
+    """The catalog arm's offer for one statement row (see CATALOG OFFERS in `_handle_offers_resolve`),
+    exactly as the handler built it inline before it moved here. `redirect_url` is the signed /r link
+    the handler minted for it, or None. The group shadow (`_group_shadow_answer`) builds its offers
+    here too, always with None: it mints nothing."""
+    destination = str(r.get("destination_url") or "").strip()
+    offer_merchant = str(r.get("merchant_id") or "").strip() or None
+    availability = str(r.get("availability") or "").strip() or None
+    price_amount = r.get("price_amount")
+    return {
+        "offer_id": f"of:catalog_offer:{r.get('offer_id')}",
+        # Both spellings — see SHAPE above.
+        "merchant_id": offer_merchant,
+        "merchant_name": str(r.get("merchant_name") or "").strip() or offer_merchant,
+        "seller": str(r.get("merchant_name") or "").strip() or offer_merchant,
+        "price": float(price_amount) if price_amount is not None else None,
+        # NEVER DEFAULTED. A row that states no currency ships none: a declared
+        # market withholds it (`_offers_in_buyer_currency`, counted as "none"), and
+        # the statement above ranks it behind every offer that states a currency,
+        # with or without a market. It used to ship as
+        # "USD", which a US buyer's filter then kept as a stated USD price.
+        "currency": str(r.get("currency") or "").strip() or None,
+        "availability": availability,
+        # In a resolved group, the seed lane's wider vocabulary too ("sold out", the
+        # schema.org OutOfStock URL...), so a sold-out retailer is never best price.
+        "in_stock": not (
+            _availability_says_out_of_stock(availability) if group_mode
+            else availability_is_known_unavailable(availability)
+        ),
+        "url": destination,
+        "purchase_route": "affiliate_outbound",
+        # NEVER the raw destination under this key. `affiliate_url` MEANS an
+        # attributed `/r` link: the gateway's sanitizer only passes it verbatim
+        # when it matches the signed-token shape, and everything else goes
+        # through the normal scrub — so an unsigned value here is both a
+        # mislabel and liable to be rewritten. `_make_external_redirect_url`
+        # declines for exactly one reachable reason, an allowlist refusal, and
+        # that is a serving decision: the offer stays visible under `url`, the
+        # signed key stays honest at None, and the shortfall is counted.
+        "affiliate_url": redirect_url,
+        # UNKNOWN, stated as such. A retailer destination is a product page as far
+        # as we know; `null` is the vocabulary's "we do not know", and claiming
+        # `false` would license an agent to tell a buyer what they will land on.
+        "cart_prefilled": None,
+        "internal_checkout_items": None,
+        # PRODUCT grain, like the seed lane's own 0.8. The identity match is
+        # exact, but a retailer offer names a product page, not a variant — and
+        # 1.0 is what this handler reserves for a SKU-level match. Claiming it
+        # here would outrank a seed offer that really did match a variant.
+        "confidence": 0.8,
+        **({"price_confidence": r.get("price_confidence")}
+           if r.get("price_confidence") is not None else {}),
+        **({"updated_at": r.get("updated_at")}
+           if r.get("updated_at") is not None else {}),
+        **(_catalog_offer_price_freshness_fields(r.get("price_checked_at"))
+           if group_mode else {}),
+        "source": {
+            "type": "catalog_offer",
+            "offer_id": str(r.get("offer_id") or ""),
+            "product_key": str(r.get("product_key") or ""),
+            "content_key": str(r.get("content_key") or ""),
+            "merchant_id": offer_merchant,
+            # `live_offer_verification._target` reads
+            # `source.canonical_url or source.destination_url`; without one of
+            # them every offer from this arm is UNVERIFIED "no_verifiable_url".
+            "destination_url": destination,
+            "offer_type": str(r.get("offer_type") or ""),
+            "is_first_party": bool(r.get("is_first_party")),
+            "readiness_tier": str(r.get("readiness_tier") or ""),
+        },
+    }
+
+
+def _catalog_offers_statement(_price_select: str, _price_order: str) -> str:
+    """The catalog arm's statement (see CATALOG OFFERS in `_handle_offers_resolve`), byte for byte as
+    the handler sent it inline before it moved here. `_price_select` / `_price_order` are the
+    `_catalog_price_freshness_sql` fragments in a merged group, empty otherwise (plus the
+    `o.sku_key` column the handler appends in a group). Shared with the group shadow
+    (`_group_shadow_answer`) so the shadow reads exactly the rows group mode would.
+
+    Plus the seed-currency conjunct, read per call: "" with the reader kill switch
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off. The conjunct is then dropped and rows and
+    plan match the pre-rule statement, but the text (and so its Query Insights digest) differs: the
+    guard's SQL comments stay in it."""
+    _seed_currency_guard = seed_projected_offer_guard_and_sql(
+        "o", "o.product_key", prefix="\n                       "
+    )
+    return f"""
+                    SELECT ranked.* FROM (
+                    SELECT twins.*,
+                           row_number() OVER (
+                               PARTITION BY twins.seller_host
+                               ORDER BY twins.foreign_currency ASC, (twins.currency_key = '') ASC,
+                                        twins.unavailable ASC,{_price_order}
+                                        twins.price_amount ASC, twins.offer_id ASC
+                           ) AS seller_rank
+                      FROM (
+                    SELECT base.*,
+                           -- Does THIS SELLER's row state a per-variant offer here? Keyed by the
+                           -- merchant too: scripts/attach_retailer_offer.py hangs ANOTHER retailer's
+                           -- offer (Amazon, Olive Young) on an existing product as
+                           -- `<product_key>::canonical` under that retailer's merchant_id, and that
+                           -- is the retailer's only offer, not a twin of the row's own variant offer.
+                           -- The merchant, not the destination host: a row's two offers can name
+                           -- `sd.com` and `m.sd.com`, and the assembler (keyed by merchant on the
+                           -- row's own host) collapses those, so this must too.
+                           bool_or(NOT base.is_placeholder) OVER (
+                               PARTITION BY base.product_key, base.merchant_id,
+                                            base.market_key, base.currency_key
+                           ) AS has_variant_offer
+                      FROM (
+                    SELECT o.offer_id, o.product_key, o.merchant_id, o.currency,
+                           o.availability, o.offer_type, o.is_first_party, o.readiness_tier,
+                           o.price_confidence, o.updated_at,{_price_select}
+                           coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) AS price_amount,
+                           coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                               AS destination_url,
+                           m.merchant_name AS merchant_name,
+                           p.content_key AS content_key,
+                           (lower(btrim(coalesce(o.availability, ''),
+                                        E' \t\n\r\f\v'))
+                            = ANY(:unavailable)) AS unavailable,
+                           upper(btrim(coalesce(o.market, ''), E' \t\n\r\f\v')) AS market_key,
+                           upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v')) AS currency_key,
+                           -- Priced in another currency than the declared market's, or in none:
+                           -- withheld below (`_offers_in_buyer_currency`), so it never holds a slot
+                           -- a servable offer could fill. No market declared: false for all, and
+                           -- `currency_key = ''` (ranked right after it) still puts an offer that
+                           -- states no currency behind one that states its own.
+                           (CAST(:buyer_currency AS TEXT) IS NOT NULL
+                            AND upper(btrim(coalesce(o.currency, ''), E' \t\n\r\f\v'))
+                                IS DISTINCT FROM CAST(:buyer_currency AS TEXT)) AS foreign_currency,
+                           -- A destination the loop below can serve: it keeps only a value that
+                           -- starts `http://` or `https://`, exactly so spelled, once trimmed.
+                           (btrim(coalesce(o.offer_payload->>'destination_url', o.source_ref),
+                                  E' \t\n\r\f\v') ~ '^https?://') AS servable,
+                           -- THE SELLER: the destination host, as `_offer_destination_host` reads
+                           -- it (the URL's host without userinfo or port, lower-cased, one
+                           -- leading `www.` dropped). An unservable destination or an empty host
+                           -- is a seller of its own, never merged with another.
+                           coalesce(nullif(regexp_replace(lower(split_part(regexp_replace(
+                                        substring(btrim(coalesce(o.offer_payload->>'destination_url',
+                                                                 o.source_ref), E' \t\n\r\f\v')
+                                                  FROM '^https?://([^/?#]+)'),
+                                        '^.*@', ''), ':', 1)), '^www[.]', ''), ''),
+                                    'offer:' || o.offer_id) AS seller_host,
+                           (o.sku_key LIKE '%::canonical') AS is_placeholder
+                      FROM catalog_products p
+                      JOIN catalog_offers o ON o.product_key = p.product_key
+                      LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
+                     WHERE p.product_key IN (
+                           SELECT d.product_key FROM catalog_products d
+                            WHERE d.pivota_signature_id = ANY(:aliases)
+                               OR d.content_key = ANY(:aliases)
+                               OR d.product_key = ANY(:aliases)
+                           -- SIBLING LISTINGS. A listing id (its product_key or signature)
+                           -- widens to every listing sharing its content_key, so asking by
+                           -- ANY seller's listing returns every seller of the product — the
+                           -- same set a `ck_` id already returns. Without this the second
+                           -- retailer is reachable only by a content_key that search, the PDP
+                           -- and this door never hand out: measured 2026-09-17 on the Pyunkang
+                           -- Yul canary, get_offers(listing) = 1 seller, get_offers(ck_) = 2.
+                           -- The anchor must itself be live: a withdrawn listing id answers
+                           -- nothing, exactly as it did before this widening.
+                           UNION
+                           SELECT s.product_key
+                             FROM catalog_products a
+                             JOIN catalog_products s ON s.content_key = a.content_key
+                            WHERE (a.pivota_signature_id = ANY(:aliases)
+                                   OR a.product_key = ANY(:aliases))
+                              AND a.content_key IS NOT NULL
+                              AND a.suppressed_at IS NULL
+                              AND a.suppression_reason IS NULL)
+                       -- The PRODUCT's own suppression, not just the offer's. Every serving
+                       -- read in services/pivot_query_service.py applies this pair, and
+                       -- scripts/withdraw_catalog_rows.py takes a product down by setting
+                       -- exactly these — so without it a withdrawn product still ships its
+                       -- retailer offer here, and the takedown silently misses this lane.
+                       AND p.suppressed_at IS NULL
+                       AND p.suppression_reason IS NULL
+                       -- Market, mirroring the seed lane at the attached-ref query above.
+                       -- Latent today (the gateway sends no market and the retailer ingest
+                       -- writes 'US'), and live the moment a caller passes market=KR.
+                       AND (CAST(:market AS TEXT) IS NULL OR o.market = CAST(:market AS TEXT))
+                       AND o.offer_type = 'retailer'
+                       AND o.offer_mode = 'redirect'
+                       AND o.suppressed_at IS NULL
+                       AND coalesce(o.merchant_effective_price, o.estimated_best_price,
+                                    o.list_price) > 0
+                       -- AN OFFER COPIED OFF A SEED IS A PRICE ONLY IN THAT SEED'S CURRENCY
+                       -- (services/seed_offer_currency, Peng 2026-10-19), the conjunct after the
+                       -- next one. Before the window above ranks, so a stale copy never holds a
+                       -- seller's slot: SKINTIFIC's set carried 20 USD 23.56 offers the variant
+                       -- backfill copied off a seed since re-read in AUD, and this arm would mint
+                       -- a link at that price. Correlated on the listing the offer prices.
+                       AND coalesce(o.offer_payload->>'destination_url', o.source_ref)
+                           IS NOT NULL{_seed_currency_guard}
+                      ) base
+                      ) twins
+                     -- THE PLACEHOLDER TWIN: every retailer row carries its product-level
+                     -- `<product_key>::canonical` offer beside its per-variant one, to the same
+                     -- destination. The variant offer is the exact variant: its price AND its
+                     -- stock (a sold-out variant beside an in-stock placeholder is sold out). The
+                     -- twin goes when the same seller's row has one in the same market and
+                     -- currency, and stays as the row's only offer there when none is.
+                     WHERE NOT (twins.is_placeholder AND twins.has_variant_offer)
+                    ) ranked
+                     -- ONE OFFER PER SELLER FIRST, then the rest, and BEFORE the LIMIT. The LIMIT
+                     -- used to cut a list ordered by stock then price that held every offer of
+                     -- every row: on ck_0dc56bdd (O HUI Age Recovery Eye Cream 25 ml, 2026-10-18,
+                     -- after the first M4 apply) 6 rows carried 12 offers, limit 10 cut the dearest
+                     -- seller's two, and koolseoul's in-stock US/USD $117 never reached the host
+                     -- dedupe below. Each host's best (the window above) now comes first, in the
+                     -- order that follows; its further offers only fill what is left (the dedupe
+                     -- below drops them, as it always did).
+                     --
+                     -- Within each pass: IN STOCK FIRST, then price. Price alone put
+                     -- eyurs.com $13 out_of_stock ahead of sokoglam.com $19.50 in_stock (prod,
+                     -- 2026-09-18), and because the LIMIT cuts this list it could also drop
+                     -- the only in-stock seller for cheaper ones that cannot sell — measured
+                     -- the same day on 6 content_keys at limit 1 or 2. Unknown ranks with in
+                     -- stock: see OFFER_UNAVAILABLE_AVAILABILITIES, which this binds, so the
+                     -- order matches the `in_stock` flag computed below. `offer_id` makes a
+                     -- price tie cut the same way every time.
+                     -- The btrim set is the common ASCII whitespace (space, tab, newline,
+                     -- CR, FF, VT), so a tab- or newline-padded value sorts the way its flag
+                     -- reads. Python's .strip() also removes 0x1C-0x1F and Unicode spaces
+                     -- (NBSP); a value padded with those would still sort as sellable while
+                     -- flagged not — no live row is (only in_stock/out_of_stock, 2026-09-18).
+                     -- An unservable destination (dropped by the loop below) goes last of all.
+                     ORDER BY ranked.servable DESC,
+                              (ranked.seller_rank > 1) ASC,
+                              ranked.foreign_currency ASC,
+                              (ranked.currency_key = '') ASC,
+                              ranked.unavailable ASC,{_price_order}
+                              ranked.price_amount ASC,
+                              ranked.offer_id ASC
+                     LIMIT :limit
+                    """
+
+
+async def _catalog_price_freshness_sql() -> Tuple[str, str, Dict[str, Any]]:
+    """(SELECT fragment, ORDER BY fragment, binds) that rank a catalog offer's FRESH price first.
+
+    FRESH = `catalog_offers.price_checked_at` within EXTERNAL_REFERRAL_STALE_DAYS (7), the clock the
+    seed lane's readiness gate puts on a seed's price (`stale_snapshot`). That column (migration
+    246) is stamped only by a writer that READ the price and is cleared by trigger when the price
+    moves without a read; `updated_at` is NOT a price read (85% of served offers share their stamp
+    minute with 100+ rows, mig 246). NULL is "no read on record" and is stale. The column is healed
+    onto prod by db/schema_guard at boot; until it is present (or the probe does not answer within
+    0.5 s) no price is known fresh, so every catalog offer reads stale -- listed, flagged, never best
+    price -- and the statement still runs. The ORDER BY term sits after stock and before price, so
+    the LIMIT never cuts a fresh seller for a cheaper stale one. It names the selected
+    `price_checked_at` unqualified: the catalog arm orders its per-seller window and its outer
+    query by it, where the offer's table alias is out of scope."""
+    from services.external_offer_dual_write import price_check_column_present
+
+    try:
+        present = await asyncio.wait_for(price_check_column_present(), timeout=0.5)
+    except asyncio.TimeoutError:
+        present = False
+    return _catalog_price_freshness_fragments(present)
+
+
+def _catalog_price_freshness_fragments(present: bool) -> Tuple[str, str, Dict[str, Any]]:
+    """`_catalog_price_freshness_sql`'s fragments once the column probe has answered `present`.
+    Split out so the group shadow can probe on its own connection and build the same statement."""
+    from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
+
+    if not present:
+        return "\n                           CAST(NULL AS TIMESTAMPTZ) AS price_checked_at,", "", {}
+    since = datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
+    return (
+        "\n                           o.price_checked_at AS price_checked_at,",
+        "\n                              (price_checked_at IS NULL"
+        " OR price_checked_at < CAST(:price_fresh_since AS TIMESTAMPTZ)) ASC,",
+        {"price_fresh_since": since},
+    )
+
+
+def _catalog_offer_price_freshness_fields(price_checked_at: Any) -> Dict[str, Any]:
+    """`price_checked_at` (ISO, or None for no read on record) and, when the price is not fresh,
+    `price_stale: true` -- top-level, the one place both lanes say it (see `_mark_price_stale`)."""
+    from services.external_referral_readiness import EXTERNAL_REFERRAL_STALE_DAYS
+
+    checked: Optional[datetime] = None
+    if isinstance(price_checked_at, datetime):
+        checked = price_checked_at
+    elif isinstance(price_checked_at, str) and price_checked_at.strip():
+        try:
+            checked = datetime.fromisoformat(price_checked_at.strip().replace("Z", "+00:00"))
+        except ValueError:
+            checked = None
+    if checked is not None:
+        checked = checked.replace(tzinfo=timezone.utc) if checked.tzinfo is None else checked.astimezone(timezone.utc)
+    fresh = checked is not None and checked >= datetime.now(timezone.utc) - timedelta(
+        days=EXTERNAL_REFERRAL_STALE_DAYS
+    )
+    return {
+        "price_checked_at": checked.isoformat() if checked is not None else None,
+        **({} if fresh else {"price_stale": True}),
+    }
+
+
+def _mark_price_stale(offers: List[Dict[str, Any]]) -> None:
+    """ONE place for the stale-price flag on both lanes: a seed offer flagged
+    `requires_live_verification` (whose nested `price_stale` stays, for compatibility) also says
+    `price_stale: true` at top level, where a catalog offer says it."""
+    for offer in offers:
+        if isinstance(offer, dict) and offer.get("requires_live_verification"):
+            offer["price_stale"] = True
+
+
+def _price_comparable_offers(
+    offers: List[Dict[str, Any]],
+    *,
+    market_hint: Optional[str],
+    named_variant: bool,
+    resolved_product_keys: set,
+    matched_catalog_offers: set,
+    catalog_sku_keys: Dict[str, Optional[str]],
+    matched_seeds: Dict[str, set],
+    seed_variants: Dict[str, List[Dict[str, Any]]],
+    defaulted_currency_ids: set,
+) -> List[Dict[str, Any]]:
+    """The served offers whose prices may be compared: exactly the best-price pool, which the
+    gateway reads through each one's `price_comparable: true` (gw#2460). An offer is in it only if:
+      * it is the SAME SELLABLE UNIT as the group: a catalog offer on a RESOLVED listing whose
+        (offer_id, sku_key) a matcher verdict lists in `matched_offers`, or a seed the resolved-group
+        read returned AND a verdict lists in `matched_seeds` (that variant, or a seed still holding
+        one variant when listed with variant_id null) -- never an internal offer, never a seed a
+        fallback lane found, never a listing, offer or seed of another size;
+      * with a variant NAMED: an `exact` seed offer of it (`source.variant_match`) -- never a catalog
+        offer (it names no variant), never a fallback at a listing's row price;
+      * FRESH: neither `price_stale` nor `requires_live_verification`;
+      * NOT KNOWN OUT OF STOCK: `in_stock` false (or, with no flag, an unavailable availability);
+        unknown stock may compare;
+      * priced in a currency the row STATED (a NULL catalog currency defaulted to "USD" is out), spelled
+        as uppercase ISO 4217, and equal to the BUYER's: the declared market's currency, or USD for a
+        caller that declares none (a US buyer, as the seed lanes read it). A declared market with no
+        known currency compares nothing."""
+    basis = _declared_buyer_currency(market_hint) if market_hint else seed_serving_currency(None)
+    if not basis:
+        return []
+    out: List[Dict[str, Any]] = []
+    for offer in offers:
+        if not isinstance(offer, dict) or offer.get("price_stale") or offer.get("requires_live_verification"):
+            continue
+        src = offer.get("source") or {}
+        if src.get("type") == "catalog_offer":
+            if named_variant or src.get("product_key") not in resolved_product_keys:
+                continue
+            # ...and only an offer the matcher matched at the group's size, by its offer_id AND its
+            # per-variant sku_key: a resolved retailer listing can carry its 30 ml and 100 ml offers
+            # beside the matched 50 ml, and an id alone can be re-pointed at another SKU.
+            if (src.get("offer_id"), catalog_sku_keys.get(offer.get("offer_id"))) not in matched_catalog_offers:
+                continue
+            if offer.get("offer_id") in defaulted_currency_ids:
+                continue
+        elif src.get("type") == "external_seed":
+            # ...and only a seed the verdict matched: that variant, or -- matched as a whole
+            # (variant_id null) -- a seed that is STILL one variant now (a refresh can add sizes).
+            if not _seed_offer_matched(src, matched_seeds.get(src.get("seed_id")) or set(),
+                                       seed_variants.get(src.get("seed_id"))):
+                continue
+            if named_variant and src.get("variant_match") != "exact":
+                continue
+        else:
+            continue
+        # KNOWN OUT OF STOCK is not a price anyone can pay (contract line 7). The flag decides when it
+        # is a boolean (a live read corrects `in_stock` and leaves the feed's text beside it); the
+        # availability text only when there is no flag. Unknown stock stays comparable.
+        if offer.get("in_stock") is False or (
+            not isinstance(offer.get("in_stock"), bool) and _availability_says_out_of_stock(offer.get("availability"))
+        ):
+            continue
+        price = offer.get("price")
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+            continue
+        # EXACTLY the basis, which is an uppercase ISO code from the market registry: a lowercase or
+        # padded spelling is not a currency this check vouches for.
+        if offer.get("currency") != basis:
+            continue
+        out.append(offer)
+    return out
+
+
+def _seed_offer_matched(src: Dict[str, Any], entries: set, variants: Optional[List[Dict[str, Any]]]) -> bool:
+    """Does a `matched_seeds` entry vouch for this seed offer?
+
+    `variants` is the seed's stored variants as read now -- None when the resolved-group read did
+    not return the seed, which is then no member offer at all (the ONE membership check for seeds).
+    A NAMED entry matches the stored entry this offer stands for (found by the offer's id,
+    `_seed_offer_variant_id`: variant_id | variantId | sku | sku_id | id) under every identity key the
+    seed lane reads (`stored_entry_answers_to`: those ids, gid, `?variant=`, the Shopify id).
+    A NULL entry ("the seed, which had one variant") holds only while the seed still has at most one."""
+    if variants is None:
+        return False
+    offer_vid = str(src.get("variant_id") or "")
+    stored = next((v for v in variants if _seed_offer_variant_id(v) == offer_vid), None)
+    for entry in entries:
+        if entry is None:
+            if len(variants) <= 1:
+                return True
+        elif stored is not None and stored_entry_answers_to(stored, entry):
+            return True
+    return False
+
+
+def _availability_says_out_of_stock(value: Any) -> bool:
+    """The catalog arm's vocabulary (OFFER_UNAVAILABLE_AVAILABILITIES) OR the seed lane's normalizer
+    (utils.availability_vocabulary: "sold out", "soldout", "out of stock", schema.org OutOfStock...)."""
+    from utils.availability_vocabulary import OUT_OF_STOCK, normalize_availability
+
+    return availability_is_known_unavailable(value) or normalize_availability(value) == OUT_OF_STOCK
+
+
+def _best_price_of(offers: List[Dict[str, Any]], comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The cheapest of the comparable set (`_price_comparable_offers`), as `metadata.best_price`; its
+    `offer_id` is the response's `best_price_offer_id`: the lowest price, then rank (a known
+    out-of-stock offer is never in the set). Empty set: no best price."""
+    stale = sum(1 for o in offers if isinstance(o, dict) and o.get("price_stale"))
+    if not comparable:
+        return {"offer_id": None, "currency": None, "fresh_priced": 0, "stale_priced": stale}
+    rank = {id(o): i for i, o in enumerate(offers)}
+    best = min(comparable, key=lambda o: (float(o["price"]), rank[id(o)]))
+    return {"offer_id": best.get("offer_id"), "price": float(best["price"]), "currency": best["currency"],
+            "fresh_priced": len(comparable), "stale_priced": stale}
+
+
+# ── GROUP SHADOW: OFFERS_RESOLVE_GROUP_SEED_SIBLINGS=shadow ──────────────────────────────────────
+#
+# WHAT IT ANSWERS. Before group mode serves, how often -- and by how much -- would it change the best
+# price a buyer sees? Shadow serves the OFF answer, byte for byte, and for a request whose content_key
+# group is RESOLVED logs ONE line (`offers_resolve_group_shadow`, WARNING, `utils.logger`) comparing
+# the off answer's best offer with the best price group mode would mark.
+#
+# WHAT IT RUNS, and what it does not:
+#   * after the response is built: a FastAPI BackgroundTask whose callable (`_run_group_shadow`) only
+#     SPAWNS a detached task and returns at once. It must not await the work: Starlette 0.27 under
+#     uvicorn holds the NEXT request on the same keep-alive connection until the background tasks
+#     of this one have finished (measured: 1.0 s behind a 1 s task);
+#   * in a FRESH contextvars.Context, so `databases` 0.7 (which keys the connection on a ContextVar a
+#     child task inherits) hands it a pool connection of its own -- never the request's;
+#   * only while it is cheap to: at most OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT shadows per process
+#     (a cancelled one counts until it has unwound), and never when the pool has no more than
+#     OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE free connection once the shadows spawned but not yet
+#     connected are taken off it -- nor when the pool cannot be read at all (fail closed). Each holds one pool connection for up
+#     to the budget, outside Cloud Run's request concurrency, so both SKIP (never wait) and are
+#     counted by reason (`_group_shadow_skip`): on the next shadow line, and in a summary line every
+#     OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY skips;
+#   * every statement inside ONE `READ ONLY` transaction that always rolls back, each under a
+#     server-side `SET LOCAL statement_timeout` that ends before the shadow's deadline (so Postgres,
+#     not an asyncio cancel, ends a slow statement and the connection stays reusable);
+#   * the whole of it bounded by OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS: a timer logs
+#     `budget_exceeded` and cancels the task; nothing ever awaits it;
+#   * READS ONLY: the resolved-group read (`_fetch_resolved_group`), the price-column probe and the
+#     catalog arm's own group-mode statement (`_catalog_offers_statement`). It never runs the sibling
+#     SEED lane: that lane's gates read recovery tasks, preflight carts at the merchant and mint links,
+#     i.e. merchant HTTP and click ids. The siblings it would have gated are COUNTED
+#     (`sibling_seeds_not_evaluated`), not evaluated. No link is minted, no click issued, no
+#     live-offer verification run;
+#   * every error is swallowed into the line's `error` field; nothing reaches the response.
+#
+# THE GATE COSTS NO QUERY. A group is resolved only through an APPLIED cross_merchant_same_size move
+# whose proposal names the group's content_key (`_fetch_resolved_group` reads proposals by exactly
+# that key). So a per-process set of those content keys, refreshed at most every
+# OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS (one query, off the request path), is a NECESSARY
+# condition: a request whose aliases and catalog rows name no key in it is not resolved and schedules
+# nothing. A key in it runs the full resolved-group check in the background. A set that reaches
+# OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT cannot gate, so the shadow then SKIPS every request (logged once
+# per refresh) rather than shadowing all of them.
+# Known blind spot: a resolved group the off answer's catalog read returned no row for (and that the
+# caller did not name by its ck_ id) is not seen -- its group answer would rest on sibling seeds,
+# which the shadow cannot evaluate anyway.
+OFFERS_RESOLVE_GROUP_SHADOW_EVENT = "offers_resolve_group_shadow"
+OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS = 300.0
+# This many keys or more and the set cannot gate: the shadow is OFF until a refresh reads fewer.
+OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT = 20000
+# After a FAILED refresh, no new refresh for this long: the last good set (if any) keeps gating, and
+# with none every request is skipped -- a broken read costs one query a minute, not one a request.
+OFFERS_RESOLVE_GROUP_SHADOW_CK_RETRY_SECONDS = 60.0
+# A statement's server timeout ends this long before the shadow's deadline and the per-statement cap.
+OFFERS_RESOLVE_GROUP_SHADOW_STATEMENT_MARGIN_SECONDS = 0.15
+OFFERS_RESOLVE_GROUP_SHADOW_MIN_STATEMENT_MS = 50
+# At most this many stale offers are listed on the line (the count is always whole).
+OFFERS_RESOLVE_GROUP_SHADOW_STALE_LISTED = 10
+# Shadows in flight per process, counting a cancelled one until it has unwound. Past it: skip.
+OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT = 2
+# Free pool connections (idle + not yet opened) the shadow leaves to requests: it starts only when the
+# pool has MORE than this many.
+OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE = 1
+# One `offers_resolve_group_shadow_skips` summary line per this many skips with no shadow line between.
+OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY = 1000
+_GROUP_SHADOW_CKS: Dict[str, Any] = {"cks": None, "loaded_at": 0.0, "overflow": False, "refreshing": False,
+                                     "failed_at": None}
+# Every shadow task until it is DONE (finished, failed, or cancelled AND unwound): the strong reference
+# that keeps a detached task alive, and the in-flight count the cap reads. Emptied by done callbacks.
+_GROUP_SHADOW_IN_FLIGHT: set = set()
+# How many of those hold a pool connection RIGHT NOW (inside `_group_shadow_transaction`). The pool's
+# own free count already excludes them; the rest of the in-flight set is spawned-but-not-connected
+# and is subtracted from it (`_run_group_shadow`), so two spawns in one loop tick cannot both take
+# the reserve.
+_GROUP_SHADOW_CONNECTED: Dict[str, int] = {"n": 0}
+# Skips by reason (cap, pool_busy, pool_unknown, overflow, refreshing) since the last line that reported them.
+_GROUP_SHADOW_SKIPS: Dict[str, int] = {}
+_GROUP_SHADOW_RESOLVED_CKS_SQL = """
+    SELECT DISTINCT content_key
+      FROM identity_resolution_proposals
+     WHERE status = 'applied'
+       AND kind = ANY(:kinds)
+       AND strategy = ANY(:strategies)
+       AND content_key IS NOT NULL
+     LIMIT :limit
+"""
+
+
+def _group_shadow_cache_verdict(keys: set) -> str:
+    """"skip" (no key names a resolved group: nothing to do), "run" (one may: check in the
+    background), "refresh" (the key set is missing or older than its TTL: refresh, then decide) or
+    "overflow" (the set hit its limit and cannot gate: the shadow is off until the next refresh)."""
+    cks = _GROUP_SHADOW_CKS["cks"]
+    now = time.monotonic()
+    if cks is None or now - _GROUP_SHADOW_CKS["loaded_at"] >= OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS:
+        failed_at = _GROUP_SHADOW_CKS.get("failed_at")
+        if failed_at is None or now - failed_at >= OFFERS_RESOLVE_GROUP_SHADOW_CK_RETRY_SECONDS:
+            return "refresh"
+        if cks is None:
+            return "skip"
+    if _GROUP_SHADOW_CKS["overflow"]:
+        return "overflow"
+    if keys & cks:
+        return "run"
+    return "skip"
+
+
+def _pivota_warning_line(event: str, payload: Dict[str, Any]) -> None:
+    """`<event> <compact JSON>` at WARNING through `utils.logger` ("pivota"), the only logger prod
+    keeps. Never raises."""
+    try:
+        from utils.logger import logger as _pivota_logger
+
+        _pivota_logger.warning(
+            "%s %s", event, json.dumps({"event": event, **payload}, sort_keys=True, separators=(",", ":"),
+                                       default=str),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _group_shadow_take_skips() -> Dict[str, int]:
+    skips = dict(_GROUP_SHADOW_SKIPS)
+    _GROUP_SHADOW_SKIPS.clear()
+    return skips
+
+
+def _group_shadow_skip(reason: str) -> None:
+    """Count a skipped shadow. No line per skip: the counts ride on the next shadow line, and every
+    OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY skips without one they go out as a summary."""
+    _GROUP_SHADOW_SKIPS[reason] = _GROUP_SHADOW_SKIPS.get(reason, 0) + 1
+    if sum(_GROUP_SHADOW_SKIPS.values()) >= OFFERS_RESOLVE_GROUP_SHADOW_SKIP_SUMMARY_EVERY:
+        _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_skips", {"skipped": _group_shadow_take_skips()})
+
+
+def _group_shadow_pool_free(db: Any) -> Optional[int]:
+    """Connections the pool can still hand out without waiting (idle + not yet opened), or None when
+    there is no asyncpg pool to ask (SQLite, not connected)."""
+    pool = getattr(getattr(db, "_backend", None), "_pool", None)
+    if pool is None:
+        return None
+    try:
+        return int(pool.get_idle_size()) + max(0, int(pool.get_max_size()) - int(pool.get_size()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _GroupShadowReader:
+    """The shadow's ONLY way to the database: `fetch_all` / `fetch_one` that put each statement under a
+    server-side statement_timeout ending before the deadline (and before the per-statement asyncio cap
+    `_fetch_resolved_group` applies), time it into `db_seconds`, and count it."""
+
+    def __init__(self, db: Any, *, deadline: float, is_pg: bool):
+        self._db = db
+        self._deadline = deadline
+        self._is_pg = is_pg
+        self.db_seconds = 0.0
+        self.statements = 0
+
+    async def _bounded(self, method: str, query: Any, values: Optional[Dict[str, Any]]) -> Any:
+        remaining = self._deadline - time.perf_counter()
+        server_seconds = (
+            min(OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS, 1.0, remaining)
+            - OFFERS_RESOLVE_GROUP_SHADOW_STATEMENT_MARGIN_SECONDS
+        )
+        server_ms = int(server_seconds * 1000)
+        if server_ms < OFFERS_RESOLVE_GROUP_SHADOW_MIN_STATEMENT_MS:
+            raise asyncio.TimeoutError("group shadow budget spent")
+        started = time.perf_counter()
+        try:
+            if self._is_pg:
+                # LOCAL: it ends with the shadow's own transaction, never outlives it on the pool.
+                await self._db.execute(f"SET LOCAL statement_timeout = {server_ms}")
+            return await asyncio.wait_for(getattr(self._db, method)(query, values), timeout=remaining)
+        finally:
+            self.db_seconds += time.perf_counter() - started
+            self.statements += 1
+
+    async def fetch_all(self, query: Any, values: Optional[Dict[str, Any]] = None) -> Any:
+        return await self._bounded("fetch_all", query, values)
+
+    async def fetch_one(self, query: Any, values: Optional[Dict[str, Any]] = None) -> Any:
+        return await self._bounded("fetch_one", query, values)
+
+
+@asynccontextmanager
+async def _group_shadow_transaction(db: Any, is_pg: bool):
+    """One transaction for the shadow's reads, rolled back however it ends; READ ONLY on Postgres, so
+    the server refuses any write. (SQLite, local dev only, has no READ ONLY transaction.)"""
+    options: Dict[str, Any] = {"readonly": True} if is_pg else {}
+    async with db.transaction(force_rollback=True, **options):
+        # Counted from the moment the connection is checked out until just before it goes back (so
+        # for an instant around each end it is counted as not holding: the reserve check then
+        # subtracts it twice, which only ever makes it skip MORE).
+        _GROUP_SHADOW_CONNECTED["n"] += 1
+        try:
+            yield
+        finally:
+            _GROUP_SHADOW_CONNECTED["n"] -= 1
+
+
+async def _group_shadow_price_column_present(reader: _GroupShadowReader) -> bool:
+    """`price_check_column_present`, asked through the shadow's own connection, and never written
+    back to that probe's process cache (the shadow changes nothing the served path reads)."""
+    from services import external_offer_dual_write as dual_write
+
+    if dual_write._price_check_column.get("present"):
+        return True
+    row = await reader.fetch_one(dual_write.PRICE_CHECK_COLUMN_SQL)
+    return bool(row and _row_to_dict(row).get("present"))
+
+
+def _shadow_offer_brief(offer: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(offer, dict):
+        return None
+    price = offer.get("price")
+    return {"offer_id": offer.get("offer_id"),
+            "price": float(price) if isinstance(price, (int, float)) and not isinstance(price, bool) else None,
+            "currency": offer.get("currency")}
+
+
+def _shadow_legacy_cheapest(served: List[Dict[str, Any]], market_hint: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The cheapest SERVED offer a buyer could take at its price: a positive numeric price in the
+    buyer's currency (the basis `_price_comparable_offers` uses), not known out of stock; first in
+    served order on a tie. Freshness and the matcher's size verdict are NOT required -- the off
+    answer has neither -- which is exactly the difference the shadow line measures."""
+    basis = _declared_buyer_currency(market_hint) if market_hint else seed_serving_currency(None)
+    best: Optional[Dict[str, Any]] = None
+    for offer in served:
+        if not isinstance(offer, dict):
+            continue
+        price = offer.get("price")
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or price <= 0:
+            continue
+        if not basis or offer.get("currency") != basis:
+            continue
+        if offer.get("in_stock") is False or (
+            not isinstance(offer.get("in_stock"), bool) and _availability_says_out_of_stock(offer.get("availability"))
+        ):
+            continue
+        if best is None or float(price) < float(best["price"]):
+            best = offer
+    return _shadow_offer_brief(best)
+
+
+def _group_shadow_compute(snap: Dict[str, Any], group: Dict[str, Any], rows: List[Any]) -> Dict[str, Any]:
+    """What group mode would serve and mark, from the off answer's own offers plus the group-mode
+    catalog read -- PURE (no I/O) and on deep copies, so nothing served is touched. Mirrors the
+    handler's group steps in order: the catalog arm (host dedupe against the seed lane, no mint), the
+    stale flag, merit rank, flagged last, buyer currency, fresh first, host-diverse head, fresh ahead
+    of stale, the comparable set and its cheapest. Live-offer verification is NOT applied (network).
+    The sibling SEED lane is NOT run; what it would have gated is counted."""
+    market_hint = snap["market"]
+    limit = snap["limit"]
+    internal = copy.deepcopy(snap["internal"])
+    # The seed lane's offers, as served by the off path; its catalog offers are re-read in group mode.
+    external = [o for o in copy.deepcopy(snap["external"])
+                if isinstance(o, dict) and (o.get("source") or {}).get("type") != "catalog_offer"]
+    held_hosts: set = set()
+    seen_hosts: set = set()
+    for prior in external:
+        held_hosts |= _offer_hosts(prior)
+        src = prior.get("source") or {}
+        for key in ("canonical_url", "destination_url"):
+            h = _offer_destination_host(src.get(key))
+            if h:
+                seen_hosts.add(h)
+        domain_host = _offer_destination_host(f"https://{src.get('domain')}" if src.get("domain") else None)
+        if domain_host:
+            seen_hosts.add(domain_host)
+    to_gate, _skipped = _sibling_rows_to_gate(
+        group["rows"], considered=snap["considered_seed_ids"], held_hosts=held_hosts,
+    )
+
+    catalog_sku_keys: Dict[str, Optional[str]] = {}
+    defaulted_currency_ids: set = set()
+    for row in rows or []:
+        r = _row_to_dict(row)
+        destination = str(r.get("destination_url") or "").strip()
+        if not destination.startswith(("http://", "https://")):
+            continue
+        dest_host = _offer_destination_host(destination)
+        if dest_host and dest_host in seen_hosts:
+            continue
+        if dest_host:
+            seen_hosts.add(dest_host)
+        offer_id = f"of:catalog_offer:{r.get('offer_id')}"
+        catalog_sku_keys[offer_id] = r.get("sku_key")
+        if not str(r.get("currency") or "").strip():
+            defaulted_currency_ids.add(offer_id)
+        external.append(_catalog_offer_entry(r, group_mode=True, redirect_url=None))
+
+    _mark_price_stale(external)
+    offers = _rank_offers_merit_first(internal + external)
+    offers = [o for o in offers if not o.get("requires_live_verification")] + [
+        o for o in offers if o.get("requires_live_verification")
+    ]
+    offers, _dropped = _offers_in_buyer_currency(offers, market_hint)
+    fresh = [o for o in offers if not o.get("requires_live_verification")]
+    flagged = [o for o in offers if o.get("requires_live_verification")]
+    fresh = [o for o in fresh if not o.get("price_stale")] + [o for o in fresh if o.get("price_stale")]
+    offers = _host_diverse_head(fresh, limit)
+    if flagged and len(offers) < limit:
+        offers = offers + _host_diverse_head(flagged, limit - len(offers))
+    offers = [o for o in offers if not o.get("price_stale")] + [o for o in offers if o.get("price_stale")]
+
+    comparable = _price_comparable_offers(
+        offers, market_hint=market_hint, named_variant=bool(snap["sku_id"]),
+        resolved_product_keys={str(m["product_key"]) for m in group["resolved"]},
+        matched_catalog_offers=set(group["matched_offers"]), catalog_sku_keys=catalog_sku_keys,
+        matched_seeds=dict(group["matched_seeds"]),
+        seed_variants={str(r.get("id") or ""): _seed_variants(_ensure_seed_data_obj(r.get("seed_data")))
+                       for r in group["rows"]},
+        defaulted_currency_ids=defaulted_currency_ids,
+    )
+    best = _best_price_of(offers, comparable)
+    stale = [o for o in offers if o.get("price_stale")]
+    legacy_best = _shadow_offer_brief((snap["served"] or [None])[0])
+    group_best: Any = (
+        {"offer_id": best["offer_id"], "price": best["price"], "currency": best["currency"]}
+        if best.get("offer_id") else "no_fresh_comparable_price"
+    )
+    return {
+        "legacy_best": legacy_best,
+        "legacy_cheapest": _shadow_legacy_cheapest(snap["served"], market_hint),
+        "group_best": group_best,
+        "best_differs": (legacy_best or {}).get("offer_id") != (group_best if isinstance(group_best, dict) else {}).get("offer_id"),
+        "group_offers": len(offers),
+        "comparable": len(comparable),
+        "fresh": len(offers) - len(stale),
+        "stale": len(stale),
+        "price_stale": [
+            {"offer_id": o.get("offer_id"),
+             "host": _offer_destination_host(o.get("url") or (o.get("source") or {}).get("destination_url")
+                                             or (o.get("source") or {}).get("canonical_url")) or None,
+             "price_checked_at": o.get("price_checked_at")}
+            for o in stale[:OFFERS_RESOLVE_GROUP_SHADOW_STALE_LISTED]
+        ],
+        "catalog_rows": len(rows or []),
+        "sibling_seeds_not_evaluated": len(to_gate),
+    }
+
+
+def _group_shadow_cache_line(*, trigger: str, refreshed: bool, refresh_ms: Optional[int] = None,
+                             reason: Optional[str] = None, error: Optional[str] = None,
+                             pool_free: Any = None) -> None:
+    """`offers_resolve_group_shadow_cache`: ONE line per key-set refresh (and per arming check that could
+    not refresh, with its `reason`), so the shadow's state is visible with no offers traffic at all.
+    Reads the skip counters WITHOUT resetting them (they still ride on the next shadow line)."""
+    if pool_free is None:
+        try:
+            from db.database import database
+
+            pool_free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            pool_free = None
+    cks = _GROUP_SHADOW_CKS.get("cks")
+    _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_cache", {
+        "trigger": trigger,
+        "mode": _group_seed_siblings_mode(),
+        "refreshed": refreshed,
+        "keys": len(cks) if cks is not None else None,
+        "overflow": bool(_GROUP_SHADOW_CKS.get("overflow")),
+        **({"refresh_ms": refresh_ms} if refresh_ms is not None else {}),
+        "pool_free": pool_free if pool_free is not None else "unknown",
+        "in_flight": len(_GROUP_SHADOW_IN_FLIGHT),
+        "connected": _GROUP_SHADOW_CONNECTED["n"],
+        "skipped": dict(_GROUP_SHADOW_SKIPS),
+        "pid": os.getpid(),
+        **({"reason": reason} if reason else {}),
+        **({"error": error} if error else {}),
+    })
+
+
+async def _group_shadow_refresh_cks(db: Any, reader: "_GroupShadowReader", is_pg: bool, *, trigger: str) -> None:
+    """Re-read the resolved key set (the caller holds `_GROUP_SHADOW_CKS["refreshing"]`), through the
+    shadow's reader: its own READ ONLY transaction, every statement under a server-side timeout. A
+    failure starts the retry backoff and is re-raised. Either way, one `_cache` line."""
+    started = time.perf_counter()
+    error: Optional[str] = None
+    try:
+        async with _group_shadow_transaction(db, is_pg):
+            ck_rows = await reader.fetch_all(_GROUP_SHADOW_RESOLVED_CKS_SQL, {
+                "kinds": list(RESOLVED_GROUP_KINDS), "strategies": list(RESOLVED_GROUP_STRATEGIES),
+                "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
+            })
+        cks = frozenset(str(_row_to_dict(r).get("content_key") or "") for r in ck_rows or []) - {""}
+        overflow = len(ck_rows or []) >= OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT
+        _GROUP_SHADOW_CKS.update(cks=cks, loaded_at=time.monotonic(), failed_at=None, overflow=overflow)
+        if overflow:
+            # ONCE per refresh, not per request: until a refresh reads fewer keys, every request skips.
+            _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT + "_disabled", {
+                "reason": "overflow", "keys": len(ck_rows or []),
+                "limit": OFFERS_RESOLVE_GROUP_SHADOW_CK_LIMIT,
+                "retry_after_seconds": OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS,
+            })
+    except BaseException as exc:
+        _GROUP_SHADOW_CKS["failed_at"] = time.monotonic()
+        error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        raise
+    finally:
+        _group_shadow_cache_line(trigger=trigger, refreshed=error is None,
+                                 refresh_ms=int((time.perf_counter() - started) * 1000), error=error)
+
+
+# ── ARMING: the shadow says it is alive with no offers traffic at all ──────────────────────────────
+#
+# The key set is refreshed LAZILY, from a shadow-mode request, so with no offers.resolve traffic it is
+# never read and nothing is logged -- which looks exactly like a shadow that skips everything (a pool
+# it cannot read, a cap that never frees). So in `shadow` mode ONLY, each worker process runs one
+# detached loop (`start_group_shadow_arming`, from main.app_lifespan): shortly after startup, and then
+# whenever the key set falls due (OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS), it refreshes it through
+# the SAME gated path -- fail-closed pool check, cap, its own task in a fresh contextvars.Context, READ
+# ONLY transaction, statement_timeout, the budget -- and the refresh logs its `_cache` line. A check
+# that cannot refresh logs the line with its `reason` instead. It IS the per-TTL refresh, not a second
+# one: it refreshes only a key set that is due (a lazy refresh that just ran pushes it back), and the
+# `refreshing` flag keeps the two from ever running together. Mode `on` does not use the key set, and
+# `off` starts nothing: no task, no query, no line.
+OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS = 5.0
+
+
+def _group_shadow_next_refresh_in() -> float:
+    """Seconds until the key set falls due (or its failure backoff ends), within [1, TTL]."""
+    now = time.monotonic()
+    cks = _GROUP_SHADOW_CKS.get("cks")
+    due = 0.0 if cks is None else _GROUP_SHADOW_CKS["loaded_at"] + OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS - now
+    failed_at = _GROUP_SHADOW_CKS.get("failed_at")
+    if failed_at is not None:
+        due = max(due, failed_at + OFFERS_RESOLVE_GROUP_SHADOW_CK_RETRY_SECONDS - now)
+    return min(max(due + 0.05, 1.0), OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS)
+
+
+async def _group_shadow_arm_refresh(trigger: str) -> None:
+    from db.database import database
+
+    is_pg = str(getattr(database, "url", "")).lower().startswith(("postgresql://", "postgres://"))
+    reader = _GroupShadowReader(database, deadline=time.perf_counter() + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS,
+                                is_pg=is_pg)
+    if _GROUP_SHADOW_CKS["refreshing"]:
+        return  # a lazy refresh is running and logs its own line
+    _GROUP_SHADOW_CKS["refreshing"] = True
+    try:
+        await _group_shadow_refresh_cks(database, reader, is_pg, trigger=trigger)
+    except Exception:  # noqa: BLE001 -- on the line already
+        pass
+    finally:
+        _GROUP_SHADOW_CKS["refreshing"] = False
+
+
+async def _group_shadow_arm_once(trigger: str) -> bool:
+    """One arming check. True when it ran a refresh, False when it could not (and logged why). Never
+    raises; never waits past the budget."""
+    try:
+        if _GROUP_SHADOW_CKS["refreshing"]:
+            return False
+        from db.database import database
+
+        try:
+            free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            free = None
+        if free is None:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="pool_unknown")
+            return False
+        if len(_GROUP_SHADOW_IN_FLIGHT) >= OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="cap", pool_free=free)
+            return False
+        not_yet_connected = max(0, len(_GROUP_SHADOW_IN_FLIGHT) - _GROUP_SHADOW_CONNECTED["n"])
+        if free - not_yet_connected <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
+            _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="pool_busy", pool_free=free)
+            return False
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_group_shadow_arm_refresh(trigger), context=contextvars.Context())
+        _GROUP_SHADOW_IN_FLIGHT.add(task)  # counts against the cap and the reserve like any shadow
+        task.add_done_callback(lambda t: _group_shadow_task_done(t, {}))
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS + 0.1)
+        except asyncio.CancelledError:
+            task.cancel()  # shutdown: the refresh goes with the loop (its done callback still runs)
+            raise
+        if task not in done:
+            task.cancel()  # stays in the in-flight set until it has unwound; its line says CancelledError
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _group_shadow_cache_line(trigger=trigger, refreshed=False, reason="arming_error",
+                                 error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        return False
+
+
+async def _group_shadow_arming_loop() -> None:
+    await asyncio.sleep(OFFERS_RESOLVE_GROUP_SHADOW_ARM_DELAY_SECONDS)
+    trigger = "startup"
+    while True:
+        wait = None
+        try:
+            if _group_seed_siblings_mode() == "shadow" and _group_shadow_cache_verdict(set()) == "refresh":
+                if not await _group_shadow_arm_once(trigger):
+                    wait = OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS  # could not refresh: next try in a TTL
+            if wait is None:
+                wait = _group_shadow_next_refresh_in()
+        except Exception:  # noqa: BLE001
+            wait = OFFERS_RESOLVE_GROUP_SHADOW_CK_TTL_SECONDS
+        trigger = "periodic"
+        await asyncio.sleep(wait)
+
+
+def start_group_shadow_arming() -> "Optional[asyncio.Task[Any]]":
+    """Called once per worker process from main.app_lifespan. In `shadow` mode: a detached arming loop,
+    in a fresh contextvars.Context (the caller cancels it at shutdown). Any other mode: None -- no
+    task, no query, no line. Never raises."""
+    try:
+        if _group_seed_siblings_mode() != "shadow":
+            return None
+        return asyncio.get_running_loop().create_task(_group_shadow_arming_loop(), context=contextvars.Context())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _group_shadow_answer(snap: Dict[str, Any], *, deadline: float, record: Dict[str, Any]) -> bool:
+    """The shadow's reads and its comparison, filling `record`. True when there is a line to log
+    (the group is RESOLVED), False when there is nothing to say. Raises on any failure; the caller
+    (`_run_group_shadow`) turns that into the line's `error`."""
+    from db.database import database
+
+    is_pg = str(getattr(database, "url", "")).lower().startswith(("postgresql://", "postgres://"))
+    reader = _GroupShadowReader(database, deadline=deadline, is_pg=is_pg)
+    record["_reader"] = reader
+    keys = set(snap["keys"])
+    if _group_shadow_cache_verdict(keys) == "refresh":
+        if _GROUP_SHADOW_CKS["refreshing"]:
+            _group_shadow_skip("refreshing")  # another shadow is refreshing the set right now
+            return False
+        _GROUP_SHADOW_CKS["refreshing"] = True
+        try:
+            await _group_shadow_refresh_cks(database, reader, is_pg, trigger="request")
+        finally:
+            _GROUP_SHADOW_CKS["refreshing"] = False
+    verdict = _group_shadow_cache_verdict(keys)
+    if verdict == "overflow":
+        _group_shadow_skip("overflow")
+    if verdict != "run":
+        return False
+    async with _group_shadow_transaction(database, is_pg):
+        group = await _fetch_resolved_group(reader, aliases=snap["aliases"], market_hint=snap["market"],
+                                            deadline=deadline)
+        if len(group["resolved"]) < 2:
+            return False
+        record["content_key"] = str(group["resolved"][0].get("content_key") or "") or None
+        record["members"] = len(group["members"])
+        record["resolved"] = len(group["resolved"])
+        present = await _group_shadow_price_column_present(reader)
+        price_select, price_order, price_params = _catalog_price_freshness_fragments(present)
+        record["price_column"] = present
+        price_select += "\n                           o.sku_key AS sku_key,"
+        rows = await reader.fetch_all(
+            _catalog_offers_statement(price_select, price_order),
+            {"aliases": snap["aliases"], "limit": max(snap["limit"], 1),
+             "market": snap["market"],
+             "buyer_currency": _declared_buyer_currency(snap["market"]),
+             "unavailable": sorted(OFFER_UNAVAILABLE_AVAILABILITIES),
+             **price_params},
+        )
+    record.update(_group_shadow_compute(snap, group, list(rows or [])))
+    return True
+
+
+def _group_shadow_emit(snap: Dict[str, Any], state: Dict[str, Any], error: Optional[str]) -> None:
+    """The ONE line of a shadow. Never raises."""
+    record = dict(state["record"])
+    reader = record.pop("_reader", None)
+    skipped = _group_shadow_take_skips()
+    _pivota_warning_line(OFFERS_RESOLVE_GROUP_SHADOW_EVENT, {
+        "product_id": snap.get("product_id"),
+        "sku_id": snap.get("sku_id"),
+        "market": snap.get("market"),
+        **record,
+        "shadow_ms": int((time.perf_counter() - state["started"]) * 1000),
+        "shadow_db_ms": int((reader.db_seconds if reader else 0.0) * 1000),
+        "shadow_statements": reader.statements if reader else 0,
+        **({"skipped": skipped} if skipped else {}),
+        **({"error": error} if error else {}),
+    })
+
+
+async def _group_shadow_task(snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The detached shadow. Logs at most one line, and none once the budget timer has spoken."""
+    error: Optional[str] = None
+    try:
+        log = await _group_shadow_answer(
+            snap, deadline=state["started"] + OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS,
+            record=state["record"],
+        )
+    except asyncio.CancelledError:
+        state["done"] = True  # the budget timer (which has logged) or shutdown: unwind, say nothing
+        raise
+    except Exception as exc:  # noqa: BLE001 -- swallowed: the shadow never reaches the response
+        log, error = True, f"{type(exc).__name__}: {str(exc)[:200]}"
+    if state["done"]:
+        return
+    state["done"] = True
+    if log:
+        _group_shadow_emit(snap, state, error)
+
+
+def _group_shadow_budget_spent(task: "asyncio.Task[Any]", snap: Dict[str, Any], state: Dict[str, Any]) -> None:
+    """The budget timer: log `budget_exceeded` now and cancel the task. Never waits for it to unwind;
+    it stays in _GROUP_SHADOW_IN_FLIGHT (and so counts against the cap) until it has."""
+    if state["done"] or task.done():
+        return
+    state["done"] = True
+    _group_shadow_emit(snap, state, "budget_exceeded")
+    task.cancel()
+
+
+def _group_shadow_task_done(task: "asyncio.Task[Any]", state: Dict[str, Any]) -> None:
+    _GROUP_SHADOW_IN_FLIGHT.discard(task)
+    timer = state.get("timer")
+    if timer is not None:
+        timer.cancel()
+    if not task.cancelled():
+        task.exception()  # retrieved, so asyncio never logs "Task exception was never retrieved"
+
+
+async def _run_group_shadow(snap: Dict[str, Any]) -> None:
+    """The BackgroundTasks callable. SPAWNS the shadow and returns at once -- it never awaits it, so
+    the next request on this keep-alive connection is not held behind it. Never raises."""
+    try:
+        if len(_GROUP_SHADOW_IN_FLIGHT) >= OFFERS_RESOLVE_GROUP_SHADOW_MAX_IN_FLIGHT:
+            _group_shadow_skip("cap")
+            return
+        from db.database import database
+
+        try:
+            free = _group_shadow_pool_free(database)
+        except Exception:  # noqa: BLE001
+            free = None
+        if free is None:
+            # FAIL CLOSED: a pool we cannot read (missing, not connected, raising) may be exhausted.
+            _group_shadow_skip("pool_unknown")
+            return
+        # The pool's free count already excludes every shadow that HOLDS a connection; a shadow
+        # spawned but not yet connected (e.g. a second spawn in this same loop tick) does not show
+        # in it yet, so it is subtracted here -- never the connected ones, which would count twice.
+        not_yet_connected = max(0, len(_GROUP_SHADOW_IN_FLIGHT) - _GROUP_SHADOW_CONNECTED["n"])
+        if free - not_yet_connected <= OFFERS_RESOLVE_GROUP_SHADOW_POOL_RESERVE:
+            _group_shadow_skip("pool_busy")
+            return
+        loop = asyncio.get_running_loop()
+        state: Dict[str, Any] = {"started": time.perf_counter(), "record": {}, "done": False, "timer": None}
+        # A FRESH Context: `databases` 0.7 keeps the task's connection in a ContextVar, and a task
+        # created the usual way copies the caller's context -- i.e. the request's connection.
+        task = loop.create_task(_group_shadow_task(snap, state), context=contextvars.Context())
+        _GROUP_SHADOW_IN_FLIGHT.add(task)
+        # The done callback FIRST: whatever happens below, the task leaves the in-flight set when done.
+        task.add_done_callback(lambda t: _group_shadow_task_done(t, state))
+        state["timer"] = loop.call_later(
+            OFFERS_RESOLVE_GROUP_SIBLING_BUDGET_SECONDS, _group_shadow_budget_spent, task, snap, state,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _schedule_group_shadow(
+    background_tasks: Optional[BackgroundTasks],
+    *,
+    product_id: Optional[str],
+    sku_id: Optional[str],
+    market_hint: Optional[str],
+    limit: int,
+    aliases: List[str],
+    content_keys: set,
+    served: List[Dict[str, Any]],
+    internal: List[Dict[str, Any]],
+    external: List[Dict[str, Any]],
+    considered_seed_ids: set,
+) -> bool:
+    """On the request path: decide, with no I/O, whether this request MAY name a resolved group, and
+    if so hand `_run_group_shadow` a snapshot. Shallow copies only (the deep copy happens in the
+    background). Never raises. True when a task was scheduled."""
+    try:
+        if background_tasks is None:
+            return False
+        keys = (set(content_keys) | set(aliases)) - {""}
+        if not keys:
+            return False
+        verdict = _group_shadow_cache_verdict(keys)
+        if verdict == "overflow":
+            _group_shadow_skip("overflow")
+            return False
+        if verdict == "skip":
+            return False
+        background_tasks.add_task(_run_group_shadow, {
+            "product_id": product_id, "sku_id": sku_id, "market": market_hint, "limit": limit,
+            "aliases": list(aliases), "keys": frozenset(keys),
+            "served": list(served), "internal": list(internal), "external": list(external),
+            "considered_seed_ids": set(considered_seed_ids),
+        })
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _host_diverse_head(offers: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     """Truncate to `limit` while keeping one offer per DESTINATION HOST at the front.
 
@@ -8799,6 +11057,8 @@ def _external_seed_redirect_identity(
     seed_data: Dict[str, Any],
     offer_variant_id: Optional[str] = None,
     handover: Optional[HandoverVariant] = None,
+    # The per-variant lane's own stored entry (offers.resolve). None = a product-grain caller.
+    offer_variant: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Optional[str]]:
     """Derive the attribution identity for an external-seed redirect.
 
@@ -8998,8 +11258,25 @@ def _external_seed_redirect_identity(
             and canonical_variant_id(attached_variant_id) != _catalog_vid
         ):
             cart_variant_id = None
+        elif _catalog_vid:
+            cart_variant_id = _catalog_vid
+        elif _operator_vid and _attached_variant_is_this_offer(
+            seed_data,
+            offer_variant_id=offer_variant_id,
+            attached_variant_id=attached_variant_id,
+            offer_variant=offer_variant,
+            product_key=attached_key,
+            product_id=source_product_id,
+        ):
+            cart_variant_id = _operator_vid
         else:
-            cart_variant_id = _catalog_vid or _operator_vid
+            # THE OPERATOR ID NAMES ONE VARIANT, AND THIS OFFER MAY BE ANOTHER. It is seed-wide,
+            # so on a multi-variant seed every per-variant offer used to carry a cart for that
+            # one variant: review of #2620 (2026-10-14) shipped an in-stock $19 offer with
+            # `cart_prefilled: true` and a cart for the sold-out $29 sibling. A price belongs to
+            # the exact variant it was quoted for, so an offer that is not the attached variant
+            # gets the referral, not someone else's cart.
+            cart_variant_id = None
 
     return {
         "merchant_id": merchant_id,
@@ -9011,6 +11288,238 @@ def _external_seed_redirect_identity(
         "seller_ref": seller_ref,
         "seed_kind": seed_kind,
     }
+
+
+def _seed_source_product_id(row: Dict[str, Any], seed_data: Dict[str, Any]) -> Optional[str]:
+    """The BARE source product id `_external_seed_redirect_identity` compares variant ids against:
+    the tail of `attached_product_key` (double-colon storage form, or the pipe transport form),
+    else `external_product_id`. Same parse, so `_cart_is_the_named_offer`'s contradiction check asks
+    the question #2623's attach rule asks: with `external_product_id` instead, an entry whose `id`
+    restates the attached product read as a merchant-issued variant and refused a lone listing's
+    own cart (review r2 of the named-variant guard)."""
+    row = row or {}
+    seed_data = seed_data or {}
+    attached_key = str(row.get("attached_product_key") or seed_data.get("attached_product_key") or "").strip()
+    tail: Optional[str] = None
+    if attached_key.startswith("prod::"):
+        parts = attached_key.split("::")
+        if len(parts) >= 4:
+            tail = "::".join(parts[3:]).strip() or None
+    elif attached_key.count("|") >= 2:
+        tail = attached_key.split("|", 2)[2].strip() or None
+    return tail or str(row.get("external_product_id") or seed_data.get("external_product_id") or "").strip() or None
+
+
+def _cart_is_the_named_offer(
+    cart_variant_id: Any, *, seed_data: Dict[str, Any], offer_variant: Dict[str, Any], named_variant_id: Any,
+    product_key: Optional[str] = None, product_id: Optional[str] = None,
+) -> bool:
+    """May an offer for a NAMED variant carry a cart for `cart_variant_id`? (No cart: trivially.)
+
+    When the id is one of the offer's OWN: the named id itself, and every id the stored entry the
+    offer IS names, and the ONE snapshot entry answering to the name -- read by the lane's shared
+    reader (`stored_entry_variant_ids`: canonical identity keys, plus the `?variant=N` of a JSON-LD
+    offer `@id`-shaped id, the shape most stored entries carry, census 2026-10-15). The snapshot
+    counts because it is the same variant under another read: the route's `_seed_variants` reads
+    top-level `variants` only, so a seed storing its variants solely in `snapshot.variants` serves a
+    named one as the `[{}]` fallback while the stamp the cart comes from sits on that very snapshot
+    entry. Two snapshot entries answering to one name say nothing.
+
+    Or when the offer IS the seed's one stored variant (by object, as `_attached_variant_is_this_offer`
+    identifies it) and nothing on that entry contradicts the cart: a lone entry is "nothing to choose
+    between", the rule #2623 and #2624 apply to the operator's id and the sole catalog row, and naming
+    that variant (by its SKU, say) must not cost it the cart its listing gets unnamed. The
+    contradiction check is HERE, not left to those rules: review found only the operator rule
+    applying it to every key -- the sole catalog row is contradicted on `variant_id|variantId|id`
+    only, and the seed stamp never looks at the top-level entry -- so a lone entry stamped
+    `shopify_variant_id: ...002` was handed a sole catalog row's or a snapshot stamp's ...000.
+    Claimed ids only (`stored_entry_claimed_variant_ids`: never a `sku`, which may match a variant but
+    not refuse one; a URL-shaped id contributes its `?variant=`), judged parent-aware against the
+    attached key's product.
+    """
+    cart = canonical_variant_id(cart_variant_id)
+    if not cart:
+        return True
+
+    named = canonical_variant_id(named_variant_id)
+    own = stored_entry_variant_ids(offer_variant) | {
+        x for x in (named, url_named_variant_id(named_variant_id)) if x
+    }
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    snapshot_variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if named and isinstance(snapshot_variants, list):
+        twins = [x for x in snapshot_variants if stored_entry_answers_to(x, named)]
+        if len(twins) == 1:
+            own |= stored_entry_variant_ids(twins[0])
+    if cart in own:
+        return True
+    served = _seed_variants(seed_data)
+    # The SAME variant read twice (#2627): an entry the corroborated fold -- the snapshot holds
+    # exactly one variant and it is the cart's, the entry claims no other, the price agrees -- makes
+    # the cart's variant. That is the cart #2627 restores for a SKU-named entry; it is its own.
+    if isinstance(offer_variant, dict) and offer_variant and any(v is offer_variant for v in served) and (
+        entry_is_the_sole_variant_read_again(
+            offer_variant, variant_id=cart, stored=served, seed_data=seed_data,
+            product_key=product_key, product_id=product_id,
+        )
+    ):
+        return True
+    if not (len(served) == 1 and served[0] is offer_variant):
+        return False
+    # THE CALLER'S NAME IS A CLAIM HERE (Peng, 2026-10-15). A stored `sku` may match a variant but
+    # never refuse one, because on this corpus it is routinely a barcode -- but that doctrine is for
+    # data that came WITH the entry. A name the caller sent is an assertion about which variant the
+    # buyer wants, and when it is itself shaped like a merchant-issued id (parent-aware, so a
+    # restated product id is not one) and differs from the cart, a cart for the other id is a silent
+    # substitution. Refusing costs at worst a click (a barcode-named single-variant listing lands on
+    # its PDP); not refusing can charge for the wrong shade. Only on this branch: everywhere else
+    # the cart is already one of the offer's own ids, or the corroborated fold above has proven the
+    # product has exactly one variant. (The name differs from the cart by construction here: it is
+    # one of `own`, and a cart in `own` has already returned.)
+    if names_a_merchant_issued_variant(named, product_key=product_key, product_id=product_id):
+        return False
+    return not any(
+        claimed != cart
+        and names_a_merchant_issued_variant(claimed, product_key=product_key, product_id=product_id)
+        for claimed in stored_entry_claimed_variant_ids(offer_variant)
+    )
+
+
+def _attached_variant_is_this_offer(
+    seed_data: Dict[str, Any],
+    *,
+    offer_variant_id: Optional[str],
+    attached_variant_id: Optional[str],
+    offer_variant: Optional[Dict[str, Any]] = None,
+    product_key: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> bool:
+    """May a seed-wide `attached_variant_id` name the cart of this offer?
+
+    PER-VARIANT LANE (`offer_variant` given — offers.resolve). The offer is identified by OBJECT
+    among the stored variants, never by an id string: two entries can share one (both `sku: X`)
+    or both have none, and string matching then handed the first, $19 entry the $29 sibling's
+    cart (review of #2623). The entry gets the cart when one of its identity keys answers to the
+    attached id. Failing that, only a seed storing exactly that one variant may still take it,
+    and only when nothing on the entry names a DIFFERENT merchant-issued variant. An offer that
+    is no stored entry (the `[{}]` fallback) gets it only on a seed storing at most one variant,
+    under the same contradiction check on its id and the lone entry.
+
+    PRODUCT-GRAIN CALLERS (`offer_variant` None — the card lanes). Unchanged from before except
+    for the contradiction check: no offer id, or a seed storing at most one variant, is "nothing
+    to choose"; otherwise the offer id must answer. The card lanes pass no per-variant identity
+    today and are a known follow-up, not this rule's job.
+
+    Ids compare canonically (a gid and its bare number agree). Contradiction uses
+    `names_a_merchant_issued_variant`, parent-aware, on CLAIM keys only — never a `sku`, which
+    on this corpus is routinely a barcode and may match but not refuse (the L3469 doctrine) —
+    and on the offer STRING only when it is a Shopify gid, since that string comes from a chain
+    that includes `sku`.
+    """
+    target = canonical_variant_id(attached_variant_id)
+    if not target:
+        return False
+    served = _seed_variants(seed_data)
+    offer = str(offer_variant_id or "").strip()
+
+    def _contradicts(value: Any) -> bool:
+        return bool(
+            names_a_merchant_issued_variant(value, product_key=product_key, product_id=product_id)
+            and canonical_variant_id(value) != target
+        )
+
+    def _offer_contradicts() -> bool:
+        # The OFFER STRING comes from `_seed_offer_variant_id`, whose chain includes `sku`: a bare
+        # number there may be a barcode, and a barcode may match but never refuse
+        # (`test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain`). Only a
+        # Shopify gid is unambiguously a variant claim, so only a gid may contradict here.
+        return offer.lower().startswith("gid://shopify/productvariant/") and _contradicts(offer)
+
+    def _entry_contradicts(v: Dict[str, Any]) -> bool:
+        # The shared reader's CLAIM ids (no `sku`), URL-shaped ids read for their `variant=`.
+        return any(_contradicts(x) for x in stored_entry_claimed_variant_ids(v))
+
+    def _answers(v: Dict[str, Any]) -> bool:
+        # The ONE reader every matcher in this lane uses (services/handover_variant_identity):
+        # it also reads `?variant=N` off a JSON-LD `@id`-shaped id, the shape most stored
+        # entries carry (census 2026-10-15).
+        return stored_entry_answers_to(v, target)
+
+    if offer_variant is not None:
+        mine = next((v for v in served if v is offer_variant), None)
+        if mine is not None:
+            if _answers(mine):
+                # Several entries naming it at different prices: whose price is the cart's?
+                return namers_agree_on_price(served, target)
+            return len(served) == 1 and not _entry_contradicts(mine)
+        if len(served) > 1:
+            return False
+        return not _offer_contradicts() and not any(_entry_contradicts(v) for v in served)
+
+    if len(served) <= 1:
+        return not _offer_contradicts() and not any(_entry_contradicts(v) for v in served)
+    if not offer:
+        return True
+    mine = [v for v in served if _seed_offer_variant_id(v) == offer]
+    if not mine:
+        return canonical_variant_id(offer) == target
+    # EXACTLY ONE entry may be this offer. Two entries sharing its id (both `sku: X`) cannot
+    # say which one the offer is, so neither may lend it the attached cart.
+    return len(mine) == 1 and _answers(mine[0]) and namers_agree_on_price(served, target)
+
+
+def _cart_pinned_to(cart_url: Any, market: Any) -> bool:
+    """Is there a cart, and is it pinned (`country=`) to exactly this market?"""
+    if not cart_url or not market:
+        return False
+    from urllib.parse import parse_qs, urlsplit
+
+    return parse_qs(urlsplit(str(cart_url)).query).get("country") == [str(market).strip().upper()]
+
+
+def _live_cart_identity(
+    claims: Any,
+    *,
+    redirect_identity: Dict[str, Any],
+    destination_url: str,
+    handover_variant_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """The redirect identity with an ACCEPTED gateway live read's `vid` as the cart variant, for an
+    offer whose normal path names none -- or None when it may not have one.
+
+    Only when the normal path names nothing at all (no cart id, and no hand-over id other than
+    `vid`), and the read's host `h` is the store the cart would be built on (www-insensitive: a
+    variant id belongs to one Shopify store).
+
+    THE READ IS ALSO SHOPIFY EVIDENCE FOR `h`, and for this offer only. The gateway reads nothing
+    but a store's Shopify UCP endpoint (/.well-known/ucp -> /api/ucp/mcp, `lookup_catalog` on
+    gid://shopify/ProductVariant/<vid>), so a store that answered `vid` IS a Shopify store at `h`.
+    Like the snapshot's storefront evidence in `_external_seed_redirect_identity`, it may only
+    replace the INTAKE LANE label (None / "external_seed"), never a writer-verified platform; it is
+    never persisted, and no other offer sees it. `platform` feeds only the cart-permalink decisions
+    (`resolve_cart_permalink`: the purchasability gate, the mint and the published spec). Then
+    `resolve_cart_permalink` must actually build a cart on `vid`, so `execution_spec.variant_id`
+    stays null exactly when `cart_url` does."""
+    if redirect_identity.get("cart_variant_id"):
+        return None
+    if handover_variant_id and str(handover_variant_id).strip() != claims.vid:
+        return None
+
+    _store = offer_live_verification.store_host
+    cart_host = _store(redirect_identity.get("shop_domain")) or _store(destination_url)
+    if not cart_host or _store(claims.h) != cart_host:
+        return None
+    platform = redirect_identity.get("platform")
+    if platform in (None, "external_seed"):
+        platform = "shopify"
+    if not resolve_cart_permalink(
+        destination_url=destination_url,
+        shop_domain=redirect_identity.get("shop_domain"),
+        platform=platform,
+        cart_variant_id=claims.vid,
+    ):
+        return None
+    return {**redirect_identity, "platform": platform, "cart_variant_id": claims.vid}
 
 
 def resolve_cart_permalink(
@@ -9335,6 +11844,14 @@ def _cart_prefilled_claim(
     # provable where it would otherwise be `None`. Defaulted because omitting it errs SAFE:
     # the claim stays `None` ("unknown"), never a wrong `False`.
     purchasability_tier: Optional[str] = None,
+    # Set when the offer's own stock claim withheld the cart. Signed into the token the same
+    # way, and knocked out by the warm lane the same way; defaulted for the same reason.
+    stock_declined: bool = False,
+    # Set when the offer is returned flagged `requires_live_verification`. Signed and knocked out
+    # the same way; defaulted for the same reason.
+    live_verification_required: bool = False,
+    # Set when a named variant's cart was withheld as another variant's. Same road again.
+    variant_declined: bool = False,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -9406,6 +11923,9 @@ def _cart_prefilled_claim(
         ctx={
             "join_mode": "referral_only",
             **({PURCHASABILITY_TIER_KEY: purchasability_tier} if purchasability_tier else {}),
+            **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
+            **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
+            **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
         },
         settings=settings,
     ):
@@ -9436,6 +11956,26 @@ def _redirect_token_expiry(redirect_url: Optional[str]) -> Optional[str]:
         return None
 
 
+# Token payload key for the country a minted cart was pinned to (see `_make_external_redirect_url`).
+TOKEN_CART_COUNTRY_KEY = "cart_country"
+
+
+def _cart_country_pin(market: Any, observed: Any) -> Optional[str]:
+    """The ISO-2 country a cart link is pinned to: the BUYER's market as the request declared it,
+    only when it was declared (`observed`; a defaulted "US" is not a buyer's market) and the
+    market registry lists it. Otherwise None, and the link is exactly what it was.
+
+    Never the row's listing market: an SG buyer on a US-listed card pinned to `country=US` would
+    be forced into a US checkout (review of #2622). Callers pass the request's market."""
+    if observed is not True:
+        return None
+    entry = market_registry.market_or_none(market)
+    code = market_registry.normalize_market(market)
+    if not entry or not re.fullmatch(r"[A-Z]{2}", code):
+        return None
+    return code
+
+
 def compose_attributed_destinations(
     *,
     destination_url: str,
@@ -9448,6 +11988,7 @@ def compose_attributed_destinations(
     click_id: str,
     recovery_key: Optional[str] = None,
     quantity: int = 1,
+    pin_country: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compose every attributed URL for one external offer, ONCE.
 
@@ -9497,6 +12038,12 @@ def compose_attributed_destinations(
         if cart_utm
         else None
     )
+    # THE BUYER'S MARKET ON THE CART (`_cart_country_pin`). Without it a cart permalink opens in
+    # whatever market the store picks for the visitor, so a US buyer could land in a GBP or JPY
+    # checkout. `country=<CC>` pins the checkout's market (verified live 2026-09-18, judydoll:
+    # build_shopify_cart_permalink). The PDP is not pinned: it is a page, not a checkout.
+    if cart_url and pin_country:
+        cart_url = append_shopify_cart_country(cart_url, pin_country)
     return {
         "primary": cart_url or pdp_url,
         "cart_url": cart_url,
@@ -9559,6 +12106,12 @@ async def _make_external_redirect_url(
     # ctx, destination and ids signed into the token, so the row recorded at issue time and the
     # one `/r` fills can never describe different clicks. The caller writes the batch.
     issued_clicks: Optional[List[IssuedClick]] = None,
+    # The BUYER's declared market, to pin a cart permalink's checkout to (`_cart_country_pin`).
+    # Explicit and opt-in: `market` here is the market the link is SERVED under, which on some
+    # lanes is the row's listing market, not the buyer's. None (every caller but offers.resolve
+    # today) leaves the link exactly as before. A pin is signed into the token as `cart_country`
+    # so a re-derive from the token applies the same one.
+    cart_country: Optional[str] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -9586,8 +12139,12 @@ async def _make_external_redirect_url(
         cart_variant_id=cart_variant_id,
         click_id=stable_click_id,
         quantity=quantity,
+        pin_country=_cart_country_pin(cart_country, market_observed),
     )
     join_mode = composed["join_mode"]
+    applied_cart_country = (
+        _cart_country_pin(cart_country, market_observed) if composed["cart_url"] else None
+    )
     dest = composed["primary"]
 
     runtime_allowed_domains = allowed_domains
@@ -9634,6 +12191,8 @@ async def _make_external_redirect_url(
             # Absent rather than `false` for an unobserved market, so the token is
             # byte-identical to a pre-provenance mint on that (majority) path.
             **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
+            # Only when a cart was pinned, so every other token is byte-identical to before.
+            **({TOKEN_CART_COUNTRY_KEY: applied_cart_country} if applied_cart_country else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
@@ -9714,6 +12273,8 @@ def _seed_attribution_from_redirect(
         cart_variant_id=cart_variant_id,
         click_id=click_id,
         quantity=quantity,
+        # The pin the mint applied, as the token itself records it.
+        pin_country=_cart_country_pin(payload.get(TOKEN_CART_COUNTRY_KEY), True),
     )
     if composed["primary"] != signed_dest:
         return None

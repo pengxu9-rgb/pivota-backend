@@ -443,11 +443,22 @@ print(json.dumps({
 # metric this script created seconds ago may not have one yet; with the check off the policy is
 # accepted, evaluates to nothing until the metric exists, and to data after. Use it only for a
 # metric this script creates, and keep the name under test: the API will no longer catch a typo.
-promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE [RENOTIFY [NEW_METRIC]]
+# Optional trailing SEVERITY= and SUBJECT= arguments affect only the policy that opts in.
+# A subject can name the labels retained by a PromQL aggregation instead of relying on the
+# default resource display name (which is missing for an ungrouped PromQL sum).
+promql_policy() { # DISPLAY_NAME CONDITION_NAME DOC QUERY DURATION EVAL_INTERVAL AUTOCLOSE [RENOTIFY [NEW_METRIC]] [SEVERITY=...] [SUBJECT=...]
   python3 -c '
 import json, sys
 args = sys.argv[1:]
 channel = args.pop()
+metadata = {}
+while args and args[-1].startswith(("SEVERITY=", "SUBJECT=")):
+    key, value = args.pop().split("=", 1)
+    if key in metadata or not value:
+        sys.exit("promql_policy: duplicate or empty " + key)
+    metadata[key] = value
+if "SEVERITY" in metadata and metadata["SEVERITY"] not in {"WARNING", "ERROR", "CRITICAL"}:
+    sys.exit("promql_policy: unsupported severity " + repr(metadata["SEVERITY"]))
 (name, condition_name, doc, query, duration, evaluation_interval, autoclose) = args[:7]
 condition = {"query": query, "duration": duration, "evaluationInterval": evaluation_interval}
 strategy = {"autoClose": autoclose}
@@ -458,7 +469,7 @@ if len(args) > 8:
     if args[8] != "NEW_METRIC":
         sys.exit("promql_policy: the ninth argument can only be NEW_METRIC, got " + repr(args[8]))
     condition["disableMetricValidation"] = True
-print(json.dumps({
+body = {
   "displayName": name,
   "documentation": {"content": doc, "mimeType": "text/markdown"},
   "combiner": "OR",
@@ -466,7 +477,12 @@ print(json.dumps({
     "displayName": condition_name,
     "conditionPrometheusQueryLanguage": condition}],
   "notificationChannels": [channel],
-  "alertStrategy": strategy}))' "$@" "$CHANNEL"
+  "alertStrategy": strategy}
+if "SEVERITY" in metadata:
+    body["severity"] = metadata["SEVERITY"]
+if "SUBJECT" in metadata:
+    body["documentation"]["subject"] = metadata["SUBJECT"]
+print(json.dumps(body))' "$@" "$CHANNEL"
 }
 
 # A policy over a log metric THIS RUN may have created seconds ago. Monitoring rejects such a
@@ -555,14 +571,17 @@ upsert "prod: TLS certificate expiring" "$(policy \
   ALIGN_MIN REDUCE_MIN resource.label.host COMPARISON_LT 14 3600s 3600s 86400s)"
 fi
 
-# Preserve the 2026-09-25 hand-edited ratio: absolute error rate does not track changing traffic.
-# upsert deletes/re-creates by displayName, so reconciling a new policy must not revert this one.
+# Preserve the 1% ratio and 10-minute windows as traffic changes. Retain LB/backend identity on
+# BOTH sides of the ratio: a project-wide sum hid which backend failed and let healthy backends
+# dilute it. On 2026-10-27 that also produced a notification "on __missing__" with no severity.
+# Keep edge failures with an unassigned backend in scope; do not filter backend_target_name.
 upsert "prod: load balancer 5xx" "$(promql_policy \
   "prod: load balancer 5xx" \
   "LB 5xx ratio > 1% over 10m" \
-  "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception." \
-  'sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule"}[10m])) > 0.01' \
-  600s 60s 3600s)"
+  'The external load balancer/backend is returning more than 1% 5xx over a rolling 10-minute window, sustained for 10 minutes. Project: ${metric_or_resource.label.project_id}; forwarding rule: ${metric_or_resource.label.forwarding_rule_name}; backend: ${metric_or_resource.label.backend_target_name}. Inspect load-balancer request logs and the corresponding service request/error logs. A revision that will not start, database saturation, or an unhandled exception can cause this user-visible failure. An unassigned backend can indicate an edge routing failure.' \
+  'sum by (project_id, forwarding_rule_name, backend_target_name) (rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule",response_code_class="500"}[10m])) / sum by (project_id, forwarding_rule_name, backend_target_name) (rate(loadbalancing_googleapis_com:https_request_count{monitored_resource="https_lb_rule"}[10m])) > 0.01' \
+  600s 60s 3600s SEVERITY=ERROR \
+  'SUBJECT=LB 5xx >1%: ${metric_or_resource.label.project_id} / ${metric_or_resource.label.forwarding_rule_name} / ${metric_or_resource.label.backend_target_name}')"
 
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
@@ -571,13 +590,56 @@ upsert "prod: Cloud Run job failing" "$(policy \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 300s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
-# This is continuous job occupancy (running_executions > 0 for 2h), not per-execution age: one wedged
+# This is continuous job occupancy (running_executions > 0 for 5h), not per-execution age: one wedged
 # run or runs chained back to back both fire it; two short overlapping runs do not.
-upsert "prod: relgraph-sync running over two hours" "$(policy \
-  "prod: relgraph-sync running over two hours" \
-  "relgraph-sync has running executions continuously for two hours. Today's daily run takes ~37 minutes (build ~8, sequential review ~29); the inner step timeout is 45 minutes. Task timeout is 14400s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of two hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
+# FIVE HOURS since 2026-10-20 (was two; Peng): the nightly reviews up to 10,000 labels at concurrency
+# 12 (setup_scheduler.sh relgraph_sync_env). Measured 2026-10-20: 3,000 at 16 in ~37 minutes after a
+# ~31-minute build, so 10,000 at 12 is ~3.0-4.0 h a normal night and four hours left ~40 minutes of
+# margin. Five still warns an hour before the 21600s task timeout ends a wedged attempt.
+upsert "prod: relgraph-sync running over five hours" "$(policy \
+  "prod: relgraph-sync running over five hours" \
+  "relgraph-sync has running executions continuously for five hours. The daily run reviews up to 10,000 labels at concurrency 12 and takes ~3.0-4.0 hours (build ~30 minutes, review ~2.5-3.5 hours); the inner step timeout is 300 minutes. Task timeout is 21600s with max-retries 1, so a wedged task can remain alive well after the expected run. It fires on continuous occupancy of five hours or more, whether one wedged run or runs chained back to back; two short overlapping runs do not trip it. Sampling/visibility lag can delay the alert several minutes." \
   'metric.type="run.googleapis.com/job/running_executions" AND resource.type="cloud_run_job" AND resource.label.job_name="relgraph-sync"' \
-  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 7200s 14400s)"
+  ALIGN_MAX REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 18000s 18000s)"
+
+# RETIRED NAMES. upsert() replaces a policy by displayName, so a renamed policy would leave its old
+# one live and firing. Each old name is deleted here, after its successor above has been written, and
+# the run then re-lists to prove it: the old name gone, exactly one successor live. The listing goes
+# into a variable, NOT the for-list: a command substitution that fails in a for-list is just an empty
+# list, so a listing error would retire nothing and report success (2026-10-20 review).
+retire_policy() { # OLD_DISPLAY_NAME SUCCESSOR_DISPLAY_NAME
+  set -- "$(environment_policy_name "$1")" "$(environment_policy_name "$2")"
+  local olds old resp
+  olds="$(api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("list policies FAILED: " + json.dumps(d)[:200])
+for p in d.get("alertPolicies", []):
+    if p.get("displayName") == sys.argv[1]:
+        print(p["name"])
+' "$1")" || { echo "!! retire $1: listing alert policies FAILED; nothing retired" >&2; exit 1; }
+  for old in $olds; do
+    resp="$(api DELETE "${old#projects/*/}")"
+    check "$resp" "retire $1"
+    echo "   retired $1"
+  done
+  api GET alertPolicies | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not isinstance(d, dict) or "error" in d:
+    sys.exit("retire check: list policies FAILED: " + json.dumps(d)[:200])
+names = [p.get("displayName") for p in d.get("alertPolicies", [])]
+if sys.argv[1] in names:
+    sys.exit("retire check FAILED: " + sys.argv[1] + " is still live")
+if names.count(sys.argv[2]) != 1:
+    sys.exit("retire check FAILED: expected one " + sys.argv[2] + ", found %d" % names.count(sys.argv[2]))
+' "$1" "$2"
+  echo "   checked: $1 absent, $2 live"
+}
+retire_policy "prod: relgraph-sync running over two hours" "prod: relgraph-sync running over five hours"
+# The four-hour name lived only in this change's review (never reconciled); retired in case a run wrote it.
+retire_policy "prod: relgraph-sync running over four hours" "prod: relgraph-sync running over five hours"
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \

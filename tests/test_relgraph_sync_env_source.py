@@ -10,7 +10,9 @@ from tests.test_relgraph_sync_iac_env import LIVE_PROD_ENV, WRITE_GATES, VERTEX,
 
 SCRIPT = Path(__file__).resolve().parents[1] / "infra/gcp/setup_scheduler.sh"
 PROD_ONLY = {"RELGRAPH_SYNC_REVIEW_LIMIT", "RELGRAPH_SYNC_REVIEW_CONCURRENCY", "RELGRAPH_SYNC_PRIORITIZE_UNCOVERED",
-             "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT", "RELGRAPH_SYNC_EXPAND_TARGET_RECALL"}
+             "RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT", "RELGRAPH_SYNC_EXPAND_TARGET_RECALL",
+             "RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD", "RELGRAPH_SYNC_CUTOFF", "RELGRAPH_SYNC_REVIEW_RELATION_TYPES",
+             "RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST", "RELGRAPH_DB_DUTY_CYCLE"}
 
 
 def env_function(env_name, writes):
@@ -36,8 +38,13 @@ def test_prod_target_env():
 def test_prod_grows_coverage_with_bounded_review():
     env = env_function("prod", "true")
     assert env["RELGRAPH_SYNC_PRIORITIZE_UNCOVERED"] == "true"
-    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("2000", "6")
-    assert env["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "90"
+    assert (env["RELGRAPH_SYNC_REVIEW_LIMIT"], env["RELGRAPH_SYNC_REVIEW_CONCURRENCY"]) == ("10000", "12")
+    assert env["RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES"] == "300"
+    # The global generated backlog, alternatives first: unscoped, with a cutoff reaching back.
+    assert (env["RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD"], env["RELGRAPH_SYNC_CUTOFF"]) == ("false", "2026-01-01T00:00:00Z")
+    assert env["RELGRAPH_SYNC_REVIEW_RELATION_TYPES"] == "competitive_alternative"
+    # Uncovered anchors first (PIVOTA-Agent #2471): coverage before depth.
+    assert env["RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST"] == "true"
     # The backfill needs the prioritize-uncovered build; the gateway cron refuses it otherwise.
     assert (env["RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT"], env["RELGRAPH_SYNC_EXPAND_TARGET_RECALL"]) == ("200", "true")
 

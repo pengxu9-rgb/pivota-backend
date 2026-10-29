@@ -38,9 +38,17 @@ dropped) and would write B instead. The plan HOLDS every record of that row on t
 The drain could not read `catalog_products.canonical_url` for the planned rows, so it cannot tell a move from a first
 ingest. Fix the database access and re-run; it cannot be accepted.
 
+## `listing_spellings_unread` -- never acceptable
+
+The same read, for the `ext:retailer:` rows. Their listing never moves, but their offer and seed ids hash the URL as
+spelled, so the drain writes each row under the host spelling (`www.` or not) its stored `canonical_url` already uses
+(`checks.listing_spellings`, and `listing_respellings` in the plan). Without that read, a job queued under the other
+spelling would write a second offer and seed for every row it re-crawls. Fix the database access and re-run.
+
 ## CLI (`scripts/onboard_curated_brands.py`)
 
-- `--apply` always reads the rows' listings and exits 2 (`current_listings_unread`) when it cannot.
+- `--apply` always reads the rows' listings and exits 2 (`current_listings_unread`, or `listing_spellings_unread`
+  for retailer rows) when it cannot.
 - A dry run reads them only with `--check-current-listings`; held rows print as
   `held, row names a listing this crawl does not carry {...}`, left-out listings as
   `left out, same title as another listing {...}`.

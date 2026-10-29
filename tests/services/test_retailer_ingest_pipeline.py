@@ -206,6 +206,13 @@ def env(monkeypatch):
     return state
 
 
+def run_flags(env):
+    """The latest run's flags, as an assert MESSAGE (be#2641 CI): a stage that was HELD instead of
+    reaching `apply_due` / `done` names the BLOCK rule that held it, instead of a bare status diff."""
+    runs = list(env.ledger.runs.values()) if env.ledger.runs else []
+    return runs[-1].get("flags") if runs else None
+
+
 def job(status="queued", **options):
     return {"id": "rij_1", "domain": "k-touch.us", "brand": "3CE", "status": status, "attempts": 0,
             "max_attempts": 6, "options": {"vendors": ["3CE"], "require_currency": "USD", **options}}
@@ -213,7 +220,7 @@ def job(status="queued", **options):
 
 async def test_a_clean_dry_run_advances_to_apply(env):
     out = await pipeline.run_stage(job(), db=env.db)
-    assert out["status"] == "apply_due" and out["outcome"] == "clean"
+    assert out["status"] == "apply_due" and out["outcome"] == "clean", run_flags(env)
     assert env.ledger.transitions[-1]["status"] == "apply_due"
     assert env.applied == []  # a dry run never writes
 
@@ -314,7 +321,7 @@ async def test_a_row_backend_recall_cannot_see_is_noted_but_never_fails_the_job(
                 for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("done", "applied")
+    assert (out["status"], out["outcome"]) == ("done", "applied"), run_flags(env)
     readback = list(env.ledger.runs.values())[-1]["readback"]
     assert readback["problems"] == []
     assert bool(readback["notes"]) is noted
@@ -329,7 +336,7 @@ async def test_a_row_backend_recall_cannot_see_is_noted_but_never_fails_the_job(
 async def test_a_readback_problem_fails_the_job_after_apply(env):
     env.readback_rows = []  # the gate said it landed; the catalog has none of it
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert out["status"] == "failed" and out["outcome"] == "readback_failed"
+    assert out["status"] == "failed" and out["outcome"] == "readback_failed", run_flags(env)
     run = list(env.ledger.runs.values())[-1]
     assert run["readback"]["problems"][0]["problem"] == "not in catalog_products"
 
@@ -486,7 +493,7 @@ async def test_a_busy_write_lock_writes_nothing_and_returns_the_job_to_apply_due
     assert await other_apply.fetchval(_TRY)
     before = datetime.now(timezone.utc)
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due"
+    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due", run_flags(env)
     assert env.locked_during_apply == [] and env.applied == []  # apply_ingest_plan never called
     t = env.ledger.transitions[-1]
     assert t["status"] == "apply_due" and t["expected_status"] == "apply_due" and not t["count_attempt"]
@@ -613,7 +620,7 @@ async def test_a_busy_lock_never_runs_the_block_and_closes_its_session():
 
 async def test_no_time_left_for_the_write_means_no_marker_no_write_and_back_to_apply_due(env):
     out = await pipeline.run_stage(job("apply_due"), db=env.db, time_left_s=pipeline.WRITE_MARGIN_S - 1)
-    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due"
+    assert out["outcome"] == "write_lock_busy" and out["status"] == "apply_due", run_flags(env)
     assert "no time left" in out["reason"]
     assert env.ledger.events == [] and env.applied == []          # never marked, never written
     assert env.ledger.lock_server.sessions == []                   # never even waited for the lock
@@ -647,7 +654,7 @@ async def test_a_lock_connection_failure_is_retried_not_failed(env, where):
     else:
         env.ledger.lock_server.try_error = OSError("connection reset")
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert out["outcome"] == "write_lock_unavailable" and out["status"] == "apply_due"
+    assert out["outcome"] == "write_lock_unavailable" and out["status"] == "apply_due", run_flags(env)
     assert ("ConnectionRefusedError" if where == "connect" else "OSError") in out["reason"]
     assert env.ledger.events == [] and env.applied == []
     t = env.ledger.transitions[-1]
@@ -740,7 +747,7 @@ async def test_invalid_options_are_refused_before_any_crawl(env, options):
 
 async def test_a_null_option_is_an_absent_one(env):
     out = await pipeline.run_stage(job(exclude_handles=None, accepted_flags=None), db=env.db)
-    assert out["status"] == "apply_due"
+    assert out["status"] == "apply_due", run_flags(env)
 
 
 async def test_an_exclusion_the_merchant_delisted_can_be_accepted(env):
@@ -798,7 +805,7 @@ def oy(env, monkeypatch):
 
 async def test_a_feed_job_dry_runs_clean_from_the_feed_not_the_storefront(oy):
     out = await pipeline.run_stage(feed_job(), db=oy.db)
-    assert out["status"] == "apply_due" and out["outcome"] == "clean"
+    assert out["status"] == "apply_due" and out["outcome"] == "clean", run_flags(oy)
     run = list(oy.ledger.runs.values())[-1]
     assert run["checks"]["crawl"]["source"] == "affiliate_feed:example_network"
     assert run["checks"]["crawl"]["rows_kept"] == 2 and run["checks"]["crawl"]["sku_links_collapsed"] == 0
@@ -812,6 +819,21 @@ async def test_a_feed_job_applies_one_listing_per_product(oy):
     assert len(plan["pdps"]) == 2
     assert {o["source_ref"] for o in plan["offers"]} == {
         "https://invl.example-network.com/c/GA1", "https://invl.example-network.com/c/GA2"}
+
+
+async def test_a_feed_job_never_vouches_for_its_prices(oy, monkeypatch):
+    """An affiliate feed's prices are as old as the file: its apply never dates them
+    (`apply_ingest_plan(price_read=False)`; catalog_offers.price_checked_at, migration 246)."""
+    from services.catalog_enrichment_agent import apply as apply_mod
+    seen = []
+    fake = apply_mod.apply_ingest_plan
+
+    async def spy(plan, **kw):
+        seen.append(kw.get("price_read"))
+        return await fake(plan, **kw)
+    monkeypatch.setattr(apply_mod, "apply_ingest_plan", spy)
+    out = await pipeline.run_stage(feed_job("apply_due"), db=oy.db)
+    assert out["status"] == "done" and seen == [False]
 
 
 @pytest.mark.parametrize("code", [429, 503])
@@ -895,7 +917,7 @@ async def test_an_olive_young_product_can_be_excluded_by_its_product_id(oy):
 async def test_a_resolved_category_pass_records_each_row_it_left_out_and_why(env):
     env.rows = [TINT, LIPSTICK_NO_TYPE]  # no merchant type and no lip-title evidence: cannot be placed
     out = await pipeline.run_stage(job(only_resolved_category=True), db=env.db)
-    assert out["status"] == "apply_due"
+    assert out["status"] == "apply_due", run_flags(env)
     checks = list(env.ledger.runs.values())[-1]["checks"]
     assert checks["kept"] == 1 and checks["left_out"]["count"] == 1
     assert checks["left_out"]["by_reason"] == {"category_unresolved": 1}
@@ -1041,7 +1063,7 @@ async def test_a_brand_store_named_for_the_brand_needs_no_approval(env):
     j = job(source_role="brand_official")
     j["domain"] = "3ce.com"
     out = await pipeline.run_stage(j, db=env.db)
-    assert out["status"] == "apply_due"
+    assert out["status"] == "apply_due", run_flags(env)
 
 
 async def test_a_known_retailer_can_never_be_a_brand_official_store(env):
@@ -1110,7 +1132,7 @@ async def test_a_multi_brand_cohort_crawls_once_and_keeps_every_vendor_as_its_br
             scanned_products=2, pages=1)
     monkeypatch.setattr(feed, "records_for_brand", fetch)
     opts = {"multi_brand": True, "vendors": ["3CE", "rom&nd"], "brands": {"3CE": "3CE", "rom&nd": "rom&nd"}}
-    assert (await pipeline.run_stage({**job(**opts), "brand": "k-touch.us (2 brands)"}, db=env.db))["status"] == "apply_due"
+    assert (await pipeline.run_stage({**job(**opts), "brand": "k-touch.us (2 brands)"}, db=env.db))["status"] == "apply_due", run_flags(env)
     out = await pipeline.run_stage({**job("apply_due", **opts), "brand": "k-touch.us (2 brands)"}, db=env.db)
     assert out["status"] == "done", env.ledger.runs
     assert seen[0]["brand"] is None and sorted(seen[0]["only_vendors"]) == ["3ce", "rom&nd"]
@@ -1261,7 +1283,7 @@ async def test_a_row_the_index_refused_on_content_is_noted_and_the_store_still_a
     env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]
     env.db.fetch_all = _rows([None, blocker])
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("done", "applied")
+    assert (out["status"], out["outcome"]) == ("done", "applied"), run_flags(env)
     run = list(env.ledger.runs.values())[-1]
     assert run["readback"]["problems"] == []
     [note] = run["readback"]["notes"]
@@ -1278,7 +1300,7 @@ async def test_any_other_reason_a_row_is_not_served_still_fails_the_store(env, b
                  "offers_in_currency": 1, "offers_in_market": 1} for k in values["keys"]]
     env.db.fetch_all = fetch_all
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed"), run_flags(env)
     problem = list(env.ledger.runs.values())[-1]["readback"]["problems"][0]["problem"]
     assert problem.startswith("not serving-eligible")
 
@@ -1299,7 +1321,7 @@ async def test_a_content_refusal_that_may_mask_a_lost_write_still_fails(env, evi
     env.rows = [TINT, ("3CE - Velvet Lip Tint Rose 4g", "LIP TINT", "velvet-lip-tint-rose")]  # both carry an image
     env.db.fetch_all = _rows([None, "low_quality"], **evidence)
     out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("failed", "readback_failed")
+    assert (out["status"], out["outcome"]) == ("failed", "readback_failed"), run_flags(env)
 
 
 async def test_a_product_the_store_publishes_without_an_image_is_still_only_a_note(env):
@@ -1315,7 +1337,7 @@ async def test_a_product_the_store_publishes_without_an_image_is_still_only_a_no
     import unittest.mock as um
     with um.patch.object(cbf, "shopify_product_to_record", side_effect=without_image):
         out = await pipeline.run_stage(job("apply_due"), db=env.db)
-    assert (out["status"], out["outcome"]) == ("done", "applied")
+    assert (out["status"], out["outcome"]) == ("done", "applied"), run_flags(env)
 
 
 

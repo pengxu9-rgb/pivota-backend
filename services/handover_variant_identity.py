@@ -53,7 +53,8 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from urllib.parse import parse_qs, urlparse
 
 from services.outbound_links_service import extract_shopify_numeric_variant_id
 from services.variant_identity import MERCHANT_ISSUED, is_merchant_issued_variant_id
@@ -80,6 +81,12 @@ R_AMBIGUOUS = "multiple_merchant_issued_skus"
 #: to refuse, reached through the one door it had left open.
 R_CONTRADICTED = "hand_over_names_a_different_merchant_issued_id"
 R_NO_IDENTITY = "no_merchant_issued_sku"
+#: ONE live candidate, but the seed stores several variants and the offer being handed over is
+#: one the candidate is not. The sole-candidate path used to hand that one id to EVERY offer of
+#: the seed whose own name was a SKU (a SKU cannot contradict), so a two-variant seed with one
+#: catalog row gave the sibling offer the other variant's cart, quoting one variant's price for
+#: another's checkout. Found 2026-10-14 in review of #2620 / #2623 (the operator-id twin).
+R_SIBLING = "sole_sku_is_another_stored_variant"
 R_NO_PRODUCT_KEY = "no_attached_product_key"
 R_NOT_PRIMED = "not_primed"
 R_LOOKUP_FAILED = "sku_lookup_failed"
@@ -303,6 +310,227 @@ def candidate_from_row(row: Any, rejects: Optional[Dict[str, int]] = None) -> Op
     )
 
 
+#: Every key a stored seed variant may carry its own identity under. ONE tuple for every matcher
+#: in this lane (the route imports it): the offer may be named by its SKU while the same entry
+#: carries the Shopify id a catalog row or an operator attachment holds.
+STORED_VARIANT_ID_KEYS = (
+    "variant_id", "variantId", "id", "sku", "sku_id", "shopify_variant_id", "source_variant_id",
+)
+#: The keys that CLAIM to be a variant id, so may contradict one. Never `sku`/`sku_id`: on this
+#: corpus a SKU is routinely a barcode, which may match a variant but not refuse one.
+CLAIM_VARIANT_ID_KEYS = ("variant_id", "variantId", "id", "shopify_variant_id", "source_variant_id")
+
+
+def url_named_variant_id(value: Any) -> str:
+    """The Shopify variant a URL-SHAPED id names through `variant=N`, or "".
+
+    Measured 2026-10-15 (census oneoff-sibling-entries-census): stored entries routinely carry the
+    JSON-LD offer `@id` as their `variant_id` — `/products/<handle>?variant=45253610242298#offer` —
+    and `canonical_variant_id` reads only a gid or bare digits, so the entry that IS the candidate
+    never answered to it and #2624 refused its offer (211 lost carts). The parse is strict, as in
+    `shopify_variant_identity._url_named_variant_ids`: every `variant=` value must be ASCII digits
+    and there must be exactly one distinct value, or the URL names nothing.
+    """
+    raw = _norm(value)
+    if "variant=" not in raw:
+        return ""
+    try:
+        query = parse_qs(urlparse(raw).query, keep_blank_values=True)
+    except ValueError:
+        return ""
+    # A SUBSCRIPTION offer of the variant, not the variant: `?variant=N&selling_plan=P` is priced
+    # at the plan's price, so a cart for N would charge the one-time price against it. Review
+    # of #2627 (controller, 2026-10-15).
+    if "selling_plan" in query:
+        return ""
+    values = query.get("variant", [])
+    if not values or any(not (v.isascii() and v.isdigit()) for v in values):
+        return ""
+    distinct = set(values)
+    return distinct.pop() if len(distinct) == 1 else ""
+
+
+def _entry_ids(entry: Dict[str, Any], keys: Sequence[str]) -> Set[str]:
+    out: Set[str] = set()
+    for key in keys:
+        canonical = canonical_variant_id(entry.get(key))
+        if canonical:
+            out.add(canonical)
+        named = url_named_variant_id(entry.get(key))
+        if named:
+            out.add(named)
+    return out
+
+
+def stored_entry_variant_ids(entry: Any) -> Set[str]:
+    """Every variant id ONE stored entry names: the canonical form of each identity key, the
+    `variant=` a URL-shaped one names, and the `variant=` on the entry's own `url`. The ONE reader
+    every matcher in this lane uses, so they cannot drift apart again (#2624 review, P3)."""
+    if not isinstance(entry, dict):
+        return set()
+    out = _entry_ids(entry, STORED_VARIANT_ID_KEYS)
+    named = url_named_variant_id(entry.get("url"))
+    if named:
+        out.add(named)
+    return out
+
+
+def stored_entry_claimed_variant_ids(entry: Any) -> Set[str]:
+    """The ids an entry CLAIMS (no `sku`), URL-read too — the only ones that may contradict."""
+    if not isinstance(entry, dict):
+        return set()
+    return _entry_ids(entry, CLAIM_VARIANT_ID_KEYS)
+
+
+def stored_entry_answers_to(entry: Any, variant_id: Any) -> bool:
+    target = canonical_variant_id(variant_id)
+    return bool(target) and target in stored_entry_variant_ids(entry)
+
+
+def _entry_price(entry: Any) -> Optional[float]:
+    if not isinstance(entry, dict):
+        return None
+    for key in ("price_amount", "price"):
+        value = entry.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return round(float(value), 2)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _entry_currency(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return _norm(entry.get("price_currency") or entry.get("currency")).upper()
+
+
+def _price_key(entry: Any) -> tuple:
+    return (_entry_price(entry), _entry_currency(entry))
+
+
+def namers_agree_on_price(stored: Sequence[Dict[str, Any]], variant_id: Any) -> bool:
+    """True when the stored entries naming `variant_id` cannot disagree about its price: at most
+    one names it, or every one of them states the SAME known price (and currency). Two entries
+    naming one variant at $19 and $29 — or a one-time offer and its subscription plans — make
+    the price ambiguous, and an ambiguous price gets no cart (review of #2627, 2026-10-15)."""
+    namers = [v for v in stored if stored_entry_answers_to(v, variant_id)]
+    if len(namers) <= 1:
+        return True
+    keys = {_price_key(v) for v in namers}
+    return len(keys) == 1 and next(iter(keys))[0] is not None
+
+
+def snapshot_names_one_variant(seed_data: Any, variant_id: Any) -> bool:
+    """True when the seed's snapshot holds EXACTLY ONE variant and it is `variant_id` — the
+    products.js-backed statement that the product has a single variant."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data, dict) else None
+    variants = snapshot.get("variants") if isinstance(snapshot, dict) else None
+    if not isinstance(variants, list) or len(variants) != 1:
+        return False
+    return stored_entry_answers_to(variants[0], variant_id)
+
+
+def entry_is_the_sole_variant_read_again(
+    entry: Dict[str, Any],
+    *,
+    variant_id: Any,
+    stored: Sequence[Dict[str, Any]],
+    seed_data: Any,
+    product_key: Any = None,
+    product_id: Any = None,
+) -> bool:
+    """May an entry that does not name `variant_id` still be folded into it — the same single
+    variant read twice (JSON-LD offer + a SKU/barcode entry: census 2026-10-15)?
+
+    ONLY WITH CORROBORATION (controller ruling, 2026-10-15): the snapshot holds exactly one
+    variant and it is `variant_id`; the entry claims no OTHER variant id (a URL-named one, or a
+    claim the classifier calls merchant-issued relative to the product — a 6-digit product or SKU
+    number like jurlique's "114807" is neither); and its price (and
+    currency, where both say one) equals that of the one stored entry naming `variant_id`, or the
+    seed's own price when no entry names it. Equal price alone never folds: a same-price wrong
+    shade is still a wrong-variant cart.
+    """
+    target = canonical_variant_id(variant_id)
+    if not target or not snapshot_names_one_variant(seed_data, target):
+        return False
+    for claimed in stored_entry_claimed_variant_ids(entry) - {target}:
+        if url_named_variant_id(claimed) or claimed.isdigit() and names_a_merchant_issued_variant(
+            claimed, product_key=product_key, product_id=product_id
+        ):
+            return False
+    for key in CLAIM_VARIANT_ID_KEYS:
+        named = url_named_variant_id(entry.get(key))
+        if named and named != target:
+            return False
+    namers = [v for v in stored if stored_entry_answers_to(v, target)]
+    # ONE VARIANT, SEVERAL PRICES among the entries that do not name it: those are selling plans
+    # or sale/compare prices, not the variant read again, and picking the one priced like the
+    # reference would hand a subscription offer the one-time cart (review of #2627: murad, seed
+    # price 16.38, the 1-month plan folded and the one-time entry did not). Fold none.
+    others = {
+        _entry_price(v) for v in stored
+        if all(v is not n for n in namers) and _entry_price(v) is not None
+    }
+    if len(others) > 1:
+        return False
+    if len(namers) == 1:
+        reference_price, reference_currency = _entry_price(namers[0]), _entry_currency(namers[0])
+    elif not namers:
+        reference_price = _entry_price(seed_data) if isinstance(seed_data, dict) else None
+        reference_currency = _entry_currency(seed_data)
+    else:
+        return False
+    price = _entry_price(entry)
+    if price is None or reference_price is None or price != reference_price:
+        return False
+    currency = _entry_currency(entry)
+    return not (currency and reference_currency and currency != reference_currency)
+
+
+def _offer_may_take_the_sole_candidate(
+    one: Candidate, *, seed_data: Any, wanted: str, offer_variant: Any = None
+) -> bool:
+    """May the lone candidate be handed over for the offer named `wanted`?
+
+    Yes when there is nothing to choose between: a product-grain hand-over (no name) or a seed
+    storing at most one entry — the case R_SOLE was written for. Otherwise EXACTLY ONE stored
+    entry must be the offer, and it must name the candidate (`stored_entry_answers_to`, which
+    reads a URL-shaped id's `variant=`), or be the snapshot-corroborated sole variant read again
+    (`entry_is_the_sole_variant_read_again`). An offer the stored entries do not know is refused.
+    """
+    stored = seed_data.get("variants") if isinstance(seed_data, dict) else None
+    stored = [v for v in stored if isinstance(v, dict)] if isinstance(stored, list) else []
+    if offer_variant is not None:
+        # PER-VARIANT LANE (offers.resolve hands over the stored entry the offer IS): identified by
+        # OBJECT, never by its name. An entry with no id at all used to read as "no name" -- product
+        # grain -- and took the sole candidate on a multi-variant seed, so a $19 listing offer shipped
+        # the $29 variant's catalog cart (final review of #2622). The `[{}]` fallback of an unmatched
+        # name is no stored entry, so on a multi-variant seed it takes nothing.
+        if len(stored) <= 1:
+            return True
+        mine = [v for v in stored if v is offer_variant]
+    else:
+        if not wanted:
+            return True
+        if len(stored) <= 1:
+            return True
+        mine = [v for v in stored if any(_norm(v.get(k)) == wanted for k in STORED_VARIANT_ID_KEYS)]
+    # EXACTLY ONE entry may be this offer. Two entries answering to its name (both `sku: X`, or
+    # every `id` restating the product id) cannot say which one it is, so neither lends it the
+    # candidate. Review of #2624 (controller, 2026-10-14).
+    if len(mine) != 1:
+        return False
+    if stored_entry_answers_to(mine[0], one.variant_id):
+        return namers_agree_on_price(stored, one.variant_id)
+    return entry_is_the_sole_variant_read_again(
+        mine[0], variant_id=one.variant_id, stored=stored, seed_data=seed_data,
+        product_key=one.product_key, product_id=one.source_product_id or None,
+    )
+
+
 def choose_handover_variant(
     candidates: Optional[Sequence[Candidate]],
     *,
@@ -313,6 +541,7 @@ def choose_handover_variant(
     product_id: Any = None,
     primed: bool = True,
     lookup_ok: bool = True,
+    offer_variant: Any = None,
 ) -> HandoverVariant:
     """The whole decision, pure — so it can be tested without a database.
 
@@ -367,6 +596,10 @@ def choose_handover_variant(
 
     if len(live) == 1:
         one = live[0]
+        if not _offer_may_take_the_sole_candidate(
+            one, seed_data=seed_data, wanted=wanted, offer_variant=offer_variant
+        ):
+            return HandoverVariant(None, R_SIBLING, None, None, 1)
         return HandoverVariant(one.variant_id, R_SOLE, SOURCE_CATALOG_SKU, one.sku_key, 1)
 
     if len(live) > 1:
@@ -439,6 +672,7 @@ class HandoverVariantResolver:
             "handover_resolved_catalog": 0,
             "handover_resolved_seed_stamp": 0,
             "handover_refused_ambiguous": 0,
+            "handover_refused_sibling": 0,
             "handover_contradicted": 0,
             "handover_no_identity": 0,
             "handover_no_product_key": 0,
@@ -542,8 +776,10 @@ class HandoverVariantResolver:
         offer_variant_id: Any = None,
         named_variant_id: Any = _UNSET,
         product_id: Any = None,
+        offer_variant: Any = None,
     ) -> HandoverVariant:
-        """The per-hand-over answer. Pure — `prime` already did every await."""
+        """The per-hand-over answer. Pure — `prime` already did every await. `offer_variant`: the
+        stored entry the offer IS, from offers.resolve's per-variant lane (identity by object)."""
         self.stats["handover_considered"] += 1
         key = _norm(product_key)
         if not key:
@@ -556,7 +792,7 @@ class HandoverVariantResolver:
             # that simply has no merchant-issued SKU.
             answer = choose_handover_variant(
                 (), seed_data=seed_data, offer_variant_id=offer_variant_id,
-                named_variant_id=named_variant_id, product_id=product_id,
+                named_variant_id=named_variant_id, product_id=product_id, offer_variant=offer_variant,
             )
             if not answer.resolved:
                 answer = HandoverVariant(None, R_NO_PRODUCT_KEY)
@@ -574,6 +810,7 @@ class HandoverVariantResolver:
             product_id=product_id,
             primed=key in self._primed,
             lookup_ok=key not in self._failed,
+            offer_variant=offer_variant,
         )
         self._count(answer)
         return answer
@@ -588,6 +825,8 @@ class HandoverVariantResolver:
             return
         if answer.reason == R_AMBIGUOUS:
             self.stats["handover_refused_ambiguous"] += 1
+        elif answer.reason == R_SIBLING:
+            self.stats["handover_refused_sibling"] += 1
         elif answer.reason == R_CONTRADICTED:
             self.stats["handover_contradicted"] += 1
         elif answer.reason == R_LOOKUP_FAILED:
@@ -627,6 +866,7 @@ def handover_coverage_fields(stats: Optional[Dict[str, int]]) -> Dict[str, Any]:
         "handover_resolved_catalog": stats.get("handover_resolved_catalog", 0),
         "handover_resolved_seed_stamp": stats.get("handover_resolved_seed_stamp", 0),
         "handover_refused_ambiguous": stats.get("handover_refused_ambiguous", 0),
+        "handover_refused_sibling": stats.get("handover_refused_sibling", 0),
         "handover_no_identity": stats.get("handover_no_identity", 0),
         "handover_no_product_key": stats.get("handover_no_product_key", 0),
         "handover_lookup_failed": stats.get("handover_lookup_failed", 0),
@@ -650,7 +890,7 @@ def handover_coverage_message(fields: Dict[str, Any]) -> str:
         " handover considered=%d resolved=%d catalog=%d seed_stamp=%d ambiguous=%d"
         " contradicted=%d no_identity=%d no_product_key=%d lookup_failed=%d not_primed=%d"
         " rows_scanned=%d rows_rejected=%d stamp_vetoed=%d payload_disagreed=%d"
-        " resolved_fraction=%.3f"
+        " sibling=%d resolved_fraction=%.3f"
     ) % (
         fields["handover_considered"], fields["handover_resolved"],
         fields["handover_resolved_catalog"], fields["handover_resolved_seed_stamp"],
@@ -659,7 +899,7 @@ def handover_coverage_message(fields: Dict[str, Any]) -> str:
         fields["handover_lookup_failed"], fields["handover_not_primed"],
         fields["handover_rows_scanned"], fields["handover_rows_rejected"],
         fields["handover_rows_stamp_vetoed"], fields["handover_rows_payload_disagreed"],
-        fields["handover_resolved_fraction"],
+        fields["handover_refused_sibling"], fields["handover_resolved_fraction"],
     )
 
 

@@ -144,7 +144,8 @@ the directory check passes, try `dictionary` on one job before concluding anythi
    - the directory URL;
    - the User-Agent: `Mozilla/5.0 (compatible; PivotaBot/1.0; +https://pivota.cc)` (every signed
      request carries it, and robots.txt is evaluated for it, whatever `EXTERNAL_OFFER_USER_AGENT` says);
-   - the egress IP 34.82.199.35;
+   - the egress IP 136.67.250.98 (`pivota-crawl-egress-ip-2`, since 2026-10-16; 34.82.199.35 before
+     it, kept reserved for rollback -- name both if the registration predates the swap);
    - the request rate (the shared pacer: 2 req/s overall, about 1 req/host/s);
    - the purpose: commerce discovery feeding UCP checkout on the merchant's own store.
 

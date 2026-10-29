@@ -14,6 +14,7 @@ shoppalacebeauty.com). Every positive case has a refusing twin.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -273,3 +274,169 @@ def test_verified_storefronts_by_key_maps_only_proven_brand_rows_on_the_verified
     # The proven brand on ANOTHER host: this row is not that storefront's (derive_seed_seller's own domain
     # match is a second, independent layer; this one must hold by itself).
     assert writer._verified_storefronts_by_key([official], _verified("stilacosmetics.com", "Tarte")) == {}
+
+
+# --- the same proof labels the storefront's own offers brand_direct ------------------------------
+# resolve_offer_type sees only domain + brand, so a brand whose store's name is not exactly the brand
+# ("<brand>cosmetics.com", "<brand>beauty.com") lands offer_type NULL, and the gateway's own-offer read
+# (offer_type = 'brand_direct' AND is_first_party) never serves the store's price for its own product.
+
+
+class _OfferRecordingDB(CatalogDB):
+    """CatalogDB that keeps what each catalog_offers upsert bound: offer_id -> (offer_type, is_first_party)."""
+
+    def __init__(self, **kw: Any):
+        super().__init__(**kw)
+        self.offers: Dict[str, tuple] = {}
+
+    def _record(self, query: str, values: Optional[Dict[str, Any]]) -> None:
+        if "INSERT INTO catalog_offers" not in query or not values:
+            return
+        for k, v in values.items():
+            if k.startswith("offer_id"):
+                suffix = k[len("offer_id"):]
+                self.offers[v] = (values.get(f"offer_type{suffix}"), values.get(f"is_first_party{suffix}"))
+
+    async def execute(self, query, values=None):
+        self._record(query, values)
+        return await super().execute(query, values)
+
+    async def fetch_all(self, query, values=None):
+        self._record(query, values)
+        return await super().fetch_all(query, values)
+
+    async def fetch_one(self, query, values=None):
+        self._record(query, values)
+        return await super().fetch_one(query, values)
+
+
+def _shaded_record(domain: str, *, role: str, brand: str = "Tarte", pid: int = 8101):
+    """A two-shade listing: one canonical offer plus one offer per priced variant (both call sites)."""
+    return feed.shopify_product_to_record(
+        {"id": 6644068500000 + pid, "vendor": brand, "title": "Shape Tape Concealer", "handle": f"p-{pid}",
+         "product_type": "Concealer", "body_html": "<p>Ingredients: Water, Glycerin</p>",
+         "images": [{"src": f"https://cdn.{domain}/{pid}.jpg"}],
+         "options": [{"name": "Shade"}],
+         # real-shaped Shopify variant ids: the native lane drops ids it cannot place as merchant-issued
+         "variants": [{"id": 39406294500000 + pid, "price": "32.00", "available": True, "sku": f"S{pid}a",
+                       "option1": "Fair"},
+                      {"id": 39406294600000 + pid, "price": "32.00", "available": True, "sku": f"S{pid}b",
+                       "option1": "Deep"}]},
+        domain=domain, category_path="beauty", brand_override=brand, currency="USD", source_role=role,
+        retailer_name=domain if role == "retailer" else None, emit_native_variants=True)
+
+
+async def _written_offers(monkeypatch, plan, verified, batch_mode) -> Dict[str, tuple]:
+    monkeypatch.setattr(si, "ensure_observed_seller", _mint)
+    db = _OfferRecordingDB()
+    await writer.apply_ingest_plan(plan, batch_label="t", db=db, batch=batch_mode, verified_storefront=verified)
+    assert db.offers, "the apply must write offers"
+    return db.offers
+
+
+def test_the_lane_alone_leaves_this_storefronts_offers_unlabelled():
+    # The premise: without the proof the listing's own fields give no evidence, so the plan carries NULL.
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    assert len(plan["offers"]) >= 2
+    assert {o["offer_type"] for o in plan["offers"]} == {None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_mode", [False, True])
+async def test_a_verified_storefront_apply_writes_its_offers_brand_direct(real_resolver, monkeypatch, batch_mode):  # noqa: F811
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    written = await _written_offers(monkeypatch, plan, _verified("tartecosmetics.com", "Tarte"), batch_mode)
+    assert len(written) == len(plan["offers"]) >= 2  # canonical AND per-variant offers
+    assert set(written.values()) == {("brand_direct", True)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_mode", [False, True])
+@pytest.mark.parametrize("domain,role,verified,expected", [
+    ("tartecosmetics.com", "brand_official", None, (None, False)),
+    ("luxiface.com", "brand_official", None, (None, False)),
+    ("tartecosmetics.com", "brand_official", _verified("stilacosmetics.com", "Tarte"), (None, False)),
+    ("tartecosmetics.com", "brand_official", _verified("tartecosmetics.com", "Stila"), (None, False)),
+    # a reseller listing keeps the lane's own label, proof or not
+    ("shoppalacebeauty.com", "retailer", _verified("shoppalacebeauty.com", "Tarte"), ("retailer", False)),
+])
+async def test_without_proof_for_this_row_its_offers_keep_the_lanes_label(
+    real_resolver, monkeypatch, batch_mode, domain, role, verified, expected,  # noqa: F811
+):
+    plan = ingest_validated_jsonl([_shaded_record(domain, role=role)])
+    written = await _written_offers(monkeypatch, plan, verified, batch_mode)
+    assert set(written.values()) == {expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_mode", [False, True])
+async def test_each_rows_offers_follow_its_own_proof_in_a_mixed_cohort(real_resolver, monkeypatch, batch_mode):  # noqa: F811
+    missha = _shaded_record("misshaus.com", role="brand_official", brand="Missha", pid=9101)
+    apieu = _shaded_record("misshaus.com", role="brand_official", brand="A'PIEU", pid=9201)
+    plan = ingest_validated_jsonl([missha, apieu])
+    key_of = {p["brand"]: p["product_key"] for p in plan["pdps"]}
+    pk_of = {o["offer_id"]: o["product_key"] for o in plan["offers"]}
+    written = await _written_offers(monkeypatch, plan, _verified("misshaus.com", "Missha"), batch_mode)
+    assert {v for oid, v in written.items() if pk_of[oid] == key_of["Missha"]} == {("brand_direct", True)}
+    assert {v for oid, v in written.items() if pk_of[oid] == key_of["A'PIEU"]} == {(None, False)}
+
+
+def test_an_offer_sent_off_the_verified_host_or_already_typed_is_left_alone():
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    first, second, *rest = plan["offers"]
+    moved = dict(first, offer_payload=json.dumps({"destination_url": "https://other-store.com/p/1"}))
+    typed = dict(second, offer_type="retailer", offer_mode="redirect")
+    out, counts = writer._label_verified_storefront_offers(
+        {**plan, "offers": [moved, typed, *rest]}, _verified("tartecosmetics.com", "Tarte"))
+    got = {o["offer_id"]: (o["offer_type"], o["is_first_party"]) for o in out["offers"]}
+    assert got[moved["offer_id"]] == (None, False)
+    assert got[typed["offer_id"]] == ("retailer", False)
+    assert rest and {got[o["offer_id"]] for o in rest} == {("brand_direct", True)}
+    assert counts == {"offers_labelled_verified_storefront": len(rest)}
+    # No proof: the plan comes back as it went in, and no count is added.
+    assert writer._label_verified_storefront_offers(plan, None) == (plan, {})
+
+
+def _with_destination(offer: Dict[str, Any], url: str) -> Dict[str, Any]:
+    return dict(offer, offer_payload=json.dumps({"destination_url": url}), source_ref=url)
+
+
+@pytest.mark.parametrize("destination,labelled", [
+    ("https://www.tartecosmetics.com/products/p-8101", True),        # www. is the same store
+    ("https://us.tartecosmetics.com/products/p-8101", False),        # a subdomain is another store
+    ("https://tartecosmetics.com.evil.com/products/p-8101", False),  # look-alike host
+    ("https://evil.com/tartecosmetics.com/products/p-8101", False),   # host named only in the path
+])
+def test_only_a_destination_on_the_verified_host_is_labelled(destination, labelled):
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    first, *rest = plan["offers"]
+    out, _ = writer._label_verified_storefront_offers(
+        {**plan, "offers": [_with_destination(first, destination), *rest]}, _verified("tartecosmetics.com", "Tarte"))
+    assert (out["offers"][0]["offer_type"], out["offers"][0]["is_first_party"]) == (
+        ("brand_direct", True) if labelled else (None, False))
+
+
+def test_a_proof_for_a_subdomain_store_does_not_cover_the_apex_rows():
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    assert writer._label_verified_storefront_offers(plan, _verified("us.tartecosmetics.com", "Tarte")) == (plan, {})
+
+
+def test_a_forged_proof_on_a_known_retailer_never_labels_brand_direct():
+    # The drain refuses a known retailer before any proof exists (test_nothing_else_is_proof); this is the second
+    # layer: even handed one, the seller rule's known-retailer branch wins.
+    plan = ingest_validated_jsonl([_shaded_record("sephora.com", role="brand_official")])
+    assert is_known_retailer("sephora.com")
+    unlabelled = {**plan, "offers": [dict(o, offer_type=None, is_first_party=False) for o in plan["offers"]]}
+    out, counts = writer._label_verified_storefront_offers(unlabelled, _verified("sephora.com", "Tarte"))
+    assert {(o["offer_type"], o["is_first_party"]) for o in out["offers"]} == {(None, False)}
+    assert counts == {"offers_labelled_verified_storefront": 0}
+
+
+@pytest.mark.parametrize("payload", ["[1, 2]", "null", "not json", "\"a string\""])
+def test_a_payload_that_is_not_an_object_falls_back_to_the_offers_own_destination(payload):
+    plan = ingest_validated_jsonl([_shaded_record("tartecosmetics.com", role="brand_official")])
+    first, *rest = plan["offers"]
+    odd = dict(first, offer_payload=payload)  # source_ref still holds the store destination
+    out, _ = writer._label_verified_storefront_offers({**plan, "offers": [odd, *rest]},
+                                                      _verified("tartecosmetics.com", "Tarte"))
+    assert (out["offers"][0]["offer_type"], out["offers"][0]["is_first_party"]) == ("brand_direct", True)
