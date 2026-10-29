@@ -33,21 +33,27 @@ project_pivota_external_seed_bootstrap).
 
 Usage
 -----
+Every scope needs AGENT_PDP_VIEW_MARKET_PRICES=on, dry run included, and the
+script refuses to start without it. A row rebuilt without the flag carries no
+market_prices, and the upsert bumps refreshed_at past market_prices_refreshed_at,
+so readers retire the row's summary and a non-USD buyer falls back to the row's
+own (modal-currency) prices. One-off jobs (scripts/ops/run_oneoff_job.sh) inherit
+no env from web, so pass the flag in the job's ENV_VARS.
+
 Dry-run over the enriched cohort (what workstream 1 wants):
-  python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0
 
 Apply it:
-  python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0 --apply
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py --scope enriched --limit 0 --apply
 
 Dry-run / apply over the whole corpus, paginated:
-  python3 scripts/backfill_agent_pdp_view.py --limit 200 --offset 0
-  python3 scripts/backfill_agent_pdp_view.py --apply --limit 200 --offset 0
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py --limit 200 --offset 0
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py --apply --limit 200 --offset 0
 
 Fill agent_pdp_view.market_prices (migration 263) on the rows whose summary is
 missing, stale (a later write without the flag moved refreshed_at past its
 stamp) or of another version. Requires AGENT_PDP_VIEW_MARKET_PRICES=on in the
-job's env (the script refuses otherwise: it would rewrite rows without the
-summary). The summary is keyed by currency, so it does not depend on the job's
+job's env, like every scope. The summary is keyed by currency, so it does not depend on the job's
 PIVOTA_SERVING_PRICING_REGIONS. Keyset-paged on content_key (--offset is not
 used: the --apply set shrinks as it fills); pass the report's `next_after` back
 as --after until `content_keys_considered` is 0. --sleep throttles the writes
@@ -57,8 +63,7 @@ for the 2-vCPU primary; a row that fails is counted and the page continues:
 
 Fill agent_pdp_view.seller_count (migration 269) on the rows that have none -- built before it, or
 written while the column was absent. Refuses to run until the column exists (the rebuild would not
-write it). Keyset-paged like market_prices_missing; keep AGENT_PDP_VIEW_MARKET_PRICES=on in the
-job's env as on the services, or the rebuild retires each row's summary:
+write it). Keyset-paged like market_prices_missing:
   AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py \
       --scope seller_count_missing --limit 500 --sleep 0.05 --apply [--after <content_key>]
 """
@@ -138,6 +143,8 @@ _SELLER_COUNT_MISSING_KEYS_SQL = """
       AND content_key > :after
     ORDER BY content_key ASC
 """
+
+SCOPES = ("all", "enriched", "market_prices_missing", "seller_count_missing")
 
 _KEYSET_SCOPES = {
     "market_prices_missing": _MARKET_PRICES_MISSING_KEYS_SQL,
@@ -233,12 +240,13 @@ def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
 # ---------------------------------------------------------------------
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.scope in ("market_prices_missing", "seller_count_missing") and not market_prices_enabled():
-        # Without the flag the assembled row carries no market_prices, the
-        # upsert leaves the column NULL, and the next pass selects the same keys.
-        # seller_count_missing selects every unbuilt row, so a flagless run would also
-        # rebuild the whole view without market_prices and bump refreshed_at, leaving
-        # every market entry stale (a non-USD buyer then reads the row's own prices).
+    if not market_prices_enabled():
+        # Every scope rebuilds rows. Without the flag the assembled row carries no
+        # market_prices and the plain upsert bumps refreshed_at past
+        # market_prices_refreshed_at, so readers retire every summary it touches (a
+        # non-USD buyer then reads the row's own prices); market_prices_missing would
+        # also select the same keys again. One-off jobs carry no env, so this is easy
+        # to hit; dry runs refuse too, so the flagless command never gets as far as --apply.
         raise SystemExit(
             f"--scope {args.scope} needs AGENT_PDP_VIEW_MARKET_PRICES=on"
         )
@@ -368,14 +376,14 @@ def _parse_args() -> argparse.Namespace:
         help="Actually UPSERT agent_pdp_view rows. Default: dry-run.",
     )
     p.add_argument(
-        "--scope", choices=("all", "enriched", "market_prices_missing", "seller_count_missing"),
-        default="all",
+        "--scope", choices=SCOPES, default="all",
         help=(
+            "Every scope needs AGENT_PDP_VIEW_MARKET_PRICES=on (dry run too). "
             "'all' = every content_key (default). 'enriched' = only the "
             "content_keys carrying a product_enrichment overlay — the cohort "
             "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip. "
             "'market_prices_missing' = served rows whose market_prices is NULL "
-            "(migration 263; needs AGENT_PDP_VIEW_MARKET_PRICES=on; page with --after). "
+            "(migration 263; page with --after). "
             "'seller_count_missing' = rows whose seller_count is NULL (migration 269; page with --after)."
         ),
     )

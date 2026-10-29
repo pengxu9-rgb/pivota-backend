@@ -91,7 +91,9 @@ Entry point: `services/agent_pdp_view_assembler.py`
 (`refresh_agent_pdp_view_for_content_key`), or the repaired
 `scripts/backfill_agent_pdp_view.py` **from that branch only**, which now
 delegates to a `build_agent_pdp_view_row` primitive and takes
-`--scope enriched`.
+`--scope enriched`. (Since 2026-10-29 every scope refuses to run without
+`AGENT_PDP_VIEW_MARKET_PRICES=on`: a flagless rebuild retires the row's
+market_prices summary. One-off jobs carry no env; pass it in ENV_VARS.)
 
 ### 2. INCI ingestion — biggest content-depth jump available
 
