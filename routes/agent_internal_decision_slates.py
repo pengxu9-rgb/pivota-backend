@@ -39,6 +39,10 @@ from services.protocols import DEFAULT_PROTOCOL
 # ON CONFLICT DO NOTHING instead of writing its rows twice.
 _ID_NAMESPACE = uuid.UUID("5b0f4a52-6f0e-4f43-9a51-2d7a3c1e8b90")
 MAX_CARDS = 100
+# Gateway-minted decision ids carry this prefix ("gw:" + uuid4), so they can never equal an id
+# another writer minted. agent_v2 mints bare uuid4s and queues its decision row; without the prefix
+# a gateway claim could land first and v2's queued rows would then file under the gateway's claim.
+GATEWAY_DECISION_PREFIX = "gw:"
 # The body's agent_id is the gateway's word, not an authenticated identity here. Every row says
 # so, so that no attribution or payout join ever trusts it as one.
 AGENT_ID_SOURCE = "gateway_relay"
@@ -62,9 +66,9 @@ class SlateCard(BaseModel):
 class DecisionSlate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # Required: a minted id would make every retry a new decision. agent_decision_events.decision_id
-    # is VARCHAR(64) (migration 140).
-    decision_id: str = Field(min_length=1, max_length=64)
+    # Required: a minted id would make every retry a new decision. "gw:" + up to 61 id characters
+    # (agent_decision_events.decision_id is VARCHAR(64), migration 140).
+    decision_id: str = Field(pattern=r"^gw:[A-Za-z0-9_.-]{1,61}$")
     surface: str = Field(min_length=1, max_length=128)
     channel: Optional[str] = Field(default=None, max_length=128)
     protocol: Optional[str] = Field(default=None, max_length=64)
@@ -191,8 +195,8 @@ async def ingest_decision_slate(slate: DecisionSlate, response: Response) -> Dic
     )
     replayed = existing is not None
     if replayed and (existing or {}).get("agent_context", {}).get("slate_fingerprint") != fingerprint:
-        # Covers a different slate, surface or agent under this id, and an id some other writer
-        # (e.g. agent_v2 search) already owns: its decision row carries no fingerprint.
+        # A different slate, surface or agent under this id. (Another writer's id cannot get here:
+        # the gw: prefix keeps the id spaces apart, and such a row would carry no fingerprint.)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "DECISION_ID_CONFLICT", "message": "decision_id already holds a different slate"},

@@ -60,7 +60,7 @@ def client() -> TestClient:
 
 def _slate(**overrides: Any) -> Dict[str, Any]:
     body: Dict[str, Any] = {
-        "decision_id": "dec-gw-1",
+        "decision_id": "gw:dec-1",
         "surface": "gateway.find_products_multi",
         "channel": "mcp",
         "agent_id": "agent_abc",
@@ -107,10 +107,10 @@ def test_records_the_slate_through_the_store(client: TestClient, calls: Dict[str
 
     assert response.status_code == 202
     assert response.json() == {
-        "decision_id": "dec-gw-1", "replayed": False, "cards": 2, "content_key_resolved": 1, "offer_id_kept": 1}
+        "decision_id": "gw:dec-1", "replayed": False, "cards": 2, "content_key_resolved": 1, "offer_id_kept": 1}
 
     claim = calls["claims"][0]
-    assert claim["decision_id"] == "dec-gw-1"
+    assert claim["decision_id"] == "gw:dec-1"
     assert claim["surface"] == "gateway.find_products_multi"
     assert claim["channel"] == "mcp"
     context = dict(claim["agent_context"])
@@ -120,7 +120,7 @@ def test_records_the_slate_through_the_store(client: TestClient, calls: Dict[str
         "market": "US", "request_id": "req-1", "primary_path": "local", "result_count": 2,
     }
     decision_id, exposures = calls["exposures"][0]
-    assert decision_id == "dec-gw-1"
+    assert decision_id == "gw:dec-1"
     assert [r["content_key"] for r in exposures] == [CK, None]
     assert [r["position"] for r in exposures] == [0, 1]
     assert exposures[0]["offer_id"] == "of:catalog_offer:off_1"
@@ -164,16 +164,49 @@ def test_a_different_slate_under_a_used_decision_id_is_a_conflict(
     assert len(calls["exposures"]) == 1  # the second slate wrote nothing
 
 
-def test_an_id_another_writer_owns_is_a_conflict(client: TestClient, calls: Dict[str, Any]) -> None:
-    # agent_v2 search mints its own decision rows; they carry no slate fingerprint.
-    calls["decisions"]["dec-v2"] = {"surface": "agent_v2.products.search", "agent_context": {"agent_id": "agent_abc"}}
-    assert client.post(URL, json=_slate(decision_id="dec-v2"), headers=HEADERS).status_code == 409
+@pytest.mark.parametrize("decision_id", ["3f2c7a9e-1b4d-4c8e-9a21-6f0e5d4c3b2a", "v2:abc", "gw:", "gw:has space", "gw:" + "x" * 62])
+def test_only_gateway_prefixed_ids_are_accepted(client: TestClient, calls: Dict[str, Any], decision_id: str) -> None:
+    # A bare uuid4 is what agent_v2 mints for its own (queued) decision rows; accepting one here
+    # could let a gateway claim land first and collect v2's rows.
+    assert client.post(URL, json=_slate(decision_id=decision_id), headers=HEADERS).status_code == 422
+    assert calls["claims"] == []
+
+
+def test_a_gateway_id_whose_row_carries_no_fingerprint_is_a_conflict(client: TestClient, calls: Dict[str, Any]) -> None:
+    calls["decisions"]["gw:legacy"] = {"surface": "gateway.find_products_multi", "agent_context": {"agent_id": "agent_abc"}}
+    assert client.post(URL, json=_slate(decision_id="gw:legacy"), headers=HEADERS).status_code == 409
     assert calls["exposures"] == []
 
 
+def test_the_flag_is_checked_before_the_key(client: TestClient, calls: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    # Off means invisible: the same 404 whatever key is sent, and even with no key configured.
+    monkeypatch.delenv("DECISION_SLATES_INGEST_ENABLED")
+    for headers in ({}, {"X-Internal-Key": "wrong"}, HEADERS):
+        response = client.post(URL, json=_slate(), headers=headers)
+        assert (response.status_code, response.json()["detail"]["error"]) == (404, "NOT_ENABLED")
+    monkeypatch.delenv("AGENT_AUTH_INTROSPECT_INTERNAL_KEY")
+    assert client.post(URL, json=_slate(), headers=HEADERS).status_code == 404
+
+
+def test_a_replay_with_reordered_cards_is_the_same_slate(client: TestClient, calls: Dict[str, Any]) -> None:
+    cards = [{"position": 0, "product_id": "p0", "product_key": "pk_known"},
+             {"position": 1, "product_id": "p1"}, {"position": 2, "product_id": "p2"}]
+    assert client.post(URL, json=_slate(cards=cards), headers=HEADERS).status_code == 202
+    reordered = [cards[2], cards[0], cards[1]]
+    response = client.post(URL, json=_slate(cards=reordered), headers=HEADERS)
+    assert response.status_code == 200 and response.json()["replayed"] is True
+
+
+def test_an_omitted_field_and_an_explicit_null_are_the_same_slate(client: TestClient, calls: Dict[str, Any]) -> None:
+    sparse = [{"position": 0, "product_id": "p0"}]
+    explicit = [{"position": 0, "product_id": "p0", "merchant_id": None, "product_key": None, "offer_id": None}]
+    assert client.post(URL, json=_slate(cards=sparse), headers=HEADERS).status_code == 202
+    assert client.post(URL, json=_slate(cards=explicit), headers=HEADERS).status_code == 200
+
+
 def test_row_ids_differ_across_decisions(client: TestClient, calls: Dict[str, Any]) -> None:
-    client.post(URL, json=_slate(decision_id="dec-a"), headers=HEADERS)
-    client.post(URL, json=_slate(decision_id="dec-b"), headers=HEADERS)
+    client.post(URL, json=_slate(decision_id="gw:dec-a"), headers=HEADERS)
+    client.post(URL, json=_slate(decision_id="gw:dec-b"), headers=HEADERS)
     a, b = calls["exposures"][0][1], calls["exposures"][1][1]
     assert not {r["exposure_id"] for r in a} & {r["exposure_id"] for r in b}
     assert not {r["candidate_id"] for r in a} & {r["candidate_id"] for r in b}
