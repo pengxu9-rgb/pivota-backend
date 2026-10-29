@@ -11,10 +11,11 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from db._jsonb_safe import _json_safe
 from db.database import database
+from services.catalog_identity import is_content_key
 from services.protocols import DEFAULT_PROTOCOL, validate_protocol
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ _SPEC = {
     "funnel_link": ("agent_decision_funnel_links", ("link_id", "decision_id", "funnel_event_id", "exposure_id", "checkout_decision_id", "content_key", "catalog_offer_id", "commerce_attribution_edge_id", "merchant_id", "protocol", "attribution_model", "attribution_window_seconds"), "funnel_event_id", set()),
 }
 _SQL: Dict[str, str] = {}
+_CATALOG_OFFER_PREFIX = "of:catalog_offer:"
+_OFFER_ID_MAX = 255  # catalog_offer_id VARCHAR(255) on every ledger table (migration 140)
 
 
 def _json_param(value: Any) -> Optional[str]:
@@ -46,7 +49,83 @@ def _sql(op: str) -> str:
     return _SQL[op]
 
 
-def _report(exc: Exception, *, op: str, payload: Optional[Dict[str, Any]] = None) -> None:
+def _row_content_key(row: Dict[str, Any]) -> Optional[str]:
+    """content_key is VARCHAR(40) holding "ck_"+32hex (migration 140, services/catalog_identity).
+
+    Search cards usually carry only a product_key (VARCHAR(255)). Writers used to pass that through
+    as the content_key, and one product_key longer than 40 chars failed the whole slate's insert:
+    164 slates lost every candidate and exposure row 09-30..10-29. Anything that is not a
+    content_key is NULL here; resolve_card_identities() maps product_key -> content_key first."""
+    value = row.get("content_key")
+    return value if is_content_key(value) else None
+
+
+def _row_offer_id(row: Dict[str, Any]) -> Optional[str]:
+    """The catalog_offers.offer_id when the card names one: offers.resolve prefixes catalog offers
+    with "of:catalog_offer:" (routes/agent_shop_gateway.py _catalog_offer_entry), which never joins
+    catalog_offers, so the prefix is stripped. Other offer ids (of:internal_checkout:...) are kept."""
+    value = str(row.get("catalog_offer_id") or row.get("offer_id") or "").strip()
+    if value.startswith(_CATALOG_OFFER_PREFIX):
+        value = value[len(_CATALOG_OFFER_PREFIX):].strip()
+    return value if value and len(value) <= _OFFER_ID_MAX else None
+
+
+async def resolve_card_identities(rows: List[Dict[str, Any]]) -> None:
+    """Fill each card row's content_key from catalog_products by product_key, and drop a catalog
+    offer id that is not in catalog_offers, in place. Two primary-key lookups per slate; run it in
+    the background recording task, never on the response path. Fail-soft: on a DB error the rows
+    keep whatever they carried, and the store's own guards still apply.
+
+    The lookups run in a fresh context (spawn_isolated): the writers call this from a task spawned
+    off the search request, and databases 0.7 would otherwise share that request's Connection."""
+    from services.scheduler_job_runner import spawn_isolated
+
+    cards = [row for row in rows if isinstance(row, dict)]
+    product_keys = sorted({
+        str(row.get("product_key") or "").strip() for row in cards
+        if not is_content_key(row.get("content_key")) and str(row.get("product_key") or "").strip()
+    })
+    offer_ids = sorted({
+        offer_id for offer_id in (_row_offer_id(row) for row in cards)
+        if offer_id and not offer_id.startswith("of:")
+    })
+    try:
+        if product_keys:
+            found = await spawn_isolated(database.fetch_all(
+                "SELECT product_key, content_key FROM catalog_products WHERE product_key = ANY(:keys)",
+                {"keys": product_keys},
+            ), name="decision_ledger_content_keys")
+            by_product = {r["product_key"]: r["content_key"] for r in found if is_content_key(r["content_key"])}
+            for row in cards:
+                if not is_content_key(row.get("content_key")):
+                    key = by_product.get(str(row.get("product_key") or "").strip())
+                    if key:
+                        row["content_key"] = key
+        if offer_ids:
+            found = await spawn_isolated(database.fetch_all(
+                "SELECT offer_id FROM catalog_offers WHERE offer_id = ANY(:ids)", {"ids": offer_ids}
+            ), name="decision_ledger_offer_ids")
+            known = {r["offer_id"] for r in found}
+            for row in cards:
+                offer_id = _row_offer_id(row)
+                if offer_id and not offer_id.startswith("of:") and offer_id not in known:
+                    row["catalog_offer_id"] = None
+                    row["offer_id"] = None
+    except Exception as exc:  # noqa: BLE001
+        _report(exc, op="resolve_card_identities")
+
+
+def _report(
+    exc: Exception, *, op: str, payload: Optional[Dict[str, Any]] = None,
+    rows: Optional[int] = None, failed_rows: Optional[int] = None,
+) -> None:
+    # sentry_sdk is not installed in prod, so capture_exception only logs at ERROR; this line is
+    # the countable record (ids and counts only, never row values).
+    logger.warning(json.dumps({
+        "event": "agent_decision_event_store.write_failed", "op": op,
+        "decision_id": (payload or {}).get("decision_id"), "rows": rows, "failed_rows": failed_rows,
+        "error": f"{type(exc).__name__}: {exc}"[:300],
+    }, default=str))
     try:
         from config.sentry_config import capture_exception
 
@@ -105,7 +184,7 @@ async def record_decision_event(
 async def record_decision_candidates(decision_id: str, rows: Iterable[Dict[str, Any]]) -> None:
     values = [{
         "candidate_id": str(row.get("candidate_id") or uuid.uuid4()), "decision_id": decision_id,
-        "content_key": row.get("content_key"), "catalog_offer_id": row.get("catalog_offer_id") or row.get("offer_id"),
+        "content_key": _row_content_key(row), "catalog_offer_id": _row_offer_id(row),
         "rank_position": row.get("rank_position", row.get("position", idx)),
         "eligibility_flags": _json_param(row.get("eligibility_flags") or row.get("flags")),
     } for idx, row in enumerate(rows) if isinstance(row, dict)]
@@ -116,7 +195,7 @@ async def record_decision_candidates(decision_id: str, rows: Iterable[Dict[str, 
 async def record_exposure_events(decision_id: str, rows: Iterable[Dict[str, Any]]) -> None:
     values = [{
         "exposure_id": str(row.get("exposure_id") or uuid.uuid4()), "decision_id": decision_id,
-        "content_key": row.get("content_key"), "catalog_offer_id": row.get("catalog_offer_id") or row.get("offer_id"),
+        "content_key": _row_content_key(row), "catalog_offer_id": _row_offer_id(row),
         "exposure_position": row.get("exposure_position", row.get("position", idx)), "slot": row.get("slot"),
     } for idx, row in enumerate(rows) if isinstance(row, dict)]
     if values:
@@ -217,12 +296,34 @@ def extract_order_decision_linkage(metadata: Any) -> Dict[str, Optional[str]]:
     }
 
 
+async def _write_many(op: str, payload: Dict[str, Any]) -> None:
+    rows = payload["rows"]
+    try:
+        await database.execute_many(_sql(op), rows)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    # execute_many runs one INSERT per row with no transaction, so the rows before the failing one
+    # are already in. Replay row by row (ON CONFLICT DO NOTHING keeps that idempotent) so one bad
+    # card loses only itself, not the whole slate.
+    failed = 0
+    last_exc: Optional[Exception] = None
+    for row in rows:
+        try:
+            await database.execute(_sql(op), row)
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            last_exc = exc
+    if last_exc is not None:
+        _report(last_exc, op=op, payload=payload, rows=len(rows), failed_rows=failed)
+
+
 async def _flush_loop(queue: asyncio.Queue[Tuple[str, Dict[str, Any]]]) -> None:
     while True:
         op, payload = await queue.get()
         try:
             if op in _MANY:
-                await database.execute_many(_sql(op), payload["rows"])
+                await _write_many(op, payload)
             else:
                 await database.execute(_sql(op), payload)
         except Exception as exc:  # noqa: BLE001

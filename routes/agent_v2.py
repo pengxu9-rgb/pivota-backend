@@ -824,6 +824,7 @@ async def search_products_v2(
             record_decision_candidates,
             record_decision_event,
             record_exposure_events,
+            resolve_card_identities,
         )
         from services.protocols import derive_protocol_for_surface
 
@@ -832,7 +833,10 @@ async def search_products_v2(
         for idx, product in enumerate(raw_products):
             rows.append(
                 {
-                    "content_key": product.get("content_key") or product.get("product_key"),
+                    # content_key only; a product_key is mapped to its content_key in the
+                    # background (resolve_card_identities), never written as one.
+                    "content_key": product.get("content_key"),
+                    "product_key": product.get("product_key"),
                     "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
                     "position": idx,
                     "eligibility_flags": {
@@ -871,6 +875,7 @@ async def search_products_v2(
                         else None,
                     },
                 )
+                await resolve_card_identities(rows)
                 await record_decision_candidates(decision_id, rows)
                 await record_exposure_events(decision_id, rows)
             except Exception:
