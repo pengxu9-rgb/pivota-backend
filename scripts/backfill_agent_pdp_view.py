@@ -54,6 +54,13 @@ as --after until `content_keys_considered` is 0. --sleep throttles the writes
 for the 2-vCPU primary; a row that fails is counted and the page continues:
   AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py \
       --scope market_prices_missing --limit 500 --sleep 0.05 --apply [--after <content_key>]
+
+Fill agent_pdp_view.seller_count (migration 269) on the rows that have none -- built before it, or
+written while the column was absent. Refuses to run until the column exists (the rebuild would not
+write it). Keyset-paged like market_prices_missing; keep AGENT_PDP_VIEW_MARKET_PRICES=on in the
+job's env as on the services, or the rebuild retires each row's summary:
+  AGENT_PDP_VIEW_MARKET_PRICES=on python3 scripts/backfill_agent_pdp_view.py \
+      --scope seller_count_missing --limit 500 --sleep 0.05 --apply [--after <content_key>]
 """
 
 from __future__ import annotations
@@ -72,6 +79,7 @@ from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     BACKFILL_REFRESH_SOURCE,
     MARKET_PRICES_VERSION,
+    agent_pdp_view_has_seller_count,
     build_agent_pdp_view_row,
     execute_agent_pdp_view_upsert,
     market_prices_enabled,
@@ -122,6 +130,21 @@ _MARKET_PRICES_MISSING_KEYS_SQL = f"""
 """
 
 
+# Rows with no seller count (migration 269): built before it, or written while it was absent.
+_SELLER_COUNT_MISSING_KEYS_SQL = """
+    SELECT content_key
+    FROM agent_pdp_view
+    WHERE seller_count IS NULL
+      AND content_key > :after
+    ORDER BY content_key ASC
+"""
+
+_KEYSET_SCOPES = {
+    "market_prices_missing": _MARKET_PRICES_MISSING_KEYS_SQL,
+    "seller_count_missing": _SELLER_COUNT_MISSING_KEYS_SQL,
+}
+
+
 def build_content_key_query(
     *, scope: str, limit: int, offset: int, after: str = ""
 ) -> Tuple[str, Dict[str, Any]]:
@@ -130,9 +153,9 @@ def build_content_key_query(
     assembled string lives in a function local, which the static sweep in
     tests/test_repo_sql_prepare_postgres.py cannot follow."""
     params: Dict[str, Any] = {}
-    keyset = scope == "market_prices_missing"
+    keyset = scope in _KEYSET_SCOPES
     if keyset:
-        sql = _MARKET_PRICES_MISSING_KEYS_SQL
+        sql = _KEYSET_SCOPES[scope]
         params["after"] = str(after or "")
     else:
         sql = _ENRICHED_KEYS_SQL if scope == "enriched" else _ALL_KEYS_SQL
@@ -210,14 +233,21 @@ def _overlay_flags(row: Dict[str, Any]) -> Dict[str, bool]:
 # ---------------------------------------------------------------------
 
 async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
-    if args.scope == "market_prices_missing" and not market_prices_enabled():
+    if args.scope in ("market_prices_missing", "seller_count_missing") and not market_prices_enabled():
         # Without the flag the assembled row carries no market_prices, the
         # upsert leaves the column NULL, and the next pass selects the same keys.
+        # seller_count_missing selects every unbuilt row, so a flagless run would also
+        # rebuild the whole view without market_prices and bump refreshed_at, leaving
+        # every market entry stale (a non-USD buyer then reads the row's own prices).
         raise SystemExit(
-            "--scope market_prices_missing needs AGENT_PDP_VIEW_MARKET_PRICES=on"
+            f"--scope {args.scope} needs AGENT_PDP_VIEW_MARKET_PRICES=on"
         )
     if not getattr(database, "is_connected", False):
         await database.connect()
+    if args.scope == "seller_count_missing" and not await agent_pdp_view_has_seller_count(database):
+        # The upsert names the column only once it exists; without it every row is rewritten
+        # with no seller count and stays selected.
+        raise SystemExit("--scope seller_count_missing needs agent_pdp_view.seller_count (migration 269)")
 
     refresh_source = (
         ENRICHED_REFRESH_SOURCE if args.scope == "enriched" else BACKFILL_REFRESH_SOURCE
@@ -273,7 +303,7 @@ async def _drive(args: argparse.Namespace) -> Dict[str, Any]:
         "samples": samples,
         "skipped_would_downgrade_sample": downgrades,
         "failed_sample": failures,
-        # Keyset cursor for --scope market_prices_missing: rows this pass skipped
+        # Keyset cursor for the *_missing scopes: rows this pass skipped
         # or failed stay selected, so the next pass must start after them.
         "next_after": content_keys[-1] if content_keys else None,
     }
@@ -318,6 +348,7 @@ async def _process_key(
             "title": row["title"],
             "brand": row["brand"],
             "offer_count": row["offer_count"],
+            "seller_count": row.get("seller_count"),
             "variants_count": row["variants_count"],
             "primary_merchant_id": row["primary_merchant_id"],
             **flags,
@@ -337,18 +368,20 @@ def _parse_args() -> argparse.Namespace:
         help="Actually UPSERT agent_pdp_view rows. Default: dry-run.",
     )
     p.add_argument(
-        "--scope", choices=("all", "enriched", "market_prices_missing"), default="all",
+        "--scope", choices=("all", "enriched", "market_prices_missing", "seller_count_missing"),
+        default="all",
         help=(
             "'all' = every content_key (default). 'enriched' = only the "
             "content_keys carrying a product_enrichment overlay — the cohort "
             "stranded before the SERVE_PDP_ENRICHMENT_ON_WRITE flip. "
             "'market_prices_missing' = served rows whose market_prices is NULL "
-            "(migration 263; needs AGENT_PDP_VIEW_MARKET_PRICES=on; page with --after)."
+            "(migration 263; needs AGENT_PDP_VIEW_MARKET_PRICES=on; page with --after). "
+            "'seller_count_missing' = rows whose seller_count is NULL (migration 269; page with --after)."
         ),
     )
     p.add_argument(
         "--after", default="",
-        help="market_prices_missing only: start after this content_key (keyset page).",
+        help="*_missing scopes only: start after this content_key (keyset page).",
     )
     p.add_argument(
         "--sleep", type=float, default=0.0,

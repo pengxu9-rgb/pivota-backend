@@ -120,7 +120,12 @@ SGD_ONLY = [
 def test_flag_off_emits_no_market_prices_key_and_the_legacy_upsert() -> None:
     row = _assemble(MIXED)
     assert "market_prices" not in row
-    assert assembler.upsert_sql_for_row(row) is assembler.UPSERT_SQL
+    # The row also carries seller_count (migration 269), written only once its column is probed
+    # present; with the column absent the upsert drops the key and is UPSERT_SQL byte for byte.
+    assert assembler.upsert_sql_for_row(row) is assembler.UPSERT_SQL_WITH_SELLER_COUNT
+    assert "market_prices" not in assembler.UPSERT_SQL_WITH_SELLER_COUNT
+    without = {k: v for k, v in row.items() if k != "seller_count"}
+    assert assembler.upsert_sql_for_row(without) is assembler.UPSERT_SQL
     assert "market_prices" not in assembler.UPSERT_SQL
     assert "market_prices" not in assembler.row_to_upsert_params(row)
 
@@ -553,4 +558,19 @@ async def test_the_scope_refuses_to_run_with_the_write_flag_off() -> None:
     with pytest.raises(SystemExit):
         await backfill._drive(argparse.Namespace(
             apply=True, scope="market_prices_missing", limit=3, offset=0, after="", sleep=0.0,
+        ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply", [True, False])
+async def test_the_seller_count_scope_refuses_to_run_with_the_market_prices_flag_off(apply) -> None:
+    # It selects every row not yet built with a seller count; run flagless (a one-off job
+    # carries no env) it would rebuild them all with no market_prices.
+    import argparse
+
+    import scripts.backfill_agent_pdp_view as backfill
+
+    with pytest.raises(SystemExit, match="AGENT_PDP_VIEW_MARKET_PRICES=on"):
+        await backfill._drive(argparse.Namespace(
+            apply=apply, scope="seller_count_missing", limit=3, offset=0, after="", sleep=0.0,
         ))
