@@ -427,7 +427,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - The amendment covers **showing** only. Whether Phase 2 ranking, within Q6's limits, also needs no merchant commitment is not decided here. The proposed answer is no: ranking stays within one product, adds no pricing engine, and what Pivota earns never enters it. It is decided with the Phase 2 ranking part of the `savings.v1` amendment (D4).
 6. **Ranking: off until measured, then within a product only.**
    - Phase 1 is display-only.
-   - Ranking may start only after the false-savings rate has been measured and is under the D7 stop threshold. **Proposed definition of "measured", pending peng's confirmation:** at least 50 reconciled orders in the window.
+   - Ranking may start only after the false-savings rate has been measured, meaning at least 50 reconciled orders in the window, and is under the D7 stop threshold.
    - When on, a verified deal may change only the **order of sellers within one product**, by the buyer's effective price. It never changes the order of products in a recommendation slate.
    - What Pivota earns on a seller never enters the ranking (ADR-025 Q4). Effective price is a fact about the buyer's cost, not about our relationship with the seller.
 7. **Phase 0 base: wait for the ledger.**
