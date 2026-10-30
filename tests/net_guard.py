@@ -19,6 +19,30 @@ from tests import net_guard_core as core
 core.install()
 
 
+def _check_postgres_env() -> None:
+    """libpq (psycopg2) connects in C, where the guard cannot see it: refuse to run at all
+    while a Postgres URL in the env points off this machine."""
+    if core.network_allowed():
+        return
+    problems = core.postgres_env_problems()
+    if problems:
+        raise pytest.UsageError(
+            "[net_guard] a Postgres URL in the env is not loopback or a unix socket; psycopg2 "
+            "(libpq) would connect to it past the guard. Point it at a local database or unset "
+            "it" + ("" if core._ci() else f" ({core.ALLOW_ENV}=1 skips this locally)") + ":\n  "
+            + "\n  ".join(problems)
+        )
+
+
+def pytest_configure(config):
+    _check_postgres_env()
+
+
+def pytest_collection_finish(session):
+    # Again after collection: a conftest or test module may have set one at import.
+    _check_postgres_env()
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     s = core._state()
@@ -35,17 +59,27 @@ def pytest_runtest_protocol(item, nextitem):
         os.environ.pop(core.ORIGIN_ENV, None)
 
 
-@pytest.hookimpl(wrapper=True, trylast=True)
-def pytest_runtest_teardown(item, nextitem):
-    result = yield
-    if not core._state()["installed"]:
-        return result
+def _fail_for(item) -> None:
     mine = core.take(item.nodeid)
     if mine:
         raise pytest.fail.Exception(
             core.format_violations(mine, header=f"[net_guard] {item.nodeid} reached outside loopback ({len(mine)} attempt(s))."),
             pytrace=False,
         )
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    if not core._state()["installed"]:
+        return (yield)
+    try:
+        result = yield
+    except Exception as exc:
+        # A teardown that failed on its own still owes the guard its report, or the attempts
+        # would surface at the session end as if no test had made them.
+        _fail_for(item)
+        raise exc
+    _fail_for(item)
     return result
 
 
@@ -67,7 +101,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         terminalreporter.section("net_guard: attempts outside a running test", sep="=", red=True)
         by_origin: Dict[str, List[Dict[str, Any]]] = {}
         for v in _LATE:
-            by_origin.setdefault(v.get("origin") or "(no test: import, collection or session)", []).append(v)
+            by_origin.setdefault(v.get("origin") or "(no test: import, collection, session, or an untracked thread)", []).append(v)
         for origin, entries in by_origin.items():
             terminalreporter.write_line(
                 core.format_violations(entries, header=f"started by {origin} -- after it finished, or outside any test:")

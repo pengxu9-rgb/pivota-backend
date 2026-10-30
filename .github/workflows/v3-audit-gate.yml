@@ -67,6 +67,11 @@ on:
       - "tests/services/test_audit_v3_product_concurrency.py"
       - "tests/test_audit_invariants.py"
       - ".github/workflows/v3-audit-gate.yml"
+      # The pytest network guard (repo-root conftest.py) loads in this gate's run.
+      - "conftest.py"
+      - "tests/net_guard.py"
+      - "tests/net_guard_core.py"
+      - "tests/_netguard_child/**"
 
 # Superseded PR pushes cancel the gate for the commit they replaced. Non-PR
 # events fall through to run_id — a group of one — so push-to-main and dispatch

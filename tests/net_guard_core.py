@@ -12,17 +12,27 @@ jest since gw#2519 (tests/_support/netGuard.cjs); this is its pytest twin.
 WHAT IT ALLOWS. A socket may go to 127.0.0.0/8, ::1 (or ::ffff:127.x), or a unix socket. A
 name is allowed only if it is loopback: `localhost` through the real resolver (and every address
 it returns must be loopback), `*.localhost` answered as 127.0.0.1 / ::1 without asking any
-resolver (RFC 6761 reserves the zone). An IP LITERAL passes the resolver untouched -- resolving
-"8.8.8.8" sends nothing -- and is judged by address when something connects to it. Refused,
-and recorded: every other connect, UDP send, and name lookup; and a loopback connect to a local
-proxy port (7897, 7890, 1080, 8888), which is how a laptop's system proxy carries traffic out.
+resolver (RFC 6761 reserves the zone). A name handed straight to connect() -- which resolves it
+in C, past every hook here -- goes on only if it is a localhost name, and then as the loopback
+literal. An IP LITERAL passes the resolver untouched -- resolving "8.8.8.8" sends nothing --
+and is judged by address when something connects to it; a string that only looks like one
+("[127.0.0.1]", "127.0.0.1%x") is a name. Refused, and recorded: every other connect, UDP
+send, and forward or reverse lookup; and a loopback connect to a local proxy port (7897, 7890,
+1080, 8888), which is how a laptop's system proxy carries traffic out.
 
-WHERE IT HOOKS. socket.socket.connect / connect_ex / sendto (every Python client ends there:
-httpx, requests, urllib, aiohttp, asyncpg, redis, dnspython), socket.getaddrinfo and the
-gethostby* family, and asyncio's loop.getaddrinfo, so a refused async lookup is recorded on
-the task that asked rather than on an anonymous executor thread. Not covered: C extensions
-that open their own sockets (none in the suite), and a child process that is not Python or
-whose env drops PYTHONPATH.
+WHERE IT HOOKS. socket.socket.connect / connect_ex / sendto / sendmsg (every Python client ends
+there: httpx, requests, urllib, aiohttp, asyncpg, redis, dnspython), socket.getaddrinfo, the
+gethostby* family and getnameinfo, and asyncio's loop.getaddrinfo, so a refused async lookup is
+recorded on the task that asked rather than on an anonymous executor thread. It also checks
+socket.create_connection and asyncio's loop.sock_connect, which end in the hooks above anyway,
+so that a guard installed before this one (a sitecustomize safety net) cannot refuse first and
+leave the attempt unrecorded. Python children are covered too (see below).
+
+NOT COVERED. Sockets opened in C: libpq, which psycopg2 (the sync engine, the *_postgres
+tests) connects through. tests/net_guard.py stops the session before any test runs unless
+every Postgres URL and PGHOST in the env is loopback or a unix socket. Also not covered: the
+`_socket` module used directly, a child process that is not Python, or one whose env or flags
+drop PYTHONPATH (`-I`, `-E`, an env that replaces it).
 
 PROXIES. HTTP(S)_PROXY / ALL_PROXY / NO_PROXY (both cases) are removed for the run, and the
 macOS / Windows system-proxy readers in urllib.request return nothing. Unsetting the env is
@@ -35,11 +45,12 @@ and:
   * the test that started it fails at teardown, listing each target and where it was made;
   * an attempt made after its test finished (a thread or task that outlived it) does NOT fail
     the innocent test running at the time; it fails the session at the end, naming the test
-    that started it. So does an attempt made outside any test (import, collection).
+    that started it. So does an attempt from work started outside any test (import,
+    collection), and from a thread this guard did not see start (a raw `_thread`).
 Attribution: a ContextVar carries the test's node id into everything it starts (asyncio tasks
 copy the context they are created in); threads and executor work items are tagged with the
-origin when they are started / submitted; a Python child process gets it through the env and
-appends its own refusals to a run directory the parent reads back.
+origin when they are started / submitted; a Python child process (spawned, or forked) gets it
+through the env and appends its own refusals to a run directory the parent reads back.
 
 OPT-OUT. TEST_ALLOW_NETWORK=1 disables the guard (and leaves the proxy settings alone) for a
 local debugging run. It is IGNORED when CI is set: CI must never reach the internet.
@@ -52,14 +63,15 @@ import errno
 import ipaddress
 import json
 import os
-import shutil
 import socket
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ALLOW_ENV = "TEST_ALLOW_NETWORK"
 RUN_DIR_ENV = "NETGUARD_RUN_DIR"
@@ -96,6 +108,7 @@ def _state() -> Dict[str, Any]:
             "run_dir_owned": False,
             "run_log_seen": set(),
             "originals": {},
+            "process": uuid.uuid4().hex[:12],  # with the pid, names this process's run log
             "seq": 0,
             "lock": threading.Lock(),
         }
@@ -116,16 +129,15 @@ def network_allowed() -> bool:
 # ---------------------------------------------------------------------------------------------
 
 
-def _strip(host: Any) -> str:
-    h = host.decode("ascii", "replace") if isinstance(host, (bytes, bytearray)) else str(host)
-    if h.startswith("[") and h.endswith("]"):
-        h = h[1:-1]
-    return h.split("%", 1)[0]
+def _text(host: Any) -> str:
+    return host.decode("ascii", "replace") if isinstance(host, (bytes, bytearray)) else str(host)
 
 
 def _ip(host: Any) -> Optional[ipaddress._BaseAddress]:
+    # Exactly what the C resolver takes as a literal: "fe80::1%lo0" is one, "[::1]" and
+    # "127.0.0.1%x" are names it would look up.
     try:
-        return ipaddress.ip_address(_strip(host))
+        return ipaddress.ip_address(_text(host))
     except ValueError:
         return None
 
@@ -138,11 +150,11 @@ def is_loopback_ip(host: Any) -> bool:
         ip = ip.ipv4_mapped
     if ip.version == 4:
         return ip in ipaddress.ip_network("127.0.0.0/8")
-    return ip == ipaddress.ip_address("::1")
+    return ip.is_loopback  # ::1, with or without a scope
 
 
 def _name(host: Any) -> str:
-    return _strip(host).lower().rstrip(".")
+    return _text(host).lower().rstrip(".")
 
 
 def is_localhost_name(host: Any) -> bool:
@@ -157,20 +169,25 @@ def is_localhost_name(host: Any) -> bool:
 
 def current_origin() -> Optional[str]:
     """The test whose work this is: the task's context, else the executor work item or thread
-    that test started, else (a child process) the env, else the test running right now."""
+    that test started, else (a child process) the env, else -- on the main thread only -- the
+    test running right now. A thread started outside any test, or one this guard never saw
+    start, belongs to no test: blaming whichever test happens to be running would be a guess."""
     origin = _ORIGIN.get()
     if origin:
         return origin
     origin = getattr(_TLS, "origin", None)
     if origin:
         return origin
-    origin = getattr(threading.current_thread(), "_netguard_origin", None)
+    thread = threading.current_thread()
+    origin = getattr(thread, "_netguard_origin", None)
     if origin:
         return origin
     s = _state()
     if s["child"]:
         return os.environ.get(ORIGIN_ENV) or None
-    return s["current"]
+    if thread is threading.main_thread():
+        return s["current"]
+    return None
 
 
 _STDLIB = os.path.dirname(os.__file__)
@@ -196,11 +213,12 @@ def _record(kind: str, target: str) -> Dict[str, Any]:
         s["seq"] += 1
         seq = s["seq"]
     entry = {
-        "id": f"{os.getpid()}:{seq}",
+        "id": f"{os.getpid()}:{s['process']}:{seq}",
         "kind": kind,
         "target": target,
         "origin": current_origin(),
-        "running": s["current"],
+        # A child cannot know which test the parent is running; its entries say so (None).
+        "running": None if s["child"] else s["current"],
         "thread": threading.current_thread().name,
         "at": time.time(),
         "stack": _stack(),
@@ -218,8 +236,9 @@ def _append_run_log(entry: Dict[str, Any]) -> None:
     run_dir = os.environ.get(RUN_DIR_ENV)
     if not run_dir:
         return
+    name = f"{os.getpid()}-{_state()['process']}.jsonl"  # a reused pid gets a file of its own
     try:
-        with open(os.path.join(run_dir, f"{os.getpid()}.jsonl"), "a", encoding="utf-8") as fh:
+        with open(os.path.join(run_dir, name), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except OSError:
         pass  # the run is over and its directory is gone; nothing is left to fail
@@ -286,8 +305,8 @@ def format_violations(entries: List[Dict[str, Any]], *, header: str) -> str:
     for v in entries:
         where = f"  [in child process: {v['child']}]" if v.get("child") else ""
         late = ""
-        if v.get("origin") and v.get("running") != v.get("origin"):
-            late = f"  [fired while {v.get('running') or 'no test'} was running]"
+        if not v.get("child") and v.get("running") and v.get("running") != v.get("origin"):
+            late = f"  [fired while {v['running']} was running]"
         lines.append(f"- {v['kind']} {v['target']}  (thread {v.get('thread')}){where}{late}")
         if v.get("stack"):
             lines.extend("    " + l for l in v["stack"].splitlines())
@@ -309,21 +328,26 @@ def _refuse_dns(name: str, kind: str = "dns") -> socket.gaierror:
     return socket.gaierror(socket.EAI_NONAME, f"[net_guard] blocked {kind} lookup of {name!r}: tests may only reach loopback")
 
 
-def _connect_target(sock: socket.socket, address: Any) -> Optional[str]:
-    """None if the connect may proceed, else the target to report."""
-    if sock.family not in (socket.AF_INET, socket.AF_INET6):
-        return None  # AF_UNIX and friends never leave the machine
+def _vet(family: int, address: Any) -> Tuple[Optional[str], Any]:
+    """(None, the address to use) if a connect may proceed, else (the target to report, None)."""
+    if family not in (socket.AF_INET, socket.AF_INET6):
+        return None, address  # AF_UNIX and friends never leave the machine
     try:
         host, port = address[0], int(address[1])
     except (TypeError, ValueError, IndexError):
-        return None  # let the real connect raise its own TypeError
-    target = f"{_strip(host)}:{port}"
+        return None, address  # let the real call raise its own error
+    target = f"{_text(host)}:{port}"
     if _ip(host) is None:
-        # socket.connect(("name", port)) resolves in C, past socket.getaddrinfo.
-        return None if is_localhost_name(host) and port not in PROXY_PORTS else target
-    if is_loopback_ip(host) and port not in PROXY_PORTS:
-        return None
-    return target + ("  (a local proxy port)" if is_loopback_ip(host) else "")
+        if not is_localhost_name(host):
+            return target, None
+        # connect(("name", port)) resolves in C, past socket.getaddrinfo: send the literal.
+        host = "::1" if family == socket.AF_INET6 else "127.0.0.1"
+        address = (host, *tuple(address)[1:])
+    if not is_loopback_ip(host):
+        return target, None
+    if port in PROXY_PORTS:
+        return target + "  (a local proxy port)", None
+    return None, address
 
 
 def _resolve_target(host: Any) -> Optional[str]:
@@ -340,13 +364,34 @@ def _resolve_target(host: Any) -> Optional[str]:
         return None  # a literal never leaves the process
     if _name(host) == "localhost":
         return None
-    return _strip(host)
+    return _text(host)
 
 
-def _check_loopback_results(name: Any, results: List[Any]) -> None:
-    outside = [r[4][0] for r in results if not is_loopback_ip(r[4][0])]
+def _check_loopback_results(name: Any, addresses: List[Any]) -> None:
+    outside = [a for a in addresses if not is_loopback_ip(a)]
     if outside:
-        raise _refuse_dns(f"{_strip(name)} (resolved to {outside[0]})")
+        raise _refuse_dns(f"{_text(name)} (resolved to {outside[0]})")
+
+
+def _precheck(family: int, address: Any) -> Any:
+    """For an entry point that resolves and connects by itself (socket.create_connection,
+    loop.sock_connect): refuse, here, what the guarded getaddrinfo / connect underneath would,
+    so no hook installed before this guard gets the attempt first. Returns the address to use."""
+    try:
+        host, port = address[0], int(address[1])
+    except (TypeError, ValueError, IndexError):
+        return address
+    if _ip(host) is None and not is_localhost_name(host):
+        target = _resolve_target(host)
+        if target is not None:
+            raise _refuse_dns(target)
+        return address
+    target, vetted = _vet(family, address)
+    if target is not None:
+        raise _refuse_connect(target)
+    if _name(host) == "localhost":
+        return address  # resolved -- and every answer checked -- by the guarded getaddrinfo
+    return vetted
 
 
 def _install_patches() -> None:
@@ -356,30 +401,49 @@ def _install_patches() -> None:
     o["connect"] = socket.socket.connect
     o["connect_ex"] = socket.socket.connect_ex
     o["sendto"] = socket.socket.sendto
+    o["sendmsg"] = getattr(socket.socket, "sendmsg", None)
+    o["create_connection"] = socket.create_connection
     o["getaddrinfo"] = socket.getaddrinfo
     o["gethostbyname"] = socket.gethostbyname
     o["gethostbyname_ex"] = socket.gethostbyname_ex
     o["gethostbyaddr"] = socket.gethostbyaddr
+    o["getnameinfo"] = socket.getnameinfo
 
     def connect(self, address):
-        target = _connect_target(self, address)
+        target, address = _vet(self.family, address)
         if target is None:
             return o["connect"](self, address)
         raise _refuse_connect(target)
 
     def connect_ex(self, address):
-        target = _connect_target(self, address)
+        target, address = _vet(self.family, address)
         if target is None:
             return o["connect_ex"](self, address)
         _refuse_connect(target)
         return errno.ECONNREFUSED
 
     def sendto(self, data, *args):
-        address = args[-1] if args else None
-        target = _connect_target(self, address) if address is not None else None
-        if target is None:
-            return o["sendto"](self, data, *args)
-        raise _refuse_connect(target + " (udp)")
+        # sendto(data, address) or sendto(data, flags, address)
+        if args:
+            target, address = _vet(self.family, args[-1])
+            if target is not None:
+                raise _refuse_connect(target + " (udp)")
+            args = (*args[:-1], address)
+        return o["sendto"](self, data, *args)
+
+    def sendmsg(self, buffers, *args):
+        # sendmsg(buffers[, ancdata[, flags[, address]]])
+        if len(args) >= 3 and args[2] is not None:
+            target, address = _vet(self.family, args[2])
+            if target is not None:
+                raise _refuse_connect(target + " (sendmsg)")
+            args = (*args[:2], address, *args[3:])
+        return o["sendmsg"](self, buffers, *args)
+
+    def create_connection(address, *args, **kwargs):
+        ip = _ip(address[0]) if isinstance(address, (tuple, list)) and address else None
+        family = socket.AF_INET6 if ip is not None and ip.version == 6 else socket.AF_INET
+        return o["create_connection"](_precheck(family, address), *args, **kwargs)
 
     def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         if host is not None and _ip(host) is None and is_localhost_name(host) and _name(host) != "localhost":
@@ -390,7 +454,7 @@ def _install_patches() -> None:
             raise _refuse_dns(target)
         results = o["getaddrinfo"](host, port, family, type, proto, flags)
         if host is not None and _ip(host) is None:
-            _check_loopback_results(host, results)
+            _check_loopback_results(host, [r[4][0] for r in results])
         return results
 
     def gethostbyname(host):
@@ -400,35 +464,52 @@ def _install_patches() -> None:
         if target is not None:
             raise _refuse_dns(target)
         out = o["gethostbyname"](host)
-        if _ip(host) is None and not is_loopback_ip(out):
-            raise _refuse_dns(f"{_strip(host)} (resolved to {out})")
+        if _ip(host) is None:
+            _check_loopback_results(host, [out])
         return out
 
     def gethostbyname_ex(host):
+        if is_localhost_name(host) and _name(host) != "localhost":
+            return (_text(host), [], ["127.0.0.1"])
         target = _resolve_target(host)
-        if target is not None and not is_localhost_name(host):
+        if target is not None:
             raise _refuse_dns(target)
-        return o["gethostbyname_ex"](host)
+        out = o["gethostbyname_ex"](host)
+        if _ip(host) is None:
+            _check_loopback_results(host, out[2])
+        return out
 
     def gethostbyaddr(host):
         # A reverse lookup of anything but loopback is a DNS query.
         if is_loopback_ip(host) or _name(host) == "localhost":
             return o["gethostbyaddr"](host)
-        raise _refuse_dns(_strip(host), kind="reverse-dns")
+        raise _refuse_dns(_text(host), kind="reverse-dns")
+
+    def getnameinfo(sockaddr, flags):
+        # Without NI_NUMERICHOST this is a reverse lookup of the address.
+        if flags & socket.NI_NUMERICHOST or is_loopback_ip(sockaddr[0]):
+            return o["getnameinfo"](sockaddr, flags)
+        raise _refuse_dns(_text(sockaddr[0]), kind="reverse-dns")
 
     socket.socket.connect = connect
     socket.socket.connect_ex = connect_ex
     socket.socket.sendto = sendto
+    if o["sendmsg"] is not None:
+        socket.socket.sendmsg = sendmsg
+    socket.create_connection = create_connection
     socket.getaddrinfo = getaddrinfo
     socket.gethostbyname = gethostbyname
     socket.gethostbyname_ex = gethostbyname_ex
     socket.gethostbyaddr = gethostbyaddr
+    socket.getnameinfo = getnameinfo
 
     # asyncio resolves on an executor thread, which has neither the task's context nor its
     # test. Refuse here, on the task, so the attempt is recorded against the test that awaited it.
     import asyncio.base_events as base_events
+    import asyncio.selector_events as selector_events
 
     o["loop_getaddrinfo"] = base_events.BaseEventLoop.getaddrinfo
+    o["sock_connect"] = selector_events.BaseSelectorEventLoop.sock_connect
 
     async def loop_getaddrinfo(self, host, port, *, family=0, type=0, proto=0, flags=0):
         if not (host is not None and _ip(host) is None and is_localhost_name(host)):
@@ -437,7 +518,13 @@ def _install_patches() -> None:
                 raise _refuse_dns(target)
         return await o["loop_getaddrinfo"](self, host, port, family=family, type=type, proto=proto, flags=flags)
 
+    async def sock_connect(self, sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            address = _precheck(sock.family, address)
+        return await o["sock_connect"](self, sock, address)
+
     base_events.BaseEventLoop.getaddrinfo = loop_getaddrinfo
+    selector_events.BaseSelectorEventLoop.sock_connect = sock_connect
 
     # Carry the starting test into threads and executor work items (contextvars do not cross
     # into either on Python 3.11). Tagging only: the code under test sees no difference.
@@ -469,6 +556,23 @@ def _install_patches() -> None:
 
     cf_thread.ThreadPoolExecutor.submit = executor_submit
 
+    # A forked child (os.fork, multiprocessing's fork start method) keeps these patches but not
+    # the parent's memory: it reports through the run directory, like a spawned child.
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(after_in_child=_after_fork)
+
+
+def _after_fork() -> None:
+    s = _state()
+    if not s["installed"]:
+        return
+    s["lock"] = threading.Lock()  # the parent's may have been held by another thread
+    s["process"] = uuid.uuid4().hex[:12]
+    s["seq"] = 0
+    if not s["child"]:
+        s["child"] = True
+        s["violations"] = []
+
 
 def _disable_proxies() -> None:
     for name in PROXY_ENV:
@@ -486,6 +590,66 @@ def _disable_proxies() -> None:
             setattr(urllib.request, bypass, lambda host: False)
 
 
+# ---------------------------------------------------------------------------------------------
+# Postgres URLs: libpq connects in C, past every hook above.
+# ---------------------------------------------------------------------------------------------
+
+_PG_SCHEMES = ("postgres", "postgresql")
+
+
+def _pg_hosts(value: str) -> Optional[List[str]]:
+    """The hosts a libpq / asyncpg URL or key=value DSN connects to ("" = the default unix
+    socket), or None if `value` is not a Postgres connection string."""
+    value = value.strip()
+    scheme = value.split("://", 1)[0].lower() if "://" in value else ""
+    if scheme.split("+", 1)[0] in _PG_SCHEMES:
+        parts = urlsplit(value)
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        hosts = []
+        for item in netloc.split(","):
+            item = unquote(item)
+            if item.startswith("["):
+                hosts.append(item[1:].split("]", 1)[0])
+            else:
+                hosts.append(item.rsplit(":", 1)[0] if item.count(":") == 1 else item)
+        query = parse_qs(parts.query)
+        for key in ("host", "hostaddr"):
+            for v in query.get(key, []):
+                hosts.extend(v.split(","))
+        return hosts
+    if "=" in value and not scheme and any(k in value for k in ("host=", "hostaddr=", "dbname=")):
+        hosts = []
+        for token in value.split():
+            key, _, v = token.partition("=")
+            if key in ("host", "hostaddr"):
+                hosts.extend(v.strip("'\"").split(","))
+        return hosts
+    return None
+
+
+def _pg_host_ok(host: str) -> bool:
+    host = host.strip()
+    return host == "" or host.startswith("/") or is_localhost_name(host) or is_loopback_ip(host)
+
+
+def postgres_env_problems(environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """Each env var that would point libpq (or asyncpg) off this machine."""
+    env = os.environ if environ is None else environ
+    problems = []
+    for key in sorted(env):
+        value = env[key]
+        if key in ("PGHOST", "PGHOSTADDR"):
+            hosts: Optional[List[str]] = value.split(",")
+        else:
+            hosts = _pg_hosts(value)
+        if not hosts:
+            continue
+        bad = [h for h in hosts if not _pg_host_ok(h)]
+        if bad:
+            problems.append(f"{key} -> {', '.join(bad)}")
+    return problems
+
+
 def install() -> bool:
     """Install the guard in the pytest process. Idempotent; False under the opt-out."""
     s = _state()
@@ -501,7 +665,8 @@ def install() -> bool:
         s["run_dir_owned"] = True
         os.environ[RUN_DIR_ENV] = run_dir
     s["run_dir"] = run_dir
-    # Python children load tests/_netguard_child/sitecustomize.py, which installs the child half.
+    # Python children load tests/_netguard_child/sitecustomize.py, which installs the child half
+    # and then runs the sitecustomize it shadows.
     parts = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p and p != _CHILD_SITE_DIR]
     os.environ["PYTHONPATH"] = os.pathsep.join([_CHILD_SITE_DIR, *parts])
     s["installed"] = True
