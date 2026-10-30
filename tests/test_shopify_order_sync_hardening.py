@@ -120,6 +120,13 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
             return DummyResponse(201, payload={"order": {"id": 999}}, text="201")
         return DummyResponse(500, payload={"errors": "unexpected"}, text="500")
 
+    # Unpatched, this was a real GET to shop.myshopify.com (Shopify) after the create.
+    reconciliation_fetches = []
+
+    async def fake_fetch_shopify_order_reconciliation_payload_best_effort(**kwargs):
+        reconciliation_fetches.append(dict(kwargs))
+        return None
+
     monkeypatch.setattr(order_routes, "get_order", fake_get_order)
     monkeypatch.setattr(order_routes, "get_merchant_onboarding", fake_get_merchant_onboarding)
     monkeypatch.setattr(order_routes, "get_merchant_active_stores", fake_get_active_stores)
@@ -129,6 +136,11 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
         order_routes,
         "ensure_external_payment_transaction_best_effort",
         fake_ensure_external_payment_transaction_best_effort,
+    )
+    monkeypatch.setattr(
+        order_routes,
+        "_fetch_shopify_order_reconciliation_payload_best_effort",
+        fake_fetch_shopify_order_reconciliation_payload_best_effort,
     )
 
     import db.orders as orders_db
@@ -154,6 +166,11 @@ async def test_create_shopify_order_falls_back_to_other_store_on_401(monkeypatch
 
     assert updated_store_id["order_id"] == order_id
     assert updated_store_id["update_data"]["store_id"] == "store_2"
+
+    # The re-read goes to the store that took the order, with its token, not the one that 401'd.
+    assert reconciliation_fetches == [
+        {"shop_domain": "shop.myshopify.com", "access_token": "good_token", "shopify_order_id": "999"}
+    ]
 
 
 @pytest.mark.asyncio
