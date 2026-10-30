@@ -54,6 +54,12 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `a2a_rail_purchase_poll` — every A2A_RAIL_POLL_INTERVAL_SECONDS (default 20): advance A2A token
+  rail purchases one step each (jobs/a2a_rail_purchase_poll). Dormant unless A2A_RAIL_WORKER_ENABLED
+  and the rail client is configured.
+- `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
+  detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
+  webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
 - `reap_agentic_purchase_poll` — every REAP_AGENTIC_POLL_INTERVAL_SECONDS
   (default 30), drives jobs/reap_agentic_purchase_poll: requeue stale claims,
   expire overdue purchases (the PII deadline), fail attempt-exhausted ones, then
@@ -141,6 +147,8 @@ _JOB_RUN_DEADLINES = {
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
     "catalog_row_trust_backfill": 7200,
+    # hourly CRAWL_FRESH decay recheck (bounded; under the next run's start)
+    "catalog_row_trust_crawl_fresh_recheck": 1800,
     "agent_pdp_view_reconcile": 7200,
     "pdp_will_render_reconcile": 7200,
     # monthly money crons (external calls, must never wedge silently)
@@ -153,6 +161,8 @@ _JOB_RUN_DEADLINES = {
     "cafe24_reconciliation": 900,
     "audit_health_tick": 600,
     "catalog_onboard_queue_drain": 1500,
+    # hourly; a few hundred job rows plus one evidence read, then at most MAX_PER_RUN inserts
+    "retailer_ingest_weekly_reenqueue": 900,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
     # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
@@ -260,6 +270,14 @@ _JOB_RUN_DEADLINES = {
     # try/finally that releases every claim on CancelledError, so a cut run
     # strands no leases and the next tick simply re-claims what it did not reach.
     "reap_agentic_purchase_poll": 600,
+    # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
+    # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
+    "agent_purchase_events": 300,
+    # Starts no new step after 60 s. One step is a card read plus at most one write; each call is
+    # bounded by the client's total deadline (60 s) and the first may also mint a token (another
+    # 60 s), so a step is <= 180 s and a tick <= ~240 s. A cut tick releases every claim it did not
+    # step, and a write cut mid-call stays pending for the next holder to reconcile.
+    "a2a_rail_purchase_poll": 300,
 }
 
 
@@ -589,6 +607,45 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Rail-purchase webhook events (payment orchestration P1): detect events from the
+        # agent_purchases ledger and hand them to the agent webhook sender. Dormant unless
+        # AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED (checked inside the job).
+        # max_instances=1 + coalesce: a slow tick never stacks; the hand-over claim is the fence.
+        from jobs.agent_purchase_events import (
+            job_interval_seconds as _ape_interval_seconds,
+            run_agent_purchase_events,
+        )
+        _ape_interval = _ape_interval_seconds()
+        _add_job(
+            run_agent_purchase_events,
+            "interval",
+            seconds=_ape_interval,
+            id="agent_purchase_events",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_ape_interval,
+            coalesce=True,
+        )
+
+        # The A2A token rail's purchase worker (payment orchestration P2b): one step per claimed
+        # purchase. Dormant unless A2A_RAIL_WORKER_ENABLED and the rail client is configured (both
+        # checked inside the job). max_instances=1 + coalesce; the ledger claim is the fence.
+        from jobs.a2a_rail_purchase_poll import (
+            job_interval_seconds as _a2a_interval_seconds,
+            run_a2a_rail_purchase_poll,
+        )
+        _a2a_interval = _a2a_interval_seconds()
+        _add_job(
+            run_a2a_rail_purchase_poll,
+            "interval",
+            seconds=_a2a_interval,
+            id="a2a_rail_purchase_poll",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_a2a_interval,
+            coalesce=True,
+        )
+
         # Store-lifecycle reconciliation (issue #1648): probe stores we believe
         # are connected against their upstream platform and disconnect the ones
         # that are gone, then re-derive catalog_merchants.status from
@@ -681,6 +738,24 @@ async def start_scheduler() -> None:
             replace_existing=True,
             misfire_grace_time=600,
             coalesce=True,
+        )
+
+        # Re-enqueue of every done retailer-ingest cohort before its last price read ages out, each with an
+        # explicit options.market (services/retailer_ingest/weekly_reenqueue.py). Hourly; a cohort is due
+        # when its last applied read is INTERVAL_HOURS old. OFF BY DEFAULT: the tick returns before touching
+        # the database unless RETAILER_INGEST_WEEKLY_REENQUEUE_ENABLED is set. Database-only (it crawls
+        # nothing), so it runs here rather than in the crawl-subnet drain, whose image is pinned and rolled
+        # by hand.
+        from jobs.retailer_ingest_weekly_reenqueue import run_retailer_ingest_weekly_reenqueue_tick
+        _add_job(
+            run_retailer_ingest_weekly_reenqueue_tick,
+            "cron",
+            minute=11,
+            id="retailer_ingest_weekly_reenqueue",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
         )
 
         # P2.2: drive queued audit_runs through the async lifecycle.
@@ -1119,6 +1194,7 @@ async def start_scheduler() -> None:
 
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
         )
         _add_job(
             run_catalog_row_trust_backfill_tick,
@@ -1128,6 +1204,19 @@ async def start_scheduler() -> None:
             id="catalog_row_trust_backfill",
             replace_existing=True,
             misfire_grace_time=1800,  # fire up to 30min late (post-restart) not skip
+            coalesce=True,
+            max_instances=1,
+        )
+        # CRAWL_FRESH decay recheck (services/catalog_row_trust_upserter), hourly:
+        # a crawl-fresh row whose read aged past N is re-derived within the hour.
+        # A bounded GIN-index read that writes nothing while no row carries the code.
+        _add_job(
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
+            "cron",
+            minute=47,
+            id="catalog_row_trust_crawl_fresh_recheck",
+            replace_existing=True,
+            misfire_grace_time=1800,
             coalesce=True,
             max_instances=1,
         )

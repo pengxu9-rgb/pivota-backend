@@ -13,6 +13,7 @@ from db.database import database
 
 ZERO_OR_MISSING_PRICE = "zero_or_missing_price"
 ORPHAN_NO_SKU = "orphan_no_sku"
+INVALID_LIVE_PRODUCT_SKU_LINK = "invalid_live_product_sku_link"
 
 
 @dataclass
@@ -199,7 +200,7 @@ async def guard_catalog_offer_rows(
         for row in accepted:
             identity = (str(row.get("sku_key") or row.get("sku_id") or ""), str(row.get("product_key") or ""))
             if identity not in live:
-                reason = "invalid_live_product_sku_link"
+                reason = INVALID_LIVE_PRODUCT_SKU_LINK
                 reasons[reason] = reasons.get(reason, 0) + 1
                 rejected.append({"offer_id": row.get("offer_id"), "reasons": [reason]})
             else:

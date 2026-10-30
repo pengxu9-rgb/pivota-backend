@@ -51,9 +51,16 @@ else:
                 sys.exit(7)
         else:
             out = {path: s.get(path, [])}
+            # The policy listing fails right after this displayName is written: the last policy POST is
+            # that policy's, so it is the listing that follows its upsert (the retirement's), not its own.
+            fail_after = os.environ.get("MONITORING_POLICY_LIST_FAIL_AFTER", "")
+            posts = [c for c in s["calls"] if c["method"] == "POST" and c["path"] == "alertPolicies"]
+            if path == "alertPolicies" and fail_after and posts and (posts[-1]["body"] or {}).get("displayName") == fail_after:
+                out = {"error": {"code": 503, "message": "The service is currently unavailable."}}
     elif method == "DELETE":
         kind = path.split("/")[0]
-        s[kind] = [x for x in s.get(kind, []) if x["name"] != "projects/" + project + "/" + path]
+        if not (kind == "alertPolicies" and os.environ.get("MONITORING_POLICY_DELETE_NOOP")):
+            s[kind] = [x for x in s.get(kind, []) if x["name"] != "projects/" + project + "/" + path]
         out = {}
     else:
         # A log metric Monitoring cannot see yet (MONITORING_UNSEEN_METRICS, comma-separated): a policy
@@ -256,3 +263,59 @@ def test_a_metric_that_becomes_visible_within_the_budget_is_waited_for(tmp_path)
     # Every metric this script creates is read by some policy ("went silent" reads the report metric through
     # PromQL), so each was really rejected once and really waited for.
     assert state["rejected"] == {m: 1 for m in SCRIPT_METRICS.split(",")}
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+def test_the_renamed_relgraph_occupancy_alert_retires_its_two_hour_predecessor(tmp_path, env):
+    # upsert() replaces by displayName: without the retirement the old two-hour policy would stay live
+    # and page on every 10,000-review night (2026-10-20).
+    run_script(tmp_path, env)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text())
+    project = "pivota-staging" if env == "staging" else "pivota-prod"
+    old_name = env + ": relgraph-sync running over two hours"
+    state["alertPolicies"].append({"name": "projects/" + project + "/alertPolicies/legacy-two-hours", "displayName": old_name})
+    state_path.write_text(json.dumps(state))
+    count_before = len(state["alertPolicies"])
+    after = run_script(tmp_path, env, repeat=True)
+    names = [p["displayName"] for p in after["alertPolicies"]]
+    assert old_name not in names
+    assert names.count(env + ": relgraph-sync running over five hours") == 1
+    assert len(after["alertPolicies"]) == count_before - 1
+    deletes = [c for c in after["calls"] if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours"]
+    assert len(deletes) == 1
+    creates = [i for i, c in enumerate(after["calls"]) if c["method"] == "POST"
+               and (c["body"] or {}).get("displayName") == env + ": relgraph-sync running over five hours"]
+    retire = next(i for i, c in enumerate(after["calls"]) if c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours")
+    assert creates and creates[-1] < retire  # the successor exists before the old policy goes
+
+
+def _seed_two_hour_policy(tmp_path, env):
+    run_script(tmp_path, env)
+    state_path = tmp_path / "state.json"
+    state = json.loads(state_path.read_text())
+    project = "pivota-staging" if env == "staging" else "pivota-prod"
+    state["alertPolicies"].append({"name": "projects/" + project + "/alertPolicies/legacy-two-hours",
+                                   "displayName": env + ": relgraph-sync running over two hours"})
+    state_path.write_text(json.dumps(state))
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+def test_a_failed_policy_listing_aborts_the_retirement_instead_of_reporting_success(tmp_path, env):
+    # A listing error inside the for-list was an empty loop: nothing retired, exit 0 (2026-10-20 review).
+    _seed_two_hour_policy(tmp_path, env)
+    after, proc = run_script(tmp_path, env, repeat=True, return_process=True,
+                             extra_env={"MONITORING_POLICY_LIST_FAIL_AFTER": env + ": relgraph-sync running over five hours"})
+    assert proc.returncode != 0
+    assert "listing alert policies FAILED" in proc.stderr
+    assert env + ": relgraph-sync running over two hours" in [p["displayName"] for p in after["alertPolicies"]]
+    assert not any(c["method"] == "DELETE" and c["path"] == "alertPolicies/legacy-two-hours" for c in after["calls"])
+
+
+@pytest.mark.parametrize("env", ["staging", "prod"])
+def test_the_retirement_post_check_fails_when_the_old_policy_survives_its_delete(tmp_path, env):
+    _seed_two_hour_policy(tmp_path, env)
+    after, proc = run_script(tmp_path, env, repeat=True, return_process=True,
+                             extra_env={"MONITORING_POLICY_DELETE_NOOP": "1"})
+    assert proc.returncode != 0
+    assert "retire check FAILED: " + env + ": relgraph-sync running over two hours is still live" in proc.stderr

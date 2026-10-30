@@ -32,7 +32,7 @@ from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
 )
-from services import crawl_ip_throttle, crawl_politeness
+from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services.external_seed_search import (
     SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
@@ -90,14 +90,17 @@ def _min_origin_yield() -> float:
 
 
 def _min_budget_reach() -> float:
-    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", "").strip()
-    try:
-        value = float(raw) if raw else _MIN_BUDGET_REACH_DEFAULT
-    except ValueError:
-        return _MIN_BUDGET_REACH_DEFAULT
-    if not math.isfinite(value):
-        return _MIN_BUDGET_REACH_DEFAULT
-    return min(max(value, 0.0), 1.0)
+    """EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH, read through the pacing knobs' shared helper
+    (`crawl_global_pacer.resolve_setting`) since 2026-10-17: a share in (0, 1], and 0, negative or
+    garbage is an ERROR and the default. TUNABLE BECAUSE THE GLOBAL PACER MOVED THE FLOOR UNDER IT:
+    at 0.5 rows/s and 6 new hosts a minute a host-diverse queue head (1 row per host) reaches ~331
+    of 2,000 rows in 3,300 s (0.17) and reads as degraded every night, while a head of >= 4 rows per
+    host reaches 0.5. Which one prod has is what `pacing_census/refresh_head_hosts.py` measures;
+    this knob and EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE are what to move after it,
+    without a deploy (review M4)."""
+    return crawl_global_pacer.resolve_setting(
+        None, "EXTERNAL_REFERRAL_REFRESH_MIN_BUDGET_REACH", _MIN_BUDGET_REACH_DEFAULT, maximum=1.0,
+    )
 
 
 def _host_block_trip() -> int:
@@ -139,6 +142,22 @@ _UNREACHABLE_REASON_BUCKETS = frozenset({"connection", "timeout", "dns", "tls"})
 # any per-host "unreachable" statistic measured before then.
 _HOST_UNREACHABLE_TRIP_DEFAULT = 20
 
+# A host that has answered this many Cloudflare CHALLENGES IN A ROW (`cf-mitigated: challenge`, at
+# any status) is skipped for the rest of the run, its remaining rows unstamped (controller review of
+# be#2640, 2026-10-17). Neither existing breaker could see it: the 429/503 one counts only those
+# statuses, the unreachable one only network errors, and `CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS` only
+# keeps a host out of the IP rule. ichibanm.com answered 239 requests with a 403 challenge in one run
+# and was asked every time: about 15% of the run's slots spent on answers that cannot change. 3, like
+# the IP rule's own idea of "not a fluke"; through the shared helper, so 0 is never "off".
+_HOST_CHALLENGE_TRIP_DEFAULT = 3
+
+
+def _host_challenge_trip() -> int:
+    """EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP, then 3. Rounded up, at least 1."""
+    return crawl_global_pacer.resolve_count(
+        None, "EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", _HOST_CHALLENGE_TRIP_DEFAULT
+    )
+
 # Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
 # once, but every worker holds an event-loop slice for HTML parsing on a 1-vCPU job, and the
 # DB pool (DB_POOL_MAX_SIZE) is shared.
@@ -166,6 +185,50 @@ def _refresh_host_concurrency(explicit: Optional[int]) -> int:
     return min(max(value, 1), _HOST_CONCURRENCY_MAX)
 
 
+# THE IP'S TOTAL RATE (`services.crawl_global_pacer`), and how fast the run may start on new hosts.
+#
+# 0.5 origin requests/s, MEASURED AGAINST WHAT GOT THE ADDRESS LISTED. 10-08..10-15 the refresh read
+# 8,155-13,156 rows per 3,300 s run at host concurrency 4: 2.5-4.0 requests/s, every night, from one
+# NAT address, plus the destination sweep's ~5,000 reads in ~15 min (~5/s) at 03:15Z. On 10-16
+# Cloudflare challenge-listed the address. The serial loop of 09-27 (3,282 rows/3,300 s, ~1/s) was
+# never listed; 0.5/s is half of that and one fifth to one eighth of the listing nights, and leaves
+# room for the other crawl jobs on the same IP (merchant-purchasability-sweep: <= ~7 requests/hour;
+# the store-audit probes: no merchant requests at all in the 24 h measured). 1,650 requests per
+# 3,300 s budget, of which every new host's robots.txt is one.
+#
+# 6 NEW HOSTS A MINUTE because a challenged request answers instantly: with no cap, four workers
+# swept 262 distinct hosts in 60 s on 10-16. Cloudflare scores the address across every zone it
+# fronts, so breadth is what it sees. 6/min (one every 10 s) is <= 330 hosts in a 55 min run.
+_GLOBAL_RPS_DEFAULT = crawl_global_pacer.RPS_DEFAULT
+_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = crawl_global_pacer.MAX_NEW_HOSTS_PER_MINUTE_DEFAULT
+
+
+# ZERO IS NOT "OFF" (2026-10-17 review, M3). Both knobs used to accept 0 as "disabled", and the cap
+# went through `int()`, so 0.9 truncated to 0 and switched it off too. Both now resolve through
+# `crawl_global_pacer`, the one helper the destination sweep's knobs use as well: 0, negative, NaN or
+# garbage is an ERROR and the default; the rate is clamped to [0.05, 1.0]; the cap is rounded up and
+# is at least 1. The only off switch is CRAWL_GLOBAL_PACER_DISABLED=true (the exact word; there is no
+# per-lane alias), which logs at ERROR every run.
+def _refresh_global_rps(explicit: Optional[float]) -> float:
+    """`--global-rps`, then EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5; clamped to [0.05, 1.0]."""
+    return crawl_global_pacer.resolve_rps(explicit, "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS", _GLOBAL_RPS_DEFAULT)
+
+
+def _refresh_max_new_hosts_per_minute(explicit: Optional[float]) -> int:
+    """`--max-new-hosts-per-minute`, then EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE, then
+    6; rounded up, at least 1."""
+    return crawl_global_pacer.resolve_new_host_cap(
+        explicit, "EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE", _MAX_NEW_HOSTS_PER_MINUTE_DEFAULT
+    )
+
+
+def _refresh_global_pacer_disabled() -> bool:
+    """The kill switch, logged at ERROR by `crawl_global_pacer.pacer_disabled` on every run."""
+    return crawl_global_pacer.pacer_disabled(
+        lane="external-referral-refresh",
+    )
+
+
 _MAX_STRUCTURAL_SHARE_DEFAULT = 0.2
 
 
@@ -177,6 +240,46 @@ def _max_structural_share() -> float:
         return float(raw) if raw else _MAX_STRUCTURAL_SHARE_DEFAULT
     except ValueError:
         return _MAX_STRUCTURAL_SHARE_DEFAULT
+
+
+# A SPIKE IN CURRENCY REFUSALS (services/seed_offer_currency). A seed whose column and page read
+# disagree, or that states no currency, makes the offer writer write nothing (`refused_currency`, a
+# structural skip). On 2026-10-19 that was 1,254 of 26,950 active seeds, ~4.7%. A night sampling the
+# queue should refuse about that share of its ATTEMPTED projections: every attempted projection is one
+# seed, and both lanes (mirror and attached) refuse a seed with no currency of its own. The count is
+# a LOWER bound: the attached lane reports `refused_currency` only for a seed that reaches its
+# currency check (after no_listing_offer / listing_offer_suppressed / ambiguous_listing_seller /
+# currency_not_read); past that check every such seed is refused whole, whoever wrote its rows
+# (Peng 2026-10-22). Twice it (10%) means reads started disagreeing with the
+# stored column (a geo-served storefront, an extractor regression), and those seeds silently stop
+# being priced. The structural-share rule cannot see it while the attached lane writes anything.
+# The minimum count keeps a tiny night (1 refusal in 5) from flapping.
+_MAX_REFUSED_CURRENCY_SHARE_DEFAULT = 0.10
+_MIN_REFUSED_CURRENCY_COUNT_DEFAULT = 20
+
+
+def _max_refused_currency_share() -> float:
+    """EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE; >= 1 disables the rule.
+
+    Clamped: a share <= 0 (or not a number) would degrade every night that refuses anything, and a
+    degraded run exits 1 and fails the Cloud Run execution, so it falls back to the default."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE") or "").strip()
+    try:
+        value = float(raw) if raw else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+    except ValueError:
+        return _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+    return value if math.isfinite(value) and value > 0 else _MAX_REFUSED_CURRENCY_SHARE_DEFAULT
+
+
+def _min_refused_currency_count() -> int:
+    """EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT: below this many refusals the share is
+    noise. Clamped to >= 1 for the same reason as the share."""
+    raw = (os.getenv("EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT") or "").strip()
+    try:
+        value = int(raw) if raw else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+    except ValueError:
+        return _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
+    return value if value >= 1 else _MIN_REFUSED_CURRENCY_COUNT_DEFAULT
 
 
 def batch_run_status(
@@ -193,6 +296,7 @@ def batch_run_status(
     projections_written_attached: int = 0,
     candidate_count: int = 0,
     skipped_for_budget: int = 0,
+    projections_refused_currency: int = 0,
 ) -> str:
     """The run's health, as one word. Pure so it can be tested without a database.
 
@@ -249,6 +353,15 @@ def batch_run_status(
     # not have moved (so `price_changes` is 0) and the writer may still have blown up on
     # every row -- the error count was previously collected and read by nothing.
     if projections_attempted and projections_errored >= projections_attempted:
+        return "degraded"
+    # Refusals are structural (they leave the rules above alone) but a SPIKE of them is not the
+    # catalogue's shape: see _MAX_REFUSED_CURRENCY_SHARE_DEFAULT.
+    refused = max(0, projections_refused_currency)
+    if (
+        projections_attempted
+        and refused >= _min_refused_currency_count()
+        and refused / projections_attempted > _max_refused_currency_share()
+    ):
         return "degraded"
     return "success"
 
@@ -1869,29 +1982,23 @@ EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS = 3300.0
 
 
 def _refresh_budget_seconds(explicit: Optional[float]) -> float:
-    """Resolve the run's wall-clock budget. `<= 0` disables it (and says so in the summary).
+    """Resolve the run's wall-clock budget: the flag, then EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS,
+    then 3300. Always > 0.
 
     NON-FINITE FALLS BACK TO THE DEFAULT rather than through. `argparse type=float` accepts
     `nan` and `inf`, and either would (a) silently disable the budget, since `budget > 0` is
     False for NaN, while the summary still reported `stopped_early: false`, and (b) reach
     `json.dumps` in `jobs/external_referral_refresh.main`, which emits a bare `NaN` that is
     not valid JSON for any downstream parser.
-    """
-    def _finite(value: Any) -> Optional[float]:
-        try:
-            out = float(value)
-        except (TypeError, ValueError):
-            return None
-        return out if math.isfinite(out) else None
 
-    if explicit is not None:
-        resolved = _finite(explicit)
-        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
-    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS")
-    if raw is None or not str(raw).strip():
-        return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
-    resolved = _finite(raw)
-    return EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS if resolved is None else resolved
+    AND SO DOES 0 (2026-10-17 review, M3). `<= 0` used to disable the budget, which also left the
+    global pacer with no deadline: a cool-down could then be waited out into the 3,600 s task
+    timeout. It is an ERROR and the default now (`crawl_global_pacer.resolve_budget_seconds`); a run
+    that needs longer passes a longer budget.
+    """
+    return crawl_global_pacer.resolve_budget_seconds(
+        explicit, "EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS", EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS
+    )
 
 
 async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, str]:
@@ -1960,6 +2067,11 @@ async def run_external_referral_refresh_batch(
     ip_throttle_enabled: Optional[bool] = None,
     candidate_seed_ids: Optional[Sequence[str]] = None,
     market: Optional[str] = None,
+    global_rps: Optional[float] = None,
+    max_new_hosts_per_minute: Optional[float] = None,
+    ip_challenge_trip_hosts: Optional[int] = None,
+    ip_challenge_window_seconds: Optional[float] = None,
+    ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     candidate_seed_ids = await get_external_referral_refresh_candidate_seed_ids(
         limit=limit, **({"seed_ids": candidate_seed_ids, "market": market} if candidate_seed_ids is not None else {})
@@ -1969,16 +2081,50 @@ async def run_external_referral_refresh_batch(
     # 331 hosts at once, and the per-host breaker tripped 261 times, one host at a time, while the
     # run kept asking. It trips on DISTINCT hosts throttling inside a window, whatever edge they
     # sit behind. See `services.crawl_ip_throttle`.
-    ip_breaker = crawl_ip_throttle.IpThrottleBreaker.from_env(
+    #
+    # STAGED SINCE 2026-10-16 (`crawl_ip_throttle.StagedIpThrottleBreaker`): it also trips on 3
+    # distinct hosts answering a Cloudflare challenge within 120 s, and its FIRST trip pauses every
+    # origin read for a cool-down (15 min) and resumes at half the global rate; only the second ends
+    # the run. Wired to the run's global pacer through `on_trip`.
+    budget = _refresh_budget_seconds(budget_seconds)
+    # THE GLOBAL PACER (`services.crawl_global_pacer`): every origin request this run makes, page
+    # fetches, retries and robots.txt, starts no sooner than its slot in one shared bucket. Its
+    # deadline is the budget, so a cool-down that would outlast the run stops it instead.
+    #
+    # THE KILL SWITCH (CRAWL_GLOBAL_PACER_DISABLED=true) builds an UNPACED pacer rather than none:
+    # no rate and no new-host cap, but the breaker's cool-down and stop and the budget's deadline
+    # still reach every request.
+    pacer_deadline = crawl_global_pacer._now() + budget
+    if _refresh_global_pacer_disabled():
+        pacer = crawl_global_pacer.GlobalOriginPacer(unpaced=True, deadline=pacer_deadline)
+    else:
+        pacer = crawl_global_pacer.GlobalOriginPacer(
+            rps=_refresh_global_rps(global_rps),
+            max_new_hosts_per_minute=_refresh_max_new_hosts_per_minute(max_new_hosts_per_minute),
+            deadline=pacer_deadline,
+        )
+
+    def _on_trip(breaker: crawl_ip_throttle.StagedIpThrottleBreaker, event: Dict[str, Any]) -> None:
+        if event.get("action") == "cooldown":
+            pacer.pause(breaker.cooldown_seconds)
+            pacer.set_rate(pacer.rps / 2.0)
+        else:
+            pacer.stop("ip breaker tripped")
+
+    ip_breaker = crawl_ip_throttle.StagedIpThrottleBreaker.from_env(
         trip_hosts=ip_throttle_trip_hosts,
         window_seconds=ip_throttle_window_seconds,
         enabled=ip_throttle_enabled,
+        challenge_trip_hosts=ip_challenge_trip_hosts,
+        challenge_window_seconds=ip_challenge_window_seconds,
+        cooldown_seconds=ip_throttle_cooldown_seconds,
+        on_trip=_on_trip,
     )
     ip_throttle_skips: Dict[str, int] = {}
     skipped_for_ip_throttle = 0
-    budget = _refresh_budget_seconds(budget_seconds)
     host_trip = _host_block_trip()
     unreachable_trip = _host_unreachable_trip()
+    challenge_trip = _host_challenge_trip()
     concurrency = _refresh_host_concurrency(host_concurrency)
     # Looked up whatever the breakers say: the host is also the concurrency key (one row in
     # flight per host) and the per-host timing key. Without hosts every row is its own lane.
@@ -2056,13 +2202,21 @@ async def run_external_referral_refresh_batch(
     # 09-26/27 answered a plain HEAD from outside the crawl egress.
     unreachable_samples: Dict[str, str] = {}
     skipped_for_unreachable_host = 0
+    # Hosts that answered `challenge_trip` Cloudflare challenges in a row, and the rows passed over.
+    challenged_hosts: Dict[str, int] = {}
+    skipped_for_host_challenge = 0
     # Per-host cost, measured around the refresh call: the fetch, the pacing wait it includes,
     # the writes and the projection. This is how to see which hosts the budget goes to.
     host_stats: Dict[str, Dict[str, float]] = {}
     rows_started = 0
+    # Rows IN FLIGHT when the pacer stopped (review M1): their request was refused, not sent, so
+    # they are deferred unstamped like the rows still queued -- to `skipped_for_ip_throttle` on the
+    # breaker's final trip, to `skipped_for_budget` when the budget ended.
+    pace_stopped_for_budget = 0
 
     async def _process(seed_id: str, host: str) -> None:
         nonlocal refreshed, refreshed_from_cache, degraded, failed, unprocessable
+        nonlocal skipped_for_ip_throttle, pace_stopped_for_budget, stopped_early
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
@@ -2137,6 +2291,18 @@ async def run_external_referral_refresh_batch(
             else:
                 failed += 1
                 errors.append({"seed_id": seed_id, "status": status, "error": result.get("error")})
+        except crawl_global_pacer.GlobalPaceStopped:
+            # REFUSED, NOT TRIED (review M1, 2026-10-17). `resolve_external_offer` and
+            # `_refresh_external_seed_by_id` re-raise this so the row is never stamped; here it is
+            # counted with the rows the stop deferred and touches nothing else: not `failed`, not
+            # the host's stats, not its unreachable streak.
+            if ip_breaker.tripped:
+                skipped_for_ip_throttle += 1
+                ip_throttle_skips[host or seed_id] = ip_throttle_skips.get(host or seed_id, 0) + 1
+            else:
+                pace_stopped_for_budget += 1
+                stopped_early = True
+            return
         except HTTPException as exc:
             # NARROW ON PURPOSE. Only the two permanent per-seed data conditions are absorbed:
             # SEED_NOT_FOUND (404) and INVALID_URL (400). ~628 seeds carry no usable destination
@@ -2168,6 +2334,21 @@ async def run_external_referral_refresh_batch(
             logger.warning(
                 "external referral refresh: %s answered %d 429/503s in a row; skipping its "
                 "remaining rows this run", host, crawl_politeness.consecutive_blocks(host),
+            )
+        # A CHALLENGE STREAK, at any status: stop asking. The same place and the same reasoning as
+        # the 429 breaker above: the streak lives in the pacing layer (`note_response`, which sees
+        # every challenged answer this row earned, robots.txt included), and it changes WHETHER the
+        # host is asked again, never how fast. An excluded host (CRAWL_IP_CHALLENGE_EXCLUDED_HOSTS)
+        # is skipped here like any other: exclusion keeps it out of the IP rule, not in the queue.
+        if (
+            host
+            and host not in tripped_hosts
+            and crawl_politeness.consecutive_challenges(host) >= challenge_trip
+        ):
+            challenged_hosts[host] = 0
+            logger.warning(
+                "external referral refresh: %s answered %d Cloudflare challenges in a row; skipping "
+                "its remaining rows this run", host, crawl_politeness.consecutive_challenges(host),
             )
         if not host:
             return
@@ -2213,16 +2394,46 @@ async def run_external_referral_refresh_batch(
     # waiting out its interval, its Crawl-delay, a slow TLS handshake or a timeout is a second
     # no other host is read. The sibling destination sweep already reads 4 hosts at once from the
     # same crawl egress, daily at 03:15Z (`SWEEP_HOST_CONCURRENCY`).
+    #
+    # TWO READY HEAPS SINCE THE NEW-HOST CAP (2026-10-16). `ready_new` holds lanes on hosts this
+    # run has not contacted; `ready_known` holds the rest (and host-less rows, which have no pacing
+    # key). The earliest head of the two is taken, exactly the one-heap rule, EXCEPT when it is a
+    # new host and the pacer's new-hosts-per-minute cap has no room right now: then the earliest
+    # known lane is read instead of parking a worker on the cap. With the cap off (or room under
+    # it) this is the old rule. The admission is reserved at take time, with no await before it.
     queue_position = {seed_id: index for index, seed_id in enumerate(candidate_seed_ids)}
     lanes: Dict[str, Deque[str]] = {}
     for seed_id in candidate_seed_ids:
         lane_host = candidate_hosts.get(seed_id, "")
         # A row with no host has no pacing key, so it is its own lane.
         lanes.setdefault(lane_host or f"\x00{seed_id}", deque()).append(seed_id)
-    ready: List[Tuple[int, str]] = [(queue_position[lane[0]], key) for key, lane in lanes.items()]
-    heapq.heapify(ready)
+    ready_new: List[Tuple[int, str]] = []
+    ready_known: List[Tuple[int, str]] = []
+    for key, lane in lanes.items():
+        (ready_known if key.startswith("\x00") else ready_new).append((queue_position[lane[0]], key))
+    heapq.heapify(ready_new)
+    heapq.heapify(ready_known)
     in_flight = 0
     lane_freed = asyncio.Condition()
+
+    def _take() -> str:
+        if ready_new and (not ready_known or ready_new[0] < ready_known[0]):
+            if not ready_known or pacer.new_host_wait() <= 0:
+                key = heapq.heappop(ready_new)[1]
+                pacer.admit(key)
+                return key
+        if ready_known:
+            return heapq.heappop(ready_known)[1]
+        key = heapq.heappop(ready_new)[1]
+        pacer.admit(key)
+        return key
+
+    def _drain_all_ip_throttled() -> None:
+        # THE FINAL TRIP ENDS THE RUN: every lane not in flight is deferred, unstamped. A lane in
+        # flight is drained when its row returns (the `finally` below).
+        for heap in (ready_new, ready_known):
+            while heap:
+                _drain_ip_throttled_lane(heapq.heappop(heap)[1])
 
     def _drain_ip_throttled_lane(key: str) -> None:
         nonlocal skipped_for_ip_throttle
@@ -2233,7 +2444,7 @@ async def run_external_referral_refresh_batch(
         skipped_for_ip_throttle += remaining
 
     def _drain_tripped_lane(key: str) -> None:
-        nonlocal skipped_for_host_backoff, skipped_for_unreachable_host
+        nonlocal skipped_for_host_backoff, skipped_for_unreachable_host, skipped_for_host_challenge
         # Passed-over rows are NOT stamped (`refresh_seed_by_id` is never called), so they keep
         # their place at the head of tomorrow's queue instead of being recorded as an attempt
         # that never happened.
@@ -2241,6 +2452,9 @@ async def run_external_referral_refresh_batch(
         if key in tripped_hosts:
             tripped_hosts[key] += remaining
             skipped_for_host_backoff += remaining
+        elif key in challenged_hosts:
+            challenged_hosts[key] += remaining
+            skipped_for_host_challenge += remaining
         else:
             unreachable_hosts[key] += remaining
             skipped_for_unreachable_host += remaining
@@ -2249,24 +2463,35 @@ async def run_external_referral_refresh_batch(
         nonlocal in_flight, stopped_early, rows_started
         while True:
             async with lane_freed:
-                while not ready and in_flight:
+                while not (ready_new or ready_known) and in_flight:
                     await lane_freed.wait()
+                if ip_breaker.tripped:
+                    _drain_all_ip_throttled()
+                    lane_freed.notify_all()
+                    return
                 # CHECKED BEFORE THE ROW, and after any wait: the point is to stop STARTING work,
                 # and a check after the call would still pay one more full row past the budget.
                 # It cannot interrupt rows already in flight, so the true ceiling is `budget`
                 # plus the slowest in-flight row -- bounded, since `crawl_politeness` caps what
-                # one row can cost.
-                if budget > 0 and (time.monotonic() - started) >= budget:
+                # one row can cost. A row that could only start after a cool-down that outlasts
+                # the budget is not started either, nor one after the pacer has stopped on the
+                # budget (its next slot fell past the deadline, review L1): that row's request
+                # would only be refused.
+                if (
+                    (time.monotonic() - started) >= budget
+                    or (pacer.deadline is not None and pacer.paused_until >= pacer.deadline)
+                    or pacer.stopped
+                ):
                     stopped_early = True
                     return
-                if not ready:
+                if not (ready_new or ready_known):
                     return
-                _position, key = heapq.heappop(ready)
+                key = _take()
                 # AT TAKE TIME, the one place it needs to be: a host whose lane is back in
-                # `ready` has no row in flight. Once the IP breaker has tripped, a host that has
-                # throttled us this run, or is known to be Shopify-served, is not asked again. A
-                # host first seen after the trip costs one request; if it throttles, that is its
-                # last.
+                # a ready heap has no row in flight. After the IP breaker's first trip (the
+                # cool-down stage), a host whose latest answer was a throttle or a challenge -- and,
+                # if the 429 rule tripped, a known Shopify-served host -- is not asked again. A host
+                # first seen after the trip costs one request; if it throttles, that is its last.
                 if ip_breaker.blocks(key):
                     _drain_ip_throttled_lane(key)
                     lane_freed.notify_all()
@@ -2279,26 +2504,34 @@ async def run_external_referral_refresh_batch(
             finally:
                 async with lane_freed:
                     in_flight -= 1
-                    if key in tripped_hosts or key in unreachable_hosts:
+                    # A PHANTOM PLACE (controller review, LOW): a row that ended without sending a
+                    # request (a missing seed, a refusal before the fetch) leaves its host's
+                    # provisional new-host place behind, holding room under the cap for nobody.
+                    # Give it back. A no-op once the host has really been contacted. (A drained lane
+                    # needs no release of its own: a breaker only ever drains a host that answered.)
+                    pacer.release(key)
+                    if key in tripped_hosts or key in unreachable_hosts or key in challenged_hosts:
                         _drain_tripped_lane(key)
+                    elif ip_breaker.tripped and lanes.get(key):
+                        _drain_ip_throttled_lane(key)
                     elif lanes.get(key):
-                        heapq.heappush(ready, (queue_position[lanes[key][0]], key))
+                        heapq.heappush(ready_known, (queue_position[lanes[key][0]], key))
                     else:
                         lanes.pop(key, None)
                     lane_freed.notify_all()
 
-    with crawl_ip_throttle.installed(ip_breaker):
+    with crawl_ip_throttle.installed(ip_breaker), crawl_global_pacer.installed(pacer):
         await _run_workers(_worker, concurrency)
     if ip_breaker.tripped:
         logger.warning(
-            "external referral refresh: IP throttled at %s (%d distinct hosts, %d Shopify-served, "
-            "429'd within %.0fs); %d rows on throttled or Shopify-served hosts deferred to the "
-            "next run",
-            ip_breaker.tripped_at, ip_breaker.trip_host_count, ip_breaker.trip_shopify_host_count,
-            ip_breaker.window_seconds, skipped_for_ip_throttle,
+            "external referral refresh: IP throttled at %s (trip %d of %d, %d distinct hosts); the "
+            "run ended and %d rows were deferred to the next run",
+            ip_breaker.tripped_at, ip_breaker.trips, ip_breaker.max_trips,
+            ip_breaker.trip_host_count, skipped_for_ip_throttle,
         )
     if stopped_early:
-        skipped_for_budget = sum(len(lane) for lane in lanes.values())
+        # The rows still queued, plus the ones in flight when the pacer stopped on the budget.
+        skipped_for_budget = sum(len(lane) for lane in lanes.values()) + pace_stopped_for_budget
         # LOUD, because a silent truncation reads exactly like a completed sweep: the summary
         # would otherwise show a smaller `refreshed` with no reason attached.
         logger.warning(
@@ -2326,6 +2559,7 @@ async def run_external_referral_refresh_batch(
         - unprocessable
         - skipped_for_host_backoff
         - skipped_for_unreachable_host
+        - skipped_for_host_challenge
         - skipped_for_ip_throttle,
     )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
@@ -2358,6 +2592,7 @@ async def run_external_referral_refresh_batch(
         projections_written_attached=int(proj_writes.get("attached") or 0),
         candidate_count=len(candidate_seed_ids),
         skipped_for_budget=skipped_for_budget,
+        projections_refused_currency=int(proj_skips.get("refused_currency") or 0),
     )
     return {
         # HONEST STATUS. This used to be `success if failed == 0`, and `failed` only counts
@@ -2389,6 +2624,9 @@ async def run_external_referral_refresh_batch(
         # Skips with no offer row to write (a subset of `projection_skips`). The status rule
         # judges `projections_attempted - projection_structural_skips`, the ones that should write.
         "projection_structural_skips": proj_structural,
+        # Seeds whose offer the writer refused for want of a currency they can vouch for (a subset of
+        # the structural skips, counted on its own because a spike degrades the run).
+        "projections_refused_currency": int(proj_skips.get("refused_currency") or 0),
         # Written rows by target: `mirror` (the seed's mirror product) or `attached` (the
         # canonical's offer for the seed's listing).
         "projection_writes": dict(sorted(proj_writes.items())),
@@ -2436,6 +2674,11 @@ async def run_external_referral_refresh_batch(
         "skipped_for_unreachable_host": skipped_for_unreachable_host,
         "unreachable_host_skips": dict(sorted(unreachable_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_unreachable_trip": unreachable_trip,
+        # Rows NOT attempted because their host answered `host_challenge_trip` Cloudflare
+        # challenges in a row (any status), per host. Unstamped, like the other host skips.
+        "skipped_for_host_challenge": skipped_for_host_challenge,
+        "host_challenge_skips": dict(sorted(challenged_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "host_challenge_trip": challenge_trip,
         "unreachable_host_errors": unreachable_samples,
         # Rows NOT attempted because the IP breaker tripped and their host had throttled us or is
         # Shopify-served.
@@ -2445,6 +2688,9 @@ async def run_external_referral_refresh_batch(
         # `ip_throttled`, the trip time, host counts, first/last 429 and the 429/503 header
         # aggregate (`throttle_diagnostics`): see `crawl_ip_throttle.IpThrottleBreaker.summary`.
         **ip_breaker.summary(),
+        # The global pacer: `global_rps` as configured, `final_rate` after any halving,
+        # `paces_waited_seconds` (summed over workers), `cooldowns`, the new-host cap and counts.
+        **pacer.summary(),
         # Where the budget went, per host: the 15 hosts that cost the most wall-clock.
         "host_seconds": {
             host: {

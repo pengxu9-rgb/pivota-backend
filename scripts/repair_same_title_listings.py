@@ -9,7 +9,9 @@ whichever offer on the shared `::canonical` SKU was touched last); 47 sell two o
 seeds on several pages, which the seed refresh re-touches.
 
 WHAT IT DOES, per live row and host with more than one listing, for ONE market (--market, default US: the keeper is
-elected for that market's buyer; other markets' offers and seeds are counted in `other_market_left`, never written). The keeper is ingestion.elect_listing_keeper -- the
+elected for that market's buyer; other markets' offers and seeds are counted in `other_market_left`, never written;
+a row/host whose suppressed offer still has a live Shopify Markets sibling is held, see the apply order below). The
+keeper is ingestion.elect_listing_keeper -- the
 SAME function the ingest uses, fed from the catalog (see `evidence`), with the row's current listing as the
 tie-break -- so the next ingest keeps the page this repair keeps instead of bringing a second one back:
   * suppress every LIVE offer of the other listings (reason `same_key_other_listing`, the run and keeper in
@@ -26,6 +28,16 @@ A row/host is SKIPPED whole and reported when its keeper would be left with no l
 last live offer away from a row), or when even its keeper is gone or sold out (every listing unavailable: nothing to
 align a row to -- services/external_seed_destination_liveness owns dead pages).
 
+HOST ALIASES (`kind: host_alias`, reason `listing_host_alias`). One listing spelled two ways -- `www.<host>/products/x`
+and `<host>/products/x` -- is ONE listing to content_listing, so the rule above never sees it; but offer_id hashes the
+URL as spelled, so a store crawled once under each spelling kept two live offers of the same page on one shelf
+(prod 2026-10-13: one brand store; fixed going forward by ingestion.respell_listing_host). Per row and
+host with ONE listing, the row's own spelling (its canonical_url, the one the ingest now writes) is kept: every LIVE
+offer at the other spelling whose (sku_key, channel, market) shelf ALSO holds a live offer at the row's spelling is
+suppressed. An alias offer alone on its shelf is never suppressed (`alias_kept_alone`); a row whose canonical_url
+names another listing or host is left to the rule above. Seeds are not touched (a seed id hashes the URL too, but
+both seeds point at the same page and refresh the same offers).
+
 Nothing is deleted. The manifest (every prior value) is STORED in identity_resolution_events before the write; the
 write is one transaction, and each statement is guarded on the exact value read at plan time -- any drift aborts it
 all. `updated_at` is not bumped (the reconciler's keeper election and ORDER BY updated_at readers must not reorder
@@ -33,9 +45,20 @@ over a repair); every touched content_key's served view and eligibility are rebu
 
   Dry run (default; writes nothing):
     python -m scripts.repair_same_title_listings [--host cocodor.com ...] [--product-key ext:... ...] [--market US]
+                                                 [--only-host-alias]
   Apply (Peng's go; AFTER the drain is re-imaged onto #2463 -- the old drain image re-points rows and re-activates
   the left-out pages' seeds on its next run of a store, undoing this; the new one never moves a row off its listing):
-    ... --apply
+    ... --host <store> [--only-host-alias] --max-groups <n> --expect-digest <plan_digest> --apply
+  An --apply re-plans live: it is refused without exactly one --host, or when the plan acts on more than
+  --max-groups groups or its plan_digest is not --expect-digest (copy both from the reviewed dry run of the SAME
+  arguments: any change since -- grown, shrunk, other rows, an extra restore -- changes the digest).
+  Host aliases: apply only after the drain image carries ingestion.respell_listing_host AND one crawl of the host
+  has run on it, then dry-run again -- before that, a crawl under the other spelling re-mints what this suppresses.
+  Both halves: dry-run EVERY market the host is captured for (--market SG, AU, ...), and apply the SIBLING markets
+  first, the base market last: a group whose suppressed base still has a live Shopify Markets sibling is skipped
+  (`sibling_market_alias_live` / `sibling_market_listing_live`, `stranded_siblings`) until that sibling's market
+  has run.
+  Folded stores: never run the same-title half (without --only-host-alias) on a store whose shade fold is on.
   Revert a run (all or nothing; refused while a LATER applied run holds any of its rows), or re-run its rebuild:
     python -m scripts.repair_same_title_listings revert --run-id samelisting_<hex>
     python -m scripts.repair_same_title_listings refresh --run-id samelisting_<hex>
@@ -61,6 +84,7 @@ from services.external_seed_destination_liveness import CONFIRMED_DEAD_VERDICTS 
 
 SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 REASON = "same_key_other_listing"
+ALIAS_REASON = "listing_host_alias"
 DUPLICATE_REASON = "duplicate_offer"  # scripts/reconcile_catalog_offers.REASON_DUPLICATE
 
 ROWS_SQL = """
@@ -201,6 +225,74 @@ def _listing_of_seed(s: Mapping[str, Any]) -> Optional[Tuple[str, str]]:
     return content_listing(s.get("canonical_url") or s.get("destination_url"))
 
 
+def _spelled_host(o: Mapping[str, Any]) -> str:
+    """The host an offer points at, as spelled (`www.` kept): the URL its offer_id hashed."""
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(str(o.get("source_ref") or o.get("destination_url") or o.get("canonical_url") or ""))
+                .hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _shelf(o: Mapping[str, Any]) -> Tuple[Any, Any, Any]:
+    return (o["sku_key"], o["channel"], o.get("market"))
+
+
+def plan_alias(row: Mapping[str, Any], host: str, listing: str, offers: List[Mapping[str, Any]], *,
+               market: str) -> Optional[Dict[str, Any]]:
+    """The host_alias entry for a row's one listing on `host`, or None when every live offer of it is spelled as
+    the row is (or the row names another listing or host)."""
+    from urllib.parse import urlsplit
+
+    current = content_listing(row.get("canonical_url"))
+    if current != (host, listing):
+        return None
+    try:
+        spelling = (urlsplit(str(row.get("canonical_url") or "").strip()).hostname or "").lower()
+    except ValueError:
+        return None
+    live = [o for o in offers if o.get("suppressed_at") is None and _in_market(o, market)]
+    kept_shelves = {_shelf(o) for o in live if _spelled_host(o) == spelling}
+    aliases = [o for o in live if _spelled_host(o) != spelling]
+    if not spelling or not aliases:
+        return None
+    suppress = [o for o in aliases if _shelf(o) in kept_shelves]
+    other_market = [o for o in offers if o.get("suppressed_at") is None and not _in_market(o, market)
+                    and _spelled_host(o) != spelling]
+    # A Shopify Markets sibling copies its base offer's source_ref and is refreshed only while that base is live
+    # (shopify_markets.CANDIDATES_SQL): suppressing a base here would leave its sibling serving a price nobody
+    # refreshes. The hazard runs one way -- suppressing a sibling strands nothing -- so the row is held only while
+    # a sibling of an offer THIS plan suppresses is live. Plan the sibling markets first, the base market last.
+    stranded = _live_siblings_of(suppress, other_market)
+    return {
+        "product_key": row["product_key"], "content_key": row.get("content_key"), "host": host,
+        "kind": "host_alias", "reason": ALIAS_REASON,
+        "keeper": spelling, "keeper_evidence": {"spelling": spelling, "listing": listing},
+        "left_out": sorted({_spelled_host(o) for o in aliases}),
+        "suppress": [o["offer_id"] for o in suppress],
+        "suppress_prior_metadata": {o["offer_id"]: (_json(o["suppression_metadata"])
+                                                    if o.get("suppression_metadata") is not None else None)
+                                    for o in suppress},
+        "alias_kept_alone": [o["offer_id"] for o in aliases if _shelf(o) not in kept_shelves],
+        "deactivate_prior_updated_at": {}, "other_market_left": len(other_market),
+        "other_market_alias_live": [o["offer_id"] for o in other_market],
+        "stranded_siblings": stranded,
+        "restore": [], "deactivate": [], "repoint": None,
+        "skipped": ("sibling_market_alias_live" if stranded
+                    else None if suppress else "alias_alone_on_its_shelf")}
+
+
+def _live_siblings_of(bases: List[Mapping[str, Any]], others: List[Mapping[str, Any]]) -> List[str]:
+    """The live other-market offers that are the Shopify Markets sibling of one of `bases` (sibling_offer_id)."""
+    from services.retailer_ingest.shopify_markets import sibling_offer_id
+
+    ids = {o["offer_id"] for o in bases}
+    return sorted(x["offer_id"] for x in others
+                  if any(x["offer_id"] == sibling_offer_id(b, str(x.get("market") or "US").upper()) for b in ids))
+
+
 def _in_market(item: Mapping[str, Any], market: str) -> bool:
     """An offer or seed of `market` (a row with no market is the catalog's default, US)."""
     return str(item.get("market") or "US").strip().upper() == market.strip().upper()
@@ -221,10 +313,24 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
         listing = _listing_of_seed(s)
         if listing:
             by_host.setdefault(listing[0], {}).setdefault(listing[1], {"offers": [], "seeds": []})["seeds"].append(s)
+    # A page carrying only VARIANT offers of this row and no seed is a folded shade's own listing (the extended fold
+    # points a variant's offer at the listing it is sold on, ingestion.own_listing_url), not a second listing of the
+    # row: every same-title record writes its `::canonical` offer and seed at its own page. Never a left-out listing.
+    canonical_sku = f"{row['product_key']}::canonical"
+    for listings in by_host.values():
+        for listing in [k for k, v in listings.items()
+                        if not v["seeds"] and all(o["sku_key"] != canonical_sku for o in v["offers"])]:
+            del listings[listing]
     current = content_listing(row.get("canonical_url"))
     groups = []
     for host, listings in sorted(by_host.items()):
+        if not listings:
+            continue
         if len(listings) < 2:
+            [(listing, found)] = listings.items()
+            alias = plan_alias(row, host, listing, found["offers"], market=market)
+            if alias:
+                groups.append(alias)
             continue
         keeper = elect_listing_keeper(
             [evidence(h, v["offers"], v["seeds"]) for h, v in sorted(listings.items())], market=market,
@@ -239,6 +345,10 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
                                 if not _in_market(o, market))
         live_others = [o for v in others.values() for o in v["offers"] if o.get("suppressed_at") is None]
         suppress = [o["offer_id"] for o in live_others]
+        # The host-alias rule (plan_alias), one way: a left-out offer suppressed here strands its live Shopify Markets
+        # sibling, refreshed only while this base is live; suppressing a sibling strands nothing.
+        stranded = _live_siblings_of(live_others, [o for o in offers if o.get("suppressed_at") is None
+                                                   and not _in_market(o, market)])
         # what a revert puts back: a live offer's metadata (NULL stays NULL)
         prior_metadata = {o["offer_id"]: (_json(o["suppression_metadata"]) if o.get("suppression_metadata") is not None
                                           else None) for o in live_others}
@@ -265,7 +375,7 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
             "suppress_prior_metadata": prior_metadata,
             "deactivate_prior_updated_at": {x["id"]: None if x.get("updated_at") is None else str(x["updated_at"])
                                             for x in seeds_off},
-            "other_market_left": other_market_left,
+            "other_market_left": other_market_left, "stranded_siblings": stranded,
             "restore": restore, "deactivate": deactivate, "repoint": None, "skipped": None}
         if keeper.get("available") is False:
             # every listing of this host is gone or sold out: moving the row between dead pages (and restoring an
@@ -286,13 +396,16 @@ def plan_row(row: Mapping[str, Any], offers: List[Mapping[str, Any]], seeds: Lis
                 # half a repair would leave the row naming one page while it sells another: leave it whole
                 entry["skipped"] = "keeper_page_unknown"
                 entry["repoint_unknown"] = {"canonical_url": bool(url), "image_url": bool(image)}
+        if not entry["skipped"] and stranded:
+            entry["skipped"] = "sibling_market_listing_live"  # held whole until the siblings' market has run
         if not entry["skipped"] and not (suppress or restore or deactivate or entry["repoint"]):
             entry["skipped"] = "nothing_to_change"  # already one live listing, the row names it, no stray seed
         groups.append(entry)
     return groups
 
 
-async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US") -> Dict[str, Any]:
+async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US",
+               only_host_alias: bool = False) -> Dict[str, Any]:
     rows = [dict(r) for r in await db.fetch_all(ROWS_SQL, {"source_system": SOURCE_SYSTEM, "keys": keys or None})]
     all_keys = [r["product_key"] for r in rows]
     offers: Dict[str, list] = {}
@@ -307,7 +420,7 @@ async def plan(db: Any, *, hosts: List[str], keys: List[str], market: str = "US"
     groups = []
     for row in rows:
         for g in plan_row(row, offers.get(row["product_key"], []), seeds.get(row["product_key"], []), market=market):
-            if not wanted or g["host"] in wanted:
+            if (not wanted or g["host"] in wanted) and (not only_host_alias or g.get("kind") == "host_alias"):
                 groups.append(g)
     return {"market": market, "hosts": sorted(wanted), "rows_read": len(rows), "groups": groups}
 
@@ -322,6 +435,10 @@ def summary(p: Mapping[str, Any]) -> Dict[str, Any]:
         "offers_to_restore": sum(len(g["restore"]) for g in act),
         "seeds_to_deactivate": sum(len(g["deactivate"]) for g in act),
         "rows_to_repoint": sum(1 for g in act if g["repoint"]),
+        "host_alias_groups": sum(1 for g in act if g.get("kind") == "host_alias"),
+        "host_alias_offers_to_suppress": sum(len(g["suppress"]) for g in act if g.get("kind") == "host_alias"),
+        "host_alias_kept_alone": sum(len(g.get("alias_kept_alone") or []) for g in p["groups"]),
+        "plan_digest": plan_digest(p),
         "listings_left_out": sum(len(g["left_out"]) for g in act),
         "other_market_left": sum(g.get("other_market_left") or 0 for g in p["groups"]),
         # how old the price of each offer that comes back is (review 2): by the day its price was last read
@@ -360,7 +477,8 @@ async def _forward(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
     for g in m["groups"]:
         if g["suppress"]:
             meta = json.dumps({"same_listing_run": m["run_id"], "same_listing_keeper": g["keeper"]})
-            got = await db.fetch_all(SUPPRESS_SQL, {"ids": g["suppress"], "reason": REASON, "metadata": meta})
+            got = await db.fetch_all(SUPPRESS_SQL, {"ids": g["suppress"], "reason": g.get("reason") or REASON,
+                                                    "metadata": meta})
             _expect(got, g["suppress"], "live offers to suppress")
             done["suppressed"] += len(got)
     for g in m["groups"]:
@@ -413,7 +531,7 @@ async def _reverse(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
         for offer_id in g["suppress"]:
             prior = g["suppress_prior_metadata"].get(offer_id)
             got = await db.fetch_all(UNSUPPRESS_SQL, {
-                "offer_id": offer_id, "reason": REASON, "run_id": m["run_id"],
+                "offer_id": offer_id, "reason": g.get("reason") or REASON, "run_id": m["run_id"],
                 "prior_metadata": None if prior is None else json.dumps(prior)})
             _expect(got, [offer_id], "suppressed offers")
             done["unsuppressed"] += 1
@@ -480,6 +598,36 @@ async def revert(db: Any, run_id: str) -> Dict[str, Any]:
     return {"run_id": run_id, **done, "refresh": await refresh_after(db, m, source=f"{run_id}:revert")}
 
 
+def plan_digest(p: Mapping[str, Any]) -> str:
+    """16 hex over every change the plan would write -- each acted group's kind, row, host and its sorted suppress,
+    restore, deactivate and repoint -- so an --apply can prove it writes exactly what the dry run showed."""
+    import hashlib
+
+    acted = sorted(
+        ({"kind": g.get("kind") or "same_title", "product_key": g["product_key"], "host": g["host"],
+          "suppress": sorted(g["suppress"]), "restore": sorted(r["offer_id"] for r in g["restore"]),
+          "deactivate": sorted(g["deactivate"]),
+          "repoint": (g["repoint"] or {}).get("canonical_url")} for g in p["groups"] if not g["skipped"]),
+        key=lambda e: (e["product_key"], e["host"], e["kind"]))
+    return hashlib.sha256(json.dumps(acted, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def apply_refusal(args: argparse.Namespace, s: Mapping[str, Any]) -> Optional[str]:
+    """Why an --apply must not write, or None. --apply re-plans live, so it is bound to the REVIEWED dry run: ONE
+    store (--host), a cap on the groups it may act on, and the dry run's plan_digest -- a plan that changed since in
+    any way (grew, shrank, other rows at the same count, an extra restore) is refused rather than written."""
+    if len(args.host or []) != 1:
+        return "--apply needs exactly one --host (one store per reviewed run)"
+    if args.max_groups is None or not args.expect_digest:
+        return "--apply needs --max-groups and --expect-digest from the reviewed dry run"
+    acted = s["groups"] - sum((s.get("skipped") or {}).values())
+    if acted > args.max_groups:
+        return f"{acted} groups to act on exceeds --max-groups {args.max_groups}"
+    if s["plan_digest"] != args.expect_digest:
+        return f"plan_digest {s['plan_digest']} is not the reviewed dry run's {args.expect_digest}"
+    return None
+
+
 def exit_code(out: Mapping[str, Any]) -> int:
     """Non-zero when a committed write left views unrebuilt: re-run `refresh --run-id`."""
     return 2 if ((out.get("refresh") or {}).get("failed_keys_total") or 0) > 0 else 0
@@ -497,9 +645,14 @@ async def run(args: argparse.Namespace) -> int:
             out = {"refresh": await refresh_after(database, m, source=args.run_id)}
             print("REFRESHED " + json.dumps(out, default=str), flush=True)
         else:
-            p = await plan(database, hosts=args.host, keys=args.product_key, market=args.market)
-            print("PLAN " + json.dumps(summary(p), default=str), flush=True)
+            p = await plan(database, hosts=args.host, keys=args.product_key, market=args.market,
+                           only_host_alias=args.only_host_alias)
+            s = summary(p)
+            print("PLAN " + json.dumps(s, default=str), flush=True)
             if args.apply:
+                refusal = apply_refusal(args, s)
+                if refusal:
+                    raise SystemExit(f"refused: {refusal}; nothing written")
                 out = await apply(database, p)
                 print("APPLIED " + json.dumps(out, default=str), flush=True)
             else:
@@ -515,6 +668,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--host", action="append", default=[])
     p.add_argument("--product-key", dest="product_key", action="append", default=[])
     p.add_argument("--market", default="US")
+    p.add_argument("--only-host-alias", dest="only_host_alias", action="store_true",
+                   help="plan (and apply) the host_alias groups alone")
+    p.add_argument("--max-groups", dest="max_groups", type=int, default=None,
+                   help="--apply: refuse a plan acting on more groups than this")
+    p.add_argument("--expect-digest", dest="expect_digest", default=None,
+                   help="--apply: the plan_digest the reviewed dry run printed; any other plan is refused")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--run-id", dest="run_id")
     args = p.parse_args(argv)

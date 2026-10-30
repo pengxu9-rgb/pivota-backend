@@ -1140,12 +1140,23 @@ def test_single_variant_fallback_refuses_a_different_native_sibling(monkeypatch)
 
 
 def test_single_variant_fallback_never_overwrites_an_explicit_other_currency(monkeypatch):
-    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock',price_currency='EUR',currency='EUR')],price=32,availability='out_of_stock')
-    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='46536716517563')]))
-    variant = stored['seed_data']['variants'][0]
+    from routes.employee_products import _reconcile_seed_variants_with_read
+
+    stored_variant = _variant('46536716517563',32,'out_of_stock',price_currency='EUR',currency='EUR')
+    page = _page([_offer(20,IN,sku='46536716517563')])
+    # The reconcile alone never re-prices a variant across currencies: no USD 20 as EUR 20.
+    (variant,), report = _reconcile_seed_variants_with_read(
+        [stored_variant], page.evidence['variants'], product_amount=20.0, product_currency='USD',
+        product_availability='in_stock', census=page.evidence['variant_census'])
     assert (variant['price_amount'],variant['price_currency'],variant['currency']) == (32,'EUR','EUR')
-    assert result['variant_refresh']['not_re_read_count'] == 1
-    assert not _trusted(_serve(stored))
+    assert report['not_re_read_count'] == 1
+    # End to end, a read in the USD row's own currency that names the variant REPLACES it (the
+    # currency heal, review of #2613): the whole variant moves, so no price is relabelled.
+    row = _seed_row(variants=[stored_variant],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,page)
+    (variant,) = stored['seed_data']['variants']
+    assert (variant['price_amount'],variant['price_currency'],variant.get('currency')) == (20.0,'USD',None)
+    assert result['variant_refresh']['status'] == 'all_re_read'
 
 
 def test_single_variant_fallback_accepts_an_equivalent_shopify_gid(monkeypatch):

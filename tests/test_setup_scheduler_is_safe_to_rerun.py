@@ -102,7 +102,12 @@ FAKE_GCLOUD = textwrap.dedent(
     case "$1 $2 $3" in
       "scheduler jobs describe")
         grep -qx "$4" "$EXISTING_TRIGGERS_FILE" && exit 0 || exit 1 ;;
-      "run jobs describe") exit 1 ;;            # jobs: always "create" — irrelevant to these tests
+      "run jobs describe")                      # jobs: "create" unless EXISTING_JOBS_FILE names them
+        if [ -n "${EXISTING_JOBS_FILE:-}" ] && grep -qx "$4" "$EXISTING_JOBS_FILE"; then
+          case "$*" in *--format*) printf '%s' "${FAKE_JOB_ARGS:-}" ;; esac   # the live job's args
+          exit 0
+        fi
+        exit 1 ;;
       "iam service-accounts") exit 0 ;;
       "run revisions describe") printf '%s' "$REVISION_JSON"; exit 0 ;;
       "run services describe")
@@ -677,3 +682,123 @@ def test_the_drain_budget_leaves_the_last_stage_room_inside_the_task_timeout():
     assert 0 < int(env["RETAILER_INGEST_DRAIN_BUDGET_SECONDS"]) <= task_timeout - 1800
     assert int(env["RETAILER_INGEST_LEASE_SECONDS"]) > task_timeout
     assert int(env["RETAILER_INGEST_TASK_TIMEOUT_SECONDS"]) == task_timeout  # the loop sizes leases from it
+
+
+# ── the external-referral refresh (be#2640): opt-in, rollout args, no retries ───────────────────────
+REFRESH = "external-referral-refresh"
+
+
+def _refresh_calls(calls: list[str]) -> list[list[str]]:
+    return [c.split() for c in calls
+            if c.startswith(f"run jobs create {REFRESH} ") or c.startswith(f"run jobs update {REFRESH} ")]
+
+
+def test_the_refresh_is_left_alone_unless_named(tmp_path):
+    calls = _run(tmp_path, {"EXTERNAL_REFERRAL_REFRESH": None})
+    assert _refresh_calls(calls) == []
+    assert not any(f"{REFRESH}-cron" in c for c in calls)
+
+
+def test_the_refresh_create_path_runs_the_rollout_with_no_retries(tmp_path):
+    """Controller mutant P17: the refresh's `--max-retries 0` must be what gcloud ends up with (the
+    last occurrence wins over mkcrawljob's default of 1)."""
+    calls = _run(tmp_path, {"EXTERNAL_REFERRAL_REFRESH": "true"})
+    (tokens,) = _refresh_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "create", REFRESH]
+    assert _values(tokens, "--max-retries")[-1] == "0"
+    assert _values(tokens, "--subnet") == ["pivota-crawl"]
+    assert _values(tokens, "--args")[-1] == (
+        "-m,jobs.external_referral_refresh,--limit,2000,--budget-seconds,3300,--host-concurrency,4"
+    )
+    assert any(c.startswith(f"scheduler jobs create http {REFRESH}-cron ") and "--schedule=15 5 * * *" in c
+               for c in calls)
+
+
+def test_the_refresh_update_path_touches_only_image_retries_timeout_and_args(tmp_path):
+    """The live job's env and secret mounts were set by hand; `--set-env-vars` would replace them."""
+    jobs = tmp_path / "jobs.txt"
+    jobs.write_text(REFRESH + "\n")
+    calls = _run(tmp_path, {"EXTERNAL_REFERRAL_REFRESH": "true", "EXISTING_JOBS_FILE": str(jobs)})
+    (tokens,) = _refresh_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "update", REFRESH]
+    assert _values(tokens, "--max-retries") == ["0"]
+    assert _values(tokens, "--task-timeout") == ["3600s"]
+    assert _values(tokens, "--args")[-1].startswith("-m,jobs.external_referral_refresh,--limit,2000,")
+    for flag in ("--set-env-vars", "--set-secrets", "--update-env-vars", "--subnet", "--memory", "--cpu",
+                 "--service-account"):
+        assert _values(tokens, flag) == [], f"{flag} must not be on the update path"
+
+
+# ── the external-seed destination sweep (be#2641): an UPDATE never rebuilds the job ─────────────────
+SWEEP = "external-seed-destination-sweep"
+
+
+def _sweep_calls(calls: list[str]) -> list[list[str]]:
+    return [c.split() for c in calls
+            if c.startswith(f"run jobs create {SWEEP} ") or c.startswith(f"run jobs update {SWEEP} ")]
+
+
+def _existing_sweep(tmp_path: Path) -> str:
+    jobs = tmp_path / "jobs.txt"
+    jobs.write_text(SWEEP + "\n")
+    return str(jobs)
+
+
+LIVE_ARGS_RETIRING = "-m;jobs.external_seed_destination_sweep;--limit;5000"
+LIVE_ARGS_OBSERVING = "-m;jobs.external_seed_destination_sweep;--limit;5000;--no-retire"
+
+
+def test_the_sweep_create_path_keeps_the_full_definition(tmp_path):
+    calls = _run(tmp_path, {"EXTERNAL_SEED_DESTINATION_SWEEP": "true"})
+    (tokens,) = _sweep_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "create", SWEEP]
+    assert _values(tokens, "--max-retries")[-1] == "0"
+    assert _values(tokens, "--subnet") == ["pivota-crawl"]
+    assert _values(tokens, "--set-env-vars") and _values(tokens, "--set-secrets")
+    assert _values(tokens, "--args")[-1] == (
+        "-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300,--no-retire"
+    )
+
+
+@pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
+def test_the_sweep_update_path_keeps_env_and_secrets(tmp_path, retire, no_retire):
+    """Review item 6: a re-run must not wipe hand-set env or secrets or reset cpu/memory; the
+    retire choice is the one stated on the run."""
+    calls = _run(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": retire,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path),
+    })
+    (tokens,) = _sweep_calls(calls)
+    assert tokens[:4] == ["run", "jobs", "update", SWEEP]
+    for flag in ("--set-env-vars", "--set-secrets", "--update-env-vars", "--update-secrets", "--subnet",
+                 "--memory", "--cpu", "--service-account", "--network"):
+        assert _values(tokens, flag) == [], f"{flag} must not be on the update path"
+    assert _values(tokens, "--max-retries") == ["0"] and _values(tokens, "--task-timeout") == ["3600s"]
+    args = _values(tokens, "--args")[-1]
+    assert args.startswith("-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300")
+    assert args.endswith(",--no-retire") is no_retire
+
+
+@pytest.mark.parametrize("live_args", [LIVE_ARGS_RETIRING, LIVE_ARGS_OBSERVING, ""])
+def test_an_update_without_a_stated_retire_choice_is_refused(tmp_path, live_args):
+    """Whatever the live job runs, an update that does not state RETIRE is refused before any write:
+    the script never reads the job template back (test_ops_scripts_read_the_serving_revision), and a
+    guessed default could silently arm or disarm retirement."""
+    calls, proc = _run_full(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": None,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": live_args,
+    }, expect_rc=2)
+    assert _sweep_calls(calls) == []
+    assert "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in proc.stderr
+
+
+@pytest.mark.parametrize("retire, no_retire", [("true", False), ("false", True)])
+def test_an_explicit_retire_flag_wins_on_update(tmp_path, retire, no_retire):
+    calls = _run(tmp_path, {
+        "EXTERNAL_SEED_DESTINATION_SWEEP": "true", "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE": retire,
+        "EXISTING_JOBS_FILE": _existing_sweep(tmp_path), "FAKE_JOB_ARGS": LIVE_ARGS_OBSERVING if not no_retire else LIVE_ARGS_RETIRING,
+    })
+    (tokens,) = _sweep_calls(calls)
+    assert _values(tokens, "--args")[-1].endswith(",--no-retire") is no_retire
+
+

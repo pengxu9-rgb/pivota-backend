@@ -15,7 +15,7 @@ import httpx
 from db.database import database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
-from services import webhook_delivery_gate
+from services import webhook_delivery_gate, webhook_destination_guard
 
 
 logger = logging.getLogger(__name__)
@@ -138,13 +138,17 @@ def _build_signature(secret: str, timestamp: str, raw_body: str) -> str:
     return f"v1={digest}"
 
 
-def _validate_destination_url(destination_url: Optional[str]) -> Optional[str]:
+def _validate_destination_url(
+    destination_url: Optional[str], stored_url: Optional[str] = None
+) -> Optional[str]:
+    """A NEW URL must look public (DestinationRejected is a ValueError: the route answers 400).
+    An unchanged stored one is not re-judged here; the send-time transport guards it."""
     raw = str(destination_url or "").strip()
     if not raw:
         return None
-    if not (raw.startswith("https://") or raw.startswith("http://")):
-        raise ValueError("Webhook URL must start with http:// or https://")
-    return raw
+    if raw == str(stored_url or "").strip():
+        return raw
+    return webhook_destination_guard.check_destination_url(raw)
 
 
 def _build_event_payload(
@@ -389,7 +393,7 @@ async def update_webhook_config(
 ) -> Dict[str, Any]:
     current = await _get_or_create_raw_config(merchant_id)
     now = _db_now()
-    next_url = _validate_destination_url(destination_url)
+    next_url = _validate_destination_url(destination_url, current.get("destination_url"))
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
     current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
@@ -672,7 +676,12 @@ async def _attempt_delivery(
 
     started = _utcnow()
     try:
-        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=DELIVERY_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            transport=webhook_destination_guard.PublicDestinationTransport(),
+            trust_env=False,
+        ) as client:
             response = await client.post(destination_url, content=raw_body, headers=headers)
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         http_status = response.status_code
@@ -686,6 +695,11 @@ async def _attempt_delivery(
             last_error = f"Webhook destination returned HTTP {response.status_code}"
         else:
             last_error = f"Webhook destination returned HTTP {response.status_code}"
+    except webhook_destination_guard.DestinationBlocked as exc:
+        # Terminal: a non-public destination stays non-public, so a retry only repeats the refusal.
+        latency_ms = int((_utcnow() - started).total_seconds() * 1000)
+        status = "failed"
+        last_error = f"Webhook destination blocked: {exc}"
     except Exception as exc:
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         last_error = str(exc)

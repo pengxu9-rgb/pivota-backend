@@ -232,8 +232,19 @@ async def test_probe_still_runs_for_a_real_shop_and_normalises_the_host(monkeypa
         seen.append(shop_domain)
         return {"order": {"id": "gid://shopify/Order/123"}}
 
+    # The probe also does a REST order read. Before this stub existed it went out for real to
+    # cosrx-renewal.myshopify.com (a real merchant's shop) three times a run, and failed quietly
+    # into rest_error.
+    rest_paths: List[str] = []
+
+    async def _fake_rest_get(*, shop_domain, access_token, api_version, path, **k):
+        seen.append(shop_domain)
+        rest_paths.append(path)
+        return {"order": {"id": 123, "name": "#1001"}}
+
     monkeypatch.setattr(rs, "_introspect_type_fields", _fake_introspect, raising=True)
     monkeypatch.setattr(rs, "shopify_admin_graphql", _fake_graphql, raising=True)
+    monkeypatch.setattr(rs, "_shopify_admin_rest_get", _fake_rest_get, raising=True)
 
     result = await rs.probe_shopify_return_eligibility_best_effort(
         shop_domain=given,
@@ -248,6 +259,8 @@ async def test_probe_still_runs_for_a_real_shop_and_normalises_the_host(monkeypa
     # The HOST THAT ARRIVED is the contract -- "did not raise" cannot distinguish a normalised host
     # from the raw one.
     assert set(seen) == {"cosrx-renewal.myshopify.com"}
+    assert len(rest_paths) == 1 and rest_paths[0].startswith("orders/123.json?")
+    assert result["shopify_order"] == {"id": 123, "name": "#1001"}
 
 
 # --------------------------------------------------------------------------------------

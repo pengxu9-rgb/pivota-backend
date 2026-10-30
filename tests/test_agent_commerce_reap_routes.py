@@ -269,12 +269,22 @@ async def _db():
     had_seed_table = await database.fetch_one(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'external_product_seeds'"
     ) is not None
+    # A table ANOTHER suite left behind may be narrower than these tests write (the sweep runs every file in
+    # one database, in collection order: #2605's resume tests met one without `attached_variant_id`). Set it
+    # aside for this test and put it back after, so neither suite sees the other's shape.
+    stashed_seed_table = False
+    if had_seed_table:
+        columns = {row["name"] for row in await database.fetch_all("PRAGMA table_info(external_product_seeds)")}
+        if not _SEED_TABLE_COLUMNS <= columns:
+            await database.execute(f"DROP TABLE IF EXISTS {_SEED_TABLE_STASH}")
+            await database.execute(f"ALTER TABLE external_product_seeds RENAME TO {_SEED_TABLE_STASH}")
+            stashed_seed_table, had_seed_table = True, False
     if not had_seed_table:
         await database.execute(
             "CREATE TABLE external_product_seeds ("
             "id TEXT PRIMARY KEY, status TEXT, domain TEXT, market TEXT, "
             "destination_url TEXT, canonical_url TEXT, attached_product_key TEXT, attached_variant_id TEXT, "
-            "seed_data TEXT)"
+            "seed_data TEXT, price_currency TEXT)"
         )
 
     for table in CATALOG_TABLES + ("buyer_identity_links", "shop_users"):
@@ -290,6 +300,16 @@ async def _db():
         )
         if not had_seed_table:
             await database.execute("DROP TABLE external_product_seeds")
+        if stashed_seed_table:
+            await database.execute(f"ALTER TABLE {_SEED_TABLE_STASH} RENAME TO external_product_seeds")
+
+
+#: The seed-table columns these tests write; a table left behind without one of them is set aside.
+_SEED_TABLE_COLUMNS = frozenset({
+    "id", "status", "domain", "market", "destination_url", "canonical_url",
+    "attached_product_key", "attached_variant_id", "seed_data", "price_currency",
+})
+_SEED_TABLE_STASH = "external_product_seeds__stashed_by_reap_routes"
 
 
 @pytest.fixture(autouse=True)
@@ -1294,6 +1314,83 @@ async def test_a_purchase_opens_and_the_response_says_so(client):
     assert row["market_country"] == "US"
     assert row["agent_id"] == AGENT
     assert row["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
+
+
+async def _agent_purchase_parents(purchase_id: str) -> list:
+    return [
+        dict(r) for r in await database.fetch_all(
+            "SELECT * FROM agent_purchases WHERE rail = 'reap' AND rail_purchase_id = :i",
+            {"i": purchase_id},
+        )
+    ]
+
+
+async def test_an_opened_purchase_gets_its_rail_neutral_parent_when_the_ledger_is_on(
+    client, monkeypatch
+):
+    """Payment orchestration P0: the parent is written after the create commits, copied from the
+    committed row, and the 202 the agent sees is unchanged."""
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    purchase_id = resp.json()["purchase_id"]
+    assert set(resp.json()) == {
+        "purchase_id", "status", "poll_after_seconds", "checkout_dispatch_state",
+        "contact_reentry_required",
+    }
+    [parent] = await _agent_purchase_parents(purchase_id)
+    assert parent["id"].startswith("pp_")
+    assert parent["executor"] == "rail_managed"
+    assert parent["agent_id"] == AGENT
+    assert parent["agent_user_ref_hash"] == hash_agent_user_ref(USER_REF)
+
+
+async def test_no_parent_is_written_while_the_ledger_is_off(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.delenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, raising=False)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    assert await _agent_purchase_parents(resp.json()["purchase_id"]) == []
+
+
+async def test_a_failing_ledger_never_fails_or_rolls_back_the_purchase(client, monkeypatch):
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("agent_purchases unavailable")
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _boom)
+    await _seed_all()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert row["state"] == "resolving"
+
+
+async def test_a_stalled_ledger_write_cannot_hold_the_202(client, monkeypatch):
+    import asyncio
+    import time
+    import db.agent_purchase_ledger as agent_purchase_ledger
+
+    monkeypatch.setenv(agent_purchase_ledger.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    monkeypatch.setattr(routes_reap, "_RECORD_PARENT_TIMEOUT_S", 0.05)
+
+    async def _stall(*a, **k):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(agent_purchase_ledger, "ensure_reap_parent", _stall)
+    await _seed_all()
+    started = time.monotonic()
+    resp = await client.post(f"{BASE}/purchases", json=_body())
+    assert resp.status_code == 202
+    assert time.monotonic() - started < 5
 
 
 async def test_the_price_is_our_catalogs_and_the_request_cannot_move_it(client):
@@ -3346,6 +3443,127 @@ async def test_the_priced_sku_is_the_lowest_one_with_an_offer(client, monkeypatc
     assert resp.status_code == 202, resp.text
 
 
+# ── a buyer-selected `variant_id`: the route resolves the catalog's own sku ─────────────────────
+#
+# Measured on prod 2026-10-13: a door that SPELLED the sku key for a selected variant (`<pk>::v::<n>` for a
+# mirror row, `<pk>::v:<n>` else) missed 878 of 6,336 variants on the Tier B domains (row_not_found): the
+# catalog spells one variant `::sku_<hash>`, `::v:<n>`, `::v::<n>` or `::v:retailer-<hash>`.
+
+
+def _variant_body(**over) -> Dict[str, Any]:
+    return _live_body(**{"variant_id": LIVE_VARIANT, **over})
+
+
+@pytest.mark.parametrize("skus,offers_on", [
+    (LIVE_STAGING_SKUS, None),                      # only the crawl lane's `::sku_<hash>` (the staging trial)
+    (LIVE_PROD_SKUS, None),                         # `::sku_<hash>` AND `::v:<n>`, both priced alike
+    (LIVE_PROD_SKUS, [LIVE_SKU_PROMOTED]),          # only the `::v:<n>` spelling carries an offer
+    (LIVE_PROD_SKUS, [LIVE_SKU_CRAWL]),             # only the `::sku_<hash>` spelling carries an offer
+], ids=["sku-only", "two-spellings", "v-priced", "sku-priced"])
+async def test_a_selected_variant_id_is_bought_whatever_the_catalog_calls_its_sku(client, monkeypatch, skus, offers_on):
+    await _seed_live_mirror(skus=skus, offers_on=offers_on)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_variant_body())
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert f"https://{LIVE_DOMAIN}/cart/{LIVE_VARIANT}:1?" in purchase["cart_url"]
+    assert (purchase["our_price_minor"], purchase["currency"]) == (1399, "USD")
+
+
+async def test_spellings_of_the_selected_variant_that_disagree_on_price_are_refused(client, monkeypatch):
+    await _seed_live_mirror()
+    await database.execute("UPDATE catalog_offers SET merchant_effective_price = '12.99' WHERE sku_key = :s",
+                           {"s": LIVE_SKU_PROMOTED})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_variant_body())
+    assert resp.status_code == 409 and _error(resp) == "row_price_ambiguous"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_a_selected_variant_id_no_sku_names_is_refused_and_writes_nothing(client, monkeypatch):
+    await _seed_live_mirror()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_variant_body(variant_id="49819267309999"))
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchase_keys") == 0
+
+
+@pytest.mark.parametrize("over", [
+    {"variant_key": LIVE_SKU_CRAWL},                 # two selectors
+    {"item_source": "reap_variant"},                 # a cart-link selector on the variant lane
+    {"variant_id": "0123"}, {"variant_id": 49819267301653}, {"variant_id": "4981926730165x"},
+])
+async def test_a_variant_id_that_is_not_one_clean_cart_link_selector_is_invalid(client, monkeypatch, over):
+    await _seed_live_mirror()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_variant_body(**over))
+    assert resp.status_code == 400 and _error(resp) == "invalid_request"
+
+
+async def test_a_variant_id_attempt_replays_and_recovers_by_what_was_sent(client, monkeypatch):
+    await _seed_live_mirror()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    body = _variant_body(idempotency_key="k-variant-id")
+    first = await client.post(f"{BASE}/purchases", json=body)
+    assert first.status_code == 202, first.text
+    again = await client.post(f"{BASE}/purchases", json=body)
+    assert again.status_code == 202 and again.json()["purchase_id"] == first.json()["purchase_id"]
+    recovered = await client.post(f"{BASE}/purchases/recover", json=body)
+    assert recovered.status_code == 200 and recovered.json()["id"] == first.json()["purchase_id"]
+    # The same key for the same variant SPELLED as a sku key is a different body: never the same attempt.
+    keyed = await client.post(f"{BASE}/purchases", json=_live_body(idempotency_key="k-variant-id", variant_key=LIVE_SKU_CRAWL))
+    assert keyed.status_code == 409 and _error(keyed) == "idempotency_conflict"
+    # Nor is a `variant_key` that happens to be the bare digits: the fingerprint marks which selector it holds.
+    bare = await client.post(f"{BASE}/purchases", json=_live_body(idempotency_key="k-variant-id", variant_key=LIVE_VARIANT))
+    assert bare.status_code == 409 and _error(bare) == "idempotency_conflict"
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+async def test_a_selected_variant_whose_sku_is_another_listings_is_refused_as_prepare_refuses_it(client, monkeypatch):
+    # Review of #2605 (reproduced): a Shopify product with a sku another merchant's lane wrote, naming variant 999,
+    # carrying an offer by the product's own seller. Selecting 999 must not mint judydoll-style /cart/999.
+    await _seed_catalog()
+    await database.execute("UPDATE catalog_skus SET source_variant_id = '41000000000001' WHERE sku_key = :s", {"s": SKU_KEY})
+    foreign = f"{PRODUCT_KEY}::v:retailer-abc"
+    await database.execute(
+        "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id, source_variant_id, title, currency) "
+        "VALUES (:sk, :pk, 'merch_other', 'shopify', '1001', '999', 'Other', 'USD')", {"sk": foreign, "pk": PRODUCT_KEY})
+    await database.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, merchant_effective_price) "
+        "VALUES ('off_foreign', :sk, :pk, 'm_brand', 'USD', '42.50')", {"sk": foreign, "pk": PRODUCT_KEY})
+    await database.execute("INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
+                           "VALUES (:d, 'US', 'ELIGIBLE', CURRENT_TIMESTAMP)", {"d": DOMAIN})
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_body(item_source="cart_link", variant_key=None, variant_id="999"))
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_a_placeholder_only_mirror_buys_only_the_variant_its_storefront_proof_names(client, monkeypatch):
+    # No real sku: the no-key path proves the variant from the seed; a selection of ANY other id is refused,
+    # never answered with the proven one (the check that the loaded variant IS the selected one).
+    await _seed_live_mirror(skus=LIVE_STAGING_SKUS[:1])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    wrong = await client.post(f"{BASE}/purchases", json=_variant_body(variant_id="49819267309999"))
+    assert wrong.status_code == 409 and _error(wrong) == "row_variant_unverified", wrong.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    right = await client.post(f"{BASE}/purchases", json=_variant_body())
+    assert right.status_code == 202, right.text
+    assert f"/cart/{LIVE_VARIANT}:1?" in (await _purchase_row(right.json()["purchase_id"]))["cart_url"]
+
+
+async def test_the_only_variant_selected_by_id_is_priced_as_without_a_selection(client, monkeypatch):
+    # A one-variant mirror whose only offer is on its `::canonical` placeholder (sole live variant): bought with
+    # no key, so it must be bought with its own id too -- a named sku would never read the placeholder's price.
+    await _seed_live_mirror(skus=LIVE_STAGING_SKUS, offers_on=[LIVE_SKU_CANONICAL])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    resp = await client.post(f"{BASE}/purchases", json=_variant_body())
+    assert resp.status_code == 202, resp.text
+    row = await _purchase_row(resp.json()["purchase_id"])
+    assert f"/cart/{LIVE_VARIANT}:1?" in row["cart_url"] and row["our_price_minor"] == 1399
+
+
 def test_the_cart_sku_choice_rule_accepts_and_refuses_by_distinct_variant():
     choose = routes_reap._cart_sku_choice
     rows = lambda pairs: [{"sku_key": k, "source_variant_id": v} for k, v in pairs]  # noqa: E731
@@ -3817,11 +4035,13 @@ KRAVE_PLACEHOLDER = f"{KRAVE_PK}::canonical"
 KRAVE_REAL = f"{KRAVE_PK}::sku_3c1f0e9a7b2d4c6e8f01"
 
 
-async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_sku=True):
+async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_sku=True,
+                             seed_currency=None, page_currency=None):
     """`offers`: [(sku_key, merchant_id, price)] -- USD, in_stock, market 'US' (the mirror writer's
     column default) -- or [(sku_key, merchant_id, price, {column: value})] to override any of
     currency / market / availability / suppression_reason / suppressed_at. `market` is the seed's
-    and the Tier B verdict's; the buyer's market is the shipping country (`_krave_body`)."""
+    and the Tier B verdict's; the buyer's market is the shipping country (`_krave_body`).
+    `seed_currency` / `page_currency`: the seed's price_currency column and snapshot.price_currency."""
     await database.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, "
         "brand, category, product_type, source_domain, source_system, source_ref, seller_ref, "
@@ -3840,12 +4060,13 @@ async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_
         )
     for i, (sku_key, merchant_id, price, *extra) in enumerate(offers):
         cols = {"currency": "USD", "market": "US", "availability": "in_stock",
-                "suppression_reason": None, "suppressed_at": None, **(extra[0] if extra else {})}
+                "suppression_reason": None, "suppressed_at": None, "source_system": None,
+                **(extra[0] if extra else {})}
         await database.execute(
             "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, market, "
-            "merchant_effective_price, availability, suppression_reason, suppressed_at) VALUES "
-            "(:oid, :sk, :pk, :m, :currency, :market, :p, :availability, :suppression_reason, "
-            ":suppressed_at)",
+            "merchant_effective_price, availability, suppression_reason, suppressed_at, source_system) "
+            "VALUES (:oid, :sk, :pk, :m, :currency, :market, :p, :availability, :suppression_reason, "
+            ":suppressed_at, :source_system)",
             {"oid": f"off_krave_{i}", "sk": sku_key, "pk": KRAVE_PK, "m": merchant_id, "p": price,
              **cols},
         )
@@ -3860,13 +4081,15 @@ async def _seed_krave_mirror(*, offers, market="US", live_variant_count=1, real_
             "checked_at": datetime.now(timezone.utc).isoformat(),
         },
     }}
+    if page_currency is not None:
+        seed["snapshot"]["price_currency"] = page_currency
     await database.execute(
         "INSERT INTO external_product_seeds (id, status, domain, market, destination_url, "
-        "canonical_url, attached_product_key, attached_variant_id, seed_data) VALUES "
-        "(:id, 'active', :d, :mk, :dest, NULL, :pk, NULL, :sd)",
+        "canonical_url, attached_product_key, attached_variant_id, seed_data, price_currency) VALUES "
+        "(:id, 'active', :d, :mk, :dest, NULL, :pk, NULL, :sd, :ccy)",
         {"id": KRAVE_SEED, "d": KRAVE_DOMAIN, "mk": market,
          "dest": f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal", "pk": KRAVE_PK,
-         "sd": json.dumps(seed)},
+         "sd": json.dumps(seed), "ccy": seed_currency},
     )
     await database.execute(
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, checked_at) "
@@ -3980,6 +4203,54 @@ async def test_a_mirror_row_placeholder_price_refusals(client, monkeypatch, offe
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
+# ── an offer copied off a seed is a price only in that seed's currency (Peng 2026-10-19) ──────
+#
+# US search served SKINTIFIC's set at USD 23.56: 20 offers the variant backfill copied off
+# seed_data.variants, after the seed was re-read in AUD. This route reads the seller's offers
+# cheapest first, so the copy would have been the cart's price. services/seed_offer_currency.
+
+_BACKFILL = {"source_system": "variant_identity_backfill_v1"}
+_MIRRORED = {"source_system": "external_product_seeds_mirror_v1"}
+_MARKETS_READ = {"source_system": "shopify_markets_us_localization"}
+
+
+@pytest.mark.parametrize("seed_currency,page_currency,offers,expected", [
+    # skintific: the variant's USD 23.56 copy on a seed re-read in AUD; the mirror's AUD offer is
+    # no US price -> nothing prices the cart.
+    ("AUD", "AUD", [(KRAVE_REAL, KRAVE_MERCHANT, "23.56", _BACKFILL),
+                    (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "56.00", {"currency": "AUD", **_MIRRORED})],
+     "row_unpriced"),
+    # ... and with the store's own Shopify-Markets US read beside it, that read is the price
+    # although the copy is cheaper.
+    ("AUD", "AUD", [(KRAVE_REAL, KRAVE_MERCHANT, "23.56", _BACKFILL),
+                    (KRAVE_REAL, KRAVE_MERCHANT, "39.00", _MARKETS_READ)], 3900),
+    # nourwish: the mirror stamped USD on an SGD seed.
+    ("SGD", "SGD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "20.00", _MIRRORED)], "row_unpriced"),
+    # the column says USD (the writers' old default); the page was read in QAR.
+    ("USD", "QAR", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED)], "row_unpriced"),
+    # the placeholder's copies must agree only among the ones that are prices
+    ("USD", "USD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED),
+                    (KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "30.00", _MIRRORED)], "row_price_ambiguous"),
+    # control: a USD seed's USD copies are its price
+    ("USD", "USD", [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00", _MIRRORED)], 2800),
+    ("USD", None, [(KRAVE_REAL, KRAVE_MERCHANT, "26.00", _BACKFILL)], 2600),
+])
+async def test_a_seed_copy_prices_the_cart_only_in_its_seeds_currency(
+    client, monkeypatch, seed_currency, page_currency, offers, expected
+):
+    await _seed_krave_mirror(offers=offers, seed_currency=seed_currency, page_currency=page_currency)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    price = expected if isinstance(expected, int) else None
+    resp = await client.post(f"{BASE}/purchases", json=_krave_body(minor=price))
+    if price is None:
+        assert resp.status_code == 409 and _error(resp) == expected, resp.text
+        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+        return
+    assert resp.status_code == 202, resp.text
+    purchase = await _purchase_row(resp.json()["purchase_id"])
+    assert purchase["our_price_minor"] == price and purchase["currency"] == "USD"
+
+
 @pytest.mark.parametrize("live_variant_count,offers,expected", [
     # control: the stubbed proof below changes nothing when the count is one
     (1, [(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")], 202),
@@ -4012,29 +4283,24 @@ async def test_a_multi_variant_proof_never_prices_from_the_placeholder(
         assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
-@pytest.mark.parametrize("live_variant_count,expected", [
-    (1, 202), (2, "row_unpriced"), (3, "row_unpriced"), ("1", "row_unpriced"),
-])
-async def test_a_named_placeholder_meets_the_same_live_variant_gate(
-    client, monkeypatch, live_variant_count, expected
+@pytest.mark.parametrize("live_variant_count", [1, 2, 3, "1"])
+async def test_a_create_naming_the_placeholder_is_refused_whatever_the_live_variant_count(
+    client, monkeypatch, live_variant_count
 ):
-    """NAMING the placeholder is not a way around the gate (review of #2457): a placeholder-only
-    row, the caller naming `<pk>::canonical`, is priced from it only under one live variant. The
-    proof reader is stubbed as in the unnamed test above."""
+    """NAMING the placeholder is refused outright (#2608 review, superseding the live-variant gate of
+    #2457 for a create): `<pk>::canonical` names no variant, so nothing at create would hold the
+    purchase to the one the caller saw -- review probe T1 bought a moved proof's variant at the old
+    price. Refused before the catalog is read, so the count never matters. The proof reader is
+    stubbed as in the unnamed test above."""
     await _seed_krave_mirror(offers=[(KRAVE_PLACEHOLDER, KRAVE_MERCHANT, "28.00")],
                              live_variant_count=live_variant_count, real_sku=False)
-    # #2459 renamed the route's authority call; the stub is the SOLE-scope answer it replaced.
     monkeypatch.setattr(routes_reap, "verified_cart_variant_id",
                         lambda *a, **k: ProvenCartVariant(KRAVE_VARIANT, "sole_variant"))
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     resp = await client.post(f"{BASE}/purchases",
                              json={**_krave_body(), "variant_key": KRAVE_PLACEHOLDER})
-    if expected == 202:
-        assert resp.status_code == 202, resp.text
-        assert (await _purchase_row(resp.json()["purchase_id"]))["our_price_minor"] == 2800
-    else:
-        assert resp.status_code == 409 and _error(resp) == expected, resp.text
-        assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+    assert resp.status_code == 409 and _error(resp) == "row_variant_unverified", resp.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
 
 
 async def test_a_named_real_mirror_sku_with_no_offer_is_not_priced_from_the_placeholder(client, monkeypatch):
@@ -4563,6 +4829,112 @@ async def test_two_selected_mirror_sizes_have_independent_proofs_and_prices(clie
     row=await _purchase_row(response.json()['purchase_id'])
     assert row['our_price_minor']==[1600,2700][choice]
     assert f'/cart/{ids[choice]}:1?' in row['cart_url']
+
+
+KRAVE_SECOND = "42199434526795"
+KRAVE_SECOND_KEY = f"{KRAVE_PK}::v::{KRAVE_SECOND}"
+KRAVE_SIZES = [KRAVE_VARIANT, KRAVE_SECOND]
+KRAVE_SIZE_MINOR = [1600, 2700]
+
+
+async def _seed_krave_two_sizes(*, first_spellings=(), offers=None):
+    """KraveBeauty 24 Carrot Retinal with TWO sizes, each spelled by another writer (`::sku_<hash>` 16.00 USD,
+    `::v::<n>` 27.00 USD) and each with its own buyer-selected proof. `first_spellings`: extra skus naming the
+    FIRST size, `(sku_key, price or None)`."""
+    from scripts.backfill_shopify_variant_ids import build_selected_variant_proofs
+    base = [(KRAVE_REAL, KRAVE_MERCHANT, "16.00"), (KRAVE_SECOND_KEY, KRAVE_MERCHANT, "27.00")]
+    await _seed_krave_mirror(offers=offers if offers is not None else base
+                             + [(key, KRAVE_MERCHANT, price) for key, price in first_spellings if price])
+    for key, vid in [(KRAVE_SECOND_KEY, KRAVE_SECOND)] + [(key, KRAVE_VARIANT) for key, _ in first_spellings]:
+        await database.execute(
+            "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) "
+            "VALUES (:sk,:pk,:m,'external_seed',:ext,:vid,'Pack','USD')",
+            {"sk": key, "pk": KRAVE_PK, "m": KRAVE_MERCHANT, "ext": KRAVE_EXT, "vid": vid})
+    variants = [{"shopify_variant_id": vid, "variant_id": vid} for vid in KRAVE_SIZES]
+    payload = {"handle": "24-carrot-retinal", "variants": [
+        {"id": int(vid), "available": True, "title": title, "price": price}
+        for vid, title, price in zip(KRAVE_SIZES, ["1 Pack", "2 Pack"], KRAVE_SIZE_MINOR)]}
+    seed = {"snapshot": {"brand": "KraveBeauty", "variants": variants, "storefront_platform": "shopify",
+                         "storefront_platform_source": "products_js_v1",
+                         "shopify_cart_variant_proofs": build_selected_variant_proofs(
+                             variants, payload, js_url=f"https://{KRAVE_DOMAIN}/products/24-carrot-retinal.js",
+                             checked_at=datetime.now(timezone.utc))}}
+    await database.execute("UPDATE external_product_seeds SET seed_data=:data WHERE id=:id",
+                           {"data": json.dumps(seed), "id": KRAVE_SEED})
+
+
+def _krave_size_body(choice: int, **over) -> Dict[str, Any]:
+    return {**_krave_body(minor=KRAVE_SIZE_MINOR[choice]), "variant_key": None, "variant_id": KRAVE_SIZES[choice], **over}
+
+
+@pytest.mark.parametrize("choice", [0, 1])
+async def test_a_selected_variant_id_picks_that_size_of_a_multi_variant_mirror(client, monkeypatch, choice):
+    # The two sizes are spelled by two writers (`::sku_<hash>` and `::v::<n>`): the door sends only the storefront
+    # id, and the route finds each one's own sku, proof and price. Without the selector this is ambiguous.
+    await _seed_krave_two_sizes()
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    body = _krave_size_body(choice)
+    response = await client.post(f"{BASE}/purchases", json=body)
+    assert response.status_code == 202, response.text
+    row = await _purchase_row(response.json()["purchase_id"])
+    assert row["our_price_minor"] == KRAVE_SIZE_MINOR[choice]
+    assert f"/cart/{KRAVE_SIZES[choice]}:1?" in row["cart_url"]
+    # The other size under the same key is a different attempt -- at the SAME shown price too: the
+    # fingerprint holds the selected id, not just the money it was shown at.
+    for price in (KRAVE_SIZE_MINOR[1 - choice], KRAVE_SIZE_MINOR[choice]):
+        other = await client.post(f"{BASE}/purchases", json={**body, "variant_id": KRAVE_SIZES[1 - choice],
+                                                              "expected_unit_price_minor": price})
+        assert other.status_code == 409 and _error(other) == "idempotency_conflict", (price, other.text)
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+async def test_two_spellings_of_a_selected_size_buy_the_priced_one(client, monkeypatch):
+    promoted = f"{KRAVE_PK}::v:{KRAVE_VARIANT}"  # sorts after `::sku_…`; the crawl spelling carries no offer here
+    await _seed_krave_two_sizes(first_spellings=[(promoted, "16.00")],
+                                offers=[(promoted, KRAVE_MERCHANT, "16.00"), (KRAVE_SECOND_KEY, KRAVE_MERCHANT, "27.00")])
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    response = await client.post(f"{BASE}/purchases", json=_krave_size_body(0))
+    assert response.status_code == 202, response.text
+    row = await _purchase_row(response.json()["purchase_id"])
+    assert (row["our_price_minor"], f"/cart/{KRAVE_VARIANT}:1?" in row["cart_url"]) == (1600, True)
+
+
+async def test_a_spelling_refused_for_anything_but_a_missing_offer_refuses_the_selection(client, monkeypatch):
+    # Only `row_unpriced` is passed over: a spelling that fails the seller / proof gates is a refusal of the
+    # selection, even though another spelling of the same size would load.
+    promoted = f"{KRAVE_PK}::v:{KRAVE_VARIANT}"
+    await _seed_krave_two_sizes(first_spellings=[(promoted, "16.00")])
+    real = routes_reap._load_cart_link_item
+
+    async def _gated(**kw):
+        if kw.get("variant_key") == KRAVE_REAL:
+            raise svc.PurchaseRefused("seller_identity_unverified", "test: this spelling fails the seller gate")
+        return await real(**kw)
+
+    monkeypatch.setattr(routes_reap, "_load_cart_link_item", _gated)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    response = await client.post(f"{BASE}/purchases", json=_krave_size_body(0))
+    assert response.status_code == 409 and _error(response) == "seller_identity_unverified", response.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+async def test_more_spellings_of_one_size_than_the_cap_are_ambiguous_and_load_none(client, monkeypatch):
+    # The catalog's identity index allows one sku per (merchant, platform, product, source_variant_id), so a real
+    # variant has only a few spellings (bare, `gid://`, `ext_…:<n>`); the cap is lowered to show it holds.
+    monkeypatch.setattr(routes_reap, "_MAX_VARIANT_SPELLINGS", 1)
+    await _seed_krave_two_sizes(first_spellings=[(f"{KRAVE_PK}::v:{KRAVE_VARIANT}", "16.00")])
+    loads = []
+    real = routes_reap._load_cart_link_item
+
+    async def _counted(**kw):
+        loads.append(kw.get("variant_key"))
+        return await real(**kw)
+
+    monkeypatch.setattr(routes_reap, "_load_cart_link_item", _counted)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    response = await client.post(f"{BASE}/purchases", json=_krave_size_body(0))
+    assert response.status_code == 409 and _error(response) == "row_variant_ambiguous", response.text
+    assert loads == []
 
 
 @pytest.mark.parametrize("field,value", [("variant_keys", ["other-sku"]), ("currency", "EUR"), ("max_total_minor", 4249)])

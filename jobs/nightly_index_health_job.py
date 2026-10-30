@@ -44,7 +44,7 @@ yesterday but archived today.
 
 Blocker codes (first failing check wins):
   not_live          — catalog_products.sync_status is not 'live' (stale/archived)
-  non_core_product  — sample/gift/protection/GWP row not eligible for commerce index
+  non_core_product  — sample/gift card/protection/donation/tip/deposit/GWP row, not a product
   no_seed           — no external seed and no APV-backed source document
   no_extraction     — a source row exists but no usable source title/document
   not_scored        — content_quality_score IS NULL (never scored; NOT a quality verdict)
@@ -91,6 +91,7 @@ from services.index_pipeline_state_service import (
     QUALITY_SCORE_THRESHOLD,
     _BATCH_QUERY,
     _UPSERT_QUERY,
+    eligibility_query,
     _classify_product,
     _coerce_dict,
     _extract_domain,
@@ -934,7 +935,7 @@ async def _run_on_pinned_connection(*, catch_up: bool) -> Dict[str, Any]:
         while True:
             try:
                 rows = await database.fetch_all(
-                    _BATCH_QUERY,
+                    eligibility_query(_BATCH_QUERY),
                     {"cursor": cursor, "batch_size": BATCH_SIZE},
                 )
             except Exception as exc:  # noqa: BLE001

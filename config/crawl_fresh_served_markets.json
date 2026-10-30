@@ -1,0 +1,14 @@
+{
+  "generated_from": "pivota-backend services.catalog_row_trust_upserter.CRAWL_SERVED_MARKET_CURRENCY_PAIRS",
+  "served_market_currency": [
+    [
+      "SG",
+      "SGD"
+    ],
+    [
+      "US",
+      "USD"
+    ]
+  ],
+  "version": 1
+}
