@@ -166,10 +166,13 @@ def test_tower28s_facial_spray_and_body_wash_resolve(title, want):
     assert resolve("", title, "tower28beauty.com") == (want, HEAD)
 
 
+_NOT_THE_SPRAY_HEAD = "not tone/toner"  # unresolved, or a pattern's own leaf (#2547's setting-spray leaf)
+
+
 @pytest.mark.parametrize("domain,ptype,title,want", [
     # the host's "spray" head is never another product's: each is constructed
-    ("tower28beauty.com", "", "Setting Spray", None),
-    ("tower28beauty.com", "", "Makeup Setting Spray", None),
+    ("tower28beauty.com", "", "Setting Spray", _NOT_THE_SPRAY_HEAD),
+    ("tower28beauty.com", "", "Makeup Setting Spray", _NOT_THE_SPRAY_HEAD),
     ("tower28beauty.com", "", "Hair Spray", None),
     ("tower28beauty.com", "", "Body Spray", None),
     ("tower28beauty.com", "", "Room & Linen Spray", None),
@@ -186,6 +189,8 @@ def test_the_spray_head_and_the_body_area_answer_stay_narrow(domain, ptype, titl
     got = resolve(ptype, title, domain)
     if want is None:
         assert unresolved(got)
+    elif want is _NOT_THE_SPRAY_HEAD:
+        assert unresolved(got) or got[0] != "beauty/skincare/tone/toner"
     else:
         assert got[0] == want
 

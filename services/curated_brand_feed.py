@@ -2602,7 +2602,7 @@ _TITLE_ACCESSORY_OR_GIVEAWAY = re.compile(
 # with a blank type). A facial mist is a toner here: the Toner pattern already claims "mist", and the
 # gateway's canonical leaf is tone/toner. Consulted ONLY where no pattern names anything, only on a
 # blank type, and never past the veto below -- a setting, hair, body, sun or scented spray is another
-# product, and the taxonomy has no setting-spray leaf (TAXONOMY_GAPS).
+# product, never this host's facial spray (a setting spray is the Setting Spray pattern's, where one exists).
 _MEASURED_TITLE_HOST_HEADS = {
     "tower28beauty.com": (("beauty/skincare/tone/toner", re.compile(r"\bspray\b", re.I)),),
 }
