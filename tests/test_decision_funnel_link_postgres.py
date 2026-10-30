@@ -19,6 +19,8 @@ shared dialect-gate database is never touched:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 import uuid
@@ -112,17 +114,27 @@ async def _funnel_event(db) -> str:
     return event_id
 
 
-async def _link_through_the_worker(db, **kwargs):
-    """record_funnel_link -> the store's queue -> its flush worker, then read the row back."""
-    import services.agent_decision_event_store as store
-
-    event_id = await _funnel_event(db)
-    await store.record_funnel_link(funnel_event_id=event_id, decision_id="dec", merchant_id="m1", **kwargs)
-    await store._QUEUE.join()
+async def _read_link(db, event_id: str):
     return await db.fetch_one(
         "SELECT decision_id, content_key, catalog_offer_id, commerce_attribution_edge_id, exposure_id, "
         "checkout_decision_id FROM agent_decision_funnel_links WHERE funnel_event_id = :e", {"e": event_id},
     )
+
+
+async def _link_through_the_worker(db, *, event_id: str = "", decision_id="dec", **kwargs):
+    """record_funnel_link -> the store's queue -> its flush worker, then read the row back."""
+    import services.agent_decision_event_store as store
+
+    event_id = event_id or await _funnel_event(db)
+    await store.record_funnel_link(funnel_event_id=event_id, decision_id=decision_id, merchant_id="m1", **kwargs)
+    if store._QUEUE is not None:
+        await store._QUEUE.join()
+    return await _read_link(db, event_id)
+
+
+def _write_stage_nulls(caplog) -> list:
+    return [json.loads(r.getMessage()) for r in caplog.records
+            if "funnel_link_refs_nulled" in r.getMessage() and '"stage": "write"' in r.getMessage()]
 
 
 @pytest.mark.asyncio
@@ -146,12 +158,28 @@ async def test_a_prefixed_catalog_offer_id_is_stripped_and_joins(scoped) -> None
 
 @pytest.mark.parametrize("offer_id", ["of:internal_checkout:merch_1:sku_9", "offer_deleted_since", "of:catalog_offer:gone"])
 @pytest.mark.asyncio
-async def test_an_offer_id_that_is_not_in_catalog_offers_is_nulled_and_the_link_lands(scoped, offer_id) -> None:
-    row = await _link_through_the_worker(scoped, catalog_offer_id=offer_id, content_key=CK,
-                                         commerce_attribution_edge_id=EDGE)
+async def test_an_offer_id_that_is_not_in_catalog_offers_is_nulled_and_the_link_lands(scoped, offer_id, caplog) -> None:
+    with caplog.at_level(logging.WARNING, logger="services.agent_decision_event_store"):
+        row = await _link_through_the_worker(scoped, catalog_offer_id=offer_id, content_key=CK,
+                                             commerce_attribution_edge_id=EDGE)
     assert row is not None, "the whole funnel link was dropped"
     assert row["catalog_offer_id"] is None
     assert (row["decision_id"], row["content_key"], row["commerce_attribution_edge_id"]) == ("dec", CK, EDGE)
+    nulls = _write_stage_nulls(caplog)
+    if offer_id.startswith("of:internal_checkout:"):
+        assert nulls == [], "a synthetic offer id is nulled before the insert, not by a failed one"
+    else:
+        [line] = nulls
+        assert line["columns"] == ["catalog_offer_id"] and line["link_id"]
+
+
+@pytest.mark.asyncio
+async def test_an_over_long_content_key_is_nulled_before_the_insert_and_the_link_lands(scoped) -> None:
+    # content_key is VARCHAR(40): sent through, it is a DataError (not an FK miss) and drops the link
+    row = await _link_through_the_worker(scoped, content_key="x" * 64, catalog_offer_id=OFFER)
+    assert row is not None, "the whole funnel link was dropped"
+    assert (row["content_key"], row["catalog_offer_id"]) == (None, OFFER)
+    assert scoped.reports == []
 
 
 @pytest.mark.parametrize("content_key", ["prod_key_that_is_not_a_content_key", "ck_" + "f" * 32])
@@ -164,16 +192,57 @@ async def test_a_content_key_that_is_not_in_the_view_is_nulled_and_the_link_land
 
 
 @pytest.mark.asyncio
-async def test_every_unknown_optional_ref_at_once_is_nulled_and_the_link_lands(scoped) -> None:
+async def test_every_unknown_never_joining_ref_at_once_is_nulled_and_the_link_lands(scoped) -> None:
     row = await _link_through_the_worker(
-        scoped, content_key="ck_" + "e" * 32, catalog_offer_id="of:internal_checkout:x",
-        commerce_attribution_edge_id="edge_unknown", exposure_id=str(uuid.uuid4()),
-        checkout_decision_id=str(uuid.uuid4()),
+        scoped, content_key="ck_" + "e" * 32, catalog_offer_id="offer_deleted_since",
+        commerce_attribution_edge_id="edge_unknown",
     )
     assert row is not None, "the whole funnel link was dropped"
     assert row["decision_id"] == "dec"
-    assert [row[c] for c in ("content_key", "catalog_offer_id", "commerce_attribution_edge_id",
-                             "exposure_id", "checkout_decision_id")] == [None] * 5
+    assert [row[c] for c in ("content_key", "catalog_offer_id", "commerce_attribution_edge_id")] == [None] * 3
+    assert scoped.reports == []
+
+
+@pytest.mark.parametrize("column", ["checkout_decision_id", "exposure_id"])
+@pytest.mark.asyncio
+async def test_a_miss_on_a_queued_parent_drops_the_link_and_reports_it(scoped, column) -> None:
+    row = await _link_through_the_worker(scoped, catalog_offer_id=OFFER, **{column: str(uuid.uuid4())})
+    assert row is None, f"a link with {column} nulled for good was written"
+    assert len(scoped.reports) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_decision_written_after_the_link_still_lands_whole_on_the_resend(scoped) -> None:
+    # The checkout row is still in another instance's queue when confirm-payment flushes the link.
+    # The link is dropped (not written with checkout_decision_id nulled, which ON CONFLICT DO NOTHING
+    # would make permanent); once the checkout row exists, the re-sent link lands with it.
+    checkout_id = str(uuid.uuid4())
+    event_id = await _funnel_event(scoped)
+    assert await _link_through_the_worker(scoped, event_id=event_id, checkout_decision_id=checkout_id,
+                                          catalog_offer_id=OFFER) is None
+    await scoped.execute(
+        "INSERT INTO checkout_decisions (checkout_decision_id, decision_id) VALUES (:c, 'dec')", {"c": checkout_id},
+    )
+    row = await _link_through_the_worker(scoped, event_id=event_id, checkout_decision_id=checkout_id,
+                                         catalog_offer_id=OFFER)
+    assert row is not None
+    assert (str(row["checkout_decision_id"]), row["decision_id"], row["catalog_offer_id"]) == (checkout_id, "dec", OFFER)
+
+
+@pytest.mark.asyncio
+async def test_no_decision_and_a_checkout_miss_writes_no_row(scoped) -> None:
+    # the confirm-payment caller has no linkage gate: an all-NULL link would count as an outcome
+    row = await _link_through_the_worker(scoped, decision_id=None, checkout_decision_id=str(uuid.uuid4()),
+                                         catalog_offer_id="of:internal_checkout:x")
+    assert row is None
+    assert await scoped.fetch_val("SELECT count(*) FROM agent_decision_funnel_links") == 0
+
+
+@pytest.mark.asyncio
+async def test_no_decision_and_no_checkout_decision_writes_no_row_and_reports_nothing(scoped) -> None:
+    row = await _link_through_the_worker(scoped, decision_id=None, catalog_offer_id=OFFER, content_key=CK)
+    assert row is None
+    assert scoped.reports == []
 
 
 @pytest.mark.asyncio

@@ -35,10 +35,16 @@ _SPEC = {
 _SQL: Dict[str, str] = {}
 _CATALOG_OFFER_PREFIX = "of:catalog_offer:"
 _OFFER_ID_MAX = 255  # catalog_offer_id VARCHAR(255) on every ledger table (migration 140)
-# agent_decision_funnel_links' optional foreign keys (all ON DELETE SET NULL in migration 140): a
-# value that joins nothing is nulled rather than losing the link. decision_id is not in here.
-_LINK_OPTIONAL_REFS = ("exposure_id", "checkout_decision_id", "content_key", "catalog_offer_id",
-                       "commerce_attribution_edge_id")
+# agent_decision_funnel_links' foreign keys that a miss nulls rather than losing the link (all ON
+# DELETE SET NULL in migration 140). Their parents are written outside this queue, so a miss means
+# the value never joins (a product_key-as-content_key, a deleted offer or edge).
+# exposure_id and checkout_decision_id are SET NULL too but are not in here: their rows go through
+# this same async queue, possibly on another instance, so a miss can mean "not written yet". Nulling
+# would be permanent (the re-send hits ON CONFLICT DO NOTHING; the backfill skips linked events), so
+# that link is dropped and reported as before, and a re-send or the backfill writes it in full.
+# decision_id (RESTRICT) and funnel_event_id (NOT NULL) are what the link is about.
+_LINK_OPTIONAL_REFS = ("content_key", "catalog_offer_id", "commerce_attribution_edge_id")
+_LINK_TABLE = "agent_decision_funnel_links"
 
 try:
     from asyncpg.exceptions import ForeignKeyViolationError as _FK_VIOLATION
@@ -302,10 +308,21 @@ async def record_funnel_link(
     # foreign keys here, so a prefixed offer id or a product_key-as-content_key failed the whole
     # link. A value that passes and still joins nothing is nulled at write time (_write_funnel_link).
     refs = {"content_key": content_key, "catalog_offer_id": catalog_offer_id}
+    row_content_key, row_offer_id = _row_content_key(refs), _row_offer_id(refs)
+    if content_key and row_content_key is None:
+        _report_enqueue_null("content_key", content_key, funnel_event_id=funnel_event_id, decision_id=decision_id)
+    offer_text = str(catalog_offer_id or "").strip()
+    if offer_text and row_offer_id is None:
+        _report_enqueue_null("catalog_offer_id", offer_text, funnel_event_id=funnel_event_id, decision_id=decision_id)
+    if row_offer_id and row_offer_id.startswith("of:"):
+        # of:internal_checkout:... never joins catalog_offers (resolve_card_identities skips them for
+        # the same reason); nulled here so the expected case costs no failed INSERT and no warning.
+        logger.debug("funnel link: synthetic offer id nulled before the insert")
+        row_offer_id = None
     await _enqueue("funnel_link", {
         "link_id": link_id, "decision_id": decision_id, "funnel_event_id": funnel_event_id,
         "exposure_id": exposure_id, "checkout_decision_id": checkout_decision_id,
-        "content_key": _row_content_key(refs), "catalog_offer_id": _row_offer_id(refs),
+        "content_key": row_content_key, "catalog_offer_id": row_offer_id,
         "commerce_attribution_edge_id": commerce_attribution_edge_id, "merchant_id": merchant_id,
         "protocol": protocol, "attribution_model": attribution_model,
         "attribution_window_seconds": attribution_window_seconds,
@@ -389,28 +406,50 @@ async def _write_many(op: str, payload: Dict[str, Any]) -> None:
         _report(last_exc, op=op, payload=payload, rows=len(rows), failed_rows=failed)
 
 
+def _report_enqueue_null(column: str, value: Any, **ids: Any) -> None:
+    """A writer passed a value the column cannot hold (a product_key as the content_key, an offer id
+    over 255 chars): the countable record, with its length and first characters, never the value."""
+    text = str(value)
+    logger.warning(json.dumps({
+        "event": "agent_decision_event_store.funnel_link_refs_nulled", "op": "funnel_link",
+        "stage": "enqueue", "column": column, "length": len(text), "prefix": text[:3], **ids,
+    }, default=str))
+
+
 def _fk_column(exc: Exception) -> Optional[str]:
-    """The column a ForeignKeyViolationError names: its detail reads 'Key (col)=(value) is not
-    present in table ...'; the default constraint name '<table>_<col>_fkey' is the fallback."""
-    detail = str(getattr(exc, "detail", "") or "")
-    if detail.startswith("Key (") and ")=" in detail:
-        return detail[len("Key ("):detail.index(")=")]
+    """The funnel-link column a ForeignKeyViolationError names, from its structured fields (the
+    message text depends on lc_messages): the default constraint name '<table>_<col>_fkey', on this
+    table only, so an FK error raised elsewhere (a trigger) never nulls a link column."""
+    if str(getattr(exc, "table_name", "") or "") != _LINK_TABLE:
+        return None
     constraint = str(getattr(exc, "constraint_name", "") or "")
-    return next((col for col in _LINK_OPTIONAL_REFS if constraint == f"agent_decision_funnel_links_{col}_fkey"), None)
+    return next((col for col in _SPEC["funnel_link"][1] if constraint == f"{_LINK_TABLE}_{col}_fkey"), None)
 
 
 async def _write_funnel_link(payload: Dict[str, Any]) -> None:
-    """Insert one funnel link; on a foreign-key miss in an optional reference, null that column and
-    insert again, so a stale or synthetic id loses only itself, not the order -> decision edge.
+    """Insert one funnel link; on a foreign-key miss in a reference that never joins later (see
+    _LINK_OPTIONAL_REFS), null that column and insert again, so a stale or synthetic id loses only
+    itself, not the order -> decision edge.
 
     Each retry nulls a different column, so this ends within len(_LINK_OPTIONAL_REFS) + 1 tries. A
-    miss on decision_id (ON DELETE RESTRICT: the link is about it) or funnel_event_id (NOT NULL), and
-    any other error, propagates to the flush loop, which reports it."""
+    miss on any other column, and any other error, propagates to the flush loop, which reports it.
+    A link that names neither a decision nor a checkout decision joins nothing and is not written."""
+    if payload.get("decision_id") is None and payload.get("checkout_decision_id") is None:
+        # The confirm-payment caller records a link for every paid order (the webhook gates on
+        # linkage first); an order with no decision linkage is expected, so this is not a warning.
+        logger.debug("funnel link without a decision or checkout decision not written")
+        return
     row = dict(payload)
     nulled: List[str] = []
+    inserted: Any = None
     while True:
         try:
-            await database.execute(_sql("funnel_link"), row)
+            if not nulled:
+                await database.execute(_sql("funnel_link"), row)
+                break
+            # RETURNING tells an insert from an ON CONFLICT no-op (another writer linked this
+            # funnel event meanwhile), so the record below counts only rows that landed nulled.
+            inserted = await database.fetch_val(_sql("funnel_link") + " RETURNING link_id", row)
             break
         except _FK_VIOLATION as exc:
             column = _fk_column(exc)
@@ -418,12 +457,12 @@ async def _write_funnel_link(payload: Dict[str, Any]) -> None:
                 raise
             row[column] = None
             nulled.append(column)
-    if nulled:
+    if nulled and inserted is not None:
         # the countable record (ids and column names only, never values)
         logger.warning(json.dumps({
             "event": "agent_decision_event_store.funnel_link_refs_nulled", "op": "funnel_link",
-            "decision_id": row.get("decision_id"), "funnel_event_id": row.get("funnel_event_id"),
-            "columns": nulled,
+            "stage": "write", "link_id": inserted, "decision_id": row.get("decision_id"),
+            "funnel_event_id": row.get("funnel_event_id"), "columns": nulled,
         }, default=str))
 
 
