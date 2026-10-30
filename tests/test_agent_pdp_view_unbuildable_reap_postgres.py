@@ -1253,3 +1253,27 @@ def test_the_boot_heal_builds_the_same_index_as_migration_273(run) -> None:
     out = run(body)
     assert len(out["mig273"]) == 1 and "WHERE (content_key IS NOT NULL)" in out["mig273"][0]
     assert out["heal273"] == out["mig273"]
+
+
+def test_the_boot_heal_runs_and_creates_the_273_index(run) -> None:
+    # Prod skips migrations: this heal is the index's only automatic path. It must be called
+    # from the boot guard, and calling it must build the index.
+    import ast
+
+    import db.schema_guard as guard
+
+    tree = ast.parse((REPO_ROOT / "db" / "schema_guard.py").read_text())
+    boot = next(f for f in ast.walk(tree)
+                if isinstance(f, ast.AsyncFunctionDef) and f.name == "ensure_required_schema_light")
+    calls = [n for n in ast.walk(boot) if isinstance(n, ast.Await) and isinstance(n.value, ast.Call)
+             and getattr(n.value.func, "id", "") == "_heal_unbuildable_reap_schema"]
+    assert len(calls) == 1
+
+    async def body(db):
+        await db.execute("DROP INDEX IF EXISTS idx_agent_decision_funnel_links_content_key")
+        await guard._heal_unbuildable_reap_schema()
+        return await db.fetch_val(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_agent_decision_funnel_links_content_key'")
+
+    indexdef = run(body)
+    assert indexdef and "(content_key)" in indexdef and "WHERE (content_key IS NOT NULL)" in indexdef
