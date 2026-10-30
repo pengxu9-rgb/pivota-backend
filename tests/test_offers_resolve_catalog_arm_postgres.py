@@ -47,6 +47,12 @@ def pg_engine():
 
     engine = create_engine(DATABASE_URL)
     metadata.create_all(engine, checkfirst=True)
+    # The arm correlates each offer with its listing's seeds (services/seed_offer_currency), so the
+    # statement needs the seed table's columns even where this file plants no seed.
+    from tests.seed_offer_currency_tables import ensure_seed_currency_columns
+
+    with engine.begin() as conn:
+        ensure_seed_currency_columns(conn)
     yield engine
     engine.dispose()
 

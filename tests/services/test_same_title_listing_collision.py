@@ -385,16 +385,17 @@ def test_price_evidence_is_the_variants_and_the_offers_only_without_them():
 
 
 class _Catalog:
-    """What apply.current_listings reads: catalog_products.canonical_url by product_key."""
+    """What apply.current_listings reads: catalog_products.canonical_url (and source_domain) by product_key."""
 
     is_connected = True
 
-    def __init__(self, rows):
-        self.rows, self.queries = rows, []
+    def __init__(self, rows, source_domains=None):
+        self.rows, self.queries, self.source_domains = rows, [], dict(source_domains or {})
 
     async def fetch_all(self, query, values=None):
         self.queries.append(query)
-        return [{"product_key": k, "canonical_url": u} for k, u in self.rows.items()
+        return [{"product_key": k, "canonical_url": u, "source_domain": self.source_domains.get(k)}
+                for k, u in self.rows.items()
                 if k in (values or {}).get("product_keys", [])]
 
 
@@ -530,16 +531,20 @@ def cocodor_url(handle):
 
 
 def test_retailer_rows_are_never_read_for_a_current_listing():
-    """`ext:retailer:` rows are keyed by their URL: their listing cannot move, so a plan of them reads nothing."""
+    """`ext:retailer:` rows are keyed by their URL: their listing cannot move, so they never enter
+    `current_listings` -- they are read for their host spelling only (`listing_spellings`,
+    tests/services/test_retailer_listing_host_spelling.py), in the same one SELECT."""
     import asyncio
 
     from services.catalog_enrichment_agent.apply import plan_with_current_listings
-    catalog = _Catalog({})
     rows = [official("Black Cherry", "refill", h, "6.99", domain="k-touch.us", role="retailer") for h in ("a", "b")]
+    keys = [p["product_key"] for p in ingest_validated_jsonl(rows)["pdps"]]
+    catalog = _Catalog({k: f"https://k-touch.us/products/{h}" for k, h in zip(keys, ("a", "b"))})
     plan = asyncio.run(plan_with_current_listings(rows, db=catalog))
-    assert plan["current_listings"] == {"status": "not_applicable"} and catalog.queries == []
+    assert plan["current_listings"] == {"status": "not_applicable"} and len(catalog.queries) == 1
+    assert plan["listing_spellings"] == {"status": "read", "rows": 2} and plan["listing_moves"] == []
     mixed = asyncio.run(plan_with_current_listings(rows + [official(*REFILL)], db=catalog))
-    assert mixed["current_listings"]["status"] == "read" and len(catalog.queries) == 1
+    assert mixed["current_listings"] == {"status": "read", "rows": 0} and len(catalog.queries) == 2
 
 
 def test_a_cli_apply_that_cannot_read_the_rows_listings_writes_nothing(monkeypatch, capsys):

@@ -95,6 +95,10 @@
 #   * tierb-cart-link-eligibility      03:30, 1800 s, retries 0 -> 03:30-04:00.
 #   * external-referral-refresh        LIVE prod only (no script in this repo): 05:15, 3600 s,
 #                                      retries 0 -> 05:15-06:15.
+#   * relgraph-sync                    LIVE prod Cloud Scheduler relgraph-sync-cron `37 10 * * *`. Its
+#                                      build/recall SQL takes pivota-pg to 0.5-0.6 CPU; 10:30-11:20 is
+#                                      reserved for it daily (2026-10-14), and its review phase runs on
+#                                      to ~12:10. A mirror pass started at 10:13 ran straight into it.
 # The every-5 / every-10 minute lanes (store-audit probes, retailer-ingest-drain) and the hourly
 # merchant-purchasability-sweep (:07-:27) cannot be avoided by a run longer than 40 minutes, only
 # not coincided with: both start minutes are off the multiples of 5 and off :07. The two jobs here
@@ -116,14 +120,15 @@
 #     wrapper already isolates a store's crash, commits each 250-product page as it ends, stores a
 #     cursor per store, and prints its partial report on the timeout's SIGTERM.
 #     Daily against a 72 h proof: two missed days of margin.
-#   mirror      10:13 daily. Budget 10800 s, task timeout 15000 s -> worst case over by 14:23.
+#   mirror      13:13 daily (was 10:13 until 2026-10-14: a full 42-store pass is ~2 h, which put
+#     it inside relgraph's window). Budget 10800 s, task timeout 15000 s -> worst case over by 17:23.
 #     MEASURED (prod census, read-only, 2026-09-30, the backfill's own eligibility SQL): 2,092
 #     candidate seeds over the 42 Tier B domains (34 with any; fentybeauty.com 724, paulmitchell.com
 #     243, mixsoon.us 197, tonymoly.us 185, then <= 73 each; 0 hold a proof today). One .js per
 #     candidate at 3.0 s per store (stores are walked one at a time) is 6,276 s, plus ~125 writer
 #     calls (25 candidates a page) x the 3 s inter-call gap = ~6,650 s. THE SHARED 2 req/s DOES NOT LENGTHEN IT: this lane
 #     sends 0.33 req/s, under even the pacer's fail-open local rate (a quarter of 2 = 0.5 req/s), and
-#     between 10:13 and 14:23 only the hourly purchasability sweep (1.5 s pacing, 0.67 req/s) shares
+#     between 13:13 and 17:23 only the hourly purchasability sweep (1.5 s pacing, 0.67 req/s) shares
 #     the edge budget: 1.0 req/s of 2. The 10,800 s budget is 1.62x the measured need, which also
 #     absorbs an average edge wait of up to ~2 s per request. If the budget cuts the pass (exit 4),
 #     the cut store resumes from its stored cursor, stalest stores first; exit 4 on consecutive days
@@ -176,7 +181,7 @@ done
 GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
 SUBNET=pivota-crawl
 MIRROR_JOB=reap-cart-proof-mirror
-MIRROR_SCHEDULE="13 10 * * *"
+MIRROR_SCHEDULE="13 13 * * *"
 MIRROR_BUDGET_SECONDS=10800
 MIRROR_TASK_TIMEOUT=15000s
 ENRICHMENT_JOB=reap-cart-proof-enrichment
@@ -440,7 +445,7 @@ settrigger "$ENRICHMENT_JOB"
 settrigger "$MIRROR_JOB"
 
 if [ "$ENABLED" = true ]; then
-  echo "ARMED: $ENRICHMENT_JOB daily at 06:41 UTC and $MIRROR_JOB daily at 10:13 UTC, writing."
+  echo "ARMED: $ENRICHMENT_JOB daily at 06:41 UTC and $MIRROR_JOB daily at 13:13 UTC, writing."
 else
   echo "DARK: both triggers are paused and REAP_CART_PROOF_APPLY=false on both jobs (a hand"
   echo "execution is a DRY RUN: it fetches, writes nothing). Arm with --enable."

@@ -126,3 +126,17 @@ handed-back new keys. The new keys go back to shadow.
   Peng's explicit go, `--apply` with `--stale-brand "Tower 28 Beauty"`, which performs the handover and the
   retire in one transaction. Alternatively, wait for a drain re-run of tower28beauty.com on the re-imaged
   drain.
+
+## Runbook notes (review of #2544)
+
+- **A failed handover check** (the trust preview or the candidate read raised) hands nothing over and keeps those pairs as
+  `new_not_serving`, which is the pre-#2544 behaviour. The drain records it as `stale_brand_retire.handover_error`, and the
+  status line says the check FAILED, so it does not read as an ordinary "new key does not serve yet" wait. Re-run the
+  retire once the cause is fixed.
+- **A handed-over pair can still fail the read-back.** The handover is judged on the new row's trust BEFORE the write.
+  If the retire itself changes the new row's trust inputs (for example, a seed shared by both rows is deactivated with the
+  old one), the new row can come out non-public. The drain then reports `readback_failed` (`searchable before, new key not
+  searchable`) or `trust_not_refreshed` (`handed-over key(s) not public`). It flags itself, but it needs a human:
+  1. revert with `retire_superseded_brand_keys revert --ingest-run <run>`, which hands the URL back;
+  2. then run `revert_offer_suppression`;
+  3. then run `refresh-trust`.

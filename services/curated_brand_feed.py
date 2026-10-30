@@ -23,13 +23,16 @@ import contextvars
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import unicodedata
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 
 from services.catalog_identity import validated_source_gtin
 from services import storefront_currency
@@ -37,6 +40,13 @@ from services import storefront_currency
 from services.retailer_ingest.sitemap_crawler import _looks_like_inci_list
 from services import crawl_politeness, shopify_edge_pacer
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
+# Re-exported: the measured brand families and the brand comparison key live in a module with no I/O
+# imports (services/brand_spelling.py) so pure matchers can use them without importing this one.
+from services.brand_spelling import (  # noqa: F401 - re-exported names
+    RETAILER_BRAND_CANONICAL,
+    RETAILER_BRAND_SPELLINGS,
+    brand_key as _brand_key,
+)
 
 logger = logging.getLogger("curated_brand_feed")
 
@@ -196,6 +206,12 @@ def _variant_option_name(variant: Dict[str, Any], base_option_name: str) -> str:
     # the variant from, and a shade row with an empty handle stores "" — which a
     # truthiness test reads as "not folded", handing that shade the base's own
     # axis and reproducing the mislabel this function exists to prevent.
+    # The extended fold (retailer lane, `fold_shade_listings(extended=True)`) already decided the axis per base,
+    # from the shop's own option names where it gave one -- on every folded-in variant, and on the parent's own
+    # item it labelled (_parent_item_label). The legacy fold never stamps it.
+    decided = str(variant.get(FOLD_AXIS_KEY) or "").strip()
+    if decided:
+        return decided
     if FOLDED_FROM_KEY in variant:
         if base_option_name.strip().lower() in _SHADE_AXIS_NAMES:
             return base_option_name
@@ -463,13 +479,70 @@ def classify_transport_failure(exc: BaseException) -> Optional[Dict[str, str]]:
 
 class ShopifyProductBatch(list):
     """List-compatible result; successful results always represent an exhausted feed -- of the
-    store, or (scope "collection:<handle>") of one collection only, never claimed for the store."""
-    def __init__(self, products: list, *, scanned_products: int, pages: int, scope: str = "store"):
+    store, or (scope "collection:<handle>") of one collection only, never claimed for the store.
+    `presented` is the crawl's own `cart_currency` evidence (`_PresentedCurrency.report()`), when read."""
+    def __init__(self, products: list, *, scanned_products: int, pages: int, scope: str = "store",
+                 presented: Optional[Dict[str, Any]] = None):
         super().__init__(products)
         self.crawl_report = {"status": "complete", "scanned_products": scanned_products,
                              "selected_products": len(products), "pages": pages}
         if scope != "store":
             self.crawl_report["scope"] = scope
+        if presented is not None:
+            self.crawl_report["presented_currency"] = presented
+
+
+class _PresentedCurrency:
+    """The currency each `/products.json` page was PRESENTED in, from the `cart_currency` Set-Cookie of
+    that page's own response (services/shopify_presentment: the one rule for "which currency was this
+    read in"). The body carries prices but no currency, and `/meta.json` names the shop's BASE currency,
+    not the one a given requester is shown: Shopify presents by the requester's geography and the store's
+    Markets setup. ADR-026 (Appendix B, 2026-10-11) measured one served store presenting our crawl
+    egress a foreign currency while its /meta.json named USD -- a crawl would have labelled those amounts
+    USD. `records_for_brand` refuses a crawl whose pages were presented in another currency
+    (`PresentedCurrencyMismatch`). A page with no cookie proves nothing either way and is only counted."""
+
+    def __init__(self) -> None:
+        self.pages: Dict[str, int] = {}  # currency -> pages presented in it
+        self.pages_without_cookie = 0
+        self.problems: Dict[str, int] = {}
+        #: Currency-shaped values from a response that is no proof (two different values, or e.g. `qar`): the
+        #: payload's currency is unknown there, so a foreign one among them still refuses (fail closed).
+        self.unproven_values: set = set()
+
+    def note(self, resp: Any) -> None:
+        from services.shopify_presentment import presentment_currency
+        headers = getattr(resp, "headers", None)
+        cookies = headers.get_list("set-cookie") if hasattr(headers, "get_list") else []
+        currency, problem = presentment_currency(cookies)
+        if currency is not None:
+            self.pages[currency] = self.pages.get(currency, 0) + 1
+            return
+        if problem == "cookie_absent":
+            self.pages_without_cookie += 1
+            return
+        # Two different values on one response, or a malformed one: no proof, and recorded as such.
+        self.problems[problem] = self.problems.get(problem, 0) + 1
+        for header in cookies:
+            name, sep, rest = str(header).partition("=")
+            value = rest.split(";", 1)[0].strip().upper()
+            if sep and name.strip() == "cart_currency" and _ISO_CURRENCY.fullmatch(value):
+                self.unproven_values.add(value)
+
+    def merge(self, report: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(report, dict):
+            return
+        for k, v in (report.get("pages_by_currency") or {}).items():
+            self.pages[k] = self.pages.get(k, 0) + int(v or 0)
+        self.pages_without_cookie += int(report.get("pages_without_cookie") or 0)
+        for k, v in (report.get("problems") or {}).items():
+            self.problems[k] = self.problems.get(k, 0) + int(v or 0)
+        self.unproven_values.update(report.get("unproven_values") or ())
+
+    def report(self) -> Dict[str, Any]:
+        return {"currencies": sorted(self.pages), "pages_by_currency": dict(sorted(self.pages.items())),
+                "pages_without_cookie": self.pages_without_cookie, "problems": dict(self.problems),
+                "unproven_values": sorted(self.unproven_values)}
 
 
 #: Shopify serves /products.json pages 1..100 only: page 101 answers HTTP 400 (measured 2026-09-24 on
@@ -521,6 +594,7 @@ async def fetch_shopify_products(
     scanned = 0
     page = 1
     seen_pages: set = set()
+    presented = _PresentedCurrency()
     # /products.json (and a collection's) is Shopify's storefront feed: this host is Shopify-served
     # by construction, so every page of the crawl -- the first included -- is paced on the crawl IP's
     # shared Shopify-edge budget (a no-op with CRAWL_SHOPIFY_EDGE_PACER_ENABLED off).
@@ -540,7 +614,12 @@ async def fetch_shopify_products(
                                selected_products=len(out), reason_code=reason_code)
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+        # NO cookie jar: a cart_currency/localization cookie set by one response (a redirect hop included) must
+        # never ride a later request, or it steers what the store presents and the page answering under it may
+        # not re-send the cookie that would reveal it (`_PresentedCurrency`). Each page is its own evidence.
+        no_cookies = CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers,
+                                     cookies=no_cookies) as client:
             while True:
                 if page > SHOPIFY_MAX_PAGES:
                     raise incomplete(
@@ -569,6 +648,7 @@ async def fetch_shopify_products(
                     raise incomplete(f"HTTP {resp.status_code}")
                 if "application/json" not in (resp.headers.get("content-type") or ""):
                     raise incomplete("storefront did not return JSON")
+                presented.note(resp)
                 body = resp.json()
                 if not isinstance(body, dict) or not isinstance(body.get("products"), list):
                     raise incomplete("invalid products.json envelope")
@@ -576,7 +656,8 @@ async def fetch_shopify_products(
                 if not all(isinstance(p, dict) for p in products):
                     raise incomplete("products.json contains a non-object product")
                 if not products:
-                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page, scope=scope)
+                    return ShopifyProductBatch(out, scanned_products=scanned, pages=page, scope=scope,
+                                               presented=presented.report())
                 fingerprint = json.dumps(products, sort_keys=True, default=str)
                 if fingerprint in seen_pages:
                     raise incomplete("repeated page; pagination did not advance")
@@ -635,6 +716,7 @@ async def fetch_shopify_collections(
     merged: Dict[Any, Dict[str, Any]] = {}
     per: Dict[str, Dict[str, Any]] = {}
     scanned = pages = 0
+    presented = _PresentedCurrency()
     for handle in handles:
         remaining = max_scan_products - scanned  # the scan budget bounds ALL collections together
         if remaining < 1:
@@ -650,6 +732,7 @@ async def fetch_shopify_collections(
             exc.selected_products += len(merged)
             raise
         report = batch.crawl_report
+        presented.merge(report.get("presented_currency"))
         per[handle] = {k: report.get(k) for k in ("pages", "scanned_products", "selected_products")}
         scanned += int(report.get("scanned_products") or 0)
         pages += int(report.get("pages") or 0)
@@ -664,7 +747,7 @@ async def fetch_shopify_collections(
         raise CrawlIncomplete(f"{_clean_domain(domain)}: selected-product budget {max_products} exhausted",
                               status="capped", next_page=0, scanned_products=scanned, selected_products=len(merged))
     out = ShopifyProductBatch(list(merged.values()), scanned_products=scanned, pages=pages,
-                              scope="collections:" + ",".join(handles))
+                              scope="collections:" + ",".join(handles), presented=presented.report())
     out.crawl_report["collections"] = per
     return out
 
@@ -873,21 +956,564 @@ _HTML_BLOCK_RE = re.compile(r"(?is)<(script|style)\b.*?</\1\s*>|<!--.*?-->")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 BODY_TEXT_MAX_LEN = 2000  # PDP prose field, not a document store
 
+# --- body_html -> description ------------------------------------------------
+# What a buyer reads. Three kinds of damage are removed here: words split by markup, entity-encoded
+# markup surviving as literal tags, and store boilerplate (disclaimers, promo codes, policy text)
+# that is the store's, not the product's.
+#
+# WORD SPLITTING. A tag is not a word break. A drop-cap theme writes
+# `<span class="dropcap">D</span>ue to ...`; replacing every tag with a space served "D ue to".
+# Phrasing (inline) elements render with NO gap, so they leave a mark that is resolved once all the
+# markup is gone (`_inline_gap`); every other tag -- block-level elements, <br>, <img>, unknown
+# ones -- is a boundary, which is what it renders as.
+_INLINE_TAGS = frozenset({
+    "span", "a", "b", "strong", "em", "i", "u", "font", "small", "mark",
+    "abbr", "s", "strike", "del", "ins", "big", "tt", "wbr", "nobr",
+})
+# Sub/superscripts attach to their base: H<sub>2</sub>O, vitamin B<sub>5</sub>, 10<sup>th</sup>.
+_ATTACHED_TAGS = frozenset({"sub", "sup"})
+# A NUMERIC sub/superscript keeps its position: rendered as the Unicode sub/superscript characters,
+# still attached. Flattened to plain digits, a footnote marker glued to its word reads as part of it --
+# "Ceramide<sup>1</sup>" became "Ceramide1", "week<sup>3</sup>." became "week3." -- and a formula lost
+# its subscript. Now: "Ceramide\u00b9", "week\u00b3.", "H\u2082O", "m\u00b2", "10\u2076". Only content
+# that is digits (with + - = ( ) and a minus sign), or a comma list of such ("1, 2" keeps its ", "),
+# is converted; anything else -- "10<sup>th</sup>", "<sup>*</sup>", "<sup>TM</sup>", a letter -- is
+# attached as before. Tags nested inside ("<sup><span>1</span></sup>") are looked through.
+_SCRIPT_TAG_RE = re.compile(r"(?is)<\s*(sup|sub)\b[^<>]*>(.{0,200}?)<\s*/\s*\1\s*>")
+_SCRIPT_CONTENT_RE = re.compile(r"[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*(?:, *[0-9+\-=()\u2212]*[0-9][0-9+\-=()\u2212]*)*")
+_SUPERSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e\u207b")
+_SUBSCRIPT = str.maketrans("0123456789+-=()\u2212", "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e\u208b")
+# Every character a numeric sub/superscript can become: a safety cue right before one is still a cue.
+SCRIPT_NUMERAL_CHARS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b\u207c\u207d\u207e" \
+                       "\u2080\u2081\u2082\u2083\u2084\u2085\u2086\u2087\u2088\u2089\u208a\u208b\u208c\u208d\u208e"
+_SCRIPT_NUMERAL_RE = re.compile(f"[{SCRIPT_NUMERAL_CHARS}]")
+_TAG_NAME_RE = re.compile(r"<\s*/?\s*([A-Za-z][A-Za-z0-9]*)")
+# A tag-shaped token in text that has already been unescaped: a letter right after `<` or `</`,
+# and (checked in `_escaped_tag_replacement`) a real HTML element name. Narrower than _HTML_TAG_RE
+# on purpose -- by then a `<` can be prose: "<5% alcohol", "results <in 3 days>".
+_TAG_LIKE_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9]*)(?:\s[^<>]*)?/?>")
+_HTML_ELEMENTS = frozenset(
+    "p div br hr li ul ol dl dt dd h1 h2 h3 h4 h5 h6 table thead tbody tfoot tr td th caption col colgroup "
+    "section article header footer nav aside main blockquote figure figcaption pre code img picture source "
+    "video audio iframe embed object svg path g meta link title body html head script style noscript "
+    "template form input button label select option textarea center details summary q cite time data var "
+    "kbd samp address".split())
+# ENTITY-ENCODED MARKUP. `&lt;br&gt;` only becomes `<br>` when unescaped, which used to happen
+# AFTER the tag pass, so a literal "<br>" reached the description. Strip, unescape, and strip
+# again, for up to this many layers of escaping; a last pass drops what is left.
+_UNESCAPE_ROUNDS = 3
+_INLINE_MARK = "\x00"     # an inline OPENING tag was removed here; `_inline_gap` decides space or nothing
+_INLINE_CLOSE_MARK = "\x02"  # an inline CLOSING tag was removed here
+_ATTACHED_MARK = "\x01"   # a sub/sup tag was removed here; always nothing
+_MARKS = _INLINE_MARK + _INLINE_CLOSE_MARK + _ATTACHED_MARK
+_MARK_RUN_RE = re.compile(r"[\x00\x01\x02]+")
+_PREV_FRAGMENT_RE = re.compile(r"[^\s\x00\x01\x02]*$")
+_NEXT_FRAGMENT_RE = re.compile(r"[^\s\x00\x01\x02]*")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]")
+
+
+def _tag_replacement(m: "re.Match[str]") -> str:
+    name = _TAG_NAME_RE.match(m.group(0))
+    tag = name.group(1).lower() if name else ""
+    if tag in _ATTACHED_TAGS:
+        return _ATTACHED_MARK
+    if tag in _INLINE_TAGS:
+        return _INLINE_CLOSE_MARK if re.match(r"<\s*/", m.group(0)) else _INLINE_MARK
+    return "\n"
+
+
+def _script_numeral(m: "re.Match[str]") -> str:
+    """A numeric <sup>/<sub> -> its Unicode characters between attached marks (no gap either side);
+    any other one is left for the tag pass, which attaches it as before. Converted only when nothing
+    in it could be a separator: no whitespace but the spaces after a list comma (kept: "1, 2" keeps
+    its ", ", so "1 2" never reads as twelve), and no tag but an inline one (a block break inside a
+    malformed sup is still a break)."""
+    inner = m.group(2)
+    if any(name.lower() not in _INLINE_TAGS for name in _TAG_NAME_RE.findall(inner)):
+        return m.group(0)
+    content = html.unescape(_HTML_TAG_RE.sub("", inner))
+    if not _SCRIPT_CONTENT_RE.fullmatch(content):
+        return m.group(0)
+    table = _SUPERSCRIPT if m.group(1).lower() == "sup" else _SUBSCRIPT
+    return _ATTACHED_MARK + content.translate(table) + _ATTACHED_MARK
+
+
+def _escaped_tag_replacement(m: "re.Match[str]") -> str:
+    name = m.group(1).lower()
+    if name in _INLINE_TAGS or name in _ATTACHED_TAGS or name in _HTML_ELEMENTS:
+        return _tag_replacement(m)
+    return m.group(0)
+
+
+def _is_symbol(ch: str) -> bool:
+    # & and dashes, math and other symbols ("<b>Vegan</b>&amp;<b>Cruelty free</b>",
+    # "<strong>Benefits</strong>– hydrates", a decorative ✨). Not currency: "$<b>20</b>".
+    # The ASCII hyphen is not one: it joins a compound ("Long<b>-</b>wear", "Non<b>-comedogenic</b>").
+    return ch == "&" or (ch != "-" and unicodedata.category(ch) in {"Sm", "Sk", "So", "Pd"})
+
+
+def _inline_gap(m: "re.Match[str]") -> str:
+    """Space or nothing where inline tags were removed. Joined where the two sides continue one
+    word -- "D|ue" (a drop cap), "hydra|ting", "10:|30", "$1,|000", CJK -- and spaced where a
+    theme relied on the tags to separate them: "Size|50ml", "Skin type|All", "Vegan|Cruelty-free",
+    "Size:|50ml", "Vegan|&|Cruelty free", "10%|Niacinamide", and between two sibling
+    elements that each hold a word: "<span>Vegan</span><span>cruelty-free</span>"."""
+    run = m.group(0)
+    if _ATTACHED_MARK in run:
+        return ""
+    s, i, j = m.string, m.start(), m.end()
+    # The characters around the run, reading past any OTHER mark runs ("Vegan|,|Cruelty").
+    before = "".join(c for c in s[max(0, i - 8):i] if c not in _MARKS)
+    prev = before[-1:]
+    prev2 = before[-2:-1]
+    nxt = s[j] if j < len(s) else ""
+    if not prev or not nxt or prev.isspace() or nxt.isspace():
+        return ""
+    if prev in ":;!?,." and prev2.isalpha() and nxt.isalnum():
+        return " " if prev != "." or nxt.isupper() else ""
+    if prev.islower() and nxt.isupper():
+        return " "
+    if (prev.isalpha() and nxt.isdigit()) or (prev.isdigit() and nxt.isalpha()):
+        return " "
+    if _is_symbol(prev) or _is_symbol(nxt) or (prev == "%" and nxt.isalpha()):
+        return " "
+    # Sibling elements -- one closes, the next opens -- each holding a word of 2+ letters. A
+    # per-letter span run ("<span>G</span><span>l</span>...", gradient text) stays joined, as
+    # does CJK, which is written without spaces.
+    close = run.find(_INLINE_CLOSE_MARK)
+    if close != -1 and _INLINE_MARK in run[close:] and prev.isalpha() and nxt.isalpha():
+        prev_frag = _PREV_FRAGMENT_RE.search(s[max(0, i - 40):i]).group(0)
+        next_frag = _NEXT_FRAGMENT_RE.match(s, j, j + 40).group(0)
+        if (len(prev_frag) >= 2 and len(next_frag) >= 2
+                and not _CJK_RE.search(prev) and not _CJK_RE.search(nxt)):
+            return " "
+    return ""
+
+
+# SENTENCES. A sentence ends at . ! ? (or the full-width 。！？, which need no following space),
+# optionally closed by a quote or bracket -- but not after a common abbreviation ("Dr. Kim",
+# "No. 5", "approx. 30", "vs. 1%") or a dotted initialism ("e.g.", "i.e.", "U.S.").
+_SENTENCE_END_RE = re.compile(
+    r"[.!?][\"'”’)\]]*\s+|[。！？][\"'”’)\]」』]*\s*")
+_ABBREVIATION_TAIL_RE = re.compile(
+    r"(?i)(?:^|[^A-Za-z])(?:dr|no|nos|mt|st|vs|approx|incl|inc|co|ltd|mr|mrs|ms|jr|sr|oz|fl|vol|fig)\.$"
+    r"|(?:^|[^A-Za-z])(?:[A-Za-z]\.){2,}$")
+_SENTENCE_TERMINAL = ".!?。！？"
+
+
+# A boilerplate LABEL starts a new unit even without punctuation before it: "...Made in Japan Disclaimer: Due
+# to photographic lighting..." -- otherwise the product's own words and the store's disclaimer are one
+# sentence, and dropping the disclaimer would take "Made in Japan" with it.
+_LABEL_BOUNDARY_RE = re.compile(r"\s+(?=(?:disclaimer|please\s+note)\s*:)|(?<!please)\s+(?=note\s*:)", re.IGNORECASE)
+
+
+def _split_sentences(block: str) -> List[str]:
+    out: List[str] = []
+    for part in _LABEL_BOUNDARY_RE.split(block):
+        out.extend(_split_punctuated(part))
+    return out
+
+
+def _split_punctuated(block: str) -> List[str]:
+    out: List[str] = []
+    start = 0
+    for m in _SENTENCE_END_RE.finditer(block):
+        if block[m.start()] == "." and _ABBREVIATION_TAIL_RE.search(block[max(0, m.start() - 12):m.start() + 1]):
+            continue
+        piece = block[start:m.end()].strip()
+        if piece:
+            out.append(piece)
+        start = m.end()
+    tail = block[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+# STORE BOILERPLATE, class by class. A class is a list of rules; a rule matches when ALL of its
+# patterns are found in the sentence, so each rule pairs the boilerplate's own anchor with the
+# context that makes it boilerplate ("% off" only beside a store sale, "business days" only beside
+# shipping, "colours may vary" only beside a monitor/screen). Loose keywords that product copy
+# also uses ("takes 30% off the look of fine lines", "express delivery of hyaluronic acid",
+# "follow us on our journey", "shade code: NC20") never match on their own.
+#
+# A matched SENTENCE (it ends in sentence punctuation) is dropped whole, up to
+# _BOILERPLATE_MAX_UNIT_LEN. A run with no sentence punctuation -- a banner, a list item, an
+# unpunctuated CJK block -- is dropped only when the WHOLE run is boilerplate: the matches cover at
+# least _BOILERPLATE_MIN_COVERAGE of its non-space characters, or at most
+# _BOILERPLATE_MAX_RESIDUAL_WORDS word is left once the matches and filler words are taken out
+# (each CJK character counts as a word: CJK is written without spaces). "NOW ON SALE 25% OFF" and
+# "Use code GLOW20 at checkout" go; "Cruelty-free, vegan, free shipping", "Hydrating Serum 50ml
+# Free Shipping" and a CJK sentence beside a URL stay.
+_BOILERPLATE_MAX_UNIT_LEN = 400
+_BOILERPLATE_MIN_COVERAGE = 0.7
+_BOILERPLATE_MAX_RESIDUAL_WORDS = 1
+_RESIDUAL_TOKEN_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]"
+    r"|[^\W_\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff66-\uff9f]+")
+_BOILERPLATE_FILLER = frozenset(
+    "a an the and or of to in on at by for from with is are be will may your our we you this that "
+    "it its all any due please note".split())
+_CURRENCY = r"[$£€]"
+_SHIP_CONTEXT = r"(?i)\b(?:ship(?:s|ped|ping)?|deliver(?:y|ed|ies)?|dispatch(?:ed)?|orders?|carriers?|courier|mail(?:ed)?|transit|process(?:ed|ing)?|arrive)\b"
+_SALE_CONTEXT = (r"(?i)\b(?:sale|sitewide|site-wide|storewide|store-wide|checkout|orders?|subscri\w*|"
+                 r"promo|coupon|discount|today\s+only|ends|limited[- ]time)\b")
+_PLATFORM = r"(?:instagram|tiktok|facebook|youtube|pinterest|twitter)"
+
+
+def _rules(*rules: Sequence[str]) -> Tuple[Tuple["re.Pattern[str]", ...], ...]:
+    return tuple(tuple(re.compile(p) for p in rule) for rule in rules)
+
+
+_BOILERPLATE_CLASSES: Tuple[Tuple[str, Tuple[Tuple["re.Pattern[str]", ...], ...]], ...] = (
+    ("shipping_returns_policy", _rules(
+        (r"(?i)\bfree\s+(?:shipping|delivery)\b(?!\s+(?:kit|set|bundle|edition|collection)\b)"
+         rf"(?:\s+(?:on\s+)?(?:all\s+)?(?:orders?\s+)?(?:over|above)\s+{_CURRENCY}?\d+)?",),
+        (r"(?i)\b(?:standard|express|expedited|international|domestic|ground|overnight|flat[- ]rate)\s+shipping\b",),
+        (r"(?i)\b(?:shipping|returns?|refunds?|exchanges?|delivery)\s+polic(?:y|ies)\b",),
+        (r"(?i)\bshipping\s+(?:times?|rates?|fees?|costs?|restrictions?|charges?)\b",),
+        (r"(?i)\bships?\s+(?:with)?in\s+\d+(?:\s*[-–]\s*\d+)?\s+(?:business\s+)?(?:days?|hours?|weeks?)\b(?!\s+of\b)",),
+        (r"(?i)\b(?:business|working)\s+days\b", _SHIP_CONTEXT),
+        (r"(?i)\bnon[- ]?(?:returnable|refundable)\b",),
+        (r"(?i)\ball\s+sales\s+(?:are\s+)?final\b",),
+        (r"(?i)\bfinal\s+sale\b(?!\s+of\b)",),
+        (r"(?i)\b(?:returns?|exchanges?|refunds?)\s+(?:are|is)\s+not\s+(?:accepted|possible|available|offered)\b",),
+        (r"(?i)\b(?:cannot|can\s*not|can't|unable\s+to)\s+(?:be\s+)?(?:ship(?:ped)?|return(?:ed)?|refund(?:ed)?|exchang(?:e|ed))\b",),
+        (r"(?i)(?<!\bno\s)(?<!\bfree\sof\s)\b(?:hazardous\s+(?:materials?|goods|items?)|hazmat|dangerous\s+goods)\b",
+         _SHIP_CONTEXT),
+        (rf"(?i)\borders?\s+(?:over|above)\s+{_CURRENCY}?\d+",),
+    )),
+    ("promo_code", _rules(
+        # The code itself is case-sensitive: an all-caps/digit token, as stores print them.
+        (r"\b(?i:use|enter|apply|with)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*:?\s*[\"'“]?[A-Z0-9]{3,}\b",),
+        (r"(?i)\b(?:promo|discount|coupon|voucher)\s*codes?\b",),
+        (r"(?i)\b(?:bulk|wholesale)\s+(?:discounts?|pricing|prices|orders?|inquiries|enquiries|accounts?)\b",),
+        (r"(?i)\bbuy(?:ing)?\s+in\s+bulk\b", r"(?i)\b(?:save|savings|discount|off)\b"),
+        # Quantity-tier pricing: "10 pcs and above - 12% off", "MIX & MATCH BULK DISCOUNT".
+        (r"(?i)\b\d+\s*(?:pcs|pieces|units|items|bottles|sets)\s+(?:and|&|or)\s+(?:above|more|over)\b",
+         r"(?i)\b(?:off|discount|save|savings)\b"),
+        (r"(?i)\bmix\s*(?:&|and)\s*match\b", r"(?i)\b(?:bulk|discount|off|save)\b"),
+        (r"(?i)\bbuy\s+(?:\d+|one|two|three)\s*,?\s*get\s+(?:\d+|one|two|three)\s+(?:free|half|\d+\s*%)",),
+    )),
+    ("store_link", _rules(
+        (r"(?i)(?:https?://|\bwww\.)\S+",),
+        (r"(?i)\bcontact\s+us\b",),
+        (r"(?i)\b(?:email|e-mail|call|message|dm)\s+us\s+(?:at|on|via|for|if|with)\b",),
+    )),
+    ("click_here", _rules(
+        (r"(?i)\bclick\s+(?:here|the\s+link|below)\b",),
+        (r"(?i)\btap\s+here\b",),
+        (r"(?i)\bshop\s+the\s+(?:set|kit|bundle|collection|full\s+size)\s+here\b",),
+    )),
+    ("sale_banner", _rules(
+        (r"(?i)\bnow\s+on\s+sale\b",),
+        (r"(?i)\bon\s+sale\s+(?:now|today|this\s+week|until|through|for\s+a\s+limited)\b",),
+        (r"(?i)\b\d{1,3}\s*%\s*off\b", _SALE_CONTEXT),
+        (r"(?i)\b(?:save|enjoy)\s+(?:an?\s+)?(?:extra\s+)?\d{1,3}\s*%", _SALE_CONTEXT),
+        (r"(?i)\b(?:limited[- ]time|flash|black\s+friday|cyber\s+monday|clearance)\s+(?:sale|offer|deal|discount)s?\b",),
+        (r"(?i)\bsale\s+price\b",),
+        (rf"(?i)\bwas\s+{_CURRENCY}\d[\d.,]*\s*,?\s*(?:now|only|today)\b",),
+    )),
+    ("social_embed", _rules(
+        (rf"(?i)\bview\s+this\s+(?:post|photo|video|reel|profile)\s+on\s+{_PLATFORM}\b",),
+        (r"(?i)\ban?\s+(?:post|photo|video|reel)\s+shared\s+by\b[^@]{0,80}@[\w.]+\)?",),
+        (rf"(?i)\bfollow\s+us\s+(?:on\s+)?{_PLATFORM}\b",),
+        (r"(?i)\bfollow\s+us\s+@[\w.]+",),
+        (rf"(?i)\bfollow\s+(?:[^\s,.;:!?]+\s+){{0,3}}(?:on\s+)?{_PLATFORM}\b",),
+        (rf"(?i)\b(?:find|join)\s+us\s+on\s+{_PLATFORM}\b",),
+        (r"(?i)\btag\s+us\b", rf"(?i)@[\w.]+|#\w+|\b{_PLATFORM}\b"),
+    )),
+    ("colour_disclaimer", _rules((
+        r"(?i)\b(?:colou?rs?|shades?)(?:\s+(?:in|of|on|shown\s+in)\s+(?:the|this|these|our)\s+"
+        r"(?:images?|photos?|pictures?|photographs?))?\s+(?:may|might|can|could)\s+(?:vary|differ|appear\s+"
+        r"(?:slightly\s+)?different|look\s+(?:slightly\s+)?different)\b",
+        r"(?i)\bphotographic\b|\blighting\s+(?:sources?|conditions?)\b"
+        r"|\b(?:monitors?|screens?|displays?|devices?|computers?)\s+(?:settings?|resolutions?|calibrations?)\b"
+        r"|\bscreen\s+to\s+screen\b|\bmonitor\s+to\s+monitor\b"
+        r"|\b(?:on|from)\s+(?:your|each|every|different|individual|one)\s+(?:monitors?|screens?|displays?|devices?|computers?)\b",
+    ),)),
+    ("packaging_note", _rules(
+        (r"(?i)\b(?:please|kindly)\s+note\b",
+         r"(?i)\b(?:packaging|packages?|labels?|outer\s+box(?:es)?|box\s+designs?|package\s+designs?)\b",
+         r"(?i)\b(?:vary|varies|differ|differs|change[sd]?|updated?|receive|arrive)\b"),
+        (r"(?i)\b(?:packaging|labels?|package\s+designs?)\s+(?:may|might)\s+(?:vary|differ|change)\b"
+         r"(?!\s+colou?r)",),
+    )),
+)
+
+
+# SAFETY TEXT IS NEVER STORE BOILERPLATE. A warning can share a sentence with a boilerplate anchor
+# ("Discontinue use if irritation occurs and contact us for advice.", "Warning: flammable aerosol;
+# contents under pressure, cannot be shipped by air.") and can repeat on every product of a store
+# ("Avoid contact with eyes; if contact occurs, rinse thoroughly."). Neither pass may remove it: a
+# sentence carrying a safety cue is kept whole by the pattern pass (only a `;`-separated clause that is
+# pure boilerplate with no cue of its own is cut) and is never dropped by the repetition pass.
+_SAFETY_CUE_RE = re.compile(
+    r"(?i)\b(?:warnings?|cautions?|avoid|discontinue|irritat\w*|rash(?:es)?|redness|swelling|allerg\w*"
+    r"|flammable|inflammable|combustible|under\s+pressure|pressuri[sz]ed|ignit\w*|doctor|physician"
+    r"|dermatologist|medical|eyes?|keep\s+(?:out\s+of|away\s+from)|reach\s+of\s+children|children"
+    r"|external\s+use|do\s+not\s+(?:ingest|swallow|use|apply|inhale|puncture|incinerate|spray|expose)"
+    r"|patch\s+test|poison\w*|pregnan\w*|breast[- ]?feeding|nursing|broken\s+skin|sensitivity|burns?"
+    r"|harmful|toxic|first\s+aid|rinse\s+(?:thoroughly|immediately|with\s+water)|seek\s+(?:medical|advice))\b")
+
+
+def is_safety_text(sentence: str) -> bool:
+    """True when the sentence carries a safety cue (a warning, a precaution, a medical instruction).
+    A sub/superscript numeral is a word boundary here: "avoid the eyes\u00b9" carries "eyes"."""
+    return bool(_SAFETY_CUE_RE.search(_SCRIPT_NUMERAL_RE.sub(" ", sentence or "")))
+
+
+def _without_boilerplate(sentence: str) -> Optional[str]:
+    """The sentence with its store boilerplate removed, or None when all of it is boilerplate. Safety
+    text is kept: a safety sentence loses only a `;`-separated clause that is boilerplate and carries no
+    safety cue of its own; without such a clause it is kept whole."""
+    if boilerplate_class(sentence) is None:
+        return sentence
+    if not is_safety_text(sentence):
+        return None
+    clauses = [c.strip() for c in sentence.split(";")]
+    kept = [c for c in clauses if c and (is_safety_text(c) or boilerplate_class(c) is None)]
+    if len(kept) == len(clauses) or not kept:
+        return sentence
+    text = "; ".join(kept)
+    end = sentence.rstrip()[-1:]
+    if text[-1:] not in _SENTENCE_TERMINAL and end in _SENTENCE_TERMINAL:
+        text += end  # the cut clause carried the sentence's full stop
+    return text
+
+
+def _matching_rules(sentence: str) -> List[Tuple[str, Tuple["re.Pattern[str]", ...]]]:
+    return [(name, rule) for name, rules in _BOILERPLATE_CLASSES for rule in rules
+            if all(p.search(sentence) for p in rule)]
+
+
+def boilerplate_class(sentence: str) -> Optional[str]:
+    """The store-boilerplate class of one sentence (or unpunctuated run), or None for product copy."""
+    if len(sentence) > _BOILERPLATE_MAX_UNIT_LEN:
+        return None
+    hits = _matching_rules(sentence)
+    if not hits:
+        return None
+    name = hits[0][0]
+    if sentence.rstrip("\"'”’)]」』")[-1:] in _SENTENCE_TERMINAL:
+        return name
+    # Unpunctuated: boilerplate only if the matches of every rule that fired cover the run.
+    covered = [False] * len(sentence)
+    for _, rule in hits:
+        for p in rule:
+            for m in p.finditer(sentence):
+                covered[m.start():m.end()] = [True] * (m.end() - m.start())
+    chars = [k for k, c in enumerate(sentence) if not c.isspace()]
+    if chars and sum(covered[k] for k in chars) >= _BOILERPLATE_MIN_COVERAGE * len(chars):
+        return name
+    residual = "".join(" " if covered[k] else c for k, c in enumerate(sentence))
+    words = [w for w in _RESIDUAL_TOKEN_RE.findall(residual.casefold()) if w not in _BOILERPLATE_FILLER]
+    return name if len(words) <= _BOILERPLATE_MAX_RESIDUAL_WORDS else None
+
+
+def _strip_markup(body_html: str) -> str:
+    text = _MARK_RUN_RE.sub("", str(body_html))
+    for round_no in range(_UNESCAPE_ROUNDS):
+        text = _HTML_BLOCK_RE.sub("\n", text)
+        text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
+        # Raw markup: every `<...>` is a tag. After an unescape, only a tag-SHAPED token is.
+        text = (_HTML_TAG_RE.sub(_tag_replacement, text) if round_no == 0
+                else _TAG_LIKE_RE.sub(_escaped_tag_replacement, text))
+        unescaped = html.unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+    text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _SCRIPT_TAG_RE.sub(_script_numeral, text)
+    text = _TAG_LIKE_RE.sub(_escaped_tag_replacement, text)
+    return _MARK_RUN_RE.sub(_inline_gap, text)
+
+
+def body_html_sentences(body_html: Optional[str]) -> List[str]:
+    """body_html -> the description's sentences, in order, store boilerplate removed.
+
+    A "sentence" is a sentence inside a block, or a whole block when it has no sentence
+    punctuation (a list item, a heading). Joined (`join_description_sentences`) they are the description,
+    before the length cap. Deterministic; no LLM."""
+    if not body_html:
+        return []
+    out: List[str] = []
+    for block in _strip_markup(body_html).split("\n"):
+        block = re.sub(r"\s+", " ", block).strip()
+        if not block:
+            continue
+        for sentence in _split_sentences(block):
+            kept = _without_boilerplate(sentence)
+            if kept:
+                out.append(kept)
+    return out
+
+
+_CJK_CLOSERS = "\u3002\uff01\uff1f\u300d\u300f"
+
+
+def _join_sentences(sentences: Sequence[str]) -> str:
+    """Single spaces between sentences, none after a full-width terminal (CJK runs on)."""
+    parts: List[str] = []
+    for s in sentences:
+        if s:
+            if parts and parts[-1][-1] not in _CJK_CLOSERS:
+                parts.append(" ")
+            parts.append(s)
+    return "".join(parts)
+
+
+_HEADING_MAX_WORDS = 5
+
+
+def _is_heading_unit(unit: str) -> bool:
+    """A section heading: a short unit with no sentence punctuation ("Full Ingredients", "How to use:")."""
+    text = (unit or "").strip()
+    if not text or text.rstrip(":").rstrip()[-1:] in _SENTENCE_TERMINAL:
+        return False
+    return len(text.rstrip(":").split()) <= _HEADING_MAX_WORDS
+
+
+def join_description_sentences(sentences: Sequence[str], max_len: int = BODY_TEXT_MAX_LEN) -> str:
+    """Join sentences into the description, capped at `max_len` on the LAST sentence boundary
+    that fits, so the copy does not end mid-sentence. When that boundary would keep less than half
+    of `max_len` (a short heading before one long unpunctuated block), the word boundary keeps far
+    more of the copy and is used instead."""
+    text = _join_sentences(sentences)
+    if len(text) <= max_len:
+        return text
+    kept: List[str] = []
+    for s in sentences:
+        if s and len(_join_sentences(kept + [s])) > max_len:
+            break
+        if s:
+            kept.append(s)
+    # A cut that lands right after a section heading ("Full Ingredients", "How to use:") would end the copy on
+    # the bare heading: the section it introduces did not fit. Drop such trailing headings.
+    while len(kept) > 1 and _is_heading_unit(kept[-1]) and not is_safety_text(kept[-1]):
+        kept.pop()  # a short SAFETY line ("For external use only", "Avoid eyes") is never a heading to drop
+    head = _join_sentences(kept)
+    if len(head) * 2 >= max_len:
+        return head
+    cut = text[:max_len]
+    return cut.rsplit(" ", 1)[0] if " " in cut else cut
+
 
 def body_html_to_text(body_html: Optional[str]) -> str:
     """Deterministic Shopify body_html → plain text: drop script/style/comment
-    blocks, strip tags, unescape entities, collapse whitespace, cap at a word
-    boundary. Output is the brand's own words or ''."""
-    if not body_html:
-        return ""
-    text = _HTML_BLOCK_RE.sub(" ", str(body_html))
-    text = _HTML_TAG_RE.sub(" ", text)
-    text = html.unescape(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > BODY_TEXT_MAX_LEN:
-        cut = text[:BODY_TEXT_MAX_LEN]
-        text = cut.rsplit(" ", 1)[0] if " " in cut else cut
-    return text
+    blocks, strip tags (inline ones without splitting words, the rest as a
+    boundary) through up to three layers of entity-escaping, drop store-boilerplate
+    sentences, collapse whitespace, cap at a sentence boundary. Output is the
+    brand's own words or ''.
+
+    Boilerplate that repeats across one store's products without matching a known
+    class is removed per crawl batch, by `drop_repeated_store_sentences`."""
+    return join_description_sentences(body_html_sentences(body_html))
+
+
+# STORE-LEVEL REPETITION. A sentence the store prints on most of its products, as a header or a
+# footer, is the store's template (a shipping block, an "about us"), not this product's copy --
+# the backstop for boilerplate no pattern above names. A drain batch is ONE brand, and a product
+# line's shared copy (twelve nail shades over one formula paragraph) can be on most of it, so a
+# repeated sentence is dropped only when every guard below agrees it is template, not copy:
+#   * it is on at least max(3, 50%) of the batch's described rows, in a batch of 10+ of them, and
+#     has 5+ words (short attributes like "Vegan and cruelty free." legitimately recur);
+#   * it sits in the leading or trailing run of repeated sentences -- a template's position; line
+#     copy interleaved with the product's own sentences stays;
+#   * it is on rows of at least 2 different product kinds (product_type, else category leaf): a
+#     store template covers the whole store, while a line's copy -- twelve lipsticks over one
+#     formula paragraph that never says "lipstick" -- sits on ONE kind. A single-kind batch is
+#     therefore never touched by this pass;
+#   * it does not name the row's own product noun (its product_type or category leaf: "nail",
+#     "lipstick") -- template text is about the store, line copy is about the product;
+#   * the description keeps at least max(50 chars, half its length before the pass) -- otherwise
+#     the row keeps it whole. 50 is pdp_lifecycle.CANDIDATE_DESCRIPTION_MIN_LEN: the pass must
+#     never be what moves a row back to draft.
+DESCRIPTION_REPEAT_MIN_ROWS = 10
+DESCRIPTION_REPEAT_MIN_SHARE = 0.5
+DESCRIPTION_REPEAT_MIN_COUNT = 3
+DESCRIPTION_REPEAT_MIN_WORDS = 5
+DESCRIPTION_REPEAT_MIN_KEEP_CHARS = 50
+DESCRIPTION_REPEAT_MIN_KEEP_SHARE = 0.5
+DESCRIPTION_REPEAT_MIN_KINDS = 2
+_GENERIC_NOUNS = frozenset(
+    "beauty other misc general product products item items and the for with set sets kit kits".split())
+
+
+def _sentence_key(sentence: str) -> str:
+    return " ".join(re.findall(r"[^\W_]+", sentence.casefold()))
+
+
+def description_nouns(category_path: Optional[str], product_type: Optional[str]) -> FrozenSet[str]:
+    """The words that name what a row IS: its product_type and the last two category_path levels."""
+    parts = [str(product_type or "")] + str(category_path or "").split("/")[-2:]
+    return frozenset(w for w in re.findall(r"[a-z]{3,}", " ".join(parts).casefold()) if w not in _GENERIC_NOUNS)
+
+
+def description_kind(category_path: Optional[str], product_type: Optional[str]) -> str:
+    """What kind of product a row is, for the repetition pass: its product_type, else its category leaf."""
+    kind = " ".join(re.findall(r"[^\W_]+", str(product_type or "").casefold()))
+    return kind or str(category_path or "").rsplit("/", 1)[-1].casefold()
+
+
+def _names_noun(sentence: str, nouns: FrozenSet[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(n)}(?:e?s)?\b", sentence, re.IGNORECASE) for n in nouns)
+
+
+def drop_repeated_store_sentences(
+    descriptions: Sequence[Sequence[str]],
+    nouns: Optional[Sequence[FrozenSet[str]]] = None,
+    kinds: Optional[Sequence[str]] = None,
+) -> Tuple[List[List[str]], Dict[str, Any]]:
+    """Per crawl batch: drop the store's repeated header/footer sentences (see the guards above).
+    `descriptions` is one sentence list per row (see `body_html_sentences`), `nouns` the matching
+    `description_nouns` and `kinds` the `description_kind` per row (None: every row its own kind);
+    returns the lists in the same order plus a report. Pure and deterministic."""
+    rows = [list(d) for d in descriptions]
+    row_nouns = list(nouns) if nouns is not None else [frozenset()] * len(rows)
+    row_kinds = list(kinds) if kinds is not None else [str(k) for k in range(len(rows))]
+    described = sum(1 for d in rows if d)
+    report: Dict[str, Any] = {"described_rows": described, "threshold": None,
+                              "repeated_sentences": 0, "rows_changed": 0, "sample": []}
+    if described < DESCRIPTION_REPEAT_MIN_ROWS:
+        return rows, report
+    threshold = max(DESCRIPTION_REPEAT_MIN_COUNT, math.ceil(DESCRIPTION_REPEAT_MIN_SHARE * described))
+    report["threshold"] = threshold
+    counts: "collections.Counter[str]" = collections.Counter()
+    kinds_of: Dict[str, set] = {}
+    for d, kind in zip(rows, row_kinds):
+        for k in {k for k in map(_sentence_key, d) if len(k.split()) >= DESCRIPTION_REPEAT_MIN_WORDS}:
+            counts[k] += 1
+            kinds_of.setdefault(k, set()).add(kind)
+    repeated = {k for k, c in counts.items()
+                if c >= threshold and len(kinds_of[k]) >= DESCRIPTION_REPEAT_MIN_KINDS}
+    report["repeated_sentences"] = len(repeated)
+    if not repeated:
+        return rows, report
+    out: List[List[str]] = []
+    sample: Dict[str, str] = {}
+    for d, row_noun in zip(rows, row_nouns):
+        droppable = [_sentence_key(s) in repeated and not _names_noun(s, row_noun) and not is_safety_text(s)
+                     for s in d]
+        lead = 0
+        while lead < len(d) and droppable[lead]:
+            lead += 1
+        tail = len(d)
+        while tail > lead and droppable[tail - 1]:
+            tail -= 1
+        kept = d[lead:tail]
+        before_len = len(join_description_sentences(d))
+        after_len = len(join_description_sentences(kept))
+        if len(kept) == len(d) or after_len < max(DESCRIPTION_REPEAT_MIN_KEEP_CHARS,
+                                                  DESCRIPTION_REPEAT_MIN_KEEP_SHARE * before_len):
+            out.append(d)
+            continue
+        for s in d[:lead] + d[tail:]:
+            sample.setdefault(_sentence_key(s), s[:160])
+        out.append(kept)
+        report["rows_changed"] += 1
+    report["sample"] = [sample[k] for k in sorted(sample)][:10]
+    return out, report
 
 
 # Brand storefronts routinely list the INCI under an "Ingredients" heading inside
@@ -1518,22 +2144,6 @@ def _to_float(value: Any) -> Optional[float]:
         return None
 
 
-def _brand_key(value: Optional[str]) -> str:
-    """Alphanumeric-only comparison form of a brand/vendor label.
-
-    Tighter than `_vendor_token` (which only casefolds) because the comparison here is
-    "are these two labels the same BRAND", and the spellings that must compare equal
-    differ by punctuation and spacing: `A'PIEU`/`Apieu`, `MISSHA US`/`Missha`.
-    `_vendor_token` is left alone — it backs `filter_products_by_vendor`, where exact
-    selection is the point and loose matching is the documented hazard.
-
-    "&" is read as "and" before stripping: us.sandandsky.com publishes both `Sand & Sky US`
-    and `Sand and Sky INT` (measured 2026-09-26), which stripped to `sandskyus` and
-    `sandandskyint` and so could never be one brand under any job brand.
-    """
-    return "".join(c for c in str(value or "").casefold().replace("&", "and") if c.isalnum())
-
-
 # A FIRST host label that names a region or a storefront role, not the store: us.sandandsky.com,
 # us.frankbody.com, us.koraorganics.com (measured 2026-09-26), www./shop./store. hosts. The store's
 # own name is the next label. Not stripped when the next label is a public second level
@@ -1549,174 +2159,6 @@ def _store_host_label(domain: Optional[str]) -> str:
            and labels[1] not in _PUBLIC_SECOND_LEVEL_LABELS):
         labels = labels[1:]
     return _brand_key(labels[0])
-
-
-# MEASURED RENAMES that retailers still sell under the old and new names. In retailer mode a
-# vendor is written under the operator's --brand only when the two are the SAME brand; exact
-# alphanumeric equality decides that everywhere except here. Containment cannot: it would merge
-# "Purito" with "Purito Seoul" (a rename -- correct) and equally "A'PIEU" with "A'PIEU Plus"
-# (a distinct vendor -- tests/services/test_retailer_adversarial_acceptance.py pins that it is
-# NOT overridden). So each family is listed, with the evidence that it is one brand.
-#
-# Measured 2026-09-18 over every vendor at eyurs.com, ohlolly.com and sokoglam.com: these are
-# the ONLY cross-host spellings that exact equality leaves split.
-RETAILER_BRAND_SPELLINGS = {
-    # Manyo Factory renamed to ma:nyo: sokoglam "MANYO FACTORY", ohlolly "ma:nyo", eyurs "manyo".
-    "manyofactory": "manyo",
-    "manyo": "manyo",
-    # Purito renamed to Purito Seoul: eyurs "Purito SEOUL", sokoglam "Purito Seoul", ohlolly "Purito".
-    "puritoseoul": "purito",
-    "purito": "purito",
-    # US top-100 wave, measured 2026-09-24 (prod catalog_products + store vendors). A store's spelling
-    # of a prestige brand is a different brand key otherwise -- words (Tom Ford / Tom Ford Beauty,
-    # Christian Dior / Dior, Yves Saint Laurent / YSL) or ACCENTS, which _brand_key and
-    # normalize_brand both keep (perfumania "Lancome" vs the catalog's "Lancôme").
-    "tomford": "tomford", "tomfordbeauty": "tomford",                        # tomfordbeauty.com 145 rows
-    "dior": "dior", "christiandior": "dior", "diorbeauty": "dior",           # perfumania "Christian Dior"
-    "ysl": "ysl", "yslbeauty": "ysl", "yvessaintlaurent": "ysl", "yvessaintlaurentbeauty": "ysl",
-    "jomalone": "jomalone", "jomalonelondon": "jomalone",                    # bluemercury "Jo Malone London"
-    "lancome": "lancome", "lancôme": "lancome",
-    "esteelauder": "esteelauder", "estéelauder": "esteelauder",
-    "kiehls": "kiehls", "kiehlssince1851": "kiehls",
-    "dolceandgabbana": "dolcegabbana", "dolcegabbana": "dolcegabbana",
-    "lorealparis": "lorealparis", "loréalparis": "lorealparis",
-    "tresemme": "tresemme", "tresemmé": "tresemme",
-    "avene": "avene", "avène": "avene",                                      # bluemercury Avène, bigelow Avene
-    "kerastase": "kerastase", "kérastase": "kerastase",
-    # Measured 2026-09-24 over every vendor at 400+ Japanese/Australian beauty storefronts (JP/AU
-    # coverage census): the same maker spelt with and without its accent. `_brand_key` keeps accented
-    # letters (isalnum), and so does normalize_brand, so each spelling below was a separate brand
-    # identity -- e.g. "Kose" at ichibanm.com (26), goodsania.com (185) vs "Kosé" at japanesetaste.com
-    # (47), japanwithlovestore.com (93). Generic-word names that happen to split the same way
-    # ("Elegance"/"Elégance", "Naive"/"Naïve") are deliberately NOT listed: an unrelated vendor
-    # called "Elegance" would be relabelled.
-    "kose": "kose", "kosé": "kose",
-    "biore": "biore", "bioré": "biore",
-    "curel": "curel", "curél": "curel",
-    # Decorté was "Cosme Decorté" until 2020: a rename sold under both names (sasa.com "Cosme Decorte",
-    # wafuu.com "COSME DECORTÉ", ichibanm.com "Decorte", decortecosmetics.com "Decorté").
-    "decorte": "decorte", "decorté": "decorte", "cosmedecorte": "decorte", "cosmedecorté": "decorte",
-    # sasa.com and nanamall.com shorten it to "Cle de Peau" / "Clé de Peau".
-    "cledepeaubeaute": "cledepeaubeaute", "clédepeaubeauté": "cledepeaubeaute",
-    "cledepeau": "cledepeaubeaute", "clédepeau": "cledepeaubeaute",
-    "naturaglace": "naturaglace", "naturaglacé": "naturaglace",
-    "visee": "visee", "visée": "visee",
-    "fiancee": "fiancee", "fiancée": "fiancee",
-    # lamourlife.com writes the Roman-numeral character "SK-Ⅱ" (U+2161), which casefolds to "ⅱ".
-    "skii": "skii", "skⅱ": "skii",
-    # AU: the brand's own store says "Lük Beautifood"; five US retailers say "Luk Beautifood".
-    "lukbeautifood": "lukbeautifood", "lükbeautifood": "lukbeautifood",
-    # wet n wild's own store (www.wetnwildbeauty.com, read 2026-09-26) files 500 of its 580 products
-    # under the CORPORATE vendor "Markwins WNW" (Markwins Beauty Brands owns wet n wild; WNW = wet n
-    # wild) and the other 80 under "wet n wild Beauty". Without this family a brand_official crawl
-    # branded 500 products "Markwins WNW" and the domain review held the job (the store's name does
-    # not start with "Markwins WNW"). Markwins' OTHER labels (e.g. "Markwins Physicians Formula") are
-    # deliberately not listed: only the WNW code names this brand.
-    "wetnwild": "wetnwild", "wetnwildbeauty": "wetnwild", "markwinswnw": "wetnwild",
-    # ETUDE HOUSE renamed to ETUDE (2023) and retailers sell under both, measured in prod 2026-09-28: 293 retailer
-    # rows "ETUDE HOUSE" (luxiface.com 129, holiholic.com 106, openthebeauty.com 28, ...) against 184 "ETUDE" /
-    # "Etude" (dodoskin.com 77, moidaus.com 33, kbeautymakeup.com 24, ...) -- one product at two retailers never
-    # grouped. The existing rows were relabelled FIRST (scripts/relabel_retailer_brand.py, run relabel_07651af59606,
-    # 2026-09-29: 303 rows, 0 held; a re-crawl never updates a stored brand) -- this family must not reach the drain
-    # while an old-spelling row is live, or intake re-keys that row into the new key's group and apply refuses it.
-    "etudehouse": "etude", "etude": "etude",
-    # _brand_key keeps accents (isalnum), so the accented spellings are keys of their own (review of #2440).
-    "étudehouse": "etude", "étude": "etude",
-    # K-beauty / US wave, measured in prod 2026-09-30 over the 13,337 rows ingested 09-23..09-29: each brand
-    # below was stored under two or three spellings that differ ONLY in case (normalize_brand lowercases, so
-    # every spelling of one brand already shares a content_key -- these families move no identity, and so,
-    # unlike ETUDE, may reach the drain before the old rows are relabelled). The vendor's case decided the
-    # display brand: dodoskin.com/holiholic.com "MISSHA" (413 retailer rows) vs misshaus.com "Missha" (149);
-    # eyurs.com "ROUND LAB" vs roundlab.com "Round Lab"; skin1004.com itself writes both "SKIN1004" and
-    # "Skin1004"; cocomo.sg "ANUA"/"ISNTREE"/"GENABELLE"/"MOLVANY"/"ARENCIA". "Centellian 24" (one merchant
-    # row, not a crawl lane) splits by a space; the crawl lanes only ever wrote "Centellian24"/"CENTELLIAN24",
-    # so that family moves no stored crawl row's identity either.
-    # NOT here yet, because they DO move identity (see services/brand_relabel.py ORDER): "O HUI (오휘)" /
-    # "Jung Saem Mool" (smkoreabeauty.com retailer rows -- relabel first), "APIEU" (misshaus.com brand rows --
-    # the product_key moves too), "Supergoop" (supergoop.com brand rows -- no relabel tool reaches them).
-    "missha": "missha", "mixsoon": "mixsoon", "roundlab": "roundlab", "anua": "anua", "arencia": "arencia",
-    "skin1004": "skin1004", "medicube": "medicube", "beautyofjoseon": "beautyofjoseon",
-    "theordinary": "theordinary", "isntree": "isntree", "centellian24": "centellian24",
-    "makeupforever": "makeupforever", "genabelle": "genabelle", "maybelline": "maybelline",
-    "bobbibrown": "bobbibrown", "molvany": "molvany", "byterry": "byterry",
-    # Identity-changing, added only AFTER its rows were relabelled (services/brand_relabel.py ORDER): smkoreabeauty.com
-    # wrote "Jung Saem Mool" (5 retailer rows; normalize_brand keeps the spaces, so its content_key differed from
-    # jsmbeauty.sg's "JUNGSAEMMOOL"). Relabelled by scripts/relabel_retailer_brand.py --family jungsaemmool (run id
-    # in this change's PR); a re-crawl now writes "JUNGSAEMMOOL" onto the relabelled key instead of the old one.
-    "jungsaemmool": "jungsaemmool",
-    # Same ORDER: smkoreabeauty.com wrote "O HUI (오휘)" on 20 retailer rows (_brand_key keeps the Hangul, so its key
-    # differs from "O HUI"). 18 were relabelled (relabel_retailer_brand.py --family ohui, run relabel_fad2cefd5223);
-    # the 2 the relabel held -- a 2-piece and a 3-piece Extreme White set sharing one GTIN, hence one content_key --
-    # were withdrawn first (withdraw_catalog_rows.py, reason ohui_set_gtin_collision). Neither had a product group,
-    # so a re-crawl that re-keys them cannot trip _ensure_primary_retailer_group.
-    "ohui": "ohui", "ohui오휘": "ohui",
-}
-# The spelling each family is WRITTEN as -- in retailer AND brand-official mode, with or without
-# --brand. content_key is
-# built from normalize_brand(brand), which keeps punctuation ("ma:nyo" != "manyo"), so writing
-# the operator's string would still split a family whenever two runs spelled --brand
-# differently. The canonical spelling is the one the catalog ALREADY carries, measured in prod
-# 2026-09-18: 78 brand-official rows as "Ma:nyo" (manyo.us), and "Purito SEOUL"
-# (purito-seoul.com). Any other spelling would split retailer rows from those.
-RETAILER_BRAND_CANONICAL = {
-    "manyo": "Ma:nyo",
-    "purito": "Purito SEOUL",
-    # The catalog's own spelling, measured 2026-09-24 (rows): Tom Ford Beauty 145 (vs "Tom Ford" 4),
-    # Dior 23, YSL 6, Jo Malone 4, Lancôme 12, Estée Lauder 14 (vs "Estee Lauder" 2), Kiehl's Since
-    # 1851 10, Dolce and Gabbana 38 (vs "Dolce & Gabbana" 1), L'Oreal Paris 12. No rows yet for
-    # TRESemmé, Avène, Kérastase: the brand's own spelling.
-    "tomford": "Tom Ford Beauty",
-    "dior": "Dior",
-    "ysl": "YSL",
-    "jomalone": "Jo Malone",
-    "lancome": "Lancôme",
-    "esteelauder": "Estée Lauder",
-    "kiehls": "Kiehl's Since 1851",
-    "dolcegabbana": "Dolce and Gabbana",
-    "lorealparis": "L'Oreal Paris",
-    "tresemme": "TRESemmé",
-    "avene": "Avène",
-    "kerastase": "Kérastase",
-    # 2026-09-24: prod carried none of these as a brand (only two seed-mirror rows, "Biore UV" and
-    # "Clé de Peau"), so each family is written as the maker's own spelling on its own storefront.
-    "kose": "Kosé",
-    "biore": "Bioré",
-    "curel": "Curél",
-    "decorte": "Decorté",
-    "cledepeaubeaute": "Clé de Peau Beauté",
-    "naturaglace": "Naturaglacé",
-    "visee": "Visée",
-    "fiancee": "Fiancée",
-    "skii": "SK-II",
-    # The brand's own lowercase spelling, as on wetnwildbeauty.com.
-    "wetnwild": "wet n wild",
-    "lukbeautifood": "Lük Beautifood",
-    # The brand's own current name (etude.com). Every family member is relabelled to it (see the spellings note).
-    "etude": "ETUDE",
-    # 2026-09-30 wave. Rule: the spelling the catalog already carries on the rows the retailer relabel tool
-    # cannot reach (brand-official / merchant rows, not ext:retailer:), so repairing the existing rows is the
-    # reviewed relabel of retailer rows alone. Rows per spelling outside ext:retailer: in parentheses. It
-    # agrees with the brand's own styling where that is clear (SKIN1004, The Ordinary, Beauty of Joseon).
-    "missha": "Missha",                     # misshaus.com 149 (vs "MISSHA" 0; 413 retailer rows)
-    "mixsoon": "Mixsoon",                   # 225 (vs "MIXSOON" 4, mixsoon.us)
-    "roundlab": "Round Lab",                # roundlab.com 88 (vs "ROUND LAB" 42)
-    "anua": "Anua",                         # anua.com/anua.us 86 (vs "ANUA" 6, all suppressed)
-    "arencia": "Arencia",                   # 126 (vs "ARENCIA" 21)
-    "skin1004": "SKIN1004",                 # skin1004.com 93 (vs "Skin1004" 48)
-    "medicube": "MEDICUBE",                 # 66 (vs "Medicube" 17, medicube.us)
-    "beautyofjoseon": "Beauty of Joseon",   # beautyofjoseon.com 103 (vs "BEAUTY OF JOSEON" 2, suppressed)
-    "theordinary": "The Ordinary",          # 109 (vs "the ordinary" 5)
-    "isntree": "Isntree",                   # isntree-global.com 58 (vs "ISNTREE" 5, suppressed)
-    "centellian24": "Centellian24",         # centellian24usa.com 106 (vs "Centellian 24" 1, "CENTELLIAN24" 1)
-    "makeupforever": "MAKE UP FOR EVER",    # makeupforever.sg 74 (vs "Make Up For Ever" 0; 4 retailer rows)
-    "genabelle": "Genabelle",               # 31 (vs "GENABELLE" 8, suppressed)
-    "maybelline": "Maybelline",             # 25 (vs "MAYBELLINE" 0; 12 retailer rows)
-    "bobbibrown": "Bobbi Brown",            # 9 (vs "BOBBI BROWN" 0; 17 retailer rows)
-    "molvany": "Molvany",                   # 10 (vs "MOLVANY" 4, suppressed)
-    "byterry": "BY TERRY",                  # retailer rows only (11 vs "By Terry" 4): the brand's own styling
-    "jungsaemmool": "JUNGSAEMMOOL",         # jsmbeauty.sg 171 (vs smkoreabeauty.com "Jung Saem Mool" 5, relabelled)
-    "ohui": "O HUI",                        # 409 retailer rows (vs smkoreabeauty.com "O HUI (오휘)" 20: 18 relabelled, 2 withdrawn)
-}
 
 
 def _retailer_brand_family(key: str) -> Optional[str]:
@@ -2590,6 +3032,9 @@ def shopify_product_to_record(
     currency: Optional[str] = None,
     source_role: str = "brand_official",
     retailer_name: Optional[str] = None,
+    # The product's `body_html_sentences`, when the caller already computed them (records_for_brand
+    # does, for its batch pass); derived here otherwise. Same description either way.
+    body_sentences: Optional[Sequence[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Map one Shopify `/products.json` product → a Path-C validated record
     (`{pdp, offers}`). Returns None if it lacks a title/handle (not actionable).
@@ -2673,6 +3118,19 @@ def shopify_product_to_record(
             if _src:
                 image = {"src": _src}
                 break
+    # The product's OWN structured gallery: its `images[].src` in feed order (normalised by
+    # ingestion.structured_image_gallery, which ingestion applies again), carried so the row owns its
+    # gallery instead of borrowing a page scrape's. Kept only when its first image IS the row image
+    # above, so nothing reorders; otherwise (no product images, the variant-swatch fallback, a first
+    # image that is not http(s), a single image that adds nothing to the row image) the record carries
+    # none and is what it was. A fold base keeps its own images only: images the fold adopted from folded
+    # children are other listings' pictures, and each folded variant keeps its own image_url below.
+    # Behind ingestion.STRUCTURED_GALLERY_FLAG (default off): off, every record is what it always was.
+    from services.catalog_enrichment_agent.ingestion import structured_gallery_enabled, structured_image_gallery
+    image_urls = (structured_image_gallery(_image_srcs(product))
+                  if structured_gallery_enabled() and not product.get(FOLDED_IMAGES_KEY) else [])
+    if len(image_urls) < 2 or image_urls[0] != str(image.get("src") or "").strip():
+        image_urls = []
     # A line with multiple native variants is not one physical item, just as a
     # folded shade line is not. Never promote the first variant's GTIN to Tier-0
     # PDP identity: array order and stock/price changes must not change identity.
@@ -2755,6 +3213,12 @@ def shopify_product_to_record(
                 ),
                 "source_handle": str(v.get(FOLDED_FROM_KEY) or "").strip() or None,
             })
+            # Only the EXTENDED fold (FOLD_AXIS_KEY) names the listing a folded variant is sold on; ingestion
+            # points that variant's offer there. The legacy fold's variants carry no such key, so every
+            # record and offer it produced before stays byte-identical.
+            own_handle = str(v.get(FOLDED_FROM_KEY) or "").strip()
+            if FOLD_AXIS_KEY in v and own_handle and "/" not in own_handle:
+                pdp_variants[-1]["own_listing_url"] = f"https://{host}/products/{own_handle}"
     raw_tags = product.get("tags")
     tags = (
         raw_tags
@@ -2762,6 +3226,14 @@ def shopify_product_to_record(
         else [t.strip() for t in str(raw_tags or "").split(",") if t.strip()]
     )
     canonical_url = f"https://{host}/products/{handle}"
+    # Where the canonical offer's item is SOLD. The product's own page, except when the extended fold replaced
+    # an unsellable parent's variants: then the first sellable variant is a child's item, priced and stocked on
+    # the child's own listing, and the offer goes there (its price belongs to the page it points at). The
+    # record's canonical_url -- the row's key and served page -- stays the parent's.
+    sold_at = canonical_url
+    sold_handle = str(variant.get(FOLDED_FROM_KEY) or "").strip()
+    if FOLD_AXIS_KEY in variant and sold_handle and "/" not in sold_handle:
+        sold_at = f"https://{host}/products/{sold_handle}"
     category_input_path = category_path
     category_path, category_confidence = _resolve_category(
         title=title, product_type=product.get("product_type"), flag_path=category_path, domain=domain,
@@ -2784,7 +3256,8 @@ def shopify_product_to_record(
             # body copy land 'draft' and rely on the description backfill /
             # LLM enrichment lane to promote.
             "attribute_summary": (
-                body_html_to_text(product.get("body_html"))
+                (join_description_sentences(body_sentences) if body_sentences is not None
+                 else body_html_to_text(product.get("body_html")))
                 or str(product.get("product_type") or "").strip()
             ),
             "barcode": barcode,  # real GTIN when the brand fills it — strongest deposit basis
@@ -2804,6 +3277,8 @@ def shopify_product_to_record(
             # defaulted here: direct ingestion also refuses an unknown currency.
             "currency": currency,
             "variants": pdp_variants,
+            # Omitted when empty, so a product without a gallery builds the record it always did.
+            **({"image_urls": image_urls} if image_urls else {}),
         },
         "offers": [
             {
@@ -2820,7 +3295,7 @@ def shopify_product_to_record(
                 # storefronts use the same friendly name. Official-mode IDs are untouched.
                 "seller_domain": host if source_role == "retailer" else None,
                 "canonical_url": canonical_url,
-                "destination_url": canonical_url,
+                "destination_url": sold_at,
                 "image_url": str(image.get("src") or "").strip(),
                 "price": price,
                 "in_stock": variant.get("available") if isinstance(variant.get("available"), bool) else None,
@@ -2853,6 +3328,10 @@ def shopify_product_to_record(
 _SHADE_SEP = " - "
 FOLDED_FROM_KEY = "_folded_from_handle"
 FOLDED_INTO_KEY = "_folded_shades"
+#: Set on a fold base whose `images` the fold ADOPTED from its folded children (the base had none of its
+#: own). Those are other listings' pictures: the base's row image comes from them as before, but they are
+#: not the base's gallery (shopify_product_to_record).
+FOLDED_IMAGES_KEY = "_images_adopted_from_folded"
 # A suffix that names a merchandising state, not a shade. tarte sells "<line> - <X>
 # charm" as separate $10 accessories and stila suffixes "- Last Chance"/"- Limited
 # Edition" onto whole palettes; folding those makes an accessory a "shade" of the
@@ -2915,7 +3394,8 @@ def _is_stub_variant(product: Dict[str, Any]) -> bool:
     return label in ("", "Default Title", title)
 
 
-def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str, Any]], Dict[str, Any]]":
+def fold_shade_listings(products: List[Dict[str, Any]], *,
+                        extended: bool = False) -> "Tuple[List[Dict[str, Any]], Dict[str, Any]]":
     """Pure. Fold single-variant `<base> - <shade>` rows into the variants of
     the base row (matched through normalize_title). Returns (products, report):
     the base rows now carry the shades as variants (a stub placeholder variant
@@ -2923,7 +3403,13 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
     removed, order is otherwise preserved, and multi-variant rows are never
     folded — a suffixed multi-variant title is a distinct line, not a shade.
     `report` names what happened so the caller can print it: bases folded,
-    shade rows folded, stub variants replaced, and every folded handle by base."""
+    shade rows folded, stub variants replaced, and every folded handle by base.
+
+    `extended` (the retailer-ingest lane's options.fold_shades): the rule set in
+    `_fold_listings_extended`. Off, this is byte-identical to the fold the brand
+    CLI's --fold-shades has always run."""
+    if extended:
+        return _fold_listings_extended(products)
     from services.catalog_identity import normalize_title
 
     by_norm: Dict[str, Dict[str, Any]] = {}
@@ -3015,12 +3501,485 @@ def fold_shade_listings(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str,
                         adopted.append({"src": src})
             if adopted:
                 base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
                 report["images_adopted"] += 1
         report["bases"] += 1
         report["shades"] += len(shades)
         report["folded"][str(p.get("handle") or base_title)] = handles
         out.append(base)
     return out, report
+
+
+# ---- the extended fold (retailer-ingest lane, options.fold_shades) -------------------------------------
+#
+# Retailer storefronts often list every shade or size of a line as its own Shopify product, keep a parent
+# listing beside its per-size / per-shade children, or re-list one set under a code suffix ("<Set>" and
+# "<Set> - AB12CD"). The legacy fold above would mislabel or refuse those (a 30 ml / 100 ml pair is priced
+# past its 1.5x ratio, a code suffix folds as a "shade", a multi-brand store can fold across vendors), so
+# the retailer lane runs these rules instead. Every refusal is reported; a refused row stays the separate
+# product it was.
+
+#: The decided axis of a folded-in variant, stamped by the extended fold (`_variant_option_name` reads it).
+FOLD_AXIS_KEY = "_fold_axis"
+#: Shop axis names that mean quantity. A child's own Shopify option name in this set (or in
+#: _SHADE_AXIS_NAMES) is used as written; any other name is not one the renderer reads as either axis.
+_SIZE_AXIS_NAMES = {"size", "volume", "capacity", "weight", "amount"}
+_DEFAULT_SIZE_OPTION_NAME = "Size"
+#: Size siblings are priced by quantity (a 100 ml beside a 30 ml), so the 1.5x shade ratio refuses them. A
+#: size sibling priced past this ratio is still a different item.
+_FOLD_SIZE_PRICE_RATIO = 4.0
+#: Suffixes that name a different product in the retailer feeds, on top of _NON_SHADE_SUFFIX_RE: nail
+#: accessories sold beside a colour line ("<Line> - Top Coat"), multi-item sets ("<Line> - Duo"), and the
+#: travel / deluxe / trial editions the legacy list only catches as "travel size" / "mini" / "sample".
+_EXTENDED_NON_SHADE_SUFFIX_RE = re.compile(
+    r"(?i)\b(remover|top coat|base coat|tester|brush|sharpener|case|pouch|holder|duo|trio|collection|"
+    r"travel|deluxe|trial)\b"
+)
+#: A merchant's listing code, not a name: one upper-case token of letters AND digits, at least 3 letters
+#: ("AB12CD"). Shade codes that are mostly digits ("N12", "GC014", "M0N904") do not match.
+_CODE_SUFFIX_RE = re.compile(r"(?=(?:[^A-Z]*[A-Z]){3})(?=[^0-9]*[0-9])[A-Z0-9]{5,12}")
+#: A formula claim names a different product, never a shade: "<Sun Fluid> - SPF 30" beside "- SPF 50".
+#: Refused whatever the option names say.
+_FORMULA_CLAIM_SUFFIX_RE = re.compile(r"(?i)\bSPF\s*\d+|\bPA\s*\+|\bUV[AB]?\b")
+#: Finish and formula words. A suffix made ONLY of them ("<Lipstick> - Matte" / "- Satin", "<Foundation> -
+#: Oil Free" / "- Waterproof" / "- Tinted", "- Matte Finish") names another formula, not a shade; so do
+#: siblings that differ ONLY by them ("- Matte Red" beside "- Satin Red"). Both are refused unless the
+#: child's own Shopify option names a shade or size axis. A shade NAME that merely contains one of them
+#: ("Glitter Gold", "Pearl Pink", "Frosted Lilac", "Cream Beige") is a shade and folds -- which is why
+#: words that are also everyday shade names on their own ("Light", "Rich", "Classic") are not listed.
+_FINISH_WORDS = (r"matte|satin|gloss|glossy|shimmer|metallic|sheer|velvet|cream|creme|crème|dewy|radiant|"
+                 r"luminous|glitter|frost|frosted|pearl|pearlescent|oil[- ]?free|waterproof|water[- ]?resistant|"
+                 r"tinted|fragrance[- ]?free|unscented|scented|hydrating|mattifying|long[- ]?wear(?:ing)?|vegan|"
+                 r"sensitive|finish|formula")
+_FINISH_OR_FORMULA_SUFFIX_RE = re.compile(rf"(?i)\s*(?:{_FINISH_WORDS})(?:[\s/&+,-]+(?:{_FINISH_WORDS}))*\s*")
+_FINISH_WORD_RE = re.compile(rf"(?i)\b(?:{_FINISH_WORDS})\b")
+
+
+def _without_finish_words(suffix: str) -> str:
+    """The suffix with every finish / formula word removed, as a comparison key ("Matte Red" -> "red")."""
+    return " ".join(re.sub(r"[^\w]+", " ", _FINISH_WORD_RE.sub(" ", suffix or "")).casefold().split())
+#: A bare number ("<Serum> - 30" / "- 50") is a size without a unit, a shade code, or a strength: the fold
+#: cannot tell which, so it folds only when the child's own option names the axis.
+_BARE_NUMBER_SUFFIX_RE = re.compile(r"\d+(?:[.,]\d+)?")
+#: SKU strings that identify nothing ("N/A", "none", "-"), and too short to: a copy is never proven by one.
+_PLACEHOLDER_SKUS = {"n/a", "na", "none", "null", "nil", "tbd", "tba", "default", "sku", "-", "0"}
+_MIN_PROOF_SKU_ALNUM = 4
+#: A proven copy of a listing is sold at the listing's price.
+_COPY_PRICE_RATIO = 1.02
+
+
+def _norm_label(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _variant_label(variant: Dict[str, Any]) -> str:
+    """The value a variant names on its first axis, "" for Shopify's placeholder."""
+    label = str((variant or {}).get("option1") or (variant or {}).get("title") or "").strip()
+    return "" if label.lower() in _PLACEHOLDER_SHADE_LABELS else label
+
+
+_PLACEHOLDER_SHADE_LABELS = {"", "default title", "default", "title"}
+
+
+def _axis_family(name: str) -> Optional[str]:
+    n = str(name or "").strip().lower()
+    if n in _SHADE_AXIS_NAMES:
+        return "shade"
+    if n in _SIZE_AXIS_NAMES:
+        return "size"
+    return None
+
+
+def _proof_sku(value: Any) -> Optional[str]:
+    """A merchant SKU that can identify a product, casefolded, or None for a placeholder or a stub."""
+    sku = str(value or "").strip().casefold()
+    if sku in _PLACEHOLDER_SKUS or sum(c.isalnum() for c in sku) < _MIN_PROOF_SKU_ALNUM:
+        return None
+    return sku
+
+
+def _same_product_proof(base: Dict[str, Any], copy: Dict[str, Any]) -> Optional[str]:
+    """Why `copy` is the SAME product as `base` (a re-listing under a code suffix), or None.
+
+    Identity only, never a resemblance: a shared VALID GTIN (check digit right, not all zeros), a shared
+    merchant SKU that is not a placeholder ("N/A") or a stub, or two or more variants with the identical
+    label -> price set -- and in every case the two are sold at the same price (_COPY_PRICE_RATIO). A shared
+    description, image or price alone also describes every shade of a colour line, so it proves nothing."""
+    bv = [v for v in (base.get("variants") or []) if isinstance(v, dict)]
+    cv = [v for v in (copy.get("variants") or []) if isinstance(v, dict)]
+    bp, cp = _first_price(base), _first_price(copy)
+    if not bp or not cp or max(bp, cp) / min(bp, cp) > _COPY_PRICE_RATIO:
+        return None
+    gtins = [{validated_source_gtin(str(v.get("barcode") or "").strip()) for v in vs} - {None} for vs in (bv, cv)]
+    if gtins[0] & gtins[1]:
+        return "barcode"
+    if ({_proof_sku(v.get("sku")) for v in bv} & {_proof_sku(v.get("sku")) for v in cv}) - {None}:
+        return "sku"
+
+    def label_prices(vs: List[Dict[str, Any]]) -> Optional[Dict[str, Optional[float]]]:
+        out = {_norm_label(_variant_label(v)): _to_float(v.get("price")) for v in vs}
+        return out if len(out) == len(vs) and "" not in out else None
+    if len(bv) >= 2 and len(bv) == len(cv) and label_prices(bv) is not None and label_prices(bv) == label_prices(cv):
+        return "variant_set"
+    return None
+
+
+def _is_extended_stub(product: Dict[str, Any]) -> bool:
+    """A parent that SELLS NOTHING: no variant priced at or above MIN_SELLABLE_PRICE (a "choose your shade"
+    parent at 0.00). Only such a parent's own variants are replaced by its children.
+
+    NOT the legacy `_is_stub_variant` shape. A single "Default Title" variant at a real price is the normal
+    retailer product: it is the item the parent page sells, at that price. Dropping it put the parent URL's
+    canonical offer on the first child's price and stock (a 40.00 parent offered at its 100 ml child's 90.00).
+    A parent whose item a child repeats (same SKU or barcode) keeps it too; the child is absorbed."""
+    variants = [v for v in (product or {}).get("variants") or [] if isinstance(v, dict)]
+    return not any((_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE for v in variants)
+
+
+#: A quantity written in a title ("Glow Serum 30ml"): the parent's own item on a size axis.
+_TITLE_QUANTITY_RE = re.compile(r"(?i)\b\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|mg|oz|fl\.?\s*oz)\b")
+#: A title that counts units ("2 x 4.5g", "4.5g x2", "Duo", "Set of 3", "4.5g Set", "3 Pack", "25g 10 Sheets"): its
+#: quantity is one unit's, not the item's size, so it names no size for the parent's own item.
+_TITLE_MULTI_UNIT_RE = re.compile(
+    r"(?i)\d\s*[x×]\s*\d|\b[x×]\s*\d|\d\s*[x×]\b|\b(duo|trio|set|sets|pack|packs|bundle|kit)\b"
+    r"|\b\d+\s*(?:sheets?|pcs|pieces?|pads?|count|ct|capsules?|ampoules?|masks?|sachets?|patch(?:es)?|pairs?)\b")
+#: Neutral labels for a parent's own placeholder item on a SIZE axis, in order of preference.
+_PARENT_SIZE_LABELS = ("Standard", "Regular")
+
+
+def _listing_handle_usable(base_handle: str, handle: str) -> bool:
+    """Will the offer writer point a folded variant at /products/<handle>? The SAME predicate it uses
+    (ingestion.own_listing_url), on the URLs the record builder spells: the base's listing and the child's,
+    on one host. The fold does not know the host, and the predicate's host rule only asks that the two share
+    one, so any host gives the writer's answer for the handle itself."""
+    from services.catalog_enrichment_agent.ingestion import own_listing_url
+
+    if not str(handle or "").strip() or "/" in str(handle):
+        return False
+    host = "fold.invalid"
+    url = f"https://{host}/products/{handle}"
+    return own_listing_url(f"https://{host}/products/{base_handle or handle}", url) == url
+
+
+def _parent_item_label(title: str, *, taken: set) -> Optional[str]:
+    """The label for a priced parent's own placeholder item on a SIZE axis, or None to leave it unlabelled.
+
+    The ONE quantity its title states ("Glow Serum 30ml" -> "30ml"; not a multi-unit title, not
+    a title naming two quantities), else "Standard" -- the first candidate no child already uses (a repeated
+    label makes the seed writer drop them all). "Standard" says what the item is (the regular size), and invents
+    no measurement.
+
+    Never called for any other axis (the fold labels the item only when every folded child is a size). A colour
+    name the shop never wrote ("Original", "Classic") would be presented as a real shade in the picker, so on a
+    shade axis the item stays unlabelled and the existing all-or-nothing rule
+    (ingestion._drop_options_that_do_not_distinguish) serves the product as a plain list of named variants: no
+    picker, but nothing false in it."""
+    title = title or ""
+    found = [] if _TITLE_MULTI_UNIT_RE.search(title) else _TITLE_QUANTITY_RE.findall(title)
+    candidates = ([" ".join(found[0].split())] if len(found) == 1 else []) + list(_PARENT_SIZE_LABELS)
+    return next((c for c in candidates if _norm_label(c) not in taken), None)
+
+
+def _child_axis(child: Dict[str, Any], suffix: str) -> Tuple[Optional[str], str, bool]:
+    """(the shop's own axis name for this single-variant child, or None; its family; evidence).
+
+    The family is "shade", "size", or "named:<name>" for an axis the shop named that is neither ("Scent":
+    folded under the shop's own word, never relabelled a colour). `evidence` is True when the child's OWN
+    `options[0].name` names a shade or size axis for a value it really carries (option1 not a placeholder):
+    the merchant said what the variant is, which is what lets a finish word, a bare number or an untyped
+    product fold. Without a name the value decides: a quantity is a size, anything else a shade (the legacy
+    fold's assumption), with no evidence."""
+    variant = ((child.get("variants") or [{}])[0]) or {}
+    value = _variant_label(variant) or suffix
+    name = _base_option_name(child) if _variant_label(variant) else ""
+    family = _axis_family(name)
+    if family:
+        return name, family, True
+    if name:
+        return name, f"named:{name.casefold()}", False
+    return None, ("size" if _looks_like_a_size(value) else "shade"), False
+
+
+def _fold_refused_extended(base: Dict[str, Any], child: Dict[str, Any], suffix: str, family: str,
+                           evidence: bool) -> Optional[str]:
+    if _NON_SHADE_SUFFIX_RE.search(suffix or "") or _EXTENDED_NON_SHADE_SUFFIX_RE.search(suffix or ""):
+        return "non_shade_suffix"
+    if not evidence and _FINISH_OR_FORMULA_SUFFIX_RE.fullmatch(suffix or ""):
+        return "finish_or_formula_suffix"
+    if not evidence and _BARE_NUMBER_SUFFIX_RE.fullmatch((suffix or "").strip()):
+        return "bare_number_suffix"
+    bt, ct = (" ".join(str(p.get("product_type") or "").casefold().split()) for p in (base, child))
+    if bt and ct and bt != ct:
+        # A shade of a product is filed where the product is: "<Line> - Cuticle Oil" typed "Nail Care"
+        # beside a "Nail Polish" line is another product sharing a title prefix.
+        return "product_type_mismatch"
+    if not (bt and ct) and not evidence:
+        # An untyped side gives the type check nothing to compare: "<Lip Oil> - Cuticle Oil" would fold.
+        return "product_type_unknown"
+    # The parent's first SELLABLE price: an item under the floor (a 0.50 "choose a shade" stub, or a 0.00 sample
+    # listed before the real 40.00 item) names no price for the line. A parent that sells nothing has none,
+    # and its children are not price-compared.
+    bp = next((p for p in (_to_float(v.get("price")) for v in (base.get("variants") or []) if isinstance(v, dict))
+               if p is not None and p >= MIN_SELLABLE_PRICE), None)
+    cp = _first_price(child)
+    ratio = _FOLD_SIZE_PRICE_RATIO if family == "size" else _FOLD_PRICE_RATIO
+    if bp and cp and (max(bp, cp) / min(bp, cp)) > ratio:
+        return "price_mismatch"
+    return None
+
+
+def _fold_listings_extended(products: List[Dict[str, Any]]) -> "Tuple[List[Dict[str, Any]], Dict[str, Any]]":
+    """Pure. The legacy fold's collapse, with the rules the retailer feeds need:
+
+    * VENDOR-SCOPED bases: a title only matches a base of the same Shopify `vendor` (a multi-brand store
+      sells "Lip Oil" by two makers).
+    * SIZE SIBLINGS fold as Size variants: a quantity suffix or a child whose own option is named Size, at
+      the wider _FOLD_SIZE_PRICE_RATIO.
+    * OPTION NAMES from Shopify: a child's own axis name is kept, one spelling per base (the base's own
+      when it names the same axis), because the seed writer drops every label of a product whose variants
+      name two axes (ingestion._drop_options_that_do_not_distinguish).
+    * PARENT STUBS: a parent whose one variant sells nothing (placeholder or under MIN_SELLABLE_PRICE) is
+      replaced by its children; a parent's REAL variant that a child repeats (same label, SKU or barcode)
+      is kept and the child is absorbed, so no variant is listed twice.
+    * CODE-SUFFIX COPIES ("<Set> - AB12CD"): dropped as a re-listing of the base only with an identity
+      proof (`_same_product_proof`); unproven, they are refused and stay separate rows.
+    * REFUSALS on top of the legacy ones: product_type_mismatch, the extended non-shade suffixes,
+      code_suffix_unproven, and chained_fold (a base that is itself a child of a shorter base keeps its
+      own children rather than being folded away with them).
+
+    Report: the legacy keys plus `axes` (variants folded per axis family), `duplicates_absorbed` and
+    `copies_deduped` (by base handle), `superseded` (every listing that is no longer emitted, with the base
+    that took it over and why: the rows a migration retires), and `baseless_groups` (2+ single-variant
+    "<prefix> - <x>" rows with no base listing to fold into, which this fold leaves alone)."""
+    from services.catalog_identity import normalize_title
+
+    def title_of(p: Dict[str, Any]) -> str:
+        return str((p or {}).get("title") or "").strip()
+
+    def handle_of(p: Dict[str, Any]) -> str:
+        return str((p or {}).get("handle") or "")
+
+    rows = [p for p in products if isinstance(p, dict)]
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for p in rows:
+        key = (_vendor_token(p.get("vendor")), normalize_title(title_of(p)))
+        if key[1] and key not in by_key:
+            by_key[key] = p
+    refusals: List[Dict[str, str]] = []
+
+    def refuse(p: Dict[str, Any], reason: str) -> None:
+        refusals.append({"handle": handle_of(p), "title": title_of(p), "reason": reason})
+
+    # Pass 1: each row's candidate (base, kind, suffix, axis name, family).
+    target: Dict[int, Tuple[Dict[str, Any], str, str, Optional[str], str]] = {}
+    for p in rows:
+        title = title_of(p)
+        multi = len(p.get("variants") or []) > 1
+        for base_title in _shade_bases(title):
+            base = by_key.get((_vendor_token(p.get("vendor")), normalize_title(base_title))) if base_title else None
+            if base is None or base is p:
+                continue
+            suffix = title[len(base_title):].lstrip(" -").strip()
+            if _FORMULA_CLAIM_SUFFIX_RE.search(suffix):
+                refuse(p, "formula_claim_suffix")  # before the code test: "SPF50" is code-shaped
+                break
+            if _CODE_SUFFIX_RE.fullmatch(suffix):
+                proof = _same_product_proof(base, p)
+                if proof:
+                    target[id(p)] = (base, "copy", suffix, None, proof)
+                else:
+                    refuse(p, "code_suffix_unproven")
+                break
+            if multi:
+                break  # a suffixed multi-variant listing is a distinct line, as in the legacy fold
+            if not _listing_handle_usable(handle_of(base), handle_of(p)):
+                # A folded variant is sold on its own listing (/products/<handle>); a handle the offer writer will
+                # not point at (ingestion.own_listing_url: empty, "/", "?", "#", ...) would put its offer -- or
+                # the canonical one -- on the parent's page at the child's price.
+                refuse(p, "child_handle_unusable")
+                break
+            name, family, evidence = _child_axis(p, suffix)
+            refused = _fold_refused_extended(base, p, suffix, family, evidence)
+            if refused:
+                refuse(p, refused)
+            else:
+                target[id(p)] = (base, "variant", suffix, name, family)
+            break
+    # A base is never folded away: its own children would go with it.
+    bases = {id(t[0]) for t in target.values()}
+    for p in rows:
+        if id(p) in target and id(p) in bases:
+            del target[id(p)]
+            refuse(p, "chained_fold")
+    # Siblings that differ ONLY by finish / formula words ("- Matte Red" beside "- Satin Red", "- Gold" beside
+    # "- Glitter Gold") are formulas of one shade: all of them refused, unless the shop's own option names
+    # the axis (evidence, as in _fold_refused_extended).
+    by_rest: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for p in rows:
+        t = target.get(id(p))
+        if t is not None and t[1] == "variant" and not _axis_family(t[3] or ""):
+            by_rest.setdefault((id(t[0]), _without_finish_words(t[2])), []).append(p)
+    for (_base_id, rest), group in by_rest.items():
+        if rest and len({_norm_label(target[id(p)][2]) for p in group}) > 1:
+            for p in group:
+                del target[id(p)]
+                refuse(p, "finish_variant_siblings")
+    children: Dict[int, List[Dict[str, Any]]] = {}
+    for p in rows:
+        if id(p) in target:
+            children.setdefault(id(target[id(p)][0]), []).append(p)
+
+    report: Dict[str, Any] = {"bases": 0, "shades": 0, "stubs_replaced": 0, "images_adopted": 0,
+                              "folded": {}, "refused": refusals, "axes": {"shade": 0, "size": 0, "named": 0},
+                              "duplicates_absorbed": {}, "copies_deduped": {}, "superseded": [],
+                              "mixed_axes": [], "canonical_moved": [], "parent_items_labelled": []}
+    out: List[Dict[str, Any]] = []
+    for p in products:
+        if not isinstance(p, dict):
+            out.append(p)
+            continue
+        if id(p) in target:
+            continue
+        kids = children.get(id(p))
+        if not kids:
+            out.append(p)
+            continue
+        base_handle = handle_of(p) or title_of(p)
+        base_axis = _base_option_name(p)
+        stub = _is_extended_stub(p)
+        own = [] if stub else [dict(v, title=str(v.get("title") or v.get("option1") or "").strip())
+                               for v in (p.get("variants") or []) if isinstance(v, dict)]
+        seen_labels = {_norm_label(_variant_label(v)) for v in own} - {""}
+        seen_skus = {str(v.get("sku") or "").strip().casefold() for v in own} - {""}
+        seen_barcodes = {str(v.get("barcode") or "").strip() for v in own} - {""}
+        # One spelling per axis family for this base: the base's own, else the first a child wrote.
+        spelling: Dict[str, str] = {}
+        if _axis_family(base_axis) and not stub:
+            spelling[_axis_family(base_axis)] = base_axis
+        for k in kids:
+            _, _, _, name, family = target[id(k)]
+            if name and target[id(k)][1] == "variant":
+                spelling.setdefault(family, name)
+        added: List[Dict[str, Any]] = []
+        folded_handles: List[str] = []
+        for k in kids:
+            _, kind, suffix, _name, family = target[id(k)]
+            superseded = {"handle": handle_of(k), "base_handle": base_handle}
+            if kind == "copy":
+                report["copies_deduped"].setdefault(base_handle, []).append(handle_of(k))
+                report["superseded"].append({**superseded, "kind": "copy", "proof": family})
+                continue
+            sv = dict((k.get("variants") or [{}])[0] or {})
+            label = _variant_label(sv) or suffix or title_of(k)
+            sku = str(sv.get("sku") or "").strip().casefold()
+            barcode = str(sv.get("barcode") or "").strip()
+            if (_norm_label(label) in seen_labels or (sku and sku in seen_skus)
+                    or (barcode and barcode in seen_barcodes)):
+                report["duplicates_absorbed"].setdefault(base_handle, []).append(handle_of(k))
+                report["superseded"].append({**superseded, "kind": "duplicate"})
+                continue
+            seen_labels.add(_norm_label(label))
+            if sku:
+                seen_skus.add(sku)
+            if barcode:
+                seen_barcodes.add(barcode)
+            sv["title"] = label
+            sv["option1"] = label
+            sv.setdefault("id", k.get("id"))
+            img = _first(k.get("images")) or {}
+            if img.get("src"):
+                sv["image_src"] = str(img.get("src"))
+            sv[FOLDED_FROM_KEY] = handle_of(k)
+            sv[FOLD_AXIS_KEY] = spelling.get(family) or (
+                _DEFAULT_SIZE_OPTION_NAME if family == "size" else _DEFAULT_SHADE_OPTION_NAME)
+            added.append(sv)
+            folded_handles.append(handle_of(k))
+            kind_of = "named" if family.startswith("named:") else family
+            report["axes"][kind_of] += 1
+            report["superseded"].append({**superseded, "kind": kind_of})
+        if not added:
+            out.append(p)  # only copies or repeats: the base is unchanged, and is not a folded row
+            continue
+        # A priced parent's own item is usually Shopify's placeholder ("Default Title"). Unlabelled beside labelled
+        # children it makes the seed writer drop EVERY label (ingestion._drop_options_that_do_not_distinguish), so
+        # the folded product would have no picker. It gets a label on the children's axis instead.
+        added_families = {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
+        # Only when EVERY folded child is a size (_parent_item_label: no shade name is invented, and across
+        # mixed axes the seed writer drops the labels anyway).
+        if len(own) == 1 and not _variant_label(own[0]) and added_families == {"size"}:
+            label = _parent_item_label(title_of(p), taken={_norm_label(v.get("title")) for v in added})
+            if label:
+                own[0] = dict(own[0], title=label, option1=label,
+                              **{FOLD_AXIS_KEY: spelling.get("size") or _DEFAULT_SIZE_OPTION_NAME})
+                report["parent_items_labelled"].append({"base_handle": base_handle, "label": label})
+        # Two axes on one product: the seed writer then drops every label and serves the bare list
+        # (ingestion._drop_options_that_do_not_distinguish). Folded anyway, and named for the reviewer.
+        families = {_axis_family(base_axis)} - {None} if own else set()
+        families |= {target[id(k)][4] for k in kids if handle_of(k) in folded_handles}
+        if len(families) > 1:
+            report["mixed_axes"].append({"base_handle": base_handle, "axes": sorted(families)})
+        base = dict(p)
+        if stub and (p.get("variants") or []):
+            report["stubs_replaced"] += 1
+        if stub:
+            # The parent sells nothing, so the product's canonical offer is the first sellable child's item,
+            # sold on THAT child's listing (shopify_product_to_record points the offer there). The parent row
+            # keeps its key and URL; its canonical offer is not on its own page.
+            first = next((v for v in added if (_to_float(v.get("price")) or 0.0) >= MIN_SELLABLE_PRICE), None)
+            if first is not None:
+                report["canonical_moved"].append({"base_handle": base_handle, "handle": first[FOLDED_FROM_KEY]})
+        base["variants"] = own + added
+        base[FOLDED_INTO_KEY] = len(added)
+        if not _image_srcs(p):
+            adopted, seen_src = [], set()
+            for k in kids:
+                if target[id(k)][1] != "variant":
+                    continue
+                for src in _image_srcs(k):
+                    if src not in seen_src:
+                        seen_src.add(src)
+                        adopted.append({"src": src})
+            if adopted:
+                base["images"] = adopted
+                base[FOLDED_IMAGES_KEY] = True
+                report["images_adopted"] += 1
+        report["bases"] += 1
+        report["shades"] += len(added)
+        report["folded"][base_handle] = folded_handles
+        out.append(base)
+    # What this fold leaves fragmented: single-variant "<prefix> - <x>" rows with no base listing.
+    groups: Dict[Tuple[str, str], List[str]] = {}
+    for p in rows:
+        if id(p) in target or id(p) in bases or len(p.get("variants") or []) > 1:
+            continue
+        parts = title_of(p).split(_SHADE_SEP)
+        if len(parts) > 1 and parts[0].strip():
+            groups.setdefault((_vendor_token(p.get("vendor")), parts[0].strip()), []).append(handle_of(p))
+    baseless = sorted(((prefix, hs) for (_v, prefix), hs in groups.items() if len(hs) >= 2),
+                      key=lambda g: (-len(g[1]), g[0]))
+    report["baseless_groups"] = [{"prefix": prefix, "count": len(hs), "sample": hs[:5]} for prefix, hs in baseless]
+    return out, report
+
+
+def fold_report_summary(report: Optional[Dict[str, Any]], *, cap: int = 200) -> Optional[Dict[str, Any]]:
+    """A bounded copy of a fold report for a crawl report / run row: every count complete, every list at
+    most `cap` entries with a `*_truncated` flag (a store with a thousand shades must not bloat one ledger row)."""
+    if not isinstance(report, dict):
+        return None
+    out: Dict[str, Any] = {k: report.get(k) for k in ("bases", "shades", "stubs_replaced", "images_adopted")}
+    out["axes"] = dict(report.get("axes") or {})
+    out["superseded_count"] = len(report.get("superseded") or [])
+    out["refused_count"] = len(report.get("refused") or [])
+    out["refused_by_reason"] = dict(collections.Counter(r.get("reason") for r in report.get("refused") or []))
+    out["mixed_axes"] = list(report.get("mixed_axes") or [])[:cap]
+    out["canonical_moved"] = list(report.get("canonical_moved") or [])[:cap]
+    out["parent_items_labelled"] = list(report.get("parent_items_labelled") or [])[:cap]
+    for key in ("superseded", "refused", "baseless_groups"):
+        items = list(report.get(key) or [])
+        out[key] = items[:cap]
+        out[f"{key}_truncated"] = len(items) > cap
+    out["baseless_group_rows"] = sum(g.get("count", 0) for g in report.get("baseless_groups") or [])
+    return out
 
 
 def drop_shade_listings(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3038,6 +3997,12 @@ class CurrencyNotProven(RuntimeError):
     NEVER a conversion. This raises; it does not rewrite an amount into another
     currency. See services/region_pricing (ADR-024 commitment 5).
     """
+
+
+class PresentedCurrencyMismatch(CurrencyNotProven):
+    """The crawl's own `/products.json` responses were presented in a currency other than the one
+    `/meta.json` proved: the prices it read are not in the currency they would be labelled with
+    (`_PresentedCurrency`). The whole brand is refused before a record is built; nothing is relabelled."""
 
 
 def _vendor_token(value: Optional[str]) -> str:
@@ -3084,6 +4049,9 @@ class CuratedRecordBatch(list):
     def __init__(self, records: list, *, crawl_report: Optional[Dict[str, Any]] = None):
         super().__init__(records)
         self.crawl_report = dict(crawl_report) if crawl_report is not None else None
+        # The extended shade fold's FULL report (records_for_brand(fold_extended=True)), or None: the crawl
+        # report carries only a bounded summary, and a migration preview needs every superseded listing.
+        self.fold_report: Optional[Dict[str, Any]] = None
 
 
 async def records_for_brand(
@@ -3095,6 +4063,10 @@ async def records_for_brand(
     brand_by_vendor: Optional[Mapping[str, str]] = None,
     max_products: int = 500,
     base_listings_only: bool = False,
+    # With base_listings_only: fold with the retailer lane's extended rules (`_fold_listings_extended`:
+    # size siblings, parent stubs, code-suffix copies, the shop's own option names, vendor-scoped bases).
+    # The batch then carries the full fold report (`.fold_report`) and its crawl report a bounded summary.
+    fold_extended: bool = False,
     # Emit the merchant's OWN variants for products that are natively multi-variant
     # (the normal Shopify shape). Off by default: it adds one SKU + one offer per
     # variant, which moves recall fan-out and offer aggregation for every row the
@@ -3181,6 +4153,18 @@ async def records_for_brand(
                 f"page reads exactly like a missing file. If {actual or 'the proven value'} "
                 f"is genuinely right, pass --require-currency {actual or '<code>'} instead."
             )
+    presented = ((crawl_report or {}).get("presented_currency") if isinstance(crawl_report, dict) else None) or {}
+    proven = locale.get("currency")
+    foreign = {c: n for c, n in (presented.get("pages_by_currency") or {}).items() if c != proven}
+    unproven = sorted(set(presented.get("unproven_values") or ()) - {proven})
+    if foreign or unproven:
+        # BEFORE the records are built: those pages' prices are not in the currency they would be labelled.
+        seen = ", ".join([f"{c} on {n} page(s)" for c, n in sorted(foreign.items())]
+                         + [f"{c} in a conflicting or malformed cookie" for c in unproven])
+        raise PresentedCurrencyMismatch(
+            f"{domain}: /products.json was presented in {seen} (the cart_currency cookie of the crawl's own "
+            f"responses), but /meta.json proved {proven}: those prices are not {proven} amounts. Refusing the "
+            f"crawl; nothing is relabelled or converted.")
     if only_vendors is not None:
         # A filter that was ASKED FOR but normalises to nothing is refused, not skipped.
         # `--only-vendor "$VENDOR"` with the variable unset, or a jsonl row
@@ -3245,12 +4229,21 @@ async def records_for_brand(
             v["count"] for v in brand_census.values() if v["reason"] == "vendor_disagrees"
         ),
     }
+    if not isinstance(fold_extended, bool):
+        raise ValueError("fold_extended must be a boolean")
+    fold_report: Optional[Dict[str, Any]] = None
     if base_listings_only:
-        products, fold_report = fold_shade_listings(products)
+        # The legacy call is spelled exactly as before, so a caller that wraps the fold keeps working.
+        products, fold_report = (fold_shade_listings(products, extended=True) if fold_extended
+                                 else fold_shade_listings(products))
         records_for_brand.last_fold_report = fold_report  # type: ignore[attr-defined]
     records: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []  # (product, record) needing a PDP INCI try
+    # (record, its body_html sentences) for every record whose description IS its body copy (not
+    # the product_type fallback): the input of the batch-level repetition pass below.
+    described: List[Tuple[Dict[str, Any], List[str]]] = []
     for p in products:
+        sentences = body_html_sentences((p or {}).get("body_html")) if isinstance(p, dict) else []
         rec = shopify_product_to_record(
             # brand_by_vendor (multi-brand retailer cohorts): each vendor's OWN canonical spelling, applied
             # by the same resolve_record_brand rule a single-brand job's `brand` gets.
@@ -3260,14 +4253,29 @@ async def records_for_brand(
             emit_native_variants=emit_real_variants,
             currency=locale.get("currency"),
             source_role=source_role, retailer_name=retailer_name,
+            body_sentences=sentences,
         )
         if not rec:
             continue
         records.append(rec)
+        if sentences and (rec.get("pdp") or {}).get("attribute_summary") == join_description_sentences(sentences):
+            described.append((rec, sentences))
         if enrich_missing_inci and not (rec.get("pdp") or {}).get("raw_inci"):
             handle = str((p or {}).get("handle") or "").strip()
             if handle:
                 pairs.append({"handle": handle, "rec": rec})
+    # Store-level boilerplate: a sentence on most of THIS batch's products is the store's template.
+    # Re-joined (and re-capped) from the cleaned sentences, so removed boilerplate frees room
+    # under the cap for the product's own copy.
+    cleaned, repeat_report = drop_repeated_store_sentences(
+        [s for _, s in described],
+        [description_nouns(r["pdp"].get("category_path"), r["pdp"].get("category_source_product_type"))
+         for r, _ in described],
+        [description_kind(r["pdp"].get("category_path"), r["pdp"].get("category_source_product_type"))
+         for r, _ in described])
+    for (rec, before), after in zip(described, cleaned):
+        if after != before:
+            rec["pdp"]["attribute_summary"] = join_description_sentences(after)
     inci_report: Optional[Dict[str, Any]] = None
     if enrich_missing_inci and pairs:
         # A wall-clock budget as well as a count: parsing a PDP for INCI is CPU-bound and scales with the page
@@ -3317,6 +4325,9 @@ async def records_for_brand(
     report = {**crawl_report, "emitted_records": len(records),
               "gift_items_dropped": len(gifts_dropped),
               "gift_items_dropped_sample": gifts_dropped[:50]} if crawl_report is not None else None
+    if report is not None and repeat_report["threshold"] is not None:
+        # Only when the batch was big enough for the pass to run: evidence of what it removed.
+        report["description_repeats"] = repeat_report
     if report is not None and inci_report is not None:
         report["inci_enrichment"] = inci_report
     if report is not None and identity_report is not None:
@@ -3324,4 +4335,8 @@ async def records_for_brand(
     storefront = shop_storefront_identity(domain)
     if report is not None and storefront is not None:
         report["storefront"] = storefront
-    return CuratedRecordBatch(records, crawl_report=report)
+    if report is not None and fold_report is not None and fold_extended:
+        report["shade_fold"] = fold_report_summary(fold_report)
+    batch = CuratedRecordBatch(records, crawl_report=report)
+    batch.fold_report = fold_report if fold_extended else None
+    return batch

@@ -87,6 +87,16 @@ class _RecordingDB:
         self.executes.append({"sql": sql, "params": params})
 
 
+@pytest.fixture(autouse=True)
+def _market_prices_flag_on(monkeypatch: pytest.MonkeyPatch):
+    """Every scope refuses to run without the write flag, as prod jobs must carry it. The
+    stub DB does not answer the column probe, so the upsert still takes the legacy path."""
+    monkeypatch.setenv(apv.MARKET_PRICES_FLAG_ENV, "on")
+    apv.reset_market_prices_probe()
+    yield
+    apv.reset_market_prices_probe()
+
+
 @pytest.fixture
 def wired(monkeypatch: pytest.MonkeyPatch) -> _RecordingDB:
     """One enriched content_key, all source reads stubbed, overlay present."""

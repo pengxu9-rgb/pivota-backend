@@ -470,7 +470,7 @@ async def run(
         "products_scanned", "products_planned", "skus", "offers",
         "skipped_not_merchant_issued", "skipped_no_variant_price",
         "skipped_no_live_offer", "skipped_multi_merchant_product",
-        "skipped_no_destination_url", "skipped_currency_disagrees_with_offer",
+        "skipped_no_destination_url", "skipped_currency_disagrees_with_offer", "skipped_no_currency",
         "skipped_offer_owned_by_other_writer", "skipped_suppressed_sku",
         "adopted_existing_sku_row", "rolled_back_offer_refused_by_guard",
         "skipped_unique_violation", "skus_deduped_same_identity",
@@ -545,7 +545,12 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
                     # trips the ADR-024 market/currency invariant at offer grain.
                     counts["skipped_currency_disagrees_with_offer"] += 1
                     continue
-                currency = vcur or offer_currency or "USD"
+                currency = vcur or offer_currency
+                if not currency:
+                    # Never a USD default (Peng 2026-10-19): a variant price nobody stated a
+                    # currency for is not a price.
+                    counts["skipped_no_currency"] += 1
+                    continue
                 labels, attrs = _option_labels(variant)
                 sku_params = {
                     "sku_key": derive_variant_sku_key(row["product_key"], stored_vid),

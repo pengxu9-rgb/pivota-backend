@@ -83,6 +83,7 @@ and no values — and it is mapped to a bare reason code below rather than forwa
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -92,11 +93,13 @@ import secrets
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, StrictInt, StrictStr, model_validator
 
+import db.agent_purchase_ledger as agent_purchase_ledger
 import db.reap_agentic_ledger as ledger
 import db.reap_continuation as continuation
 # THE ONE consent-tag shape rule, imported rather than re-implemented. Bound at module level
@@ -129,6 +132,13 @@ from services.shopify_variant_identity import (
 # ingestion and re-key path mints with (retailer domain -> etld1 alone, else (brand, etld1)).
 # Imported, never re-implemented -- see `_mirror_seller_ref`.
 from services.seller_identity import resolve_seed_seller_identity
+# THE seed-currency rule for offers copied off a seed (Peng 2026-10-19), in its Python twin: these
+# statements stay one text on both dialects, and the SQL predicate is Postgres-only.
+from services.seed_offer_currency import (
+    is_seed_projected_offer,
+    offer_priced_in_seed_currency,
+    seed_currency_guard_enabled,
+)
 # THE ONE merchant-host canonicaliser, imported rather than re-implemented: lower case, ONE
 # leading `www.` removed, and a ValueError for anything that is not a bare DNS host name —
 # including a trailing dot. It is `tierb_cart_link_eligibility`'s own key function
@@ -261,9 +271,17 @@ def _refused(exc: svc.PurchaseRefused) -> JSONResponse:
     reason = str(getattr(exc, "reason", "") or "invalid_request")
     if reason in {"create_disabled", "pilot_scope_invalid", "pilot_scope_refused"}:
         return JSONResponse(status_code=404, content={"error": "not_available_on_this_rail"})
+    content: Dict[str, Any] = {"error": reason}
+    existing = getattr(exc, "existing_purchase_id", None)
+    if reason == "idempotency_conflict" and isinstance(existing, str):
+        # Set only by `_replayed_purchase_id`, from the owner-scoped key row: the caller's own purchase.
+        from services.payment_orchestration.rails import RAIL_ID_PREFIX
+
+        content["purchase_id"] = existing
+        content["rail"] = next((r for prefix, r in RAIL_ID_PREFIX.items() if existing.startswith(prefix)), None)
     return JSONResponse(
         status_code=_REFUSAL_STATUS.get(reason, _DEFAULT_REFUSAL_STATUS),
-        content={"error": reason},
+        content=content,
     )
 
 
@@ -494,6 +512,12 @@ class StartPurchaseRequest(BaseModel):
     merchant_domain: str = Field(..., min_length=1, max_length=255)
     product_key: str = Field(..., min_length=1)
     variant_key: Optional[str] = None
+    #: CART-LINK ONLY, and never with `variant_key`: the buyer's chosen variant as the storefront
+    #: numbers it (get_product's `variants[].variant_id`). The route resolves it to the catalog's own
+    #: sku (`_resolve_selected_variant_key`); a door must not spell a sku key itself, because the
+    #: catalog spells one variant several ways (`::sku_<hash>`, `::v:<n>`, `::v::<n>`, a
+    #: seller-scoped `::v:retailer-<hash>`), and a guessed key that is not there is `row_not_found`.
+    variant_id: Optional[StrictStr] = Field(None, pattern=r"^[1-9][0-9]{0,19}$")
     quantity: StrictInt = Field(1, ge=1, le=svc.MAX_QUANTITY)
     buyer: ReapBuyer
     return_url: Optional[str] = None
@@ -529,6 +553,12 @@ class StartPurchaseRequest(BaseModel):
         present = names & self.model_fields_set
         if present and (present != names or self.expected_unit_price_minor is None or self.expected_currency is None):
             raise ValueError("expected money must be a nonnull pair")
+        return self
+
+    @model_validator(mode="after")
+    def one_variant_selector(self):
+        if self.variant_id is not None and (str(self.variant_key or "").strip() or self.item_source != "cart_link"):
+            raise ValueError("variant_id is a cart-link selector, never beside variant_key")
         return self
 
 
@@ -1138,10 +1168,15 @@ _SKUS_FOR_PRODUCT_SQL = """
 #: both, and `Decimal(str(...))` is the parse the converter already does.
 #: The ORDER BY deliberately stays on the numeric expression — ordering on the text would sort
 #: '9.00' after '10.00'.
+#: Cheapest first, and more than one: the first row `_offers_priced_in_seed_currency` keeps is the
+#: price, so a stale seed copy that happens to be cheapest cannot hide the seller's real offer.
+#: Bounded at 20: should 20 or more cheaper refused copies sit on one sku, the real offer is not read
+#: and the row answers `row_unpriced`. That fails closed, never a wrong price.
 _OFFER_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.sku_key = :sku_key
        AND o.product_key = :product_key
@@ -1149,9 +1184,49 @@ _OFFER_SQL = """
        AND o.suppression_reason IS NULL
        AND o.suppressed_at IS NULL
        AND coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) IS NOT NULL
-     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
-     LIMIT 1
+     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC,
+              o.offer_id ASC
+     LIMIT 20
 """
+
+#: EVERY seed attached to the listing an offer prices, as stored, for the seed-currency rule
+#: (services/seed_offer_currency): an offer copied off a seed is a price only while an ACTIVE seed is
+#: attached to its listing and every active one is read in the offer's currency. On 2026-10-19 US
+#: search served SKINTIFIC's set at USD 23.56 from offers the variant backfill copied off a seed that
+#: had since been re-read in AUD; this route must not charge that number. Bounded: past 50 seeds the
+#: listing is not one whose price anyone can vouch for, and its copied offers are refused. That is the
+#: one place this route is stricter than the SQL predicate, which reads every seed and keeps a copy
+#: they all agree with (tests/test_purchase_path_seed_offer_currency_postgres.py pins both answers).
+_LISTING_SEEDS_SQL = """
+    SELECT e.status, e.price_currency, e.seed_data
+      FROM external_product_seeds e
+     WHERE e.attached_product_key = :product_key
+     ORDER BY e.id
+     LIMIT 51
+"""
+_LISTING_SEEDS_MAX = 50
+
+
+async def _offers_priced_in_seed_currency(product_key: str, rows: Any) -> List[Dict[str, Any]]:
+    """`rows` (offers on `product_key`'s listing, in order) minus every offer copied off a seed
+    that is not priced in its seed's currency. An offer no seed-copying writer wrote is kept as it
+    is, and when there is none the seeds are not read at all. With the reader kill switch
+    (CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD) off, every row is kept, as before the rule."""
+    offers = [dict(row) for row in rows or ()]
+    if not seed_currency_guard_enabled() or not any(is_seed_projected_offer(offer) for offer in offers):
+        return offers
+    seeds = [dict(row) for row in await database.fetch_all(
+        _LISTING_SEEDS_SQL, {"product_key": product_key}
+    )]
+    if len(seeds) > _LISTING_SEEDS_MAX:
+        seeds = []
+    kept = [offer for offer in offers if offer_priced_in_seed_currency(offer, seeds)]
+    if len(kept) != len(offers):
+        logger.warning(
+            "reap.offer_not_in_seed_currency product_key=%s refused=%s kept=%s",
+            product_key, len(offers) - len(kept), len(kept),
+        )
+    return kept
 
 
 async def _load_catalog_row(
@@ -1217,7 +1292,7 @@ async def _load_catalog_row(
             )
         sku = candidates[0]
 
-    offer = await database.fetch_one(
+    offers = await _offers_priced_in_seed_currency(product_key, await database.fetch_all(
         _OFFER_SQL,
         {
             "sku_key": sku["sku_key"],
@@ -1226,12 +1301,12 @@ async def _load_catalog_row(
             # sku — see the note above `_PRODUCT_SQL`.
             "merchant_id": str(product.get("merchant_id") or ""),
         },
-    )
-    if not offer:
+    ))
+    if not offers:
         raise svc.PurchaseRefused(
             "row_unpriced", "the eligible merchant has no usable offer of its own on this sku"
         )
-    offer = dict(offer)
+    offer = offers[0]
 
     currency = str(offer.get("currency") or sku.get("sku_currency") or "").strip().upper()
     if not currency:
@@ -1321,13 +1396,39 @@ _CART_PRODUCT_SKUS_SQL = """
 """
 #: More live skus than this is not a product a cart link can name one variant of.
 _CART_MAX_SKUS = 50
+# The seed's STORE is decided by `_seed_storefront_host`, not by `lower(e.domain) = <POSTed host>`: a
+# seed and its mirror row spell one store's host two ways (prod 2026-10-14: 1,540 rows whose seed says
+# `www.<store>` under a product saying `<store>`, 40 the other way), and an exact match refused them all.
 _CART_SEED_VARIANT_SQL = """
-    SELECT e.attached_variant_id, e.seed_data, e.destination_url, e.canonical_url
+    SELECT e.attached_variant_id, e.seed_data, e.destination_url, e.canonical_url, e.domain
       FROM external_product_seeds e
      WHERE e.id = :seed_id AND e.status = 'active'
        AND e.attached_product_key = :product_key
-       AND lower(e.domain) = :merchant_domain AND upper(e.market) = :market_country
+       AND upper(e.market) = :market_country
 """
+
+
+def _seed_storefront_host(seed: Mapping[str, Any], merchant_domain: str) -> Optional[str]:
+    """The storefront host of a mirror row's seed, or None when the seed is not THIS store's.
+
+    It is the host of the seed's product URL (`canonical_url`, else `destination_url`): the page its
+    storefront proofs were fetched from, so the proof readers check against it exactly. The POSTed
+    host, that URL host and the seed's `domain` column (when set) must all be ONE storefront under
+    the one-`www.` rule (`_same_storefront_host`, the enrichment branch's rule too): `www.` is noise,
+    a subdomain (`uk.<store>`) or a lookalike is another store. A seed with no `domain` is placed by
+    its URL alone (the mirror derives the row's seller the same way, `domain` else the URL host).
+    """
+    url = seed.get("canonical_url") or seed.get("destination_url")
+    try:
+        host = (urlsplit(str(url)).hostname or "") if url else ""
+    except ValueError:
+        host = ""
+    if not host or not _same_storefront_host(merchant_domain, host):
+        return None
+    domain = str(seed.get("domain") or "").strip()
+    if domain and not _same_storefront_host(merchant_domain, domain):
+        return None
+    return host
 # THE MARKET'S CURRENCY, in SQL (review of #2457): an offer in another currency is not an offer for
 # this buyer -- not a price to compare, not a cheaper pick. It gates on `currency`, NEVER on
 # `market`, for the reason `services.region_pricing` gives: `market` is NOT NULL DEFAULT 'US' and
@@ -1340,7 +1441,8 @@ _CART_OFFER_MARKET_CURRENCY = "upper(trim(coalesce(o.currency, ''))) = :market_c
 _CART_ALL_OFFERS_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.product_key = :product_key AND o.sku_key = :sku_key
        AND o.merchant_id = :merchant_id
@@ -1352,10 +1454,12 @@ _CART_ALL_OFFERS_SQL = """
      ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
      LIMIT 20
 """
+# Cheapest first, and more than one, for the reason `_OFFER_SQL` gives.
 _CART_OFFER_SQL = """
     SELECT o.currency,
            CAST(coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price)
-                AS TEXT) AS price
+                AS TEXT) AS price,
+           o.source_system
       FROM catalog_offers o
      WHERE o.product_key = :product_key AND o.sku_key = :sku_key
        AND o.merchant_id = :merchant_id
@@ -1364,8 +1468,9 @@ _CART_OFFER_SQL = """
        AND lower(coalesce(o.availability, 'unknown')) NOT IN
            ('out_of_stock', 'sold_out', 'unavailable')
        AND """ + _CART_OFFER_MARKET_CURRENCY + """
-     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC
-     LIMIT 1
+     ORDER BY coalesce(o.merchant_effective_price, o.estimated_best_price, o.list_price) ASC,
+              o.offer_id ASC
+     LIMIT 20
 """
 
 
@@ -1476,8 +1581,8 @@ def _mirror_seller_ref(product: Mapping[str, Any], seed: Mapping[str, Any], seed
     "seller_ref must equal merchant_id" refused all of them. A NULL seller_ref is accepted when the
     row's `merchant_id` is EXACTLY the observed seller id the repo's own minting function derives
     for this storefront: `resolve_seed_seller_identity(brand, domain)` over the attached ACTIVE
-    seed's domain (which `_CART_SEED_VARIANT_SQL` already pinned to `merchant_domain` and this
-    product; no seed row -> None). The brand is the one the mirror minted from
+    seed's domain (which `_seed_storefront_host` already placed on `merchant_domain`'s storefront,
+    and `_CART_SEED_VARIANT_SQL` on this product; no seed row -> None). The brand is the one the mirror minted from
     (`mirrored_seed_brand`: snapshot.brand, brand, snapshot.vendor, vendor), else the product's.
     A non-null seller_ref keeps today's rule: it must equal merchant_id. Live: brand Judydoll + judydoll.com -> merch_obs_a25cbba37ef98c52.
     """
@@ -1684,7 +1789,7 @@ def _enrichment_variant_title(sku: Mapping[str, Any]) -> Optional[str]:
 
 async def _load_enrichment_cart_link_item(
     *, product: Dict[str, Any], merchant_host: str, variant_key: Optional[str],
-    market_country: str,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """`_load_cart_link_item` for an ENRICHMENT row: the same four-tuple, or a refusal.
 
@@ -1779,6 +1884,8 @@ async def _load_enrichment_cart_link_item(
     priced, price_minor, price_reason = enrichment_offer_price_ok(listing, proof, market_currency)
     if not priced:
         raise svc.PurchaseRefused(price_reason, "enrichment offer price refused")
+    if priced_sku is not None:
+        priced_sku["sku_key"] = str(sku["sku_key"])
 
     return (
         {"shop_domain": merchant_host, "our_price_minor": int(price_minor),
@@ -1795,7 +1902,7 @@ async def _load_enrichment_cart_link_item(
 
 async def _load_cart_link_item(
     *, merchant_domain: str, product_key: str, variant_key: Optional[str],
-    market_country: str,
+    market_country: str, priced_sku: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str, str, Optional[str]]:
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
@@ -1805,6 +1912,9 @@ async def _load_cart_link_item(
 
     ENRICHMENT rows (option 2) take `_load_enrichment_cart_link_item` instead, and only while
     REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED is on. Off, not one extra statement runs here.
+
+    `priced_sku`, when given, is filled with the `sku_key` of the sku this load PRICED (on success
+    only): the one a no-key load chose, which `/purchases/prepare` names in its witness.
     """
     if svc.is_cart_link_enrichment_enabled():
         enrichment = await database.fetch_one(
@@ -1814,7 +1924,7 @@ async def _load_cart_link_item(
         if enrichment is not None:
             return await _load_enrichment_cart_link_item(
                 product=dict(enrichment), merchant_host=merchant_domain,
-                variant_key=variant_key, market_country=market_country,
+                variant_key=variant_key, market_country=market_country, priced_sku=priced_sku,
             )
     raw = await database.fetch_one(
         _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain}
@@ -1881,10 +1991,13 @@ async def _load_cart_link_item(
         seed = await database.fetch_one(
             _CART_SEED_VARIANT_SQL,
             {"seed_id": product.get("source_ref"), "product_key": product_key,
-             "merchant_domain": merchant_domain,
              "market_country": market_country},
         )
         seed = dict(seed) if seed else {}
+        # Another store's seed is no seed: no proof is read from it, so the row is refused below.
+        seed_host = _seed_storefront_host(seed, merchant_domain) if seed else None
+        if seed_host is None:
+            seed = {}
         seed_data = seed.get("seed_data")
         if isinstance(seed_data, str):
             try:
@@ -1896,13 +2009,13 @@ async def _load_cart_link_item(
         proven = verified_cart_variant_id(
             seed_data,
             product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
-            shop_domain=merchant_domain,
+            shop_domain=seed_host or merchant_domain,
             catalog_variant_id=sku_variant,
         )
         if named is not None and not _is_placeholder_sku(named, product_key):
             selected_proof = verified_selected_cart_variant_id(
                 seed_data, product_urls=[seed.get("canonical_url") or seed.get("destination_url")],
-                shop_domain=merchant_domain, catalog_variant_id=sku_variant,
+                shop_domain=seed_host or merchant_domain, catalog_variant_id=sku_variant,
             )
             proven = selected_proof or proven
         variant_id = proven.variant_id if proven else None
@@ -1944,8 +2057,9 @@ async def _load_cart_link_item(
     #     `row_price_ambiguous`;
     #   * only for a mirror row with no caller-named sku; Shopify rows are unchanged.
     mirror_placeholder = placeholder if platform != "shopify" and named is None else None
-    # The same gate when the caller NAMES the placeholder (review of #2457): it is priced by the
-    # ordinary read below, and must not become the way around `live_variant_count == 1`.
+    # The same gate when the placeholder is loaded BY NAME (review of #2457): it is priced by the
+    # ordinary read below, and must not become the way around `live_variant_count == 1`. A create may
+    # no longer name it (`_refuse_named_placeholder`); a resume of a stored body still may.
     if (platform != "shopify" and named is not None and _is_placeholder_sku(named, product_key)
             and _proof_live_variant_count(seed_data) != 1):
         raise svc.PurchaseRefused("row_unpriced", "a placeholder prices only a sole live variant")
@@ -1961,16 +2075,17 @@ async def _load_cart_link_item(
     for candidate in candidates:
         if mirror_placeholder is not None and candidate["sku_key"] == mirror_placeholder["sku_key"]:
             continue  # the placeholder is only ever read below, every offer, behind the gate
-        found = await database.fetch_one(
+        found = await _offers_priced_in_seed_currency(product_key, await database.fetch_all(
             _CART_OFFER_SQL, {**offer_params, "sku_key": candidate["sku_key"]}
-        )
-        if found is not None:
-            priced.append(_priced(candidate, found))
+        ))
+        if found:
+            priced.append(_priced(candidate, found[0]))
     if (not priced and mirror_placeholder is not None
             and _proof_live_variant_count(seed_data) == 1):
-        priced = [_priced(mirror_placeholder, found) for found in await database.fetch_all(
-            _CART_ALL_OFFERS_SQL, {**offer_params, "sku_key": mirror_placeholder["sku_key"]}
-        )]
+        priced = [_priced(mirror_placeholder, found) for found in await _offers_priced_in_seed_currency(
+            product_key, await database.fetch_all(
+                _CART_ALL_OFFERS_SQL, {**offer_params, "sku_key": mirror_placeholder["sku_key"]}
+            ))]
     if len({(cur, minor) for _c, _o, cur, minor in priced}) > 1:
         raise svc.PurchaseRefused(
             "row_price_ambiguous", "the spellings of this variant carry different prices"
@@ -1987,6 +2102,8 @@ async def _load_cart_link_item(
         raise svc.PurchaseRefused("row_currency_mismatch", "offer currency differs from market")
     if not price_minor or price_minor <= 0:
         raise svc.PurchaseRefused("row_unpriced", "offer price is not an exact minor amount")
+    if priced_sku is not None:
+        priced_sku["sku_key"] = str(sku["sku_key"])
 
     # URL and click id are filled by the route after it mints a new click. These are facts only;
     # there is no URL-shaped caller input anywhere in this path.
@@ -2048,6 +2165,112 @@ def _default_return_url() -> str:
         return configured
     hosts = rc.return_url_hosts()
     return f"https://{hosts[0]}/reap/return"
+
+
+#: The fingerprint's spelling of a `variant_id` selector. A sku key always starts with its product key
+#: (`prod::…`), so no `variant_key` can collide with it.
+_VARIANT_ID_HASH_PREFIX = "variant_id:"
+
+
+def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optional[str]]:
+    """`(variant_key, fingerprint_variant)` from a create-shaped body: the caller's `variant_key` (both
+    the same), or for a `variant_id` no key yet and `variant_id:<n>` in the fingerprint. THE ONE RULE
+    for every door that fingerprints a body (create on either route, resume, recover): the fingerprint
+    holds what the caller SENT, never a key resolved from today's catalog, so a retry hashes the same."""
+    if req.variant_id is not None:
+        return None, _VARIANT_ID_HASH_PREFIX + req.variant_id
+    key = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+    return key, key
+
+
+#: More spellings of ONE selected variant than this is not a catalog to price by loading each (prod: at most 2).
+_MAX_VARIANT_SPELLINGS = 4
+
+
+async def _resolve_selected_variant_key(
+    *, merchant_domain: str, product_key: str, variant_id: str, market_country: str,
+) -> Optional[str]:
+    """What to load for a buyer-selected storefront variant (a `variant_id` selector): a sku key to load as a
+    caller-named one, or None to load with NO key (the no-key path). EITHER WAY the caller then requires the
+    loaded variant to BE `variant_id` (`_require_selected_variant`): nothing here may buy another one.
+
+    `/purchases/prepare`'s guards first: the product on this host (`row_not_found`), and every live
+    non-placeholder sku naming that variant (`_cart_numeric_variant`, the lane's one reader) must be THIS
+    listing's -- the product's own merchant and platform -- or the selection is `row_variant_unverified`.
+      * no real sku at all (the `::canonical` placeholder only): None; the storefront proof is the identity;
+      * real skus, none naming it: `row_variant_unverified`;
+      * it is the product's ONLY distinct variant: None; the no-key path prices it exactly as it would have
+        (a sole-variant placeholder offer included, which a named sku never reads);
+      * one sku names it: that sku;
+      * several (one variant spelled by two writers, e.g. `::sku_<hash>` and `::v:<n>`; more than
+        `_MAX_VARIANT_SPELLINGS` is `row_variant_ambiguous`): the no-key path's pricing rule per spelling --
+        each is loaded as a named sku, a spelling with no usable offer (`row_unpriced`) is passed over, any
+        other refusal stands, the priced ones must agree (`row_price_ambiguous`), and the lowest sku_key wins.
+    Reads only.
+    """
+    product = await database.fetch_one(
+        _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_domain})
+    if product is None:
+        raise svc.PurchaseRefused("row_not_found", "no catalog product for this domain and key")
+    skus = [dict(row) for row in await database.fetch_all(
+        _CART_PRODUCT_SKUS_SQL.replace(
+            "s.sku_key, s.source_variant_id,", "s.sku_key, s.source_variant_id, s.merchant_id, s.platform,"),
+        {"product_key": product_key})]
+    if len(skus) > _CART_MAX_SKUS:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "too many skus to select a variant from")
+    real = [sku for sku in skus if not _is_placeholder_sku(sku, product_key)]
+    variants = {_cart_numeric_variant(sku.get("source_variant_id"), product_key) for sku in real}
+    matches = sorted((sku for sku in real
+                      if _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id),
+                     key=lambda sku: str(sku["sku_key"]))
+    if any(sku.get("merchant_id") != product["merchant_id"] or sku.get("platform") != product["platform"]
+           for sku in matches):
+        raise svc.PurchaseRefused("row_variant_unverified", "a sku naming the selected variant is another listing's")
+    if not real:
+        return None
+    if not matches:
+        raise svc.PurchaseRefused("row_variant_unverified", "no live sku names the selected variant")
+    if variants == {variant_id}:
+        return None
+    if len(matches) == 1:
+        return str(matches[0]["sku_key"])
+    if len(matches) > _MAX_VARIANT_SPELLINGS:
+        raise svc.PurchaseRefused("row_variant_ambiguous", "too many spellings of the selected variant")
+    priced: List[Tuple[str, int, str]] = []
+    unpriced: Optional[svc.PurchaseRefused] = None
+    for sku in matches:
+        try:
+            facts, _seller, _variant, _kind = await _load_cart_link_item(
+                merchant_domain=merchant_domain, product_key=product_key,
+                variant_key=str(sku["sku_key"]), market_country=market_country)
+        except svc.PurchaseRefused as exc:
+            if exc.reason != "row_unpriced":
+                raise
+            unpriced = unpriced or exc
+            continue
+        priced.append((str(sku["sku_key"]), facts["our_price_minor"], facts["currency"]))
+    if not priced:
+        raise unpriced  # type: ignore[misc] - every spelling was refused row_unpriced
+    if len({(minor, cur) for _key, minor, cur in priced}) > 1:
+        raise svc.PurchaseRefused("row_price_ambiguous", "the spellings of this variant carry different prices")
+    return priced[0][0]
+
+
+def _refuse_named_placeholder(variant_key: Optional[str], product_key: str) -> None:
+    """A CREATE may not NAME the `<product_key>::canonical` placeholder (both lanes spell it so). It names no
+    variant, so nothing at create would hold the purchase to the one a caller saw: a storefront proof that moved
+    between `/purchases/prepare` and the create would buy the new variant at the old price. A caller sends no
+    key, or the storefront `variant_id` (`_require_selected_variant` holds the purchase to it). Recovery and
+    resume are not refused here: recovery re-sends a stored body and reads no catalog, and resume is held to the
+    stored cart's own line (`_validate_resume_selection`)."""
+    if variant_key is not None and variant_key == product_key + _CANONICAL_SKU_SUFFIX:
+        raise svc.PurchaseRefused("row_variant_unverified", "a create names a variant, never the placeholder")
+
+
+def _require_selected_variant(loaded_variant: Any, variant_id: Optional[str]) -> None:
+    """A `variant_id` selection buys THAT variant or nothing: the variant the cart-link load proved must be it."""
+    if variant_id is not None and str(loaded_variant or "") != variant_id:
+        raise svc.PurchaseRefused("row_variant_unverified", "the proven variant is not the selected one")
 
 
 def _request_hash(
@@ -2152,9 +2375,18 @@ async def _replayed_purchase_id(
     # second possibly charged checkout; a new intentional purchase requires a new key.
     stored_hash = str(record.get("request_hash") or "")
     if not stored_hash or stored_hash != request_hash:
-        raise svc.PurchaseRefused(
+        refusal = svc.PurchaseRefused(
             "idempotency_conflict", "this key was used for a different request"
         )
+        # NAME THE PURCHASE THE KEY OPENED, when it opened one. The lookup above is scoped to THIS
+        # agent and THIS end user, so the id is the caller's own. A retry whose details changed
+        # under it (a re-keyed catalog row fills a different product_key) conflicts while that
+        # purchase EXISTS; the id lets the caller read it instead of guessing and buying again.
+        # Never a refusal tombstone or a retirement marker: only a well-formed rail purchase id.
+        existing = str(record.get("purchase_id") or "").strip()
+        if _RAIL_PURCHASE_ID_RE.fullmatch(existing):
+            refusal.existing_purchase_id = existing
+        raise refusal
     stored = str(record.get("purchase_id") or "").strip()
     if stored.startswith(_REFUSED_KEY_PREFIX):
         # A TOMBSTONE: this key, for this exact request, was refused (or retired). The same
@@ -2169,6 +2401,9 @@ async def _replayed_purchase_id(
         raise svc.PurchaseRefused(reason, "this key was refused for this request")
     return stored or None
 
+
+#: A rail's own purchase id, as a key row stores it (Reap `rp_`, the A2A rail `ap_`).
+_RAIL_PURCHASE_ID_RE = re.compile(r"(?:rp|ap)_[0-9a-f]{24}")
 
 #: `reap_agentic_purchase_keys.purchase_id` of a key whose request was REFUSED (not a purchase).
 _REFUSED_KEY_PREFIX = "refused:"
@@ -2544,6 +2779,55 @@ async def _owner_public_body(row):
     return body
 
 
+#: The most the post-commit parent write may add to the create's 202 (see `_record_purchase_parent`).
+_RECORD_PARENT_TIMEOUT_S = 1.0
+
+
+async def _record_purchase_parent(purchase_id: str) -> None:
+    """Payment orchestration P0: the rail-neutral parent row (db/agent_purchase_ledger.py).
+
+    AFTER this route's own transaction has committed, never inside it, and it never raises: the
+    parent is derived entirely from the committed purchase row, so a parent that is not written
+    here is written by the unified read's heal or by the backfill, and a fault in this table can
+    never fail, delay or roll back a purchase. Dark unless AGENT_PURCHASE_LEDGER_ENABLED is on.
+    BOUNDED: it is awaited inside the 202 path, so a stalled ledger write (queued DDL, an exhausted
+    pool) is abandoned after `_RECORD_PARENT_TIMEOUT_S` and healed later instead of holding the
+    agent's response. On Postgres the bound holds (asyncpg cancels the statement and the pool resets
+    or terminates the connection, so nothing dirty is handed back). On SQLite the cancellation waits
+    out the busy timeout (aiosqlite's single worker thread), which only matters in tests. An idempotent replay returns before this hook and a duplicate loser
+    never reaches it; both get their parent from the heal or the backfill.
+    """
+    if not agent_purchase_ledger.is_enabled():
+        return
+    try:
+        await asyncio.wait_for(
+            agent_purchase_ledger.ensure_reap_parent(purchase_id), timeout=_RECORD_PARENT_TIMEOUT_S
+        )
+    except Exception as exc:  # noqa: BLE001 (TimeoutError included)
+        logger.warning(
+            "reap_agentic: agent_purchases parent not written purchase=%s error_type=%s",
+            purchase_id,
+            type(exc).__name__,
+        )
+
+
+#: A key in the shared table that opened a purchase on ANOTHER rail (the rail-neutral door, routes/
+#: agent_commerce_purchases.py, writes its purchases' keys here too: one key, one attempt, either rail).
+#: Answered as a definite "it exists, there", never as "not found": a client that read 404 as "not
+#: created" would mint a new key and buy twice.
+def _opened_on_another_rail(purchase_id: str) -> JSONResponse:
+    from services.payment_orchestration.rails import RAIL_ID_PREFIX
+
+    rail = next((r for prefix, r in RAIL_ID_PREFIX.items() if purchase_id.startswith(prefix)), None)
+    return JSONResponse(status_code=409, content={
+        "error": "opened_on_another_rail", "purchase_id": purchase_id, "rail": rail,
+    })
+
+
+def _is_reap_purchase_id(purchase_id: Optional[str]) -> bool:
+    return str(purchase_id or "").startswith("rp_")
+
+
 def _not_found() -> JSONResponse:
     """WRONG OWNER AND NO SUCH PURCHASE ARE THE SAME ANSWER. 404, never 403: a 403 confirms the
     id exists, which turns this endpoint into an oracle for guessing other buyers' purchase ids.
@@ -2580,8 +2864,9 @@ async def prepare_reap_purchase_selection(
 ):
     """Authenticated read-only selection witness, before an original create body exists.
 
-    A numeric selector is not a SKU key. Resolve it to exactly one existing live SKU,
-    then use the create lane's proof, seller and own-offer reader with that exact key.
+    A numeric selector is not a SKU key. Resolve it to one existing live SKU by create's own
+    rule (`_resolve_selected_variant_key`), then use the create lane's proof, seller and
+    own-offer reader with that exact key, the key the witness names.
     No buyer, consent, idempotency, click, enrollment or purchase row is touched; no
     network fetch or provider request is made. Recovery never calls this endpoint.
     """
@@ -2634,31 +2919,29 @@ async def prepare_reap_purchase_selection(
             product = dict(product)
             if str(product.get("platform") or "").lower() not in {"shopify", "external_seed"}:
                 raise svc.PurchaseRefused("row_not_shopify")
-            skus = [dict(row) for row in await database.fetch_all(
-                _CART_PRODUCT_SKUS_SQL.replace(
-                    "s.sku_key, s.source_variant_id,", "s.sku_key, s.source_variant_id, s.merchant_id, s.platform,"
-                ), {"product_key": product_key}
-            )]
-            if len(skus) > _CART_MAX_SKUS:
-                raise svc.PurchaseRefused("row_variant_ambiguous")
-            matches = [sku for sku in skus
-                       if not _is_placeholder_sku(sku, product_key)
-                       and _cart_numeric_variant(sku.get("source_variant_id"), product_key) == variant_id]
-            if len(matches) != 1:
-                raise svc.PurchaseRefused(
-                    "row_variant_ambiguous" if matches else "row_variant_unverified"
-                )
-            variant_key = str(matches[0]["sku_key"])
-            if (matches[0]["merchant_id"] != product["merchant_id"]
-                    or matches[0]["platform"] != product["platform"]):
-                raise svc.PurchaseRefused("row_variant_unverified")
+            # THE LOAD A `variant_id` CREATE MAKES, exactly: create's and resume's selector rule
+            # (`_resolve_selected_variant_key`: every sku naming the id is this listing's own; one
+            # variant spelled by two writers is priced per spelling and must agree), then the resolved
+            # key, or none -- the no-key path, for a placeholder-only or sole-variant product. The door
+            # creates by `variant_id`, never by the witness's sku, so the witness names the sku this
+            # load PRICED and the create resolves it again by this same rule.
+            resolved_key = await _resolve_selected_variant_key(
+                merchant_domain=merchant_host, product_key=product_key,
+                variant_id=variant_id, market_country=market,
+            )
+            priced: Dict[str, Any] = {}
             facts, seller, resolved_id, _seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host, product_key=product_key,
-                variant_key=variant_key, market_country=market,
+                variant_key=resolved_key, market_country=market, priced_sku=priced,
             )
-            if resolved_id != variant_id:
-                raise svc.PurchaseRefused("row_variant_unverified")
-            if str(matches[0].get("currency") or "").strip().upper() != facts["currency"]:
+            _require_selected_variant(resolved_id, variant_id)
+            variant_key = priced["sku_key"]
+            selected_sku = await database.fetch_one(
+                _CART_SKU_BY_KEY_SQL, {"product_key": product_key, "variant_key": variant_key}
+            )
+            if selected_sku is None:
+                raise svc.PurchaseRefused("row_not_found")
+            if str(selected_sku["currency"] or "").strip().upper() != facts["currency"]:
                 raise svc.PurchaseRefused("row_currency_mismatch")
             # The enabled, source-bound enrichment loader already requires every live
             # own-listing offer to agree with this SKU's fresh storefront proof in this
@@ -2670,13 +2953,16 @@ async def prepare_reap_purchase_selection(
                 and product.get("source_system") == ENRICHMENT_SOURCE_SYSTEM
             )
             if not enrichment_priced:
-                offers = [dict(row) for row in await database.fetch_all(
+                read = [dict(row) for row in await database.fetch_all(
                     _CART_ALL_OFFERS_SQL.replace("LIMIT 20", "LIMIT 21"),
                     {"product_key": product_key, "sku_key": variant_key, "merchant_id": seller,
                      "market_currency": _MARKET_CURRENCY.get(market)},
                 )]
+                # Only offers that are prices must agree: a seed copy in another currency than
+                # its seed's is no price at all (`_offers_priced_in_seed_currency`).
+                offers = await _offers_priced_in_seed_currency(product_key, read)
                 prices = {ledger.amount_minor_or_none(row.get("price"), facts["currency"]) for row in offers}
-                if len(offers) > 20 or prices != {facts["our_price_minor"]}:
+                if len(read) > 20 or prices != {facts["our_price_minor"]}:
                     raise svc.PurchaseRefused("row_price_ambiguous")
             if not context.can_access_merchant(seller):
                 raise svc.PurchaseRefused("not_available_on_this_rail")
@@ -2775,11 +3061,9 @@ async def start_reap_purchase(
         # before any read.
         merchant_domain = _merchant_domain_key(merchant_host)
         product_key = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant_key = (
-            _identifier(req.variant_key, "variant_key", max_chars=1024)
-            if str(req.variant_key or "").strip()
-            else None
-        )
+        # A `variant_id` selector is resolved to the catalog's sku below, after the replay lookup;
+        # the fingerprint keeps what was sent.
+        variant_key, hashed_variant = _variant_selector(req)
         # THE ONE MARKET RULE (`utils.market_code.iso2_market`, bound as the fact store's
         # `normalize_market`): the same function the purchasability fact is keyed with, so the
         # rail can never ask the gate about a market the fact store would have spelled differently.
@@ -2806,7 +3090,7 @@ async def start_reap_purchase(
         request_hash = _request_hash(
             merchant_domain=merchant_domain,
             product_key=product_key,
-            variant_key=variant_key,
+            variant_key=hashed_variant,
             quantity=int(req.quantity),
             email=buyer_email,
             shipping_address=shipping_address,
@@ -2832,6 +3116,8 @@ async def start_reap_purchase(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
         )
+        if replayed and not _is_reap_purchase_id(replayed):
+            return _opened_on_another_rail(replayed)
         if replayed:
             # THE SAME ID, AND THE PURCHASE'S REAL STATE. Not a hardcoded "resolving": by the
             # time a caller retries, the row may have moved, and answering with a state it is
@@ -2938,12 +3224,18 @@ async def start_reap_purchase(
                 merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if req.variant_id is not None:
+                variant_key = await _resolve_selected_variant_key(
+                    merchant_domain=merchant_host, product_key=product_key,
+                    variant_id=req.variant_id, market_country=market_country)
+            _refuse_named_placeholder(variant_key, product_key)
             cart_facts, cart_seller, cart_variant, cart_seed_kind = await _load_cart_link_item(
                 merchant_domain=merchant_host,
                 product_key=product_key,
                 variant_key=variant_key,
                 market_country=market_country,
             )
+            _require_selected_variant(cart_variant, req.variant_id)
         else:
             # A refusal here writes nothing, the key included: every attempt that reaches here
             # carries bound money that has not passed admission yet. (A `refused:` key written before the pair was
@@ -3003,6 +3295,7 @@ async def start_reap_purchase(
             cart_link_item = svc.CartLinkItem(cart_url=cart_url, **cart_facts)
 
         winning_view = None
+        other_rail_winner = None
         try:
             # start_purchase makes no partner call. This short durable unit hides
             # the purchase from other connections until its immutable key lands.
@@ -3044,7 +3337,12 @@ async def start_reap_purchase(
                     idempotency_key=idempotency_key, purchase_id=purchase_id,
                     request_hash=request_hash,
                 )
-                if winner != purchase_id:
+                if winner != purchase_id and not _is_reap_purchase_id(winner):
+                    # The key opened a purchase on another rail first: ours is scrubbed like any
+                    # duplicate, and the answer names the winner on its rail.
+                    await _abandon_duplicate(purchase_id)
+                    other_rail_winner = winner
+                elif winner != purchase_id:
                     await _abandon_duplicate(purchase_id)
                     purchase_id = winner
                     winning_view = await _owner_view(
@@ -3059,6 +3357,8 @@ async def start_reap_purchase(
             logger.warning("reap_agentic: atomic create unavailable error_type=%s", type(exc).__name__)
             raise _PurchasePersistenceUnavailable() from None
 
+        if other_rail_winner is not None:
+            return _opened_on_another_rail(other_rail_winner)
         logger.info(
             "reap_agentic: route opened purchase=%s merchant=%s agent=%s",
             purchase_id,
@@ -3077,6 +3377,7 @@ async def start_reap_purchase(
                 raise _PurchasePersistenceUnavailable() from None
         if winning_view is None:
             raise _PurchasePersistenceUnavailable()
+        await _record_purchase_parent(purchase_id)
         accepted: Dict[str, Any] = {
             "purchase_id": purchase_id,
             "status": winning_view["state"],
@@ -3106,8 +3407,12 @@ async def _validate_resume_selection(req, row, merchant, host, product, variant,
         await _refuse_if_merchant_disabled(merchant_domain=merchant, market_country=market)
         if not await tierb_eligibility.is_cart_link_eligible(host, market):
             raise svc.PurchaseRefused("merchant_not_eligible")
+        if req.variant_id is not None:
+            variant = await _resolve_selected_variant_key(
+                merchant_domain=host, product_key=product, variant_id=req.variant_id, market_country=market)
         facts, _, selected_variant, _ = await _load_cart_link_item(
             merchant_domain=host, product_key=product, variant_key=variant, market_country=market)
+        _require_selected_variant(selected_variant, req.variant_id)
         selected_key = "shopify:" + str(selected_variant)
         price, currency = facts["our_price_minor"], facts["currency"]
         # The stored cart (including attribution) survives; only compare its immutable line.
@@ -3157,12 +3462,12 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant = _merchant_domain_key(host)
         product = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        variant, hashed_variant = _variant_selector(req)
         consent = _consent_version(req.buyer.consent_version)
         offer = _offer_code(req.offer_code)
         address = _buyer_address_for_client(req.buyer)
         email = str(req.buyer.email or "").strip()
-        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=variant,
+        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=email, shipping_address=address,
             return_url=str(req.return_url or "").strip() or _default_return_url(), item_source=req.item_source,
             offer_code=offer, expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency)
@@ -3233,10 +3538,10 @@ async def recover_reap_purchase(
         key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
         merchant = _merchant_domain_key(_identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower())
         product = _identifier(req.product_key, "product_key", max_chars=1024)
-        variant = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+        _variant, hashed_variant = _variant_selector(req)
         _consent_version(req.buyer.consent_version)  # Validation only; preserve stored consent.
         request_hash = _request_hash(
-            merchant_domain=merchant, product_key=product, variant_key=variant,
+            merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=str(req.buyer.email or "").strip(),
             shipping_address=_buyer_address_for_client(req.buyer),
             return_url=str(req.return_url or "").strip() or _default_return_url(),
@@ -3256,6 +3561,8 @@ async def recover_reap_purchase(
             agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash,
             idempotency_key=key, request_hash=request_hash,
         )
+        if purchase_id and not _is_reap_purchase_id(purchase_id):
+            return _opened_on_another_rail(purchase_id)
         if purchase_id:
             view = await _owner_view(purchase_id=purchase_id, agent_id=str(context.agent_id), agent_user_ref_hash=owner_hash)
             if view:

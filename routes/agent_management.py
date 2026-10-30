@@ -275,6 +275,21 @@ async def update_agent(
         if request.allowed_merchants is not None:
             update_data["allowed_merchants"] = request.allowed_merchants
         if request.webhook_url is not None:
+            # The legacy field feeds agent_webhook_configs (migrated there as enabled), so a NEW
+            # URL gets the same save-time check as PUT /webhooks/config. An unchanged stored one
+            # and a managed-inbox URL (rewritten to ours) are not re-judged; every send is.
+            new_url = str(request.webhook_url or "").strip()
+            if new_url and not new_url.endswith("/webhooks/managed-inbox"):
+                stored_url = await database.fetch_val(
+                    select(agents.c.webhook_url).where(agents.c.agent_id == agent_id)
+                )
+                if new_url != str(stored_url or "").strip():
+                    from services.webhook_destination_guard import DestinationRejected, check_destination_url
+
+                    try:
+                        check_destination_url(new_url)
+                    except DestinationRejected as exc:
+                        raise HTTPException(status_code=400, detail=str(exc))
             update_data["webhook_url"] = request.webhook_url
         if request.metadata is not None:
             update_data["metadata"] = request.metadata

@@ -1,0 +1,67 @@
+{
+  "affiliate_url": "https://api.pivota.cc/r?token=<token>",
+  "cart_prefilled": true,
+  "confidence": 0.8,
+  "currency": "USD",
+  "execution_spec": {
+    "cart_url": "https://brand.com/cart/41234567890001:1?utm_source=pivota&utm_medium=%2A&utm_campaign=US&attributes[pivota_click_id]=clk_<click_id>&country=US",
+    "expected_currency": "USD",
+    "expected_item_total": 27.5,
+    "expected_quantity": 1,
+    "expected_total_expires_at": "<iso>",
+    "expires_at": "<iso>",
+    "merchant_domain": "brand.com",
+    "pdp_url": "https://brand.com/products/serum?utm_source=pivota&utm_medium=%2A&utm_campaign=US&pvt_click_id=clk_<click_id>&utm_content=clk_<click_id>",
+    "rail": "shopify_cart",
+    "tracking": {
+      "click_id": "clk_<click_id>",
+      "join_mode": "cart_permalink",
+      "param": "attributes[pivota_click_id]"
+    },
+    "variant_id": "41234567890001"
+  },
+  "in_stock": true,
+  "internal_checkout_items": null,
+  "live_verification": {
+    "amount": 27.5,
+    "checked_at": "<iso>",
+    "currency": "USD",
+    "source": "gateway_live_read",
+    "status": "verified",
+    "variant_id": "41234567890001"
+  },
+  "merchant_id": "brand.com",
+  "merchant_name": "Brand",
+  "offer_id": "of:external_seed:eps_spec:https://brand.com/products/serum?variant=41234567890001#offer",
+  "price": 27.5,
+  "purchase_route": "affiliate_outbound",
+  "seller": "Brand",
+  "source": {
+    "canonical_url": "https://brand.com/products/serum",
+    "destination_url": "https://brand.com/products/serum",
+    "domain": "brand.com",
+    "external_product_id": "ext_spec",
+    "image_url": null,
+    "seed_id": "eps_spec",
+    "title": "30ml",
+    "type": "external_seed",
+    "variant_id": "https://brand.com/products/serum?variant=41234567890001#offer"
+  },
+  "variant_count": 2,
+  "variants": [
+    {
+      "currency": "USD",
+      "in_stock": true,
+      "price": 27.5,
+      "title": "30ml",
+      "variant_id": "https://brand.com/products/serum?variant=41234567890001#offer"
+    },
+    {
+      "currency": "USD",
+      "price": 29.0,
+      "price_stale": true,
+      "title": "50ml",
+      "variant_id": "https://brand.com/products/serum?variant=41234567890002#offer"
+    }
+  ]
+}

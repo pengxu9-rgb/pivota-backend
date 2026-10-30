@@ -1,0 +1,1738 @@
+{
+ "_about": "Main variant lists exactly as main a3efcf85b's producer (pre-#2634: _extract_from_html + seed_variants_from_evidence) stored them for each JSON-LD page tests/test_repair_seed_main_lists.py builds -- the defective shapes prod rows hold. Keyed by sha256(json.dumps(blocks, sort_keys=True))[:16]. Frozen because #2634's producer no longer writes these defects; regenerate only from a pre-#2634 checkout.",
+ "frozen_from": "a3efcf85b2b64725ee7b593da1f25b6d3bec9102",
+ "pages": {
+  "05012759d3e05f82": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Subscribe & Save",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "15 mL",
+       "price": "12",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Subscribe & Save",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "15 mL",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    }
+   ]
+  },
+  "0b0a622bff54e644": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "RL-50ML"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "RL-50ML"
+    }
+   ]
+  },
+  "0b15a16ec1aab882": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "LT"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "LT"
+    }
+   ]
+  },
+  "0baef2e47edfa3b6": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733451",
+       "price": "31",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733451"
+    }
+   ]
+  },
+  "0cc8be4ee24bf183": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "LT"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "LT"
+    }
+   ]
+  },
+  "102b7741db86d00c": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "One-Time Purchase",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "30 days",
+       "price": "41",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "60 days",
+       "price": "41",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "One-Time Purchase",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 41.0,
+     "price_currency": "USD",
+     "title": "30 days",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 41.0,
+     "price_currency": "USD",
+     "title": "60 days",
+     "variant_id": "offer_3"
+    }
+   ]
+  },
+  "116bd708cbc225d7": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Subscribe & Save",
+       "price": "40",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Subscription - every 30 days",
+       "price": "38",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Subscribe & Save",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 38.0,
+     "price_currency": "USD",
+     "title": "Subscription - every 30 days",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "196427346754c29c": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "LL-01"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "LL-01"
+    }
+   ]
+  },
+  "1af08b903858adc7": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "0114807"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "0114807"
+    }
+   ]
+  },
+  "1c74c7a002dc40bc": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=4006381333931#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "114807"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=4006381333931#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "114807"
+    }
+   ]
+  },
+  "1cd9237c66a52397": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      }
+     ]
+    },
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": {
+      "@type": "Offer",
+      "availability": "https://schema.org/InStock",
+      "price": "31",
+      "priceCurrency": "USD",
+      "sku": "114807",
+      "url": "https://eyurs.com/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071"
+     }
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "114807"
+    }
+   ]
+  },
+  "2472b0786f7445d4": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "SIZE-15ML"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "SIZE-15ML"
+    }
+   ]
+  },
+  "42c79ef00ed7a730": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Single Box",
+       "price": "30",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "3 Month Subscription",
+       "price": "80",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "6 Month Subscription",
+       "price": "150",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 30.0,
+     "price_currency": "USD",
+     "title": "Single Box",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 80.0,
+     "price_currency": "USD",
+     "title": "3 Month Subscription",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 150.0,
+     "price_currency": "USD",
+     "title": "6 Month Subscription",
+     "variant_id": "offer_3"
+    }
+   ]
+  },
+  "58c0a89c39161ae8": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "2 months",
+       "price": "80",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 80.0,
+     "price_currency": "USD",
+     "title": "2 months",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "674a760a1244cd31": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Subscribe & Save 15%",
+       "price": "40",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Subscribe & Save 15%",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "792276579057f42b": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "45253610242311"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "45253610242311"
+    }
+   ]
+  },
+  "84206fb620a6941f": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "1 Month Supply",
+       "price": "30",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "3 Month Supply",
+       "price": "80",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 30.0,
+     "price_currency": "USD",
+     "title": "1 Month Supply",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 80.0,
+     "price_currency": "USD",
+     "title": "3 Month Supply",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "859b6e51395381a7": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Full 50 mL",
+       "price": "80",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Subscribe & Save",
+       "price": "40",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 80.0,
+     "price_currency": "USD",
+     "title": "Full 50 mL",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Subscribe & Save",
+     "variant_id": "offer_3"
+    }
+   ]
+  },
+  "8a500394c59bb497": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "114807"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "114807"
+    }
+   ]
+  },
+  "94ef49406402980d": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "1 month",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "2 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "3 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "1 month",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "2 months",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "3 months",
+     "variant_id": "offer_3"
+    }
+   ]
+  },
+  "966ce5a8a29ebf80": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "RL-50"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD",
+       "sku": "RL-15"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "RL-50"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "RL-15"
+    }
+   ]
+  },
+  "971f7bae3a098d86": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "One-Time Purchase",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "1 month",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "2 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "3 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "One-Time Purchase",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "1 month",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "2 months",
+     "variant_id": "offer_3"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "3 months",
+     "variant_id": "offer_4"
+    }
+   ]
+  },
+  "984b1f3ba0cc7b19": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "1 month",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "2 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "3 months",
+       "price": "40.8",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "One-Time Purchase",
+       "price": "48",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "1 month",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "2 months",
+     "variant_id": "offer_2"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.8,
+     "price_currency": "USD",
+     "title": "3 months",
+     "variant_id": "offer_3"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "One-Time Purchase",
+     "variant_id": "offer_4"
+    }
+   ]
+  },
+  "9de9e6293c5338e8": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Glow Subscription Box",
+       "price": "30",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel Size",
+       "price": "10",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 30.0,
+     "price_currency": "USD",
+     "title": "Glow Subscription Box",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 10.0,
+     "price_currency": "USD",
+     "title": "Travel Size",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "a08f66dc8191b171": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733451",
+       "price": "31",
+       "priceCurrency": "USD",
+       "url": "https://eyurs.com/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733451"
+    }
+   ]
+  },
+  "a13e943b41dc1ae2": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Mini",
+       "price": "9",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 9.0,
+     "price_currency": "USD",
+     "title": "Mini",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "b75688228ede03b4": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Delivery every 2 months",
+       "price": "40",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Delivery every 2 months",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "bef9ae3f1bf7b05a": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733451",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733468",
+       "price": "12",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733451"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733468"
+    }
+   ]
+  },
+  "cead1a0743fa1ff6": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733451",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "gtin13": "8809640733468",
+       "price": "12",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733451"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "8809640733468"
+    }
+   ]
+  },
+  "d3b9da0f49588e32": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Every 6 weeks",
+       "price": "40",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Every 6 weeks",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "d7c83e1e5f3a0570": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "37169662034071"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "37169662034071"
+    }
+   ]
+  },
+  "d88edc214d8225a9": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "4006381333931"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "4006381333931"
+    }
+   ]
+  },
+  "da84ee3c813d014d": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "114807"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "114807"
+    }
+   ]
+  },
+  "e0d79f7da575f367": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Travel 15 mL",
+       "price": "48",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "name": "Auto-Replenish",
+       "price": "40",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 48.0,
+     "price_currency": "USD",
+     "title": "Travel 15 mL",
+     "variant_id": "offer_1"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 40.0,
+     "price_currency": "USD",
+     "title": "Auto-Replenish",
+     "variant_id": "offer_2"
+    }
+   ]
+  },
+  "e83c521da1812b9e": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=39876543210#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD",
+       "sku": "39876543299"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=39876543210#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "39876543299"
+    }
+   ]
+  },
+  "ff8b3e6382cd6a7a": {
+   "blocks": [
+    {
+     "@context": "https://schema.org",
+     "@type": "Product",
+     "image": "https://eyurs.com/cdn/p.jpg",
+     "name": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "offers": [
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "31",
+       "priceCurrency": "USD"
+      },
+      {
+       "@id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer",
+       "@type": "Offer",
+       "availability": "https://schema.org/InStock",
+       "price": "12",
+       "priceCurrency": "USD"
+      }
+     ]
+    }
+   ],
+   "stored": [
+    {
+     "availability": "in_stock",
+     "price_amount": 31.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=37169662034071#offer"
+    },
+    {
+     "availability": "in_stock",
+     "price_amount": 12.0,
+     "price_currency": "USD",
+     "title": "Round Lab Birch Juice Moisturizing Sunscreen",
+     "variant_id": "/products/round-lab-birch-juice-moisturizing-sunscreen?variant=41430446375063#offer"
+    }
+   ]
+  }
+ }
+}

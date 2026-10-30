@@ -183,6 +183,7 @@ async def _insert_product(
     pdp_scope: str = "merchant_owned",
     regression: bool = False,
     suppressed_at: Optional[datetime] = None,
+    product_type: Optional[str] = None,
 ) -> Dict[str, str]:
     ids = _ids(suffix)
     now = datetime.now(timezone.utc)
@@ -193,11 +194,11 @@ async def _insert_product(
         INSERT INTO catalog_products (
             product_key, merchant_id, platform, source_product_id, title,
             description, brand, pdp_scope, sync_status, canonical_url,
-            pivota_signature_id, content_key, updated_at, suppressed_at
+            pivota_signature_id, content_key, updated_at, suppressed_at, product_type
         ) VALUES (
             :product_key, :merchant_id, 'shopify', :source_product_id, 'VIS2 Product',
             :description, 'VIS2', :pdp_scope, :sync_status, :canonical_url,
-            :signature_id, :content_key, :updated_at, :suppressed_at
+            :signature_id, :content_key, :updated_at, :suppressed_at, :product_type
         )
         """,
         {
@@ -212,6 +213,7 @@ async def _insert_product(
             "canonical_url": canonical_url,
             "updated_at": now,
             "suppressed_at": suppressed_at,
+            "product_type": product_type,
         },
     )
 
@@ -408,6 +410,15 @@ async def test_recompute_happy_path_upserts_serving_eligible_true() -> None:
             {"suppressed_at": datetime(2026, 7, 1, tzinfo=timezone.utc)},
             "suppressed",
         ),
+        # A listing that is not a product: the title reaches the rule through the seed and APV
+        # joins, the product_type only through the eligibility SELECT naming cp.product_type. Suffixes
+        # carry no listing word: the suffix is in canonical_url, which the rule also reads.
+        (
+            "np_title",
+            {"seed_title": "Heart To Tarte Donation", "apv_title": "Heart To Tarte Donation"},
+            "non_core_product",
+        ),
+        ("np_type", {"product_type": "Donation"}, "non_core_product"),
     ],
 )
 async def test_recompute_blocker_transitions(
@@ -429,6 +440,15 @@ async def test_recompute_blocker_transitions(
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)
+
+
+@pytest.mark.parametrize(
+    "const_name", ["_ELIGIBILITY_COLUMNS", "_AUDIT_ELIGIBILITY_COLUMNS", "_SINGLE_QUERY_SQLITE"]
+)
+def test_every_eligibility_select_hands_the_classifier_product_type(const_name: str) -> None:
+    """The non-product rule reads cp.product_type. The recompute test above exercises the SQLite
+    SELECT only; the Postgres SELECTs (nightly batch, single key, audit page) are pinned here."""
+    assert "cp.product_type," in getattr(svc, const_name)
 
 
 @pytest.mark.asyncio
@@ -1090,8 +1110,13 @@ async def test_the_acquisition_rule_changes_nothing_for_rows_without_an_acquisit
         without_rule = await svc.recompute_serving_eligibility(ids["content_key"], reason="unit")
         without_rule_row = await _ips_row(ids["content_key"])
         assert (with_rule, with_rule_row["blocker_code"]) == (without_rule, without_rule_row["blocker_code"])
-        # ...and the verdict is today's: flag off serves any priced row; flag on serves USD only (US default).
-        assert with_rule is (currency == "USD" or not gate_on)
+        # ...and the verdict is today's: flag off serves any priced row; flag on serves a row priced in a
+        # served market's currency. Unset env = the market registry's served markets (US, SG; ADR-026), so
+        # an SGD row serves -- as it always did on web/worker, which set US,SG explicitly.
+        from services.market_registry import currency_for, served_markets
+        served_currencies = {currency_for(m) for m in served_markets()}
+        assert served_currencies == {"USD", "SGD"}
+        assert with_rule is (currency in served_currencies or not gate_on)
     finally:
         await _cleanup()
         await _disconnect_if_needed(was_connected)

@@ -279,6 +279,8 @@ class _FakeDb:
         self.executed.append((query, params))
         if "RETURNING" in str(query).upper():
             return [{"product_key": "prod::pg1", "offer_id": "offer::pg1"}]
+        if "SELECT product_key" in str(query) and "FROM catalog_products" in str(query):
+            return [{"product_key": "prod::pg1"}]  # the seed's mirror row
         return []
 
 
@@ -378,6 +380,169 @@ def test_a_live_delisted_observation_also_resets_the_streak(monkeypatch):
     assert result["failure_streak"] == 0
 
 
+# ------------------------------------------- the gap is measured from the last STEP, not the clock
+
+_CORROBORATED_DEAD = liveness.DestinationObservation(
+    liveness.VERDICT_DEAD_404, 404, None, corroborated=True
+)
+_REFRESH_DEAD = liveness.DestinationObservation(
+    liveness.VERDICT_DEAD_404, 404, None, corroborated=False
+)
+
+
+def test_a_refresh_stamp_inside_the_gap_does_not_hold_back_a_corroborated_step(monkeypatch):
+    """THE BUG THIS RULE FIXES. The 05:15Z refresh re-stamps `destination_checked_at` with an
+    observation that may not advance the streak; measuring the gap from that stamp let it HOLD
+    the streak instead. 157 of 160 active streak-1 seeds were stuck this way on 2026-10-09."""
+    row = {
+        "destination_checked_at": NOW - timedelta(hours=22),  # the refresh, yesterday 05:15
+        "destination_corroborated_dead_at": NOW - timedelta(hours=24),  # the sweep, yesterday
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    result, db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    assert result["failure_streak"] == 2
+    assert result["retire"] is True
+    assert db.executed[0][1]["corroborated_dead_at"] == NOW
+
+
+def test_two_corroborated_observations_inside_the_gap_still_cannot_retire(monkeypatch):
+    """The gap itself is untouched: a re-run of the same night's sweep is still free."""
+    anchor = NOW - timedelta(hours=1)
+    row = {
+        "destination_checked_at": NOW - timedelta(days=5),
+        "destination_corroborated_dead_at": anchor,
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    result, db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    assert result["failure_streak"] == 1
+    assert result["retire"] is False
+    assert db.executed[0][1]["corroborated_dead_at"] == anchor, "a held step keeps its clock"
+
+
+def test_the_first_corroborated_step_needs_no_gap_even_after_a_fresh_refresh_stamp(monkeypatch):
+    """Streak 0 has nothing to space from. Measuring from the refresh stamp kept the 419
+    refresh-only `dead_404` seeds at streak 0 however often the sweep corroborated them."""
+    row = {
+        "destination_checked_at": NOW - timedelta(hours=2),
+        "destination_corroborated_dead_at": None,
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 0,
+        "status": "active",
+    }
+    result, db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    assert result["failure_streak"] == 1
+    assert result["retire"] is False
+    assert db.executed[0][1]["corroborated_dead_at"] == NOW
+
+
+def test_a_streak_from_before_the_column_restarts_its_clock_when_the_gap_is_unproven(monkeypatch):
+    """No anchor, streak 1, last check 2h ago: we cannot prove 24h since the step, so hold and
+    start the clock now. That can only delay a retirement, never hasten one."""
+    row = {
+        "destination_checked_at": NOW - timedelta(hours=2),
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    result, db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    assert result["failure_streak"] == 1
+    assert result["retire"] is False
+    assert db.executed[0][1]["corroborated_dead_at"] == NOW
+
+
+def test_a_streak_from_before_the_column_still_steps_when_its_last_check_proves_the_gap(monkeypatch):
+    """The streak was earned at or before `destination_checked_at`, so a check 3 days old is
+    proof enough; this is exactly the old behaviour for such a row."""
+    row = {
+        "destination_checked_at": NOW - timedelta(days=3),
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    result, _db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    assert result["failure_streak"] == 2
+    assert result["retire"] is True
+
+
+@pytest.mark.parametrize(
+    "observation, expected_anchor",
+    [
+        # a live answer resets the streak, and the clock goes with it
+        (liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), None),
+        (liveness.DestinationObservation(liveness.VERDICT_LIVE_DELISTED, 200, None), None),
+        # "we could not look" and "we looked but have no second witness" move nothing
+        (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), "kept"),
+        (_REFRESH_DEAD, "kept"),
+    ],
+)
+def test_only_a_corroborated_step_or_a_reset_moves_the_anchor(monkeypatch, observation, expected_anchor):
+    anchor = NOW - timedelta(hours=30)
+    row = {
+        "destination_checked_at": NOW - timedelta(hours=3),
+        "destination_corroborated_dead_at": anchor,
+        "destination_verdict": liveness.VERDICT_DEAD_404,
+        "destination_failure_streak": 1,
+        "status": "active",
+    }
+    _result, db = _observe(monkeypatch, row, observation, now=NOW)
+    written = db.executed[0][1]["corroborated_dead_at"]
+    assert written == (anchor if expected_anchor == "kept" else None)
+
+
+def test_the_anchor_is_written_by_the_statement(monkeypatch):
+    """Parameters alone prove nothing if the SQL drops the column."""
+    row = {"destination_checked_at": None, "destination_verdict": None,
+           "destination_failure_streak": 0, "status": "active"}
+    _result, db = _observe(monkeypatch, row, _CORROBORATED_DEAD, now=NOW)
+    sql = " ".join(str(db.executed[0][0]).split())
+    assert "destination_corroborated_dead_at = :corroborated_dead_at" in sql
+
+
+class _StatefulDb:
+    """Applies the writer's UPDATE back to the row, so a run of nights can be replayed."""
+
+    def __init__(self, row: Dict[str, Any]) -> None:
+        self.row = row
+
+    async def fetch_one(self, _query, _params=None):
+        return dict(self.row)
+
+    async def execute(self, _query, params=None):
+        p = params or {}
+        if p.get("reached_origin"):
+            self.row["destination_verdict"] = p["verdict"]
+            self.row["destination_http_status"] = p["http_status"]
+            self.row["destination_checked_at"] = p["checked_at"]
+        self.row["destination_failure_streak"] = p["streak"]
+        self.row["destination_corroborated_dead_at"] = p["corroborated_dead_at"]
+
+
+def test_the_nightly_sweep_retires_a_dead_seed_although_the_refresh_restamps_it_daily(monkeypatch):
+    """The production cadence, replayed: sweep 03:15Z (corroborated), refresh 05:15Z
+    (uncorroborated) every day. Before this rule the streak never reached 2 here."""
+    day0 = datetime(2026, 10, 9, 0, 0, tzinfo=timezone.utc)
+    db = _StatefulDb({
+        "destination_checked_at": None, "destination_verdict": None,
+        "destination_failure_streak": 0, "destination_corroborated_dead_at": None,
+        "status": "active",
+    })
+    monkeypatch.setattr(liveness, "database", db)
+    retired_on = None
+    for day in range(4):
+        sweep_at = day0 + timedelta(days=day, hours=3, minutes=15)
+        result = _run(liveness.record_destination_observation("eps_1", _CORROBORATED_DEAD, now=sweep_at))
+        if result["retire"]:
+            retired_on = day
+            break
+        _run(liveness.record_destination_observation(
+            "eps_1", _REFRESH_DEAD, now=sweep_at + timedelta(hours=2)))
+    assert retired_on == 1, "first sweep steps to 1, the next night's sweep steps to 2"
+
+
 def test_a_never_checked_row_advances_on_its_first_dead_observation(monkeypatch):
     row = {
         "destination_checked_at": None,
@@ -461,12 +626,15 @@ class _SweepClient:
 def _sweep(monkeypatch, seeds, client, **kwargs):
     recorded: List[Any] = []
     retired: List[str] = []
+    suppress_flags: List[bool] = []
+    _sweep.suppress_flags = suppress_flags
 
     async def fake_candidates(limit):
         return seeds
 
-    async def fake_record(seed_id, observation, *, now=None):
+    async def fake_record(seed_id, observation, *, now=None, suppress=False):
         recorded.append((seed_id, observation))
+        suppress_flags.append(suppress)
         return {"seed_id": seed_id, "verdict": observation.verdict, "retire": False}
 
     async def fake_retire(seed_id, observation, *, now=None):
@@ -791,8 +959,10 @@ def test_retirement_cascades_to_the_products_offers(monkeypatch):
     mirror_sql = next(sql for sql, _ in db.executed if "catalog_products" in sql)
     assert "RETURNING product_key" in mirror_sql
 
+    # The CASCADE statement (a pending row's offers are relabeled by a separate statement first).
     offer_sql, offer_params = next(
-        (sql, params) for sql, params in db.executed if "catalog_offers" in sql
+        (sql, params) for sql, params in db.executed
+        if "catalog_offers" in sql and "suppressed_at = NOW()" in sql
     )
     assert "suppressed_at = NOW()" in offer_sql
     assert "suppression_reason" in offer_sql
@@ -802,4 +972,154 @@ def test_retirement_cascades_to_the_products_offers(monkeypatch):
     )
     assert offer_params["reason"] == "product_suppressed"
     assert offer_params["product_keys"] == ["prod::pg1"]
-    assert result["offers_suppressed"] == 1
+    # this fake answers every RETURNING with one row: one relabeled pending offer + one cascaded
+    assert result["offers_suppressed"] == 2
+
+
+# ------------------------------------------------- the pending step: hide on the first corroborated death
+
+def _statements(db, needle):
+    return [(sql, params) for sql, params in db.executed if needle in " ".join(str(sql).split())]
+
+
+def test_a_first_corroborated_death_hides_the_mirror_under_the_pending_reason(monkeypatch):
+    monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, "1")
+    row = {"destination_checked_at": None, "destination_corroborated_dead_at": None,
+           "destination_verdict": None, "destination_failure_streak": 0, "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", _CORROBORATED_DEAD, now=NOW, suppress=True))
+    assert result["failure_streak"] == 1 and result["retire"] is False
+    hide = _statements(db, "UPDATE catalog_products SET suppressed_at = :stamp")
+    assert len(hide) == 1
+    assert hide[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    cascade = _statements(db, "UPDATE catalog_offers SET suppressed_at = NOW()")
+    assert cascade and cascade[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["pending_suppressed"] == 1
+
+
+@pytest.mark.parametrize(
+    "flag, suppress, observation, streak",
+    [
+        (None, True, None, 0),          # switch off
+        ("1", False, None, 0),          # not the sweep (the refresh route, or --no-retire)
+        ("1", True, "uncorroborated", 0),  # no second witness
+        ("1", True, "uncorroborated", 1),  # no second witness, on a seed already at streak 1
+        ("1", True, None, 1),           # this step retires: retirement does it, not pending
+    ],
+)
+def test_nothing_is_hidden_without_switch_sweep_witness_or_when_retiring(monkeypatch, flag, suppress, observation, streak):
+    if flag:
+        monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, flag)
+    else:
+        monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    obs = _REFRESH_DEAD if observation == "uncorroborated" else _CORROBORATED_DEAD
+    row = {"destination_checked_at": NOW - timedelta(days=3),
+           "destination_corroborated_dead_at": NOW - timedelta(days=3) if streak else None,
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": streak,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation("eps_1", obs, now=NOW, suppress=suppress))
+    assert _statements(db, "UPDATE catalog_products") == []
+    assert "pending_suppressed" not in result
+
+
+@pytest.mark.parametrize("flag", [None, "1"])
+def test_a_live_answer_after_a_streak_lifts_the_pending_reason_switch_or_no_switch(monkeypatch, flag):
+    if flag:
+        monkeypatch.setenv(liveness.PENDING_SUPPRESSION_FLAG, flag)
+    else:
+        monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    row = {"destination_checked_at": NOW - timedelta(hours=3),
+           "destination_corroborated_dead_at": NOW - timedelta(hours=20),
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": 1,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
+    lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
+    assert len(lift) == 1
+    assert lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    sql = " ".join(lift[0][0].split())
+    assert "suppression_reason = CAST(:reason AS text)" in sql, "a lift must be scoped to OUR reason"
+    revert = _statements(db, "UPDATE catalog_offers SET suppressed_at = NULL")
+    assert revert and revert[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["pending_lifted"] == 1
+
+
+def test_a_live_answer_at_streak_0_still_lifts_a_pending_row(monkeypatch):
+    """The reset and the lift are separate statements. If the lift failed after the reset
+    committed, the row sits pending at streak 0; gating the lift on the streak it reset would
+    leave it hidden forever. The next live answer must retry it."""
+    monkeypatch.delenv(liveness.PENDING_SUPPRESSION_FLAG, raising=False)
+    row = {"destination_checked_at": NOW - timedelta(hours=3), "destination_corroborated_dead_at": None,
+           "destination_verdict": liveness.VERDICT_LIVE, "destination_failure_streak": 0,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    result = _run(liveness.record_destination_observation(
+        "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
+    lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
+    assert len(lift) == 1 and lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert result["failure_streak"] == 0 and result["pending_lifted"] == 1
+
+
+@pytest.mark.parametrize(
+    "observation, streak",
+    [
+        (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), 1),
+        (liveness.DestinationObservation(liveness.VERDICT_UNVERIFIABLE, 429, None, "bot_challenge"), 0),
+        (_REFRESH_DEAD, 1),
+    ],
+)
+def test_no_lift_without_an_answer_that_the_page_is_alive(monkeypatch, observation, streak):
+    row = {"destination_checked_at": NOW - timedelta(hours=3), "destination_corroborated_dead_at": None,
+           "destination_verdict": liveness.VERDICT_DEAD_404, "destination_failure_streak": streak,
+           "status": "active"}
+    db = _FakeDb(row)
+    monkeypatch.setattr(liveness, "database", db)
+    _run(liveness.record_destination_observation("eps_1", observation, now=NOW))
+    assert _statements(db, "UPDATE catalog_products") == []
+
+
+def test_retirement_takes_over_a_pending_row_and_relabels_its_offers(monkeypatch):
+    db = _FakeDb({"status": "active"})
+    monkeypatch.setattr(liveness, "database", db)
+    _run(liveness.retire_seed_for_dead_destination("eps_1", _CORROBORATED_DEAD, now=NOW))
+    mirror_sql, mirror_params = next((sql, p) for sql, p in db.executed if "UPDATE catalog_products" in sql)
+    assert "suppression_reason = :pending_reason" in " ".join(mirror_sql.split())
+    assert mirror_params["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    relabel = _statements(db, "UPDATE catalog_offers SET suppression_reason = CAST(:final_reason AS text)")
+    assert relabel and relabel[0][1]["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert relabel[0][1]["final_reason"] == "product_suppressed"
+
+
+@pytest.mark.parametrize("retire", [True, False])
+def test_the_sweep_asks_for_the_pending_step_exactly_when_it_may_retire(monkeypatch, retire):
+    seeds = [{"id": "eps_gone", "canonical_url": "https://brand.com/products/gone", "domain": "brand.com"}]
+    client = _SweepClient(["other"], {"https://brand.com/products/gone": httpx.Response(404)})
+    _sweep(monkeypatch, seeds, client, retire=retire)
+    assert _sweep.suppress_flags == [retire]
+
+
+def test_the_sweep_queue_spells_out_exactly_the_confirmed_dead_verdicts():
+    """The queue SQL is a literal so the static PREPARE sweep can plan it; this keeps it honest."""
+    import re
+
+    spelled = re.search(r"destination_verdict IN \(([^)]*)\)", liveness.SWEEP_CANDIDATES_SQL).group(1)
+    assert {v.strip().strip("'") for v in spelled.split(",")} == set(liveness.CONFIRMED_DEAD_VERDICTS)
+
+
+def test_the_sweep_summary_counts_the_dead_first_bucket(monkeypatch):
+    seeds = [
+        {"id": "eps_dead", "canonical_url": "https://brand.com/products/gone", "domain": "brand.com",
+         "destination_verdict": "dead_404"},
+        {"id": "eps_live", "canonical_url": "https://brand.com/products/kept", "domain": "brand.com",
+         "destination_verdict": "live"},
+    ]
+    client = _SweepClient(["kept"], {"https://brand.com/products/gone": httpx.Response(404)})
+    summary, _recorded, _retired = _sweep(monkeypatch, seeds, client)
+    assert summary["dead_first_candidates"] == 1

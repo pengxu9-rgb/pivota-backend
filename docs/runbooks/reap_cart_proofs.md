@@ -4,10 +4,15 @@
 > (`scripts/ops/run_oneoff_job.sh`), IN ANY ENVIRONMENT, until ALL of these hold:**
 >
 > **(a)** the crawl-IP incident is closed. Shopify's edge has been throttling our single crawl NAT
-> IP (34.82.199.35) across all shops since ~00:00Z 2026-09-30. "Closed" means **at least 24 h with
+> IP (then 34.82.199.35) across all shops since ~00:00Z 2026-09-30. "Closed" means **at least 24 h with
 > no crawl-backoff 429 bursts and no IP-throttle breaker trips** on the crawlers already sharing that
 > address -- the external-referral refresh, the external-seed destination sweep,
-> `tierb-cart-link-eligibility` and `merchant-purchasability-sweep` -- **plus Peng's go**;
+> `tierb-cart-link-eligibility` and `merchant-purchasability-sweep` -- **plus Peng's go**.
+> **THE 24 h WINDOW RESTARTS ON THE NEW IP.** On 2026-10-16 the crawl NAT moved to 136.67.250.98
+> (`pivota-crawl-egress-ip-2`; the old 34.82.199.35 stays reserved for rollback) after Cloudflare
+> challenge-listed the old address, together with strict global pacing on the refresh
+> (`services/crawl_global_pacer.py`). Clean hours on 34.82.199.35 do not count toward (a): the
+> window starts at the swap and is measured on 136.67.250.98 only;
 >
 > **(b)** #2474 (the shared Shopify-edge pacer in `crawl_politeness`) is merged, **both lanes are
 > wired through it** (the follow-up PR to #2471), and **`CRAWL_SHOPIFY_EDGE_PACER_ENABLED=true` is
@@ -23,7 +28,7 @@ schedule:
 | Job | Lane | Writer (the only proof logic) | Writes | Valid for | Schedule (UTC) |
 |---|---|---|---|---|---|
 | `reap-cart-proof-enrichment` | `enrichment` | `jobs/enrichment_cart_variant_proof.py` (#2464) | `enrichment_cart_variant_proofs`, one row per (product_key, sku_key): `ok` or a recorded refusal | 72 h | 06:41 daily |
-| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` and `shopify_cart_variant_proofs` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 10:13 daily |
+| `reap-cart-proof-mirror` | `mirror` | `scripts/backfill_shopify_variant_ids.py` (#2459) | `external_product_seeds.seed_data.snapshot.shopify_cart_proof` and `shopify_cart_variant_proofs` (sole or named variant; JSON `null` revokes), plus stamped variant ids | 7 days | 13:13 daily |
 
 | Piece | Where |
 |---|---|
@@ -136,7 +141,8 @@ run). With the pacer on, **a dry run writes one thing**: its slot leases in `cra
 
 ## The egress rule (read this first)
 
-**Both jobs run only on the crawl subnet `pivota-crawl` (NAT 34.82.199.35).** Never on `worker`,
+**Both jobs run only on the crawl subnet `pivota-crawl` (NAT 136.67.250.98 since 2026-10-16;
+34.82.199.35 before, kept reserved for rollback).** Never on `worker`,
 `web` or any job on the `default` subnet: their egress is 8.231.167.230, **the address payment
 partners allowlist**, and NAT port exhaustion is per IP. The entry point refuses to start without
 `--on-crawl-egress` (exit 2), and the setup script refuses to create a job when the subnet is
@@ -448,7 +454,8 @@ only not coincided with.
   (`/products.json` listing pages). The timeout covers the fallback where every store is read one
   `.js` per handle at 3 s: 962 handles before MAC (2,886 s, inside the budget) and MAC's ~1,870
   (5,610 s), 8,496 s in all. MAC is last so it can never starve the other four.
-- **mirror**, 10:13, budget 10,800 s, task timeout 12,600 s (the budget plus one 50-seed page).
+- **mirror**, 13:13 (10:13 until 2026-10-14; moved out of relgraph-sync's daily 10:30-11:20 window,
+  which a ~2 h full pass ran into), budget 10,800 s, task timeout 12,600 s (the budget plus one 50-seed page).
   At 3 s per seed that is ~3,600 seeds a day. **Not measured**: the first dry run's
   `writer.candidates` per domain is the measurement; if the pass is cut (exit 4) on consecutive
   days, raise both numbers in the setup script.
