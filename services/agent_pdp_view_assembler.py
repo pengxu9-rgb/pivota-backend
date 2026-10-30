@@ -2717,9 +2717,9 @@ async def reap_orphaned_agent_pdp_view_rows(
 #     delete will null) are ONE statement, so neither lands without the other. No
 #     audit table, no delete.
 #   * restore_reaped_agent_pdp_view_rows: a reaped key that becomes buildable again
-#     (quarantine revoked or expired) is rebuilt by the reconciler tick and by
-#     `manage_source_quarantine revoke --apply`, and its funnel links get their
-#     content_key back.
+#     (quarantine revoked or expired) is rebuilt by the reconciler tick (or the
+#     `reap_orphaned_agent_pdp_view --restore` one-off), and its funnel links get
+#     their content_key back.
 
 UNBUILDABLE_REAP_FLAG_ENV = "AGENT_PDP_VIEW_UNBUILDABLE_REAP"
 _UNBUILDABLE_REAP_AUDIT_TABLE = "agent_pdp_view_unbuildable_reap_audit"
