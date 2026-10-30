@@ -139,3 +139,15 @@ def test_dry_run_proposed_smoke(capsys):
     assert code == 0
     assert '"catalog_products"' in output
     assert '"external_product_seeds"' in output
+
+
+def test_revoke_apply_names_the_view_restore_instead_of_running_it(capsys):
+    # The CLI does not rebuild views itself (its connection is not the one the builder's
+    # overlays read); it says how restore happens.
+    argv = ["--database-url", "postgresql://test", "revoke", "--quarantine-id", "7",
+            "--revoked-by", "codex", "--apply", "--confirm", cli.CONFIRM_REVOKE]
+    assert cli.main(argv, db_factory=FakeDb) == 0
+    out = capsys.readouterr().out
+    assert '"revoked_by": "codex"' in out
+    assert "reconciler tick, within 6 h" in out and "reap_orphaned_agent_pdp_view.py --restore" in out
+    assert "AGENT_PDP_VIEW_MARKET_PRICES=on" in out
