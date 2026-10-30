@@ -2321,18 +2321,25 @@ _AMBIGUOUS_PRODUCT_TYPE_KEYS = frozenset({"lipglossoil", "lipglossliptint"})
 # A setting spray is sprayed over the face. Measured 2026-10-10 on holiholic.com's "Setting Spray" shelf:
 # it also holds Etude's "Dr. Mascara Fixer", "Bare Edge Brow Fixer", "Pang Pang Haircara Fixer" and
 # A'PIEU's "Pro Curling The Black Fixer Mascara" -- fixers for lashes, brows and hair, not for a face.
+# The rule is the classifier's own (setting_spray_names_another_area), so a typed shelf and a title
+# are judged alike.
 _SETTING_SPRAY_LEAF = "beauty/makeup/face/setting-spray"
-_SETTING_SPRAY_OTHER_AREA = re.compile(r"\b(?:mascaras?|(?:eye)?lash(?:es)?|(?:eye)?brows?|hair\w*|haircara)\b", re.I)
-# A shelf that names two products by design: the title picks which one THIS product is, and only when it
-# names exactly one of them and nothing else. credobeauty.com ("makeup, face, setting spray & powder") and
+# A shelf that names two products by design. credobeauty.com ("makeup, face, setting spray & powder") and
 # unitedbeautysupply.com ("Setting Spray and Powder") shelve both; until setting spray had a leaf, the
-# type read as powder alone and filed the sprays on it.
-_COMBINED_SHELF_LEAVES = (frozenset({_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"}),)
+# type read as powder alone and filed every product on it. Shelf -> (the leaf a title must name to leave
+# it, the shelf's answer before that leaf existed). A title naming the spray (and not the powder) takes
+# the spray leaf; every other title -- a powder, a title naming neither, a non-English one -- keeps the
+# shelf's old answer at its old confidence, so the new leaf only ever moves sprays.
+_COMBINED_SHELVES = {
+    frozenset({_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"}): (_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"),
+}
 
 
 def _title_contradicts_product_type(title: Optional[str], path: str) -> bool:
-    if path == _SETTING_SPRAY_LEAF and _SETTING_SPRAY_OTHER_AREA.search(str(title or "")):
-        return True
+    if path == _SETTING_SPRAY_LEAF:
+        from services.pdp_category_classifier import setting_spray_names_another_area
+        if setting_spray_names_another_area(title):
+            return True
     claimed = _TYPE_FAMILIES.get(path)
     if not claimed:
         return False
@@ -2982,10 +2989,12 @@ def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optiona
                 and all(path.startswith("beauty/makeup/") and not path.startswith("beauty/makeup/nails/")
                         for path in type_uses)):
             return accept("beauty/tools/brush", CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
-        shelf = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(product_type or ""))}
-        named = _title_paths(title)
-        if shelf in _COMBINED_SHELF_LEAVES and len(named) == 1 and named <= shelf:
-            return accept(next(iter(named)), CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+        shelf = frozenset(path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(str(product_type or "")))
+        if shelf in _COMBINED_SHELVES:
+            leaf, before = _COMBINED_SHELVES[shelf]
+            if _title_paths(title) & shelf == {leaf}:
+                return accept(leaf, CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+            return accept(before, CATEGORY_CONFIDENCE_MERCHANT_TYPE)
         return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
     if ptype in _GENERIC_LIP_TYPES:
         title_hit = classify(title)

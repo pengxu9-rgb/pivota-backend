@@ -14,6 +14,7 @@ at once.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -57,6 +58,26 @@ _OUTERWEAR = r"wool|cashmere|tweed|(?:wo)?men[\u2019']?s|trench|parka|jackets?|p
 # nail polish, "Men's Wool Top Coat" is a coat.
 _NAIL_CUE = r"nails?|gel|polish|lacquer|matte|quick[-\s]?dry|glossy|shine"
 _NOT_OUTERWEAR = r"(?!(?!.*\b(?:" + _NAIL_CUE + r")\b).*\b(?:" + _OUTERWEAR + r")\b)"
+
+# THE SETTING SPRAY's area rule, shared by the classifier arm below and by
+# services/curated_brand_feed (a typed "Setting Spray" shelf), so the title path and the shelf path
+# cannot disagree. A setting spray is sprayed over a made-up FACE. The same phrases also sell
+# fixers for lashes, brows and hair, wig and lace adhesives, curl and edge sprays, body and tattoo
+# setting sprays and scarf "wrap" sprays (review of #2547, every one constructed): those are not
+# face makeup, and the arm declines them, so they get whatever the rest of CATEGORY_PATTERNS says.
+# `hair\w*` covers "Haircara" and "Hairspray". Body, hand and foot stand down when the title also
+# names the face ("Face & Body Setting Spray"), as in non_face_leaf below.
+_SETTING_SPRAY_OTHER_AREAS = (r"mascaras?|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|hair\w*|curl(?:s|y|ing|ers?)?|"
+                              r"wigs?|lace|edges?|tattoos?|wraps?|scarf|scarves|styl(?:e|es|ing)|nails?|beards?")
+_SETTING_SPRAY_BODY_AREAS = r"body|hands?|foot|feet"
+SETTING_SPRAY_FACE_ONLY = (r"(?!.*\b(?:" + _SETTING_SPRAY_OTHER_AREAS + r")\b)"
+                           r"(?:(?=.*\b(?:face|facial)\b)|(?!.*\b(?:" + _SETTING_SPRAY_BODY_AREAS + r")\b))")
+_SETTING_SPRAY_FACE_ONLY_RE = re.compile(r"^" + SETTING_SPRAY_FACE_ONLY, re.IGNORECASE)
+
+
+def setting_spray_names_another_area(text: Optional[str]) -> bool:
+    """True when `text` names an area a setting spray is not for (see SETTING_SPRAY_FACE_ONLY)."""
+    return not _SETTING_SPRAY_FACE_ONLY_RE.match(" ".join(str(text or "").split()))
 
 # (category_label, taxonomy_path, regex). Order matters — more specific
 # patterns appear earlier; the first match wins.
@@ -281,14 +302,20 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # Four segments under face/, so recall's `beauty/makeup/face/` door already reaches it.
     # Only the phrases that NAME the product: a bare "finishing spray" is a hair spray as often as
     # not ("Volumizing Finishing Spray", "Finishing Hairspray"), a bare "fixer" is unread, and
-    # "makeup setting" alone names puffs as often as sprays ("Makeup Setting Puffs").
+    # "makeup setting" alone names puffs as often as sprays ("Makeup Setting Puffs"). A bare "fix" or
+    # "fixer" SPRAY is unread too ("Quick Fix Spray", "Stain Fix Spray"); a fixing spray and a fix
+    # MIST name the product.
+    # Only for the face: SETTING_SPRAY_FACE_ONLY declines a title naming lashes, brows, hair, a wig,
+    # the body... (review of #2547: "Lace Wig Fixing Spray" and "Brow Setting Spray" filed as face
+    # makeup).
     # ABOVE Toner (and above the acid-pad arm, which must sit directly on Toner), and Toner declines
     # the same phrases, so a merchant type "Setting Mist" or "Mist & Fix" is one match in
     # services/curated_brand_feed._pattern_matches, not two.
     ("Setting Spray", "beauty/makeup/face/setting-spray", re.compile(
-        r"\b(setting\s+(?:spray|mist)s?|fix(?:er|ing)?\s+(?:spray|mist)s?|mist\s*(?:&|and|\+)\s*fix|"
-        r"make[\s-]?up\s+(?:setting\s+)?fix(?:er|ing)s?|setting\s+fixers?)\b",
-        re.IGNORECASE)),
+        r"^" + SETTING_SPRAY_FACE_ONLY + r".*\b(setting\s+(?:spray|mist)s?|fixing\s+(?:spray|mist)s?|"
+        r"fix(?:er)?\s+mists?|mist\s*(?:&|and|\+)\s*fix|make[\s-]?up\s+(?:setting\s+)?fix(?:er|ing)s?|"
+        r"setting\s+fixers?)\b",
+        re.IGNORECASE | re.DOTALL)),
     # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
     #
     # 1. INDUSTRY STANDARD. Google Product Taxonomy 5976 and Shopify's standard taxonomy
@@ -845,6 +872,41 @@ def _variant_field(variant, key: str) -> Optional[str]:
     return None
 
 
+# THE QUERY SIDE of the setting-spray leaf, behind SEARCH_SETTING_SPRAY_CATEGORY_ROUTE (default OFF;
+# the gateway's route has the same flag name). The leaf changes what a QUERY routes to as well as
+# where a product is filed: "setting spray", "makeup fixer" and "fixing spray" used to route nowhere
+# and "setting mist" / "mist and fix" to beauty/skincare/tone/. Recall widens to the prefix and adds
+# a category score (services/pivot_query_service.py), so turning that on before the live setting
+# sprays are re-filed onto the leaf would boost every face-makeup row for a "setting mist" search
+# and stop boosting the toner-filed mists. With the flag off, queries route exactly as before the
+# leaf existed: the Setting Spray arm is skipped and Toner reads a bare "mist" again.
+SETTING_SPRAY_QUERY_ROUTE_FLAG = "SEARCH_SETTING_SPRAY_CATEGORY_ROUTE"
+SETTING_SPRAY_LEAF = "beauty/makeup/face/setting-spray"
+# Toner's pattern before the setting-spray leaf, verbatim.
+_TONER_BEFORE_SETTING_SPRAY = re.compile(r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)
+_QUERY_PATTERNS_BEFORE_SETTING_SPRAY: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = tuple(
+    (label, path, _TONER_BEFORE_SETTING_SPRAY if path == "beauty/skincare/tone/toner" else pattern)
+    for label, path, pattern in CATEGORY_PATTERNS
+    if path != SETTING_SPRAY_LEAF
+)
+
+
+_SUN_PROTECTION_WORD = re.compile(r"\b(?:spf|sunscreen|sun\s*screen|uv)\b", re.IGNORECASE)
+
+
+def setting_spray_query_route_enabled() -> bool:
+    return (os.getenv(SETTING_SPRAY_QUERY_ROUTE_FLAG) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _first_match(text: Optional[str], patterns) -> Optional[Tuple[str, str]]:
+    if not text:
+        return None
+    for label, path, pattern in patterns:
+        if pattern.search(text):
+            return (label, path)
+    return None
+
+
 def category_path_prefix_for_query(query: Optional[str]) -> Optional[str]:
     """Used by the recall path: when the user query matches a known category,
     return a 3-segment prefix like 'beauty/makeup/lip/' so the SQL can do
@@ -857,7 +919,14 @@ def category_path_prefix_for_query(query: Optional[str]) -> Optional[str]:
     rows on a generic 'lipstick' search). Adjust the slice depth if a more
     precise match is desired.
     """
-    hit = classify(query)
+    if setting_spray_query_route_enabled():
+        hit = classify(query)
+        if hit is not None and hit[1] == SETTING_SPRAY_LEAF and _SUN_PROTECTION_WORD.search(query):
+            # "setting spray spf": a sunscreen ask, the way "... Setting Spray SPF 30" is FILED (the
+            # Sunscreen arm sits above this one) -- a bare "spf" carries no number for it to read.
+            hit = ("Sunscreen", "beauty/skincare/sun/sunscreen")
+    else:
+        hit = _first_match(query, _QUERY_PATTERNS_BEFORE_SETTING_SPRAY)
     if hit is None:
         return None
     _, path = hit

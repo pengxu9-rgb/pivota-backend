@@ -9,7 +9,12 @@ import pytest
 
 from services import curated_brand_feed as feed
 from services.category_path_aliases import ALIASES, TAXONOMY_GAPS, TAXONOMY_LEAVES, resolve as leaf
-from services.pdp_category_classifier import category_path_prefix_for_query, classify
+from services.pdp_category_classifier import (
+    SETTING_SPRAY_QUERY_ROUTE_FLAG,
+    category_path_prefix_for_query,
+    classify,
+    resolve_path_from_row,
+)
 
 LEAF = "beauty/makeup/face/setting-spray"
 TONER = "beauty/skincare/tone/toner"
@@ -85,13 +90,24 @@ def test_a_lash_brow_or_hair_fixer_on_a_setting_spray_shelf_is_refused(title):
     ("makeup, face, setting spray & powder", "Slip Tint Undetectable Baked Setting Powder", POWDER),
     ("makeup, face, setting spray & powder", "Vital Pressed Skincare Powder", POWDER),
     ("Setting Spray and Powder", "Ruby Kisses RFS Never Touch Up Setting Spray 1.69 oz", LEAF),
-    # names two leaves (gift-set reads "Set N"): the shelf cannot be split, so it stays unresolved
-    ("Setting Spray and Powder", "Ruby Kisses HD Set N Forget Setting Powder -RRSP .4 oz", None),
-    ("Setting Spray and Powder", "Setting Spray & Powder Duo", None),                # constructed
+    ("Setting Spray and Powder", "Primer & Setting Spray", LEAF),                    # constructed: a spray title
+    # names the powder and a gift set ("Set N"): a powder title keeps the shelf's powder
+    ("Setting Spray and Powder", "Ruby Kisses HD Set N Forget Setting Powder -RRSP .4 oz", POWDER),
+    ("Setting Spray and Powder", "Setting Spray & Powder Duo", POWDER),               # constructed: both
 ])
-def test_a_combined_spray_and_powder_shelf_takes_the_one_its_title_names(ptype, title, want):
+def test_a_combined_spray_and_powder_shelf_moves_only_spray_titles(ptype, title, want):
     got = resolve(ptype, title)[0]
     assert (leaf(got) or None) == want
+
+
+@pytest.mark.parametrize("ptype", ["Setting Spray and Powder", "makeup, face, setting spray & powder"])
+@pytest.mark.parametrize("title", [
+    "Hydrating Face Mist", "Makeup Setting Puffs", "Prep & Set Mist", "Make Keep Mist EX", "Fix+ Original",
+    "메이크업 픽서", "Translucent Powder", "Lash Fixing Mist",                       # constructed
+])
+def test_a_combined_shelf_title_naming_no_spray_stays_as_it_was_filed(ptype, title):
+    # before the leaf, the type read as powder alone: same leaf, same confidence
+    assert resolve(ptype, title) == ("beauty/makeup/face/powder", feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
 
 
 def test_the_combined_shelf_rule_reads_only_that_pair():
@@ -99,6 +115,121 @@ def test_the_combined_shelf_rule_reads_only_that_pair():
     assert not leaf(resolve("Primer & Foundation", "Blurring Primer")[0])
 
 
-@pytest.mark.parametrize("query", ["setting spray", "setting mist", "makeup fixer"])
-def test_a_setting_spray_query_browses_face_makeup(query):
+# The review of #2547's titles that the bare phrases released onto face makeup (all constructed), and
+# what the classifier answered before the leaf existed -- the answer they keep.
+@pytest.mark.parametrize("title,want", [
+    ("Lash Fixing Mist", None),
+    ("Brow Setting Spray", None),
+    ("Eyebrow Fixing Spray", None),
+    ("Curl Setting Spray", None),
+    ("Setting Spray for Curls", None),
+    ("Lace Wig Fixing Spray", None),
+    ("Edge Fixing Spray", None),
+    ("Style Fixing Spray", None),
+    ("Wrap Setting Spray", "fashion/accessories/scarf"),
+    ("Body Setting Spray", None),
+    ("Tattoo Setting Spray", None),
+    ("Nail Setting Spray", None),
+    ("Hair Fixer", "beauty/haircare/general"),
+    # a bare "fix"/"fixer" spray names no setting spray
+    ("Quick Fix Spray", None),
+    ("Stain Fix Spray", None),
+    ("Fixer Spray", None),
+])
+def test_a_setting_phrase_for_another_area_is_not_a_face_setting_spray(title, want):
+    for hit in (classify(title), resolve_path_from_row(category=None, product_type=None, title=title)):
+        assert (hit[1] if hit else None) == want
+
+
+@pytest.mark.parametrize("title", ["Face & Body Setting Spray", "Setting Spray for Face and Body"])
+def test_a_title_naming_the_face_keeps_the_leaf_despite_the_body(title):
+    assert classify(title)[1] == LEAF
+
+
+@pytest.mark.parametrize("title", [
+    "Lace Wig Fixing Spray", "Brow Setting Spray", "Body Mist", "Hair Fixer", "Hairspray Setting Mist",
+    "Tattoo Setting Spray",
+])
+def test_the_typed_shelf_refuses_the_same_titles_as_the_classifier(title):
+    # one rule (setting_spray_names_another_area) for the shelf and the title
+    assert not leaf(resolve("Setting Spray", title)[0])
+
+
+@pytest.mark.parametrize("query", ["setting spray", "setting mist", "makeup fixer", "fixing spray", "mist and fix"])
+def test_with_the_flag_on_a_setting_spray_query_browses_face_makeup(query, monkeypatch):
+    monkeypatch.setenv(SETTING_SPRAY_QUERY_ROUTE_FLAG, "on")
     assert category_path_prefix_for_query(query) == "beauty/makeup/face/"
+
+
+@pytest.mark.parametrize("query", ["setting spray spf", "setting spray spf 30", "sunscreen setting spray"])
+def test_with_the_flag_on_a_setting_spray_spf_query_is_a_sunscreen_ask(query, monkeypatch):
+    monkeypatch.setenv(SETTING_SPRAY_QUERY_ROUTE_FLAG, "on")
+    assert category_path_prefix_for_query(query) == "beauty/skincare/sun/"
+
+
+# category_path_prefix_for_query on origin/main 46d9257f8, before the leaf (captured 2026-10-30).
+_QUERY_PREFIX_ON_MAIN = {
+    "blush": "beauty/makeup/face/",
+    "body setting spray": None,
+    "body spray": "beauty/fragrance/",
+    "bronzer": "beauty/makeup/face/",
+    "brow setting spray": None,
+    "cleanser": "beauty/skincare/cleanse/",
+    "concealer": "beauty/makeup/face/",
+    "dewy setting spray": None,
+    "eyeliner": "beauty/makeup/eye/",
+    "eyeshadow": "beauty/makeup/eye/",
+    "face mist": "beauty/skincare/tone/",
+    "facial mist": "beauty/skincare/tone/",
+    "false lashes": "beauty/makeup/eye/",
+    "finishing spray": None,
+    "fix spray": None,
+    "fixer": None,
+    "fixing spray": None,
+    "foundation": "beauty/makeup/face/",
+    "glow serum setting spray": "beauty/skincare/treat/",
+    "hair fixing spray": "beauty/haircare/",
+    "hair spray": "beauty/haircare/",
+    "highlighter": "beauty/makeup/face/",
+    "lash fixing mist": "beauty/skincare/tone/",
+    "lip balm": "beauty/makeup/lip/",
+    "lip gloss": "beauty/makeup/lip/",
+    "lipstick": "beauty/makeup/lip/",
+    "make up fixer": None,
+    "makeup fixer": None,
+    "makeup fixing mist": "beauty/skincare/tone/",
+    "makeup setting spray": None,
+    "mascara": "beauty/makeup/eye/",
+    "matte setting spray": None,
+    "mist": "beauty/skincare/tone/",
+    "mist & fix": "beauty/skincare/tone/",
+    "mist and fix": "beauty/skincare/tone/",
+    "moisturizer": "beauty/skincare/moisturize/",
+    "nail polish": "beauty/makeup/nails/",
+    "perfume": "beauty/fragrance/",
+    "primer": "beauty/makeup/face/",
+    "quick fix spray": None,
+    "rose water mist": "beauty/skincare/tone/",
+    "serum": "beauty/skincare/treat/",
+    "setting fixer": None,
+    "setting mist": "beauty/skincare/tone/",
+    "setting powder": "beauty/makeup/face/",
+    "setting spray": None,
+    "setting spray spf": None,
+    "setting spray spf 30": "beauty/skincare/sun/",
+    "shampoo": "beauty/haircare/",
+    "skin booster": "beauty/skincare/tone/",
+    "sunscreen": "beauty/skincare/sun/",
+    "toner": "beauty/skincare/tone/",
+    "toner pad": "beauty/skincare/tone/",
+    "tonic": "beauty/skincare/tone/",
+}
+
+
+@pytest.mark.parametrize("value", [None, "", "off", "false", "0", "no"])
+def test_with_the_flag_off_query_routing_is_exactly_main(value, monkeypatch):
+    if value is None:
+        monkeypatch.delenv(SETTING_SPRAY_QUERY_ROUTE_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(SETTING_SPRAY_QUERY_ROUTE_FLAG, value)
+    assert {q: category_path_prefix_for_query(q) for q in _QUERY_PREFIX_ON_MAIN} == _QUERY_PREFIX_ON_MAIN
