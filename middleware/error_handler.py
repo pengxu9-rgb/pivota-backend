@@ -19,10 +19,13 @@ from utils.error_codes import ErrorCode, PivotaAPIError, create_error_response
 from utils.logger import logger
 
 
-# A JSON body may carry "\ud800": json.loads turns it into a lone surrogate, pydantic rejects it
-# (string_unicode), and the 422 echoes it back as `input`. UTF-8 cannot encode a surrogate, so
-# JSONResponse.render raised and every such request came back 500. A str that reached Python
-# holds no valid pair (json.loads joins those into one code point), so every surrogate goes.
+# A JSON body may carry "\ud800": json.loads turns it into a lone surrogate. A constrained str
+# field rejects it (string_unicode) and the 422 echoes it back as `input`; UTF-8 cannot encode a
+# surrogate, so JSONResponse.render raised and the request came back 500. _encodable covers that
+# echo, the middleware's re-read of >=400 JSON bodies, and the 500 `message`. It does NOT stop a
+# plain str / Dict / Any field or raw request.json() from carrying a lone surrogate into a route
+# (known follow-up). A str that reached Python holds no valid pair (json.loads joins those into
+# one code point), so every surrogate goes.
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
@@ -304,7 +307,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
         error_dict = create_error_response(
             error_code=ErrorCode.INVALID_REQUEST,
             message="Request validation failed",
-            details={"validation_errors": _encodable(errors)},
+            details={"validation_errors": errors},
             request_id=request_id
         )
         
