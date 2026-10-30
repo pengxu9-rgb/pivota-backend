@@ -31,7 +31,7 @@ CONFIRM_CREATE = "SOURCE_QUARANTINE_CREATE"
 CONFIRM_REVOKE = "SOURCE_QUARANTINE_REVOKE"
 VIEW_RESTORE_NEXT_STEP = (
     "agent_pdp_view rows reaped while this source was quarantined are restored by the next "
-    "reconciler tick; to restore now: ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,"
+    "reconciler tick, within 6 h (it runs every 6 h at :43, up to 150 keys a tick); to restore now: ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,"
     "DB_COMMAND_TIMEOUT_SECONDS=600,AGENT_PDP_VIEW_MARKET_PRICES=on bash scripts/ops/run_oneoff_job.sh "
     "scripts/reap_orphaned_agent_pdp_view.py --restore"
 )

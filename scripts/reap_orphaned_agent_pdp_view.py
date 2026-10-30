@@ -86,7 +86,7 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
     was = await _connect_if_needed(db)
     try:
         if getattr(args, "restore", False):
-            return await restore_reaped_agent_pdp_view_rows(db=db, limit=args.limit)
+            return await restore_reaped_agent_pdp_view_rows(db=db, max_keys=args.limit or None)
         if getattr(args, "unbuildable", False):
             return await reap_unbuildable_agent_pdp_view_rows(
                 db=db, limit=args.limit, dry_run=not args.apply
@@ -106,7 +106,8 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--limit", type=int, default=0,
-        help="Max orphans to process this run (0 = all). Default 0.",
+        help="Max keys to process this run (0 = all): orphans by default, unbuildable rows "
+        "with --unbuildable, keys to restore with --restore. Default 0.",
     )
     p.add_argument(
         "--unbuildable", action="store_true",

@@ -3246,7 +3246,9 @@ async def ensure_required_schema_light() -> None:
                             funnel_link_ids     JSONB NOT NULL DEFAULT '[]'::jsonb,
                             row_snapshot        JSONB NOT NULL,
                             deleted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            restored_at         TIMESTAMPTZ
+                            restored_at         TIMESTAMPTZ,
+                            attempts            INTEGER NOT NULL DEFAULT 0,
+                            next_attempt_at     TIMESTAMPTZ
                         );
                         """
                     )

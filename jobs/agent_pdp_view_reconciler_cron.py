@@ -47,6 +47,8 @@ Env vars:
       stays in the minutes range, well inside the 6h cron cadence)
   AGENT_PDP_VIEW_DRIFT_ALERT_THRESHOLD   default 200 — ERROR-log when more
       stale+missing view rows than this remain after a pass
+  AGENT_PDP_VIEW_RESTORE_MAX_KEYS        default 150 — unbuildable-reap restores per tick
+  AGENT_PDP_VIEW_RESTORE_MAX_SECONDS     default 180 — and at most this long
 """
 
 from __future__ import annotations
@@ -64,6 +66,14 @@ _ENV_LIMIT = "AGENT_PDP_VIEW_RECONCILE_LIMIT"
 _ENV_DRIFT_THRESHOLD = "AGENT_PDP_VIEW_DRIFT_ALERT_THRESHOLD"
 
 REFRESH_SOURCE = "reconciler_cron"
+
+# The unbuildable-reap restore runs first in each tick; a large revoke must not hold the
+# reconcile pass up, so one tick finishes at most this many keys / seconds (~1s+ per rebuild).
+# The rest wait for the next tick; `reap_orphaned_agent_pdp_view --restore` has no bound.
+_ENV_RESTORE_MAX_KEYS = "AGENT_PDP_VIEW_RESTORE_MAX_KEYS"
+_ENV_RESTORE_MAX_SECONDS = "AGENT_PDP_VIEW_RESTORE_MAX_SECONDS"
+_DEFAULT_RESTORE_MAX_KEYS = 150
+_DEFAULT_RESTORE_MAX_SECONDS = 180
 
 
 def _is_enabled() -> bool:
@@ -299,7 +309,12 @@ async def _restore_reaped_rows(db: Any) -> None:
     try:
         from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
 
-        restored = await restore_reaped_agent_pdp_view_rows(db=db, refresh_source=REFRESH_SOURCE)
+        restored = await restore_reaped_agent_pdp_view_rows(
+            db=db,
+            refresh_source=REFRESH_SOURCE,
+            max_keys=_int_env(_ENV_RESTORE_MAX_KEYS, _DEFAULT_RESTORE_MAX_KEYS, floor=1),
+            max_seconds=_int_env(_ENV_RESTORE_MAX_SECONDS, _DEFAULT_RESTORE_MAX_SECONDS, floor=1),
+        )
         if restored["errors"]:
             logger.warning(
                 "agent_pdp_view_reconcile: unbuildable restore: %d key(s) failed "

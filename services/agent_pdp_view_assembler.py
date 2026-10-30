@@ -2825,12 +2825,14 @@ async def _reap_tables_present(db: Any) -> Dict[str, bool]:
         f"""
         SELECT to_regclass('{_UNBUILDABLE_REAP_AUDIT_TABLE}') IS NOT NULL AS audit,
                to_regclass('product_enrichment') IS NOT NULL AS enrichment,
-               to_regclass('agent_decision_funnel_links') IS NOT NULL AS links
+               to_regclass('agent_decision_funnel_links') IS NOT NULL AS links,
+               to_regclass('checkout_decisions') IS NOT NULL AS checkout_decisions,
+               to_regclass('agent_decision_candidates') IS NOT NULL AS candidates
         """,
         {},
     )
     row = dict(row) if row else {}
-    return {k: bool(row.get(k)) for k in ("audit", "enrichment", "links")}
+    return {k: bool(row.get(k)) for k in ("audit", "enrichment", "links", "checkout_decisions", "candidates")}
 
 
 def _new_run_id(prefix: str) -> str:
@@ -2985,7 +2987,8 @@ def _restore_queue_sql(*, with_enrichment: bool) -> str:
     """Unrestored keys that can be finished NOW, a page at a time (keyset on content_key):
     a view row exists again (another writer rebuilt it), or the key has catalog rows and one
     of them is buildable. Filtering here, before the LIMIT, is what keeps a key that is still
-    quarantined (or an orphan, or re-quarantined) from holding a page forever."""
+    quarantined (or an orphan, or re-quarantined) from holding a page forever. A key the
+    builder declined (or that failed) on an earlier pass waits out its next_attempt_at."""
     return f"""
     SELECT av.content_key,
            EXISTS (SELECT 1 FROM agent_pdp_view v WHERE v.content_key = av.content_key) AS has_view,
@@ -2995,6 +2998,7 @@ def _restore_queue_sql(*, with_enrichment: bool) -> str:
                MIN(a.deleted_at) AS since
         FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
         WHERE a.restored_at IS NULL AND a.content_key > :after
+          AND (a.next_attempt_at IS NULL OR a.next_attempt_at <= NOW())
         GROUP BY a.content_key
     ) av
     WHERE EXISTS (SELECT 1 FROM agent_pdp_view v WHERE v.content_key = av.content_key)
@@ -3004,11 +3008,50 @@ def _restore_queue_sql(*, with_enrichment: bool) -> str:
 """
 
 
-# The links one reap nulled (their ids are in the audit), plus links INSERTED with content_key
-# NULL while the key was reaped: services/agent_decision_event_store nulls a content_key whose
-# view row is missing rather than drop the link. Those are matched only through their own
-# catalog_offer_id, an offer of a product under this key, and only if written after the reap.
-_REPOINT_LINKS_SQL = f"""
+# A key the predicate calls buildable but the builder declines (or one whose restore raised)
+# is retried after 1h, 2h, 4h, ... capped at 7 days, not on every pass.
+_BACKOFF_SQL = f"""
+    UPDATE {_UNBUILDABLE_REAP_AUDIT_TABLE}
+    SET attempts = attempts + 1,
+        next_attempt_at = NOW() + LEAST(INTERVAL '1 hour' * power(2, LEAST(attempts, 8)), INTERVAL '7 days')
+    WHERE audit_id = ANY(:audit_ids) AND restored_at IS NULL
+"""
+
+
+def _repoint_links_sql(present: Dict[str, bool]) -> str:
+    """The links one reap nulled (their ids are in the audit), plus links INSERTED with
+    content_key NULL while the key was reaped (services/agent_decision_event_store nulls a
+    content_key whose view row is missing rather than drop the link). A NULL content_key alone
+    is not that proof (it is also what a writer that named no valid key leaves), so an inserted
+    link qualifies only if the decision layer's own record names this key, which no reap
+    touches (no FK to the view): its checkout decision cites :ck, or its offer is one of this
+    key's AND a candidate of its decision cites :ck. And only if written between the first reap
+    (:since) and the view's return (:until)."""
+    names_key = []
+    if present.get("checkout_decisions"):
+        names_key.append(
+            "EXISTS (SELECT 1 FROM checkout_decisions cd "
+            "WHERE cd.checkout_decision_id = l.checkout_decision_id AND cd.content_key = :ck)"
+        )
+    if present.get("candidates"):
+        names_key.append(
+            """(l.catalog_offer_id IN (
+                SELECT co.offer_id FROM catalog_offers co
+                JOIN catalog_products cp ON cp.product_key = co.product_key
+                WHERE cp.content_key = :ck)
+              AND EXISTS (SELECT 1 FROM agent_decision_candidates c
+                          WHERE c.decision_id = l.decision_id AND c.content_key = :ck))"""
+        )
+    inserted = (
+        f"""
+        OR (
+            l.created_at >= :since AND l.created_at <= :until
+            AND ({" OR ".join(names_key)})
+        )"""
+        if names_key
+        else ""
+    )
+    return f"""
     UPDATE agent_decision_funnel_links l
     SET content_key = :ck
     WHERE l.content_key IS NULL
@@ -3017,38 +3060,32 @@ _REPOINT_LINKS_SQL = f"""
             SELECT jsonb_array_elements_text(a.funnel_link_ids)
             FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
             WHERE a.audit_id = ANY(:audit_ids)
-        )
-        OR (
-            l.created_at >= :since
-            AND l.catalog_offer_id IN (
-                SELECT co.offer_id FROM catalog_offers co
-                JOIN catalog_products cp ON cp.product_key = co.product_key
-                WHERE cp.content_key = :ck
-            )
-        )
+        ){inserted}
       )
     RETURNING l.link_id
 """
 
 
-async def _finish_restore(db: Any, row: Dict[str, Any], *, links: bool) -> Optional[int]:
+async def _finish_restore(db: Any, row: Dict[str, Any], *, present: Dict[str, bool]) -> Optional[int]:
     """Re-point the key's links and stamp its queued audit rows, in ONE transaction, under a
     lock on the view row. None when the view row is gone again (reaped meanwhile): nothing is
     stamped and the key stays queued. Only the audit rows read with the queue are stamped, so
-    a newer reap's row is never marked restored by an older pass."""
+    a newer reap's row is never marked restored by an older pass. The view row's refreshed_at,
+    read under the lock, bounds the window for inserted links (_repoint_links_sql)."""
     async with db.transaction():
         held = await db.fetch_one(
-            "SELECT content_key FROM agent_pdp_view WHERE content_key = :ck FOR UPDATE",
+            "SELECT content_key, refreshed_at FROM agent_pdp_view WHERE content_key = :ck FOR UPDATE",
             {"ck": row["content_key"]},
         )
         if not held:
             return None
         fixed = []
-        if links:
-            fixed = await db.fetch_all(
-                _REPOINT_LINKS_SQL,
-                {"ck": row["content_key"], "audit_ids": list(row["audit_ids"]), "since": row["since"]},
-            )
+        if present.get("links"):
+            sql = _repoint_links_sql(present)
+            params = {"ck": row["content_key"], "audit_ids": list(row["audit_ids"])}
+            if ":since" in sql:
+                params.update(since=row["since"], until=dict(held)["refreshed_at"])
+            fixed = await db.fetch_all(sql, params)
         await db.execute(
             f"UPDATE {_UNBUILDABLE_REAP_AUDIT_TABLE} SET restored_at = NOW() "
             "WHERE audit_id = ANY(:audit_ids) AND restored_at IS NULL",
@@ -3061,28 +3098,38 @@ async def restore_reaped_agent_pdp_view_rows(
     *,
     db: Any = None,
     limit: Optional[int] = 200,
+    max_keys: Optional[int] = None,
+    max_seconds: Optional[float] = None,
     refresh_source: str = "unbuildable_restore",
 ) -> Dict[str, int]:
-    """Finish every reaped key that can be finished now.
+    """Finish the reaped keys that can be finished now, within an optional budget.
 
     The queue (_restore_queue_sql) is the unrestored audit rows of keys that are buildable now
-    or already have a view row again, read `limit` keys per page until it is exhausted. For a
-    key without a view row, rebuild it from catalog truth (refresh_agent_pdp_view_for_content_key:
-    today's data, not the snapshot). Then, for every key with a view row, re-point the funnel
-    links the reap nulled and stamp the audit rows (_finish_restore). A key that still does not
-    build is counted and skipped; it comes back once it can build. Each key runs on its own:
-    one that raises is counted in `errors` and the pass goes on.
+    or already have a view row again, read `limit` keys per page. For a key without a view row,
+    rebuild it from catalog truth (refresh_agent_pdp_view_for_content_key: today's data, not the
+    snapshot). Then, for every key with a view row, re-point the funnel links the reap nulled and
+    stamp the audit rows (_finish_restore). A key that still does not build, or whose restore
+    raises, is counted (`still_unbuildable` / `errors`, the latter named in a WARNING) and backed
+    off (_BACKOFF_SQL), and the pass goes on.
+
+    `max_keys` / `max_seconds` bound one pass (the reconciler tick sets both, so a large revoke
+    cannot hold up its reconcile pass); `budget_exhausted` = 1 when either stopped it. Keys left
+    over wait for the next pass. None = no bound (the --restore one-off).
 
     Not gated on AGENT_PDP_VIEW_UNBUILDABLE_REAP: restoring is never the risky direction, and
     links must heal while deletes are switched off. No audit table: nothing to restore.
     """
+    import time
+
     read_db = db or database
     counters = {"candidates": 0, "restored": 0, "relinked": 0, "still_unbuildable": 0,
-                "links_restored": 0, "errors": 0}
+                "links_restored": 0, "errors": 0, "budget_exhausted": 0}
     present = await _reap_tables_present(read_db)
     if not present["audit"]:
         return counters
     page = int(limit) if limit and int(limit) > 0 else 500
+    cap = int(max_keys) if max_keys and int(max_keys) > 0 else None
+    deadline = time.monotonic() + float(max_seconds) if max_seconds and max_seconds > 0 else None
     queue_sql = _restore_queue_sql(with_enrichment=present["enrichment"])
     after = ""
     while True:
@@ -3091,6 +3138,11 @@ async def restore_reaped_agent_pdp_view_rows(
             break
         after = rows[-1]["content_key"]
         for row in rows:
+            if (cap is not None and counters["candidates"] >= cap) or (
+                deadline is not None and time.monotonic() >= deadline
+            ):
+                counters["budget_exhausted"] = 1
+                break
             counters["candidates"] += 1
             ck = row["content_key"]
             try:
@@ -3099,8 +3151,9 @@ async def restore_reaped_agent_pdp_view_rows(
                         ck, refresh_source=refresh_source, db=read_db
                     ):
                         counters["still_unbuildable"] += 1
+                        await read_db.execute(_BACKOFF_SQL, {"audit_ids": list(row["audit_ids"])})
                         continue
-                fixed = await _finish_restore(read_db, row, links=present["links"])
+                fixed = await _finish_restore(read_db, row, present=present)
                 if fixed is None:
                     counters["still_unbuildable"] += 1
                     continue
@@ -3113,9 +3166,13 @@ async def restore_reaped_agent_pdp_view_rows(
                     "content_key": ck,
                     "error": f"{type(exc).__name__}: {str(exc)[:200]}",
                 })
-        if len(rows) < page:
+                try:
+                    await read_db.execute(_BACKOFF_SQL, {"audit_ids": list(row["audit_ids"])})
+                except Exception:  # noqa: BLE001 — the key is retried next pass instead
+                    pass
+        if counters["budget_exhausted"] or len(rows) < page:
             break
-    if counters["restored"] or counters["relinked"] or counters["errors"]:
+    if counters["restored"] or counters["relinked"] or counters["errors"] or counters["budget_exhausted"]:
         logger.warning({"event": "agent_pdp_view_unbuildable_restored", **counters})
     return counters
 

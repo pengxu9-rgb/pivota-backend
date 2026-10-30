@@ -66,7 +66,17 @@ _LINKS_STUB = """CREATE TABLE IF NOT EXISTS agent_decision_funnel_links (
     funnel_event_id uuid NOT NULL DEFAULT gen_random_uuid(),
     content_key VARCHAR(40) NULL REFERENCES agent_pdp_view(content_key) ON DELETE SET NULL,
     catalog_offer_id VARCHAR(255) NULL,
+    decision_id VARCHAR(64) NULL,
+    checkout_decision_id uuid NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"""
+# The decision layer's own records of the key (migration 140; no FK to the view, so a reap
+# leaves them alone): the columns the restore's re-point reads.
+_DECISION_STUBS = (
+    """CREATE TABLE IF NOT EXISTS checkout_decisions (
+        checkout_decision_id uuid PRIMARY KEY, content_key VARCHAR(40) NULL)""",
+    """CREATE TABLE IF NOT EXISTS agent_decision_candidates (
+        decision_id VARCHAR(64) NOT NULL, content_key VARCHAR(40) NULL)""",
+)
 _AUDIT = "agent_pdp_view_unbuildable_reap_audit"
 
 
@@ -118,6 +128,8 @@ def db_url():
         for ddl in _CHAIN_STUBS:
             conn.execute(_text(ddl))
         conn.execute(_text(_LINKS_STUB))
+        for ddl in _DECISION_STUBS:
+            conn.execute(_text(ddl))
         assert conn.execute(_text(f"SELECT to_regclass('{_AUDIT}') IS NOT NULL")).scalar(), \
             "migration 272 did not create the audit table"
     engine.dispose()
@@ -167,7 +179,8 @@ def run(db_url, monkeypatch):  # noqa: C901
                 if handle is dbmod.database or isinstance(handle, databases.Database):
                     monkeypatch.setattr(mod, "database", database)
             try:
-                for table in ("agent_decision_funnel_links", _AUDIT, "agent_pdp_view",
+                for table in ("agent_decision_funnel_links", "checkout_decisions",
+                              "agent_decision_candidates", _AUDIT, "agent_pdp_view",
                               "catalog_products", "catalog_offers",
                               "catalog_source_quarantine", "external_product_seeds"):
                     await database.execute(f"DELETE FROM {table}")
@@ -725,41 +738,43 @@ def test_the_restored_row_equals_an_in_process_build(run) -> None:
     }
 
 
-def test_links_written_while_the_key_was_reaped_are_repointed_through_their_offer(run) -> None:
-    # The ledger writer nulls a content_key whose view row is missing and keeps the link. A
-    # link for this key's own offer, written after the reap, gets the key back; one for
-    # another key's offer, or older than the reap, does not.
+def test_links_written_while_the_key_was_reaped_are_repointed_only_when_their_decision_names_it(run) -> None:
+    # The ledger writer nulls a content_key whose view row is missing and keeps the link. A link
+    # inserted while the key was reaped gets the key back only if the decision layer names it:
+    # its checkout decision cites the key, or its offer is the key's AND a candidate of its
+    # decision cites the key. The offer alone, or a link older than the reap, is not enough.
     async def body(db):
         from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
 
         await _product(db, "ck_off", "pk_off", domain=_BAD_DOMAIN, description="Current copy.")
         await _product(db, "ck_elsewhere", "pk_elsewhere", domain=_GOOD_DOMAIN)
         for offer, pk in (("offer:mine", "pk_off"), ("offer:theirs", "pk_elsewhere")):
-            await db.execute(
-                "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id) "
-                "VALUES (:o, :o, :pk, 'm1')", {"o": offer, "pk": pk})
-        await db.execute(
-            "INSERT INTO agent_decision_funnel_links (content_key, catalog_offer_id, created_at) "
-            "VALUES (NULL, 'offer:mine', NOW() - INTERVAL '2 days')")  # before the reap
+            await _offer(db, offer, pk)
+        cd = await _checkout_decision(db, "ck_off")
+        await db.execute("INSERT INTO agent_decision_candidates VALUES ('dec_off', 'ck_off')")
+        await _link(db, offer="offer:mine", decision="dec_off", created_sql="NOW() - INTERVAL '2 days'")  # before the reap
         await _stale_view(db, "ck_off")
         assert await _refresh(db, "ck_off") is False
-        await db.execute(
-            "INSERT INTO agent_decision_funnel_links (content_key, catalog_offer_id) "
-            "VALUES (NULL, 'offer:mine'), (NULL, 'offer:theirs')")
+        await _link(db, offer="offer:mine", decision="dec_off")     # offer + candidate: yes
+        await _link(db, offer="offer:mine")                         # offer alone: no
+        await _link(db, checkout=cd)                                 # checkout decision: yes
+        await _link(db, offer="offer:theirs", decision="dec_off")   # another key's offer: no
         await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
         counters = await restore_reaped_agent_pdp_view_rows(db=db)
         rows = [dict(r) for r in await db.fetch_all(
-            "SELECT catalog_offer_id, content_key, created_at < NOW() - INTERVAL '1 day' AS old "
-            "FROM agent_decision_funnel_links ORDER BY catalog_offer_id, created_at")]
-        await db.execute("DELETE FROM catalog_offers")
+            "SELECT tag, content_key FROM (SELECT COALESCE(catalog_offer_id, '-') || '|' || COALESCE(decision_id, '-') || '|' "
+            "|| (checkout_decision_id IS NOT NULL)::text || '|' || (created_at < NOW() - INTERVAL '1 day')::text AS tag, "
+            "content_key FROM agent_decision_funnel_links) t ORDER BY tag")]
         return counters, rows
 
     counters, rows = run(body)
-    assert counters["restored"] == 1 and counters["links_restored"] == 1
-    assert [(r["catalog_offer_id"], r["content_key"], r["old"]) for r in rows] == [
-        ("offer:mine", None, True),
-        ("offer:mine", "ck_off", False),
-        ("offer:theirs", None, False),
+    assert counters["restored"] == 1 and counters["links_restored"] == 2
+    assert [(r["tag"], r["content_key"]) for r in rows] == [
+        ("-|-|true|false", "ck_off"),
+        ("offer:mine|-|false|false", None),
+        ("offer:mine|dec_off|false|false", "ck_off"),
+        ("offer:mine|dec_off|false|true", None),
+        ("offer:theirs|dec_off|false|false", None),
     ]
 
 
@@ -811,7 +826,8 @@ def test_restore_stamps_only_the_audit_rows_it_read(run) -> None:
         first = await db.fetch_val(f"SELECT audit_id FROM {_AUDIT} WHERE content_key = 'ck_st'")
         await _audit(db, "ck_st")  # the newer row
         since = await db.fetch_val(f"SELECT MIN(deleted_at) FROM {_AUDIT}")
-        await _finish_restore(db, {"content_key": "ck_st", "audit_ids": [first], "since": since}, links=True)
+        await _finish_restore(db, {"content_key": "ck_st", "audit_ids": [first], "since": since},
+                              present={"links": True, "checkout_decisions": True, "candidates": True})
         return [dict(r) for r in await db.fetch_all(
             f"SELECT audit_id, restored_at IS NOT NULL AS done FROM {_AUDIT} ORDER BY audit_id")], first
 
@@ -936,9 +952,304 @@ def test_finishing_a_key_whose_row_is_gone_again_stamps_nothing(run) -> None:
         row = dict(await db.fetch_one(
             f"SELECT content_key, array_agg(audit_id) AS audit_ids, MIN(deleted_at) AS since "
             f"FROM {_AUDIT} GROUP BY content_key"))
-        fixed = await _finish_restore(db, row, links=True)
+        fixed = await _finish_restore(db, row, present={"links": True, "checkout_decisions": True,
+                                                        "candidates": True})
         return fixed, await _audit_rows(db)
 
     fixed, audit = run(body)
     assert fixed is None
     assert [r["restored_at"] for r in audit] == [None]
+
+
+
+async def _offer(db, offer_id, product_key):
+    await db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id) VALUES (:o, :o, :pk, 'm1')",
+        {"o": offer_id, "pk": product_key},
+    )
+
+
+async def _checkout_decision(db, ck):
+    import uuid
+
+    cd = str(uuid.uuid4())
+    await db.execute("INSERT INTO checkout_decisions VALUES (CAST(:cd AS uuid), :ck)", {"cd": cd, "ck": ck})
+    return cd
+
+
+async def _link(db, *, offer=None, decision=None, checkout=None, created_sql="NOW()"):
+    await db.execute(
+        "INSERT INTO agent_decision_funnel_links (content_key, catalog_offer_id, decision_id, checkout_decision_id, created_at) "
+        f"VALUES (NULL, :o, :d, CAST(:cd AS uuid), {created_sql})",
+        {"o": offer, "d": decision, "cd": checkout},
+    )
+
+
+async def _link_ck(db, offer_id):
+    return await db.fetch_val(
+        "SELECT content_key FROM agent_decision_funnel_links WHERE catalog_offer_id = :o", {"o": offer_id})
+
+
+def test_an_offer_that_moved_keys_does_not_carry_its_link_to_the_new_key(run) -> None:
+    # Review probe F5a: both keys reaped, a link for offer:moved (cited for ck_m1), then the offer
+    # moves to ck_m2's product (as merge_duplicate_canonicals does). The link must not land on
+    # ck_m2; with nothing in the decision layer naming a key it stays NULL, and with ck_m1's
+    # checkout decision it goes to ck_m1.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_m1", "pk_m1", domain=_BAD_DOMAIN, description="m1 copy.")
+        await _product(db, "ck_m2", "pk_m2", domain=_BAD_DOMAIN, description="m2 copy.")
+        await _offer(db, "offer:moved", "pk_m1")
+        await _offer(db, "offer:moved2", "pk_m1")
+        for ck in ("ck_m1", "ck_m2"):
+            await _stale_view(db, ck)
+            assert await _refresh(db, ck) is False
+        await _link(db, offer="offer:moved")
+        await _link(db, offer="offer:moved2", checkout=await _checkout_decision(db, "ck_m1"))
+        await db.execute("UPDATE catalog_offers SET product_key = 'pk_m2'")
+        await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
+        counters = await restore_reaped_agent_pdp_view_rows(db=db)
+        return counters, await _link_ck(db, "offer:moved"), await _link_ck(db, "offer:moved2")
+
+    counters, bare, cited = run(body)
+    assert counters["restored"] == 2
+    assert bare is None
+    assert cited == "ck_m1"
+
+
+def test_a_null_link_written_after_the_view_returned_is_not_claimed(run) -> None:
+    # Review probe F5b: reaped, rebuilt by another writer, THEN a link is written with content_key
+    # NULL (a writer that named no valid key). It is outside the reap window, so even a checkout
+    # decision citing the key does not claim it; the never-reaped control stays NULL too.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_nn", "pk_nn", domain=_BAD_DOMAIN, description="nn copy.")
+        await _offer(db, "offer:nn", "pk_nn")
+        await _stale_view(db, "ck_nn")
+        assert await _refresh(db, "ck_nn") is False
+        await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
+        assert await _refresh(db, "ck_nn") is True
+        await _link(db, offer="offer:nn", checkout=await _checkout_decision(db, "ck_nn"))
+        counters = await restore_reaped_agent_pdp_view_rows(db=db)
+        ck = await _link_ck(db, "offer:nn")
+        await _product(db, "ck_ctrl", "pk_ctrl", domain=_GOOD_DOMAIN)
+        await _offer(db, "offer:ctrl", "pk_ctrl")
+        assert await _refresh(db, "ck_ctrl") is True
+        await _link(db, offer="offer:ctrl")
+        await restore_reaped_agent_pdp_view_rows(db=db)
+        return counters, ck, await _link_ck(db, "offer:ctrl")
+
+    counters, ck, ctrl = run(body)
+    assert counters["relinked"] == 1 and counters["links_restored"] == 0
+    assert ck is None
+    assert ctrl is None
+
+
+def test_the_window_starts_at_the_first_reap(run) -> None:
+    # Two reaps of one key (two audit rows): a link written between them is inside the window.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_two", "pk_two", domain=_GOOD_DOMAIN)
+        for days in (3, 1):
+            await db.execute(
+                f"INSERT INTO {_AUDIT} (content_key, reason, run_id, row_snapshot, deleted_at) "
+                f"VALUES ('ck_two', 'all_members_quarantined', 'test:seed', '{{}}'::jsonb, NOW() - INTERVAL '{days} days')")
+        await _link(db, checkout=await _checkout_decision(db, "ck_two"), created_sql="NOW() - INTERVAL '2 days'")
+        counters = await restore_reaped_agent_pdp_view_rows(db=db)
+        return counters, await db.fetch_val("SELECT content_key FROM agent_decision_funnel_links")
+
+    counters, ck = run(body)
+    assert counters["restored"] == 1 and counters["links_restored"] == 1
+    assert ck == "ck_two"
+
+
+def test_a_pass_stops_at_its_budget_and_the_next_one_finishes(run, monkeypatch) -> None:
+    async def body(db):
+        from jobs.agent_pdp_view_reconciler_cron import run_agent_pdp_view_reconcile_tick
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        for i in range(5):
+            await _product(db, f"ck_b{i}", f"pk_b{i}", domain=_GOOD_DOMAIN)
+            await _audit(db, f"ck_b{i}")
+        first = await restore_reaped_agent_pdp_view_rows(db=db, limit=2, max_keys=2)
+        monkeypatch.setenv("AGENT_PDP_VIEW_RESTORE_MAX_KEYS", "1")
+        await run_agent_pdp_view_reconcile_tick(db=db)
+        after_tick = await db.fetch_val(f"SELECT count(*) FROM {_AUDIT} WHERE restored_at IS NOT NULL")
+        rest = await restore_reaped_agent_pdp_view_rows(db=db, limit=2)
+        return first, after_tick, rest
+
+    first, after_tick, rest = run(body)
+    assert first["restored"] == 2 and first["budget_exhausted"] == 1
+    assert after_tick == 3
+    assert rest["restored"] == 2 and rest["budget_exhausted"] == 0
+
+
+def test_a_key_the_builder_declines_is_backed_off_not_rebuilt_every_pass(run) -> None:
+    # The predicate calls an NBSP-only title buildable (PG trim strips spaces only); the builder
+    # does not. It is tried, backed off, and skipped until its next_attempt_at.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_nbsp", "pk_nbsp", domain=_GOOD_DOMAIN, title="  ")
+        await _audit(db, "ck_nbsp")
+        first = await restore_reaped_agent_pdp_view_rows(db=db)
+        second = await restore_reaped_agent_pdp_view_rows(db=db)
+        state1 = dict(await db.fetch_one(
+            f"SELECT attempts, next_attempt_at > NOW() + INTERVAL '50 minutes' AS later FROM {_AUDIT}"))
+        await db.execute(f"UPDATE {_AUDIT} SET next_attempt_at = NOW() - INTERVAL '1 second'")
+        third = await restore_reaped_agent_pdp_view_rows(db=db)
+        state2 = dict(await db.fetch_one(
+            f"SELECT attempts, next_attempt_at > NOW() + INTERVAL '110 minutes' AS later FROM {_AUDIT}"))
+        return first, second, state1, third, state2
+
+    first, second, state1, third, state2 = run(body)
+    assert first["still_unbuildable"] == 1
+    assert second["candidates"] == 0
+    assert state1 == {"attempts": 1, "later": True}
+    assert third["still_unbuildable"] == 1
+    assert state2 == {"attempts": 2, "later": True}
+
+
+def test_one_pass_pages_through_every_finishable_key(run) -> None:
+    async def body(db):
+        from services import agent_pdp_view_assembler as apv
+
+        for i in range(5):
+            await _product(db, f"ck_p{i}", f"pk_p{i}", domain=_GOOD_DOMAIN)
+            await _audit(db, f"ck_p{i}")
+        reads = []
+
+        class Counting:
+            def __getattr__(self, name):
+                return getattr(db, name)
+
+            async def fetch_all(self, query, values=None):
+                if "array_agg(a.audit_id" in query:
+                    reads.append(values["after"])
+                return await db.fetch_all(query, values)
+
+        counters = await apv.restore_reaped_agent_pdp_view_rows(db=Counting(), limit=2)
+        return counters, reads
+
+    counters, reads = run(body)
+    assert counters["restored"] == 5
+    assert reads == ["", "ck_p1", "ck_p3"]
+
+
+def test_a_full_page_of_keys_that_do_not_build_still_ends_the_pass(run) -> None:
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        for i in range(4):
+            await _product(db, f"ck_s{i}", f"pk_s{i}", domain=_GOOD_DOMAIN, title=" ")
+            await _audit(db, f"ck_s{i}")
+        await _product(db, "ck_s9", "pk_s9", domain=_GOOD_DOMAIN)
+        await _audit(db, "ck_s9")
+        return await asyncio.wait_for(restore_reaped_agent_pdp_view_rows(db=db, limit=2), timeout=60)
+
+    counters = run(body)
+    assert counters["still_unbuildable"] == 4 and counters["restored"] == 1
+
+
+class _LockProbe:
+    """Delegates to `db`; right after a FOR UPDATE read returns, checks from a second
+    connection whether that row is still locked (NOWAIT), i.e. whether the lock is held
+    across the work that follows it."""
+
+    def __init__(self, db, other, ck):
+        self._db, self._other, self._ck, self.held = db, other, ck, []
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def transaction(self):
+        return self._db.transaction()
+
+    async def fetch_one(self, query, values=None):
+        row = await self._db.fetch_one(query, values)
+        if "FOR UPDATE" in query:
+            try:
+                async with self._other.transaction():
+                    await self._other.fetch_one(
+                        "SELECT 1 FROM agent_pdp_view WHERE content_key = :ck FOR UPDATE NOWAIT", {"ck": self._ck})
+                self.held.append(False)
+            except Exception as exc:  # noqa: BLE001 — LockNotAvailable: still held
+                self.held.append("could not obtain lock" in str(exc) or "LockNotAvailable" in type(exc).__name__)
+        return row
+
+
+def test_the_delete_holds_its_row_lock_until_the_delete(run, db_url) -> None:
+    async def body(db):
+        import databases
+
+        from services.agent_pdp_view_assembler import delete_agent_pdp_view_if_unbuildable
+
+        await _product(db, "ck_lk", "pk_lk", domain=_BAD_DOMAIN)
+        await _stale_view(db, "ck_lk")
+        other = databases.Database(db_url.replace("postgresql://", "postgresql+asyncpg://"))
+        await other.connect()
+        try:
+            probe = _LockProbe(db, other, "ck_lk")
+            deleted = await delete_agent_pdp_view_if_unbuildable("ck_lk", db=probe)
+        finally:
+            await other.disconnect()
+        return deleted, probe.held
+
+    deleted, held = run(body)
+    assert deleted is True
+    assert held == [True]
+
+
+def test_finishing_a_restore_holds_its_row_lock(run, db_url) -> None:
+    async def body(db):
+        import databases
+
+        from services.agent_pdp_view_assembler import _finish_restore
+
+        await _product(db, "ck_fl", "pk_fl", domain=_GOOD_DOMAIN)
+        await _stale_view(db, "ck_fl")
+        await _audit(db, "ck_fl")
+        row = dict(await db.fetch_one(
+            f"SELECT content_key, array_agg(audit_id) AS audit_ids, MIN(deleted_at) AS since FROM {_AUDIT} GROUP BY content_key"))
+        other = databases.Database(db_url.replace("postgresql://", "postgresql+asyncpg://"))
+        await other.connect()
+        try:
+            probe = _LockProbe(db, other, "ck_fl")
+            fixed = await _finish_restore(probe, row, present={"links": True, "checkout_decisions": True, "candidates": True})
+        finally:
+            await other.disconnect()
+        return fixed, probe.held
+
+    fixed, held = run(body)
+    assert fixed == 0
+    assert held == [True]
+
+
+def test_the_boot_heal_builds_the_same_index_as_migration_273(run) -> None:
+    import re as _re
+
+    guard_src = (REPO_ROOT / "db" / "schema_guard.py").read_text()
+    m = _re.search(r'"(CREATE INDEX IF NOT EXISTS idx_agent_decision_funnel_links_content_key "\s*"[^"]*)"', guard_src)
+    assert m, "schema_guard.py lost the migration 273 heal"
+    heal = _re.sub(r'"\s*"', "", m.group(1))
+    mig = (REPO_ROOT / "db" / "migrations" / "273_agent_decision_funnel_links_content_key_index.sql").read_text()
+    mig_sql = _re.search(r"(CREATE INDEX CONCURRENTLY IF NOT EXISTS .*?;)", mig, _re.S).group(1)
+
+    async def body(db):
+        out = {}
+        for schema, sql in (("heal273", heal), ("mig273", mig_sql.replace(" CONCURRENTLY", ""))):
+            await db.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            await db.execute(f"CREATE SCHEMA {schema}")
+            await db.execute(f"CREATE TABLE {schema}.agent_decision_funnel_links (LIKE public.agent_decision_funnel_links)")
+            await db.execute(sql.replace("ON agent_decision_funnel_links", f"ON {schema}.agent_decision_funnel_links"))
+            out[schema] = [dict(r)["indexdef"].replace(f"{schema}.", "") for r in await db.fetch_all(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = :s", {"s": schema})]
+            await db.execute(f"DROP SCHEMA {schema} CASCADE")
+        return out
+
+    out = run(body)
+    assert len(out["mig273"]) == 1 and "WHERE (content_key IS NOT NULL)" in out["mig273"][0]
+    assert out["heal273"] == out["mig273"]
