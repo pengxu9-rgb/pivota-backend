@@ -56,6 +56,27 @@ def client() -> TestClient:
     return TestClient(main.app)
 
 
+@pytest.fixture(autouse=True)
+def platform_upstream(monkeypatch) -> List[str]:
+    """Every platform API a connect route validates against, answering 401, and recorded.
+
+    Past the gate the connect routes check the credential with the platform (Wix, Woo,
+    BigCommerce, Squarespace, Webflow, PrestaShop). That is not this file's business -- but
+    unscripted it went out to the real platform APIs on every run. A 401 is what those fake
+    credentials would get. Patched at httpx's network transport, which TestClient does not
+    use. The record lets the refusal test prove no platform was called at all."""
+    import httpx
+
+    calls: List[str] = []
+
+    async def handle_async_request(self, request):
+        calls.append(f"{request.method} {request.url.host}")
+        return httpx.Response(401, json={"error": "scripted: invalid credentials"}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request)
+    return calls
+
+
 def _token(role: str, merchant_id: Optional[str] = None) -> str:
     from utils.auth import create_access_token
 
@@ -236,13 +257,15 @@ def _ownership_refusal(resp, message: str) -> bool:
     [r[1:] for r in _ROUTES],
     ids=_ROUTE_IDS,
 )
-def test_merchant_is_refused_another_merchants_id(client, method, path, build, message):
+def test_merchant_is_refused_another_merchants_id(client, method, path, build, message, platform_upstream):
     resp = _call(client, method, path, _auth("merchant", MERCHANT_A), **build(MERCHANT_B))
 
     assert _ownership_refusal(resp, message), (
         f"cross-merchant call was not refused by the ownership check: "
         f"{resp.status_code} {resp.text[:300]}"
     )
+    # Refused BEFORE the victim's credential was tried against any platform.
+    assert platform_upstream == []
 
 
 @pytest.mark.parametrize(

@@ -40,6 +40,8 @@ on:
       - "db/**"
       - "models/**"
       - "tests/**"
+      # The repo-root conftest.py loads the pytest network guard (tests/net_guard*.py).
+      - "conftest.py"
       - "scripts/**"
       - "docs/ops/SHOPIFY_DISCOUNT_DEV_STORE_VALIDATION.md"
       - "docs/shopify-discount-*.md"

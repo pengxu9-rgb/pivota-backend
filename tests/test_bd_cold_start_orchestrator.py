@@ -17,6 +17,38 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def storefront_io(monkeypatch):
+    """The orchestrator's best-effort storefront reads, scripted as unreachable, and recorded.
+
+    Discovery is patched per test below, but enrichment and brand signals also read the
+    storefront: `{pdp}.json` per product, `/sitemap.xml` and `/robots.txt`. Unscripted, those
+    went out to the brand's real site on every run (and the test result depended on whether
+    it answered). Unreachable is what each helper already degrades to; tests that care about
+    the calls read the record."""
+    from services import bd_brand_signals as signals
+    from services import bd_cold_start_service as mod
+
+    calls: Dict[str, List[str]] = {"shopify_native": [], "sitemap": [], "robots": []}
+
+    async def shopify_native(pdp_url):
+        calls["shopify_native"].append(pdp_url)
+        return None
+
+    async def sitemap(base_url):
+        calls["sitemap"].append(base_url)
+        return [], "fetch error: scripted"
+
+    async def robots(base_url):
+        calls["robots"].append(base_url)
+        return None
+
+    monkeypatch.setattr(mod, "_fetch_shopify_native", shopify_native)
+    monkeypatch.setattr(signals, "_fetch_sitemap_urls", sitemap)
+    monkeypatch.setattr(signals, "_fetch_robots_txt", robots)
+    return calls
+
+
 @pytest.fixture
 def with_catalog_intelligence(monkeypatch):
     """Configure catalog-intelligence URL so client thinks it's
@@ -291,7 +323,7 @@ async def test_catalog_intelligence_skips_products_missing_url_or_title(
 
 @pytest.mark.asyncio
 async def test_orchestrator_uses_catalog_intelligence_when_available(
-    with_catalog_intelligence,
+    with_catalog_intelligence, storefront_io,
 ):
     """Primary path: catalog-intelligence returns rich data; fallback
     is NOT invoked. Backfill upsert hits prospect_products."""
@@ -348,6 +380,12 @@ async def test_orchestrator_uses_catalog_intelligence_when_available(
     assert upsert_calls[0]["prospect_domain"] == "gruns.co"
     assert upsert_calls[0]["discovery_source"] == "catalog_intelligence"
     assert len(upsert_calls[0]["products"]) == 3
+    # Enrichment re-read each audited product lacking vendor/type, and brand signals read the
+    # site's sitemap and robots -- scripted (storefront_io), never the brand's real store.
+    assert storefront_io["shopify_native"] == [
+        "https://gruns.co/products/strawberry", "https://gruns.co/products/mango",
+    ]
+    assert storefront_io["sitemap"] == storefront_io["robots"] == ["https://gruns.co"]
 
 
 @pytest.mark.asyncio
