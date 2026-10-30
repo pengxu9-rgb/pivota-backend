@@ -898,3 +898,47 @@ def test_the_boot_ddl_builds_the_same_audit_table_as_migration_272(run) -> None:
 
     assert shape("public") and shape("public") == shape("guard_ddl")
     assert idx_shape("public") == idx_shape("guard_ddl")
+
+
+def test_a_rebuilt_key_quarantined_again_before_the_tick_still_gets_its_links(run, monkeypatch) -> None:
+    # Rebuilt by another writer, then quarantined again while deletes are off: the view row
+    # serves, so the links it lost belong on it again, buildable or not.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_back_again", "pk_back_again", domain=_BAD_DOMAIN, description="Current copy.")
+        await _stale_view(db, "ck_back_again")
+        await _links(db, "ck_back_again", 1)
+        assert await _refresh(db, "ck_back_again") is False
+        await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
+        assert await _refresh(db, "ck_back_again") is True
+        monkeypatch.delenv("AGENT_PDP_VIEW_UNBUILDABLE_REAP")
+        await _quarantine(db, _BAD_DOMAIN)
+        counters = await restore_reaped_agent_pdp_view_rows(db=db)
+        linked = await db.fetch_val(
+            "SELECT count(*) FROM agent_decision_funnel_links WHERE content_key = 'ck_back_again'")
+        return counters, linked
+
+    counters, linked = run(body)
+    assert counters["relinked"] == 1 and linked == 1
+
+
+def test_finishing_a_key_whose_row_is_gone_again_stamps_nothing(run) -> None:
+    # Reaped again between the rebuild and the stamp: the lock finds no row, nothing is
+    # re-pointed or stamped, and the key stays queued.
+    async def body(db):
+        from services.agent_pdp_view_assembler import _finish_restore
+
+        await _product(db, "ck_gone", "pk_gone", domain=_BAD_DOMAIN)
+        await _stale_view(db, "ck_gone")
+        await _links(db, "ck_gone", 1)
+        assert await _refresh(db, "ck_gone") is False
+        row = dict(await db.fetch_one(
+            f"SELECT content_key, array_agg(audit_id) AS audit_ids, MIN(deleted_at) AS since "
+            f"FROM {_AUDIT} GROUP BY content_key"))
+        fixed = await _finish_restore(db, row, links=True)
+        return fixed, await _audit_rows(db)
+
+    fixed, audit = run(body)
+    assert fixed is None
+    assert [r["restored_at"] for r in audit] == [None]
