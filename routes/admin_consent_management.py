@@ -9,6 +9,7 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Depends, Request, status
 from pydantic import BaseModel, Field
 from db.database import database
+from utils.secret_fingerprint import secret_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ async def issue_consent(
             logger.warning(f"Audit log failed (table may not exist): {audit_error}")
         
         logger.info(
-            f"✅ Admin issued consent {consent_data['token']} "
+            f"✅ Admin issued consent {secret_fingerprint(consent_data['token'])} "
             f"to agent {consent_request.agent_id}"
         )
         

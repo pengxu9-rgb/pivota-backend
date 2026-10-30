@@ -239,14 +239,18 @@ def test_stale_timestamp_is_rejected_even_with_a_valid_mac(rig):
     assert fresh.status_code == 200
 
 
-def test_future_timestamp_beyond_tolerance_is_rejected(rig):
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 0.999])
+def test_future_timestamp_beyond_tolerance_is_rejected(rig, monkeypatch, fraction):
     """The window is enforced SYMMETRICALLY (documented in verify_signature): a future-dated `t`
     is a clock we cannot trust, or a signature farmed to outlive the window."""
     client, state = rig
+    import services.reap_webhooks as svc
+    now = 1_709_312_400 + fraction
+    monkeypatch.setattr(svc, "_now", lambda: now)
     raw = json.dumps(_event()).encode()
     r = client.post(
         "/webhooks/reap", content=raw,
-        headers={"content-type": "application/json", SIG_HEADER: _sign(raw, age=-301)},
+        headers={"content-type": "application/json", SIG_HEADER: _sign(raw, ts=int(now) + 301)},
     )
     assert r.status_code == 401
     assert state["events"] == []

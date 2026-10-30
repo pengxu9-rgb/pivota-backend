@@ -34,6 +34,27 @@ db/migrations/231_merchant_purchasability.sql for the incident that motivates it
      network fact. Equally, it must not FREEZE the affordance either, which is the original
      defect; the TTL is what stops that, because a row nobody can verify stops being fresh.
 
+── TWO QUESTIONS, TWO READERS (2026-10-09) ──────────────────────────────────────────────────
+
+The fact answers two different consumers, and NO_CARD_PAYMENT is where they part:
+
+  * `is_purchasable` — THE HEADLESS CARD QUESTION. May the Reap rail, which pays by card with no
+    human present, start a purchase? Only a fresh POSITIVE fact (ELIGIBLE + card) says yes. A
+    checkout that offers PayPal / an offsite card provider / a bank transfer and no on-site card
+    line is NO_CARD_PAYMENT, and for this reader that is a confirmed negative.
+  * `human_handoff_allowed` — THE HUMAN CART QUESTION. May a prefilled cart be handed to a HUMAN
+    (offers.resolve and the product-card lanes, `routes/agent_shop_gateway._CartPurchasabilityGate`)?
+    A human pays however the checkout lets them, so the only reason to withhold the cart is that
+    NOBODY can buy: the store wants a login or a password, is not accepting orders, or the
+    variant is gone — or we hold no fresh fact at all. NO_CARD_PAYMENT keeps the cart. Measured
+    2026-10-09 by the PR controller from a Mac: 643 of 839 negative cart seeds (26 hosts) were
+    NO_CARD_PAYMENT, and most of those checkouts take cards through an OFFSITE provider
+    (Eximbay, Payfast, "Pay via Cards/Wallets/Bank Transfer") a human completes without
+    noticing — the first cut of the cart gate declined every one of them. Peng's decision.
+
+  Both read the buyer vantage and both fail CLOSED; neither defaults a market. The preflight,
+  the sweep and the three write rules above are unchanged by the second reader.
+
 ── VANTAGE IS PART OF THE KEY ───────────────────────────────────────────────────────────────
 
 Reachability is EGRESS-DEPENDENT and that was measured, not assumed. `is_purchasable` requires a
@@ -90,6 +111,8 @@ __all__ = [
     "record_check",
     "get_fact",
     "is_purchasable",
+    "HUMAN_HANDOFF_VERDICTS",
+    "human_handoff_allowed",
     "list_due",
 ]
 
@@ -120,6 +143,18 @@ NEGATIVE_VERDICTS: FrozenSet[str] = frozenset({
     Verdict.NOT_ACCEPTING_ORDERS.value,
     Verdict.LOGIN_REQUIRED.value,
     Verdict.VARIANT_GONE.value,
+    Verdict.PRICE_DRIFT.value,
+})
+
+#: THE VERDICTS A HUMAN CAN CHECK OUT UNDER — `human_handoff_allowed`'s allow-list, written as a
+#: POSITIVE set so a verdict added later declines until somebody decides otherwise. ELIGIBLE (a
+#: checkout with our line on it), NO_CARD_PAYMENT (that checkout, read, with no on-site card line
+#: — a human pays by whatever it offers) and PRICE_DRIFT (that checkout, at another price — the
+#: human sees the price). Everything in `NEGATIVE_VERDICTS` that is NOT here is a store nobody
+#: can buy from; everything unverifiable (rule 3) is not here because nothing was read.
+HUMAN_HANDOFF_VERDICTS: FrozenSet[str] = frozenset({
+    Verdict.ELIGIBLE.value,
+    Verdict.NO_CARD_PAYMENT.value,
     Verdict.PRICE_DRIFT.value,
 })
 
@@ -377,6 +412,27 @@ SELECT 1 AS ok FROM merchant_purchasability
    AND vantage = :vantage
    AND positive_until IS NOT NULL
    AND positive_until > datetime('now')
+"""
+
+# THE HUMAN CART'S QUESTION: the row from the named vantage, only while its LAST CHECK is inside
+# the TTL — freshness is `checked_at + TTL`, the same window a positive fact gets, computed on
+# the SERVER's clock; `positive_until` is not read here because it is armed only by ELIGIBLE +
+# card, and the whole point of this reader is a verdict that never arms it. The verdict is
+# decided in Python against `HUMAN_HANDOFF_VERDICTS`.
+_SELECT_HUMAN_HANDOFF_SQL = """
+SELECT verdict FROM merchant_purchasability
+ WHERE merchant_domain = :merchant_domain
+   AND market_country = :market_country
+   AND vantage = :vantage
+   AND checked_at > clock_timestamp() - (CAST(:ttl_hours AS INTEGER) * INTERVAL '1 hour')
+"""
+
+_SELECT_HUMAN_HANDOFF_SQL_SQLITE = """
+SELECT verdict FROM merchant_purchasability
+ WHERE merchant_domain = :merchant_domain
+   AND market_country = :market_country
+   AND vantage = :vantage
+   AND checked_at > datetime('now', '-' || CAST(:ttl_hours AS INTEGER) || ' hours')
 """
 
 # The sweep's due list, for ONE vantage: rows never checked first (NULLs sort first here by the
@@ -668,6 +724,40 @@ async def is_purchasable(domain: Any, market: Any, *, now: Optional[datetime] = 
             reference = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
             return until > reference
     return False
+
+
+async def human_handoff_allowed(domain: Any, market: Any) -> bool:
+    """MAY A PREFILLED CART FOR THIS MERCHANT x MARKET BE HANDED TO A HUMAN?
+
+    True only for a FRESH fact (checked within the TTL) FROM THE BUYER VANTAGE whose verdict is
+    in `HUMAN_HANDOFF_VERDICTS`. Every other state — no row, a stale row, a verdict nobody can
+    buy under (LOGIN_REQUIRED, PASSWORD_PAGE, NOT_ACCEPTING_ORDERS, VARIANT_GONE), an
+    unverifiable verdict, a row from another vantage, a database that will not answer — is
+    False. See "TWO QUESTIONS, TWO READERS" in the module header for why this is not
+    `is_purchasable`: a human can pay a PayPal-only or offsite-card checkout; a card-paying
+    agent cannot.
+
+    FAIL-CLOSED ON ERROR and NO CLAIM FOR AN UNKNOWN MARKET, exactly as `is_purchasable`: the
+    same key normalisation, the same vantage dial, the same silence on a market-less input.
+    """
+    key_market = normalize_market(market)
+    if key_market is None:
+        return False
+    statement = _SELECT_HUMAN_HANDOFF_SQL if IS_POSTGRES else _SELECT_HUMAN_HANDOFF_SQL_SQLITE
+    values = {
+        "merchant_domain": normalize_domain(domain),
+        "market_country": key_market,
+        "vantage": buyer_vantage(),
+        "ttl_hours": ttl_hours(),
+    }
+    try:
+        record = await database.fetch_one(statement, values)
+    except Exception:  # noqa: BLE001
+        logger.exception("merchant_purchasability: human_handoff_allowed failed; withholding the cart")
+        return False
+    if record is None:
+        return False
+    return str(dict(record).get("verdict") or "") in HUMAN_HANDOFF_VERDICTS
 
 
 #: The most rows `list_due` returns. The sweep reads the WHOLE vantage to order its rotation, and

@@ -23,6 +23,12 @@ catalog_skus row per real variant. After this:
     under one canonical PDP — same UX as Sephora / Ulta / Tom Ford's
     own site
 
+For external-seed mirrors, successful SKU writes also project missing variant offers
+from the active attached seed. Existing offers are preserved and checkout readiness
+is never inferred from this projection. CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0
+(or false/no/off) skips it; a projection error is contained in the projection's own
+savepoint, logged, and never rolls back the group's SKU writes or stops the run.
+
 What this service does NOT do:
   - Touch catalog_products. Identity stays where it is.
   - Touch seed_data / product_payload. Variants are already there —
@@ -139,6 +145,10 @@ class GroupOutcome:
     variants_tier_held: int = 0
     skipped_reason: Optional[str] = None
     sample_variant_titles: List[str] = field(default_factory=list)
+    variant_offers_created: int = 0
+    #: The mirror variant-offer projection raised. Its own writes were rolled back to a
+    #: savepoint; this group's SKU writes were kept. Retried by the next run.
+    variant_offer_projection_failed: bool = False
     #: Rows refused by the OTHER unique constraint — same sku_key, different
     #: identity tuple. Counted rather than fatal; see the upsert loop.
     #:
@@ -162,6 +172,9 @@ class GroupOutcome:
 
 @dataclass
 class PromoterReport:
+    variant_offers_created: int = 0
+    #: Groups whose variant-offer projection raised (see `GroupOutcome.variant_offer_projection_failed`).
+    variant_offer_projection_failures: int = 0
     groups_considered: int = 0
     #: Groups where at least one row's tier could move. A group on the redirect lane
     #: is written but never promoted; it is `groups_tier_held`, not this.
@@ -444,6 +457,7 @@ SELECT_GROUP_PRIMARY_SQL = """
            cp.platform,
            cp.source_product_id,
            cp.catalog_track,
+           cp.source_system,
            cp.title AS parent_title,
            cp.product_payload AS product_payload,
            eps.seed_data AS seed_data
@@ -454,6 +468,10 @@ SELECT_GROUP_PRIMARY_SQL = """
      AND cp.source_product_id = pgm.platform_product_id
     LEFT JOIN external_product_seeds eps
       ON eps.external_product_id = cp.source_product_id
+     AND eps.attached_product_key = cp.product_key
+     AND eps.status = 'active'
+     AND (cp.source_system IS DISTINCT FROM 'external_product_seeds_mirror_v1'
+          OR eps.id::text = cp.source_ref)
     WHERE pgm.product_group_id = :group_id
       AND pgm.is_primary = TRUE
     LIMIT 1
@@ -567,7 +585,8 @@ UPSERT_SKU_SQL = """
         sku = EXCLUDED.sku,
         barcode = EXCLUDED.barcode,
         title = EXCLUDED.title,
-        currency = EXCLUDED.currency,
+        currency = CASE WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL
+          THEN catalog_skus.currency ELSE EXCLUDED.currency END,
         image_url = EXCLUDED.image_url,
         visible_option_labels = EXCLUDED.visible_option_labels,
         visible_attributes = EXCLUDED.visible_attributes,
@@ -576,7 +595,10 @@ UPSERT_SKU_SQL = """
         -- `agent_version` / `canonical_url`. COALESCE because `NULL || jsonb` is
         -- NULL and the column is nullable.
         sku_payload = COALESCE(catalog_skus.sku_payload, CAST('{}' AS jsonb))
-                      || EXCLUDED.sku_payload,
+                      || CASE WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL
+                        THEN EXCLUDED.sku_payload - ARRAY['price','price_amount','list_price','currency','price_currency',
+                          'available','availability','stock','merchant_effective_price','estimated_best_price']
+                        ELSE EXCLUDED.sku_payload END,
         -- `readiness_tier` WAS INSERT-ONLY, and with the identity arbiter that made
         -- the promoter's headline count a lie. An ingest-spelled `<pk>::v:<vid>` row
         -- sits at 'referral_only' (that is what `apply._SKU_UPSERT_SQL` inserts);
@@ -599,6 +621,7 @@ UPSERT_SKU_SQL = """
         -- every (stored, offered) pair through this CASE and checks it against that
         -- module's list.
         readiness_tier = CASE
+            WHEN catalog_skus.sku_payload->'price_repair' IS NOT NULL THEN catalog_skus.readiness_tier
             WHEN catalog_skus.readiness_tier = 'referral_only'
                  AND EXCLUDED.readiness_tier IN ('knowledge_ready', 'commerce_ready')
               THEN EXCLUDED.readiness_tier
@@ -643,6 +666,49 @@ def _extract_variants_for_primary(primary: Dict[str, Any]) -> List[Dict[str, Any
         return seed_variants
     payload_variants = _extract_variants_from_payload(primary.get("product_payload"))
     return payload_variants
+
+
+async def _project_variant_offers(product_key: str) -> Tuple[int, bool]:
+    """Project the group's missing variant offers, INSIDE the group transaction.
+
+    Returns (offers inserted, failed). Runs where it always ran -- after the SKU upserts, under
+    the product lock the group took first, so the projector's product -> seed -> SKU -> offer
+    lock order is unchanged and the new offers commit atomically with the SKUs they hang off.
+
+    A PROJECTION FAILURE IS NOT A GROUP FAILURE. It used to propagate: the group's transaction
+    rolled back every SKU write it had just made, and the exception ended `promote_variants_all`
+    with every later group unvisited. Now it is caught here, logged at WARNING with the product
+    and the error TYPE, counted on the outcome, and retried by the next run.
+
+    THE ISOLATION IS THE PROJECTION'S OWN TRANSACTION, NOT ONE OPENED HERE.
+    `project_missing_variant_offers` does all of its database work inside its own
+    `db.transaction()`, which, nested in the group's transaction, is a SAVEPOINT: an error rolls
+    back only the projection's writes and (on Postgres) clears the aborted-transaction state, so
+    the group can still commit. A second savepoint around the call would add nothing, so there
+    is none; tests/test_catalog_variant_promoter.py pins that the projection opens its own, and
+    tests/test_catalog_variant_offer_projection_postgres.py fails the real projection on a real
+    Postgres error and checks the group's SKUs commit. `CATALOG_VARIANT_OFFER_PROJECTION_ENABLED=0`
+    skips the projection entirely.
+    """
+    from services.catalog_variant_offer_projection import (
+        project_missing_variant_offers, projection_enabled,
+    )
+
+    if not projection_enabled():
+        logger.info("variant offer projection disabled (CATALOG_VARIANT_OFFER_PROJECTION_ENABLED) product=%s",
+                    product_key)
+        return 0, False
+    try:
+        offer_result = await project_missing_variant_offers(product_key, apply=True, db=database)
+    except Exception as exc:  # noqa: BLE001 - isolated by the projection's own savepoint; see above
+        logger.warning(
+            "variant offer projection failed product_key=%s error_type=%s -- its writes rolled "
+            "back to its savepoint; the group's SKU writes are kept and the run continues",
+            product_key, type(exc).__name__,
+        )
+        return 0, True
+    logger.info("variant offer projection product=%s result=%s", product_key, offer_result)
+    return int(offer_result.get("inserted") or 0), False
 
 
 async def promote_variants_for_group(
@@ -724,12 +790,21 @@ async def promote_variants_for_group(
     # move, and the counter says which.
     tier_can_move = readiness_tier != "referral_only"
 
+    projected_offers = 0
+    projection_failed = False
     promoted = 0
     tier_held = 0
     identity_conflicts = 0
     write_failures = 0
     if apply and rows_to_upsert:
         async with database.transaction():
+            # Match the projector's product -> seed -> SKU -> offer lock order.
+            # Taking a SKU lock first can deadlock with concurrent repair/sync.
+            if primary.get("source_system") == "external_product_seeds_mirror_v1":
+                await database.fetch_one(
+                    "SELECT product_key FROM catalog_products WHERE product_key=:pk FOR UPDATE",
+                    {"pk": primary["product_key"]},
+                )
             for r in rows_to_upsert:
                 params = {
                     "readiness_tier": readiness_tier,
@@ -799,6 +874,9 @@ async def promote_variants_for_group(
                         r.source_variant_id, str(exc)[:200],
                     )
 
+            if primary.get("source_system") == "external_product_seeds_mirror_v1":
+                projected_offers, projection_failed = await _project_variant_offers(primary["product_key"])
+
     return GroupOutcome(
         product_group_id=group_id,
         primary_product_key=primary["product_key"],
@@ -813,6 +891,8 @@ async def promote_variants_for_group(
             tier_held if apply else (0 if tier_can_move else len(rows_to_upsert))
         ),
         sample_variant_titles=sample_titles,
+        variant_offers_created=projected_offers,
+        variant_offer_projection_failed=projection_failed,
         skus_identity_conflict=identity_conflicts,
         skus_write_failed=write_failures,
         skus_deduped_same_identity=identity_collisions,
@@ -896,6 +976,8 @@ async def promote_variants_all(
         report.groups_considered += 1
         outcome = await promote_variants_for_group(group_id=gid, apply=apply)
         report.per_group.append(outcome)
+        report.variant_offers_created += outcome.variant_offers_created
+        report.variant_offer_projection_failures += int(outcome.variant_offer_projection_failed)
         if outcome.skipped_reason == "no_primary_for_group":
             report.groups_skipped_no_primary += 1
         elif outcome.skipped_reason == "no_real_variants":

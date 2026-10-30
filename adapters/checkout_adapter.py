@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 from adapters.psp_adapter import PSPAdapter, PaymentIntent
 from config.settings import settings
+from utils.secret_fingerprint import secret_fingerprint
 
 # Default processing channel ID (fallback if not provided)
 PROCESSING_CHANNEL = "pc_default_channel"
@@ -46,7 +47,8 @@ class CheckoutAdapter(PSPAdapter):
         try:
             # Log for debugging
             print(f"🔍 Checkout: Creating payment intent for {amount} {currency}")
-            print(f"   API Key: {self.api_key[:20]}... (len={len(self.api_key)})")
+            # Never characters of the key: this is the merchant's Checkout.com secret key.
+            print(f"   API Key: {secret_fingerprint(self.api_key)}")
             print(f"   Base URL: {self.base_url}")
             
             # Checkout.com uses the secret key directly (no Bearer prefix for secret keys)
@@ -54,7 +56,6 @@ class CheckoutAdapter(PSPAdapter):
                 "Authorization": self.api_key,
                 "Content-Type": "application/json"
             }
-            print(f"   Auth: {self.api_key[:15]}...")
             
             print(f"   Payload: amount={int(amount * 100)}, currency={currency.upper()}")
 
@@ -84,7 +85,8 @@ class CheckoutAdapter(PSPAdapter):
                     f"{self.base_url}/payment-sessions", json=payload, headers=headers, timeout=15.0
                 )
             print(f"   Response: {resp.status_code}")
-            print(f"   Response Body: {resp.text[:500]}")
+            # No response body here: a 2xx body carries payment_session_token and
+            # payment_session_secret. The failure branch below logs the error body.
             
             if resp.status_code in (200, 201):
                 data = resp.json()
@@ -92,7 +94,7 @@ class CheckoutAdapter(PSPAdapter):
                 payment_session_token = data.get("payment_session_token", "")
                 
                 print(f"   ✅ Payment session created: {session_id}")
-                print(f"   🎫 Payment session token: {payment_session_token[:50]}...")
+                print(f"   🎫 Payment session token: {secret_fingerprint(payment_session_token)}")
                 
                 # For Checkout payment sessions, we return the token
                 # Frontend would use Checkout.js Frames to complete payment

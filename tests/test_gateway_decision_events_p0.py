@@ -187,3 +187,27 @@ def test_derive_protocol_for_surface_mapping() -> None:
     assert derive_protocol_for_surface("shopping-agent-web") == DEFAULT_PROTOCOL
     assert derive_protocol_for_surface(None) == DEFAULT_PROTOCOL
     assert derive_protocol_for_surface("") == DEFAULT_PROTOCOL
+
+
+@pytest.mark.asyncio
+async def test_a_long_product_key_never_reaches_the_content_key_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 2026-10-29: this writer passed product_key as content_key (VARCHAR(40)); one long key lost
+    # the slate. The producer's real card shape goes in; the enqueued rows must fit the columns.
+    enqueued = _capture_enqueue(monkeypatch)
+    ck = "ck_" + "ab" * 16
+
+    async def fake_fetch_all(query: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if "catalog_products" in query:
+            return [{"product_key": k, "content_key": ck} for k in values["keys"] if k.startswith("pk_known")]
+        return []
+
+    monkeypatch.setattr(store.database, "fetch_all", fake_fetch_all)
+    result = _result(3)
+    result["products"][0]["product_key"] = "pk_known_" + "z" * 60
+    result["products"][1]["attached_product_key"] = "seed:" + "y" * 80
+    gw._record_gateway_decision_events(result, surface="agent_shop_gateway.find_products_multi", query="q")
+    for _ in range(6):
+        await _drain()
+
+    exposures = dict(enqueued)["exposures"]["rows"]
+    assert [r["content_key"] for r in exposures] == [ck, None, None]

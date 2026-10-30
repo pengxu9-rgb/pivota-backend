@@ -382,6 +382,89 @@ def test_the_listing_skips_count_as_structural(monkeypatch):
     assert summary["status"] == "success"
 
 
+def test_a_currency_refusal_counts_as_structural(monkeypatch):
+    """A seed with no currency it can vouch for (column and page read disagree: 1,254 active seeds on
+    2026-10-19) makes the writer write nothing rather than a default. That is the seed's shape, not a
+    projection that should have written, so a night of them beside real writes stays green."""
+    rows = [_structural(status="refused_currency") for _ in range(2)]
+    summary = _run(monkeypatch, rows + [_wrote() for _ in range(8)], limit=20)
+    assert summary["projection_structural_skips"] == 2
+    assert summary["projection_skips"] == {"refused_currency": 2}
+    assert summary["status"] == "success"
+
+
+@pytest.mark.parametrize("refused, wrote, status", [
+    (30, 70, "degraded"),   # 30% of attempts refused: reads stopped agreeing with the stored column
+    (12, 88, "success"),    # 12% but under the 20-refusal floor: a small night, not a spike
+    (25, 275, "success"),   # 25 refusals is past the floor, but 8.3% of attempts is the baseline's shape
+    (20, 80, "degraded"),   # the floor is inclusive (>= 20) ...
+    (19, 81, "success"),    # ... one under it is not
+    (20, 180, "success"),   # the share is strict: exactly 10% is not over it
+])
+def test_a_currency_refusal_spike_degrades(monkeypatch, refused, wrote, status):
+    """2026-10-19's baseline: 1,254 of 26,950 active seeds (~4.7%) refuse. Above twice that share
+    (10%), with at least 20 refusals, the night is degraded even though the attached lane wrote."""
+    rows = [_structural(status="refused_currency") for _ in range(refused)] + [_wrote() for _ in range(wrote)]
+    summary = _run(monkeypatch, rows, limit=refused + wrote)
+    assert summary["projections_refused_currency"] == refused
+    assert summary["status"] == status
+
+
+@pytest.mark.parametrize("raw", ["-0.5", "0", "nan", "x"])
+def test_a_nonsense_refusal_share_falls_back_to_the_default(monkeypatch, raw):
+    """A negative or zero share would degrade every night that refuses anything, and a degraded run
+    fails the Cloud Run execution, so the env var is clamped."""
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_REFUSED_CURRENCY_SHARE", raw)
+    rows = [_structural(status="refused_currency") for _ in range(25)] + [_wrote() for _ in range(275)]
+    assert _run(monkeypatch, rows, limit=300)["status"] == "success"
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "x"])
+def test_a_nonsense_minimum_refusal_count_falls_back_to_the_default(monkeypatch, raw):
+    """A minimum of 0 or below would let a single refusal on a tiny night trip the share rule."""
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MIN_REFUSED_CURRENCY_COUNT", raw)
+    rows = [_structural(status="refused_currency") for _ in range(5)] + [_wrote() for _ in range(5)]
+    assert _run(monkeypatch, rows, limit=10)["status"] == "success"
+
+
+async def _projected(monkeypatch, outcome):
+    """One seed's projection counters from the REAL helper (routes/employee_products), given what
+    sync_offer_for_seed returned, so the summary is fed exactly what production feeds it."""
+    import routes.employee_products as ep
+    import services.external_offer_dual_write as dual_write
+    import services.seed_data_writer as sdw
+
+    async def _sync(*args, **kwargs):
+        return dict(outcome)
+
+    async def _pdp(*args, **kwargs):
+        return "refreshed"
+
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setattr(dual_write, "sync_offer_for_seed", _sync)
+    monkeypatch.setattr(sdw, "refresh_agent_pdp_view_for_seed", _pdp)
+    return await ep._project_refreshed_seed_to_serving_surfaces("eps_x", price_source="refresh", currency_read=True)
+
+
+@pytest.mark.parametrize("lane_target", ["mirror", "attached"])
+def test_refusals_from_either_lane_reach_the_spike_rule_through_the_real_helper(monkeypatch, lane_target):
+    """`refused_currency` as the writer returns it, from the mirror lane or the attached lane (H1 of
+    the #2657 review), counted by the real per-seed helper and summarised by the real batch."""
+    refused = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "refused_currency"}))
+    wrote = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "synced", "target": lane_target}))
+    assert refused.get("skip_refused_currency") == 1 and wrote.get("wrote_" + lane_target) == 1
+
+    def _row(projection):
+        row = _ok(projected=0)
+        row["projection"] = dict(projection)
+        return row
+
+    summary = _run(monkeypatch, [_row(refused) for _ in range(30)] + [_row(wrote) for _ in range(70)], limit=100)
+    assert summary["projections_refused_currency"] == 30
+    assert summary["projection_structural_skips"] == 30
+    assert summary["status"] == "degraded"
+
+
 def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
     """Structural skips leave the denominator; the rest still have to land something while
     prices move."""
@@ -413,7 +496,7 @@ def test_the_structural_share_rule_directly(monkeypatch):
     from services.external_offer_dual_write import OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
 
     assert OFFER_SYNC_STRUCTURAL_SKIP_STATUSES == {
-        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed",
+        "no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency",
     }
     base = dict(failed=0, stopped_early=False, attempted_count=10, origin_reads=10,
                 price_changes=3, projections_attempted=10)

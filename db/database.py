@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
 
 from config.platform import is_deployed
 from config.settings import settings
+from utils.secret_fingerprint import redact_url_credentials
 
 def _normalize_database_url(raw: str) -> str:
     url_str = (raw or "").strip()
@@ -67,7 +68,7 @@ IS_SQLITE = lower_url.startswith("sqlite://") or lower_url.startswith("sqlite+ai
 if not (IS_POSTGRES or IS_SQLITE):
     raise RuntimeError(
         "❌ Invalid DATABASE_URL!\n"
-        f"Got: {DATABASE_URL[:80]}...\n"
+        f"Got: {redact_url_credentials(DATABASE_URL)[:80]}...\n"
         "Supported URL schemes: postgresql://, postgres://, sqlite://, sqlite+aiosqlite://"
     )
 

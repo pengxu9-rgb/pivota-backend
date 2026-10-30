@@ -360,7 +360,9 @@ PROBE_JOB="verify-worker-$$-$RANDOM"
 # script (2026-09-06, run 34012321564): every request came back 403 and the deploy rolled
 # itself back. The reasoning that put it there was "deploy_backend.sh probes without a token
 # and that is proven in this VPC" - true, and irrelevant: deploy_backend.sh probes `web`, which
-# is deployed --allow-unauthenticated. The worker is --ingress internal AND not publicly
+# prod deploys --allow-unauthenticated. (Staging `web` is private, and the same missing token
+# refused a healthy staging revision on 2026-09-29; deploy_backend.sh and deploy_gateway.sh now
+# mint one the same way when PUBLIC!=1.) The worker is --ingress internal AND not publicly
 # invokable, so Google's front end rejects an unauthenticated request before the app sees it.
 # Being inside the VPC satisfies INGRESS; it does not satisfy IAM.
 #

@@ -70,9 +70,9 @@ def evaluate_agent_decision_gates(
 
     # A priced offer in a currency one of the SERVED regions expects.
     #
-    # Reads `has_serving_region_offer`, which equals `has_us_offer` unless an operator
-    # has named more regions in PIVOTA_SERVING_PRICING_REGIONS (see
-    # index_pipeline_state_service.serving_pricing_regions). FALLS BACK to has_us_offer
+    # Reads `has_serving_region_offer`: priced in the currency of ANY served market -- the market
+    # registry's served list (US, SG since #2575), narrowed only if PIVOTA_SERVING_PRICING_REGIONS
+    # says so (index_pipeline_state_service.serving_pricing_regions). FALLS BACK to has_us_offer
     # so a caller that computed only the older column keeps its old verdict rather than
     # reading a missing key as False and blocking every row it fetched.
     #

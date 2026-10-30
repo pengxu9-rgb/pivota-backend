@@ -18,7 +18,7 @@ from config.settings import resolve_public_api_base_url
 from db.database import database
 from db.schema_guard import guarded_statements, is_lock_timeout
 from db.startup_ddl import execute_ddl
-from services import webhook_retry_delivery_gate
+from services import webhook_delivery_gate, webhook_destination_guard
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,25 @@ WEBHOOK_EVENT_CATALOG: List[Dict[str, Any]] = [
         "event_type": "order.cancelled",
         "category": "orders",
         "description": "An order was cancelled.",
+    },
+    # Rail purchases (agent_purchases ledger, payment orchestration). Emitted durably by
+    # services/payment_orchestration/purchase_events.py with a stable event id per event, so a
+    # receiver de-duplicates retries on `id`. `data` is the unified purchase view, the same body as
+    # GET /agent/v2/commerce/purchases/{id}.
+    {
+        "event_type": "purchase.action_required",
+        "category": "purchases",
+        "description": "The buyer must open a rail-hosted page (add a card, or approve the purchase).",
+    },
+    {
+        "event_type": "purchase.completed",
+        "category": "purchases",
+        "description": "The merchant order was placed; carries the order reference.",
+    },
+    {
+        "event_type": "purchase.failed",
+        "category": "purchases",
+        "description": "The purchase ended without an order (failed, refused, or expired).",
     },
     {
         "event_type": "api.auth_failed",
@@ -185,6 +204,12 @@ def get_managed_receiver_url(agent_id: str) -> str:
 
 
 def _normalize_destination_url(agent_id: str, destination_url: Optional[str]) -> Optional[str]:
+    """Pin this agent's managed inbox to the host we serve it from TODAY, whatever host is stored.
+
+    The stored config (and every delivery row) keeps the URL as it was written, so after the API
+    host moved, a managed-inbox config still named the retired host and every send 404'd there.
+    Read paths showed the rewritten URL while emit, test send and retry POSTed the stored one, so
+    every place that resolves a send's destination must call this, not read the column raw."""
     raw = str(destination_url or "").strip()
     if not raw:
         return None
@@ -200,6 +225,14 @@ def _normalize_destination_url(agent_id: str, destination_url: Optional[str]) ->
         return managed_url
 
     return raw
+
+
+def _delivery_client_options(agent_id: str, destination_url: str) -> Dict[str, Any]:
+    """Every destination an agent registered goes through the public-address transport. The one
+    exception is this agent's own managed inbox, a URL built from our config, not the agent's."""
+    if destination_url == get_managed_receiver_url(agent_id):
+        return {}
+    return {"transport": webhook_destination_guard.PublicDestinationTransport(), "trust_env": False}
 
 
 def _build_event_payload(
@@ -547,6 +580,11 @@ async def update_webhook_config(
     current = await _get_or_create_raw_config(agent_id)
     now = _db_now()
     next_url = _normalize_destination_url(agent_id, destination_url)
+    stored_url = str(current.get("destination_url") or "").strip() or None
+    if next_url and next_url != stored_url and next_url != get_managed_receiver_url(agent_id):
+        # A NEW URL must look public (DestinationRejected is a ValueError: the route answers 400).
+        # An unchanged stored one is not re-judged here; the send-time transport guards it.
+        next_url = webhook_destination_guard.check_destination_url(next_url)
     next_enabled = bool(enabled and next_url)
     next_events = _normalize_events(subscribed_events)
     current_secret = str(current.get("signing_secret") or "").strip() or _generate_signing_secret()
@@ -896,6 +934,10 @@ async def _attempt_delivery(
     prior_attempts: int = 0,
     created_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    if not webhook_delivery_gate.delivery_enabled():
+        # The one place this service POSTs, so emit, per-row retry, test send and the retry loop
+        # all stop here outside production. No HTTP, no row; a retrying row stays as it was.
+        return webhook_delivery_gate.skipped_result(event_type=event_type, delivery_id=delivery_id)
     delivery_id = delivery_id or f"whd_{uuid.uuid4().hex[:24]}"
     event_id = event_id or f"evt_{uuid.uuid4().hex[:24]}"
     created_at = created_at or _utcnow()
@@ -926,7 +968,11 @@ async def _attempt_delivery(
 
     started = _utcnow()
     try:
-        async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=DELIVERY_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            **_delivery_client_options(agent_id, destination_url),
+        ) as client:
             response = await client.post(destination_url, content=raw_body, headers=headers)
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         http_status = response.status_code
@@ -941,6 +987,11 @@ async def _attempt_delivery(
         else:
             status = "failed"
             last_error = f"Webhook destination returned HTTP {response.status_code}"
+    except webhook_destination_guard.DestinationBlocked as exc:
+        # Terminal: a non-public destination stays non-public, so a retry only repeats the refusal.
+        latency_ms = int((_utcnow() - started).total_seconds() * 1000)
+        status = "failed"
+        last_error = f"Webhook destination blocked: {exc}"
     except Exception as exc:
         latency_ms = int((_utcnow() - started).total_seconds() * 1000)
         last_error = str(exc)
@@ -991,9 +1042,12 @@ async def emit_agent_webhook_event(
     event_type: str,
     payload: Dict[str, Any],
     request_id: Optional[str] = None,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """`event_id`, when given, is the caller's stored id for this event; every delivery of it then
+    carries the same `id`, so a receiver can de-duplicate. Omitted, a fresh id is minted per call."""
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url")) or ""
     enabled = bool(config.get("enabled") and destination_url)
     subscribed_events = _normalize_events(_coerce_json(config.get("subscribed_events"), []))
     signing_secret = str(config.get("signing_secret") or "").strip()
@@ -1037,12 +1091,13 @@ async def emit_agent_webhook_event(
         destination_url=destination_url,
         signing_secret=signing_secret,
         request_id=request_id,
+        event_id=event_id,
     )
 
 
 async def send_test_webhook(agent_id: str, *, request_id: Optional[str] = None) -> Dict[str, Any]:
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(config.get("destination_url") or "").strip()
+    destination_url = _normalize_destination_url(agent_id, config.get("destination_url"))
     if not destination_url or not bool(config.get("enabled")):
         raise ValueError("Configure and enable a webhook destination before sending a test event.")
 
@@ -1146,7 +1201,11 @@ async def retry_delivery(agent_id: str, delivery_id: str) -> Dict[str, Any]:
         raise ValueError("Webhook delivery not found.")
 
     config = await _get_or_create_raw_config(agent_id)
-    destination_url = str(row["destination_url"] or config.get("destination_url") or "").strip()
+    # A row stores the URL it was first sent to, so a managed-inbox row written before a host
+    # move would retry at the old host forever; it goes to the inbox's current URL instead.
+    destination_url = _normalize_destination_url(
+        agent_id, row["destination_url"] or config.get("destination_url")
+    ) or ""
     signing_secret = str(config.get("signing_secret") or "").strip()
     if not destination_url or not signing_secret:
         raise ValueError("Webhook destination is not configured.")
@@ -1263,9 +1322,9 @@ async def process_due_retries(
     Nothing is lost by stopping early: an undelivered retry stays `retrying` with its
     `next_retry_at` unchanged, so the next instance picks it up on its next poll.
     """
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # Outside production (or with the kill switch off) nothing is selected and nothing is
-        # sent; due rows stay exactly as they are. See services/webhook_retry_delivery_gate.py.
+        # sent; due rows stay exactly as they are. See services/webhook_delivery_gate.py.
         return 0
     await ensure_agent_webhook_tables()
     rows = await database.fetch_all(
@@ -1300,13 +1359,13 @@ async def process_due_retries(
 
 
 async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
-    if not webhook_retry_delivery_gate.retry_delivery_enabled():
+    if not webhook_delivery_gate.delivery_enabled():
         # WARNING, not INFO: prod drops module-logger INFO, and this line is the only sign on a
         # staging process that its retries are deliberately parked rather than broken.
         logger.warning(
-            "agent webhook retry worker NOT started: retry delivery is disabled on this process "
+            "agent webhook retry worker NOT started: webhook delivery is disabled on this process "
             "(%s). Due retries stay due. Set %s=true to deliver them.",
-            webhook_retry_delivery_gate.describe(), webhook_retry_delivery_gate.ENV_VAR,
+            webhook_delivery_gate.describe(), webhook_delivery_gate.ENV_VAR,
         )
         return
     while not stop_event.is_set():
@@ -1324,6 +1383,10 @@ async def _retry_worker_loop(stop_event: asyncio.Event) -> None:
 async def start_agent_webhook_retry_worker() -> None:
     global _retry_worker_task, _retry_worker_stop
     if _retry_worker_task and not _retry_worker_task.done():
+        return
+    # SCHEDULER_JOB_ALLOWLIST: a no-op unless set; when set, this loop starts only if listed.
+    from services import scheduler_job_allowlist as job_allowlist
+    if not job_allowlist.process_loop_allowed(job_allowlist.AGENT_WEBHOOK_RETRY_WORKER):
         return
     _retry_worker_stop = asyncio.Event()
     # Fresh context => own `databases` Connection (issue #1754: startup-spawned

@@ -70,6 +70,8 @@ if _IS_PG:
         _cart_seeds,
         # The cart-mint scan-cache cases: a moved clock and a counted scan.
         _scans,
+        # The IP-throttle cases: the sweep armed, a fake-clock pacer, the breaker state reset.
+        _armed,
         page,
         res,
     )

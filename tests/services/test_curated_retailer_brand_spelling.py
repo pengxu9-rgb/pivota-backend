@@ -230,7 +230,8 @@ def test_a_neighbour_of_an_accent_family_keeps_its_own_name(vendor):
 
 @pytest.mark.parametrize("brands,ok", [
     ({"Kose": "Kosé"}, True),              # the family's own spelling
-    ({"Kose": "KOSE"}, True),              # same letters: a plain respelling
+    ({"Kose": "KOSE"}, False),              # same letters, but neither the vendor's spelling nor the family's
+    ({"Kose": "Kose"}, True),               # the vendor's own spelling: no respelling asked; the family writes "Kosé"
     ({"Kose": "Shiseido"}, False),         # review of #2302: a family vendor accepted ANY value, then wrote "Kosé"
     ({"Kose": "Bioré"}, False),            # another family's spelling: would be silently ignored too
 ])

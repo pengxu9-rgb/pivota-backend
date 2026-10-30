@@ -51,6 +51,12 @@ class UniversalSyncResponse(BaseModel):
     platform: str
     products_synced: int
     catalog_synced: int = 0
+    # Offer-level outcome of the catalog ingest. `catalog_synced` counts PRODUCTS,
+    # so a merchant whose every offer was skipped (all parents suppressed) would
+    # otherwise read "success, catalog_synced=20" with nothing written.
+    offers_ingested: int = 0
+    offers_skipped: int = 0
+    offer_skip_reasons: Dict[str, int] = {}
     error: Optional[str] = None
     sync_time: str
     demo_mode: bool = False
@@ -269,6 +275,9 @@ async def universal_product_sync(
             )
 
         catalog_synced = 0
+        offers_ingested = 0
+        offers_skipped = 0
+        offer_skip_reasons: Dict[str, int] = {}
         catalog_error_message = None
         if catalog_payloads:
             try:
@@ -282,6 +291,9 @@ async def universal_product_sync(
                 )
                 if isinstance(catalog_result, dict):
                     catalog_synced = int(catalog_result.get("products_ingested") or 0)
+                    offers_ingested = int(catalog_result.get("offers_ingested") or 0)
+                    offers_skipped = int(catalog_result.get("offers_skipped") or 0)
+                    offer_skip_reasons = dict(catalog_result.get("offer_skip_reasons") or {})
                 # Onboarding→audit readiness: same hook run_catalog_sync_job has
                 # carried since it existed, and which THIS path — the one every
                 # portal sync button actually goes through (wix/shopify/
@@ -387,6 +399,9 @@ async def universal_product_sync(
             platform=platform,
             products_synced=synced_count,
             catalog_synced=catalog_synced,
+            offers_ingested=offers_ingested,
+            offers_skipped=offers_skipped,
+            offer_skip_reasons=offer_skip_reasons,
             sync_time=datetime.now().isoformat()
         )
         

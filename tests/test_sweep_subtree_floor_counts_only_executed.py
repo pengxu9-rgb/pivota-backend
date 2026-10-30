@@ -92,6 +92,24 @@ def _global_floor() -> int:
     return int(m.group(1))
 
 
+def _services_floor() -> int:
+    """The tests.services floor the workflow declares in SUBTREES, read like FLOOR.
+
+    The healthy-run fixtures used a hardcoded services=_healthy_services() (the 2026-10-13
+    measurement). Re-floating tests.services to 5,879 on 2026-10-17 made that an
+    under-floor run, so test_a_healthy_run_still_passes went red on a correct
+    workflow change -- the same trap _global_floor() closed for FLOOR.
+    """
+    m = re.search(r"'tests\.services':\s*(\d+)", _assert_script())
+    assert m, "could not read the tests.services floor out of SUBTREES"
+    return int(m.group(1))
+
+
+# A healthy services count: above its floor, well under its cap (floor x 1.10).
+def _healthy_services() -> int:
+    return _services_floor() + 100
+
+
 def _xml(*, services: int, readiness: int, skip_readiness: bool = False,
          skip_services: bool = False, other: Optional[int] = None,
          readiness_skipped: int = 0) -> str:
@@ -131,7 +149,7 @@ def _xml(*, services: int, readiness: int, skip_readiness: bool = False,
 
 def test_a_fully_skipped_subtree_is_rejected(tmp_path):
     """THE hole. Every readiness case collected, none executed — previously exit 0."""
-    proc = _run(tmp_path, _xml(services=4506, readiness=133, skip_readiness=True))
+    proc = _run(tmp_path, _xml(services=_healthy_services(), readiness=133, skip_readiness=True))
     assert proc.returncode != 0, (
         "a subtree whose every test is SKIPPED cleared its minimum:\n" + proc.stdout
     )
@@ -149,7 +167,7 @@ def test_a_fully_skipped_subtree_is_rejected(tmp_path):
 
 def test_a_healthy_run_still_passes(tmp_path):
     """Guard the guard: the fix must not red a genuinely green sweep."""
-    proc = _run(tmp_path, _xml(services=4506, readiness=133))
+    proc = _run(tmp_path, _xml(services=_healthy_services(), readiness=133))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "readiness.tests: 133" in proc.stdout
 
@@ -158,14 +176,14 @@ def test_partial_skips_are_subtracted(tmp_path):
     """120 is the minimum; 133 collected with 14 skipped is 119 executed — below it."""
     # Built directly rather than by string-patching a hardcoded total, which silently
     # no-ops if the `other=` default ever changes.
-    proc = _run(tmp_path, _xml(services=4506, readiness=133, skip_readiness=False,
+    proc = _run(tmp_path, _xml(services=_healthy_services(), readiness=133, skip_readiness=False,
                                readiness_skipped=14))
     assert proc.returncode != 0, "119 executed should not clear a minimum of 120:\n" + proc.stdout
 
 
 def test_the_global_floor_still_bites(tmp_path):
     """Unchanged behaviour — the fix must not disturb the global gate."""
-    proc = _run(tmp_path, _xml(services=4506, readiness=133, other=100))
+    proc = _run(tmp_path, _xml(services=_healthy_services(), readiness=133, other=100))
     assert proc.returncode != 0
     # Assert the GLOBAL line specifically. The bare word "floor" appears in
     # sys.exit's summary on EVERY failure, subtree ones included, so matching it
@@ -173,7 +191,7 @@ def test_the_global_floor_still_bites(tmp_path):
     # which is what would happen the first time a floor raise pushes the readiness
     # minimum past the 133 this fixture models.
     out = proc.stdout + proc.stderr
-    assert "only 4739 tests executed" in out, out
+    assert f"only {_healthy_services() + 133 + 100} tests executed" in out, out
 
 
 def test_the_healthy_fixture_is_healthy_by_the_CURRENT_floor():
@@ -192,7 +210,7 @@ def test_the_healthy_fixture_is_healthy_by_the_CURRENT_floor():
     """
     import xml.etree.ElementTree as ET
 
-    root = ET.fromstring(_xml(services=4506, readiness=133))
+    root = ET.fromstring(_xml(services=_healthy_services(), readiness=133))
     suite = root if root.tag == "testsuite" else root.find("testsuite")
     executed = int(suite.get("tests")) - int(suite.get("skipped"))
     floor = _global_floor()

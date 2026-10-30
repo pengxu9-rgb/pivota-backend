@@ -293,3 +293,23 @@ def test_bind_params_in_untypeable_positions_are_cast():
     assert ":script" not in build_obj.replace("CAST(:script AS text)", "")
     assert ":prior" not in build_obj.replace("CAST(:prior AS text)", "")
     assert "CAST(:script AS text)" in remediate.REVERT_CANDIDATES_SQL
+
+
+@pytest.mark.asyncio
+async def test_revert_never_revives_a_row_whose_url_a_live_retailer_listing_now_owns(monkeypatch):
+    """Review of #2448: the retailer apply admits a new ext:retailer: listing onto a URL whose legacy chain is
+    retired; reviving that chain would put two live listings on one URL. Skipped, with the owner named, and
+    nothing of it -- product, offers, seed -- is touched."""
+    class DB(_FakeDB):
+        async def fetch_all(self, query, values=None):
+            if "product_key LIKE 'ext:retailer:%'" in " ".join(str(query).split()):
+                return [{"product_key": "ext:retailer:new", "canonical_url": "https://x.com/products/a?variant=1"}]
+            return await super().fetch_all(query, values)
+    db = DB({"ck_1": True})
+    _patch(monkeypatch, db)
+    owned, free = _row("s1", "https://www.x.com/products/a"), _row("s2", "https://x.com/products/b")
+    for row in (owned, free):
+        row["suppression_metadata"] = {"script": remediate.SCRIPT_NAME, "prior_seed_status": "active"}
+    await remediate._revert([owned, free])
+    revived = [v for q, v in db.touching("suppressed_at=NULL")] + [v for q, v in db.touching("status='active'")]
+    assert revived and {v["id"] for v in revived} == {"s2"}

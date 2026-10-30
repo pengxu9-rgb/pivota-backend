@@ -103,6 +103,11 @@ catalog_products = Table(
     Column("canonical_url", Text, nullable=True),
     Column("image_url", Text, nullable=True),
     Column("product_payload", JSONB_TYPE, nullable=True),
+    # NOT HERE ON PURPOSE: the two folded-name columns of migration 260 are read only by the
+    # PIVOTA-Agent gateway. A column this Table names must exist before the new image serves, and the
+    # boot heal's ADD COLUMN can lose its 500 ms lock race to the gateway's multi-second category reads
+    # (see the warning at the end of this file); so the migration owns those columns, applied by hand,
+    # and no backend code names them (a test pins that).
     Column("freshness_json", JSONB_TYPE, nullable=True),
     # Phase O-1 — free-form merchant-provided tags from StandardProduct.tags[]
     # (Shopify/Wix/WooCommerce sync). JSONB array; NULL on rows predating
@@ -280,6 +285,13 @@ catalog_skus = Table(
     Column("created_at", DateTime, server_default=func.now(), nullable=False),
     Column("updated_at", DateTime, server_default=func.now(), nullable=False),
     Index("idx_catalog_skus_product_key", "product_key"),
+    # mig 262 (F2, 2026-10-10): intake identity's Tier-0a matches variant barcodes here
+    # (services/intake_identity.barcode_lookup_sql). Partial: most SKUs carry none.
+    Index(
+        "idx_catalog_skus_barcode",
+        "barcode",
+        postgresql_where=Column("barcode").isnot(None),
+    ),
     Index(
         "idx_catalog_skus_source_identity_v2",
         "merchant_id",
@@ -760,6 +772,11 @@ agent_pdp_view = Table(
     # Review signal mirrored from catalog_products for the serve path (mig 186).
     Column("rating_value", Numeric, nullable=True),
     Column("rating_count", Integer, nullable=True),
+    # Per-currency price summary (mig 263): {"version": 1, "currencies": {"USD":
+    # {price_min, price_max, offer_count, offers}, ...}}, valid only while
+    # market_prices_refreshed_at = refreshed_at (the write that produced it).
+    Column("market_prices", JSONB_TYPE, nullable=True),
+    Column("market_prices_refreshed_at", DateTime(timezone=True), nullable=True),
     Column(
         "refreshed_at", DateTime(timezone=True), server_default=func.now(), nullable=False
     ),

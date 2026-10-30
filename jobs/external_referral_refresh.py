@@ -20,6 +20,37 @@ only when someone rebuilds and updates the job.
 Usage:
 
     python3 -m jobs.external_referral_refresh --limit 500 [--budget-seconds 3300] [--host-concurrency 4]
+        [--global-rps 0.5] [--max-new-hosts-per-minute 6] [--ip-throttle-cooldown-seconds 900]
+
+STRICT GLOBAL PACING (2026-10-16). Cloudflare challenge-listed the crawl NAT address after nights of
+2.5-4.0 origin reads/s from it; `--host-concurrency` capped hosts in flight but nothing capped the
+IP. Every origin request now also waits on one shared bucket (`services.crawl_global_pacer`,
+`--global-rps`, `--max-new-hosts-per-minute`), and the IP breaker trips earlier, on 3 hosts
+answering a Cloudflare challenge within 120 s, first into a cool-down at half rate and only on its
+second trip out of the run (`crawl_ip_throttle.StagedIpThrottleBreaker`).
+
+NO KNOB HAS AN "OFF" VALUE (2026-10-17 review). `--global-rps`, `--max-new-hosts-per-minute`,
+`--budget-seconds` and their env vars resolve through `crawl_global_pacer.resolve_setting`: 0, a
+negative, NaN or garbage logs an ERROR and uses the default; the rate is clamped to [0.05, 1.0] and
+the new-host cap rounds up to at least 1. The one kill switch is `CRAWL_GLOBAL_PACER_DISABLED=true`,
+the exact word (any case): `1`, `yes`, `on` or anything else is unreadable, logged at ERROR, and the
+run stays paced. There is no per-lane alias. It logs at ERROR on every run and still leaves the
+breaker's cool-down, its stop and the budget's deadline in force.
+
+A FIRST TRIP LATE IN THE RUN ENDS IT AS A BUDGET STOP, EXIT 1, NOT 3 (review L3). The cool-down is
+900 s and the default budget 3,300 s, so a first trip after ~2,400 s leaves a cool-down that ends past
+the budget. The run does not wait into the 3,600 s task timeout for it: it stops starting rows
+(`stopped_early`, `skipped_for_budget`), and `budget_reach` is usually under `min_budget_reach`, so
+the night reports `degraded` and exits 1. `breaker_trips: 1`, `cooldowns: 1` and the IP_THROTTLE line
+say what happened; read them before reading a 1 as "slow hosts". Exit 3 (`ip_throttled`) is only the
+SECOND trip. Likewise a request whose global slot falls past the deadline is refused, not sent: the
+row is deferred unstamped and counted in `skipped_for_budget`.
+
+ROWS THE PACER REFUSED ARE NEVER STAMPED (review M1). When the breaker's final trip or the budget
+stops the pacer, a row already in flight gets `GlobalPaceStopped` instead of a request;
+`resolve_external_offer` and `_refresh_external_seed_by_id` re-raise it (no cached snapshot is
+written, `last_crawl_attempt_at` is untouched), and the batch counts the row in
+`skipped_for_ip_throttle` or `skipped_for_budget`, so it leads tomorrow's queue.
 
 COVERAGE, measured 2026-09-27 (image 8f7605b1e, serial): 3,282 rows in 3,300s, 2,220 origin
 reads, a ~12-day cycle over ~23.8k active seeds. The launch target is every SERVED seed re-read
@@ -39,6 +70,7 @@ from typing import Any, Dict, Optional
 
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
+from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
 
@@ -83,13 +115,44 @@ async def run_daily_external_referral_refresh(
     limit: int = 500,
     budget_seconds: Optional[float] = None,
     host_concurrency: Optional[int] = None,
+    ip_throttle_trip_hosts: Optional[int] = None,
+    ip_throttle_window_seconds: Optional[float] = None,
+    ip_throttle_enabled: Optional[bool] = None,
+    global_rps: Optional[float] = None,
+    max_new_hosts_per_minute: Optional[float] = None,
+    ip_challenge_trip_hosts: Optional[int] = None,
+    ip_challenge_window_seconds: Optional[float] = None,
+    ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    return await run_external_referral_refresh_batch(
+    summary = await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
         budget_seconds=budget_seconds,
         host_concurrency=host_concurrency,
+        ip_throttle_trip_hosts=ip_throttle_trip_hosts,
+        ip_throttle_window_seconds=ip_throttle_window_seconds,
+        ip_throttle_enabled=ip_throttle_enabled,
+        global_rps=global_rps,
+        max_new_hosts_per_minute=max_new_hosts_per_minute,
+        ip_challenge_trip_hosts=ip_challenge_trip_hosts,
+        ip_challenge_window_seconds=ip_challenge_window_seconds,
+        ip_throttle_cooldown_seconds=ip_throttle_cooldown_seconds,
     )
+    if shopify_edge_pacer.enabled():
+        # Only with the flag on, so the summary is unchanged while the pacer is dark. Every fetch
+        # of this job reaches the shared budget through `crawl_politeness.await_slot`.
+        summary["shopify_edge_pacer"] = shopify_edge_pacer.stats()
+    return summary
+
+
+# Exit codes. Both non-zero ones fail the Cloud Run execution, so an alert on a failed execution
+# fires for either; the code (and the log line before it) says which it was.
+EXIT_OK = 0
+EXIT_DEGRADED = 1
+# A shared edge (Shopify's, on 09-30) throttled our egress IP and the run stopped asking the hosts
+# that throttled it (`services.crawl_ip_throttle`). Distinct from 1 because the fix is different: nothing on
+# our side is broken, the crawl rate from one IP is. Not 2, which argparse uses for bad arguments.
+EXIT_IP_THROTTLED = 3
 
 
 PRICE_REFRESH_KEYS = (
@@ -111,6 +174,20 @@ def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
 
 
+def ip_throttle_line(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """The IP breaker's outcome and the 429/503 diagnostics, as the `IP_THROTTLE` line carries them."""
+    keys = [k for k in summary if k.startswith("ip_throttle")]
+    keys += ["skipped_for_ip_throttle", "throttle_diagnostics", "status", "status_without_ip_throttle"]
+    # The global pacer and the staged breaker (2026-10-16): what rate the run ran at, how long it
+    # waited for it, and whether it tripped, cooled down and resumed.
+    keys += [
+        "global_rps", "final_rate", "global_pacer_disabled", "max_new_hosts_per_minute", "paced_requests",
+        "new_hosts_contacted", "paces_waited_seconds", "breaker_trips", "breaker_trip_events",
+        "cooldowns", "cooldown_seconds",
+    ]
+    return {key: summary.get(key) for key in keys}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh active external referral seeds for runtime gating.")
     parser.add_argument("--limit", type=int, default=500, help="Maximum number of referral seeds to refresh")
@@ -121,8 +198,8 @@ def main() -> int:
         help=(
             "Wall-clock ceiling for the run; stop starting rows once it is spent. "
             "Defaults to EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS, then to "
-            "services.external_referral_readiness.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS. "
-            "0 disables it."
+            "services.external_referral_readiness.EXTERNAL_REFERRAL_REFRESH_BUDGET_SECONDS (3300). "
+            "Must be > 0: 0, negative or garbage is logged at ERROR and the default is used."
         ),
     )
     parser.add_argument(
@@ -132,6 +209,82 @@ def main() -> int:
         help=(
             "Hosts read at once, never two rows of one host at a time (1 = serial). Defaults to "
             "EXTERNAL_REFERRAL_REFRESH_HOST_CONCURRENCY, then 1. Clamped to [1, 8]."
+        ),
+    )
+    parser.add_argument(
+        "--ip-throttle-trip-hosts",
+        type=int,
+        default=None,
+        help=(
+            "Distinct hosts answering 429 (or 503 + Retry-After) within the window that trip the "
+            "IP breaker. Defaults to CRAWL_IP_THROTTLE_TRIP_HOSTS, then 10. <= 0 disables this rule "
+            "only (the challenge rule, --ip-challenge-trip-hosts, has its own)."
+        ),
+    )
+    parser.add_argument(
+        "--ip-throttle-window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "The IP breaker's sliding window. Defaults to CRAWL_IP_THROTTLE_WINDOW_SECONDS, then 60. "
+            "A value <= 0 is invalid and falls back to 60; use --no-ip-throttle-breaker to disable."
+        ),
+    )
+    parser.add_argument(
+        "--global-rps",
+        type=float,
+        default=None,
+        help=(
+            "The IP's total origin-request rate for this run, shared by every host worker, each gap "
+            "jittered +-30%%. Every page fetch, retry and robots.txt read takes a slot. Defaults to "
+            "EXTERNAL_REFERRAL_REFRESH_GLOBAL_RPS, then 0.5. Clamped to [0.05, 1.0]; 0, negative or "
+            "garbage is logged at ERROR and the default is used (CRAWL_GLOBAL_PACER_DISABLED=true is "
+            "the only off switch)."
+        ),
+    )
+    parser.add_argument(
+        "--max-new-hosts-per-minute",
+        # float, so a fractional value reaches the helper and is rounded UP, never truncated to 0.
+        type=float,
+        default=None,
+        help=(
+            "Hosts contacted for the first time in any 60s window, however fast they answer. "
+            "Defaults to EXTERNAL_REFERRAL_REFRESH_MAX_NEW_HOSTS_PER_MINUTE, then 6. Rounded up, at "
+            "least 1; 0, negative or garbage is logged at ERROR and the default is used."
+        ),
+    )
+    parser.add_argument(
+        "--ip-challenge-trip-hosts",
+        type=int,
+        default=None,
+        help=(
+            "Distinct hosts answering a Cloudflare challenge (cf-mitigated: challenge) within the "
+            "challenge window that trip the IP breaker. Defaults to CRAWL_IP_CHALLENGE_TRIP_HOSTS, "
+            "then 8. <= 0 disables this rule only."
+        ),
+    )
+    parser.add_argument(
+        "--ip-challenge-window-seconds",
+        type=float,
+        default=None,
+        help="The challenge rule's sliding window. Defaults to CRAWL_IP_CHALLENGE_WINDOW_SECONDS, then 120.",
+    )
+    parser.add_argument(
+        "--ip-throttle-cooldown-seconds",
+        type=float,
+        default=None,
+        help=(
+            "After the breaker's FIRST trip, pause every origin read this long, then resume at half "
+            "the global rate; a second trip ends the run. Defaults to "
+            "CRAWL_IP_THROTTLE_COOLDOWN_SECONDS, then 900. <= 0: the first trip ends the run."
+        ),
+    )
+    parser.add_argument(
+        "--no-ip-throttle-breaker",
+        action="store_true",
+        help=(
+            "Kill switch: never trip the IP breaker (diagnostics are still collected). "
+            "CRAWL_IP_THROTTLE_BREAKER_ENABLED=false does the same without a flag."
         ),
     )
     args = parser.parse_args()
@@ -150,6 +303,15 @@ def main() -> int:
                 limit=args.limit,
                 budget_seconds=args.budget_seconds,
                 host_concurrency=args.host_concurrency,
+                ip_throttle_trip_hosts=args.ip_throttle_trip_hosts,
+                ip_throttle_window_seconds=args.ip_throttle_window_seconds,
+                # None, not True, when the flag is absent: the env var still gets its say.
+                ip_throttle_enabled=False if args.no_ip_throttle_breaker else None,
+                global_rps=args.global_rps,
+                max_new_hosts_per_minute=args.max_new_hosts_per_minute,
+                ip_challenge_trip_hosts=args.ip_challenge_trip_hosts,
+                ip_challenge_window_seconds=args.ip_challenge_window_seconds,
+                ip_throttle_cooldown_seconds=args.ip_throttle_cooldown_seconds,
             )
         finally:
             await database.disconnect()
@@ -160,6 +322,8 @@ def main() -> int:
     # line in Cloud Logging) and the logger.info below is dropped in prod (root at WARNING), so
     # neither can be filtered for a night's price counts. The prefix keeps it textPayload.
     print("PRICE_REFRESH " + json.dumps(price_refresh_line(summary), separators=(",", ":"), default=str))
+    # Same reason, for the IP breaker and the 429/503 header aggregate: one filterable line a night.
+    print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659
@@ -167,6 +331,22 @@ def main() -> int:
     # A scheduler tick is the only place anyone would notice, so the summary has to reach it.
     # `maxRetries` is 0 on the job, so a non-zero exit surfaces the run without a retry storm.
     status = str(summary.get("status") or "").strip().lower()
+    if status == "ip_throttled":
+        logger.error(
+            "external referral refresh finished ip_throttled: the IP breaker tripped %s time(s) "
+            "(%s cool-down(s); last trip %s distinct hosts; first throttle %s, ended %s); %s rows "
+            "deferred to the next run (skipped_for_ip_throttle). Without the IP throttle this run "
+            "would read %s (origin_yield=%s)",
+            summary.get("breaker_trips"),
+            summary.get("cooldowns"),
+            summary.get("ip_throttle_trip_host_count"),
+            summary.get("ip_throttle_first_429_at"),
+            summary.get("ip_throttle_tripped_at"),
+            summary.get("skipped_for_ip_throttle"),
+            summary.get("status_without_ip_throttle"),
+            summary.get("origin_yield"),
+        )
+        return EXIT_IP_THROTTLED
     if status != "success":
         logger.warning(
             "external referral refresh finished %s (stopped_early=%s budget_reach=%s "
@@ -178,8 +358,8 @@ def main() -> int:
             summary.get("host_backoff_skips"),
             summary.get("degraded_reason_counts"),
         )
-        return 1
-    return 0
+        return EXIT_DEGRADED
+    return EXIT_OK
 
 
 if __name__ == "__main__":

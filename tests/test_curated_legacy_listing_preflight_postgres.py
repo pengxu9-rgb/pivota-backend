@@ -35,8 +35,12 @@ async def catalog(request):
     await admin.execute(f'SET search_path TO "{schema}"')
     database = None
     try:
-        table = dbmod.metadata.tables["catalog_products"]
-        await admin.execute(str(sa.schema.CreateTable(table).compile(dialect=postgresql.dialect())))
+        for name in ("catalog_products", "catalog_offers"):
+            table = dbmod.metadata.tables[name]
+            await admin.execute(str(sa.schema.CreateTable(table).compile(dialect=postgresql.dialect())))
+        # Not on the shared metadata (mig 044): the two columns the finder reads, in this private schema only.
+        await admin.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY, attached_product_key TEXT, "
+                            "status TEXT)")
         database = databases.Database(url, server_settings={"search_path": schema})
         await database.connect()
         yield database, admin
@@ -61,13 +65,14 @@ def _plan():
     return ing.ingest_validated_jsonl([record])
 
 
-async def _insert(admin, key, url, *, suppressed=False):
+async def _insert(admin, key, url, *, suppressed=False, source_ref=None):
+    # source_product_id is NOT the product key on real rows (it is the store's product id): nothing may join on it.
     await admin.execute(
         """INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title,
-                                         canonical_url, source_domain, suppressed_at, suppression_reason)
-           VALUES ($1, 'm_legacy', 'external_seed', $1, 'Legacy', $2, NULL, $3, $4)""",
+                                         canonical_url, source_domain, suppressed_at, suppression_reason, source_ref)
+           VALUES ($1, 'm_legacy', 'external_seed', 'shopify:9000001', 'Legacy', $2, NULL, $3, $4, $5)""",
         key, url, datetime(2026, 9, 1, tzinfo=timezone.utc) if suppressed else None,
-        "stale" if suppressed else None,
+        "stale" if suppressed else None, source_ref,
     )
 
 
@@ -93,7 +98,8 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
     findings = await writer.find_legacy_retailer_listing_owners(plan, cli._SelectOnlyHandle(database))
     by_key = {f["legacy_product_key"]: f for f in findings}
     assert set(by_key) == {LEGACY_LIVE, LEGACY_SUPPRESSED}
-    assert {f["kind"] for f in findings} == {"conflict"}
+    # The live owner conflicts; the suppressed one has no seed or offer left, so its chain is retired (2026-09-29).
+    assert by_key[LEGACY_LIVE]["kind"] == "conflict" and by_key[LEGACY_SUPPRESSED]["kind"] == "retired_owner"
     assert by_key[LEGACY_LIVE]["suppressed"] is False
     assert by_key[LEGACY_SUPPRESSED]["suppressed"] is True
     assert by_key[LEGACY_SUPPRESSED]["suppression_reason"] == "stale"
@@ -107,14 +113,88 @@ async def test_real_sql_finds_live_and_suppressed_owners_and_writes_nothing(cata
     assert await _snapshot(admin) == before
 
 
-async def test_real_sql_suppressed_owner_alone_still_refuses(catalog):
+async def _seed(admin, key, status, *, attached=True):
+    """attached=False: the seed that CREATED the row (catalog_products.source_ref) but was never attached to it."""
+    seed_id = f"seed:{key}:{status!r}"
+    await admin.execute("INSERT INTO external_product_seeds (id, attached_product_key, status) VALUES ($1, $2, $3)",
+                        seed_id, key if attached else None, status)
+    return seed_id
+
+
+async def _offer(admin, key, *, suppressed):
+    await admin.execute(
+        """INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, suppressed_at)
+           VALUES ($1, $1, $2, 'm_legacy', 'USD', $3)""",
+        f"offer:{key}:{suppressed}", key, datetime(2026, 9, 1, tzinfo=timezone.utc) if suppressed else None)
+
+
+@pytest.mark.parametrize("live_link", ["active_seed", "ACTIVE_seed", "source_ref_seed", "null_status_seed",
+                                       "blank_status_seed", "padded_status_seed", "live_offer"])
+async def test_real_sql_a_suppressed_owner_with_any_live_link_still_refuses(catalog, live_link):
+    """Suppressing the product row is not retiring its chain: an active seed (attached, or the row's own
+    source_ref seed; status in any case) or a live offer on it still refuses."""
+    from services.catalog_enrichment_agent import apply as writer
+
+    database, admin = catalog
+    plan = _plan()
+    # NULL / blank / padded: the serving predicate (pdp_renderability, acceptable_only) serves those seeds too.
+    status = {"active_seed": "active", "ACTIVE_seed": "ACTIVE", "source_ref_seed": "active", "null_status_seed": None,
+              "blank_status_seed": "", "padded_status_seed": " active "}.get(live_link, "inactive")
+    seed_id = await _seed(admin, LEGACY_SUPPRESSED, status, attached=live_link != "source_ref_seed")
+    await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
+                  suppressed=True, source_ref=seed_id)
+    await _offer(admin, LEGACY_SUPPRESSED, suppressed=live_link != "live_offer")
+    with pytest.raises(ValueError, match=f"retailer_listing_migration_required: existing product {LEGACY_SUPPRESSED}"):
+        await writer._refuse_parallel_retailer_listings(plan, database)
+
+
+async def test_real_sql_a_fully_retired_chain_is_reported_not_refused(catalog):
+    """cocomo.sg, 2026-09-29: product suppressed with a reason, every seed inactive, every offer suppressed."""
+    from scripts import onboard_curated_brands as cli
     from services.catalog_enrichment_agent import apply as writer
 
     database, admin = catalog
     plan = _plan()
     await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
                   suppressed=True)
-    with pytest.raises(ValueError, match=f"retailer_listing_migration_required: existing product {LEGACY_SUPPRESSED}"):
+    await _seed(admin, LEGACY_SUPPRESSED, "inactive")
+    await _offer(admin, LEGACY_SUPPRESSED, suppressed=True)
+    [finding] = await writer.find_legacy_retailer_listing_owners(plan, cli._SelectOnlyHandle(database))
+    assert finding["kind"] == "retired_owner" and finding["legacy_product_key"] == LEGACY_SUPPRESSED
+    await writer._refuse_parallel_retailer_listings(plan, database)  # admitted: no raise
+
+
+@pytest.mark.parametrize("reason", ["stale_after_sync", "d2_same_url"])
+async def test_real_sql_a_suppression_its_own_lane_lifts_is_not_a_retirement(catalog, reason):
+    """Review of #2448: catalog_sync clears `stale_after_sync` on the next re-sync; identity_resolution.revert_run
+    revives its `d2_*` rows with their seeds. A new listing admitted onto either URL would be its twin by then."""
+    from services import catalog_sync_service, identity_resolution
+    from services.catalog_enrichment_agent import apply as writer
+
+    assert catalog_sync_service.STALE_AFTER_SYNC in writer.SELF_REVIVING_SUPPRESSION_REASONS
+    assert "suppression_reason LIKE 'd2" in identity_resolution.REVERT_ROWS_SQL
+    database, admin = catalog
+    plan = _plan()
+    await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
+                  suppressed=True)
+    await admin.execute("UPDATE catalog_products SET suppression_reason = $2 WHERE product_key = $1",
+                        LEGACY_SUPPRESSED, reason)
+    await _seed(admin, LEGACY_SUPPRESSED, "inactive")
+    await _offer(admin, LEGACY_SUPPRESSED, suppressed=True)
+    with pytest.raises(ValueError, match="retailer_listing_migration_required"):
+        await writer._refuse_parallel_retailer_listings(plan, database)
+
+
+async def test_real_sql_a_suppression_without_a_reason_is_not_a_retirement(catalog):
+    from services.catalog_enrichment_agent import apply as writer
+
+    database, admin = catalog
+    plan = _plan()
+    await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
+                  suppressed=True)
+    await admin.execute("UPDATE catalog_products SET suppression_reason = '  ' WHERE product_key = $1",
+                        LEGACY_SUPPRESSED)
+    with pytest.raises(ValueError, match="retailer_listing_migration_required"):
         await writer._refuse_parallel_retailer_listings(plan, database)
 
 
@@ -125,11 +205,49 @@ async def test_cli_dry_run_report_over_real_sql(catalog, monkeypatch):
     plan = _plan()
     await _insert(admin, LEGACY_SUPPRESSED, "https://ohlolly.com/products/haruharu-wonder-serum-mist",
                   suppressed=True)
+    await _seed(admin, LEGACY_SUPPRESSED, "active")  # a live link: still the conflict it always was
     before = await _snapshot(admin)
     monkeypatch.setattr(cli, "_preflight_database", lambda: (database, None))
     report = await cli._legacy_listing_report(plan, check=True)
     assert report["status"] == "conflicts"
     assert (report["conflict_count"], report["suppressed_conflict_count"]) == (1, 1)
     assert report["conflicts"][0]["legacy_owners"][0]["product_key"] == LEGACY_SUPPRESSED
+    assert report["retired_owner_count"] == 0
     assert database.is_connected  # a handle the preflight did not open is left open for its owner
     assert await _snapshot(admin) == before
+    # ...and once that seed is inactive too, the chain is retired: the dry run says clear, and counts it.
+    await admin.execute("UPDATE external_product_seeds SET status = 'inactive'")
+    report = await cli._legacy_listing_report(plan, check=True)
+    assert (report["status"], report["retired_owner_count"], report["apply_would_refuse"]) == ("clear", 1, False)
+
+
+async def test_real_sql_a_live_owner_with_a_leftover_reason_is_not_retired(catalog):
+    """An un-suppressed row can keep an old suppression_reason (a revert that cleared only suppressed_at); with no
+    seed or offer it is still a LIVE row owning the URL."""
+    from services.catalog_enrichment_agent import apply as writer
+
+    database, admin = catalog
+    plan = _plan()
+    await _insert(admin, LEGACY_LIVE, "https://ohlolly.com/products/haruharu-wonder-serum-mist")
+    await admin.execute("UPDATE catalog_products SET suppression_reason = 'reverted' WHERE product_key = $1",
+                        LEGACY_LIVE)
+    with pytest.raises(ValueError, match=f"retailer_listing_migration_required: existing product {LEGACY_LIVE}"):
+        await writer._refuse_parallel_retailer_listings(plan, database)
+
+
+async def test_real_sql_live_retailer_listing_owner_matches_the_url_not_the_host(catalog):
+    """withdraw_catalog_rows --revert asks it before reviving a retired chain (review of #2448)."""
+    from services.catalog_enrichment_agent import apply as writer
+
+    database, admin = catalog
+    url = "https://ohlolly.com/products/haruharu-wonder-serum-mist"
+    await _insert(admin, "ext:retailer:live", url + "?variant=45000000000001")
+    await _insert(admin, "ext:retailer:gone", "https://www.ohlolly.com/products/other", suppressed=True)
+    await _insert(admin, "ext:retailer:other", "https://ohlolly.com/products/other-thing")
+    await _insert(admin, "ext:legacy-live", "https://ohlolly.com/products/legacy-only")  # live, but not a listing
+    assert await writer.live_retailer_listing_owner(database, "https://www.ohlolly.com" + url[19:] + "/") \
+        == "ext:retailer:live"
+    assert await writer.live_retailer_listing_owner(database, "https://ohlolly.com/products/other") is None
+    assert await writer.live_retailer_listing_owner(database, "https://ohlolly.com/products/legacy-only") is None
+    assert await writer.live_retailer_listing_owner(database, None) is None
+    assert await writer.live_retailer_listing_owner(database, "https://[bad/products/x") is None

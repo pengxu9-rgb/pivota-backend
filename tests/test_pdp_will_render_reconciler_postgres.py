@@ -211,6 +211,8 @@ async def test_reconcile_is_a_noop_when_already_converged(pg_engine):
 
     with pg_engine.begin() as conn:
         _seed(conn, pk="pk_idem", ck="ck_idem", serving_eligible=True, will_render=True)
+        from sqlalchemy import text
+        conn.execute(text("UPDATE catalog_products SET pdp_will_render_computed_at = now()"))
 
     db = Database(DATABASE_URL, min_size=1, max_size=2)
     await db.connect()
@@ -219,3 +221,46 @@ async def test_reconcile_is_a_noop_when_already_converged(pg_engine):
         assert result == {"candidates": 0, "written": 0}
     finally:
         await db.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("will_render", [True, False])
+async def test_unchanged_old_result_is_rechecked_and_timestamp_advances(pg_engine, will_render):
+    """Zero drift must not starve the gateway's seven-day fresh-anchor pool."""
+    from sqlalchemy import text
+    from databases import Database
+    from jobs.pdp_renderability_reconciler_cron import count_pdp_will_render_drift, reconcile_pdp_will_render
+
+    with pg_engine.begin() as conn:
+        _seed(conn, pk="pk_age", ck="ck_age", serving_eligible=will_render, will_render=will_render)
+        conn.execute(text("UPDATE catalog_products SET pdp_will_render_computed_at = now() - interval '30 days'"))
+    db = Database(DATABASE_URL, min_size=1, max_size=2)
+    await db.connect()
+    try:
+        before = await count_pdp_will_render_drift(db)
+        assert before["total"] == 0 and before["stale"] == 1
+        result = await reconcile_pdp_will_render(db=db, limit=1)
+        assert result == {"candidates": 1, "written": 1}
+        row = await db.fetch_one("SELECT pdp_will_render, pdp_will_render_computed_at > now() - interval '1 minute' AS fresh FROM catalog_products")
+        assert row["pdp_will_render"] is will_render and row["fresh"] is True
+        assert (await count_pdp_will_render_drift(db))["stale"] == 0
+    finally:
+        await db.disconnect()
+
+
+def test_future_check_is_not_starved_by_more_old_rows_than_a_pass_can_handle(pg_engine):
+    from sqlalchemy import text
+    from jobs.pdp_renderability_reconciler_cron import candidates_select
+    with pg_engine.begin() as conn:
+        _seed(conn, pk="pk_future", ck="ck_future", serving_eligible=True, will_render=True)
+        conn.execute(text("UPDATE catalog_products SET pdp_will_render_computed_at = now() + interval '1 day'"))
+        conn.execute(text("INSERT INTO external_product_seeds(external_product_id,status) SELECT 'past_' || n,'active' FROM generate_series(1,2001) n"))
+        conn.execute(text("""
+          INSERT INTO catalog_products(product_key, merchant_id, platform, source_product_id, title, content_key,
+            catalog_track, pdp_will_render, pdp_will_render_computed_at)
+          SELECT 'past_' || n, 'external_seed','external_seed','past_' || n,'Past','ck_future',
+            'external_referral',true,now() - interval '30 days' FROM generate_series(1,2001) n
+        """))
+        rows = conn.execute(candidates_select(99999)).fetchall()
+        assert len(rows) == 2000
+        assert rows[0][0] == "pk_future"

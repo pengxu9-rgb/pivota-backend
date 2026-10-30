@@ -16,7 +16,6 @@ at import time.
 """
 
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -51,6 +50,8 @@ def _run_probe(
     log_output: str = "",
     create_rc: int = 0,
     curl_out: str = "404",
+    url: str = "https://candidate.example.invalid/health",
+    args_out: "Path | None" = None,
 ) -> str:
     """Run the real probe_health with gcloud/curl/sleep stubbed. Returns its stdout.
 
@@ -72,6 +73,8 @@ def _run_probe(
         '    case "$*" in *"--command python"*) ;; *) echo "stub: create without --command python" >&2; exit 9 ;; esac\n'
         "    case \"$*\" in *'--args=^|^-c|'*) ;; *) echo 'stub: create without the ^|^-c| payload' >&2; exit 9 ;; esac\n"
         '    prev=""; for a in "$@"; do [ "$prev" = "create" ] && { printf %s "$a" > "$STUB_STATE"; break; }; prev="$a"; done\n'
+        # Keep the payload gcloud received, verbatim, for the tests that execute it.
+        '    for a in "$@"; do case "$a" in --args=*) printf %s "${a#--args=}" > "$STUB_ARGS" ;; esac; done\n'
         '    exit "$STUB_CREATE_RC" ;;\n'
         '  *"jobs execute"*)\n'
         # Without --wait this returns 0 as soon as the execution is created, not when it passes.
@@ -103,7 +106,7 @@ def _run_probe(
         f'GCLOUD="{bin_dir}/gcloud"\n'
         'REGION=us-west1\nPROJECT=test-project\nAUTH_ARGS=()\n'
         f"{_probe_health_source()}\n"
-        'probe_health "https://candidate.example.invalid/health"\n'
+        f'probe_health "{url}"\n'
     )
     proc = subprocess.run(
         ["bash", str(harness)],
@@ -113,6 +116,7 @@ def _run_probe(
             "STUB_STATE": str(state), "STUB_CREATE_RC": str(create_rc),
             "STUB_EXECUTE_RC": str(execute_rc), "STUB_LOG_OUTPUT": log_output,
             "STUB_CURL_OUT": curl_out,
+            "STUB_ARGS": str(args_out or tmp_path / "probe_args"),
         },
     )
     assert proc.returncode == 0, f"harness failed: {proc.stderr}"
@@ -123,6 +127,23 @@ def _run_probe(
     lines = proc.stdout.splitlines()
     assert len(lines) == 1, f"probe_health must emit exactly one stdout line, got {proc.stdout!r}"
     return lines[0].strip()
+
+
+def _probe_payload(tmp_path: Path, url: str) -> str:
+    """The Python program the REAL probe_health hands to `gcloud run jobs create`, for `url`.
+
+    Captured from the stub's argv rather than regex-extracted from the script text: the program
+    is now assembled at run time (with or without a token step), so the source holds `$py`, and a
+    text extraction would execute that literal - a NameError that "refuses" every status and
+    passes the refusal rows while testing nothing.
+    """
+    args = tmp_path / "captured_args"
+    _run_probe(tmp_path, execute_rc=1, url=url, args_out=args)
+    payload = args.read_text(encoding="utf-8")
+    assert payload.startswith("^|^-c|"), payload[:40]
+    payload = payload[len("^|^-c|"):]
+    assert "urlopen" in payload and "sys.exit" in payload and url in payload
+    return payload
 
 
 def test_a_passing_probe_promotes_even_when_cloud_logging_has_not_caught_up(tmp_path):
@@ -226,12 +247,6 @@ def test_the_probe_payload_exits_zero_only_for_an_exact_200(tmp_path, status, sh
     import sys
     import threading
 
-    src = SCRIPT.read_text(encoding="utf-8")
-    m = re.search(r'--args="\^\|\^-c\|(.*?)"\s*\\\n', src, re.S)
-    assert m, "could not extract the in-VPC probe payload from deploy_backend.sh"
-    payload = m.group(1)
-    assert "urlopen" in payload and "sys.exit" in payload
-
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             # A LIVE 200 behind the redirect, deliberately. Pointing it at a dead port would make
@@ -258,8 +273,9 @@ def test_the_probe_payload_exits_zero_only_for_an_exact_200(tmp_path, status, sh
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/health"
+        payload = _probe_payload(tmp_path, url)
         rc = subprocess.run(
-            [sys.executable, "-c", payload.replace("$url", url)],
+            [sys.executable, "-c", payload],
             capture_output=True, timeout=60, env=_no_proxy_env(),
         ).returncode
     finally:
@@ -271,16 +287,23 @@ def test_an_unreachable_candidate_never_promotes(tmp_path):
     import socket
     import sys
 
-    src = SCRIPT.read_text(encoding="utf-8")
-    m = re.search(r'--args="\^\|\^-c\|(.*?)"\s*\\\n', src, re.S)
-    assert m, "could not extract the in-VPC probe payload from deploy_backend.sh"
-    payload = m.group(1)
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
     rc = subprocess.run(
-        [sys.executable, "-c", payload.replace("$url", f"http://127.0.0.1:{port}/health")],
+        [sys.executable, "-c", _probe_payload(tmp_path, f"http://127.0.0.1:{port}/health")],
         capture_output=True, timeout=60, env=_no_proxy_env(),
     ).returncode
     assert rc != 0
+
+
+def test_a_probe_program_containing_the_args_delimiter_is_never_run(tmp_path):
+    """`|` is the --args delimiter (`^|^`), so a program containing one would be shredded into
+    separate argv entries. It must refuse without creating a job, not run a mangled probe."""
+    args = tmp_path / "captured_args"
+    assert _run_probe(
+        tmp_path, execute_rc=0, log_output="PROBE_STATUS=200\n",
+        url="https://candidate.example.invalid/health?a|b", args_out=args,
+    ) == "000"
+    assert not args.exists(), "a job was created for a program gcloud would have split apart"

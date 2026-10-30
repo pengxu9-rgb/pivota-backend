@@ -1,0 +1,373 @@
+[
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "300s",
+              "crossSeriesReducer": "REDUCE_MEAN",
+              "groupByFields": [
+                "resource.label.host"
+              ],
+              "perSeriesAligner": "ALIGN_FRACTION_TRUE"
+            }
+          ],
+          "comparison": "COMPARISON_LT",
+          "duration": "300s",
+          "filter": "metric.type=\"monitoring.googleapis.com/uptime_check/check_passed\" AND resource.type=\"uptime_url\"",
+          "thresholdValue": 0.6,
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: host is down",
+        "name": "projects/pivota-prod/alertPolicies/1209329264725245793/conditions/1209329264725243702"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:01:52.946786276Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: host is down",
+    "documentation": {
+      "content": "An uptime check against a public pivota.cc host is failing. This is the only alert that fires when the whole path breaks - DNS, load balancer, TLS or the service itself.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:01:52.946786276Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/1209329264725245793",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "300s",
+              "crossSeriesReducer": "REDUCE_SUM",
+              "groupByFields": [
+                "resource.label.job_name"
+              ],
+              "perSeriesAligner": "ALIGN_SUM"
+            }
+          ],
+          "comparison": "COMPARISON_GT",
+          "duration": "300s",
+          "filter": "metric.type=\"run.googleapis.com/job/completed_task_attempt_count\" AND resource.type=\"cloud_run_job\" AND metric.label.result=\"failed\"",
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: Cloud Run job failing",
+        "name": "projects/pivota-prod/alertPolicies/14759478589092682276/conditions/14759478589092682407"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:08.916056241Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: Cloud Run job failing",
+    "documentation": {
+      "content": "A scheduled Cloud Run job task is failing. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:02:08.916056241Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/14759478589092682276",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "86400s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "3600s",
+              "crossSeriesReducer": "REDUCE_MIN",
+              "groupByFields": [
+                "resource.label.host"
+              ],
+              "perSeriesAligner": "ALIGN_MIN"
+            }
+          ],
+          "comparison": "COMPARISON_LT",
+          "duration": "3600s",
+          "filter": "metric.type=\"monitoring.googleapis.com/uptime_check/time_until_ssl_cert_expires\" AND resource.type=\"uptime_url\"",
+          "thresholdValue": 14.0,
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: TLS certificate expiring",
+        "name": "projects/pivota-prod/alertPolicies/15235666648614982064/conditions/15235666648614983783"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:01:58.125269547Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: TLS certificate expiring",
+    "documentation": {
+      "content": "A certificate is within 14 days of expiry. These are Certificate-Manager MANAGED certs that renew automatically, so this firing means renewal is BLOCKED - almost always because an _acme-challenge CNAME was removed from the pivota.cc zone. Fix the DNS authorization before the cert actually expires.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:01:58.125269547Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/15235666648614982064",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "3600s",
+              "crossSeriesReducer": "REDUCE_SUM",
+              "groupByFields": [
+                "resource.label.job_name"
+              ],
+              "perSeriesAligner": "ALIGN_SUM"
+            }
+          ],
+          "comparison": "COMPARISON_GT",
+          "duration": "0s",
+          "filter": "metric.type=\"logging.googleapis.com/user/retailer_ingest_drain_held\" AND resource.type=\"cloud_run_job\"",
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: retailer ingest held for review",
+        "name": "projects/pivota-prod/alertPolicies/679637629036186436/conditions/679637629036185839"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:21.105979703Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: retailer ingest held for review",
+    "documentation": {
+      "content": "At least one retailer ingest job is HELD: a BLOCK flag stopped the store and nothing is written until someone decides. This stays open while any job is held. Read the flags: `SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'held'` and the job's latest retailer_ingest_runs row (checks, flags). Then approve (optionally excluding handles or accepting flag keys) or cancel it via db/retailer_ingest.py approve()/cancel().",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:02:21.105979703Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/679637629036186436",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "300s",
+              "crossSeriesReducer": "REDUCE_SUM",
+              "groupByFields": [
+                "resource.label.service_name"
+              ],
+              "perSeriesAligner": "ALIGN_SUM"
+            }
+          ],
+          "comparison": "COMPARISON_GT",
+          "duration": "300s",
+          "filter": "metric.type=\"logging.googleapis.com/user/pool_checkout_timeout\" AND resource.type=\"cloud_run_revision\"",
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: database pool exhausted",
+        "name": "projects/pivota-prod/alertPolicies/785633574601953759/conditions/785633574601955910"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:17.419709804Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: database pool exhausted",
+    "documentation": {
+      "content": "The backend cannot get a connection from its own pool (PoolCheckoutTimeout). Check Cloud SQL num_backends FIRST: if it is low - it was 28/300 on 2026-08-28 - the database is fine and the application is leaking pool slots, so restarting the revision restores service while the leak is found. There is no liveness probe on the web service, so a wedged instance is never recycled on its own.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:02:17.419709804Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/785633574601953759",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionPrometheusQueryLanguage": {
+          "duration": "600s",
+          "evaluationInterval": "60s",
+          "query": "sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource=\"https_lb_rule\",response_code_class=\"500\"}[10m])) / sum(rate(loadbalancing_googleapis_com:https_request_count{monitored_resource=\"https_lb_rule\"}[10m])) > 0.01"
+        },
+        "displayName": "LB 5xx ratio > 1% over 10m",
+        "name": "projects/pivota-prod/alertPolicies/785633574601954337/conditions/18012453709104357423"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:03.083839250Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: load balancer 5xx",
+    "documentation": {
+      "content": "The external load balancer is returning 5xx. This is the user-visible symptom of most backend failures - a revision that will not start, database saturation, or an unhandled exception.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-25T23:15:19.214415050Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/785633574601954337",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "300s",
+              "crossSeriesReducer": "REDUCE_SUM",
+              "perSeriesAligner": "ALIGN_MAX"
+            }
+          ],
+          "comparison": "COMPARISON_GT",
+          "duration": "300s",
+          "filter": "metric.type=\"cloudsql.googleapis.com/database/postgresql/num_backends\" AND resource.type=\"cloudsql_database\"",
+          "thresholdValue": 240.0,
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: Cloud SQL connections high",
+        "name": "projects/pivota-prod/alertPolicies/785633574601954567/conditions/785633574601956718"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:13.912815137Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: Cloud SQL connections high",
+    "documentation": {
+      "content": "Postgres backends are above 80% of max_connections (300). This codebase has wedged on pool exhaustion before - see the 2026-08-20 sitemap incident, where a plan built without statistics opened enough connections to exhaust the pool. Look for a stuck query or a revision that will not scale down.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:02:13.912815137Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/785633574601954567",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  },
+  {
+    "alertStrategy": {
+      "autoClose": "3600s"
+    },
+    "combiner": "OR",
+    "conditions": [
+      {
+        "conditionThreshold": {
+          "aggregations": [
+            {
+              "alignmentPeriod": "300s",
+              "crossSeriesReducer": "REDUCE_SUM",
+              "groupByFields": [
+                "resource.label.job_name"
+              ],
+              "perSeriesAligner": "ALIGN_SUM"
+            }
+          ],
+          "comparison": "COMPARISON_GT",
+          "duration": "0s",
+          "filter": "metric.type=\"logging.googleapis.com/user/retailer_ingest_drain_failed\" AND resource.type=\"cloud_run_job\"",
+          "trigger": {
+            "count": 1
+          }
+        },
+        "displayName": "prod: retailer ingest job failed",
+        "name": "projects/pivota-prod/alertPolicies/8860165686716910735/conditions/8860165686716909740"
+      }
+    ],
+    "creationRecord": {
+      "mutateTime": "2026-09-23T11:02:24.761453663Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "displayName": "prod: retailer ingest job failed",
+    "documentation": {
+      "content": "A retailer-ingest-drain stage left a job FAILED: crawl capped or failed, currency unproven, retry budget spent, apply refused (MAY BE PARTIAL), or the apply gate / read-back disagreed. The execution itself exited 0, so the Cloud Run job-failing policy does not fire for this. Read `SELECT id, domain, brand, status_reason FROM retailer_ingest_jobs WHERE status = 'failed' ORDER BY updated_at DESC` and the job's latest retailer_ingest_runs row.",
+      "mimeType": "text/markdown"
+    },
+    "enabled": true,
+    "mutationRecord": {
+      "mutateTime": "2026-09-23T11:02:24.761453663Z",
+      "mutatedBy": "peng@woopay.tech"
+    },
+    "name": "projects/pivota-prod/alertPolicies/8860165686716910735",
+    "notificationChannels": [
+      "projects/pivota-prod/notificationChannels/17241360148162881146"
+    ]
+  }
+]

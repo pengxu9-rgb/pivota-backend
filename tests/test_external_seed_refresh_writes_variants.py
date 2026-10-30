@@ -1128,3 +1128,72 @@ def test_the_reset_pins_the_id_the_gateway_serves_today():
     sql = script._RESET_SQL
     assert "'{external_product_id}'" in sql and "THEN to_jsonb(CAST(:served_id AS TEXT))" in sql
     assert "ELSE seed_data::jsonb->'external_product_id' END" in sql, "an existing id is never replaced"
+
+
+def test_single_variant_fallback_refuses_a_different_native_sibling(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='46536716517564')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['availability']) == (32,'out_of_stock')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))
+
+
+def test_single_variant_fallback_never_overwrites_an_explicit_other_currency(monkeypatch):
+    from routes.employee_products import _reconcile_seed_variants_with_read
+
+    stored_variant = _variant('46536716517563',32,'out_of_stock',price_currency='EUR',currency='EUR')
+    page = _page([_offer(20,IN,sku='46536716517563')])
+    # The reconcile alone never re-prices a variant across currencies: no USD 20 as EUR 20.
+    (variant,), report = _reconcile_seed_variants_with_read(
+        [stored_variant], page.evidence['variants'], product_amount=20.0, product_currency='USD',
+        product_availability='in_stock', census=page.evidence['variant_census'])
+    assert (variant['price_amount'],variant['price_currency'],variant['currency']) == (32,'EUR','EUR')
+    assert report['not_re_read_count'] == 1
+    # End to end, a read in the USD row's own currency that names the variant REPLACES it (the
+    # currency heal, review of #2613): the whole variant moves, so no price is relabelled.
+    row = _seed_row(variants=[stored_variant],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,page)
+    (variant,) = stored['seed_data']['variants']
+    assert (variant['price_amount'],variant['price_currency'],variant.get('currency')) == (20.0,'USD',None)
+    assert result['variant_refresh']['status'] == 'all_re_read'
+
+
+def test_single_variant_fallback_accepts_an_equivalent_shopify_gid(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='gid://shopify/ProductVariant/46536716517563')]))
+    assert stored['seed_data']['variants'][0]['price_amount'] == 20
+    assert result['variant_refresh']['status'] == 'all_re_read'
+
+
+def test_a_localized_stored_price_requires_its_own_price_read(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563','20,00','out_of_stock',price_currency='EUR'),
+                             _variant('46536716517564',25,'in_stock')],price=25,availability='in_stock')
+    result, stored = _refresh(monkeypatch,row,_page([
+        {'@type':'Offer','sku':'46536716517563','availability':IN,'priceCurrency':'EUR'},
+        _offer(25,IN,sku='46536716517564'),
+    ]))
+    assert stored['seed_data']['variants'][0]['price_amount'] == '20,00'
+    assert '46536716517563' in result['variant_refresh']['not_re_read']
+    assert not _trusted(_serve(stored))
+
+
+def test_empty_primary_money_does_not_make_a_priced_variant_stock_only(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563','','out_of_stock',price=20),
+                             _variant('46536716517564',25,'in_stock')],price=25,availability='in_stock')
+    result, stored = _refresh(monkeypatch,row,_page([
+        _offer(25,IN,sku='46536716517564'),
+        {'@type':'Offer','sku':'46536716517563','availability':IN,'priceCurrency':'USD'},
+    ]))
+    assert stored['seed_data']['variants'][0]['price'] == 20
+    assert '46536716517563' in result['variant_refresh']['not_re_read']
+    assert not _trusted(_serve(stored))
+
+
+def test_known_stored_sku_refuses_a_different_explicit_page_sku(monkeypatch):
+    row = _seed_row(variants=[_variant('46536716517563',32,'out_of_stock',sku='ABC')],price=32,availability='out_of_stock')
+    result, stored = _refresh(monkeypatch,row,_page([_offer(20,IN,sku='DEF')]))
+    variant = stored['seed_data']['variants'][0]
+    assert (variant['price_amount'],variant['availability'],variant['sku']) == (32,'out_of_stock','ABC')
+    assert result['variant_refresh']['not_re_read_count'] == 1
+    assert not _trusted(_serve(stored))

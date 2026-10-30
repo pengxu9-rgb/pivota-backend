@@ -46,6 +46,8 @@ esac
 #                 trigger's pause state and rewrites no worker env (CONFIG=preserve).
 #   arm one lane: ARM=content-canonical-election-cron infra/gcp/setup_scheduler.sh prod <a> <b>
 #   disarm one:   DISARM=reviews-invitation-send-cron infra/gcp/setup_scheduler.sh prod <a> <b>
+#   graph dry run: RELGRAPH_SYNC_WRITES=false infra/gcp/setup_scheduler.sh prod <a> <b>
+#                 (relgraph-sync writes stay ON in prod when unset; see RELGRAPH_SYNC_WRITES below)
 #   rewrite env:  CONFIG=apply WORKERS=true infra/gcp/setup_scheduler.sh prod <a> <b>
 #                 Needs the Railway-ported files, which no longer exist. See CONFIG below.
 #
@@ -68,6 +70,9 @@ _INSIGHT_REFRESH_WORKER_EXPLICIT="${INSIGHT_REFRESH_WORKER+set}"
 _STORE_AUDIT_UCP_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_UCP_REPROBE_WORKER+set}"
 _STORE_AUDIT_COMMERCE_REPROBE_WORKER_EXPLICIT="${STORE_AUDIT_COMMERCE_REPROBE_WORKER+set}"
 _EXTERNAL_SEED_DESTINATION_SWEEP_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP+set}"
+_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT="${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE+set}"
+_CATALOG_DESTINATION_SWEEP_EXPLICIT="${CATALOG_DESTINATION_SWEEP+set}"
+_EXTERNAL_REFERRAL_REFRESH_EXPLICIT="${EXTERNAL_REFERRAL_REFRESH+set}"
 # Did the CALLER ask for a WORKERS value, or is this the default? The summary at the end needs
 # that distinction to tell "you asked and we ignored it" from "nobody mentioned it".
 WORKERS_REQUESTED="${WORKERS-}"
@@ -95,6 +100,21 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 # the mirrored catalog rows, which is a different blast radius and gets its own switch.
 : "${EXTERNAL_SEED_DESTINATION_SWEEP:=false}"
 : "${EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE:=false}"
+# The PENDING step (services/destination_dead_suppression): hide a mirror on its first corroborated
+# dead observation, lifted by the next live answer. Only meaningful with RETIRE (the sweep passes
+# suppress=retire). Default false: a new nightly write lane is armed deliberately.
+: "${EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION:=false}"
+# The catalog-enrichment twin (jobs.catalog_destination_sweep, migration 267): rows with no seed.
+# OBSERVES unless SUPPRESS is armed; with it, a first corroborated dead observation hides the row
+# (pending, lifted by the next live answer) and a second withdraws it.
+: "${CATALOG_DESTINATION_SWEEP:=false}"
+: "${CATALOG_DESTINATION_SWEEP_SUPPRESS:=false}"
+# The nightly external-referral refresh (jobs/external_referral_refresh.py). LIVE in prod, but until
+# 2026-10-17 provisioned by hand only (the cart-proof setup script said "no script in this repo"), so
+# its --max-retries and args lived nowhere reviewable. OPT-IN, default false: a run that does not name
+# it leaves the live job and its trigger exactly as they are. See the job block below for what an
+# opted-in run changes and what it deliberately does not.
+: "${EXTERNAL_REFERRAL_REFRESH:=false}"
 case "$WORKERS" in true|false) ;; *) echo "WORKERS must be exactly true or false (got '$WORKERS')" >&2; exit 2 ;; esac
 case "$PAUSED"  in 0|1)         ;; *) echo "PAUSED must be exactly 0 or 1 (got '$PAUSED')" >&2; exit 2 ;; esac
 case "$RELGRAPH_PUBLICATION_WORKER" in true|false) ;; *) echo "RELGRAPH_PUBLICATION_WORKER must be exactly true or false (got '$RELGRAPH_PUBLICATION_WORKER')" >&2; exit 2 ;; esac
@@ -107,8 +127,34 @@ case "$STORE_AUDIT_COMMERCE_REPROBE_WORKER" in true|false) ;; *) echo "STORE_AUD
 case "$STORE_AUDIT_COMMERCE_REPROBE_ARMED" in true|false) ;; *) echo "STORE_AUDIT_COMMERCE_REPROBE_ARMED must be exactly true or false (got '$STORE_AUDIT_COMMERCE_REPROBE_ARMED')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
 case "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" in true|false) ;; *) echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE must be exactly true or false (got '$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE')" >&2; exit 2 ;; esac
+case "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" in true|false) ;; *) echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION must be exactly true or false (got '$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION')" >&2; exit 2 ;; esac
+case "$CATALOG_DESTINATION_SWEEP" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP')" >&2; exit 2 ;; esac
+case "$CATALOG_DESTINATION_SWEEP_SUPPRESS" in true|false) ;; *) echo "CATALOG_DESTINATION_SWEEP_SUPPRESS must be exactly true or false (got '$CATALOG_DESTINATION_SWEEP_SUPPRESS')" >&2; exit 2 ;; esac
+case "$EXTERNAL_REFERRAL_REFRESH" in true|false) ;; *) echo "EXTERNAL_REFERRAL_REFRESH must be exactly true or false (got '$EXTERNAL_REFERRAL_REFRESH')" >&2; exit 2 ;; esac
+# relgraph-sync WRITES (build + AI review apply). Unlike the lanes above, these are LIVE in prod
+# (armed by hand 2026-09-27, verified green 2026-09-30), and the job's --set-env-vars REPLACES its
+# whole env, so a reconcile that left them out would silently turn the graph back into a dry run.
+# Unset = the environment's standing state: on in prod, off in staging. RELGRAPH_SYNC_WRITES=false
+# reconciles prod as a dry run. Staging refuses true: it holds a prod snapshot (see STAGING SAFETY).
+# An emergency writes-off done by hand (`gcloud run jobs update relgraph-sync --update-env-vars
+# RELGRAPH_SYNC_ALLOW_WRITES=false`) is RE-ARMED by the next plain reconcile; keep it off by passing
+# RELGRAPH_SYNC_WRITES=false to every run until it is meant to come back.
+: "${RELGRAPH_SYNC_WRITES:=}"
+case "$RELGRAPH_SYNC_WRITES" in ""|true|false) ;; *) echo "RELGRAPH_SYNC_WRITES must be true, false or unset (got '$RELGRAPH_SYNC_WRITES')" >&2; exit 2 ;; esac
+if [ -z "$RELGRAPH_SYNC_WRITES" ]; then
+  if [ "$ENV" = prod ]; then RELGRAPH_SYNC_WRITES=true; else RELGRAPH_SYNC_WRITES=false; fi
+fi
+if [ "$ENV" = staging ] && [ "$RELGRAPH_SYNC_WRITES" = true ]; then
+  echo "RELGRAPH_SYNC_WRITES=true is refused in staging: it would run LLM review writes against a production snapshot" >&2; exit 2
+fi
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP" != true ]; then
   echo "EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true requires EXTERNAL_SEED_DESTINATION_SWEEP=true" >&2; exit 2
+fi
+if [ "$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" = true ] && [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" != true ]; then
+  echo "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION=true requires EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true" >&2; exit 2
+fi
+if [ "$CATALOG_DESTINATION_SWEEP_SUPPRESS" = true ] && [ "$CATALOG_DESTINATION_SWEEP" != true ]; then
+  echo "CATALOG_DESTINATION_SWEEP_SUPPRESS=true requires CATALOG_DESTINATION_SWEEP=true" >&2; exit 2
 fi
 if [ "$STORE_AUDIT_UCP_REPROBE_ARMED" = true ] && [ "$STORE_AUDIT_UCP_REPROBE_WORKER" != true ]; then
   echo "STORE_AUDIT_UCP_REPROBE_ARMED=true requires STORE_AUDIT_UCP_REPROBE_WORKER=true" >&2; exit 2
@@ -327,29 +373,116 @@ echo "== job: relgraph-sync (Railway cron 37 10 * * *)"
 # that costs two attempts, so 3600s really means two wasted hours; 14400s likewise means eight.
 #
 # ⚠️ THE CAPS ARE NOT SET HERE AND CANNOT BE SET LIVE. They are RELGRAPH_SYNC_LIMIT (default 200,
-# max 2000) and RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000), read inside the GATEWAY image by
-# PIVOTA-Agent's scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them
-# finds nothing. Raising them means adding them to the --set-env-vars line below, because that flag
-# REPLACES the whole env set: an operator who adds them with `gcloud run jobs update` has them wiped
-# by the next reconcile of this script. That is the same drift this timeout override exists to
-# prevent, and it applies to the caps too.
+# max 2000), RELGRAPH_SYNC_SELECT_LIMIT (default 250, max 5000) and RELGRAPH_SYNC_REVIEW_LIMIT
+# (default 250), read inside the GATEWAY image by PIVOTA-Agent's
+# scripts/run-relationship-graph-sync-routine-cron.js — grepping THIS repo for them finds nothing.
+# Raising them means adding them to relgraph_sync_env below, because --set-env-vars REPLACES the
+# whole env set: an operator who adds them with `gcloud run jobs update` has them wiped by the next
+# reconcile of this script. That is the same drift this timeout override exists to prevent, and it
+# applies to the caps too.
 #
-# So this raise removes ONE of three walls. It changes nothing about the daily run, which exits in
-# minutes either way.
+# THE ENV BELOW IS THE LIVE JOB'S, VAR FOR VAR (2026-09-30). The write gates, the confirm token (a
+# code constant, WRAPPER_CONFIRM_TOKEN, not a secret), the Vertex settings and the 45-minute step
+# budget were all set by hand, so before this a reconcile silently disarmed graph writes and broke
+# AI review. Measured shape at these values: build ~8 min + 250 sequential reviews ~29 min (~7 s
+# each) = ~37 of 45 minutes. (Then: no raise of RELGRAPH_SYNC_REVIEW_LIMIT before bounded review
+# concurrency, PIVOTA-Agent #2335. Both have since shipped; the current values are in the dated notes
+# below, the latest being GLOBAL REVIEW BACKLOG, 2026-10-20.)
+#
+# So this raise removes ONE of three walls. It changes nothing about the daily run, which takes
+# ~37 minutes at today's caps either way.
 #
 # COST: infra/gcp/setup_monitoring.sh alerts on relgraph-sync via completed_task_attempt_count
-# {result=failed} — it fires only AFTER a task dies, and there is no duration-based alert. A wedged
-# job is therefore silent for 4h instead of 1h (8h instead of 2h across the retry). Accepted here
-# because the daily run exits in minutes, so a run that is still alive at 1h is already anomalous —
-# but if these caps are ever raised, add a duration alert rather than relying on the failure signal.
+# {result=failed}, which fires only AFTER a task dies, and via "prod: relgraph-sync running over five
+# hours" (running_executions > 0 for 18000s; two hours until 2026-10-20), which catches a wedged or
+# chained run at ~5h instead of at the 6h task timeout (12h across the retry). A normal night is
+# ~3.0-4.0 h at the 2026-10-20 review size (10,000 at concurrency 12).
 #
 # Precedent for raising, not just lowering: the twelve other mkjob callers all LOWER 3600s, but
 # external-seed-destination-sweep raises mkcrawljob's 300s to 3600s. This is the first override to
 # exceed 3600s.
+# COVERAGE + THROUGHPUT (2026-10-11, Peng: "make sure main route works"). The similar rails are moving
+# to relationship-graph-only (PIVOTA-Agent #2409), so the nightly run must GROW coverage, not follow
+# ingest churn: on 2026-10-09 its 250 reviews went to whatever catalog rows changed in 24h (KISS
+# press-ons, Stila, OPI), and 2,550 of ~18,000 products had a served alternative after a one-off
+# backlog drain. Prod only:
+#   RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true  - build for live anchors with no served alternative first
+#     (PIVOTA-Agent #2336; cooldown 7 days by default). PREREQUISITE: migration
+#     061_relationship_graph_anchor_attempts applied in prod, and an image containing #2336 (0ef182dcd).
+#   RELGRAPH_SYNC_REVIEW_LIMIT=1000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=6 - the 2026-10-10 drain measured
+#     1,000 reviews at concurrency 6 in ~27 minutes (2.1-4.1% errors); with the ~8 minute build that is
+#     well inside the step budget, which rises to 90 minutes. The anchor caps (RELGRAPH_SYNC_LIMIT 200,
+#     SELECT_LIMIT 250) stay at the image defaults until a night at these values is measured.
+# UNCOVERED BACKFILL (2026-10-13, PIVOTA-Agent #2418 + its follow-up). The nightly selector only reaches
+# rows changed in 24h: 19,744 of 24,675 renderable beauty products (80%) had never had a relationship
+# label, so graph-only rails were empty on 35 of 45 sampled PDPs however many reviews ran. Prod only:
+#   RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200 - each night also builds up to 200 never-covered products
+#     (the build's coverage predicate, rotated by the 7-day attempt cooldown; requires
+#     PRIORITIZE_UNCOVERED). The cron widens the build limit (200 -> 400) and target recall's anchor cap
+#     with it (400 is recall's maximum, so 200 is the nightly cap).
+#   RELGRAPH_SYNC_REVIEW_LIMIT=2000 - 400 anchors at ~7.6 candidates each are ~3,000 labels a night; at
+#     1,000 the backfill's labels would wait. ~54 minutes of review at concurrency 6, inside the 90-minute
+#     step budget. (Peng 2026-10-13: graph-only is live with ~91% of PDPs empty; drain + nightly 200/2000.)
+#   RELGRAPH_SYNC_REVIEW_CONCURRENCY=8 (Peng 2026-10-13, review cap kept at 2000) - the first night at
+#     2000 reviews took 93 minutes; pivota-pg CPU then was mean 15% / p90 25%, its only bursts over 35%
+#     (8 minutes, max 58%) in the build/recall phase, the review stretch near baseline (the reviews are
+#     LLM calls), so 8 shortens the review without loading the then 2-vCPU primary (4 vCPU since
+#     2026-10-19). The run's review error gate (max 25%) fails the run if the model provider throttles.
+#   RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true - candidates come from each anchor's own category, not the
+#     ~1,400 newest rows; a targeted run of 45 anchors generated 344 candidates for 32 that had none.
+#     This applies to the recency anchors too.
+#   PREREQUISITE: a relgraph-sync image containing #2418 and its follow-up (the job is pinned by digest).
+# GLOBAL REVIEW BACKLOG (Peng 2026-10-20). The nightly reviewed only the labels its own build produced
+# (RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD defaults on) and only labels updated since the 24h selection
+# window (RELGRAPH_SYNC_CUTOFF defaults to it), ~1,000 a night, while 26,617 competitive_alternative
+# labels sat `generated` and unreviewed (census 2026-10-20). Prod only:
+#   RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false + RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z - review the
+#     global score-ordered generated queue. The cutoff feeds only the review step.
+#   RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative - the similar rail's backlog first
+#     (~3 nights); related_product (43,300 generated) after.
+#   RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true (Peng 2026-10-20, PIVOTA-Agent #2471) - the queue reviews the
+#     labels of anchors with no served alternative first, one per anchor per round, then the covered
+#     anchors by score. Only 5,933 of the 26,617 generated alternatives sat on the 2,616 uncovered
+#     anchors; the score-ordered top 3,000 reached 440 of them, this order reaches all 2,616.
+#   RELGRAPH_SYNC_REVIEW_LIMIT=10000 + RELGRAPH_SYNC_REVIEW_CONCURRENCY=12 - PREREQUISITE: a gateway
+#     image whose review-limit cap is 10,000 at every layer (PIVOTA-Agent: cron, sync routine, routine
+#     job, review script; before it, each silently capped 10,000 at 5,000). 16 is the gateway's maximum.
+#     Measured at concurrency 8: ~1-1.7 s per review, so 10,000 is ~1.4-2.4 h at 16 plus the ~30-minute
+#     build. CONCURRENCY 12, not 16 (Peng 2026-10-20): the first night at 16 (3,000 reviews, 2026-10-20)
+#     errored 10.3% against 1.5-3.2% at 8, so ~3.0-4.0 h a night at 12. The step budget rises to 300
+#     minutes (the review needs ~165-210) and the task timeout to 21600s (6 h); with
+#     --max-retries 1 a wedged run can cost 12 h. If the model provider throttles at 16, the review error
+#     gate (max 25%) fails the run only AFTER the step, reading the finished review; inside the step only
+#     the breaker on 8 consecutive transport errors stops it. The occupancy alert
+#     moves to five hours with this change (setup_monitoring.sh); reconcile monitoring with the env.
+#   RELGRAPH_DB_DUTY_CYCLE=1 - set by hand on 2026-10-15 (PIVOTA-Agent #2444: duty-cycle pacing keeps the
+#     build's database streams at ~0.25 of the primary, 2 vCPU then, 4 since 2026-10-19); without it
+#     here a reconcile turns it off.
+# Staging keeps the 45-minute budget and none of these. --set-env-vars replaces the whole env, so the
+# live job must carry exactly these values before the next reconcile (set them with the same update).
+# Staging gets neither Vertex nor the write gates: GOOGLE_CLOUD_PROJECT follows $PROJECT, and the
+# gates follow RELGRAPH_SYNC_WRITES (validated above; never true in staging).
+relgraph_sync_env(){
+  local env="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1"
+  if [ "$ENV" = prod ]; then
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=300,RELGRAPH_SYNC_REVIEW_LIMIT=10000,RELGRAPH_SYNC_REVIEW_CONCURRENCY=12,RELGRAPH_SYNC_PRIORITIZE_UNCOVERED=true"
+    env="$env,RELGRAPH_SYNC_SCOPE_REVIEW_TO_BUILD=false,RELGRAPH_SYNC_CUTOFF=2026-01-01T00:00:00Z,RELGRAPH_SYNC_REVIEW_RELATION_TYPES=competitive_alternative"
+    env="$env,RELGRAPH_SYNC_REVIEW_UNCOVERED_FIRST=true"
+    env="$env,RELGRAPH_DB_DUTY_CYCLE=1"
+    env="$env,RELGRAPH_SYNC_UNCOVERED_BACKFILL_LIMIT=200,RELGRAPH_SYNC_EXPAND_TARGET_RECALL=true"
+    env="$env,VERTEX_AI_ENABLED=true,GOOGLE_CLOUD_PROJECT=$PROJECT,GOOGLE_CLOUD_LOCATION=global,GCE_METADATA_HOST=metadata.google.internal"
+  else
+    env="$env,RELGRAPH_SYNC_STEP_TIMEOUT_MINUTES=45"
+  fi
+  if [ "$RELGRAPH_SYNC_WRITES" = true ]; then
+    env="$env,RELGRAPH_SYNC_APPLY_BUILD=true,RELGRAPH_SYNC_APPLY_REVIEW=true,RELGRAPH_SYNC_ALLOW_WRITES=true,RELGRAPH_SYNC_CONFIRM=APPLY_RELGRAPH_SYNC_ROUTINE"
+  fi
+  printf '%s' "$env"
+}
 mkjob relgraph-sync "$GATEWAY_IMAGE" "$SA" \
   --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest,PCI_KB_DATABASE_URL=PCI_KB_DATABASE_URL_NOVERIFY:latest" \
-  --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=relgraph-sync,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3,PCI_KB_DB_POOL_MAX=1,INGREDIENT_REFERENCE_DB_POOL_MAX=1,INGREDIENT_SIGNAL_DB_POOL_MAX=1" \
-  --task-timeout 14400s \
+  --set-env-vars "$(relgraph_sync_env)" \
+  --task-timeout 21600s \
   --command npm --args "run,relgraph:sync-routine:cron"
 
 echo "== job: relgraph-health (was GH Actions cron 0 10 * * *)"
@@ -813,17 +946,103 @@ sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
 # most brand hosts and reports "0 dead links" while having seen almost nothing.
 # task-timeout is raised over the crawl default because per-host pacing is the point: ~1,700 seeds
 # a day is a full corpus pass inside the 7-day staleness window.
+#
+# PACED SINCE be#2641 (2026-10-17): every request waits on one global bucket (0.5/s, 6 new hosts a
+# minute) and the run carries a wall-clock budget, so these values are the ones agreed for it:
+#   --limit 3500 --budget-seconds 3300   prod read 5,000 candidates in ~15 min unpaced; paced, a run
+#                                        spends its 3,300 s budget (under the 3,600 s task timeout,
+#                                        so it prints its own summary) and leaves the rest of the
+#                                        3,500 for tomorrow (`hosts_not_started`).
+#   --max-retries 0                      OVERRIDES mkcrawljob's 1: an exit 3 (ip_throttled) or a crash
+#                                        must not re-run a full pass from the same address minutes
+#                                        after it was throttled. The next night is the retry.
+#
+# AN EXISTING JOB IS UPDATED, NOT REBUILT (controller review of be#2641, 2026-10-17). mkcrawljob on an
+# existing job is an `update` carrying --set-env-vars (REPLACES the whole env), --set-secrets
+# (replaces the mounts), --cpu 1 --memory 1Gi, and args with `--no-retire` unless RETIRE=true; with
+# EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION defaulting to false. A plain re-run of this script for any
+# other job would then silently disarm retirement and the pending suppression, and wipe hand-set env.
+# So the UPDATE path passes only the image, the args, --max-retries and --task-timeout, and the
+# retire choice in the args must be stated on the run (EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false):
+# an update without it is refused, never guessed. CREATE (a fresh project) keeps mkcrawljob and its full definition.
 if [ "$EXTERNAL_SEED_DESTINATION_SWEEP" = true ]; then
-  echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE)"
-  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,1700"
-  [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
-  mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
-    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
-    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
-    --task-timeout 3600s \
-    --command python --args="$SWEEP_ARGS"
+  echo "== job: external-seed-destination-sweep (retire=$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE pending=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION)"
+  SWEEP_ARGS="-m,jobs.external_seed_destination_sweep,--limit,3500,--budget-seconds,3300"
+  if have "$GCLOUD" run jobs describe external-seed-destination-sweep --region "$REGION"; then
+    # The retire choice must be STATED on an update. Reading it back from the job would be a template
+    # read, which this script never does for a runtime question (tests/test_ops_scripts_read_the_
+    # serving_revision.py); guessing a default could silently arm or disarm retirement.
+    if [ -z "$_EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE_EXPLICIT" ]; then
+      echo "external-seed-destination-sweep exists: set EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE=true|false explicitly for this update (check the live job's args for --no-retire first); refusing to guess" >&2
+      exit 2
+    fi
+    SWEEP_NO_RETIRE=$([ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] && echo false || echo true)
+    [ "$SWEEP_NO_RETIRE" = true ] && SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
+    echo "   (update: image, args, --max-retries 0, --task-timeout 3600s only; env and secrets untouched; no-retire=$SWEEP_NO_RETIRE)"
+    "$GCLOUD" run jobs update external-seed-destination-sweep --region "$REGION" --image "$BACKEND_IMAGE" \
+      --max-retries 0 --task-timeout 3600s --command python --args="$SWEEP_ARGS" --quiet
+  else
+    [ "$EXTERNAL_SEED_DESTINATION_SWEEP_RETIRE" = true ] || SWEEP_ARGS="$SWEEP_ARGS,--no-retire"
+    mkcrawljob external-seed-destination-sweep "$BACKEND_IMAGE" "$SA" \
+      --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-seed-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED=$EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION" \
+      --task-timeout 3600s --max-retries 0 \
+      --command python --args="$SWEEP_ARGS"
+  fi
 else
   echo "== external-seed destination sweep not created (EXTERNAL_SEED_DESTINATION_SWEEP=false)"
+fi
+
+# ---- external-referral refresh (opt-in: EXTERNAL_REFERRAL_REFRESH=true) ----------------------
+# Re-reads the price and availability of the external seeds we serve, nightly at 05:15Z, from the
+# crawl egress (`mkcrawljob`). 2026-10-16 Cloudflare challenge-listed the crawl NAT address after
+# nights of 2.5-4.0 origin reads/s from this job; be#2640 paces it (crawl_global_pacer). These are
+# the ROLLOUT values agreed for the paced image, not a steady state:
+#   --limit 2000            prod ran --limit 15000 on 10-16. At 0.5 requests/s and 6 new hosts a
+#                           minute a 3,300 s run reaches ~1,650 requests, so 2,000 candidates is
+#                           already more than it can start; a larger limit only grows
+#                           `skipped_for_budget`. Raise it after the head-host census
+#                           (pacing_census/refresh_head_hosts.py) and a few paced nights.
+#   --budget-seconds 3300   under the 3,600 s task timeout, so the run prints its own summary.
+#   --host-concurrency 4    unchanged from prod; the global bucket, not the workers, sets the rate.
+#   --max-retries 0         an exit 1 (degraded / budget stop) or 3 (ip_throttled) must NOT be re-run
+#                           at once: a retry is a second full pass from the same address minutes after
+#                           the IP was throttled. The next night is the retry.
+# WHAT AN OPTED-IN RUN DOES NOT TOUCH on an EXISTING job: its env and its secret mounts. They were set
+# by hand (EXTERNAL_OFFER_DUAL_WRITE_ENABLED and friends; see the job's docstring), and
+# `--set-env-vars` REPLACES the whole env set, so an update passes only the image, the retries, the
+# timeout and the args. Only a CREATE (a fresh project) builds the job from `mkcrawljob` with the
+# minimal env below. The trigger keeps its pause state like every other `sched` trigger.
+if [ "$EXTERNAL_REFERRAL_REFRESH" = true ]; then
+  echo "== job: external-referral-refresh (rollout: --limit 2000 --budget-seconds 3300 --host-concurrency 4, retries 0)"
+  REFRESH_ARGS="-m,jobs.external_referral_refresh,--limit,2000,--budget-seconds,3300,--host-concurrency,4"
+  if have "$GCLOUD" run jobs describe external-referral-refresh --region "$REGION"; then
+    "$GCLOUD" run jobs update external-referral-refresh --region "$REGION" --image "$BACKEND_IMAGE" \
+      --max-retries 0 --task-timeout 3600s --command python --args="$REFRESH_ARGS" --quiet
+  else
+    mkcrawljob external-referral-refresh "$BACKEND_IMAGE" "$SA" \
+      --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
+      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-referral-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+      --task-timeout 3600s --max-retries 0 --memory 2Gi \
+      --command python --args="$REFRESH_ARGS"
+  fi
+else
+  echo "== external-referral refresh not reconciled (EXTERNAL_REFERRAL_REFRESH=false; the live job is left as it is)"
+fi
+
+# ---- catalog destination sweep (rows with no seed) ------------------------------------------
+# Same crawl egress and pacing as the seed sweep above, for catalog_enrichment_agent_v1 rows.
+if [ "$CATALOG_DESTINATION_SWEEP" = true ]; then
+  echo "== job: catalog-destination-sweep (suppress=$CATALOG_DESTINATION_SWEEP_SUPPRESS)"
+  CATALOG_SWEEP_ARGS="-m,jobs.catalog_destination_sweep,--limit,4000"
+  [ "$CATALOG_DESTINATION_SWEEP_SUPPRESS" = true ] && CATALOG_SWEEP_ARGS="$CATALOG_SWEEP_ARGS,--suppress"
+  mkcrawljob catalog-destination-sweep "$BACKEND_IMAGE" "$SA" \
+    --set-secrets "DATABASE_URL=DATABASE_URL_NOVERIFY:latest" \
+    --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=catalog-destination-sweep,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
+    --task-timeout 3600s \
+    --command python --args="$CATALOG_SWEEP_ARGS"
+else
+  echo "== catalog destination sweep not created (CATALOG_DESTINATION_SWEEP=false)"
 fi
 
 # ---- retailer ingest drain -----------------------------------------------------------------
@@ -898,6 +1117,19 @@ else
     "$GCLOUD" scheduler jobs pause external-seed-destination-sweep-cron --location "$REGION" --quiet
     echo "   (paused: external-seed-destination-sweep-cron; EXTERNAL_SEED_DESTINATION_SWEEP=false)"
   fi
+fi
+if [ "$CATALOG_DESTINATION_SWEEP" = true ]; then
+  # 04:10 UTC: after the seed sweep and the 03:30 cart-link job, before the 05:15 referral refresh.
+  sched catalog-destination-sweep-cron "10 4 * * *" catalog-destination-sweep
+else
+  if [ -n "$_CATALOG_DESTINATION_SWEEP_EXPLICIT" ] && have "$GCLOUD" scheduler jobs describe catalog-destination-sweep-cron --location "$REGION"; then
+    "$GCLOUD" scheduler jobs pause catalog-destination-sweep-cron --location "$REGION" --quiet
+    echo "   (paused: catalog-destination-sweep-cron; CATALOG_DESTINATION_SWEEP=false)"
+  fi
+fi
+if [ "$EXTERNAL_REFERRAL_REFRESH" = true ]; then
+  # 05:15 UTC, the live trigger's slot: after the 03:15 sweep and the 04:10 catalog sweep.
+  sched external-referral-refresh-cron "15 5 * * *" external-referral-refresh
 fi
 sched reviews-invitation-send-cron "* * * * *" reviews-invitation-send
 # 00:52/06:52/12:52/18:52 UTC. The exact cron the GH workflow carried, and the

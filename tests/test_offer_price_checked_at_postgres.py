@@ -88,6 +88,17 @@ async def _scratch(with_price_check: bool):
         await _apply(scoped, name)
     if with_price_check:
         await _apply(scoped, _PRICE_CHECK_MIGRATION)
+    # The mirror writer requires a live product and its canonical SKU.
+    await scoped.execute(
+        "INSERT INTO catalog_products(product_key,merchant_id,platform,source_product_id,title)"
+        " VALUES(:pk,'merch_obs_price_check','external_seed','ext_price_check','price fixture')",
+        {"pk": PK},
+    )
+    await scoped.execute(
+        "INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency)"
+        " VALUES(:sku,:pk,'merch_obs_price_check','external_seed','ext_price_check','canonical','price fixture','SGD')",
+        {"sku": PK + "::canonical", "pk": PK},
+    )
     return admin, scoped
 
 
@@ -392,6 +403,14 @@ async def test_without_the_column_prices_still_move_and_stamp_once_it_lands(unmi
     assert float(moved["list_price"]) == 28.2
 
     dest = "https://missha.us/products/pdrn-peel-shot"
+    await unmigrated_db.execute(
+        "INSERT INTO catalog_products(product_key,merchant_id,platform,source_product_id,title)"
+        " VALUES('ext:pdrn','agent_seed::missha','external_seed','pdrn','attached fixture')"
+    )
+    await unmigrated_db.execute(
+        "INSERT INTO catalog_skus(sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency)"
+        " VALUES('ext:pdrn::canonical','ext:pdrn','agent_seed::missha','external_seed','pdrn','canonical','attached fixture','USD')"
+    )
     await unmigrated_db.execute(
         "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, currency, list_price,"
         " merchant_effective_price, estimated_best_price, source_ref)"

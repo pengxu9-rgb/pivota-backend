@@ -1061,6 +1061,10 @@ def purchase_body(state: Mapping[str, Any], opts: Mapping[str, Any]) -> Dict[str
             "consent_version": state["consent_version"],
         },
         "idempotency_key": f"local-e2e-{uuid.uuid4().hex[:16]}",
+        # Both REQUIRED by the route: the money `seed` priced the offer at (a two-decimal
+        # currency, as `seed` enforces), which the route checks against the offer it reads.
+        "expected_unit_price_minor": int(Decimal(str(state["price"])) * 100),
+        "expected_currency": state["currency"],
     }
     if opts.get("return_url"):
         body["return_url"] = opts["return_url"]

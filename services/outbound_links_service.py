@@ -285,6 +285,12 @@ def _append_query_fragment(url: str, fragment: str) -> str:
     return f"{url}{sep}{fragment}"
 
 
+def append_shopify_cart_country(url: str, country: str) -> str:
+    """Pin a cart permalink's checkout market: ``country=<CC>`` (see build_shopify_cart_permalink).
+    The one spelling every cart lane uses."""
+    return _append_query_fragment(url, f"{SHOPIFY_CART_COUNTRY_PARAM}={country.upper()}")
+
+
 def append_shopify_cart_click_attribute(
     url: str, click_id: str, recovery_key: Optional[str] = None,
 ) -> str:
@@ -481,7 +487,7 @@ def build_shopify_cart_permalink(
         return None
     url = append_shopify_cart_click_attribute(base, click_id)
     if country is not None:
-        url = _append_query_fragment(url, f"{SHOPIFY_CART_COUNTRY_PARAM}={country.upper()}")
+        url = append_shopify_cart_country(url, country)
     if buyer is not None:
         url = _append_query_fragment(url, _cart_prefill_query(buyer))
     return url

@@ -19,6 +19,7 @@ from fastapi import (
     FastAPI, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect,
     Request, Response, status,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from middleware.cors import TieredCORSMiddleware, resolve_trusted_origins
 from middleware.rate_limiter import RateLimitMiddleware
@@ -27,7 +28,7 @@ from middleware.structured_logging import (
     StructuredLoggingMiddleware,
     install_uvicorn_access_log_redaction,
 )
-from middleware.error_handler import ErrorHandlerMiddleware
+from middleware.error_handler import ErrorHandlerMiddleware, request_validation_exception_handler
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -139,9 +140,11 @@ from routes.demo_data_routes import router as demo_data_router
 from routes.auth_routes import router as auth_router
 from routes.auth import router as auth_api_router  # API auth endpoints
 from routes.mcp_oauth_as import router as mcp_oauth_as_router  # MCP OAuth Authorization Server (flag-gated)
+from routes.crawl_identity import router as crawl_identity_router  # Web Bot Auth key directory (404 until keyed)
 from routes.agent_account import router as agent_account_router  # Agent account management
 from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
+from routes.agent_commerce_purchases import router as agent_commerce_purchases_router
 from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
@@ -398,6 +401,7 @@ from routes.store_audit_public_intake import router as store_audit_public_intake
 from routes.store_audit_public_intake import claim_router as store_audit_claim_router
 from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
+from routes.agent_internal_decision_slates import router as agent_internal_decision_slates_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.buyer_api import router as buyer_router
@@ -927,6 +931,15 @@ async def startup_event():
     # accepted requests but no worker tick ever drained the queue.
     # Log the exception with traceback so the boot-time failure is
     # visible in logs while preserving the best-effort contract.
+    # The effective CRAWL_FRESH switch and N, once per boot at WARNING (web and
+    # worker both run this startup), so a flip can be verified from the logs.
+    try:
+        from config.platform import service_name as _crawl_fresh_service_name
+        from services.catalog_row_trust_upserter import log_crawl_fresh_config
+        log_crawl_fresh_config(_crawl_fresh_service_name() or "web")
+    except Exception:  # noqa: BLE001 -- a log line never blocks boot
+        pass
+
     try:
         from services.audit_scheduler import start_scheduler
         await start_scheduler()
@@ -987,6 +1000,9 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
+# FastAPI's own 422 handler echoes the input and 500s when it holds a lone surrogate ("\ud800"),
+# which UTF-8 cannot encode; this one returns the same 422 with the echo made encodable.
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
 # Security response headers on EVERY response, including the ones other middleware generate.
 #
@@ -1090,6 +1106,7 @@ app.include_router(psp_router)
 app.include_router(payment_router)
 app.include_router(auth_router)  # New authentication system
 app.include_router(mcp_oauth_as_router)  # MCP OAuth Authorization Server (returns 404 unless MCP_OAUTH_AS_ENABLED=1)
+app.include_router(crawl_identity_router)  # GET /.well-known/http-message-signatures-directory (404 unless WEB_BOT_AUTH_PRIVATE_KEY)
 app.include_router(auth_api_router)  # API auth endpoints (/api/auth/*)
 app.include_router(admin_migrations_router)  # Admin migrations
 app.include_router(admin_apply_agent_center_migration_router)  # Agent Center V1 migration apply/verify
@@ -1155,6 +1172,9 @@ app.include_router(agent_commerce_router)  # Agent v2 commerce execute contract
 # when a dial is on is a router whose mounting is itself untested, and the dial is read per
 # request so flipping it must not need a redeploy.
 app.include_router(agent_commerce_reap_router)
+# GET /agent/v2/commerce/purchases[/{id}]: the rail-neutral purchase read (payment orchestration
+# P0). Read-only; dark (404) unless AGENT_PURCHASE_LEDGER_ENABLED, read per request.
+app.include_router(agent_commerce_purchases_router)
 # GET/HEAD /reap/return: the static page Reap's hosted checkout sends the buyer's browser back to
 # (the rail's default returnUrl is https://api.pivota.cc/reap/return). Public and NOT dialled:
 # a buyer mid-purchase must never land on a 404 because an operator turned the rail off. It
@@ -1412,6 +1432,7 @@ app.include_router(store_audit_public_intake_router)  # Public store-audit intak
 app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
 app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
+app.include_router(agent_internal_decision_slates_router)  # Gateway-served slates into the decision ledger (/agent/internal/decision-slates)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
 app.include_router(refund_api_router)  # Refund processing
@@ -2145,6 +2166,16 @@ async def app_lifespan(_app: FastAPI):
     # purpose: during the 2026-08-05/06 incident every scheduler job was
     # wedged, and a repair mechanism must not share fate with what it repairs.
     reconnect_supervisor = asyncio.create_task(run_database_reconnect_supervisor())
+    # OFFERS_RESOLVE_GROUP_SEED_SIBLINGS=shadow only: a detached loop that refreshes the shadow's key
+    # set on its own TTL and logs `offers_resolve_group_shadow_cache`, so the shadow proves it is armed
+    # with no offers traffic. None (nothing started) in every other mode. Never blocks startup.
+    group_shadow_armer = None
+    try:
+        from routes.agent_shop_gateway import start_group_shadow_arming
+
+        group_shadow_armer = start_group_shadow_arming()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("group shadow arming not started: %s", exc)
     try:
         yield
     finally:
@@ -2154,6 +2185,10 @@ async def app_lifespan(_app: FastAPI):
         # shutdown()/shutdown_event() entirely (review round 20).
         with suppress(asyncio.CancelledError, Exception):
             await reconnect_supervisor
+        if group_shadow_armer is not None:
+            group_shadow_armer.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await group_shadow_armer
         # ORDER IS LOAD-BEARING, and it was the wrong way round.
         #
         # `shutdown()` is `database.disconnect()`, which closes the asyncpg pool.

@@ -131,6 +131,32 @@ def _handle(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Placeholder price bounds were written in dollars (a $999,999,999 TEST product; a $1 "see store" token) and
+# were applied to every currency's numbers as-is, so any JPY or KRW row priced 1,000 or more -- nearly every
+# real one -- was a placeholder_product BLOCK (found 2026-10-10 building the SG capture: JPY base crawls of
+# Japanese retailers could never apply unattended). The bounds now scale by the currency's ORDER OF MAGNITUDE
+# against the dollar. This is a coarse unit, not FX: no price is converted, compared across currencies or
+# written; a 10x margin either way still separates a token or a test row from a real price list. A currency
+# not listed (or none) keeps the dollar bounds, exactly today's behaviour.
+# Each value sits at or BELOW the currency's usual rate to the dollar, so a scaled upper bound holds a little
+# earlier than in dollars (fails safe) and a scaled token bound never reaches a common real price point (CNY's
+# 9.9 trial size sits under no token bound at 5).
+_PRICE_MAGNITUDE = {
+    "JPY": 100.0, "KRW": 1000.0, "HKD": 5.0, "CNY": 5.0, "TWD": 30.0, "THB": 30.0, "PHP": 50.0,
+    "INR": 50.0, "IDR": 10000.0, "VND": 20000.0, "MYR": 4.0, "SEK": 10.0, "NOK": 10.0, "DKK": 5.0,
+    "MXN": 15.0, "ZAR": 15.0,
+}
+
+
+def _currency(record: Dict[str, Any]) -> str:
+    return str(_pdp(record).get("currency") or "").strip().upper()
+
+
+def price_magnitude(currency: Optional[str]) -> float:
+    """How many units of `currency` sit where one dollar does in the placeholder bounds (1.0 if unknown)."""
+    return _PRICE_MAGNITUDE.get(str(currency or "").strip().upper(), 1.0)
+
+
 def _prices(record: Dict[str, Any]) -> List[float]:
     out = []
     for offer in record.get("offers") or []:
@@ -162,8 +188,14 @@ def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Opt
     minimum and applied the other 19 unanswered, and an only_category lip slice of an all-$1 store kept
     10 rows and applied them at $1. It is still NOT the whole store: records_for_brand's vendor filter
     has already scoped the crawl to the job's brands."""
-    every = [p for record in population or [] if _pdp(record) for p in _variant_prices(record)]
+    population = [record for record in population or [] if _pdp(record)]
+    every = [p for record in population for p in _variant_prices(record)]
     total = len(every)
+    # One storefront prices in one currency (its /meta.json; the pipeline stops a job whose records disagree).
+    # Should a population ever mix currencies, take the LARGEST scale present: deterministic, and it fails
+    # safe -- a larger token bound holds more, never fewer.
+    scale = max((price_magnitude(_currency(record)) for record in population), default=1.0)
+    token_price, modal_ceiling = _STORE_TOKEN_PRICE * scale, _STORE_MODAL_CEILING * scale
     if total < _STORE_MIN_VARIANTS:
         return None
     counts: Dict[float, int] = {}
@@ -171,17 +203,17 @@ def placeholder_price_store_verdict(population: Iterable[Dict[str, Any]]) -> Opt
         counts[p] = counts.get(p, 0) + 1
     # Ties go to the LOWER price: the placeholder is the cheap one.
     modal, modal_n = min(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    token_n = sum(1 for p in every if p <= _STORE_TOKEN_PRICE)
+    token_n = sum(1 for p in every if p <= token_price)
     ceilings = []
-    if modal_n / total >= _STORE_MODAL_SHARE and modal <= _STORE_MODAL_CEILING:
+    if modal_n / total >= _STORE_MODAL_SHARE and modal <= modal_ceiling:
         ceilings.append(modal)
     if token_n / total >= _STORE_TOKEN_SHARE:
-        ceilings.append(_STORE_TOKEN_PRICE)
+        ceilings.append(token_price)
     if not ceilings:
         return None
     return {"ceiling": max(ceilings),
             "evidence": (f"store-wide placeholder pricing: {modal_n}/{total} variants at {modal:.2f}, "
-                         f"{token_n}/{total} at or below {_STORE_TOKEN_PRICE:.2f}")}
+                         f"{token_n}/{total} at or below {token_price:.2f}")}
 
 
 def placeholder_price_store_flags(records: Iterable[Dict[str, Any]],
@@ -351,14 +383,79 @@ def detect(records: Iterable[Dict[str, Any]], *, store_level: bool = True,
 
         prices = _prices(record)
         vendor = str(pdp.get("brand") or "")
+        scale = price_magnitude(_currency(record))
+        # The low bound also reads every VARIANT price: the feed's sellable floor (MIN_SELLABLE_PRICE = 1.0 in
+        # the store's currency) drops a $0.01 promo variant in dollars, but in yen it is 1 yen, so a 1-yen
+        # "free sample" variant survives into pdp.variants while the offer carries the real price (review of
+        # this change, 2026-10-10). In dollars nothing changes: no variant under $1 reaches a record.
+        token_variants = sorted({p for p in _variant_prices(record) if p <= 0.5 * scale})
         if (_PLACEHOLDER.search(title) or re.search(r"\bdev\b", vendor, re.I)
-                or any(p <= 0.5 or p >= 1000 for p in prices)):
+                or any(p <= 0.5 * scale or p >= 1000 * scale for p in prices) or token_variants):
+            # Name a token VARIANT in the detail: the offer may carry only the real price, and a reviewer who
+            # saw "prices [5500.0]" would accept the key -- applying exactly the 1-yen offer this rule stops.
             flags.append(_flag("placeholder_product", BLOCK, record,
-                               f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]})"))
+                               f"looks like a test/placeholder row (prices {sorted(set(prices))[:4]}"
+                               + (f"; token variant prices {token_variants[:4]}" if token_variants else "")
+                               + ")"))
     if store_level:
         verdict = placeholder_price_store_verdict(cohort) if store_verdict is _OWN else store_verdict
         flags.extend(placeholder_price_store_flags(cohort, verdict))
     return flags
+
+
+def listing_collision_flags(collisions: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """same_key_other_listing: one flag per listing the plan left out because an earlier listing on
+    the same host carries the same title, and so the same content key (ingestion.ingest_validated_jsonl).
+
+    Leaving it out is what keeps a buyer from seeing one page and buying another; the flag says what
+    was left out. INFO only when both pages look like one product listed twice -- the same prices, the
+    same merchant product type AND the same image (an ad landing clone, a region copy). Otherwise BLOCK,
+    and a reviewer decides: a different price or type is how a different product wearing the same title
+    shows (COCODOR "Black Cherry" refill $6.99 vs diffuser $11.19; Mr. Smith full size vs sachet), and a
+    different image at one price is a shade (us.mcobeauty.com lists each "Dream Liquid Dewy Blush" shade
+    as its own $5.99 product). Accepting the key (or options.accept_listing_collisions) applies the cohort
+    without that listing; exclude_handles on the KEPT listing makes the other one the row's listing."""
+    flags = []
+    for c in collisions or []:
+        kept, dropped = c.get("kept") or {}, c.get("dropped") or {}
+        same = (bool(kept.get("prices")) and kept.get("prices") == dropped.get("prices")
+                and kept.get("product_type") == dropped.get("product_type")
+                and bool(kept.get("image")) and kept.get("image") == dropped.get("image"))
+        flags.append({
+            "key": f"same_key_other_listing:{dropped.get('handle')}",
+            "rule": "same_key_other_listing",
+            "severity": INFO if same else BLOCK,
+            "handle": dropped.get("handle"),
+            "product_name": dropped.get("product_name"),
+            "category_path": None,
+            "merchant_product_type": dropped.get("product_type"),
+            "detail": (f"left out: {c.get('host')} lists {dropped.get('handle')!r} (type "
+                       f"{dropped.get('product_type')!r}, prices {(dropped.get('prices') or [])[:4]}, image "
+                       f"{dropped.get('image')!r}) under the same title as {kept.get('handle')!r} (type "
+                       f"{kept.get('product_type')!r}, prices {(kept.get('prices') or [])[:4]}, image "
+                       f"{kept.get('image')!r}), which keeps {c.get('product_key')}"),
+        })
+    return flags
+
+
+def listing_move_flags(moves: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """listing_moved: a row names a listing on this host that the crawl does not carry, so the plan held
+    every record of it (ingestion.ingest_validated_jsonl never moves a row). Always BLOCK and never covered
+    by options.accept_listing_collisions: accepting `listing_moved:<product_key>` is what lets the row move
+    to the listing named in the detail (a renamed handle, an unpublished page); a crawl that merely dropped
+    the page is answered by re-running it."""
+    return [{
+        "key": f"listing_moved:{m.get('product_key')}",
+        "rule": "listing_moved",
+        "severity": BLOCK,
+        "handle": m.get("would_keep"),
+        "product_name": None,
+        "category_path": None,
+        "merchant_product_type": None,
+        "detail": (f"held: {m.get('host')} row {m.get('product_key')} names {m.get('current')!r}, which this "
+                   f"crawl does not carry; accepting moves it to {m.get('would_keep')!r} "
+                   f"(crawled {list(m.get('crawled') or [])[:5]})"),
+    } for m in moves or []]
 
 
 def blocking(flags: Iterable[Dict[str, Any]], *, accepted: Iterable[str] = ()) -> List[Dict[str, Any]]:

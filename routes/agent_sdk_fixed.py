@@ -853,6 +853,10 @@ async def search_products(
     external_seed_strategy: str = Query(default="legacy"),
     fast_mode: bool = Query(default=False),
     market: Optional[str] = Query(default=None),
+    serving_market: Optional[str] = Query(
+        default=None,
+        description="The BUYER's market (ISO-2): decides the served currency; `market` stays the storage partition.",
+    ),
     context: AgentContext = Depends(get_agent_context)
 ):
     """
@@ -1185,6 +1189,7 @@ async def search_products(
                 external_seed_strategy=external_seed_strategy,
                 fast_mode=fast_mode,
                 market=market,
+                serving_market=serving_market,
                 context=context,
             ),
             delegate_timeout_s,
@@ -1231,6 +1236,7 @@ async def search_products(
                 record_decision_candidates,
                 record_decision_event,
                 record_exposure_events,
+                resolve_card_identities,
             )
             from services.protocols import DEFAULT_PROTOCOL
 
@@ -1239,7 +1245,9 @@ async def search_products(
             for idx, product in enumerate(raw_products):
                 rows.append(
                     {
-                        "content_key": product.get("content_key") or product.get("product_key"),
+                        # content_key only; resolve_card_identities maps a product_key in the background.
+                        "content_key": product.get("content_key"),
+                        "product_key": product.get("product_key"),
                         "catalog_offer_id": product.get("catalog_offer_id") or product.get("offer_id"),
                         "position": idx,
                         "eligibility_flags": {
@@ -1270,6 +1278,7 @@ async def search_products(
                             "offset": offset,
                         },
                     )
+                    await resolve_card_identities(rows)
                     await record_decision_candidates(decision_id, rows)
                     await record_exposure_events(decision_id, rows)
                 except Exception:

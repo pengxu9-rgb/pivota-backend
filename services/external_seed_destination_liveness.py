@@ -36,6 +36,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -44,8 +46,10 @@ from urllib.parse import urlparse
 import httpx
 
 from db.database import database
-from services import crawl_politeness
+from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
+from services import shopify_edge_pacer
 from services.catalog_offer_suppression import cascade_offer_suppression
+from services import destination_dead_suppression
 from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.outbound_warm_handoff import extract_product_handle
 
@@ -84,6 +88,17 @@ OBSERVED_VERDICTS = frozenset(set(ALL_VERDICTS) - {VERDICT_UNVERIFIABLE})
 RETIREMENT_STREAK = 2
 RETIREMENT_MIN_GAP = timedelta(hours=24)
 SUPPRESSION_REASON = "external_seed_destination_dead"
+# THE PENDING STEP (services/destination_dead_suppression). The first CORROBORATED confirmed-dead
+# observation hides the mirror under this reason; the next answer from the origin that the page is
+# alive lifts exactly it; retirement converts it to SUPPRESSION_REASON. Written only by the sweep
+# (`suppress=True`) and only with the switch on; lifted whatever the switch says, because a lift
+# can only undo this lane's own reason.
+PENDING_SUPPRESSION_REASON = "external_seed_destination_dead_pending"
+PENDING_SUPPRESSION_FLAG = "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED"
+
+
+def pending_suppression_enabled() -> bool:
+    return str(os.getenv(PENDING_SUPPRESSION_FLAG) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 PAGE_LIMIT = 250
 MAX_CATALOGUE_PAGES = 80
@@ -91,6 +106,26 @@ MAX_CATALOGUE_PAGES = 80
 # hitting any single storefront harder. Serial hosts made a full pass a sum-of-waits, which a
 # 3600s Cloud Run task timeout does not comfortably hold.
 SWEEP_HOST_CONCURRENCY = 4
+
+# STRICT GLOBAL PACING (2026-10-16), the refresh's rules (be#2640, `services.crawl_global_pacer`).
+# Measured 10-14/10-15: this sweep read 5,000 candidates across 228-354 hosts in ~15 min, ~4-5
+# requests/s from the one crawl NAT address, the fastest crawler on it; on 10-16 (after Cloudflare
+# challenge-listed the address) it took 319 backoffs from its first second and ran into the 3,600 s
+# task timeout. `SWEEP_HOST_CONCURRENCY` capped hosts in flight, not the IP's rate.
+#   * 0.5 requests/s shared by every host worker (+-30% jitter), 6 new hosts a minute: the
+#     refresh's defaults and reasons (services/external_referral_readiness._GLOBAL_RPS_DEFAULT);
+#   * a WALL-CLOCK BUDGET, which this sweep never had: at 0.5/s a 5,000-seed pass (~1,750 requests
+#     + one robots.txt per host) needs ~4,100 s, past the task timeout, so the run would be killed
+#     before printing its summary. 3,300 s, the refresh's number, under the 3,600 s timeout. No
+#     request starts after it (the pacer's deadline); a host cut short records nothing more.
+# Flag first, then env, then default, through `crawl_global_pacer`'s ONE helper (be#2640 review M3,
+# be#2641 review H1): NO KNOB HAS AN OFF VALUE. 0, negative, NaN or garbage is an ERROR and the
+# default; the rate is clamped to [0.05, 1.0], the new-host cap rounds up to at least 1, the budget is
+# > 0. The one rollback is the kill switch CRAWL_GLOBAL_PACER_DISABLED=true (ERROR every run), which
+# runs the pacer unpaced but keeps the breaker's cool-down/stop and the budget's deadline.
+SWEEP_GLOBAL_RPS_DEFAULT = 0.5
+SWEEP_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT = 6
+SWEEP_BUDGET_SECONDS_DEFAULT = 3300.0
 
 # Catalogue-read outcomes. Only `ok` is a catalogue.
 CATALOGUE_OK = "ok"
@@ -124,6 +159,10 @@ class DestinationObservation:
     # independent witness. Repetition cannot substitute: a WAF policy is MORE persistent than
     # a dead product, so it clears the 24h gap by construction.
     corroborated: bool = False
+    # The final URL was on ANOTHER host than the one asked (`www.` folded) and still named a product
+    # handle: a domain move (luafee.jp -> luafeejp.com) that classifies as usual. Recorded in `note`
+    # too, and counted by the sweep (`cross_host_landings`), so a run of them is visible.
+    cross_host: bool = False
 
     @property
     def confirmed_dead(self) -> bool:
@@ -170,6 +209,15 @@ def classify_destination(
         return DestinationObservation(
             VERDICT_UNVERIFIABLE, status_code, final_url, f"http_{status_code}"
         )
+    off_site = _landed_off_site(requested_url, final_url)
+    if off_site and off_site != _OFF_SITE_OTHER_HOST:
+        # A BOT WALL THAT ENDS IN A 200 (be#2641 review M2). Some walls 302 to `/challenge`,
+        # `/checkpoint` or a captcha host and answer 200 there, with no `cf-mitigated` header. That
+        # used to read as `redirected_off_product`, a CONFIRMED-DEAD verdict, and a stage-2 probe is
+        # corroborated by construction (its handle is already absent from the catalogue), so two
+        # nights of a wall could retire a live product. A challenge-shaped landing says where the
+        # wall sent us, not whether the product exists: unverifiable, whatever its path holds.
+        return DestinationObservation(VERDICT_UNVERIFIABLE, status_code, final_url, off_site)
 
     wanted = (extract_product_handle(requested_url) or "").lower()
     landed = (extract_product_handle(final_url or requested_url) or "").lower()
@@ -188,6 +236,13 @@ def classify_destination(
             "destination is not product-shaped",
             corroborated=False,
         )
+    if not landed and off_site == _OFF_SITE_OTHER_HOST:
+        # LEFT /products/ FOR ANOTHER HOST (`www.` folded): a wall's own domain looks exactly like
+        # this, so it is unverifiable, never dead (review M2). A landing on ANOTHER host that still
+        # names a product handle is not affected: the same handle there is a domain move and reads
+        # `live` (luafee.jp -> luafeejp.com, tests/test_product_handle_non_ascii.py), a different one
+        # is `redirected_to_product`, neither of which can retire a seed.
+        return DestinationObservation(VERDICT_UNVERIFIABLE, status_code, final_url, off_site)
     if not landed:
         return DestinationObservation(
             VERDICT_REDIRECTED_OFF_PRODUCT,
@@ -196,15 +251,68 @@ def classify_destination(
             "left /products/",
             corroborated=corroborated,
         )
+    # A DOMAIN MOVE (review item 7): the verdict is the usual one, the landing host goes in the note.
+    cross_host = off_site == _OFF_SITE_OTHER_HOST
+    moved = f"cross-host landing on {_landing_host(final_url)}" if cross_host else ""
+
+    def _noted(note: str) -> str:
+        return "; ".join(part for part in (note, moved) if part)
+
     if landed != wanted:
         return DestinationObservation(
-            VERDICT_REDIRECTED_TO_PRODUCT, status_code, final_url, f"-> {landed}"
+            VERDICT_REDIRECTED_TO_PRODUCT, status_code, final_url, _noted(f"-> {landed}"), cross_host=cross_host
         )
     if listed_in_catalogue is False:
         return DestinationObservation(
-            VERDICT_LIVE_DELISTED, status_code, final_url, "absent from products.json"
+            VERDICT_LIVE_DELISTED, status_code, final_url, _noted("absent from products.json"),
+            cross_host=cross_host,
         )
-    return DestinationObservation(VERDICT_LIVE, status_code, final_url, "")
+    return DestinationObservation(VERDICT_LIVE, status_code, final_url, _noted(""), cross_host=cross_host)
+
+
+_OFF_SITE_OTHER_HOST = "landed on another host"
+_CHALLENGE_PATH_RE = re.compile(r"/(?:challenge|checkpoint|captcha|cdn-cgi)(?:/|$|[?#._-])", re.IGNORECASE)
+
+
+def _fold_www(host: str) -> str:
+    host = (host or "").strip().lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _landing_host(final_url: Optional[str]) -> str:
+    try:
+        return (urlparse(str(final_url or "")).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
+    """Why a final URL cannot speak for the product ("" when it can): another host, or a
+    challenge-shaped path (`/challenge`, `/checkpoint`, `/captcha`, `/cdn-cgi/`), or a captcha
+    host."""
+    if not final_url:
+        return ""
+    try:
+        wanted = urlparse(str(requested_url or ""))
+        landed = urlparse(str(final_url))
+    except Exception:  # noqa: BLE001 - an unparsable final URL is not evidence either way
+        return "unparsable final url"
+    landed_host = (landed.hostname or "").lower()
+    if "captcha" in landed_host:
+        return "landed on a captcha host"
+    # THE PATH RULE ONLY READS A PATH WE WERE SENT TO (controller review of be#2641, 2026-10-17).
+    # `_CHALLENGE_PATH_RE` also matches real handles (`/products/checkpoint-mesh-bag`), and this
+    # function feeds the refresh's `_read_the_served_product`: unguarded, a seed whose handle starts
+    # with challenge-, checkpoint-, captcha- or cdn-cgi- could never be read. So it applies only when
+    # the final path DIFFERS from the requested one: a product answering on its own URL is never a
+    # wall, whatever its handle. (A redirect onto a different, challenge-shaped path is still read as
+    # a wall: unverifiable, which can never retire anything.)
+    landed_path = landed.path or ""
+    if landed_path != (wanted.path or "") and _CHALLENGE_PATH_RE.search(landed_path):
+        return "landed on a challenge path"
+    if landed_host and _fold_www(landed_host) != _fold_www(wanted.hostname or ""):
+        return _OFF_SITE_OTHER_HOST
+    return ""
 
 
 def should_retire(verdict: str, failure_streak: int) -> bool:
@@ -228,6 +336,10 @@ async def probe_destination(
         return classify_destination(
             requested_url=url, status_code=None, transport_error="robots_disallowed"
         )
+    except crawl_global_pacer.GlobalPaceStopped:
+        # The run stopped (budget spent, or the IP breaker's final trip). NOT an observation:
+        # recording `unverifiable` for a request we never sent would stamp the seed as checked.
+        raise
     except Exception as exc:  # noqa: BLE001
         return classify_destination(
             requested_url=url, status_code=None, transport_error=type(exc).__name__
@@ -235,14 +347,26 @@ async def probe_destination(
 
     try:
         resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+    except crawl_global_pacer.GlobalPaceStopped:
+        # A REDIRECT HOP the pacer refused (its request hook runs inside `client.get`): the run
+        # stopped mid-chain. Not an observation, exactly like a refused first request.
+        raise
+    except crawl_politeness.RobotsDisallowed:
+        # A redirect hop onto another host whose robots.txt refuses it (be#2640's hop hook).
+        return classify_destination(
+            requested_url=url, status_code=None, transport_error="robots_disallowed"
+        )
     except Exception as exc:  # noqa: BLE001
         return classify_destination(
             requested_url=url, status_code=None, transport_error=type(exc).__name__
         )
 
+    # WITH ITS HEADERS: that is how the installed IP breaker sees `cf-mitigated: challenge`.
     crawl_politeness.note_response(
-        url, resp.status_code, retry_after=resp.headers.get("retry-after")
+        url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers
     )
+    # Teaches the shared Shopify-edge budget which hosts it covers (a no-op with its flag off).
+    shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
     return classify_destination(
         requested_url=url,
         status_code=resp.status_code,
@@ -330,19 +454,28 @@ async def _get_catalogue_page(
             await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=0)
         except crawl_politeness.RobotsDisallowed:
             return "robots_disallowed", "robots.txt"
+        except crawl_global_pacer.GlobalPaceStopped:
+            raise  # the run stopped: not a fact about this host
         except Exception as exc:  # noqa: BLE001
             return "gate_error", f"{type(exc).__name__}: {exc}"
 
         try:
             resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+        except crawl_global_pacer.GlobalPaceStopped:
+            raise  # a refused redirect hop: the run stopped, not a fact about this host
+        except crawl_politeness.RobotsDisallowed:
+            # A redirect hop onto another host whose robots.txt refuses it: told not to, so no
+            # retry (retrying would only ask that robots.txt again).
+            return "robots_disallowed", "robots.txt (redirect hop)"
         except Exception as exc:  # noqa: BLE001
             last = type(exc).__name__
             await asyncio.sleep(2 * (attempt + 1))
             continue
 
         crawl_politeness.note_response(
-            url, resp.status_code, retry_after=resp.headers.get("retry-after")
+            url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers
         )
+        shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
         mitigated = resp.headers.get("cf-mitigated")
         if mitigated:
             # A challenge is a refusal, not a pacing signal — retrying can only stall.
@@ -369,6 +502,7 @@ async def record_destination_observation(
     observation: DestinationObservation,
     *,
     now: Optional[datetime] = None,
+    suppress: bool = False,
 ) -> Dict[str, Any]:
     """Write one observation. Returns what the row now says.
 
@@ -381,22 +515,30 @@ async def record_destination_observation(
       confirmed 404 with a full streak, handing its dead link straight back to the serving
       lane. The row keeps its last CONCLUSIVE answer until a new one arrives.
     * the failure streak advances only on a confirmed-dead verdict that stage 1 CORROBORATED
-      (see `DestinationObservation.corroborated`), and only when the previous observation is
-      at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a seed, which is
-      what makes a sweep re-run free.
+      (see `DestinationObservation.corroborated`), and only when the previous CORROBORATED
+      observation is at least `RETIREMENT_MIN_GAP` old — two probes in one run cannot retire a
+      seed, which is what makes a sweep re-run free. See `_gap_anchor` for why the gap is not
+      measured from `destination_checked_at`.
     * an uncorroborated confirmed-dead verdict is recorded but HOLDS the streak. It is a real
       observation and the serving lane may act on it; it is just not, on its own, enough to
       withdraw a row.
     * any non-dead ANSWER resets the streak to 0. An `unverifiable` does not: it is not
       evidence the link came back.
+
+    And one action (services/destination_dead_suppression): with `suppress=True` (the sweep) and
+    PENDING_SUPPRESSION_FLAG on, a corroborated confirmed-dead observation that leaves the streak at
+    1 hides the mirror under PENDING_SUPPRESSION_REASON; any non-dead answer from the origin lifts
+    exactly that reason, switch or no switch, WHATEVER THE STREAK WAS. The reset and the lift are
+    separate statements: gating the lift on the pre-observation streak meant a lift that failed
+    after its reset committed left the row hidden at streak 0 with nothing left to lift it. The
+    refresh route never passes `suppress`, and its observations are never corroborated anyway.
     """
     stamp = now or _now()
-    advance_streak = observation.confirmed_dead
-    gap_cutoff = stamp - RETIREMENT_MIN_GAP
 
     row = await database.fetch_one(
         """
-        SELECT destination_checked_at, destination_verdict, destination_failure_streak, status
+        SELECT destination_checked_at, destination_verdict, destination_failure_streak,
+               destination_corroborated_dead_at, status
         FROM external_product_seeds
         WHERE id = :id
         """,
@@ -405,25 +547,7 @@ async def record_destination_observation(
     if not row:
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
-    previous_checked_at = current.get("destination_checked_at")
-    streak = int(current.get("destination_failure_streak") or 0)
-
-    if not observation.reached_origin:
-        next_streak = streak
-    elif not advance_streak:
-        next_streak = 0
-    elif not observation.corroborated:
-        # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
-        # It is recorded (the verdict is real and worth serving on) but it may not push the
-        # seed toward retirement on its own, because a 404 from a WAF and a 404 from a deleted
-        # product are the same bytes. Only the sweep, which has just read this brand's
-        # catalogue and found the handle missing, sets `corroborated`. See
-        # `DestinationObservation.corroborated` for why repetition is not a substitute.
-        next_streak = streak
-    else:
-        # A second look inside the gap is not a second observation.
-        within_gap = previous_checked_at is not None and _as_utc(previous_checked_at) > gap_cutoff
-        next_streak = streak if within_gap else streak + 1
+    next_streak, next_corroborated_dead_at = next_streak_state(current, observation, stamp)
 
     await database.execute(
         """
@@ -437,6 +561,7 @@ async def record_destination_observation(
                 ELSE destination_http_status
             END,
             destination_failure_streak = :streak,
+            destination_corroborated_dead_at = :corroborated_dead_at,
             destination_checked_at = CASE
                 WHEN CAST(:reached_origin AS BOOLEAN) THEN :checked_at
                 ELSE destination_checked_at
@@ -448,18 +573,125 @@ async def record_destination_observation(
             "verdict": observation.verdict,
             "http_status": observation.http_status,
             "streak": next_streak,
+            "corroborated_dead_at": next_corroborated_dead_at,
             "reached_origin": bool(observation.reached_origin),
             "checked_at": stamp,
         },
     )
-    return {
+    retire = should_retire(observation.verdict, next_streak)
+    result: Dict[str, Any] = {
         "seed_id": seed_id,
         "verdict": observation.verdict,
         "http_status": observation.http_status,
         "failure_streak": next_streak,
         "checked_at": stamp.isoformat() if observation.reached_origin else None,
-        "retire": should_retire(observation.verdict, next_streak),
+        "retire": retire,
     }
+    # THE PENDING STEP. Hide on a corroborated confirmed-dead observation that leaves the streak
+    # at 1 or more (retirement itself handles 2); lift on any answer from the origin that the
+    # page is alive. NOT gated on the streak this observation reset: the reset above has already
+    # committed, so a lift that failed last time must be retried by the next live answer, which
+    # sees streak 0. The lift is scoped to our pending reason, so on any other row it moves nothing.
+    if (
+        suppress
+        and not retire
+        and observation.confirmed_dead
+        and observation.corroborated
+        and next_streak >= 1
+        and pending_suppression_enabled()
+    ):
+        moved = await destination_dead_suppression.suppress_pending(
+            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, stamp=stamp,
+            db=database,  # the SAME handle as the observation write, as retirement does
+        )
+        result["pending_suppressed"] = len(moved["products"])
+    elif observation.reached_origin and not observation.confirmed_dead:
+        moved = await destination_dead_suppression.lift_pending(
+            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, db=database,
+        )
+        result["pending_lifted"] = len(moved["products"])
+    return result
+
+
+#: The seed -> mirror link is the PAIR (source_ref, source_system); see retirement below.
+MIRROR_PRODUCT_KEYS_SQL = """
+    SELECT product_key
+      FROM catalog_products
+     WHERE source_ref = :id
+       AND source_system = :source_system
+"""
+
+
+async def _mirror_product_keys(seed_id: str) -> List[str]:
+    rows = await database.fetch_all(
+        MIRROR_PRODUCT_KEYS_SQL, {"id": seed_id, "source_system": MIRROR_SOURCE_SYSTEM}
+    )
+    return [str(r["product_key"]) for r in (rows or [])]
+
+
+def next_streak_state(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime
+) -> Tuple[int, Optional[Any]]:
+    """The failure streak and its clock after `observation`. Pure; one rule for every lane.
+
+    `current` carries `destination_failure_streak`, `destination_corroborated_dead_at` and
+    `destination_checked_at` (the legacy fallback, see `_gap_anchor`). The rules are the ones
+    `record_destination_observation` documents.
+    """
+    streak = int(current.get("destination_failure_streak") or 0)
+    corroborated_dead_at = current.get("destination_corroborated_dead_at")
+    gap_cutoff = stamp - RETIREMENT_MIN_GAP
+
+    if not observation.reached_origin:
+        return streak, corroborated_dead_at
+    if not observation.confirmed_dead:
+        # The streak is gone, so the clock that spaces its steps goes with it.
+        return 0, None
+    if not observation.corroborated:
+        # A CONFIRMED-DEAD PROBE WITH NO SECOND WITNESS HOLDS THE STREAK WHERE IT IS.
+        # It is recorded (the verdict is real and worth serving on) but it may not push the
+        # seed toward retirement on its own, because a 404 from a WAF and a 404 from a deleted
+        # product are the same bytes. Only the sweep, which has just read this brand's
+        # catalogue and found the handle missing, sets `corroborated`. See
+        # `DestinationObservation.corroborated` for why repetition is not a substitute.
+        return streak, corroborated_dead_at
+    # A second look inside the gap is not a second observation.
+    anchor = _gap_anchor(current)
+    within_gap = anchor is not None and _as_utc(anchor) > gap_cutoff
+    if not within_gap:
+        return streak + 1, stamp
+    if corroborated_dead_at is None:
+        # A streak earned before this column existed, whose last check of any kind is
+        # too recent to prove the gap. Start its clock HERE, the conservative end: the
+        # streak was really earned earlier, so this can only delay a retirement.
+        return streak, stamp
+    return streak, corroborated_dead_at
+
+
+def _gap_anchor(current: Dict[str, Any]) -> Optional[Any]:
+    """When did the streak last step? The retirement gap is measured from here.
+
+    NOT `destination_checked_at`. That column is stamped by EVERY observation that reached the
+    origin, including the refresh route's uncorroborated ones, and the refresh runs at 05:15Z
+    over ~10k seeds while the sweep runs at 03:15Z. So the sweep almost always found a check
+    less than 24h old, and the streak almost never stepped: on 2026-10-09, 157 of the 160
+    active seeds at streak 1 had last been stamped by the refresh, and auto-retirements had
+    fallen to 0-12 a day while 562 active seeds sat at `dead_404`. An observation that is not
+    allowed to ADVANCE the streak must not be able to hold it back either.
+
+    `destination_corroborated_dead_at` is written when the streak steps and cleared when it
+    resets, so it measures exactly the gap the rule is about. A streak earned before that
+    column existed falls back to `destination_checked_at`: the streak was earned at or before
+    that stamp, so a gap measured from it is never shorter than the real one (and if that gap
+    is not yet long enough, the caller starts the new clock then, which can only delay). A
+    streak of 0 has no anchor: the first corroborated observation needs no gap, only the second
+    one does.
+    """
+    if current.get("destination_corroborated_dead_at") is not None:
+        return current["destination_corroborated_dead_at"]
+    if int(current.get("destination_failure_streak") or 0) > 0:
+        return current.get("destination_checked_at")
+    return None
 
 
 def _as_utc(value: Any) -> datetime:
@@ -485,7 +717,9 @@ async def retire_seed_for_dead_destination(
 
       * `get_sweep_candidates` selects `WHERE status = 'active'`, so a retired seed is never
         looked at again — if the brand puts the product back, nothing here notices;
-      * nothing clears `suppressed_at` / `suppression_reason` for `SUPPRESSION_REASON`.
+      * nothing clears `suppressed_at` / `suppression_reason` for `SUPPRESSION_REASON`. (The
+        PENDING step before it is reversible — see `record_destination_observation` — and a
+        row pending under it is taken over here, not left pending.)
         Compare `services/identity_resolution.REVERT_ROWS_SQL`, which exists precisely so a
         suppression can be lifted.
 
@@ -528,13 +762,16 @@ async def retire_seed_for_dead_destination(
             updated_at = NOW()
         WHERE source_ref = :id
           AND source_system = :source_system
-          AND suppressed_at IS NULL
+          AND (suppressed_at IS NULL OR suppression_reason = :pending_reason)
         RETURNING product_key
         """,
         {
             "id": seed_id,
             "stamp": stamp,
             "reason": SUPPRESSION_REASON,
+            # A row hidden by the pending step is OURS: retirement takes it over (and its pending
+            # offers become ordinary cascaded offers below) instead of leaving it pending forever.
+            "pending_reason": PENDING_SUPPRESSION_REASON,
             # `source_ref` ALONE IS NOT THE LINK. services/external_offer_dual_write states the
             # contract: "catalog_products.source_ref = external_product_seeds.id WITH THIS
             # source_system — that pair is the stable seed->product link", and
@@ -558,9 +795,11 @@ async def retire_seed_for_dead_destination(
     # import. In production they are one object; in a test they are not, and a
     # helper that reached past the caller's handle would write to a different
     # database than the statement above.
-    cascaded = await cascade_offer_suppression(
-        [str(row["product_key"]) for row in (suppressed or [])], db=database
+    gated_keys = [str(row["product_key"]) for row in (suppressed or [])]
+    relabeled = await destination_dead_suppression.relabel_pending_offers(
+        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, db=database
     )
+    cascaded = relabeled + await cascade_offer_suppression(gated_keys, db=database)
     logger.info(
         "external seed retired for dead destination",
         extra={"seed_id": seed_id, "verdict": observation.verdict,
@@ -571,18 +810,57 @@ async def retire_seed_for_dead_destination(
             "offers_suppressed": len(cascaded)}
 
 
+#: A LITERAL, so the repo's static PREPARE sweep (tests/test_repo_sql_prepare_postgres.py) can plan
+#: it; the dead list is CONFIRMED_DEAD_VERDICTS spelled out, and a test pins the two together.
+#: `destination_verdict` is projected so the sweep can count the dead-first bucket.
+#:
+#: HANDLE-LESS ROWS GO LAST (be#2641 review M3). `group_by_host` drops a seed whose destination has
+#: no `/products/<handle>` (the sweep cannot verify it), so it is never stamped, keeps its NULL
+#: `destination_checked_at` and sat at the head of the queue forever, taking a slice of every
+#: night's `--limit` for nothing. The first key is the SQL spelling of `extract_product_handle`'s
+#: `/products/([^/?#]+)` on the URL `destination_of` reads (canonical_url, else destination_url),
+#: case-insensitive: a `/products/` segment followed by at least one character that is not `/?#`.
+SWEEP_CANDIDATES_SQL = """
+    SELECT id, market, domain, canonical_url, destination_url, destination_checked_at,
+           destination_verdict
+      FROM external_product_seeds
+     WHERE status = 'active'
+     ORDER BY CASE WHEN lower(COALESCE(NULLIF(trim(canonical_url), ''), destination_url, '')) LIKE '%/products/_%'
+                    AND lower(COALESCE(NULLIF(trim(canonical_url), ''), destination_url, '')) NOT LIKE '%/products/?%'
+                    AND lower(COALESCE(NULLIF(trim(canonical_url), ''), destination_url, '')) NOT LIKE '%/products/#%'
+                    AND lower(COALESCE(NULLIF(trim(canonical_url), ''), destination_url, '')) NOT LIKE '%/products//%'
+                   THEN 0 ELSE 1 END,
+              CASE WHEN destination_verdict IN ('dead_404', 'redirected_off_product') THEN 0 ELSE 1 END,
+              destination_checked_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
+     LIMIT :limit
+"""
+
+
 async def get_sweep_candidates(limit: int) -> List[Dict[str, Any]]:
-    """Active seeds, least-recently-verified first. NULLS FIRST: that is the whole corpus."""
-    rows = await database.fetch_all(
-        """
-        SELECT id, market, domain, canonical_url, destination_url, destination_checked_at
-        FROM external_product_seeds
-        WHERE status = 'active'
-        ORDER BY destination_checked_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
-        LIMIT :limit
-        """,
-        {"limit": max(1, int(limit or 1))},
-    )
+    """Active seeds whose last answer was DEAD first, then least-recently-verified first.
+
+    A DEAD VERDICT IS A QUESTION THE SWEEP ALONE CAN ANSWER. The refresh route records a 404
+    but cannot corroborate it (it never reads the brand's catalogue), so that seed sits at
+    `dead_404` holding its streak until the sweep looks. Ordering by the clock alone did not get
+    it looked at: the refresh re-stamps `destination_checked_at` on ~10k seeds every morning,
+    which puts exactly those seeds at the BACK of a clock-ordered queue. Measured 2026-10-09:
+    419 active seeds at `dead_404` streak 0 and 143 at streak 1, while the nightly pass of
+    5,000 spent its budget re-reading seeds last seen alive.
+
+    There are a few hundred such seeds and the pass is thousands, so putting them first costs
+    the rest of the queue almost nothing. A host we cannot read still produces no verdict, so a
+    dead seed on an unreadable host is re-asked nightly and never retired by being asked.
+    NULLS FIRST within each group: never-verified is still the oldest answer there is.
+
+    That bucket has no cap, so the sweep summary counts it (`dead_first_candidates`): a host whose
+    seeds the refresh keeps calling dead but the sweep can never read would grow it night after
+    night, and that is the number that shows it.
+
+    Looking is not stepping: while the retirement gap is measured from `destination_checked_at`,
+    the 05:15Z refresh's re-stamp keeps a looked-at seed inside the gap. Anchoring the gap on the
+    last corroborated step is pivota-backend #2537.
+    """
+    rows = await database.fetch_all(SWEEP_CANDIDATES_SQL, {"limit": max(1, int(limit or 1))})
     return [dict(row) for row in rows or []]
 
 
@@ -598,6 +876,25 @@ def host_of(url: str) -> str:
     except Exception:  # noqa: BLE001
         return ""
     return host[4:] if host.startswith("www.") else host
+
+
+def request_host(seeds: Sequence[Dict[str, Any]], folded: str) -> str:
+    """The host spelling to REQUEST for a group: the most common stored hostname of its seeds (be#2641
+    review M1). `group_by_host` folds `www.` to group a catalogue, and the sweep used to request the
+    folded apex: a store whose primary is `www.` then 301'd every `/products.json` page, so a 3-page
+    catalogue cost 8 origin requests, the hops unpaced and `www.` never admitted as a new host.
+    Ties go to the first seed's spelling; no stored spelling falls back to the folded key."""
+    counts: Dict[str, int] = {}
+    for seed in seeds:
+        try:
+            raw = (urlparse(destination_of(seed)).hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            raw = ""
+        if raw:
+            counts[raw] = counts.get(raw, 0) + 1
+    if not counts:
+        return folded
+    return max(counts, key=lambda h: (counts[h], -list(counts).index(h)))
 
 
 def group_by_host(rows: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -621,34 +918,123 @@ async def run_destination_sweep(
     client: Optional[httpx.AsyncClient] = None,
     retire: bool = True,
     now: Optional[datetime] = None,
+    budget_seconds: Optional[float] = None,
+    global_rps: Optional[float] = None,
+    max_new_hosts_per_minute: Optional[float] = None,
+    ip_throttle_enabled: Optional[bool] = None,
+    ip_challenge_trip_hosts: Optional[int] = None,
+    ip_challenge_window_seconds: Optional[float] = None,
+    ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Stage 1 per host, then stage 2 only for the handles the brand no longer lists.
 
     Sizing: a full pass must fit inside the `stale_snapshot` window (7 days). At ~11.4k active
     seeds that is ~1,700/day, and stage 1 makes it a few hundred requests rather than 11,400.
+
+    PACED (2026-10-16): every request of the run (catalogue pages, their retries, PDP probes,
+    robots.txt) waits on one `crawl_global_pacer.GlobalOriginPacer`, and a
+    `crawl_ip_throttle.StagedIpThrottleBreaker` watches every answer: 8 hosts answering a
+    Cloudflare challenge within 120 s (healthy refresh nights peak at 4) pause the run 900 s and halve its rate; a second trip ends
+    it. See `SWEEP_GLOBAL_RPS_DEFAULT`.
     """
     candidates = await get_sweep_candidates(limit)
     grouped = group_by_host(candidates)
 
+    # THE SHARED HELPERS (be#2641 review H1): no knob has an off value, and `int()` no longer
+    # truncates a cap of 0.9 to "no cap". The kill switch builds an UNPACED pacer that still carries
+    # the breaker's cool-down and stop and the budget's deadline.
+    budget = crawl_global_pacer.resolve_budget_seconds(
+        budget_seconds, "EXTERNAL_SEED_DESTINATION_SWEEP_BUDGET_SECONDS", SWEEP_BUDGET_SECONDS_DEFAULT
+    )
+    deadline = crawl_global_pacer._now() + budget
+    if crawl_global_pacer.pacer_disabled(lane="external-seed-destination-sweep"):
+        pacer = crawl_global_pacer.GlobalOriginPacer(unpaced=True, deadline=deadline)
+    else:
+        pacer = crawl_global_pacer.GlobalOriginPacer(
+            rps=crawl_global_pacer.resolve_rps(
+                global_rps, "EXTERNAL_SEED_DESTINATION_SWEEP_GLOBAL_RPS", SWEEP_GLOBAL_RPS_DEFAULT
+            ),
+            max_new_hosts_per_minute=crawl_global_pacer.resolve_new_host_cap(
+                max_new_hosts_per_minute, "EXTERNAL_SEED_DESTINATION_SWEEP_MAX_NEW_HOSTS_PER_MINUTE",
+                SWEEP_MAX_NEW_HOSTS_PER_MINUTE_DEFAULT,
+            ),
+            deadline=deadline,
+        )
+
+    def _on_trip(breaker: crawl_ip_throttle.StagedIpThrottleBreaker, event: Dict[str, Any]) -> None:
+        if event.get("action") == "cooldown":
+            pacer.pause(breaker.cooldown_seconds)
+            pacer.set_rate(pacer.rps / 2.0)
+        else:
+            pacer.stop("ip breaker tripped")
+
+    breaker = crawl_ip_throttle.StagedIpThrottleBreaker.from_env(
+        enabled=ip_throttle_enabled,
+        challenge_trip_hosts=ip_challenge_trip_hosts,
+        challenge_window_seconds=ip_challenge_window_seconds,
+        cooldown_seconds=ip_throttle_cooldown_seconds,
+        on_trip=_on_trip,
+    )
+
     summary: Dict[str, Any] = {
         "candidates": len(candidates),
+        "dead_first_candidates": sum(
+            1 for c in candidates if c.get("destination_verdict") in CONFIRMED_DEAD_VERDICTS
+        ),
         "hosts": len(grouped),
         "hosts_unverifiable": 0,
         "listed": 0,
         "probed": 0,
         "dead_links_found": 0,
         "seeds_retired": 0,
+        "pending_suppressed": 0,
+        "pending_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
+        # Probes whose final URL was on ANOTHER host but still named a product handle (a domain
+        # move, classified as usual; see `DestinationObservation.cross_host`).
+        "cross_host_landings": 0,
         "catalogue_status": {},
+        # Hosts the run did not finish because it stopped (budget spent or the IP breaker's final
+        # trip): cut short mid-host, or never started. Kept OUT of `hosts_unverifiable`, which
+        # is the coverage alarm's numerator: we did not fail to read them, we did not ask.
+        "hosts_stopped": 0,
+        "hosts_not_started": 0,
+        # Hosts held back after a breaker trip because their latest answer was a throttle or a
+        # challenge.
+        "hosts_skipped_ip_throttle": 0,
+        # Hosts the run actually asked (its catalogue read started). The coverage alarm's
+        # denominator (review LOW 1): hosts never started or held back were not failures to read.
+        "hosts_attempted": 0,
+        "budget_seconds": budget,
     }
 
     owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=25.0, follow_redirects=True)
+    # EVERY REDIRECT HOP PAYS (be#2641 review M1, the refresh's be#2640 M2): the global pacer's
+    # request hook takes a slot for each hop after the first and admits a hop onto another host as
+    # a new host; at most `crawl_global_pacer.MAX_REDIRECTS` (5) hops.
+    client = client or httpx.AsyncClient(
+        timeout=25.0, follow_redirects=True,
+        **crawl_global_pacer.redirect_client_kwargs(robots_user_agent=USER_AGENT),
+    )
     host_slot = asyncio.Semaphore(SWEEP_HOST_CONCURRENCY)
 
     async def sweep_one_host(host: str, seeds: List[Dict[str, Any]]) -> None:
         async with host_slot:
-            catalogue = await read_brand_catalogue(client, host)
+            # CHECKED AT TAKE TIME, after any wait for a slot: stop STARTING hosts once the run is
+            # over (final trip, budget), and do not ask a host the breaker holds back.
+            if not pacer.stopped and pacer.deadline is not None and crawl_global_pacer._now() >= pacer.deadline:
+                pacer.stop("budget spent")
+            if pacer.stopped or breaker.tripped:
+                summary["hosts_not_started"] += 1
+                return
+            # THE STORED SPELLING (review M1), which is also the key the breaker and the per-host
+            # pacing learn from (`crawl_politeness.host_of` keeps `www.`).
+            ask = request_host(seeds, host)
+            if breaker.blocks(ask):
+                summary["hosts_skipped_ip_throttle"] += 1
+                return
+            summary["hosts_attempted"] += 1
+            catalogue = await read_brand_catalogue(client, ask)
             summary["catalogue_status"][catalogue.status] = (
                 summary["catalogue_status"].get(catalogue.status, 0) + 1
             )
@@ -685,7 +1071,13 @@ async def run_destination_sweep(
                 summary["verdicts"][observation.verdict] = (
                     summary["verdicts"].get(observation.verdict, 0) + 1
                 )
-                result = await record_destination_observation(seed["id"], observation, now=now)
+                if observation.cross_host:
+                    summary["cross_host_landings"] += 1
+                result = await record_destination_observation(
+                    seed["id"], observation, now=now, suppress=retire
+                )
+                summary["pending_suppressed"] += int(result.get("pending_suppressed") or 0)
+                summary["pending_lifted"] += int(result.get("pending_lifted") or 0)
                 if observation.confirmed_dead:
                     summary["dead_links_found"] += 1
                 if retire and result.get("retire"):
@@ -695,11 +1087,14 @@ async def run_destination_sweep(
     try:
         # One host failing must not void the rest of the pass — the counters above are the
         # deliverable, and a half-swept corpus is strictly better than none.
-        results = await asyncio.gather(
-            *(sweep_one_host(h, s) for h, s in grouped.items()), return_exceptions=True
-        )
+        with crawl_ip_throttle.installed(breaker), crawl_global_pacer.installed(pacer):
+            results = await asyncio.gather(
+                *(sweep_one_host(h, s) for h, s in grouped.items()), return_exceptions=True
+            )
         for host, outcome in zip(grouped, results):
-            if isinstance(outcome, BaseException):
+            if isinstance(outcome, crawl_global_pacer.GlobalPaceStopped):
+                summary["hosts_stopped"] += 1
+            elif isinstance(outcome, BaseException):
                 summary["hosts_unverifiable"] += 1
                 logger.warning(
                     "destination sweep host failed",
@@ -709,6 +1104,26 @@ async def run_destination_sweep(
         if owns_client:
             await client.aclose()
 
+    # One spelling for any budget stop in the summary ("budget spent"), whichever check caught it:
+    # the take-time check above, or the pacer refusing a slot past its deadline. The pacer's own
+    # wording stays in `pacer_stopped`.
+    reason = pacer.stop_reason
+    summary["stopped"] = "budget spent" if reason and reason.startswith("budget") else reason
+    # Same field names as the refresh's summary (`ip_throttled`, `breaker_trips`, `global_rps`,
+    # `final_rate`, `paces_waited_seconds`, `cooldowns`, ...), so one log filter reads both.
+    summary.update(breaker.summary())
+    summary.update(pacer.summary())
+    if breaker.tripped:
+        logger.warning(
+            "destination sweep: IP throttled (trip %d of %d); the run ended with %d host(s) cut "
+            "short and %d not started", breaker.trips, breaker.max_trips,
+            summary["hosts_stopped"], summary["hosts_not_started"],
+        )
+    elif pacer.stop_reason:
+        logger.warning(
+            "destination sweep: %s after %.0fs; %d host(s) cut short and %d not started",
+            pacer.stop_reason, budget, summary["hosts_stopped"], summary["hosts_not_started"],
+        )
     logger.info("external seed destination sweep complete", extra={"summary": summary})
     return summary
 
@@ -719,12 +1134,18 @@ def coverage_alarm(summary: Dict[str, Any]) -> Optional[str]:
     Returns a message when more hosts were unreadable than readable. During the 2026-08-25
     audit that ratio was 213:44 from a client outside the reserved crawl egress — a sweep
     reporting "0 dead links" from there would have been indistinguishable from a healthy one.
+
+    OUT OF THE HOSTS IT ASKED (be#2641 review LOW 1). A paced run with a budget does not reach every
+    host: dividing by all of them let a run that asked 40 hosts and could read none of them stay
+    under the alarm because 300 more were never started. `hosts_attempted` when present (every
+    run since the pacing), else `hosts` (an older summary).
     """
-    hosts = int(summary.get("hosts") or 0)
+    attempted = summary.get("hosts_attempted")
+    hosts = int(attempted if attempted is not None else (summary.get("hosts") or 0))
     blind = int(summary.get("hosts_unverifiable") or 0)
     if hosts and blind * 2 > hosts:
         return (
-            f"destination sweep could not read {blind} of {hosts} brand hosts — "
+            f"destination sweep could not read {blind} of {hosts} brand hosts it asked — "
             "a 'no dead links' result from this run means nothing"
         )
     return None
@@ -737,6 +1158,8 @@ __all__: Iterable[str] = (
     "DestinationObservation",
     "RETIREMENT_MIN_GAP",
     "RETIREMENT_STREAK",
+    "PENDING_SUPPRESSION_FLAG",
+    "PENDING_SUPPRESSION_REASON",
     "SUPPRESSION_REASON",
     "VERDICT_DEAD_404",
     "VERDICT_LIVE",
@@ -747,6 +1170,8 @@ __all__: Iterable[str] = (
     "classify_destination",
     "coverage_alarm",
     "get_sweep_candidates",
+    "next_streak_state",
+    "pending_suppression_enabled",
     "group_by_host",
     "probe_destination",
     "read_brand_catalogue",

@@ -93,6 +93,7 @@ from scripts.onboard_external_brand_from_crawl import (
     TOOL,
     UNPUBLISHED_SUPPRESSION_REASON,
 )
+from services.catalog_enrichment_agent.apply import live_retailer_listing_owner
 from services.catalog_offer_suppression import (
     cascade_offer_suppression,
     revert_offer_suppression,
@@ -283,6 +284,12 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
             except ValueError:
                 meta = {}
         prior = (meta or {}).get("prior_seed_status")
+        # A retired chain whose URL a retailer listing was since admitted onto (apply.legacy_chain_retired):
+        # reviving it would put two live listings on one URL. Retire that listing first, then revert.
+        owner = await live_retailer_listing_owner(database, row.get("destination_url"))
+        if owner and owner != row.get("product_key"):
+            print(f"  ! {row.get('product_key')}: its URL is now {owner}'s live retailer listing, not reverting")
+            continue
         restored = await database.fetch_all(
             "UPDATE catalog_products SET suppressed_at=NULL, updated_at=NOW() "
             "WHERE source_ref=:id AND suppressed_at IS NOT NULL "

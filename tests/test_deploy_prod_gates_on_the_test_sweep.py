@@ -309,6 +309,43 @@ def test_the_deploy_does_not_read_github_sha_under_a_workflow_run_trigger():
     )
 
 
+def _critical_path_minutes(workflow: str, jobs: dict, name: str, _seen=()) -> int:
+    """The longest a workflow can run up to and including job `name`: its own
+    `timeout-minutes` plus the slowest chain of jobs it `needs:`.
+
+    A MAX over single jobs stopped being the workflow's worst case on 2026-09-29, when
+    the sweep became a 30-minute shard matrix followed by a 10-minute `sweep` job that
+    `needs:` it. Neither job alone is 40; the run is.
+    """
+    assert name not in _seen, f"{workflow}: `needs:` cycle through {name}"
+    job = jobs[name] or {}
+    # No `timeout-minutes:` means GitHub's default of 360, which no sane
+    # deadline can clear. Say so rather than silently reading it as 0.
+    declared = job.get("timeout-minutes")
+    assert declared is not None, (
+        f"a job in {workflow} declares no `timeout-minutes`, so it may run "
+        "for 360 minutes and this gate cannot wait it out. Give it one."
+    )
+    needs = job.get("needs") or []
+    needs = [needs] if isinstance(needs, str) else needs
+    upstream = max(
+        (_critical_path_minutes(workflow, jobs, n, _seen + (name,)) for n in needs),
+        default=0,
+    )
+    return int(declared) + upstream
+
+
+def test_the_critical_path_sums_timeouts_along_needs():
+    """Pin the helper itself, so the deadline test cannot pass by under-counting."""
+    jobs = {
+        "shard": {"timeout-minutes": 30},
+        "merge": {"timeout-minutes": 10, "needs": "shard"},
+        "side": {"timeout-minutes": 5},
+    }
+    assert _critical_path_minutes("w", jobs, "merge") == 40
+    assert _critical_path_minutes("w", jobs, "side") == 5
+
+
 def test_the_poll_deadline_sits_above_every_required_workflows_own_timeout():
     """Otherwise the gate reports `never reported` on a suite that was merely slow,
     and hard-blocks a deploy whose tests then pass — the ci-entrypoint.yml lesson."""
@@ -318,15 +355,9 @@ def test_the_poll_deadline_sits_above_every_required_workflows_own_timeout():
 
     slowest = 0
     for path in REQUIRED_WORKFLOW_FILES:
-        for job in (yaml.safe_load(path.read_text()).get("jobs") or {}).values():
-            # No `timeout-minutes:` means GitHub's default of 360, which no sane
-            # deadline can clear. Say so rather than silently reading it as 0.
-            declared = (job or {}).get("timeout-minutes")
-            assert declared is not None, (
-                f"a job in {path.name} declares no `timeout-minutes`, so it may run "
-                "for 360 minutes and this gate cannot wait it out. Give it one."
-            )
-            slowest = max(slowest, int(declared))
+        jobs = yaml.safe_load(path.read_text()).get("jobs") or {}
+        for name in jobs:
+            slowest = max(slowest, _critical_path_minutes(path.name, jobs, name))
     assert deadline > slowest, (
         f"the gate waits {deadline}m but a required workflow may run {slowest}m"
     )

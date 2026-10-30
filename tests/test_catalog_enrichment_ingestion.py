@@ -6,11 +6,13 @@ edge cases that the Stage 3 ingestion runner will execute against the DB.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -92,6 +94,140 @@ def test_derive_product_key_differs_by_content():
 def test_derive_product_key_under_255_chars():
     a = derive_product_key("X" * 300, "Y" * 300)
     assert len(a) <= 255
+
+
+# --- Non-Latin names: the digest hashed the ASCII slug, which keeps nothing of them ---
+
+#: Pairs the adversarial review (2026-09-29) ran through the real function: each pair shared one key
+#: (ext:unknown::50d8b4a9 / ext:sulwhasoo::971a96b9), so ingest's UPSERT landed the second product
+#: on the first one's row.
+_NON_LATIN_COLLISIONS = [
+    (("設計", "化粧水"), ("설화수", "자음생크림")),
+    (("Sulwhasoo", "자음생크림"), ("Sulwhasoo", "윤조에센스")),
+    (("Laneige", "ครีม"), ("Laneige", "คร ม")),          # Thai: a vowel mark is part of the word
+    (("Missha", "Крем"), ("Missha", "Серум")),
+    (("Shiseido", "ｸﾞﾛｳ"), ("Shiseido", "ﾏｽｸ")),
+    (("Brand", "Ｇｌｏｗ"), ("Brand", "Ｓｈｉｎｅ")),        # fullwidth Latin: the slug drops it too
+    (("IPSA", "Metabolizer ME Ⅰ"), ("IPSA", "Metabolizer ME Ⅱ")),   # Roman numerals (Nl)
+    (("Brand", "Mask ①"), ("Brand", "Mask ②")),
+    (("Cocoon", "Kem dưỡng mắt"), ("Cocoon", "Kem dưỡng mặt")),     # eye cream / face cream
+    (("é", "è"), ("ö", "ü")),                                       # slug "unknown", no script letter
+]
+
+
+@pytest.mark.parametrize("first,second", _NON_LATIN_COLLISIONS)
+def test_non_latin_names_get_distinct_identity(first, second):
+    """Through the real producer, not the helper: product_key, source_product_id (unique per merchant,
+    platform) and the Pivota signature minted from it must all tell the two products apart."""
+    a = ingest_validated_record(_record(brand=first[0], product_name=first[1]))["pdp"]
+    b = ingest_validated_record(_record(brand=second[0], product_name=second[1]))["pdp"]
+    assert a["product_key"] != b["product_key"]
+    assert a["source_product_id"] != b["source_product_id"]
+    assert a["pivota_signature_id"] != b["pivota_signature_id"]
+    assert not a["product_key"].endswith("::50d8b4a9")
+
+
+def test_non_latin_identity_ignores_case_symbols_and_width():
+    """Still one product per (brand, name): case, ™ and NFKC-equivalent forms do not split it."""
+    key = derive_product_key("Sulwhasoo", "자음생크림")
+    assert derive_product_key("SULWHASOO", "자음생크림™") == key
+    assert derive_product_key("Sulwhasoo", "  자음생크림 ") == key
+    assert derive_product_key("Cos de BAHA", "MVマルチビタ") == derive_product_key("Cos de BAHA", "MVﾏﾙﾁﾋﾞﾀ")
+    # The whole key, prefix included: fullwidth ＭＶ / ５０ beside kana is common in Japanese titles.
+    assert derive_product_key("Cos de BAHA", "ＭＶマルチビタ") == derive_product_key("Cos de BAHA", "MVマルチビタ")
+    assert derive_product_key("Brand", "化粧水 ５０ml") == derive_product_key("Brand", "化粧水 50ml")
+    # Invisible characters are not word breaks.
+    assert derive_product_key("Sulwhasoo", "자음​생크림") == key
+    assert derive_product_key("Sulwhasoo", "자음­생크림") == key
+    assert derive_product_key("Brand", "크림 ❤️") == derive_product_key("Brand", "크림 ❤")
+    # A unit sign is its letters, not a symbol to drop.
+    assert derive_product_key("Brand", "化粧水 50㎖") == derive_product_key("Brand", "化粧水 50ml")
+    assert derive_product_key("Brand", "化粧水 50㎖") != derive_product_key("Brand", "化粧水 50")
+
+
+@pytest.mark.parametrize("modified,plain", [
+    ("Kiehlʼs Ultra Facial Cream", "Kiehl's Ultra Facial Cream"),
+    ("Hawaiʻi Kukui Oil", "Hawai'i Kukui Oil"),
+])
+def test_a_modifier_apostrophe_keeps_the_latin_key(modified, plain):
+    """ʼ/ʻ are Latin punctuation, not a script: the name keeps the key its ASCII spelling has."""
+    assert derive_product_key("Brand", modified) == derive_product_key("Brand", plain)
+    assert derive_product_key("Brand", modified + " 크림") == derive_product_key("Brand", plain + " 크림")
+    assert derive_product_key("Brand", modified).endswith("::" + hashlib.sha1(
+        canonical_product_name("Brand", plain).encode("utf-8")).hexdigest()[:8])
+
+
+# (brand, title, key) read from prod 2026-09-29. Every one of these names loses characters in the slug
+# (symbols, Latin diacritics, superscripts, "º") and none of them may change key: a new key would mint
+# a duplicate row beside the live one on its next ingest.
+_PROD_KEYS_THAT_MUST_NOT_MOVE = [
+    ("Tower 28", "SunnyDays™ Tinted SPF 30", "ext:tower-28-sunnydays-tinted-spf-30::dadfcdbd"),
+    ("Tarte", "maracuja juicy lip crème", "ext:tarte-maracuja-juicy-lip-cr-me::15a5c2fe"),
+    ("Westman Atelier", "The Suprême Skin Duo", "ext:westman-atelier-the-supr-me-skin-duo::04e26763"),
+    ("Ultraceuticals", "Ultra B² Micellar Cleansing Water",
+     "ext:ultraceuticals-ultra-b-micellar-cleansing-water::c8a7e749"),
+    ("Centellian24", "360º Shot PDRN glowing eye patch",
+     "ext:centellian24-360-shot-pdrn-glowing-eye-patch::b81186a3"),
+    ("Cos de BAHA", "Azelaic Acid 5% Toner for Face with Niacinamide – Rosacea Skin Care, Pore Tightening, "
+     "Acne Scar, Dark Spot & Redness Treatment, 200ml",
+     "ext:cos-de-baha-azelaic-acid-5-toner-for-face-with-niacinamide-rosacea-skin-care-pore-tightening-"
+     "acne-scar-dark-spot-redness-treatment-200ml::00e01639"),
+]
+
+
+@pytest.mark.parametrize("brand,title,key", _PROD_KEYS_THAT_MUST_NOT_MOVE)
+def test_existing_latin_keys_are_byte_identical(brand, title, key):
+    assert derive_product_key(brand, title) == key
+    slug = canonical_product_name(brand, title)
+    legacy_source_product_id = slug if len(slug) <= 128 else \
+        f"{slug[:119]}-{hashlib.sha1(slug.encode('utf-8')).hexdigest()[:8]}"
+    pdp = ingest_validated_record(_record(brand=brand, product_name=title))["pdp"]
+    assert pdp["source_product_id"] == legacy_source_product_id
+
+
+def test_the_one_prod_key_the_fix_moves():
+    """The only live key whose name drops non-Latin text (census 2026-09-29, 1 of 6,191 content-keyed
+    rows, draft stage). Pinned so the repair plan in the PR names the right row."""
+    brand, title = "Cos de BAHA", "【美容神ゆりちゃん監修】MVマルチビタ導入美容液 50ml"
+    assert derive_product_key(brand, title) == "ext:cos-de-baha-mv-50ml::63c46c9fb300432e"
+    pdp = ingest_validated_record(_record(brand=brand, product_name=title))["pdp"]
+    assert pdp["source_product_id"] == "cos-de-baha-mv-50ml-63c46c9fb300432e"
+
+
+def test_non_latin_keys_fit_the_widest_key_budget():
+    """Every writer sizes SKU keys against the widest product_key (214); the 16-hex digest must not widen it."""
+    for brand, name in [("설" * 300, "크림"), ("a" * 300, "크림"), ("X" * 300, "Y" * 300)]:
+        assert len(derive_product_key(brand, name)) <= 214
+        pdp = ingest_validated_record(_record(brand=brand, product_name=name))["pdp"]
+        assert len(pdp["source_product_id"]) <= 128
+
+
+def test_a_symbol_only_name_is_not_ingested():
+    """"™"/"—" identify nothing; they used to mint the shared ext:unknown::50d8b4a9."""
+    assert ingest_validated_record(_record(brand="™", product_name="—")) is None
+    # A slug that is literally "unknown" lands on the same shared key.
+    assert ingest_validated_record(_record(brand="Unknown", product_name="™")) is None
+
+
+def test_a_retailer_row_is_not_refused_for_a_key_it_never_uses():
+    """Retailer rows are keyed by their URL; refusing one for the shared content key would fail the
+    whole store's primary apply over a row that cannot collide. Symbol-only names are still refused."""
+    kept = ingest_validated_record(_record(brand="Unknown", product_name="É", source_role="retailer"))
+    assert kept["pdp"]["product_key"].startswith("ext:retailer:")
+    assert ingest_validated_record(_record(brand="Unknown", product_name="É")) is None
+    assert ingest_validated_record(_record(brand="™", product_name="—", source_role="retailer")) is None
+
+
+def test_decomposed_unicode_is_the_same_product():
+    """NFD input (macOS filenames, some feeds) spells the same letters: same key as NFC, and the
+    Vietnamese trigger still sees the precomposed letter, so "mắt"/"mặt" stay apart."""
+    nfd = lambda t: unicodedata.normalize("NFD", t)
+    assert derive_product_key("Cocoon", nfd("Kem dưỡng mắt")) == derive_product_key("Cocoon", "Kem dưỡng mắt")
+    assert derive_product_key("Cocoon", nfd("Kem dưỡng mắt")) != derive_product_key("Cocoon", nfd("Kem dưỡng mặt"))
+    assert derive_product_key("Tarte", nfd("maracuja juicy lip crème")) == \
+        "ext:tarte-maracuja-juicy-lip-cr-me::15a5c2fe"
+    # An invisible character between a letter and its marks must not hide the letter from the trigger.
+    assert derive_product_key("Cocoon", "Kem ma​̣̂t") != derive_product_key("Cocoon", "Kem ma​̆́t")
 
 
 def test_derive_seed_id_is_deterministic():

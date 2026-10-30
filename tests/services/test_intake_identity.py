@@ -74,7 +74,12 @@ def quiet(monkeypatch: pytest.MonkeyPatch) -> Dict[str, List[Any]]:
     async def capture_review(door: str, ctx: Dict, ck: Optional[str], matcher: str, detail: Dict) -> None:
         calls["reviews"].append({"door": door, "matcher": matcher, "detail": detail})
 
+    async def no_open_review(*a: Any, **k: Any) -> bool:
+        return False
+
     monkeypatch.setattr(ii, "_rows_by_gtin", none_rows)
+    monkeypatch.setattr(ii, "_rows_by_barcodes", none_rows)
+    monkeypatch.setattr(ii, "_open_identity_review_exists", no_open_review)
     monkeypatch.setattr(ii, "_rows_by_content_key", none_rows)
     monkeypatch.setattr(ii, "_candidates_by_canonical_url", none_rows)
     monkeypatch.setattr(ii, "_candidates_by_source_id", none_rows)

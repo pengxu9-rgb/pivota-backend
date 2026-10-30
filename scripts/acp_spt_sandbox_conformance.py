@@ -58,6 +58,7 @@ if str(ROOT) not in sys.path:
 
 from config.settings import settings  # noqa: E402
 from services import acp_offsession_capture as cap  # noqa: E402
+from utils.secret_fingerprint import secret_fingerprint  # noqa: E402
 
 MERCHANT_ID = "spt_conformance_merchant"
 TEST_CARD_PM = "pm_card_visa"
@@ -239,7 +240,7 @@ async def run(args: argparse.Namespace) -> int:
             "(US/CA only, seller terms required). That is an ops prerequisite, not a bug."
         )
         return 2
-    print(f"  minted token ...{token[-6:]}  (cap={cap_cents} {currency}, expires in {args.expiry_seconds}s)")
+    print(f"  minted token {secret_fingerprint(token)}  (cap={cap_cents} {currency}, expires in {args.expiry_seconds}s)")
 
     result = await charge_spt(
         token, amount_cents=args.amount_cents, currency=currency, idem=f"spt_conf_ok_{now}"
@@ -346,7 +347,7 @@ async def run(args: argparse.Namespace) -> int:
                 summary.append(_row("expired refused", False, "mint failed"))
                 short_token = None
             else:
-                print(f"  minted short-lived token ...{short_token[-6:]}; waiting {wait_s}s for expiry")
+                print(f"  minted short-lived token {secret_fingerprint(short_token)}; waiting {wait_s}s for expiry")
                 await asyncio.sleep(wait_s)
                 past_token = short_token
         if past_token:

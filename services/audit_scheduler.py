@@ -54,6 +54,12 @@ Job registration happens at start-up time. Currently registers:
 - `cafe24_reconciliation` — every 15 minutes, replays Cafe24 webhook and
   Data Bridge logs for a bounded least-recently-run store batch. It is dormant
   unless CAFE24_RECONCILIATION_ENABLED is explicitly enabled.
+- `a2a_rail_purchase_poll` — every A2A_RAIL_POLL_INTERVAL_SECONDS (default 20): advance A2A token
+  rail purchases one step each (jobs/a2a_rail_purchase_poll). Dormant unless A2A_RAIL_WORKER_ENABLED
+  and the rail client is configured.
+- `agent_purchase_events` — every AGENT_PURCHASE_EVENTS_INTERVAL_SECONDS (default 30):
+  detect purchase.* webhook events from the agent_purchases ledger and hand them to the agent
+  webhook sender. Dormant unless AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED.
 - `reap_agentic_purchase_poll` — every REAP_AGENTIC_POLL_INTERVAL_SECONDS
   (default 30), drives jobs/reap_agentic_purchase_poll: requeue stale claims,
   expire overdue purchases (the PII deadline), fail attempt-exhausted ones, then
@@ -78,6 +84,10 @@ jobs otherwise SHARE the Connection this startup context created, the root
 cause of the #1754 all-jobs wedge) and is bounded by `_JOB_RUN_DEADLINES`.
 Per-run state is on /__scheduler_health (`runs`, `stalled`); an operator can
 force a run with POST /admin/scheduler/jobs/{id}/run-now.
+
+SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py) narrows a worker to
+the job ids it names; unset or empty it filters nothing. Skipped ids are
+reported on /__scheduler_health. Runbook: docs/runbooks/scheduler_job_allowlist.md.
 """
 
 from __future__ import annotations
@@ -89,6 +99,7 @@ import os
 from typing import Optional
 
 from config.platform import is_deployed, platform_env, service_name
+from services.worker_flag import worker_flag_override  # the one AUDIT_WORKER_ENABLED parser
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +147,8 @@ _JOB_RUN_DEADLINES = {
     # 6-hourly catalog sweeps (bounded per run, stalest-first)
     "pdp_scope_backfill": 7200,
     "catalog_row_trust_backfill": 7200,
+    # hourly CRAWL_FRESH decay recheck (bounded; under the next run's start)
+    "catalog_row_trust_crawl_fresh_recheck": 1800,
     "agent_pdp_view_reconcile": 7200,
     "pdp_will_render_reconcile": 7200,
     # monthly money crons (external calls, must never wedge silently)
@@ -148,6 +161,8 @@ _JOB_RUN_DEADLINES = {
     "cafe24_reconciliation": 900,
     "audit_health_tick": 600,
     "catalog_onboard_queue_drain": 1500,
+    # hourly; a few hundred job rows plus one evidence read, then at most MAX_PER_RUN inserts
+    "retailer_ingest_weekly_reenqueue": 900,
     "external_conversion_poll": 600,
     "external_seed_catalog_materialization": 600,
     # Orphan card revocation: up to AGENT_CARD_REVOCATION_BATCH (100) orphans per run, each one
@@ -255,6 +270,14 @@ _JOB_RUN_DEADLINES = {
     # try/finally that releases every claim on CancelledError, so a cut run
     # strands no leases and the next tick simply re-claims what it did not reach.
     "reap_agentic_purchase_poll": 600,
+    # Detect reads at most 200 candidates; hand-over starts no new round of 10 after 150 s and one
+    # POST is capped at 10 s, so a tick ends well inside 300 s (a cut tick releases its claims).
+    "agent_purchase_events": 300,
+    # Starts no new step after 60 s. One step is a card read plus at most one write; each call is
+    # bounded by the client's total deadline (60 s) and the first may also mint a token (another
+    # 60 s), so a step is <= 180 s and a tick <= ~240 s. A cut tick releases every claim it did not
+    # step, and a write cut mid-call stays pending for the next holder to reconcile.
+    "a2a_rail_purchase_poll": 300,
 }
 
 
@@ -305,7 +328,20 @@ def scheduler_diagnostics() -> dict:
         "fireable_job_count": fireable,
         "runs": runs,
         "stalled": stalled,
+        # job_allowlist / skipped_by_allowlist / job_allowlist_unknown_ids — present ONLY when
+        # SCHEDULER_JOB_ALLOWLIST is set, so this payload is unchanged everywhere else.
+        **_allowlist_diagnostics(),
     }
+
+
+def _allowlist_diagnostics() -> dict:
+    try:
+        from services.scheduler_job_allowlist import diagnostics
+        return diagnostics()
+    except Exception as exc:  # noqa: BLE001 — diagnostics must never break the health endpoint
+        # NOT `{}`: that is exactly what an unset allowlist reports, so a broken read would
+        # look like "no filter" on the one page an operator checks. Type only, no message.
+        return {"job_allowlist_error": type(exc).__name__}
 
 
 def _queue_worker_enabled() -> bool:
@@ -329,9 +365,9 @@ def _queue_worker_enabled() -> bool:
     service, or AUDIT_WORKER_ENABLED is explicitly false — so a detection miss
     can never accidentally stop the PRODUCTION worker (worst case = no change).
     """
-    override = (os.getenv("AUDIT_WORKER_ENABLED") or "").strip().lower()
-    if override:
-        return override in ("1", "true", "yes", "on")
+    override = worker_flag_override()
+    if override is not None:
+        return override
     service = (service_name() or "").lower()
     if "staging" in service or "preview" in service:
         return False
@@ -384,6 +420,16 @@ async def start_scheduler() -> None:
             )
 
         from services.scheduler_job_runner import wrap_job
+        from services import scheduler_job_allowlist as job_allowlist
+
+        # SCHEDULER_JOB_ALLOWLIST (services/scheduler_job_allowlist.py): None when unset/empty,
+        # which is NO FILTER — every branch below that consults it is then a no-op. Outside
+        # production with AUDIT_WORKER_ENABLED explicitly true, unset means ALLOW-NOTHING.
+        allowlist, allowlist_source = job_allowlist.resolve_allowlist()
+        job_allowlist.begin_scheduler_boot()
+        # Every id `_add_job` is asked for on a worker, registered or not — what an allowlist
+        # entry is checked against, so a typo is reported rather than silently starting nothing.
+        seen_job_ids: set = set()
 
         def _add_job(func, *args, **kwargs):
             # Register a scheduled job ONLY on the production worker, so a
@@ -403,6 +449,12 @@ async def start_scheduler() -> None:
             # completes cannot make `max_instances=1` skip every future tick.
             if worker_enabled:
                 job_id = kwargs.get("id") or getattr(func, "__name__", repr(func))
+                seen_job_ids.add(job_id)
+                # Skipped BEFORE wrap_job, so a skipped id is also absent from the runner's
+                # registry: run-now answers 404 job_not_registered for it, not a forced run.
+                if not job_allowlist.is_allowed(job_id, allowlist):
+                    job_allowlist.note_skipped(job_id, job_allowlist.KIND_SCHEDULER_JOB)
+                    return
                 wrapped = wrap_job(
                     job_id, func, deadline_seconds=run_deadline_for(job_id),
                 )
@@ -555,6 +607,45 @@ async def start_scheduler() -> None:
             coalesce=True,
         )
 
+        # Rail-purchase webhook events (payment orchestration P1): detect events from the
+        # agent_purchases ledger and hand them to the agent webhook sender. Dormant unless
+        # AGENT_PURCHASE_WEBHOOKS_ENABLED and AGENT_PURCHASE_LEDGER_ENABLED (checked inside the job).
+        # max_instances=1 + coalesce: a slow tick never stacks; the hand-over claim is the fence.
+        from jobs.agent_purchase_events import (
+            job_interval_seconds as _ape_interval_seconds,
+            run_agent_purchase_events,
+        )
+        _ape_interval = _ape_interval_seconds()
+        _add_job(
+            run_agent_purchase_events,
+            "interval",
+            seconds=_ape_interval,
+            id="agent_purchase_events",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_ape_interval,
+            coalesce=True,
+        )
+
+        # The A2A token rail's purchase worker (payment orchestration P2b): one step per claimed
+        # purchase. Dormant unless A2A_RAIL_WORKER_ENABLED and the rail client is configured (both
+        # checked inside the job). max_instances=1 + coalesce; the ledger claim is the fence.
+        from jobs.a2a_rail_purchase_poll import (
+            job_interval_seconds as _a2a_interval_seconds,
+            run_a2a_rail_purchase_poll,
+        )
+        _a2a_interval = _a2a_interval_seconds()
+        _add_job(
+            run_a2a_rail_purchase_poll,
+            "interval",
+            seconds=_a2a_interval,
+            id="a2a_rail_purchase_poll",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=_a2a_interval,
+            coalesce=True,
+        )
+
         # Store-lifecycle reconciliation (issue #1648): probe stores we believe
         # are connected against their upstream platform and disconnect the ones
         # that are gone, then re-derive catalog_merchants.status from
@@ -647,6 +738,24 @@ async def start_scheduler() -> None:
             replace_existing=True,
             misfire_grace_time=600,
             coalesce=True,
+        )
+
+        # Re-enqueue of every done retailer-ingest cohort before its last price read ages out, each with an
+        # explicit options.market (services/retailer_ingest/weekly_reenqueue.py). Hourly; a cohort is due
+        # when its last applied read is INTERVAL_HOURS old. OFF BY DEFAULT: the tick returns before touching
+        # the database unless RETAILER_INGEST_WEEKLY_REENQUEUE_ENABLED is set. Database-only (it crawls
+        # nothing), so it runs here rather than in the crawl-subnet drain, whose image is pinned and rolled
+        # by hand.
+        from jobs.retailer_ingest_weekly_reenqueue import run_retailer_ingest_weekly_reenqueue_tick
+        _add_job(
+            run_retailer_ingest_weekly_reenqueue_tick,
+            "cron",
+            minute=11,
+            id="retailer_ingest_weekly_reenqueue",
+            replace_existing=True,
+            misfire_grace_time=1800,
+            coalesce=True,
+            max_instances=1,
         )
 
         # P2.2: drive queued audit_runs through the async lifecycle.
@@ -1085,6 +1194,7 @@ async def start_scheduler() -> None:
 
         from jobs.catalog_row_trust_backfill_cron import (
             run_catalog_row_trust_backfill_tick,
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
         )
         _add_job(
             run_catalog_row_trust_backfill_tick,
@@ -1094,6 +1204,19 @@ async def start_scheduler() -> None:
             id="catalog_row_trust_backfill",
             replace_existing=True,
             misfire_grace_time=1800,  # fire up to 30min late (post-restart) not skip
+            coalesce=True,
+            max_instances=1,
+        )
+        # CRAWL_FRESH decay recheck (services/catalog_row_trust_upserter), hourly:
+        # a crawl-fresh row whose read aged past N is re-derived within the hour.
+        # A bounded GIN-index read that writes nothing while no row carries the code.
+        _add_job(
+            run_catalog_row_trust_crawl_fresh_recheck_tick,
+            "cron",
+            minute=47,
+            id="catalog_row_trust_crawl_fresh_recheck",
+            replace_existing=True,
+            misfire_grace_time=1800,
             coalesce=True,
             max_instances=1,
         )
@@ -1389,6 +1512,9 @@ async def start_scheduler() -> None:
             misfire_grace_time=21600,  # fire up to 6h late rather than skip a week
         )
 
+        if allowlist_source != job_allowlist.SOURCE_UNSET:
+            _report_allowlist(allowlist, seen_job_ids, worker_enabled, scheduler)
+
         scheduler.start()
         _SCHEDULER = scheduler
 
@@ -1491,6 +1617,46 @@ async def start_scheduler() -> None:
             "audit_scheduler: start failed (continuing degraded): %s",
             exc,
         )
+
+
+def _report_allowlist(allowlist, seen_job_ids, worker_enabled: bool, scheduler) -> None:
+    """Boot-time report for an ACTIVE SCHEDULER_JOB_ALLOWLIST — a list, `*`, or the
+    non-production fail-closed. Never called when it is unset (source "unset").
+
+    Through the "pivota" logger at WARNING: prod leaves root at WARNING, so a module logger's
+    lines here could be dropped, and "which jobs did this worker decline to start" is exactly the
+    question someone arming a single-purpose worker needs answered from the logs alone.
+    """
+    from services import scheduler_job_allowlist as job_allowlist
+    from utils.logger import logger as operator_logger
+
+    # Only on a worker: with the worker gate off `_add_job` records no ids (and the
+    # `if worker_enabled:` blocks never call it), so every entry would read as a typo.
+    # allowlist None here means `*` (source "all"): no ids to check, but still an ACTIVE line.
+    unknown = (
+        job_allowlist.unknown_ids(allowlist, seen_job_ids)
+        if worker_enabled and allowlist is not None else []
+    )
+    job_allowlist.record_unknown(unknown)
+    if unknown:
+        operator_logger.warning(
+            "audit_scheduler: %s names %d id(s) that match no scheduler job or process loop: "
+            "%s (matching is exact and case-sensitive; known ids are on /__scheduler_health "
+            "and in docs/runbooks/scheduler_job_allowlist.md)",
+            job_allowlist.ENV_VAR, len(unknown), unknown,
+        )
+    try:
+        registered = sorted(j.id for j in scheduler.get_jobs())
+    except Exception:  # noqa: BLE001 — a report must never break boot
+        registered = []
+    operator_logger.warning(
+        "audit_scheduler: %s ACTIVE allowlist=%s worker_enabled=%s registered=%s "
+        "skipped_by_allowlist=%d",
+        job_allowlist.ENV_VAR,
+        [job_allowlist.ALL_JOBS] if allowlist is None else sorted(allowlist),
+        worker_enabled, registered,
+        len(job_allowlist.skipped_ids()),
+    )
 
 
 async def restart_scheduler() -> dict:

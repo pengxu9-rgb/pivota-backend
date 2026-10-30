@@ -558,6 +558,10 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             "destination_http_status",
             "destination_verdict",
             "destination_failure_streak",
+            # Migration 266. When the streak last stepped on a corroborated dead
+            # observation: the retirement gap is measured from here, because
+            # destination_checked_at is re-stamped by uncorroborated refresh observations.
+            "destination_corroborated_dead_at",
             # Content freshness (migration 202). Written ONLY by the success path of
             # _refresh_external_seed_by_id, so the refresh queue can order by "when did
             # we last re-read this PRICE" instead of `updated_at`, which an attach, a
@@ -640,6 +644,58 @@ async def check_required_schema() -> Dict[str, List[str]]:
             missing[spec.table] = missing_cols
 
     return missing
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """A UNIQUE violation on either driver: asyncpg's `UniqueViolationError` (SQLSTATE 23505) or
+    SQLite's `IntegrityError` naming "unique", looked for through `__cause__`/`__context__`/`orig`
+    too. Local rather than imported from db/reap_agentic_ledger: this module is imported by far
+    more than the rail, and must not pull the rail's imports into every boot."""
+    seen, candidates = set(), [exc]
+    while candidates:
+        current = candidates.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "23505":
+            return True
+        if type(current).__name__ == "UniqueViolationError":
+            return True
+        if type(current).__name__ == "IntegrityError" and "unique" in str(current).lower():
+            return True
+        candidates.extend(
+            (current.__cause__, current.__context__, getattr(current, "orig", None))
+        )
+    return False
+
+
+def _warn_one_pending_index_missing(exc: BaseException) -> None:
+    """Migration 252's index could not be built. SWALLOWED like every sibling (startup must not
+    fail on it) but NOT SILENT, because this is the one index whose absence changes behaviour:
+    without it a concurrent mint is no longer handed the winner, and the purchase service's
+    reconcile-every-pending-row path is what keeps a buyer from being stranded.
+
+    THE CAUSE IS NAMED ONLY WHEN IT IS KNOWN. A unique violation means a buyer_ref already holds
+    two pending enrollments, and the runbook's census finds them; any other failure (a missing
+    table, a lock, a permission) is reported as what it is, not blamed on duplicates. The
+    exception's MESSAGE is logged: for a CREATE INDEX it is DDL text (Postgres keeps the
+    offending key in `detail`, which is not read here), never a row of buyer data."""
+    message = str(exc)[:300]
+    if _is_unique_violation(exc):
+        logger.warning(
+            "schema_guard: could not create uq_reap_agentic_enrollments_one_pending: %s: %s — "
+            "a buyer_ref already has two pending enrollments. Run the census in "
+            "docs/runbooks/reap_agentic_purchase.md ('One pending row per buyer') and reconcile "
+            "the duplicates, then restart or apply db/migrations/252 by hand",
+            type(exc).__name__,
+            message,
+        )
+        return
+    logger.warning(
+        "schema_guard: could not build uq_reap_agentic_enrollments_one_pending: %s: %s",
+        type(exc).__name__,
+        message,
+    )
 
 
 async def ensure_required_schema_light() -> None:
@@ -1015,6 +1071,169 @@ async def ensure_required_schema_light() -> None:
                 # call against it is an UndefinedTable 500 rather than a wrong
                 # answer, so the failure is visible from the first request.
                 pass
+            # mig 255 and mig 253: the operator audit tables
+            # (reap_unopened_attempt_retirements, reap_checkout_manual_resolution_audit).
+            # EACH IN ITS OWN try, AFTER the mig-224 block. They used to sit inside it,
+            # between the enrollments and the purchases DDL: a failure in either abandoned
+            # the purchases table, and a failure in the enrollment indexes abandoned both
+            # audit tables, which the operator decisions refuse to run without. Neither
+            # depends on the other or on the mig-224 tables. DDL text unchanged.
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_unopened_attempt_retirements (mig 255) unavailable (%s)",
+                               type(exc).__name__)
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMPTZ NOT NULL,
+    evidence_observed_at TIMESTAMPTZ NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_manual_resolution_audit (mig 253) unavailable (%s)",
+                               type(exc).__name__)
+            try:
+                await _heal_add_columns("""
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS dispatch_tracking_version INTEGER,
+                        ADD COLUMN IF NOT EXISTS checkout_dispatch_key VARCHAR(64),
+                        ADD COLUMN IF NOT EXISTS contact_received_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS contact_purged_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS contact_revision INTEGER NOT NULL DEFAULT 0;
+                """)
+            except Exception:
+                pass
+            # mig 256: privacy clocks and durable dispatch fence, independent of enrollment indexes.
+            try:
+                from db.reap_continuation import ensure_continuation_schema
+                await ensure_continuation_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 257: reap_checkout_dispatch_resolution_audit, the parked-dispatch decision
+            # audit, in its OWN try as well. `ensure_continuation_schema` creates it LAST, after
+            # the column adds, the journal, its widening and its triggers, so any of those
+            # failing skipped it. Re-issued here on its own (CREATE TABLE IF NOT EXISTS, a no-op
+            # when the call above succeeded), with the module's own DDL text.
+            try:
+                from db.reap_continuation import _RESOLUTION_AUDIT
+                await database.execute(_RESOLUTION_AUDIT)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_dispatch_resolution_audit (mig 257) unavailable (%s)",
+                               type(exc).__name__)
+            # mig 258: the price witness (preflight quote + corroborated price change). Its own
+            # try: the columns are read and written only behind dark dials, and a failure here must
+            # not starve what follows. The same statement as
+            # db/reap_price_witness._ADD_COLUMNS_PG, spelled here for the coverage gate
+            # (tests/test_schema_guard_migration_coverage.py).
+            try:
+                await _heal_add_columns("""
+                    ALTER TABLE IF EXISTS reap_agentic_purchases
+                        ADD COLUMN IF NOT EXISTS preflight_outcome VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS preflight_error_code VARCHAR(64),
+                        ADD COLUMN IF NOT EXISTS preflight_checked_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS preflight_items_subtotal_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_shipping_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_tax_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS preflight_tax_included BOOLEAN,
+                        ADD COLUMN IF NOT EXISTS preflight_total_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_unit_price_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_items_subtotal_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_quoted_total_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS live_price_stage VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS price_rebound_from_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS price_rebound_to_minor BIGINT,
+                        ADD COLUMN IF NOT EXISTS price_corroboration_source VARCHAR(32),
+                        ADD COLUMN IF NOT EXISTS price_corroborated_at TIMESTAMPTZ;
+                """)
+            except Exception:
+                pass
+            try:
+                from db.reap_price_witness import ensure_price_witness_schema
+                await ensure_price_witness_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
+            # mig 268: the A2A token rail's ledger (payment orchestration P2). Own try: written only by
+            # that rail's dark worker; DDL in db/a2a_rail_ledger (dialect split there).
+            try:
+                from db.a2a_rail_ledger import ensure_a2a_rail_schema
+                await ensure_a2a_rail_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
+            # mig 252: AT MOST ONE PENDING ENROLLMENT PER BUYER.
+            # db/migrations/252_reap_agentic_enrollments_one_pending.sql is the
+            # same index. Two purchases of one buyer, each in 'resolving' in one
+            # tick, used to mint one pending enrollment EACH (two hosted links to
+            # one buyer, review of #2483 P2-1); with this index the second INSERT
+            # is refused and db/reap_agentic_ledger.upsert_pending_enrollment
+            # hands it the winner instead.
+            #
+            # ITS OWN try/except, for the reason every sibling states: CREATE
+            # UNIQUE INDEX FAILS on a database that already holds two pending
+            # rows for one buyer_ref, and that failure must not starve anything
+            # after it. The rail stays correct without the index — the purchase
+            # service reconciles EVERY pending row, oldest first — it just stops
+            # being able to prevent the duplicate. The runbook has the census.
+            try:
+                await _ensure_index(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_reap_agentic_enrollments_one_pending "
+                    "ON reap_agentic_enrollments (buyer_ref) "
+                    "WHERE status = 'pending';"
+                )
+            except Exception as exc:  # noqa: BLE001
+                _warn_one_pending_index_missing(exc)
+            # mig 254: durable malformed expiry provenance, independently healed.
+            try:
+                await _heal_add_columns("ALTER TABLE IF EXISTS reap_agentic_enrollments ADD COLUMN IF NOT EXISTS hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;")
+            except Exception:  # noqa: BLE001
+                pass
             # mig 225: the resolver's three hint columns.
             #
             # THIS DDL MUST BUILD THE SAME SCHEMA AS
@@ -1343,6 +1562,20 @@ async def ensure_required_schema_light() -> None:
                         ADD COLUMN IF NOT EXISTS offer_code_outcome VARCHAR(16),
                         ADD COLUMN IF NOT EXISTS discount_minor BIGINT,
                         ADD COLUMN IF NOT EXISTS tax_included BOOLEAN;
+                    """
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 249: the live variant title on the enrichment cart proof (display only; the
+            # proof job writes it, PR C shows it). The table itself is created on first use by
+            # db/enrichment_cart_variant_proofs.ensure_table(), which also runs this ALTER; this
+            # heal covers a table created before 249. A no-op while the table does not exist.
+            # ITS OWN try, per this block's rule.
+            try:
+                await _heal_add_columns(
+                    """
+                    ALTER TABLE IF EXISTS enrichment_cart_variant_proofs
+                        ADD COLUMN IF NOT EXISTS variant_title TEXT;
                     """
                 )
             except Exception:  # noqa: BLE001
@@ -2712,6 +2945,14 @@ async def ensure_required_schema_light() -> None:
                   ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;
                 """
             )
+            # Migration 266: the clock the retirement gap is measured from. The writer
+            # SELECTs it on every observation, so a database without it fails every sweep.
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;
+                """
+            )
             await database.execute(
                 text(
                     """
@@ -2966,6 +3207,25 @@ async def ensure_required_schema_light() -> None:
                 "ALTER TABLE IF EXISTS agent_pdp_view "
                 "ADD COLUMN IF NOT EXISTS rating_value NUMERIC, "
                 "ADD COLUMN IF NOT EXISTS rating_count INTEGER;"
+            )
+            # mig 263: per-currency price summary on the served view, and the
+            # stamp tying it to the write that produced it
+            # (services/agent_pdp_view_assembler.build_market_prices). Nullable,
+            # written only while AGENT_PDP_VIEW_MARKET_PRICES is on; readers use
+            # the summary only while its stamp equals refreshed_at.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS market_prices JSONB, "
+                "ADD COLUMN IF NOT EXISTS market_prices_refreshed_at TIMESTAMPTZ;"
+            )
+            # mig 269: how many sellers price the product
+            # (services/agent_pdp_view_assembler.count_sellers). Nullable; the
+            # writer names it only once probed present, and readers select it
+            # through to_jsonb (seller_count_sql), so a deferred heal fails nothing.
+            # Not on the db.catalog Table -- see the probe in the assembler.
+            await _heal_add_columns(
+                "ALTER TABLE IF EXISTS agent_pdp_view "
+                "ADD COLUMN IF NOT EXISTS seller_count INTEGER;"
             )
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
@@ -3616,6 +3876,127 @@ async def ensure_required_schema_light() -> None:
                         "WHERE reap_checkout_id IS NOT NULL;"
                     )
                 )
+            except Exception:  # noqa: BLE001
+                pass
+            # mig 255 and mig 253: the operator audit tables
+            # (reap_unopened_attempt_retirements, reap_checkout_manual_resolution_audit).
+            # EACH IN ITS OWN try, AFTER the mig-224 block. They used to sit inside it,
+            # between the enrollments and the purchases DDL: a failure in either abandoned
+            # the purchases table, and a failure in the enrollment indexes abandoned both
+            # audit tables, which the operator decisions refuse to run without. Neither
+            # depends on the other or on the mig-224 tables. DDL text unchanged. SQLite twin.
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_unopened_attempt_retirements (
+    receipt_id VARCHAR(32) PRIMARY KEY,
+    agent_id VARCHAR(128) NOT NULL,
+    agent_user_ref_hash VARCHAR(64) NOT NULL,
+    native_key VARCHAR(128) NOT NULL,
+    cart_key VARCHAR(128) NOT NULL,
+    native_request_hash VARCHAR(64) NOT NULL,
+    cart_request_hash VARCHAR(64) NOT NULL,
+    authority_sha256 VARCHAR(64) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agent_id, agent_user_ref_hash, native_key, cart_key),
+    CHECK (native_key <> cart_key)
+);
+"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_unopened_attempt_retirements (mig 255) unavailable (%s)",
+                               type(exc).__name__)
+            try:
+                await database.execute(text("""CREATE TABLE IF NOT EXISTS reap_checkout_manual_resolution_audit (
+    purchase_id VARCHAR(64) PRIMARY KEY,
+    reap_checkout_id VARCHAR(128) NOT NULL,
+    from_state VARCHAR(32) NOT NULL,
+    resolved_state VARCHAR(32) NOT NULL,
+    attribution_outcome VARCHAR(32) NOT NULL,
+    operator_ref VARCHAR(128) NOT NULL,
+    evidence_source VARCHAR(64) NOT NULL,
+    evidence_reference VARCHAR(128) NOT NULL,
+    evidence_sha256 VARCHAR(64) NOT NULL,
+    expected_updated_at TIMESTAMP NOT NULL,
+    evidence_observed_at TIMESTAMP NOT NULL,
+    provider_base_url VARCHAR(255) NOT NULL,
+    provider_status VARCHAR(32) NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (from_state IN ('awaiting_approval','processing')),
+    CHECK (resolved_state IN ('completed','failed','expired')),
+    CHECK (provider_status IN ('COMPLETED','FAILED','EXPIRED')),
+    CHECK (attribution_outcome IN ('edge_closed','closed_by_other_channel','not_applicable')),
+    CHECK (evidence_source IN ('authenticated_reap_checkout_read','verified_reap_support_statement'))
+);"""))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_manual_resolution_audit (mig 253) unavailable (%s)",
+                               type(exc).__name__)
+            # mig 256: privacy clocks and durable dispatch fence, independent of enrollment indexes.
+            try:
+                from db.reap_continuation import ensure_continuation_schema
+                await ensure_continuation_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap continuation schema unavailable (%s)", type(exc).__name__)
+            # mig 257: reap_checkout_dispatch_resolution_audit, the parked-dispatch decision
+            # audit, in its OWN try as well. `ensure_continuation_schema` creates it LAST, after
+            # the column adds, the journal, its widening and its triggers, so any of those
+            # failing skipped it. Re-issued here on its own (CREATE TABLE IF NOT EXISTS, a no-op
+            # when the call above succeeded), with the module's own DDL text. SQLite twin: the
+            # same TIMESTAMPTZ -> TIMESTAMP spelling the module applies.
+            try:
+                from db.reap_continuation import _RESOLUTION_AUDIT
+                await database.execute(_RESOLUTION_AUDIT.replace('TIMESTAMPTZ', 'TIMESTAMP'))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema_guard: reap_checkout_dispatch_resolution_audit (mig 257) unavailable (%s)",
+                               type(exc).__name__)
+            # mig 258: the price witness (preflight quote + corroborated price change). Its own
+            # try: the columns are read and written only behind dark dials, and a failure here must
+            # not starve what follows.
+            try:
+                from db.reap_price_witness import ensure_price_witness_schema
+                await ensure_price_witness_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: Reap price witness schema unavailable (%s)", type(exc).__name__)
+            # mig 264: the rail-neutral purchase ledger (payment orchestration P0). Its own try:
+            # it is written only behind AGENT_PURCHASE_LEDGER_ENABLED, never inside a rail's
+            # transaction, and a failure here must not starve what follows. The DDL lives in
+            # db/agent_purchase_ledger._CREATE_TABLE_PG (dialect split there).
+            try:
+                from db.agent_purchase_ledger import ensure_agent_purchase_schema
+                await ensure_agent_purchase_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchases (mig 264) unavailable (%s)", type(exc).__name__)
+            # mig 265: durable purchase events for agent platforms (payment orchestration P1). Own try:
+            # written only behind AGENT_PURCHASE_WEBHOOKS_ENABLED; DDL in db/agent_purchase_events.
+            try:
+                from db.agent_purchase_events import ensure_agent_purchase_events_schema
+                await ensure_agent_purchase_events_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: agent_purchase_events (mig 265) unavailable (%s)", type(exc).__name__)
+            # mig 268: the A2A token rail's ledger (payment orchestration P2). Own try: written only by
+            # that rail's dark worker; DDL in db/a2a_rail_ledger (dialect split there).
+            try:
+                from db.a2a_rail_ledger import ensure_a2a_rail_schema
+                await ensure_a2a_rail_schema()
+            except Exception as exc:
+                logger.warning("schema_guard: a2a rail ledger (mig 268) unavailable (%s)", type(exc).__name__)
+            # mig 252: at most one PENDING enrollment per buyer, SQLite twin of
+            # the Postgres block above (same index, same reason, same own try:
+            # it fails on a database that already holds two pending rows for one
+            # buyer_ref, and must not starve what follows).
+            try:
+                await database.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_reap_agentic_enrollments_one_pending "
+                        "ON reap_agentic_enrollments (buyer_ref) "
+                        "WHERE status = 'pending';"
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                _warn_one_pending_index_missing(exc)
+            # mig 254: SQLite twin; duplicate column is the idempotent no-op.
+            try:
+                await database.execute(text("ALTER TABLE reap_agentic_enrollments ADD COLUMN hosted_url_expiry_invalid BOOLEAN NOT NULL DEFAULT FALSE;"))
             except Exception:  # noqa: BLE001
                 pass
             # mig 225: the resolver's three hint columns, SQLite twin.

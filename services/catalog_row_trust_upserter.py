@@ -31,10 +31,17 @@ the Node side.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-from services.catalog_trust_policy import derive_trust
+from services.catalog_trust_policy import (
+    CRAWL_FRESH_DEFAULT_DAYS,
+    CRAWL_SOURCE_SYSTEM,
+    derive_trust,
+    is_crawl_fresh,
+    is_crawl_listing,
+)
 from services.source_quarantine import (
     minted_seed_identity_leg_sql,
     SEED_PICK_ORDER,
@@ -45,7 +52,9 @@ from services.pdp_renderability import (
     pdp_route_resolvable,
     seed_route_resolves_sql,
 )
-from services.priced_offer_sql import priced_offer_exists_sql
+from services.priced_offer_sql import (
+    priced_offer_exists_sql,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -381,6 +390,411 @@ _UPSERT_SQL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# CRAWL_FRESH input (2026-10-20) — default OFF
+# ---------------------------------------------------------------------------
+#
+# THE SWITCH LIVES HERE, NOT IN THE POLICY. catalog_row_trust is shared state
+# written by this service and by the PIVOTA-Agent twin (catalogRowTrustUpserter
+# on identity events), so whatever decides a row must be computed identically on
+# both sides. The policy stays a pure function of its inputs; this upserter
+# decides whether to SUPPLY the `crawl_fresh` input at all.
+#
+#   * OFF (default): no extra query runs and the input key is never set, so the
+#     inputs dict, every decision, every reason code and POLICY_VERSION are
+#     byte-identical to main.
+#   * ON: drain-lane crawl rows (catalog_trust_policy.is_crawl_listing: retailer
+#     listings and brand-official / curated `ext:` canonicals)
+#     get `crawl_fresh` = True/False from the row's price-read date below.
+#
+# 🚨 SET IT ON BOTH SERVICES OR NEITHER, and set the SAME N. With it on one side
+# only, this side writes the fresh listings 'public' and the twin re-derives them
+# 'shadow' on its next identity event for them: rows FLAP on the live serving
+# surface. The rule CATALOG_TRUST_RENDERABLE_GATE documents, unchanged.
+#
+# Not a separate SELECT column in the product join, deliberately: with the switch
+# off the join text stays byte-identical to main (every Postgres gate that pins
+# it keeps passing untouched), a database whose catalog_offers lacks
+# price_checked_at (migration 246) is never sent a statement naming it, and the
+# lookup runs only for the drain-lane rows of a batch, not the whole catalog.
+CRAWL_FRESH_ENV = "CATALOG_TRUST_CRAWL_FRESH_ENABLED"
+CRAWL_FRESH_DAYS_ENV = "CATALOG_TRUST_CRAWL_FRESH_DAYS"
+
+
+def crawl_fresh_enabled() -> bool:
+    """Default OFF. The same truthy spelling as the policy's other switches."""
+    return (os.getenv(CRAWL_FRESH_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def crawl_fresh_days() -> float:
+    """N for "crawl-fresh", in days. Unset, unparseable, non-finite or not
+    positive -> the default (7). Fractions are allowed (0.5 = 12 hours)."""
+    raw = os.getenv(CRAWL_FRESH_DAYS_ENV)
+    if raw is None or not raw.strip():
+        return float(CRAWL_FRESH_DEFAULT_DAYS)
+    try:
+        days = float(raw.strip())
+    except ValueError:
+        days = float("nan")
+    if not (days > 0 and days != float("inf")):
+        logger.warning(
+            "catalog_row_trust: invalid %s=%r; using %d",
+            CRAWL_FRESH_DAYS_ENV, raw, CRAWL_FRESH_DEFAULT_DAYS,
+        )
+        return float(CRAWL_FRESH_DEFAULT_DAYS)
+    return days
+
+
+# An affiliate-feed offer's link is a network tracking URL, not the listing,
+# and the drain never read its price from the storefront: never a valid read.
+CRAWL_OFFER_NOT_AFFILIATE_SQL = (
+    "coalesce(co.offer_payload->>'validated_at', '') NOT LIKE 'affiliate_feed:%'"
+)
+
+
+# ---- rounds 4-5 (2026-10-20): EVERY live offer, fail closed -----------------------
+#
+# Trust stays per PRODUCT (catalog_row_trust has no market column), and the
+# readers serve every live offer of a product to somebody: the buyer-currency
+# filter (routes/agent_shop_gateway._offers_in_buyer_currency) keeps offers by
+# currency only and, for a caller that declares no market, keeps them all;
+# copies the attached-listing lane priced (any source_system) and market
+# siblings serve beside the drain's. So the row may go public only when NO
+# offer any reader can show carries a price we cannot vouch for. The input is
+# the row's price-read date: the OLDEST valid read across EVERY live offer,
+# NULL as soon as one of them has none.
+#
+# THE CLASS -- every LIVE offer on the row (crawl_offer_class_conjuncts):
+# unsuppressed and priced the way the WIDEST reader prices an offer,
+# coalesce(merchant_effective_price, estimated_best_price, list_price) > 0
+# (CRAWL_OFFER_CLASS_PRICED_SQL; round 6). That is how the PDP view's normalize_offer,
+# offers.resolve's group/sibling read, the purchase reads and the budget path
+# price it, and the price mig 246's stamp-forgetting trigger watches -- wider
+# than the shared price gate (services.priced_offer_sql: mep, else list), which
+# would leave an offer priced only by estimated_best_price outside the class
+# while those readers serve it. Nothing else: ANY source_system, ANY market, ANY currency,
+# affiliate offers included, and ANY link. (Round 3 narrowed the class to
+# drain-lane, non-affiliate offers in a served market/currency pair, so an
+# offer outside it neither dated nor blocked the row -- while a no-market
+# caller was still served its price.)
+#   * No link test (round 5): the readers do not all test the link. The
+#     gateway's offer read keeps only an http(s) destination, but the canonical
+#     PDP's own-money read (PIVOTA-Agent canonicalPdpOwnMoney) needs only a
+#     public row and serves the price of an offer whose destination is '' or a
+#     bare path. So an unservable link never takes an offer out of the class:
+#     it must carry a valid read like any other, or the row is not fresh. The
+#     link is not part of VALID either -- a drain offer with a bad link whose
+#     price was read is still a read.
+#
+# A VALID READ of one class offer (CRAWL_OFFER_VALID_READ_SQL), ALL of:
+#   * written by the drain (source_system catalog_enrichment_agent_v1): no other
+#     writer's date is a storefront read this rule vouches for (a variant copy,
+#     a market sibling, a mirror row);
+#   * in a SERVED market priced in that market's currency
+#     (CRAWL_SERVED_MARKET_CURRENCY_PAIRS: config/market_registry.json's served
+#     markets x region_pricing's currencies -- the REGISTRY, not the env
+#     PIVOTA_SERVING_PRICING_REGIONS the serving index reads; the pair list is
+#     committed as config/crawl_fresh_served_markets.json for the twin to pin).
+#     An offer in a market we do not serve, or in another currency than its
+#     market's, is still shown to a no-market caller, so it is never valid;
+#   * not an affiliate-feed offer;
+#   * dated by price_checked_at, not after the bound :now (a future stamp is
+#     stale -- per offer, so it can never mask a sibling either);
+#   * its market was DECLARED by the writer: offer_payload.declared_market equals
+#     catalog_offers.market. The column is NOT NULL DEFAULT 'US' (mig 149), so a
+#     market-less write lands as 'US' whatever the store's market; only the
+#     retailer-ingest drain stamps the key, and only when its job carried an
+#     EXPLICIT options.market (retailer_ingest.pipeline.stamp_declared_market;
+#     job_market()'s US fallback never stamps). Nothing here ever defaults a
+#     market: an undeclared offer is not fresh until a declared crawl re-writes
+#     it;
+#   * not dated by an employee price edit (offer_payload.price_read_source =
+#     'employee_edit', the attached-listing lane's marker). A NULL source -- the
+#     drain apply, or any stamp from before the marker -- counts as a crawl.
+# So ONE live offer that is not the drain's, not in a served pair, priced in
+# the wrong currency, an affiliate offer, undeclared, unread, employee-edited or
+# future-dated makes the row NOT fresh (NULL): fail closed.
+#
+# THE ROW IS CRAWL-FRESH when it has at least one class offer, EVERY class offer
+# has a valid read, at least one class offer is not explicitly out of stock, and
+# the oldest of those reads is within N days (catalog_trust_policy.
+# is_crawl_fresh, judged against the SAME :now the statement was bound with).
+#   * cross-market: a fresh SG read never carries a stale US offer;
+#   * variants: every live variant offer must be fresh, and `::canonical` too --
+#     the refresh dates `::canonical` even when it skipped variants
+#     (`variant_not_re_read`), which simply leaves the row stale;
+#   * availability NEVER excuses an offer from freshness: an out-of-stock offer
+#     is in the class and needs its valid read like any other (the attached lane
+#     never updates availability, so its flag can be as old as the drain apply
+#     that wrote it). Availability only adds the "at least one in stock" test.
+#     That test runs over the whole class, which here is the same as over the
+#     VALID offers: a row with any non-valid class offer is NULL already, so
+#     whenever the date survives, every class offer is a valid one.
+CRAWL_DECLARED_MARKET_KEY = "declared_market"
+
+
+def _served_market_currency_pairs() -> tuple:
+    from services.market_registry import served_markets
+    from services.region_pricing import pricing_currency_for_region
+
+    return tuple(sorted((m, pricing_currency_for_region(m)) for m in served_markets()))
+
+
+#: The served (market, currency) pairs, the twin's pin target
+#: (config/crawl_fresh_served_markets.json, scripts/generate_crawl_fresh_served_markets.py).
+CRAWL_SERVED_MARKET_CURRENCY_PAIRS = _served_market_currency_pairs()
+CRAWL_OFFER_SERVED_MARKET_SQL = (
+    "(upper(btrim(coalesce(co.market, ''))), upper(btrim(coalesce(co.currency, ''))))"
+    " IN (" + ", ".join(f"('{m}', '{c}')" for m, c in CRAWL_SERVED_MARKET_CURRENCY_PAIRS) + ")"
+)
+
+
+def _unavailable_availabilities() -> list[str]:
+    from services.offer_buyability import OFFER_UNAVAILABLE_AVAILABILITIES
+
+    return sorted(OFFER_UNAVAILABLE_AVAILABILITIES)
+
+
+CRAWL_OFFER_IN_STOCK_SQL = (
+    "lower(btrim(coalesce(co.availability, '')))"
+    " NOT IN (" + ", ".join(f"'{a}'" for a in _unavailable_availabilities()) + ")"
+)
+# The key services/external_offer_dual_write writes (PRICE_READ_SOURCE_KEY there;
+# pinned equal by test) and the one source that is not a crawl.
+CRAWL_PRICE_READ_SOURCE_KEY = "price_read_source"
+CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL = (
+    f"coalesce(co.offer_payload->>'{CRAWL_PRICE_READ_SOURCE_KEY}', '') <> 'employee_edit'"
+)
+CRAWL_OFFER_DECLARED_MARKET_SQL = (
+    f"upper(btrim(coalesce(co.offer_payload->>'{CRAWL_DECLARED_MARKET_KEY}', '')))"
+    " = upper(btrim(coalesce(co.market, '')))"
+)
+CRAWL_OFFER_DRAIN_SOURCE_SQL = f"co.source_system = '{CRAWL_SOURCE_SYSTEM}'"
+CRAWL_OFFER_VALID_READ_SQL = (
+    f"CASE WHEN {CRAWL_OFFER_DRAIN_SOURCE_SQL}"
+    f" AND {CRAWL_OFFER_SERVED_MARKET_SQL}"
+    f" AND {CRAWL_OFFER_NOT_AFFILIATE_SQL}"
+    " AND co.price_checked_at <= CAST(:now AS timestamptz)"
+    f" AND {CRAWL_OFFER_DECLARED_MARKET_SQL}"
+    f" AND {CRAWL_OFFER_NOT_EMPLOYEE_EDIT_SQL}"
+    " THEN co.price_checked_at END"
+)
+
+
+CRAWL_OFFER_CLASS_PRICED_SQL = "coalesce(co.merchant_effective_price, co.estimated_best_price, co.list_price) > 0"
+
+
+def crawl_offer_class_conjuncts(product_key_expr: str) -> list[str]:
+    """The class for one row: every unsuppressed offer any reader prices, whatever
+    its link (see above). `product_key_expr` is SQL."""
+    return [f"co.product_key = {product_key_expr}", "co.suppressed_at IS NULL", CRAWL_OFFER_CLASS_PRICED_SQL]
+
+
+def crawl_row_price_read_lateral_sql(product_key_expr: str, indent: str = "   ") -> str:
+    """The row's price-read date as the body of a LATERAL: the oldest valid read
+    across every class offer, or NULL. Shared by the input statement and the
+    recheck so they cannot disagree. Binds :now."""
+    where = f"\n{indent}   AND ".join(crawl_offer_class_conjuncts(product_key_expr))
+    return (
+        f"{indent}SELECT CASE WHEN count(*) > 0\n"
+        f"{indent}             AND bool_and(({CRAWL_OFFER_VALID_READ_SQL}) IS NOT NULL)\n"
+        f"{indent}             AND bool_or({CRAWL_OFFER_IN_STOCK_SQL})\n"
+        f"{indent}            THEN min({CRAWL_OFFER_VALID_READ_SQL}) END AS row_price_read_at\n"
+        f"{indent}  FROM catalog_offers co\n"
+        f"{indent} WHERE {where}\n"
+    )
+
+
+# One indexed probe per key (idx_catalog_offers_product_key), as a LATERAL over the
+# key list rather than `product_key = ANY(:keys) GROUP BY`: measured on local PG
+# (100k products, 300k offers) the ANY form flips to a parallel SEQ SCAN of
+# catalog_offers at a backfill batch of 5,000 keys; the lateral stays index probes.
+# Rounds 4-5 widened the class (no source_system / market / affiliate / link
+# conjunct in the WHERE): the probe is still the product_key equality, and every
+# other test filters or aggregates that one key's offers.
+#
+# WHO DATES THESE OFFERS (every writer of price_checked_at that can reach a
+# catalog_enrichment_agent_v1 offer on an `ext:` row):
+#   * the drain apply, `apply_ingest_plan(price_read=True)` -- the storefront
+#     crawl itself;
+#   * the attached-listing lane (services/external_offer_dual_write
+#     ATTACHED_LISTING_OFFER_UPDATE_SQL): the external-referral refresh, after
+#     it re-read the served page from the origin AND the page named the
+#     currency (price_read_source 'refresh'), or an employee price edit on the
+#     PATCH route ('employee_edit', not a crawl);
+#   * scripts/backfill_offer_price_checked_at (one-off, fill-only): the seed's
+#     last_crawled_at, only where the offer's price IS that read's.
+# So "fresh" means "the listing page was read recently" (by the drain or by the
+# refresh), not "the drain re-crawled it". The same lane also re-prices offers
+# other writers own (its offer read has no source_system filter, e.g. variant
+# copies): their dates are never valid reads, and such an offer, being live,
+# keeps the row NULL.
+#
+# ONE CLOCK. :now is bound from Python, once per batch, and the age is judged in
+# Python against that same value (round 3): SQL now() and the app clock can no
+# longer disagree about a row.
+CRAWL_ROW_PRICE_READ_SQL = (
+    "SELECT k.product_key, r.row_price_read_at\n"
+    "  FROM unnest(CAST(:product_keys AS text[])) AS k(product_key)\n"
+    " CROSS JOIN LATERAL (\n"
+    + crawl_row_price_read_lateral_sql("k.product_key")
+    + " ) r\n"
+    " WHERE r.row_price_read_at IS NOT NULL\n"
+)
+
+
+# ---- the decay recheck -------------------------------------------------------
+#
+# A CRAWL_FRESH row stays public only until something re-derives it after its
+# read ages past N. The 6h cron's oldest-first pass cannot be that something:
+# the UPSERT writes only on a verdict change, so unchanged rows keep old
+# updated_at values and stay at the head of the queue while a freshly flipped
+# row goes to the back; above CATALOG_TRUST_BACKFILL_LIMIT catalog rows it is
+# never reached again. So a dedicated HOURLY job
+# (jobs/catalog_row_trust_backfill_cron.run_catalog_row_trust_crawl_fresh_recheck_tick,
+# scheduled at :47 by services/audit_scheduler; the 6h tick runs it first too)
+# re-derives, bounded and through the GIN index on serving_reason_codes (mig 136):
+#   * switch ON: the CRAWL_FRESH rows whose price-read date is missing or older
+#     than now - N (they have expired);
+#   * switch OFF: EVERY CRAWL_FRESH row, so turning the switch off rolls the
+#     rule back on the next run (a no-op read while none exist).
+# Both join catalog_products, so a trust row whose product is gone cannot hold a
+# slot forever; those orphans are demoted first by a bounded direct trust write
+# (_CRAWL_FRESH_ORPHAN_DEMOTE_SQL) to blocked / ROW_TOMBSTONED.
+#
+# THE REAL BOUND. A row expires at read + N; it is re-derived by the first run
+# after that: public at most N + 1h, + the 30 min misfire grace. Only while the
+# scheduler is up on the worker AND CATALOG_TRUST_BACKFILL_ENABLED is not off --
+# with either down, decay stops and rows stay public until an identity event, a
+# drain apply or a re-run touches them. One run re-derives at most
+# CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT rows (default 20,000), so the
+# flag-off rollback is complete in one run only below that many CRAWL_FRESH rows.
+CRAWL_FRESH_RECHECK_LIMIT_ENV = "CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT"
+CRAWL_FRESH_RECHECK_DEFAULT_LIMIT = 20_000
+CRAWL_FRESH_RECHECK_SQL = (
+    "SELECT crt.subject_key\n"
+    "  FROM catalog_row_trust crt\n"
+    "  JOIN catalog_products cp ON cp.product_key = crt.subject_key\n"
+    "  LEFT JOIN LATERAL (\n"
+    + crawl_row_price_read_lateral_sql("crt.subject_key")
+    + "  ) r ON TRUE\n"
+    " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    "   AND (r.row_price_read_at IS NULL\n"
+    "        OR r.row_price_read_at < CAST(:cutoff AS timestamptz))\n"
+    " ORDER BY crt.updated_at ASC NULLS FIRST, crt.subject_key\n"
+    " LIMIT :limit\n"
+)
+# Presence only -- the switched-off rollback must not depend on migration 246.
+_CRAWL_FRESH_ROWS_ALL_SQL = (
+    "SELECT crt.subject_key\n"
+    "  FROM catalog_row_trust crt\n"
+    "  JOIN catalog_products cp ON cp.product_key = crt.subject_key\n"
+    " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    " ORDER BY crt.updated_at ASC NULLS FIRST, crt.subject_key\n"
+    " LIMIT :limit\n"
+)
+# A CRAWL_FRESH trust row whose catalog row is gone: no policy can re-derive it
+# (the product join finds nothing), so it is demoted directly. ROW_TOMBSTONED is
+# the vocabulary's word for "this catalog row no longer stands"; RETURNING, so
+# the count is of rows changed (databases' execute reports none).
+#
+# The outer WHERE re-states BOTH conditions on the row it updates. Under READ
+# COMMITTED a row the subquery picked that a concurrent writer changed is
+# re-checked (EvalPlanQual) against the outer quals on its NEW version, so a
+# trust row re-derived meanwhile (its catalog row re-created and re-upserted:
+# no longer CRAWL_FRESH) is left alone instead of tombstoned. The NOT EXISTS is
+# re-stated too; it reads the statement's snapshot, so on its own it cannot see
+# a catalog row committed after the statement began -- the reason-code recheck
+# is what covers that race once the upserter has re-derived the row.
+_CRAWL_FRESH_ORPHAN_DEMOTE_SQL = (
+    "UPDATE catalog_row_trust crt\n"
+    "   SET serving_decision = 'blocked',\n"
+    "       serving_reason_codes = CAST(ARRAY['ROW_TOMBSTONED'] AS text[]),\n"
+    "       source_lifecycle_state = 'tombstoned',\n"
+    "       updated_at = now()\n"
+    " WHERE crt.subject_type = 'product'\n"
+    "   AND crt.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    "   AND NOT EXISTS (SELECT 1 FROM catalog_products cp WHERE cp.product_key = crt.subject_key)\n"
+    "   AND crt.subject_key IN (\n"
+    "     SELECT o.subject_key FROM catalog_row_trust o\n"
+    "      WHERE o.subject_type = 'product'\n"
+    "        AND o.serving_reason_codes @> CAST(ARRAY['CRAWL_FRESH'] AS text[])\n"
+    "        AND NOT EXISTS (SELECT 1 FROM catalog_products cp WHERE cp.product_key = o.subject_key)\n"
+    "      ORDER BY o.subject_key\n"
+    "      LIMIT :limit)\n"
+    " RETURNING crt.subject_key\n"
+)
+
+
+def crawl_fresh_recheck_limit() -> int:
+    raw = (os.getenv(CRAWL_FRESH_RECHECK_LIMIT_ENV) or "").strip()
+    try:
+        value = int(raw) if raw else CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+    except ValueError:
+        return CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+    return value if value > 0 else CRAWL_FRESH_RECHECK_DEFAULT_LIMIT
+
+
+def _utc(now: Optional[datetime]) -> datetime:
+    """`now`, UTC-aware: a naive value is read as UTC; None is the current time."""
+    if not isinstance(now, datetime):
+        return datetime.now(timezone.utc)
+    return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+
+
+async def recheck_crawl_fresh_rows(
+    *,
+    db: Any,
+    now: Optional[datetime] = None,
+    limit: Optional[int] = None,
+) -> list[str]:
+    """Re-derive the CRAWL_FRESH rows that have aged out (see above), after
+    demoting orphans. Returns the keys actually re-derived -- a key whose batch
+    failed is NOT returned, so the caller's own pass still covers it. Raises on
+    a failed selection read; the cron logs it."""
+    now_value = _utc(now)
+    bound = int(limit) if limit else crawl_fresh_recheck_limit()
+    orphans = await _fetch_all(db, _CRAWL_FRESH_ORPHAN_DEMOTE_SQL, {"limit": bound})
+    if orphans:
+        logger.warning(
+            "catalog_row_trust_crawl_fresh_orphans_demoted count=%d", len(orphans),
+        )
+    if crawl_fresh_enabled() and await _price_check_column_present(db):
+        cutoff = now_value - timedelta(days=crawl_fresh_days())
+        rows = await _fetch_all(
+            db, CRAWL_FRESH_RECHECK_SQL,
+            {"cutoff": cutoff, "now": now_value, "limit": bound},
+        )
+    else:
+        rows = await _fetch_all(db, _CRAWL_FRESH_ROWS_ALL_SQL, {"limit": bound})
+    keys = [str(_row_get(r, "subject_key")) for r in rows if _row_get(r, "subject_key")]
+    written: list[str] = []
+    if keys:
+        await upsert_catalog_row_trust_many(db=db, product_keys=keys, now=now, written_keys=written)
+    return written
+
+
+def log_crawl_fresh_config(component: str) -> None:
+    """One WARNING line at startup with the effective switch and N, so a flip is
+    verifiable from the logs of every runtime (web, worker, the drain job).
+    Through the pivota logger: prod's root is at WARNING and drops module INFO."""
+    try:
+        from utils.logger import logger as operator_logger
+    except Exception:  # noqa: BLE001
+        operator_logger = logger
+    operator_logger.warning(
+        "catalog_row_trust_crawl_fresh_config component=%s enabled=%s days=%s recheck_limit=%d "
+        "served_market_currency=%s",
+        component, crawl_fresh_enabled(), crawl_fresh_days(), crawl_fresh_recheck_limit(),
+        ",".join(f"{m}:{c}" for m, c in CRAWL_SERVED_MARKET_CURRENCY_PAIRS),
+    )
+
+
+
 _QUARANTINE_SELECT_SQL = """
   SELECT quarantine_id, match_type, match_value, state, expires_at
   FROM catalog_source_quarantine
@@ -419,11 +833,13 @@ async def upsert_catalog_row_trust(
             )
             return False
         quarantines = await _load_active_quarantines(db)
+        crawl_fresh = await _crawl_fresh_by_key(db, [joined], now)
         return await _compute_and_upsert(
             db=db,
             joined=joined,
             quarantines=quarantines,
             now=now,
+            crawl_fresh=crawl_fresh,
         )
     except Exception:  # pragma: no cover — log-and-swallow contract
         logger.exception(
@@ -438,8 +854,12 @@ async def upsert_catalog_row_trust_many(
     product_keys: Sequence[str],
     now: Optional[datetime] = None,
     limit: int = _QUARANTINE_BULK_MAX,
+    written_keys: Optional[list] = None,
 ) -> int:
     """Recompute and UPSERT trust rows for every supplied ``product_key``.
+
+    ``written_keys``, when given, collects every key whose row was written, so
+    a caller can tell a key that failed (its batch or its row) from one done.
 
     ``limit`` bounds each fetch BATCH, not total coverage: the keys are
     processed in the caller's order, ``limit`` at a time, until the list is
@@ -469,13 +889,17 @@ async def upsert_catalog_row_trust_many(
             )
             if quarantines is None:
                 quarantines = await _load_active_quarantines(db)
+            crawl_fresh = await _crawl_fresh_by_key(db, rows, now)
             no_catalog_row += max(0, len(chunk) - len(rows))
             for row in rows:
                 try:
                     if await _compute_and_upsert(
-                        db=db, joined=row, quarantines=quarantines, now=now
+                        db=db, joined=row, quarantines=quarantines, now=now,
+                        crawl_fresh=crawl_fresh,
                     ):
                         wrote += 1
+                        if written_keys is not None:
+                            written_keys.append(str(_row_get(row, "product_key")))
                 except Exception:  # pragma: no cover
                     logger.exception(
                         "catalog_row_trust upsert failed for product_key=%s",
@@ -501,6 +925,44 @@ async def upsert_catalog_row_trust_many(
             len(keys),
         )
     return wrote
+
+
+async def preview_serving_decisions(
+    *,
+    db: Any,
+    product_keys: Sequence[str],
+    row_is_elected_canonical: Optional[bool] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, str]:
+    """``serving_decision`` per product_key as an upsert would write it NOW, writing
+    nothing. Same join, same input shape, same policy as the upsert.
+
+    ``row_is_elected_canonical`` replaces that one input for every key: "would this
+    row be public if it held its content_key's canonical URL?". That is the question
+    a caller asks before handing the URL over (scripts/retire_superseded_brand_keys.py),
+    and asking the policy rather than reading NON_CANONICAL_DUPLICATE off a stored
+    trust row keeps the rule in one place.
+
+    Raises on a failed read, unlike the upserts: a caller deciding on the answer must
+    not mistake a failure for "not public" or for "public".
+    """
+    keys = [str(k) for k in product_keys if k]
+    if not keys:
+        return {}
+    rows = await _fetch_all(
+        db, _SELECT_BY_PRODUCT_KEYS_SQL, {"product_keys": keys, "limit": len(keys)}
+    )
+    quarantines = await _load_active_quarantines(db)
+    crawl_fresh = await _crawl_fresh_by_key(db, rows, now)
+    out: dict[str, str] = {}
+    for row in rows:
+        inputs = _joined_row_to_inputs(row, quarantines, now, crawl_fresh=crawl_fresh)
+        if not inputs.get("subject_key"):
+            continue
+        if row_is_elected_canonical is not None:
+            inputs["row_is_elected_canonical"] = row_is_elected_canonical
+        out[inputs["subject_key"]] = derive_trust(inputs)["serving_decision"]
+    return out
 
 
 async def upsert_catalog_row_trust_for_quarantine_match(
@@ -539,11 +1001,13 @@ async def upsert_catalog_row_trust_for_quarantine_match(
             {"match_value": match_value, "limit": int(limit)},
         )
         quarantines = await _load_active_quarantines(db)
+        crawl_fresh = await _crawl_fresh_by_key(db, rows, now)
         wrote = 0
         for row in rows:
             try:
                 if await _compute_and_upsert(
-                    db=db, joined=row, quarantines=quarantines, now=now
+                    db=db, joined=row, quarantines=quarantines, now=now,
+                    crawl_fresh=crawl_fresh,
                 ):
                     wrote += 1
             except Exception:  # pragma: no cover
@@ -582,8 +1046,9 @@ async def _compute_and_upsert(
     joined: Mapping[str, Any],
     quarantines: list[dict[str, Any]],
     now: Optional[datetime],
+    crawl_fresh: Optional[Mapping[str, bool]] = None,
 ) -> bool:
-    inputs = _joined_row_to_inputs(joined, quarantines, now)
+    inputs = _joined_row_to_inputs(joined, quarantines, now, crawl_fresh=crawl_fresh)
     if not inputs.get("subject_key"):
         return False
     trust = derive_trust(inputs)
@@ -595,10 +1060,17 @@ def _joined_row_to_inputs(
     row: Mapping[str, Any],
     active_quarantines: list[dict[str, Any]],
     now: Optional[datetime],
+    *,
+    crawl_fresh: Optional[Mapping[str, bool]] = None,
 ) -> dict[str, Any]:
     """Reshape the JOIN row into the ``derive_trust`` input shape.
 
     Mirrors ``rowToPolicyInputs`` in ``scripts/backfill-catalog-row-trust.cjs``.
+
+    ``crawl_fresh`` is :func:`_crawl_fresh_by_key`'s answer for the
+    batch. None (the switch off, or no price_checked_at column) and a key absent
+    from it both leave ``crawl_fresh`` UNSET, so the dict is exactly
+    what main built.
     """
     now_value = now if isinstance(now, datetime) else datetime.now(timezone.utc)
 
@@ -609,7 +1081,7 @@ def _joined_row_to_inputs(
     has_store = _row_get(row, "ms_merchant_id") is not None
     has_override = _row_get(row, "override_id") is not None
 
-    return {
+    inputs = {
         "subject_type": "product",
         "subject_key": product_key,
         # c1.v0.5. The lane test is pure row data; only the seed EXISTS needs
@@ -724,6 +1196,9 @@ def _joined_row_to_inputs(
         "active_quarantines": active_quarantines,
         "now": now_value,
     }
+    if crawl_fresh is not None and product_key in crawl_fresh:
+        inputs["crawl_fresh"] = bool(crawl_fresh[product_key])
+    return inputs
 
 
 def _trust_to_params(trust: Mapping[str, Any]) -> dict[str, Any]:
@@ -750,6 +1225,93 @@ def _trust_to_params(trust: Mapping[str, Any]) -> dict[str, Any]:
         "manual_override_id": trust["manual_override_id"],
         "policy_version": trust["policy_version"],
     }
+
+
+async def _crawl_fresh_by_key(
+    db: Any,
+    rows: Iterable[Any],
+    now: Optional[datetime],
+) -> Optional[dict[str, bool]]:
+    """``{product_key: crawl-fresh?}`` for the drain-lane crawl rows among
+    ``rows``, or None when the input must not be supplied at all.
+
+    None (-> the flag-off verdict for every row of the batch) when the switch is
+    off, when this database's catalog_offers has no price_checked_at yet (asked
+    first, so no statement naming a missing column is ever sent), and when the
+    read FAILS: fail closed per batch, log `catalog_row_trust_crawl_fresh_read_failed`,
+    and let the caller write the batch anyway (the PIVOTA-Agent twin does the
+    same). Both reads run inside a savepoint (`databases`' nested transaction; a
+    plain transaction when none is open), so a failed statement never aborts the
+    caller's transaction. Rows that are not drain-lane crawl rows never appear in
+    the map; a crawl row with no fresh read maps to False (today's gates).
+
+    `now` is bound ONCE for the batch: the statement's :now and the age test use
+    the same value. A naive datetime is read as UTC.
+    """
+    if not crawl_fresh_enabled():
+        return None
+    keys = sorted(
+        {
+            str(_row_get(r, "product_key"))
+            for r in rows
+            if is_crawl_listing(
+                {
+                    "product_key": _row_get(r, "product_key"),
+                    "source_system": _row_get(r, "source_system"),
+                }
+            )
+        }
+    )
+    if not keys:
+        return {}
+    now_value = _utc(now)
+    try:
+        if not await _price_check_column_present(db):
+            return None
+        fetched = await _in_savepoint(
+            db, _fetch_all, CRAWL_ROW_PRICE_READ_SQL, {"product_keys": keys, "now": now_value}
+        )
+    except Exception:  # noqa: BLE001 -- fail closed per batch, never into the caller
+        logger.warning(
+            "catalog_row_trust_crawl_fresh_read_failed keys=%d; writing the batch with flag-off verdicts",
+            len(keys),
+            exc_info=True,
+        )
+        return None
+    max_age_days = crawl_fresh_days()
+    reads = {str(_row_get(r, "product_key")): _row_get(r, "row_price_read_at") for r in fetched}
+    return {
+        pk: is_crawl_fresh(reads.get(pk), now=now_value, max_age_days=max_age_days)
+        for pk in keys
+    }
+
+
+async def _in_savepoint(db: Any, fn: Any, *args: Any) -> Any:
+    """Run one read inside `db.transaction()` when the handle has one: a SAVEPOINT
+    inside an open transaction, its own transaction otherwise. A failure rolls
+    back only the savepoint and is re-raised to the caller, who decides."""
+    transaction = getattr(db, "transaction", None)
+    if transaction is None:
+        return await fn(db, *args)
+    async with transaction():
+        return await fn(db, *args)
+
+
+async def _price_check_column_present(db: Any) -> bool:
+    """Does THIS database's catalog_offers carry price_checked_at (mig 246)?
+
+    Asked of the caller's own connection (the apply's readiness handoff runs in
+    its own), with the column probe external_offer_dual_write owns, inside a
+    savepoint. Never raises: a failed read (SQLite has no pg_attribute) is
+    "absent". Not cached: one catalog lookup per batch, only while the switch is on.
+    """
+    from services.external_offer_dual_write import PRICE_CHECK_COLUMN_SQL
+
+    try:
+        row = await _in_savepoint(db, _fetch_one, PRICE_CHECK_COLUMN_SQL, {})
+        return bool(row is not None and _row_get(row, "present"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def _load_active_quarantines(db: Any) -> list[dict[str, Any]]:
@@ -790,6 +1352,17 @@ async def _execute(db: Any, sql: str, values: Mapping[str, Any]) -> Any:
 
 
 __all__ = [
+    "CRAWL_FRESH_RECHECK_SQL",
+    "CRAWL_ROW_PRICE_READ_SQL",
+    "CRAWL_SERVED_MARKET_CURRENCY_PAIRS",
+    "crawl_row_price_read_lateral_sql",
+    "log_crawl_fresh_config",
+    "recheck_crawl_fresh_rows",
+    "CRAWL_FRESH_ENV",
+    "CRAWL_FRESH_DAYS_ENV",
+    "preview_serving_decisions",
+    "crawl_fresh_days",
+    "crawl_fresh_enabled",
     "upsert_catalog_row_trust",
     "upsert_catalog_row_trust_many",
     "upsert_catalog_row_trust_for_quarantine_match",

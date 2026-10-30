@@ -76,13 +76,20 @@ async def run_candidates(
         candidates, concurrency=concurrency, timeout_s=timeout_s
     )
     with_offers = sum(1 for v in validated if (v or {}).get("offers"))
-    plan = ingest_validated_jsonl(validated)
+    if db is not None:
+        # Never move a row off the listing it names (ingestion.ingest_validated_jsonl `listing_moves`).
+        from services.catalog_enrichment_agent.apply import plan_with_current_listings
+        plan = await plan_with_current_listings(validated, db=db)
+    else:
+        plan = ingest_validated_jsonl(validated)
     summary: Dict[str, Any] = {
         "candidates": len(candidates),
         "validated_with_offers": with_offers,
         "plan_pdps": len(plan.get("pdps") or []),
         "plan_offers": len(plan.get("offers") or []),
         "plan_skipped": plan.get("skipped"),
+        "plan_listing_collisions": len(plan.get("listing_collisions") or []),
+        "plan_listing_moves": len(plan.get("listing_moves") or []),
         "applied": None,
     }
     if apply and plan.get("pdps"):

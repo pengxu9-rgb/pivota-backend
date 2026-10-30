@@ -6,6 +6,13 @@ import pytest
 import jobs.retailer_ingest_drain as drain
 
 
+@pytest.fixture(autouse=True)
+def _no_claim_window(monkeypatch):
+    """These tests drive the real main(); the default claim window (03:00-06:30Z) would make them depend on
+    the wall clock. tests/services/test_retailer_ingest_claim_window.py covers the window."""
+    monkeypatch.setenv("RETAILER_INGEST_CLAIM_BLACKOUT_UTC", "off")
+
+
 def test_creating_the_job_is_not_arming_it(monkeypatch, capsys):
     monkeypatch.delenv("RETAILER_INGEST_DRAIN_ENABLED", raising=False)
     monkeypatch.setattr(drain, "drain_once", lambda **kw: (_ for _ in ()).throw(AssertionError("ran")))

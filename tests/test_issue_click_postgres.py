@@ -286,6 +286,73 @@ async def test_an_order_on_a_link_nobody_clicked_still_closes_against_its_issued
     assert dict(edge)["agent_id"] == "agent_minds"
 
 
+@pytest.mark.parametrize(
+    "click_agent,partner_agent,expected_agent",
+    [
+        ("agent_minds", "agent_reap", "agent_reap"),
+        ("agent_minds", None, "agent_minds"),
+        (None, None, None),
+    ],
+)
+async def test_conversion_event_preserves_the_edges_agent_and_dedupes(
+    db, monkeypatch, click_agent, partner_agent, expected_agent
+):
+    """The real event writer must agree with the edge, including its traffic snapshot."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateIndex, CreateTable
+
+    from db.commerce_interactions import commerce_interaction_events, commerce_interactions
+    from services import commerce_attribution_service as cas
+    from services import commerce_interaction_service as cis
+
+    tables = (commerce_interactions, commerce_interaction_events)
+    for table in reversed(tables):
+        await db.execute(f"DROP TABLE IF EXISTS {table.name} CASCADE")
+    try:
+        for table in tables:
+            await db.execute(str(CreateTable(table).compile(dialect=postgresql.dialect())))
+            for index in table.indexes:
+                await db.execute(str(CreateIndex(index).compile(dialect=postgresql.dialect())))
+        monkeypatch.setattr(cas, "record_commerce_event_best_effort", cis.record_commerce_event_best_effort)
+        await cas.issue_clicks([
+            _issued(
+                merchant_id="m_seller", agent_id=click_agent,
+                context={"seller_ref": "m_seller", "seed_kind": "self"},
+            )
+        ])
+        params = dict(
+            merchant_id="m_seller", click_id="clk_issued_1", external_order_id="evt_agent_1",
+            gross_amount_cents=2398, currency="USD", converting_shop_domain="brand.example",
+            trusted_partner_provenance=(
+                {"partner_reported": True, "agent_id": partner_agent} if partner_agent else None
+            ),
+        )
+        assert not (await cas.close_external_order_conversion(**params)).get("replayed")
+        assert (await cas.close_external_order_conversion(**params))["replayed"] is True
+
+        edge = await db.fetch_one(
+            "SELECT agent_id FROM commerce_attribution_edges WHERE external_order_id='evt_agent_1'"
+        )
+        events = await db.fetch_all(
+            "SELECT interaction_id,payload FROM commerce_interaction_events "
+            "WHERE event_type='order.external_converted'"
+        )
+        assert len(events) == 1
+        interaction = await db.fetch_one(
+            "SELECT agent_id FROM commerce_interactions WHERE interaction_id=:i",
+            {"i": events[0]["interaction_id"]},
+        )
+        payload = events[0]["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        assert edge["agent_id"] == interaction["agent_id"] == expected_agent
+        assert payload["traffic"]["agent_id"] == (expected_agent or "unknown")
+        assert await db.fetch_val("SELECT count(*) FROM commerce_attribution_edges") == 1
+    finally:
+        for table in reversed(tables):
+            await db.execute(f"DROP TABLE IF EXISTS {table.name} CASCADE")
+
+
 # --- an agent-less issued link stays agent-less (review of #2294) ---------------------------------
 
 

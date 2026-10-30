@@ -2126,13 +2126,14 @@ async def test_the_ops_route_normalises_a_present_market_instead_of_refusing_it(
 
 
 async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason(_db, ops_app):
-    """Zero-diff for a keyed request: the only new key is `reason`, and it is null. PINNED
-    LITERALS — the key set and note below are main's response (2a590bb9c) plus `reason`."""
+    """Zero-diff for a keyed request: the only new keys are `reason` (null) and, since
+    2026-10-09, `human_handoff_tier`. PINNED LITERALS — the key set and note below are main's
+    response (2a590bb9c) plus those two."""
     await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
     body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=us")).json()
     assert set(body) == {
-        "domain", "market", "tier", "reason", "enforced", "buyer_vantage", "sweep_enabled",
-        "ttl_hours", "facts", "note",
+        "domain", "market", "tier", "human_handoff_tier", "reason", "enforced", "buyer_vantage",
+        "sweep_enabled", "ttl_hours", "facts", "note",
     }
     assert body["reason"] is None
     assert (body["domain"], body["market"], body["tier"]) == ("judydoll.com", "US", "purchase")
@@ -2230,8 +2231,22 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
 # onboarding store) and keys each store on the host the card's cart is built on x the merchant's
 # declared region, which is used ONLY when it is an ISO-2 country.
 
+#: TEST MERCHANTS, taken from the policy itself rather than restated: two listed rig ids (one with
+#: a live store, one with only a legacy store) and one merchant only the policy's
+#: `pivota-review-demo*` domain resolver can name. Every one would be ADMITTED by the lane's own
+#: rules (Shopify, products, region US) — so only the test-merchant skip keeps them out.
+from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS  # noqa: E402
+
+_RIG_LIVE, _RIG_LEGACY = sorted(KNOWN_TEST_MERCHANT_IDS)[:2]
+_RIG_BY_DOMAIN = "m_demo_domain_rig"
+
 _CONNECTED_MERCHANTS = (
     # merchant_id, region, has a cached product
+    (_RIG_LIVE, "US", True),
+    (_RIG_LEGACY, "US", True),
+    # Its region is junk, like prod's review-demo rows: a rig must not be reported as
+    # market-unknown, because it was never going to be swept at all.
+    (_RIG_BY_DOMAIN, "shopify", True),
     ("m_conn", "us", True),
     ("m_conn_twin", "US", True),        # a second live row on the SAME store host
     ("m_url", "US", True),              # domain stored as a URL
@@ -2250,6 +2265,8 @@ _CONNECTED_MERCHANTS = (
 
 _CONNECTED_STORES = (
     # store_id, merchant_id, platform, domain, status
+    ("st_rig_live", _RIG_LIVE, "shopify", "rig-live.myshopify.com", "active"),
+    ("st_rig_domain", _RIG_BY_DOMAIN, "shopify", "pivota-review-demo-9.myshopify.com", "active"),
     ("st_conn", "m_conn", "shopify", "Conn-Store.myshopify.com", "active"),
     ("st_twin", "m_conn_twin", "Shopify", "conn-store.myshopify.com", "connected"),
     ("st_url", "m_url", "shopify", "https://url-store.myshopify.com/", "active"),
@@ -2265,6 +2282,7 @@ _CONNECTED_STORES = (
 
 _LEGACY_STORES = {
     # merchant_id -> (mcp_platform, mcp_shop_domain, mcp_connected)
+    _RIG_LEGACY: ("shopify", "rig-legacy.myshopify.com", True),
     "m_legacy": ("shopify", "legacy-store.myshopify.com", True),
     "m_legacy_dead": ("Shopify", "legacy-dead.myshopify.com", False),
     "m_legacy_shadowed": ("shopify", "legacy-shadowed.myshopify.com", True),
@@ -2280,8 +2298,16 @@ _CONNECTED_EXPECTED = {
 }
 
 
+#: The rigs above, one row each.
+_CONNECTED_TEST_MERCHANT_ROWS = 3
+
+
 @pytest.fixture
 async def _connected(_population):
+    from services import test_merchant_policy
+
+    # The policy memoises its domain-resolved set; a set another test resolved must not answer here.
+    test_merchant_policy.reset_cache()
     for merchant_id, region, _has_product in _CONNECTED_MERCHANTS:
         platform, shop_domain, connected = _LEGACY_STORES.get(merchant_id, (None, None, False))
         await database.execute(
@@ -2306,6 +2332,7 @@ async def _connected(_population):
     yield
     for merchant_id in with_products:
         await database.execute("DELETE FROM products_cache WHERE merchant_id = :m", {"m": merchant_id})
+    test_merchant_policy.reset_cache()
 
 
 async def test_the_population_adds_the_connected_shopify_stores(_db, _connected):
@@ -2314,8 +2341,14 @@ async def test_the_population_adds_the_connected_shopify_stores(_db, _connected)
     keys = {(t.domain, t.market) for t in targets}
     assert keys == {("judydoll.com", "US"), ("flowerbeauty.com", "US")} | _CONNECTED_EXPECTED
     assert len(targets) == len(keys), "two live rows on one host are ONE merchant x market"
-    # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US.
-    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 4}
+    # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US. The three
+    # test merchants are counted as that and nothing else: the rig whose region is "shopify" is
+    # NOT a fifth market-unknown.
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 4,
+                     sweep.TEST_MERCHANT_TALLY: _CONNECTED_TEST_MERCHANT_ROWS}
+    rig_hosts = {"rig-live.myshopify.com", "rig-legacy.myshopify.com",
+                 "pivota-review-demo-9.myshopify.com"}
+    assert not {t.domain for t in targets} & rig_hosts
     assert all(t.variant_id is None for t in targets if (t.domain, t.market) in _CONNECTED_EXPECTED), (
         "the connected lane carries no variant; the preflight picks one for the market"
     )
@@ -2347,7 +2380,11 @@ async def test_a_swept_connected_store_answers_the_card_gate(_db, monkeypatch, _
     report = await sweep.run_merchant_purchasability_sweep()
     swept = {(host, kwargs["market"]) for host, kwargs in fetcher.calls}
     assert _CONNECTED_EXPECTED <= swept
+    assert not {host for host, _m in swept} & {
+        "rig-live.myshopify.com", "rig-legacy.myshopify.com", "pivota-review-demo-9.myshopify.com"
+    }, "a test store is never contacted: each check leaves an abandoned checkout on it"
     assert report.population_skipped_market_unknown == 4
+    assert report.population_skipped_test_merchant == _CONNECTED_TEST_MERCHANT_ROWS
     assert report.population_unreadable == 0
     assert await mp.is_purchasable("conn-store.myshopify.com", "US") is True
     assert await mp.is_purchasable("conn-store.myshopify.com", "CA") is False
@@ -2946,3 +2983,441 @@ async def test_the_census_scans_fresh_and_touches_no_cache(_db, _scans):
     lanes = await sweep.collect_population(fresh_cart_mint_scan=True)
     assert calls["scans"] == 1 and set(lanes["cart-mint"]) == _CART_MINT_EXPECTED
     assert await mint_scans.latest(complete_only=False) is None
+
+
+# ══ an IP-level throttle stops the run and demotes nobody ═════════════════════════════════
+#
+# Prod, 2026-10-07 07:08Z onward: 17-20 of the 20 merchants unverifiable every hour, 163 of ~196 checks
+# answering `products_json_page_1_status_429` across unrelated stores, and the sweep kept asking all 20
+# every hour. 2026-10-08 ~00:20Z: a FRESH crawl NAT IP got the same 429 on its very first request (the
+# headers below, measured). Everything here is driven through the REAL preflight over a MockTransport, so
+# the guard is tested against what the producer actually emits.
+
+_MEASURED_429 = {"server": "cloudflare", "retry-after": "60", "content-type": "text/plain"}
+_CHALLENGE = {"server": "cloudflare", "cf-mitigated": "challenge", "content-type": "text/html"}
+_EXTRA_STORES = tuple(f"store{i}.example" for i in range(1, 7))  # + flowerbeauty + judydoll = 8
+_LONG_AGO = "2026-10-01 12:00:00"  # a literal: Postgres reads it in the session's zone, SQLite as UTC
+
+
+async def _throttle_population():
+    """The `_population` fixture's two merchants plus six more Reap merchants, each holding a LIVE
+    positive window, every one last checked long ago (so the due order is by key)."""
+    for domain in _EXTRA_STORES:
+        await database.execute(
+            "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
+            "market_country, enabled) VALUES (:d, '', '', 'US', TRUE)", {"d": domain})
+    domains = ("flowerbeauty.com", "judydoll.com") + _EXTRA_STORES
+    for domain in domains:
+        await mp.record_check(domain, "US", res("ELIGIBLE", card=True, host=domain))
+    # One earlier CONFIRMED negative on one store, so a throttle visibly does not touch the count.
+    await mp.record_check("store1.example", "US", res("PRICE_DRIFT", card=True, host="store1.example"))
+    await database.execute(f"UPDATE {TABLE} SET checked_at = '{_LONG_AGO}'")
+    return domains
+
+
+def _fake_clock_pacer(monkeypatch, interval_s=None):
+    """ONE fake clock for the pacer AND the breaker's window (`crawl_ip_throttle._now`), so request
+    spacing is what the breaker measures -- with the real monotonic clock every test throttle would
+    land within milliseconds and no window could ever be shown to matter."""
+    import services.crawl_ip_throttle as cit
+    from jobs.tierb_cart_link_eligibility import MIN_REQUEST_INTERVAL_S, RequestPacer
+
+    clock = {"t": 1000.0}
+
+    async def _sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(cit, "_now", lambda: clock["t"])
+    monkeypatch.setattr(sweep, "_new_pacer", lambda: RequestPacer(
+        interval_s or MIN_REQUEST_INTERVAL_S, clock=lambda: clock["t"], sleep=_sleep))
+    return clock
+
+
+def _storefront(monkeypatch, answer):
+    """Every request of the run goes to `answer(request)`; returns the list of requests seen."""
+    seen = []
+
+    def _handler(request):
+        seen.append(request)
+        return answer(request)
+
+    monkeypatch.setattr(sweep, "_inner_transport", lambda via: httpx.MockTransport(_handler))
+    return seen
+
+
+def _ip_throttle_line(out: str) -> dict:
+    lines = [line for line in out.splitlines() if line.startswith(sweep.IP_THROTTLE_PREFIX)]
+    assert len(lines) == 1, out[-3000:]
+    return json.loads(lines[0][len(sweep.IP_THROTTLE_PREFIX):])
+
+
+@pytest.fixture
+def _armed(monkeypatch):
+    import services.crawl_ip_throttle as cit
+    import services.crawl_politeness as cp
+
+    cp.reset_for_tests()
+    cit.reset_for_tests()
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    for name in ("MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS",
+                 "MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS",
+                 "CRAWL_IP_THROTTLE_BREAKER_ENABLED", "CRAWL_SHOPIFY_EDGE_PACER_ENABLED"):
+        monkeypatch.delenv(name, raising=False)
+    _fake_clock_pacer(monkeypatch)
+    yield
+    cp.reset_for_tests()
+    cit.reset_for_tests()
+
+
+@pytest.mark.parametrize("status, headers, detail", [
+    (429, _MEASURED_429, "resolve:throttled_429"),
+    (403, _CHALLENGE, "resolve:throttled_challenge_403"),
+    # Cloudflare can serve its challenge with a 200: the preflight says throttled, and the breaker counts it.
+    (200, _CHALLENGE, "resolve:throttled_challenge_200"),
+])
+async def test_an_ip_throttle_stops_the_run_and_demotes_nobody(
+    _db, _population, _armed, monkeypatch, capsys, status, headers, detail
+):
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(status, headers=headers, text="local_rate_limited"))
+
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    # THE RUN STOPPED after the third distinct merchant: three requests, not eight (or 20 an hour).
+    assert len(seen) == 3 and len({r.url.host for r in seen}) == 3
+    assert (report.ip_throttled, report.checked, report.throttled, report.unverifiable) == (1, 3, 3, 3)
+    assert (report.written, report.skipped_ip_throttle, report.errors) == (3, 5, 0)
+    assert report.positive == report.negative == 0
+    # A TRIP IS NOT A FAILURE: the job runs hourly and "Cloud Run job failing" pages on any failed task,
+    # so a 14-17 h throttle window would page every hour. The IP_THROTTLE line is the signal.
+    assert sweep.exit_code_for(report) == sweep.EXIT_OK
+    assert not hasattr(sweep, "EXIT_IP_THROTTLED")
+
+    contacted = {r.url.host for r in seen}
+    for domain in domains:
+        row = await _row(domain)
+        # NOBODY IS DEMOTED: every window stands, every failure count is what it was.
+        assert row["positive_until"] is not None, domain
+        assert await mp.is_purchasable(domain, "US"), domain
+        assert row["consecutive_failures"] == (1 if domain == "store1.example" else 0), domain
+        if domain in contacted:
+            assert row["verdict"] == "TRANSPORT_ERROR"
+            assert row["evidence"]["retryable"] is True and row["evidence"]["detail"] == detail
+        else:
+            # NOTHING WRITTEN for a merchant the stopped run did not contact.
+            assert row["verdict"] == "ELIGIBLE"
+            assert row["checked_at"] < datetime(2026, 10, 5, tzinfo=timezone.utc), "its checked_at moved"
+
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["job"] == "merchant-purchasability-sweep" and line["status"] == "ip_throttled"
+    assert line["ip_throttled"] is True and line["ip_throttle_trip_host_count"] == 3
+    assert line["ip_throttle_tripped_at"] and line["ip_throttle_first_429_at"]
+    assert (line["throttled_checks"], line["skipped_for_ip_throttle"]) == (3, 5)
+    assert line["throttle_diagnostics"]["responses"] == 3
+    assert line["throttle_diagnostics"]["cf_mitigated"] == (3 if "cf-mitigated" in headers else 0)
+    assert not any(domain in json.dumps(line) for domain in domains), "the line lists no host"
+
+
+async def test_the_next_run_starts_with_the_merchants_a_stopped_run_did_not_reach(
+    _db, _population, _armed, monkeypatch
+):
+    """THE STARVATION GUARD. A stopped run writes its throttled checks, so their `checked_at` moves and
+    they sink to the back of the due list; the next run probes the address with OTHER merchants. Were
+    they left unwritten, the same few stores would head every run and trip it before anyone else."""
+    await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+
+    first = await sweep.run_merchant_purchasability_sweep()
+    hosts_first = {r.url.host for r in seen}
+    seen.clear()
+    second = await sweep.run_merchant_purchasability_sweep()
+    hosts_second = {r.url.host for r in seen}
+
+    assert first.ip_throttled == second.ip_throttled == 1
+    assert len(hosts_first) == len(hosts_second) == 3
+    assert not hosts_first & hosts_second, (hosts_first, hosts_second)
+    # And the merchants throttled in BOTH halves still hold their windows.
+    for host in hosts_first | hosts_second:
+        assert await mp.is_purchasable(host, "US"), host
+
+
+async def test_two_throttled_merchants_do_not_stop_the_run(_db, _population, _armed, monkeypatch, capsys):
+    """Below the trip count the run carries on: every merchant is asked, the two throttled checks are
+    recorded as unverifiable, and the run exits 0."""
+    domains = await _throttle_population()
+    throttling = {"store1.example", "store2.example"}
+
+    def _answer(request):
+        if request.url.host in throttling:
+            return httpx.Response(429, headers=_MEASURED_429)
+        return httpx.Response(404, text="not found")  # the store answered; nothing to do with a throttle
+
+    seen = _storefront(monkeypatch, _answer)
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    assert {r.url.host for r in seen} == set(domains)
+    assert (report.ip_throttled, report.throttled, report.skipped_ip_throttle) == (0, 2, 0)
+    assert report.checked == len(domains) and sweep.exit_code_for(report) == sweep.EXIT_OK
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["status"] == "ok" and line["ip_throttled"] is False
+    assert line["ip_throttle_hosts"] == 2
+
+
+@pytest.mark.parametrize("env", [
+    {"MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS": "0"},
+    {"CRAWL_IP_THROTTLE_BREAKER_ENABLED": "false"},
+])
+async def test_the_breaker_kill_switches_let_the_run_finish(_db, _population, _armed, monkeypatch, capsys, env):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    assert {r.url.host for r in seen} == set(domains)
+    assert (report.ip_throttled, report.throttled, report.skipped_ip_throttle) == (0, len(domains), 0)
+    for domain in domains:
+        assert await mp.is_purchasable(domain, "US"), "disarmed or not, a throttle demotes nobody"
+    line = _ip_throttle_line(capsys.readouterr().out)
+    assert line["ip_throttle_breaker_armed"] is False and line["ip_throttle_hosts"] == len(domains)
+
+
+async def test_proxy_vantage_throttles_do_not_trip_the_crawl_ip_breaker(_db, _population, _armed, monkeypatch):
+    """The proxy vantage leaves from another address: its 429s say nothing about the crawl IP."""
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    domains = await _throttle_population()
+    seen = []
+
+    def _transport(via):
+        def _handler(request):
+            seen.append((via, request.url.host))
+            if via:
+                return httpx.Response(429, headers=_MEASURED_429)
+            return httpx.Response(404, text="not found")
+        return httpx.MockTransport(_handler)
+
+    monkeypatch.setattr(sweep, "_inner_transport", _transport)
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.ip_throttled == 0 and report.throttled == len(domains)
+    assert {host for via, host in seen if via is None} == set(domains)
+
+
+def test_the_sweep_breaker_folds_www_and_counts_a_challenge():
+    """One merchant answering from its apex and its `www.` twin is ONE key; a Cloudflare challenge
+    counts as a throttle (the parent breaker counts 429 / 503 + Retry-After only)."""
+    from services.crawl_ip_throttle import capture_throttle_headers
+
+    breaker = sweep.SweepThrottleBreaker(trip_hosts=2, window_seconds=600)
+    throttle = capture_throttle_headers(httpx.Headers(_MEASURED_429))
+    breaker.observe("www.a.example", 429, throttle)
+    breaker.observe("a.example", 429, throttle)
+    assert not breaker.tripped, "apex + www is one merchant"
+    breaker.observe("b.example", 403, capture_throttle_headers(httpx.Headers({"server": "cloudflare"})))
+    assert not breaker.tripped, "a plain 403 is not a throttle"
+    breaker.observe("b.example", 403, capture_throttle_headers(httpx.Headers(_CHALLENGE)))
+    assert breaker.tripped and breaker.trip_host_count == 2
+
+
+async def test_a_trip_refuses_the_rest_of_that_merchants_vantages_and_writes_nothing_for_them(
+    _db, _population, _armed, monkeypatch
+):
+    """With a proxy vantage, the merchant whose crawl-IP answer trips the breaker still has its proxy
+    check to run. It is refused LOCALLY (no request leaves), and the refusal is not written as a fact."""
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    await _throttle_population()
+    seen = []
+
+    def _transport(via):
+        def _handler(request):
+            seen.append((via, request.url.host))
+            return httpx.Response(404, text="nf") if via else httpx.Response(429, headers=_MEASURED_429)
+        return httpx.MockTransport(_handler)
+
+    monkeypatch.setattr(sweep, "_inner_transport", _transport)
+    report = await sweep.run_merchant_purchasability_sweep()
+
+    direct = [host for via, host in seen if via is None]
+    proxied = [host for via, host in seen if via]
+    assert len(direct) == 3 and proxied == direct[:2], seen
+    assert report.ip_throttled == 1 and report.checked == 5 and report.written == 5
+    # 8 merchants x 2 vantages = 16 pairs: 5 checked, the tripping merchant's proxy pair refused, 10 not started.
+    assert report.skipped_ip_throttle == 11 and report.errors == 0
+    tripper = direct[2]
+    proxy_rows = [r for r in await mp.list_facts(tripper, "US") if r["vantage"] == "proxy"]
+    assert proxy_rows == [], "a locally refused check was written as a fact"
+
+
+def test_the_breaker_defaults_are_three_merchants_within_one_run():
+    """Pinned: the setup script does not set them, so these ARE prod's values."""
+    assert sweep.DIALS["ip_throttle_trip_hosts"].default == 3
+    assert sweep.DIALS["ip_throttle_window_seconds"].default == 1200
+    breaker = sweep._new_breaker()
+    assert (breaker.trip_hosts, breaker.window_seconds, breaker.enabled) == (3, 1200.0, True)
+
+
+@pytest.mark.parametrize("window, trips", [("60", False), ("1200", True)])
+async def test_the_window_is_measured_on_the_request_clock(_db, _population, _armed, monkeypatch, window, trips):
+    """Merchants 40 s apart on the request clock: 3 throttles span 80 s, so a 60 s window never holds three,
+    and the default window does. A breaker whose window could not see the spacing would trip both or neither."""
+    _fake_clock_pacer(monkeypatch, interval_s=40.0)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS", window)
+    domains = await _throttle_population()
+    seen = _storefront(monkeypatch, lambda r: httpx.Response(429, headers=_MEASURED_429))
+    report = await sweep.run_merchant_purchasability_sweep()
+    assert report.ip_throttled == int(trips)
+    assert len(seen) == (3 if trips else len(domains))
+
+
+async def test_web_bot_auth_signs_the_direct_vantage_and_leaves_the_proxy_vantage_a_buyer(_db, monkeypatch, _population):
+    """CRAWL_WEB_BOT_AUTH_ENABLED + key: a real sweep run. Requests from the crawl egress (direct
+    vantage) are signed and declare PivotaBot; the proxy vantage, which stands in for a buyer's network
+    and leaves from an unregistered address, stays unsigned with the lane's own User-Agent."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from services import crawl_identity
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
+    monkeypatch.setenv("VANTAGE_PROXY_URL", "http://vantage-proxy.example:3128")
+    monkeypatch.setenv(crawl_identity.FLAG_ENV, "true")
+    monkeypatch.setenv(crawl_identity.KEY_ENV, Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode())
+    crawl_identity.reset_for_tests()
+    seen = []
+
+    def _transport(*a, proxy=None, **k):
+        return httpx.MockTransport(lambda r: seen.append((proxy, r)) or httpx.Response(200, text="ok"))
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _transport)
+
+    async def _two_requests(host, **kwargs):
+        for path in ("/cart/1:1", "/checkouts/cn/T"):
+            await kwargs["client"].get(f"https://{host}{path}")
+        return res("ELIGIBLE", card=True, host=host)
+
+    monkeypatch.setattr(sweep, "_preflight", _two_requests)
+    await sweep.run_merchant_purchasability_sweep()
+    direct = [r for proxy, r in seen if proxy is None]
+    via_proxy = [r for proxy, r in seen if proxy]
+    assert direct and via_proxy
+    assert all(r.headers["user-agent"] == crawl_identity.DECLARED_USER_AGENT and "signature" in r.headers for r in direct)
+    assert all(r.headers["user-agent"] == sweep.USER_AGENT and "signature" not in r.headers for r in via_proxy)
+    crawl_identity.reset_for_tests()
+
+
+# ══ the HUMAN-HANDOFF reader (2026-10-09) ═══════════════════════════════════════════════════
+#
+# `is_purchasable` answers the headless card rail; `human_handoff_allowed` answers the cart mints
+# that hand a prefilled cart to a human. They part on NO_CARD_PAYMENT: a checkout read with no
+# on-site card line refuses the rail and keeps the human cart, because a human pays by whatever the
+# checkout offers (PayPal, an offsite card provider, a bank transfer). Measured 2026-10-09: 643 of
+# 839 negative cart seeds were NO_CARD_PAYMENT. Peng's decision.
+
+_HUMAN_ALLOWED = {"ELIGIBLE", "NO_CARD_PAYMENT", "PRICE_DRIFT"}
+
+
+def test_the_human_allow_list_partitions_every_verdict_with_the_rails_sets():
+    """Every verdict is exactly one of: human-allowed, a nobody-can-buy negative, or unverifiable
+    — so a verdict added to the enum lands in a test, not in a silent default."""
+    every = {v.value for v in Verdict}
+    assert mp.HUMAN_HANDOFF_VERDICTS == _HUMAN_ALLOWED
+    nobody_can_buy = set(mp.NEGATIVE_VERDICTS) - mp.HUMAN_HANDOFF_VERDICTS
+    assert nobody_can_buy == {"LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS", "VARIANT_GONE"}
+    assert mp.HUMAN_HANDOFF_VERDICTS.isdisjoint(UNVERIFIABLE)
+    assert mp.HUMAN_HANDOFF_VERDICTS | nobody_can_buy | set(UNVERIFIABLE) == every, (
+        every - (mp.HUMAN_HANDOFF_VERDICTS | nobody_can_buy | set(UNVERIFIABLE)))
+    assert "PASSWORD_PAGE" in UNVERIFIABLE, "a password wall declines the human cart too"
+
+
+@pytest.mark.parametrize("verdict", sorted(v.value for v in Verdict))
+async def test_every_verdict_answers_the_human_reader_from_a_real_row(_db, verdict):
+    """CONTRACT over real `record_check` rows: one fresh row per verdict, from the buyer vantage.
+    The card flag is whatever that verdict would carry (False for NO_CARD_PAYMENT, True for
+    ELIGIBLE, unknown otherwise); it never decides the human answer."""
+    card = {"ELIGIBLE": True, "NO_CARD_PAYMENT": False}.get(verdict)
+    assert await mp.record_check("judydoll.com", "US", res(verdict, card=card)) is not None
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is (verdict in _HUMAN_ALLOWED), verdict
+    # The rail's reader is unchanged: only ELIGIBLE + card opens it.
+    assert await mp.is_purchasable("judydoll.com", "US") is (verdict == "ELIGIBLE")
+
+
+async def test_a_no_card_payment_row_keeps_the_human_cart_however_many_times_it_repeats(_db):
+    """Two consecutive NO_CARD_PAYMENT checks DEMOTE the rail (rule 2) — and the human cart stays,
+    because demotion is `positive_until`, which this reader does not consult."""
+    for _ in range(3):
+        await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
+    row = await _row("flowerbeauty.com")
+    assert row["consecutive_failures"] == 3 and row["positive_until"] is None
+    assert await mp.is_purchasable("flowerbeauty.com", "US") is False
+    assert await mp.human_handoff_allowed("flowerbeauty.com", "US") is True
+
+
+async def test_a_stale_fact_does_not_open_the_human_cart(_db):
+    """Freshness is the LAST CHECK inside the TTL, not `positive_until`. A row nobody has
+    re-checked for longer than the TTL says nothing about today's checkout."""
+    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    past = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() + 1)
+    await _set("checked_at", past.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else past)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+    # Just inside the window still answers.
+    recent = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() - 1)
+    await _set("checked_at", recent.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else recent)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+
+async def test_the_human_reader_reads_the_buyer_vantage_only(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False, "default vantage is worker"
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "proxy")
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+
+async def test_the_human_reader_is_per_market_and_never_defaults_one(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    assert await mp.human_handoff_allowed("judydoll.com", "SG") is False
+    calls = []
+    real = database.fetch_one
+
+    async def _spy(*a, **k):
+        calls.append(a)
+        return await real(*a, **k)
+
+    monkeypatch.setattr(database, "fetch_one", _spy)
+    for unknown in (None, "", "  ", "USA", "U1"):
+        assert await mp.human_handoff_allowed("judydoll.com", unknown) is False
+    assert calls == [], "an unknown market is answered without a database read"
+
+
+async def test_the_human_reader_fails_closed_when_the_database_raises(_db, monkeypatch):
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+
+    async def _explode(*args, **kwargs):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(database, "fetch_one", _explode)
+    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+
+
+async def test_the_ops_route_publishes_the_human_tier_beside_the_rails(_db, ops_app, monkeypatch):
+    """The gateway's gate strips a human cart on `tier`; it must have the human answer to read
+    instead. The two part on NO_CARD_PAYMENT and nowhere else in this table."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("luafee.com", "US", res("NOT_ACCEPTING_ORDERS"))
+    expected = {
+        "judydoll.com": ("purchase", "purchase"),
+        "flowerbeauty.com": ("browse_only", "purchase"),
+        "luafee.com": ("browse_only", "browse_only"),
+        "never-seen.com": ("browse_only", "browse_only"),
+    }
+    for domain, (tier, human) in expected.items():
+        body = (await ops_get(ops_app, f"/ops/merchant-purchasability?domain={domain}&market=US")).json()
+        assert (body["tier"], body["human_handoff_tier"]) == (tier, human), domain
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com")).json()
+    assert (body["tier"], body["human_handoff_tier"], body["reason"]) == (
+        "browse_only", "browse_only", "market_unknown")

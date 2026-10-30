@@ -773,7 +773,7 @@ async def get_review_summary_for_sku(
         ),
         database.fetch_all(
             f"""
-            SELECT r.id, r.merchant_id, r.rating,
+            SELECT r.id, r.merchant_id, r.product_key, r.sku_key, r.group_id, r.rating,
                    r.title,
                    COALESCE(NULLIF(r.body_redacted, ''), r.body) AS body_effective,
                    r.created_at,
@@ -839,6 +839,14 @@ async def get_review_summary_for_sku(
             preview_media_by_review[rid] = {
                 "type": _as_text(_row_get(mr, "type")) or "image",
                 "url": signed_url,
+                "role": "customer_review",
+                "provenance": {
+                    "source_type": "customer_review",
+                    "review_id": str(rid),
+                    "source_record_id": pid or str(mid),
+                    "verification_status": "review_linked",
+                    "moderation_status": "active",
+                },
             }
     preview_items: List[Dict[str, Any]] = []
     for pr in preview_rows:
@@ -860,7 +868,21 @@ async def get_review_summary_for_sku(
             item["title"] = title_text
         preview_media = preview_media_by_review.get(rid)
         if preview_media:
-            item["media"] = [preview_media]
+            # A shared review group is NOT a product-line/review-family identity.
+            # Only exact source-listing proof can mark this asset exact_item.
+            evidence = dict(preview_media["provenance"])
+            evidence["merchant_id"] = str(pr["merchant_id"])
+            exact_listing = (
+                _as_text(_row_get(pr, "product_key")) == product_key
+                and str(pr["merchant_id"]) == _as_text(merchant_id)
+            )
+            if exact_listing:
+                evidence.update({"scope": "exact_item", "product_id": _as_text(platform_product_id)})
+            elif _row_get(pr, "group_id") is not None:
+                evidence.update({"scope": "review_group", "review_group_id": str(_row_get(pr, "group_id"))})
+            else:
+                evidence["scope"] = "unknown"
+            item["media"] = [{**preview_media, "provenance": evidence}]
         preview_items.append(
             item
         )
@@ -881,6 +903,10 @@ async def get_review_summary_for_sku(
         "scale": 5,
         "rating": rating,
         "review_count": review_count,
+        # Successful storage read establishes only this linked review scope, not
+        # whether the merchant has reviews not yet collected or linked here.
+        "availability_state": "ready" if review_count > 0 else "empty",
+        "review_scope": "linked_review_store",
         "rating_count": rated_review_count,
         "star_distribution": star_distribution,
         "preview_items": preview_items,

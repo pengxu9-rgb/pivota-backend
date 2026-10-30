@@ -62,6 +62,7 @@ def _offer(offer_id, *, sku=None, vid=None, currency="USD", merchant=SELLER, sou
         "payload_seed_id": payload_seed,
         "suppressed": suppressed,
         "source_variant_id": vid,
+        "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
     }
 
 
@@ -148,7 +149,91 @@ def test_the_sg_row_takes_an_sgd_read_in_its_own_currency():
 
 
 def test_a_seed_with_no_currency_writes_nothing():
+    """No currency the seed can vouch for: refused before any row is planned, and counted with the
+    mirror lane's refusals (`refused_currency` is a structural skip)."""
     plan = _plan(_seed(price_currency=None), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+def _projected(offer_id, source_system="variant_identity_backfill_v1", **kw):
+    row = _offer(offer_id, **kw)
+    row["source_system"] = source_system
+    return row
+
+
+# skintific.com's shape on the sync path: column USD, page read AUD (projected), and the readers'
+# own answer, projected: the seed states none.
+_DISAGREEING = {"price_currency": "USD", "snapshot_price_currency": "AUD", "seed_currency": None}
+
+
+@pytest.mark.parametrize("source_system", [
+    "external_product_seeds_mirror_v1", "variant_identity_backfill_v1", "variant_offer_projection_v1",
+])
+def test_rows_the_readers_withhold_are_not_repriced(source_system):
+    """PR controller review of #2657 (H1): a seed-projected row of a seed the readers cannot price was
+    re-priced and stamped fresh every night. Every live row is such a row here, so the seed is refused."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+@pytest.mark.parametrize("source_system", ["catalog_enrichment_agent_v1", "variant_identity_backfill_v1", None])
+def test_a_read_reprices_no_row_of_a_seed_with_no_currency(source_system):
+    """Peng 2026-10-22, after #2657 (M2): a READ of a seed whose currency nobody can state (us.oiolab.co:
+    column USD, page EUR) re-prices no row, whoever wrote it."""
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_canon", source_system)], source="refresh")
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+def test_an_employee_edit_reprices_the_rows_another_writer_owns():
+    """Peng 2026-10-22: an explicit employee edit is a person vouching for the column's currency and
+    amount, so it re-prices the listing's enrichment row as on main; the seed-projected row stays refused
+    (#2657). The same seed under a refresh writes nothing (above)."""
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows, source="employee_edit", currency_read=False)
+    assert plan["status"] == "planned"
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+    assert plan["skips"] == {"refused_currency": 1}
+
+
+def test_an_employee_edit_never_reprices_seed_projected_rows():
+    plan = _plan(_seed(**_DISAGREEING), [_projected("of_copy")], source="employee_edit", currency_read=False)
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 1})
+
+
+def test_the_refusal_counts_live_rows_only():
+    """A suppressed row of the listing is not one the lane would have written, so it is not counted
+    as refused (PR controller review of #2665, M10)."""
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _offer("of_gone", sku=f"{PK}::v:47761881301179", vid="47761881301179", suppressed=True)]
+    plan = _plan(_seed(**_DISAGREEING), rows)
+    assert (plan["status"], plan["skips"]) == ("refused_currency", {"refused_currency": 1})
+
+
+def test_a_mixed_listing_is_refused_whole_by_a_read():
+    rows = [_projected("of_canon", "catalog_enrichment_agent_v1"),
+            _projected("of_copy", sku=f"{PK}::canonical")]
+    plan = _plan(_seed(**_DISAGREEING), rows, source="refresh")
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("refused_currency", [], {"refused_currency": 2})
+
+
+def test_an_agreeing_seed_writes_its_projected_rows():
+    plan = _plan(_seed(price_currency="USD", snapshot_price_currency="USD", seed_currency="USD"),
+                 [_projected("of_canon")])
+    assert plan["writes"] == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+
+
+def test_a_blank_column_writes_nothing_even_with_a_page_read():
+    """M1 of the #2657 review: main required a column currency, and a lone page read must not start
+    writing seeds this lane never wrote."""
+    for row in (_offer("of_canon", currency="AUD"), _projected("of_canon", currency="AUD")):
+        plan = _plan(_seed(price_currency=None, snapshot_price_currency="AUD", seed_currency="AUD", price_amount=56), [row])
+        assert (plan["status"], plan["writes"]) == ("refused_currency", [])
+
+
+def test_a_row_currency_is_read_as_the_readers_read_it():
+    """'USD\t' is not 'USD' to SQL's trim() (spaces only), so the row is not this seed's currency."""
+    plan = _plan(_seed(), [_offer("of_canon", currency="USD\t")])
     assert plan["writes"] == [] and plan["skips"] == {"currency_mismatch": 1}
 
 
@@ -252,16 +337,25 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "attached"
     assert result["status"] in mod.OFFER_SYNC_WRITTEN_STATUSES
-    assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD"}]
+    assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD",
+                             "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
+                             # who vouched for the read (offer_payload.price_read_source)
+                             "read_source": "refresh"}]
     assert fake.executed == [], "the attached lane never upserts: it only prices existing rows"
 
 
 def test_the_mirror_still_wins_when_the_seed_has_one(monkeypatch):
+    from unittest.mock import AsyncMock
+    from services import catalog_variant_offer_projection
+
+    project = AsyncMock(return_value={"planned": 0, "inserted": 0, "skips": {}})
+    monkeypatch.setattr(catalog_variant_offer_projection, "project_missing_variant_offers", project)
     fake = FakeDB(seed=_seed(), mirror={"product_key": "prod::merch_obs_x::external_seed::e",
                                         "merchant_id": "merch_obs_x"}, offers=[_offer("of_canon")])
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "mirror"
     assert fake.updates == [] and len(fake.executed) == 1
+    project.assert_awaited_once_with(fake.mirror["product_key"], apply=True, db=fake)
 
 
 def test_an_unattached_seed_without_a_mirror_is_still_no_mirror_product(monkeypatch):
@@ -356,6 +450,44 @@ def test_an_employee_edit_is_not_bounded_and_moves_only_the_product_row():
     assert plan["skips"] == {"variant_not_edited": 1}
 
 
+def test_a_column_with_a_trailing_newline_no_longer_writes_an_enrichment_row():
+    """PR controller review of #2657 (B6). Main compared `.strip()`-ed codes, so a column of 'USD\\n' re-priced a USD row. The lane now
+    reads a code as SQL's trim() does (spaces only), as the readers do: 'USD\\n' is not 'USD', and
+    the row is a currency_mismatch, the withholding direction."""
+    plan = _plan(_seed(price_currency="USD\n"), [_offer("of_canon")])
+    assert (plan["status"], plan["writes"], plan["skips"]) == ("planned", [], {"currency_mismatch": 1})
+
+
+def test_an_employee_edits_refused_rows_are_logged(monkeypatch, caplog):
+    import logging
+
+    fake = FakeDB(seed=_seed(**_DISAGREEING),
+                  offers=[_projected("of_canon", "catalog_enrichment_agent_v1"),
+                          _projected("of_copy", sku=f"{PK}::canonical")])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake, source="employee_edit", currency_read=False)
+    assert (result["status"], result["offers_written"], result["offer_skips"]) == ("synced", 1, {"refused_currency": 1})
+    assert [u["offer_id"] for u in fake.updates] == ["of_canon"]
+    assert any("refused_currency" in str(r.msg) and "'rows_refused': 1" in str(r.msg) for r in caplog.records)
+
+
+def test_a_refused_seed_is_logged_and_stamps_nothing(monkeypatch, caplog):
+    """Through the real sync: a mixed listing of a seed with no currency of its own writes no row,
+    enrichment row included, and the refusal gets its warning line."""
+    import logging
+
+    fake = FakeDB(seed=_seed(**_DISAGREEING),
+                  offers=[_projected("of_canon", "catalog_enrichment_agent_v1"),
+                          _projected("of_copy", sku=f"{PK}::canonical")])
+    with caplog.at_level(logging.WARNING, logger=mod.logger.name):
+        result = _sync(monkeypatch, fake)
+    assert result["status"] == "refused_currency"
+    assert result["status"] in mod.OFFER_SYNC_STRUCTURAL_SKIP_STATUSES
+    assert fake.updates == []
+    assert any("external_offer_attached_refused" in str(r.msg) and "refused_currency" in str(r.msg)
+               and "'rows_refused': 2" in str(r.msg) for r in caplog.records)
+
+
 def test_refused_rows_are_logged_for_review(monkeypatch, caplog):
     import logging
 
@@ -376,3 +508,69 @@ def test_the_ratio_env_knob_refuses_nonsense(monkeypatch):
     for bad in ("0.5", "1", "abc"):
         monkeypatch.setenv("EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO", bad)
         assert mod.max_price_ratio() == 3.0
+
+@pytest.mark.parametrize('variants,reason', [
+    ([{'variant_id':'47761881301180','price_amount':38,'price_currency':'EUR'}], 'variant_currency_mismatch'),
+    ([{'variant_id':'47761881301180','price_amount':38,'price_currency':'USD','currency':'EUR'}], 'variant_currency_mismatch'),
+    ([{'variant_id':'47761881301180','price_amount':38,'price':39}], 'variant_price_alias_conflict'),
+    ([{'variant_id':'47761881301180','price_amount':38}, {'variant_id':'47761881301180','price_amount':38}], 'ambiguous_variant_identity'),
+    ([{'variant_id':'47761881301180','id':'47761881301181','price_amount':38}], 'variant_identity_conflict'),
+    ([{'variant_id':'47761881301180','price_amount':float('inf')}], 'no_variant_price'),
+])
+def test_contradictory_variant_evidence_never_prices_an_offer(variants,reason):
+    offer = _offer('of_v2',sku=f'{PK}::v:47761881301180',vid='47761881301180')
+    plan = _plan(_seed(seed_variants=variants),[offer])
+    assert plan['writes'] == [] and plan['skips'] == {reason:1}
+
+@pytest.mark.parametrize('price',[float('inf'),float('nan'),1e11,0.0001])
+def test_unrepresentable_seed_money_is_never_stamped_fresh(price):
+    plan = _plan(_seed(price_amount=price),[_offer('of_canon')])
+    assert plan['writes'] == [] and plan['skips'] == {'no_seed_price':1}
+
+@pytest.mark.parametrize('source',['refresh','employee_edit'])
+def test_listing_projection_cannot_supersede_reviewed_native_money(source):
+    offer = _offer('of_canon'); offer['price_repaired'] = True
+    plan = _plan(_seed(),[offer],source=source)
+    assert plan['writes'] == [] and plan['skips'] == {'reviewed_price_repair':1}
+
+def test_an_offer_whose_sku_currency_disagrees_is_not_repriced():
+    offer = _offer('of_canon'); offer['sku_currency'] = 'EUR'
+    plan = _plan(_seed(),[offer])
+    assert plan['writes'] == [] and plan['skips'] == {'sku_currency_mismatch':1}
+
+@pytest.mark.parametrize('raw',['inf','nan','-inf'])
+def test_nonfinite_projection_ratio_uses_the_conservative_default(monkeypatch,raw):
+    monkeypatch.setenv('EXTERNAL_OFFER_PROJECTION_MAX_PRICE_RATIO',raw)
+    assert mod.max_price_ratio() == 3
+
+@pytest.mark.parametrize('change',[
+    {'payload_dest':DEST+'-other','source_ref':None},
+    {'source_ref':DEST+'-other','payload_dest':DEST},
+    {'payload_seed':'another-seed'},
+])
+def test_seed_identity_does_not_override_a_conflicting_listing(change):
+    seed=_seed()
+    offer=_offer('old-listing',payload_seed=seed['id'])
+    offer.update({'payload_destination_url' if k=='payload_dest' else 'payload_seed_id' if k=='payload_seed' else k:v
+                  for k,v in change.items()})
+    assert _plan(seed,[offer])['status'] == 'no_listing_offer'
+
+
+def test_equivalent_numeric_and_gid_aliases_name_the_same_variant():
+    seed=_seed(seed_variants=[{'variant_id':'47761881301180',
+                             'id':'gid://shopify/ProductVariant/47761881301180',
+                             'price_amount':38,'price_currency':'USD'}])
+    offer=_offer('of_v2',sku=f'{PK}::v:47761881301180',vid='47761881301180')
+    assert _plan(seed,[offer])['writes'] == [{'offer_id':'of_v2','price':38,'currency':'USD'}]
+
+@pytest.mark.parametrize('source_ref',['HTTPS://missha.us/products/other','  https://missha.us/products/other  '])
+def test_url_formatting_cannot_hide_a_conflicting_listing_claim(source_ref):
+    seed=_seed();offer=_offer('other',source_ref=source_ref,payload_dest=None,payload_seed=seed['id'])
+    assert _plan(seed,[offer])['status'] == 'no_listing_offer'
+
+
+def test_the_lane_refuses_an_unknown_price_source():
+    """jsonb_set is strict: a NULL or unknown marker must never reach the write (the check runs before any read)."""
+    for bad in (None, "", "crawl", "EMPLOYEE_EDIT"):
+        with pytest.raises(ValueError):
+            asyncio.run(mod.sync_attached_listing_offers({"id": "s", "attached_product_key": "pk"}, source=bad))

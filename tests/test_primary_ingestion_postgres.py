@@ -93,7 +93,7 @@ async def install_job(db, monkeypatch, planned, *, batch=False, records=None):
         ),
     )
     if planned is not None:
-        monkeypatch.setattr(worker, "ingest_validated_jsonl", lambda _: copy.deepcopy(planned))
+        monkeypatch.setattr(worker, "ingest_validated_jsonl", lambda *_, **__: copy.deepcopy(planned))
     real = writer.apply_ingest_plan
 
     async def apply(*args, **kwargs):

@@ -232,9 +232,17 @@ async def _process_curated_brand(payload: Dict[str, Any], *, apply: bool, db: An
     from services.catalog_enrichment_agent.primary_ingestion import (
         inspect_primary_plan, require_primary_plan, require_primary_apply,
     )
-    plan = ingest_validated_jsonl(records)
+    if db is not None:
+        # Unattended: never move a row off the listing it names (held rows are reported, not moved).
+        from services.catalog_enrichment_agent.apply import plan_with_current_listings
+        plan = await plan_with_current_listings(records, db=db, planner=ingest_validated_jsonl)
+    else:
+        plan = ingest_validated_jsonl(records)
     out = {"records": len(records), "plan_pdps": len(plan.get("pdps") or []), "applied": None,
-           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan)}
+           "crawl": crawl_report, "primary_ingestion": inspect_primary_plan(plan),
+           # Listings left out: another listing on this host has the same title (one content key).
+           "listing_collisions": plan.get("listing_collisions") or [],
+           "listing_moves": plan.get("listing_moves") or []}
     if apply:
         preflight = require_primary_plan(plan)
     if apply and plan.get("pdps"):

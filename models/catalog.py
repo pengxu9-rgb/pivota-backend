@@ -96,6 +96,14 @@ class PivotPaymentContext(BaseModel):
 class PivotQueryRequest(BaseModel):
     query: str
     merchant_id: Optional[str] = None
+    merchant_ids: Optional[List[str]] = Field(default=None, max_length=50)
+    # Canonical shopping constraints are offer-scoped and applied before recall
+    # caps; non-canonical callers retain their existing owner-scoped behavior.
+    price_min: Optional[Decimal] = Field(default=None, ge=0)
+    price_max: Optional[Decimal] = Field(default=None, ge=0)
+    price_currency: Optional[str] = None
+    price_min_exclusive: bool = False
+    price_max_exclusive: bool = False
     market: str = "US"
     limit: int = Field(default=20, ge=1, le=100)
     include_external: bool = True

@@ -97,22 +97,51 @@ if [ "$STORE_AUDIT_COMMERCE_PROBE_RECEIPT_ENABLED" = true ] && [ "$CONFIG" = pre
 fi
 # Staging holds a restored copy of production data and production third-party credentials, so it is
 # IAM-gated by default. Prod is a public API. Override with PUBLIC=1 / PUBLIC=0.
+# UNDER CONFIG=preserve AN UNSET PUBLIC KEEPS WHAT THE SERVICE ALREADY GRANTS (see
+# preserved_public_invoker below): a service that already grants roles/run.invoker to allUsers is
+# redeployed public. Staging `web` became allUsers-invokable on 2026-09-29 (Peng) because the
+# staging gateway calls /agent/internal/auth/introspect without an ID token; ingress stays
+# `internal`. Before this, every preserve deploy of staging ran --no-allow-unauthenticated and
+# silently REVOKED that binding, breaking the staging gateway. An explicit PUBLIC=0 still wins.
 # all-traffic, NOT private-ranges-only. Under private-ranges-only outbound traffic to the public
 # internet does not traverse the VPC, so it never leaves via Cloud NAT and the reserved address is
 # NOT the source IP. `8.231.167.230` is published to Antom/Adyen for allowlisting, so a deploy that
 # reverted this would silently break their IP checks. Verified from inside the VPC: a Cloud Run job
 # on this egress mode reports EGRESS_IP=8.231.167.230.
 : "${VPC_EGRESS:=all-traffic}"
+_PUBLIC_EXPLICIT="${PUBLIC+1}"
 : "${PUBLIC:=$([ "$ENV" = prod ] && echo 1 || echo 0)}"
 # `internal` and `internal-and-cloud-load-balancing` are DIFFERENT values: only the latter admits
 # requests from Google Cloud Load Balancing. Setting plain `internal` on a service behind the LB
 # makes every request through api.pivota.cc fail with a valid certificate and a correct-looking
 # url map - the same "looks built, is not" shape as the unattached backend service.
 : "${INGRESS:=$([ "$ENV" = prod ] && echo internal-and-cloud-load-balancing || echo internal)}"
-[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 GCLOUD="${GCLOUD:-gcloud}"
 REGION=us-west1
 SERVICE="${SERVICE:-web}"
+preserved_public_invoker(){ # echoes 1 when the running service grants roles/run.invoker to allUsers
+  # A read failure (no service yet, no permission) echoes nothing: the env default then stands.
+  "$GCLOUD" run services get-iam-policy "$SERVICE" --project "$PROJECT" --region "$REGION" --format=json 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(1 if any(b.get("role") == "roles/run.invoker" and "allUsers" in (b.get("members") or []) for b in (d.get("bindings") or [])) else 0)' 2>/dev/null || true
+}
+if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ]; then
+  _PRESERVED_PUBLIC="$(preserved_public_invoker)"
+  if [ "$_PRESERVED_PUBLIC" = 1 ]; then
+    PUBLIC=1
+    echo "note: $SERVICE already grants roles/run.invoker to allUsers; CONFIG=preserve keeps it (PUBLIC=1). Pass PUBLIC=0 to make it private." >&2
+  elif [ -z "$_PRESERVED_PUBLIC" ]; then
+    # The read failed (no service yet, no permission, expired auth, gcloud/python3 error), so the
+    # default below may REVOKE an allUsers binding nobody can see from here. Say so, loudly.
+    echo "WARNING: could not read $SERVICE's IAM policy in $PROJECT; deploying with --no-allow-unauthenticated," \
+      "which REVOKES any existing allUsers invoker binding. Pass PUBLIC=1 to keep it public, or PUBLIC=0 to confirm private." >&2
+  fi
+fi
+[ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
 if [ "$STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED" = true ] && [ "$SERVICE" != web ]; then
   echo "STORE_AUDIT_UCP_PROBE_RECEIPT_ENABLED is only valid for SERVICE=web." >&2
   exit 2
@@ -407,8 +436,35 @@ probe_health(){ # url -> echoes the status code
   esac
   rm -f /tmp/pivota-health.$$
   echo "   direct probe got $code (ingress-blocked from here); re-probing from inside the VPC" >&2
+  # A PRIVATE SERVICE NEEDS A TOKEN HERE TOO. Being inside the VPC satisfies INGRESS; it does not
+  # satisfy IAM. On 2026-09-29 a staging deploy (PUBLIC=0) of a revision that was Ready and serving
+  # (web-00025-tut, "Application startup complete") was refused: this job called /health with no
+  # Authorization header, Google's front end answered for the app ("The request was not
+  # authenticated ... Empty Authorization header"), and the traffic shift was done by hand. Prod is
+  # public, so prod never reached this line with a private service. deploy_worker.sh learned the
+  # same thing on 2026-09-06.
+  #
+  # The job runs as sa-worker, which holds project-level roles/run.invoker in pivota-staging and
+  # pivota-prod, and mints an ID token from the metadata server. THE AUDIENCE IS THE SERVICE URL,
+  # NOT THE TAG URL BEING CALLED. Measured 2026-09-29 from inside the staging VPC as sa-worker,
+  # calling a tag URL of `web`: aud=<tag URL> -> 401, aud=<service URL> -> 200, no token -> 403.
+  # PROBE_AUDIENCE is set by the caller only when PUBLIC!=1; a public service gets no token at all.
+  #
+  # A token that cannot be minted raises, and so exits non-zero: the failure direction is unchanged.
+  local py="import urllib.request,sys
+q=urllib.request.Request('$url')"
+  if [ -n "${PROBE_AUDIENCE:-}" ]; then
+    py="$py
+t=urllib.request.Request('http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=$PROBE_AUDIENCE')
+t.add_header('Metadata-Flavor','Google')
+q.add_header('Authorization','Bearer '+urllib.request.urlopen(t,timeout=10).read().decode())"
+  fi
+  py="$py
+r=urllib.request.urlopen(q,timeout=25);s=r.status;u=r.geturl();print('PROBE_STATUS='+str(s)+' FINAL_URL='+u);sys.exit(0 if s==200 and u=='$url' else 1)"
   # ^|^ delimiter: gcloud splits --args on COMMAS, and this probe is Python that contains commas
-  # (`,timeout=25`), which would otherwise be shredded into separate argv entries.
+  # (`,timeout=25`), which would otherwise be shredded into separate argv entries. That makes `|`
+  # the one character the program may not contain - refuse rather than run a shredded probe.
+  case "$py" in *"|"*) echo "   the probe program contains a '|', the --args delimiter - not running it" >&2; echo 000; return 0 ;; esac
   local job="verify-$$-$RANDOM"
   local out="" i probe_rc=0 create_rc=0
   "$GCLOUD" run jobs create "$job" --region "$REGION" --project "$PROJECT" \
@@ -416,7 +472,7 @@ probe_health(){ # url -> echoes the status code
     --service-account "sa-worker@$PROJECT.iam.gserviceaccount.com" \
     --network default --subnet default --vpc-egress all-traffic \
     --max-retries 0 --task-timeout 120s --command python \
-    --args="^|^-c|import urllib.request,sys;r=urllib.request.urlopen('$url',timeout=25);s=r.status;u=r.geturl();print('PROBE_STATUS='+str(s)+' FINAL_URL='+u);sys.exit(0 if s==200 and u=='$url' else 1)" \
+    --args="^|^-c|$py" \
     --quiet >/dev/null 2>&1 || create_rc=$?
   # THE VERDICT IS THE JOB'S EXIT CODE, NOT ITS LOGS.
   #
@@ -508,6 +564,13 @@ CAND_URL="${CAND_URL:-$("$GCLOUD" run services describe "$SERVICE" --project "$P
 AUTH=()
 [ "$PUBLIC" = 1 ] || AUTH=(-H "Authorization: Bearer $("$GCLOUD" auth print-identity-token)")
 AUTH_ARGS=(${AUTH[@]+"${AUTH[@]}"})
+# The in-VPC re-probe's token audience (see probe_health): the SERVICE URL even though the probe
+# calls the candidate's TAG URL - a token scoped to the tag URL is rejected 401. Empty when public.
+PROBE_AUDIENCE=""
+if [ "$PUBLIC" != 1 ]; then
+  PROBE_AUDIENCE=$("$GCLOUD" run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format='value(status.url)')
+  [ -n "$PROBE_AUDIENCE" ] || { echo "could not read $SERVICE's URL, so the in-VPC probe cannot authenticate - NOT shifting traffic." >&2; exit 1; }
+fi
 echo "verifying candidate at $CAND_URL"
 CODE=$(probe_health "$CAND_URL/health")
 [ "$CODE" = 200 ] || { echo "candidate health check returned $CODE — NOT shifting traffic. Previous revision still serving." >&2; exit 1; }

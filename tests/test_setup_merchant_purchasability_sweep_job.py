@@ -76,7 +76,11 @@ def _flag(argv: List[str], name: str) -> str:
 
 
 def _env_vars(argv: List[str]) -> Dict[str, str]:
-    return dict(pair.split("=", 1) for pair in _flag(argv, "--set-env-vars").split(","))
+    raw = _flag(argv, "--set-env-vars")
+    # gcloud's alternate-delimiter form: `^|^a=1|b=2,3` splits on `|`, so a value may hold a comma.
+    sep = raw[1] if raw.startswith("^") and raw[2:3] == "^" else ","
+    body = raw[3:] if sep != "," else raw
+    return dict(pair.split("=", 1) for pair in body.split(sep))
 
 
 def test_the_script_parses():
@@ -228,7 +232,10 @@ def test_the_schedule_never_overlaps_the_daily_crawls_on_the_same_address(tmp_pa
     seed_block = seed_block[: seed_block.index("\nelse")]
     seed_timeout = _last_int(r"--task-timeout (\d+)s", helper + seed_block)
     seed_retries = _last_int(r"--max-retries (\d+)", helper + seed_block)
-    assert seed_retries >= 1, "precondition: this is the retry the first schedule missed"
+    # The helper's default retry is still read (the first version of this schedule missed it); since
+    # be#2641 the paced sweep overrides it to 0, after the default, so the override is what counts.
+    assert _last_int(r"--max-retries (\d+)", helper) >= 1, "precondition: mkcrawljob's default retry is read"
+    assert seed_retries == 0, "the sweep's own --max-retries 0 wins over mkcrawljob's default"
 
     for name, theirs in (
         ("tierb-cart-link-eligibility", _windows(tierb_cron, tierb_timeout, tierb_retries)),
@@ -269,3 +276,36 @@ def test_staging_targets_the_staging_project(tmp_path):
     job = _one(calls, "run", "jobs", "create", "merchant-purchasability-sweep")
     assert _flag(job, "--service-account") == "sa-worker@pivota-staging.iam.gserviceaccount.com"
     assert _env_vars(job)["PIVOTA_ENV"] == "staging"
+
+
+def test_the_job_shares_the_shopify_edge_budget_like_the_reap_proof_jobs(tmp_path):
+    """#2474: the sweep's every request already goes through `PacedTransport(shopify_edge=True)`, which is
+    a no-op unless the flag is on in the process. Set exactly as setup_reap_cart_proof_jobs.sh sets it,
+    and the shared RATE is never set here (every job on the address must use one rate). The IP breaker's
+    dials are not pinned: the module's defaults are the documented ones."""
+    proc, calls = _run(tmp_path, "prod", TAG)
+    assert proc.returncode == 0, proc.stderr
+    env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
+    assert env["CRAWL_SHOPIFY_EDGE_PACER_ENABLED"] == "true" and env["CRAWL_SHOPIFY_EDGE_LEASE"] == "2"
+    assert "CRAWL_SHOPIFY_EDGE_RPS" not in env
+    assert not [k for k in env if k.startswith("MERCHANT_PURCHASABILITY_IP_THROTTLE_")]
+
+
+def test_the_env_is_exactly_the_live_jobs_with_both_served_markets(tmp_path):
+    """The whole env, pinned: the `^|^` separator keeps the comma inside PIVOTA_SERVING_PRICING_REGIONS=US,SG,
+    and no two variables may merge (a merged DB_POOL_MIN_SIZE/MAX_SIZE would silently fall back to the
+    default pool). The served markets match web and the drain, so no serving path ever defaults to US alone."""
+    proc, calls = _run(tmp_path, "prod", TAG)
+    assert proc.returncode == 0, proc.stderr
+    env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
+    assert env == {
+        "PIVOTA_ENV": "production", "PIVOTA_SERVICE_NAME": "merchant-purchasability-sweep",
+        "PIVOTA_COMMIT_SHA": TAG, "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
+        "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
+        "MERCHANT_PURCHASABILITY_BUDGET_SECONDS": env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"],
+        "MERCHANT_PURCHASABILITY_BATCH": env["MERCHANT_PURCHASABILITY_BATCH"],
+        "MERCHANT_PURCHASABILITY_SWEEP_ENABLED": "false",
+        "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
+        "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
+    }
+    assert env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"].isdigit() and env["MERCHANT_PURCHASABILITY_BATCH"].isdigit()

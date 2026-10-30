@@ -1,0 +1,98 @@
+{
+ "product": {
+  "id": 9493095285013,
+  "title": "Silky Matte Lip Ink",
+  "handle": "silky-matte-lip-ink",
+  "vendor": "Judydoll-JOY GROUP",
+  "variants": [
+   {
+    "id": 49819267170581,
+    "product_id": 9493095285013,
+    "title": "01 PETAL INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800823",
+    "position": 1
+   },
+   {
+    "id": 49819267203349,
+    "product_id": 9493095285013,
+    "title": "02 PEACH INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800830",
+    "position": 2
+   },
+   {
+    "id": 49819267236117,
+    "product_id": 9493095285013,
+    "title": "03 SAND INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800847",
+    "position": 3
+   },
+   {
+    "id": 49819267268885,
+    "product_id": 9493095285013,
+    "title": "05 ROSY INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800861",
+    "position": 4
+   },
+   {
+    "id": 49819267301653,
+    "product_id": 9493095285013,
+    "title": "07 BURGUNDY INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800885",
+    "position": 5
+   },
+   {
+    "id": 49819267334421,
+    "product_id": 9493095285013,
+    "title": "08 BERRY INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800892",
+    "position": 6
+   },
+   {
+    "id": 49819267367189,
+    "product_id": 9493095285013,
+    "title": "09 MULBERRY INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800908",
+    "position": 7
+   },
+   {
+    "id": 49819267399957,
+    "product_id": 9493095285013,
+    "title": "10 TERRA INK",
+    "price": "13.99",
+    "price_currency": "USD",
+    "compare_at_price": "",
+    "compare_at_price_currency": "",
+    "sku": "6978647800922",
+    "position": 8
+   }
+  ]
+ }
+}

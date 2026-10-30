@@ -16,6 +16,7 @@ from services.agent_webhook_service import (
     send_test_webhook,
     update_webhook_config,
 )
+from services import webhook_delivery_gate
 from utils.auth import get_current_user
 
 
@@ -101,6 +102,8 @@ async def put_agent_webhook_config(
         }
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to save webhook config: {exc}")
 
@@ -126,6 +129,11 @@ async def post_agent_webhook_test(
             agent_id,
             request_id=request.headers.get("x-request-id"),
         )
+        if webhook_delivery_gate.skipped_by_environment(result):
+            raise HTTPException(
+                status_code=webhook_delivery_gate.SKIP_HTTP_STATUS,
+                detail=webhook_delivery_gate.SKIP_DETAIL,
+            )
         return {
             "status": "success",
             "delivery": result,
@@ -163,6 +171,11 @@ async def post_agent_webhook_retry(
     _authorize_agent_scope(agent_id, current_user)
     try:
         delivery = await retry_delivery(agent_id, delivery_id)
+        if webhook_delivery_gate.skipped_by_environment(delivery):
+            raise HTTPException(
+                status_code=webhook_delivery_gate.SKIP_HTTP_STATUS,
+                detail=webhook_delivery_gate.SKIP_DETAIL,
+            )
         return {
             "status": "success",
             "delivery": delivery,

@@ -1,0 +1,19 @@
+{
+  "_doc": "THE market registry (ADR-026 decision 2). One entry per ISO-3166-1 alpha-2 market. services/market_registry.py loads and validates it; every market list and market->currency map in pivota-backend and PIVOTA-Agent is to be derived from it (the gateway reads a generated copy: scripts/generate_market_registry_json.py). status: off | acquisition (ingest and store truthfully, never serve) | shadow (internal and partner-test traffic only) | served. pricing_region: listed in region_pricing's measured-supply map (ADR-024). ingest: a retailer_ingest job may name it. capture: a shopify_markets capture may target it. A change here is reviewed like code; there is no runtime toggle.",
+  "version": 1,
+  "markets": {
+    "US": {"currency": "USD", "status": "served", "pricing_region": true, "ingest": true, "capture": true, "locales": ["en-US"], "price_display": "tax_exclusive"},
+    "SG": {"currency": "SGD", "status": "served", "pricing_region": true, "ingest": true, "capture": true, "locales": ["en-SG"], "price_display": "tax_inclusive"},
+    "AU": {"currency": "AUD", "status": "acquisition", "pricing_region": true, "ingest": true, "capture": false, "locales": ["en-AU"], "price_display": "tax_inclusive"},
+    "JP": {"currency": "JPY", "status": "acquisition", "pricing_region": true, "ingest": true, "capture": false, "locales": ["ja-JP"], "price_display": "tax_inclusive"},
+    "GB": {"currency": "GBP", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["en-GB"], "price_display": "tax_inclusive"},
+    "FR": {"currency": "EUR", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["fr-FR"], "price_display": "tax_inclusive"},
+    "HR": {"currency": "EUR", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["hr-HR"], "price_display": "tax_inclusive"},
+    "FI": {"currency": "EUR", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["fi-FI"], "price_display": "tax_inclusive"},
+    "SE": {"currency": "SEK", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["sv-SE"], "price_display": "tax_inclusive"},
+    "KR": {"currency": "KRW", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["ko-KR"], "price_display": "tax_inclusive"},
+    "HK": {"currency": "HKD", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["zh-HK", "en-HK"], "price_display": "tax_inclusive"},
+    "CA": {"currency": "CAD", "status": "off", "pricing_region": true, "ingest": false, "capture": false, "locales": ["en-CA", "fr-CA"], "price_display": "tax_exclusive"},
+    "NZ": {"currency": "NZD", "status": "off", "pricing_region": false, "ingest": false, "capture": false, "locales": ["en-NZ"], "price_display": "tax_inclusive"}
+  }
+}

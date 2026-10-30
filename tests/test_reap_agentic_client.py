@@ -7154,3 +7154,33 @@ def test_the_alias_flag_has_no_shared_mutable_default(monkeypatch):
     monkeypatch.setattr(_sys, "argv", ["prog"])
     module.main()
     assert seen == [("First",), ()], seen
+
+
+@pytest.mark.parametrize("verb", ["get", "post"])
+async def test_worker_stop_during_client_entry_prevents_new_dispatch(monkeypatch, verb):
+    import httpx
+    import os
+    monkeypatch.setenv("REAP_API_BASE_URL", "https://sandbox.api.reap.global")
+    monkeypatch.setenv("REAP_API_KEY", "synthetic-local-test-key")
+    monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "1")
+    dispatched = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self):
+            monkeypatch.setenv("REAP_AGENTIC_RECONCILE_ENABLED", "0")
+            return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs):
+            dispatched.append(args[0])
+            raise AssertionError("new provider dispatch after stop")
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    token = rc.worker_provider_permission.set(lambda: os.getenv("REAP_AGENTIC_RECONCILE_ENABLED") == "1")
+    try:
+        with pytest.raises(rc.ProviderOperationStopped):
+            if verb == "get":
+                await rc._get("/agentic/checkouts/synthetic")
+            else:
+                await rc._post("/agentic/checkouts", {})
+        assert dispatched == []
+    finally:
+        rc.worker_provider_permission.reset(token)

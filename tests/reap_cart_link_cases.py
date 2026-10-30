@@ -65,6 +65,12 @@ MIGRATIONS = (
     # feedback_a_later_migration_that_alters_a_table_breaks_that_tables_own_parity_test.
     MIGRATIONS_DIR / "233_reap_agentic_purchase_consent.sql",
     MIGRATIONS_DIR / "247_reap_agentic_purchase_offer_code.sql",  # offer code + outcome + discount
+    # 252: at most one PENDING enrollment per buyer (the self-heal builds it too).
+    MIGRATIONS_DIR / "252_reap_agentic_enrollments_one_pending.sql",
+    MIGRATIONS_DIR / "253_reap_checkout_manual_resolution_audit.sql",
+    MIGRATIONS_DIR / "254_reap_enrollment_expiry_provenance.sql",
+    MIGRATIONS_DIR / "256_reap_enrollment_continuation.sql",
+    MIGRATIONS_DIR / "258_reap_price_witness.sql",  # the price witness (dark dials)
 )
 SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 
@@ -94,7 +100,10 @@ ENROLLMENT_CREATED = {
     "nextAction": {
         "type": "REDIRECT",
         "url": "https://pay.prava.space/enroll/3fa85f64",
-        "expiresAt": "2026-09-17T21:00:00Z",
+        # FAR future on purpose: a create whose link is already dead is now RETIRED rather than
+        # handed to the buyer (a replayed attempt; see `_link_is_usable`). The dead-link
+        # case has its own tests.
+        "expiresAt": "2099-01-01T00:00:00Z",
     },
 }
 ENROLLMENT_ACTIVE = {
@@ -186,6 +195,8 @@ async def apply_migrations(paths=MIGRATIONS):
 
 
 async def drop_tables():
+    # Append-only evidence is removed only with the isolated fixture table, never DELETE.
+    await database.execute("DROP TABLE IF EXISTS reap_checkout_dispatch_events")
     await database.execute("DROP TABLE IF EXISTS conversion_click_claims")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_buyer_refs")
     await database.execute("DROP TABLE IF EXISTS reap_agentic_purchases")
@@ -1271,14 +1282,23 @@ async def test_a_503_on_the_quote_refuses_as_not_completable(reap, attribution):
 
 
 @pytest.mark.parametrize(
-    "env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"), ("REAP_AGENTIC_ENABLED", "ture")]
+    "env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"), ("REAP_AGENTIC_ENABLED", "ture"),
+                  ("REAP_AGENTIC_CREATE_ENABLED", "0"), ("REAP_AGENTIC_CREATE_ENABLED", "ture")]
 )
-async def test_a_dial_turned_off_refuses_a_resolving_row(reap, attribution, monkeypatch, env, value):
+async def test_lane_disable_refuses_but_master_or_create_pause_retains_a_resolving_row(reap, attribution, monkeypatch, env, value):
     purchase_id = await start()
     monkeypatch.setenv(env, value)
     moved = await step(purchase_id)
-    assert moved.state == "refused" and moved.refusal_reason == "cart_link_disabled"
-    assert (await get(purchase_id))["buyer_email"] is None
+    stored = await get(purchase_id)
+    if env == "REAP_AGENTIC_CART_LINK_ENABLED":
+        assert moved.state == "refused" and moved.refusal_reason == "cart_link_disabled"
+        assert stored["buyer_email"] is None
+    else:
+        assert moved.outcome == "released" and moved.state == "resolving"
+        assert stored["last_error_code"] is None
+        assert stored["buyer_email"] is not None
+        assert stored["claimed_by"] is None
+        assert stored["next_poll_at"] is not None
     assert reap.calls == []
 
 
@@ -1292,13 +1312,16 @@ async def test_a_dial_turned_off_refuses_a_quoting_row_before_any_quote(
     assert reap.named("request_cart_link_quote") == []
 
 
+@pytest.mark.parametrize("env,value", [("REAP_AGENTIC_CART_LINK_ENABLED", "0"),
+    ("REAP_AGENTIC_ENABLED", "0"), ("REAP_AGENTIC_CREATE_ENABLED", "0"),
+    ("REAP_AGENTIC_PILOT_SCOPE", "malformed")])
 async def test_a_dial_turned_off_after_the_checkout_exists_never_abandons_it(
-    reap, attribution, monkeypatch
+    reap, attribution, monkeypatch, env, value
 ):
     """The buyer may have approved. Polling continues and the purchase completes."""
     purchase_id = await to_quoting(reap)
     assert (await step(purchase_id)).state == "awaiting_approval"
-    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "0")
+    monkeypatch.setenv(env, value)
     assert (await step(purchase_id)).state == "completed"
     assert len(attribution.calls) == 1
 
@@ -2904,7 +2927,9 @@ async def test_checkout_temporarily_unavailable_is_released_not_failed(reap, att
         error_code="CHECKOUT_TEMPORARILY_UNAVAILABLE", retry_after_seconds=9)
     moved = await step(purchase_id)
     assert moved.outcome == "released" and moved.state == "quoting"
-    assert moved.next_poll_in_seconds == 9
+    # Reap's 9 s is shorter than the quote idempotency bucket, so the hold is the bucket plus a
+    # margin: a re-quote inside the bucket would replay the same quote id and park the row.
+    assert moved.next_poll_in_seconds == svc.PROVIDER_NOT_CREATED_HOLD_S
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "x" * 129, "A\x00B"])
@@ -3009,3 +3034,37 @@ async def test_a_reap_outage_is_released_not_refused(reap, attribution):
     assert moved.outcome == "released" and moved.state == "quoting"
     assert moved.last_error_code == "service_unavailable"
     assert (await get(purchase_id))["buyer_email"] == EMAIL
+
+
+@pytest.mark.parametrize("cap,allowed", [(2820, False), (3319, False), (3320, True)])
+async def test_cart_pilot_uses_actual_variant_namespace_and_shipping_total(monkeypatch, reap, cap, allowed):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": [SHOP], "markets": ["US"],
+             "product_keys": ["cart_product"], "quantities": [1],
+             "variant_keys": ["shopify:" + VARIANT], "currency": "USD", "max_total_minor": cap}
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    await active_enrollment()
+    purchase = await start(cart_link=item(product_key="cart_product"))
+    row = await get(purchase)
+    assert row["variant_key"] == "shopify:" + VARIANT
+    assert len(await ledger.claim_due_purchases("scope-worker", pilot_scope=svc.pilot_admission_scope())) == 1
+    result = await svc.advance(purchase, "scope-worker")
+    assert result.state == "quoting"
+    result = await step(purchase)
+    assert bool(reap.named("create_checkout")) is allowed
+    assert result.state == ("awaiting_approval" if allowed else "refused")
+    if not allowed:
+        assert result.refusal_reason == "pilot_scope_refused"
+
+
+@pytest.mark.parametrize("identity", [VARIANT, "sku_placeholder", "var_opaque_1"])
+async def test_cart_pilot_refuses_provider_or_placeholder_identity(monkeypatch, identity):
+    scope = {"agent_ids": ["agent_one"], "merchant_domains": [SHOP], "markets": ["US"],
+             "product_keys": ["cart_product"], "quantities": [1],
+             "variant_keys": [identity], "currency": "USD", "max_total_minor": 5000}
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", json.dumps(scope))
+    with pytest.raises(svc.PurchaseRefused) as exc:
+        await start(cart_link=item(product_key="cart_product"))
+    assert exc.value.reason == "pilot_scope_refused"
+    assert await count() == 0

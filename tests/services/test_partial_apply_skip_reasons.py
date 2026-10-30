@@ -95,6 +95,7 @@ def real_resolver(monkeypatch):
     monkeypatch.delenv("DISABLE_AUDIT_BRAND_FRAGMENTATION_GUARD", raising=False)
     monkeypatch.setattr(identity, "_write_provenance", AsyncMock())
     monkeypatch.setattr(identity, "_rows_by_gtin", AsyncMock(return_value=[]))
+    monkeypatch.setattr(identity, "_rows_by_barcodes", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_candidates_by_canonical_url", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_candidates_by_source_id", AsyncMock(return_value=[]))
     monkeypatch.setattr(identity, "_existing_pg_for_listing", AsyncMock(return_value="pg_existing"))
@@ -120,7 +121,11 @@ def real_resolver(monkeypatch):
     monkeypatch.setattr(identity, "resolve_or_attach_content_identity", tracking)
     monkeypatch.setattr(writer, "write_writer_audit_log", AsyncMock())
     # Stages after the PDP one read the process pool; they are not what these tests are about.
-    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=lambda offers: (offers, {}, [])))
+    async def accept_live_offers(offers, *, require_live_links=False):
+        assert require_live_links is True
+        return offers, {}, []
+
+    monkeypatch.setattr(writer, "guard_catalog_offer_rows", AsyncMock(side_effect=accept_live_offers))
     monkeypatch.setattr(writer, "_derive_seed_seller_for_plan_row", AsyncMock(return_value=("seller", "cross")))
     monkeypatch.setattr(writer, "_apply_inci_rows", AsyncMock(return_value={}))
     return state
@@ -274,6 +279,7 @@ def run_apply(monkeypatch, capsys, counts):
     fake = AsyncMock()
     fake.is_connected = True
     monkeypatch.setattr(db_module, "database", fake)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (fake, None))  # an apply reads the rows' spellings
     rc = cli.main(_RETAILER_ARGS + ["--apply"])
     return rc, *capsys.readouterr()
 
@@ -312,8 +318,10 @@ def test_an_unrelated_apply_error_prints_no_invented_report(monkeypatch, capsys)
     fake = AsyncMock()
     fake.is_connected = True
     monkeypatch.setattr(db_module, "database", fake)
+    monkeypatch.setattr(cli, "_preflight_database", lambda: (fake, None))  # an apply reads the rows' spellings
     assert cli.main(_RETAILER_ARGS + ["--apply"]) == 2
-    out = capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert "retailer_listing_migration_required" in err  # the apply ran: no earlier refusal exited 2
     assert not any('"applied"' in line for line in out.splitlines() if gate.MARKER in line)
     assert cli.SKIPPED_PDP_PREFIX not in out
 

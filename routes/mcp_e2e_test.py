@@ -16,6 +16,7 @@ from adapters.bigcommerce_adapter import (
     normalize_bigcommerce_store_hash,
 )
 from adapters.woocommerce_adapter import normalize_woocommerce_store_url
+from utils.secret_fingerprint import secret_fingerprint
 
 logger = logging.getLogger(__name__)
 # No prefix here: main.py mounts this router at the real prefix AND at the
@@ -232,7 +233,7 @@ async def _test_single_store_api(platform: str, domain: str, api_key: str, name:
                     parsed = json.loads(api_key)
                     token = parsed.get("access_token") or parsed.get("token") or api_key
                     token_source = "json_parsed"
-                    logger.info(f"Shopify token parsed from JSON: {token[:15]}...")
+                    logger.info(f"Shopify token parsed from JSON: {secret_fingerprint(token)}")
             except Exception as parse_error:
                 logger.warning(f"Failed to parse Shopify token as JSON: {parse_error}")
                 token_source = "parse_failed"

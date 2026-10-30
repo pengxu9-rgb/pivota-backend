@@ -221,14 +221,15 @@ async def _boot_while_a_reader_holds(
     return finished_while_held, blocked, recording
 
 
-@pytest.mark.parametrize("table", ["orders", "merchant_psps"])
+@pytest.mark.parametrize("table", ["orders", "merchant_psps", "reap_agentic_enrollments"])
 async def test_a_boot_does_not_queue_behind_a_reader_when_the_columns_exist(
     _db, table, monkeypatch
 ):
     from db.schema_guard import ensure_required_schema_light
 
     await ensure_required_schema_light()  # the first boot heals; every boot after is this one
-    healed = _ORDERS_HEALED if table == "orders" else _MERCHANT_PSPS_HEALED
+    healed = {"orders": _ORDERS_HEALED, "merchant_psps": _MERCHANT_PSPS_HEALED,
+              "reap_agentic_enrollments": ("hosted_url_expiry_invalid",)}[table]
     present = {c[0] for c in await _columns(table)}
     assert set(healed) <= present, "precondition: the first boot healed the columns"
 
@@ -239,24 +240,28 @@ async def test_a_boot_does_not_queue_behind_a_reader_when_the_columns_exist(
     assert finished_while_held, f"the boot finished only once the reader let go of {table}"
 
 
-async def test_a_boot_gives_up_on_a_missing_column_instead_of_waiting(_db, monkeypatch):
+@pytest.mark.parametrize("table,column", [
+    ("merchant_psps", "last_validated_at"),
+    ("reap_agentic_enrollments", "hosted_url_expiry_invalid"),
+])
+async def test_a_boot_gives_up_on_a_missing_column_instead_of_waiting(_db, monkeypatch, table, column):
     from db.schema_guard import HEAL_LOCK_TIMEOUT, ensure_required_schema_light
 
     assert HEAL_LOCK_TIMEOUT == "500ms"
     await ensure_required_schema_light()
-    await _db.execute("ALTER TABLE merchant_psps DROP COLUMN last_validated_at")
+    await _db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
-    finished_while_held, blocked, ran = await _boot_while_a_reader_holds("merchant_psps", monkeypatch)
+    finished_while_held, blocked, ran = await _boot_while_a_reader_holds(table, monkeypatch)
 
     # The heal DID try (the column is missing), so it waited — for its lock_timeout only.
-    assert any("merchant_psps" in q for q in blocked), "precondition: the heal attempted the lock"
-    [error] = ran.heal_of("merchant_psps")
+    assert any(table in q for q in blocked), "precondition: the heal attempted the lock"
+    [error] = ran.heal_of(table)
     assert error is not None and "lock timeout" in error, error
     assert finished_while_held, "the heal waited for the reader instead of its lock_timeout"
-    assert "last_validated_at" not in {c[0] for c in await _columns("merchant_psps")}
+    assert column not in {c[0] for c in await _columns(table)}
 
     await ensure_required_schema_light()  # the next boot, no reader: heals it
-    assert "last_validated_at" in {c[0] for c in await _columns("merchant_psps")}
+    assert column in {c[0] for c in await _columns(table)}
 
 
 async def test_a_missing_column_is_healed_exactly_as_the_bare_alter_healed_it(_db, monkeypatch):

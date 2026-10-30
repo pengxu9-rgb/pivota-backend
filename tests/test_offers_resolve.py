@@ -309,7 +309,9 @@ def test_offers_resolve_prefetches_attached_seed_before_broad_seed_query(
                     **_VERIFIED_DESTINATION,
                 }
             ]
-        if "FROM external_product_seeds" in q:
+        # The catalog-offers arm names external_product_seeds too (the seed-currency rule), and is
+        # no seed query.
+        if "FROM external_product_seeds" in q and "JOIN catalog_offers" not in q:
             raise AssertionError("broad external seed query should be skipped when attached prefetch succeeds")
         if "FROM products_cache" in q:
             return [
@@ -371,7 +373,7 @@ def test_offers_resolve_recovers_external_seed_by_internal_identity_after_store_
 
     async def fake_fetch_all(query: str, values=None):
         q = str(query)
-        if "FROM external_product_seeds" in q and "LOWER(COALESCE(title,'')) LIKE" in q:
+        if "FROM external_product_seeds" in q and ":identity_title_0" in q:
             assert values["identity_title_0"] == "%kravebeauty great barrier relief%"
             assert values["identity_title_1"] == "%great barrier relief%"
             return [
@@ -2574,8 +2576,14 @@ def _resolve_exec_spec_offer(
     evidence: bool,
     row_overrides: dict = None,
     allowed_domains: list = None,
+    product: dict = None,
 ) -> dict:
-    """One external offer for the exec-spec fixture, through the real route."""
+    """One external offer for the exec-spec fixture, through the real route.
+
+    Named (`sku_id: SKU-1`) by default. `product=_PRODUCT_GRAIN` asks for the listing instead,
+    which the warm-lane claim tests need: a NAMED variant's cartless link is signed
+    `variant_declined` and never warmed (a handle-only click-time cart would be a guess at the
+    variant), so only a product-grain link is the cold population the lane upgrades."""
     import routes.agent_shop_gateway as gateway
 
     row = _seed_row_for_exec_spec(evidence=evidence)
@@ -2593,7 +2601,8 @@ def _resolve_exec_spec_offer(
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {"product": product or {"sku_id": "SKU-1"}, "limit": 10, "market": "US",
+                        "tool": "*"},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -2602,6 +2611,10 @@ def _resolve_exec_spec_offer(
               if o.get("purchase_route") == "affiliate_outbound"]
     assert offers, "the external offer must be returned for this to prove anything"
     return offers[0]
+
+
+#: The listing, not a named variant -- see `_resolve_exec_spec_offer`.
+_PRODUCT_GRAIN = {"product_id": "ext_spec"}
 
 
 def _token_of(offer: dict) -> str:
@@ -2619,7 +2632,7 @@ def test_cart_prefilled_is_null_not_false_when_the_warm_lane_could_contradict_it
 
     Without the guard this is `False` — and the buyer lands in a prefilled cart anyway.
     """
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert "cart_prefilled" in offer, "the field must still be present — null is a STATE, not an omission"
     assert offer["cart_prefilled"] is None, (
         "a `false` here is a claim the warm-handoff lane can contradict after the answer "
@@ -2675,7 +2688,7 @@ def test_cart_prefilled_tracks_the_percentage_rollout(
     """With an empty allowlist the rollout pct decides — and the claim must follow it."""
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", pct)
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert offer["cart_prefilled"] is expected
 
 
@@ -2696,7 +2709,7 @@ def test_cart_prefilled_agrees_with_the_click_lane_on_the_SAME_token(
 
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "")
     monkeypatch.setattr(warm_lane, "outbound_warm_handoff_rollout_pct", 50)
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
 
     click_eligible, reason = evaluate_warm_eligibility(
         dest=_dest_of(offer),
@@ -2753,7 +2766,7 @@ def test_a_null_claim_is_warranted_because_the_click_really_does_land_in_a_cart(
     import services.outbound_warm_handoff as warm
 
     warm.memo_clear()
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert offer["cart_prefilled"] is None
 
     cart_url = "https://brand.myshopify.com/cart/c/abc123?key=k"
@@ -2917,7 +2930,7 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
     so reading it would restore a `false` the warm lane can contradict.
     """
     offer = _resolve_exec_spec_offer(
-        monkeypatch, client, evidence=False,
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
         row_overrides={
             "canonical_url": "https://brand.com/products/serum",
             "destination_url": "https://other.com/products/serum",
@@ -3309,7 +3322,7 @@ def test_rail_is_null_rather_than_referral_when_the_warm_lane_could_upgrade(
     An agent that hands the buyer `affiliate_url` (the attributed link we WANT it to use) is
     told "referral" and the buyer can land in a prefilled cart.
     """
-    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     spec = offer["execution_spec"]
     assert "rail" in spec, "the field must stay present — null is a STATE, not an omission"
     assert spec["rail"] is None
@@ -4595,9 +4608,13 @@ def test_a_variant_fan_out_cannot_truncate_the_competing_retailer_away(
         offers = res.json().get("offers") or []
         ids = [str(o.get("offer_id") or "") for o in offers]
         assert len(ids) <= limit, f"limit={limit} must still be honoured: {ids}"
-        # ...and the head must FILL: 12 seed variants + 1 retailer is 13 offers, so a limit of 10
-        # ships 10. Taking only one per host and stopping would ship 2 and waste the budget.
-        assert len(ids) == limit, f"limit={limit} must be filled, not just diversified: {ids}"
+        # ONE OFFER PER SELLER LISTING: the 12-shade seed is one offer (its shades ride in
+        # `variants`), so seed + retailer is 2 offers at any limit >= 2. It used to fan out one
+        # offer per shade and fill the head with them.
+        assert len(ids) == min(limit, 2), f"limit={limit}: one offer per seller: {ids}"
+        (seed_offer,) = [o for o in offers if str(o.get("offer_id") or "").startswith("of:external_seed:")]
+        assert seed_offer["variant_count"] == 12
+        assert len(seed_offer["variants"]) == 12
         assert any(i.startswith("of:catalog_offer:") for i in ids), (
             f"limit={limit}: the competing retailer must survive a variant fan-out — {ids}"
         )
@@ -5049,7 +5066,8 @@ def test_a_referral_only_request_attaches_no_coverage(
     # the gate apply to nothing", and suppressing it on exactly the requests where everything
     # was refused would hide the only population worth reading. It carries no preflight_ field
     # and no fraction anyone can mistake for gate coverage.
-    assert "handover considered=12" in rec.getMessage()
+    # One offer per seller listing: 3 rows of 4 variants are 3 hand-overs (were 12, one per shade).
+    assert "handover considered=3" in rec.getMessage()
     assert "resolved=0" in rec.getMessage()
 
 
@@ -5067,14 +5085,16 @@ def test_a_mixed_request_counts_only_gated_rows_in_the_denominator(
         assert _resolve(client).status_code == 200
     rec = _summary_record(caplog)
     assert rec is not None and asked
-    assert rec.preflight_candidates == 12
-    assert rec.preflight_gated == 6
-    assert rec.preflight_carts_built == 6
+    # One offer per seller listing: 4 rows are 4 candidates, the 2 stamped rows are gated and
+    # build a cart each (were 12 / 6 / 6, one per shade).
+    assert rec.preflight_candidates == 4
+    assert rec.preflight_gated == 2
+    assert rec.preflight_carts_built == 2
     assert rec.preflight_candidates > rec.preflight_gated
     assert rec.preflight_answered_fraction == 1.0
     # and the values are in the MESSAGE, not only in `extra`, which no formatter here renders
     msg = rec.getMessage()
-    assert "gated=6" in msg and "carts_built=6" in msg
+    assert "gated=2" in msg and "carts_built=2" in msg
     assert "answered_fraction=1.000" in msg and "mode=shadow" in msg
 
 
@@ -5100,3 +5120,987 @@ def test_no_coverage_line_when_the_preflight_is_off(
                 if getattr(r, "event", None) == "offers.resolve.summary"), None)
     assert rec is None or not hasattr(rec, "preflight_answered_fraction"), (
         "off must not attach coverage fields")
+
+
+# ---------------------------------------------------------------------------
+# MERCHANT PURCHASABILITY at the mint (offers.resolve)
+#
+# A `cart_permalink` /r link hands the buyer a PREFILLED CART, and the warm-handoff lane skips
+# the gateway's gate for a cart join — so the cart was served even for a merchant whose
+# purchasability fact is `browse_only`. Under MERCHANT_PURCHASABILITY_ENFORCE the mint now asks
+# the fact first and, on a decline, mints the PDP referral instead. Every test below drives the
+# real route with the real `_make_external_redirect_url`, and reads the answer off the offer and
+# the signed token the route actually emitted — never off a hand-built offer.
+# ---------------------------------------------------------------------------
+
+
+def _purchasability_fake(monkeypatch: pytest.MonkeyPatch, *, purchasable: bool) -> list:
+    """Replace ONLY the fact read (`human_handoff_allowed`) with a recording answer. The gate, the
+    route and the mint around it are the real ones."""
+    import db.merchant_purchasability as mp
+
+    calls: list = []
+
+    async def fake_human_handoff_allowed(domain, market):
+        calls.append((domain, market))
+        return purchasable
+
+    monkeypatch.setattr(mp, "human_handoff_allowed", fake_human_handoff_allowed)
+    return calls
+
+
+def _resolve_seed_offers(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    *,
+    rows: list,
+    market=None,
+) -> list:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return rows
+        return []
+
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    payload = {"product": {"sku_id": "SKU-1"}, "limit": 10, "tool": "*"}
+    if market is not None:
+        payload["market"] = market
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve", "payload": payload,
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers
+
+
+def _assert_referral_only(offer: dict) -> None:
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None, spec
+    assert spec["variant_id"] is None, spec
+    assert spec["tracking"]["join_mode"] == "referral_only", spec
+    assert "/cart/" not in _dest_of(offer), "the signed /r destination must be the PDP"
+    assert _ctx_of(offer)["join_mode"] == "referral_only"
+    assert _ctx_of(offer)["purchasability_tier"] == "browse_only"
+
+
+def _assert_cart(offer: dict) -> None:
+    assert offer["cart_prefilled"] is True
+    assert offer["execution_spec"]["cart_url"], offer["execution_spec"]
+    assert "/cart/" in _dest_of(offer)
+    assert _ctx_of(offer)["join_mode"] == "cart_permalink"
+    assert "purchasability_tier" not in _ctx_of(offer), (
+        "an undeclined token must be byte-identical to a pre-gate one")
+    assert "stock_declined" not in _ctx_of(offer), (
+        "an undeclined token must be byte-identical to a pre-gate one")
+
+
+def test_a_browse_only_merchant_is_minted_a_referral_not_a_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The defect, end to end, in PROD POSTURE: enforcement armed and the warm lane allowlisting
+    this very host. Before the gate this offer was `cart_prefilled: true` with a /cart/ dest.
+
+    `cart_prefilled` must be `False`, not `None`: `None` is what the warm-eligible PDP population
+    gets, because the click lane could still build a cart. The decline is signed into the token
+    and the lane knocks it out, so here `False` is provable."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+
+    assert calls == [("brand.com", "US")], "keyed on the cart's host x the REQUEST market"
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
+    assert offer["execution_spec"]["rail"] == "referral"
+    assert offer["execution_spec"]["pdp_url"], "a decline removes the cart, never the product page"
+    assert offer["affiliate_url"], "and never the offer"
+
+
+def test_the_declined_link_really_does_land_on_the_pdp_when_followed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """Follow the minted link through the real `GET /r`. Without the knockout the warm lane
+    upgrades this cold PDP into the prefilled cart the mint just refused — the decline would
+    last exactly until the click."""
+    import routes.outbound_links as outbound_routes
+    import services.outbound_warm_handoff as warm
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer),
+        ctx=_ctx_of(offer), settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "purchase_declined")
+
+    asked: list = []
+
+    async def _fake_resolve(**kwargs):
+        asked.append(kwargs)
+        return {"continue_url": "https://brand.myshopify.com/cart/c/abc123?key=k", "cart_id": "c_1"}
+
+    async def _fake_log(**kwargs):
+        return None
+
+    warm.memo_clear()
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _fake_resolve)
+    monkeypatch.setattr(outbound_routes, "log_outbound_click", _fake_log)
+    try:
+        res = client.get("/r", params={"token": _token_of(offer)},
+                         headers={"user-agent": _WARM_HUMAN_UA}, follow_redirects=False)
+    finally:
+        warm.memo_clear()
+    assert res.status_code == 302, res.text
+    assert res.headers["location"] == _dest_of(offer)
+    assert "/cart/" not in res.headers["location"]
+    assert asked == [], "the warm lane must not even ask the gateway for a declined merchant"
+
+
+def test_a_purchasable_merchant_keeps_its_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="us")[0]
+    assert calls == [("brand.com", "US")]
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+
+def test_the_dial_off_mints_exactly_what_it_minted_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """MERCHANT_PURCHASABILITY_ENFORCE unset: the ops route says `enforced: false` and its
+    consumers keep their previous behaviour. So does the mint — and it asks nothing."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    assert calls == []
+    _assert_cart(offer)
+
+
+@pytest.mark.parametrize("market", [None, "", "  "])
+def test_no_usable_market_is_no_fact_and_declines_without_asking(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, market
+) -> None:
+    """The ops route's `reason: market_unknown`, `tier: browse_only`. The seed row is LISTED in
+    US and is served under `used_market` "US" — neither is the buyer's market, and gating on
+    either would answer a non-US buyer with the US fact."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market=market)[0]
+    assert calls == [], "no market is answered without a database read"
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_referral_only_offer_never_asks_the_fact(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """No storefront evidence -> no cart would be built -> nothing to gate. The majority of
+    seeds; they must not cost a query each."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=False)], market="US")[0]
+    assert calls == []
+    assert offer["execution_spec"]["cart_url"] is None
+    assert "purchasability_tier" not in _ctx_of(offer), "only a DECLINE is signed"
+
+
+def test_one_request_asks_once_per_merchant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    second = _seed_row_for_exec_spec(evidence=True)
+    second.update({"id": "eps_spec_2", "external_product_id": "ext_spec_2",
+                   "destination_url": "https://brand.com/products/toner",
+                   "canonical_url": "https://brand.com/products/toner"})
+    offers = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True), second], market="US")
+    assert len(offers) == 2
+    assert calls == [("brand.com", "US")]
+    for offer in offers:
+        _assert_referral_only(offer)
+
+
+@pytest.fixture
+async def purchasability_table():
+    """The REAL fact table, built the way production does (the schema guard's own DDL), empty,
+    with enforcement armed and the buyer vantage at its default. Dropped afterwards."""
+    import os
+
+    from db.database import database
+    from db.schema_guard import ensure_required_schema_light
+
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    saved = {k: os.environ.get(k) for k in ("MERCHANT_PURCHASABILITY_ENFORCE",
+                                            "MERCHANT_PURCHASABILITY_BUYER_VANTAGE")}
+    try:
+        await database.execute("DROP TABLE IF EXISTS merchant_purchasability")
+        await ensure_required_schema_light()
+        os.environ["MERCHANT_PURCHASABILITY_ENFORCE"] = "1"
+        os.environ.pop("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", None)
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        await database.execute("DROP TABLE IF EXISTS merchant_purchasability")
+        await ensure_required_schema_light()
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+def _fact(verdict, card):
+    from services.shopify_cart_link_preflight import PreflightResult, Verdict
+
+    return PreflightResult(host="x", verdict=Verdict(verdict), market="US", variant_id="1",
+                           card_available=card)
+
+
+async def test_the_gate_answers_what_the_ops_route_answers_for_the_same_fact(purchasability_table) -> None:
+    """ONE contract: for every (merchant, market) the mint allows a cart exactly when
+    `GET /ops/merchant-purchasability` would say `human_handoff_tier: purchase` under
+    enforcement — the HUMAN cart's field, not the Reap rail's `tier`. Real fact table, real
+    `record_check` writes, the ops handler called directly.
+
+    THE TWO FIELDS PART ON NO_CARD_PAYMENT (Peng, 2026-10-09): a checkout read with no on-site
+    card line refuses the headless card rail and KEEPS the human cart. Pinned here as the one
+    case where `tier` and `human_handoff_tier` disagree, in that direction and no other."""
+    import db.merchant_purchasability as mp
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+    from routes.merchant_purchasability_ops import merchant_purchasability as ops_read
+
+    await mp.record_check("good.com", "US", _fact("ELIGIBLE", True))
+    await mp.record_check("nocard.com", "US", _fact("ELIGIBLE", None))
+    await mp.record_check("paypal-only.com", "US", _fact("NO_CARD_PAYMENT", False))
+    await mp.record_check("drift.com", "US", _fact("PRICE_DRIFT", True))
+    await mp.record_check("login.com", "US", _fact("LOGIN_REQUIRED", None))
+    await mp.record_check("password.com", "US", _fact("PASSWORD_PAGE", None))
+    await mp.record_check("closed.com", "US", _fact("NOT_ACCEPTING_ORDERS", None))
+    await mp.record_check("gone.com", "US", _fact("VARIANT_GONE", None))
+    await mp.record_check("blocked.com", "US", _fact("BLOCKED_UNKNOWN", None))
+    await mp.record_check("proxyonly.com", "US", _fact("ELIGIBLE", True), vantage="proxy")
+
+    cases = [
+        ("https://good.com/cart/1:1", "good.com", "US"),
+        ("https://www.good.com/cart/1:1", "good.com", "US"),
+        ("https://good.com/cart/1:1", "good.com", "SG"),
+        ("https://good.com/cart/1:1", "good.com", None),
+        ("https://nocard.com/cart/1:1", "nocard.com", "US"),
+        ("https://paypal-only.com/cart/1:1", "paypal-only.com", "US"),
+        ("https://drift.com/cart/1:1", "drift.com", "US"),
+        ("https://login.com/cart/1:1", "login.com", "US"),
+        ("https://password.com/cart/1:1", "password.com", "US"),
+        ("https://closed.com/cart/1:1", "closed.com", "US"),
+        ("https://gone.com/cart/1:1", "gone.com", "US"),
+        ("https://blocked.com/cart/1:1", "blocked.com", "US"),
+        ("https://proxyonly.com/cart/1:1", "proxyonly.com", "US"),
+        ("https://never-checked.com/cart/1:1", "never-checked.com", "US"),
+    ]
+    seen = {}
+    for cart, domain, market in cases:
+        route = await ops_read(domain=domain, market=market, _principal={})
+        assert route.enforced is True
+        allowed = await _CartPurchasabilityGate(market).allows_cart(cart)
+        assert allowed is (route.human_handoff_tier == "purchase"), (cart, market, route.human_handoff_tier)
+        seen[(domain, market)] = (route.tier, route.human_handoff_tier, allowed)
+    assert seen[("good.com", "US")] == ("purchase", "purchase", True)
+    assert seen[("paypal-only.com", "US")] == ("browse_only", "purchase", True), (
+        "NO_CARD_PAYMENT: the rail refuses, the human keeps the cart")
+    assert seen[("nocard.com", "US")] == ("browse_only", "purchase", True), (
+        "ELIGIBLE with an unread card line: a checkout with our line on it")
+    assert seen[("drift.com", "US")] == ("browse_only", "purchase", True)
+    for domain in ("login.com", "password.com", "closed.com", "gone.com", "blocked.com",
+                   "proxyonly.com", "never-checked.com"):
+        assert seen[(domain, "US")] == ("browse_only", "browse_only", False), domain
+    assert seen[("good.com", None)] == ("browse_only", "browse_only", False)
+    assert seen[("good.com", "SG")] == ("browse_only", "browse_only", False)
+    assert not any(t == "purchase" and h == "browse_only" for t, h, _a in seen.values()), (
+        "the human tier is never STRICTER than the rail's")
+
+
+async def test_a_no_card_payment_merchant_keeps_its_cart_and_a_login_wall_loses_it(
+    purchasability_table, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real route, on real fact rows. The NO_CARD_PAYMENT offer's token must be
+    byte-identical to an ungated one (no `purchasability_tier` key); the LOGIN_REQUIRED offer
+    is the referral the first cut would have given both."""
+    import db.merchant_purchasability as mp
+
+    await mp.record_check("brand.com", "US", _fact("NO_CARD_PAYMENT", False))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+    await mp.record_check("brand.com", "US", _fact("LOGIN_REQUIRED", None))
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    _assert_referral_only(offer)
+    assert offer["cart_prefilled"] is False
+
+
+# ---------------------------------------------------------------------------
+# THE OFFER'S OWN STOCK at the mint (offers.resolve)
+#
+# Prod 2026-10-14, get_offers(tangleangel_gb_6826386948176, market=GB): one offer,
+# `in_stock: false`, beside `cart_prefilled: true`, rail `shopify_cart`, join_mode
+# `cart_permalink`. The seed's fresh column said out_of_stock; the preflight is shadow-only and the
+# purchasability gate asks about the merchant x market, so nothing on the mint path read the item's
+# stock. The row below is that seed's shape: column + top-level variant out of stock (the nightly
+# refresh's fresh read), and a single July `snapshot.variants` entry still "in_stock" carrying the
+# stamped Shopify id the cart is built from.
+# ---------------------------------------------------------------------------
+
+
+def _sold_out_seed_row(*, column: str = "out_of_stock", variant: str = "out_of_stock") -> dict:
+    row = _seed_row_for_exec_spec(evidence=True)
+    row["availability"] = column
+    row["seed_data"] = {
+        **row["seed_data"],
+        "availability": column,
+        "variants": [{"variant_id": "32318", "title": "Serum", "price_amount": 19.0,
+                      "availability": variant}],
+    }
+    return row
+
+
+def test_an_offer_served_out_of_stock_is_not_handed_a_prefilled_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """The defect, in prod posture: enforcement armed, the merchant purchasable in this market,
+    the warm lane allowlisting this host. Before the fix: `in_stock: False` AND a /cart/ dest."""
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+
+    offer = _resolve_seed_offers(monkeypatch, client, rows=[_sold_out_seed_row()], market="US")[0]
+
+    assert offer["in_stock"] is False, "the precondition: the offer itself says sold out"
+    spec = offer["execution_spec"]
+    assert spec["cart_url"] is None, spec
+    assert spec["tracking"]["join_mode"] == "referral_only", spec
+    assert "/cart/" not in _dest_of(offer), "the signed /r destination must be the PDP"
+    assert _ctx_of(offer)["join_mode"] == "referral_only"
+    assert _ctx_of(offer)["stock_declined"] == "out_of_stock"
+    assert "purchasability_tier" not in _ctx_of(offer), "a stock decline is not a merchant fact"
+    assert offer["cart_prefilled"] is False, "provable: the warm lane knocks the token out"
+    assert spec["rail"] == "referral"
+    assert spec["pdp_url"], "a decline removes the cart, never the product page"
+    assert offer["affiliate_url"], "and never the offer"
+    assert calls == [], "a cart that will not be built never asks the purchasability fact"
+
+
+def test_the_out_of_stock_link_really_does_land_on_the_pdp_when_followed(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, warm_lane
+) -> None:
+    """Through the real `GET /r`. Without the knockout the warm lane would upgrade the cold PDP
+    into the cart the mint just withheld."""
+    import routes.outbound_links as outbound_routes
+    import services.outbound_warm_handoff as warm
+
+    offer = _resolve_seed_offers(monkeypatch, client, rows=[_sold_out_seed_row()], market="US")[0]
+
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer),
+        ctx=_ctx_of(offer), settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "stock_declined")
+
+    asked: list = []
+
+    async def _fake_resolve(**kwargs):
+        asked.append(kwargs)
+        return {"continue_url": "https://brand.myshopify.com/cart/c/abc123?key=k", "cart_id": "c_1"}
+
+    async def _fake_log(**kwargs):
+        return None
+
+    warm.memo_clear()
+    monkeypatch.setattr(outbound_routes, "resolve_warm_handoff", _fake_resolve)
+    monkeypatch.setattr(outbound_routes, "log_outbound_click", _fake_log)
+    try:
+        res = client.get("/r", params={"token": _token_of(offer)},
+                         headers={"user-agent": _WARM_HUMAN_UA}, follow_redirects=False)
+    finally:
+        warm.memo_clear()
+    assert res.status_code == 302, res.text
+    assert res.headers["location"] == _dest_of(offer)
+    assert "/cart/" not in res.headers["location"]
+    assert asked == [], "the warm lane must not even ask the gateway for a sold-out offer"
+
+
+def test_unknown_stock_keeps_its_cart(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    """Only an explicit False declines. A column the stored variant contradicts makes the offer
+    unknown, and unknown is servable everywhere in this repo — a decline here would delete carts
+    on no evidence."""
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_sold_out_seed_row(variant="in_stock")], market="US")[0]
+    assert "in_stock" not in offer and offer.get("availability") == "unknown", offer
+    _assert_cart(offer)
+
+
+def test_an_in_stock_offer_keeps_its_cart_byte_identical(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    offer = _resolve_seed_offers(
+        monkeypatch, client,
+        rows=[_sold_out_seed_row(column="in_stock", variant="in_stock")], market="US")[0]
+    assert offer["in_stock"] is True
+    _assert_cart(offer)
+    assert offer["execution_spec"]["rail"] == "shopify_cart"
+
+
+
+# ---------------------------------------------------------------------------
+# A SEED-WIDE ATTACHED VARIANT ID NAMES ONE VARIANT'S CART, NOT EVERY OFFER'S
+#
+# The attached-Shopify branch of `_external_seed_redirect_identity` shipped the operator-typed
+# `attached_variant_id` as `cart_variant_id` for EVERY per-variant offer of the seed. Review of
+# #2620 (2026-10-14): an in-stock $19 offer shipped `cart_prefilled: true` with a cart for the
+# sold-out $29 sibling. A price belongs to the exact variant it was quoted for. These drive the
+# real route and the real mint with no catalog_skus rows (the operator id is the only identity),
+# and read each offer's own price and cart off the response.
+# ---------------------------------------------------------------------------
+
+_ATTACHED_B_VID = "43062643884185"
+
+
+def _attached_two_variant_row(*, b_availability: str = "in_stock", attached: str = _ATTACHED_B_VID,
+                              b_ids: dict = None) -> dict:
+    row = _seed_row_for_exec_spec(evidence=False)
+    row["attached_product_key"] = "prod::m_brand::shopify::serum"
+    row["attached_variant_id"] = attached
+    row["seed_data"] = {
+        **row["seed_data"],
+        "variants": [
+            {"variant_id": "SKU-30ML", "title": "30ml", "price_amount": 19.0,
+             "price_currency": "USD", "availability": "in_stock"},
+            {"variant_id": "SKU-50ML", "title": "50ml", "price_amount": 29.0,
+             "price_currency": "USD", "availability": b_availability,
+             **(b_ids if b_ids is not None else {"shopify_variant_id": _ATTACHED_B_VID})},
+        ],
+    }
+    return row
+
+
+def _resolve_every_variant(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict) -> dict:
+    """Every stored variant's OWN offer, keyed by price. offers.resolve answers one offer per seller
+    listing unless the caller names a variant (pivota-backend #2622), so each stored variant is
+    named in turn (`product.sku_id`) and its offer read with the real mint."""
+    by_price = {}
+    for v in row["seed_data"]["variants"]:
+        for o in _resolve_by_product(monkeypatch, client, row, sku_id=v["variant_id"]):
+            by_price[float(o["price"])] = o
+    assert set(by_price) == {19.0, 29.0}, f"one offer per stored variant: {sorted(by_price)}"
+    return by_price
+
+
+def _resolve_by_product(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: dict,
+                        sku_id: str = None) -> list:
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext_spec", **({"sku_id": sku_id} if sku_id else {})},
+                          "limit": 10, "market": "US", "tool": "*"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    offers = [o for o in (res.json().get("offers") or [])
+              if o.get("purchase_route") == "affiliate_outbound"]
+    assert offers, "the external offer must be returned for this to prove anything"
+    return offers
+
+
+# The ONE offer a listing answers when no variant is named (#2622) is subject to the same rule: it
+# stands for one stored variant, and carries the attached cart only when it IS the attached one.
+
+
+def test_the_listing_offer_is_the_attached_variant_with_its_own_cart_while_in_stock(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row())
+    assert float(offer["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+    assert offer["variant_count"] == 2
+
+
+def test_a_sold_out_attached_variant_does_not_make_the_listing_sold_out_or_lend_its_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(b_availability="out_of_stock"))
+    assert float(offer["price"]) == 19.0, "the listing stands for its in-stock variant"
+    assert offer["in_stock"] is True
+    assert offer["execution_spec"]["cart_url"] is None, "the $19 variant is not the attached one"
+    assert _ATTACHED_B_VID not in _dest_of(offer)
+
+
+def test_a_gid_attachment_still_picks_the_attached_variant_for_the_listing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(
+        attached=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}"))
+    assert float(offer["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+def test_an_attached_id_two_stored_variants_answer_to_picks_neither_for_the_listing(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Two entries claim the attached id (#2624's duplicate rule): the attachment names neither, so
+    the listing stands for its first in-stock variant, not for whichever claimant comes first."""
+    row = _attached_two_variant_row()
+    a, b = row["seed_data"]["variants"]
+    a["shopify_variant_id"] = _ATTACHED_B_VID
+    first = {"variant_id": "SKU-15ML", "title": "15ml", "price_amount": 15.0,
+             "price_currency": "USD", "availability": "in_stock"}
+    row["seed_data"]["variants"] = [first, a, b]
+    [offer] = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 15.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_an_attached_id_no_stored_variant_answers_to_gives_the_listing_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    [offer] = _resolve_by_product(monkeypatch, client, _attached_two_variant_row(b_ids={}))
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_a_sibling_offer_is_not_handed_the_attached_variants_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The review's probe: $19 offer A in stock, the attached $29 variant B sold out. Before the
+    fix A shipped `cart_prefilled: true` with a cart for B."""
+    offers = _resolve_every_variant(
+        monkeypatch, client, _attached_two_variant_row(b_availability="out_of_stock"))
+    a = offers[19.0]
+    assert a["in_stock"] is True
+    assert a["execution_spec"]["cart_url"] is None, a["execution_spec"]
+    assert _ATTACHED_B_VID not in _dest_of(a), "A's link must not carry B's variant"
+    assert "/cart/" not in _dest_of(a)
+    assert a["execution_spec"]["tracking"]["join_mode"] == "referral_only"
+    assert offers[29.0]["execution_spec"]["cart_url"] is None, "B is sold out (#2620)"
+
+
+def test_the_attached_variant_keeps_its_own_cart_and_only_it(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row())
+    b = offers[29.0]
+    assert b["cart_prefilled"] is True
+    assert f"/cart/{_ATTACHED_B_VID}:1" in b["execution_spec"]["cart_url"]
+    assert b["execution_spec"]["variant_id"] == _ATTACHED_B_VID
+    a = offers[19.0]
+    assert a["execution_spec"]["cart_url"] is None, "the $19 offer is not the attached variant"
+
+
+def test_a_gid_attached_id_still_finds_its_variant(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Compared canonically: a gid attachment and the variant's bare numeric id are one variant."""
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row(
+        attached=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}"))
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+    assert offers[19.0]["execution_spec"]["cart_url"] is None
+
+
+def test_an_attached_id_no_stored_variant_answers_to_names_no_offer(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Two variants, and neither carries the attached id: we cannot say which one the operator
+    meant, so neither offer is handed a cart built from it."""
+    offers = _resolve_every_variant(monkeypatch, client, _attached_two_variant_row(b_ids={}))
+    for offer in offers.values():
+        assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_a_single_variant_seed_keeps_the_operator_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Nothing to choose between: the pre-existing behaviour, byte for byte."""
+    import routes.agent_shop_gateway as gateway
+
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"] = row["seed_data"]["variants"][:1]
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market",
+                        AsyncMock(return_value=["brand.com"]))
+    res = client.post(
+        "/agent/shop/v1/invoke",
+        json={"operation": "offers.resolve",
+              "payload": {"product": {"product_id": "ext_spec"}, "limit": 10, "market": "US",
+                          "tool": "*"},
+              "metadata": {"source": "creator-agent-ui"}},
+    )
+    assert res.status_code == 200, res.text
+    (offer,) = [o for o in res.json()["offers"] if o.get("purchase_route") == "affiliate_outbound"]
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+# Review of #2623, round 1: the "nothing to choose" shortcuts were reachable with a choice.
+
+
+def test_an_id_less_two_variant_seed_hands_its_one_offer_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P1 probe. Neither stored variant has an id, so both offers dedupe to the first ($19) one,
+    which used to look product-grain and took the $29 variant's cart."""
+    row = _attached_two_variant_row(b_ids={})
+    for v in row["seed_data"]["variants"]:
+        v.pop("variant_id")
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(offer["price"]) == 19.0
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+    assert "/cart/" not in _dest_of(offer)
+
+
+def test_a_lone_variant_naming_another_merchant_id_takes_no_attached_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P2 probe. One stored variant whose own id is a DIFFERENT merchant-issued variant: there is
+    a choice, and the entry has already made it."""
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"] = [{"variant_id": "43062643884100", "title": "30ml",
+                                     "price_amount": 19.0, "price_currency": "USD",
+                                     "availability": "in_stock"}]
+    (offer,) = _resolve_by_product(monkeypatch, client, row)
+    assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+def test_two_entries_sharing_one_id_do_not_lend_each_other_a_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """P4 probe. Both entries are `sku: X`; only the second carries the attached id.
+
+    Named by the shared id, the offers dedupe to the first ($19) entry, which must not take the
+    second's cart. Unnamed, the listing's one offer (#2622) stands for the only entry that answers
+    to the attached id, the $29 one, with exactly its own cart."""
+    row = _attached_two_variant_row()
+    a, b = row["seed_data"]["variants"]
+    for v in (a, b):
+        v.pop("variant_id")
+        v["sku"] = "X"
+    (named,) = _resolve_by_product(monkeypatch, client, row, sku_id="X")
+    assert float(named["price"]) == 19.0
+    assert named["execution_spec"]["cart_url"] is None, named["execution_spec"]
+    (listing,) = _resolve_by_product(monkeypatch, client, row)
+    assert float(listing["price"]) == 29.0
+    assert f"/cart/{_ATTACHED_B_VID}:1" in listing["execution_spec"]["cart_url"]
+
+
+def test_an_explicit_other_gid_on_an_empty_seed_takes_no_attached_cart() -> None:
+    """P2 probe, product-grain caller: no stored variants, and the offer names a different
+    variant as a Shopify gid, which is unambiguously a variant claim."""
+    import routes.agent_shop_gateway as gateway
+
+    kw = dict(product_key="prod::m_brand::shopify::serum", product_id="serum")
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="gid://shopify/ProductVariant/43062643884100",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is False
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id=f"gid://shopify/ProductVariant/{_ATTACHED_B_VID}",
+        attached_variant_id=_ATTACHED_B_VID, **kw,
+    ) is True, "the attached variant itself, in either spelling, still takes it"
+
+
+def test_a_bare_number_offer_string_may_not_refuse_the_attached_cart() -> None:
+    """The deliberate limit of the P2 fix. A product-grain caller's offer string comes from
+    `_seed_offer_variant_id`, whose chain includes `sku`; a bare number there may be a barcode,
+    which may match but never refuse (pinned by
+    test_shopify_variant_identity::test_an_attached_shopify_seed_uses_catalog_identity_not_the_sku_chain).
+    A stored entry's CLAIM keys still contradict — see the lone-variant probe above."""
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._attached_variant_is_this_offer(
+        {}, offer_variant_id="43062643884100", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is True
+
+
+def test_a_product_grain_offer_shared_by_two_entries_takes_no_attached_cart() -> None:
+    """P4, product-grain path: two entries answer to the offer's id `X`, only the second carries
+    the attached id. Which entry the offer is cannot be said, so it takes no cart."""
+    import routes.agent_shop_gateway as gateway
+
+    seed = {"variants": [{"sku": "X", "price_amount": 19.0},
+                         {"sku": "X", "shopify_variant_id": _ATTACHED_B_VID, "price_amount": 29.0}]}
+    assert gateway._attached_variant_is_this_offer(
+        seed, offer_variant_id="X", attached_variant_id=_ATTACHED_B_VID,
+        product_key="prod::m_brand::shopify::serum", product_id="serum",
+    ) is False
+
+
+def test_an_attached_id_finds_its_entry_through_the_jsonld_offer_id(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The operator path reads stored entries through the SAME shared reader: an entry whose
+    variant_id is the JSON-LD `@id` URL naming the attached variant is that variant."""
+    row = _attached_two_variant_row(b_ids={})
+    row["seed_data"]["variants"][1]["variant_id"] = (
+        "/products/serum?variant=" + _ATTACHED_B_VID + "#offer")
+    offers = _resolve_every_variant(monkeypatch, client, row)
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offers[29.0]["execution_spec"]["cart_url"]
+    assert offers[19.0]["execution_spec"]["cart_url"] is None
+
+
+def test_two_entries_naming_the_attached_variant_at_two_prices_take_no_cart(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Review of #2627: the operator path's namer check is price-aware too. Both entries name B
+    (one by its @id URL, one by shopify_variant_id) at $19 and $29: no cart for either."""
+    row = _attached_two_variant_row()
+    row["seed_data"]["variants"][0]["variant_id"] = (
+        "/products/serum?variant=" + _ATTACHED_B_VID + "#offer")
+    offers = _resolve_every_variant(monkeypatch, client, row)
+    for offer in offers.values():
+        assert offer["execution_spec"]["cart_url"] is None, offer["execution_spec"]
+
+
+
+# ---------------------------------------------------------------- live-verification opt-in
+# A seed gated ONLY for freshness (7-day content/link clocks) is dropped from offers.resolve, so a
+# product search shows in stock got 0 offers (Laneige Lip Sleeping Mask, 2026-10-15; ~45% of active
+# US seeds). A caller that re-reads offers live (the gateway's get_offers under enforce) may opt in
+# and get them back flagged, with nothing the stale read says claimed.
+
+
+def _resolve_gated(monkeypatch, client, row, reasons, *, opt_in, sku_id=None):
+    import routes.agent_shop_gateway as gateway
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return [row]
+        return []
+
+    async def fake_gate(*args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": list(reasons)})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com"]))
+    payload = {"product": {"product_id": "ext_spec", **({"sku_id": sku_id} if sku_id else {})},
+               "limit": 10, "market": "US", "tool": "*"}
+    if opt_in:
+        payload["includeLiveVerificationOffers"] = True
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": payload,
+                                                     "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    return [o for o in (body.get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"], body
+
+
+def test_a_freshness_gated_seed_is_still_dropped_for_a_caller_that_does_not_opt_in(monkeypatch, client):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=False)
+    assert offers == []
+    assert "live_verification_returned" not in (body.get("metadata") or {})
+
+
+@pytest.mark.parametrize("reasons", [["stale_snapshot"], ["destination_stale"], ["destination_never_verified"],
+                                     ["destination_never_verified", "stale_snapshot"]])
+def test_an_opted_in_caller_gets_the_freshness_gated_offer_flagged_with_nothing_claimed(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    [offer] = offers
+    flag = offer["requires_live_verification"]
+    assert flag["reasons"] == sorted(reasons)
+    assert flag["price_stale"] is True
+    assert flag["lookup_variant_id"] == _ATTACHED_B_VID, "the attached in-stock variant the listing stands for"
+    assert offer["execution_spec"]["cart_url"] is None, "no cart: a cart claims buyable at this price now"
+    assert offer["cart_prefilled"] is not True
+    assert "in_stock" not in offer and offer["availability"] == "unknown"
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 1, "offers": 1}
+
+
+@pytest.mark.parametrize("reasons", [["locale_market_mismatch"], ["price_currency_mismatch"], ["zero_variants"],
+                                     ["stale_snapshot", "price_currency_mismatch"]])
+def test_a_seed_gated_for_anything_but_freshness_is_dropped_even_when_opted_in(monkeypatch, client, reasons):
+    offers, body = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), reasons, opt_in=True)
+    assert offers == []
+    assert body["metadata"]["live_verification_returned"] == {"seeds": 0, "offers": 0}
+
+
+def test_a_fresh_seed_is_unchanged_by_the_opt_in(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "requires_live_verification" not in offer
+    assert f"/cart/{_ATTACHED_B_VID}:1" in offer["execution_spec"]["cart_url"]
+
+
+def test_a_named_entry_with_a_json_ld_offer_id_is_looked_up_by_its_variant():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._live_lookup_variant_id({"variant_id": f"/products/x?variant={_ATTACHED_B_VID}#offer"}) == _ATTACHED_B_VID
+    assert gateway._live_lookup_variant_id({"variant_id": "SKU-30ML"}) is None
+    assert gateway._live_lookup_variant_id({}) is None
+    # An entry naming TWO variants (variant_id one, shopify_variant_id another) names none.
+    assert gateway._live_lookup_variant_id({"variant_id": "45253610242298", "shopify_variant_id": _ATTACHED_B_VID}) is None
+
+
+def test_a_flagged_offers_link_is_never_warmed_into_the_cart_the_mint_withheld(monkeypatch, client, warm_lane):
+    """Product grain (no sku_id): nothing else knocks the token out. Without its own signed key the
+    click-time warm lane would build a cart for an offer the answer said needs a live check."""
+    import services.outbound_warm_handoff as warm
+
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    ctx = _ctx_of(offer)
+    assert ctx["live_verification_required"] == "freshness"
+    eligible, reason = warm.evaluate_warm_eligibility(
+        dest=_dest_of(offer), user_agent=_WARM_HUMAN_UA, token=_token_of(offer), ctx=ctx, settings=warm_lane,
+    )
+    assert (eligible, reason) == (False, "live_verification_required")
+    assert offer["cart_prefilled"] is False, "provable: the warm lane knocks the token out"
+
+
+def test_a_fresh_offers_token_carries_no_live_verification_key(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert "live_verification_required" not in _ctx_of(offer)
+
+
+# Review of #2629: yield, stale variant options, barcode-safe lookup id, no preflight for flagged.
+
+
+def _resolve_two(monkeypatch, client, rows_and_reasons, *, limit, opt_in=True):
+    import routes.agent_shop_gateway as gateway
+
+    rows = [r for r, _ in rows_and_reasons]
+    by_id = {r["id"]: reasons for r, reasons in rows_and_reasons}
+
+    async def fake_fetch_all(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return rows
+        return []
+
+    async def fake_gate(row, *args, **kwargs):
+        return False, type("GateStatus", (), {"blocker_anomaly_types": list(by_id.get(row.get("id"), []))})()
+
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
+    monkeypatch.setattr(gateway.database, "fetch_all", fake_fetch_all)
+    monkeypatch.setattr(gateway, "should_block_external_referral_runtime", fake_gate)
+    monkeypatch.setattr(gateway, "get_allowed_domains_for_market", AsyncMock(return_value=["brand.com", "other.com"]))
+    payload = {"product": {"product_id": "ext_spec"}, "limit": limit, "market": "US", "tool": "*",
+               **({"includeLiveVerificationOffers": True} if opt_in else {})}
+    res = client.post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": payload,
+                                                     "metadata": {"source": "creator-agent-ui"}})
+    assert res.status_code == 200, res.text
+    return [o for o in (res.json().get("offers") or []) if o.get("purchase_route") == "affiliate_outbound"]
+
+
+def _other_store_row():
+    import copy
+
+    row = copy.deepcopy(_seed_row_for_exec_spec(evidence=False))
+    row.update({"id": "eps_other", "external_product_id": "ext_spec", "domain": "other.com",
+                "destination_url": "https://other.com/products/serum", "canonical_url": "https://other.com/products/serum"})
+    row["seed_data"] = {**row["seed_data"], "destination_url": "https://other.com/products/serum",
+                        "canonical_url": "https://other.com/products/serum", "domain": "other.com"}
+    return row
+
+
+def test_a_flagged_offer_never_takes_a_fresh_offers_slot(monkeypatch, client):
+    """Opting in must never cost the caller an offer it gets today: with limit=1, a stale seed ranked
+    first by merit still yields to the fresh one (the flagged one may not be verifiable)."""
+    stale = _seed_row_for_exec_spec(evidence=False)
+    fresh = _other_store_row()
+    today = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=1, opt_in=False)
+    opted = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=1, opt_in=True)
+    assert [o["source"]["seed_id"] for o in today] == ["eps_other"]
+    assert [o["source"]["seed_id"] for o in opted] == ["eps_other"]
+    both = _resolve_two(monkeypatch, client, [(stale, ["stale_snapshot"]), (fresh, [])], limit=2, opt_in=True)
+    assert [bool(o.get("requires_live_verification")) for o in both] == [False, True], "flagged ones last"
+
+
+def test_a_flagged_offers_variant_options_claim_no_stock_and_mark_prices_stale(monkeypatch, client):
+    [offer], _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    assert offer["variants"], "the fixture lists two options"
+    for opt in offer["variants"]:
+        assert "in_stock" not in opt, opt
+        assert opt.get("price_stale") is True, opt
+    fresh, _ = _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert all("price_stale" not in opt for opt in fresh[0]["variants"])
+
+
+def test_the_lookup_id_ignores_a_barcode_sku_and_reads_the_entry_url():
+    import routes.agent_shop_gateway as gateway
+
+    assert gateway._live_lookup_variant_id({"variant_id": _ATTACHED_B_VID, "sku": "8809598451234"}) == _ATTACHED_B_VID
+    assert gateway._live_lookup_variant_id({"sku": "8809598451234"}) is None
+    assert gateway._live_lookup_variant_id({"title": "50ml", "url": f"https://brand.com/products/serum?variant={_ATTACHED_B_VID}"}) == _ATTACHED_B_VID
+
+
+def test_a_flagged_offer_is_never_preflighted(monkeypatch, client):
+    from services import checkout_preflight as cp
+
+    asked = []
+
+    async def counting_preflight(offer):
+        asked.append(offer)
+        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", counting_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    _resolve_gated(monkeypatch, client, _attached_two_variant_row(), ["stale_snapshot"], opt_in=True)
+    assert asked == [], "a flagged offer has no cart to hand over, so it spends no preflight"
+    _resolve_gated(monkeypatch, client, _attached_two_variant_row(), [], opt_in=True)
+    assert len(asked) == 1, "the fresh offer's cart is still preflighted"
+
+
+def test_host_diversity_never_lets_a_flagged_offer_take_a_second_fresh_offers_slot(monkeypatch, client):
+    """Seeds [stale on other.com, two fresh on brand.com] at limit=2: the one-per-host head used to pick
+    the flagged other.com offer over the second fresh brand.com one (review round 2 of #2629)."""
+    import copy
+
+    stale = _other_store_row()
+    a1 = copy.deepcopy(_seed_row_for_exec_spec(evidence=False))
+    a2 = copy.deepcopy(a1)
+    a2["id"] = "eps_spec_2"
+    a2["destination_url"] = a2["canonical_url"] = "https://brand.com/products/serum-2"
+    a2["seed_data"] = {**a2["seed_data"], "destination_url": "https://brand.com/products/serum-2",
+                       "canonical_url": "https://brand.com/products/serum-2"}
+    rows = [(stale, ["stale_snapshot"]), (a1, []), (a2, [])]
+    today = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=False)
+    opted = _resolve_two(monkeypatch, client, rows, limit=2, opt_in=True)
+    assert sorted(o["source"]["seed_id"] for o in today) == ["eps_spec", "eps_spec_2"]
+    assert sorted(o["source"]["seed_id"] for o in opted) == ["eps_spec", "eps_spec_2"]
+    roomy = _resolve_two(monkeypatch, client, rows, limit=3, opt_in=True)
+    assert [bool(o.get("requires_live_verification")) for o in roomy] == [False, False, True]

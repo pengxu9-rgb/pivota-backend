@@ -29,6 +29,7 @@ from db.database import database
 from services.catalog_identity import validated_source_gtin
 from services.claim_safety import ensure_category_disclaimers
 from services.offer_buyability import availability_is_known_unavailable
+from services.seed_offer_currency import seed_projected_offer_guard_and_sql
 from services.source_quarantine import (
     CATALOG_PRODUCT_DOMAIN_SQL,
     build_quarantine_anti_join_sql,
@@ -161,11 +162,19 @@ async def fetch_skus_for_keys(product_keys: List[str], *, db: Any = None) -> Lis
 
 
 async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> List[Dict[str, Any]]:
+    """The live offers of a content_key's listings, minus the ones that are not prices.
+
+    An offer copied off a seed (services/seed_offer_currency) is a price only in that seed's own
+    currency: on 2026-10-19 this view served SKINTIFIC's set with five USD 23.56 offers that the
+    variant backfill had copied off seed_data.variants, while the seed itself had been re-read in
+    AUD. The same rule bounds the gateway's search offers, so a PDP and a search card cannot
+    disagree on whether a row is a price. Kill switch: CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD=off
+    (default on, read per call), the gateway's own name."""
     if not product_keys:
         return []
     read_db = db or database
     rows = await read_db.fetch_all(
-        """
+        f"""
         SELECT
           o.offer_id, o.sku_key, o.product_key, o.merchant_id,
           o.availability, o.currency, o.list_price,
@@ -175,7 +184,7 @@ async def fetch_offers_for_keys(product_keys: List[str], *, db: Any = None) -> L
         FROM catalog_offers o
         LEFT JOIN catalog_merchants m ON m.merchant_id = o.merchant_id
         WHERE o.product_key = ANY(:keys)
-          AND o.suppressed_at IS NULL
+          AND o.suppressed_at IS NULL{seed_projected_offer_guard_and_sql("o", "o.product_key")}
         """,
         {"keys": product_keys},
     )
@@ -847,6 +856,14 @@ def read_image_urls(payload: Any) -> List[str]:
     upstream shapes vary (Shopify nests under .images[].src, Wix has
     .media, our external seeds drop a flat array). Try the common ones.
     """
+    # `fetch_products_for_key` reads rows with raw SQL, and through `databases` + asyncpg a JSONB
+    # column arrives as its TEXT (no JSON codec is registered). A str here is that text; read it,
+    # or every row reads as "no gallery of its own".
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return []
     if not isinstance(payload, dict):
         return []
     found: List[str] = []
@@ -910,6 +927,7 @@ def aggregate_offers(
     primary_merchant_id: Optional[str],
     merchant_url_by_id: Dict[str, Optional[str]],
     seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
 ) -> Tuple[
     Optional[str],
     Optional[Decimal],
@@ -919,24 +937,22 @@ def aggregate_offers(
 ]:
     """Compute price aggregates + top-N offers. Stable ordering:
     sellable before known-unavailable, then primary merchant first, then
-    price ASC, then merchant_id ASC — all applied BEFORE the top-N cut.
+    price ASC, then merchant_id ASC — all applied BEFORE the top-N cut, which
+    takes one offer per SELLER first (`_top_offers`).
 
     `seller_trust_by_id` (W8): the outcome-derived per-merchant trust envelope,
     injected onto each offer like `url` is. Absent/None → offers carry no trust
     key (the honest empty state — no transacted outcomes, no claim).
+
+    `listing_host_by_product_key`: each catalog row's own host, the second half
+    of an offer's seller (`_offer_seller_key`). Absent: the seller is the merchant.
     """
-    trust_by_id = seller_trust_by_id or {}
-    normalized: List[Dict[str, Any]] = []
-    for o in offers:
-        n = normalize_offer(o, primary_merchant_id)
-        if not n:
-            continue
-        merchant_id = n.get("merchant_id") or ""
-        n["url"] = merchant_url_by_id.get(merchant_id)
-        trust = trust_by_id.get(merchant_id)
-        if trust:
-            n["seller_trust"] = trust
-        normalized.append(n)
+    pairs = _normalized_offer_pairs(
+        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
+    )
+    # The currency, the price bounds and offer_count read the offers WITHOUT their placeholder
+    # twins (THE AGGREGATES READ THE OFFERS, NOT THE TWINS, below).
+    normalized = [n for _, n, _ in _offers_without_twins(pairs, listing_host_by_product_key)]
 
     if not normalized:
         return None, None, None, 0, []
@@ -974,10 +990,11 @@ def aggregate_offers(
     # defect, not a preference (The Ordinary out of stock over ulta.com in stock at the same
     # $19; COSRX out of stock at $15 over stylekorean in stock at $6.30). The best_offer
     # companion to #2218 (PIVOTA-Agent#2240, offersToSignals) makes the same call. The primary still leads WITHIN its
-    # stock group, and can only leave the stored set when it is unavailable and at least N
-    # sellable offers exist — 0 rows in prod that day. No reader of these offers (backend,
+    # stock group, and can only leave the stored set when it is unavailable and at least N other
+    # sellers can sell (since the per-seller cut; "N sellable offers" before it) — 0 rows in prod
+    # on 2026-09-18. No reader of these offers (backend,
     # PIVOTA-Agent, pivota-agent-ui) keys on is_primary or offers[0]; offer_count, price_min
-    # and price_max still cover every offer, unavailable ones included.
+    # and price_max still cover every offer but the placeholder twins, unavailable ones included.
     #
     # Unknown availability is sellable here: one vocabulary, OFFER_UNAVAILABLE_AVAILABILITIES,
     # shared with offers.resolve; the reasons are at the constant in services/offer_buyability.py.
@@ -986,16 +1003,416 @@ def aggregate_offers(
     # offer's `availability` is what catalog_sync wrote from the gate's own stock verdict
     # (standard_variant_in_stock: `available` first, then quantity), so an untracked or
     # keep-selling variant is in_stock here and a sold-out one is not.
-    def sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
+    top = _top_offers(pairs, listing_host_by_product_key, currency)
+    return currency, price_min, price_max, len(normalized), top
+
+
+def _normalized_offer_pairs(
+    offers: List[Dict[str, Any]],
+    primary_merchant_id: Optional[str],
+    merchant_url_by_id: Dict[str, Optional[str]],
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """(catalog_offers row, normalize_offer of it) for every priced row, with the url and
+    seller_trust injected. The one projection both aggregate_offers and build_market_prices read,
+    so the per-market summaries can never describe a different offer set. The row rides along
+    for the top-N cut, which needs its product_key and sku_key; only the projection is stored."""
+    trust_by_id = seller_trust_by_id or {}
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for o in offers:
+        n = normalize_offer(o, primary_merchant_id)
+        if not n:
+            continue
+        merchant_id = n.get("merchant_id") or ""
+        n["url"] = merchant_url_by_id.get(merchant_id)
+        trust = trust_by_id.get(merchant_id)
+        if trust:
+            n["seller_trust"] = trust
+        pairs.append((o, n))
+    return pairs
+
+
+# THE TOP-N CUT IS PER SELLER. `offers` exists to show who sells the product, and the cut used to
+# count OFFERS: a product's offers are per variant, and every retailer row also carries its
+# product-level `<product_key>::canonical` placeholder offer beside its per-variant one. So after
+# the first cross-merchant (M4) apply on 2026-10-18, 9 of the 28 merged content_keys stored only 2-3
+# of their 4-5 stores -- ck_0dc56bdd (O HUI Age Recovery Eye Cream 25 ml) stored kbeautymakeup x2
+# and nanasbeautyholic x3, the two cheapest sellers' offers and their twins.
+#
+# So, before the cut:
+#   1. A PLACEHOLDER TWIN goes: a `::canonical` offer whose own row states a per-variant offer OF THE
+#      SAME SELLER in the same market and currency. The variant offer is the exact variant -- its
+#      price and its stock (a sold-out variant beside an in-stock placeholder is sold out); the
+#      placeholder repeats the listing at product level. The seller is part of the key because
+#      scripts/attach_retailer_offer.py hangs ANOTHER retailer's offer on an existing product as
+#      `<product_key>::canonical`: that is the retailer's only offer, not a twin. A placeholder with
+#      no such sibling is its row's only offer there and stays.
+#   2. ONE OFFER PER SELLER until OFFER_TOP_N sellers are in. A seller is represented by the offer the
+#      buy pick (offer_buyability.annotate_offer_buyability) would take from it: in the row's
+#      currency, then not known unavailable, then explicitly in stock, then cheapest. The stored
+#      order alone would compare raw amounts across currencies and rank `unknown` stock with in
+#      stock, so a cheaper GBP or unknown-stock offer could stand for a seller and its in-stock offer
+#      in the row's currency be cut. Sellers enter in the stored order of those offers.
+#   3. Remaining slots, in the stored order (_offer_sort_key): a seller's further offers (its other
+#      shades, sizes or currencies).
+# The kept offers keep the stored order. One seller, or at most N offers once the twins are gone:
+# the same offers as before.
+#
+# THE AGGREGATES READ THE OFFERS, NOT THE TWINS. offer_count, price_min, price_max and the row's
+# currency (and each market_prices entry's) read the offers rule 1 keeps, and seller_count counts
+# their sellers (_offer_seller_key). Every reader of offer_count read it as a seller count --
+# agent_pdp_v1's `multi_merchant_canonical` scope, pivota-agent-ui's multi-seller cards (which drop
+# the savings badge), PIVOTA-Agent's discovery cards -- and a one-store retailer row with its one
+# twin pair counted 2. A read-only census of prod on 2026-10-19 (26,763 rows): 18,927 had
+# offer_count > 1 and 1,845 have more than one seller; dropping the twins takes 11,164 to 1, and
+# 5,918 stay above 1 on one store's shades or sizes -- the reason seller_count is a field of its own
+# and the scope reads it. A twin's price was the headline on 632 rows (price_min is
+# agent_pdp_v1's `price.current`): $19 on a placeholder beside shades from $20, a price no variant
+# has.
+_PLACEHOLDER_SKU_SUFFIX = "::canonical"
+
+
+def _offer_seller_key(
+    row: Dict[str, Any], listing_host_by_product_key: Optional[Dict[str, Optional[str]]], index: int
+) -> Tuple[str, str]:
+    """WHO SELLS this offer: its merchant on its listing's host. The merchant alone is not enough --
+    the retired `external_seed` bucket put every seed-mirrored store under one merchant_id -- and the
+    host alone is not either (two brands on one host are two observed sellers, ADR-009 D2). A row
+    with no merchant and no known host is a seller of its own, never merged with another."""
+    merchant = str(row.get("merchant_id") or "").strip()
+    product_key = str(row.get("product_key") or "").strip()
+    host = (listing_host_by_product_key or {}).get(product_key) or ""
+    if not merchant and not host:
+        return ("", f"offer-{index}")
+    return (merchant, host)
+
+
+def _twin_group(row: Dict[str, Any], seller: Tuple[str, str]) -> Tuple[Any, ...]:
+    return (
+        seller,
+        str(row.get("product_key") or "").strip(),
+        str(row.get("market") or "").strip().upper(),
+        str(row.get("currency") or "").strip().upper(),
+    )
+
+
+def _is_placeholder_offer(row: Dict[str, Any]) -> bool:
+    return str(row.get("sku_key") or "").strip().endswith(_PLACEHOLDER_SKU_SUFFIX)
+
+
+def _offers_without_twins(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
+) -> List[Tuple[Dict[str, Any], Dict[str, Any], Tuple[str, str]]]:
+    """(row, offer, seller) for every offer of `pairs` but the placeholder twins (rule 1 above), in
+    the order given."""
+    keyed = [
+        (row, n, _offer_seller_key(row, listing_host_by_product_key, index))
+        for index, (row, n) in enumerate(pairs)
+    ]
+    variant_groups = {_twin_group(row, seller) for row, _, seller in keyed if not _is_placeholder_offer(row)}
+    return [
+        (row, n, seller) for row, n, seller in keyed
+        if not (_is_placeholder_offer(row) and _twin_group(row, seller) in variant_groups)
+    ]
+
+
+def count_sellers(
+    offers: List[Dict[str, Any]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
+) -> int:
+    """How many SELLERS (_offer_seller_key) price these catalog_offers rows, in any currency: the
+    row's seller_count. 0 with no priced offer."""
+    pairs = _normalized_offer_pairs(offers, None, {})
+    return len({seller for _, _, seller in _offers_without_twins(pairs, listing_host_by_product_key)})
+
+
+def _top_offers(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]],
+    currency: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """The stored top-N (see THE TOP-N CUT IS PER SELLER above), in the stored order. `currency` is
+    the row's (aggregate_offers' modal currency); None when every offer shares one."""
+    from services.offer_buyability import IN_STOCK_AVAILABILITY
+
+    ranked = sorted(pairs, key=lambda pair: _offer_sort_key(pair[1]))
+    kept = [(n, seller) for _, n, seller in _offers_without_twins(ranked, listing_host_by_product_key)]
+
+    def representative_rank(index: int) -> Tuple[int, int, int, float, int]:
+        n = kept[index][0]
         return (
-            1 if availability_is_known_unavailable(o.get("availability")) else 0,
-            0 if o.get("is_primary") else 1,
-            float(o.get("price") or 0.0),
-            o.get("merchant_id") or "",
+            1 if currency is not None and n.get("currency") != currency else 0,
+            1 if availability_is_known_unavailable(n.get("availability")) else 0,
+            0 if str(n.get("availability") or "").strip().lower() in IN_STOCK_AVAILABILITY else 1,
+            float(n.get("price") or 0.0),
+            index,
         )
 
-    top = sorted(normalized, key=sort_key)[:OFFER_TOP_N]
-    return currency, price_min, price_max, len(normalized), top
+    representative: Dict[Tuple[str, str], int] = {}
+    for index, (_, seller) in enumerate(kept):
+        if seller not in representative or representative_rank(index) < representative_rank(representative[seller]):
+            representative[seller] = index
+    picked = sorted(representative.values())[:OFFER_TOP_N]
+    chosen = set(picked)
+    picked += [index for index in range(len(kept)) if index not in chosen][: max(0, OFFER_TOP_N - len(picked))]
+    return [kept[index][0] for index in sorted(picked)]
+
+
+def listing_hosts(products: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """{product_key: the row's own host} -- its source_domain, else its canonical URL's host."""
+    from services.offer_seller_identity import host_from_url, normalize_host
+
+    return {
+        str(p.get("product_key")): normalize_host(p.get("source_domain")) or host_from_url(p.get("canonical_url"))
+        for p in products
+        if p.get("product_key")
+    }
+
+
+def _offer_sort_key(o: Dict[str, Any]) -> Tuple[int, int, float, str]:
+    """The stored-offer order (see the comment in aggregate_offers): sellable
+    first, then primary, then price ASC, then merchant_id ASC."""
+    return (
+        1 if availability_is_known_unavailable(o.get("availability")) else 0,
+        0 if o.get("is_primary") else 1,
+        float(o.get("price") or 0.0),
+        o.get("merchant_id") or "",
+    )
+
+
+# ---------------------------------------------------------------------
+# Per-currency price summary (agent_pdp_view.market_prices, migration 263)
+# ---------------------------------------------------------------------
+#
+# WHY. The row-level currency / price_min / price_max above are ONE currency:
+# the modal one, ties to the higher code. A product can carry offers in several
+# served currencies (retailer_ingest shopify_markets writes USD siblings beside a
+# non-USD base offer today, and SGD siblings beside USD ones once #2553 lands);
+# with USD offers and SGD ones it is a USD row, and every reader that serves an
+# SG buyer from those columns drops it; and the top-N cut sorts raw prices
+# across currencies, so the SGD offers can be cut from `offers` altogether.
+#
+# THE CONTRACT (version 1):
+#
+#   {"version": 1,
+#    "currencies": {"USD": {"price_min": 18.0, "price_max": 24.0,
+#                           "offer_count": 3, "seller_count": 2,
+#                           "offers": [<top-N USD offers>]},
+#                   "SGD": {...}}}
+#
+#   * One entry per currency the offers are priced in (upper-cased ISO code;
+#     an offer with no well-formed code prices no entry). KEYED BY CURRENCY, and
+#     every currency, so the stored value never depends on the writer's
+#     environment (PIVOTA_SERVING_PRICING_REGIONS): the READER maps its buyer's
+#     market to a currency (services/region_pricing) and decides what it serves.
+#     Never offers.market, a DEFAULT 'US' most writers never set.
+#   * No conversion: an entry only compares amounts in its own currency.
+#   * offer_count counts every such offer but the placeholder twins, unavailable
+#     ones included, like the row-level offer_count, and price_min / price_max read
+#     the same offers; seller_count counts their sellers (THE AGGREGATES READ THE
+#     OFFERS, NOT THE TWINS); `offers` is that currency's top OFFER_TOP_N, one per
+#     seller first (_top_offers), in the stored order (_offer_sort_key). An entry
+#     written before seller_count has no such key.
+#   * {"version": 1, "currencies": {}} = computed, no priced offer.
+#
+# STALENESS. A writer without the flag (an old image, a one-off with no env,
+# the flag turned off, scripts/repair_external_seed_offer_mainline.py's
+# APV_OFFER_FIELDS_UPDATE_SQL) rewrites offers and refreshed_at but not the
+# summary. So the flag-on upsert stamps market_prices_refreshed_at with the
+# same NOW() as refreshed_at, and readers use the summary ONLY while the two
+# are equal (MARKET_PRICES_FRESH_SQL); any later write that bumps refreshed_at
+# without restamping retires it. NULL summary, NULL stamp, an unknown version:
+# all read as "not computed", and readers fall back to the legacy columns.
+#
+# The legacy columns are computed exactly as before and never read from here.
+# Written only while AGENT_PDP_VIEW_MARKET_PRICES is on and the columns exist
+# (agent_pdp_view_has_market_prices): otherwise assemble_row emits no summary
+# and the upsert is UPSERT_SQL byte for byte.
+
+MARKET_PRICES_FLAG_ENV = "AGENT_PDP_VIEW_MARKET_PRICES"
+MARKET_PRICES_VERSION = 1
+_ISO_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+
+
+def market_prices_enabled() -> bool:
+    """Write flag for agent_pdp_view.market_prices. Default OFF."""
+    return (os.getenv(MARKET_PRICES_FLAG_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def market_prices_fresh_sql(alias: str = "") -> str:
+    """The summary only while it was written by the write that set refreshed_at, else NULL.
+    Every reader selects the column through this, never bare."""
+    a = f"{alias}." if alias else ""
+    return (
+        f"CASE WHEN {a}market_prices_refreshed_at = {a}refreshed_at "
+        f"AND {a}market_prices->>'version' = '{MARKET_PRICES_VERSION}' "
+        f"THEN {a}market_prices END"
+    )
+
+
+def build_market_prices(
+    offers: List[Dict[str, Any]],
+    primary_merchant_id: Optional[str],
+    merchant_url_by_id: Dict[str, Optional[str]],
+    seller_trust_by_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    listing_host_by_product_key: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """The per-currency price summary (contract above). Pure, and independent of
+    process environment."""
+    pairs = _normalized_offer_pairs(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id)
+    by_currency: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    for row, n in pairs:
+        code = str(n.get("currency") or "").strip().upper()
+        if _ISO_CURRENCY_RE.match(code):
+            by_currency.setdefault(code, []).append((row, n))
+    currencies: Dict[str, Dict[str, Any]] = {}
+    for code in sorted(by_currency):
+        in_currency = by_currency[code]
+        kept = _offers_without_twins(in_currency, listing_host_by_product_key)
+        prices = [Decimal(str(n["price"])) for _, n, _ in kept]
+        currencies[code] = {
+            "price_min": float(min(prices)),
+            "price_max": float(max(prices)),
+            "offer_count": len(kept),
+            "seller_count": len({seller for _, _, seller in kept}),
+            "offers": _top_offers(in_currency, listing_host_by_product_key),
+        }
+    return {"version": MARKET_PRICES_VERSION, "currencies": currencies}
+
+
+def market_prices_entry(market_prices: Any, currency: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A reader's lookup: the entry for `currency` in a version-1 summary, else None."""
+    if isinstance(market_prices, str):
+        try:
+            market_prices = json.loads(market_prices)
+        except ValueError:
+            return None
+    if not isinstance(market_prices, dict) or market_prices.get("version") != MARKET_PRICES_VERSION:
+        return None
+    currencies = market_prices.get("currencies")
+    code = str(currency or "").strip().upper()
+    entry = currencies.get(code) if isinstance(currencies, dict) and code else None
+    return entry if isinstance(entry, dict) else None
+
+
+# Does agent_pdp_view have both columns? Migration 263 does not self-apply (schema_guard adds the
+# columns at boot, and a heal can defer), and a writer or reader naming a missing column fails --
+# for the refresh path silently, since catalog_sync swallows the error and legacy prices would stop
+# refreshing. Probed once per process: a positive answer is kept, a negative one for
+# _MARKET_PRICES_PROBE_RETRY_S, so a later heal is picked up without a restart.
+_MARKET_PRICES_COLUMNS = ("market_prices", "market_prices_refreshed_at")
+_MARKET_PRICES_PROBE_RETRY_S = 300.0
+_market_prices_probe: Dict[str, Any] = {"present": None, "checked_at": 0.0}
+MARKET_PRICES_COLUMNS_PROBE_SQL = """
+    SELECT count(*) AS n
+    FROM information_schema.columns
+    WHERE table_name = 'agent_pdp_view'
+      AND table_schema = ANY(current_schemas(false))
+      AND column_name IN ('market_prices', 'market_prices_refreshed_at')
+"""
+
+
+def reset_market_prices_probe() -> None:
+    _market_prices_probe.update(present=None, checked_at=0.0)
+
+
+def mark_market_prices_columns_missing() -> None:
+    import time
+
+    _market_prices_probe.update(present=False, checked_at=time.monotonic())
+
+
+async def agent_pdp_view_has_market_prices(db: Any = None) -> bool:
+    import time
+
+    if _market_prices_probe["present"] is True:
+        return True
+    now = time.monotonic()
+    if (
+        _market_prices_probe["present"] is False
+        and now - _market_prices_probe["checked_at"] < _MARKET_PRICES_PROBE_RETRY_S
+    ):
+        return False
+    try:
+        row = await (db or database).fetch_one(MARKET_PRICES_COLUMNS_PROBE_SQL)
+        present = bool(row) and int(dict(row).get("n") or 0) == len(_MARKET_PRICES_COLUMNS)
+    except Exception:  # noqa: BLE001 - an unanswerable probe is "absent": the legacy path is safe
+        present = False
+    _market_prices_probe.update(present=present, checked_at=now)
+    return present
+
+
+def is_missing_market_prices_column_error(exc: BaseException) -> bool:
+    """asyncpg UndefinedColumnError (42703) naming the summary columns."""
+    return _is_missing_column_error(exc, "market_prices")
+
+
+def _is_missing_column_error(exc: BaseException, column: str) -> bool:
+    code = getattr(exc, "sqlstate", None) or getattr(getattr(exc, "orig", None), "sqlstate", None)
+    message = str(exc)
+    return (code == "42703" or "does not exist" in message) and column in message
+
+
+# agent_pdp_view.seller_count (migration 269), probed like the summary columns above and for the
+# same reason: migration 269 does not self-apply, schema_guard's heal can defer, and an upsert
+# naming a missing column fails every refresh. It is NOT on db.catalog's agent_pdp_view Table:
+# audit_evidence_builder and scripts/backfill_audit_content_key.py run agent_pdp_view.select(),
+# which names every Table column, so a heal that lost its lock race would turn those reads into
+# UndefinedColumn errors. routes/agent_pdp_v1 reads it through to_jsonb (SELLER_COUNT_SQL), which
+# answers NULL while the column is absent.
+_seller_count_probe: Dict[str, Any] = {"present": None, "checked_at": 0.0}
+SELLER_COUNT_COLUMN_PROBE_SQL = """
+    SELECT count(*) AS n
+    FROM information_schema.columns
+    WHERE table_name = 'agent_pdp_view'
+      AND table_schema = ANY(current_schemas(false))
+      AND column_name = 'seller_count'
+"""
+
+
+def reset_seller_count_probe() -> None:
+    _seller_count_probe.update(present=None, checked_at=0.0)
+
+
+def mark_seller_count_column_missing() -> None:
+    import time
+
+    _seller_count_probe.update(present=False, checked_at=time.monotonic())
+
+
+async def agent_pdp_view_has_seller_count(db: Any = None) -> bool:
+    import time
+
+    if _seller_count_probe["present"] is True:
+        return True
+    now = time.monotonic()
+    if (
+        _seller_count_probe["present"] is False
+        and now - _seller_count_probe["checked_at"] < _MARKET_PRICES_PROBE_RETRY_S
+    ):
+        return False
+    try:
+        row = await (db or database).fetch_one(SELLER_COUNT_COLUMN_PROBE_SQL)
+        present = bool(row) and int(dict(row).get("n") or 0) == 1
+    except Exception:  # noqa: BLE001 - an unanswerable probe is "absent": the write without it is safe
+        present = False
+    _seller_count_probe.update(present=present, checked_at=now)
+    return present
+
+
+def is_missing_seller_count_column_error(exc: BaseException) -> bool:
+    """asyncpg UndefinedColumnError (42703) naming seller_count."""
+    return _is_missing_column_error(exc, "seller_count")
+
+
+def seller_count_sql(row_ref: str) -> str:
+    """agent_pdp_view.seller_count as a SELECT expression that never names the column: NULL while
+    migration 269 is absent, so a reader cannot fail on it. `row_ref` is the table's alias, or its
+    name when it has none."""
+    return f"CAST(to_jsonb({row_ref}) ->> 'seller_count' AS INTEGER) AS seller_count"
 
 
 def aggregate_variants(skus: List[Dict[str, Any]], canonical_source_product_id: Optional[str]) -> Tuple[List[Dict[str, Any]], int]:
@@ -1390,10 +1807,14 @@ def assemble_row(
     )
 
     image_urls = read_image_urls(canonical.get("product_payload"))
+    # The seed's gallery is a page read; it FILLS a product that carries no gallery of its own and
+    # is never appended to one that does. Appended, a page read's nav tiles and promo crops landed
+    # after the merchant's own images (us.laneige.com, cocomo.sg, 2026-10-14).
+    owns_gallery = bool(image_urls)
     if image_url and image_url not in image_urls:
         image_urls.insert(0, image_url)
     seed_images = seed_data.get("image_urls") if isinstance(seed_data, dict) else None
-    if isinstance(seed_images, list):
+    if not owns_gallery and isinstance(seed_images, list):
         for u in seed_images:
             if isinstance(u, str) and u.strip() and u.strip() not in image_urls:
                 image_urls.append(u.strip())
@@ -1417,8 +1838,15 @@ def assemble_row(
         if mid and mid not in merchant_url_by_id:
             merchant_url_by_id[mid] = p.get("canonical_url")
 
+    hosts = listing_hosts(products)
     currency, price_min, price_max, offer_count, top_offers = aggregate_offers(
-        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id
+        offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts
+    )
+    sellers = count_sellers(offers, hosts)
+    market_prices = (
+        build_market_prices(offers, primary_merchant_id, merchant_url_by_id, seller_trust_by_id, hosts)
+        if market_prices_enabled()
+        else None
     )
 
     variants_capped, variants_count = aggregate_variants(
@@ -1434,7 +1862,7 @@ def assemble_row(
 
     fashion = coalesce_fashion_fields(products, external_seed)
 
-    return {
+    row = {
         "content_key": content_key,
         "pivota_signature_id": sig,
         "product_group_id": product_group_id,
@@ -1460,6 +1888,8 @@ def assemble_row(
         "price_min": price_min,
         "price_max": price_max,
         "offer_count": offer_count,
+        # Migration 269; written only while the column exists (execute_agent_pdp_view_upsert).
+        "seller_count": sellers,
         "offers": top_offers or None,
         "variants": variants_capped or None,
         "variants_count": variants_count,
@@ -1486,6 +1916,11 @@ def assemble_row(
         "rating_count": canonical.get("rating_count"),
         "refresh_source": refresh_source,
     }
+    # Only while the write flag is on: the key's presence is what selects the
+    # upsert that names the column (upsert_sql_for_row).
+    if market_prices is not None:
+        row["market_prices"] = market_prices
+    return row
 
 
 UPSERT_SQL = """
@@ -1590,6 +2025,112 @@ UPSERT_SQL = """
 """
 
 
+def _upsert_sql_with_market_prices(base: str) -> str:
+    """UPSERT_SQL plus market_prices and its stamp (migration 263), derived from it
+    so the two can never drift in any other column. The stamp is the statement's
+    own NOW(), the value refreshed_at gets in the same row write."""
+    insert_anchor = "      rating_value, rating_count,\n      refreshed_at,"
+    values_anchor = "      :rating_value, :rating_count,\n      NOW(),"
+    update_anchor = "      rating_count = EXCLUDED.rating_count,\n"
+    for anchor in (insert_anchor, values_anchor, update_anchor):
+        if base.count(anchor) != 1:
+            raise RuntimeError("UPSERT_SQL changed shape; update _upsert_sql_with_market_prices")
+    return (
+        base.replace(
+            insert_anchor,
+            "      rating_value, rating_count, market_prices, market_prices_refreshed_at,\n      refreshed_at,",
+        )
+        .replace(
+            values_anchor,
+            "      :rating_value, :rating_count, CAST(:market_prices AS jsonb), NOW(),\n      NOW(),",
+        )
+        .replace(
+            update_anchor,
+            update_anchor
+            + "      market_prices = EXCLUDED.market_prices,\n"
+            + "      market_prices_refreshed_at = EXCLUDED.market_prices_refreshed_at,\n",
+        )
+    )
+
+
+UPSERT_SQL_WITH_MARKET_PRICES = _upsert_sql_with_market_prices(UPSERT_SQL)
+
+
+def _upsert_sql_with_seller_count(base: str) -> str:
+    """`base` (UPSERT_SQL, or its market_prices variant) plus seller_count (migration 269), beside
+    offer_count, derived so the variants never drift in any other column."""
+    insert_anchor = "      currency, price_min, price_max, offer_count, offers,\n"
+    values_anchor = "      :currency, :price_min, :price_max, :offer_count, CAST(:offers AS jsonb),\n"
+    update_anchor = "      offer_count = EXCLUDED.offer_count,\n"
+    for anchor in (insert_anchor, values_anchor, update_anchor):
+        if base.count(anchor) != 1:
+            raise RuntimeError("UPSERT_SQL changed shape; update _upsert_sql_with_seller_count")
+    return (
+        base.replace(insert_anchor, "      currency, price_min, price_max, offer_count, seller_count, offers,\n")
+        .replace(
+            values_anchor,
+            "      :currency, :price_min, :price_max, :offer_count, :seller_count, CAST(:offers AS jsonb),\n",
+        )
+        .replace(update_anchor, update_anchor + "      seller_count = EXCLUDED.seller_count,\n")
+    )
+
+
+UPSERT_SQL_WITH_SELLER_COUNT = _upsert_sql_with_seller_count(UPSERT_SQL)
+UPSERT_SQL_WITH_MARKET_PRICES_AND_SELLER_COUNT = _upsert_sql_with_seller_count(UPSERT_SQL_WITH_MARKET_PRICES)
+
+
+def upsert_sql_for_row(row: Dict[str, Any]) -> str:
+    """The upsert for an assembled row, naming market_prices only when the row carries the key
+    (AGENT_PDP_VIEW_MARKET_PRICES on) and seller_count only when the row carries it (the column
+    probed present). Neither: UPSERT_SQL byte for byte, which runs before migrations 263 and 269."""
+    if "seller_count" in row:
+        return (
+            UPSERT_SQL_WITH_MARKET_PRICES_AND_SELLER_COUNT if "market_prices" in row
+            else UPSERT_SQL_WITH_SELLER_COUNT
+        )
+    return UPSERT_SQL_WITH_MARKET_PRICES if "market_prices" in row else UPSERT_SQL
+
+
+async def execute_agent_pdp_view_upsert(db: Any, row: Dict[str, Any]) -> None:
+    """Write an assembled row. The summary (migration 263) and seller_count (269) are
+    each written only when their columns exist; otherwise -- the heal not run yet --
+    the row is written without them, so the legacy columns keep refreshing instead
+    of every refresh failing on the missing column.
+
+    Inside a caller's transaction the missing-column retry cannot recover: the
+    failed statement has already aborted the transaction, so the legacy retry
+    raises InFailedSQLTransactionError -- loudly, never masked. Only a column
+    dropped AFTER a positive probe gets there (review of #2556, 2026-10-11); the
+    absent-column case is decided by the probe before any statement runs."""
+    if "market_prices" in row and not await agent_pdp_view_has_market_prices(db):
+        row = {k: v for k, v in row.items() if k != "market_prices"}
+    if "seller_count" in row and not await agent_pdp_view_has_seller_count(db):
+        row = {k: v for k, v in row.items() if k != "seller_count"}
+    try:
+        await db.execute(upsert_sql_for_row(row), _upsert_params_for_row(row))
+    except Exception as exc:
+        # The probe said present and the write says otherwise (dropped after the probe).
+        missing = set()
+        if "market_prices" in row and is_missing_market_prices_column_error(exc):
+            mark_market_prices_columns_missing()
+            missing.add("market_prices")
+        if "seller_count" in row and is_missing_seller_count_column_error(exc):
+            mark_seller_count_column_missing()
+            missing.add("seller_count")
+        if not missing:
+            raise
+        legacy = {k: v for k, v in row.items() if k not in missing}
+        await db.execute(upsert_sql_for_row(legacy), _upsert_params_for_row(legacy))
+
+
+def _upsert_params_for_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """row_to_upsert_params, plus seller_count when upsert_sql_for_row names it."""
+    params = row_to_upsert_params(row)
+    if "seller_count" in row:
+        params["seller_count"] = row["seller_count"]
+    return params
+
+
 def to_jsonb(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -1598,8 +2139,11 @@ def to_jsonb(value: Any) -> Optional[str]:
 
 def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     """Project assemble_row() output to the bind-parameter dict shape
-    UPSERT_SQL expects (JSONB columns → JSON-encoded strings)."""
+    UPSERT_SQL expects (JSONB columns → JSON-encoded strings). Never seller_count:
+    UPSERT_SQL does not name it, and a bind the statement does not define is an
+    error; execute_agent_pdp_view_upsert adds it for the statement that does."""
     params = dict(row)
+    params.pop("seller_count", None)
     params["image_urls"] = to_jsonb(row.get("image_urls"))
     params["offers"] = to_jsonb(row.get("offers"))
     params["variants"] = to_jsonb(row.get("variants"))
@@ -1614,6 +2158,12 @@ def row_to_upsert_params(row: Dict[str, Any]) -> Dict[str, Any]:
     # passes it through verbatim. Re-encode for the SQLAlchemy bind. Other
     # fashion fields are plain text + float and pass through unchanged.
     params["size_guide"] = to_jsonb(row.get("size_guide"))
+    if "market_prices" in row:
+        # Always a version-1 object, never NULL: NULL means "not computed yet".
+        mp = row.get("market_prices")
+        params["market_prices"] = to_jsonb(
+            mp if mp is not None else {"version": MARKET_PRICES_VERSION, "currencies": {}}
+        )
     params["refreshed_by_proposal_id"] = row.get("refreshed_by_proposal_id")
     # Default FALSE, so every existing caller that builds a row without going
     # through build_agent_pdp_view_row keeps the previous overwrite semantics
@@ -1865,7 +2415,7 @@ async def refresh_agent_pdp_view_for_content_key(
             content_key, refresh_source=refresh_source, db=read_db
         )
         return False
-    await read_db.execute(UPSERT_SQL, row_to_upsert_params(row))
+    await execute_agent_pdp_view_upsert(read_db, row)
     return True
 
 

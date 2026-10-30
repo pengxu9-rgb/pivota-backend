@@ -348,6 +348,9 @@ def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False, 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    # A live answer looks up the seed's mirror keys to lift a pending suppression (#2539); no
+    # mirror rows here, so nothing to lift.
+    monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=[]))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "_stamp_crawl_attempt", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", fake_resolve)
@@ -417,6 +420,9 @@ def test_every_degraded_return_reports_the_host_it_failed_on(monkeypatch, mode):
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    # A live answer looks up the seed's mirror keys to lift a pending suppression (#2539); no
+    # mirror rows here, so nothing to lift.
+    monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=[]))
     monkeypatch.setattr(ep, "_stamp_crawl_attempt", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", resolver)
 
@@ -507,6 +513,9 @@ def test_an_invalid_url_seed_is_stamped_before_it_is_refused(monkeypatch):
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
+    # A live answer looks up the seed's mirror keys to lift a pending suppression (#2539); no
+    # mirror rows here, so nothing to lift.
+    monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=[]))
     monkeypatch.setattr(ep, "_stamp_crawl_attempt", stamp)
 
     with pytest.raises(HTTPException) as excinfo:

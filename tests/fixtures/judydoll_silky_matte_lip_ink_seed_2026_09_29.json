@@ -1,0 +1,75 @@
+{
+ "_fixture_note": "Staging external_product_seeds row epsv_38ad88d436c32e24ba7c6446 as read (read-only) 2026-09-29, trimmed: image lists and description copy dropped; every key the cart proof reads is kept verbatim. Prod has the same shape except canonical_url also carries ?variant=49819267301653 (see PROD_CANONICAL_URL in the tests). Before scripts/backfill_shopify_variant_ids.py runs: no shopify_variant_id, no storefront_platform, no shopify_cart_proof.",
+ "id": "epsv_38ad88d436c32e24ba7c6446",
+ "status": "active",
+ "domain": "judydoll.com",
+ "market": "US",
+ "canonical_url": "https://judydoll.com/products/silky-matte-lip-ink",
+ "destination_url": "https://judydoll.com/products/silky-matte-lip-ink?variant=49819267301653&utm_source=pivota&utm_medium=affiliate",
+ "attached_product_key": "prod::external_seed::external_seed::ext_0f95730ee5ba05a6b7957ada",
+ "attached_variant_id": null,
+ "seed_data": {
+  "brand": "Judydoll",
+  "selected_variant_id": "49819267301653",
+  "default_variant_id": "49819267301653",
+  "variants": [
+   {
+    "id": "49819267301653",
+    "sku": "6978647800885",
+    "title": "07 BURGUNDY INK",
+    "price": "13.99",
+    "url": "https://judydoll.com/products/silky-matte-lip-ink?variant=49819267301653&utm_source=pivota&utm_medium=affiliate"
+   }
+  ],
+  "snapshot": {
+   "brand": null,
+   "vendor": null,
+   "title": "Silky Matte Lip Ink",
+   "variant_title": "07 BURGUNDY INK",
+   "selected_variant_id": "49819267301653",
+   "default_variant_id": "49819267301653",
+   "variant_skus": [
+    "6978647800823",
+    "6978647800830",
+    "6978647800847",
+    "6978647800861",
+    "6978647800885",
+    "6978647800892",
+    "6978647800908",
+    "6978647800922"
+   ],
+   "price_amount": 13.99,
+   "price_currency": null,
+   "availability": "in_stock",
+   "destination_url": "https://judydoll.com/products/silky-matte-lip-ink?variant=49819267301653&utm_source=pivota&utm_medium=affiliate",
+   "canonical_url": "https://judydoll.com/products/silky-matte-lip-ink",
+   "source": "catalog_intelligence",
+   "variants": [
+    {
+     "id": "49819267301653",
+     "sku": "6978647800885",
+     "url": "https://judydoll.com/products/silky-matte-lip-ink?variant=49819267301653&utm_source=pivota&utm_medium=affiliate",
+     "price": "13.99",
+     "stock": "In Stock",
+     "title": "07 BURGUNDY INK",
+     "options": [
+      {
+       "name": "Shade",
+       "value": "07 BURGUNDY INK",
+       "axis_kind": "shade"
+      }
+     ],
+     "currency": "USD",
+     "axis_kind": "shade",
+     "deep_link": "https://judydoll.com/products/silky-matte-lip-ink?variant=49819267301653&utm_source=pivota&utm_medium=affiliate",
+     "variant_id": "49819267301653",
+     "option_name": "Shade",
+     "product_url": "https://judydoll.com/products/silky-matte-lip-ink",
+     "option_value": "07 BURGUNDY INK",
+     "display_label": "Shade: 07 BURGUNDY INK",
+     "source_quality_status": "reviewed_deterministic"
+    }
+   ]
+  }
+ }
+}

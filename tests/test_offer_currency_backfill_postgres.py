@@ -162,21 +162,8 @@ async def test_update_prepares_and_executes(pg_schema, live_only):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("live_only", [False, True])
-async def test_update_actually_returns_the_rows_it_wrote(pg_schema, live_only):
-    """`RETURNING` must be there AND must yield one row per write.
-
-    A review mutation deleted `RETURNING o.offer_id` and NOTHING went red: on an
-    empty table `assert rows == []` is satisfied identically by "prepared, matched
-    nothing" and by "the statement has no RETURNING clause at all". The unit file
-    cannot see it either — its fake DB hands back a hardcoded row for any UPDATE,
-    so the write count there is fiction.
-
-    That matters because the count IS the operator's only evidence: `database
-    .execute()` returns None for an UPDATE without RETURNING, and that exact
-    gotcha once reported `0` while writing 664 rows. So this seeds a real matching
-    row and asserts the row comes back — the only assertion that can tell the two
-    apart.
-    """
+async def test_domain_hint_cannot_relabel_even_a_matching_live_offer(pg_schema, live_only):
+    """An audit hint cannot change the denomination of a captured amount."""
     from sqlalchemy import text
 
     from db.database import database
@@ -217,14 +204,11 @@ async def test_update_actually_returns_the_rows_it_wrote(pg_schema, live_only):
         finally:
             await database.disconnect()
 
-        assert len(rows) == 1, (
-            "RETURNING must yield one row per relabelled offer — the write count "
-            "the operator reads is derived from exactly this"
-        )
-        assert rows[0]["offer_id"] == offer_id
+        assert rows == []
+        with engine.begin() as conn:
+            unchanged=conn.execute(text("SELECT currency,market,list_price FROM catalog_offers WHERE offer_id=:o"),{"o":offer_id}).one()
+        assert tuple(unchanged)==("USD","US",10)
 
-        # and the correct-only guard means a second pass is a no-op: the row now
-        # carries a real currency and is structurally untouchable.
         await database.connect()
         try:
             again = await database.fetch_all(

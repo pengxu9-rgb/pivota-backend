@@ -1498,3 +1498,188 @@ def test_classic_account_login_is_login_required():
     assert _classify(good, chain=[(302, "https://s.com/account/login?return_url=x"), (200, good)])[0] \
         is Verdict.LOGIN_REQUIRED
     assert _classify(good, chain=[(302, "https://s.com/account"), (200, good)])[0] is Verdict.ELIGIBLE
+
+
+# --- an edge THROTTLE is retryable and says nothing about the store -------------------------------
+#
+# 2026-10-07 07:08Z onward, prod: 163 of ~196 sweep checks in 24 h answered
+# `products_json_page_1_status_429` across unrelated Shopify stores, each recorded VARIANT_UNVERIFIED with
+# retryable=False. 2026-10-08 ~00:20Z, a one-off probe from a FRESH crawl NAT IP got this on its very first
+# request to flowerknows.co and dermalogica.com: 429, `server: cloudflare`, `retry-after: 60`, text/plain
+# `local_rate_limited`, no `cf-mitigated`. These responses are that one, byte for byte where it matters.
+
+MEASURED_429 = {"server": "cloudflare", "retry-after": "60", "content-type": "text/plain"}
+CHALLENGE_403 = {"server": "cloudflare", "cf-mitigated": "challenge", "content-type": "text/html"}
+
+
+def throttled(status=429, headers=MEASURED_429, body="local_rate_limited"):
+    return lambda request: httpx.Response(status, headers=headers, text=body)
+
+
+def _assert_throttle(result, stage, signal, status):
+    assert result.verdict is Verdict.TRANSPORT_ERROR
+    assert result.retryable is True, "a throttle is retryable: the next run should ask again"
+    assert result.throttled is True
+    assert result.detail == f"{stage}:throttled_{signal}"
+    assert result.final_status == status
+
+
+async def test_a_measured_429_on_the_catalog_is_a_retryable_throttle_not_variant_unverified():
+    store = Store({("judydoll.com", "/products.json"): throttled(), **cart_to_checkout()})
+    result = await run(store, variant_id=VID)
+    _assert_throttle(result, "resolve", "429", 429)
+    assert result.verdict is not Verdict.VARIANT_UNVERIFIED
+    assert store.hit("/cart/") == [], "the throttle stops the preflight: no permalink, no checkout created"
+    assert len(store.requests) == 1, "one throttled answer, one request: the preflight does not keep asking"
+
+
+async def test_a_429_on_a_later_catalog_page_is_a_throttle_too():
+    def pages(request):
+        if request.url.params.get("page") == "1":
+            return httpx.Response(200, json=catalog(cvar("41000000000001", title="other")))
+        return throttled()(request)
+
+    store = Store({("judydoll.com", "/products.json"): pages})
+    result = await run(store, variant_id=VID)
+    _assert_throttle(result, "resolve", "429", 429)
+    assert [r.url.params.get("page") for r in store.requests] == ["1", "2"]
+
+
+async def test_a_429_on_the_handle_read_is_a_throttle():
+    store = Store({("judydoll.com", "/products/single-eyeshadow.js"): throttled()})
+    result = await run(store, variant_id=VID, product_handle="single-eyeshadow")
+    _assert_throttle(result, "resolve", "429", 429)
+
+
+async def test_a_429_after_a_redirect_hop_is_a_throttle_and_the_hop_is_kept():
+    store = Store({
+        ("judydoll.com", "/products.json"): redirect(301, "https://www.judydoll.com/products.json"),
+        ("www.judydoll.com", "/products.json"): throttled(),
+    })
+    result = await run(store, variant_id=VID)
+    _assert_throttle(result, "resolve", "429", 429)
+    assert [status for status, _ in result.resolve_chain] == [301, 429]
+
+
+async def test_a_429_on_the_permalink_is_a_throttle_with_the_resolved_variant_kept():
+    store = Store({
+        ("judydoll.com", "/products.json"): products_json(catalog(cvar())),
+        ("judydoll.com", f"/cart/{VID}:1"): throttled(),
+    })
+    result = await run(store, variant_id=VID)
+    _assert_throttle(result, "permalink", "429", 429)
+    assert result.variant_id == VID and result.variant_source == "caller"
+
+
+async def test_a_challenged_checkout_is_a_throttle_that_keeps_blocked_unknown():
+    """Flagged and retryable, but the VERDICT stays BLOCKED_UNKNOWN: definite in the Tier B lane, so a
+    checkout that challenges automated clients still takes the store off the cart-link rail there."""
+    store = Store({
+        ("judydoll.com", "/products.json"): products_json(catalog(cvar())),
+        **cart_to_checkout(),
+    })
+    store.routes[("judydoll.com", f"/checkouts/cn/{TOKEN}/en-us")] = throttled(403, CHALLENGE_403, "<html>Just a moment...</html>")
+    result = await run(store, variant_id=VID)
+    assert result.verdict is Verdict.BLOCKED_UNKNOWN
+    assert result.throttled is True and result.retryable is True
+    assert result.detail == "permalink:throttled_challenge_403" and result.final_status == 403
+
+
+async def test_a_challenged_catalog_page_is_a_transport_error_throttle():
+    store = Store({("judydoll.com", "/products.json"): throttled(403, CHALLENGE_403, "<html>Just a moment...</html>")})
+    _assert_throttle(await run(store, variant_id=VID), "resolve", "challenge_403", 403)
+
+
+async def test_a_challenge_on_a_200_is_a_throttle_too():
+    """`cf-mitigated` on ANY status: Cloudflare can serve its challenge page with a 200."""
+    store = Store({("judydoll.com", "/products.json"): throttled(200, CHALLENGE_403, "<html>Just a moment...</html>")})
+    _assert_throttle(await run(store, variant_id=VID), "resolve", "challenge_200", 200)
+
+
+# A WALL STILL WINS: a throttled login or password hop is the store's redirect answering, not the edge.
+
+@pytest.mark.parametrize("status, headers", [(403, CHALLENGE_403), (429, MEASURED_429)])
+async def test_a_throttled_shopify_login_hop_is_still_login_required(status, headers):
+    vid = "46060205703339"
+    routes = _login_routes("forbeaut.us", vid)
+    routes[("shopify.com", "/authentication/73087058091/oauth/authorize")] = throttled(status, headers)
+    store = Store({("forbeaut.us", "/products.json"): products_json(catalog(cvar(vid))), **routes})
+    result = await run(store, host="forbeaut.us", variant_id=vid)
+    assert result.verdict is Verdict.LOGIN_REQUIRED and result.throttled is False
+    assert result.final_status == status and result.final_host == "shopify.com"
+
+
+async def test_a_catalog_redirected_to_a_throttled_login_is_still_login_required():
+    store = Store({
+        ("judydoll.com", "/products.json"): redirect(302, "https://judydoll.com/account/login"),
+        ("judydoll.com", "/account/login"): throttled(),
+    })
+    result = await run(store, variant_id=VID)
+    assert result.verdict is Verdict.LOGIN_REQUIRED and result.throttled is False
+
+
+async def test_a_throttled_password_page_is_still_password_page():
+    store = Store({
+        ("judydoll.com", "/products.json"): redirect(302, "https://judydoll.com/password"),
+        ("judydoll.com", "/password"): throttled(),
+    })
+    result = await run(store, variant_id=VID)
+    assert result.verdict is Verdict.PASSWORD_PAGE and result.throttled is False
+
+
+async def test_a_503_with_retry_after_is_a_throttle():
+    store = Store({("judydoll.com", "/products.json"): throttled(503, {"retry-after": "30"}, "busy")})
+    _assert_throttle(await run(store, variant_id=VID), "resolve", "503", 503)
+
+
+# The refusing side. Each of these is the store (or an outage) answering, and keeps the verdict it had.
+
+async def test_a_bare_503_is_an_outage_not_a_throttle():
+    store = Store({("judydoll.com", "/products.json"): throttled(503, {"server": "cloudflare"}, "down")})
+    result = await run(store, variant_id=VID)
+    assert result.throttled is False
+    assert result.verdict is Verdict.VARIANT_UNVERIFIED and result.detail == "products_json_page_1_status_503"
+
+
+async def test_a_plain_403_on_the_checkout_stays_blocked_unknown():
+    store = Store({("judydoll.com", "/products.json"): products_json(catalog(cvar())), **cart_to_checkout(
+        body=PLAIN_403_BODY, status=403)})
+    result = await run(store, variant_id=VID)
+    assert result.throttled is False
+    assert result.verdict is Verdict.BLOCKED_UNKNOWN and result.retryable is False
+
+
+async def test_not_accepting_orders_is_still_the_store_answering():
+    store = Store({("judydoll.com", "/products.json"): products_json(catalog(cvar())), **cart_to_checkout(
+        body=NOT_ACCEPTING_BODY, status=403)})
+    result = await run(store, variant_id=VID)
+    assert result.throttled is False and result.verdict is Verdict.NOT_ACCEPTING_ORDERS
+
+
+@pytest.mark.parametrize("status, headers, expected", [
+    (429, {}, "429"),
+    (429, {"Retry-After": "60"}, "429"),
+    (503, {"Retry-After": "5"}, "503"),
+    (503, {}, None),
+    (403, {"CF-Mitigated": "challenge"}, "challenge_403"),
+    (403, {"server": "cloudflare"}, None),
+    (200, {"server": "cloudflare", "powered-by": "Shopify"}, None),
+    (404, {}, None),
+])
+def test_throttle_signal_is_exactly_these_shapes(status, headers, expected):
+    assert pf.throttle_signal(status, httpx.Headers(headers)) == expected
+
+
+async def test_script_does_not_retry_a_throttle_from_the_real_preflight():
+    """The operator script retries a TRANSPORT_ERROR once; a THROTTLE is one too, and must not be."""
+    script = _load_script()
+    store = Store({("judydoll.com", "/products.json"): throttled()})
+
+    async def real(host, **kwargs):
+        async with store.client() as client:
+            return await preflight(host, client=client, **kwargs)
+
+    rows = [script.normalize_row({"domain": "judydoll.com", "market": "US", "variant_id": VID})]
+    out = await script.run_rows(rows, preflight_fn=real, retry_delay_s=0)
+    assert out[0]["attempts"] == 1 and out[0]["result"]["throttled"] is True
+    assert len(store.requests) == 1
