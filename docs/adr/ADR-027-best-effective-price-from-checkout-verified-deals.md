@@ -1,6 +1,6 @@
 # ADR-027: Best effective price comes from checkout-verified deals, never from scraped coupon sites
 
-**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review.
+**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link).
 - peng resolved four questions on 2026-10-29 and six more on 2026-10-30 (see "Resolved questions").
 - Phase 0a ran on 2026-10-29. Its base was unusable, so the gate has not been computed (see "Phases and gates").
 
@@ -198,7 +198,9 @@ It never replaces the quoted price, and `pricing.total` stays the only amount th
 
 Deals reach `get_offers`, PDP and recommendation responses through a read of the store in D6, keyed by `(seller_id, market, variant)`. **No request path makes an outbound call for deals.** There is no request-time re-check, in any phase: a re-check would run in `web`, which leaves by the payment-allowlisted address.
 
-Hot deals are kept fresh by the background verifier instead: it re-verifies the variants most often shown before their TTL runs out, inside the D3 cap.
+Deals must be found before the buyer reaches the merchant's checkout, because a buyer who leaves checkout to look for a code is a conversion we may lose (Q11). The background verifier therefore spends the D3 cap in this order, and re-verifies before the TTL runs out:
+1. the merchants and variants we send the most click-outs to, from the click rows;
+2. then the variants most often shown.
 
 ### D6. Storage: observed store offers, not a promotions engine
 
@@ -355,6 +357,8 @@ That shows peng whether a failed gate means few deals or few connections.
 
 **Phase 0b: reference carts on connected stores.** Verifying automatic discounts and published codes on connected stores means creating carts in merchant stores. Those carts are writes, however harmless, so each run is a one-off prod job that needs a controller slot and stays under the D3 cap (Q8). Phase 0b does not touch non-connected stores (Q2).
 
+**Phase 0: prepare Q2's approval request now (Q11).** Most of the stores we send buyers to are not connected, so Phase 1 alone leaves most guest checkouts without a code. The request for Q2's separate approval is prepared during Phase 0, not after Phase 1. Phase 0 also reports, per market, the merchants with the most click-outs and whether each is connected, so the first stores verified after an approval are the ones that matter most.
+
 **Phase 1: US, Shopify, verified, display-only.**
 - `observed_store_offers` and its per-variant verification table, the opt-out denylist and the daily cap counter.
 - `merchant_published` extraction from text existing crawls already store.
@@ -376,6 +380,8 @@ That shows peng whether a failed gate means few deals or few connections.
 ## Metrics
 
 - **Verified-deal coverage:** per market, the gate's measure over the Phase 0 base.
+- **Click-out coverage:** per market, the share of Shopify click-outs whose link carried a verified code (`discount_carried = true`), overall and for the merchants with the most click-outs (Q11).
+- **Both-carried rate:** among reconciled orders from clicks where `/r` appended the code, the share whose order shows both the code and our click attribute. The first such orders are also checked by hand (Q12).
 - **False-savings rate:** codes `/r` appended (`discount_carried = true`) that did not apply on a paid order, among reconciled orders. Target under 2%. **This is the metric that can stop the lane** (D7 stop rule). It counts finished orders only, so it is survivor-only (D7).
 - **Median and p90 savings** per verified deal, in market currency, on the reference-cart base.
 - **Click-out to order conversion** with and without a verified deal (A/B, Phase 2).
@@ -392,7 +398,7 @@ That shows peng whether a failed gate means few deals or few connections.
 ## Consequences
 
 - Buyers see fewer deals than an aggregator would show, and the ones they see work. This is the trade-off.
-- Per-variant verification costs more carts than per-scope verification. The daily cap therefore limits coverage, and the verifier spends it on the variants we show most.
+- Per-variant verification costs more carts than per-scope verification. The daily cap therefore limits coverage, and the verifier spends it on the merchants and variants we send the most click-outs to (D5).
 - Only connected stores can have a verified deal until Q2 or UCP widens it, and in Phase 2 only sellers in our affiliate programs join them. Those are also the sellers Pivota can attribute and earn on. This is why Phase 1 is display-only, and why Q6 limits ranking to seller order within a product, never product order in a slate.
 - `TestPromotionsLaneStaysDeleted` stays as is. Add new pins:
   - the deal-read module (the code that reads `observed_store_offers` for serving and for `/r`) makes no outbound HTTP calls (D5). `/r`'s warm handoff, which does, is outside it;
@@ -424,7 +430,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - Showing observed, checkout-verified deals is not the rebuild ADR-022 gates. It adds no pricing engine and keeps ADR-022's invariant: only a deal the merchant's checkout applied, for that item, market and lane, is shown.
    - Phase 1 therefore does not wait for a merchant commitment.
    - The trigger still applies to merchant-created codes (D8, Phase 3).
-   - The amendment covers **showing** only. Whether Phase 2 ranking, within Q6's limits, also needs no merchant commitment is not decided here. The proposed answer is no: ranking stays within one product, adds no pricing engine, and what Pivota earns never enters it. It is decided with the Phase 2 ranking part of the `savings.v1` amendment (D4).
+   - Phase 2 ranking, within Q6's limits, needs no merchant commitment either: it stays within one product, adds no pricing engine, and what Pivota earns never enters it. The Phase 2 ranking part of the `savings.v1` amendment (D4) still applies.
 6. **Ranking: off until measured, then within a product only.**
    - Phase 1 is display-only.
    - Ranking may start only after the false-savings rate has been measured, meaning at least 50 reconciled orders in the window, and is under the D7 stop threshold.
@@ -440,3 +446,12 @@ That shows peng whether a failed gate means few deals or few connections.
    - An `authorized_feed` deal follows ADR-025's carrier: the network's tracking link, with our click id as sub-id. The code rides that link where the network supports it; otherwise the deal is not emitted on that lane.
    - Before a code and a click are combined for a program, that program's terms must allow it in writing.
 10. **Q2's separate approval.** Its form is recorded by peng outside this ADR. The public wording stays: testing codes on non-connected stores needs a separate, explicit approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then.
+11. **Coverage before guest checkout.**
+   - A verified code must already be on the link when the buyer reaches the merchant's checkout. A buyer who leaves to search for a code may not come back.
+   - The verifier puts the merchants and variants we send the most click-outs to first (D5).
+   - Testing codes on non-connected stores still needs Q2's separate approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. The approval request is prepared now, during Phase 0, so coverage can widen as soon as it is given.
+12. **The code and our attribution travel on one link.**
+   - A deal-lane code is emitted only on a link that also carries Pivota's attribution: the click attribute on a Shopify cart permalink (D7), or the network's tracking link with our click id as sub-id (Q9).
+   - Where a lane can carry our attribution but not the code, the link carries the attribution only, and the deal is not emitted on that lane. We never trade attribution for the code.
+   - Those lanes are listed as work to do, each with its own review: the Reap cart-link, whose allowlist refuses `discount=` (D7), and any affiliate network whose tracking link drops it (Q9).
+   - That both arrive together is checked on the first reconciled orders (Metrics: both-carried rate).
