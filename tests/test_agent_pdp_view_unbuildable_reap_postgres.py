@@ -769,7 +769,8 @@ def test_links_written_while_the_key_was_reaped_are_repointed_only_when_their_de
 
     counters, rows = run(body)
     assert counters["restored"] == 1 and counters["links_restored"] == 2
-    assert [(r["tag"], r["content_key"]) for r in rows] == [
+    # Sorted here, not by ORDER BY: CI's Postgres collation orders "-" differently from a local one.
+    assert sorted((r["tag"], r["content_key"]) for r in rows) == [
         ("-|-|true|false", "ck_off"),
         ("offer:mine|-|false|false", None),
         ("offer:mine|dec_off|false|false", "ck_off"),
