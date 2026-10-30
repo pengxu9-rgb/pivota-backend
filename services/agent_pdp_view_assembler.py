@@ -2747,17 +2747,26 @@ def _titled_override_arm() -> str:
         )"""
 
 
-def _unbuildable_predicate(*, with_enrichment: bool) -> str:
-    return f"""
-    EXISTS (SELECT 1 FROM catalog_products cp0 WHERE cp0.content_key = av.content_key)
-    AND NOT (
+def _buildable_arms(*, with_enrichment: bool) -> str:
+    """A member that survives the quarantine anti-join and has a title (its own, or an
+    enrichment title_override). Reads `av.content_key`."""
+    return f"""(
         EXISTS (
             SELECT 1 FROM catalog_products cp
             WHERE cp.content_key = av.content_key
               AND cp.title IS NOT NULL AND trim(cp.title) <> ''
             {_SOURCE_QUARANTINE_ANTI_JOIN}
         ){_titled_override_arm() if with_enrichment else ""}
-    )
+    )"""
+
+
+_HAS_CATALOG_ROWS = "EXISTS (SELECT 1 FROM catalog_products cp0 WHERE cp0.content_key = av.content_key)"
+
+
+def _unbuildable_predicate(*, with_enrichment: bool) -> str:
+    return f"""
+    {_HAS_CATALOG_ROWS}
+    AND NOT {_buildable_arms(with_enrichment=with_enrichment)}
 """
 
 
@@ -2858,14 +2867,27 @@ async def delete_agent_pdp_view_if_unbuildable(
             "content_key": content_key,
         })
         return False
-    deleted = await read_db.fetch_one(
-        _delete_if_unbuildable_sql(with_enrichment=present["enrichment"], with_links=present["links"]),
-        {
-            "content_key": content_key,
-            "run_id": run_id or _new_run_id("refresh"),
-            "refresh_source": refresh_source,
-        },
-    )
+    # Lock the row first, then decide in a NEW statement. The deleting statement's CTEs
+    # read its own snapshot, and a DELETE that waited on a concurrent rebuild re-checks
+    # only its join (EvalPlanQual), so a snapshot taken before a revoke committed could
+    # delete the row that revoke's rebuild just wrote. Under READ COMMITTED the statement
+    # after the FOR UPDATE takes its snapshot once the lock is held, i.e. after any
+    # concurrent writer of this row has committed.
+    async with read_db.transaction():
+        locked = await read_db.fetch_one(
+            "SELECT content_key FROM agent_pdp_view WHERE content_key = :content_key FOR UPDATE",
+            {"content_key": content_key},
+        )
+        if not locked:
+            return False
+        deleted = await read_db.fetch_one(
+            _delete_if_unbuildable_sql(with_enrichment=present["enrichment"], with_links=present["links"]),
+            {
+                "content_key": content_key,
+                "run_id": run_id or _new_run_id("refresh"),
+                "refresh_source": refresh_source,
+            },
+        )
     if not deleted:
         return False
     deleted = dict(deleted)
@@ -2959,73 +2981,141 @@ async def reap_unbuildable_agent_pdp_view_rows(
     }
 
 
+def _restore_queue_sql(*, with_enrichment: bool) -> str:
+    """Unrestored keys that can be finished NOW, a page at a time (keyset on content_key):
+    a view row exists again (another writer rebuilt it), or the key has catalog rows and one
+    of them is buildable. Filtering here, before the LIMIT, is what keeps a key that is still
+    quarantined (or an orphan, or re-quarantined) from holding a page forever."""
+    return f"""
+    SELECT av.content_key,
+           EXISTS (SELECT 1 FROM agent_pdp_view v WHERE v.content_key = av.content_key) AS has_view,
+           av.audit_ids, av.since
+    FROM (
+        SELECT a.content_key, array_agg(a.audit_id ORDER BY a.audit_id) AS audit_ids,
+               MIN(a.deleted_at) AS since
+        FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
+        WHERE a.restored_at IS NULL AND a.content_key > :after
+        GROUP BY a.content_key
+    ) av
+    WHERE EXISTS (SELECT 1 FROM agent_pdp_view v WHERE v.content_key = av.content_key)
+       OR ({_HAS_CATALOG_ROWS} AND {_buildable_arms(with_enrichment=with_enrichment)})
+    ORDER BY av.content_key
+    LIMIT :page
+"""
+
+
+# The links one reap nulled (their ids are in the audit), plus links INSERTED with content_key
+# NULL while the key was reaped: services/agent_decision_event_store nulls a content_key whose
+# view row is missing rather than drop the link. Those are matched only through their own
+# catalog_offer_id, an offer of a product under this key, and only if written after the reap.
+_REPOINT_LINKS_SQL = f"""
+    UPDATE agent_decision_funnel_links l
+    SET content_key = :ck
+    WHERE l.content_key IS NULL
+      AND (
+        l.link_id::text IN (
+            SELECT jsonb_array_elements_text(a.funnel_link_ids)
+            FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
+            WHERE a.audit_id = ANY(:audit_ids)
+        )
+        OR (
+            l.created_at >= :since
+            AND l.catalog_offer_id IN (
+                SELECT co.offer_id FROM catalog_offers co
+                JOIN catalog_products cp ON cp.product_key = co.product_key
+                WHERE cp.content_key = :ck
+            )
+        )
+      )
+    RETURNING l.link_id
+"""
+
+
+async def _finish_restore(db: Any, row: Dict[str, Any], *, links: bool) -> Optional[int]:
+    """Re-point the key's links and stamp its queued audit rows, in ONE transaction, under a
+    lock on the view row. None when the view row is gone again (reaped meanwhile): nothing is
+    stamped and the key stays queued. Only the audit rows read with the queue are stamped, so
+    a newer reap's row is never marked restored by an older pass."""
+    async with db.transaction():
+        held = await db.fetch_one(
+            "SELECT content_key FROM agent_pdp_view WHERE content_key = :ck FOR UPDATE",
+            {"ck": row["content_key"]},
+        )
+        if not held:
+            return None
+        fixed = []
+        if links:
+            fixed = await db.fetch_all(
+                _REPOINT_LINKS_SQL,
+                {"ck": row["content_key"], "audit_ids": list(row["audit_ids"]), "since": row["since"]},
+            )
+        await db.execute(
+            f"UPDATE {_UNBUILDABLE_REAP_AUDIT_TABLE} SET restored_at = NOW() "
+            "WHERE audit_id = ANY(:audit_ids) AND restored_at IS NULL",
+            {"audit_ids": list(row["audit_ids"])},
+        )
+    return len(fixed or [])
+
+
 async def restore_reaped_agent_pdp_view_rows(
     *,
     db: Any = None,
     limit: Optional[int] = 200,
     refresh_source: str = "unbuildable_restore",
 ) -> Dict[str, int]:
-    """Rebuild reaped keys that are buildable again (quarantine revoked or expired).
+    """Finish every reaped key that can be finished now.
 
-    Candidates: audit rows not yet restored whose key has no view row now. Each is
-    rebuilt from catalog truth through refresh_agent_pdp_view_for_content_key (the
-    audit snapshot is the record, not the source: a rebuild serves today's data).
-    When the rebuild lands, the key's audit rows are stamped restored_at and the
-    funnel links the delete nulled get their content_key back (only links still
-    NULL there, so a link re-pointed meanwhile is left alone). A key still
-    unbuildable is skipped and stays a candidate. Runs whatever the reap flag says:
-    restoring is never the risky direction. No audit table: nothing to restore.
+    The queue (_restore_queue_sql) is the unrestored audit rows of keys that are buildable now
+    or already have a view row again, read `limit` keys per page until it is exhausted. For a
+    key without a view row, rebuild it from catalog truth (refresh_agent_pdp_view_for_content_key:
+    today's data, not the snapshot). Then, for every key with a view row, re-point the funnel
+    links the reap nulled and stamp the audit rows (_finish_restore). A key that still does not
+    build is counted and skipped; it comes back once it can build. Each key runs on its own:
+    one that raises is counted in `errors` and the pass goes on.
+
+    Not gated on AGENT_PDP_VIEW_UNBUILDABLE_REAP: restoring is never the risky direction, and
+    links must heal while deletes are switched off. No audit table: nothing to restore.
     """
     read_db = db or database
+    counters = {"candidates": 0, "restored": 0, "relinked": 0, "still_unbuildable": 0,
+                "links_restored": 0, "errors": 0}
     present = await _reap_tables_present(read_db)
     if not present["audit"]:
-        return {"candidates": 0, "restored": 0, "still_unbuildable": 0, "links_restored": 0}
-    limit_clause = " LIMIT :limit" if limit and int(limit) > 0 else ""
-    params = {"limit": int(limit)} if limit and int(limit) > 0 else {}
-    rows = await read_db.fetch_all(
-        f"""
-        SELECT a.content_key
-        FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
-        WHERE a.restored_at IS NULL
-          AND NOT EXISTS (SELECT 1 FROM agent_pdp_view av WHERE av.content_key = a.content_key)
-        GROUP BY a.content_key
-        ORDER BY MIN(a.deleted_at), a.content_key
-        """ + limit_clause,
-        params,
-    )
-    keys = [dict(r)["content_key"] for r in rows]
-    restored = still = links_restored = 0
-    for ck in keys:
-        if not await refresh_agent_pdp_view_for_content_key(ck, refresh_source=refresh_source, db=read_db):
-            still += 1
-            continue
-        restored += 1
-        if present["links"]:
-            fixed = await read_db.fetch_all(
-                f"""
-                UPDATE agent_decision_funnel_links l
-                SET content_key = :ck
-                WHERE l.content_key IS NULL
-                  AND l.link_id::text IN (
-                      SELECT jsonb_array_elements_text(a.funnel_link_ids)
-                      FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
-                      WHERE a.content_key = :ck AND a.restored_at IS NULL
-                  )
-                RETURNING l.link_id
-                """,
-                {"ck": ck},
-            )
-            links_restored += len(fixed or [])
-        await read_db.execute(
-            f"UPDATE {_UNBUILDABLE_REAP_AUDIT_TABLE} SET restored_at = NOW() "
-            "WHERE content_key = :ck AND restored_at IS NULL",
-            {"ck": ck},
-        )
-    counters = {
-        "candidates": len(keys), "restored": restored,
-        "still_unbuildable": still, "links_restored": links_restored,
-    }
-    if restored:
+        return counters
+    page = int(limit) if limit and int(limit) > 0 else 500
+    queue_sql = _restore_queue_sql(with_enrichment=present["enrichment"])
+    after = ""
+    while True:
+        rows = [dict(r) for r in await read_db.fetch_all(queue_sql, {"after": after, "page": page})]
+        if not rows:
+            break
+        after = rows[-1]["content_key"]
+        for row in rows:
+            counters["candidates"] += 1
+            ck = row["content_key"]
+            try:
+                if not row["has_view"]:
+                    if not await refresh_agent_pdp_view_for_content_key(
+                        ck, refresh_source=refresh_source, db=read_db
+                    ):
+                        counters["still_unbuildable"] += 1
+                        continue
+                fixed = await _finish_restore(read_db, row, links=present["links"])
+                if fixed is None:
+                    counters["still_unbuildable"] += 1
+                    continue
+                counters["restored" if not row["has_view"] else "relinked"] += 1
+                counters["links_restored"] += fixed
+            except Exception as exc:  # noqa: BLE001 — one key must not block the rest
+                counters["errors"] += 1
+                logger.warning({
+                    "event": "agent_pdp_view_unbuildable_restore_failed",
+                    "content_key": ck,
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                })
+        if len(rows) < page:
+            break
+    if counters["restored"] or counters["relinked"] or counters["errors"]:
         logger.warning({"event": "agent_pdp_view_unbuildable_restored", **counters})
     return counters
 

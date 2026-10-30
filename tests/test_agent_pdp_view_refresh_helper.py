@@ -38,7 +38,18 @@ _PRODUCT_FOR_TRISTATE = {
 }
 
 
+class _FakeTransaction:
+    async def __aenter__(self) -> "_FakeTransaction":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
 class _FakeDB:
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
+
     def __init__(self, fetch_one_result: Optional[Dict[str, Any]] = None) -> None:
         self.executes: List[Dict[str, Any]] = []
         self.fetch_ones: List[Dict[str, Any]] = []
@@ -192,8 +203,9 @@ async def test_refresh_with_the_reap_on_runs_the_audited_delete(monkeypatch: pyt
     )
     assert built is False
     assert db.executes == []
-    probe, delete = db.fetch_ones
+    probe, lock, delete = db.fetch_ones
     assert "to_regclass" in probe["sql"]
+    assert lock["sql"].rstrip().endswith("FOR UPDATE")
     assert delete["sql"] == apv._delete_if_unbuildable_sql(with_enrichment=True, with_links=True)
     assert delete["params"]["content_key"] == "ck-missing"
     assert delete["params"]["refresh_source"] == "catalog_sync"

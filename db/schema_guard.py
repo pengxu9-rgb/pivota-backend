@@ -3261,6 +3261,16 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("schema guard: unbuildable reap audit heal deferred to next boot: %s", exc)
+            # mig 273: the funnel links' content_key FK had no index (see the migration).
+            # Plain build here, behind the heal lock_timeout: the migration carries the
+            # CONCURRENTLY form, which a guard transaction cannot run. Small table.
+            try:
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_decision_funnel_links_content_key "
+                    "ON agent_decision_funnel_links (content_key) WHERE content_key IS NOT NULL;"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema guard: funnel-link content_key index deferred to next boot: %s", exc)
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
             # identical content under a self-referential canonical tag. The

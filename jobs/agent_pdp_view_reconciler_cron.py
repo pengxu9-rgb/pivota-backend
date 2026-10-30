@@ -291,15 +291,22 @@ async def _restore_reaped_rows(db: Any) -> None:
     """Rebuild unbuildable-reaped keys whose quarantine was revoked or has expired.
 
     Expiry fires no event (the quarantine anti-join just stops matching), so this
-    tick is what brings an expired quarantine's keys back; a revoke through
-    scripts/manage_source_quarantine pokes the same restore at once. Best-effort:
+    tick is what brings an expired quarantine's keys back, and a revoked one's (the
+    quarantine CLI does not rebuild views: its connection is not the one the builder's
+    overlays read). Best-effort:
     a restore failure never fails the reconcile pass.
     """
     try:
         from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
 
         restored = await restore_reaped_agent_pdp_view_rows(db=db, refresh_source=REFRESH_SOURCE)
-        if restored["candidates"]:
+        if restored["errors"]:
+            logger.warning(
+                "agent_pdp_view_reconcile: unbuildable restore: %d key(s) failed "
+                "(agent_pdp_view_unbuildable_restore_failed lines name them); %s",
+                restored["errors"], restored,
+            )
+        elif restored["candidates"]:
             logger.warning("agent_pdp_view_reconcile: unbuildable restore %s", restored)
     except Exception as exc:  # noqa: BLE001 — WARNING, not ERROR: the drift ERROR is the pass's alarm
         logger.warning("agent_pdp_view_reconcile: unbuildable restore failed: %s", str(exc)[:300])
