@@ -58,9 +58,10 @@ from db.database import database
 # Candidate (order, funnel_event) pairs that have decision linkage and are not
 # yet linked. We read decision_id + checkout_decision_id from the order's
 # decision_layer metadata block. EVERY foreign-key reference is validated
-# against its parent table (agent_decision_funnel_links has ON DELETE RESTRICT
-# FKs on decision_id/checkout_decision_id/content_key/catalog_offer_id), so a
-# dangling id is nulled out here rather than aborting the INSERT. A row is only
+# against its parent table (agent_decision_funnel_links has FKs on decision_id
+# (ON DELETE RESTRICT) and checkout_decision_id/content_key/catalog_offer_id
+# (ON DELETE SET NULL); any miss aborts the INSERT), so a dangling id is nulled
+# out here rather than aborting the INSERT. A row is only
 # returned if it still has at least one valid decision link (decision_id or
 # checkout_decision_id) after validation.
 SELECT_CANDIDATES_SQL = """

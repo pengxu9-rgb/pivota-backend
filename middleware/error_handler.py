@@ -7,14 +7,46 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 import traceback
 import json
+import re
 from pathlib import Path
 
 from utils.error_codes import ErrorCode, PivotaAPIError, create_error_response
 from utils.logger import logger
+
+
+# A JSON body may carry "\ud800": json.loads turns it into a lone surrogate. A constrained str
+# field rejects it (string_unicode) and the 422 echoes it back as `input`; UTF-8 cannot encode a
+# surrogate, so JSONResponse.render raised and the request came back 500. _encodable covers that
+# echo, the middleware's re-read of >=400 JSON bodies, and the 500 `message`. It does NOT stop a
+# plain str / Dict / Any field or raw request.json() from carrying a lone surrogate into a route
+# (known follow-up). A str that reached Python holds no valid pair (json.loads joins those into
+# one code point), so every surrogate goes.
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def _encodable(value):
+    """`value` with every surrogate code point, in keys and values, replaced by U+FFFD."""
+    if isinstance(value, str):
+        return _SURROGATES.sub("\ufffd", value)
+    if isinstance(value, dict):
+        return {_encodable(k): _encodable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encodable(v) for v in value]
+    return value
+
+
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's default 422 (same status and `{"detail": [...]}` shape), with the echoed errors
+    made UTF-8-encodable. ErrorHandlerMiddleware still re-nests it as INVALID_REQUEST."""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _encodable(jsonable_encoder(exc.errors()))},
+    )
 
 
 class ErrorHandlerMiddleware(BaseHTTPMiddleware):
@@ -56,7 +88,9 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
                 body += chunk
 
             try:
-                payload = json.loads(body.decode("utf-8") or "{}")
+                # An ASCII-escaped body can carry "\ud800" that only becomes unencodable once
+                # parsed; the responses below re-render it.
+                payload = _encodable(json.loads(body.decode("utf-8") or "{}"))
             except Exception:
                 # If we can't parse it, return the original response body.
                 return JSONResponse(status_code=response.status_code, content={"detail": body.decode("utf-8", errors="replace")})
@@ -313,7 +347,7 @@ class ErrorHandlerMiddleware(BaseHTTPMiddleware):
             try:
                 msg = str(exc)
                 if msg:
-                    details["message"] = msg[:240]
+                    details["message"] = _encodable(msg[:240])
             except Exception:
                 pass
 

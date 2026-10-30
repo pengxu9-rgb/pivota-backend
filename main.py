@@ -19,6 +19,7 @@ from fastapi import (
     FastAPI, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect,
     Request, Response, status,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from middleware.cors import TieredCORSMiddleware, resolve_trusted_origins
 from middleware.rate_limiter import RateLimitMiddleware
@@ -27,7 +28,7 @@ from middleware.structured_logging import (
     StructuredLoggingMiddleware,
     install_uvicorn_access_log_redaction,
 )
-from middleware.error_handler import ErrorHandlerMiddleware
+from middleware.error_handler import ErrorHandlerMiddleware, request_validation_exception_handler
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -400,6 +401,7 @@ from routes.store_audit_public_intake import router as store_audit_public_intake
 from routes.store_audit_public_intake import claim_router as store_audit_claim_router
 from routes.store_readiness import router as store_readiness_router
 from routes.agent_internal_products import router as agent_internal_products_router
+from routes.agent_internal_decision_slates import router as agent_internal_decision_slates_router
 from routes.subject_resolve import router as subject_resolve_router
 from routes.accounts_orders_api import router as accounts_orders_router
 from routes.buyer_api import router as buyer_router
@@ -998,6 +1000,9 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
+# FastAPI's own 422 handler echoes the input and 500s when it holds a lone surrogate ("\ud800"),
+# which UTF-8 cannot encode; this one returns the same 422 with the echo made encodable.
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
 # Security response headers on EVERY response, including the ones other middleware generate.
 #
@@ -1427,6 +1432,7 @@ app.include_router(store_audit_public_intake_router)  # Public store-audit intak
 app.include_router(store_audit_claim_router)  # AUTHENTICATED claim of an anonymous funnel run (same flag; not under /public/*)
 app.include_router(store_readiness_router)  # Merchant-triggered storefront journey: search -> PDP -> cart -> address -> checkout
 app.include_router(agent_internal_products_router)  # Thin internal search primitive (/agent/internal/products/search)
+app.include_router(agent_internal_decision_slates_router)  # Gateway-served slates into the decision ledger (/agent/internal/decision-slates)
 app.include_router(agent_management_router)  # Agent management
 app.include_router(fulfillment_api_router)  # Fulfillment tracking for agents
 app.include_router(refund_api_router)  # Refund processing
