@@ -19,6 +19,7 @@ from fastapi import (
     FastAPI, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect,
     Request, Response, status,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from middleware.cors import TieredCORSMiddleware, resolve_trusted_origins
 from middleware.rate_limiter import RateLimitMiddleware
@@ -27,7 +28,7 @@ from middleware.structured_logging import (
     StructuredLoggingMiddleware,
     install_uvicorn_access_log_redaction,
 )
-from middleware.error_handler import ErrorHandlerMiddleware
+from middleware.error_handler import ErrorHandlerMiddleware, request_validation_exception_handler
 from middleware.ap2_security import AP2SecurityMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -999,6 +1000,9 @@ app.add_middleware(StructuredLoggingMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)
+# FastAPI's own 422 handler echoes the input and 500s when it holds a lone surrogate ("\ud800"),
+# which UTF-8 cannot encode; this one returns the same 422 with the echo made encodable.
+app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
 
 # Security response headers on EVERY response, including the ones other middleware generate.
 #
