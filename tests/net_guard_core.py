@@ -63,6 +63,7 @@ import errno
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -160,6 +161,15 @@ def _name(host: Any) -> str:
 def is_localhost_name(host: Any) -> bool:
     h = _name(host)
     return h == "localhost" or h.endswith(".localhost")
+
+
+def _answered_here(host: Any) -> bool:
+    """A localhost name the guard answers itself, as the loopback literal, without asking any
+    resolver: `*.localhost`, and every spelling of localhost but the plain one ("LOCALHOST",
+    "localhost.") -- a trailing dot makes it a fully qualified name a resolver may send to DNS.
+    Plain `localhost` goes to the real resolver, which answers it from the hosts file, and its
+    every answer is checked."""
+    return host is not None and _ip(host) is None and is_localhost_name(host) and _text(host) != "localhost"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -389,7 +399,7 @@ def _precheck(family: int, address: Any) -> Any:
     target, vetted = _vet(family, address)
     if target is not None:
         raise _refuse_connect(target)
-    if _name(host) == "localhost":
+    if _text(host) == "localhost":
         return address  # resolved -- and every answer checked -- by the guarded getaddrinfo
     return vetted
 
@@ -446,7 +456,7 @@ def _install_patches() -> None:
         return o["create_connection"](_precheck(family, address), *args, **kwargs)
 
     def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        if host is not None and _ip(host) is None and is_localhost_name(host) and _name(host) != "localhost":
+        if _answered_here(host):
             v6 = family == socket.AF_INET6
             return o["getaddrinfo"]("::1" if v6 else "127.0.0.1", port, family, type, proto, flags)
         target = _resolve_target(host)
@@ -458,7 +468,7 @@ def _install_patches() -> None:
         return results
 
     def gethostbyname(host):
-        if is_localhost_name(host) and _name(host) != "localhost":
+        if _answered_here(host):
             return "127.0.0.1"
         target = _resolve_target(host)
         if target is not None:
@@ -469,7 +479,7 @@ def _install_patches() -> None:
         return out
 
     def gethostbyname_ex(host):
-        if is_localhost_name(host) and _name(host) != "localhost":
+        if _answered_here(host):
             return (_text(host), [], ["127.0.0.1"])
         target = _resolve_target(host)
         if target is not None:
@@ -594,42 +604,75 @@ def _disable_proxies() -> None:
 # Postgres URLs: libpq connects in C, past every hook above.
 # ---------------------------------------------------------------------------------------------
 
-_PG_SCHEMES = ("postgres", "postgresql")
+#: A Postgres URL anywhere in a value (on its own, or inside JSON or a longer string).
+_PG_URL = re.compile(r"postgres(?:ql)?(?:\+\w+)?://[^\s\"'<>;]+", re.IGNORECASE)
+#: libpq's key=value form: `key = value`, spaces optional, a value optionally single-quoted.
+_CONNINFO_PAIR = re.compile(r"\s*([A-Za-z_]+)\s*=\s*('(?:[^'\\]|\\.)*'|[^\s']*)")
+_CONNINFO_KEYS = frozenset(
+    """host hostaddr port dbname user password passfile channel_binding connect_timeout
+    client_encoding options application_name fallback_application_name keepalives
+    keepalives_idle keepalives_interval keepalives_count tcp_user_timeout replication gssencmode
+    sslmode requiressl sslcompression sslcert sslkey sslpassword sslcertmode sslrootcert sslcrl
+    sslcrldir sslsni requirepeer require_auth ssl_min_protocol_version ssl_max_protocol_version
+    krbsrvname gsslib gssdelegation service target_session_attrs load_balance_hosts""".split()
+)
 
 
-def _pg_hosts(value: str) -> Optional[List[str]]:
-    """The hosts a libpq / asyncpg URL or key=value DSN connects to ("" = the default unix
-    socket), or None if `value` is not a Postgres connection string."""
-    value = value.strip()
-    scheme = value.split("://", 1)[0].lower() if "://" in value else ""
-    if scheme.split("+", 1)[0] in _PG_SCHEMES:
-        parts = urlsplit(value)
-        netloc = parts.netloc.rsplit("@", 1)[-1]
-        hosts = []
-        for item in netloc.split(","):
-            item = unquote(item)
-            if item.startswith("["):
-                hosts.append(item[1:].split("]", 1)[0])
-            else:
-                hosts.append(item.rsplit(":", 1)[0] if item.count(":") == 1 else item)
+def _service(name: str) -> str:
+    # A pg_service.conf entry can name any host; this guard does not read service files.
+    return f"service={name} (a service file can name any host)"
+
+
+def _url_hosts(url: str) -> List[str]:
+    try:
+        parts = urlsplit(url)
         query = parse_qs(parts.query)
-        for key in ("host", "hostaddr"):
-            for v in query.get(key, []):
-                hosts.extend(v.split(","))
-        return hosts
-    if "=" in value and not scheme and any(k in value for k in ("host=", "hostaddr=", "dbname=")):
-        hosts = []
-        for token in value.split():
-            key, _, v = token.partition("=")
-            if key in ("host", "hostaddr"):
-                hosts.extend(v.strip("'\"").split(","))
-        return hosts
-    return None
+    except ValueError:
+        return [f"{url.split('@')[-1][:40]!r} (unparseable)"]
+    hosts = []
+    for item in parts.netloc.rsplit("@", 1)[-1].split(","):
+        item = unquote(item)
+        if item.startswith("["):
+            hosts.append(item[1:].split("]", 1)[0])
+        else:
+            hosts.append(item.rsplit(":", 1)[0] if item.count(":") == 1 else item)
+    for key in ("host", "hostaddr"):
+        for v in query.get(key, []):
+            hosts.extend(v.split(","))
+    hosts.extend(_service(v) for v in query.get("service", []))
+    return hosts
+
+
+def _conninfo_hosts(value: str) -> Optional[List[str]]:
+    """The hosts of a libpq key=value string, or None if `value` is not one."""
+    pairs, pos = [], 0
+    while value[pos:].strip():
+        m = _CONNINFO_PAIR.match(value, pos)
+        if m is None or m.end() == pos:
+            return None
+        key, v = m.group(1).lower(), m.group(2)
+        if key not in _CONNINFO_KEYS:
+            return None
+        if v.startswith("'"):
+            v = re.sub(r"\\(.)", r"\1", v[1:-1])
+        pairs.append((key, v))
+        pos = m.end()
+    if not pairs:
+        return None
+    hosts = []
+    for key, v in pairs:
+        if key in ("host", "hostaddr"):
+            hosts.extend(v.split(","))
+        elif key == "service":
+            hosts.append(_service(v))
+    return hosts
 
 
 def _pg_host_ok(host: str) -> bool:
+    # Only `localhost` itself: libpq resolves any other name, `*.localhost` included, through
+    # the system resolver, which may ask DNS.
     host = host.strip()
-    return host == "" or host.startswith("/") or is_localhost_name(host) or is_loopback_ip(host)
+    return host == "" or host.startswith("/") or host.lower() == "localhost" or is_loopback_ip(host)
 
 
 def postgres_env_problems(environ: Optional[Dict[str, str]] = None) -> List[str]:
@@ -639,11 +682,12 @@ def postgres_env_problems(environ: Optional[Dict[str, str]] = None) -> List[str]
     for key in sorted(env):
         value = env[key]
         if key in ("PGHOST", "PGHOSTADDR"):
-            hosts: Optional[List[str]] = value.split(",")
+            hosts: List[str] = value.split(",")
+        elif key == "PGSERVICE":
+            hosts = [_service(value)]
         else:
-            hosts = _pg_hosts(value)
-        if not hosts:
-            continue
+            urls = _PG_URL.findall(value)
+            hosts = [h for url in urls for h in _url_hosts(url)] if urls else (_conninfo_hosts(value) or [])
         bad = [h for h in hosts if not _pg_host_ok(h)]
         if bad:
             problems.append(f"{key} -> {', '.join(bad)}")
@@ -667,7 +711,7 @@ def install() -> bool:
     s["run_dir"] = run_dir
     # Python children load tests/_netguard_child/sitecustomize.py, which installs the child half
     # and then runs the sitecustomize it shadows.
-    parts = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p and p != _CHILD_SITE_DIR]
+    parts = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p and os.path.realpath(p) != os.path.realpath(_CHILD_SITE_DIR)]
     os.environ["PYTHONPATH"] = os.pathsep.join([_CHILD_SITE_DIR, *parts])
     s["installed"] = True
     return True

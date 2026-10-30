@@ -8,7 +8,9 @@ the whole failure mode the guard exists for.
 A broken guard must fail these tests, not send traffic. So an inner case that expects a refusal
 runs with the guard's `originals` -- what it calls for traffic it lets through -- swapped for a
 sink that raises and records: a target the guard wrongly allows lands there, and the case fails
-by saying so. Cases that need real loopback traffic swap in a stub that passes literals and
+by saying so; every case also checks the sink stayed silent, so a guard that records an attempt
+and then makes it anyway fails too. A spawned child installs the same sink itself (or, if the
+guard did not reach it, blocks the socket calls outright). Cases that need real loopback traffic swap in a stub that passes literals and
 `localhost` only, so a name the guard should have answered itself fails instead of reaching the
 resolver. The targets are TEST-NET-3 (203.0.113.0/24), 2001:db8::/32 and `.example` names, and
 the inner sessions' proxy settings point at a listener this file owns. Any outer guard (a
@@ -148,6 +150,32 @@ SUPPORT = textwrap.dedent(
         if host is None or _literal(host):
             return True
         return host == "localhost" and key not in _RAW_SOCKET
+
+
+    def install_in_this_child():
+        """A spawned child's sink: below its guard when the guard is installed there, else in place
+        of the socket calls themselves, so a child the guard failed to reach still sends nothing."""
+        from tests import net_guard_core as core
+
+        if core.installed():
+            return install(nothing_that_can_leave)[0]
+        reached = []
+
+        def refuse(name):
+            def call(*args, **kwargs):
+                reached.append(name)
+                raise ConnectionRefusedError(f"[selftest sink] {name} in a child without the guard")
+            return call
+
+        socket.socket.connect = refuse("connect")
+        socket.socket.connect_ex = refuse("connect_ex")
+        socket.socket.sendto = refuse("sendto")
+        socket.create_connection = refuse("create_connection")
+        real_getaddrinfo, refuse_getaddrinfo = socket.getaddrinfo, refuse("getaddrinfo")
+        socket.getaddrinfo = lambda host, *a, **k: (
+            real_getaddrinfo(host, *a, **k) if host is None or _literal(host) else refuse_getaddrinfo()
+        )
+        return reached
 
 
     @pytest.fixture
@@ -307,9 +335,20 @@ INNER = textwrap.dedent(
 
 
     def test_child_process_leak_fails(sink):
-        # Twice to the same target: each attempt is its own entry, not merged by target.
-        code = "import socket\\nfor _ in range(2):\\n try:\\n  socket.create_connection(('203.0.113.9', 80), 1)\\n except OSError:\\n  pass\\n"
-        subprocess.run([sys.executable, "-c", code], check=True)
+        # Twice to the same target: each attempt is its own entry, not merged by target. The
+        # child installs its own sink first: the one above does not cross into it.
+        code = (
+            "import socket, selftest_support\\n"
+            "reached = selftest_support.install_in_this_child()\\n"
+            "for _ in range(2):\\n"
+            " try:\\n"
+            "  socket.create_connection(('203.0.113.9', 80), 1)\\n"
+            " except OSError:\\n"
+            "  pass\\n"
+            "assert not reached, f'the guard let these through to the layer below it: {reached}'\\n"
+        )
+        child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert child.returncode == 0, child.stderr
 
 
     def test_forked_child_leak_fails(sink):
@@ -357,6 +396,12 @@ INNER = textwrap.dedent(
             assert {a[4][0] for a in socket.getaddrinfo("api.localhost", port)} <= {"127.0.0.1", "::1"}
             assert socket.gethostbyname("api.localhost") == "127.0.0.1"
             assert socket.gethostbyname_ex("api.localhost") == ("api.localhost", [], ["127.0.0.1"])
+            # Every other spelling of localhost too: "localhost." is fully qualified, for DNS.
+            for host in ("LOCALHOST", "localhost.", "Localhost"):
+                assert {a[4][0] for a in socket.getaddrinfo(host, port)} <= {"127.0.0.1", "::1"}
+                assert socket.gethostbyname(host) == "127.0.0.1"
+                assert socket.gethostbyname_ex(host)[2] == ["127.0.0.1"]
+                socket.create_connection((host, port), timeout=1).close()
             socket.create_connection(("api.localhost", port), timeout=1).close()
             for host in ("api.localhost", "LOCALHOST", "localhost."):
                 with socket.socket() as s:
@@ -423,7 +468,7 @@ INNER_LATE = textwrap.dedent(
     from selftest_support import install, nothing_that_can_leave
 
     # Nothing below the guard for the whole session: these attempts fire between tests.
-    install(nothing_that_can_leave)
+    _REACHED, _ = install(nothing_that_can_leave)
 
 
     def _swallow(fn):
@@ -510,6 +555,11 @@ INNER_LATE = textwrap.dedent(
 
         _thread.start_new_thread(raw, ())
         done.wait(5)
+
+
+    def test_z_nothing_got_past_the_guard():
+        # Runs last, after every late attempt above has fired.
+        assert not _REACHED, f"the guard let these through to the layer below it: {_REACHED}"
     '''
 )
 
@@ -553,6 +603,7 @@ LATE_PASS = {
     "test_f_runs_on_that_loop_while_the_task_fires",
     "test_g_runs_while_import_time_work_fires",
     "test_h_starts_a_raw_thread",
+    "test_z_nothing_got_past_the_guard",
 }
 #: Where the attempt's stack has no frame of the test itself: a child process runs `-c` code.
 NO_TEST_FRAME = {"test_child_process_leak_fails"}
@@ -565,6 +616,9 @@ EXPECTED_PASS = {
     "test_proxies_are_off",
 }
 NO_TEST = "(no test: import, collection, session, or an untracked thread)"
+#: What a sink says when the guard let an attempt through to the layer below it. A guard that
+#: records an attempt and then makes it anyway produces the expected report AND this.
+SINK_REACHED = "let these through to the layer below"
 
 
 @pytest.fixture(scope="module")
@@ -595,6 +649,8 @@ def proxy_listener():
     stop.set()
     thread.join(2)
     server.close()
+    # After every inner session of this module: none went through the proxy.
+    assert accepted == [], f"an inner session connected to the stand-in proxy: {accepted}"
 
 
 def _run_inner(tmp_path: Path, source: str, proxy, *, path_before=(), **env_overrides: str):
@@ -626,10 +682,9 @@ def _run_inner(tmp_path: Path, source: str, proxy, *, path_before=(), **env_over
     outcomes = {}
     if junit.exists():
         for case in ET.parse(junit).getroot().iter("testcase"):
-            bad = case.find("error")
-            if bad is None:
-                bad = case.find("failure")
-            outcomes[case.get("name")] = None if bad is None else (bad.get("message", "") + (bad.text or ""))
+            # A call failure and a teardown error are separate elements: keep every one.
+            bad = case.findall("failure") + case.findall("error")
+            outcomes[case.get("name")] = "\n".join(b.get("message", "") + (b.text or "") for b in bad) or None
     return proc, outcomes
 
 
@@ -647,6 +702,8 @@ def test_a_swallowed_attempt_fails_the_test_that_made_it(guarded_run, name):
         assert expected in outcomes[name], outcomes[name]
     # Each attempt fired inside its own test (or a child it ran): none is labelled late.
     assert "fired while" not in outcomes[name], outcomes[name]
+    # Refused, not recorded-and-made: nothing reached the layer below the guard.
+    assert SINK_REACHED not in outcomes[name], outcomes[name]
     if name not in NO_TEST_FRAME:
         # A frame of the test itself, not just its node id in the header: an attempt recorded
         # on an anonymous thread (a resolver executor) says WHAT, but not WHERE.
@@ -681,6 +738,7 @@ def test_a_late_attempt_fails_the_session_naming_the_test_that_started_it(late_r
     # session failed anyway.
     assert outcomes == {name: None for name in LATE_PASS}, outcomes
     assert proc.returncode == 1, proc.stdout[-3000:]
+    assert SINK_REACHED not in proc.stdout, proc.stdout[-3000:]
     groups = _late_groups(proc.stdout)
     a = groups["test_inner.py::test_a_starts_work_that_fires_after_it"]
     assert "203.0.113.10:80" in a
@@ -700,10 +758,6 @@ def test_a_late_attempt_fails_the_session_naming_the_test_that_started_it(late_r
         "test_inner.py::test_e_leaves_a_task_on_a_shared_loop",
         NO_TEST,
     }, sorted(groups)
-
-
-def test_no_inner_session_used_the_proxy(guarded_run, late_run, proxy_listener):
-    assert proxy_listener.accepted == []
 
 
 def test_the_opt_out_disables_the_guard_locally(tmp_path, proxy_listener):
@@ -737,6 +791,7 @@ def test_the_opt_out_is_ignored_under_ci(tmp_path, proxy_listener):
     )
     proc, outcomes = _run_inner(tmp_path, source, proxy_listener, TEST_ALLOW_NETWORK="1", CI="true")
     assert outcomes.get("test_leak") and "203.0.113.14:80" in outcomes["test_leak"], proc.stdout[-3000:]
+    assert SINK_REACHED not in outcomes["test_leak"], outcomes["test_leak"]
 
 
 def test_a_child_runs_the_sitecustomize_it_shadows_with_the_guard_on_top(tmp_path, proxy_listener):
@@ -791,6 +846,22 @@ def test_a_child_that_cannot_install_the_guard_exits(tmp_path):
     assert "exiting rather than running unguarded" in proc.stderr
 
 
+def test_two_copies_of_the_shim_on_the_path_install_the_guard_once(tmp_path):
+    # The same directory under a second spelling (a symlink), and another checkout's copy: each
+    # shim skips the other instead of chaining to it without end.
+    real = REPO_ROOT / "tests" / "_netguard_child"
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    other = tmp_path / "other_checkout" / "tests"
+    shutil.copytree(real, other / "_netguard_child")
+    shutil.copy(REPO_ROOT / "tests" / "net_guard_core.py", other)
+    code = "import json, socket; s = socket._pivota_net_guard_state; print(json.dumps([s['installed'], s['child']]))"
+    for path in ([alias, real], [real, alias], [other / "_netguard_child", real], [real, other / "_netguard_child"]):
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, path)), core.RUN_DIR_ENV: str(tmp_path)}
+        proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        assert (proc.returncode, proc.stdout.strip()) == (0, "[true, true]"), (path, proc.returncode, proc.stderr[-2000:])
+
+
 @pytest.mark.parametrize(
     "env, problems",
     [
@@ -806,6 +877,21 @@ def test_a_child_that_cannot_install_the_guard_exits(tmp_path):
         ({"DATABASE_URL": "postgresql://u@localhost/x?host=203.0.113.27"}, ["DATABASE_URL -> 203.0.113.27"]),
         ({"PG_DSN": "dbname=x host=db.example user=u"}, ["PG_DSN -> db.example"]),
         ({"PGHOST": "10.0.0.5"}, ["PGHOST -> 10.0.0.5"]),
+        # libpq's key=value form: spaces around "=", quoted values, hostaddr.
+        ({"PG_DSN": "dbname=x host = db.example"}, ["PG_DSN -> db.example"]),
+        ({"PG_DSN": "host = db.example port=5432"}, ["PG_DSN -> db.example"]),
+        ({"PG_DSN": "dbname=x hostaddr=203.0.113.41"}, ["PG_DSN -> 203.0.113.41"]),
+        ({"PG_DSN": "host='/var/run/postgresql' dbname=x", "NOT_A_DSN": "a=b c=d"}, []),
+        # A service file can name any host.
+        ({"PG_DSN": "service=prod"}, ["PG_DSN -> service=prod (a service file can name any host)"]),
+        ({"DATABASE_URL": "postgresql:///x?service=prod"}, ["DATABASE_URL -> service=prod (a service file can name any host)"]),
+        ({"PGSERVICE": "prod"}, ["PGSERVICE -> service=prod (a service file can name any host)"]),
+        # Only localhost itself: libpq sends any other name to the system resolver.
+        ({"DATABASE_URL": "postgresql://u@db.localhost/x"}, ["DATABASE_URL -> db.localhost"]),
+        ({"DATABASE_URL": "postgresql://u@localhost.db.example/x"}, ["DATABASE_URL -> localhost.db.example"]),
+        # A URL inside a longer value, and one urlsplit cannot parse: reported, not an error.
+        ({"APP_CONFIG": '{"db": "postgresql://u@db.example/x", "n": 1}'}, ["APP_CONFIG -> db.example"]),
+        ({"DATABASE_URL": "postgresql://u@[db.example]/x"}, ["DATABASE_URL -> '[db.example]/x' (unparseable)"]),
     ],
 )
 def test_a_postgres_url_is_judged_by_every_host_it_names(env, problems):
