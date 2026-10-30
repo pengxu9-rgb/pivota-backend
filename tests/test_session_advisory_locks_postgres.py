@@ -121,14 +121,30 @@ async def pg(monkeypatch):
 # ---------------------------------------------------------------------------------------------
 
 
+#: What `_finalize_success` re-reads after the create, via
+#: `_fetch_shopify_order_reconciliation_payload_best_effort`.
+_RECONCILIATION_GET_URL = (
+    "https://shop.myshopify.com/admin/api/2025-10/orders/999.json"
+    "?status=any&fields=id,current_total_price,total_price,current_total_discounts,total_discounts,"
+    "total_price_set,total_discounts_set"
+)
+
+
 class _ShopifyStub:
     """The order row, the merchant's store and Shopify itself, scripted; the lock is real. The
-    FIRST order POST parks until `release` is set, so a create is caught in flight."""
+    FIRST order POST parks until `release` is set, so a create is caught in flight.
+
+    Every httpx call is scripted. The post-create reconciliation GET used to go out for real
+    (to shop.myshopify.com, which is Shopify), and the test still passed because that fetch is
+    best-effort. Now the GET gets a 404, so the reconciliation payload is None, as it is for
+    any order without a pricing quote. Any other request lands in `unexpected`."""
 
     def __init__(self, order_id: str):
         self.order_id = order_id
         self.shopify_order_id = None
         self.posts = 0
+        self.gets: list = []
+        self.unexpected: list = []
         self.parked = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -202,6 +218,23 @@ class _ShopifyStub:
                 await stub.release.wait()
             return _Resp()
 
+        class _NotFound:
+            status_code = 404
+            text = "404"
+            content = b""
+
+            def json(self):
+                return {}
+
+        async def get(_self, url, **_kwargs):
+            stub.gets.append(str(url))
+            return _NotFound()
+
+        async def send(_self, request, **_kwargs):
+            # post/get are patched above and never reach send; anything else would hit the network.
+            stub.unexpected.append(f"{request.method} {request.url}")
+            raise AssertionError(f"unscripted outbound request {request.method} {request.url}")
+
         monkeypatch.setattr(order_routes, "get_order", get_order)
         monkeypatch.setattr(order_routes, "get_merchant_onboarding", get_merchant_onboarding)
         monkeypatch.setattr(order_routes, "get_merchant_active_stores", get_merchant_active_stores)
@@ -211,6 +244,8 @@ class _ShopifyStub:
         monkeypatch.setattr(orders_db, "update_order", lambda *_a, **_k: noop())
         monkeypatch.setattr(gql, "shopify_admin_graphql", shopify_admin_graphql)
         monkeypatch.setattr(httpx.AsyncClient, "post", post, raising=True)
+        monkeypatch.setattr(httpx.AsyncClient, "get", get, raising=True)
+        monkeypatch.setattr(httpx.AsyncClient, "send", send, raising=True)
 
 
 @pytest.fixture
@@ -243,6 +278,9 @@ async def test_a_second_create_of_an_order_in_flight_does_not_post_to_shopify_ag
     assert await asyncio.wait_for(first, timeout=10) is True
     assert await asyncio.wait_for(second, timeout=15) is True
     assert stub.posts == 1, "two Shopify orders were created for one paid order"
+    # Only the create that posted re-reads the order; the second finds it and returns.
+    assert stub.gets == [_RECONCILIATION_GET_URL]
+    assert stub.unexpected == []
     assert await _another_session_can_take(lock_id)  # released at the end
 
 
