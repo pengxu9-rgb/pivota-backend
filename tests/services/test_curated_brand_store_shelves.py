@@ -169,6 +169,14 @@ def test_tower28s_facial_spray_and_body_wash_resolve(title, want):
 _NOT_THE_SPRAY_HEAD = "not tone/toner"  # unresolved, or a pattern's own leaf (#2547's setting-spray leaf)
 
 
+# The body-area answer applies on every measured title host, to every body area the guard knows: a
+# face-skincare head on a hand, body or foot product is that area's (constructed titles).
+@pytest.mark.parametrize("domain", ["tower28beauty.com", "stilacosmetics.com"])
+@pytest.mark.parametrize("title", ["SOS Daily Rescue Hand Cream", "SOS Rescue Body Lotion", "SOS Foot Cream"])
+def test_a_hand_body_or_foot_cream_on_a_measured_title_host_is_body_care(domain, title):
+    assert resolve("", title, domain) == ("beauty/body/care", HEAD)
+
+
 @pytest.mark.parametrize("domain,ptype,title,want", [
     # the host's "spray" head is never another product's: each is constructed
     ("tower28beauty.com", "", "Setting Spray", _NOT_THE_SPRAY_HEAD),
@@ -176,6 +184,10 @@ _NOT_THE_SPRAY_HEAD = "not tone/toner"  # unresolved, or a pattern's own leaf (#
     ("tower28beauty.com", "", "Hair Spray", None),
     ("tower28beauty.com", "", "Body Spray", None),
     ("tower28beauty.com", "", "Room & Linen Spray", None),
+    # ...nor a sun spray: these name no sunscreen pattern, so only the veto keeps them off tone/toner
+    ("tower28beauty.com", "", "Sun Spray", None),
+    ("tower28beauty.com", "", "Daily Sun Spray", None),
+    ("tower28beauty.com", "", "SPF Glow Spray", None),
     # ...a pattern that names something keeps its answer
     ("tower28beauty.com", "", "SunnyDays SPF 30 Sunscreen Spray", "beauty/skincare/sun/sunscreen"),
     # ...a typed shelf is not the blank type the spray head was read on
