@@ -72,6 +72,9 @@ on:
       # infra/ and .github/ entries.
       - 'dashboard/**'
       - 'orchestrator/**'
+      # The repo-root conftest.py loads the loopback-only network guard (tests/net_guard.py) for
+      # tests/ and readiness/tests/ alike; nothing above matches a root file.
+      - 'conftest.py'
       # psp/** is listed for a directory that does NOT exist: the whole
       # package was deleted on 2026-08-31 and
       # tests/test_dead_psp_connectors_removed.py asserts it stays gone.

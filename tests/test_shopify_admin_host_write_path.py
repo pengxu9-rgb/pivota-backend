@@ -262,6 +262,23 @@ async def test_verify_refuses_a_hostile_stored_domain_before_any_connection(
     assert stored not in str(raised)
 
 
+def _script_admin_api(monkeypatch) -> List[str]:
+    """The Admin API calls verify makes after the domain decision (webhook registration, the
+    payments and returns probes), answering 401, with each one's host recorded. Unscripted they
+    went out to the real `*.myshopify.com` host. The recorded hosts are asserted: whatever the
+    upstream said, the follow-on calls carrying the token go to the validated host."""
+    import httpx
+
+    hosts: List[str] = []
+
+    async def handle_async_request(self, request):
+        hosts.append(request.url.host)
+        return httpx.Response(401, json={"errors": "scripted"}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request)
+    return hosts
+
+
 async def test_verify_does_not_persist_a_hostile_upstream_myshopify_domain(monkeypatch):
     """Hole 2, at the verify service: the canonical domain came from the upstream response and was
     written to merchant_stores.domain unchecked. A bad value must mean 'do not canonicalise'."""
@@ -301,6 +318,7 @@ async def test_verify_does_not_persist_a_hostile_upstream_myshopify_domain(monke
     monkeypatch.setattr(svc, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
     monkeypatch.setattr(svc, "_shopify_get_json", _fake_get_json, raising=True)
     monkeypatch.setattr(svc, "database", _DB(), raising=True)
+    admin_hosts = _script_admin_api(monkeypatch)
 
     try:
         await svc.verify_shopify_integration(
@@ -312,6 +330,7 @@ async def test_verify_does_not_persist_a_hostile_upstream_myshopify_domain(monke
         pass
 
     assert "evil.example" not in writes, "a hostile upstream domain reached merchant_stores.domain"
+    assert admin_hosts and set(admin_hosts) == {"good-shop.myshopify.com"}, admin_hosts
 
 # --------------------------------------------------------------------------------------
 # 4. The two derivation sites in routes/merchant_store_connections.py.
@@ -427,6 +446,7 @@ async def test_verify_persists_a_valid_but_different_upstream_domain(monkeypatch
     monkeypatch.setattr(svc, "resolve_shopify_admin_access_token", _fake_resolve, raising=True)
     monkeypatch.setattr(svc, "_shopify_get_json", _fake_get_json, raising=True)
     monkeypatch.setattr(svc, "database", _DB(), raising=True)
+    admin_hosts = _script_admin_api(monkeypatch)
 
     try:
         await svc.verify_shopify_integration(
@@ -439,6 +459,8 @@ async def test_verify_persists_a_valid_but_different_upstream_domain(monkeypatch
         "a valid canonical domain must still be persisted; this is the write the "
         "X-Shopify-Shop-Domain webhook match depends on"
     )
+    # ...and the follow-on Admin calls use it too.
+    assert admin_hosts and set(admin_hosts) == {"new-handle.myshopify.com"}, admin_hosts
 
 
 # --------------------------------------------------------------------------------------
