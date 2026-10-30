@@ -3227,6 +3227,40 @@ async def ensure_required_schema_light() -> None:
                 "ALTER TABLE IF EXISTS agent_pdp_view "
                 "ADD COLUMN IF NOT EXISTS seller_count INTEGER;"
             )
+            # mig 272: the audit of deleted unbuildable view rows
+            # (services/agent_pdp_view_assembler.delete_agent_pdp_view_if_unbuildable).
+            # The delete fails closed while this table is missing, so a deferred heal
+            # deletes nothing; its own try so it never abandons the heals after it.
+            try:
+                await database.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS agent_pdp_view_unbuildable_reap_audit (
+                            audit_id            BIGSERIAL PRIMARY KEY,
+                            content_key         TEXT NOT NULL,
+                            pivota_signature_id TEXT,
+                            reason              TEXT NOT NULL,
+                            run_id              TEXT NOT NULL,
+                            refresh_source      TEXT,
+                            funnel_link_count   INTEGER NOT NULL DEFAULT 0,
+                            funnel_link_ids     JSONB NOT NULL DEFAULT '[]'::jsonb,
+                            row_snapshot        JSONB NOT NULL,
+                            deleted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            restored_at         TIMESTAMPTZ
+                        );
+                        """
+                    )
+                )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_pdp_view_unbuildable_reap_audit_pending "
+                    "ON agent_pdp_view_unbuildable_reap_audit (content_key) WHERE restored_at IS NULL;"
+                )
+                await _ensure_index(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_pdp_view_unbuildable_reap_audit_run "
+                    "ON agent_pdp_view_unbuildable_reap_audit (run_id);"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("schema guard: unbuildable reap audit heal deferred to next boot: %s", exc)
             # mig 181: ONE canonical URL per content_key. 474 content_keys
             # carry >1 sitemap-eligible renderable sig; every sibling serves
             # identical content under a self-referential canonical tag. The

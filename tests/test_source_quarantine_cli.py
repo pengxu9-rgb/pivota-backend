@@ -139,3 +139,50 @@ def test_dry_run_proposed_smoke(capsys):
     assert code == 0
     assert '"catalog_products"' in output
     assert '"external_product_seeds"' in output
+
+
+def test_revoke_apply_pokes_the_view_restore_after_the_revoke(capsys):
+    # The poke runs after the revoke's transaction (the `async with`) has closed, so the
+    # rebuild sees the lifted quarantine; a failing poke never undoes the revoke.
+    order = []
+
+    class _Open:
+        def __init__(self, url):
+            self.db = FakeDb(url)
+
+        async def __aenter__(self):
+            return self.db
+
+        async def __aexit__(self, *exc):
+            order.append("revoke_committed")
+
+    async def poke(url):
+        order.append(("restore", url))
+        return {"candidates": 2, "restored": 2, "still_unbuildable": 0, "links_restored": 3}
+
+    async def failing_poke(url):
+        raise RuntimeError("db unreachable")
+
+    argv = ["--database-url", "postgresql://test", "revoke", "--quarantine-id", "7",
+            "--revoked-by", "codex", "--apply", "--confirm", cli.CONFIRM_REVOKE]
+    assert cli.main(argv, db_factory=_Open, restore_poke=poke) == 0
+    out = capsys.readouterr().out
+    assert '"restored": 2' in out and '"links_restored": 3' in out
+    assert order[-1] == ("restore", "postgresql://test")
+    assert "revoke_committed" in order[:-1]
+
+    assert cli.main(argv, db_factory=_Open, restore_poke=failing_poke) == 0
+    out = capsys.readouterr().out
+    assert '"revoked_by": "codex"' in out and "db unreachable" in out
+
+
+def test_revoke_dry_run_does_not_poke(capsys):
+    calls = []
+
+    async def poke(url):
+        calls.append(url)
+        return {}
+
+    argv = ["--database-url", "postgresql://test", "revoke", "--quarantine-id", "7", "--revoked-by", "codex"]
+    assert cli.main(argv, db_factory=FakeDb, restore_poke=poke) == 0
+    assert calls == []

@@ -33,8 +33,11 @@ idle passes write nothing. Orphan view rows (content_key with no
 catalog_products row left) are deliberately out of scope — the orphan
 reaper owns deletes; this job only converges rows that upstream truth says
 should exist. The same goes for view rows whose keys fail the `buildable`
-gate below: the refresh primitive deletes those itself
-(services.agent_pdp_view_assembler.delete_agent_pdp_view_if_unbuildable).
+gate below: the refresh primitive deletes those itself while
+AGENT_PDP_VIEW_UNBUILDABLE_REAP is on
+(services.agent_pdp_view_assembler.delete_agent_pdp_view_if_unbuildable), and
+each tick rebuilds the reaped keys that are buildable again
+(restore_reaped_agent_pdp_view_rows).
 
 Env vars:
   AGENT_PDP_VIEW_RECONCILE_ENABLED       default true — set false to pause
@@ -284,6 +287,24 @@ async def reconcile_agent_pdp_view(
     return counters
 
 
+async def _restore_reaped_rows(db: Any) -> None:
+    """Rebuild unbuildable-reaped keys whose quarantine was revoked or has expired.
+
+    Expiry fires no event (the quarantine anti-join just stops matching), so this
+    tick is what brings an expired quarantine's keys back; a revoke through
+    scripts/manage_source_quarantine pokes the same restore at once. Best-effort:
+    a restore failure never fails the reconcile pass.
+    """
+    try:
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        restored = await restore_reaped_agent_pdp_view_rows(db=db, refresh_source=REFRESH_SOURCE)
+        if restored["candidates"]:
+            logger.warning("agent_pdp_view_reconcile: unbuildable restore %s", restored)
+    except Exception as exc:  # noqa: BLE001 — WARNING, not ERROR: the drift ERROR is the pass's alarm
+        logger.warning("agent_pdp_view_reconcile: unbuildable restore failed: %s", str(exc)[:300])
+
+
 async def run_agent_pdp_view_reconcile_tick(
     *,
     db: Any = None,
@@ -298,6 +319,8 @@ async def run_agent_pdp_view_reconcile_tick(
         if db is None:
             from db.database import database as db  # type: ignore[no-redef]
 
+        # First, and on its own guard: a reconcile failure must not also stall restores.
+        await _restore_reaped_rows(db)
         counters = await reconcile_agent_pdp_view(db=db, limit=_limit(), refresh=refresh)
         logger.info(
             "agent_pdp_view_reconcile: candidates=%d refreshed=%d "

@@ -107,16 +107,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def restore_reaped_view_rows(database_url: str) -> dict[str, Any]:
+    """Rebuild the agent_pdp_view rows the unbuildable reaper deleted while their
+    source was quarantined (services.agent_pdp_view_assembler.
+    restore_reaped_agent_pdp_view_rows), right after a revoke commits. Runs on its
+    own connection, after the revoke's transaction, so the rebuild sees the lifted
+    quarantine. Best-effort: the reconciler tick runs the same pass every cadence."""
+    import databases
+
+    from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+    url = _normalize_database_url(database_url)
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    db = databases.Database(url)
+    await db.connect()
+    try:
+        return await restore_reaped_agent_pdp_view_rows(db=db, limit=0)
+    finally:
+        await db.disconnect()
+
+
 def main(
     argv: Optional[list[str]] = None,
     *,
     db_factory: Callable[[str], Any] = PsycopgDatabase,
+    restore_poke: Callable[[str], Any] = restore_reaped_view_rows,
 ) -> int:
     args = build_parser().parse_args(argv)
-    return asyncio.run(_main_async(args, db_factory=db_factory))
+    return asyncio.run(_main_async(args, db_factory=db_factory, restore_poke=restore_poke))
 
 
-async def _main_async(args: argparse.Namespace, *, db_factory: Callable[[str], Any]) -> int:
+async def _main_async(
+    args: argparse.Namespace,
+    *,
+    db_factory: Callable[[str], Any],
+    restore_poke: Optional[Callable[[str], Any]] = None,
+) -> int:
     if not args.database_url:
         raise SystemExit("ERROR: missing --database-url (or env DATABASE_PUBLIC_URL / DATABASE_URL)")
 
@@ -137,6 +164,13 @@ async def _main_async(args: argparse.Namespace, *, db_factory: Callable[[str], A
             )
         else:
             raise SystemExit(f"unsupported command: {args.command}")
+
+    if args.command == "revoke" and not report.get("dry_run") and restore_poke is not None:
+        # After the `async with`: the revoke is committed, so the rebuild sees it.
+        try:
+            report["view_restore"] = await restore_poke(args.database_url)
+        except Exception as exc:  # noqa: BLE001 — the revoke stands; the reconciler retries
+            report["view_restore"] = {"error": str(exc)[:300], "retry": "agent_pdp_view reconciler tick"}
 
     print(json.dumps(_json_safe(report), indent=2, sort_keys=True))
     return 0

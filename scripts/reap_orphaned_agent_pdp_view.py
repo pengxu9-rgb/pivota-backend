@@ -32,10 +32,14 @@ Usage:
 catalog rows, none of which the builder may use (all source-quarantined or all
 title-less), so every refresh declines them and they keep serving an old snapshot.
 See reap_unbuildable_agent_pdp_view_rows. The scheduled Job does not pass it; the
-backlog is removed by hand, dry-run first:
+backlog is removed by hand, dry-run first. --apply refuses unless
+AGENT_PDP_VIEW_UNBUILDABLE_REAP=on and the audit table (migration 272) exists; every
+deleted row is recorded there. --restore rebuilds reaped keys that are buildable again
+and re-points their funnel links (the reconciler tick runs the same pass):
 
   python -m scripts.reap_orphaned_agent_pdp_view --unbuildable            # dry-run
-  python -m scripts.reap_orphaned_agent_pdp_view --unbuildable --apply
+  AGENT_PDP_VIEW_UNBUILDABLE_REAP=on python -m scripts.reap_orphaned_agent_pdp_view --unbuildable --apply
+  python -m scripts.reap_orphaned_agent_pdp_view --restore
 """
 
 from __future__ import annotations
@@ -60,6 +64,7 @@ from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     reap_orphaned_agent_pdp_view_rows,
     reap_unbuildable_agent_pdp_view_rows,
+    restore_reaped_agent_pdp_view_rows,
 )
 
 logger = logging.getLogger("reap_orphaned_agent_pdp_view")
@@ -80,6 +85,8 @@ async def _disconnect_if_needed(db: Any, was: bool) -> None:
 async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, Any]:
     was = await _connect_if_needed(db)
     try:
+        if getattr(args, "restore", False):
+            return await restore_reaped_agent_pdp_view_rows(db=db, limit=args.limit)
         if getattr(args, "unbuildable", False):
             return await reap_unbuildable_agent_pdp_view_rows(
                 db=db, limit=args.limit, dry_run=not args.apply
@@ -106,6 +113,10 @@ def _parse_args() -> argparse.Namespace:
         help="Reap view rows whose catalog rows all fail the builder (quarantined / "
         "title-less) instead of orphans. Default: orphans.",
     )
+    p.add_argument(
+        "--restore", action="store_true",
+        help="Rebuild unbuildable-reaped keys that are buildable again, from the audit table.",
+    )
     return p.parse_args()
 
 
@@ -114,8 +125,8 @@ def main() -> int:
     args = _parse_args()
     report = asyncio.run(_drive(args))
     print(json.dumps(report, indent=2, default=str))
-    if args.unbuildable:
-        # reap_unbuildable_agent_pdp_view_rows logs its own WARNING line.
+    if args.unbuildable or args.restore:
+        # Both passes log their own WARNING line.
         return 0
 
     # Emitted at WARNING so it carries a severity into Cloud Logging, where this

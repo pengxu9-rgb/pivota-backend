@@ -169,20 +169,40 @@ async def test_refresh_overlays_enrichment_description_markdown(monkeypatch: pyt
 @pytest.mark.asyncio
 async def test_refresh_returns_false_when_no_products(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_fetches(monkeypatch, products=[])
+    monkeypatch.delenv(apv.UNBUILDABLE_REAP_FLAG_ENV, raising=False)
     db = _FakeDB()
     built = await apv.refresh_agent_pdp_view_for_content_key(
         "ck-missing", refresh_source="catalog_sync", db=db
     )
     assert built is False
     assert db.executes == []  # no upsert
-    # Nothing built -> the guarded reap runs (its predicate is exercised on real
-    # Postgres in tests/test_agent_pdp_view_unbuildable_reap_postgres.py).
-    assert db.fetch_ones[-1]["sql"] == apv._DELETE_IF_UNBUILDABLE_SQL
-    assert db.fetch_ones[-1]["params"] == {"content_key": "ck-missing"}
+    # AGENT_PDP_VIEW_UNBUILDABLE_REAP is off by default: nothing built, nothing deleted,
+    # not even a probe (the reap itself runs on real Postgres in
+    # tests/test_agent_pdp_view_unbuildable_reap_postgres.py).
+    assert db.fetch_ones == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_the_reap_on_runs_the_audited_delete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_fetches(monkeypatch, products=[])
+    monkeypatch.setenv(apv.UNBUILDABLE_REAP_FLAG_ENV, "on")
+    db = _FakeDB(fetch_one_result={"audit": True, "enrichment": True, "links": True})
+    built = await apv.refresh_agent_pdp_view_for_content_key(
+        "ck-missing", refresh_source="catalog_sync", db=db
+    )
+    assert built is False
+    assert db.executes == []
+    probe, delete = db.fetch_ones
+    assert "to_regclass" in probe["sql"]
+    assert delete["sql"] == apv._delete_if_unbuildable_sql(with_enrichment=True, with_links=True)
+    assert delete["params"]["content_key"] == "ck-missing"
+    assert delete["params"]["refresh_source"] == "catalog_sync"
+    assert delete["params"]["run_id"].startswith("refresh:")
 
 
 @pytest.mark.asyncio
 async def test_refresh_returns_false_when_row_too_thin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(apv.UNBUILDABLE_REAP_FLAG_ENV, raising=False)
     # Products exist but no title → assemble_row returns None → no upsert.
     _patch_fetches(
         monkeypatch,
@@ -200,8 +220,7 @@ async def test_refresh_returns_false_when_row_too_thin(monkeypatch: pytest.Monke
     )
     assert built is False
     assert db.executes == []  # no upsert
-    assert db.fetch_ones[-1]["sql"] == apv._DELETE_IF_UNBUILDABLE_SQL
-    assert db.fetch_ones[-1]["params"] == {"content_key": "ck-2"}
+    assert db.fetch_ones == []  # reap off by default
 
 
 # ── B① write-triggered enrichment propagation ──────────────────────────────

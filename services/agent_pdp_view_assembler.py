@@ -2697,56 +2697,188 @@ async def reap_orphaned_agent_pdp_view_rows(
 # 922 of 23,473 view rows, 778 of them last written by the 2026-06 backfill
 # (backfill_3a_ii), 553 still serving_eligible or index_eligible. The reconciler
 # excludes these keys by design (its `buildable` gate), so no sweep ever touched
-# them.
+# them. Owner decision 2026-09-29: quarantined pages stop being cited. Deleting the
+# view row does that: index_pipeline_state reads has_image off the view, so the
+# next recompute takes the key out of serving/index eligibility.
 #
 # "Buildable" is the reconciler's own predicate (jobs/agent_pdp_view_reconciler_cron
 # _TRUTH_CTE): a member that survives the quarantine anti-join with a non-empty
-# title. Using the same predicate means the reconciler and this reaper split the
-# keys between them; neither has to guess what the other covers. Deleting is safe
-# because the view is a cache: if the quarantine is revoked, the next refresh (or
-# the reconciler's missing-public pass) builds the row again from catalog truth.
+# title, widened by one arm the reconciler does not need: a surviving member whose
+# product_enrichment overlay carries a title_override. assemble_row serves that
+# override over the storefront title, so such a key IS buildable and the sweep
+# (which judges by this predicate alone) must never delete it.
+#
+# What makes a delete safe to run in production:
+#   * AGENT_PDP_VIEW_UNBUILDABLE_REAP, default OFF: nothing is deleted, by the
+#     refresh path or the sweep, until it is turned on.
+#   * agent_pdp_view_unbuildable_reap_audit (migration 272, healed at boot by
+#     db/schema_guard.py): the delete, the audit row (a full snapshot of the
+#     deleted view row, the reason, the run, and the ids of the funnel links the
+#     delete will null) are ONE statement, so neither lands without the other. No
+#     audit table, no delete.
+#   * restore_reaped_agent_pdp_view_rows: a reaped key that becomes buildable again
+#     (quarantine revoked or expired) is rebuilt by the reconciler tick and by
+#     `manage_source_quarantine revoke --apply`, and its funnel links get their
+#     content_key back.
 
-_UNBUILDABLE_PREDICATE = f"""
+UNBUILDABLE_REAP_FLAG_ENV = "AGENT_PDP_VIEW_UNBUILDABLE_REAP"
+_UNBUILDABLE_REAP_AUDIT_TABLE = "agent_pdp_view_unbuildable_reap_audit"
+
+
+def unbuildable_reap_enabled() -> bool:
+    """Kill switch for deleting unbuildable view rows. Default OFF (read per call)."""
+    return (os.getenv(UNBUILDABLE_REAP_FLAG_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _titled_override_arm() -> str:
+    return f"""
+        OR EXISTS (
+            SELECT 1 FROM catalog_products cp
+            JOIN product_enrichment pe
+              ON pe.merchant_id = cp.merchant_id
+             AND pe.platform = cp.platform
+             AND pe.platform_product_id = cp.source_product_id
+             AND pe.geo_code = 'default'
+            WHERE cp.content_key = av.content_key
+              AND pe.title_override IS NOT NULL AND trim(pe.title_override) <> ''
+            {_SOURCE_QUARANTINE_ANTI_JOIN}
+        )"""
+
+
+def _unbuildable_predicate(*, with_enrichment: bool) -> str:
+    return f"""
     EXISTS (SELECT 1 FROM catalog_products cp0 WHERE cp0.content_key = av.content_key)
-    AND NOT EXISTS (
-        SELECT 1 FROM catalog_products cp
-        WHERE cp.content_key = av.content_key
-          AND cp.title IS NOT NULL AND trim(cp.title) <> ''
-        {_SOURCE_QUARANTINE_ANTI_JOIN}
+    AND NOT (
+        EXISTS (
+            SELECT 1 FROM catalog_products cp
+            WHERE cp.content_key = av.content_key
+              AND cp.title IS NOT NULL AND trim(cp.title) <> ''
+            {_SOURCE_QUARANTINE_ANTI_JOIN}
+        ){_titled_override_arm() if with_enrichment else ""}
     )
 """
 
-_DELETE_IF_UNBUILDABLE_SQL = f"""
-    DELETE FROM agent_pdp_view av
-    WHERE av.content_key = :content_key
-      AND {_UNBUILDABLE_PREDICATE}
-    RETURNING av.content_key, av.pdp_lifecycle_stage, av.refresh_source
+
+# Why the key is unbuildable, for the audit row: no member survives the quarantine
+# at all, or some do but none has a title.
+_UNBUILDABLE_REASON_SQL = f"""
+    CASE WHEN EXISTS (
+        SELECT 1 FROM catalog_products cp
+        WHERE cp.content_key = av.content_key
+        {_SOURCE_QUARANTINE_ANTI_JOIN}
+    ) THEN 'no_titled_unquarantined_member' ELSE 'all_members_quarantined' END
 """
 
 
+def _delete_if_unbuildable_sql(*, with_enrichment: bool, with_links: bool) -> str:
+    # One statement: every CTE reads the snapshot taken when it starts, so `links`
+    # sees the funnel links before the FK's ON DELETE SET NULL runs, and the audit
+    # INSERT and the DELETE commit or fail together.
+    links_cte = (
+        """, links AS (
+        SELECT COALESCE(jsonb_agg(l.link_id::text ORDER BY l.link_id::text), '[]'::jsonb) AS ids
+        FROM agent_decision_funnel_links l
+        WHERE l.content_key = :content_key
+    )"""
+        if with_links
+        else """, links AS (SELECT '[]'::jsonb AS ids)"""
+    )
+    return f"""
+    WITH target AS (
+        SELECT av.content_key, ({_UNBUILDABLE_REASON_SQL}) AS reason
+        FROM agent_pdp_view av
+        WHERE av.content_key = :content_key
+          AND {_unbuildable_predicate(with_enrichment=with_enrichment)}
+    ){links_cte}, del AS (
+        DELETE FROM agent_pdp_view av
+        USING target t
+        WHERE av.content_key = t.content_key
+        RETURNING av.*
+    ), audit AS (
+        INSERT INTO {_UNBUILDABLE_REAP_AUDIT_TABLE}
+          (content_key, pivota_signature_id, reason, run_id, refresh_source,
+           funnel_link_count, funnel_link_ids, row_snapshot)
+        SELECT d.content_key, d.pivota_signature_id, t.reason, :run_id, :refresh_source,
+               jsonb_array_length(links.ids), links.ids, to_jsonb(d)
+        FROM del d JOIN target t ON t.content_key = d.content_key CROSS JOIN links
+        RETURNING audit_id, content_key, reason, funnel_link_count
+    )
+    SELECT a.audit_id, a.content_key, a.reason, a.funnel_link_count,
+           d.pdp_lifecycle_stage, d.refresh_source AS last_refresh_source
+    FROM audit a JOIN del d ON d.content_key = a.content_key
+"""
+
+
+async def _reap_tables_present(db: Any) -> Dict[str, bool]:
+    row = await db.fetch_one(
+        f"""
+        SELECT to_regclass('{_UNBUILDABLE_REAP_AUDIT_TABLE}') IS NOT NULL AS audit,
+               to_regclass('product_enrichment') IS NOT NULL AS enrichment,
+               to_regclass('agent_decision_funnel_links') IS NOT NULL AS links
+        """,
+        {},
+    )
+    row = dict(row) if row else {}
+    return {k: bool(row.get(k)) for k in ("audit", "enrichment", "links")}
+
+
+def _new_run_id(prefix: str) -> str:
+    import uuid
+
+    return f"{prefix}:{uuid.uuid4().hex[:12]}"
+
+
 async def delete_agent_pdp_view_if_unbuildable(
-    content_key: str, *, refresh_source: Optional[str] = None, db: Any = None
+    content_key: str,
+    *,
+    refresh_source: Optional[str] = None,
+    run_id: Optional[str] = None,
+    db: Any = None,
 ) -> bool:
     """Delete the view row for `content_key` IFF catalog rows still reference the
-    key but none is buildable. The predicate is re-checked inside the DELETE, so a
-    member that became buildable after the caller's build returned None keeps its
-    row. No-op for a live key, an orphan, or a key with no view row.
+    key but none is buildable, writing its audit row in the same statement. The
+    predicate is re-checked inside the statement, so a member that became
+    buildable after the caller's build returned None keeps its row. No-op for a
+    live key, an orphan, or a key with no view row; and no-op while
+    AGENT_PDP_VIEW_UNBUILDABLE_REAP is off or the audit table is missing.
 
     Returns True when a row was deleted.
     """
-    if not content_key:
+    if not content_key or not unbuildable_reap_enabled():
         return False
     read_db = db or database
-    deleted = await read_db.fetch_one(_DELETE_IF_UNBUILDABLE_SQL, {"content_key": content_key})
+    present = await _reap_tables_present(read_db)
+    if not present["audit"]:
+        # Fail closed: a delete nobody can restore from is not one this code makes.
+        logger.warning({
+            "event": "agent_pdp_view_unbuildable_reap_skipped",
+            "reason": "audit_table_missing",
+            "content_key": content_key,
+        })
+        return False
+    deleted = await read_db.fetch_one(
+        _delete_if_unbuildable_sql(with_enrichment=present["enrichment"], with_links=present["links"]),
+        {
+            "content_key": content_key,
+            "run_id": run_id or _new_run_id("refresh"),
+            "refresh_source": refresh_source,
+        },
+    )
     if not deleted:
         return False
+    deleted = dict(deleted)
     # WARNING: prod drops INFO from module loggers, and a served row going away
     # is worth seeing.
     logger.warning({
         "event": "agent_pdp_view_unbuildable_reaped",
         "content_key": content_key,
-        "pdp_lifecycle_stage": dict(deleted).get("pdp_lifecycle_stage"),
-        "last_refresh_source": dict(deleted).get("refresh_source"),
+        "audit_id": deleted.get("audit_id"),
+        "reason": deleted.get("reason"),
+        "funnel_link_count": deleted.get("funnel_link_count"),
+        "pdp_lifecycle_stage": deleted.get("pdp_lifecycle_stage"),
+        "last_refresh_source": deleted.get("last_refresh_source"),
         "refresh_source": refresh_source,
     })
     return True
@@ -2762,42 +2894,140 @@ async def reap_unbuildable_agent_pdp_view_rows(
 
     Dry-run by DEFAULT, unlike the orphan sweep: the first run removes the
     backlog of stale rows (922 on 2026-09-29), which is a prod write that needs an
-    explicit go. Returns {"unbuildable", "deleted", "content_keys", "sample"};
-    `content_keys` is the full list so a dry run can be kept as a manifest.
+    explicit go. A non-dry run refuses while AGENT_PDP_VIEW_UNBUILDABLE_REAP is
+    off. Returns {"unbuildable", "deleted", "content_keys", "funnel_links",
+    "by_reason", "run_id", "sample"}; `content_keys` is the full list so a dry run
+    can be kept as a manifest, and `funnel_links` maps each key that has links to
+    their count (the links the delete nulls; the audit row keeps their ids).
     """
     read_db = db or database
+    if not dry_run and not unbuildable_reap_enabled():
+        raise RuntimeError(f"unbuildable reap is off: set {UNBUILDABLE_REAP_FLAG_ENV}=on to apply")
+    present = await _reap_tables_present(read_db)
+    if not dry_run and not present["audit"]:
+        raise RuntimeError(f"{_UNBUILDABLE_REAP_AUDIT_TABLE} is missing: apply migration 272 first")
     limit_clause = " LIMIT :limit" if limit and int(limit) > 0 else ""
     params = {"limit": int(limit)} if limit and int(limit) > 0 else {}
+    links_col = (
+        "(SELECT count(*) FROM agent_decision_funnel_links l WHERE l.content_key = av.content_key)"
+        if present["links"]
+        else "0"
+    )
     rows = await read_db.fetch_all(
         f"""
         SELECT av.content_key, av.pivota_signature_id, av.title,
-               av.pdp_lifecycle_stage, av.refresh_source
+               av.pdp_lifecycle_stage, av.refresh_source,
+               ({_UNBUILDABLE_REASON_SQL}) AS reason,
+               {links_col} AS funnel_link_count
         FROM agent_pdp_view av
-        WHERE {_UNBUILDABLE_PREDICATE}
+        WHERE {_unbuildable_predicate(with_enrichment=present["enrichment"])}
         ORDER BY av.refreshed_at ASC, av.content_key
         """ + limit_clause,
         params,
     )
     found = [dict(r) for r in rows]
+    run_id = _new_run_id("unbuildable_sweep")
     deleted = 0
     if not dry_run:
         for r in found:
             deleted += int(await delete_agent_pdp_view_if_unbuildable(
-                r["content_key"], refresh_source="unbuildable_sweep", db=read_db
+                r["content_key"], refresh_source="unbuildable_sweep", run_id=run_id, db=read_db
             ))
+    by_reason: Dict[str, int] = {}
+    for r in found:
+        by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + 1
+    funnel_links = {
+        r["content_key"]: int(r["funnel_link_count"]) for r in found if int(r["funnel_link_count"] or 0)
+    }
     if found:
         logger.warning({
             "event": "agent_pdp_view_unbuildable_sweep",
             "unbuildable": len(found),
             "deleted": deleted,
             "dry_run": dry_run,
+            "run_id": run_id,
+            "keys_with_funnel_links": len(funnel_links),
         })
     return {
         "unbuildable": len(found),
         "deleted": deleted,
+        "run_id": run_id,
+        "by_reason": by_reason,
+        "funnel_links": funnel_links,
         "content_keys": [r["content_key"] for r in found],
         "sample": found[:10],
     }
+
+
+async def restore_reaped_agent_pdp_view_rows(
+    *,
+    db: Any = None,
+    limit: Optional[int] = 200,
+    refresh_source: str = "unbuildable_restore",
+) -> Dict[str, int]:
+    """Rebuild reaped keys that are buildable again (quarantine revoked or expired).
+
+    Candidates: audit rows not yet restored whose key has no view row now. Each is
+    rebuilt from catalog truth through refresh_agent_pdp_view_for_content_key (the
+    audit snapshot is the record, not the source: a rebuild serves today's data).
+    When the rebuild lands, the key's audit rows are stamped restored_at and the
+    funnel links the delete nulled get their content_key back (only links still
+    NULL there, so a link re-pointed meanwhile is left alone). A key still
+    unbuildable is skipped and stays a candidate. Runs whatever the reap flag says:
+    restoring is never the risky direction. No audit table: nothing to restore.
+    """
+    read_db = db or database
+    present = await _reap_tables_present(read_db)
+    if not present["audit"]:
+        return {"candidates": 0, "restored": 0, "still_unbuildable": 0, "links_restored": 0}
+    limit_clause = " LIMIT :limit" if limit and int(limit) > 0 else ""
+    params = {"limit": int(limit)} if limit and int(limit) > 0 else {}
+    rows = await read_db.fetch_all(
+        f"""
+        SELECT a.content_key
+        FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
+        WHERE a.restored_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM agent_pdp_view av WHERE av.content_key = a.content_key)
+        GROUP BY a.content_key
+        ORDER BY MIN(a.deleted_at), a.content_key
+        """ + limit_clause,
+        params,
+    )
+    keys = [dict(r)["content_key"] for r in rows]
+    restored = still = links_restored = 0
+    for ck in keys:
+        if not await refresh_agent_pdp_view_for_content_key(ck, refresh_source=refresh_source, db=read_db):
+            still += 1
+            continue
+        restored += 1
+        if present["links"]:
+            fixed = await read_db.fetch_all(
+                f"""
+                UPDATE agent_decision_funnel_links l
+                SET content_key = :ck
+                WHERE l.content_key IS NULL
+                  AND l.link_id::text IN (
+                      SELECT jsonb_array_elements_text(a.funnel_link_ids)
+                      FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
+                      WHERE a.content_key = :ck AND a.restored_at IS NULL
+                  )
+                RETURNING l.link_id
+                """,
+                {"ck": ck},
+            )
+            links_restored += len(fixed or [])
+        await read_db.execute(
+            f"UPDATE {_UNBUILDABLE_REAP_AUDIT_TABLE} SET restored_at = NOW() "
+            "WHERE content_key = :ck AND restored_at IS NULL",
+            {"ck": ck},
+        )
+    counters = {
+        "candidates": len(keys), "restored": restored,
+        "still_unbuildable": still, "links_restored": links_restored,
+    }
+    if restored:
+        logger.warning({"event": "agent_pdp_view_unbuildable_restored", **counters})
+    return counters
 
 
 def _propagate_enrichment_on_write_enabled() -> bool:
