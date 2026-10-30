@@ -9,9 +9,13 @@ Server-to-server only: X-Internal-Key = AGENT_AUTH_INTROSPECT_INTERNAL_KEY, the 
 already holds for /agent/internal/auth. Off unless DECISION_SLATES_INGEST_ENABLED is on.
 
 One decision_id is one slate. The decision row is claimed atomically: a replay of the identical
-slate is a 200 no-op (its rows re-enqueue under the same ids), and a different slate, surface or
-agent under an existing decision_id is a 409. Without that, a reused id produced a hybrid slate
+request is a 200 (its rows are rewritten under the same ids, a no-op or a repair), and anything
+else under an existing decision_id is a 409. Without that, a reused id produced a hybrid slate
 (the first agent, the first slate's cards, plus the second slate's extra positions).
+
+Rows are written before the answer: 202/200 means they are in (or lost to a row-level error,
+counted in rows_lost), and a 503 means the database failed and the gateway should resend the same
+request.
 """
 
 from __future__ import annotations
@@ -24,13 +28,14 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from services.agent_decision_event_store import (
+    _ROW_LEVEL_ERRORS,
+    _row_offer_id,
     claim_decision_event,
-    record_decision_candidates,
-    record_exposure_events,
     resolve_card_identities,
+    write_slate_rows,
 )
 from services.catalog_identity import is_content_key
 from services.protocols import DEFAULT_PROTOCOL
@@ -48,8 +53,15 @@ GATEWAY_DECISION_PREFIX = "gw:"
 AGENT_ID_SOURCE = "gateway_relay"
 
 
+def _strip_nul(value: Any) -> Any:
+    # Postgres text cannot hold NUL; one in surface/query made the claim INSERT raise, a 500 the
+    # gateway would retry forever.
+    return value.replace("\x00", "") if isinstance(value, str) else value
+
+
 class SlateCard(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    # Numeric ids from the gateway are ids, not a reason to refuse the slate.
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
 
     position: Optional[int] = Field(default=None, ge=0, le=10_000)
     product_id: Optional[str] = Field(default=None, max_length=255)
@@ -57,14 +69,19 @@ class SlateCard(BaseModel):
     product_key: Optional[str] = Field(default=None, max_length=255)
     attached_product_key: Optional[str] = Field(default=None, max_length=255)
     content_key: Optional[str] = Field(default=None, max_length=64)
-    offer_id: Optional[str] = Field(default=None, max_length=512)
+    # The backend writers read catalog_offer_id or offer_id; accept both spellings here too.
+    offer_id: Optional[str] = Field(
+        default=None, max_length=512, validation_alias=AliasChoices("offer_id", "catalog_offer_id")
+    )
     platform: Optional[str] = Field(default=None, max_length=64)
     source: Optional[str] = Field(default=None, max_length=128)
     in_stock: Optional[bool] = None
 
+    _no_nul = field_validator("*", mode="before")(_strip_nul)
+
 
 class DecisionSlate(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", coerce_numbers_to_str=True)
 
     # Required: a minted id would make every retry a new decision. "gw:" + up to 61 id characters
     # (agent_decision_events.decision_id is VARCHAR(64), migration 140).
@@ -79,6 +96,12 @@ class DecisionSlate(BaseModel):
     request_id: Optional[str] = Field(default=None, max_length=128)
     primary_path: Optional[str] = Field(default=None, max_length=64)
     cards: List[SlateCard] = Field(default_factory=list, max_length=MAX_CARDS)
+
+    # Not decision_id: a NUL there must fail the gw: pattern, not be stripped into a different id.
+    _no_nul = field_validator(
+        "surface", "channel", "protocol", "merchant_id", "agent_id", "query", "market", "request_id",
+        "primary_path", mode="before",
+    )(_strip_nul)
 
 
 def _ingest_enabled() -> None:
@@ -121,11 +144,16 @@ router = APIRouter(
 
 
 def _positions(cards: List[SlateCard]) -> List[int]:
-    """Explicit positions when every card has one and they are distinct; the list index when any
-    card lacks one. Two cards on one position would share a row id and the second would vanish."""
+    """Every card's explicit position, or none (then the list index). Two cards on one position
+    would share a row id and the second would vanish; a mix would silently re-rank the cards."""
     explicit = [card.position for card in cards]
-    if any(p is None for p in explicit):
+    if all(p is None for p in explicit):
         return list(range(len(cards)))
+    if any(p is None for p in explicit):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "MIXED_POSITIONS", "message": "give every card a position, or none"},
+        )
     if len(set(explicit)) != len(explicit):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -135,14 +163,20 @@ def _positions(cards: List[SlateCard]) -> List[int]:
 
 
 def _fingerprint(slate: DecisionSlate, positions: List[int]) -> str:
-    """What makes two POSTs the same slate: surface, agent and the cards as sent (before any
-    identity resolution, so a replay matches even if catalog_products changed in between)."""
-    cards = [
-        [pos, card.product_id, card.merchant_id, card.product_key, card.attached_product_key,
-         card.content_key, card.offer_id]
-        for pos, card in sorted(zip(positions, slate.cards), key=lambda pair: pair[0])
-    ]
-    raw = json.dumps([slate.surface, slate.agent_id, cards], separators=(",", ":"), default=str)
+    """The whole validated request except decision_id and request_id: every other slate field and
+    every card field, the cards in position order with positions applied. An omitted field and an
+    explicit null validate to the same model, so they fingerprint alike; any other difference
+    (query, market, a card's stock...) is a different request and gets a 409 rather than being
+    dropped as a "replay". request_id is left out because the gateway mints one per HTTP attempt,
+    so a resend after a 503 carries a new one; the stored one is the first attempt's."""
+    body = slate.model_dump(mode="json", exclude={"decision_id", "request_id", "cards"})
+    cards = []
+    for pos, card in sorted(zip(positions, slate.cards), key=lambda pair: pair[0]):
+        dumped = card.model_dump(mode="json")
+        dumped["position"] = pos
+        cards.append(dumped)
+    body["cards"] = cards
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -176,27 +210,33 @@ async def ingest_decision_slate(slate: DecisionSlate, response: Response) -> Dic
     positions = _positions(slate.cards)
     fingerprint = _fingerprint(slate, positions)
 
-    existing = await claim_decision_event(
-        decision_id=decision_id,
-        merchant_id=slate.merchant_id,
-        surface=slate.surface,
-        channel=slate.channel,
-        protocol=slate.protocol or DEFAULT_PROTOCOL,
-        agent_context={
-            "agent_id": slate.agent_id,
-            "agent_id_source": AGENT_ID_SOURCE,
-            "query": slate.query,
-            "market": slate.market,
-            "request_id": slate.request_id,
-            "primary_path": slate.primary_path,
-            "result_count": len(slate.cards),
-            "slate_fingerprint": fingerprint,
-        },
-    )
+    try:
+        existing = await claim_decision_event(
+            decision_id=decision_id,
+            merchant_id=slate.merchant_id,
+            surface=slate.surface,
+            channel=slate.channel,
+            protocol=slate.protocol or DEFAULT_PROTOCOL,
+            agent_context={
+                "agent_id": slate.agent_id,
+                "agent_id_source": AGENT_ID_SOURCE,
+                "query": slate.query,
+                "market": slate.market,
+                "request_id": slate.request_id,
+                "primary_path": slate.primary_path,
+                "result_count": len(slate.cards),
+                "slate_fingerprint": fingerprint,
+            },
+        )
+    except _ROW_LEVEL_ERRORS:
+        # A value Postgres refuses: resending the same request cannot succeed.
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"error": "UNSTORABLE_VALUE"})
+    except Exception:  # noqa: BLE001 - the database failed; the same request will succeed later
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"error": "LEDGER_UNAVAILABLE"})
     replayed = existing is not None
     if replayed and (existing or {}).get("agent_context", {}).get("slate_fingerprint") != fingerprint:
-        # A different slate, surface or agent under this id. (Another writer's id cannot get here:
-        # the gw: prefix keeps the id spaces apart, and such a row would carry no fingerprint.)
+        # A different request under this id. (Another writer's id cannot get here: the gw: prefix
+        # keeps the id spaces apart, and such a row would carry no fingerprint.)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"error": "DECISION_ID_CONFLICT", "message": "decision_id already holds a different slate"},
@@ -204,11 +244,12 @@ async def ingest_decision_slate(slate: DecisionSlate, response: Response) -> Dic
 
     rows = _card_rows(decision_id, slate.cards, positions)
     await resolve_card_identities(rows)
-    if rows:
-        # On a replay these re-enqueue under the same ids: a no-op if they landed, a repair if the
-        # first attempt's rows were dropped (queue full, DB blip).
-        await record_decision_candidates(decision_id, rows)
-        await record_exposure_events(decision_id, rows)
+    try:
+        # Written now, not queued: the answer tells the gateway whether to resend. On a replay the
+        # same row ids make this a no-op where rows landed and a repair where they did not.
+        rows_lost = await write_slate_rows(decision_id, rows)
+    except Exception:  # noqa: BLE001 - systemic; reported by the store
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail={"error": "LEDGER_UNAVAILABLE"})
 
     if replayed:
         response.status_code = status.HTTP_200_OK
@@ -216,6 +257,7 @@ async def ingest_decision_slate(slate: DecisionSlate, response: Response) -> Dic
         "decision_id": decision_id,
         "replayed": replayed,
         "cards": len(rows),
+        "rows_lost": rows_lost,
         "content_key_resolved": sum(1 for row in rows if is_content_key(row.get("content_key"))),
-        "offer_id_kept": sum(1 for row in rows if row.get("offer_id")),
+        "offer_id_kept": sum(1 for row in rows if _row_offer_id(row)),
     }
