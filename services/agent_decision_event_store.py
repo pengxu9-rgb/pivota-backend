@@ -41,7 +41,10 @@ _OFFER_ID_MAX = 255  # catalog_offer_id VARCHAR(255) on every ledger table (migr
 # exposure_id and checkout_decision_id are SET NULL too but are not in here: their rows go through
 # this same async queue, possibly on another instance, so a miss can mean "not written yet". Nulling
 # would be permanent (the re-send hits ON CONFLICT DO NOTHING; the backfill skips linked events), so
-# that link is dropped and reported as before, and a re-send or the backfill writes it in full.
+# that link is dropped and reported as before. A later re-send (only when both confirm-payment and
+# the payment webhook record the same funnel event) or a manual run of
+# scripts/backfill_decision_funnel_links.py (which does not write commerce_attribution_edge_id) can
+# still write it; nothing repairs it automatically.
 # decision_id (RESTRICT) and funnel_event_id (NOT NULL) are what the link is about.
 _LINK_OPTIONAL_REFS = ("content_key", "catalog_offer_id", "commerce_attribution_edge_id")
 _LINK_TABLE = "agent_decision_funnel_links"
@@ -433,8 +436,10 @@ async def _write_funnel_link(payload: Dict[str, Any]) -> None:
 
     Each retry nulls a different column, so this ends within len(_LINK_OPTIONAL_REFS) + 1 tries. A
     miss on any other column, and any other error, propagates to the flush loop, which reports it.
-    A link that arrives naming neither a decision nor a checkout decision is written as given
-    (decision_id is nullable; the row still carries the funnel event and the attribution edge)."""
+    A link that arrives naming neither a decision nor a checkout decision is written (decision_id
+    is nullable; the row still carries the funnel event and the attribution edge). Its refs get the
+    same treatment as any link's, so one whose refs all miss lands with every ref NULL, where main
+    dropped it on the FK error; no current caller sends that shape."""
     row = dict(payload)
     nulled: List[str] = []
     inserted: Any = None
