@@ -144,6 +144,13 @@ on:
       # touching only those files would not run the job it just disarmed.
       - "tests/conftest.py"
       - "pytest.ini"
+      # The loopback-only network guard loads from the repo-root conftest.py and runs in every gate
+      # file. A change to it that refused a gate's own database dial would fail (or, worse,
+      # skip) the whole gate, so a PR touching only the guard must run it.
+      - "conftest.py"
+      - "tests/net_guard.py"
+      - "tests/net_guard_core.py"
+      - "tests/_netguard_child/**"
       # The compile-shape ride-along is not matched by the glob above, so it
       # needs its own entry or a change to it would not run its own gate.
       - "tests/test_pdp_renderability.py"
