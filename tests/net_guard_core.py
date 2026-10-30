@@ -30,7 +30,8 @@ leave the attempt unrecorded. Python children are covered too (see below).
 
 NOT COVERED. Sockets opened in C: libpq, which psycopg2 (the sync engine, the *_postgres
 tests) connects through. tests/net_guard.py stops the session before any test runs unless
-every Postgres URL and PGHOST in the env is loopback or a unix socket. Also not covered: the
+every Postgres URL in the env (in any variable), every libpq key=value string (in a variable
+named like a database setting), and PGHOST / PGHOSTADDR is loopback or a unix socket. Also not covered: the
 `_socket` module used directly, a child process that is not Python, or one whose env or flags
 drop PYTHONPATH (`-I`, `-E`, an env that replaces it).
 
@@ -604,8 +605,9 @@ def _disable_proxies() -> None:
 # Postgres URLs: libpq connects in C, past every hook above.
 # ---------------------------------------------------------------------------------------------
 
-#: A Postgres URL anywhere in a value (on its own, or inside JSON or a longer string).
-_PG_URL = re.compile(r"postgres(?:ql)?(?:\+\w+)?://[^\s\"'<>;]+", re.IGNORECASE)
+#: A Postgres URL anywhere in a value (on its own, or inside JSON or a longer string, where
+#: the slashes may be escaped).
+_PG_URL = re.compile(r"postgres(?:ql)?(?:\+\w+)?:(?://|\\/\\/)[^\s\"'<>;]+", re.IGNORECASE)
 #: libpq's key=value form: `key = value`, spaces optional, a value optionally single-quoted.
 _CONNINFO_PAIR = re.compile(r"\s*([A-Za-z_]+)\s*=\s*('(?:[^'\\]|\\.)*'|[^\s']*)")
 _CONNINFO_KEYS = frozenset(
@@ -668,6 +670,13 @@ def _conninfo_hosts(value: str) -> Optional[List[str]]:
     return hosts
 
 
+def _names_a_database(key: str) -> bool:
+    """A variable whose value may be a libpq key=value string. Elsewhere `service=api` or
+    `host=0.0.0.0 port=8000` means something else; a URL counts in any variable."""
+    k = key.upper()
+    return k.startswith("PG") or "POSTGRES" in k or "DATABASE" in k or k.endswith("DSN") or "_PG_" in k or k.endswith("_PG")
+
+
 def _pg_host_ok(host: str) -> bool:
     # Only `localhost` itself: libpq resolves any other name, `*.localhost` included, through
     # the system resolver, which may ask DNS.
@@ -686,8 +695,13 @@ def postgres_env_problems(environ: Optional[Dict[str, str]] = None) -> List[str]
         elif key == "PGSERVICE":
             hosts = [_service(value)]
         else:
-            urls = _PG_URL.findall(value)
-            hosts = [h for url in urls for h in _url_hosts(url)] if urls else (_conninfo_hosts(value) or [])
+            urls = [url.replace("\\/", "/") for url in _PG_URL.findall(value)]
+            if urls:
+                hosts = [h for url in urls for h in _url_hosts(url)]
+            elif _names_a_database(key):
+                hosts = _conninfo_hosts(value) or []
+            else:
+                continue
         bad = [h for h in hosts if not _pg_host_ok(h)]
         if bad:
             problems.append(f"{key} -> {', '.join(bad)}")

@@ -157,7 +157,13 @@ SUPPORT = textwrap.dedent(
         of the socket calls themselves, so a child the guard failed to reach still sends nothing."""
         from tests import net_guard_core as core
 
-        if core.installed():
+        # Installed means patched: the flag alone is not enough, the calls must be the guard's.
+        patched = all(
+            getattr(f, "__module__", None) == "_pivota_net_guard_child"
+            for f in (socket.create_connection, socket.socket.connect, socket.socket.connect_ex,
+                      socket.socket.sendto, socket.getaddrinfo)
+        )
+        if core.installed() and patched:
             return install(nothing_that_can_leave)[0]
         reached = []
 
@@ -358,8 +364,10 @@ INNER = textwrap.dedent(
                 socket.create_connection(("203.0.113.24", 80), timeout=1)
             except BaseException:
                 pass
-            os._exit(0)
-        os.waitpid(pid, 0)
+            # The child's copy of the sink is the only one that saw its calls: report by exit code.
+            os._exit(3 if sink else 0)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, "the guard let these through to the layer below it (in the forked child)"
 
 
     def test_thread_leak_inside_its_test_fails(sink):
@@ -682,9 +690,12 @@ def _run_inner(tmp_path: Path, source: str, proxy, *, path_before=(), **env_over
     outcomes = {}
     if junit.exists():
         for case in ET.parse(junit).getroot().iter("testcase"):
-            # A call failure and a teardown error are separate elements: keep every one.
+            # pytest writes a call failure and a teardown error as two <testcase> elements with
+            # the same name: keep the text of every one, so neither hides the other.
             bad = case.findall("failure") + case.findall("error")
-            outcomes[case.get("name")] = "\n".join(b.get("message", "") + (b.text or "") for b in bad) or None
+            text = "\n".join(b.get("message", "") + (b.text or "") for b in bad) or None
+            prev = outcomes.get(case.get("name"))
+            outcomes[case.get("name")] = "\n".join(t for t in (prev, text) if t) or None
     return proc, outcomes
 
 
@@ -855,11 +866,18 @@ def test_two_copies_of_the_shim_on_the_path_install_the_guard_once(tmp_path):
     other = tmp_path / "other_checkout" / "tests"
     shutil.copytree(real, other / "_netguard_child")
     shutil.copy(REPO_ROOT / "tests" / "net_guard_core.py", other)
-    code = "import json, socket; s = socket._pivota_net_guard_state; print(json.dumps([s['installed'], s['child']]))"
+    # And a sitecustomize after both copies (a safety net): it must still run, under the guard.
+    site = tmp_path / "outer_site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text("import socket\nsocket._selftest_outer_site = True\n")
+    code = (
+        "import json, socket; s = socket._pivota_net_guard_state; "
+        "print(json.dumps([s['installed'], s['child'], getattr(socket, '_selftest_outer_site', False)]))"
+    )
     for path in ([alias, real], [real, alias], [other / "_netguard_child", real], [real, other / "_netguard_child"]):
-        env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, path)), core.RUN_DIR_ENV: str(tmp_path)}
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, [*path, site])), core.RUN_DIR_ENV: str(tmp_path)}
         proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
-        assert (proc.returncode, proc.stdout.strip()) == (0, "[true, true]"), (path, proc.returncode, proc.stderr[-2000:])
+        assert (proc.returncode, proc.stdout.strip()) == (0, "[true, true, true]"), (path, proc.returncode, proc.stderr[-2000:])
 
 
 @pytest.mark.parametrize(
@@ -892,6 +910,14 @@ def test_two_copies_of_the_shim_on_the_path_install_the_guard_once(tmp_path):
         # A URL inside a longer value, and one urlsplit cannot parse: reported, not an error.
         ({"APP_CONFIG": '{"db": "postgresql://u@db.example/x", "n": 1}'}, ["APP_CONFIG -> db.example"]),
         ({"DATABASE_URL": "postgresql://u@[db.example]/x"}, ["DATABASE_URL -> '[db.example]/x' (unparseable)"]),
+        # Every URL in a value, and a JSON-escaped one.
+        ({"APP_CONFIG": "postgresql://u@localhost/x postgresql://u@db.example/y"}, ["APP_CONFIG -> db.example"]),
+        ({"APP_CONFIG": '{"db": "postgresql:\\/\\/u@db.example\\/x"}'}, ["APP_CONFIG -> db.example"]),
+        # The key=value form only in a variable named like a database setting: elsewhere
+        # "service=api" or "host=0.0.0.0 port=8000" is something else.
+        ({"SERVICE_SPEC": "service=api", "APP_ARGS": "host=0.0.0.0 port=8000"}, []),
+        ({"ANALYTICS_DATABASE_URL": "host=db.example dbname=x", "MY_POSTGRES_OPTS": "service=api"},
+         ["ANALYTICS_DATABASE_URL -> db.example", "MY_POSTGRES_OPTS -> service=api (a service file can name any host)"]),
     ],
 )
 def test_a_postgres_url_is_judged_by_every_host_it_names(env, problems):
