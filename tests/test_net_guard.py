@@ -918,6 +918,12 @@ def test_two_copies_of_the_shim_on_the_path_install_the_guard_once(tmp_path):
         ({"SERVICE_SPEC": "service=api", "APP_ARGS": "host=0.0.0.0 port=8000"}, []),
         ({"ANALYTICS_DATABASE_URL": "host=db.example dbname=x", "MY_POSTGRES_OPTS": "service=api"},
          ["ANALYTICS_DATABASE_URL -> db.example", "MY_POSTGRES_OPTS -> service=api (a service file can name any host)"]),
+        # The *_DB_URL / DB_* names the repo reads (psycopg2.connect takes key=value too), and *DSN.
+        ({"MIGRATION_PR1_DB_URL": "host=db.example dbname=x"}, ["MIGRATION_PR1_DB_URL -> db.example"]),
+        ({"DB_URL": "dbname=x host=203.0.113.9"}, ["DB_URL -> 203.0.113.9"]),
+        ({"APP_DSN": "host=db.example"}, ["APP_DSN -> db.example"]),
+        # Named like one, but a D-Bus address is not a libpq string.
+        ({"DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}, []),
     ],
 )
 def test_a_postgres_url_is_judged_by_every_host_it_names(env, problems):
