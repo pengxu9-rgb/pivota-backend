@@ -44,6 +44,8 @@ ADR-022 deleted a promotions lane that showed deals the checkout never applied. 
 
 It also requires that display is evidence-gated for **the lane the order will use**, and it ruled out a second pricing engine. The index stores *observed* offer economics with provenance, predicts at quote time, and reconciles quoted against charged after checkout. A code we scraped satisfies that invariant only after the merchant's checkout has accepted it, for that item, in that market, on that lane.
 
+ADR-022's concrete bullet says a deal renders only if **the quote layer** marks it predictable for the lane the order will use. On the click-out lanes there is no Pivota quote. On those lanes this ADR meets that bullet with the D3 reference cart for that variant and market, together with invalidation (D3) and the stop rule (D7). The residual risk is accepted: the buyer's real cart can still differ from the reference cart, which `subject_to_checkout: true` (D4) states and the stop rule watches. On the orchestrated lane the quote still decides (D7).
+
 ### What exists today and can be reused
 
 - **Code validation against Shopify's checkout authority.** `services/shopify_storefront_pricing_service.py` already submits `discountCodes` on a Storefront cart and reads back `discountCodes { code applicable }` together with allocations. It uses `buyerIdentity.countryCode` / `@inContext(country:)` so pricing is in the market's presentment currency. Today this needs a storefront token from a **connected** store.
@@ -148,7 +150,7 @@ What one verification proves, and what it does not:
 
 **Invalidation inside the TTL.** A verification holds only while the variant is unchanged. Serving shows an effective price only while both of these are true:
 - the variant's current observed unit price, from the latest live verification or refresh in the same currency, equals the reference cart's pre-discount unit price;
-- no automatic discount has been observed on the variant since the reference cart was built.
+- no change to the automatic discounts on the variant has been observed since the reference cart was built.
 
 Any change to the variant's price, its compare-at (sale) state or the automatic discounts observed on it, and any report that the code is used up or disabled, sets that (deal, variant) back to `unverified` at once and queues a re-verify. The 24h TTL is a ceiling, not a promise.
 
@@ -227,7 +229,9 @@ A new table, `observed_store_offers`. It deliberately does not reuse the name `p
   - `verified_via` (`shopify_storefront_connected | shopify_storefront_tokenless | ucp_checkout`);
   - the reference cart: variant, quantity (always 1), subtotal, discount amount and currency;
   - `failure_reason`.
-- **On the click row:** a new nullable `discount_code` field on `IssuedClick` and its click table, written only by `issue_click` (D7). This is a schema change to ADR-025's click row.
+- **On the click row** (a schema change to ADR-025's click row; D7):
+  - a new nullable `discount_code` field on `IssuedClick` and its click table, written by `issue_click` at issue time: the deal-lane code the link may carry;
+  - a new `discount_carried` flag, filled by `/r` on that same row when the link is followed: whether `/r` actually appended the code.
 - **Outcome (D7):**
   - `orders_seen`;
   - `orders_applied`;
@@ -253,42 +257,53 @@ A verified deal may show an effective price only on a lane that both carries the
 | Lane | Carries the code? | Evidence needed | v1 |
 |---|---|---|---|
 | **Pivota-orchestrated checkout** (the merchant's PSP charges; Pivota orchestrates, ADR-016) | Yes: the quote's `discount_codes` | The quote itself. The quote decides, and an applied code lands in `appliedStoreDiscounts` | Yes, for **order-level** codes only. Product-scoped codes on this lane are hard to write into the Shopify order (the order is written as a draft, or its receipt is suppressed), so a product-scoped deal-lane code is not offered here in v1 |
-| **Orchestrated checkout's permalink fallback** (used when payment-intent creation fails) | Today: the buyer's quote codes, unpinned | The quote's own `checkout_url` where one exists | For an order carrying a **deal-lane** code: prefer the quote's `checkout_url`; otherwise the fallback permalink must pin `country=` to the buyer's declared market, or it is suppressed. Buyer-entered codes keep today's behaviour |
-| **Shopify cart permalink** (human click-out, through `/r`) | Yes: `?discount=CODE`, added when the `/r` link is followed | Variant verified in the buyer's declared market (D3). The link pins that market with `country=` | Yes, through `compose_attributed_destinations` (below) |
-| **Direct `cart_url`** (`offers.resolve` hands the cart link to an agent, no `/r` hop) | **No** in v1 | — | Carries no `discount=` and no effective price, because a link handed out directly cannot be recalled |
+| **Orchestrated checkout's permalink fallback** (used when payment-intent creation fails) | Today: the buyer's quote codes, with no click id and no `country=` | The quote's own `checkout_url` where one exists | For an order carrying a **deal-lane** code: use the quote's `checkout_url`; with none, no fallback permalink is built for that order. The permalink has no click id, so it cannot meet the rule below. Buyer-entered codes keep today's behaviour |
+| **Shopify cart permalink** (human click-out, through `/r`) | Yes: `?discount=CODE`, appended **only by `/r`** when the link is followed | Variant verified in the buyer's declared market (D3). The link pins that market with `country=` | Yes. The caller decides, the composer signs a deal reference, and `/r` appends the code (below) |
+| **Direct `cart_url`** (no `/r` hop: `offers.resolve` hands the cart link to an agent; connected-store product cards publish it through `_seed_attribution_from_redirect`) | **No** in v1 | — | Carries no `discount=` and no effective price, because a link handed out directly cannot be recalled |
+| **Referral link** (the card's `/r` destination is a product page, not a cart, for example when the purchasability gate declines the cart) | **No** | — | Not emitted. `/r` never appends a code to a referral destination |
 | **Reap cart-link** (ADR-025 D6b) | **No.** `validate_cart_link` deliberately refuses `discount=`, and Reap's callers never pass a code | — | **Excluded.** Carrying a code there needs a change to Reap's allowlist, which is a separate decision with its own review |
 | **UCP delegated checkout / Reap variant lane** | Not established | Per-merchant proof that a code can be passed and is applied | Excluded in v1. Revisit in Phase 2 with UCP verification |
 | **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together | Excluded in v1. When added, the carrier is the network link (Q9) |
 | **Handed-out `pdp_url`** (an agent passes the product page on) | No | — | No effective price. The effective price is attached to the code-carrying link only, never to the bare `pdp_url` |
 | **Other click-outs** (non-Shopify web checkout; the buyer types the code) | Only by the buyer | A verification on that same checkout (UCP, Phase 2) | Excluded in v1 |
 
-#### One decision, one composer
+#### One decision at issue time, one re-check at click time
 
-`compose_attributed_destinations` already exists to compose a click-out link once. It becomes the one place that decides **both** whether a deal is shown on an offer and whether its link carries the code, so the two cannot disagree:
-- `attributes[pivota_click_id]` from `issue_click`;
-- `country=<MARKET>` from `_cart_country_pin`, which pins the **buyer's declared** market and nothing else. Without it, the checkout's market follows the opener's IP address;
-- `discount=CODE`, only if the deal is shown on that offer (D4), which requires the declared market to equal the verification market.
+Two places touch a deal-lane code, each with one job:
+- **Issue time.** The caller resolves the deal decision once per offer and passes it to `compose_attributed_destinations`. The decision needs database reads (the verification row, the stop row, the flags, the opt-out denylist). The composer stays pure and synchronous, as its contract already requires: `recovery_key` is passed in pre-resolved for the same reason. The composer uses the decision both to say whether the deal is shown on the offer (D4) and to sign a **deal reference** (deal, variant, verification market) into the `/r` token, so display and link cannot disagree. It adds:
+  - `attributes[pivota_click_id]` from `issue_click`;
+  - `country=<MARKET>` from `_cart_country_pin`, which pins the **buyer's declared** market and nothing else. Without it, the checkout's market follows the opener's IP address.
 
-The rule applies to **deal-lane codes** only: no deal-lane `discount=` without `country=` and the click attribute. Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
+  It **never** writes `discount=` into the signed `dest` or the published `cart_url`. Both stay exactly as today, so `_seed_attribution_from_redirect`'s check that the recomposed link equals the signed `dest` still holds.
+- **Click time.** **Only `/r` appends `discount=CODE`**, and only after it re-checks the deal (below).
 
-**Links outlive decisions, so `/r` decides again.** In v1, a deal-lane code travels only on the `/r` redirect, never on a direct `cart_url`. When a `/r` link is followed, the redirect re-checks the deal and adds `discount=` only if all of these hold at that moment:
+The rule applies to **deal-lane codes** only: no deal-lane `discount=` on a click-out link without `country=` and the click attribute. Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
+
+**Links outlive decisions, so `/r` checks again.** In v1, a deal-lane code travels only on the `/r` redirect, never on a direct `cart_url`. When a `/r` link is followed, the redirect reads the token's deal reference and appends `discount=` only if all of these hold at that moment:
 - the token has not expired;
+- the signed `dest` is the Shopify cart permalink of the verified variant, pinned with `country=` to the verification market. `/r` never appends to a referral destination or to a warm-handoff `continue_url`;
 - the verification is still valid (D3);
 - no stop row exists and the flags allow it.
 
-Otherwise it redirects without the code. So the kill switches and the stop row take effect on links already handed out, not only on new ones. An expired token still redirects for cached feeds, as today, but never with a deal-lane code.
+Otherwise it redirects without the code. So the kill switches and the stop row take effect on links already handed out, not only on new ones. An expired token still redirects to its signed `dest` for cached feeds, as today; since that `dest` never contains `discount=`, it never carries a deal-lane code.
 
 **Migration (Phase 1).** The author of the Phase 1 deal-lane PRs owns this, reviewed through the PR controller:
-- `compose_attributed_destinations` and the `/r` redirect gain the deal decision and `discount=`;
+- the callers of `compose_attributed_destinations` resolve the deal decision and pass it in; the composer signs the deal reference; `/r` re-checks and appends `discount=`;
+- `_attach_connected_product_redirects`, which mints `/r` links on connected-store product cards, must pass the request's **declared** buyer market to the mint. Today its three callers (`find_products`, `find_products_multi`, `get_product_detail`) pass the request market to the purchasability gate only, and the mint gets no market and no `cart_country`. So the pin is unset, and under D4 no deal would ever be emitted on the one population Phase 1 can verify. This fails closed, but it must be fixed for Phase 1 to show anything;
 - `build_shopify_cart_permalink` callers (A2A purchase, Reap cart-link, cart-link preflight) are unchanged; none passes a deal-lane code;
-- the orchestrated fallback gets the matrix rule above for orders carrying a deal-lane code.
+- the orchestrated fallback gets the matrix rule above. `_get_platform_checkout_fallback_url_best_effort` receives a bare list of codes today, so the quote records which of its codes are deal-lane codes. A code counts as one when it matches a verified deal emitted for that variant and market. The order keeps that marker, and the fallback's callers pass it in.
+
+**Purchasability enforcement.** Under `MERCHANT_PURCHASABILITY_ENFORCE` (on in prod `web` when last measured, on 2026-09-27; not re-checked for this ADR), a connected Shopify card gets a cart permalink only with a fresh positive purchasability fact for its host and the buyer's market. The purchasability sweep has covered connected stores since 2026-09-28. Without such a fact the card is a referral link, which carries no code, so no deal is emitted on it. Phase 1's reach is therefore connected Shopify stores that have a fresh positive fact in the buyer's declared market. That is a subset of the connected-store share Phase 0 reports.
 
 #### Recording the code, and reconciling (Phase 1)
 
-- **Recording.** The code issued with a click is written by ADR-025's `issue_click` at issue time, into the new `discount_code` field on the click row (D6). There is no second writer.
+- **Recording.**
+  - At issue time, ADR-025's `issue_click` writes the deal-lane code the link may carry into the new `discount_code` field on the click row (D6).
+  - When the link is followed, `/r` fills that same row, as it already fills the issued click today, with `discount_carried`: whether it actually appended the code.
+  - This is `/r` completing the issued row, not a second writer. An expired token is not logged, so its click has no `discount_carried`.
 - **Reconciling.** When order evidence returns (ADR-025 link 4), the order's discount codes are compared with the issued code:
   - applied: increments `orders_applied`;
-  - a **failure signal** is an order that meets all of these: it is paid; it came from a click whose link carried the code; it contains the verified variant; and the code is absent from it. Eligibility-limited codes are never emitted in v1 (D3), so a returning customer's ineligibility cannot cause one;
+  - a **failure signal** is an order that meets all of these: it is paid; it came from a click where `/r` recorded `discount_carried = true`; it contains the verified variant; and the code is absent from it. Clicks where `/r` dropped the code, because the verification had lapsed (it lasts at most 24h, a token 7 days) or a stop row existed, are never failure signals. So a cleared stop row is not re-tripped by its own stripped clicks. Eligibility-limited codes are never emitted in v1 (D3), so a returning customer's ineligibility cannot cause one;
   - not counted: orders without the verified variant; orders whose cart changed shape so that another discount won instead (an extra item unlocking a better automatic discount); and, where order evidence shows the landing parameters, orders where the buyer removed the code;
   - two failure signals within the TTL demote that variant's verification to `failed`, pending re-verification.
 - **Coverage.** Reconciliation covers only merchants whose orders reach us (about 21 connected stores today). Whether an affiliate network's report carries the coupon code used is not established. Until it is confirmed per network, the false-savings rate is measured on connected stores only.
@@ -299,7 +314,7 @@ Otherwise it redirects without the code. So the kill switches and the stop row t
 Four independent flags, all default off, each able to stop its part alone:
 - `DEAL_LANE_EMIT_ENABLED`: serving emits deals at all;
 - `DEAL_LANE_RANKING_ENABLED`: deals may change seller order within a product (stays off through Phase 1; Q6);
-- `DEAL_LANE_DISCOUNT_PARAM_ENABLED`: the click-out builder adds `discount=`;
+- `DEAL_LANE_DISCOUNT_PARAM_ENABLED`: `/r` appends `discount=`;
 - `DEAL_VERIFY_JOB_ENABLED`: the verifier job runs.
 
 **Stop rule (automatic).**
@@ -307,7 +322,7 @@ Four independent flags, all default off, each able to stop its part alone:
 - **Rate trigger:** once the window has at least **50 reconciled orders** carrying an issued code, a rate of **2% or higher** writes a stop row. At 50 orders that is a single failure. **This hair trigger is intended**: a stop fails safe, because it only hides deals until a person looks.
 - **Absolute trigger:** **3 or more failure signals in 14 days** writes a stop row at any volume, armed or not.
 - **Before the rate trigger arms:** while the window has fewer than 50 reconciled orders, a person reviews every failure signal **weekly**. Expected volume from about 21 connected stores may keep the rate trigger unarmed for a long time; the absolute trigger and the weekly review are the guards until it arms.
-- **Effect:** serving, `compose_attributed_destinations` and the `/r` redirect read the stop row. While it exists they behave as if `DEAL_LANE_EMIT_ENABLED`, `DEAL_LANE_RANKING_ENABLED` and `DEAL_LANE_DISCOUNT_PARAM_ENABLED` were off, including for links already handed out.
+- **Effect:** serving, the deal decision its callers pass to `compose_attributed_destinations`, and the `/r` re-check read the stop row. While it exists they behave as if `DEAL_LANE_EMIT_ENABLED`, `DEAL_LANE_RANKING_ENABLED` and `DEAL_LANE_DISCOUNT_PARAM_ENABLED` were off, including for links already handed out.
 - **Alerting:** writing a stop row alerts the deal-lane owner and the on-call channel. Only a person clears it, after review.
 - **Time to detect:** the order-evidence lag (webhook: minutes; poller: up to its interval), plus up to one hour for the check. A failure can therefore stop the lane within a few hours of the order, once it meets a trigger.
 
@@ -346,8 +361,8 @@ That shows peng whether a failed gate means few deals or few connections.
 - The verifier job (connected stores only, unless Q2's separate approval exists), under D3's egress rules.
 - `estimated_effective_price` and `availableStoreOffers` on `get_offers`, with the display part of the `savings.v1` amendment. **No ranking effect.**
 - Invalidation on price, sale-state, automatic-discount or code-status change (D3), and `read_discounts` eligibility reads on connected stores.
-- The deal decision and `discount=` in `compose_attributed_destinations` and the `/r` redirect; the orchestrated-fallback rule (D7 migration).
-- The `discount_code` field on the click row, code-on-click recording through `issue_click`, reconciliation, and the stop rule with its absolute trigger and weekly review (D7).
+- The deal decision resolved by the callers of `compose_attributed_destinations`, the signed deal reference, the `/r` re-check that appends `discount=`, the declared buyer market on connected-store product cards, and the orchestrated-fallback rule (D7 migration).
+- The `discount_code` and `discount_carried` fields on the click row (written by `issue_click`, filled by `/r`), reconciliation, and the stop rule with its absolute trigger and weekly review (D7).
 - The four kill flags and the shared crawl lock.
 
 **Phase 2: measure, then widen.**
@@ -361,7 +376,7 @@ That shows peng whether a failed gate means few deals or few connections.
 ## Metrics
 
 - **Verified-deal coverage:** per market, the gate's measure over the Phase 0 base.
-- **False-savings rate:** issued codes, carried in the URL, that did not apply on a paid order, among reconciled orders. Target under 2%. **This is the metric that can stop the lane** (D7 stop rule). It counts finished orders only, so it is survivor-only (D7).
+- **False-savings rate:** codes `/r` appended (`discount_carried = true`) that did not apply on a paid order, among reconciled orders. Target under 2%. **This is the metric that can stop the lane** (D7 stop rule). It counts finished orders only, so it is survivor-only (D7).
 - **Median and p90 savings** per verified deal, in market currency, on the reference-cart base.
 - **Click-out to order conversion** with and without a verified deal (A/B, Phase 2).
 - **Verifier load:** carts per host per day, from the database counter. Alert at 80% of the cap.
@@ -380,9 +395,11 @@ That shows peng whether a failed gate means few deals or few connections.
 - Per-variant verification costs more carts than per-scope verification. The daily cap therefore limits coverage, and the verifier spends it on the variants we show most.
 - Only connected stores can have a verified deal until Q2 or UCP widens it, and in Phase 2 only sellers in our affiliate programs join them. Those are also the sellers Pivota can attribute and earn on. This is why Phase 1 is display-only, and why Q6 limits ranking to seller order within a product, never product order in a slate.
 - `TestPromotionsLaneStaysDeleted` stays as is. Add new pins:
-  - the serving modules that read `observed_store_offers` make no outbound HTTP calls (D5);
-  - `compose_attributed_destinations` and `/r` never emit a deal-lane `discount=` without `country=` and the click attribute, nor when the declared market differs from the verification market or the market was defaulted (D7);
+  - the deal-read module (the code that reads `observed_store_offers` for serving and for `/r`) makes no outbound HTTP calls (D5). `/r`'s warm handoff, which does, is outside it;
+  - `compose_attributed_destinations` never writes `discount=` into the signed `dest` or the published `cart_url` (D7);
+  - `/r` never appends a deal-lane `discount=` without `country=` and the click attribute, to a referral or warm-handoff destination, on an expired token, or when the declared market differs from the verification market or the market was defaulted (D7);
   - a direct `cart_url` never carries a deal-lane `discount=` (D7);
+  - a click where `/r` dropped the code is never counted as a failure signal (D7);
   - a price or sale-state change on a verified variant drops its effective price (D3);
   - the verifier refuses hosts on the opt-out denylist and non-connected hosts while `DEAL_VERIFY_NONCONNECTED_ENABLED` is unset (D2, D3).
 
@@ -407,9 +424,10 @@ That shows peng whether a failed gate means few deals or few connections.
    - Showing observed, checkout-verified deals is not the rebuild ADR-022 gates. It adds no pricing engine and keeps ADR-022's invariant: only a deal the merchant's checkout applied, for that item, market and lane, is shown.
    - Phase 1 therefore does not wait for a merchant commitment.
    - The trigger still applies to merchant-created codes (D8, Phase 3).
+   - The amendment covers **showing** only. Whether Phase 2 ranking, within Q6's limits, also needs no merchant commitment is not decided here. The proposed answer is no: ranking stays within one product, adds no pricing engine, and what Pivota earns never enters it. It is decided with the Phase 2 ranking part of the `savings.v1` amendment (D4).
 6. **Ranking: off until measured, then within a product only.**
    - Phase 1 is display-only.
-   - Ranking may start only after the false-savings rate has been measured (at least 50 reconciled orders) and is under the D7 stop threshold.
+   - Ranking may start only after the false-savings rate has been measured and is under the D7 stop threshold. **Proposed definition of "measured", pending peng's confirmation:** at least 50 reconciled orders in the window.
    - When on, a verified deal may change only the **order of sellers within one product**, by the buyer's effective price. It never changes the order of products in a recommendation slate.
    - What Pivota earns on a seller never enters the ranking (ADR-025 Q4). Effective price is a fact about the buyer's cost, not about our relationship with the seller.
 7. **Phase 0 base: wait for the ledger.**
