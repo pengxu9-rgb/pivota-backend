@@ -236,12 +236,18 @@ async def test_no_decision_and_a_checkout_miss_writes_no_row(scoped) -> None:
                                          catalog_offer_id="of:internal_checkout:x")
     assert row is None
     assert await scoped.fetch_val("SELECT count(*) FROM agent_decision_funnel_links") == 0
+    [(exc, kw)] = scoped.reports
+    assert kw.get("op") == "funnel_link", "reported by the flush loop as a write failure"
 
 
 @pytest.mark.asyncio
-async def test_no_decision_and_no_checkout_decision_writes_no_row_and_reports_nothing(scoped) -> None:
-    row = await _link_through_the_worker(scoped, decision_id=None, catalog_offer_id=OFFER, content_key=CK)
-    assert row is None
+async def test_no_decision_and_no_checkout_decision_is_written_as_on_the_merge_base(scoped) -> None:
+    # confirm-payment records a link for every paid order; one with no decision linkage still lands
+    row = await _link_through_the_worker(scoped, decision_id=None, catalog_offer_id=OFFER, content_key=CK,
+                                         commerce_attribution_edge_id=EDGE)
+    assert row is not None
+    assert (row["decision_id"], row["checkout_decision_id"]) == (None, None)
+    assert (row["content_key"], row["catalog_offer_id"], row["commerce_attribution_edge_id"]) == (CK, OFFER, EDGE)
     assert scoped.reports == []
 
 

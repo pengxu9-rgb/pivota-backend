@@ -433,12 +433,8 @@ async def _write_funnel_link(payload: Dict[str, Any]) -> None:
 
     Each retry nulls a different column, so this ends within len(_LINK_OPTIONAL_REFS) + 1 tries. A
     miss on any other column, and any other error, propagates to the flush loop, which reports it.
-    A link that names neither a decision nor a checkout decision joins nothing and is not written."""
-    if payload.get("decision_id") is None and payload.get("checkout_decision_id") is None:
-        # The confirm-payment caller records a link for every paid order (the webhook gates on
-        # linkage first); an order with no decision linkage is expected, so this is not a warning.
-        logger.debug("funnel link without a decision or checkout decision not written")
-        return
+    A link that arrives naming neither a decision nor a checkout decision is written as given
+    (decision_id is nullable; the row still carries the funnel event and the attribution edge)."""
     row = dict(payload)
     nulled: List[str] = []
     inserted: Any = None

@@ -193,14 +193,17 @@ async def test_a_miss_on_a_queued_parent_drops_the_link_so_it_stays_repairable(
 
 
 @pytest.mark.asyncio
-async def test_a_link_naming_no_decision_and_no_checkout_decision_is_not_written(
+async def test_a_link_naming_no_decision_and_no_checkout_decision_is_written_as_given(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # as on the merge-base: decision_id is nullable and the row still carries the funnel event + edge
     db = _FakeDb({})
     monkeypatch.setattr(store, "database", db)
     with caplog.at_level(logging.WARNING, logger=store.logger.name):
-        await store._write_funnel_link(_link(decision_id=None, catalog_offer_id="offer_9", content_key=CK))
-    assert db.rows == []
+        await store._write_funnel_link(_link(decision_id=None, commerce_attribution_edge_id="edge_1"))
+    assert [(r["decision_id"], r["checkout_decision_id"], r["commerce_attribution_edge_id"]) for r in db.rows] == [
+        (None, None, "edge_1"),
+    ]
     assert caplog.records == []
 
 
