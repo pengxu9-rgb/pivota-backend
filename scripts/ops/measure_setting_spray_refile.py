@@ -13,14 +13,17 @@ WHAT IT DOES.
          `SET LOCAL statement_timeout` took (`SHOW statement_timeout`).
      Then it prints the bare line `GATE_OPEN`.
   2. Selects the candidates with PostgreSQL regex (`\\y` is the word boundary there; `\\b` is a
-     backspace): rows on the old gap spelling, and rows whose title or merchant type names a setting
-     phrase (CANDIDATE_SQL).
+     backspace), generated from the classifier's own SETTING_SPRAY_PHRASES: rows on the old gap
+     spelling, and rows whose title, merchant type or category names a setting phrase (CANDIDATE_SQL).
   3. Runs the REAL resolvers from this image on each row, in Python:
-       * `row`  = services.pdp_category_classifier.resolve_path_from_row (what the backfill would write);
+       * `row`  = services.pdp_category_classifier.resolve_path_from_row: the classifier's answer for the
+         row. The backfill WRITES it only on a NULL or interior path and only when strictly deeper, so a
+         toner -> leaf or powder -> "" move here is not a backfill write;
        * `feed` = services.curated_brand_feed._resolve_category under a coarse "beauty" job flag (what a
          drain re-ingest re-derives; the drain passes the job's category, not the row's stored path).
          "" is UNRESOLVED: the drain leaves that product out of its plan (category_unresolved), so a
-         re-ingest does not re-file it.
+         re-ingest does not re-file it. "beauty" is the coarse fallback (0.3), which the drain marks
+         resolved: every two-product shelf reads that way.
   4. Prints from->to counts by source_domain for each resolver, serving rows counted separately, with the
      combined spray+powder shelf and every other multi-product type broken out, and one `key` line per
      row whose answer moves (the measured key list the re-file steps are scoped to).
@@ -28,8 +31,14 @@ WHAT IT DOES.
      leaf's own two rows (the leaf and its gap alias) taken out, so it compares with the baseline taken
      on the previous image.
 
+OUTPUT. Every line is TEXT, so Cloud Logging keeps it as textPayload (a bare-JSON stdout line lands in
+jsonPayload and comes back blank through run_oneoff_job.sh's `value(textPayload,...)`):
+`MEASURE {json}` for every line, `MEASURE_KEY {json}` per moved key, the bare `GATE_OPEN` after the
+preconditions and again at the end, and last `MEASURE_DONE lines=N`, N = the lines printed before it,
+so a reader can check that nothing was dropped (the log read is capped and newest first).
+
 SAFETY. One READ ONLY transaction with SET LOCAL statement_timeout; it writes nothing and creates
-nothing. JSON lines only, plus the one bare GATE_OPEN line:
+nothing:
 
     IMAGE=.../backend:<merge sha> scripts/ops/run_oneoff_job.sh scripts/ops/measure_setting_spray_refile.py
 """
@@ -49,18 +58,22 @@ if os.path.isdir("/app") and "/app" not in sys.path:
 STATEMENT_TIMEOUT = "30s"
 LEAF = "beauty/makeup/face/setting-spray"
 GAP_SPELLING = "beauty/makeup/setting-spray"
-# The classifier's Setting Spray phrases, in PostgreSQL's regex dialect.
-TITLE_REGEX = (r"\y(setting\s+(spray|mist)s?|fix(er|ing)?\s+(spray|mist)s?|mist\s*(&|and|\+)\s*fix|"
-               r"make[\s-]?up\s+(setting\s+)?fix(er|ing)s?|setting\s+fixers?)\y")
-TYPE_REGEX = r"setting spray|setting mist|makeup (setting )?fixer"
 CANDIDATE_SQL = """
 SELECT cp.product_key, cp.category_path, cp.category, cp.product_type, cp.title, cp.source_domain,
        coalesce(ips.serving_eligible, false) AS serving_eligible
 FROM catalog_products cp
 LEFT JOIN index_pipeline_state ips ON ips.content_key = cp.content_key
-WHERE cp.category_path = $1 OR cp.title ~* $2 OR cp.product_type ~* $3
+WHERE cp.category_path = $1 OR cp.title ~* $2 OR cp.product_type ~* $2 OR cp.category ~* $2
 ORDER BY cp.product_key
 """
+
+
+def candidate_regex() -> str:
+    """The classifier's Setting Spray phrases (pdp_category_classifier.SETTING_SPRAY_PHRASES), in
+    PostgreSQL's dialect: only the word boundary differs."""
+    from services.pdp_category_classifier import SETTING_SPRAY_PHRASES
+
+    return r"\y(" + SETTING_SPRAY_PHRASES.replace(r"\b", r"\y") + r")\y"
 
 
 class _Rows:
@@ -155,7 +168,7 @@ async def collect(conn: Any) -> List[Any]:
             return out + [{"kind": "error", "error": f"statement_timeout = {timeout!r}"}]
         out.append({"kind": "precondition", "check": "statement_timeout", "ok": True, "value": timeout})
         out.append("GATE_OPEN")
-        rows = [dict(r) for r in await conn.fetch(CANDIDATE_SQL, GAP_SPELLING, TITLE_REGEX, TYPE_REGEX)]
+        rows = [dict(r) for r in await conn.fetch(CANDIDATE_SQL, GAP_SPELLING, candidate_regex())]
         from services.catalog_invariant_checks import _run_taxonomy_code_vs_table_drift
 
         drift = await _run_taxonomy_code_vs_table_drift(_Rows(conn))
@@ -163,21 +176,37 @@ async def collect(conn: Any) -> List[Any]:
     return out + summarize(rows) + drift_lines(drift)
 
 
+def render(lines: List[Any]) -> List[str]:
+    """The printed form: text lines only (see OUTPUT), GATE_OPEN repeated at the end when it opened,
+    and the closing MEASURE_DONE count."""
+    out: List[str] = []
+    for line in lines:
+        if isinstance(line, str):
+            out.append(line)
+        else:
+            tag = "MEASURE_KEY" if line.get("kind") == "key" else "MEASURE"
+            out.append(f"{tag} {json.dumps(line, sort_keys=True, default=str)}")
+    if "GATE_OPEN" in lines and not any(isinstance(l, dict) and l.get("kind") == "error" for l in lines):
+        out.append("GATE_OPEN")
+    out.append(f"MEASURE_DONE lines={len(out)}")
+    return out
+
+
 async def _main() -> int:
     import asyncpg
 
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
     if not url:
-        print(json.dumps({"kind": "error", "error": "DATABASE_URL is not set"}))
-        return 2
-    print(json.dumps({"kind": "precondition", "check": "database_url", "ok": True}), flush=True)
-    conn = await asyncpg.connect(url)
-    try:
-        lines = await collect(conn)
-    finally:
-        await conn.close()
-    for line in lines:
-        print(line if isinstance(line, str) else json.dumps(line, sort_keys=True, default=str), flush=True)
+        lines: List[Any] = [{"kind": "error", "error": "DATABASE_URL is not set"}]
+    else:
+        lines = [{"kind": "precondition", "check": "database_url", "ok": True}]
+        conn = await asyncpg.connect(url)
+        try:
+            lines += await collect(conn)
+        finally:
+            await conn.close()
+    for text in render(lines):
+        print(text, flush=True)
     return 2 if any(isinstance(line, dict) and line.get("kind") == "error" for line in lines) else 0
 
 

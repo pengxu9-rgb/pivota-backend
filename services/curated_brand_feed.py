@@ -2326,9 +2326,8 @@ _AMBIGUOUS_PRODUCT_TYPE_KEYS = frozenset({"lipglossoil", "lipglossliptint"})
 _SETTING_SPRAY_LEAF = "beauty/makeup/face/setting-spray"
 # A shelf that names two products by design. credobeauty.com ("makeup, face, setting spray & powder") and
 # unitedbeautysupply.com ("Setting Spray and Powder") shelve both; until setting spray had a leaf, the
-# type read as powder alone and filed every product on it. Shelf -> (the leaf a title must name to leave
-# it, the shelf's answer before that leaf existed). A title naming the spray (and not the powder) takes
-# the spray leaf; every other title -- a powder, a title naming neither, a non-English one -- keeps the
+# type read as powder alone and filed every product on it. Shelf -> (the new leaf, the shelf's other
+# product). A title naming the spray and nothing else takes the spray leaf; every other title keeps the
 # shelf's old answer at its old confidence, so the new leaf only ever moves sprays.
 _COMBINED_SHELVES = {
     frozenset({_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"}): (_SETTING_SPRAY_LEAF, "beauty/makeup/face/powder"),
@@ -2998,12 +2997,23 @@ def _resolve_category_by_evidence(*, product_type: Optional[str], title: Optiona
             return accept("beauty/tools/brush", CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
         shelf = _shelf_paths(product_type)
         if shelf in _COMBINED_SHELVES:
-            leaf, before = _COMBINED_SHELVES[shelf]
+            leaf, other = _COMBINED_SHELVES[shelf]
+            named = _title_paths(title)
             # The title must name the spray and nothing else: a "Fragrance Setting Mist" or a "Cleanser &
             # Setting Spray" on that shelf is not plainly a setting spray, so it keeps the old answer.
-            if _title_paths(title) == {leaf}:
+            if named == {leaf}:
                 return accept(leaf, CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
-            return accept(before, CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+            # The old answer is what the shelf read as before the leaf: the singular spelling read as the
+            # powder alone; the plural ("Setting Sprays & Powders") as nothing, the #2158 ambiguity --
+            # where only a title naming the powder, and nothing else, is filed on it.
+            from services.pdp_category_classifier import PATTERNS_BEFORE_SETTING_SPRAY
+            before = {path for _label, path, pattern in PATTERNS_BEFORE_SETTING_SPRAY
+                      if pattern.search(str(product_type or ""))}
+            if before == {other}:
+                return accept(other, CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+            if named == {other}:
+                return accept(other, CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+            return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
         return fallback, CATEGORY_CONFIDENCE_FEED_DEFAULT
     if ptype in _GENERIC_LIP_TYPES:
         title_hit = classify(title)

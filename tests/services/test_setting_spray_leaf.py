@@ -116,10 +116,16 @@ def test_a_combined_shelf_title_naming_no_spray_stays_as_it_was_filed(ptype, tit
 # Constructed shelves that name two products in the plural: before the leaf they were two matches (the
 # #2158 ambiguity, unresolved), and they stay so -- as does the singular spelling, which main filed on
 # tone/toner through its bare "mist".
-@pytest.mark.parametrize("ptype", [
+_TWO_PRODUCT_SHELVES = [
     "Face Mists & Setting Sprays", "Mists & Setting Sprays", "Setting Sprays & Mists", "Primers & Setting Sprays",
     "Face Mist & Setting Spray",
-])
+    # any case, and -es plurals (narrow review of #2547)
+    "FACE MISTS & SETTING SPRAYS", "PRIMERS & SETTING SPRAYS", "Face MISTS & Setting SPRAYS",
+    "Blushes & Setting Sprays", "Brushes & Setting Sprays", "Lip Glosses & Setting Sprays",
+]
+
+
+@pytest.mark.parametrize("ptype", _TWO_PRODUCT_SHELVES)
 @pytest.mark.parametrize("title", ["Rose Water Facial Mist", "All Nighter Setting Spray", "Blurring Primer"])
 def test_a_two_product_shelf_naming_a_setting_spray_is_ambiguous(ptype, title):
     assert not leaf(resolve(ptype, title)[0])
@@ -137,6 +143,26 @@ def test_the_backfill_lets_the_title_decide_on_a_two_product_type(ptype, title, 
     assert (hit[1] if hit else None) == want
 
 
+@pytest.mark.parametrize("ptype", _TWO_PRODUCT_SHELVES)
+@pytest.mark.parametrize("title,want", [
+    ("Rose Water Facial Mist", TONER), ("Cheek Blush", "beauty/makeup/face/blush"), ("Translucent Powder", POWDER),
+])
+def test_the_backfill_reads_every_two_product_shelf_by_its_title(ptype, title, want):
+    assert resolve_path_from_row(category=None, product_type=ptype, title=title)[1] == want
+
+
+@pytest.mark.parametrize("title,want", [
+    ("All Nighter Setting Spray", (LEAF, feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE)),
+    ("Translucent Powder", (POWDER, feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE)),
+    # titles naming neither: the plural shelf read as nothing before the leaf, and still does
+    ("Rose Water Facial Mist", ("beauty", feed.CATEGORY_CONFIDENCE_FEED_DEFAULT)),
+    ("Blurring Primer", ("beauty", feed.CATEGORY_CONFIDENCE_FEED_DEFAULT)),
+    ("Foundation Brush", ("beauty", feed.CATEGORY_CONFIDENCE_FEED_DEFAULT)),
+])
+def test_the_plural_combined_shelf_moves_only_spray_and_powder_titles(title, want):
+    assert resolve("Setting Sprays & Powders", title) == want
+
+
 @pytest.mark.parametrize("ptype", ["Setting Sprays", "Setting Spray", "SETTING SPRAY"])
 def test_a_one_product_plural_shelf_is_still_one_product(ptype):
     assert resolve(ptype, "All Nighter Setting Spray")[0] == LEAF
@@ -146,6 +172,15 @@ def test_a_one_product_plural_shelf_is_still_one_product(ptype):
 def test_a_brush_on_a_setting_spray_shelf_is_a_brush(title):
     # before the leaf the type read as nothing, and the tool rescue filed the brush
     assert resolve("Setting Spray", title) == ("beauty/tools/brush", feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
+    # ...in the backfill's resolver too
+    assert resolve_path_from_row(category=None, product_type="Setting Spray", title=title)[1] == "beauty/tools/brush"
+
+
+def test_the_classifiers_brush_rescue_reads_the_feeds_own_tool_words():
+    from services import pdp_category_classifier as classifier
+
+    assert classifier._BRUSH_TITLE.pattern == feed._TOOL_NOUN_SUFFIX.pattern
+    assert classifier._BRUSH_TITLE_FORMULA_CONTEXT.pattern == feed._TOOL_FORMULA_CONTEXT.pattern
 
 
 def test_the_combined_shelf_rule_reads_only_that_pair():

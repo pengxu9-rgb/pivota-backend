@@ -45,6 +45,9 @@ ROWS = [
     ("k_powder", "beauty/makeup/face/powder", "Translucent Powder", "Setting Spray and Powder", "c.example", True),
     ("k_combined", "beauty/makeup/face/powder", "Never Touch Up Setting Spray", "Setting Spray and Powder", "c.example", True),
     ("k_brow", "beauty", "Brow Setting Spray", "", "shop.example", True),
+    # the phrase only in the merchant type, or only in the category column
+    ("k_typefix", "beauty", "Dewy Glow 100ml", "Make-Up Setting Fixer", "shop.example", True),
+    ("k_cat", "beauty", "Dewy Glow 50ml", "", "shop.example", True),
     # not candidates: no setting phrase, and "setting" is not a word boundary inside "Upsetting"
     ("k_mist", "beauty/skincare/tone/toner", "Hydrating Face Mist", "", "shop.example", True),
     ("k_word", "beauty", "Upsetting Sprayer Bottle", "", "shop.example", True),
@@ -80,9 +83,10 @@ def _schema():
                          {"p": record["path"], "l": record["label"], "f": record["is_leaf"], "a": record.get("alias_of")})
         for key, path, title, ptype, domain, serving in ROWS:
             conn.execute(text("INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, "
-                              "content_key, title, product_type, category_path, source_domain) "
-                              "VALUES (:k, 'm', 'shopify', :k, :k, :t, :p, :c, :d)"),
-                         {"k": key, "t": title, "p": ptype, "c": path, "d": domain})
+                              "content_key, title, product_type, category, category_path, source_domain) "
+                              "VALUES (:k, 'm', 'shopify', :k, :k, :t, :p, :cat, :c, :d)"),
+                         {"k": key, "t": title, "p": ptype, "c": path, "d": domain,
+                          "cat": "Makeup Fixing Spray" if key == "k_cat" else None})
             conn.execute(text("INSERT INTO index_pipeline_state VALUES (:k, :s)"), {"k": key, "s": serving})
     engine.dispose()
     yield
@@ -117,9 +121,10 @@ def test_gate_open_follows_the_read_only_and_timeout_preconditions():
 def test_the_candidate_sql_selects_by_postgres_regex_and_the_resolvers_decide():
     lines = _collect()
     [params] = [line for line in lines if isinstance(line, dict) and line["kind"] == "params"]
-    assert params["candidates"] == 6            # every row but the face mist and "Upsetting"
+    assert params["candidates"] == 8            # every row but the face mist and "Upsetting"
     keys = {line["product_key"]: line for line in lines if isinstance(line, dict) and line["kind"] == "key"}
-    assert set(keys) == {"k_toner", "k_gap", "k_typed", "k_combined", "k_brow"}
+    assert set(keys) == {"k_toner", "k_gap", "k_typed", "k_combined", "k_brow", "k_typefix", "k_cat"}
+    assert keys["k_typefix"]["feed"] == LEAF and keys["k_cat"]["row"] == LEAF
     assert keys["k_toner"]["row"] == LEAF and keys["k_gap"]["row"] == LEAF
     assert keys["k_typed"]["feed"] == LEAF                   # a typed shelf is what the drain reads
     assert keys["k_combined"]["shelf"] == "combined_spray_powder" and keys["k_combined"]["feed"] == LEAF

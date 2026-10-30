@@ -75,6 +75,11 @@ _SETTING_SPRAY_BODY_AREAS = r"body|hands?|handcreams?|legs?|foot|feet"
 SETTING_SPRAY_FACE_ONLY = (r"(?!.*\b(?:" + _SETTING_SPRAY_OTHER_AREAS + r")\b)"
                            r"(?:(?=.*\b(?:face|facial)\b)|(?!.*\b(?:" + _SETTING_SPRAY_BODY_AREAS + r")\b))")
 _SETTING_SPRAY_FACE_ONLY_RE = re.compile(r"^" + SETTING_SPRAY_FACE_ONLY, re.IGNORECASE)
+# The phrases that NAME a setting spray (the arm below reads them; scripts/ops/
+# measure_setting_spray_refile.py turns them into its PostgreSQL candidate regex). Kept to
+# constructs PostgreSQL's regex dialect reads the same way.
+SETTING_SPRAY_PHRASES = (r"setting\s+(?:spray|mist)s?|fixing\s+(?:spray|mist)s?|fix(?:er)?\s+mists?|"
+                         r"mist\s*(?:&|and|\+)\s*fix|make[\s-]?up\s+(?:setting\s+)?fix(?:er|ing)s?|setting\s+fixers?")
 
 
 def setting_spray_names_another_area(text: Optional[str]) -> bool:
@@ -314,9 +319,7 @@ CATEGORY_PATTERNS: List[Tuple[str, str, "re.Pattern[str]"]] = [
     # the same phrases, so a merchant type "Setting Mist" or "Mist & Fix" is one match in
     # services/curated_brand_feed._pattern_matches, not two.
     ("Setting Spray", "beauty/makeup/face/setting-spray", re.compile(
-        r"^" + SETTING_SPRAY_FACE_ONLY + r".*\b(setting\s+(?:spray|mist)s?|fixing\s+(?:spray|mist)s?|"
-        r"fix(?:er)?\s+mists?|mist\s*(?:&|and|\+)\s*fix|make[\s-]?up\s+(?:setting\s+)?fix(?:er|ing)s?|"
-        r"setting\s+fixers?)\b",
+        r"^" + SETTING_SPRAY_FACE_ONLY + r".*\b(" + SETTING_SPRAY_PHRASES + r")\b",
         re.IGNORECASE | re.DOTALL)),
     # TONER GETS ITS OWN BUCKET, not a slot inside `treat/`. Two reasons, and they agree:
     #
@@ -735,9 +738,20 @@ def resolve_path_from_row(
     return _guard_face_leaf(_first_hit(category, product_type, title), title, product_type, category)
 
 
+# services/curated_brand_feed's _TOOL_NOUN_SUFFIX and _TOOL_FORMULA_CONTEXT, copied (the feed imports
+# this module, not the reverse); tests/services/test_setting_spray_leaf.py pins them equal.
+_BRUSH_TITLE = re.compile(r"\bbrush(?:es)?(?:\s+#?\d{1,4})?\s*$", re.I)
+_BRUSH_TITLE_FORMULA_CONTEXT = re.compile(r"[+&/]|\b(?:and|with|includes?|including|for|using|built[- ]in)\b|brush[- ]on", re.I)
+
+
 def _first_hit(category: Optional[str], product_type: Optional[str], title: Optional[str]) -> Optional[Tuple[str, str]]:
     for is_title, candidate in ((False, category), (False, product_type), (True, title)):
         hit = classify(candidate)
+        if (hit is not None and hit[1] == SETTING_SPRAY_LEAF and not is_title and _BRUSH_TITLE.search(str(title or ""))
+                and not _BRUSH_TITLE_FORMULA_CONTEXT.search(str(title or ""))):
+            # A brush on a "Setting Spray" shelf is a brush, as the curated feed's tool rescue files it
+            # (and as this resolver did before the leaf, when that type matched nothing).
+            return ("Brush", "beauty/tools/brush")
         if hit is not None and hit[1] == SETTING_SPRAY_LEAF and not is_title and len(shelf_paths(candidate)) > 1:
             # A merchant TYPE naming a setting spray and another product ("Setting Spray and Powder",
             # "Face Mist & Setting Spray") says nothing about which one THIS product is: the title
@@ -751,7 +765,13 @@ def _first_hit(category: Optional[str], product_type: Optional[str], title: Opti
 # Plural-aware, for text naming a setting spray only: the Setting Spray arm reads plurals ("Setting
 # Sprays"), Toner's "mist" and Primer's "primer" do not, so "Face Mists & Setting Sprays" would read as
 # ONE product (review of #2547). Its words are read singular too; every other text is read as before.
-_PLURAL_WORD = re.compile(r"\b(\w{3,})s\b")
+# Any case, and -s / -es / -ies ("MISTS", "Glosses", "Brushes", "Blushes"): each spelling is read, and a
+# word that is not really a plural ("Glass" -> "Glas") only ever adds a match that was not there.
+_SINGULARS = (
+    (re.compile(r"\b(\w{2,})ies\b", re.IGNORECASE), r"\1y"),
+    (re.compile(r"\b(\w{3,}?)es\b", re.IGNORECASE), r"\1"),
+    (re.compile(r"\b(\w{3,})s\b", re.IGNORECASE), r"\1"),
+)
 
 
 def shelf_paths(text: Optional[str]) -> frozenset:
@@ -759,8 +779,9 @@ def shelf_paths(text: Optional[str]) -> frozenset:
     text = str(text or "")
     paths = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(text)}
     if SETTING_SPRAY_LEAF in paths:
-        singular = _PLURAL_WORD.sub(r"\1", text)
-        paths |= {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(singular)}
+        for plural, singular in _SINGULARS:
+            spelling = plural.sub(singular, text)
+            paths |= {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(spelling)}
     return frozenset(paths)
 
 
@@ -907,7 +928,7 @@ SETTING_SPRAY_QUERY_ROUTE_FLAG = "SEARCH_SETTING_SPRAY_CATEGORY_ROUTE"
 SETTING_SPRAY_LEAF = "beauty/makeup/face/setting-spray"
 # Toner's pattern before the setting-spray leaf, verbatim.
 _TONER_BEFORE_SETTING_SPRAY = re.compile(r"\b(toner|tonic|mist|pad|skin booster)\b", re.IGNORECASE)
-_QUERY_PATTERNS_BEFORE_SETTING_SPRAY: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = tuple(
+PATTERNS_BEFORE_SETTING_SPRAY: Tuple[Tuple[str, str, "re.Pattern[str]"], ...] = tuple(
     (label, path, _TONER_BEFORE_SETTING_SPRAY if path == "beauty/skincare/tone/toner" else pattern)
     for label, path, pattern in CATEGORY_PATTERNS
     if path != SETTING_SPRAY_LEAF
@@ -949,7 +970,7 @@ def category_path_prefix_for_query(query: Optional[str]) -> Optional[str]:
             # Sunscreen arm sits above this one) -- a bare "spf" carries no number for it to read.
             hit = ("Sunscreen", "beauty/skincare/sun/sunscreen")
     else:
-        hit = _first_match(query, _QUERY_PATTERNS_BEFORE_SETTING_SPRAY)
+        hit = _first_match(query, PATTERNS_BEFORE_SETTING_SPRAY)
     if hit is None:
         return None
     _, path = hit

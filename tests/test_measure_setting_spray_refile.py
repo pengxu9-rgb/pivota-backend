@@ -21,19 +21,40 @@ def _as_python(pg_regex: str) -> "re.Pattern[str]":
     return re.compile(pg_regex.replace(r"\y", r"\b"), re.I)
 
 
-@pytest.mark.parametrize("title", [
+@pytest.mark.parametrize("text", [
     "Makeup Fixing Mist", "You Mist Makeup-Extending Setting Spray", "Jill Stuart Crystal Glow & Fix Mist",
     "Mist & Fix Matte Spray", "3CE Makeup Fixer Mist", "Hera Make Up Fixer 80ml", "espoir Fresh Setting Fixer 100ml",
     "All Nighter Setting Spray",
+    # merchant type / category spellings the first version's type regex missed (narrow review of #2547)
+    "Fixing Mist", "Fix Mist 50ml", "Mist & Fix", "Makeup Fixing Spray", "Make-Up Setting Fixer", "Setting Fixers",
 ])
-def test_every_title_the_classifier_files_on_the_leaf_is_a_candidate(title):
-    assert classify(title)[1] == LEAF
-    assert _as_python(measure.TITLE_REGEX).search(title)
+def test_every_text_the_classifier_files_on_the_leaf_is_a_candidate(text):
+    assert classify(text)[1] == LEAF
+    assert _as_python(measure.candidate_regex()).search(text)
 
 
-def test_the_sql_uses_postgres_word_boundaries():
-    assert r"\b" not in measure.TITLE_REGEX
-    assert measure.TITLE_REGEX.startswith(r"\y") and measure.TITLE_REGEX.endswith(r"\y")
+def test_the_candidate_regex_is_the_classifiers_own_in_postgres_dialect():
+    from services.pdp_category_classifier import SETTING_SPRAY_PHRASES
+
+    regex = measure.candidate_regex()
+    assert r"\b" not in regex and regex.startswith(r"\y(") and regex.endswith(r")\y")
+    assert SETTING_SPRAY_PHRASES in regex
+
+
+def test_every_printed_line_is_text_and_the_count_closes_the_run():
+    out = measure.render([{"kind": "precondition", "check": "x", "ok": True}, "GATE_OPEN",
+                          {"kind": "key", "product_key": "k"}, {"kind": "summary"}])
+    assert out[0].startswith("MEASURE {") and out[1] == "GATE_OPEN" and out[2].startswith("MEASURE_KEY {")
+    assert out[-2] == "GATE_OPEN" and out[-1] == f"MEASURE_DONE lines={len(out) - 1}"
+    assert all(not line.startswith("{") for line in out)
+
+
+def test_a_failed_run_never_reopens_the_gate_but_still_counts():
+    out = measure.render([{"kind": "precondition", "check": "x", "ok": True}, "GATE_OPEN",
+                          {"kind": "error", "error": "boom"}])
+    assert out.count("GATE_OPEN") == 1 and out[-1] == f"MEASURE_DONE lines={len(out) - 1}"
+    assert measure.render([{"kind": "error", "error": "no url"}]) == [
+        'MEASURE {"error": "no url", "kind": "error"}', "MEASURE_DONE lines=1"]
 
 
 def _row(key, path, title, ptype="", domain="shop.example", serving=True):
