@@ -123,12 +123,19 @@ async def pg(monkeypatch):
 
 class _ShopifyStub:
     """The order row, the merchant's store and Shopify itself, scripted; the lock is real. The
-    FIRST order POST parks until `release` is set, so a create is caught in flight."""
+    FIRST order POST parks until `release` is set, so a create is caught in flight.
+
+    Every other httpx request is refused and recorded in `unscripted`. The post-create
+    reconciliation GET used to go out for real to `shop.myshopify.com` (a Shopify edge IP) and,
+    being best-effort, swallowed the failure -- so a refusal alone never fails a test; the test
+    asserts `unscripted` is empty."""
 
     def __init__(self, order_id: str):
         self.order_id = order_id
         self.shopify_order_id = None
         self.posts = 0
+        self.reconciliation_fetches = 0
+        self.unscripted: list = []
         self.parked = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -202,6 +209,14 @@ class _ShopifyStub:
                 await stub.release.wait()
             return _Resp()
 
+        async def fetch_reconciliation_payload(**_kwargs):
+            stub.reconciliation_fetches += 1
+            return None  # what a failed best-effort fetch returns; the POST payload stands
+
+        async def send(_self, request, **_kwargs):
+            stub.unscripted.append(f"{request.method} {request.url}")
+            raise httpx.ConnectError("unscripted request in a gate test", request=request)
+
         monkeypatch.setattr(order_routes, "get_order", get_order)
         monkeypatch.setattr(order_routes, "get_merchant_onboarding", get_merchant_onboarding)
         monkeypatch.setattr(order_routes, "get_merchant_active_stores", get_merchant_active_stores)
@@ -210,7 +225,12 @@ class _ShopifyStub:
         monkeypatch.setattr(order_routes, "ensure_external_payment_transaction_best_effort", ok)
         monkeypatch.setattr(orders_db, "update_order", lambda *_a, **_k: noop())
         monkeypatch.setattr(gql, "shopify_admin_graphql", shopify_admin_graphql)
+        monkeypatch.setattr(
+            order_routes, "_fetch_shopify_order_reconciliation_payload_best_effort",
+            fetch_reconciliation_payload,
+        )
         monkeypatch.setattr(httpx.AsyncClient, "post", post, raising=True)
+        monkeypatch.setattr(httpx.AsyncClient, "send", send, raising=True)
 
 
 @pytest.fixture
@@ -244,6 +264,8 @@ async def test_a_second_create_of_an_order_in_flight_does_not_post_to_shopify_ag
     assert await asyncio.wait_for(second, timeout=15) is True
     assert stub.posts == 1, "two Shopify orders were created for one paid order"
     assert await _another_session_can_take(lock_id)  # released at the end
+    assert stub.unscripted == [], f"requests left the test unscripted: {stub.unscripted}"
+    assert stub.reconciliation_fetches == 1
 
 
 async def test_the_create_lock_is_held_for_the_block_and_a_failure_inside_it_surfaces_as_itself(order_routes):
