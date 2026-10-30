@@ -90,7 +90,10 @@ def test_a_lash_brow_or_hair_fixer_on_a_setting_spray_shelf_is_refused(title):
     ("makeup, face, setting spray & powder", "Slip Tint Undetectable Baked Setting Powder", POWDER),
     ("makeup, face, setting spray & powder", "Vital Pressed Skincare Powder", POWDER),
     ("Setting Spray and Powder", "Ruby Kisses RFS Never Touch Up Setting Spray 1.69 oz", LEAF),
-    ("Setting Spray and Powder", "Primer & Setting Spray", LEAF),                    # constructed: a spray title
+    # a title naming a third leaf is not plainly a setting spray: the shelf's old answer (constructed)
+    ("Setting Spray and Powder", "Primer & Setting Spray", POWDER),
+    ("Setting Spray and Powder", "Fragrance Setting Mist", POWDER),
+    ("Setting Spray and Powder", "Cleanser & Setting Spray", POWDER),
     # names the powder and a gift set ("Set N"): a powder title keeps the shelf's powder
     ("Setting Spray and Powder", "Ruby Kisses HD Set N Forget Setting Powder -RRSP .4 oz", POWDER),
     ("Setting Spray and Powder", "Setting Spray & Powder Duo", POWDER),               # constructed: both
@@ -108,6 +111,41 @@ def test_a_combined_spray_and_powder_shelf_moves_only_spray_titles(ptype, title,
 def test_a_combined_shelf_title_naming_no_spray_stays_as_it_was_filed(ptype, title):
     # before the leaf, the type read as powder alone: same leaf, same confidence
     assert resolve(ptype, title) == ("beauty/makeup/face/powder", feed.CATEGORY_CONFIDENCE_MERCHANT_TYPE)
+
+
+# Constructed shelves that name two products in the plural: before the leaf they were two matches (the
+# #2158 ambiguity, unresolved), and they stay so -- as does the singular spelling, which main filed on
+# tone/toner through its bare "mist".
+@pytest.mark.parametrize("ptype", [
+    "Face Mists & Setting Sprays", "Mists & Setting Sprays", "Setting Sprays & Mists", "Primers & Setting Sprays",
+    "Face Mist & Setting Spray",
+])
+@pytest.mark.parametrize("title", ["Rose Water Facial Mist", "All Nighter Setting Spray", "Blurring Primer"])
+def test_a_two_product_shelf_naming_a_setting_spray_is_ambiguous(ptype, title):
+    assert not leaf(resolve(ptype, title)[0])
+
+
+@pytest.mark.parametrize("ptype,title,want", [
+    ("Setting Spray and Powder", "Translucent Powder", POWDER),
+    ("Setting Spray and Powder", "Never Touch Up Setting Spray", LEAF),
+    ("Face Mist & Setting Spray", "Rose Water Facial Mist", TONER),
+    ("Face Mists & Setting Sprays", "Blurring Primer", "beauty/makeup/face/primer"),
+    ("Setting Sprays", "Translucent Powder", LEAF),                     # one product: the type decides
+])
+def test_the_backfill_lets_the_title_decide_on_a_two_product_type(ptype, title, want):
+    hit = resolve_path_from_row(category=None, product_type=ptype, title=title)
+    assert (hit[1] if hit else None) == want
+
+
+@pytest.mark.parametrize("ptype", ["Setting Sprays", "Setting Spray", "SETTING SPRAY"])
+def test_a_one_product_plural_shelf_is_still_one_product(ptype):
+    assert resolve(ptype, "All Nighter Setting Spray")[0] == LEAF
+
+
+@pytest.mark.parametrize("title", ["Foundation Brush", "Kabuki Brush"])
+def test_a_brush_on_a_setting_spray_shelf_is_a_brush(title):
+    # before the leaf the type read as nothing, and the tool rescue filed the brush
+    assert resolve("Setting Spray", title) == ("beauty/tools/brush", feed.CATEGORY_CONFIDENCE_EXPLICIT_TITLE)
 
 
 def test_the_combined_shelf_rule_reads_only_that_pair():
@@ -130,6 +168,14 @@ def test_the_combined_shelf_rule_reads_only_that_pair():
     ("Body Setting Spray", None),
     ("Tattoo Setting Spray", None),
     ("Nail Setting Spray", None),
+    ("Beard Setting Spray", None),
+    ("Lace Melt Setting Spray", None),
+    ("Hand Setting Spray", None),
+    ("Leg Makeup Setting Spray", None),
+    ("Tan Fixing Spray", None),
+    ("Self Tan Setting Mist", "beauty/body/tanning"),
+    ("Scalp Setting Spray", "beauty/haircare/general"),
+    ("Cuticle Fixing Mist", None),
     ("Hair Fixer", "beauty/haircare/general"),
     # a bare "fix"/"fixer" spray names no setting spray
     ("Quick Fix Spray", None),
@@ -148,7 +194,7 @@ def test_a_title_naming_the_face_keeps_the_leaf_despite_the_body(title):
 
 @pytest.mark.parametrize("title", [
     "Lace Wig Fixing Spray", "Brow Setting Spray", "Body Mist", "Hair Fixer", "Hairspray Setting Mist",
-    "Tattoo Setting Spray",
+    "Tattoo Setting Spray", "Cuticle Oil", "Scalp Serum", "Shea Handcream", "Self Tanning Mist",
 ])
 def test_the_typed_shelf_refuses_the_same_titles_as_the_classifier(title):
     # one rule (setting_spray_names_another_area) for the shelf and the title

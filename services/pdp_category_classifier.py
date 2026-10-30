@@ -65,11 +65,13 @@ _NOT_OUTERWEAR = r"(?!(?!.*\b(?:" + _NAIL_CUE + r")\b).*\b(?:" + _OUTERWEAR + r"
 # fixers for lashes, brows and hair, wig and lace adhesives, curl and edge sprays, body and tattoo
 # setting sprays and scarf "wrap" sprays (review of #2547, every one constructed): those are not
 # face makeup, and the arm declines them, so they get whatever the rest of CATEGORY_PATTERNS says.
-# `hair\w*` covers "Haircara" and "Hairspray". Body, hand and foot stand down when the title also
-# names the face ("Face & Body Setting Spray"), as in non_face_leaf below.
-_SETTING_SPRAY_OTHER_AREAS = (r"mascaras?|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|hair\w*|curl(?:s|y|ing|ers?)?|"
-                              r"wigs?|lace|edges?|tattoos?|wraps?|scarf|scarves|styl(?:e|es|ing)|nails?|beards?")
-_SETTING_SPRAY_BODY_AREAS = r"body|hands?|foot|feet"
+# `hair\w*` covers "Haircara" and "Hairspray"; a scalp, a cuticle and a (self-)tan are other areas too.
+# Body, hand, leg and foot stand down when the title also names the face ("Face & Body Setting Spray"),
+# as in non_face_leaf below.
+_SETTING_SPRAY_OTHER_AREAS = (r"mascaras?|(?:eye\s?)?lash(?:es)?|(?:eye)?brows?|hair\w*|scalps?|curl(?:s|y|ing|ers?)?|"
+                              r"wigs?|lace|edges?|tattoos?|wraps?|scarf|scarves|styl(?:e|es|ing)|nails?|cuticles?|beards?|"
+                              r"(?:self[\s-]?)?tan(?:ning|ner)?")
+_SETTING_SPRAY_BODY_AREAS = r"body|hands?|handcreams?|legs?|foot|feet"
 SETTING_SPRAY_FACE_ONLY = (r"(?!.*\b(?:" + _SETTING_SPRAY_OTHER_AREAS + r")\b)"
                            r"(?:(?=.*\b(?:face|facial)\b)|(?!.*\b(?:" + _SETTING_SPRAY_BODY_AREAS + r")\b))")
 _SETTING_SPRAY_FACE_ONLY_RE = re.compile(r"^" + SETTING_SPRAY_FACE_ONLY, re.IGNORECASE)
@@ -733,12 +735,33 @@ def resolve_path_from_row(
     return _guard_face_leaf(_first_hit(category, product_type, title), title, product_type, category)
 
 
-def _first_hit(*candidates: Optional[str]) -> Optional[Tuple[str, str]]:
-    for candidate in candidates:
+def _first_hit(category: Optional[str], product_type: Optional[str], title: Optional[str]) -> Optional[Tuple[str, str]]:
+    for is_title, candidate in ((False, category), (False, product_type), (True, title)):
         hit = classify(candidate)
+        if hit is not None and hit[1] == SETTING_SPRAY_LEAF and not is_title and len(shelf_paths(candidate)) > 1:
+            # A merchant TYPE naming a setting spray and another product ("Setting Spray and Powder",
+            # "Face Mist & Setting Spray") says nothing about which one THIS product is: the title
+            # decides, as services/curated_brand_feed reads the same shelf.
+            continue
         if hit is not None:
             return hit
     return None
+
+
+# Plural-aware, for text naming a setting spray only: the Setting Spray arm reads plurals ("Setting
+# Sprays"), Toner's "mist" and Primer's "primer" do not, so "Face Mists & Setting Sprays" would read as
+# ONE product (review of #2547). Its words are read singular too; every other text is read as before.
+_PLURAL_WORD = re.compile(r"\b(\w{3,})s\b")
+
+
+def shelf_paths(text: Optional[str]) -> frozenset:
+    """Every leaf a merchant shelf (product type) names; the #2158 two-product test is len() > 1."""
+    text = str(text or "")
+    paths = {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(text)}
+    if SETTING_SPRAY_LEAF in paths:
+        singular = _PLURAL_WORD.sub(r"\1", text)
+        paths |= {path for _label, path, pattern in CATEGORY_PATTERNS if pattern.search(singular)}
+    return frozenset(paths)
 
 
 def _guard_face_leaf(hit: Optional[Tuple[str, str]], *texts: Optional[str]) -> Optional[Tuple[str, str]]:
