@@ -674,7 +674,8 @@ def _names_a_database(key: str) -> bool:
     """A variable whose value may be a libpq key=value string. Elsewhere `service=api` or
     `host=0.0.0.0 port=8000` means something else; a URL counts in any variable."""
     k = key.upper()
-    return k.startswith("PG") or "POSTGRES" in k or "DATABASE" in k or k.endswith("DSN") or "_PG_" in k or k.endswith("_PG")
+    return (k.startswith("PG") or "POSTGRES" in k or "DATABASE" in k or k.endswith("DSN") or "_PG_" in k or k.endswith("_PG")
+            or "_DB" in k or k.startswith("DB"))
 
 
 def _pg_host_ok(host: str) -> bool:
