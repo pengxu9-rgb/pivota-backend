@@ -1643,11 +1643,11 @@ async def handle_stripe_webhook(
                         # and the link still records. This is what lets
                         # outcome_aggregation value the decision via the edge.
                         edge_id = await get_order_attribution_edge_id(order_id)
-                        # content_key / catalog_offer_id are deliberately omitted:
-                        # they're ON DELETE RESTRICT FKs and a stale value would
-                        # abort the whole link row, dropping an otherwise-valid
-                        # decision join. They're recoverable downstream via the
-                        # checkout_decisions / agent_decision_candidates rows.
+                        # content_key / catalog_offer_id are deliberately omitted.
+                        # They're FKs (ON DELETE SET NULL); the store nulls a value
+                        # that joins nothing rather than dropping the link, but they
+                        # are recoverable downstream via the checkout_decisions /
+                        # agent_decision_candidates rows anyway.
                         link_kwargs = {
                             "decision_id": linkage.get("decision_id"),
                             "checkout_decision_id": linkage.get("checkout_decision_id"),

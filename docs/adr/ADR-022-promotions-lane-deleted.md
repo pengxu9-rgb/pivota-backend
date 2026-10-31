@@ -1,6 +1,6 @@
 # ADR-022: The merchant-promotions lane is deleted; any rebuild must follow checkout authority
 
-**Status:** Accepted (2026-08-11)
+**Status:** Accepted (2026-08-11). Rebuild trigger amended by ADR-027 (2026-10-30).
 **Decision owner:** peng
 **Supersedes:** the manual promo-type gate from #1728 / PIVOTA-Agent #1954 (both now deleted along with the routes they guarded)
 
@@ -84,6 +84,9 @@ Enforcement authority follows checkout authority, per order. Concretely:
   predictable for the lane the order will use.
 - **Rebuild trigger:** a real partner/merchant commitment — the agent-ui demo
   exists to elicit exactly that. Not before.
+  *Amended by ADR-027 (2026-10-30):* showing observed, checkout-verified deals
+  is not this rebuild and does not wait for a commitment. It keeps the invariant
+  above and adds no pricing engine. Merchant-created AI-channel codes still do.
 
 ## Recovery
 

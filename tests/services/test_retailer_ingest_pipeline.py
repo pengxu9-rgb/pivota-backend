@@ -1177,9 +1177,19 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
 
     async def locale(domain, **kw):
         return {"currency": "USD"}
+    # The real records_for_brand runs GTIN recovery for variants with no barcode, which fetched
+    # each product's .js page (and robots.txt) from the store's real host. Scripted as "no GTIN
+    # on the page", and recorded.
+    gtin_fetches = []
+
+    async def fetch_missing_gtins(product, *, domain, client, deadline=None, hosts=None):
+        gtin_fetches.append((domain, product.get("handle")))
+        return {}, 0
+
     monkeypatch.setattr(feed, "fetch_shopify_products", fetch_products)
     monkeypatch.setattr(feed, "fetch_shopify_shop_locale", locale)
     monkeypatch.setattr(feed, "records_for_brand", _REAL_RECORDS_FOR_BRAND)
+    monkeypatch.setattr(feed, "_fetch_missing_variant_gtins", fetch_missing_gtins)
     opts = dict(multi_brand=True, max_pdp_inci_fetches=0, vendors=["Dr. Jart+", "3CE"],
                 brands={"Dr. Jart+": "Dr.Jart+", "3CE": "3ce"})
     first = await pipeline.run_stage({**job(**opts), "brand": "store (2 brands)"}, db=env.db)
@@ -1188,6 +1198,8 @@ async def test_multi_brand_writes_each_vendors_canonical_spelling(env, monkeypat
     assert out["status"] == "done", env.ledger.runs
     # Both vendors are outside spelling families, so the operator mappings reach the crawl.
     assert sorted(p["brand"] for p in env.applied[-1]["pdps"]) == ["3ce", "Dr.Jart+"]
+    # Each crawl (dry run, then apply) tried GTIN recovery once per barcode-less product.
+    assert sorted(gtin_fetches) == sorted([("k-touch.us", "ampoule"), ("k-touch.us", "cicapair")] * 2)
 
 
 @pytest.mark.parametrize("options", [
