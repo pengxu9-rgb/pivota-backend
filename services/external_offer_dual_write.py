@@ -676,11 +676,22 @@ def _served_seed_variants(seed: Dict[str, Any]) -> list:
     return []
 
 
+#: Offer writers whose row is NOT the seed's listing even when its destination is the seed's URL.
+#: `us_market_capture` (scripts/capture_us_market_offers.py) stores the price the store quotes a US
+#: buyer through Shopify Markets, a reading of its own: its destination_url is the product page, so
+#: the URL rule below would claim it, and a seed whose column says USD over a EUR/GBP page would
+#: rewrite that honest USD row with the seed's own number labelled USD (PR controller review of #2666).
+NON_LISTING_OFFER_SOURCE_SYSTEMS = frozenset({"us_market_capture"})
+
+
 def is_listing_offer(offer: Dict[str, Any], seed: Dict[str, Any]) -> bool:
     """Is this canonical offer row the seed's own listing? An exact id or a same-destination URL
-    (services/seed_served_url, the refresh's own rule), never a host or a seller alone."""
+    (services/seed_served_url, the refresh's own rule), never a host or a seller alone, and never a
+    row another lane read for itself (NON_LISTING_OFFER_SOURCE_SYSTEMS)."""
     from services.seed_served_url import same_destination
 
+    if str(offer.get("source_system") or "") in NON_LISTING_OFFER_SOURCE_SYSTEMS:
+        return False
     seed_id = str(seed.get("id") or "")
     dest = seed.get("destination_url")
     payload_seed = offer.get("payload_seed_id")
