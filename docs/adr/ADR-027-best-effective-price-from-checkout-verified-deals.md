@@ -386,7 +386,7 @@ That shows peng whether a failed gate means few deals or few connections.
 ## Metrics
 
 - **Verified-deal coverage:** per market, the gate's measure over the Phase 0 base.
-- **Click-out coverage:** per market, the share of Shopify click-outs whose link carried a verified code (`discount_carried = true`), overall and for the merchants with the most click-outs (Q11).
+- **Click-out coverage:** per market, the share of click-outs whose link carried a verified code (`discount_carried = true`). Click-outs on both the Shopify cart-permalink lane and the network lane count; on the network lane, a click-out carried a code when `/r` served the coded link (Q14). It is reported overall and for the merchants with the most click-outs (Q11).
 - **Both-carried rate:** among reconciled orders from clicks where `/r` appended the code, the share whose order shows both the code and our click attribute. The first such orders are also checked by hand (Q12).
 - **False-savings rate:** codes `/r` appended (`discount_carried = true`) that did not apply on a paid order, among reconciled orders. Target under 2%. **This is the metric that can stop the lane** (D7 stop rule). It counts finished orders only, so it is survivor-only (D7).
 - **Median and p90 savings** per verified deal, in market currency, on the reference-cart base.
@@ -417,7 +417,7 @@ That shows peng whether a failed gate means few deals or few connections.
   - the verifier refuses a host in a joined program unless its program permission is recorded, `DEAL_VERIFY_PROGRAM_ENABLED` is set and the code came from that program's feed. `DEAL_VERIFY_NONCONNECTED_ENABLED` never authorizes such a host (Q13);
   - on the network lane, `/r` redirects to the coded network link only after its re-check passes, and otherwise to the tracking-only link. The token never contains the coded link or the code. `/r` loads the coded link by the network-links row id signed in the token, and uses it only when the row's deal reference matches the token's (Q14);
   - a network-links row is rejected at write time unless the coded link's host is that program's network tracking host, and its embedded destination is exactly the verified variant's cart permalink with the deal's code and `country=` for the verification market (Q14);
-  - `/r` uses a coded link only when its host equals the signed `dest`'s host. Otherwise, and when the row is missing, its deal reference does not match or the coded link is past its expiry, `/r` goes to the tracking-only link (Q14);
+  - `/r` uses a coded link only when its host equals the signed `dest`'s host, and its embedded destination, parsed the same way as at write time, is exactly the cart permalink of the variant in the token's deal reference, with that deal's code and `country=`. Otherwise, and when the row is missing, its deal reference does not match or the coded link is past its expiry, `/r` goes to the tracking-only link (Q14);
   - a coded network link is never handed out except through `/r` (Q14).
 
 ## Resolved questions (peng, 2026-10-29)
@@ -501,8 +501,8 @@ That shows peng whether a failed gate means few deals or few connections.
        - The signed `dest` is the tracking-only link with our sub-id. It carries no code.
        - The token also carries the deal reference and the network-links row id.
        - **Checked when a row is written.** The background job writes a row only from the network's own link interface, after carrier steps 1 and 2 pass for that program. Each row is also checked on its own: it is rejected unless the coded link's host is that program's network tracking host, and its embedded destination is exactly the verified variant's cart permalink with the deal's code and `country=` for the verification market.
-       - **Checked when a link is followed.** `/r` loads the coded link from that row. It uses it only when the row's deal reference matches the token's, the coded link's host equals the signed `dest`'s host, and the coded link is not past its expiry.
-       - **Fallback.** A missing row, a mismatched deal reference, a different host or an expired coded link sends the buyer to the tracking-only link. So a bad row can never turn `/r` into an open redirect.
+       - **Checked when a link is followed.** `/r` loads the coded link from that row. It uses it only when all of these hold: the row's deal reference matches the token's; the coded link's host equals the signed `dest`'s host; its embedded destination, parsed the same way as at write time, is exactly the cart permalink of the variant in the token's deal reference, with that deal's code and `country=`; and the coded link is not past its expiry.
+       - **Fallback.** A missing row, a mismatched deal reference, a different host, a different embedded destination or an expired coded link sends the buyer to the tracking-only link. So a bad row cannot send a buyer through `/r` anywhere but the verified variant's cart, by way of that program's network tracking host.
      - When the link is followed, `/r` runs the same re-check as D7: an unexpired token, a valid verification, a declared buyer market equal to the verification market, no stop row, and the flags allow it (`DEAL_LANE_EMIT_ENABLED` and `DEAL_LANE_DISCOUNT_PARAM_ENABLED`). Only then does it redirect to the coded link.
      - Otherwise it redirects to the tracking-only link. An expired token goes to the tracking-only link.
      - `issue_click` writes `discount_code` and `/r` fills `discount_carried` as on the Shopify lane, so the kill switches, the stop row and the reconciliation rules (D7) cover this lane as well.
@@ -511,7 +511,10 @@ That shows peng whether a failed gate means few deals or few connections.
      1. The deep link is generated through the network's own link interface, without a click, and it confirms that deep links to the exact destination host are allowed. Some networks silently send a disallowed deep link to the home page, so the code would never load.
      2. The generated coded link still carries the destination's code intact.
      3. One test click confirms that the network's click identifier reaches the merchant's landing page.
-        - It runs as a one-off job on the crawl egress with a controller slot. It uses a coded link built exactly as `/r` builds one: from a row that passes the write-time check, with a test sub-id appended the same way. It does not go through `/r`, writes no click row, stays out of the click-out coverage metric, and is never followed by a purchase.
+        - It runs as a one-off job on the crawl egress with a controller slot. It uses a coded link built exactly as `/r` builds one: from a row that passes the write-time check, with a test sub-id appended the same way. Opening the coded cart permalink creates a cart on the store, so the test click:
+          - reserves a slot under the per-host daily cart cap (D3);
+          - requires that program's recorded and current permission and `DEAL_VERIFY_PROGRAM_ENABLED` (Q13);
+          - is refused for a seller on the opt-out denylist (D2). It does not go through `/r`, writes no click row, stays out of the click-out coverage metric, and is never followed by a purchase.
         - **If the identifier does not arrive, the program gets tracking-only links.** Without the click identifier the network cannot tie an order to our click, so neither the hand check nor the D7 failure signal could be computed for its orders.
      4. For each order, the network's conversion report must show our sub-id, the code the order used, and enough line-item detail to tell whether it contains the verified variant. These are what the D7 failure signal needs. If the report cannot show all three, the program's orders cannot be reconciled, and its codes are not emitted.
    - **After the first codes are emitted on a program:**
