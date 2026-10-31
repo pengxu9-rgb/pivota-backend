@@ -596,10 +596,11 @@ MIRROR = {"product_key": "prod::external_seed::external_seed::ext_74e14bd6", "me
 MPK = MIRROR["product_key"]
 
 
-def _mirror_offer(offer_id, *, sku, vid, price=13.6, source_ref=DEST, payload_seed=None, source_product_id="ext_74e14bd6"):
-    return {**_offer(offer_id, sku=sku, vid=vid, merchant=MIRROR["merchant_id"], source_ref=source_ref,
+def _mirror_offer(offer_id, *, sku, vid, price=13.6, source_ref=DEST, payload_seed=None, source_product_id="ext_74e14bd6",
+                  merchant=None, market="US"):
+    return {**_offer(offer_id, sku=sku, vid=vid, merchant=merchant or MIRROR["merchant_id"], source_ref=source_ref,
                      payload_seed=payload_seed, price=price),
-            "read_product": json.dumps({"source_product_id": source_product_id})}
+            "market": market, "read_product": json.dumps({"source_product_id": source_product_id})}
 
 
 def _mirror_fake(**over):
@@ -637,10 +638,11 @@ def test_only_a_refresh_reprices_the_mirrors_variant_rows(monkeypatch, source):
     assert fake.updates == [] and fake.reads == []
 
 
-def test_the_kill_switch_leaves_the_mirror_as_it_was(monkeypatch):
+@pytest.mark.parametrize("spelling", ["0", "false", "off", "no", " OFF "])
+def test_the_kill_switch_leaves_the_mirror_as_it_was(monkeypatch, spelling):
     fake, project = _mirror_fake()
     _patch_projection(monkeypatch, project)
-    monkeypatch.setenv(mod.MIRROR_VARIANT_REPRICE_ENV, "0")
+    monkeypatch.setenv(mod.MIRROR_VARIANT_REPRICE_ENV, spelling)
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and "variant_status" not in result and fake.updates == []
 
@@ -652,7 +654,8 @@ def test_the_mirror_variant_rows_keep_the_attached_lanes_rules(monkeypatch):
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced"
     assert result["variant_status"] == "listing_offer_not_written"
-    assert result["offer_skips"] == {"variant_not_re_read": 1} and fake.updates == []
+    # Its own bucket: never summed with the attached lane's `variant_not_re_read`.
+    assert result["offer_skips"] == {"mirror_variants_variant_not_re_read": 1} and fake.updates == []
 
 
 def test_a_failing_variant_half_never_unwrites_the_mirror(monkeypatch):
@@ -701,7 +704,7 @@ def test_the_refresh_hook_reports_the_mirror_variant_half_without_unprojecting_t
     outcomes = iter([
         {"status": "synced", "target": "mirror", "variant_status": "synced", "variant_offers_written": 2},
         {"status": "synced", "target": "mirror", "variant_status": "listing_offer_not_written",
-         "offer_skips": {"variant_not_re_read": 3}},
+         "offer_skips": {"variant_not_re_read": 3}},  # the hook passes reasons through as they come
         {"status": "synced", "target": "mirror", "variant_status": "error"},
     ])
 
@@ -716,9 +719,131 @@ def test_the_refresh_hook_reports_the_mirror_variant_half_without_unprojecting_t
     monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
     wrote, held, failed = (asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1")) for _ in range(3))
     assert wrote["projected"] == 1 and wrote["wrote_mirror"] == 1 and wrote["wrote_mirror_variants"] == 1
+    assert wrote["errored"] == 0
     assert held["projected"] == 1 and held["offer_skip_variant_not_re_read"] == 3
     assert held["offer_skip_mirror_variants_listing_offer_not_written"] == 1
-    assert failed["projected"] == 1 and failed["errored"] == 0
-    assert failed["offer_skip_mirror_variants_error"] == 1
+    # A raise in the variant half is an ERROR the run verdict reads, not a skip that can fall out of the
+    # top-8 histogram; the mirror row it rode beside is still counted as projected.
+    assert failed["projected"] == 1 and failed["errored"] == 1 and failed["mirror_variants_errored"] == 1
+    assert "offer_skip_mirror_variants_error" not in failed
     for counts in (wrote, held, failed):
         assert not any(k.startswith("skip_") for k in counts), counts
+
+
+# ----------------------------------------------- the two checks the planner cannot make here (review)
+
+
+def test_a_row_under_another_seller_than_the_mirrors_is_never_written(monkeypatch):
+    """The product-level row (the mirror's seller) is not in the planner's input, so its one-seller rule
+    sees only the variant rows. A row under any other seller is refused by the lane itself."""
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_mine", sku=f"{MPK}::v:47761881301179", vid="47761881301179"),
+        _mirror_offer("of_theirs", sku=f"{MPK}::v:47761881301180", vid="47761881301180", merchant="merch_obs_OTHER"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert [u["offer_id"] for u in fake.updates] == ["of_mine"]
+    assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 1}
+
+
+def test_only_another_sellers_rows_write_nothing_and_say_why(monkeypatch):
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_theirs", sku=f"{MPK}::v:47761881301179", vid="47761881301179", merchant="merch_obs_OTHER"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["variant_status"] == "listing_offer_not_written" and fake.updates == []
+    assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 1}
+
+
+def test_a_row_in_another_market_is_never_written(monkeypatch):
+    """The mirror upsert refuses a market mismatch (`catalog_offers.market = EXCLUDED.market`); the
+    variant rows get the same refusal, even when the currency agrees (EC prices in USD)."""
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_us", sku=f"{MPK}::v:47761881301179", vid="47761881301179"),
+        _mirror_offer("of_ec", sku=f"{MPK}::v:47761881301180", vid="47761881301180", market="EC"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert [u["offer_id"] for u in fake.updates] == ["of_us"]
+    assert result["offer_skips"] == {"mirror_variants_mirror_market_mismatch": 1}
+
+
+def test_the_mirrors_own_offer_on_another_sku_is_left_to_the_upsert(monkeypatch):
+    """ON CONFLICT (offer_id) never moves sku_key, so the mirror's offer can sit on a variant sku. It
+    takes the upsert's price; the lane must not price it a second time in the same refresh."""
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer(mod.derive_mirror_offer_id(MPK), sku=f"{MPK}::v:47761881301179", vid="47761881301179"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["variant_status"] == "no_variant_offer" and fake.updates == []
+
+
+def test_a_mirror_refresh_whose_page_named_no_currency_writes_no_variant_row(monkeypatch):
+    """The KRW-as-USD guard: a read whose currency the reader filled in is not a reading."""
+    fake, project = _mirror_fake()
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake, currency_read=False)
+    assert result["status"] == "synced" and result["variant_status"] == "currency_not_read"
+    assert fake.updates == []
+
+
+def test_the_ratio_band_holds_on_the_mirror_lane(monkeypatch):
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_backfill", sku=f"{MPK}::v:47761881301179", vid="47761881301179", price=1.0),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["variant_status"] == "listing_offer_not_written" and fake.updates == []
+    assert result["offer_skips"] == {"mirror_variants_price_ratio_out_of_bounds": 1}
+
+
+def test_a_failure_part_way_reports_what_was_written(monkeypatch):
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_v1", sku=f"{MPK}::v:47761881301179", vid="47761881301179"),
+        _mirror_offer("of_v2", sku=f"{MPK}::v:47761881301180", vid="47761881301180", price=40.0),
+    ])
+    _patch_projection(monkeypatch, project)
+    real = fake.fetch_one
+
+    async def second_update_fails(sql, params=None):
+        if str(sql).strip().startswith("UPDATE catalog_offers") and fake.updates:
+            raise RuntimeError("connection reset")
+        return await real(sql, params)
+
+    fake.fetch_one = second_update_fails
+    result = _sync(monkeypatch, fake)
+    assert result["status"] == "synced" and result["variant_status"] == "error"
+    assert result["variant_offers_written"] == 1
+
+
+@pytest.mark.parametrize("source_product_id", ["", None])
+def test_an_empty_source_product_id_strips_nothing(source_product_id):
+    """`":" + vid` would otherwise match the bare-colon prefix an empty product id makes."""
+    row = _mirror_offer("of_old", sku="s", vid=":47761881301180", source_product_id=source_product_id)
+    assert mod._native_variant_row(row)["source_variant_id"] == ":47761881301180"
+
+
+def test_a_suppressed_mirror_variant_row_is_never_written(monkeypatch):
+    """A human or a quarantine withdrew the row: the refresh does not bring it back to life with a price."""
+    suppressed = {**_mirror_offer("of_held", sku=f"{MPK}::v:47761881301180", vid="47761881301180"), "suppressed": True}
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_live", sku=f"{MPK}::v:47761881301179", vid="47761881301179"), suppressed,
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert [u["offer_id"] for u in fake.updates] == ["of_live"], result
+
+
+def test_the_lanes_own_refusals_are_reported_even_when_the_planner_declines_the_rest(monkeypatch):
+    """Another seller's row (refused by the lane) beside a row for another listing (refused by the
+    planner as no_listing_offer): both reasons reach the report, not only the planner's status."""
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_theirs", sku=f"{MPK}::v:47761881301179", vid="47761881301179", merchant="merch_obs_OTHER"),
+        _mirror_offer("of_50ml", sku=f"{MPK}::v:47761881301180", vid="47761881301180", source_ref=DEST + "-50ml"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["variant_status"] == "no_listing_offer" and fake.updates == []
+    assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 1}

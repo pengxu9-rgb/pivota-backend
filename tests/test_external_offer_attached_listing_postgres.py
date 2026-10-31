@@ -472,7 +472,7 @@ async def test_a_refresh_reprices_the_mirrors_variant_rows_not_only_its_product_
 
     assert result["status"] == "synced" and result["target"] == "mirror", result
     assert result["variant_status"] == "synced" and result["variant_offers_written"] == 2, result
-    assert result["offer_skips"] == {"variant_not_on_seed": 1}
+    assert result["offer_skips"] == {"mirror_variants_variant_not_on_seed": 1}
     rows = await _mirror_offers(scoped_db)
     # The mirror upsert still owns the product-level row.
     assert float(rows[derive_mirror_offer_id(MIRROR_PK)]["list_price"]) == 15.3
@@ -493,7 +493,7 @@ async def test_mirror_variant_rows_hold_until_every_variant_was_re_read(scoped_d
     result = await _sync_mirror(monkeypatch, scoped_db)
 
     assert result["status"] == "synced" and result["variant_status"] == "listing_offer_not_written", result
-    assert result["offer_skips"] == {"variant_not_re_read": 2, "variant_not_on_seed": 1}
+    assert result["offer_skips"] == {"mirror_variants_variant_not_re_read": 2, "mirror_variants_variant_not_on_seed": 1}
     rows = await _mirror_offers(scoped_db)
     assert float(rows["of_backfill"]["list_price"]) == 13.6 and not rows["of_backfill"]["checked"]
 
@@ -505,3 +505,162 @@ async def test_an_employee_edit_moves_no_mirror_variant_row(scoped_db, monkeypat
     assert result["status"] == "synced" and "variant_status" not in result, result
     rows = await _mirror_offers(scoped_db)
     assert float(rows["of_backfill"]["list_price"]) == 13.6 and not rows["of_backfill"]["touched"]
+
+
+# ── review of #2684: what the planner cannot see on a mirror, on real Postgres ───────────────────
+
+
+async def _add_mirror_offer(db, oid, sku, vid, price, *, merchant=MIRROR_SELLER, market="US", currency="USD",
+                            new_sku=True, payload=None):
+    if new_sku:
+        await db.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,"
+            " source_product_id, source_variant_id, title, currency)"
+            " VALUES (:sk, :pk, :m, 'external_seed', :spid, :vid, 'x', :cur)",
+            {"sk": sku, "pk": MIRROR_PK, "m": merchant, "spid": MIRROR_SOURCE_PRODUCT, "vid": vid, "cur": currency},
+        )
+    await db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
+        " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
+        " currency, market, list_price, merchant_effective_price, estimated_best_price,"
+        " source_system, source_ref, offer_payload, offer_type, updated_at)"
+        " VALUES (:oid, :sk, :pk, :m, 'external_referral', 'observed', 'referral_only',"
+        "         'redirect', 'external_referral', 'in_stock', :cur, :mkt, :p, :p, :p,"
+        "         'variant_identity_backfill_v1', :ref, CAST(:payload AS jsonb), 'brand_direct',"
+        "         TIMESTAMP '2026-09-08 06:07:17')",
+        {"oid": oid, "sk": sku, "pk": MIRROR_PK, "m": merchant, "p": price, "ref": MIRROR_DEST,
+         "cur": currency, "mkt": market, "payload": json.dumps(payload or {"destination_url": MIRROR_DEST})},
+    )
+
+
+async def test_a_mirror_variant_row_in_another_market_keeps_its_price(scoped_db, monkeypatch):
+    """Reviewer's reproduction: a US/USD seed wrote 15.30 onto its mirror's EC (USD) variant row."""
+    await _load_mirror(scoped_db)
+    await _add_mirror_offer(scoped_db, "of_ec", f"{MIRROR_PK}::v:49884244017398", "49884244017398", 13.6,
+                            market="EC", new_sku=False)
+    result = await _sync_mirror(monkeypatch, scoped_db)
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows["of_ec"]["list_price"]) == 13.6 and not rows["of_ec"]["checked"], result
+    assert result["offer_skips"]["mirror_variants_mirror_market_mismatch"] == 1
+    assert float(rows["of_backfill"]["list_price"]) == 15.3  # the US row on the same sku still moves
+
+
+async def test_mirror_variant_rows_of_another_seller_keep_their_price(scoped_db, monkeypatch):
+    """Reviewer's reproduction: variant rows under another merchant took the seed's price (13.60 → 15.30)."""
+    await _load_mirror(scoped_db)
+    await scoped_db.execute("UPDATE catalog_offers SET merchant_id = 'merch_obs_OTHER'"
+                            " WHERE offer_id IN ('of_backfill', 'of_old_mirror_variant', 'of_not_on_seed')")
+    result = await _sync_mirror(monkeypatch, scoped_db)
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows["of_backfill"]["list_price"]) == 13.6 and not rows["of_backfill"]["checked"], result
+    assert result["variant_status"] == "listing_offer_not_written"
+    assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 3}
+
+
+async def test_the_mirrors_own_offer_on_a_variant_sku_takes_only_the_upserts_price(scoped_db, monkeypatch):
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await _load_mirror(scoped_db)
+    oid = derive_mirror_offer_id(MIRROR_PK)
+    await scoped_db.execute("DELETE FROM catalog_offers WHERE offer_id = 'of_old_mirror_variant'")
+    await scoped_db.execute("UPDATE catalog_offers SET sku_key = :sk WHERE offer_id = :oid",
+                            {"sk": f"{MIRROR_SOURCE_PRODUCT}:49884244017399", "oid": oid})
+    result = await _sync_mirror(monkeypatch, scoped_db)
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows[oid]["list_price"]) == 15.3  # the upsert's price (the seed's), not the variant's 26.0
+    assert result["variant_offers_written"] == 1  # of_backfill only
+
+
+async def test_a_reviewed_price_repair_and_another_seeds_row_never_move(scoped_db, monkeypatch):
+    await _load_mirror(scoped_db)
+    await scoped_db.execute("UPDATE catalog_offers SET offer_payload = offer_payload"
+                            " || CAST('{\"price_repair\": {\"x\": 1}}' AS jsonb) WHERE offer_id = 'of_backfill'")
+    await scoped_db.execute("UPDATE catalog_offers SET offer_payload = offer_payload"
+                            " || CAST('{\"external_seed_id\": \"eps_other\"}' AS jsonb) WHERE offer_id = 'of_old_mirror_variant'")
+    result = await _sync_mirror(monkeypatch, scoped_db)
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows["of_backfill"]["list_price"]) == 13.6, result
+    assert float(rows["of_old_mirror_variant"]["list_price"]) == 24.0
+    assert result["offer_skips"]["mirror_variants_reviewed_price_repair"] == 1
+
+
+async def test_a_variant_update_that_fails_in_postgres_leaves_the_mirror_row_written(scoped_db, monkeypatch):
+    from services import external_offer_dual_write as mod
+
+    await _load_mirror(scoped_db)
+    bad = ("UPDATE catalog_offers SET list_price = 1/0 WHERE offer_id = :offer_id AND :price > 0"
+           " AND :currency <> '' AND :read_offer <> '' AND :read_sku <> '' AND :read_product <> ''"
+           " AND :read_source <> '' RETURNING offer_id")
+    monkeypatch.setattr(mod, "ATTACHED_LISTING_OFFER_UPDATE_SQL", bad)
+    monkeypatch.setattr(mod, "ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK", bad)
+    result = await _sync_mirror(monkeypatch, scoped_db)
+    rows = await _mirror_offers(scoped_db)
+    assert result["status"] == "synced" and result["variant_status"] == "error", result
+    assert float(rows[mod.derive_mirror_offer_id(MIRROR_PK)]["list_price"]) == 15.3
+
+
+async def test_a_row_in_the_variant_projections_shape_is_repriced_with_the_projection_on(scoped_db, monkeypatch):
+    """The third producer's row shape (`catalog_variant_offer_projection.plan_offers`: offer_id
+    `offer:variant-projection:<hash>`, source_ref = the listing URL, payload external_seed_id + variant_id
+    + price_freshness), with the projection itself ON inside the mirror upsert, as prod runs it."""
+    from services import external_offer_dual_write as mod
+
+    await _load_mirror(scoped_db)
+    await scoped_db.execute(
+        "UPDATE catalog_offers SET offer_id = 'offer:variant-projection:0123abcd',"
+        " source_system = 'variant_offer_projection_v1', offer_payload = CAST(:payload AS jsonb)"
+        " WHERE offer_id = 'of_backfill'",
+        {"payload": json.dumps({"source_system": "variant_offer_projection_v1", "external_seed_id": MIRROR_SEED,
+                                "variant_id": "49884244017398", "variant_id_provenance": "merchant_issued",
+                                "price_from": "variant", "destination_url": MIRROR_DEST,
+                                "price_freshness": "stored_snapshot_only"})},
+    )
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", "1")
+    monkeypatch.setattr(mod, "database", scoped_db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
+    result = await mod.sync_offer_for_seed(MIRROR_SEED, attached_price_source="refresh", currency_read=True)
+    rows = await _mirror_offers(scoped_db)
+    row = rows["offer:variant-projection:0123abcd"]
+    assert result["status"] == "synced" and result["variant_status"] == "synced", result
+    assert float(row["list_price"]) == 15.3 and row["checked"] and row["read_source"] == "refresh"
+
+
+# ── the dry-run script, end to end against the same rows ───────────────────────────────────────
+
+
+def _run_plan_script(env_over):
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k not in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+    env.update(env_over)
+    return subprocess.run([sys.executable, str(Path(__file__).resolve().parent.parent / "scripts/ops/plan_mirror_variant_reprice.py")],
+                          env=env, capture_output=True, text=True, timeout=120)
+
+
+async def test_the_dry_run_plans_exactly_what_the_lane_writes_and_writes_nothing(scoped_db):
+    await _load_mirror(scoped_db)
+    before = await _mirror_offers(scoped_db)
+    sep = "&" if "?" in _url() else "?"
+    out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "30",
+                            "DATABASE_URL": f"{_url()}{sep}search_path={_SCHEMA}"})
+    lines = out.stdout.splitlines()
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert lines[0] == "GATE_OPEN", lines
+    data = [l for l in lines[1:] if l.startswith("MVR_PLAN ")]
+    assert lines[-1] == f"MVR_PLAN DONE lines={len(data) - 1}" and len(data) == len(lines) - 1
+    by_kind = {l.split(" ", 2)[1]: json.loads(l.split(" ", 2)[2]) for l in data[:-1]}
+    summary = by_kind["summary"]
+    assert summary["products"] == 1 and summary["variant_rows"] == 3 and summary["planned_writes"] == 2
+    assert summary["price_moves"] == 2 and summary["ours_lower_now"] == 2 and summary["assumes_currency_read"] is True
+    assert by_kind["statuses"] == {"planned": 1} and by_kind["skips"] == {"variant_not_on_seed": 1}
+    assert sorted((s["before"], s["after"]) for s in by_kind["sample"]) == [(13.6, 15.3), (24.0, 26.0)]
+    assert await _mirror_offers(scoped_db) == before, "a dry run wrote"
+
+
+async def test_the_dry_run_gate_stays_closed_outside_production():
+    out = _run_plan_script({"PIVOTA_ENV": "staging", "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DATABASE_URL": _url()})
+    assert out.returncode == 3 and out.stdout.strip() == "GATE_CLOSED PIVOTA_ENV is not production"
+    out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "", "DATABASE_URL": _url()})
+    assert out.returncode == 3 and out.stdout.startswith("GATE_CLOSED DB_STATEMENT_TIMEOUT_SECONDS unset")

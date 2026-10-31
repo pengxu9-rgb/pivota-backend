@@ -150,8 +150,12 @@ async def test_real_mirror_owner_write_is_not_fresh_without_price_currency_read(
       ALTER TABLE catalog_offers ADD COLUMN updated_at timestamptz;
       ALTER TABLE catalog_offers ADD COLUMN suppression_reason text;
       CREATE TABLE catalog_skus(sku_key text PRIMARY KEY,product_key text,
-        suppressed_at timestamptz,suppression_reason text);
-      INSERT INTO catalog_skus VALUES('P1::canonical','P1',NULL,NULL);
+        suppressed_at timestamptz,suppression_reason text,
+        currency text,source_variant_id text);
+      INSERT INTO catalog_skus VALUES('P1::canonical','P1',NULL,NULL,'USD','P1');
+      ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS currency text;
+      ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS list_price numeric;
+      ALTER TABLE catalog_offers ADD COLUMN IF NOT EXISTS merchant_effective_price numeric;
       UPDATE catalog_offers SET sku_key='P1::canonical',merchant_id='seller';
     """
     for statement in setup_sql.split(";"):
@@ -169,6 +173,9 @@ async def test_real_mirror_owner_write_is_not_fresh_without_price_currency_read(
         await scoped_db.execute("UPDATE external_product_seeds SET last_crawled_at=now() WHERE id='seed_good'")
         result = await owner.sync_offer_for_seed("seed_good", attached_price_source="refresh", currency_read=price_read)
         assert result["status"] == "synced" and result["target"] == "mirror"
+        # The mirror's variant lane ran for real and found only the product-level row (it must not
+        # pass here by erroring on a schema it cannot read).
+        assert result["variant_status"] == "no_variant_offer", result
         return {"status":"success", "attempted_count":1, "origin_reads":1,
                 "projections_attempted":1, "projections_written":1, "price_unchanged":1}
     async def pages(keys, **kwargs):
