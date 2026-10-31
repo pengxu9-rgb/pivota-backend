@@ -397,6 +397,20 @@ def test_the_lane_carries_no_cookie_from_one_response_to_the_next(monkeypatch):
     assert not any("cookie" in r.headers for r in seen)
 
 
+def test_a_client_the_read_opened_is_closed_whatever_the_outcome(monkeypatch):
+    closed: List[str] = []
+
+    class _Tracked(httpx.AsyncClient):
+        async def aclose(self) -> None:
+            closed.append("closed")
+            await super().aclose()
+
+    for handler in (_store([[_product()]]), _store([[_product()]], base=None)):
+        monkeypatch.setattr(lane, "_client", lambda h=handler: _Tracked(transport=httpx.MockTransport(h)))
+        asyncio.run(lane.read_host_catalogue(HOST, {HANDLE}))
+    assert closed == ["closed", "closed"]
+
+
 def test_the_sweeps_read_is_unchanged_by_the_price_lane():
     """`read_brand_catalogue` without `want_products` keeps no products and stops only at the end."""
     async def go():

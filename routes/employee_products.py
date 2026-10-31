@@ -5998,7 +5998,7 @@ async def _refresh_external_seed_by_id(
                 "availability": snap_availability,
                 "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
                 or _to_iso(datetime.now(timezone.utc)),
-                "read_source": (evidence or {}).get("read_source") if isinstance(evidence, dict) else None,
+                "read_source": evidence.get("read_source") if isinstance(evidence, dict) else None,
             }
         )
     else:

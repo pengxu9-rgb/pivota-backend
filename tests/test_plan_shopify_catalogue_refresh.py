@@ -94,8 +94,11 @@ def test_a_host_line_counts_matches_reasons_and_samples_disagreements():
     seed = {**_drain_row(), "snapshot_variants": None}
     seed["variants"] = seed["seed_data"]["variants"]
     gone = {**seed, "id": "s-gone", "destination_url": f"https://{HOST}/products/gone"}
-    line = mod.plan_host(HOST, catalogue, [seed, gone])
-    assert (line["seeds"], line["matched"]) == (2, 1)
-    assert line["reasons"] == {"read": 1, "handle_not_read": 1}
-    assert line["price"] == {"moved_over_10pct": 1} and line["sample"][0]["seed_id"] == seed["id"]
+    agreeing = {**seed, "id": "s-agree", "price_amount": 90.0}
+    line = mod.plan_host(HOST, catalogue, [seed, gone, agreeing])
+    assert (line["seeds"], line["matched"]) == (3, 2)
+    assert line["reasons"] == {"read": 2, "handle_not_read": 1}
+    assert line["price"] == {"moved_over_10pct": 1, "agree": 1}
+    # The sample is what a reviewer reads: only the seeds whose price would move.
+    assert [s["seed_id"] for s in line["sample"]] == [seed["id"]]
     assert line["status"] == "ok" and line["proof"] == "base_and_page_cookie"

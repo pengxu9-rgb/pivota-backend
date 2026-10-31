@@ -2783,7 +2783,7 @@ async def run_external_referral_refresh_batch(
         ),
         "availability_changed": availability_changed,
         # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
-        # how many rows it priced, and why the others kept their page read (`catalogue_rows`).
+        # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {
             "enabled": catalogue_on,
             "min_seeds": catalogue_min,
