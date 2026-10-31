@@ -377,6 +377,14 @@ async def _heal_unbuildable_reap_schema() -> None:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("schema guard: unbuildable reap audit heal deferred to next boot: %s", exc)
+    # The backoff columns came after the table's first shape: a database that ran an earlier
+    # build of this code has the table without them, and CREATE TABLE IF NOT EXISTS leaves it so.
+    # Without them every restore pass fails on its queue read.
+    await _heal_add_columns(
+        "ALTER TABLE IF EXISTS agent_pdp_view_unbuildable_reap_audit "
+        "ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0, "
+        "ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;"
+    )
     # mig 273: the funnel links' content_key FK had no index (see the migration).
     # Plain build here, behind the heal lock_timeout: the migration carries the
     # CONCURRENTLY form, which a guard transaction cannot run. Small table.

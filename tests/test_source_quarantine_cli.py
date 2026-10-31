@@ -149,5 +149,6 @@ def test_revoke_apply_names_the_view_restore_instead_of_running_it(capsys):
     assert cli.main(argv, db_factory=FakeDb) == 0
     out = capsys.readouterr().out
     assert '"revoked_by": "codex"' in out
-    assert "reconciler tick, within 6 h" in out and "reap_orphaned_agent_pdp_view.py --restore" in out
+    assert "usually within 6 h" in out and "longer for revokes over 150 keys" in out
+    assert "reap_orphaned_agent_pdp_view.py --restore" in out and "--retry-backoff" in out
     assert "AGENT_PDP_VIEW_MARKET_PRICES=on" in out

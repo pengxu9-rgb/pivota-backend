@@ -2998,7 +2998,7 @@ def _restore_queue_sql(*, with_enrichment: bool) -> str:
                MIN(a.deleted_at) AS since
         FROM {_UNBUILDABLE_REAP_AUDIT_TABLE} a
         WHERE a.restored_at IS NULL AND a.content_key > :after
-          AND (a.next_attempt_at IS NULL OR a.next_attempt_at <= NOW())
+          AND (CAST(:ignore_backoff AS boolean) OR a.next_attempt_at IS NULL OR a.next_attempt_at <= NOW())
         GROUP BY a.content_key
     ) av
     WHERE EXISTS (SELECT 1 FROM agent_pdp_view v WHERE v.content_key = av.content_key)
@@ -3024,23 +3024,39 @@ def _repoint_links_sql(present: Dict[str, bool]) -> str:
     content_key whose view row is missing rather than drop the link). A NULL content_key alone
     is not that proof (it is also what a writer that named no valid key leaves), so an inserted
     link qualifies only if the decision layer's own record names this key, which no reap
-    touches (no FK to the view): its checkout decision cites :ck, or its offer is one of this
-    key's AND a candidate of its decision cites :ck. And only if written between the first reap
-    (:since) and the view's return (:until)."""
+    touches (no FK to the view), and nothing on the link contradicts it:
+
+      * checkout arm: its checkout decision cites :ck, and its own catalog_offer_id (if any)
+        is not today an offer of a DIFFERENT key (the offer and the checkout must not disagree);
+      * candidate arm: a candidate of its decision cites :ck WITH the link's own offer, and no
+        candidate of that decision cites the same offer under another key. The candidate row
+        records what the decision saw, so an offer that later moved to another product (a
+        twin merge) carries the link to the key the decision cited, never to the offer's new key.
+
+    And only if written between the first reap (:since) and the view row's refreshed_at read
+    under the restore's lock (:until): an upper bound on the view's return, not the moment
+    itself, so a link written after the return and before a later refresh still qualifies,
+    through the same decision-layer match."""
     names_key = []
     if present.get("checkout_decisions"):
         names_key.append(
-            "EXISTS (SELECT 1 FROM checkout_decisions cd "
-            "WHERE cd.checkout_decision_id = l.checkout_decision_id AND cd.content_key = :ck)"
+            """(EXISTS (SELECT 1 FROM checkout_decisions cd
+                       WHERE cd.checkout_decision_id = l.checkout_decision_id AND cd.content_key = :ck)
+              AND NOT EXISTS (
+                  SELECT 1 FROM catalog_offers co
+                  JOIN catalog_products cp ON cp.product_key = co.product_key
+                  WHERE co.offer_id = l.catalog_offer_id AND cp.content_key <> :ck))"""
         )
     if present.get("candidates"):
         names_key.append(
-            """(l.catalog_offer_id IN (
-                SELECT co.offer_id FROM catalog_offers co
-                JOIN catalog_products cp ON cp.product_key = co.product_key
-                WHERE cp.content_key = :ck)
+            """(l.catalog_offer_id IS NOT NULL
               AND EXISTS (SELECT 1 FROM agent_decision_candidates c
-                          WHERE c.decision_id = l.decision_id AND c.content_key = :ck))"""
+                          WHERE c.decision_id = l.decision_id AND c.content_key = :ck
+                            AND c.catalog_offer_id = l.catalog_offer_id)
+              AND NOT EXISTS (SELECT 1 FROM agent_decision_candidates c2
+                              WHERE c2.decision_id = l.decision_id
+                                AND c2.catalog_offer_id = l.catalog_offer_id
+                                AND c2.content_key <> :ck))"""
         )
     inserted = (
         f"""
@@ -3101,6 +3117,7 @@ async def restore_reaped_agent_pdp_view_rows(
     max_keys: Optional[int] = None,
     max_seconds: Optional[float] = None,
     refresh_source: str = "unbuildable_restore",
+    ignore_backoff: bool = False,
 ) -> Dict[str, int]:
     """Finish the reaped keys that can be finished now, within an optional budget.
 
@@ -3115,6 +3132,10 @@ async def restore_reaped_agent_pdp_view_rows(
     `max_keys` / `max_seconds` bound one pass (the reconciler tick sets both, so a large revoke
     cannot hold up its reconcile pass); `budget_exhausted` = 1 when either stopped it. Keys left
     over wait for the next pass. None = no bound (the --restore one-off).
+
+    `ignore_backoff` queues backed-off keys too, for this pass only: the operator's way back
+    after a fixed outage (`reap_orphaned_agent_pdp_view --restore --retry-backoff`) without
+    waiting out a backoff of up to 7 days. A key that still fails is backed off again.
 
     Not gated on AGENT_PDP_VIEW_UNBUILDABLE_REAP: restoring is never the risky direction, and
     links must heal while deletes are switched off. No audit table: nothing to restore.
@@ -3133,7 +3154,8 @@ async def restore_reaped_agent_pdp_view_rows(
     queue_sql = _restore_queue_sql(with_enrichment=present["enrichment"])
     after = ""
     while True:
-        rows = [dict(r) for r in await read_db.fetch_all(queue_sql, {"after": after, "page": page})]
+        rows = [dict(r) for r in await read_db.fetch_all(
+            queue_sql, {"after": after, "page": page, "ignore_backoff": bool(ignore_backoff)})]
         if not rows:
             break
         after = rows[-1]["content_key"]

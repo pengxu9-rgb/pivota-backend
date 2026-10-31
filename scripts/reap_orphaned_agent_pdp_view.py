@@ -35,11 +35,15 @@ See reap_unbuildable_agent_pdp_view_rows. The scheduled Job does not pass it; th
 backlog is removed by hand, dry-run first. --apply refuses unless
 AGENT_PDP_VIEW_UNBUILDABLE_REAP=on and the audit table (migration 272) exists; every
 deleted row is recorded there. --restore rebuilds reaped keys that are buildable again
-and re-points their funnel links (the reconciler tick runs the same pass):
+and re-points their funnel links (the reconciler tick runs the same pass, usually within 6 h;
+--restore is the way to do it now). --retry-backoff also takes keys whose restore failed or
+was declined earlier and are waiting out a backoff (up to 7 days): use it after an outage is
+fixed.
 
   python -m scripts.reap_orphaned_agent_pdp_view --unbuildable            # dry-run
   AGENT_PDP_VIEW_UNBUILDABLE_REAP=on python -m scripts.reap_orphaned_agent_pdp_view --unbuildable --apply
   python -m scripts.reap_orphaned_agent_pdp_view --restore
+  python -m scripts.reap_orphaned_agent_pdp_view --restore --retry-backoff
 """
 
 from __future__ import annotations
@@ -86,7 +90,10 @@ async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, A
     was = await _connect_if_needed(db)
     try:
         if getattr(args, "restore", False):
-            return await restore_reaped_agent_pdp_view_rows(db=db, max_keys=args.limit or None)
+            return await restore_reaped_agent_pdp_view_rows(
+                db=db, max_keys=args.limit or None,
+                ignore_backoff=bool(getattr(args, "retry_backoff", False)),
+            )
         if getattr(args, "unbuildable", False):
             return await reap_unbuildable_agent_pdp_view_rows(
                 db=db, limit=args.limit, dry_run=not args.apply
@@ -113,6 +120,10 @@ def _parse_args() -> argparse.Namespace:
         "--unbuildable", action="store_true",
         help="Reap view rows whose catalog rows all fail the builder (quarantined / "
         "title-less) instead of orphans. Default: orphans.",
+    )
+    p.add_argument(
+        "--retry-backoff", action="store_true",
+        help="With --restore: also retry keys waiting out a backoff (after a fixed outage).",
     )
     p.add_argument(
         "--restore", action="store_true",
