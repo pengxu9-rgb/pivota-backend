@@ -303,8 +303,9 @@ async def _restore_reaped_rows(db: Any) -> None:
     Expiry fires no event (the quarantine anti-join just stops matching), so this
     tick is what brings an expired quarantine's keys back, and a revoked one's (the
     quarantine CLI does not rebuild views: its connection is not the one the builder's
-    overlays read). Best-effort:
-    a restore failure never fails the reconcile pass.
+    overlays read). The tick runs every 6 h at :43, so a key is back usually within 6 h;
+    longer for revokes over the per-tick cap (AGENT_PDP_VIEW_RESTORE_MAX_KEYS, 150) or for
+    backed-off keys. Best-effort: a restore failure never fails the reconcile pass.
     """
     try:
         from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
