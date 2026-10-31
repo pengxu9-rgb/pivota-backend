@@ -1,9 +1,17 @@
 """READ-ONLY prod dry run of the mirror variant re-price (be#2684), before the refresh job is re-imaged.
 
-Plans EVERY variant row on every unsuppressed mirror product (the ones the lane resolves) with the lane's own planner,
+Plans the variant rows the refresh would actually reach, with the lane's own planner,
 `services.external_offer_dual_write.plan_mirror_variant_writes`, over the rows the lane itself reads
 (`ATTACHED_LISTING_OFFERS_SQL`, the seed through `_SEED_OFFER_COLUMNS`). Writes nothing: one READ ONLY
-transaction per chunk of products, with a statement timeout from DB_STATEMENT_TIMEOUT_SECONDS.
+transaction per chunk of products, each with a statement timeout from DB_STATEMENT_TIMEOUT_SECONDS
+(floored at 1 s).
+
+WHAT THE REFRESH REACHES, and so what is planned: a seed with status 'active' and an
+external_product_id (`sync_offer_for_seed` returns before the mirror otherwise), and per seed only the
+mirror `resolve_mirror_product` picks (source_ref = the seed id, newest `updated_at` first). Every
+other mirror product that carries variant rows is counted, never planned, in its own `excluded` bucket
+(`seed_missing`, `seed_status_<status>`, `seed_no_external_product_id`, `not_the_resolved_mirror`), so
+the summary accounts for all of them.
 
 It needs the MERGED image: the planner is imported, never restated, so this plans exactly the code
 that will run. On an image without it the gate stays closed.
@@ -19,11 +27,12 @@ Launch (Peng; pg CPU gate first):
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/plan_mirror_variant_reprice.py)"
 
 Output:
-  * `GATE_OPEN` once every precondition holds (production env, statement timeout set, a read-only
-    transaction, the tables present, the planner importable), else `GATE_CLOSED <reason>` and exit 3
-    before a single plan query;
-  * then only `MVR_PLAN <kind> {json}` lines: `progress`, `summary`, `skips`, `statuses`,
-    `price_moves`, `sample` (before/after of planned writes) and `refused_sample`;
+  * `GATE_OPEN` once every precondition holds (production env, a numeric statement timeout, the planner
+    importable, a read-only transaction, the tables present), else `GATE_CLOSED <reason>` and exit 3
+    before a single plan query (the product scan included: it runs after GATE_OPEN);
+  * then only `MVR_PLAN <kind> {json}` lines: `progress` (with the chunk's own `statement_timeout`),
+    `summary`, `excluded`, `statuses`, `skips`, `variant_refresh_status`, `sample` (before/after of
+    planned writes) and `refused_sample`;
   * last, `MVR_PLAN DONE lines=N`, N = the MVR_PLAN lines before it. A run that stops early has none.
 """
 
@@ -46,15 +55,33 @@ CHUNK = 200
 SAMPLE = 40
 _lines = {"n": 0}
 
+# Every unsuppressed mirror product with a non-product-level row, with what decides whether the refresh
+# reaches it: its seed's status and external_product_id, and whether it is the mirror
+# `resolve_mirror_product` picks for that seed (same filter, same ORDER BY: updated_at DESC NULLS LAST).
+# `variant_rows` excludes the product-level row by sku AND by the mirror's offer id, as the lane does
+# (derive_mirror_offer_id: 'offer:external_seed:' + the first 32 hex of sha256(product_key)).
 MIRROR_PRODUCTS_SQL = """
-SELECT p.product_key, p.merchant_id, p.source_ref AS seed_id, to_jsonb(p) ->> 'sync_status' AS sync_status
-FROM catalog_products p
-WHERE p.source_system = 'external_product_seeds_mirror_v1'
-  AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
-  AND EXISTS (SELECT 1 FROM catalog_offers o
-              WHERE o.product_key = p.product_key AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL
-                AND o.sku_key <> p.product_key || '::canonical')
-ORDER BY p.product_key
+WITH m AS (
+  SELECT p.product_key, p.merchant_id, p.source_ref AS seed_id, to_jsonb(p) ->> 'sync_status' AS sync_status,
+         row_number() OVER (PARTITION BY p.source_ref ORDER BY p.updated_at DESC NULLS LAST) AS mirror_rank
+  FROM catalog_products p
+  WHERE p.source_system = 'external_product_seeds_mirror_v1'
+    AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+)
+SELECT m.product_key, m.merchant_id, m.seed_id, m.sync_status, m.mirror_rank,
+       (e.id IS NOT NULL) AS seed_exists, e.status AS seed_status,
+       (coalesce(e.external_product_id, '') <> '') AS has_external_product_id,
+       v.variant_rows
+FROM m
+LEFT JOIN external_product_seeds e ON e.id::text = m.seed_id
+CROSS JOIN LATERAL (
+  SELECT count(*) AS variant_rows FROM catalog_offers o
+  WHERE o.product_key = m.product_key AND o.suppressed_at IS NULL AND o.suppression_reason IS NULL
+    AND o.sku_key <> m.product_key || '::canonical'
+    AND o.offer_id <> 'offer:external_seed:' || left(encode(sha256(convert_to(m.product_key, 'UTF8')), 'hex'), 32)
+) v
+WHERE v.variant_rows > 0
+ORDER BY m.product_key
 """
 
 
@@ -84,6 +111,19 @@ def _bump(counter, key, n=1):
     counter[key] = counter.get(key, 0) + n
 
 
+def _exclusion(product):
+    """Why the refresh never reaches this mirror product's variant rows, or None when it does."""
+    if not product["seed_exists"]:
+        return "seed_missing"
+    if product["seed_status"] != "active":
+        return "seed_status_" + str(product["seed_status"])
+    if not product["has_external_product_id"]:
+        return "seed_no_external_product_id"
+    if product["mirror_rank"] != 1:
+        return "not_the_resolved_mirror"
+    return None
+
+
 async def main():
     import asyncpg
 
@@ -92,9 +132,17 @@ async def main():
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
     if not url:
         _closed("DATABASE_URL missing")
-    timeout_s = float(os.getenv("DB_STATEMENT_TIMEOUT_SECONDS") or 0)
-    if timeout_s <= 0:
+    raw_timeout = (os.getenv("DB_STATEMENT_TIMEOUT_SECONDS") or "").strip()
+    if not raw_timeout:
         _closed("DB_STATEMENT_TIMEOUT_SECONDS unset: refusing to run without a statement timeout")
+    try:
+        timeout_s = float(raw_timeout)
+    except ValueError:
+        _closed("DB_STATEMENT_TIMEOUT_SECONDS is not a number: " + raw_timeout[:40])
+    if not timeout_s > 0:
+        _closed("DB_STATEMENT_TIMEOUT_SECONDS must be positive")
+    # Floored: a sub-second value would make every plan query time out (and 0 would mean none at all).
+    timeout_ms = max(int(timeout_s * 1000), 1000)
     try:
         from services import external_offer_dual_write as mod
         from services.seed_offer_currency import SeedOfferCurrencyRefused
@@ -112,7 +160,7 @@ async def main():
     async def read_only():
         tr = conn.transaction(readonly=True)
         await tr.start()
-        await conn.execute("SET LOCAL statement_timeout = " + str(int(timeout_s * 1000)))
+        await conn.execute("SET LOCAL statement_timeout = " + str(timeout_ms))
         if await conn.fetchval("SHOW transaction_read_only") != "on":
             await tr.rollback()
             _closed("transaction is not read-only")
@@ -120,26 +168,40 @@ async def main():
 
     try:
         tr = await read_only()
-        present = await conn.fetchrow(
-            """
-            SELECT to_regclass('catalog_products') IS NOT NULL AS products,
-                   to_regclass('catalog_offers') IS NOT NULL AS offers,
-                   to_regclass('catalog_skus') IS NOT NULL AS skus,
-                   to_regclass('external_product_seeds') IS NOT NULL AS seeds
-            """
-        )
+        try:
+            present = await conn.fetchrow(
+                """
+                SELECT to_regclass('catalog_products') IS NOT NULL AS products,
+                       to_regclass('catalog_offers') IS NOT NULL AS offers,
+                       to_regclass('catalog_skus') IS NOT NULL AS skus,
+                       to_regclass('external_product_seeds') IS NOT NULL AS seeds
+                """
+            )
+        finally:
+            await tr.rollback()
         for need in ("products", "offers", "skus", "seeds"):
             if not present[need]:
-                await tr.rollback()
                 _closed("table missing: " + need)
-        products = [dict(r) for r in await conn.fetch(MIRROR_PRODUCTS_SQL)]
-        await tr.rollback()
         print("GATE_OPEN", flush=True)
 
-        # Every unsuppressed mirror the lane would resolve (`resolve_mirror_product` does not read
-        # sync_status), counted by sync_status so the live share is visible.
+        tr = await read_only()
+        try:
+            candidates = [dict(r) for r in await conn.fetch(MIRROR_PRODUCTS_SQL)]
+        finally:
+            await tr.rollback()
+        excluded, products = {}, []
+        for product in candidates:
+            reason = _exclusion(product)
+            if reason:
+                bucket = excluded.setdefault(reason, {"products": 0, "variant_rows": 0})
+                bucket["products"] += 1
+                bucket["variant_rows"] += int(product["variant_rows"])
+            else:
+                products.append(product)
+
         totals = {"products": len(products), "variant_rows": 0, "planned_writes": 0, "price_moves": 0,
-                  "price_moves_over_10pct": 0, "ours_lower_now": 0, "same_price_restamp": 0}
+                  "price_moves_over_10pct": 0, "ours_lower_now": 0, "same_price_restamp": 0,
+                  "mirror_products_with_variant_rows": len(candidates)}
         sync_states = {}
         for product in products:
             _bump(sync_states, str(product["sync_status"]))
@@ -148,6 +210,8 @@ async def main():
         for start in range(0, len(products), CHUNK):
             tr = await read_only()
             try:
+                # Read back inside the chunk's own transaction: the bound this chunk ran under, not the intent.
+                chunk_timeout = await conn.fetchval("SHOW statement_timeout")
                 for product in products[start:start + CHUNK]:
                     pk, merchant = product["product_key"], product["merchant_id"]
                     seed_row = await conn.fetchrow(seed_sql, str(product["seed_id"] or ""))
@@ -156,6 +220,7 @@ async def main():
                                     and r["offer_id"] != mod.derive_mirror_offer_id(pk))
                     totals["variant_rows"] += n_variant
                     if not seed_row:
+                        # Deleted between the scan and this read.
                         _bump(statuses, "seed_missing")
                         _bump(skips, "seed_missing", n_variant)
                         continue
@@ -194,8 +259,10 @@ async def main():
                             refused_sample.append({"product_key": pk, **refused})
             finally:
                 await tr.rollback()
-            emit("progress", {"products_done": min(start + CHUNK, len(products)), "of": len(products)})
+            emit("progress", {"products_done": min(start + CHUNK, len(products)), "of": len(products),
+                              "statement_timeout": chunk_timeout})
         emit("summary", {**totals, "assumes_currency_read": True, "products_by_sync_status": sync_states})
+        emit("excluded", excluded)
         emit("statuses", statuses)
         emit("skips", skips)
         emit("variant_refresh_status", seed_states)

@@ -639,24 +639,140 @@ def _run_plan_script(env_over):
                           env=env, capture_output=True, text=True, timeout=120)
 
 
-async def test_the_dry_run_plans_exactly_what_the_lane_writes_and_writes_nothing(scoped_db):
-    await _load_mirror(scoped_db)
-    before = await _mirror_offers(scoped_db)
-    sep = "&" if "?" in _url() else "?"
-    out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "30",
-                            "DATABASE_URL": f"{_url()}{sep}search_path={_SCHEMA}"})
+def _plan_lines(out):
     lines = out.stdout.splitlines()
     assert out.returncode == 0, out.stderr[-2000:]
     assert lines[0] == "GATE_OPEN", lines
     data = [l for l in lines[1:] if l.startswith("MVR_PLAN ")]
-    assert lines[-1] == f"MVR_PLAN DONE lines={len(data) - 1}" and len(data) == len(lines) - 1
-    by_kind = {l.split(" ", 2)[1]: json.loads(l.split(" ", 2)[2]) for l in data[:-1]}
-    summary = by_kind["summary"]
+    assert lines[-1] == f"MVR_PLAN DONE lines={len(data) - 1}" and len(data) == len(lines) - 1, lines
+    kinds = {}
+    for line in data[:-1]:
+        _, kind, payload = line.split(" ", 2)
+        kinds.setdefault(kind, []).append(json.loads(payload))
+    return kinds
+
+
+def _plan_env(timeout="30"):
+    sep = "&" if "?" in _url() else "?"
+    return {"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": timeout,
+            "DATABASE_URL": f"{_url()}{sep}search_path={_SCHEMA}"}
+
+
+async def test_the_dry_run_plans_exactly_what_the_lane_writes_and_writes_nothing(scoped_db):
+    await _load_mirror(scoped_db)
+    before = await _mirror_offers(scoped_db)
+    kinds = _plan_lines(_run_plan_script(_plan_env()))
+    summary = kinds["summary"][0]
     assert summary["products"] == 1 and summary["variant_rows"] == 3 and summary["planned_writes"] == 2
     assert summary["price_moves"] == 2 and summary["ours_lower_now"] == 2 and summary["assumes_currency_read"] is True
-    assert by_kind["statuses"] == {"planned": 1} and by_kind["skips"] == {"variant_not_on_seed": 1}
-    assert sorted((s["before"], s["after"]) for s in by_kind["sample"]) == [(13.6, 15.3), (24.0, 26.0)]
+    assert kinds["statuses"] == [{"planned": 1}] and kinds["skips"] == [{"variant_not_on_seed": 1}]
+    assert kinds["excluded"] == [{}] and kinds["variant_refresh_status"] == [{"all_re_read": 1}]
+    assert sorted((s["before"], s["after"]) for s in kinds["sample"][0]) == [(13.6, 15.3), (24.0, 26.0)]
+    # Every chunk ran under the bound it was given, read back inside its own transaction.
+    assert [p["statement_timeout"] for p in kinds["progress"]] == ["30s"]
     assert await _mirror_offers(scoped_db) == before, "a dry run wrote"
+
+
+async def test_the_dry_run_counts_the_mirrors_own_offer_on_a_variant_sku_as_product_level(scoped_db):
+    """Only the offer-id exclusion applies to this row (its sku is a variant sku), in the scan and the plan."""
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await _load_mirror(scoped_db)
+    await scoped_db.execute("DELETE FROM catalog_offers WHERE offer_id = 'of_old_mirror_variant'")
+    await scoped_db.execute("UPDATE catalog_offers SET sku_key = :sk WHERE offer_id = :oid",
+                            {"sk": f"{MIRROR_SOURCE_PRODUCT}:49884244017399", "oid": derive_mirror_offer_id(MIRROR_PK)})
+    summary = _plan_lines(_run_plan_script(_plan_env()))["summary"][0]
+    assert summary["variant_rows"] == 2 and summary["planned_writes"] == 1, summary
+
+
+async def test_the_dry_run_plans_only_what_the_refresh_reaches_and_counts_the_rest(scoped_db):
+    import hashlib
+
+    await _load_mirror(scoped_db)
+
+    async def mirror_with_a_variant_row(pk, seed_id, *, updated_at=None):
+        # (merchant, platform, source_variant_id) is unique across products: one variant id per product.
+        vid = "7" + str(int(hashlib.sha256(pk.encode()).hexdigest(), 16) % 10**11).zfill(11)
+        await scoped_db.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title,"
+            " catalog_track, truth_tier, readiness_tier, source_system, source_ref, updated_at)"
+            " VALUES (:pk, :m, 'external_seed', :pk, 'x', 'external_referral', 'observed', 'referral_only',"
+            "         'external_product_seeds_mirror_v1', :seed, COALESCE(:at, now()))",
+            {"pk": pk, "m": MIRROR_SELLER, "seed": seed_id, "at": updated_at},
+        )
+        await scoped_db.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform, source_product_id,"
+            " source_variant_id, title, currency) VALUES (:sk, :pk, :m, 'external_seed', :pk, :vid, 'x', 'USD')",
+            {"sk": pk + "::v:" + vid, "pk": pk, "m": MIRROR_SELLER, "vid": vid},
+        )
+        await scoped_db.execute(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,"
+            " readiness_tier, offer_mode, channel, availability, currency, market, list_price,"
+            " merchant_effective_price, estimated_best_price, source_system, source_ref, offer_payload)"
+            " VALUES (:oid, :sk, :pk, :m, 'external_referral', 'observed', 'referral_only', 'redirect',"
+            "         'external_referral', 'in_stock', 'USD', 'US', 9, 9, 9, 'variant_identity_backfill_v1', :ref,"
+            "         CAST(:payload AS jsonb))",
+            {"oid": "of_" + pk[-8:], "sk": pk + "::v:" + vid, "pk": pk, "m": MIRROR_SELLER,
+             "ref": MIRROR_DEST, "payload": json.dumps({"destination_url": MIRROR_DEST})},
+        )
+
+    async def seed(seed_id, *, status, external_product_id):
+        await scoped_db.execute(
+            "INSERT INTO external_product_seeds (id, external_product_id, market, destination_url, domain, title,"
+            " price_amount, price_currency, availability, status, seed_data)"
+            " VALUES (:id, :ext, 'US', :dest, 'www.skin1004.com', 'x', 15.3, 'USD', 'in_stock', :st, CAST('{}' AS jsonb))",
+            {"id": seed_id, "ext": external_product_id, "dest": MIRROR_DEST, "st": status},
+        )
+
+    # An older second mirror of the same seed: resolve_mirror_product picks the newest only.
+    from datetime import datetime
+
+    await mirror_with_a_variant_row("prod::older::mirror::aaaaaaa1", MIRROR_SEED, updated_at=datetime(2020, 1, 1))
+    await seed("eps_inactive", status="inactive", external_product_id="ext_inactive")
+    await mirror_with_a_variant_row("prod::inactive::mirror::bbbbbbb2", "eps_inactive")
+    await seed("eps_no_epid", status="active", external_product_id="")
+    await mirror_with_a_variant_row("prod::no_epid::mirror::ccccccc3", "eps_no_epid")
+    await mirror_with_a_variant_row("prod::orphan::mirror::ddddddd4", "eps_gone")
+
+    kinds = _plan_lines(_run_plan_script(_plan_env()))
+    summary = kinds["summary"][0]
+    assert summary["products"] == 1 and summary["mirror_products_with_variant_rows"] == 5, summary
+    assert summary["variant_rows"] == 3 and summary["planned_writes"] == 2
+    assert kinds["excluded"] == [{
+        "not_the_resolved_mirror": {"products": 1, "variant_rows": 1},
+        "seed_status_inactive": {"products": 1, "variant_rows": 1},
+        "seed_no_external_product_id": {"products": 1, "variant_rows": 1},
+        "seed_missing": {"products": 1, "variant_rows": 1},
+    }]
+
+
+async def test_the_scan_never_counts_a_mirror_whose_only_extra_row_is_its_own_offer(scoped_db):
+    """The scan applies the offer-id exclusion too: a mirror (here on an inactive seed) whose only
+    non-canonical-sku row is the mirror's own offer has no variant row, so it is in no bucket at all."""
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await _load_mirror(scoped_db)
+    await scoped_db.execute("UPDATE external_product_seeds SET status = 'inactive' WHERE id = :id", {"id": MIRROR_SEED})
+    await scoped_db.execute("DELETE FROM catalog_offers WHERE offer_id <> :oid", {"oid": derive_mirror_offer_id(MIRROR_PK)})
+    await scoped_db.execute("UPDATE catalog_offers SET sku_key = :sk", {"sk": f"{MIRROR_PK}::v:49884244017398"})
+    kinds = _plan_lines(_run_plan_script(_plan_env()))
+    assert kinds["summary"][0]["mirror_products_with_variant_rows"] == 0 and kinds["excluded"] == [{}], kinds
+
+
+async def test_the_product_scan_runs_after_the_gate_opens(scoped_db):
+    """The gate checks preconditions only; the scan is the first plan query. A scan that fails (here: a
+    seeds table without the column it reads) fails after GATE_OPEN, never in place of the gate."""
+    await _load_mirror(scoped_db)
+    await scoped_db.execute("ALTER TABLE external_product_seeds RENAME COLUMN status TO status_renamed")
+    out = _run_plan_script(_plan_env())
+    assert out.returncode != 0 and out.stdout.splitlines()[0] == "GATE_OPEN", (out.stdout, out.stderr[-500:])
+    assert "MVR_PLAN DONE" not in out.stdout
+
+
+async def test_the_dry_run_floors_a_sub_second_timeout(scoped_db):
+    await _load_mirror(scoped_db)
+    kinds = _plan_lines(_run_plan_script(_plan_env(timeout="0.2")))
+    assert [p["statement_timeout"] for p in kinds["progress"]] == ["1s"]
 
 
 async def test_the_dry_run_gate_stays_closed_outside_production():
@@ -664,3 +780,8 @@ async def test_the_dry_run_gate_stays_closed_outside_production():
     assert out.returncode == 3 and out.stdout.strip() == "GATE_CLOSED PIVOTA_ENV is not production"
     out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "", "DATABASE_URL": _url()})
     assert out.returncode == 3 and out.stdout.startswith("GATE_CLOSED DB_STATEMENT_TIMEOUT_SECONDS unset")
+    out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "30s", "DATABASE_URL": _url()})
+    assert out.returncode == 3 and out.stdout.strip() == "GATE_CLOSED DB_STATEMENT_TIMEOUT_SECONDS is not a number: 30s"
+    assert "Traceback" not in out.stderr
+    out = _run_plan_script({"PIVOTA_ENV": "production", "DB_STATEMENT_TIMEOUT_SECONDS": "-5", "DATABASE_URL": _url()})
+    assert out.returncode == 3 and out.stdout.strip() == "GATE_CLOSED DB_STATEMENT_TIMEOUT_SECONDS must be positive"
