@@ -26,6 +26,14 @@ import json
 import os
 import sys
 
+# `python scripts/ops/<this>.py` puts scripts/ops/ on sys.path, and `python -c` has no __file__.
+# /app is the image's repo root.
+try:
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+except NameError:
+    _REPO_ROOT = "/app"
+sys.path.insert(0, _REPO_ROOT)
+
 
 def _closed(reason):
     print("GATE_CLOSED " + reason, flush=True)
