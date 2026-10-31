@@ -11524,6 +11524,48 @@ def _live_cart_identity(
     return {**redirect_identity, "platform": platform, "cart_variant_id": claims.vid}
 
 
+def _card_cart_at_card_price(
+    identity: Dict[str, Optional[str]],
+    *,
+    seed_data: Dict[str, Any],
+    card_price: Any,
+    card_currency: Optional[str],
+) -> Dict[str, Optional[str]]:
+    """A PRODUCT-GRAIN card's cart, kept only where the card's price is the cart variant's.
+
+    A product card is priced at the seed-level `price_amount` and carries no per-variant identity,
+    so on a seed storing several variants the cart its identity names (catalog hand-over, seed
+    stamp, or operator-attached id) can be a variant priced differently from the card: a $19 card
+    whose cart is the $29 size. A price belongs to the exact variant it was quoted for. So on a
+    multi-variant seed the cart survives only when EXACTLY ONE stored entry is that variant and
+    its own price and currency equal the card's; anything else — no entry, two entries, an unread
+    price, a different price or currency — gets the referral (a COPY with `cart_variant_id`
+    None, the caller's dict untouched). A seed storing at most one variant has nothing to choose
+    between and is returned as is. The variant's currency falls back to the card's own observed
+    currency, as offers.resolve reads a variant without one.
+    """
+    cart = canonical_variant_id(identity.get("cart_variant_id"))
+    if not cart:
+        return identity
+    served = _seed_variants(seed_data)
+    if len(served) <= 1:
+        return identity
+    hits = [
+        v for v in served
+        if any(canonical_variant_id(v.get(key)) == cart for key in _SEED_VARIANT_IDENTITY_KEYS)
+    ]
+    card_amount = _coerce_float(card_price)
+    if len(hits) == 1 and card_amount is not None and card_currency:
+        amount, currency = _extract_price_currency_from_variant(hits[0], fallback_currency=card_currency)
+        if (
+            amount is not None
+            and round(amount, 2) == round(card_amount, 2)
+            and str(currency or "").upper() == str(card_currency).upper()
+        ):
+            return identity
+    return {**identity, "cart_variant_id": None}
+
+
 def resolve_cart_permalink(
     *,
     destination_url: str,
@@ -15114,6 +15156,13 @@ async def _handle_find_products_multi_inner(
                     offer_variant_id=getattr(candidate, "variant_id", None),
                 ),
             )
+            # THE CARD'S PRICE IS THE CART'S. This card is product-grain and priced at the
+            # seed-level `price_amount`; on a multi-variant seed its cart may be another size.
+            # Decided before the purchasability gate and the mint, so both read the one value.
+            redirect_identity = _card_cart_at_card_price(
+                redirect_identity, seed_data=seed_data,
+                card_price=price_amount, card_currency=price_currency,
+            )
             # MERCHANT PURCHASABILITY, decided before the mint; the gated identity feeds BOTH
             # the mint and `_seed_attribution_from_redirect` below, which refuses unless its
             # recomposed primary equals the signed dest.
@@ -15130,6 +15179,10 @@ async def _handle_find_products_multi_inner(
             # ADR-009 D3: include seller_ref/seed_kind in the cache key so a cache
             # hit never reuses a redirect built for a different seller. The provenance flag is
             # in the key too: two rows that serve the same market can differ in it.
+            # The CART and the SEED are in the key too. Two seeds can share one PDP, and
+            # `_card_cart_at_card_price` can keep one's cart and refuse the other's: keyed
+            # without them, the second card reused the first's signed /cart/ link (and its
+            # `seedId`) while publishing no cart_url. Review of #2625 (controller, 2026-10-14).
             redirect_cache_key = "||".join(
                 [
                     market,
@@ -15140,6 +15193,8 @@ async def _handle_find_products_multi_inner(
                     str(redirect_identity.get("seed_kind") or ""),
                     "observed" if observed else "unobserved",
                     str(purchasability_tier or ""),
+                    str(redirect_identity.get("cart_variant_id") or ""),
+                    str(row_dict.get("id") or ""),
                 ]
             )
             if redirect_cache_key in external_redirect_cache:
