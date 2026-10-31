@@ -35,6 +35,8 @@ _TABLE_MIGRATIONS = (
     "169_external_product_seeds_seller_ref.sql",
     "058_catalog_core.sql",
     "132_catalog_offer_suppression_writer_audit.sql",
+    # catalog_offers.source_domain: the mirror upsert (the mirror tests below) writes it.
+    "133_catalog_source_domain.sql",
     "135_catalog_product_sku_stale_suppression.sql",
     "149_catalog_offers_agent_decision_fields.sql",
     "246_catalog_offers_price_checked_at.sql",
@@ -354,3 +356,152 @@ async def test_a_non_object_payload_passes_through_while_the_price_and_its_date_
         " jsonb_typeof(offer_payload) AS kind FROM catalog_offers WHERE offer_id = 'of_canon'")
     assert float(row["list_price"]) == 22.7 and row["checked"]
     assert row["kind"] in ("string", "array") and row["payload"] == payload
+
+
+# ── a seed WITH a mirror: the refresh re-prices the mirror's variant rows (2026-10-31) ───────────
+#
+# The rows are the producers' shapes on a live mirror product:
+#   * the mirror's product-level row (`upsert_catalog_offer_from_seed_row`): sku `<pk>::canonical`;
+#   * `scripts/backfill_variant_identity_skus`: sku `<pk>::v:<vid>`, source_ref = the listing URL,
+#     payload {destination_url}, source_system variant_identity_backfill_v1 (prod: written 09-08);
+#   * the mirror's older per-variant row: source_variant_id `<source_product_id>:<vid>`, source_ref =
+#     the seed id, payload {external_seed_id}.
+# Prod 2026-10-31 (Centella Teca Ampoule): product-level row $15.30 checked 10-20, variant row $13.60
+# from 09-08 never checked, and the PDP served the variant row.
+
+MIRROR_PK = "prod::external_seed::external_seed::ext_74e14bd64686117a6145542a"
+MIRROR_SEED = "eps_6c74aab66d1ecda52b73fa80"
+MIRROR_SELLER = "merch_obs_bb9261c0db7aef08"
+MIRROR_SOURCE_PRODUCT = "ext_74e14bd64686117a6145542a"
+MIRROR_DEST = "https://www.skin1004.com/products/centella-teca-ampoule"
+
+
+async def _load_mirror(db, *, variant_refresh_status="all_re_read"):
+    seed_data = {
+        "variants": [
+            {"variant_id": "49884244017398", "price": 15.3, "price_amount": 15.3, "price_currency": "USD"},
+            {"variant_id": "49884244017399", "price": 26.0, "price_amount": 26.0, "price_currency": "USD"},
+        ],
+        # The snapshot list is the ingest-time copy (its own defect); the planner reads the top-level list.
+        "snapshot": {"variants": [{"variant_id": "49884244017398", "price": "13.60"}],
+                     "variant_refresh": {"status": variant_refresh_status}},
+    }
+    await db.execute(
+        "INSERT INTO external_product_seeds (id, external_product_id, market, destination_url,"
+        " domain, title, price_amount, price_currency, availability, status, attached_product_key, seed_data)"
+        " VALUES (:id, :ext, 'US', :dest, 'www.skin1004.com', 'Centella Teca Ampoule', 15.3, 'USD',"
+        "         'in_stock', 'active', :pk, CAST(:sd AS jsonb))",
+        {"id": MIRROR_SEED, "ext": MIRROR_SOURCE_PRODUCT, "dest": MIRROR_DEST, "pk": MIRROR_PK,
+         "sd": json.dumps(seed_data)},
+    )
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id,"
+        " title, catalog_track, truth_tier, readiness_tier, source_system, source_ref)"
+        " VALUES (:pk, :m, 'external_seed', :spid, 'Centella Teca Ampoule', 'external_referral',"
+        "         'observed', 'referral_only', 'external_product_seeds_mirror_v1', :seed)",
+        {"pk": MIRROR_PK, "m": MIRROR_SELLER, "spid": MIRROR_SOURCE_PRODUCT, "seed": MIRROR_SEED},
+    )
+    for sku, vid in ((f"{MIRROR_PK}::canonical", MIRROR_PK),
+                     (f"{MIRROR_PK}::v:49884244017398", "49884244017398"),
+                     (f"{MIRROR_SOURCE_PRODUCT}:49884244017399", f"{MIRROR_SOURCE_PRODUCT}:49884244017399"),
+                     (f"{MIRROR_PK}::v:49884244017400", "49884244017400")):
+        await db.execute(
+            "INSERT INTO catalog_skus (sku_key, product_key, merchant_id, platform,"
+            " source_product_id, source_variant_id, title, currency)"
+            " VALUES (:sk, :pk, :m, 'external_seed', :spid, :vid, 'x', 'USD')",
+            {"sk": sku, "pk": MIRROR_PK, "m": MIRROR_SELLER, "spid": MIRROR_SOURCE_PRODUCT, "vid": vid},
+        )
+
+    async def offer(oid, sku, price, *, source_system, source_ref, payload):
+        await db.execute(
+            "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id,"
+            " catalog_track, truth_tier, readiness_tier, offer_mode, channel, availability,"
+            " currency, market, list_price, merchant_effective_price, estimated_best_price,"
+            " source_system, source_ref, offer_payload, offer_type, updated_at)"
+            " VALUES (:oid, :sk, :pk, :m, 'external_referral', 'observed', 'referral_only',"
+            "         'redirect', 'external_referral', 'in_stock', 'USD', 'US', :p, :p, :p,"
+            "         :ss, :ref, CAST(:payload AS jsonb), 'brand_direct', TIMESTAMP '2026-09-08 06:07:17')",
+            {"oid": oid, "sk": sku, "pk": MIRROR_PK, "m": MIRROR_SELLER, "p": price, "ss": source_system,
+             "ref": source_ref, "payload": json.dumps(payload)},
+        )
+
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await offer(derive_mirror_offer_id(MIRROR_PK), f"{MIRROR_PK}::canonical", 13.60,
+                source_system="external_product_seeds_mirror_v1", source_ref=MIRROR_SEED,
+                payload={"external_seed_id": MIRROR_SEED, "destination_url": MIRROR_DEST})
+    await offer("of_backfill", f"{MIRROR_PK}::v:49884244017398", 13.60,
+                source_system="variant_identity_backfill_v1", source_ref=MIRROR_DEST,
+                payload={"source_system": "variant_identity_backfill_v1", "price_from": "variant",
+                         "destination_url": MIRROR_DEST})
+    await offer("of_old_mirror_variant", f"{MIRROR_SOURCE_PRODUCT}:49884244017399", 24.00,
+                source_system="external_product_seeds_mirror_v1", source_ref=MIRROR_SEED,
+                payload={"external_seed_id": MIRROR_SEED, "destination_url": MIRROR_DEST})
+    await offer("of_not_on_seed", f"{MIRROR_PK}::v:49884244017400", 11.00,
+                source_system="variant_identity_backfill_v1", source_ref=MIRROR_DEST,
+                payload={"destination_url": MIRROR_DEST})
+
+
+async def _sync_mirror(monkeypatch, db, source="refresh"):
+    from services import external_offer_dual_write as mod
+
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    # The missing-variant projection has its own suite; here the rows above are the whole mirror.
+    monkeypatch.setenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED", "0")
+    monkeypatch.setattr(mod, "database", db)
+    monkeypatch.setattr(mod, "_price_check_column", {"present": False, "checked": None})
+    return await mod.sync_offer_for_seed(MIRROR_SEED, attached_price_source=source, currency_read=source == "refresh")
+
+
+async def _mirror_offers(db):
+    rows = await db.fetch_all(
+        "SELECT offer_id, list_price, merchant_effective_price, estimated_best_price,"
+        " updated_at > TIMESTAMP '2026-09-08 06:07:17' AS touched,"
+        " price_checked_at IS NOT NULL AS checked, offer_payload ->> 'price_read_source' AS read_source"
+        " FROM catalog_offers WHERE product_key = :pk",
+        {"pk": MIRROR_PK},
+    )
+    return {r["offer_id"]: dict(r) for r in rows}
+
+
+async def test_a_refresh_reprices_the_mirrors_variant_rows_not_only_its_product_row(scoped_db, monkeypatch):
+    from services.external_offer_dual_write import derive_mirror_offer_id
+
+    await _load_mirror(scoped_db)
+    result = await _sync_mirror(monkeypatch, scoped_db)
+
+    assert result["status"] == "synced" and result["target"] == "mirror", result
+    assert result["variant_status"] == "synced" and result["variant_offers_written"] == 2, result
+    assert result["offer_skips"] == {"variant_not_on_seed": 1}
+    rows = await _mirror_offers(scoped_db)
+    # The mirror upsert still owns the product-level row.
+    assert float(rows[derive_mirror_offer_id(MIRROR_PK)]["list_price"]) == 15.3
+    # The row the PDP prices the variant from now holds the re-read, dated, with who vouched for it.
+    for oid, price in (("of_backfill", 15.3), ("of_old_mirror_variant", 26.0)):
+        row = rows[oid]
+        assert float(row["list_price"]) == price, oid
+        assert float(row["merchant_effective_price"]) == price
+        assert float(row["estimated_best_price"]) == price
+        assert row["touched"] and row["checked"] and row["read_source"] == "refresh", oid
+    # A variant the page did not list keeps its price and its clock.
+    assert float(rows["of_not_on_seed"]["list_price"]) == 11.0
+    assert not rows["of_not_on_seed"]["touched"] and not rows["of_not_on_seed"]["checked"]
+
+
+async def test_mirror_variant_rows_hold_until_every_variant_was_re_read(scoped_db, monkeypatch):
+    await _load_mirror(scoped_db, variant_refresh_status="not_all_re_read")
+    result = await _sync_mirror(monkeypatch, scoped_db)
+
+    assert result["status"] == "synced" and result["variant_status"] == "listing_offer_not_written", result
+    assert result["offer_skips"] == {"variant_not_re_read": 2, "variant_not_on_seed": 1}
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows["of_backfill"]["list_price"]) == 13.6 and not rows["of_backfill"]["checked"]
+
+
+async def test_an_employee_edit_moves_no_mirror_variant_row(scoped_db, monkeypatch):
+    await _load_mirror(scoped_db)
+    result = await _sync_mirror(monkeypatch, scoped_db, source="employee_edit")
+
+    assert result["status"] == "synced" and "variant_status" not in result, result
+    rows = await _mirror_offers(scoped_db)
+    assert float(rows["of_backfill"]["list_price"]) == 13.6 and not rows["of_backfill"]["touched"]

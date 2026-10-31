@@ -869,11 +869,84 @@ async def sync_attached_listing_offers(
     if source not in ATTACHED_PRICE_SOURCES:
         # jsonb_set is strict: a NULL marker would null the whole payload. Refuse anything else up front.
         raise ValueError(f"attached listing lane: unknown price source {source!r}")
-    seed_id = seed.get("id")
     product_key = str(seed.get("attached_product_key") or "")
     rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
+    return await _price_listing_rows(
+        seed, product_key, [dict(r) for r in rows or []],
+        source=source, currency_read=currency_read, target="attached",
+    )
+
+
+# ── the mirror's variant rows ────────────────────────────────────────────────────────────────────
+#
+# THE GAP (2026-10-31). A seed WITH a mirror product took only the mirror's product-level row
+# (`upsert_catalog_offer_from_seed_row`, sku `<pk>::canonical`). The mirror product also carries
+# VARIANT rows -- `scripts/backfill_variant_identity_skus` (sku `<pk>::v:<vid>`, source_ref = the
+# listing URL), `catalog_variant_offer_projection` (same shape, payload external_seed_id) and the
+# mirror's own older per-variant rows (source_variant_id `<source_product_id>:<vid>`, source_ref =
+# the seed id) -- and the PDP prices a variant from the row keyed by its `source_variant_id`. Nothing
+# re-priced those: the attached lane runs only when there is no mirror. Measured on prod 2026-10-31:
+# 7,882 variant rows on 4,236 live mirror products, 7,881 never price-checked, and 1,055 differing
+# from a crawl of the same variant made after the row was written (552 by >10%, 554 serving content
+# keys). In a 146-variant sample checked against the stores' live prices, 17 of 46 misses were this:
+# the product-level row held the store's price, the variant row a 09-08 price.
+#
+# THE RULE IS THE ATTACHED LANE'S, unchanged (`plan_attached_listing_offer_writes`): only this
+# listing's rows, one seller, the row's own currency, a variant's own price matched on the merchant's
+# variant id, only when the refresh re-read every stored variant, inside the ratio band, never over a
+# reviewed price repair. Run over the rows the prod planner would see, it re-prices 814 of those
+# 1,055 (dry run 2026-10-31); the rest it refuses for the reasons above, which is the point of reusing it.
+# The product-level row is left to the mirror upsert, which owns it, and only a `refresh` asks:
+# an employee edit moves no variant row (the variants in the seed are not the employee's claim).
+MIRROR_VARIANT_REPRICE_ENV = "EXTERNAL_OFFER_MIRROR_VARIANT_REPRICE_ENABLED"
+
+
+def mirror_variant_reprice_enabled() -> bool:
+    """Kill switch, default ON: the lane's rules are the attached lane's, which is live."""
+    return os.getenv(MIRROR_VARIANT_REPRICE_ENV, "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _native_variant_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The row with `source_variant_id` as the merchant's own id.
+
+    The mirror's older per-variant SKUs spell it `<source_product_id>:<vid>`; the planner matches the
+    bare id. Only that exact prefix, and only onto a merchant-issued id (8+ digits), the rule
+    `catalog_variant_price_repair.resolve_native_variant` applies to the same rows. Anything else is
+    left as written, so it stays `variant_not_on_seed` rather than matching by accident."""
+    vid = str(row.get("source_variant_id") or "")
+    product = _json_value(row.get("read_product")) or {}
+    prefix = str(product.get("source_product_id") or "") + ":" if isinstance(product, dict) else ":"
+    if prefix != ":" and vid.startswith(prefix) and re.fullmatch(r"[0-9]{8,}", vid[len(prefix):]):
+        return {**row, "source_variant_id": vid[len(prefix):]}
+    return row
+
+
+async def sync_mirror_variant_offers(
+    seed: Dict[str, Any], product_key: str, *, currency_read: bool
+) -> Dict[str, Any]:
+    """Re-price the variant rows on a seed's mirror product from a refresh's re-read.
+
+    `synced` when at least one row was written, `no_variant_offer` when the mirror has no variant
+    row, otherwise the plan's status or `listing_offer_not_written`, with the per-row reasons."""
+    rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
+    canonical = derive_mirror_sku_key(product_key)
+    variant_rows = [_native_variant_row(dict(r)) for r in rows or [] if r["sku_key"] != canonical]
+    if not variant_rows:
+        return {"seed_id": seed.get("id"), "status": "no_variant_offer", "product_key": product_key}
+    return await _price_listing_rows(
+        {**seed, "attached_product_key": product_key}, product_key, variant_rows,
+        source="refresh", currency_read=currency_read, target="mirror_variants",
+    )
+
+
+async def _price_listing_rows(
+    seed: Dict[str, Any], product_key: str, rows: list, *, source: str, currency_read: bool,
+    target: str,
+) -> Dict[str, Any]:
+    """Plan (`plan_attached_listing_offer_writes`) and write one listing's rows, logging refusals."""
+    seed_id = seed.get("id")
     plan = plan_attached_listing_offer_writes(
-        seed, [dict(r) for r in rows or []], source=source, currency_read=currency_read
+        seed, rows, source=source, currency_read=currency_read
     )
     if plan["status"] in ("currency_not_read", "refused_currency"):
         logger.warning({
@@ -881,6 +954,7 @@ async def sync_attached_listing_offers(
             "reason": plan["status"],
             "seed_id": seed_id,
             "product_key": product_key,
+            "target": target,
             "rows_refused": int((plan.get("skips") or {}).get("refused_currency") or 0),
         })
     elif plan["skips"].get("refused_currency"):
@@ -891,6 +965,7 @@ async def sync_attached_listing_offers(
             "reason": "refused_currency",
             "seed_id": seed_id,
             "product_key": product_key,
+            "target": target,
             "rows_refused": plan["skips"]["refused_currency"],
         })
     for refused in plan.get("refused") or []:
@@ -900,6 +975,7 @@ async def sync_attached_listing_offers(
             "reason": "price_ratio_out_of_bounds",
             "seed_id": seed_id,
             "product_key": product_key,
+            "target": target,
             **refused,
         })
     if plan["status"] != "planned":
@@ -924,7 +1000,7 @@ async def sync_attached_listing_offers(
     result = {
         "seed_id": seed_id,
         "product_key": product_key,
-        "target": "attached",
+        "target": target,
         "offers_written": written,
         "offer_skips": skips,
     }
@@ -942,8 +1018,10 @@ async def sync_offer_for_seed(
     must not break them. No-op (skipped) when the flag is off, the seed is gone,
     it has no external_product_id, or it has neither a mirror product (the
     materialization job owns product creation) nor an attached canonical. A seed
-    with a mirror upserts the mirror's offer; an attached seed without one prices
-    its listing's existing rows on the canonical (`sync_attached_listing_offers`).
+    with a mirror upserts the mirror's offer and, on a `refresh`, re-prices the
+    mirror's variant rows (`sync_mirror_variant_offers`, reported as `variant_status`
+    beside the mirror's `synced`); an attached seed without one prices its
+    listing's existing rows on the canonical (`sync_attached_listing_offers`).
     Returns a small status dict.
 
     `attached_price_source` is the caller vouching that the seed's price is
@@ -998,7 +1076,25 @@ async def sync_offer_for_seed(
             # written. Its own status, so refresh counters and readiness can tell it from an exception.
             logger.warning({"event": "external_offer_dual_write_refused_currency", "seed_id": seed_id, "reason": str(refused)})
             return {"seed_id": seed_id, "status": "refused_currency", "product_key": product_key, "error": str(refused)}
-        return {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
+        result = {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
+        if attached_price_source == "refresh" and mirror_variant_reprice_enabled():
+            # The variant rows the PDP prices from (see `sync_mirror_variant_offers`). The mirror row
+            # is already written, so a failure here is reported beside it, never instead of it.
+            try:
+                variants = await sync_mirror_variant_offers(seed, product_key, currency_read=currency_read)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning({
+                    "event": "external_offer_mirror_variants_failed",
+                    "seed_id": seed_id,
+                    "product_key": product_key,
+                    "error": str(exc)[:300],
+                })
+                variants = {"status": "error"}
+            result["variant_status"] = variants.get("status")
+            result["variant_offers_written"] = int(variants.get("offers_written") or 0)
+            if variants.get("offer_skips"):
+                result["offer_skips"] = variants["offer_skips"]
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning({
             "event": "external_offer_dual_write_failed",

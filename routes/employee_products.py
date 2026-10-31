@@ -5705,6 +5705,15 @@ async def _project_refreshed_seed_to_serving_surfaces(
         if isinstance(offer_skips, dict):
             for reason, n in offer_skips.items():
                 counts["offer_skip_" + str(reason)] = int(n or 0)
+        # A mirror write also re-prices the mirror's variant rows (`sync_mirror_variant_offers`).
+        # Its outcome rides beside the mirror's, never in place of it: a seed that wrote its mirror
+        # row is `projected` whatever its variants did, so the variant half reports as a write
+        # target, or as a row-level skip bucket, and never as a seed-level skip or error.
+        variant_status = (outcome or {}).get("variant_status")
+        if variant_status == "synced":
+            counts["wrote_mirror_variants"] = 1
+        elif variant_status:
+            counts["offer_skip_mirror_variants_" + str(variant_status)] = 1
     except Exception as exc:  # noqa: BLE001 - a cache write must not break the source of truth
         counts["errored"] = 1
         logger.warning(

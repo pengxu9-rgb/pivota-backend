@@ -265,8 +265,10 @@ def test_the_banned_bucket_is_never_a_seller_we_write_under():
 class FakeDB:
     """The reads sync_offer_for_seed makes, routed on SQL substrings, plus the guarded UPDATE."""
 
-    def __init__(self, *, seed, mirror=None, offers=(), guard_matches=True):
+    def __init__(self, *, seed, mirror=None, offers=(), mirror_offers=(), guard_matches=True):
         self.seed, self.mirror, self.offers = seed, mirror, list(offers)
+        self.mirror_offers = list(mirror_offers)
+        self.reads: List[str] = []
         self.guard_matches = guard_matches
         self.updates: List[Dict[str, Any]] = []
         self.executed: List[str] = []
@@ -283,7 +285,11 @@ class FakeDB:
         raise AssertionError(f"unexpected fetch_one: {s[:80]}")
 
     async def fetch_all(self, sql, params=None):
-        assert "FROM catalog_offers" in str(sql) and params == {"product_key": PK}
+        assert "FROM catalog_offers" in str(sql)
+        self.reads.append(params["product_key"])
+        if self.mirror and params == {"product_key": self.mirror["product_key"]}:
+            return [dict(o) for o in self.mirror_offers]
+        assert params == {"product_key": PK}
         return [dict(o) for o in self.offers]
 
     async def execute(self, sql, params=None):
@@ -354,7 +360,10 @@ def test_the_mirror_still_wins_when_the_seed_has_one(monkeypatch):
                                         "merchant_id": "merch_obs_x"}, offers=[_offer("of_canon")])
     result = _sync(monkeypatch, fake)
     assert result["status"] == "synced" and result["target"] == "mirror"
+    # The mirror has no variant row: its product-level row is the mirror upsert's alone.
+    assert result["variant_status"] == "no_variant_offer"
     assert fake.updates == [] and len(fake.executed) == 1
+    assert fake.reads == [fake.mirror["product_key"]], "never the attached canonical's rows"
     project.assert_awaited_once_with(fake.mirror["product_key"], apply=True, db=fake)
 
 
@@ -574,3 +583,142 @@ def test_the_lane_refuses_an_unknown_price_source():
     for bad in (None, "", "crawl", "EMPLOYEE_EDIT"):
         with pytest.raises(ValueError):
             asyncio.run(mod.sync_attached_listing_offers({"id": "s", "attached_product_key": "pk"}, source=bad))
+
+
+# ------------------------------------------------------------ the mirror's variant rows (2026-10-31)
+#
+# A seed WITH a mirror product took only the mirror's product-level row; the variant rows on the
+# same mirror (the variant backfill's, the projection's, the mirror's older per-variant rows) were
+# never re-priced, and the PDP prices a variant from those. The real SQL is pinned in
+# test_external_offer_attached_listing_postgres.py; these pin the routing and the reporting.
+
+MIRROR = {"product_key": "prod::external_seed::external_seed::ext_74e14bd6", "merchant_id": "merch_obs_bb92"}
+MPK = MIRROR["product_key"]
+
+
+def _mirror_offer(offer_id, *, sku, vid, price=13.6, source_ref=DEST, payload_seed=None, source_product_id="ext_74e14bd6"):
+    return {**_offer(offer_id, sku=sku, vid=vid, merchant=MIRROR["merchant_id"], source_ref=source_ref,
+                     payload_seed=payload_seed, price=price),
+            "read_product": json.dumps({"source_product_id": source_product_id})}
+
+
+def _mirror_fake(**over):
+    from unittest.mock import AsyncMock
+    offers = over.pop("mirror_offers", [
+        _mirror_offer("of_mirror_canon", sku=f"{MPK}::canonical", vid=MPK, source_ref="seed:x"),
+        _mirror_offer("of_backfill", sku=f"{MPK}::v:47761881301179", vid="47761881301179"),
+    ])
+    return FakeDB(seed=_seed(**over), mirror=MIRROR, mirror_offers=offers), AsyncMock(
+        return_value={"planned": 0, "inserted": 0, "skips": {}})
+
+
+def _patch_projection(monkeypatch, project):
+    from services import catalog_variant_offer_projection
+    monkeypatch.setattr(catalog_variant_offer_projection, "project_missing_variant_offers", project)
+
+
+def test_a_refresh_reprices_the_mirrors_variant_rows_beside_its_own_row(monkeypatch):
+    fake, project = _mirror_fake()
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["status"] == "synced" and result["target"] == "mirror"
+    assert result["variant_status"] == "synced" and result["variant_offers_written"] == 1
+    assert len(fake.executed) == 1, "the product-level row is still the mirror upsert's"
+    assert [(u["offer_id"], u["price"], u["read_source"]) for u in fake.updates] == [("of_backfill", 22.7, "refresh")]
+
+
+@pytest.mark.parametrize("source", [None, "employee_edit", "seed_data_merge"])
+def test_only_a_refresh_reprices_the_mirrors_variant_rows(monkeypatch, source):
+    """An employee edit vouches for the product's price, not for the variants the last refresh left."""
+    fake, project = _mirror_fake()
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake, source=source, currency_read=False)
+    assert result["status"] == "synced" and "variant_status" not in result
+    assert fake.updates == [] and fake.reads == []
+
+
+def test_the_kill_switch_leaves_the_mirror_as_it_was(monkeypatch):
+    fake, project = _mirror_fake()
+    _patch_projection(monkeypatch, project)
+    monkeypatch.setenv(mod.MIRROR_VARIANT_REPRICE_ENV, "0")
+    result = _sync(monkeypatch, fake)
+    assert result["status"] == "synced" and "variant_status" not in result and fake.updates == []
+
+
+def test_the_mirror_variant_rows_keep_the_attached_lanes_rules(monkeypatch):
+    """Not re-read: the variant row keeps its price, and the seed still reports its mirror write."""
+    fake, project = _mirror_fake(variant_refresh_status="not_all_re_read")
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["status"] == "synced"
+    assert result["variant_status"] == "listing_offer_not_written"
+    assert result["offer_skips"] == {"variant_not_re_read": 1} and fake.updates == []
+
+
+def test_a_failing_variant_half_never_unwrites_the_mirror(monkeypatch):
+    fake, project = _mirror_fake()
+    _patch_projection(monkeypatch, project)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("variant read failed")
+
+    monkeypatch.setattr(mod, "sync_mirror_variant_offers", boom)
+    result = _sync(monkeypatch, fake)
+    assert result["status"] == "synced" and result["variant_status"] == "error"
+
+
+def test_the_mirrors_prefixed_variant_id_is_its_native_id():
+    row = _mirror_offer("of_old", sku="ext_74e14bd6:47761881301180", vid="ext_74e14bd6:47761881301180")
+    assert mod._native_variant_row(row)["source_variant_id"] == "47761881301180"
+
+
+@pytest.mark.parametrize("vid", [
+    "ext_OTHER:47761881301180",   # another product's prefix
+    "ext_74e14bd6:123",           # not a merchant-issued id
+    "ext_74e14bd6:47761881301180:x",
+    "47761881301180",             # already native
+])
+def test_only_this_products_prefix_onto_a_native_id_is_stripped(vid):
+    row = _mirror_offer("of_old", sku="s", vid=vid)
+    assert mod._native_variant_row(row)["source_variant_id"] == vid
+
+
+def test_a_prefixed_mirror_variant_row_takes_its_variants_price(monkeypatch):
+    fake, project = _mirror_fake(mirror_offers=[
+        _mirror_offer("of_old", sku="ext_74e14bd6:47761881301180", vid="ext_74e14bd6:47761881301180",
+                      source_ref="seed:catalog_enrichment_agent_v1:2bed56bf52daa7d4",
+                      payload_seed="seed:catalog_enrichment_agent_v1:2bed56bf52daa7d4"),
+    ])
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert result["variant_status"] == "synced"
+    assert [(u["offer_id"], u["price"]) for u in fake.updates] == [("of_old", 38.0)]
+
+
+def test_the_refresh_hook_reports_the_mirror_variant_half_without_unprojecting_the_seed(monkeypatch):
+    import routes.employee_products as ep
+
+    outcomes = iter([
+        {"status": "synced", "target": "mirror", "variant_status": "synced", "variant_offers_written": 2},
+        {"status": "synced", "target": "mirror", "variant_status": "listing_offer_not_written",
+         "offer_skips": {"variant_not_re_read": 3}},
+        {"status": "synced", "target": "mirror", "variant_status": "error"},
+    ])
+
+    async def fake_sync(seed_id, **kwargs):
+        return next(outcomes)
+
+    async def fake_pdp(**kwargs):
+        return "refreshed"
+
+    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
+    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
+    wrote, held, failed = (asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1")) for _ in range(3))
+    assert wrote["projected"] == 1 and wrote["wrote_mirror"] == 1 and wrote["wrote_mirror_variants"] == 1
+    assert held["projected"] == 1 and held["offer_skip_variant_not_re_read"] == 3
+    assert held["offer_skip_mirror_variants_listing_offer_not_written"] == 1
+    assert failed["projected"] == 1 and failed["errored"] == 0
+    assert failed["offer_skip_mirror_variants_error"] == 1
+    for counts in (wrote, held, failed):
+        assert not any(k.startswith("skip_") for k in counts), counts
