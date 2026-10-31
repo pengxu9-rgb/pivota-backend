@@ -1,6 +1,6 @@
 # ADR-027: Best effective price comes from checkout-verified deals, never from scraped coupon sites
 
-**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link).
+**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link) and 2026-10-31 (Q13 program permission to test, Q14 the network lane).
 - peng resolved four questions on 2026-10-29 and six more on 2026-10-30 (see "Resolved questions").
 - Phase 0a ran on 2026-10-29. Its base was unusable, so the gate has not been computed (see "Phases and gates").
 
@@ -97,7 +97,7 @@ Pivota does not query coupon aggregator sites while serving a request, and v1 do
 |---|---|---|---|
 | `checkout_automatic` | A | A Shopify automatic discount that appears as an allocation on a reference cart | Verified, per variant (D3) |
 | `merchant_published` | B | "Use WELCOME15" on the merchant's own homepage, PDP or promo bar | Verified per variant after D3; otherwise stored, **not emitted (v1)** |
-| `authorized_feed` | B | An affiliate network's promotion feed for a program we belong to | Verified per variant after D3; otherwise stored, **not emitted (v1)** |
+| `authorized_feed` | B | An affiliate network's promotion feed for a program we belong to, limited to codes Q14 allows | Verified per variant after D3 (Q13); otherwise stored, **not emitted (v1)** |
 | `channel_exclusive` | A+ | A code the merchant creates for AI-channel buyers, created in their Shopify by us (D8) | Verified, per variant (D3) |
 
 These are **never** ingested:
@@ -130,7 +130,8 @@ What one verification proves, and what it does not:
 
 **Platforms:**
 - **Shopify, connected store:** the existing Storefront cart path in `shopify_storefront_pricing_service`.
-- **Shopify, not connected:** these deals stay stored and unverified until both of these are true:
+- **Shopify, not connected, but in an affiliate program we have joined (Q13):** that program's feed codes may be tested, under every rule below, once the program's permission is recorded and `DEAL_VERIFY_PROGRAM_ENABLED` is set.
+- **Shopify, not connected, with no such relationship:** these deals stay stored and unverified until both of these are true:
   - tokenless Storefront carts are confirmed to support the cart mutations we need. Phase 0a answered this from Shopify's documentation only; it has not been tried against any store;
   - testing codes against non-connected stores has been separately and explicitly approved by peng (Q2, Q10). **Testing is off until then.** The verifier refuses non-connected hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` is set, and the flag stays unset until that approval.
 - **Other platforms:** a UCP `create_checkout` where the merchant exposes one (Phase 2). Otherwise the deal stays stored and unverified.
@@ -265,7 +266,7 @@ A verified deal may show an effective price only on a lane that both carries the
 | **Referral link** (the card's `/r` destination is a product page, not a cart, for example when the purchasability gate declines the cart) | **No** | — | Not emitted. `/r` never appends a code to a referral destination |
 | **Reap cart-link** (ADR-025 D6b) | **No.** `validate_cart_link` deliberately refuses `discount=`, and Reap's callers never pass a code | — | **Excluded.** Carrying a code there needs a change to Reap's allowlist, which is a separate decision with its own review |
 | **UCP delegated checkout / Reap variant lane** | Not established | Per-merchant proof that a code can be passed and is applied | Excluded in v1. Revisit in Phase 2 with UCP verification |
-| **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together | Excluded in v1. When added, the carrier is the network link (Q9) |
+| **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together, plus that program's carrier check (Q14) | Excluded in v1. When added, the carrier is the network link (Q9, Q14) |
 | **Handed-out `pdp_url`** (an agent passes the product page on) | No | — | No effective price. The effective price is attached to the code-carrying link only, never to the bare `pdp_url` |
 | **Other click-outs** (non-Shopify web checkout; the buyer types the code) | Only by the buyer | A verification on that same checkout (UCP, Phase 2) | Excluded in v1 |
 
@@ -313,7 +314,7 @@ Otherwise it redirects without the code. So the kill switches and the stop row t
 
 #### Kill switches
 
-Four independent flags, all default off, each able to stop its part alone:
+Four independent flags, all default off, each able to stop its part alone (plus the two testing-scope flags in D3, `DEAL_VERIFY_NONCONNECTED_ENABLED` and `DEAL_VERIFY_PROGRAM_ENABLED`):
 - `DEAL_LANE_EMIT_ENABLED`: serving emits deals at all;
 - `DEAL_LANE_RANKING_ENABLED`: deals may change seller order within a product (stays off through Phase 1; Q6);
 - `DEAL_LANE_DISCOUNT_PARAM_ENABLED`: `/r` appends `discount=`;
@@ -372,7 +373,7 @@ That shows peng whether a failed gate means few deals or few connections.
 **Phase 2: measure, then widen.**
 - Ranking on verified deals, within Q6's limits: seller order within a product only, and only once the false-savings rate has been measured.
 - UCP verification for non-Shopify merchants.
-- `authorized_feed` ingestion, once affiliate network access exists, carried on the network link (Q9).
+- `authorized_feed` ingestion, once affiliate network access exists, carried on the network link (Q9), under Q13's testing permission and Q14's per-program rules.
 - SG, if it passes the gate (Q4).
 
 **Phase 3: channel-exclusive codes (D8)**, on a merchant commitment.
@@ -455,3 +456,24 @@ That shows peng whether a failed gate means few deals or few connections.
    - Where a lane can carry our attribution but not the code, the link carries the attribution only, and the deal is not emitted on that lane. We never trade attribution for the code.
    - Those lanes are listed as work to do, each with its own review: the Reap cart-link, whose allowlist refuses `discount=` (D7), and any affiliate network whose tracking link drops it (Q9).
    - That both arrive together is checked on the first reconciled orders (Metrics: both-carried rate).
+
+## Resolved questions (peng, 2026-10-31)
+
+13. **An affiliate program we have joined counts as permission to test its codes.**
+   - Being an approved publisher in a merchant's program, where the program's terms or the merchant in writing allow automated checks, is that merchant's permission to test that program's feed codes. The permission is recorded per program, in the database, with its source and date.
+   - Testing then follows every D3 rule: the per-host daily cap, the crawl egress, signed requests, carts never checked out, and the opt-out denylist. It covers only codes Q14 allows, from that program's feed.
+   - It is behind its own flag, `DEAL_VERIFY_PROGRAM_ENABLED` (default off). The verifier refuses a non-connected host unless that host's program permission is recorded and the flag is set, or Q2's approval exists.
+   - Q2's separate approval now covers only stores with no relationship to Pivota.
+14. **The network lane: which codes, and how the link is checked.**
+   - **Which codes.** Only codes from that network's feed, for a program we have joined, inside their start and end dates, that are assigned to Pivota or open to every publisher in the program. Never:
+     - a code assigned to another publisher: networks credit an assigned code to its owner, even without a click, or reverse the sale;
+     - a code from outside the network, such as one from the merchant's own site, unless the program's terms allow it in writing;
+     - a code whose assignment the feed does not state. Where a network's feed has no such field, we ask the program for a code assigned to Pivota, or emit none.
+   - **Codes assigned to Pivota are preferred.** We ask each program for one. With code-based attribution, a sale on our own code is credited to us even if the network's click id is lost between the redirect and the checkout.
+   - **How we apply.** We describe Pivota as what it is: an AI shopping assistant that compares sellers and shows offers the merchant provides. We do not declare a coupon or deal model only to obtain codes, and we do not hide code use behind another category. A program that excludes coupon or deal publishers gets the tracked link only, never a code (Q12).
+   - **The carrier check, once per program, before any code is emitted on it:**
+     1. The deep link is generated through the network's own link interface, without a click, and it confirms that deep links to the exact destination host are allowed. Some networks silently send a disallowed deep link to the home page, so the code would never load.
+     2. The generated link still carries the destination's code intact.
+     3. One test click, run as a one-off job on the crawl egress with a controller slot, confirms that the network's click identifier reaches the merchant's landing page. If it does not, the program's codes are emitted only where Pivota holds a code assigned to it; otherwise the link carries our tracking only.
+     4. The first conversions in the network's report must show both our sub-id and the code (Metrics: both-carried rate).
+   - Agreements made directly with merchants are a separate, later decision.
