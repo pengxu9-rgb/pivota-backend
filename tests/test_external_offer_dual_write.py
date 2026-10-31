@@ -49,6 +49,12 @@ class FakeDB:
     async def execute(self, sql, params=None):
         self.executed.append({"sql": str(sql), "params": dict(params or {})})
 
+    async def fetch_all(self, sql, params=None):
+        # A refresh of a mirrored seed reads the mirror's offer rows for its variant lane
+        # (`sync_mirror_variant_offers`): this mirror has no variant row.
+        assert "FROM catalog_offers" in str(sql) and params == {"product_key": self._mirror["product_key"]}
+        return []
+
 
 _REAL_PK = "prod::merch_obs_deadbeef::external_seed::ext1"  # per-brand seller key
 _REAL_SELLER = "merch_obs_deadbeef"
@@ -313,6 +319,8 @@ async def test_the_mirror_row_is_stamped_only_on_a_vouched_read(monkeypatch, sou
 
     result = await mod.sync_offer_for_seed("s1", attached_price_source=source, currency_read=currency_read)
     assert result["status"] == "synced" and result["target"] == "mirror"
+    # Only a refresh runs the variant lane, and here it really ran (no variant row), not errored.
+    assert result.get("variant_status") == ("no_variant_offer" if source == "refresh" else None), result
     assert fake.executed[0]["params"]["price_read"] is stamped
     assert mod.price_was_read(source, currency_read) is stamped
 
@@ -346,7 +354,7 @@ async def test_without_the_column_the_mirror_writes_the_price_with_the_pre_246_s
     monkeypatch.setattr(mod, "database", fake)
 
     result = await mod.sync_offer_for_seed("s1", attached_price_source="refresh", currency_read=True)
-    assert result["status"] == "synced"
+    assert result["status"] == "synced" and result["variant_status"] == "no_variant_offer", result
     write = fake.executed[0]
     assert write["sql"] == mod.MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK
     assert "price_checked_at" not in write["sql"] and "price_read" not in write["params"]
