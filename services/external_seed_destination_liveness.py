@@ -384,14 +384,34 @@ class CatalogueRead:
     handles: Set[str] = field(default_factory=set)
     product_count: int = 0
     note: str = ""
+    # THE PRICE LANE'S HALF (the seed refresh, `services.external_seed_catalogue_refresh`), filled
+    # only when the caller names the handles it wants (`want_products`). Each value is a product
+    # object exactly as a 200 JSON page served it, so it is a FACT ABOUT THAT PRODUCT however the read
+    # ended -- unlike `handles`, which stays empty on any read that did not reach the end, because an
+    # absent handle is only evidence about a catalogue read whole. Never absence evidence.
+    products: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Per page that served products, in order: the `Set-Cookie` headers of THAT response, so the
+    # price lane can read the currency each page was presented in (`services.shopify_presentment`).
+    page_set_cookies: List[List[str]] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
         return self.status == CATALOGUE_OK
 
 
+# The price lane found every handle it asked for before the end of the catalogue and stopped there.
+# NOT `usable`: the handles past that page were never read, so nothing may be called delisted off it.
+CATALOGUE_WANTED_FOUND = "wanted_found"
+
+
 async def read_brand_catalogue(
-    client: httpx.AsyncClient, host: str, *, attempts: int = 3
+    client: httpx.AsyncClient,
+    host: str,
+    *,
+    attempts: int = 3,
+    want_products: Optional[Set[str]] = None,
+    max_pages: Optional[int] = None,
+    user_agent: str = USER_AGENT,
 ) -> CatalogueRead:
     """Every handle a Shopify storefront lists, or an honest reason we could not read it.
 
@@ -399,19 +419,37 @@ async def read_brand_catalogue(
     every unread page into a fabricated dead handle — it produced 285 of them on one host
     before this was fixed — so a truncated read is discarded and its host leaves the
     denominator entirely.
+
+    `want_products` (the seed refresh's catalogue price lane): the lower-cased handles whose
+    product objects to keep in `products`, with each page's Set-Cookie headers in
+    `page_set_cookies`. The read stops at the first page after which every wanted handle has been
+    seen (`CATALOGUE_WANTED_FOUND`), and after `max_pages` pages (`CATALOGUE_INCOMPLETE`). The
+    sweep passes neither, and its read is exactly what it was. `user_agent` is the one robots.txt
+    is asked for and the request carries.
     """
     handles: Set[str] = set()
     total = 0
     seen_pages: Set[Tuple[str, ...]] = set()
-    for page in range(1, MAX_CATALOGUE_PAGES + 1):
+    wanted = {str(h).strip().lower() for h in (want_products or ()) if str(h).strip()}
+    products: Dict[str, Dict[str, Any]] = {}
+    page_set_cookies: List[List[str]] = []
+
+    def _read(status: str, kept_handles: Set[str], count: int, note: str) -> CatalogueRead:
+        return CatalogueRead(status, kept_handles, count, note, products, page_set_cookies)
+
+    page_cap = MAX_CATALOGUE_PAGES if max_pages is None else max(1, min(int(max_pages), MAX_CATALOGUE_PAGES))
+    for page in range(1, page_cap + 1):
         url = f"https://{host}/products.json?limit={PAGE_LIMIT}&page={page}"
-        kind, payload = await _get_catalogue_page(client, url, attempts)
+        cookies: List[List[str]] = []
+        kind, payload = await _get_catalogue_page(
+            client, url, attempts, user_agent=user_agent, set_cookies_out=cookies if wanted else None
+        )
         if kind != "products":
             note = payload if isinstance(payload, str) else str(payload)
             if page == 1:
                 status = note if kind == "http" else kind
-                return CatalogueRead(status, set(), total, note)
-            return CatalogueRead(CATALOGUE_INCOMPLETE, set(), total, f"broke at page {page}: {note}")
+                return _read(status, set(), total, note)
+            return _read(CATALOGUE_INCOMPLETE, set(), total, f"broke at page {page}: {note}")
         if not payload:
             if page == 1:
                 # ZERO PRODUCTS ON PAGE 1 IS NOT A CATALOGUE OF ZERO PRODUCTS. A storefront
@@ -420,38 +458,53 @@ async def read_brand_catalogue(
                 # answering 200. Treating it as usable marks every seed on the host delisted
                 # and turns "one request per host" into one PDP fetch per seed — aimed at
                 # exactly the hosts most likely to be refusing us.
-                return CatalogueRead(CATALOGUE_EMPTY, set(), 0, "page 1 listed no products")
-            return CatalogueRead(CATALOGUE_OK, handles, total, f"{page - 1} page(s)")
+                return _read(CATALOGUE_EMPTY, set(), 0, "page 1 listed no products")
+            return _read(CATALOGUE_OK, handles, total, f"{page - 1} page(s)")
         # A store that ignores ?page serves page 1 forever: with no short-page stop, only this
         # ends it (before MAX_CATALOGUE_PAGES identical requests), as an honest non-read.
         page_key = tuple(json.dumps([(p or {}).get("id"), (p or {}).get("handle"), (p or {}).get("title")],
                                     default=str) for p in payload)
         if page_key in seen_pages:
-            return CatalogueRead(CATALOGUE_INCOMPLETE, set(), total,
-                                 f"page {page} repeated an earlier page; pagination did not advance")
+            return _read(CATALOGUE_INCOMPLETE, set(), total,
+                         f"page {page} repeated an earlier page; pagination did not advance")
         seen_pages.add(page_key)
         total += len(payload)
+        if wanted:
+            page_set_cookies.append(cookies[0] if cookies else [])
         for product in payload:
             handle = str((product or {}).get("handle") or "").strip().lower()
             if handle:
                 handles.add(handle)
+                # The FIRST page to list a handle wins: a later listing of the same handle is a
+                # store's data error, not a newer price.
+                if handle in wanted and handle not in products and isinstance(product, dict):
+                    products[handle] = product
         # Only the empty page above ends the catalogue: Shopify serves SHORT pages mid-catalogue
         # (hidden products count toward `limit`; bluemercury.com page 1 = 249, page 2 = 250), and
         # stopping on one reads every later handle as delisted.
-    return CatalogueRead(
+        if wanted and wanted <= set(products):
+            return _read(CATALOGUE_WANTED_FOUND, set(), total, f"{page} page(s); every wanted handle found")
+    if page_cap < MAX_CATALOGUE_PAGES:
+        return _read(CATALOGUE_INCOMPLETE, set(), total, f"hit max_pages={page_cap}")
+    return _read(
         CATALOGUE_INCOMPLETE, set(), total, f"hit MAX_CATALOGUE_PAGES={MAX_CATALOGUE_PAGES}"
     )
 
 
 async def _get_catalogue_page(
-    client: httpx.AsyncClient, url: str, attempts: int
+    client: httpx.AsyncClient,
+    url: str,
+    attempts: int,
+    *,
+    user_agent: str = USER_AGENT,
+    set_cookies_out: Optional[List[List[str]]] = None,
 ) -> Tuple[str, Any]:
     last = ""
     for attempt in range(max(1, attempts)):
         try:
             # max_wait=0 is UNBOUNDED, which is what a batch wants: the default ceiling makes
             # the backoff curve above ~16s unreachable and records a refusal instead of waiting.
-            await crawl_politeness.before_request(url, user_agent=USER_AGENT, max_wait=0)
+            await crawl_politeness.before_request(url, user_agent=user_agent, max_wait=0)
         except crawl_politeness.RobotsDisallowed:
             return "robots_disallowed", "robots.txt"
         except crawl_global_pacer.GlobalPaceStopped:
@@ -460,7 +513,7 @@ async def _get_catalogue_page(
             return "gate_error", f"{type(exc).__name__}: {exc}"
 
         try:
-            resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+            resp = await client.get(url, headers={"User-Agent": user_agent})
         except crawl_global_pacer.GlobalPaceStopped:
             raise  # a refused redirect hop: the run stopped, not a fact about this host
         except crawl_politeness.RobotsDisallowed:
@@ -489,9 +542,13 @@ async def _get_catalogue_page(
         if "json" not in (resp.headers.get("content-type") or "").lower():
             return "not_json", (resp.headers.get("content-type") or "")[:60]
         try:
-            return "products", (resp.json() or {}).get("products") or []
+            products = (resp.json() or {}).get("products") or []
         except Exception:  # noqa: BLE001
             return "bad_json", ""
+        if set_cookies_out is not None:
+            get_list = getattr(resp.headers, "get_list", None)
+            set_cookies_out.append(list(get_list("set-cookie")) if callable(get_list) else [])
+        return "products", products
     return "exhausted", last or "retries exhausted"
 
 
