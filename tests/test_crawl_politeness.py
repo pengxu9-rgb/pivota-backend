@@ -917,9 +917,23 @@ def test_the_inflight_map_is_dropped_when_the_event_loop_changes() -> None:
     async def once() -> bool:
         return await cp.robots_allows("https://shop.example/x", user_agent="PivotaBot")
 
-    assert asyncio.run(once()) is True
-    cp._ROBOTS.clear()          # force a cache miss so the second run takes the leader path
-    assert asyncio.run(once()) is True, "a second event loop must not inherit a stale future"
+    # Each asyncio.run() copies this context, so the scripted robots.txt (a 404: no rules)
+    # reaches both loops. Unscripted, both runs looked the host up for real.
+    fetched: List[str] = []
+
+    def robots(request: httpx.Request) -> httpx.Response:
+        fetched.append(str(request.url))
+        return httpx.Response(404, request=request)
+
+    token = cp.ROBOTS_TRANSPORT_FACTORY.set(lambda: httpx.MockTransport(robots))
+    try:
+        assert asyncio.run(once()) is True
+        cp._ROBOTS.clear()          # force a cache miss so the second run takes the leader path
+        assert asyncio.run(once()) is True, "a second event loop must not inherit a stale future"
+    finally:
+        cp.ROBOTS_TRANSPORT_FACTORY.reset(token)
+    # The second loop really did lead a fresh fetch, rather than finding something cached.
+    assert fetched == ["https://shop.example/robots.txt"] * 2
 
 
 # --- per-lane semantics, not just "the string is present" -------------------------------------

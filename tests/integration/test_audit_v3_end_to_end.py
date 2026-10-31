@@ -398,6 +398,20 @@ def audit_harness(monkeypatch):
         audit_runs_routes.settings, "deepseek_api_key", "test-deepseek-key",
         raising=False,
     )
+
+    # That key makes the provider look configured, so prompt synthesis (winnable prompts)
+    # runs -- and, unscripted, POSTed the fake key to the provider's real API on every run.
+    # Scripted as the refusal a bad key gets; every caller is best-effort and falls back to
+    # the deterministic prompt specs, which is the path these tests assert.
+    from services import llm_synthesis
+
+    store.synth_calls = []
+
+    async def _synthesize(**kwargs):
+        store.synth_calls.append(kwargs.get("provider"))
+        raise llm_synthesis.LLMSynthesisError("scripted: provider refused the key", provider=kwargs.get("provider"))
+
+    monkeypatch.setattr(llm_synthesis, "synthesize", _synthesize)
     monkeypatch.setattr(
         audit_runs_routes, "find_in_flight_by_idempotency_key",
         store.find_idempotent,
@@ -634,6 +648,9 @@ async def test_v3_audit_happy_path_returns_per_sku_report(audit_harness):
     }
     assert {"gemini", "chatgpt", "deepseek"}.issubset(provider_names)
     _recursive_assert_absent(body, "usd_cogs_internal")
+    # Prompt synthesis was tried with the configured provider, refused (scripted), and the run
+    # completed on the deterministic prompt specs.
+    assert store.synth_calls and set(store.synth_calls) == {"deepseek"}
 
 
 @pytest.mark.asyncio

@@ -440,6 +440,16 @@ def test_psp_setup_route_executed(monkeypatch, status, auto_approved, expected):
         if hasattr(module, name):
             monkeypatch.setattr(module, name, fake_update)
 
+    # Past the gate the key is checked against the PSP's API. Unscripted, that sent this fake key
+    # to the real API on every run. Scripted as a key the PSP rejects, and recorded.
+    validated = []
+
+    def fake_validate(api_key):
+        validated.append(api_key)
+        return False
+
+    monkeypatch.setattr(module, "validate_stripe_key_sync", fake_validate)
+
     resp = client.post(
         "/merchant/onboarding/psp/setup",
         json={"merchant_id": "merch_a", "psp_type": "stripe", "psp_key": "sk_test_x"},
@@ -449,8 +459,10 @@ def test_psp_setup_route_executed(monkeypatch, status, auto_approved, expected):
             f"status={status} auto_approved={auto_approved} reached PSP setup"
         )
         assert "approved" in str(resp.json()).lower()
+        assert validated == [], "a merchant that is not approved had its key sent to the PSP"
     else:
         assert resp.status_code != 400 or "approved" not in str(resp.json()).lower()
+        assert validated == ["sk_test_x"]
 
 
 def test_rejecting_calls_the_serving_suppression(monkeypatch):

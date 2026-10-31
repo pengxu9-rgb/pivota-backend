@@ -29,6 +29,13 @@ from services.source_quarantine import (  # noqa: E402
 
 CONFIRM_CREATE = "SOURCE_QUARANTINE_CREATE"
 CONFIRM_REVOKE = "SOURCE_QUARANTINE_REVOKE"
+VIEW_RESTORE_NEXT_STEP = (
+    "agent_pdp_view rows reaped while this source was quarantined are restored by the reconciler "
+    "tick, usually within 6 h (it runs every 6 h at :43); longer for revokes over 150 keys (150 a "
+    "tick) or for backed-off keys. To restore now: ENV_VARS=PIVOTA_ENV=production,DB_STATEMENT_TIMEOUT_SECONDS=30,"
+    "DB_COMMAND_TIMEOUT_SECONDS=600,AGENT_PDP_VIEW_MARKET_PRICES=on bash scripts/ops/run_oneoff_job.sh "
+    "scripts/reap_orphaned_agent_pdp_view.py --restore (add --retry-backoff after a fixed outage)"
+)
 SAMPLE_LIMIT = 10
 
 
@@ -188,7 +195,16 @@ async def _handle_revoke(args: argparse.Namespace, db: Any) -> dict[str, Any]:
         revoked_by=args.revoked_by,
         db=db,
     )
-    return {"action": "revoke", "dry_run": False, "revoked": asdict(row)}
+    return {
+        "action": "revoke",
+        "dry_run": False,
+        "revoked": asdict(row),
+        # Not rebuilt from here: this CLI's connection is not the process-wide database the
+        # builder's enrichment and seller-trust overlays read, so a row rebuilt here would be
+        # served without them. The agent_pdp_view reconciler tick restores reaped keys every
+        # pass, in-process; to restore now, run the restore as a one-off job.
+        "view_restore": VIEW_RESTORE_NEXT_STEP,
+    }
 
 
 async def _handle_list(args: argparse.Namespace, db: Any) -> dict[str, Any]:

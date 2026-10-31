@@ -32,7 +32,12 @@ refreshed_at=NOW(), so a converged row drops out of the candidate set and
 idle passes write nothing. Orphan view rows (content_key with no
 catalog_products row left) are deliberately out of scope — the orphan
 reaper owns deletes; this job only converges rows that upstream truth says
-should exist.
+should exist. The same goes for view rows whose keys fail the `buildable`
+gate below: the refresh primitive deletes those itself while
+AGENT_PDP_VIEW_UNBUILDABLE_REAP is on
+(services.agent_pdp_view_assembler.delete_agent_pdp_view_if_unbuildable), and
+each tick rebuilds the reaped keys that are buildable again
+(restore_reaped_agent_pdp_view_rows).
 
 Env vars:
   AGENT_PDP_VIEW_RECONCILE_ENABLED       default true — set false to pause
@@ -42,6 +47,8 @@ Env vars:
       stays in the minutes range, well inside the 6h cron cadence)
   AGENT_PDP_VIEW_DRIFT_ALERT_THRESHOLD   default 200 — ERROR-log when more
       stale+missing view rows than this remain after a pass
+  AGENT_PDP_VIEW_RESTORE_MAX_KEYS        default 150 — unbuildable-reap restores per tick
+  AGENT_PDP_VIEW_RESTORE_MAX_SECONDS     default 180 — and at most this long
 """
 
 from __future__ import annotations
@@ -59,6 +66,14 @@ _ENV_LIMIT = "AGENT_PDP_VIEW_RECONCILE_LIMIT"
 _ENV_DRIFT_THRESHOLD = "AGENT_PDP_VIEW_DRIFT_ALERT_THRESHOLD"
 
 REFRESH_SOURCE = "reconciler_cron"
+
+# The unbuildable-reap restore runs first in each tick; a large revoke must not hold the
+# reconcile pass up, so one tick finishes at most this many keys / seconds (~1s+ per rebuild).
+# The rest wait for the next tick; `reap_orphaned_agent_pdp_view --restore` has no bound.
+_ENV_RESTORE_MAX_KEYS = "AGENT_PDP_VIEW_RESTORE_MAX_KEYS"
+_ENV_RESTORE_MAX_SECONDS = "AGENT_PDP_VIEW_RESTORE_MAX_SECONDS"
+_DEFAULT_RESTORE_MAX_KEYS = 150
+_DEFAULT_RESTORE_MAX_SECONDS = 180
 
 
 def _is_enabled() -> bool:
@@ -282,6 +297,37 @@ async def reconcile_agent_pdp_view(
     return counters
 
 
+async def _restore_reaped_rows(db: Any) -> None:
+    """Rebuild unbuildable-reaped keys whose quarantine was revoked or has expired.
+
+    Expiry fires no event (the quarantine anti-join just stops matching), so this
+    tick is what brings an expired quarantine's keys back, and a revoked one's (the
+    quarantine CLI does not rebuild views: its connection is not the one the builder's
+    overlays read). The tick runs every 6 h at :43, so a key is back usually within 6 h;
+    longer for revokes over the per-tick cap (AGENT_PDP_VIEW_RESTORE_MAX_KEYS, 150) or for
+    backed-off keys. Best-effort: a restore failure never fails the reconcile pass.
+    """
+    try:
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        restored = await restore_reaped_agent_pdp_view_rows(
+            db=db,
+            refresh_source=REFRESH_SOURCE,
+            max_keys=_int_env(_ENV_RESTORE_MAX_KEYS, _DEFAULT_RESTORE_MAX_KEYS, floor=1),
+            max_seconds=_int_env(_ENV_RESTORE_MAX_SECONDS, _DEFAULT_RESTORE_MAX_SECONDS, floor=1),
+        )
+        if restored["errors"]:
+            logger.warning(
+                "agent_pdp_view_reconcile: unbuildable restore: %d key(s) failed "
+                "(agent_pdp_view_unbuildable_restore_failed lines name them); %s",
+                restored["errors"], restored,
+            )
+        elif restored["candidates"]:
+            logger.warning("agent_pdp_view_reconcile: unbuildable restore %s", restored)
+    except Exception as exc:  # noqa: BLE001 — WARNING, not ERROR: the drift ERROR is the pass's alarm
+        logger.warning("agent_pdp_view_reconcile: unbuildable restore failed: %s", str(exc)[:300])
+
+
 async def run_agent_pdp_view_reconcile_tick(
     *,
     db: Any = None,
@@ -296,6 +342,8 @@ async def run_agent_pdp_view_reconcile_tick(
         if db is None:
             from db.database import database as db  # type: ignore[no-redef]
 
+        # First, and on its own guard: a reconcile failure must not also stall restores.
+        await _restore_reaped_rows(db)
         counters = await reconcile_agent_pdp_view(db=db, limit=_limit(), refresh=refresh)
         logger.info(
             "agent_pdp_view_reconcile: candidates=%d refreshed=%d "

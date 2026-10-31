@@ -27,6 +27,23 @@ Usage:
   # by hand against prod — dry-run first, since the Job's baked args include --apply
   gcloud run jobs execute agent-pdp-orphan-reaper --region us-west1 --project pivota-prod --wait \
     --args 'scripts/reap_orphaned_agent_pdp_view.py,--limit,0'
+
+--unbuildable switches to the OTHER class: view rows whose content_key still has
+catalog rows, none of which the builder may use (all source-quarantined or all
+title-less), so every refresh declines them and they keep serving an old snapshot.
+See reap_unbuildable_agent_pdp_view_rows. The scheduled Job does not pass it; the
+backlog is removed by hand, dry-run first. --apply refuses unless
+AGENT_PDP_VIEW_UNBUILDABLE_REAP=on and the audit table (migration 272) exists; every
+deleted row is recorded there. --restore rebuilds reaped keys that are buildable again
+and re-points their funnel links (the reconciler tick runs the same pass, usually within 6 h;
+--restore is the way to do it now). --retry-backoff also takes keys whose restore failed or
+was declined earlier and are waiting out a backoff (up to 7 days): use it after an outage is
+fixed.
+
+  python -m scripts.reap_orphaned_agent_pdp_view --unbuildable            # dry-run
+  AGENT_PDP_VIEW_UNBUILDABLE_REAP=on python -m scripts.reap_orphaned_agent_pdp_view --unbuildable --apply
+  python -m scripts.reap_orphaned_agent_pdp_view --restore
+  python -m scripts.reap_orphaned_agent_pdp_view --restore --retry-backoff
 """
 
 from __future__ import annotations
@@ -50,6 +67,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.agent_pdp_view_assembler import (  # noqa: E402
     reap_orphaned_agent_pdp_view_rows,
+    reap_unbuildable_agent_pdp_view_rows,
+    restore_reaped_agent_pdp_view_rows,
 )
 
 logger = logging.getLogger("reap_orphaned_agent_pdp_view")
@@ -70,6 +89,15 @@ async def _disconnect_if_needed(db: Any, was: bool) -> None:
 async def _drive(args: argparse.Namespace, *, db: Any = database) -> Dict[str, Any]:
     was = await _connect_if_needed(db)
     try:
+        if getattr(args, "restore", False):
+            return await restore_reaped_agent_pdp_view_rows(
+                db=db, max_keys=args.limit or None,
+                ignore_backoff=bool(getattr(args, "retry_backoff", False)),
+            )
+        if getattr(args, "unbuildable", False):
+            return await reap_unbuildable_agent_pdp_view_rows(
+                db=db, limit=args.limit, dry_run=not args.apply
+            )
         return await reap_orphaned_agent_pdp_view_rows(
             db=db, limit=args.limit, dry_run=not args.apply
         )
@@ -85,7 +113,21 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--limit", type=int, default=0,
-        help="Max orphans to process this run (0 = all). Default 0.",
+        help="Max keys to process this run (0 = all): orphans by default, unbuildable rows "
+        "with --unbuildable, keys to restore with --restore. Default 0.",
+    )
+    p.add_argument(
+        "--unbuildable", action="store_true",
+        help="Reap view rows whose catalog rows all fail the builder (quarantined / "
+        "title-less) instead of orphans. Default: orphans.",
+    )
+    p.add_argument(
+        "--retry-backoff", action="store_true",
+        help="With --restore: also retry keys waiting out a backoff (after a fixed outage).",
+    )
+    p.add_argument(
+        "--restore", action="store_true",
+        help="Rebuild unbuildable-reaped keys that are buildable again, from the audit table.",
     )
     return p.parse_args()
 
@@ -95,6 +137,9 @@ def main() -> int:
     args = _parse_args()
     report = asyncio.run(_drive(args))
     print(json.dumps(report, indent=2, default=str))
+    if args.unbuildable or args.restore:
+        # Both passes log their own WARNING line.
+        return 0
 
     # Emitted at WARNING so it carries a severity into Cloud Logging, where this
     # sweep now runs. The GitHub workflow it replaces uploaded both reports as a
