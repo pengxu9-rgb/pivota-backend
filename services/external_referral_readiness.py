@@ -33,6 +33,7 @@ from services.external_seed_destination_liveness import (
     RETIREMENT_STREAK,
 )
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
+from services import external_seed_catalogue_refresh as catalogue_lane
 from services.external_seed_search import (
     SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
@@ -2037,6 +2038,34 @@ async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, s
     return hosts
 
 
+async def _fetch_refresh_candidate_dests(seed_ids: Sequence[str]) -> Dict[str, str]:
+    """seed id -> destination_url, for the catalogue price lane's plan (the URL the refresh reads).
+
+    Fails open to "no catalogue lane": a lookup error leaves every row on its page read."""
+    dests: Dict[str, str] = {}
+    ids = [str(s) for s in seed_ids if s]
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            params = {f"id{i}": seed_id for i, seed_id in enumerate(chunk)}
+            placeholders = ", ".join(f":id{i}" for i in range(len(chunk)))
+            rows = await database.fetch_all(
+                f"SELECT id, destination_url FROM external_product_seeds WHERE id IN ({placeholders})",
+                params,
+            )
+            for row in rows or []:
+                row_dict = _row_to_dict(row)
+                if row_dict.get("destination_url"):
+                    dests[str(row_dict.get("id"))] = str(row_dict["destination_url"])
+    except Exception as exc:  # noqa: BLE001 - the lane is an optimisation, the refresh is not
+        logger.warning(
+            "external referral refresh: destination lookup failed (%s); the catalogue lane is OFF "
+            "for this run", str(exc)[:200],
+        )
+        return {}
+    return dests
+
+
 async def _run_workers(worker: Callable[[], Awaitable[None]], concurrency: int) -> None:
     if concurrency <= 1:
         # Inline, in this task's own context: exactly the serial loop this replaced.
@@ -2129,6 +2158,25 @@ async def run_external_referral_refresh_batch(
     # Looked up whatever the breakers say: the host is also the concurrency key (one row in
     # flight per host) and the per-host timing key. Without hosts every row is its own lane.
     candidate_hosts = await _fetch_refresh_candidate_hosts(candidate_seed_ids)
+    # THE CATALOGUE PRICE LANE (`services.external_seed_catalogue_refresh`, default OFF). A host with
+    # at least `catalogue_min_seeds()` candidates whose URL its own catalogue prices has its
+    # `/products.json` read ONCE, by the worker that takes its lane (so still one request in flight per
+    # host, every request on the global pacer), and each of its rows is then refreshed from memory.
+    # Every row the catalogue does not price keeps its page read, unchanged.
+    catalogue_on = catalogue_lane.catalogue_refresh_enabled()
+    catalogue_min = catalogue_lane.catalogue_min_seeds()
+    catalogue_wanted: Dict[str, set] = {}
+    candidate_dests: Dict[str, str] = {}
+    if catalogue_on and candidate_hosts:
+        candidate_dests = await _fetch_refresh_candidate_dests(candidate_seed_ids)
+        for seed_id, host in candidate_hosts.items():
+            handle = catalogue_lane.catalogue_handle(candidate_dests.get(seed_id))
+            if handle:
+                catalogue_wanted.setdefault(host, set()).add(handle)
+        catalogue_wanted = {h: w for h, w in catalogue_wanted.items() if len(w) >= catalogue_min}
+    host_catalogues: Dict[str, Any] = {}
+    catalogue_reasons: Dict[str, int] = {}
+    catalogue_rows_read = 0
     # Hosts this run has stopped asking, and how many of their rows it passed over. Those rows
     # are NOT stamped (`refresh_seed_by_id` is never called), so they keep their place at the
     # head of tomorrow's queue instead of being recorded as an attempt that never happened.
@@ -2221,16 +2269,27 @@ async def run_external_referral_refresh_batch(
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
         nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
-        nonlocal pdp_refreshed, pdp_errored
+        nonlocal pdp_refreshed, pdp_errored, catalogue_rows_read
         outcome = "failed"
         outcome_bucket = ""
         row_started = time.monotonic()
         try:
-            result = await refresh_seed_by_id(seed_id)
+            catalogue_read = None
+            if host in catalogue_wanted:
+                if host not in host_catalogues:
+                    host_catalogues[host] = await catalogue_lane.read_host_catalogue(host, catalogue_wanted[host])
+                catalogue_read, why = catalogue_lane.seed_catalogue_read(host_catalogues[host], candidate_dests.get(seed_id))
+                _bump(catalogue_reasons, why)
+            if catalogue_read is not None:
+                result = await refresh_seed_by_id(seed_id, catalogue_read=catalogue_read)
+            else:
+                result = await refresh_seed_by_id(seed_id)
             status = str(result.get("status") or "success")
             outcome = status
             if status == "success":
                 refreshed += 1
+                if result.get("read_source") == catalogue_lane.READ_SOURCE:
+                    catalogue_rows_read += 1
                 if result.get("snapshot_from_cache"):
                     refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
@@ -2723,5 +2782,20 @@ async def run_external_referral_refresh_batch(
             sorted(price_unreadable_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         ),
         "availability_changed": availability_changed,
+        # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
+        # how many rows it priced, and why the others kept their page read (`rows`).
+        "catalogue": {
+            "enabled": catalogue_on,
+            "min_seeds": catalogue_min,
+            "hosts_planned": len(catalogue_wanted),
+            "hosts_read": len(host_catalogues),
+            "host_status": dict(Counter(c.status for c in host_catalogues.values())),
+            "pages_read": sum(c.pages_read for c in host_catalogues.values()),
+            "rows_read": catalogue_rows_read,
+            "rows": dict(sorted(catalogue_reasons.items(), key=lambda kv: -kv[1])),
+            "hosts": [
+                c.summary() for c in sorted(host_catalogues.values(), key=lambda c: -c.wanted)[:15]
+            ],
+        },
         "errors": errors[:20],
     }

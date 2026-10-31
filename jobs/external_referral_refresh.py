@@ -77,7 +77,7 @@ from services.external_referral_readiness import run_external_referral_refresh_b
 logger = logging.getLogger(__name__)
 
 
-async def _refresh_unbounded(seed_id: str) -> Dict[str, Any]:
+async def _refresh_unbounded(seed_id: str, *, catalogue_read: Any = None) -> Dict[str, Any]:
     """The batch's patience is UNBOUNDED, and it has to say so.
 
     `crawl_politeness` refuses a slot further out than the caller allows, and the default
@@ -106,7 +106,13 @@ async def _refresh_unbounded(seed_id: str) -> Dict[str, Any]:
     (`services.external_referral_readiness.host_backoff_tripped`). That is strictly MORE polite,
     not less — the host gets no further requests this run — and its rows stay unstamped at the
     head of tomorrow's queue. Per-row patience is unchanged.
+
+    `catalogue_read` is the batch's catalogue price lane handing over this seed's entry from its host's
+    `/products.json` (EXTERNAL_REFERRAL_REFRESH_CATALOGUE_ENABLED, default off); without it the page is
+    read as always.
     """
+    if catalogue_read is not None:
+        return await _refresh_external_seed_by_id(seed_id, max_wait=0, catalogue_read=catalogue_read)
     return await _refresh_external_seed_by_id(seed_id, max_wait=0)
 
 
@@ -324,6 +330,8 @@ def main() -> int:
     print("PRICE_REFRESH " + json.dumps(price_refresh_line(summary), separators=(",", ":"), default=str))
     # Same reason, for the IP breaker and the 429/503 header aggregate: one filterable line a night.
     print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
+    # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
+    print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659
