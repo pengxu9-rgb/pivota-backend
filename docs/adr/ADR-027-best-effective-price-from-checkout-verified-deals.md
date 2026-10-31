@@ -205,7 +205,7 @@ Deals must be found before the buyer reaches the merchant's checkout, because a 
 
 ### D6. Storage: observed store offers, not a promotions engine
 
-A new table, `observed_store_offers`. It deliberately does not reuse the name `promotions` or any module name pinned by `TestPromotionsLaneStaysDeleted`. Those pins stay. One row per (seller, market, code-or-automatic-rule):
+A new table, `observed_store_offers`. It deliberately does not reuse the name `promotions` or any module name pinned by `TestPromotionsLaneStaysDeleted`. Those pins stay. One row per (seller, market, code-or-automatic-rule), plus `program_id` for `authorized_feed` rows:
 
 - **Identity:**
   - `seller_id` (ADR-009);
@@ -234,8 +234,8 @@ A new table, `observed_store_offers`. It deliberately does not reuse the name `p
   - the reference cart: variant, quantity (always 1), subtotal, discount amount and currency;
   - `failure_reason`;
   - `authorized_by`: which permission allowed the test (`connected`, `q2_approval` or `program:<program id>`), for the audit trail.
-- **Program permissions (Q13):** one row per affiliate program, holding the program, the network, our membership status, the source of the permission (program terms or the merchant in writing), its date, and the hosts it covers. A permission counts only while our membership is active. It is re-confirmed whenever the network reports a change to the program's terms, and it is suspended until then.
-- **Network links (Q14):** one row per (deal, variant, market), holding the tracking-only network link and the coded network link, with when each was generated and when it expires.
+- **Program permissions (Q13):** one row per affiliate program, holding the program, the network, our membership status, the source of the permission (program terms or the merchant in writing), its date, and the hosts it covers. A permission counts only while our membership is active. It is re-confirmed whenever the network reports a change to the program's terms, and in any case by a recorded re-confirmation date at most 90 days after the last one. That covers written merchant permissions and term changes the network does not report. Until it is re-confirmed, the permission is suspended.
+- **Network links (Q14):** one row per (deal, variant, market), holding its id, the deal reference, the tracking-only network link and the coded network link, with when each was generated and when it expires. A regenerated link replaces the old one in the same row, so tokens already handed out reach the current link.
 - **On the click row** (a schema change to ADR-025's click row; D7):
   - a new nullable `discount_code` field on `IssuedClick` and its click table, written by `issue_click` at issue time: the deal-lane code the link may carry;
   - a new `discount_carried` flag, filled by `/r` on that same row when the link is followed: whether `/r` actually appended the code.
@@ -285,7 +285,7 @@ Two places touch a deal-lane code, each with one job:
   It **never** writes `discount=` into the signed `dest` or the published `cart_url`. Both stay exactly as today, so `_seed_attribution_from_redirect`'s check that the recomposed link equals the signed `dest` still holds.
 - **Click time.** **Only `/r` appends `discount=CODE`**, and only after it re-checks the deal (below).
 
-The rule applies to **deal-lane codes** only: no deal-lane `discount=` on a click-out link without `country=` and the click attribute. Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
+The rule applies to **deal-lane codes** only: no deal-lane `discount=` on a click-out link without `country=` and the click attribute. On the network lane, our sub-id in the network's tracking link takes the place of the click attribute, and `country=` sits in the coded link's destination (Q14). Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
 
 **Links outlive decisions, so `/r` checks again.** In v1, a deal-lane code travels only on the `/r` redirect, never on a direct `cart_url`. When a `/r` link is followed, the redirect reads the token's deal reference and appends `discount=` only if all of these hold at that moment:
 - the token has not expired;
@@ -409,13 +409,13 @@ That shows peng whether a failed gate means few deals or few connections.
 - `TestPromotionsLaneStaysDeleted` stays as is. Add new pins:
   - the deal-read module (the code that reads `observed_store_offers` for serving and for `/r`) makes no outbound HTTP calls (D5). `/r`'s warm handoff, which does, is outside it;
   - `compose_attributed_destinations` never writes `discount=` into the signed `dest` or the published `cart_url` (D7);
-  - `/r` never appends a deal-lane `discount=` without `country=` and the click attribute, to a referral or warm-handoff destination, on an expired token, or when the declared market differs from the verification market or the market was defaulted (D7);
+  - `/r` never appends a deal-lane `discount=` without `country=` and the click attribute (on the network lane, the sub-id), to a referral or warm-handoff destination, on an expired token, or when the declared market differs from the verification market or the market was defaulted (D7);
   - a direct `cart_url` never carries a deal-lane `discount=` (D7);
   - a click where `/r` dropped the code is never counted as a failure signal (D7);
   - a price or sale-state change on a verified variant drops its effective price (D3);
   - the verifier refuses hosts on the opt-out denylist, and non-connected hosts with no program relationship while `DEAL_VERIFY_NONCONNECTED_ENABLED` is unset (D2, D3);
   - the verifier refuses a host in a joined program unless its program permission is recorded, `DEAL_VERIFY_PROGRAM_ENABLED` is set and the code came from that program's feed. `DEAL_VERIFY_NONCONNECTED_ENABLED` never authorizes such a host (Q13);
-  - on the network lane, `/r` redirects to the coded network link only after its re-check passes, and otherwise to the tracking-only link. It redirects only to links signed in the token (Q14);
+  - on the network lane, `/r` redirects to the coded network link only after its re-check passes, and otherwise to the tracking-only link. The token never contains the coded link or the code. `/r` loads the coded link by the network-links row id signed in the token, and uses it only when the row's deal reference matches the token's (Q14);
   - a coded network link is never handed out except through `/r` (Q14).
 
 ## Resolved questions (peng, 2026-10-29)
@@ -489,12 +489,17 @@ That shows peng whether a failed gate means few deals or few connections.
    - **Which code when two apply.** We ask each program for a code assigned to Pivota, because such a code cannot be credited to another publisher. When our code and an open code both apply to an offer, ours is used only when the buyer's verified price is the same or better. The buyer's price comes first (Q6).
    - **How we apply.** We describe Pivota as what it is: an AI shopping assistant that compares sellers and shows offers the merchant provides. We do not declare a coupon or deal model only to obtain codes, and we do not hide code use behind another category. A program that excludes coupon or deal publishers gets the tracked link only, never a code (Q12).
    - **The network lane goes through `/r` too.**
-     - For each (deal, variant, market), a background job generates two network links through the network's link interface (D6):
+     - For each (deal, variant, market), a background job generates two network links through the network's link interface, and stores them in one network-links row (D6):
        - a tracking-only link;
        - a coded link whose destination is the verified variant's cart permalink, carrying the code and `country=` for the verification market.
 
-       The job regenerates both before the network's links expire. No deal is emitted on this lane until both links exist.
-     - **Both links are signed into the `/r` token.** The tracking-only link is the `dest`, the coded link is signed alongside it, and the token carries the deal reference. `/r` only ever redirects to one of the two links signed in the token, never to a URL read from a database row at click time.
+       The job regenerates both before the network's links expire, in the same row. No deal is emitted on this lane until both links exist.
+     - **Our sub-id is added per click.** The links are generated before any click exists. So at issue time, our click id from `issue_click` is appended to the tracking-only link as the network's sub-id parameter. At click time, `/r` appends the same sub-id to the coded link. Carrier steps 1 and 2 confirm that the network accepts the sub-id appended this way, without regenerating the link, and that the code stays intact.
+     - **The token never holds the coded link or the code.** `/r` tokens are signed but not encrypted, so anything in them can be read by whoever holds the URL.
+       - The signed `dest` is the tracking-only link with our sub-id. It carries no code.
+       - The token also carries the deal reference and the network-links row id.
+       - At click time, `/r` loads the coded link from that row, and uses it only when the row's deal reference matches the token's.
+       - A row is written only by the background job, from the network's own link interface, after carrier steps 1 and 2 pass for that program.
      - When the link is followed, `/r` runs the same re-check as D7: an unexpired token, a valid verification, a declared buyer market equal to the verification market, no stop row, and the flags allow it (`DEAL_LANE_EMIT_ENABLED` and `DEAL_LANE_DISCOUNT_PARAM_ENABLED`). Only then does it redirect to the coded link.
      - Otherwise it redirects to the tracking-only link. An expired token goes to the tracking-only link.
      - `issue_click` writes `discount_code` and `/r` fills `discount_carried` as on the Shopify lane, so the kill switches, the stop row and the reconciliation rules (D7) cover this lane as well.
