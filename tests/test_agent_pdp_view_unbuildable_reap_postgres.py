@@ -1420,3 +1420,266 @@ def test_the_heal_upgrades_an_audit_table_from_an_earlier_build(run) -> None:
     assert before == "UndefinedColumnError"
     assert cols == ["attempts", "next_attempt_at"]
     assert after["restored"] == 1
+
+
+# ---- be#2681 review round: cross-arm precedence, NULL semantics, retry and heal pins ----------
+
+async def _mklink(db, *, offer=None, decision=None, checkout=None):
+    return str(await db.fetch_val(
+        "INSERT INTO agent_decision_funnel_links (content_key, catalog_offer_id, decision_id, checkout_decision_id) "
+        "VALUES (NULL, :o, :d, CAST(:cd AS uuid)) RETURNING link_id",
+        {"o": offer, "d": decision, "cd": checkout}))
+
+
+async def _ck_of(db, link_id):
+    return await db.fetch_val(
+        "SELECT content_key FROM agent_decision_funnel_links WHERE link_id = CAST(:l AS uuid)", {"l": link_id})
+
+
+async def _cand(db, decision, ck, offer):
+    await db.execute("INSERT INTO agent_decision_candidates VALUES (:d, :ck, :o)", {"d": decision, "ck": ck, "o": offer})
+
+
+async def _reap(db, *pairs):
+    for ck, pk in pairs:
+        await _product(db, ck, pk, domain=_BAD_DOMAIN, description=f"{ck} copy.")
+    for ck, _ in pairs:
+        await _stale_view(db, ck)
+        assert await _refresh(db, ck) is False
+
+
+async def _revoke_restore(db, **kw):
+    from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+    await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
+    return await restore_reaped_agent_pdp_view_rows(db=db, **kw)
+
+
+def test_twins_citing_one_offer_in_different_decisions_each_get_their_own_key(run) -> None:
+    # Review p1: the ambiguity check is per decision, not across decisions.
+    async def body(db):
+        await _reap(db, ("ck_p1a", "pk_p1a"), ("ck_p1b", "pk_p1b"))
+        await _offer(db, "offer:p1", "pk_p1a")
+        await _cand(db, "dec_p1_1", "ck_p1a", "offer:p1")
+        await _cand(db, "dec_p1_2", "ck_p1b", "offer:p1")
+        l1 = await _mklink(db, offer="offer:p1", decision="dec_p1_1")
+        l2 = await _mklink(db, offer="offer:p1", decision="dec_p1_2")
+        await _revoke_restore(db)
+        return await _ck_of(db, l1), await _ck_of(db, l2)
+
+    assert run(body) == ("ck_p1a", "ck_p1b")
+
+
+@pytest.mark.parametrize("cand_key,checkout_key", [("ck_x1", "ck_x2"), ("ck_x2", "ck_x1")])
+def test_a_checkout_naming_another_key_overrides_the_candidate_arm(run, cand_key, checkout_key) -> None:
+    # Review p6: the slate saw the offer under cand_key, a twin merge moved it to checkout_key's
+    # product, and the order cites checkout_key with it (consistent). Both reaped, one pass. The
+    # checkout (the purchase-time record) decides, whichever key restores first.
+    async def body(db):
+        pk = {"ck_x1": "pk_x1", "ck_x2": "pk_x2"}
+        await _reap(db, ("ck_x1", "pk_x1"), ("ck_x2", "pk_x2"))
+        await _offer(db, "offer:x", pk[cand_key])
+        await _cand(db, "dec_x", cand_key, "offer:x")
+        await db.execute("UPDATE catalog_offers SET product_key = :pk WHERE offer_id = 'offer:x'",
+                         {"pk": pk[checkout_key]})
+        link = await _mklink(db, offer="offer:x", decision="dec_x", checkout=await _checkout_decision(db, checkout_key))
+        await _revoke_restore(db)
+        return await _ck_of(db, link)
+
+    assert run(body) == checkout_key
+
+
+def test_a_checkout_and_a_candidate_that_disagree_leave_the_link_null(run) -> None:
+    # Review p6b: the offer is ck_b's throughout and the slate cited (ck_b, offer); the checkout
+    # cites ck_a. The checkout arm refuses (offer vs checkout), and the candidate arm defers to
+    # the checkout, so the link stays NULL.
+    async def body(db):
+        await _reap(db, ("ck_y_a", "pk_y_a"), ("ck_y_b", "pk_y_b"))
+        await _offer(db, "offer:y", "pk_y_b")
+        await _cand(db, "dec_y", "ck_y_b", "offer:y")
+        link = await _mklink(db, offer="offer:y", decision="dec_y", checkout=await _checkout_decision(db, "ck_y_a"))
+        await _revoke_restore(db)
+        return await _ck_of(db, link)
+
+    assert run(body) is None
+
+
+def test_the_checkout_key_wins_even_when_the_candidate_key_restores_first(run) -> None:
+    # Review p6c: the checkout key is still quarantined when the candidate key restores; the
+    # candidate arm must not take the link meanwhile. It goes to the checkout key once that restores.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_z1", "pk_z1", domain="other-bad.example.com", description="z1")
+        await _product(db, "ck_z2", "pk_z2", domain=_BAD_DOMAIN, description="z2")
+        await db.execute(
+            "INSERT INTO catalog_source_quarantine (match_type, match_value, state, reason, created_by) "
+            "VALUES ('domain', 'other-bad.example.com', 'active', 't', 't')")
+        for ck in ("ck_z1", "ck_z2"):
+            await _stale_view(db, ck)
+            assert await _refresh(db, ck) is False
+        await _offer(db, "offer:z", "pk_z2")
+        await _cand(db, "dec_z", "ck_z2", "offer:z")
+        await db.execute("UPDATE catalog_offers SET product_key = 'pk_z1' WHERE offer_id = 'offer:z'")
+        link = await _mklink(db, offer="offer:z", decision="dec_z", checkout=await _checkout_decision(db, "ck_z1"))
+        await db.execute(f"UPDATE catalog_source_quarantine SET state = 'revoked' WHERE match_value = '{_BAD_DOMAIN}'")
+        first = await restore_reaped_agent_pdp_view_rows(db=db)
+        between = await _ck_of(db, link)
+        await db.execute("UPDATE catalog_source_quarantine SET state = 'revoked'")
+        second = await restore_reaped_agent_pdp_view_rows(db=db)
+        return first, between, second, await _ck_of(db, link)
+
+    first, between, second, final = run(body)
+    assert first["restored"] == 1 and second["restored"] == 1
+    assert between is None
+    assert final == "ck_z1"
+
+
+def test_null_keys_are_unknown_never_a_match_and_never_a_contradiction(run) -> None:
+    # Pinned on purpose (review p7, p8, m11): a NULL-key candidate claims nothing and does not make
+    # an offer ambiguous; an offer whose product has a NULL content_key does not disagree with a
+    # checkout.
+    async def body(db):
+        await _reap(db, ("ck_n7", "pk_n7"), ("ck_n8", "pk_n8"), ("ck_n9", "pk_n9"))
+        await _offer(db, "offer:n7", "pk_n7")
+        await _offer(db, "offer:n8", "pk_n8")
+        await _product(db, "ck_null_owner", "pk_null_owner", domain=_GOOD_DOMAIN)
+        await db.execute("UPDATE catalog_products SET content_key = NULL WHERE product_key = 'pk_null_owner'")
+        await _offer(db, "offer:n9", "pk_null_owner")
+        await _cand(db, "dec_n7", "ck_n7", "offer:n7")
+        await _cand(db, "dec_n7", None, "offer:n7")      # NULL-key twin: not ambiguity
+        await _cand(db, "dec_n8", None, "offer:n8")      # NULL-key candidate alone: no claim
+        l7 = await _mklink(db, offer="offer:n7", decision="dec_n7")
+        l8 = await _mklink(db, offer="offer:n8", decision="dec_n8")
+        l9 = await _mklink(db, offer="offer:n9", checkout=await _checkout_decision(db, "ck_n9"))
+        await _revoke_restore(db)
+        return await _ck_of(db, l7), await _ck_of(db, l8), await _ck_of(db, l9)
+
+    assert run(body) == ("ck_n7", None, "ck_n9")
+
+
+def test_retry_backoff_tries_a_failing_key_once_per_run_and_backs_it_off_again(run, monkeypatch) -> None:
+    # Review r1: under --retry-backoff a key whose rebuild raises is tried once, backed off again,
+    # and skipped by a plain pass in between.
+    from services import agent_pdp_view_assembler as apv
+
+    calls = []
+
+    async def boom(ck, **kw):
+        calls.append(ck)
+        raise RuntimeError("still broken")
+
+    async def body(db):
+        await _product(db, "ck_r1", "pk_r1", domain=_GOOD_DOMAIN)
+        await _audit(db, "ck_r1")
+        monkeypatch.setattr(apv, "refresh_agent_pdp_view_for_content_key", boom)
+        out = []
+        for _ in range(3):
+            out.append(await apv.restore_reaped_agent_pdp_view_rows(db=db, ignore_backoff=True))
+            out.append(await apv.restore_reaped_agent_pdp_view_rows(db=db))
+        st = dict(await db.fetch_one(f"SELECT attempts, next_attempt_at > NOW() AS later FROM {_AUDIT}"))
+        return out, st
+
+    out, st = run(body)
+    assert [o["errors"] for o in out] == [1, 0, 1, 0, 1, 0]
+    assert len(calls) == 3
+    assert st == {"attempts": 3, "later": True}
+
+
+def test_retry_backoff_backs_off_a_key_the_builder_still_declines(run) -> None:
+    # Review m4: the decline branch re-backs-off under --retry-backoff too.
+    async def body(db):
+        from services.agent_pdp_view_assembler import restore_reaped_agent_pdp_view_rows
+
+        await _product(db, "ck_dec", "pk_dec", domain=_GOOD_DOMAIN, title=" ")
+        await _audit(db, "ck_dec")
+        await db.execute(f"UPDATE {_AUDIT} SET attempts = 3, next_attempt_at = NOW() + INTERVAL '2 days'")
+        retry = await restore_reaped_agent_pdp_view_rows(db=db, ignore_backoff=True)
+        st = dict(await db.fetch_one(
+            f"SELECT attempts, next_attempt_at > NOW() + INTERVAL '7 hours' AS later FROM {_AUDIT}"))
+        return retry, st
+
+    retry, st = run(body)
+    assert retry["still_unbuildable"] == 1
+    assert st == {"attempts": 4, "later": True}
+
+
+def test_the_tick_never_ignores_backoff(run) -> None:
+    # Review r3.
+    async def body(db):
+        from jobs.agent_pdp_view_reconciler_cron import _restore_reaped_rows
+
+        await _product(db, "ck_r3", "pk_r3", domain=_GOOD_DOMAIN)
+        await _audit(db, "ck_r3")
+        await db.execute(f"UPDATE {_AUDIT} SET next_attempt_at = NOW() + INTERVAL '1 day'")
+        await _restore_reaped_rows(db)
+        return await db.fetch_val(f"SELECT restored_at FROM {_AUDIT}")
+
+    assert run(body) is None
+
+
+def test_retry_backoff_pages_past_the_first_page(run) -> None:
+    # Review r4.
+    from services import agent_pdp_view_assembler as apv
+
+    async def body(db):
+        for i in range(3):
+            await _product(db, f"ck_r4_{i}", f"pk_r4_{i}", domain=_GOOD_DOMAIN)
+            await _audit(db, f"ck_r4_{i}")
+        await db.execute(f"UPDATE {_AUDIT} SET attempts = 4, next_attempt_at = NOW() + INTERVAL '3 days'")
+        return await apv.restore_reaped_agent_pdp_view_rows(db=db, ignore_backoff=True, limit=1)
+
+    assert run(body)["restored"] == 3
+
+
+def test_the_heal_gives_up_on_a_busy_old_table_then_converges_not_null_default_zero(run, db_url, caplog) -> None:
+    # Review h2: on an earlier build's table with a writer mid-transaction, the heal waits at
+    # most its lock_timeout, adds nothing, and converges on the next call with attempts NOT NULL
+    # DEFAULT 0 on the old rows (a nullable attempts would leave the backoff NULL forever).
+    import time
+
+    import asyncpg
+
+    import db.schema_guard as guard
+
+    async def body(db):
+        await db.execute(f"ALTER TABLE {_AUDIT} RENAME TO {_AUDIT}_cur")
+        try:
+            await db.execute(
+                f"CREATE TABLE {_AUDIT} (audit_id BIGSERIAL PRIMARY KEY, content_key TEXT NOT NULL, "
+                "pivota_signature_id TEXT, reason TEXT NOT NULL, run_id TEXT NOT NULL, refresh_source TEXT, "
+                "funnel_link_count INTEGER NOT NULL DEFAULT 0, funnel_link_ids JSONB NOT NULL DEFAULT '[]'::jsonb, "
+                "row_snapshot JSONB NOT NULL, deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), restored_at TIMESTAMPTZ)")
+            await db.execute(f"INSERT INTO {_AUDIT} (content_key, reason, run_id, row_snapshot) "
+                             "VALUES ('ck_h2', 'r', 'x', '{}'::jsonb)")
+            other = await asyncpg.connect(db_url)
+            try:
+                tr = other.transaction()
+                await tr.start()
+                await other.execute(f"UPDATE {_AUDIT} SET reason = 'r2'")
+                t0 = time.monotonic()
+                with caplog.at_level("WARNING"):
+                    await asyncio.wait_for(guard._heal_unbuildable_reap_schema(), 10)
+                dt = time.monotonic() - t0
+                cols_busy = await db.fetch_val(
+                    "SELECT count(*) FROM information_schema.columns WHERE table_name = :t "
+                    "AND column_name IN ('attempts', 'next_attempt_at')", {"t": _AUDIT})
+                await tr.commit()
+            finally:
+                await other.close()
+            await guard._heal_unbuildable_reap_schema()
+            cols = [dict(r) for r in await db.fetch_all(
+                "SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name = :t "
+                "AND column_name IN ('attempts', 'next_attempt_at') ORDER BY 1", {"t": _AUDIT})]
+            att = await db.fetch_val(f"SELECT attempts FROM {_AUDIT}")
+            return dt, cols_busy, cols, att
+        finally:
+            await db.execute(f"DROP TABLE IF EXISTS {_AUDIT}")
+            await db.execute(f"ALTER TABLE {_AUDIT}_cur RENAME TO {_AUDIT}")
+
+    dt, cols_busy, cols, att = run(body)
+    assert dt < 5.0, dt
+    assert cols_busy == 0
+    assert [c["column_name"] for c in cols] == ["attempts", "next_attempt_at"]
+    assert cols[0]["is_nullable"] == "NO" and cols[0]["column_default"] == "0" and att == 0
+    assert any("column heal deferred" in r.getMessage() for r in caplog.records)

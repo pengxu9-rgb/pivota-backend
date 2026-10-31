@@ -3028,10 +3028,19 @@ def _repoint_links_sql(present: Dict[str, bool]) -> str:
 
       * checkout arm: its checkout decision cites :ck, and its own catalog_offer_id (if any)
         is not today an offer of a DIFFERENT key (the offer and the checkout must not disagree);
-      * candidate arm: a candidate of its decision cites :ck WITH the link's own offer, and no
-        candidate of that decision cites the same offer under another key. The candidate row
-        records what the decision saw, so an offer that later moved to another product (a
-        twin merge) carries the link to the key the decision cited, never to the offer's new key.
+      * candidate arm: a candidate of its decision cites :ck WITH the link's own offer, no
+        candidate of that decision cites the same offer under another key, and its checkout
+        decision (if any) names no other key. The candidate row records what the decision saw,
+        so an offer that later moved to another product (a twin merge) carries the link to the
+        key the decision cited, unless the checkout names another key: then the checkout, the
+        later purchase-time record, decides (its own arm, or NULL when it disagrees with the
+        offer). The arms are therefore exclusive whenever a checkout decision names a key.
+        This arm rarely fires for today's writers: v2/sdk search candidates carry NULL offer
+        ids. Links the reap itself nulled are restored by id from the audit regardless.
+
+    NULL is "unknown", never a match and never a contradiction: a candidate with a NULL key
+    claims nothing (and does not make an offer ambiguous), and an offer whose product has a NULL
+    content_key does not disagree with a checkout. Hence `=` / `<>`, not IS DISTINCT FROM.
 
     And only if written between the first reap (:since) and the view row's refreshed_at read
     under the restore's lock (:until): an upper bound on the view's return, not the moment
@@ -3048,15 +3057,23 @@ def _repoint_links_sql(present: Dict[str, bool]) -> str:
                   WHERE co.offer_id = l.catalog_offer_id AND cp.content_key <> :ck))"""
         )
     if present.get("candidates"):
+        defers_to_checkout = (
+            """
+              AND NOT EXISTS (SELECT 1 FROM checkout_decisions cdx
+                              WHERE cdx.checkout_decision_id = l.checkout_decision_id
+                                AND cdx.content_key <> :ck)"""
+            if present.get("checkout_decisions")
+            else ""
+        )
         names_key.append(
-            """(l.catalog_offer_id IS NOT NULL
+            f"""(l.catalog_offer_id IS NOT NULL
               AND EXISTS (SELECT 1 FROM agent_decision_candidates c
                           WHERE c.decision_id = l.decision_id AND c.content_key = :ck
                             AND c.catalog_offer_id = l.catalog_offer_id)
               AND NOT EXISTS (SELECT 1 FROM agent_decision_candidates c2
                               WHERE c2.decision_id = l.decision_id
                                 AND c2.catalog_offer_id = l.catalog_offer_id
-                                AND c2.content_key <> :ck))"""
+                                AND c2.content_key <> :ck){defers_to_checkout})"""
         )
     inserted = (
         f"""
