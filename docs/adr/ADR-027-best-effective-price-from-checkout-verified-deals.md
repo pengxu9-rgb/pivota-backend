@@ -1,7 +1,7 @@
 # ADR-027: Best effective price comes from checkout-verified deals, never from scraped coupon sites
 
-**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link).
-- peng resolved four questions on 2026-10-29 and six more on 2026-10-30 (see "Resolved questions").
+**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link) and 2026-10-31 (Q13 program permission to test, Q14 the network lane).
+- peng resolved four questions on 2026-10-29, eight more on 2026-10-30 and two on 2026-10-31 (see "Resolved questions").
 - Phase 0a ran on 2026-10-29. Its base was unusable, so the gate has not been computed (see "Phases and gates").
 
 **Decision owner:** peng
@@ -97,12 +97,12 @@ Pivota does not query coupon aggregator sites while serving a request, and v1 do
 |---|---|---|---|
 | `checkout_automatic` | A | A Shopify automatic discount that appears as an allocation on a reference cart | Verified, per variant (D3) |
 | `merchant_published` | B | "Use WELCOME15" on the merchant's own homepage, PDP or promo bar | Verified per variant after D3; otherwise stored, **not emitted (v1)** |
-| `authorized_feed` | B | An affiliate network's promotion feed for a program we belong to | Verified per variant after D3; otherwise stored, **not emitted (v1)** |
+| `authorized_feed` | B | An affiliate network's promotion feed for a program we belong to, limited to codes Q14 allows | Verified per variant after D3 (Q13); otherwise stored, **not emitted (v1)** |
 | `channel_exclusive` | A+ | A code the merchant creates for AI-channel buyers, created in their Shopify by us (D8) | Verified, per variant (D3) |
 
 These are **never** ingested:
 - codes from aggregator sites (D1);
-- codes visibly scoped to a person or audience: employee, influencer, student, customer-service or single-use codes;
+- codes visibly scoped to a person or audience: employee, influencer, student, customer-service or single-use codes. A code a network lists as assigned to Pivota is not one of these (Q14);
 - codes guessed, enumerated or brute-forced. We only test codes a merchant or an authorized feed published.
 
 **Where `merchant_published` text comes from.** Today's crawls store mostly PDP copy, not homepages or promo bars. Phase 1 reads only what existing crawls already store. Fetching new surfaces (homepage, promo bar) is a new fetch. It needs its own per-host budget, runs on the crawl egress under D3's egress rules, and is not part of Phase 1 unless Phase 0 shows PDP text misses most published codes.
@@ -130,9 +130,10 @@ What one verification proves, and what it does not:
 
 **Platforms:**
 - **Shopify, connected store:** the existing Storefront cart path in `shopify_storefront_pricing_service`.
-- **Shopify, not connected:** these deals stay stored and unverified until both of these are true:
+- **Shopify, not connected, but in an affiliate program we have joined (Q13):** that program's feed codes may be tested, under every rule below, once all of these hold: the tokenless-cart precondition below; the program's permission is recorded; and `DEAL_VERIFY_PROGRAM_ENABLED` (default off) is set. Q2's approval never applies to such a host.
+- **Shopify, not connected, with no such relationship:** these deals stay stored and unverified until both of these are true:
   - tokenless Storefront carts are confirmed to support the cart mutations we need. Phase 0a answered this from Shopify's documentation only; it has not been tried against any store;
-  - testing codes against non-connected stores has been separately and explicitly approved by peng (Q2, Q10). **Testing is off until then.** The verifier refuses non-connected hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` is set, and the flag stays unset until that approval.
+  - testing codes against non-connected stores with no program relationship (Q13) has been separately and explicitly approved by peng (Q2, Q10). **Testing is off until then.** The verifier refuses such hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` (default off) is set, and the flag stays unset until that approval.
 - **Other platforms:** a UCP `create_checkout` where the merchant exposes one (Phase 2). Otherwise the deal stays stored and unverified.
 
 **Testing policy (a hard limit, enforced in code):**
@@ -204,13 +205,14 @@ Deals must be found before the buyer reaches the merchant's checkout, because a 
 
 ### D6. Storage: observed store offers, not a promotions engine
 
-A new table, `observed_store_offers`. It deliberately does not reuse the name `promotions` or any module name pinned by `TestPromotionsLaneStaysDeleted`. Those pins stay. One row per (seller, market, code-or-automatic-rule):
+A new table, `observed_store_offers`. It deliberately does not reuse the name `promotions` or any module name pinned by `TestPromotionsLaneStaysDeleted`. Those pins stay. One row per (seller, market, code-or-automatic-rule), plus `program_id` for `authorized_feed` rows:
 
 - **Identity:**
   - `seller_id` (ADR-009);
   - `market` (ADR-026 registry; see "Market" below);
   - `code` (nullable for automatic discounts);
-  - `platform_rule_ref` (when observable).
+  - `platform_rule_ref` (when observable);
+  - `program_id`, for `authorized_feed` rows: the affiliate program whose feed listed the code. An open code listed by two programs is two rows (Q13, Q14).
 - **Economics, as published (metadata, never evidence):**
   - `kind` (`percent | amount | free_shipping | gift | bxgy`);
   - `value`;
@@ -230,7 +232,10 @@ A new table, `observed_store_offers`. It deliberately does not reuse the name `p
   - `verified_at`;
   - `verified_via` (`shopify_storefront_connected | shopify_storefront_tokenless | ucp_checkout`);
   - the reference cart: variant, quantity (always 1), subtotal, discount amount and currency;
-  - `failure_reason`.
+  - `failure_reason`;
+  - `authorized_by`: which permission allowed the test (`connected`, `q2_approval` or `program:<program id>`), for the audit trail.
+- **Program permissions (Q13):** one row per affiliate program, holding the program, the network, our membership status, the source of the permission (program terms or the merchant in writing), its date, and the hosts it covers. A permission counts only while our membership is active. It is re-confirmed whenever the network reports a change to the program's terms, and in any case by a recorded re-confirmation date at most 90 days after the last one. That covers written merchant permissions and term changes the network does not report. Until it is re-confirmed, the permission is suspended.
+- **Network links (Q14):** one row per (deal, variant, market), holding its id, the deal reference, the tracking-only network link and the coded network link, with when each was generated and when it expires. A regenerated link replaces the old one in the same row, so tokens already handed out reach the current **coded** link. The tracking-only link is frozen in each token as its signed `dest`, so an old token, including an expired one, keeps redirecting to the tracking-only link it was issued with. If the network later retires that link, such a click may go untracked or fail to land. That cost is accepted: it is the same as for every `/r` destination today, and that link never carries a code.
 - **On the click row** (a schema change to ADR-025's click row; D7):
   - a new nullable `discount_code` field on `IssuedClick` and its click table, written by `issue_click` at issue time: the deal-lane code the link may carry;
   - a new `discount_carried` flag, filled by `/r` on that same row when the link is followed: whether `/r` actually appended the code.
@@ -239,7 +244,7 @@ A new table, `observed_store_offers`. It deliberately does not reuse the name `p
   - `orders_applied`;
   - `last_order_at`.
 
-Writers are background jobs only. Serving reads only.
+Writers are background jobs only, except program-permission rows, which a person records after reading the program's terms or the merchant's written agreement. Serving reads only.
 
 **Market.** A market is never defaulted.
 - **`merchant_published` rows:** crawls leave from one region, so a stored page is whatever version the store served there. The row's market comes from page evidence: the store's market context, a locale path, or the currency on the page. With no evidence, the row has no market. It is never verified and never served. It never falls back to US.
@@ -262,10 +267,11 @@ A verified deal may show an effective price only on a lane that both carries the
 | **Orchestrated checkout's permalink fallback** (used when payment-intent creation fails) | Today: the buyer's quote codes, with no click id and no `country=` | The quote's own `checkout_url` where one exists | For an order carrying a **deal-lane** code: use the quote's `checkout_url`; with none, no fallback permalink is built for that order. The permalink has no click id, so it cannot meet the rule below. Buyer-entered codes keep today's behaviour |
 | **Shopify cart permalink** (human click-out, through `/r`) | Yes: `?discount=CODE`, appended **only by `/r`** when the link is followed | Variant verified in the buyer's declared market (D3). The link pins that market with `country=` | Yes. The caller decides, the composer signs a deal reference, and `/r` appends the code (below) |
 | **Direct `cart_url`** (no `/r` hop: `offers.resolve` hands the cart link to an agent; connected-store product cards publish it through `_seed_attribution_from_redirect`) | **No** in v1 | — | Carries no `discount=` and no effective price, because a link handed out directly cannot be recalled |
+| **Coded network link handed out directly** (no `/r` hop) | **No** | — | Never handed out. A coded network link reaches a buyer only through `/r`'s click-time switch (Q14), because a link handed out directly cannot be recalled |
 | **Referral link** (the card's `/r` destination is a product page, not a cart, for example when the purchasability gate declines the cart) | **No** | — | Not emitted. `/r` never appends a code to a referral destination |
 | **Reap cart-link** (ADR-025 D6b) | **No.** `validate_cart_link` deliberately refuses `discount=`, and Reap's callers never pass a code | — | **Excluded.** Carrying a code there needs a change to Reap's allowlist, which is a separate decision with its own review |
 | **UCP delegated checkout / Reap variant lane** | Not established | Per-merchant proof that a code can be passed and is applied | Excluded in v1. Revisit in Phase 2 with UCP verification |
-| **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together | Excluded in v1. When added, the carrier is the network link (Q9) |
+| **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together, plus that program's carrier check (Q14) | Excluded in v1. When added, the carrier is the network link (Q9, Q14) |
 | **Handed-out `pdp_url`** (an agent passes the product page on) | No | — | No effective price. The effective price is attached to the code-carrying link only, never to the bare `pdp_url` |
 | **Other click-outs** (non-Shopify web checkout; the buyer types the code) | Only by the buyer | A verification on that same checkout (UCP, Phase 2) | Excluded in v1 |
 
@@ -279,7 +285,7 @@ Two places touch a deal-lane code, each with one job:
   It **never** writes `discount=` into the signed `dest` or the published `cart_url`. Both stay exactly as today, so `_seed_attribution_from_redirect`'s check that the recomposed link equals the signed `dest` still holds.
 - **Click time.** **Only `/r` appends `discount=CODE`**, and only after it re-checks the deal (below).
 
-The rule applies to **deal-lane codes** only: no deal-lane `discount=` on a click-out link without `country=` and the click attribute. Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
+The rule applies to **deal-lane codes** only: no deal-lane `discount=` on a click-out link without `country=` and the click attribute. On the network lane, our sub-id in the network's tracking link takes the place of the click attribute, and `country=` sits in the coded link's destination (Q14). Codes a buyer typed into a Pivota quote are not deal-lane codes, and their behaviour does not change.
 
 **Links outlive decisions, so `/r` checks again.** In v1, a deal-lane code travels only on the `/r` redirect, never on a direct `cart_url`. When a `/r` link is followed, the redirect reads the token's deal reference and appends `discount=` only if all of these hold at that moment:
 - the token has not expired;
@@ -300,7 +306,7 @@ Otherwise it redirects without the code. So the kill switches and the stop row t
 #### Recording the code, and reconciling (Phase 1)
 
 - **Recording.**
-  - At issue time, ADR-025's `issue_click` writes the deal-lane code the link may carry into the new `discount_code` field on the click row (D6).
+  - At issue time, ADR-025's `issue_click` writes the deal-lane code the link may carry into the new `discount_code` field on the click row (D6). This includes network-lane tokens (Q14).
   - When the link is followed, `/r` fills that same row, as it already fills the issued click today, with `discount_carried`: whether it actually appended the code.
   - This is `/r` completing the issued row, not a second writer. An expired token is not logged, so its click has no `discount_carried`.
 - **Reconciling.** When order evidence returns (ADR-025 link 4), the order's discount codes are compared with the issued code:
@@ -308,15 +314,15 @@ Otherwise it redirects without the code. So the kill switches and the stop row t
   - a **failure signal** is an order that meets all of these: it is paid; it came from a click where `/r` recorded `discount_carried = true`; it contains the verified variant; and the code is absent from it. Clicks where `/r` dropped the code, because the verification had lapsed (it lasts at most 24h, a token 7 days) or a stop row existed, are never failure signals. So a cleared stop row is not re-tripped by its own stripped clicks. Eligibility-limited codes are never emitted in v1 (D3), so a returning customer's ineligibility cannot cause one;
   - not counted: orders without the verified variant; orders whose cart changed shape so that another discount won instead (an extra item unlocking a better automatic discount); and, where order evidence shows the landing parameters, orders where the buyer removed the code;
   - two failure signals within the TTL demote that variant's verification to `failed`, pending re-verification.
-- **Coverage.** Reconciliation covers only merchants whose orders reach us (about 21 connected stores today). Whether an affiliate network's report carries the coupon code used is not established. Until it is confirmed per network, the false-savings rate is measured on connected stores only.
+- **Coverage.** Reconciliation covers only merchants whose orders reach us (about 21 connected stores today), plus network programs whose conversion reports show the code an order used (Q14). Whether a given network's report carries the code is checked per program before any code is emitted on it (Q14, step 4).
 - **Abandonment.** Paid orders count only the buyers who finished. A buyer whose code failed and who then left produces no order, so the stop rule below is **survivor-only** and biased towards not firing. A signal that counts those buyers would need new `checkouts/*` webhook subscriptions on every connected store, and probably a customer-data review, since checkout payloads carry contact details. That is not in Phase 1. The stop rule compensates with an absolute trigger and a weekly human review instead.
 
 #### Kill switches
 
-Four independent flags, all default off, each able to stop its part alone:
+Four independent flags, all default off, each able to stop its part alone. The two testing-scope flags in D3, `DEAL_VERIFY_NONCONNECTED_ENABLED` and `DEAL_VERIFY_PROGRAM_ENABLED`, are also default off.
 - `DEAL_LANE_EMIT_ENABLED`: serving emits deals at all;
 - `DEAL_LANE_RANKING_ENABLED`: deals may change seller order within a product (stays off through Phase 1; Q6);
-- `DEAL_LANE_DISCOUNT_PARAM_ENABLED`: `/r` appends `discount=`;
+- `DEAL_LANE_DISCOUNT_PARAM_ENABLED`: `/r` appends `discount=`, or on the network lane switches to the coded link (Q14);
 - `DEAL_VERIFY_JOB_ENABLED`: the verifier job runs.
 
 **Stop rule (automatic).**
@@ -348,8 +354,8 @@ It needs a merchant commitment first (ADR-022's rebuild trigger). It ships in Ph
 
 **Gate (exact form).** Per market, the share of **distinct recommended offers** in that base that have at least one variant with a `checkout_verified` deal on a lane that carries it. The threshold is **10.0%**. Each market passes or fails on its own: if US passes and SG fails, US goes ahead and SG waits (Q4). If US fails, stop here and put the effort into cross-seller effective-price comparison instead, which needs no coupons. peng confirmed the threshold and denominator (Q7).
 
-**Report two numbers beside the gate.** Only connected stores can be verified (Q2), and they are a small minority of checkout hosts, so the gate can fail just because few recommended offers come from connected stores. Phase 0 therefore reports, per market:
-- the **verified share**: the gate's measure (connected stores only);
+**Report two numbers beside the gate.** In Phase 1 only connected stores can be verified (Q2; Q13 adds joined programs' feed codes from Phase 2), and connected stores are a small minority of checkout hosts, so the gate can fail just because few recommended offers come from connected stores. Phase 0 therefore reports, per market:
+- the **verified share**: the gate's measure (connected stores only, in Phase 1);
 - the **published-code share**: distinct recommended offers whose seller has a published code in stored text (all sellers);
 - the share of distinct recommended offers that come from connected stores.
 
@@ -357,12 +363,12 @@ That shows peng whether a failed gate means few deals or few connections.
 
 **Phase 0b: reference carts on connected stores.** Verifying automatic discounts and published codes on connected stores means creating carts in merchant stores. Those carts are writes, however harmless, so each run is a one-off prod job that needs a controller slot and stays under the D3 cap (Q8). Phase 0b does not touch non-connected stores (Q2).
 
-**Phase 0: prepare Q2's approval request now (Q11).** Most of the stores we send buyers to are not connected, so Phase 1 alone leaves most guest checkouts without a code. The request for Q2's separate approval is prepared during Phase 0, not after Phase 1. Phase 0 also reports, per market, the merchants with the most click-outs and whether each is connected, so the first stores verified after an approval are the ones that matter most.
+**Phase 0: prepare Q2's approval request now (Q11).** Most of the stores we send buyers to are not connected, so Phase 1 alone leaves most guest checkouts without a code. The request for Q2's separate approval, which now covers only stores with no program relationship (Q13), is prepared during Phase 0, not after Phase 1. Phase 0 also reports, per market, the merchants with the most click-outs and whether each is connected, so the first stores verified after an approval are the ones that matter most.
 
 **Phase 1: US, Shopify, verified, display-only.**
 - `observed_store_offers` and its per-variant verification table, the opt-out denylist and the daily cap counter.
 - `merchant_published` extraction from text existing crawls already store.
-- The verifier job (connected stores only, unless Q2's separate approval exists), under D3's egress rules.
+- The verifier job, under D3's egress rules. Connected stores only, unless Q2's separate approval exists for stores with no program relationship. Joined programs' feed codes (Q13) come in Phase 2.
 - `estimated_effective_price` and `availableStoreOffers` on `get_offers`, with the display part of the `savings.v1` amendment. **No ranking effect.**
 - Invalidation on price, sale-state, automatic-discount or code-status change (D3), and `read_discounts` eligibility reads on connected stores.
 - The deal decision resolved by the callers of `compose_attributed_destinations`, the signed deal reference, the `/r` re-check that appends `discount=`, the declared buyer market on connected-store product cards, and the orchestrated-fallback rule (D7 migration).
@@ -372,7 +378,7 @@ That shows peng whether a failed gate means few deals or few connections.
 **Phase 2: measure, then widen.**
 - Ranking on verified deals, within Q6's limits: seller order within a product only, and only once the false-savings rate has been measured.
 - UCP verification for non-Shopify merchants.
-- `authorized_feed` ingestion, once affiliate network access exists, carried on the network link (Q9).
+- `authorized_feed` ingestion, once affiliate network access exists, carried on the network link (Q9), under Q13's testing permission and Q14's per-program rules.
 - SG, if it passes the gate (Q4).
 
 **Phase 3: channel-exclusive codes (D8)**, on a merchant commitment.
@@ -380,7 +386,7 @@ That shows peng whether a failed gate means few deals or few connections.
 ## Metrics
 
 - **Verified-deal coverage:** per market, the gate's measure over the Phase 0 base.
-- **Click-out coverage:** per market, the share of Shopify click-outs whose link carried a verified code (`discount_carried = true`), overall and for the merchants with the most click-outs (Q11).
+- **Click-out coverage:** per market, the share of click-outs whose link carried a verified code (`discount_carried = true`). Click-outs on both the Shopify cart-permalink lane and the network lane count; on the network lane, a click-out carried a code when `/r` served the coded link (Q14). It is reported overall and for the merchants with the most click-outs (Q11).
 - **Both-carried rate:** among reconciled orders from clicks where `/r` appended the code, the share whose order shows both the code and our click attribute. The first such orders are also checked by hand (Q12).
 - **False-savings rate:** codes `/r` appended (`discount_carried = true`) that did not apply on a paid order, among reconciled orders. Target under 2%. **This is the metric that can stop the lane** (D7 stop rule). It counts finished orders only, so it is survivor-only (D7).
 - **Median and p90 savings** per verified deal, in market currency, on the reference-cart base.
@@ -403,11 +409,16 @@ That shows peng whether a failed gate means few deals or few connections.
 - `TestPromotionsLaneStaysDeleted` stays as is. Add new pins:
   - the deal-read module (the code that reads `observed_store_offers` for serving and for `/r`) makes no outbound HTTP calls (D5). `/r`'s warm handoff, which does, is outside it;
   - `compose_attributed_destinations` never writes `discount=` into the signed `dest` or the published `cart_url` (D7);
-  - `/r` never appends a deal-lane `discount=` without `country=` and the click attribute, to a referral or warm-handoff destination, on an expired token, or when the declared market differs from the verification market or the market was defaulted (D7);
+  - `/r` never appends a deal-lane `discount=` without `country=` and the click attribute (on the network lane, the sub-id), to a referral or warm-handoff destination, on an expired token, or when the declared market differs from the verification market or the market was defaulted (D7);
   - a direct `cart_url` never carries a deal-lane `discount=` (D7);
   - a click where `/r` dropped the code is never counted as a failure signal (D7);
   - a price or sale-state change on a verified variant drops its effective price (D3);
-  - the verifier refuses hosts on the opt-out denylist and non-connected hosts while `DEAL_VERIFY_NONCONNECTED_ENABLED` is unset (D2, D3).
+  - the verifier refuses hosts on the opt-out denylist, and non-connected hosts with no program relationship while `DEAL_VERIFY_NONCONNECTED_ENABLED` is unset (D2, D3);
+  - the verifier refuses a host in a joined program unless its program permission is recorded, `DEAL_VERIFY_PROGRAM_ENABLED` is set and the code came from that program's feed. `DEAL_VERIFY_NONCONNECTED_ENABLED` never authorizes such a host (Q13);
+  - on the network lane, `/r` redirects to the coded network link only after its re-check passes, and otherwise to the tracking-only link. The token never contains the coded link or the code. `/r` loads the coded link by the network-links row id signed in the token, and uses it only when the row's deal reference matches the token's (Q14);
+  - a network-links row is rejected at write time unless the coded link's host is that program's network tracking host, and its embedded destination is exactly the verified variant's cart permalink with the deal's code and `country=` for the verification market (Q14);
+  - `/r` uses a coded link only when its host equals the signed `dest`'s host, and its embedded destination, parsed the same way as at write time, is exactly the cart permalink of the variant in the token's deal reference, with that deal's code and `country=`. Otherwise, and when the row is missing, its deal reference does not match or the coded link is past its expiry, `/r` goes to the tracking-only link (Q14);
+  - a coded network link is never handed out except through `/r` (Q14).
 
 ## Resolved questions (peng, 2026-10-29)
 
@@ -417,6 +428,7 @@ That shows peng whether a failed gate means few deals or few connections.
 2. **Testing codes on non-connected stores: off until separately approved.**
    - Phase 0a answered only whether tokenless carts work, from documentation.
    - Until approval, the verifier refuses non-connected hosts (D3), and their deals stay unverified and unemitted.
+   - Narrowed by Q13 (2026-10-31): Q2 now covers only stores with no relationship to Pivota.
 3. **Showing unverified deals: off in v1.**
    - Only `checkout_verified` deals are emitted (D4).
    - Revisit with the measured false-savings rate, by amending this ADR.
@@ -445,13 +457,67 @@ That shows peng whether a failed gate means few deals or few connections.
 9. **Affiliate sellers: the network link carries the code.**
    - An `authorized_feed` deal follows ADR-025's carrier: the network's tracking link, with our click id as sub-id. The code rides that link where the network supports it; otherwise the deal is not emitted on that lane.
    - Before a code and a click are combined for a program, that program's terms must allow it in writing.
-10. **Q2's separate approval.** Its form is recorded by peng outside this ADR. The public wording stays: testing codes on non-connected stores needs a separate, explicit approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then.
+10. **Q2's separate approval.** Its form is recorded by peng outside this ADR. The public wording stays: testing codes on non-connected stores needs a separate, explicit approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. Narrowed by Q13: it covers only stores with no relationship to Pivota.
 11. **Coverage before guest checkout.**
    - A verified code must already be on the link when the buyer reaches the merchant's checkout. A buyer who leaves to search for a code may not come back.
    - The verifier puts the merchants and variants we send the most click-outs to first (D5).
-   - Testing codes on non-connected stores still needs Q2's separate approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. The approval request is prepared now, during Phase 0, so coverage can widen as soon as it is given.
+   - Testing codes on non-connected stores with no program relationship still needs Q2's separate approval, and `DEAL_VERIFY_NONCONNECTED_ENABLED` stays unset until then. Joined programs are covered by Q13. The approval request is prepared now, during Phase 0, so coverage can widen as soon as it is given.
 12. **The code and our attribution travel on one link.**
    - A deal-lane code is emitted only on a link that also carries Pivota's attribution: the click attribute on a Shopify cart permalink (D7), or the network's tracking link with our click id as sub-id (Q9).
    - Where a lane can carry our attribution but not the code, the link carries the attribution only, and the deal is not emitted on that lane. We never trade attribution for the code.
    - Those lanes are listed as work to do, each with its own review: the Reap cart-link, whose allowlist refuses `discount=` (D7), and any affiliate network whose tracking link drops it (Q9).
    - That both arrive together is checked on the first reconciled orders (Metrics: both-carried rate).
+
+## Resolved questions (peng, 2026-10-31)
+
+13. **An affiliate program we have joined counts as permission to test its codes.**
+   - We treat being an approved publisher in a merchant's program as that merchant's permission to test that program's feed codes, where the program's terms or the merchant in writing allow automated checks. The permission is recorded per program, in the database, with its source and date (D6).
+   - Testing then follows every D3 rule, including: the tokenless-cart precondition; the per-host daily cap; the crawl lock and joint pacing; the crawl egress; signed requests; background jobs only; carts never checked out; the opt-out denylist; the eligibility rules (an eligibility-limited or unknown code is not emitted); and the TTL with its invalidation.
+   - **What the check is keyed on.** The verifier tests a code on a non-connected host under this permission only when all of these hold:
+     - the code came from that program's feed (Q14), as recorded on its deal row (`program_id`, D6);
+     - that program's permission is recorded and current (D6);
+     - `DEAL_VERIFY_PROGRAM_ENABLED` (default off) is set.
+
+     A `merchant_published` code, or another program's code, on the same host does not pass.
+   - **Q2 never applies to a host in a joined program.** Such a host is tested only under its program's recorded permission. `DEAL_VERIFY_NONCONNECTED_ENABLED` never authorizes it, so a program whose terms forbid automated checks is never tested, whatever Q2's approval says.
+   - Q2's separate approval now covers only stores with no relationship to Pivota.
+   - Each verification records which permission authorized it, Q2 or Q13 (D6).
+   - This testing lands with `authorized_feed` ingestion, in Phase 2.
+14. **The network lane: which codes, and how the link is checked.**
+   - **Which codes.** Only codes that the network itself lists for our account, for a program we have joined. In this ADR, "the program's feed" means that listing, whether the network provides it as a feed or as a promo-code listing. The codes must be inside their start and end dates, and either assigned to Pivota or open to every publisher in the program. A code assigned to Pivota counts only once the network lists it for our account; a code sent to us any other way is not used until it is listed. Never:
+     - a code assigned to another publisher. Networks may credit an assigned code to its owner, even without a click, or reverse the sale;
+     - a code from outside the network, such as one from the merchant's own site. Q13 tests only feed codes, so such a code could never be verified for this lane;
+     - a code whose assignment the network does not state. Where a network's feed has no such field, we ask the program for a code assigned to Pivota, or emit none.
+   - **Which code when two apply.** We ask each program for a code assigned to Pivota, because such a code cannot be credited to another publisher. When our code and an open code both apply to an offer, ours is used only when the buyer's verified price is the same or better. The buyer's price comes first (Q6).
+   - **How we apply.** We describe Pivota as what it is: an AI shopping assistant that compares sellers and shows offers the merchant provides. We do not declare a coupon or deal model only to obtain codes, and we do not hide code use behind another category. A program that excludes coupon or deal publishers gets the tracked link only, never a code (Q12).
+   - **The network lane goes through `/r` too.**
+     - For each (deal, variant, market), a background job generates two network links through the network's link interface, and stores them in one network-links row (D6):
+       - a tracking-only link;
+       - a coded link whose destination is the verified variant's cart permalink, carrying the code and `country=` for the verification market.
+
+       The job regenerates both before the network's links expire, in the same row. No deal is emitted on this lane until both links exist.
+     - **Our sub-id is added per click.** The links are generated before any click exists. So at issue time, our click id from `issue_click` is appended to the tracking-only link as the network's sub-id parameter. At click time, `/r` appends the same sub-id to the coded link, taken from the signed token, never from the request's query string. Carrier steps 1 and 2 confirm that the network accepts the sub-id appended this way, without regenerating the link, and that the code stays intact.
+     - **The token never holds the coded link or the code.** `/r` tokens are signed but not encrypted, so anything in them can be read by whoever holds the URL.
+       - The signed `dest` is the tracking-only link with our sub-id. It carries no code.
+       - The token also carries the deal reference and the network-links row id.
+       - **Checked when a row is written.** The background job writes a row only from the network's own link interface, after carrier steps 1 and 2 pass for that program. Each row is also checked on its own: it is rejected unless the coded link's host is that program's network tracking host, and its embedded destination is exactly the verified variant's cart permalink with the deal's code and `country=` for the verification market.
+       - **Checked when a link is followed.** `/r` loads the coded link from that row. It uses it only when all of these hold: the row's deal reference matches the token's; the coded link's host equals the signed `dest`'s host; its embedded destination, parsed the same way as at write time, is exactly the cart permalink of the variant in the token's deal reference, with that deal's code and `country=`; and the coded link is not past its expiry.
+       - **Fallback.** A missing row, a mismatched deal reference, a different host, a different embedded destination or an expired coded link sends the buyer to the tracking-only link. So a bad row cannot send a buyer through `/r` anywhere but the verified variant's cart, by way of that program's network tracking host.
+     - When the link is followed, `/r` runs the same re-check as D7: an unexpired token, a valid verification, a declared buyer market equal to the verification market, no stop row, and the flags allow it (`DEAL_LANE_EMIT_ENABLED` and `DEAL_LANE_DISCOUNT_PARAM_ENABLED`). Only then does it redirect to the coded link.
+     - Otherwise it redirects to the tracking-only link. An expired token goes to the tracking-only link.
+     - `issue_click` writes `discount_code` and `/r` fills `discount_carried` as on the Shopify lane, so the kill switches, the stop row and the reconciliation rules (D7) cover this lane as well.
+     - A coded network link is never handed out directly (D7 lane matrix).
+   - **Before any code is emitted on a program** (once per program):
+     1. The deep link is generated through the network's own link interface, without a click, and it confirms that deep links to the exact destination host are allowed. Some networks silently send a disallowed deep link to the home page, so the code would never load.
+     2. The generated coded link still carries the destination's code intact.
+     3. One test click confirms that the network's click identifier reaches the merchant's landing page.
+        - It runs as a one-off job on the crawl egress with a controller slot. It uses a coded link built exactly as `/r` builds one: from a row that passes the write-time check, with a test sub-id appended the same way. Opening the coded cart permalink creates a cart on the store, so the test click:
+          - reserves a slot under the per-host daily cart cap (D3);
+          - requires that program's recorded and current permission and `DEAL_VERIFY_PROGRAM_ENABLED` (Q13);
+          - is refused for a seller on the opt-out denylist (D2). It does not go through `/r`, writes no click row, stays out of the click-out coverage metric, and is never followed by a purchase.
+        - **If the identifier does not arrive, the program gets tracking-only links.** Without the click identifier the network cannot tie an order to our click, so neither the hand check nor the D7 failure signal could be computed for its orders.
+     4. For each order, the network's conversion report must show our sub-id, the code the order used, and enough line-item detail to tell whether it contains the verified variant. These are what the D7 failure signal needs. If the report cannot show all three, the program's orders cannot be reconciled, and its codes are not emitted.
+   - **After the first codes are emitted on a program:**
+     - The first conversions from clicks where `/r` sent the coded link are checked by hand. Each must show both our sub-id and the code (Metrics: both-carried rate). If one shows either missing, that program goes back to tracking-only links until a person reviews it.
+     - From then on, the network's conversion reports are this lane's order evidence. Their failure signals, defined as in D7, are counted per program and feed the D7 stop rule for the market, in the same way as connected stores' orders.
+   - Agreements made directly with merchants are a separate, later decision.
