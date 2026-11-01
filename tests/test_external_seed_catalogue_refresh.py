@@ -1247,3 +1247,22 @@ def test_the_job_prints_one_catalogue_line(monkeypatch, capsys):
     assert job.main() == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("CATALOGUE_REFRESH ")]
     assert lines == ['CATALOGUE_REFRESH {"enabled":true,"rows_read":7}']
+
+
+def test_migration_274_bounds_its_own_lock_wait_before_the_alter() -> None:
+    """274's ADD COLUMN takes ACCESS EXCLUSIVE on external_product_seeds: queued behind a long reader,
+    it would block every read of the table. The file sets its own lock_timeout first, in a file the
+    runner classifies as one transaction (where SET LOCAL holds)."""
+    from pathlib import Path
+
+    from db.sql_migrations import needs_autocommit, split_statements
+
+    path = Path(__file__).resolve().parents[1] / "db" / "migrations" / "274_external_seed_last_page_read_at.sql.disabled"
+    sql = path.read_text()
+    statements = [
+        "\n".join(line for line in s.splitlines() if not line.lstrip().startswith("--")).strip().rstrip(";").strip()
+        for s in split_statements(sql)
+    ]
+    assert statements[0] == "SET LOCAL lock_timeout = '3s'"
+    assert statements[1].startswith("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_page_read_at")
+    assert needs_autocommit(sql) is False
