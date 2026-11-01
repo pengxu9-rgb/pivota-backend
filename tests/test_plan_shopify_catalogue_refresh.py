@@ -7,11 +7,12 @@ and the plan reads seeds with the lane's own rule.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,8 @@ def _module():
 
 def _run(env):
     base = {k: v for k, v in os.environ.items() if k not in (
-        "PIVOTA_ENV", "CATALOGUE_PLAN_EGRESS", "DATABASE_URL", "DB_STATEMENT_TIMEOUT_SECONDS", "TOP_HOSTS")}
+        "PIVOTA_ENV", "CATALOGUE_PLAN_EGRESS", "CLOUD_RUN_JOB", "DATABASE_URL", "DB_STATEMENT_TIMEOUT_SECONDS",
+        "TOP_HOSTS")}
     return subprocess.run([sys.executable, str(SCRIPT)], env={**base, **env}, capture_output=True, text=True,
                           timeout=120)
 
@@ -45,6 +47,8 @@ def test_the_file_has_no_at_sign():
     ({}, "PIVOTA_ENV is not production"),
     ({"PIVOTA_ENV": "production"}, "CATALOGUE_PLAN_EGRESS must state pivota-crawl"),
     ({"PIVOTA_ENV": "production", "CATALOGUE_PLAN_EGRESS": "default"}, "CATALOGUE_PLAN_EGRESS must state pivota-crawl"),
+    # The declared egress alone is a claim a laptop can make; Cloud Run sets CLOUD_RUN_JOB in every job.
+    ({"PIVOTA_ENV": "production", "CATALOGUE_PLAN_EGRESS": "pivota-crawl"}, "CLOUD_RUN_JOB unset"),
 ])
 def test_a_gate_closes_before_anything_runs(env, reason):
     proc = _run(env)
@@ -102,3 +106,103 @@ def test_a_host_line_counts_matches_reasons_and_samples_disagreements():
     # The sample is what a reviewer reads: only the seeds whose price would move.
     assert [s["seed_id"] for s in line["sample"]] == [seed["id"]]
     assert line["status"] == "ok" and line["proof"] == "base_and_page_cookie"
+
+
+class _Conn:
+    """An asyncpg connection as far as `read_only_transaction` asks it anything."""
+
+    def __init__(self, read_only="on", timeout_takes=True):
+        self.read_only, self.timeout_takes = read_only, timeout_takes
+        self.sql, self.rolled_back, self.readonly_asked = [], 0, None
+        self.timeout = "0"
+
+    def transaction(self, readonly=False):
+        self.readonly_asked = readonly
+        conn = self
+
+        class _Tr:
+            async def start(self):
+                return None
+
+            async def rollback(self):
+                conn.rolled_back += 1
+
+        return _Tr()
+
+    async def execute(self, sql):
+        self.sql.append(sql)
+        if sql.startswith("SET LOCAL statement_timeout = ") and self.timeout_takes:
+            self.timeout = sql.rsplit(" ", 1)[1] + "ms"
+
+    async def fetchval(self, sql):
+        return {"SHOW transaction_read_only": self.read_only, "SHOW statement_timeout": self.timeout}[sql]
+
+
+def test_every_transaction_is_read_only_with_a_statement_timeout():
+    mod = _module()
+    conn = _Conn()
+    asyncio.run(mod.read_only_transaction(conn, 30000))
+    assert conn.readonly_asked is True and conn.sql == ["SET LOCAL statement_timeout = 30000"]
+    assert conn.rolled_back == 0
+
+
+@pytest.mark.parametrize("conn,reason", [
+    (_Conn(read_only="off"), "transaction is not read-only"),
+    (_Conn(timeout_takes=False), "statement_timeout did not take"),
+])
+def test_a_transaction_that_is_not_read_only_or_timed_closes_the_gate(conn, reason, capsys):
+    mod = _module()
+    with pytest.raises(SystemExit) as exit_:
+        asyncio.run(mod.read_only_transaction(conn, 30000))
+    assert exit_.value.code == 3 and conn.rolled_back == 1
+    assert capsys.readouterr().out == "GATE_CLOSED " + reason + "\n"
+
+
+@pytest.mark.parametrize("ratios,expected", [
+    ([], {"n": 0, "median": None, "p10": None, "p90": None, "offset_suspected": False}),
+    ([1.0, 1.0, 1.0, 1.1], {"n": 4, "median": 1.0, "p10": 1.0, "p90": 1.1, "offset_suspected": False}),
+    # Every price 5% up in the store's own currency: a Market's adjustment, not drift.
+    ([1.05, 1.05, 1.05, 1.0501, 1.0499], {"n": 5, "median": 1.05, "p10": 1.0499, "p90": 1.0501, "offset_suspected": True}),
+    ([0.9, 0.9, 0.91], {"n": 3, "median": 0.9, "p10": 0.9, "p90": 0.91, "offset_suspected": True}),
+    ([1.05, 1.05], {"n": 2, "median": 1.05, "p10": 1.05, "p90": 1.05, "offset_suspected": False}),   # too few
+    ([0.8, 1.05, 1.05, 1.2], {"n": 4, "median": 1.05, "p10": 0.8, "p90": 1.2, "offset_suspected": False}),  # two-sided
+    ([1.005, 1.005, 1.005], {"n": 3, "median": 1.005, "p10": 1.005, "p90": 1.005, "offset_suspected": False}),  # within 1%
+    ([None, 1.0], {"n": 1, "median": 1.0, "p10": 1.0, "p90": 1.0, "offset_suspected": False}),
+])
+def test_a_constant_price_offset_is_told_from_drift(ratios, expected):
+    assert _module().price_ratio_stats(ratios) == expected
+
+
+def test_a_host_line_carries_the_price_ratio_and_the_seeds_due_a_page_read():
+    mod = _module()
+    from tests.test_external_seed_catalogue_refresh import _read_host
+
+    catalogue = _read_host([[_product(p50="84.00")]], wanted=(HANDLE, "x", "y"))
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = seed["seed_data"]["variants"]
+    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    seeds = [{**seed, "id": f"s{i}", "last_crawled_at": now - timedelta(days=2)} for i in range(3)]
+    seeds[0]["last_crawled_at"] = now - timedelta(days=45)
+    seeds[1]["destination_verdict"] = "dead"
+    line = mod.plan_host(HOST, catalogue, seeds, now=now)
+    assert line["price_ratio"] == {"n": 3, "median": 1.05, "p10": 1.05, "p90": 1.05, "offset_suspected": True}
+    assert line["page_read_due"] == {"page_read_too_old": 1, "destination_not_live": 1}
+    assert line["matched"] == 3, "due seeds are still compared"
+
+
+def test_a_stored_variant_in_another_currency_is_never_re_read_by_the_plan():
+    mod = _module()
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = [{**v, "price_currency": "CAD"} for v in seed["seed_data"]["variants"]]
+    compared = mod.compare_seed(seed, _seed_read())
+    assert compared["price"] == "agree" and compared["variants"] == "not_all_re_read"
+
+
+def test_the_go_no_go_figures():
+    mod = _module()
+    totals = {"matched": 50, "variants": {"all_re_read": 49, "not_all_re_read": 1},
+              "price": {"agree": 45, "moved_over_10pct": 5}, "offset_suspected_hosts": [{"host": "a"}],
+              "proof": {"base_and_page_cookie": 3, "base_and_cart": 1}}
+    assert mod.go_no_go(totals) == {"not_all_re_read_share": 0.02, "moved_over_10pct_share": 0.1,
+                                    "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
+    assert mod.go_no_go({**totals, "matched": 0})["not_all_re_read_share"] is None

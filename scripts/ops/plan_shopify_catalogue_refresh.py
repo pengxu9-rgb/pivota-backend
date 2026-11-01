@@ -10,8 +10,19 @@ seed on it with the lane's own rule (`seed_catalogue_read`). Then, per host:
   * price agreement with each matched seed's stored price, the latest page read's: agree, moved (within 2%,
     within 10%, more), in another currency (the refresh would refuse it: skipped_currency_mismatch), none
     stored; and whether the variant reconcile (`routes.employee_products._reconcile_seed_variants_with_read`,
-    pure) would re-read every stored variant, which is what stamps the row fresh.
+    pure) would re-read every stored variant, which is what stamps the row fresh (a row it would not is
+    page-read instead by the lane, so each one costs a page read);
+  * the ratio catalogue/stored price over its same-currency matched seeds (median, p10, p90): a median off 1
+    with p10..p90 on the same side is a CONSTANT OFFSET (the egress landing in a Market that adjusts prices in
+    the base currency), not drift, and `offset_suspected` names it;
+  * how many seeds the lane would send to their page read anyway (`page_read_due`: no page read in
+    EXTERNAL_REFERRAL_REFRESH_CATALOGUE_PAGE_MAX_AGE_DAYS, or a destination not known live). They are still
+    read here, so the price comparison covers them.
 And the cost: origin requests made (the pacer's count) per seed matched, against the page read's ~1.3.
+
+GO / NO-GO for the flag (the `summary` line's `go_no_go`, judged by a person): `not_all_re_read_share` about 0;
+`offset_suspected_hosts` empty; `moved_over_10pct` explained by the samples; `proof` mostly
+base_and_page_cookie (base_and_cart is the residual risk: a cookie-less page vouched for by another response).
 It writes nothing: no seed, no snapshot, no offer. The database is read in READ ONLY transactions with a
 statement timeout and closed before the first fetch.
 
@@ -30,7 +41,7 @@ Launch (Peng; pg CPU gate first):
     bash scripts/ops/run_oneoff_job.sh -c "$(cat scripts/ops/plan_shopify_catalogue_refresh.py)"
 
 Output:
-  * `GATE_OPEN` once every precondition holds (production env, the egress stated, outside 03:00-06:30Z, a
+  * `GATE_OPEN` once every precondition holds (production env, the egress stated, a Cloud Run job, outside 03:00-06:30Z, a
     numeric statement timeout, the lane importable, a read-only transaction, the table present), else
     `GATE_CLOSED <reason>` and exit 3 before any query or fetch;
   * then only `SCR_PLAN <kind> {json}` lines: `hosts` (the plan), one `host` per host read, `summary`,
@@ -65,10 +76,15 @@ SELECT id, destination_url FROM external_product_seeds WHERE status = 'active' A
 
 SEED_COLUMNS_SQL = """
 SELECT id, market, destination_url, canonical_url, price_amount, price_currency, availability, last_crawled_at,
+       destination_verdict, destination_failure_streak,
        seed_data -> 'variants' AS variants, seed_data -> 'snapshot' -> 'variants' AS snapshot_variants,
-       seed_data ->> 'title' AS title
+       seed_data ->> 'title' AS title,
+       seed_data -> 'snapshot' ->> 'page_read_at' AS page_read_at, seed_data -> 'snapshot' ->> 'read_source' AS read_source
 FROM external_product_seeds WHERE id = ANY($1::text[])
 """
+#: A host's median catalogue/stored ratio this far off 1, with p10..p90 on one side of it, is an offset.
+OFFSET_MIN = 0.01
+OFFSET_MIN_SEEDS = 3
 
 
 def _closed(reason):
@@ -118,9 +134,27 @@ def _json(value):
     return value
 
 
+def _quantile(sorted_values, q):
+    """Nearest-rank quantile of a sorted, non-empty list."""
+    idx = min(len(sorted_values) - 1, max(0, int(round(q * (len(sorted_values) - 1)))))
+    return sorted_values[idx]
+
+
+def price_ratio_stats(ratios):
+    """{n, median, p10, p90, offset_suspected} of a host's catalogue/stored price ratios."""
+    values = sorted(r for r in ratios if r is not None)
+    if not values:
+        return {"n": 0, "median": None, "p10": None, "p90": None, "offset_suspected": False}
+    median, p10, p90 = (round(_quantile(values, q), 4) for q in (0.5, 0.1, 0.9))
+    one_sided = (p10 > 1.0 and p90 > 1.0) or (p10 < 1.0 and p90 < 1.0)
+    offset = len(values) >= OFFSET_MIN_SEEDS and abs(median - 1.0) >= OFFSET_MIN and one_sided
+    return {"n": len(values), "median": median, "p10": p10, "p90": p90, "offset_suspected": offset}
+
+
 def compare_seed(seed, read):
     """How the catalogue's reading of one seed compares to what it stores (the latest page read)."""
-    from routes.employee_products import _reconcile_seed_variants_with_read
+    from routes.employee_products import _foreign_refresh_variant_currencies, _reconcile_seed_variants_with_read
+    from services.external_offers_service import seed_variants_from_evidence
 
     snap = read.snapshot
     stored_amount = float(seed["price_amount"]) if seed.get("price_amount") is not None else None
@@ -136,6 +170,7 @@ def compare_seed(seed, read):
         diff = abs(snap.price_amount - stored_amount)
         pct = diff / stored_amount if stored_amount else None
         out["pct"] = round(pct, 4) if pct is not None else None
+        out["ratio"] = round(snap.price_amount / stored_amount, 4) if stored_amount else None
         if diff < 0.005:
             out["price"] = "agree"
         elif pct is not None and pct <= 0.02:
@@ -149,6 +184,11 @@ def compare_seed(seed, read):
         variants = _json(seed.get("snapshot_variants"))
     stored_variants = [v for v in (variants or []) if isinstance(v, dict)]
     takes_product = out["price"] in ("agree", "none_stored") or out["price"].startswith("moved")
+    # The refresh's own bar on the variants: a stored variant priced in a currency the read is not.
+    refused = _foreign_refresh_variant_currencies(
+        existing=stored_variants, incoming=seed_variants_from_evidence(snap.evidence) or [],
+        row_currency=seed.get("price_currency"),
+    )
     _, report = _reconcile_seed_variants_with_read(
         stored_variants,
         snap.evidence["variants"],
@@ -156,6 +196,7 @@ def compare_seed(seed, read):
         product_currency=snap.price_currency,
         product_availability=snap.availability if snap.availability != "unknown" else None,
         census=snap.evidence["variant_census"],
+        refused_currencies=refused,
         product_title=seed.get("title"),
     )
     out["variants"] = "all_re_read" if not report["not_re_read_count"] else "not_all_re_read"
@@ -163,15 +204,20 @@ def compare_seed(seed, read):
     return out
 
 
-def plan_host(host, catalogue, seeds):
+def plan_host(host, catalogue, seeds, *, now=None):
     """The `host` line for one host's catalogue read and its seeds."""
-    from services.external_seed_catalogue_refresh import seed_catalogue_read
+    from services import external_seed_catalogue_refresh as lane
 
-    reasons, prices, variants = {}, {}, {}
-    sample = []
+    reasons, prices, variants, due = {}, {}, {}, {}
+    sample, ratios = [], []
     matched = 0
+    now = now or _now_utc()
+    max_age = lane.page_max_age_days()
     for seed in seeds:
-        read, why = seed_catalogue_read(catalogue, seed["destination_url"], market=str(seed.get("market") or ""))
+        why_due = lane.page_read_due(seed, now=now, max_age_days=max_age)
+        if why_due:
+            _bump(due, why_due)
+        read, why = lane.seed_catalogue_read(catalogue, seed["destination_url"], market=str(seed.get("market") or ""))
         _bump(reasons, why)
         if read is None:
             continue
@@ -179,10 +225,37 @@ def plan_host(host, catalogue, seeds):
         compared = compare_seed(seed, read)
         _bump(prices, compared["price"])
         _bump(variants, compared["variants"])
+        ratios.append(compared.get("ratio"))
         if compared["price"] not in ("agree",) and len(sample) < SAMPLE:
             sample.append(compared)
     return {**catalogue.summary(), "seeds": len(seeds), "matched": matched, "reasons": reasons,
-            "price": prices, "variants": variants, "sample": sample}
+            "price": prices, "variants": variants, "price_ratio": price_ratio_stats(ratios),
+            "page_read_due": due, "sample": sample}
+
+
+async def read_only_transaction(conn, timeout_ms):
+    """A started READ ONLY transaction with `statement_timeout` set, or GATE_CLOSED (exit 3)."""
+    tr = conn.transaction(readonly=True)
+    await tr.start()
+    await conn.execute("SET LOCAL statement_timeout = " + str(timeout_ms))
+    if await conn.fetchval("SHOW transaction_read_only") != "on":
+        await tr.rollback()
+        _closed("transaction is not read-only")
+    if str(await conn.fetchval("SHOW statement_timeout")) in ("0", ""):
+        await tr.rollback()
+        _closed("statement_timeout did not take")
+    return tr
+
+
+def go_no_go(totals):
+    """The figures the flag decision reads (see the module docstring); a person judges them."""
+    matched = totals["matched"]
+    return {
+        "not_all_re_read_share": round(totals["variants"].get("not_all_re_read", 0) / matched, 4) if matched else None,
+        "moved_over_10pct_share": round(totals["price"].get("moved_over_10pct", 0) / matched, 4) if matched else None,
+        "offset_suspected_hosts": len(totals["offset_suspected_hosts"]),
+        "hosts_priced_on_cart_proof": totals["proof"].get("base_and_cart", 0),
+    }
 
 
 async def main():
@@ -192,6 +265,9 @@ async def main():
         _closed("PIVOTA_ENV is not production")
     if os.getenv("CATALOGUE_PLAN_EGRESS") != "pivota-crawl":
         _closed("CATALOGUE_PLAN_EGRESS must state pivota-crawl: launch with SUBNET=pivota-crawl, never from a laptop")
+    if not os.getenv("CLOUD_RUN_JOB"):
+        # Set by Cloud Run in every job execution, never on a laptop: the declared egress alone is a claim.
+        _closed("CLOUD_RUN_JOB unset: this runs as a Cloud Run job on the crawl subnet, never from a laptop")
     if in_quiet_window(_now_utc()):
         _closed("03:00-06:30Z belongs to the destination sweep and the nightly refresh")
     url = (os.getenv("DATABASE_URL") or "").replace("postgresql+asyncpg://", "postgresql://")
@@ -222,17 +298,8 @@ async def main():
 
     conn = await asyncpg.connect(url, command_timeout=float(os.getenv("DB_COMMAND_TIMEOUT_SECONDS") or 600))
 
-    async def read_only():
-        tr = conn.transaction(readonly=True)
-        await tr.start()
-        await conn.execute("SET LOCAL statement_timeout = " + str(timeout_ms))
-        if await conn.fetchval("SHOW transaction_read_only") != "on":
-            await tr.rollback()
-            _closed("transaction is not read-only")
-        return tr
-
     try:
-        tr = await read_only()
+        tr = await read_only_transaction(conn, timeout_ms)
         try:
             present = await conn.fetchval("SELECT to_regclass('external_product_seeds') IS NOT NULL")
         finally:
@@ -241,7 +308,7 @@ async def main():
             _closed("table missing: external_product_seeds")
         print("GATE_OPEN", flush=True)
 
-        tr = await read_only()
+        tr = await read_only_transaction(conn, timeout_ms)
         try:
             hosts = plan_hosts([dict(r) for r in await conn.fetch(ACTIVE_DESTINATIONS_SQL)], top_hosts)
             ids = [i for seed_ids in hosts.values() for i in seed_ids]
@@ -272,7 +339,8 @@ async def main():
 
     breaker = crawl_ip_throttle.StagedIpThrottleBreaker.from_env(on_trip=_on_trip)
     totals = {"hosts_planned": len(hosts), "hosts_read": 0, "hosts_priceable": 0, "seeds": len(seeds),
-              "matched": 0, "host_status": {}, "price": {}, "variants": {}, "stopped": None}
+              "matched": 0, "host_status": {}, "price": {}, "variants": {}, "page_read_due": {}, "proof": {},
+              "offset_suspected_hosts": [], "stopped": None}
     with crawl_ip_throttle.installed(breaker), crawl_global_pacer.installed(pacer):
         for host, seed_ids in hosts.items():
             if pacer.stopped or breaker.tripped or breaker.blocks(host):
@@ -291,14 +359,19 @@ async def main():
             _bump(totals["host_status"], catalogue.status)
             totals["hosts_priceable"] += int(catalogue.status == lane.STATUS_OK)
             totals["matched"] += line["matched"]
-            for key in ("price", "variants"):
+            for key in ("price", "variants", "page_read_due"):
                 for k, n in line[key].items():
                     _bump(totals[key], k, n)
+            if catalogue.status == lane.STATUS_OK:
+                _bump(totals["proof"], catalogue.proof)
+            if line["price_ratio"]["offset_suspected"]:
+                totals["offset_suspected_hosts"].append({"host": host, **line["price_ratio"]})
     pace = pacer.summary()
     requests = int(pace.get("paced_requests") or 0)
     totals["origin_requests"] = requests
     totals["requests_per_matched_seed"] = round(requests / totals["matched"], 3) if totals["matched"] else None
     totals["page_read_requests_for_the_same_seeds_est"] = round(1.3 * totals["matched"])
+    totals["go_no_go"] = go_no_go(totals)
     emit("summary", totals)
     emit("pacer", {**pace, **breaker.summary()})
     print(f"{PREFIX} DONE lines={_lines['n']}", flush=True)

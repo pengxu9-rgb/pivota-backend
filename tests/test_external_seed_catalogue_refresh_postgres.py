@@ -171,6 +171,14 @@ async def _row(db, seed_id: str) -> Dict[str, Any]:
     return row
 
 
+async def _page_read_days_ago(db, seed_ids, days: int) -> None:
+    """The stamp a refresh's page read left (every refresh before the lane): `last_crawled_at`."""
+    for seed_id in seed_ids:
+        await db.execute(
+            "UPDATE external_product_seeds SET last_crawled_at = NOW() - make_interval(days => :days) WHERE id = :id",
+            {"id": seed_id, "days": days})
+
+
 async def _run_batch(monkeypatch, db, seed_ids, pages) -> Dict[str, Any]:
     import jobs.external_referral_refresh as job
     import routes.employee_products as routes_mod
@@ -207,11 +215,11 @@ async def test_the_batch_prices_the_drains_seeds_off_the_catalogue_on_postgres(s
     for seed in seeds:
         await _write_seed(scoped_db, seed)
     target = seeds[0]["id"]
-    # A stale page read's stamps, and a previous dead_404 at streak 1 the listed observation must reset.
+    # Page-read 20 days ago (inside the 30-day maximum), live then, with an HTTP status from that read.
+    await _page_read_days_ago(scoped_db, [s["id"] for s in seeds], 20)
     await scoped_db.execute(
-        "UPDATE external_product_seeds SET destination_verdict = 'dead_404', destination_http_status = 404,"
-        " destination_failure_streak = 1, destination_checked_at = NOW() - interval '3 days',"
-        " last_crawled_at = NOW() - interval '20 days' WHERE id = :id", {"id": target})
+        "UPDATE external_product_seeds SET destination_verdict = 'live', destination_http_status = 200,"
+        " destination_checked_at = NOW() - interval '20 days' WHERE id = :id", {"id": target})
     before = await _row(scoped_db, target)
     assert [v["variant_id"] for v in before["seed_data"]["variants"]] == [V50, V15]
 
@@ -230,7 +238,7 @@ async def test_the_batch_prices_the_drains_seeds_off_the_catalogue_on_postgres(s
     assert (by_id[V15]["availability"], by_id[V15]["in_stock"]) == ("out_of_stock", False)
     snapshot = after["seed_data"]["snapshot"]
     assert snapshot["variant_refresh"]["status"] == "all_re_read"
-    assert snapshot["read_source"] == "products_json"
+    assert snapshot["read_source"] == "products_json" and "page_read_at" not in snapshot
     assert datetime.fromisoformat(snapshot["extracted_at"]) > datetime.now(timezone.utc) - timedelta(minutes=5)
     # The stamps the queue and the freshness gate read.
     now = datetime.now(timezone.utc)
@@ -241,11 +249,50 @@ async def test_the_batch_prices_the_drains_seeds_off_the_catalogue_on_postgres(s
         assert after[col] == before[col], col
     for key in ("title", "image_urls", "product_name", "brand"):
         assert after["seed_data"].get(key) == before["seed_data"].get(key), key
-    # The sweep's listed observation: live, checked now, no HTTP status invented, streak reset.
+    # The sweep's listed observation: live, checked now, no HTTP status invented.
     assert after["destination_verdict"] == "live"
     assert after["destination_http_status"] is None
     assert after["destination_failure_streak"] == 0
     assert now - after["destination_checked_at"] < timedelta(minutes=5)
+
+
+async def test_a_seed_due_its_page_read_is_page_read_on_postgres(scoped_db, monkeypatch):
+    """Review P2-2(a): a destination with a failure streak, and one whose last PAGE read is older than the
+    maximum, get the page read the catalogue cannot replace; the rest are priced off the catalogue."""
+    import routes.employee_products as routes_mod
+
+    handles = (HANDLE, "other-a", "other-b", "dying", "long-unread")
+    seeds = [_drain_seed(_product(), handle=h) for h in handles]
+    for seed in seeds:
+        await _write_seed(scoped_db, seed)
+    await _page_read_days_ago(scoped_db, [s["id"] for s in seeds], 20)
+    dying, unread = seeds[3]["id"], seeds[4]["id"]
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET destination_verdict = 'dead_404', destination_http_status = 404,"
+        " destination_failure_streak = 1 WHERE id = :id", {"id": dying})
+    # The lane read it last night; its last PAGE read was 40 days ago.
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET last_crawled_at = NOW(), seed_data = seed_data || jsonb_build_object("
+        " 'snapshot', COALESCE(seed_data -> 'snapshot', '{}'::jsonb)"
+        " || jsonb_build_object('read_source', 'products_json', 'page_read_at', CAST(:at AS text))) WHERE id = :id", {"id": unread, "at": (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()})
+    page_reads = []
+
+    async def page_read(*, url, **_kw):
+        page_reads.append(url)
+        raise RuntimeError("page read (stubbed)")
+
+    monkeypatch.setattr(routes_mod, "resolve_external_offer", page_read)
+    pages = [[dict(_product(), handle=h) for h in handles]]
+    summary = await _run_batch(monkeypatch, scoped_db, [s["id"] for s in seeds], pages)
+
+    cat = summary["catalogue"]
+    assert cat["rows_read"] == 3 and cat["rows"]["read"] == 3, cat
+    assert cat["rows"]["page_read_due:destination_failure_streak"] == 1
+    assert cat["rows"]["page_read_due:page_read_too_old"] == 1
+    assert sorted(page_reads) == sorted(s["destination_url"] for s in seeds[3:])
+    after = await _row(scoped_db, dying)
+    assert (after["destination_verdict"], after["destination_failure_streak"]) == ("dead_404", 1), \
+        "a listing never resets a dead streak"
 
 
 async def test_flag_off_the_batch_never_reads_the_catalogue_on_postgres(scoped_db, monkeypatch):
@@ -300,6 +347,7 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     monkeypatch.setattr(mod, "_now_utc", lambda: datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc))
     monkeypatch.setenv("PIVOTA_ENV", "production")
     monkeypatch.setenv("CATALOGUE_PLAN_EGRESS", "pivota-crawl")
+    monkeypatch.setenv("CLOUD_RUN_JOB", "plan-shopify-catalogue-refresh")
     monkeypatch.setenv("DB_STATEMENT_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("PLAN_RPS", "1.0")
     # asyncpg passes an unknown DSN parameter as a server setting: the script's own connection reads this schema.
@@ -319,10 +367,16 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     assert host["reasons"] == {"read": 3, "handle_not_read": 1}
     assert host["price"] == {"agree": 1, "moved_within_2pct": 1, "moved_over_10pct": 1}
     assert host["variants"] == {"all_re_read": 3}
+    # Stored 80.00 against 90.00, 80.00 and 81.00: drift on one seed, no constant offset.
+    assert host["price_ratio"] == {"n": 3, "median": 1.0125, "p10": 1.0, "p90": 1.125, "offset_suspected": False}
+    # The drain's rows were never page-read: the lane would read their pages first.
+    assert host["page_read_due"] == {"page_read_unknown": 4}
     summary = payload["summary"]
     assert (summary["hosts_read"], summary["hosts_priceable"], summary["matched"]) == (1, 1, 3)
     # meta.json + 3 catalogue pages (the third, empty, ends it: "gone" is not listed).
     assert summary["origin_requests"] == 4 and summary["requests_per_matched_seed"] == 1.333
+    assert summary["go_no_go"] == {"not_all_re_read_share": 0.0, "moved_over_10pct_share": 0.3333,
+                                   "offset_suspected_hosts": 0, "hosts_priced_on_cart_proof": 0}
 
     after = [dict(r) for r in await scoped_db.fetch_all(
         "SELECT id, price_amount, seed_data::text AS sd, updated_at, last_crawled_at, destination_checked_at"

@@ -40,7 +40,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -402,6 +402,20 @@ class CatalogueRead:
 # The price lane found every handle it asked for before the end of the catalogue and stopped there.
 # NOT `usable`: the handles past that page were never read, so nothing may be called delisted off it.
 CATALOGUE_WANTED_FOUND = "wanted_found"
+# The price lane's `stop_after_page` ended the read (a page presented in a currency it will refuse).
+CATALOGUE_STOPPED = "stopped"
+# The price lane's `same_host_only`: a page's FINAL response came from another storefront.
+CATALOGUE_REDIRECTED_OFF_HOST = "redirected_off_host"
+
+
+def same_storefront(host: Any, other: Any) -> bool:
+    """`host` and `other` name one storefront: equal but for case, a trailing dot and a leading `www.`,
+    the one difference `routes.employee_products._same_destination` forgives too."""
+    def _norm(value: Any) -> str:
+        name = str(value or "").strip().lower().rstrip(".")
+        return name[4:] if name.startswith("www.") else name
+
+    return bool(_norm(host)) and _norm(host) == _norm(other)
 
 
 async def read_brand_catalogue(
@@ -412,6 +426,8 @@ async def read_brand_catalogue(
     want_products: Optional[Set[str]] = None,
     max_pages: Optional[int] = None,
     user_agent: str = USER_AGENT,
+    same_host_only: bool = False,
+    stop_after_page: Optional[Callable[[List[str]], Optional[str]]] = None,
 ) -> CatalogueRead:
     """Every handle a Shopify storefront lists, or an honest reason we could not read it.
 
@@ -426,6 +442,12 @@ async def read_brand_catalogue(
     seen (`CATALOGUE_WANTED_FOUND`), and after `max_pages` pages (`CATALOGUE_INCOMPLETE`). The
     sweep passes neither, and its read is exactly what it was. `user_agent` is the one robots.txt
     is asked for and the request carries.
+
+    Two more for the price lane, which the sweep passes neither of either: `same_host_only` refuses a
+    page whose final response (after redirects) came from another storefront than `host`
+    (`same_storefront`), as `CATALOGUE_REDIRECTED_OFF_HOST` on page 1 and `CATALOGUE_INCOMPLETE` after;
+    `stop_after_page(page_set_cookies)` is asked after each page is kept, and a note it returns ends
+    the read there (`CATALOGUE_STOPPED`), so a page that already refuses the host costs no more pages.
     """
     handles: Set[str] = set()
     total = 0
@@ -442,7 +464,8 @@ async def read_brand_catalogue(
         url = f"https://{host}/products.json?limit={PAGE_LIMIT}&page={page}"
         cookies: List[List[str]] = []
         kind, payload = await _get_catalogue_page(
-            client, url, attempts, user_agent=user_agent, set_cookies_out=cookies if wanted else None
+            client, url, attempts, user_agent=user_agent, set_cookies_out=cookies if wanted else None,
+            expect_host=host if same_host_only else None,
         )
         if kind != "products":
             note = payload if isinstance(payload, str) else str(payload)
@@ -479,6 +502,10 @@ async def read_brand_catalogue(
                 # store's data error, not a newer price.
                 if handle in wanted and handle not in products and isinstance(product, dict):
                     products[handle] = product
+        if stop_after_page is not None:
+            stop_note = stop_after_page(page_set_cookies[-1] if page_set_cookies else [])
+            if stop_note:
+                return _read(CATALOGUE_STOPPED, set(), total, f"stopped after page {page}: {stop_note}")
         # Only the empty page above ends the catalogue: Shopify serves SHORT pages mid-catalogue
         # (hidden products count toward `limit`; bluemercury.com page 1 = 249, page 2 = 250), and
         # stopping on one reads every later handle as delisted.
@@ -498,6 +525,7 @@ async def _get_catalogue_page(
     *,
     user_agent: str = USER_AGENT,
     set_cookies_out: Optional[List[List[str]]] = None,
+    expect_host: Optional[str] = None,
 ) -> Tuple[str, Any]:
     last = ""
     for attempt in range(max(1, attempts)):
@@ -529,6 +557,11 @@ async def _get_catalogue_page(
             url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers
         )
         shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
+        if expect_host is not None and not same_storefront(resp.url.host, expect_host):
+            # Another storefront answered (a 301 onto a sister store, a reseller, a parked domain):
+            # whatever it lists is not this host's catalogue. The response was noted above, so its
+            # status still feeds the pacing and the breakers.
+            return CATALOGUE_REDIRECTED_OFF_HOST, f"final host {str(resp.url.host)[:80]}"
         mitigated = resp.headers.get("cf-mitigated")
         if mitigated:
             # A challenge is a refusal, not a pacing signal — retrying can only stall.

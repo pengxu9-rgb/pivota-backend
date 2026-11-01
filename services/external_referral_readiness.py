@@ -2038,25 +2038,31 @@ async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, s
     return hosts
 
 
-async def _fetch_refresh_candidate_dests(seed_ids: Sequence[str]) -> Dict[str, str]:
-    """seed id -> destination_url, for the catalogue price lane's plan (the URL the refresh reads).
+_CATALOGUE_PLAN_SQL = """
+SELECT id, destination_url, last_crawled_at, destination_verdict, destination_failure_streak,
+       seed_data -> 'snapshot' ->> 'page_read_at' AS page_read_at,
+       seed_data -> 'snapshot' ->> 'read_source' AS read_source
+FROM external_product_seeds WHERE id IN ({placeholders})
+"""
+
+
+async def _fetch_refresh_candidate_dests(seed_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    """seed id -> what the catalogue price lane plans from: `destination_url` (the URL the refresh reads)
+    and the fields `external_seed_catalogue_refresh.page_read_due` reads.
 
     Fails open to "no catalogue lane": a lookup error leaves every row on its page read."""
-    dests: Dict[str, str] = {}
+    dests: Dict[str, Dict[str, Any]] = {}
     ids = [str(s) for s in seed_ids if s]
     try:
         for start in range(0, len(ids), 500):
             chunk = ids[start:start + 500]
             params = {f"id{i}": seed_id for i, seed_id in enumerate(chunk)}
             placeholders = ", ".join(f":id{i}" for i in range(len(chunk)))
-            rows = await database.fetch_all(
-                f"SELECT id, destination_url FROM external_product_seeds WHERE id IN ({placeholders})",
-                params,
-            )
+            rows = await database.fetch_all(_CATALOGUE_PLAN_SQL.format(placeholders=placeholders), params)
             for row in rows or []:
                 row_dict = _row_to_dict(row)
                 if row_dict.get("destination_url"):
-                    dests[str(row_dict.get("id"))] = str(row_dict["destination_url"])
+                    dests[str(row_dict.get("id"))] = row_dict
     except Exception as exc:  # noqa: BLE001 - the lane is an optimisation, the refresh is not
         logger.warning(
             "external referral refresh: destination lookup failed (%s); the catalogue lane is OFF "
@@ -2166,16 +2172,26 @@ async def run_external_referral_refresh_batch(
     catalogue_on = catalogue_lane.catalogue_refresh_enabled()
     catalogue_min = catalogue_lane.catalogue_min_seeds()
     catalogue_wanted: Dict[str, set] = {}
-    candidate_dests: Dict[str, str] = {}
+    candidate_dests: Dict[str, Dict[str, Any]] = {}
+    # Seeds whose PAGE read is due (`page_read_due`): never asked of the catalogue, so they cost it no page.
+    catalogue_page_due: Dict[str, str] = {}
     if catalogue_on and candidate_hosts:
         candidate_dests = await _fetch_refresh_candidate_dests(candidate_seed_ids)
+        plan_now, page_max_age = datetime.now(timezone.utc), catalogue_lane.page_max_age_days()
         for seed_id, host in candidate_hosts.items():
-            handle = catalogue_lane.catalogue_handle(candidate_dests.get(seed_id))
-            if handle:
-                catalogue_wanted.setdefault(host, set()).add(handle)
+            info = candidate_dests.get(seed_id) or {}
+            handle = catalogue_lane.catalogue_handle(info.get("destination_url"))
+            if not handle:
+                continue
+            due = catalogue_lane.page_read_due(info, now=plan_now, max_age_days=page_max_age)
+            if due:
+                catalogue_page_due[seed_id] = due
+                continue
+            catalogue_wanted.setdefault(host, set()).add(handle)
         catalogue_wanted = {h: w for h, w in catalogue_wanted.items() if len(w) >= catalogue_min}
     host_catalogues: Dict[str, Any] = {}
     catalogue_reasons: Dict[str, int] = {}
+    catalogue_fallbacks: Dict[str, int] = {}
     catalogue_rows_read = 0
     # Hosts this run has stopped asking, and how many of their rows it passed over. Those rows
     # are NOT stamped (`refresh_seed_by_id` is never called), so they keep their place at the
@@ -2275,10 +2291,14 @@ async def run_external_referral_refresh_batch(
         row_started = time.monotonic()
         try:
             catalogue_read = None
-            if host in catalogue_wanted:
+            if seed_id in catalogue_page_due:
+                _bump(catalogue_reasons, "page_read_due:" + catalogue_page_due[seed_id])
+            elif host in catalogue_wanted:
                 if host not in host_catalogues:
                     host_catalogues[host] = await catalogue_lane.read_host_catalogue(host, catalogue_wanted[host])
-                catalogue_read, why = catalogue_lane.seed_catalogue_read(host_catalogues[host], candidate_dests.get(seed_id))
+                catalogue_read, why = catalogue_lane.seed_catalogue_read(
+                    host_catalogues[host], (candidate_dests.get(seed_id) or {}).get("destination_url")
+                )
                 _bump(catalogue_reasons, why)
             if catalogue_read is not None:
                 result = await refresh_seed_by_id(seed_id, catalogue_read=catalogue_read)
@@ -2290,6 +2310,8 @@ async def run_external_referral_refresh_batch(
                 refreshed += 1
                 if result.get("read_source") == catalogue_lane.READ_SOURCE:
                     catalogue_rows_read += 1
+                if catalogue_read is not None and result.get("catalogue_fallback"):
+                    _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
                 if result.get("snapshot_from_cache"):
                     refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
@@ -2793,6 +2815,9 @@ async def run_external_referral_refresh_batch(
             "pages_read": sum(c.pages_read for c in host_catalogues.values()),
             "rows_read": catalogue_rows_read,
             "rows": dict(sorted(catalogue_reasons.items(), key=lambda kv: -kv[1])),
+            "page_max_age_days": catalogue_lane.page_max_age_days(),
+            # Handed a catalogue read, and read from their page after all (the route's reason).
+            "fallbacks": dict(sorted(catalogue_fallbacks.items(), key=lambda kv: -kv[1])),
             "hosts": [
                 c.summary() for c in sorted(host_catalogues.values(), key=lambda c: -c.wanted)[:15]
             ],

@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import AsyncMock
@@ -37,6 +39,10 @@ V50, V15 = "37169662034071", "41430446375063"  # real-shaped Shopify variant ids
 TITLE = "Example Eau De Toilette"
 
 
+#: The pacing layer's own response hook, before `_no_pacing` stubs it (the breaker test puts it back).
+_REAL_NOTE_RESPONSE = cp.note_response
+
+
 @pytest.fixture(autouse=True)
 def _no_pacing(monkeypatch: pytest.MonkeyPatch):
     """The gate is tested in tests/test_crawl_politeness.py; here it records and never waits."""
@@ -54,6 +60,7 @@ def _no_pacing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(liveness.asyncio, "sleep", _no_sleep)
     monkeypatch.delenv(lane.FLAG, raising=False)
     monkeypatch.delenv(lane.MIN_SEEDS_ENV, raising=False)
+    monkeypatch.delenv(lane.PAGE_MAX_AGE_ENV, raising=False)
     yield asked
     cp.reset_for_tests()
 
@@ -411,6 +418,181 @@ def test_a_client_the_read_opened_is_closed_whatever_the_outcome(monkeypatch):
     assert closed == ["closed", "closed"]
 
 
+# ----------------------------------------------------------------- review of #2685: one storefront, early stop
+
+
+OTHER_HOST = "sister-store.example"
+
+
+def _read_following(handler, wanted=(HANDLE, "x", "y"), host: str = HOST) -> lane.HostCatalogue:
+    """`read_host_catalogue` over a client that follows redirects, as the lane's own `_client()` does."""
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+            return await lane.read_host_catalogue(host, set(wanted), client=client)
+
+    return asyncio.run(go())
+
+
+def _redirecting(inner, *, to: str, paths=("/meta.json", "/products.json", "/cart.js"), seen=None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        if request.url.host == HOST and request.url.path in paths:
+            return httpx.Response(301, headers={"location": str(request.url.copy_with(host=to))})
+        return inner(request)
+
+    return handler
+
+
+def test_a_host_redirected_onto_another_storefront_is_not_priced_from_it():
+    """Review P2-1 (the reviewer's F1): every answer came from the other store, a consistent USD one."""
+    seen: List[httpx.Request] = []
+    store = _store([[_product(p50="99.00")]], base="USD", cookie="USD")
+    catalogue = _read_following(_redirecting(store, to=OTHER_HOST, seen=seen))
+    assert catalogue.status == lane.STATUS_REDIRECTED_OFF_HOST and not catalogue.products
+    assert [r.url.path for r in seen] == ["/meta.json", "/meta.json"], "the hop, then nothing more"
+    assert lane.seed_catalogue_read(catalogue, DEST) == (None, lane.STATUS_REDIRECTED_OFF_HOST)
+
+
+def test_a_catalogue_redirected_onto_another_storefront_is_not_priced_from_it():
+    store = _store([[_product(p50="99.00")]], base="USD", cookie="USD")
+    catalogue = _read_following(_redirecting(store, to=OTHER_HOST, paths=("/products.json",)))
+    assert catalogue.status == "catalogue_" + liveness.CATALOGUE_REDIRECTED_OFF_HOST
+    assert lane.seed_catalogue_read(catalogue, DEST)[0] is None
+
+
+def test_a_page_redirected_mid_catalogue_ends_the_read_with_what_this_host_listed():
+    store = _store([[_product(), _other(1)], [_other(2)]], base="USD", cookie="USD")
+
+    def handler(request):
+        if request.url.host == HOST and request.url.params.get("page") == "2":
+            return httpx.Response(301, headers={"location": str(request.url.copy_with(host=OTHER_HOST))})
+        return store(request)
+
+    catalogue = _read_following(handler)
+    assert catalogue.status == lane.STATUS_OK and catalogue.catalogue_status == liveness.CATALOGUE_INCOMPLETE
+    assert set(catalogue.products) == {HANDLE} and "final host" in catalogue.note
+
+
+def test_a_redirect_to_the_www_storefront_is_the_same_storefront():
+    catalogue = _read_following(_redirecting(_store([[_product(p50="85.00")]]), to="www." + HOST))
+    assert catalogue.status == lane.STATUS_OK
+    read, why = lane.seed_catalogue_read(catalogue, DEST)
+    assert why == "read" and read.snapshot.price_amount == 85.0
+
+
+def test_a_cart_js_from_another_storefront_proves_nothing():
+    store = _store([[_product()]], base="USD", cookie=None, cart="USD")
+    catalogue = _read_following(_redirecting(store, to=OTHER_HOST, paths=("/cart.js",)))
+    assert (catalogue.status, catalogue.cart_currency) == (lane.STATUS_CURRENCY_UNPROVEN, None)
+
+
+@pytest.mark.parametrize("host,other,same", [
+    ("brand.example", "brand.example", True), ("brand.example", "WWW.Brand.Example.", True),
+    ("www.brand.example", "brand.example", True), ("brand.example", "shop.brand.example", False),
+    ("brand.example", "brand.example.evil", False), ("", "", False),
+])
+def test_one_storefront_is_one_host_but_for_www(host, other, same):
+    assert liveness.same_storefront(host, other) is same
+
+
+def test_a_first_page_presented_in_another_currency_ends_the_read_there():
+    """Review P2-3 (the reviewer's F2): it read meta and six pages before refusing."""
+    pages = [[_other(i) for i in range(p * 10, p * 10 + 3)] for p in range(4)] + [[_product()]]
+    seen: List[httpx.Request] = []
+    catalogue = _read_host(pages, wanted=(HANDLE, "a", "b", "c", "d", "e"), base="GBP", cookie="USD", cart="GBP", seen=seen)
+    assert catalogue.status == lane.STATUS_CURRENCY_CONFLICT
+    assert [r.url.path for r in seen] == ["/meta.json", "/products.json"], "no more pages, no /cart.js"
+    assert catalogue.catalogue_status == liveness.CATALOGUE_STOPPED and catalogue.pages_read == 1
+
+
+def test_a_later_page_presented_in_another_currency_ends_the_read_there():
+    store = _store([[_other(1)], [_other(2)], [_product()]], base="USD", cookie="USD")
+    seen: List[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        resp = store(request)
+        if request.url.params.get("page") == "2":
+            return httpx.Response(200, json=resp.json(), headers=[("set-cookie", "cart_currency=CAD; path=/")])
+        return resp
+
+    catalogue = _read_following(handler, wanted=(HANDLE, "x", "y"))
+    assert catalogue.status == lane.STATUS_CURRENCY_CONFLICT
+    assert [r.url.params.get("page") for r in seen if r.url.path == "/products.json"] == ["1", "2"]
+
+
+def test_the_catalogues_answers_feed_the_host_breakers(monkeypatch):
+    """The batch's 429 and challenge breakers read `crawl_politeness`'s per-host streaks, which every lane
+    response is noted into, so a refused catalogue counts toward them like a refused page."""
+    monkeypatch.setattr(cp, "note_response", _REAL_NOTE_RESPONSE)
+    store = _store([[_product()]])
+
+    def handler(request):
+        if request.url.path == "/meta.json":
+            return httpx.Response(429, headers={"retry-after": "1"}, text="")
+        return store(request)
+
+    assert _read_host_with(handler).status == lane.STATUS_BASE_UNREAD
+    assert cp.consecutive_blocks(HOST) == 1
+
+    def challenged(request):
+        if request.url.path == "/products.json":
+            return httpx.Response(403, headers={"cf-mitigated": "challenge"}, text="")
+        return store(request)
+
+    cp.reset_for_tests()
+    assert _read_host_with(challenged).status == "catalogue_" + liveness.CATALOGUE_BOT_CHALLENGE
+    assert cp.consecutive_challenges(HOST) == 1
+
+
+def _read_host_with(handler) -> lane.HostCatalogue:
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await lane.read_host_catalogue(HOST, {HANDLE, "x", "y"}, client=client)
+
+    return asyncio.run(go())
+
+
+def test_every_snapshot_is_stamped_when_the_catalogue_was_fetched():
+    catalogue = _read_host([[_product(), _other(1), _other(2)]], wanted=(HANDLE, "x", "y"))
+    fetched = datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc)
+    catalogue.fetched_at = fetched
+    read, _ = lane.seed_catalogue_read(catalogue, DEST)
+    assert read.snapshot.last_checked_at == fetched and read.snapshot.evidence["fetchedAt"] == fetched.isoformat()
+
+
+NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("seed,due", [
+    ({"last_crawled_at": NOW - timedelta(days=29)}, None),
+    ({"last_crawled_at": NOW - timedelta(days=31)}, lane.DUE_TOO_OLD),
+    ({"last_crawled_at": (NOW - timedelta(days=29)).replace(tzinfo=None)}, None),   # a naive UTC column
+    ({"last_crawled_at": (NOW - timedelta(days=2)).isoformat()}, None),
+    ({}, lane.DUE_UNKNOWN),
+    ({"last_crawled_at": "not a time"}, lane.DUE_UNKNOWN),
+    # The lane's own read stamps last_crawled_at too: it never stands in for a page read.
+    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE}, lane.DUE_UNKNOWN),
+    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE, "page_read_at": (NOW - timedelta(days=3)).isoformat()}, None),
+    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE, "page_read_at": "2026-09-01T00:00:00Z"}, lane.DUE_TOO_OLD),
+    ({"last_crawled_at": NOW, "page_read_at": "2026-09-01T00:00:00+00:00"}, lane.DUE_TOO_OLD),
+    ({"last_crawled_at": NOW, "destination_verdict": liveness.VERDICT_LIVE}, None),
+    ({"last_crawled_at": NOW, "destination_verdict": "dead"}, lane.DUE_NOT_LIVE),
+    ({"last_crawled_at": NOW, "destination_verdict": "unverifiable"}, lane.DUE_NOT_LIVE),
+    ({"last_crawled_at": NOW, "destination_failure_streak": 1}, lane.DUE_FAILURE_STREAK),
+    ({"last_crawled_at": NOW, "destination_failure_streak": None}, None),
+])
+def test_a_page_read_is_due_by_age_and_by_liveness(seed, due):
+    assert lane.page_read_due(seed, now=NOW, max_age_days=30) == due
+
+
+@pytest.mark.parametrize("raw,days", [("", 30), ("7", 7), ("0", 1), ("-3", 1), ("x", 30)])
+def test_the_page_read_max_age_is_at_least_a_day(monkeypatch, raw, days):
+    monkeypatch.setenv(lane.PAGE_MAX_AGE_ENV, raw)
+    assert lane.page_max_age_days() == days
+
+
 def test_the_sweeps_read_is_unchanged_by_the_price_lane():
     """`read_brand_catalogue` without `want_products` keeps no products and stops only at the end."""
     async def go():
@@ -514,10 +696,13 @@ class _Refresh:
     """The real `_refresh_external_seed_by_id` over one stored row; DB, fetch, liveness writer and
     projection stubbed and recorded."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any]) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, row: Dict[str, Any], *, page_read_days_ago: Optional[float] = 1) -> None:
         import routes.employee_products as mod
 
         self.mod, self.stored = mod, copy.deepcopy(row)
+        if page_read_days_ago is not None and self.stored.get("last_crawled_at") is None:
+            # A row the refresh last read from its page that long ago (every refresh before the lane).
+            self.stored["last_crawled_at"] = datetime.now(timezone.utc) - timedelta(days=page_read_days_ago)
         self.page = None
         self.fetched: List[str] = []
         self.observations: List[Any] = []
@@ -651,14 +836,78 @@ def test_a_catalogue_read_never_replaces_a_page_read_variant_list(monkeypatch):
     """A seed whose variants an earlier PAGE read adopted (no merchant provenance) would have its list
     replaced by a richer page read. A catalogue read only re-prices: same list, same entries."""
     row = _drain_row()
-    page_variant = {"variant_id": "EXBASE", "title": TITLE, "price_amount": 80.0, "price_currency": "USD",
+    page_variant = {"variant_id": V50, "title": TITLE, "price_amount": 80.0, "price_currency": "USD",
                     "availability": "in_stock"}
     row["seed_data"]["variants"] = [page_variant]
     run = _Refresh(monkeypatch, row)
-    run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
-    assert [v["variant_id"] for v in run.stored["seed_data"]["variants"]] == ["EXBASE"]
-    # Its one id matches no catalogue variant and the list prices two values: not re-read, not stamped.
-    assert run.stored["seed_data"]["snapshot"]["variant_refresh"]["status"] == "not_all_re_read"
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
+    assert result["read_source"] == lane.READ_SOURCE and result["catalogue_fallback"] is None
+    assert [v["variant_id"] for v in run.stored["seed_data"]["variants"]] == [V50]
+    assert run.variants[V50]["price_amount"] == 85.0
+    assert run.stored["seed_data"]["snapshot"]["variant_refresh"]["status"] == "all_re_read"
+
+
+def test_a_catalogue_read_that_cannot_re_read_every_variant_is_dropped_for_the_page(monkeypatch):
+    """Review P2-2(b): stored keys the catalogue cannot match (here a page read's own id) would have the lane
+    remove `extracted_at` every night. The read is discarded unwritten and the page read in the same call."""
+    row = _drain_row()
+    row["seed_data"]["variants"] = [{"variant_id": "EXBASE", "title": TITLE, "price_amount": 80.0,
+                                     "price_currency": "USD", "availability": "in_stock"}]
+    run = _Refresh(monkeypatch, row)
+    run.page = _page_snapshot(85, 34)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
+    assert result["catalogue_fallback"] == "not_all_re_read" and result["read_source"] == "page"
+    assert run.fetched == [DEST]
+    assert len([q for q, _ in run.sql if "last_crawled_at" in q]) == 1, "the catalogue read wrote nothing"
+    assert "read_source" not in run.stored["seed_data"]["snapshot"]
+    assert len(run.observations) == 1 and run.observations[0].http_status == 200
+
+
+def test_a_page_read_is_due_after_the_max_age_and_on_a_destination_not_known_live(monkeypatch):
+    """Review P2-2(a): a listed handle can still 404, and only the page read sees it."""
+    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=31)
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read())
+    assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_TOO_OLD and run.fetched == [DEST]
+    assert run.stored["seed_data"]["snapshot"]["page_read_at"], "the page read is stamped"
+    # Now a page read is a day old ... but the destination has a failure streak: still the page.
+    run.stored["destination_failure_streak"] = 1
+    result = run.catalogue(_seed_read())
+    assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_FAILURE_STREAK and len(run.fetched) == 2
+    run.stored["destination_failure_streak"] = 0
+    run.page = None
+    assert run.catalogue(_seed_read())["read_source"] == lane.READ_SOURCE
+
+
+def test_a_catalogue_read_keeps_the_last_page_reads_stamp(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=None)
+    run.page_read(80, 32)
+    page_read_at = run.stored["seed_data"]["snapshot"]["page_read_at"]
+    run.stored["last_crawled_at"] = None
+    run.catalogue(_seed_read(_product(p50="85.00")))
+    assert run.stored["seed_data"]["snapshot"]["page_read_at"] == page_read_at
+    assert run.stored["seed_data"]["snapshot"]["read_source"] == lane.READ_SOURCE
+    # The stamp is the page read's, so the lane's own last_crawled_at never stands in for it.
+    run.stored["seed_data"]["snapshot"].pop("page_read_at")
+    run.page = _page_snapshot(85, 32)
+    assert run.catalogue(_seed_read())["catalogue_fallback"] == "page_read_due:" + lane.DUE_UNKNOWN
+
+
+def test_freshness_is_stamped_at_the_catalogue_fetch_not_the_rows_turn(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row())
+    read = _seed_read(_product(p50="85.00"))
+    fetched = datetime(2026, 11, 1, 7, 0, tzinfo=timezone.utc)
+    read = dataclasses.replace(read, snapshot=dataclasses.replace(read.snapshot, last_checked_at=fetched))
+    run.catalogue(read)
+    snapshot = run.stored["seed_data"]["snapshot"]
+    assert snapshot["extracted_at"].startswith("2026-11-01T07:00:00") and snapshot["refreshed_at"].startswith("2026-11-01T07:00:00")
+
+
+def test_a_catalogue_read_of_another_host_is_not_this_destinations(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(dataclasses.replace(_seed_read(), host="sister-store.example"))
+    assert result["catalogue_fallback"] == "not_this_destination" and run.fetched == [DEST]
 
 
 def test_a_page_read_after_a_catalogue_read_takes_its_own_source_back(monkeypatch):
@@ -677,23 +926,31 @@ def test_the_urls_variant_prices_the_column(monkeypatch):
     assert run.stored["price_amount"] == 34.0
 
 
-def test_the_currency_guard_still_refuses_and_nothing_is_stamped_fresh(monkeypatch):
+def _writes(run: "_Refresh") -> List[Dict[str, Any]]:
+    return [v for q, v in run.sql if "last_crawled_at" in q]
+
+
+def test_the_currency_guard_still_refuses_and_the_page_decides(monkeypatch):
     run = _Refresh(monkeypatch, _drain_row())
     run.page_read(80, 32)
+    run.page = _page_snapshot(80, 32)
     result = run.catalogue(_seed_read(_product(p50="99.00"), base="CAD", cookie="CAD"))
-    assert result["price_refresh"]["status"] == "skipped_currency_mismatch"
-    assert run.stored["price_amount"] == 80.0 and run.stored["price_currency"] == "USD"
+    assert result["catalogue_discarded"]["price_refresh"]["status"] == "skipped_currency_mismatch"
+    assert result["catalogue_fallback"] == "not_all_re_read" and result["read_source"] == "page"
+    assert all(w["price_amount"] == 80.0 and w["price_currency"] == "USD" for w in _writes(run)), \
+        "the CAD read is never written"
     assert run.variants[V50]["price_amount"] == 80.0, "a CAD read never prices a USD variant"
-    assert "extracted_at" not in run.stored["seed_data"]["snapshot"]
-    assert len(run.projections) == 1, "only the page read projected"
+    assert len(_writes(run)) == 2 and len(run.projections) == 2, "two page reads, no catalogue write"
 
 
-def test_an_unread_catalogue_price_is_counted_and_keeps_the_stored_one(monkeypatch):
+def test_an_unread_catalogue_price_is_counted_and_the_page_decides(monkeypatch):
     run = _Refresh(monkeypatch, _drain_row())
+    run.page = _page_snapshot(80, 32)
     result = run.catalogue(_seed_read(_product(p50="80,00")))
-    assert result["price_refresh"] == {**result["price_refresh"], "status": "skipped_unreadable",
-                                       "reason": "catalogue_price_unread"}
-    assert run.stored["price_amount"] == 80.0 and not run.projections
+    assert result["catalogue_discarded"]["price_refresh"] == {
+        **result["catalogue_discarded"]["price_refresh"], "status": "skipped_unreadable", "reason": "catalogue_price_unread"}
+    assert result["catalogue_fallback"] == "not_all_re_read" and run.fetched == [DEST]
+    assert len(_writes(run)) == 1 and run.stored["price_amount"] == 80.0
 
 
 def test_a_read_planned_for_another_destination_falls_back_to_the_page(monkeypatch):
@@ -715,26 +972,37 @@ def test_a_served_url_that_is_not_the_destination_is_not_called_read(monkeypatch
     assert not run.projections and "extracted_at" not in run.stored["seed_data"]["snapshot"]
 
 
-def test_a_single_variant_seed_takes_the_product_price_only_off_a_one_value_list(monkeypatch):
+def _id_less_single_variant_row() -> Dict[str, Any]:
     row = _drain_row()
     only = dict(row["seed_data"]["variants"][0])
     # No id left to match a read variant by (not even its SKU): only the product-level fallback can re-read it.
     only.pop("variant_id"), only.pop("id"), only.pop("sku")
     row["seed_data"]["variants"] = [only]
-    run = _Refresh(monkeypatch, row)
-    run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
-    # Two variants at two prices: the product price is not this variant's, so it is not re-read.
-    assert run.stored["seed_data"]["snapshot"]["variant_refresh"]["status"] == "not_all_re_read"
-    run.catalogue(_seed_read(_product(p50="85.00", p15="85.00")))
+    return row
+
+
+def test_a_single_variant_seed_takes_the_product_price_only_off_a_one_value_list(monkeypatch):
+    run = _Refresh(monkeypatch, _id_less_single_variant_row())
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="85.00")))
+    assert result["read_source"] == lane.READ_SOURCE
     assert run.stored["seed_data"]["snapshot"]["variant_refresh"]["status"] == "all_re_read"
     assert run.stored["seed_data"]["variants"][0]["price_amount"] == 85.0
+
+
+def test_a_single_variant_seed_off_a_two_value_list_is_page_read(monkeypatch):
+    run = _Refresh(monkeypatch, _id_less_single_variant_row())
+    run.page = _page_snapshot(85, 34)
+    # Two variants at two prices: the product price is not this variant's, so it is not re-read.
+    assert run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))["catalogue_fallback"] == "not_all_re_read"
+    assert run.fetched == [DEST]
 
 
 # ----------------------------------------------------------------- the real batch
 
 
-def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=None, refresh_result=None):
-    """Run the real batch over `dests` (seed id -> destination URL) with an injected refresher."""
+def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=None, refresh_result=None, plan=None):
+    """Run the real batch over `dests` (seed id -> destination URL) with an injected refresher. Every seed
+    was page-read yesterday unless `plan` (seed id -> plan row fields) says otherwise."""
     import services.external_referral_readiness as err
 
     if on:
@@ -744,7 +1012,10 @@ def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=No
                         lambda *a, **k: asyncio.sleep(0, result=seed_ids))
     monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts",
                         lambda ids: asyncio.sleep(0, result={s: cp.host_of(d) for s, d in dests.items()}))
-    monkeypatch.setattr(err, "_fetch_refresh_candidate_dests", lambda ids: asyncio.sleep(0, result=dict(dests)))
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    rows = {s: {"id": s, "destination_url": d, "last_crawled_at": yesterday, **((plan or {}).get(s) or {})}
+            for s, d in dests.items()}
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_dests", lambda ids: asyncio.sleep(0, result=rows))
     reads: List[Any] = []
 
     async def read_host(host, wanted, **kw):
@@ -813,6 +1084,37 @@ def test_the_minimum_is_configurable(monkeypatch):
     monkeypatch.setenv(lane.MIN_SEEDS_ENV, "2")
     _, reads, _ = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a"), "small.example": _ok_catalogue()})
     assert {h for h, _ in reads} == {HOST, "small.example"}
+
+
+def test_a_seed_due_its_page_read_is_never_asked_of_the_catalogue(monkeypatch):
+    plan = {"s2": {"last_crawled_at": datetime.now(timezone.utc) - timedelta(days=40)},
+            "s7": {"destination_verdict": "dead"}}
+    dests = {**SEEDS, "s7": f"https://{HOST}/products/e", "s8": f"https://{HOST}/products/f"}
+    summary, reads, calls = _batch(monkeypatch, dests, catalogues={HOST: _ok_catalogue("a", "c", "f")}, plan=plan)
+    assert reads == [(HOST, {"a", "c", "f"})], "a due seed costs the catalogue no page"
+    by_seed = dict(calls)
+    assert by_seed["s2"] is None and by_seed["s7"] is None and by_seed["s8"] is not None
+    rows = summary["catalogue"]["rows"]
+    assert rows["page_read_due:" + lane.DUE_TOO_OLD] == 1 and rows["page_read_due:" + lane.DUE_NOT_LIVE] == 1
+    assert summary["catalogue"]["page_max_age_days"] == lane.PAGE_MAX_AGE_DEFAULT_DAYS
+
+
+def test_due_seeds_do_not_count_toward_the_minimum(monkeypatch):
+    plan = {"s1": {"last_crawled_at": None}}
+    _, reads, _ = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("b", "c")}, plan=plan)
+    assert reads == [], "two eligible seeds are below the minimum of three"
+
+
+def test_the_routes_fallbacks_are_counted(monkeypatch):
+    def result(seed_id, kwargs):
+        fallback = "not_all_re_read" if kwargs.get("catalogue_read") and seed_id == "s3" else None
+        return {"status": "success", "price_refresh": {"status": "unchanged"}, "projection": {},
+                "read_source": "page" if fallback or not kwargs.get("catalogue_read") else lane.READ_SOURCE,
+                "catalogue_fallback": fallback}
+
+    summary, _, _ = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a", "c")}, refresh_result=result)
+    assert summary["catalogue"]["fallbacks"] == {"not_all_re_read": 1}
+    assert summary["catalogue"]["rows_read"] == 1
 
 
 def test_a_stopped_run_during_the_catalogue_read_defers_the_row_unstamped(monkeypatch):

@@ -5787,6 +5787,20 @@ def _catalogue_read_is_for(dest: Optional[str], catalogue_read: Any) -> bool:
     return bool(handle) and handle == catalogue_read.handle and crawl_politeness.host_of(str(dest or "")) == catalogue_read.host
 
 
+def _catalogue_page_read_due(row: Dict[str, Any]) -> Optional[str]:
+    """Why this row must have its PAGE read even though the batch handed it a catalogue read, or None
+    (`services.external_seed_catalogue_refresh.page_read_due`, on the row as it is at its turn)."""
+    from services import external_seed_catalogue_refresh as catalogue_lane
+
+    snapshot = _ensure_json_obj(row.get("seed_data")).get("snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    return catalogue_lane.page_read_due(
+        {**row, "page_read_at": snapshot.get("page_read_at"), "read_source": snapshot.get("read_source")},
+        now=datetime.now(timezone.utc),
+        max_age_days=catalogue_lane.page_max_age_days(),
+    )
+
+
 def _refresh_read_outcome(
     row: Dict[str, Any], dest: Optional[str], observed: Dict[str, Any], catalogue_read: Any
 ) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool]:
@@ -5857,8 +5871,13 @@ async def _refresh_external_seed_by_id(
     # See docs/external-seed-dead-pdp-link-audit.md §4.2 and §5.2.
     snapshot = None
     observed: Dict[str, Any] = {}
+    catalogue_fallback: Optional[str] = None
     if catalogue_read is not None and not _catalogue_read_is_for(dest, catalogue_read):
-        catalogue_read = None
+        catalogue_read, catalogue_fallback = None, "not_this_destination"
+    if catalogue_read is not None:
+        due = _catalogue_page_read_due(row)
+        if due:
+            catalogue_read, catalogue_fallback = None, f"page_read_due:{due}"
     content_read = catalogue_read is None
     try:
         if catalogue_read is not None:
@@ -6360,9 +6379,29 @@ async def _refresh_external_seed_by_id(
                 "at": _to_iso(datetime.now(timezone.utc)),
                 "replaced": variant_refresh["replaced"][:50],
             }
+    if catalogue_read is not None and variant_refresh.get("not_re_read_count"):
+        # A CATALOGUE READ THAT CANNOT RE-READ EVERY STORED VARIANT IS NOT USED. It would remove the
+        # `extracted_at` stamp below, and the lane would be back tomorrow and remove it again, so a row
+        # whose variants the catalogue cannot match (positional or SKU keys) would never be fresh.
+        # Nothing has been written yet: the page is read instead, in this call, as without the lane.
+        result = await _refresh_external_seed_by_id(seed_id, max_wait=max_wait)
+        result["catalogue_fallback"] = "not_all_re_read"
+        # What the discarded catalogue pass would have done, for the operator (never written).
+        result["catalogue_discarded"] = {
+            "price_refresh": price_refresh,
+            "not_re_read_count": variant_refresh.get("not_re_read_count"),
+        }
+        return result
     if read_the_served_product:
+        if content_read:
+            # The page read the catalogue lane defers to every `page_max_age_days()`.
+            seed_data["snapshot"]["page_read_at"] = _to_iso(datetime.now(timezone.utc))
         if price_re_read and not variant_refresh.get("not_re_read_count"):
-            seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+            # A catalogue read is as fresh as its fetch, not as the row's turn in the queue.
+            seed_data["snapshot"]["extracted_at"] = _to_iso(
+                (getattr(snapshot, "last_checked_at", None) if not content_read else None)
+                or datetime.now(timezone.utc)
+            )
         elif price_re_read or price_status.startswith("skipped_") or variant_refresh.get("not_re_read_count"):
             # A price this run refused to take (a CAD read of a USD row is `skipped_currency_mismatch`),
             # or a stored variant it did not re-read: the stamp an earlier refresh left behind would
@@ -6519,6 +6558,8 @@ async def _refresh_external_seed_by_id(
         "snapshot_from_cache": bool(observed.get("from_cache")),
         # Which reader priced this row: a page read, or the batch's catalogue lane.
         "read_source": "page" if catalogue_read is None else (getattr(snapshot, "evidence", None) or {}).get("read_source"),
+        # Why a catalogue read the batch handed over was not used (the page was read instead), or None.
+        "catalogue_fallback": catalogue_fallback,
         # Drift report. The batch runner sums these so "we re-crawled N seeds" can
         # be stated as "N re-crawled, M prices actually moved" — the difference is
         # the whole point of the refresh existing.

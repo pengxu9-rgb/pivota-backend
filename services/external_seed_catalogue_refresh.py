@@ -24,7 +24,12 @@ THE RULES, each one a refusal that sends the seed back to its page read:
     currency (`/meta.json` `currency`) is also the currency it PRESENTED to us: every catalogue page's own
     `cart_currency` Set-Cookie names it (the same-response rule), or, when a page carries none,
     `/cart.js` `currency` does. Base equal to presentment leaves one currency the numbers can be in.
-    Anything else naming a different currency refuses the host (`decide_host_currency`).
+    Anything else naming a different currency refuses the host (`decide_host_currency`), and the first
+    page whose cookie does so ends the read there. RESIDUAL RISK: a page that carries no cookie is vouched
+    for by `/cart.js`, another response; the dry run counts the hosts priced on that proof.
+  * ONE STOREFRONT ANSWERS: every response the host is priced from must have come from that host (a
+    leading `www.` aside). A `/meta.json` or catalogue page that redirects onto another storefront
+    refuses the host; whatever that store lists is not this one's catalogue.
   * ONE STOREFRONT, ONE MARKET: only a `/products/<handle>` (or `/collections/<c>/products/<handle>`) URL
     on the host the catalogue was read from. A locale prefix (`/en-gb/products/...`) is a Markets
     subfolder priced in another currency, and keeps its page read.
@@ -34,6 +39,15 @@ THE RULES, each one a refusal that sends the seed back to its page read:
   * A host is read only when it pays: at least `catalogue_min_seeds()` candidate seeds this run, at most
     one catalogue page per wanted seed, and not when `/meta.json` says the catalogue needs more pages
     than that (`pages_worth_reading`).
+
+THE PAGE READ STAYS THE CHECK ON WHAT A CATALOGUE CANNOT SEE, so it is never replaced for good:
+  * A LISTED HANDLE CAN STILL 404 (about 1.5% did when the sweep probed listed handles). A seed whose
+    last PAGE read (`snapshot.page_read_at`) is older than `page_max_age_days()` (default 30, about the
+    interval at which the refresh reaches a seed today), or whose destination is not known live, gets
+    its page read instead (`page_read_due`).
+  * A STORED VARIANT LIST THE CATALOGUE CANNOT MATCH (positional `offer_N` keys, SKU keys) would lose its
+    `extracted_at` stamp every night. A catalogue read that leaves a stored variant un-re-read is
+    discarded and the page is read in the same call (`routes.employee_products`).
 
 Default OFF (`EXTERNAL_REFERRAL_REFRESH_CATALOGUE_ENABLED`). The dry run is
 `scripts/ops/plan_shopify_catalogue_refresh.py`.
@@ -47,8 +61,8 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, unquote, urlparse
 
 import httpx
@@ -64,6 +78,8 @@ logger = logging.getLogger(__name__)
 FLAG = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_ENABLED"
 MIN_SEEDS_ENV = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_MIN_SEEDS"
 MIN_SEEDS_DEFAULT = 3
+PAGE_MAX_AGE_ENV = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_PAGE_MAX_AGE_DAYS"
+PAGE_MAX_AGE_DEFAULT_DAYS = 30
 
 #: `seed_data.snapshot.read_source` and `evidence.read_source` of a catalogue-priced refresh.
 READ_SOURCE = "products_json"
@@ -79,7 +95,14 @@ STATUS_NOT_WORTH_IT = "not_worth_it"
 STATUS_CURRENCY_CONFLICT = "currency_conflict"
 STATUS_CURRENCY_UNPROVEN = "currency_unproven"
 STATUS_NONE_LISTED = "no_wanted_handle_listed"
+STATUS_REDIRECTED_OFF_HOST = "redirected_off_host"
 STATUS_ERROR = "error"
+
+#: Why a seed gets its page read rather than a catalogue read (`page_read_due`).
+DUE_FAILURE_STREAK = "destination_failure_streak"
+DUE_NOT_LIVE = "destination_not_live"
+DUE_UNKNOWN = "page_read_unknown"
+DUE_TOO_OLD = "page_read_too_old"
 
 #: Variants kept per product. The snapshot is never stored, so this is not the page lane's 50
 #: (`MAX_VARIANTS`); a product listing more is `truncated` in the census.
@@ -104,6 +127,49 @@ def catalogue_min_seeds() -> int:
     except ValueError:
         return MIN_SEEDS_DEFAULT
     return max(1, value)
+
+
+def page_max_age_days() -> int:
+    """Days a seed may go without a PAGE read before it gets one again. At least 1; garbage is the default."""
+    raw = str(os.getenv(PAGE_MAX_AGE_ENV) or "").strip()
+    try:
+        value = int(raw) if raw else PAGE_MAX_AGE_DEFAULT_DAYS
+    except ValueError:
+        return PAGE_MAX_AGE_DEFAULT_DAYS
+    return max(1, value)
+
+
+def _as_utc(value: Any) -> Optional[datetime]:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def page_read_due(seed: Mapping[str, Any], *, now: datetime, max_age_days: int) -> Optional[str]:
+    """Why this seed must have its PAGE read tonight rather than a catalogue read, or None.
+
+    `seed` carries the row's `destination_verdict`, `destination_failure_streak` and `last_crawled_at`,
+    and its snapshot's `page_read_at` and `read_source`. The last page read is `page_read_at` (stamped
+    by every page read of the served product); a row without one whose last refresh was not a catalogue
+    read was last read from its page at `last_crawled_at` (every refresh before this lane). A drain
+    rewrite of `seed_data` drops both, so such a row can go at most twice `max_age_days` unread."""
+    if int(seed.get("destination_failure_streak") or 0) > 0:
+        return DUE_FAILURE_STREAK
+    if seed.get("destination_verdict") not in (None, "", liveness.VERDICT_LIVE):
+        return DUE_NOT_LIVE
+    last = _as_utc(seed.get("page_read_at"))
+    if last is None and str(seed.get("read_source") or "") != READ_SOURCE:
+        last = _as_utc(seed.get("last_crawled_at"))
+    if last is None:
+        return DUE_UNKNOWN
+    if _as_utc(now) - last > timedelta(days=max_age_days):
+        return DUE_TOO_OLD
+    return None
 
 
 def user_agent() -> str:
@@ -362,6 +428,8 @@ class HostCatalogue:
     published_products_count: Optional[int] = None
     wanted: int = 0
     note: str = ""
+    #: When the read began: what every snapshot priced from it is stamped with (never the row's turn).
+    fetched_at: Optional[datetime] = None
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -411,6 +479,8 @@ async def _get_json(client: httpx.AsyncClient, url: str, agent: str) -> Tuple[Op
         return None, type(exc).__name__
     crawl_politeness.note_response(url, resp.status_code, retry_after=resp.headers.get("retry-after"), headers=resp.headers)
     shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
+    if not liveness.same_storefront(resp.url.host, httpx.URL(url).host):
+        return None, STATUS_REDIRECTED_OFF_HOST
     if resp.headers.get("cf-mitigated"):
         return None, "bot_challenge"
     if resp.status_code != 200:
@@ -444,16 +514,21 @@ async def read_host_catalogue(
     """Read `host`'s currency and the catalogue entries of the `wanted` handles, at the run's pace.
 
     Requests, in order, each through `crawl_politeness` (robots.txt, per-host pacing, 429 backoff) and the
-    run's installed global pacer: `/meta.json`; then catalogue pages until every wanted handle is found or
-    `pages_worth_reading` runs out; then `/cart.js`, only when a page carried no `cart_currency`. Never
-    raises, except `GlobalPaceStopped` (the run stopped: not a fact about this host)."""
+    run's installed global pacer: `/meta.json`; then catalogue pages until every wanted handle is found,
+    `pages_worth_reading` runs out, or a page's cookie names another currency than the base; then
+    `/cart.js`, only when a page carried no `cart_currency`. A response from another storefront refuses
+    what it answered. Never raises, except `GlobalPaceStopped` (the run stopped: not a fact about this
+    host)."""
     wanted = {str(h).strip().lower() for h in wanted if str(h).strip()}
-    result = HostCatalogue(host=host, status=STATUS_ERROR, wanted=len(wanted))
+    result = HostCatalogue(host=host, status=STATUS_ERROR, wanted=len(wanted), fetched_at=datetime.now(timezone.utc))
     owns_client = client is None
     client = client or _client()
     agent = user_agent()
     try:
         body, why = await _get_json(client, f"https://{host}/meta.json", agent)
+        if why == STATUS_REDIRECTED_OFF_HOST:
+            result.status = STATUS_REDIRECTED_OFF_HOST
+            return result
         meta = parse_meta(body)
         if meta is None:
             result.status, result.note = STATUS_BASE_UNREAD, why or "meta.json names no currency"
@@ -468,18 +543,29 @@ async def read_host_catalogue(
         if max_pages is None:
             result.status = STATUS_NOT_WORTH_IT
             return result
+        base = result.base_currency
+
+        def _other_currency(set_cookies: List[str]) -> Optional[str]:
+            presented = presentment_currency(list(set_cookies or ()))[0]
+            return f"presented {presented}, base {base}" if presented and presented != base else None
+
         read = await liveness.read_brand_catalogue(
-            client, host, want_products=wanted, max_pages=max_pages, user_agent=agent
+            client, host, want_products=wanted, max_pages=max_pages, user_agent=agent,
+            same_host_only=True, stop_after_page=_other_currency,
         )
         result.catalogue_status = read.status
         result.pages_read = len(read.page_set_cookies)
         result.note = read.note
+        result.page_cookie_currencies = page_currencies(read.page_set_cookies)
+        if any(c and c != base for c in result.page_cookie_currencies):
+            # Decided by the page that ended the read: /cart.js could not make it agree.
+            result.status = STATUS_CURRENCY_CONFLICT
+            return result
         if not read.products:
             # Nothing to price: a page-1 refusal (`catalogue_<status>`), or pages that listed none of
             # the wanted handles. Either way /cart.js is not asked.
             result.status = STATUS_NONE_LISTED if read.page_set_cookies else f"catalogue_{read.status}"
             return result
-        result.page_cookie_currencies = page_currencies(read.page_set_cookies)
         if not all(result.page_cookie_currencies):
             cart_body, _ = await _get_json(client, f"https://{host}/cart.js", agent)
             result.cart_currency = _cart_currency(cart_body)
@@ -521,7 +607,8 @@ def seed_catalogue_read(
     if url_variant_id(url) is None:
         return None, "url_variant_unreadable"
     snapshot = catalogue_snapshot(
-        product, url=str(url), host=catalogue.host, currency=catalogue.currency, proof=catalogue.proof, market=market
+        product, url=str(url), host=catalogue.host, currency=catalogue.currency, proof=catalogue.proof,
+        market=market, now=catalogue.fetched_at,
     )
     if snapshot is None:
         return None, "url_variant_not_listed"
@@ -542,6 +629,8 @@ __all__ = (
     "catalogue_refresh_enabled",
     "catalogue_snapshot",
     "decide_host_currency",
+    "page_max_age_days",
+    "page_read_due",
     "pages_worth_reading",
     "read_host_catalogue",
     "read_variants",
