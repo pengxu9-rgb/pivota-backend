@@ -4,7 +4,9 @@ See services/synthetic_call.py for what the header must prove. This middleware o
 the request; each writer checks services.synthetic_call.is_synthetic_call() and skips its row.
 
 Registered outside UsageLoggerMiddleware and RateLimitMiddleware (main.py), so the verdict is set before
-anything that writes after call_next. A request without the header costs one header lookup.
+anything that writes after call_next. It is one more BaseHTTPMiddleware layer on every request; past that,
+a request without the header, or any request while no secret is configured, costs one lookup and is
+never logged (anyone can send the header).
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from services.synthetic_call import (
     INVOKE_PATH,
+    assertion_secrets,
     SYNTHETIC_ASSERTION_HEADER,
     SYNTHETIC_READ_INVOKE_OPS,
     reset_synthetic_call,
@@ -50,12 +53,13 @@ async def _invoke_operation(request: Request):
 class SyntheticCallMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         token = request.headers.get(SYNTHETIC_ASSERTION_HEADER)
-        if not token:
+        if not token or not assertion_secrets():
             return await call_next(request)
 
         from routes.agent_auth import request_api_key
 
-        path = request.url.path
+        # The path the router matches (scope["path"]), not the URL's.
+        path = request.scope.get("path") or ""
         operation = await _invoke_operation(request) if request.method == "POST" and path == INVOKE_PATH else None
         call, reason = await resolve_synthetic_call(
             token, api_key=request_api_key(request), method=request.method, path=path, operation=operation

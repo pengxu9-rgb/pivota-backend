@@ -99,8 +99,11 @@ async def _is_partner_client(caller: str) -> bool:
     hit = _partner_client_cache.get(caller)
     if hit is not None and now - hit[1] < _PARTNER_CLIENT_TTL_SECONDS:
         return hit[0]
-    issuer, sep, client_id = caller.rpartition("|")
-    if not sep or not issuer or not client_id:
+    # The gateway writes "<iss>|<client_id>"; anything that does not split into exactly two is not ours.
+    if caller.count("|") != 1:
+        return True
+    issuer, _, client_id = caller.partition("|")
+    if not issuer or not client_id:
         return True
     try:
         from db.database import database

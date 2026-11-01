@@ -719,3 +719,256 @@ def test_a_synthetic_product_detail_never_tries_the_admin_fallback(monkeypatch, 
         asyncio.run(run())
     assert err.value.status_code == 404
     assert asked == ([] if is_synthetic else ["merch_x"])
+
+
+def test_a_synthetic_search_never_fills_the_shared_seed_search_cache(monkeypatch):
+    """Its cached products would carry synthetic /r links to the next real buyer, whose click /r drops."""
+    import routes.agent_api as agent_api
+    from services.outbound_links_service import make_redirect_token, parse_redirect_token_verified, token_is_synthetic
+
+    monkeypatch.setattr(agent_api, "AGENT_EXTERNAL_SEED_CACHE_ENABLED", True)
+    monkeypatch.setattr(agent_api, "_EXTERNAL_SEED_SEARCH_CACHE", type(agent_api._EXTERNAL_SEED_SEARCH_CACHE)())
+    monkeypatch.setattr(agent_api, "_EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT", {})
+    loads: List[bool] = []
+
+    async def fake_load(**kw):
+        loads.append(sc.is_synthetic_call())
+        token = make_redirect_token({"market": "US", "tool": "search", "dest": "https://brand.example/p", "ctx": {}})
+        kw["metrics_out"].update({"executed": True, "rows_fetched": 1, "rows_built": 1, "skip_reason": None})
+        return [{"product_id": "p1", "_token": token}]
+
+    monkeypatch.setattr(agent_api, "_load_external_seed_products_for_search", fake_load)
+    req = Request({"type": "http", "method": "GET", "path": PROBE_PATH, "headers": [], "query_string": b""})
+    kwargs = dict(
+        query="lip tint", market="US", query_semantic_class=None, limit=10, build_budget_ms=None,
+        build_concurrency=None, include_seed_data_text_match=False, normalized_seed_strategy="default",
+        normalized_catalog_surface="beauty", page_offset=0,
+    )
+
+    async def run():
+        token = sc.set_synthetic_call(CALL)
+        try:
+            await agent_api._load_external_seed_products_with_cache(req=req, **kwargs)
+        finally:
+            sc.reset_synthetic_call(token)
+        assert not agent_api._EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT, "no refresh scheduled by a synthetic call"
+        real = await agent_api._load_external_seed_products_with_cache(req=req, **kwargs)
+        # A synthetic call may still READ what a real one cached.
+        token = sc.set_synthetic_call(CALL)
+        try:
+            synthetic_read = await agent_api._load_external_seed_products_with_cache(req=req, **kwargs)
+        finally:
+            sc.reset_synthetic_call(token)
+        return real, synthetic_read
+
+    real, synthetic_read = asyncio.run(run())
+    payload, _ = parse_redirect_token_verified(real[0]["_token"])
+    assert not token_is_synthetic(payload), "the real buyer gets a link of its own"
+    assert loads == [True, False], "the real call loaded fresh; the synthetic one read the real call's entry"
+    assert synthetic_read[0]["_token"] == real[0]["_token"]
+
+
+# ---------------------------------------------------------------------------------------------------
+# Review of #2686: merchant egress on the variant route, the currency read, and the middleware's edges
+
+
+@pytest.fixture
+def shopify_admin(monkeypatch):
+    """The variant route's dependencies, faked; every Shopify Admin GET is recorded and answers 404."""
+    import routes.agent_products as products
+
+    calls: List[str] = []
+
+    class _Resp:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **k):
+            calls.append(url)
+            return _Resp()
+
+    async def none(*a, **k):
+        return None
+
+    async def onboarding(merchant_id):
+        return {"merchant_id": merchant_id}
+
+    async def store(merchant_id):
+        return {"platform": "shopify", "domain": "brand.example.invalid", "api_key": "k", "store_id": "s1"}
+
+    async def token(**k):
+        return "k", None
+
+    monkeypatch.setattr(products, "_external_seller_detail_via_gateway", none)
+    monkeypatch.setattr(products, "get_merchant_onboarding", onboarding)
+    monkeypatch.setattr(products.merchant_store_service, "get_primary_store", store)
+    monkeypatch.setattr(products, "resolve_shopify_admin_access_token", token)
+    monkeypatch.setattr(products, "get_redis_client", lambda: None)
+    monkeypatch.setattr(products.httpx, "AsyncClient", FakeClient)
+    return calls
+
+
+class _Ctx:
+    agent_id = GATEWAY_AGENT_ID
+    session_id = None
+
+    def can_access_merchant(self, merchant_id):
+        return True
+
+
+@pytest.mark.parametrize("is_synthetic", [False, True])
+@pytest.mark.parametrize("route", ["variant", "product"])
+def test_the_variant_and_product_routes_make_no_admin_call_for_a_synthetic_call(shopify_admin, is_synthetic, route):
+    from fastapi import BackgroundTasks, HTTPException
+
+    import routes.agent_products as products
+
+    req = Request({"type": "http", "method": "GET", "path": "/x", "headers": [], "query_string": b""})
+
+    async def run():
+        token = sc.set_synthetic_call(CALL if is_synthetic else None)
+        try:
+            if route == "variant":
+                await products.get_product_details_by_variant(req, "merch_x", "4455", BackgroundTasks(), _Ctx())
+            else:
+                await products.get_product_details(
+                    req=req, merchant_id="merch_x", product_id="4455", background_tasks=BackgroundTasks(), context=_Ctx()
+                )
+        finally:
+            sc.reset_synthetic_call(token)
+
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(run())
+    assert err.value.status_code == 404
+    if is_synthetic:
+        assert shopify_admin == []
+    else:
+        assert shopify_admin and "/admin/api/" in shopify_admin[0]
+
+
+def test_a_synthetic_call_never_writes_the_product_details_cache(monkeypatch, synthetic):
+    import routes.agent_products as products
+
+    monkeypatch.setattr(products, "get_redis_client", lambda: (_ for _ in ()).throw(AssertionError("redis written")))
+    assert asyncio.run(products._redis_set_json("k", {"a": 1}, 60)) is None
+
+
+@pytest.mark.parametrize("is_synthetic", [False, True])
+def test_the_shop_currency_read_is_cache_only_for_a_synthetic_call(monkeypatch, is_synthetic):
+    import routes.agent_shop_gateway as gateway
+    import services.merchant_store_service as stores
+
+    asked: List[str] = []
+
+    async def active_stores(merchant_id):
+        asked.append(merchant_id)
+        return []
+
+    monkeypatch.setattr(stores, "get_merchant_active_stores", active_stores)
+    monkeypatch.setattr(gateway, "_get_cached_merchant_shopify_currency", lambda merchant_id: None)
+
+    async def run():
+        token = sc.set_synthetic_call(CALL if is_synthetic else None)
+        try:
+            return await gateway._resolve_shopify_currency_for_merchant("merch_x")
+        finally:
+            sc.reset_synthetic_call(token)
+
+    assert asyncio.run(run()) is None
+    assert asked == ([] if is_synthetic else ["merch_x"])
+
+
+def test_with_no_secret_the_header_is_not_even_read(monkeypatch, key_owner, caplog):
+    monkeypatch.delenv(sc.SYNTHETIC_ASSERTION_SECRET_ENV)
+
+    async def boom(*a, **k):
+        raise AssertionError("resolved")
+
+    import middleware.synthetic_call as mw
+
+    monkeypatch.setattr(mw, "resolve_synthetic_call", boom)
+    monkeypatch.setattr(mw, "_invoke_operation", boom)
+    with caplog.at_level("WARNING", logger="middleware.synthetic_call"):
+        res = TestClient(_probe_app()).post(
+            "/agent/shop/v1/invoke", json={"operation": "find_products_multi", "payload": {}}, headers=_headers()
+        )
+    assert res.json()["synthetic"] is False and res.json()["operation"] == "find_products_multi"
+    assert not [r for r in caplog.records if "synthetic_assertion" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/agent/v1/products/search/extra",
+        "/x/agent/v1/products/search",
+        "/agent/v1/products/searchx",
+        "/agent/shop/v1/invoke/x",
+        "/agent/v1/products/merchants/m/variant/v/x",
+    ],
+)
+def test_the_scope_patterns_are_anchored_at_both_ends(path):
+    assert sc.synthetic_scope_allows("GET", path) is False
+    assert sc.synthetic_scope_allows("POST", path, "find_products_multi") is False
+
+
+@pytest.mark.parametrize(
+    "raw, expect_synthetic",
+    [
+        ('{"operation": "create_order", "op": "find_products_multi", "payload": {}}', False),
+        ('{"op": "find_products_multi", "operation": "create_order", "payload": {}}', False),
+        ('{"operation": "find_products_multi", "operation": "create_order", "payload": {}}', False),
+        ('{"operation": "create_order", "operation": "find_products_multi", "payload": {}}', True),
+    ],
+)
+def test_the_middleware_and_the_route_read_the_same_operation(key_owner, raw, expect_synthetic):
+    """Whatever the body says, the op that decided synthetic is the op the route runs."""
+    res = TestClient(_probe_app()).post(
+        "/agent/shop/v1/invoke", content=raw, headers={**_headers(), "Content-Type": "application/json"}
+    )
+    body = res.json()
+    assert body["synthetic"] is expect_synthetic
+    assert (body["operation"] == "find_products_multi") is expect_synthetic
+
+
+def test_a_query_string_cannot_mark_a_real_link_synthetic(click_writes):
+    token = _mint()
+    TestClient(app).get(f"/r?token={token}&syn=1", follow_redirects=False)
+    assert "click" in click_writes
+
+
+@pytest.mark.parametrize("caller", ["a|b|c", "|client", "issuer|", "no-separator", ""])
+def test_a_caller_that_does_not_split_into_issuer_and_client_is_treated_as_a_partner(monkeypatch, caller):
+    from db.database import database
+
+    async def registry_says_not_a_partner(query, values=None):
+        return None
+
+    monkeypatch.setattr(database, "fetch_one", registry_says_not_a_partner)
+    sc._partner_client_cache.clear()
+    assert asyncio.run(sc._is_partner_client(caller)) is True
+    assert asyncio.run(sc._is_partner_client("https://as.example.invalid|client_1")) is False
+    sc._partner_client_cache.clear()
+
+
+def test_sentry_events_never_carry_the_assertion():
+    from config.sentry_config import filter_sensitive_data
+
+    event = {"request": {"headers": {"X-Pivota-Synthetic-Assertion": VECTOR["token"], "X-Api-Key": "k", "Accept": "a"}}}
+    out = filter_sensitive_data(event, None)
+    assert out["request"]["headers"] == {
+        "X-Pivota-Synthetic-Assertion": "[REDACTED]",
+        "X-Api-Key": "[REDACTED]",
+        "Accept": "a",
+    }

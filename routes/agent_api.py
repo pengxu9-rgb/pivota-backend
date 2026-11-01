@@ -3,6 +3,7 @@ Agent 专用 API 路由
 为 AI Agent 提供优化的电商接口
 """
 
+from services.synthetic_call import is_synthetic_call
 from services.seed_variant_options import normalize_seed_variant_options
 from services import agent_search_gateway_proxy
 from config.settings import settings as _app_settings
@@ -2899,6 +2900,10 @@ def _get_cached_external_seed_products(cache_key: str) -> Optional[List[Dict[str
 
 
 def _put_cached_external_seed_products(cache_key: str, products: List[Dict[str, Any]]) -> None:
+    # Our own eval traffic reads this cache but never writes it (services/synthetic_call.py): its products
+    # carry /r links stamped synthetic, whose clicks a real buyer served from here would lose.
+    if is_synthetic_call():
+        return
     ttl_seconds = AGENT_EXTERNAL_SEED_CACHE_HIT_TTL_SECONDS if products else AGENT_EXTERNAL_SEED_CACHE_EMPTY_TTL_SECONDS
     _EXTERNAL_SEED_SEARCH_CACHE[cache_key] = {
         "products": [dict(item) if isinstance(item, dict) else item for item in (products or [])],
@@ -2956,6 +2961,9 @@ def _schedule_external_seed_cache_refresh(
     request_market: Optional[str] = None,
     serving_market: Optional[str] = None,
 ) -> bool:
+    if is_synthetic_call():
+        # A refresh scheduled here would run synthetic (and hold the in-flight slot a real one needs).
+        return False
     existing = _EXTERNAL_SEED_SEARCH_CACHE_INFLIGHT.get(cache_key)
     if existing is not None and not existing.done():
         return False

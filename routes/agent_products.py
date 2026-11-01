@@ -6,6 +6,7 @@ Allows agents to view merchant products via hybrid query (cache or realtime)
 from services.product_query_service import get_products_hybrid, log_query_source
 from services.agent_product_service import get_agent_product_view
 import services.merchant_store_service as merchant_store_service
+from services.synthetic_call import is_synthetic_call
 from services.shopify_access_token_service import resolve_shopify_admin_access_token
 from services.agent_ranking_service import (
     AgentRankingFeatures,
@@ -74,6 +75,8 @@ async def _redis_get_json(key: str) -> Optional[Dict[str, Any]]:
 
 
 async def _redis_set_json(key: str, value: Dict[str, Any], ttl_seconds: int) -> None:
+    if is_synthetic_call():  # our own eval traffic never writes a shared cache (services/synthetic_call.py)
+        return
     client = get_redis_client()
     if client is None:
         return None
@@ -1029,7 +1032,10 @@ async def get_product_details(
             )
             return resp
 
-        # Shopify path: fetch fresh details from Shopify Admin API
+        # Shopify path: fetch fresh details from Shopify Admin API. Never for our own eval traffic, which
+        # makes no merchant call (services/synthetic_call.py): past the cache it is not found.
+        if is_synthetic_call():
+            raise HTTPException(status_code=404, detail="Product not found")
         shop_domain = store.get("domain") or store.get("shop_domain")
         if not shop_domain:
             raise HTTPException(
@@ -1288,6 +1294,9 @@ async def get_product_details_by_variant(
             cached_pid = None
 
     product_id = str(cached_pid or "").strip() or None
+    if not product_id and is_synthetic_call():
+        # Our own eval traffic makes no Shopify Admin call (services/synthetic_call.py).
+        raise HTTPException(status_code=404, detail="Variant not found")
     if not product_id:
         url = f"https://{shop_domain}/admin/api/2025-10/variants/{variant_id}.json"
         headers = {
