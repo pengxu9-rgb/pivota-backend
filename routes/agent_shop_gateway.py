@@ -10797,6 +10797,10 @@ def _schedule_group_shadow(
     try:
         if background_tasks is None:
             return False
+        if is_synthetic_call():
+            # The shadow runs in a fresh Context, where the verdict is not visible, and its lines are a
+            # measurement of real traffic: our own eval traffic schedules none (services/synthetic_call.py).
+            return False
         keys = (set(content_keys) | set(aliases)) - {""}
         if not keys:
             return False

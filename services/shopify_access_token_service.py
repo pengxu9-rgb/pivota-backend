@@ -10,6 +10,7 @@ import httpx
 from db.database import database
 from services.shopify_transactions_service import extract_shopify_access_token
 from services.shopify_domain import normalize_myshopify_domain
+from services.synthetic_call import is_synthetic_call
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,10 @@ async def resolve_shopify_admin_access_token(
             shop_domain,
             store_id,
         )
+        return current_token, meta
+    if is_synthetic_call():
+        # Our own eval traffic makes no Shopify call and writes no row (services/synthetic_call.py).
+        meta["refresh_error"] = "synthetic_call"
         return current_token, meta
 
     new_token, expires_in, refresh_error = await exchange_shopify_client_credentials_token(
