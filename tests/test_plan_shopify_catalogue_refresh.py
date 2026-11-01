@@ -190,12 +190,35 @@ def test_a_host_line_carries_the_price_ratio_and_the_seeds_due_a_page_read():
     assert line["matched"] == 3, "due seeds are still compared"
 
 
-def test_a_stored_variant_in_another_currency_is_never_re_read_by_the_plan():
+def test_a_read_in_a_refused_currency_never_re_prices_a_variant_that_states_none():
+    """The refresh's own bar (`_foreign_refresh_variant_currencies`): a USD row takes no CAD read, and a
+    stored variant that states no currency would otherwise take the CAD price. The plan bars it too."""
     mod = _module()
     seed = {**_drain_row(), "snapshot_variants": None}
-    seed["variants"] = [{**v, "price_currency": "CAD"} for v in seed["seed_data"]["variants"]]
-    compared = mod.compare_seed(seed, _seed_read())
-    assert compared["price"] == "agree" and compared["variants"] == "not_all_re_read"
+    seed["variants"] = [{k: v for k, v in var.items() if k not in ("price_currency", "currency")}
+                        for var in seed["seed_data"]["variants"]]
+    compared = mod.compare_seed(seed, _seed_read(base="CAD", cookie="CAD"))
+    assert compared["price"] == "other_currency" and compared["variants"] == "not_all_re_read"
+    assert compared["variants_changed"] == 0
+
+
+def test_the_summary_folds_every_host_line_and_names_the_offset_hosts():
+    mod = _module()
+    from types import SimpleNamespace
+
+    totals = mod.new_totals(2, 6)
+    ok = SimpleNamespace(status="ok", proof="base_and_cart")
+    offset = {"n": 3, "median": 1.05, "p10": 1.05, "p90": 1.05, "offset_suspected": True}
+    mod.fold_host_line(totals, "a.example", ok, {"matched": 3, "price": {"moved_within_10pct": 3},
+                                                 "variants": {"all_re_read": 3}, "page_read_due": {"page_read_too_old": 1},
+                                                 "price_ratio": offset})
+    mod.fold_host_line(totals, "b.example", SimpleNamespace(status="currency_conflict", proof=None),
+                       {"matched": 0, "price": {}, "variants": {}, "page_read_due": {},
+                        "price_ratio": {**offset, "n": 0, "offset_suspected": False}})
+    assert (totals["hosts_read"], totals["hosts_priceable"], totals["matched"]) == (2, 1, 3)
+    assert totals["host_status"] == {"ok": 1, "currency_conflict": 1} and totals["proof"] == {"base_and_cart": 1}
+    assert totals["page_read_due"] == {"page_read_too_old": 1}
+    assert totals["offset_suspected_hosts"] == [{"host": "a.example", **offset}]
 
 
 def test_the_go_no_go_figures():

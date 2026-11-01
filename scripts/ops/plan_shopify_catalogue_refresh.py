@@ -247,6 +247,29 @@ async def read_only_transaction(conn, timeout_ms):
     return tr
 
 
+def new_totals(hosts_planned, seeds):
+    return {"hosts_planned": hosts_planned, "hosts_read": 0, "hosts_priceable": 0, "seeds": seeds,
+            "matched": 0, "host_status": {}, "price": {}, "variants": {}, "page_read_due": {}, "proof": {},
+            "offset_suspected_hosts": [], "stopped": None}
+
+
+def fold_host_line(totals, host, catalogue, line):
+    """Add one host's read and `host` line to the run's `summary` totals."""
+    from services.external_seed_catalogue_refresh import STATUS_OK
+
+    totals["hosts_read"] += 1
+    _bump(totals["host_status"], catalogue.status)
+    totals["hosts_priceable"] += int(catalogue.status == STATUS_OK)
+    totals["matched"] += line["matched"]
+    for key in ("price", "variants", "page_read_due"):
+        for k, n in line[key].items():
+            _bump(totals[key], k, n)
+    if catalogue.status == STATUS_OK:
+        _bump(totals["proof"], catalogue.proof)
+    if line["price_ratio"]["offset_suspected"]:
+        totals["offset_suspected_hosts"].append({"host": host, **line["price_ratio"]})
+
+
 def go_no_go(totals):
     """The figures the flag decision reads (see the module docstring); a person judges them."""
     matched = totals["matched"]
@@ -338,9 +361,7 @@ async def main():
             pacer.stop("ip breaker tripped")
 
     breaker = crawl_ip_throttle.StagedIpThrottleBreaker.from_env(on_trip=_on_trip)
-    totals = {"hosts_planned": len(hosts), "hosts_read": 0, "hosts_priceable": 0, "seeds": len(seeds),
-              "matched": 0, "host_status": {}, "price": {}, "variants": {}, "page_read_due": {}, "proof": {},
-              "offset_suspected_hosts": [], "stopped": None}
+    totals = new_totals(len(hosts), len(seeds))
     with crawl_ip_throttle.installed(breaker), crawl_global_pacer.installed(pacer):
         for host, seed_ids in hosts.items():
             if pacer.stopped or breaker.tripped or breaker.blocks(host):
@@ -353,19 +374,9 @@ async def main():
             except crawl_global_pacer.GlobalPaceStopped:
                 totals["stopped"] = pacer.stop_reason or "pacer stopped"
                 break
-            totals["hosts_read"] += 1
             line = plan_host(host, catalogue, host_seeds)
             emit("host", line)
-            _bump(totals["host_status"], catalogue.status)
-            totals["hosts_priceable"] += int(catalogue.status == lane.STATUS_OK)
-            totals["matched"] += line["matched"]
-            for key in ("price", "variants", "page_read_due"):
-                for k, n in line[key].items():
-                    _bump(totals[key], k, n)
-            if catalogue.status == lane.STATUS_OK:
-                _bump(totals["proof"], catalogue.proof)
-            if line["price_ratio"]["offset_suspected"]:
-                totals["offset_suspected_hosts"].append({"host": host, **line["price_ratio"]})
+            fold_host_line(totals, host, catalogue, line)
     pace = pacer.summary()
     requests = int(pace.get("paced_requests") or 0)
     totals["origin_requests"] = requests
