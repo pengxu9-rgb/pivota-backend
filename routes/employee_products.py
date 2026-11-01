@@ -5792,12 +5792,8 @@ def _catalogue_page_read_due(row: Dict[str, Any]) -> Optional[str]:
     (`services.external_seed_catalogue_refresh.page_read_due`, on the row as it is at its turn)."""
     from services import external_seed_catalogue_refresh as catalogue_lane
 
-    snapshot = _ensure_json_obj(row.get("seed_data")).get("snapshot")
-    snapshot = snapshot if isinstance(snapshot, dict) else {}
     return catalogue_lane.page_read_due(
-        {**row, "page_read_at": snapshot.get("page_read_at"), "read_source": snapshot.get("read_source")},
-        now=datetime.now(timezone.utc),
-        max_age_days=catalogue_lane.page_max_age_days(),
+        row, now=datetime.now(timezone.utc), max_age_days=catalogue_lane.page_max_age_days()
     )
 
 
@@ -5814,7 +5810,11 @@ def _refresh_read_outcome(
 
 
 async def _refresh_external_seed_by_id(
-    seed_id: str, *, max_wait: Optional[float] = None, catalogue_read: Any = None
+    seed_id: str,
+    *,
+    max_wait: Optional[float] = None,
+    catalogue_read: Any = None,
+    page_read_column: bool = False,
 ) -> Dict[str, Any]:
     """Re-read one seed's price/availability from the origin.
 
@@ -5833,6 +5833,11 @@ async def _refresh_external_seed_by_id(
     reads no copy and no images, so those are left exactly as stored; nor does it write the
     `external_offer_snapshots` cache, which holds the last page read. A read planned for another
     destination than the row now has is ignored, and the page is read as before.
+
+    `page_read_column` says the batch found `last_page_read_at` (migration 274, by hand): only then is
+    it written -- NOW() by a page read of the served product, the page read it replaces by a catalogue
+    read -- and only then is a catalogue read taken, since one that could not carry the page read
+    forward would make the seed look page-read tonight (`catalogue_lane.page_read_due`).
     """
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
@@ -5872,6 +5877,8 @@ async def _refresh_external_seed_by_id(
     snapshot = None
     observed: Dict[str, Any] = {}
     catalogue_fallback: Optional[str] = None
+    if catalogue_read is not None and not page_read_column:
+        catalogue_read, catalogue_fallback = None, "no_page_read_column"
     if catalogue_read is not None and not _catalogue_read_is_for(dest, catalogue_read):
         catalogue_read, catalogue_fallback = None, "not_this_destination"
     if catalogue_read is not None:
@@ -6384,7 +6391,7 @@ async def _refresh_external_seed_by_id(
         # `extracted_at` stamp below, and the lane would be back tomorrow and remove it again, so a row
         # whose variants the catalogue cannot match (positional or SKU keys) would never be fresh.
         # Nothing has been written yet: the page is read instead, in this call, as without the lane.
-        result = await _refresh_external_seed_by_id(seed_id, max_wait=max_wait)
+        result = await _refresh_external_seed_by_id(seed_id, max_wait=max_wait, page_read_column=page_read_column)
         result["catalogue_fallback"] = "not_all_re_read"
         # What the discarded catalogue pass would have done, for the operator (never written).
         result["catalogue_discarded"] = {
@@ -6393,9 +6400,6 @@ async def _refresh_external_seed_by_id(
         }
         return result
     if read_the_served_product:
-        if content_read:
-            # The page read the catalogue lane defers to every `page_max_age_days()`.
-            seed_data["snapshot"]["page_read_at"] = _to_iso(datetime.now(timezone.utc))
         if price_re_read and not variant_refresh.get("not_re_read_count"):
             # A catalogue read is as fresh as its fetch, not as the row's turn in the queue.
             seed_data["snapshot"]["extracted_at"] = _to_iso(
@@ -6415,6 +6419,15 @@ async def _refresh_external_seed_by_id(
         domain,
         read_the_served_product=read_the_served_product,
     )
+    # THE PAGE READ THE CATALOGUE LANE DEFERS TO every `page_max_age_days()`. A catalogue read moves
+    # `last_crawled_at` without reading the page, so it hands the page read that column held (SET reads
+    # the row as it was before this statement) to `last_page_read_at`, where no other writer goes.
+    page_read_set = ""
+    if page_read_column and read_the_served_product:
+        page_read_set = (
+            ",\n            last_page_read_at = NOW()" if content_read
+            else ",\n            last_page_read_at = COALESCE(last_page_read_at, last_crawled_at)"
+        )
 
     await _execute_seed_data_stmt(
         """
@@ -6447,7 +6460,9 @@ async def _refresh_external_seed_by_id(
             last_crawled_at = CASE
                 WHEN CAST(:read_the_served_product AS BOOLEAN) THEN NOW()
                 ELSE last_crawled_at
-            END
+            END"""
+        + page_read_set
+        + """
         WHERE id = :id
         """,
         {

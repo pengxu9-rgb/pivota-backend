@@ -2039,11 +2039,28 @@ async def _fetch_refresh_candidate_hosts(seed_ids: Sequence[str]) -> Dict[str, s
 
 
 _CATALOGUE_PLAN_SQL = """
-SELECT id, destination_url, last_crawled_at, destination_verdict, destination_failure_streak,
-       seed_data -> 'snapshot' ->> 'page_read_at' AS page_read_at,
-       seed_data -> 'snapshot' ->> 'read_source' AS read_source
+SELECT id, destination_url, last_crawled_at, last_page_read_at, destination_verdict, destination_failure_streak
 FROM external_product_seeds WHERE id IN ({placeholders})
 """
+
+# Resolved the way the refresh's own statements resolve the table: the first schema on the search_path.
+_PAGE_READ_COLUMN_SQL = """
+SELECT 1 FROM information_schema.columns
+WHERE table_schema = (current_schemas(false))[1] AND table_name = 'external_product_seeds'
+  AND column_name = :column
+"""
+
+
+async def _page_read_column_ready() -> bool:
+    """Does `external_product_seeds.last_page_read_at` exist (migration 274, applied by hand)?
+
+    The lane cannot run without it: the column is where a catalogue read carries the last page read
+    forward. Fails closed to "no catalogue lane"."""
+    try:
+        return bool(await database.fetch_one(_PAGE_READ_COLUMN_SQL, {"column": catalogue_lane.PAGE_READ_COLUMN}))
+    except Exception as exc:  # noqa: BLE001 - the lane is an optimisation, the refresh is not
+        logger.warning("external referral refresh: page-read column check failed (%s)", str(exc)[:200])
+        return False
 
 
 async def _fetch_refresh_candidate_dests(seed_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
@@ -2170,6 +2187,17 @@ async def run_external_referral_refresh_batch(
     # host, every request on the global pacer), and each of its rows is then refreshed from memory.
     # Every row the catalogue does not price keeps its page read, unchanged.
     catalogue_on = catalogue_lane.catalogue_refresh_enabled()
+    # Switched on without migration 274, the lane stays off for the run and says so; with it, every
+    # refresh of the run (page reads too) keeps `last_page_read_at`.
+    catalogue_column_missing = catalogue_on and not await _page_read_column_ready()
+    if catalogue_column_missing:
+        logger.warning(
+            "external referral refresh: %s is on but external_product_seeds.%s is missing "
+            "(migration 274); the catalogue lane is OFF for this run",
+            catalogue_lane.FLAG, catalogue_lane.PAGE_READ_COLUMN,
+        )
+        catalogue_on = False
+    refresh_kwargs: Dict[str, Any] = {"page_read_column": True} if catalogue_on else {}
     catalogue_min = catalogue_lane.catalogue_min_seeds()
     catalogue_wanted: Dict[str, set] = {}
     candidate_dests: Dict[str, Dict[str, Any]] = {}
@@ -2301,9 +2329,9 @@ async def run_external_referral_refresh_batch(
                 )
                 _bump(catalogue_reasons, why)
             if catalogue_read is not None:
-                result = await refresh_seed_by_id(seed_id, catalogue_read=catalogue_read)
+                result = await refresh_seed_by_id(seed_id, catalogue_read=catalogue_read, **refresh_kwargs)
             else:
-                result = await refresh_seed_by_id(seed_id)
+                result = await refresh_seed_by_id(seed_id, **refresh_kwargs)
             status = str(result.get("status") or "success")
             outcome = status
             if status == "success":
@@ -2808,6 +2836,7 @@ async def run_external_referral_refresh_batch(
         # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {
             "enabled": catalogue_on,
+            "page_read_column_missing": catalogue_column_missing,
             "min_seeds": catalogue_min,
             "hosts_planned": len(catalogue_wanted),
             "hosts_read": len(host_catalogues),

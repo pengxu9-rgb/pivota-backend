@@ -50,6 +50,8 @@ _TABLE_MIGRATIONS = (
     "200_external_seed_destination_liveness.sql",
     "202_external_seed_content_freshness.sql",
     "266_external_seed_destination_corroborated_dead_at.sql",
+    # Hand-applied before the lane is switched on: the page read the lane carries across its own reads.
+    "274_external_seed_last_page_read_at.sql.disabled",
     # catalog_products: the candidate query's suppressed-product anti-join and the liveness writer's
     # mirror lookup read it.
     "058_catalog_core.sql",
@@ -238,7 +240,9 @@ async def test_the_batch_prices_the_drains_seeds_off_the_catalogue_on_postgres(s
     assert (by_id[V15]["availability"], by_id[V15]["in_stock"]) == ("out_of_stock", False)
     snapshot = after["seed_data"]["snapshot"]
     assert snapshot["variant_refresh"]["status"] == "all_re_read"
-    assert snapshot["read_source"] == "products_json" and "page_read_at" not in snapshot
+    assert snapshot["read_source"] == "products_json"
+    # The page read 20 days ago, carried out of last_crawled_at as the catalogue read replaced it.
+    assert after["last_page_read_at"] == before["last_crawled_at"]
     assert datetime.fromisoformat(snapshot["extracted_at"]) > datetime.now(timezone.utc) - timedelta(minutes=5)
     # The stamps the queue and the freshness gate read.
     now = datetime.now(timezone.utc)
@@ -272,9 +276,8 @@ async def test_a_seed_due_its_page_read_is_page_read_on_postgres(scoped_db, monk
         " destination_failure_streak = 1 WHERE id = :id", {"id": dying})
     # The lane read it last night; its last PAGE read was 40 days ago.
     await scoped_db.execute(
-        "UPDATE external_product_seeds SET last_crawled_at = NOW(), seed_data = seed_data || jsonb_build_object("
-        " 'snapshot', COALESCE(seed_data -> 'snapshot', '{}'::jsonb)"
-        " || jsonb_build_object('read_source', 'products_json', 'page_read_at', CAST(:at AS text))) WHERE id = :id", {"id": unread, "at": (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()})
+        "UPDATE external_product_seeds SET last_crawled_at = NOW(),"
+        " last_page_read_at = NOW() - interval '40 days' WHERE id = :id", {"id": unread})
     page_reads = []
 
     async def page_read(*, url, **_kw):
@@ -293,6 +296,72 @@ async def test_a_seed_due_its_page_read_is_page_read_on_postgres(scoped_db, monk
     after = await _row(scoped_db, dying)
     assert (after["destination_verdict"], after["destination_failure_streak"]) == ("dead_404", 1), \
         "a listing never resets a dead streak"
+
+
+async def test_the_drains_rewrite_never_hides_a_page_read_the_lane_owes_on_postgres(scoped_db, monkeypatch):
+    """Review round 2: the drain's upsert replaces seed_data whole about every five days. The page read a
+    catalogue read carried forward lives in a column that upsert never names, so it still comes due."""
+    import routes.employee_products as routes_mod
+    from services import external_seed_catalogue_refresh as lane
+
+    handles = (HANDLE, "other-a", "other-b", "other-c")   # one more than the minimum, so one can come due
+    seeds = [_drain_seed(_product(), handle=h) for h in handles]
+    for seed in seeds:
+        await _write_seed(scoped_db, seed)
+    ids = [s["id"] for s in seeds]
+    await _page_read_days_ago(scoped_db, ids, 20)
+    pages = [[dict(_product(p50="85.00"), handle=h) for h in handles]]
+    assert (await _run_batch(monkeypatch, scoped_db, ids, pages))["catalogue"]["rows_read"] == 4
+    # The drain re-applies its cohort: same rows, its own seed_data, no snapshot.
+    for seed in seeds:
+        await _write_seed(scoped_db, seed)
+    row = await _row(scoped_db, ids[0])
+    assert "snapshot" not in row["seed_data"]
+    now = datetime.now(timezone.utc)
+    assert now - row["last_crawled_at"] < timedelta(minutes=5), "the catalogue read set last_crawled_at"
+    assert lane.page_read_due(row, now=now, max_age_days=30) is None
+    assert lane.page_read_due(row, now=now + timedelta(days=11), max_age_days=30) == lane.DUE_TOO_OLD
+
+    # Eleven days on, the next run reads that seed's page and stamps it.
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET last_crawled_at = last_crawled_at - interval '11 days',"
+        " last_page_read_at = last_page_read_at - interval '11 days' WHERE id = :id", {"id": ids[0]})
+    page_reads = []
+    real_resolve = routes_mod.resolve_external_offer
+
+    async def page_read(*, url, **kw):
+        page_reads.append(url)
+        raise RuntimeError("page read (stubbed)")
+
+    monkeypatch.setattr(routes_mod, "resolve_external_offer", page_read)
+    try:
+        summary = await _run_batch(monkeypatch, scoped_db, ids, pages)
+    finally:
+        monkeypatch.setattr(routes_mod, "resolve_external_offer", real_resolve)
+    assert summary["catalogue"]["rows"].get("page_read_due:page_read_too_old") == 1, summary["catalogue"]
+    assert summary["catalogue"]["rows_read"] == 3
+    assert page_reads == [seeds[0]["destination_url"]]
+
+
+async def test_switched_on_without_the_column_the_lane_stays_off_on_postgres(scoped_db, monkeypatch):
+    import routes.employee_products as routes_mod
+
+    await scoped_db.execute("ALTER TABLE external_product_seeds DROP COLUMN last_page_read_at")
+    seeds = [_drain_seed(_product(), handle=h) for h in (HANDLE, "other-a", "other-b")]
+    for seed in seeds:
+        await _write_seed(scoped_db, seed)
+    await _page_read_days_ago(scoped_db, [s["id"] for s in seeds], 20)
+    page_reads = []
+
+    async def page_read(*, url, **_kw):
+        page_reads.append(url)
+        raise RuntimeError("page read (stubbed)")
+
+    monkeypatch.setattr(routes_mod, "resolve_external_offer", page_read)
+    summary = await _run_batch(monkeypatch, scoped_db, [s["id"] for s in seeds], [[_product()]])
+    cat = summary["catalogue"]
+    assert cat["page_read_column_missing"] is True and cat["enabled"] is False and cat["hosts_read"] == 0
+    assert sorted(page_reads) == sorted(s["destination_url"] for s in seeds)
 
 
 async def test_flag_off_the_batch_never_reads_the_catalogue_on_postgres(scoped_db, monkeypatch):
@@ -326,6 +395,10 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     seeds = [_drain_seed(_product(), handle=h) for h in (HANDLE, "other-a", "other-b", "gone")]
     for seed in seeds:
         await _write_seed(scoped_db, seed)
+    # One the lane read last night, whose last page read (carried in the column) is 40 days old.
+    await scoped_db.execute(
+        "UPDATE external_product_seeds SET last_crawled_at = NOW(), last_page_read_at = NOW() - interval '40 days'"
+        " WHERE id = :id", {"id": seeds[1]["id"]})
     snapshot_before = [dict(r) for r in await scoped_db.fetch_all(
         "SELECT id, price_amount, seed_data::text AS sd, updated_at, last_crawled_at, destination_checked_at"
         " FROM external_product_seeds ORDER BY id")]
@@ -360,7 +433,7 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     lines = [line for line in out if line.startswith("SCR_PLAN ")]
     assert lines[-1] == f"SCR_PLAN DONE lines={len(lines) - 1}"
     payload = {line.split(" ", 2)[1]: json.loads(line.split(" ", 2)[2]) for line in lines[:-1]}
-    assert payload["hosts"] == {HOST: 4}
+    assert payload["hosts"] == {HOST: 4} and payload["page_read_column"] is True
     host = payload["host"]
     assert (host["status"], host["currency"], host["proof"]) == ("ok", "USD", "base_and_page_cookie")
     assert (host["seeds"], host["matched"]) == (4, 3)
@@ -370,7 +443,7 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     # Stored 80.00 against 90.00, 80.00 and 81.00: drift on one seed, no constant offset.
     assert host["price_ratio"] == {"n": 3, "median": 1.0125, "p10": 1.0, "p90": 1.125, "offset_suspected": False}
     # The drain's rows were never page-read: the lane would read their pages first.
-    assert host["page_read_due"] == {"page_read_unknown": 4}
+    assert host["page_read_due"] == {"page_read_unknown": 3, "page_read_too_old": 1}
     summary = payload["summary"]
     assert (summary["hosts_read"], summary["hosts_priceable"], summary["matched"]) == (1, 1, 3)
     # meta.json + 3 catalogue pages (the third, empty, ends it: "gone" is not listed).
@@ -382,3 +455,13 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
         "SELECT id, price_amount, seed_data::text AS sd, updated_at, last_crawled_at, destination_checked_at"
         " FROM external_product_seeds ORDER BY id")]
     assert after == snapshot_before, "a dry run writes nothing"
+
+    # Before migration 274 is applied the dry run still runs, every page read on last_crawled_at.
+    await scoped_db.execute("ALTER TABLE external_product_seeds DROP COLUMN last_page_read_at")
+    cp.reset_for_tests()
+    await mod.main()
+    out = capsys.readouterr().out.splitlines()
+    payload = {line.split(" ", 2)[1]: json.loads(line.split(" ", 2)[2])
+               for line in out if line.startswith("SCR_PLAN ") and not line.startswith("SCR_PLAN DONE")}
+    # Without the column the lane's own last_crawled_at would pass for a page read: the column is the check.
+    assert payload["page_read_column"] is False and payload["host"]["page_read_due"] == {"page_read_unknown": 3}

@@ -42,9 +42,10 @@ THE RULES, each one a refusal that sends the seed back to its page read:
 
 THE PAGE READ STAYS THE CHECK ON WHAT A CATALOGUE CANNOT SEE, so it is never replaced for good:
   * A LISTED HANDLE CAN STILL 404 (about 1.5% did when the sweep probed listed handles). A seed whose
-    last PAGE read (`snapshot.page_read_at`) is older than `page_max_age_days()` (default 30, about the
+    last PAGE read (`PAGE_READ_COLUMN`) is older than `page_max_age_days()` (default 30, about the
     interval at which the refresh reaches a seed today), or whose destination is not known live, gets
-    its page read instead (`page_read_due`).
+    its page read instead (`page_read_due`). The stamp is a column, not a `seed_data` key, because the
+    retailer-ingest drain rewrites `seed_data` whole about every five days (`apply._SEED_UPSERT_SQL`).
   * A STORED VARIANT LIST THE CATALOGUE CANNOT MATCH (positional `offer_N` keys, SKU keys) would lose its
     `extracted_at` stamp every night. A catalogue read that leaves a stored variant un-re-read is
     discarded and the page is read in the same call (`routes.employee_products`).
@@ -97,6 +98,12 @@ STATUS_CURRENCY_UNPROVEN = "currency_unproven"
 STATUS_NONE_LISTED = "no_wanted_handle_listed"
 STATUS_REDIRECTED_OFF_HOST = "redirected_off_host"
 STATUS_ERROR = "error"
+
+#: When the refresh last read this seed's PAGE (migration 274, applied by hand before the lane is
+#: switched on). Written only by a run of the lane that found the column (`page_read_column` in the
+#: route): a page read sets it to NOW(), a catalogue read carries the previous page read forward
+#: (`COALESCE(last_page_read_at, last_crawled_at)`, against the row before its own NOW()).
+PAGE_READ_COLUMN = "last_page_read_at"
 
 #: Why a seed gets its page read rather than a catalogue read (`page_read_due`).
 DUE_FAILURE_STREAK = "destination_failure_streak"
@@ -153,17 +160,18 @@ def _as_utc(value: Any) -> Optional[datetime]:
 def page_read_due(seed: Mapping[str, Any], *, now: datetime, max_age_days: int) -> Optional[str]:
     """Why this seed must have its PAGE read tonight rather than a catalogue read, or None.
 
-    `seed` carries the row's `destination_verdict`, `destination_failure_streak` and `last_crawled_at`,
-    and its snapshot's `page_read_at` and `read_source`. The last page read is `page_read_at` (stamped
-    by every page read of the served product); a row without one whose last refresh was not a catalogue
-    read was last read from its page at `last_crawled_at` (every refresh before this lane). A drain
-    rewrite of `seed_data` drops both, so such a row can go at most twice `max_age_days` unread."""
+    `seed` carries the row's `destination_verdict`, `destination_failure_streak`, `last_crawled_at` and
+    `PAGE_READ_COLUMN`. The last page read is `PAGE_READ_COLUMN`, else `last_crawled_at`: a row whose
+    column is NULL has had no catalogue read, because the one write that can set `last_crawled_at`
+    without reading the page (a catalogue read) also fills the column with the `last_crawled_at` it
+    replaces. Before the lane, every `last_crawled_at` is a page read. Page reads outside a lane run
+    (the employee route) leave the column behind, which only makes a seed due sooner."""
     if int(seed.get("destination_failure_streak") or 0) > 0:
         return DUE_FAILURE_STREAK
     if seed.get("destination_verdict") not in (None, "", liveness.VERDICT_LIVE):
         return DUE_NOT_LIVE
-    last = _as_utc(seed.get("page_read_at"))
-    if last is None and str(seed.get("read_source") or "") != READ_SOURCE:
+    last = _as_utc(seed.get(PAGE_READ_COLUMN))
+    if last is None:
         last = _as_utc(seed.get("last_crawled_at"))
     if last is None:
         return DUE_UNKNOWN
@@ -621,6 +629,7 @@ def seed_catalogue_read(
 __all__ = (
     "FLAG",
     "HostCatalogue",
+    "PAGE_READ_COLUMN",
     "READ_SOURCE",
     "SeedCatalogueRead",
     "catalogue_handle",

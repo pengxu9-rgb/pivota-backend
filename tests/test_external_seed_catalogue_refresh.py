@@ -572,11 +572,15 @@ NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
     ({"last_crawled_at": (NOW - timedelta(days=2)).isoformat()}, None),
     ({}, lane.DUE_UNKNOWN),
     ({"last_crawled_at": "not a time"}, lane.DUE_UNKNOWN),
-    # The lane's own read stamps last_crawled_at too: it never stands in for a page read.
-    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE}, lane.DUE_UNKNOWN),
-    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE, "page_read_at": (NOW - timedelta(days=3)).isoformat()}, None),
-    ({"last_crawled_at": NOW, "read_source": lane.READ_SOURCE, "page_read_at": "2026-09-01T00:00:00Z"}, lane.DUE_TOO_OLD),
-    ({"last_crawled_at": NOW, "page_read_at": "2026-09-01T00:00:00+00:00"}, lane.DUE_TOO_OLD),
+    # After a catalogue read (last_crawled_at = NOW()) the column holds the page read it carried forward.
+    ({"last_crawled_at": NOW, "last_page_read_at": NOW - timedelta(days=3)}, None),
+    ({"last_crawled_at": NOW, "last_page_read_at": NOW - timedelta(days=31)}, lane.DUE_TOO_OLD),
+    ({"last_crawled_at": NOW, "last_page_read_at": "2026-09-01T00:00:00Z"}, lane.DUE_TOO_OLD),
+    # Review round 2: a drain rewrite of seed_data leaves the column, so the snapshot never decides.
+    ({"last_crawled_at": NOW, "last_page_read_at": NOW - timedelta(days=31), "read_source": None, "page_read_at": None},
+     lane.DUE_TOO_OLD),
+    ({"last_crawled_at": NOW, "last_page_read_at": NOW - timedelta(days=31), "page_read_at": NOW.isoformat()},
+     lane.DUE_TOO_OLD),
     ({"last_crawled_at": NOW, "destination_verdict": liveness.VERDICT_LIVE}, None),
     ({"last_crawled_at": NOW, "destination_verdict": "dead"}, lane.DUE_NOT_LIVE),
     ({"last_crawled_at": NOW, "destination_verdict": "unverifiable"}, lane.DUE_NOT_LIVE),
@@ -652,7 +656,7 @@ def _drain_row(product: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     seed["seed_data"] = json.loads(seed["seed_data"]) if isinstance(seed["seed_data"], str) else seed["seed_data"]
     for col in ("utm_template", "partner_type", "disclosure_text", "attached_variant_id", "seller_ref", "seed_kind",
                 "destination_checked_at", "destination_http_status", "destination_verdict", "last_crawled_at",
-                "last_crawl_attempt_at"):
+                "last_crawl_attempt_at", "last_page_read_at"):
         seed.setdefault(col, None)
     seed.setdefault("destination_failure_streak", 0)
     return seed
@@ -713,6 +717,16 @@ class _Refresh:
             return copy.deepcopy(self.stored) if values and values.get("id") == self.stored["id"] else None
 
         async def execute(query: str, values):
+            # The clocks, as Postgres sets them: SET reads the row as it was before the statement.
+            if "last_crawled_at = CASE" in query and values.get("read_the_served_product"):
+                now = datetime.now(timezone.utc)
+                if "last_page_read_at = NOW()" in query:
+                    self.stored["last_page_read_at"] = now
+                elif "last_page_read_at = COALESCE(last_page_read_at, last_crawled_at)" in query:
+                    self.stored["last_page_read_at"] = self.stored.get("last_page_read_at") or self.stored.get("last_crawled_at")
+                else:
+                    assert "last_page_read_at" not in query
+                self.stored["last_crawled_at"] = now
             persisted = json.loads(json.dumps(values, default=str))
             if isinstance(persisted.get("seed_data"), str):
                 persisted["seed_data"] = json.loads(persisted["seed_data"])
@@ -744,15 +758,17 @@ class _Refresh:
         monkeypatch.setattr(mod.destination_liveness, "record_destination_observation", record)
         monkeypatch.setattr(mod, "_project_refreshed_seed_to_serving_surfaces", project)
 
-    def page_read(self, p50: float, p15: float) -> Dict[str, Any]:
+    def page_read(self, p50: float, p15: float, *, page_read_column: bool = False) -> Dict[str, Any]:
         self.page = _page_snapshot(p50, p15)
+        kwargs = {"page_read_column": True} if page_read_column else {}
         try:
-            return asyncio.run(self.mod._refresh_external_seed_by_id(self.stored["id"], max_wait=0))
+            return asyncio.run(self.mod._refresh_external_seed_by_id(self.stored["id"], max_wait=0, **kwargs))
         finally:
             self.page = None
 
-    def catalogue(self, read: lane.SeedCatalogueRead) -> Dict[str, Any]:
-        return asyncio.run(self.mod._refresh_external_seed_by_id(self.stored["id"], max_wait=0, catalogue_read=read))
+    def catalogue(self, read: lane.SeedCatalogueRead, *, page_read_column: bool = True) -> Dict[str, Any]:
+        return asyncio.run(self.mod._refresh_external_seed_by_id(
+            self.stored["id"], max_wait=0, catalogue_read=read, page_read_column=page_read_column))
 
     @property
     def variants(self) -> Dict[str, Dict[str, Any]]:
@@ -869,7 +885,7 @@ def test_a_page_read_is_due_after_the_max_age_and_on_a_destination_not_known_liv
     run.page = _page_snapshot(80, 32)
     result = run.catalogue(_seed_read())
     assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_TOO_OLD and run.fetched == [DEST]
-    assert run.stored["seed_data"]["snapshot"]["page_read_at"], "the page read is stamped"
+    assert datetime.now(timezone.utc) - run.stored["last_page_read_at"] < timedelta(minutes=1), "the page read is stamped"
     # Now a page read is a day old ... but the destination has a failure streak: still the page.
     run.stored["destination_failure_streak"] = 1
     result = run.catalogue(_seed_read())
@@ -879,18 +895,42 @@ def test_a_page_read_is_due_after_the_max_age_and_on_a_destination_not_known_liv
     assert run.catalogue(_seed_read())["read_source"] == lane.READ_SOURCE
 
 
-def test_a_catalogue_read_keeps_the_last_page_reads_stamp(monkeypatch):
-    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=None)
-    run.page_read(80, 32)
-    page_read_at = run.stored["seed_data"]["snapshot"]["page_read_at"]
-    run.stored["last_crawled_at"] = None
+def test_a_catalogue_read_carries_the_last_page_read_forward(monkeypatch):
+    """Review round 2: a catalogue read moves last_crawled_at, so the page read it replaces goes to
+    last_page_read_at, which the drain's whole-seed_data upsert never names."""
+    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=20)
+    page_read = run.stored["last_crawled_at"]
     run.catalogue(_seed_read(_product(p50="85.00")))
-    assert run.stored["seed_data"]["snapshot"]["page_read_at"] == page_read_at
-    assert run.stored["seed_data"]["snapshot"]["read_source"] == lane.READ_SOURCE
-    # The stamp is the page read's, so the lane's own last_crawled_at never stands in for it.
-    run.stored["seed_data"]["snapshot"].pop("page_read_at")
+    assert run.stored["last_page_read_at"] == page_read
+    assert datetime.now(timezone.utc) - run.stored["last_crawled_at"] < timedelta(minutes=1)
+    # The next catalogue read keeps the same page read, not its predecessor's NOW().
+    run.catalogue(_seed_read(_product(p50="86.00")))
+    assert run.stored["last_page_read_at"] == page_read
+    # The drain rewrites seed_data whole: the column is not in it, and still decides.
+    run.stored["seed_data"] = _drain_row()["seed_data"]
+    run.stored["last_page_read_at"] = page_read - timedelta(days=11)
     run.page = _page_snapshot(85, 32)
-    assert run.catalogue(_seed_read())["catalogue_fallback"] == "page_read_due:" + lane.DUE_UNKNOWN
+    result = run.catalogue(_seed_read())
+    assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_TOO_OLD and run.fetched == [DEST]
+    assert datetime.now(timezone.utc) - run.stored["last_page_read_at"] < timedelta(minutes=1)
+
+
+def test_a_page_read_in_a_lane_run_stamps_the_column_and_one_outside_it_does_not(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+    assert run.stored["last_page_read_at"] is None, "the employee route never names the column"
+    assert all("last_page_read_at" not in q for q, _ in run.sql)
+    run.page_read(80, 32, page_read_column=True)
+    assert datetime.now(timezone.utc) - run.stored["last_page_read_at"] < timedelta(minutes=1)
+
+
+def test_a_catalogue_read_without_the_column_is_not_taken(monkeypatch):
+    """It could not carry the page read forward, and would leave last_crawled_at looking like one."""
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read(), page_read_column=False)
+    assert result["catalogue_fallback"] == "no_page_read_column" and result["read_source"] == "page"
+    assert run.fetched == [DEST] and all("last_page_read_at" not in q for q, _ in run.sql)
 
 
 def test_freshness_is_stamped_at_the_catalogue_fetch_not_the_rows_turn(monkeypatch):
@@ -1000,7 +1040,8 @@ def test_a_single_variant_seed_off_a_two_value_list_is_page_read(monkeypatch):
 # ----------------------------------------------------------------- the real batch
 
 
-def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=None, refresh_result=None, plan=None):
+def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=None, refresh_result=None, plan=None,
+           column: bool = True, kwargs_seen: Optional[List[Dict[str, Any]]] = None):
     """Run the real batch over `dests` (seed id -> destination URL) with an injected refresher. Every seed
     was page-read yesterday unless `plan` (seed id -> plan row fields) says otherwise."""
     import services.external_referral_readiness as err
@@ -1016,6 +1057,7 @@ def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=No
     rows = {s: {"id": s, "destination_url": d, "last_crawled_at": yesterday, **((plan or {}).get(s) or {})}
             for s, d in dests.items()}
     monkeypatch.setattr(err, "_fetch_refresh_candidate_dests", lambda ids: asyncio.sleep(0, result=rows))
+    monkeypatch.setattr(err, "_page_read_column_ready", lambda: asyncio.sleep(0, result=column))
     reads: List[Any] = []
 
     async def read_host(host, wanted, **kw):
@@ -1029,6 +1071,8 @@ def _batch(monkeypatch, dests: Dict[str, str], *, on: bool = True, catalogues=No
 
     async def refresh(seed_id: str, **kwargs):
         calls.append((seed_id, kwargs.get("catalogue_read")))
+        if kwargs_seen is not None:
+            kwargs_seen.append(kwargs)
         out = {"status": "success", "price_refresh": {"status": "unchanged"}, "projection": {}}
         out["read_source"] = lane.READ_SOURCE if kwargs.get("catalogue_read") else "page"
         return refresh_result(seed_id, kwargs) if refresh_result else out
@@ -1053,9 +1097,41 @@ SEEDS = {
 
 
 def test_off_by_default_the_batch_is_unchanged(monkeypatch):
-    summary, reads, calls = _batch(monkeypatch, SEEDS, on=False)
+    seen: List[Dict[str, Any]] = []
+    summary, reads, calls = _batch(monkeypatch, SEEDS, on=False, column=False, kwargs_seen=seen)
     assert reads == [] and all(read is None for _, read in calls)
+    assert seen == [{}] * len(SEEDS), "the refresh is called exactly as before the lane"
     assert summary["catalogue"]["enabled"] is False and summary["catalogue"]["hosts_planned"] == 0
+    assert summary["catalogue"]["page_read_column_missing"] is False
+
+
+def test_on_without_the_page_read_column_the_lane_stays_off(monkeypatch):
+    seen: List[Dict[str, Any]] = []
+    summary, reads, calls = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a", "b", "c")},
+                                   column=False, kwargs_seen=seen)
+    assert reads == [] and seen == [{}] * len(SEEDS)
+    assert summary["catalogue"]["enabled"] is False and summary["catalogue"]["page_read_column_missing"] is True
+
+
+@pytest.mark.parametrize("answer,ready", [({"?column?": 1}, True), (None, False), (RuntimeError("boom"), False)])
+def test_the_page_read_column_check_fails_closed(monkeypatch, answer, ready):
+    import services.external_referral_readiness as err
+
+    async def fetch_one(query, values):
+        assert values == {"column": "last_page_read_at"} and "current_schemas(false)" in query
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(err.database, "fetch_one", fetch_one)
+    assert asyncio.run(err._page_read_column_ready()) is ready
+
+
+def test_a_lane_run_tells_every_refresh_the_column_is_there(monkeypatch):
+    seen: List[Dict[str, Any]] = []
+    _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a", "b", "c")}, kwargs_seen=seen)
+    assert len(seen) == len(SEEDS) and all(kw.get("page_read_column") is True for kw in seen)
+    assert sum(1 for kw in seen if kw.get("catalogue_read") is not None) == 3
 
 
 def test_on_a_host_is_read_once_and_its_rows_priced_from_memory(monkeypatch):
@@ -1141,7 +1217,11 @@ def test_the_job_hands_the_catalogue_read_through_and_never_invents_one(monkeypa
     marker = object()
     asyncio.run(job._refresh_unbounded("s1"))
     asyncio.run(job._refresh_unbounded("s1", catalogue_read=marker))
-    assert seen == [{"max_wait": 0}, {"max_wait": 0, "catalogue_read": marker}]
+    asyncio.run(job._refresh_unbounded("s1", catalogue_read=marker, page_read_column=True))
+    asyncio.run(job._refresh_unbounded("s1", page_read_column=True))
+    assert seen == [{"max_wait": 0}, {"max_wait": 0, "catalogue_read": marker},
+                    {"max_wait": 0, "catalogue_read": marker, "page_read_column": True},
+                    {"max_wait": 0, "page_read_column": True}]
 
 
 def test_the_job_prints_one_catalogue_line(monkeypatch, capsys):

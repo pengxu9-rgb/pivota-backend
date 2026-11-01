@@ -77,7 +77,9 @@ from services.external_referral_readiness import run_external_referral_refresh_b
 logger = logging.getLogger(__name__)
 
 
-async def _refresh_unbounded(seed_id: str, *, catalogue_read: Any = None) -> Dict[str, Any]:
+async def _refresh_unbounded(
+    seed_id: str, *, catalogue_read: Any = None, page_read_column: bool = False
+) -> Dict[str, Any]:
     """The batch's patience is UNBOUNDED, and it has to say so.
 
     `crawl_politeness` refuses a slot further out than the caller allows, and the default
@@ -109,11 +111,14 @@ async def _refresh_unbounded(seed_id: str, *, catalogue_read: Any = None) -> Dic
 
     `catalogue_read` is the batch's catalogue price lane handing over this seed's entry from its host's
     `/products.json` (EXTERNAL_REFERRAL_REFRESH_CATALOGUE_ENABLED, default off); without it the page is
-    read as always.
+    read as always. `page_read_column` (the lane's run found `last_page_read_at`) is passed through.
     """
+    kwargs: Dict[str, Any] = {}
     if catalogue_read is not None:
-        return await _refresh_external_seed_by_id(seed_id, max_wait=0, catalogue_read=catalogue_read)
-    return await _refresh_external_seed_by_id(seed_id, max_wait=0)
+        kwargs["catalogue_read"] = catalogue_read
+    if page_read_column:
+        kwargs["page_read_column"] = True
+    return await _refresh_external_seed_by_id(seed_id, max_wait=0, **kwargs)
 
 
 async def run_daily_external_referral_refresh(

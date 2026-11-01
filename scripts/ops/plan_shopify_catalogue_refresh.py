@@ -76,12 +76,23 @@ SELECT id, destination_url FROM external_product_seeds WHERE status = 'active' A
 
 SEED_COLUMNS_SQL = """
 SELECT id, market, destination_url, canonical_url, price_amount, price_currency, availability, last_crawled_at,
-       destination_verdict, destination_failure_streak,
+       {page_read_column}, destination_verdict, destination_failure_streak,
        seed_data -> 'variants' AS variants, seed_data -> 'snapshot' -> 'variants' AS snapshot_variants,
-       seed_data ->> 'title' AS title,
-       seed_data -> 'snapshot' ->> 'page_read_at' AS page_read_at, seed_data -> 'snapshot' ->> 'read_source' AS read_source
+       seed_data ->> 'title' AS title
 FROM external_product_seeds WHERE id = ANY($1::text[])
 """
+#: Migration 274 may not be applied yet when the dry run goes: until the lane has run, a NULL column
+#: is the truth (`page_read_due` then reads `last_crawled_at`, every one of them a page read).
+PAGE_READ_COLUMN_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = (current_schemas(false))[1]"
+    " AND table_name = 'external_product_seeds' AND column_name = 'last_page_read_at')"
+)
+
+
+def seed_columns_sql(page_read_column: bool) -> str:
+    return SEED_COLUMNS_SQL.format(
+        page_read_column="last_page_read_at" if page_read_column else "NULL::timestamptz AS last_page_read_at"
+    )
 #: A host's median catalogue/stored ratio this far off 1, with p10..p90 on one side of it, is an offset.
 OFFSET_MIN = 0.01
 OFFSET_MIN_SEEDS = 3
@@ -325,6 +336,7 @@ async def main():
         tr = await read_only_transaction(conn, timeout_ms)
         try:
             present = await conn.fetchval("SELECT to_regclass('external_product_seeds') IS NOT NULL")
+            page_read_column = bool(present) and bool(await conn.fetchval(PAGE_READ_COLUMN_SQL))
         finally:
             await tr.rollback()
         if not present:
@@ -337,13 +349,14 @@ async def main():
             ids = [i for seed_ids in hosts.values() for i in seed_ids]
             seeds = {}
             for start in range(0, len(ids), CHUNK):
-                for r in await conn.fetch(SEED_COLUMNS_SQL, ids[start:start + CHUNK]):
+                for r in await conn.fetch(seed_columns_sql(page_read_column), ids[start:start + CHUNK]):
                     seeds[str(r["id"])] = dict(r)
         finally:
             await tr.rollback()
     finally:
         # Closed BEFORE the first fetch: no connection is held while the run waits on the pacer.
         await conn.close()
+    emit("page_read_column", page_read_column)
     emit("hosts", {h: len(s) for h, s in hosts.items()})
 
     budget = crawl_global_pacer.resolve_budget_seconds(None, "PLAN_BUDGET_SECONDS", 1800.0)
