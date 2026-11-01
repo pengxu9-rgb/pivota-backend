@@ -6,8 +6,10 @@
 -- is switched on, not before the merge. Nothing reads or writes the column until the lane runs, and a
 -- lane run that does not find it stays off (`external_referral_readiness._page_read_column_ready`).
 --   * ADD COLUMN without a default is a catalogue-only change, but it takes ACCESS EXCLUSIVE on the
---     table for that instant: run it with a lock_timeout, outside the refresh, sweep and drain runs,
---     and retry on a timeout.
+--     table for that instant, and queued behind a long reader it would block every read behind it.
+--     The file bounds that wait itself (SET LOCAL lock_timeout below), so run its statements in ONE
+--     transaction (db.sql_migrations.split_statements, as 260's job does; on autocommit SET LOCAL is a
+--     no-op), outside the refresh, sweep and drain runs, and retry the whole file on a lock timeout.
 --   * No backfill. A NULL column falls back to last_crawled_at, which every refresh before the lane
 --     set from a page read; the lane's first catalogue read of a seed copies that value in.
 --
@@ -20,6 +22,8 @@
 --   * a catalogue read sets it to COALESCE(last_page_read_at, last_crawled_at), read from the row as it
 --     was before the statement's own last_crawled_at = NOW().
 -- schema-guard-exempt: read and written only by a catalogue-lane run that has checked the column exists (flag default off); kept off the self-heal so no boot path races ACCESS EXCLUSIVE.
+
+SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_page_read_at TIMESTAMPTZ;
 
