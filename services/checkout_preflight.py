@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional
 
 from db.database import database
 from services import live_offer_verification
+from services.synthetic_call import is_synthetic_call
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 
 logger = logging.getLogger("checkout_preflight")
@@ -437,7 +438,8 @@ async def preflight_and_record(
 ) -> PreflightVerdict:
     """The call sites use this. One verdict, one row, and the caller reads `allows_checkout`."""
     verdict = await preflight(offer)
-    await record(verdict, offer, source=source, run_id=run_id)
+    if not is_synthetic_call():  # our own eval traffic writes no observation (services/synthetic_call.py)
+        await record(verdict, offer, source=source, run_id=run_id)
     return verdict
 
 

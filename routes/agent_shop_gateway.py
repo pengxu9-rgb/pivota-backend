@@ -67,6 +67,7 @@ from services.beauty_external_ranking import (
     rank_external_seed_rows,
 )
 from services.product_query_service import get_products_hybrid
+from services.synthetic_call import is_synthetic_call
 from services.test_merchant_policy import (
     get_excluded_merchant_ids,
     filter_out_test_merchants,
@@ -581,7 +582,7 @@ def _set_cached_merchant_shopify_currency(merchant_id: str, currency: str) -> No
 
 async def _resolve_shopify_currency_for_merchant(merchant_id: str) -> Optional[str]:
     cached = _get_cached_merchant_shopify_currency(merchant_id)
-    if cached:
+    if cached or is_synthetic_call():  # our own eval traffic makes no Admin call: the cached value or none
         return cached
 
     try:
@@ -2576,7 +2577,9 @@ def _multi_page_request_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
 
 
 def _multi_page_request_cache_put(cache_key: str, result: Dict[str, Any]) -> None:
-    if not cache_key:
+    # Our own eval traffic reads shared caches but never writes them (services/synthetic_call.py):
+    # its answers carry synthetic /r links and were built with its writes skipped.
+    if not cache_key or is_synthetic_call():
         return
     ttl_seconds = max(0.0, float(MULTI_SEARCH_PAGE_REQUEST_DEDUP_TTL_SECONDS))
     if ttl_seconds <= 0:
@@ -2690,7 +2693,7 @@ def _multi_upstream_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
 
 
 def _multi_upstream_cache_put(cache_key: str, result: Dict[str, Any], kind: str) -> None:
-    if not cache_key or not isinstance(result, dict):
+    if not cache_key or not isinstance(result, dict) or is_synthetic_call():
         return
 
     if kind == "error":
@@ -2730,6 +2733,8 @@ def _multi_upstream_circuit_is_open(now_mono: Optional[float] = None) -> bool:
 
 def _multi_upstream_record_outcome(success: bool, *, timeout: bool = False) -> None:
     global _MULTI_SEARCH_UPSTREAM_CIRCUIT_OPEN_UNTIL
+    if is_synthetic_call():  # eval failures never open the shared circuit
+        return
 
     now_mono = time.monotonic()
     _multi_upstream_circuit_prune(now_mono)
@@ -4847,6 +4852,9 @@ async def _handle_offers_resolve(
     # A DRY RUN is only a live-verification second pass's: honoured only alongside tokens, so a
     # public caller cannot use the flag to suppress its own ADR-025 issuance.
     _live_dry_run = bool(getattr(payload, "live_verifications_dry_run", False)) and bool(_live_assertions.entries)
+    # Our own eval traffic (services/synthetic_call.py): answers identically, like a dry run, but issues
+    # no clicks, writes no preflight row and spends no preflight egress.
+    _synthetic = is_synthetic_call()
     # Every seed row any lane has already put through the gates below, so the group-sibling lane
     # (OFFERS_RESOLVE_GROUP_SEED_SIBLINGS) never gates one twice. Written, never read, when off.
     _considered_seed_ids: set[str] = set()
@@ -5291,7 +5299,9 @@ async def _handle_offers_resolve(
                     _gate_vid
                     and not offer_requires_live_verification
                     and checkout_preflight.is_enabled()
-                    and not (_live_dry_run and checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE)
+                    and not (
+                        (_live_dry_run or _synthetic) and checkout_preflight.mode() != checkout_preflight.MODE_ENFORCE
+                    )
                 ):
                     _preflight_stats["gated"] += 1
                     _q = (str(canonical_url or destination_url), str(_gate_vid))
@@ -6857,7 +6867,7 @@ async def _handle_offers_resolve(
     # mismatch, expiry, a host/market/currency mismatch) the gateway serves its FIRST pass, so not one
     # link of this answer is handed out. (In `on` mode each adopted offer still leaves one first-pass
     # issued row whose link was replaced: inherent to the two-pass design.)
-    if _live_dry_run:
+    if _live_dry_run or _synthetic:
         _issuable_offers: List[Dict[str, Any]] = []
     elif _live_assertions.entries:
         _issuable_offers = [o for o in offers if isinstance(o, dict) and o.get("live_verification")]
@@ -13202,7 +13212,8 @@ async def _invoke_multi_upstream_fallback(
     timeout_seconds: float,
     hop: int,
 ) -> Optional[Dict[str, Any]]:
-    if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL:
+    # The fallback upstream would see our own eval traffic as a real call: it carries no assertion.
+    if not MULTI_SEARCH_UPSTREAM_FALLBACK_BASE_URL or is_synthetic_call():
         return None
 
     metadata_payload: Dict[str, Any] = market_telemetry.strip_for_forwarding(dict(request_metadata or {}))
@@ -17946,8 +17957,13 @@ async def _handle_get_product_detail(
 
             # No usable id -> no stores to consider -> no round trip. The
             # `if shopify_store:` block below is skipped and the request falls
-            # through to PRODUCT_NOT_FOUND.
-            stores = await get_merchant_active_stores(merchant_id) if shopify_lookup_id else []
+            # through to PRODUCT_NOT_FOUND. Our own eval traffic makes no Admin
+            # round trip and writes no cache row either (services/synthetic_call.py).
+            stores = (
+                await get_merchant_active_stores(merchant_id)
+                if shopify_lookup_id and not is_synthetic_call()
+                else []
+            )
             shopify_store = next(
                 (
                     s
@@ -18977,6 +18993,14 @@ async def invoke_shop_operation(
                         if inflight is not None:
                             dedup_inflight_joined = True
                             result = copy.deepcopy(await inflight)
+                        elif is_synthetic_call():
+                            # Never the leader: a real request joining an eval leader would get its
+                            # answer with every write skipped (services/synthetic_call.py).
+                            result = await _handle_find_products_multi(
+                                payload,
+                                multi_request_metadata,
+                                background_tasks,
+                            )
                         else:
                             task = asyncio.create_task(
                                 _handle_find_products_multi(

@@ -93,16 +93,19 @@ def filter_sensitive_data(event, hint):
         headers = event["request"]["headers"]
         
         # Redact sensitive headers
-        sensitive_headers = [
+        sensitive_headers = {
             "authorization",
             "x-api-key",
             "cookie",
-            "x-shopify-access-token"
-        ]
-        
-        for header in sensitive_headers:
-            if header in headers:
-                headers[header] = "[REDACTED]"
+            "x-shopify-access-token",
+            # services/synthetic_call.py: a key-bound credential, replayable within its window.
+            "x-pivota-synthetic-assertion",
+        }
+
+        if isinstance(headers, dict):
+            for header in list(headers):
+                if str(header).lower() in sensitive_headers:
+                    headers[header] = "[REDACTED]"
     
     # Remove sensitive query params
     if "request" in event and "query_string" in event["request"]:
