@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import httpx
 
 from services.agent_search_gateway_proxy import HOP_HEADER, gateway_headers
+from services.synthetic_call import is_synthetic_call
 
 FLAG = "AGENT_PRODUCT_DETAIL_VIA_GATEWAY"
 OBSERVED_SELLER_PREFIX = "merch_obs_"
@@ -57,6 +58,9 @@ def enabled_for(merchant_id: Optional[str], headers: Mapping[str, str], env: Map
         return False, "not_an_observed_seller"
     if any(key.lower() == HOP_HEADER.lower() for key in headers.keys()):
         return False, "already_proxied"
+    if is_synthetic_call():
+        # The gateway would see our own eval traffic as a real call: this hop carries no assertion.
+        return False, "synthetic_call"
     return True, "enabled"
 
 

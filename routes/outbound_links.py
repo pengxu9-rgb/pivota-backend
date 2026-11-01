@@ -26,6 +26,7 @@ from services.outbound_links_service import (
     resolve_outbound_link,
     log_outbound_click,
     log_outbound_event,
+    token_is_synthetic,
 )
 from config.settings import settings
 from services.outbound_warm_handoff import (
@@ -183,6 +184,10 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # never attempt a warm handoff (no cart is ever built for a stale link).
     if is_expired:
         return RedirectResponse(url=dest, status_code=302)
+    # A link minted inside our own eval traffic (TOKEN_SYNTHETIC_KEY): the same 302, no click rows, no
+    # warm-handoff cart. The bit is signed, so a real buyer's link can never carry it.
+    if token_is_synthetic(payload):
+        return RedirectResponse(url=dest, status_code=302)
 
     # Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md; flag-gated,
     # DEFAULT OFF — flag off is byte-identical to the cold redirect below). An eligible cold
@@ -326,6 +331,8 @@ async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str
             continue
         ctx2[k] = v
     payload["ctx"] = ctx2
+    if token_is_synthetic(payload):
+        return {"ok": True}
 
     try:
         await log_outbound_event(

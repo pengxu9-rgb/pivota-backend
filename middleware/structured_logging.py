@@ -15,6 +15,17 @@ import logging
 logger = logging.getLogger("structured_logs")
 
 
+#: Request headers never logged as sent. The synthetic-call assertion is a signed, key-bound credential
+#: (services/synthetic_call.py): a logged copy is replayable within its window by anyone holding the key.
+REDACTED_HEADER_NAMES = frozenset(
+    {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie", "x-pivota-synthetic-assertion"}
+)
+
+
+def redact_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: ("[REDACTED]" if str(k or "").lower() in REDACTED_HEADER_NAMES else v) for k, v in headers.items()}
+
+
 _SENSITIVE_QUERY_KEYS = {
     "sig",
     "signature",
@@ -281,11 +292,7 @@ class RequestResponseLoggingMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         
         # Log request
-        headers = dict(request.headers)
-        for hk in list(headers.keys()):
-            kl = (hk or "").lower()
-            if kl in {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie"}:
-                headers[hk] = "[REDACTED]"
+        headers = redact_headers(dict(request.headers))
 
         request_log = {
             "request_id": request_id,

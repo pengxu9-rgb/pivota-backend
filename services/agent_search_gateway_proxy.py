@@ -39,6 +39,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
+from services.synthetic_call import is_synthetic_call
+
 FLAG = "AGENT_BEAUTY_SEARCH_VIA_GATEWAY"
 AGENT_IDS_FLAG = "AGENT_BEAUTY_SEARCH_VIA_GATEWAY_AGENT_IDS"
 HOP_HEADER = "X-Pivota-Search-Proxy-Hop"
@@ -69,6 +71,9 @@ def enabled_for(agent_id: Optional[str], headers: Mapping[str, str], env: Mappin
         return False, "caller_not_enabled"
     if any(key.lower() == HOP_HEADER.lower() for key in headers.keys()):
         return False, "already_proxied"
+    if is_synthetic_call():
+        # The gateway would see our own eval traffic as a real call: this hop carries no assertion.
+        return False, "synthetic_call"
     return True, "enabled"
 
 

@@ -64,6 +64,7 @@ from urllib.parse import urlparse
 import httpx
 
 from services import crawl_politeness
+from services.synthetic_call import is_synthetic_call
 from services.shopify_variant_identity import (
     parse_product_js,
     product_js_url,
@@ -382,6 +383,8 @@ async def _check_one(
     this merchant yet" apart from "we asked and did not get an answer", because those two produce
     the same BLOCK and completely different follow-up work.
     """
+    # Our own eval traffic never touches a merchant (services/synthetic_call.py): cache reads only.
+    cache_only = cache_only or is_synthetic_call()
     js_url, variant_id = _target(offer)
     if not js_url:
         return Verdict(UNVERIFIED, NO_VERIFIABLE_URL)

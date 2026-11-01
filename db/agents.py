@@ -15,6 +15,7 @@ import os
 import time
 
 from db.database import metadata, database, IS_POSTGRES
+from services.synthetic_call import is_synthetic_call
 from utils.transient_errors import is_asyncpg_busy_error
 
 _AGENT_AUTH_CACHE_MAX_ENTRIES = max(
@@ -652,6 +653,8 @@ async def update_agent_stats(
     add_gmv: float = 0
 ):
     """更新 Agent 统计数据"""
+    if is_synthetic_call():
+        return
     query = f"""
         UPDATE agents 
         SET total_requests = total_requests + :inc_req,
@@ -692,6 +695,10 @@ async def log_agent_usage(
 ) -> str:
     """记录 Agent API 使用"""
     request_id = f"req_{secrets.token_hex(16)}"
+    if is_synthetic_call():
+        # Our own eval traffic writes no usage row (services/synthetic_call.py). Only the gateway's
+        # service key can carry it, and that key's quota is not enforced.
+        return request_id
     
     query = agent_usage_logs.insert().values(
         agent_id=agent_id,

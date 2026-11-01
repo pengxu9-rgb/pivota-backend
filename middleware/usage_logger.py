@@ -13,6 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from db.database import database
 from observability.reliability_metrics import record_traffic_taxonomy
+from services.synthetic_call import is_synthetic_call
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 
 
@@ -112,8 +113,9 @@ class UsageLoggerMiddleware(BaseHTTPMiddleware):
     """Log Agent API usage for analytics"""
     
     async def dispatch(self, request: Request, call_next):
-        # Only log agent API calls
-        if not request.url.path.startswith("/agent/v1"):
+        # Only log agent API calls, and never our own eval traffic (services/synthetic_call.py):
+        # no usage row, no taxonomy metric, no failure webhook.
+        if not request.url.path.startswith("/agent/v1") or is_synthetic_call():
             return await call_next(request)
 
         # Record start time
