@@ -5775,8 +5775,46 @@ async def _stamp_crawl_attempt(seed_id: str) -> None:
     )
 
 
+def _catalogue_read_is_for(dest: Optional[str], catalogue_read: Any) -> bool:
+    """Is the batch's catalogue read about THIS destination (same host as asked, same handle)?
+
+    The batch plans the read from the destination it looked up before the row's turn came; a writer
+    that moved the row since would otherwise have another product's catalogue entry priced onto it."""
+    from services import crawl_politeness
+    from services.external_seed_catalogue_refresh import catalogue_handle
+
+    handle = catalogue_handle(dest)
+    return bool(handle) and handle == catalogue_read.handle and crawl_politeness.host_of(str(dest or "")) == catalogue_read.host
+
+
+def _catalogue_page_read_due(row: Dict[str, Any]) -> Optional[str]:
+    """Why this row must have its PAGE read even though the batch handed it a catalogue read, or None
+    (`services.external_seed_catalogue_refresh.page_read_due`, on the row as it is at its turn)."""
+    from services import external_seed_catalogue_refresh as catalogue_lane
+
+    return catalogue_lane.page_read_due(
+        row, now=datetime.now(timezone.utc), max_age_days=catalogue_lane.page_max_age_days()
+    )
+
+
+def _refresh_read_outcome(
+    row: Dict[str, Any], dest: Optional[str], observed: Dict[str, Any], catalogue_read: Any
+) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool]:
+    """`_read_the_served_product`, or its catalogue twin: a catalogue entry for the served URL's handle
+    is a reading of that product (the sweep's `listed in products.json`), with no HTTP status to judge."""
+    if catalogue_read is None:
+        return _read_the_served_product(row, dest, observed)
+    if not _same_destination(dest, destination_liveness.destination_of(row)):
+        return None, False
+    return catalogue_read.observation, True
+
+
 async def _refresh_external_seed_by_id(
-    seed_id: str, *, max_wait: Optional[float] = None
+    seed_id: str,
+    *,
+    max_wait: Optional[float] = None,
+    catalogue_read: Any = None,
+    page_read_column: bool = False,
 ) -> Dict[str, Any]:
     """Re-read one seed's price/availability from the origin.
 
@@ -5787,6 +5825,19 @@ async def _refresh_external_seed_by_id(
     which is most of the backoff curve, and every remaining row on that host burns in
     milliseconds looking like the host was down. Passing it per-call rather than reading an
     env var keeps one function honest for both.
+
+    `catalogue_read` (a `services.external_seed_catalogue_refresh.SeedCatalogueRead`, the batch's
+    catalogue price lane) REPLACES THE PAGE FETCH, nothing after it: the snapshot it carries was
+    built from the store's `/products.json` entry for this seed's handle, in a page read's shape, and
+    goes through the same price, currency, variant, freshness, liveness and projection rules. It
+    reads no copy and no images, so those are left exactly as stored; nor does it write the
+    `external_offer_snapshots` cache, which holds the last page read. A read planned for another
+    destination than the row now has is ignored, and the page is read as before.
+
+    `page_read_column` says the batch found `last_page_read_at` (migration 274, by hand): only then is
+    it written -- NOW() by a page read of the served product, the page read it replaces by a catalogue
+    read -- and only then is a catalogue read taken, since one that could not carry the page read
+    forward would make the seed look page-read tonight (`catalogue_lane.page_read_due`).
     """
     await _ensure_external_seeds_table()
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
@@ -5825,15 +5876,29 @@ async def _refresh_external_seed_by_id(
     # See docs/external-seed-dead-pdp-link-audit.md §4.2 and §5.2.
     snapshot = None
     observed: Dict[str, Any] = {}
+    catalogue_fallback: Optional[str] = None
+    if catalogue_read is not None and not page_read_column:
+        catalogue_read, catalogue_fallback = None, "no_page_read_column"
+    if catalogue_read is not None and not _catalogue_read_is_for(dest, catalogue_read):
+        catalogue_read, catalogue_fallback = None, "not_this_destination"
+    if catalogue_read is not None:
+        due = _catalogue_page_read_due(row)
+        if due:
+            catalogue_read, catalogue_fallback = None, f"page_read_due:{due}"
+    content_read = catalogue_read is None
     try:
-        snapshot = await resolve_external_offer(
-            market=market,
-            url=dest,
-            force_refresh=True,
-            raise_on_unavailable=True,
-            observed=observed,
-            max_wait=max_wait,
-        )
+        if catalogue_read is not None:
+            # Read in bulk by the batch, from this host's catalogue: nothing is fetched for this URL.
+            snapshot = catalogue_read.snapshot
+        else:
+            snapshot = await resolve_external_offer(
+                market=market,
+                url=dest,
+                force_refresh=True,
+                raise_on_unavailable=True,
+                observed=observed,
+                max_wait=max_wait,
+            )
     except ExternalOfferUnavailable as exc:
         if not _same_destination(dest, destination_liveness.destination_of(row)):
             # See the note at the success path: a verdict about a URL we do not serve is worse
@@ -5905,7 +5970,8 @@ async def _refresh_external_seed_by_id(
     # onto a collection or another handle, or a cached snapshot returned after a failure all
     # declare nothing about THIS product: none of them may clear a gallery, upgrade a description
     # or fill one with SEO copy (final review of #2621). The same pure check the freshness stamp
-    # and liveness verdict below use.
+    # and liveness verdict below use. (A catalogue read fetched nothing for this URL: `observed` is
+    # empty, so it is never a read of the page's content.)
     _, page_read_is_the_product = _read_the_served_product(row, dest, observed)
     gallery_declared = content["gallery_declared"]
     snap_image_urls = content["image_urls"]
@@ -5947,32 +6013,48 @@ async def _refresh_external_seed_by_id(
             ),
             None,
         )
-    seed_data["snapshot"].update(
-        {
-            "canonical_url": canonical_url,
-            "domain": domain,
-            "title": snap_title,
-            "description": snap_description,
-            "image_url": snap_image_url,
-            "price_amount": snap_price_amount,
-            "price_currency": snap_price_currency,
-            "availability": snap_availability,
-            # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
-            # (..., last_checked_at, evidence, override_*) -- so this getattr has always
-            # returned None and this key has always been written as null. Nothing read it,
-            # which is why it went unnoticed; `extracted_at` below is the field the
-            # `stale_snapshot` gate actually reads. Use the real field, falling back to now.
-            "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
-            or _to_iso(datetime.now(timezone.utc)),
-        }
-    )
-    # A gallery is replaced only by a declared one; an undeclared read leaves the stored one as is.
-    if gallery_declared:
-        seed_data["snapshot"]["image_urls"] = snap_image_urls
-    if description_refused_source:
-        seed_data["snapshot"]["description_refused_source"] = description_refused_source
+    if not content_read:
+        # THE CATALOGUE LANE WRITES THE FACTS IT READ AND NOTHING ELSE: the stored snapshot's title,
+        # copy, image, gallery and canonical are the last page read's, and stay. `read_source` says
+        # which reader priced the row last (a page read removes it).
+        seed_data["snapshot"].update(
+            {
+                "price_amount": snap_price_amount,
+                "price_currency": snap_price_currency,
+                "availability": snap_availability,
+                "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+                or _to_iso(datetime.now(timezone.utc)),
+                "read_source": evidence.get("read_source") if isinstance(evidence, dict) else None,
+            }
+        )
     else:
-        seed_data["snapshot"].pop("description_refused_source", None)
+        seed_data["snapshot"].pop("read_source", None)
+        seed_data["snapshot"].update(
+            {
+                "canonical_url": canonical_url,
+                "domain": domain,
+                "title": snap_title,
+                "description": snap_description,
+                "image_url": snap_image_url,
+                "price_amount": snap_price_amount,
+                "price_currency": snap_price_currency,
+                "availability": snap_availability,
+                # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
+                # (..., last_checked_at, evidence, override_*) -- so this getattr has always
+                # returned None and this key has always been written as null. Nothing read it,
+                # which is why it went unnoticed; `extracted_at` below is the field the
+                # `stale_snapshot` gate actually reads. Use the real field, falling back to now.
+                "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+                or _to_iso(datetime.now(timezone.utc)),
+            }
+        )
+        # A gallery is replaced only by a declared one; an undeclared read leaves the stored one as is.
+        if gallery_declared:
+            seed_data["snapshot"]["image_urls"] = snap_image_urls
+        if description_refused_source:
+            seed_data["snapshot"]["description_refused_source"] = description_refused_source
+        else:
+            seed_data["snapshot"].pop("description_refused_source", None)
     # Only overwrite curated fields if they are missing.
     if _should_replace_localized_copy(
         existing_text=seed_data.get("description"),
@@ -6029,6 +6111,10 @@ async def _refresh_external_seed_by_id(
     # Keep the stored variants; the reconcile below is barred from these currencies too.
     variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
     if variant_adoption_refused:
+        pass
+    elif not content_read:
+        # A catalogue read RE-PRICES the stored variants (the reconcile below); it never replaces the
+        # list. Titles, images and links of a catalogue variant are not what a page read adopts.
         pass
     elif adoptable_variants:
         existing_variants = _seed_variants(seed_data)
@@ -6225,7 +6311,7 @@ async def _refresh_external_seed_by_id(
     # status code alone is not a reading). `classify_destination` is pure, so hoisting it costs
     # nothing and removes the twin-implementation drift this file keeps paying for.
     served_url = destination_liveness.destination_of(row)
-    observation, read_the_served_product = _read_the_served_product(row, dest, observed)
+    observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
 
     # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
     #
@@ -6300,9 +6386,26 @@ async def _refresh_external_seed_by_id(
                 "at": _to_iso(datetime.now(timezone.utc)),
                 "replaced": variant_refresh["replaced"][:50],
             }
+    if catalogue_read is not None and variant_refresh.get("not_re_read_count"):
+        # A CATALOGUE READ THAT CANNOT RE-READ EVERY STORED VARIANT IS NOT USED. It would remove the
+        # `extracted_at` stamp below, and the lane would be back tomorrow and remove it again, so a row
+        # whose variants the catalogue cannot match (positional or SKU keys) would never be fresh.
+        # Nothing has been written yet: the page is read instead, in this call, as without the lane.
+        result = await _refresh_external_seed_by_id(seed_id, max_wait=max_wait, page_read_column=page_read_column)
+        result["catalogue_fallback"] = "not_all_re_read"
+        # What the discarded catalogue pass would have done, for the operator (never written).
+        result["catalogue_discarded"] = {
+            "price_refresh": price_refresh,
+            "not_re_read_count": variant_refresh.get("not_re_read_count"),
+        }
+        return result
     if read_the_served_product:
         if price_re_read and not variant_refresh.get("not_re_read_count"):
-            seed_data["snapshot"]["extracted_at"] = _to_iso(datetime.now(timezone.utc))
+            # A catalogue read is as fresh as its fetch, not as the row's turn in the queue.
+            seed_data["snapshot"]["extracted_at"] = _to_iso(
+                (getattr(snapshot, "last_checked_at", None) if not content_read else None)
+                or datetime.now(timezone.utc)
+            )
         elif price_re_read or price_status.startswith("skipped_") or variant_refresh.get("not_re_read_count"):
             # A price this run refused to take (a CAD read of a USD row is `skipped_currency_mismatch`),
             # or a stored variant it did not re-read: the stamp an earlier refresh left behind would
@@ -6316,6 +6419,15 @@ async def _refresh_external_seed_by_id(
         domain,
         read_the_served_product=read_the_served_product,
     )
+    # THE PAGE READ THE CATALOGUE LANE DEFERS TO every `page_max_age_days()`. A catalogue read moves
+    # `last_crawled_at` without reading the page, so it hands the page read that column held (SET reads
+    # the row as it was before this statement) to `last_page_read_at`, where no other writer goes.
+    page_read_set = ""
+    if page_read_column and read_the_served_product:
+        page_read_set = (
+            ",\n            last_page_read_at = NOW()" if content_read
+            else ",\n            last_page_read_at = COALESCE(last_page_read_at, last_crawled_at)"
+        )
 
     await _execute_seed_data_stmt(
         """
@@ -6348,7 +6460,9 @@ async def _refresh_external_seed_by_id(
             last_crawled_at = CASE
                 WHEN CAST(:read_the_served_product AS BOOLEAN) THEN NOW()
                 ELSE last_crawled_at
-            END
+            END"""
+        + page_read_set
+        + """
         WHERE id = :id
         """,
         {
@@ -6375,6 +6489,16 @@ async def _refresh_external_seed_by_id(
     # handle for perfectly live products, and a `redirected_off_product` verdict is one of the
     # two that can eventually retire a seed. A guess must never be able to do that.
     destination_refresh: Dict[str, Any] = {"status": "not_observed"}
+    if catalogue_read is not None:
+        # The sweep's rule for a handle its catalogue lists: an observation (live, no HTTP status),
+        # for the served URL only. Like every refresh observation it is never corroborated, so it
+        # can reset a streak and never advance one.
+        if observation is None:
+            destination_refresh = {"status": "not_observed", "reason": "not_the_served_url"}
+        else:
+            destination_refresh = await destination_liveness.record_destination_observation(
+                seed_id, observation
+            )
     # ONLY JUDGE THE URL WE ACTUALLY SERVE. This function fetches `destination_url`, but the
     # readiness gate and the sweep both resolve a seed to `canonical_url or destination_url`
     # — and this very function writes `canonical_url` from the fetched page a few lines up, so
@@ -6383,7 +6507,7 @@ async def _refresh_external_seed_by_id(
     # When they differ, the sweep observes the served URL; saying nothing here is correct.
     # `served_url` and `observation` are the HOISTED values from above; recomputing them here
     # is what would let the stamp and the verdict disagree.
-    if observed.get("status_code") is None:
+    elif observed.get("status_code") is None:
         # The fetch never reached the origin (or came from the snapshot cache), so there is
         # nothing to record. Distinct from the case below, and the drift report says which.
         destination_refresh = {"status": "not_observed", "reason": "no_origin_response"}
@@ -6447,6 +6571,10 @@ async def _refresh_external_seed_by_id(
         # hostile robots.txt voided every row reported exactly like a complete one. Same
         # reasoning as `stopped_early`/`skipped_for_budget` on the batch summary.
         "snapshot_from_cache": bool(observed.get("from_cache")),
+        # Which reader priced this row: a page read, or the batch's catalogue lane.
+        "read_source": "page" if catalogue_read is None else (getattr(snapshot, "evidence", None) or {}).get("read_source"),
+        # Why a catalogue read the batch handed over was not used (the page was read instead), or None.
+        "catalogue_fallback": catalogue_fallback,
         # Drift report. The batch runner sums these so "we re-crawled N seeds" can
         # be stated as "N re-crawled, M prices actually moved" — the difference is
         # the whole point of the refresh existing.

@@ -1439,13 +1439,15 @@ def test_hand_applied_migrations_are_in_the_fixture_and_retired_ones_are_not(pre
     # here depends on them existing. Their out-of-band build runs them statement by statement.
     assert "270_external_seed_active_any_trgm_indexes.sql.disabled" in names
     assert "271_external_seed_active_seed_title_trgm_index.sql.disabled" in names
+    # 274 is the catalogue lane's page-read column, applied before its flag flips: the lane's SQL names it.
+    assert "274_external_seed_last_page_read_at.sql.disabled" in names
     # Exact names: 014/015/017 have ACTIVE successors under the same number.
     for retired in ("002_production_tables", "007_agents_management_upgrade",
                     "014_dual_sided_revenue", "015_agent_portal_settlement",
                     "017_agent_payout_comprehensive"):
         assert (REPO_ROOT / "db" / "migrations" / f"{retired}.sql.disabled").exists(), retired
         assert f"{retired}.sql.disabled" not in names, retired
-    assert sum(n.endswith(".sql.disabled") for n in names) == 4
+    assert sum(n.endswith(".sql.disabled") for n in names) == 5
     # Every active file is in, in version order, with 260 placed by its number.
     active = [Path(p).name for p in list_migration_files(str(REPO_ROOT))]
     assert set(active) <= set(names)
