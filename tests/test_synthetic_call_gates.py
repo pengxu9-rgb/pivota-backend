@@ -1122,3 +1122,39 @@ def test_the_middleware_scopes_on_the_routed_path_not_the_url(key_owner):
     scope["path"], and so does the scope check."""
     res = TestClient(_probe_app(), root_path="/pfx").get(PROBE_PATH, headers=_headers())
     assert res.json()["synthetic"] is True
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_a_real_call_with_no_credentials_is_still_refused_before_anything_is_served(monkeypatch, shopify_admin, cached):
+    """The credentials check now runs after the variant cache read; for a real call it must still refuse
+    on a hit as on a miss, before get_product_details or any Admin GET."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    import routes.agent_products as products
+
+    served: List[str] = []
+
+    async def no_token(**k):
+        return None, None
+
+    class Redis:
+        async def get(self, key):
+            return "pid_1" if cached else None
+
+        async def set(self, *a, **k):
+            return True
+
+    async def details(**k):
+        served.append(k["product_id"])
+        return {"status": "success", "product": {"id": k["product_id"]}}
+
+    monkeypatch.setattr(products, "resolve_shopify_admin_access_token", no_token)
+    monkeypatch.setattr(products, "get_redis_client", lambda: Redis())
+    monkeypatch.setattr(products, "get_product_details", details)
+    req = Request({"type": "http", "method": "GET", "path": "/x", "headers": [], "query_string": b""})
+
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(products.get_product_details_by_variant(req, "merch_x", "4455", BackgroundTasks(), _Ctx()))
+    assert err.value.status_code == 400
+    assert err.value.headers == {"X-Error-Code": "INVALID_STORE_CONFIG"}
+    assert (served, shopify_admin) == ([], [])
