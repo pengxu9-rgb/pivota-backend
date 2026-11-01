@@ -1264,26 +1264,6 @@ async def get_product_details_by_variant(
         return resp
 
     shop_domain = store.get("domain") or store.get("shop_domain")
-    access_token, _ = await resolve_shopify_admin_access_token(
-        shop_domain=shop_domain,
-        api_key_raw=store.get("api_key_raw") or store.get("api_key") or store.get("access_token"),
-        store_id=str(store.get("store_id") or "").strip() or None,
-    )
-
-    if not shop_domain:
-        raise HTTPException(
-            status_code=400,
-            detail="Store configuration incomplete - missing domain",
-            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
-        )
-
-    if not access_token:
-        raise HTTPException(
-            status_code=400,
-            detail="Store configuration incomplete - missing credentials",
-            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
-        )
-
     variant_key = _variant_to_product_cache_key(merchant_id=merchant_id, platform="shopify", variant_id=str(variant_id))
     cached_pid = None
     client = get_redis_client()
@@ -1292,11 +1272,36 @@ async def get_product_details_by_variant(
             cached_pid = await client.get(variant_key)
         except Exception:
             cached_pid = None
-
     product_id = str(cached_pid or "").strip() or None
-    if not product_id and is_synthetic_call():
-        # Our own eval traffic makes no Shopify Admin call (services/synthetic_call.py).
+
+    # Our own eval traffic makes no Shopify call (services/synthetic_call.py), and that includes the token
+    # resolver, which may refresh the token (a client_credentials POST plus a merchant_stores UPDATE).
+    # Past the variant cache it is not found; on a hit get_product_details answers from its own cache.
+    synthetic = is_synthetic_call()
+    if synthetic and not product_id:
         raise HTTPException(status_code=404, detail="Variant not found")
+    access_token = None
+    if not synthetic:
+        access_token, _ = await resolve_shopify_admin_access_token(
+            shop_domain=shop_domain,
+            api_key_raw=store.get("api_key_raw") or store.get("api_key") or store.get("access_token"),
+            store_id=str(store.get("store_id") or "").strip() or None,
+        )
+
+    if not shop_domain:
+        raise HTTPException(
+            status_code=400,
+            detail="Store configuration incomplete - missing domain",
+            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+        )
+
+    if not access_token and not synthetic:
+        raise HTTPException(
+            status_code=400,
+            detail="Store configuration incomplete - missing credentials",
+            headers={"X-Error-Code": "INVALID_STORE_CONFIG"},
+        )
+
     if not product_id:
         url = f"https://{shop_domain}/admin/api/2025-10/variants/{variant_id}.json"
         headers = {

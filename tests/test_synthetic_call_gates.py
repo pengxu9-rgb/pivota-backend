@@ -972,3 +972,189 @@ def test_sentry_events_never_carry_the_assertion():
         "X-Api-Key": "[REDACTED]",
         "Accept": "a",
     }
+
+
+# ---------------------------------------------------------------------------------------------------
+# Follow-ups to #2686: the token resolver, the group shadow, and the scope patterns' edges
+
+
+@pytest.mark.parametrize("is_synthetic", [False, True])
+@pytest.mark.parametrize("cached", [False, True])
+def test_the_variant_route_never_resolves_a_token_for_a_synthetic_call(monkeypatch, shopify_admin, is_synthetic, cached):
+    """The resolver may refresh the token: a client_credentials POST and a merchant_stores UPDATE."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    import routes.agent_products as products
+
+    resolved: List[dict] = []
+    served: List[str] = []
+
+    async def token(**k):
+        resolved.append(k)
+        return "k", None
+
+    class Redis:
+        async def get(self, key):
+            return "pid_1" if cached else None
+
+        async def set(self, *a, **k):
+            return True
+
+    async def details(*, req, merchant_id, product_id, background_tasks, context):
+        served.append(product_id)
+        return {"status": "success", "product": {"id": product_id}}
+
+    monkeypatch.setattr(products, "resolve_shopify_admin_access_token", token)
+    monkeypatch.setattr(products, "get_redis_client", lambda: Redis())
+    monkeypatch.setattr(products, "get_product_details", details)
+    req = Request({"type": "http", "method": "GET", "path": "/x", "headers": [], "query_string": b""})
+
+    async def run():
+        ctx_token = sc.set_synthetic_call(CALL if is_synthetic else None)
+        try:
+            return await products.get_product_details_by_variant(req, "merch_x", "4455", BackgroundTasks(), _Ctx())
+        finally:
+            sc.reset_synthetic_call(ctx_token)
+
+    if cached:
+        assert asyncio.run(run())["selected_variant_id"] == "4455"
+        assert served == ["pid_1"]
+    else:
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(run())
+        assert err.value.status_code == 404
+    assert len(resolved) == (0 if is_synthetic else 1)
+    if is_synthetic or cached:
+        assert shopify_admin == []
+    else:
+        assert shopify_admin and "/admin/api/" in shopify_admin[0]
+
+
+@pytest.mark.parametrize("is_synthetic", [False, True])
+def test_the_token_resolver_never_refreshes_for_a_synthetic_call(monkeypatch, is_synthetic):
+    import services.shopify_access_token_service as tokens
+
+    exchanged: List[dict] = []
+    written: List[Any] = []
+
+    async def exchange(**k):
+        exchanged.append(k)
+        return "new_token", 3600, None
+
+    async def execute(query, values=None):
+        written.append(values)
+
+    monkeypatch.setattr(tokens, "exchange_shopify_client_credentials_token", exchange)
+    monkeypatch.setattr(tokens.database, "execute", execute)
+    # Client credentials and no expiry metadata: a real call refreshes once and persists.
+    creds = json.dumps({"client_id": "cid", "client_secret": "csecret", "access_token": "old_token"})
+
+    async def run():
+        ctx_token = sc.set_synthetic_call(CALL if is_synthetic else None)
+        try:
+            return await tokens.resolve_shopify_admin_access_token(
+                shop_domain="brand.myshopify.com", api_key_raw=creds, store_id="s1"
+            )
+        finally:
+            sc.reset_synthetic_call(ctx_token)
+
+    token, meta = asyncio.run(run())
+    if is_synthetic:
+        assert (token, exchanged, written) == ("old_token", [], [])
+        assert meta["refresh_error"] == "synthetic_call" and meta["refreshed"] is False
+    else:
+        assert token == "new_token" and len(exchanged) == 1 and len(written) == 1
+
+
+@pytest.mark.parametrize("is_synthetic", [False, True])
+def test_a_synthetic_call_schedules_no_group_shadow(monkeypatch, is_synthetic):
+    """The shadow runs in a fresh Context, where the verdict is not visible, so the check is made here."""
+    from fastapi import BackgroundTasks
+
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "_group_shadow_cache_verdict", lambda keys: "run")
+    tasks = BackgroundTasks()
+    token = sc.set_synthetic_call(CALL if is_synthetic else None)
+    try:
+        scheduled = gateway._schedule_group_shadow(
+            tasks, product_id="p_1", sku_id=None, market_hint="US", limit=3, aliases=[], content_keys={"ck_1"},
+            served=[], internal=[], external=[], considered_seed_ids=set(),
+        )
+    finally:
+        sc.reset_synthetic_call(token)
+    assert scheduled is (not is_synthetic)
+    assert len(tasks.tasks) == (0 if is_synthetic else 1)
+
+
+# One request each read pattern exists for, in SYNTHETIC_READ_ROUTES order.
+_ROUTE_EXAMPLES = [
+    ("POST", "/agent/shop/v1/invoke", "find_products_multi"),
+    ("POST", "/agent/v2/products/search", None),
+    ("GET", "/agent/v1/products/search", None),
+    ("POST", "/agent/internal/products/search", None),
+    ("POST", "/agent/shop/v1/attribution/external-seed-links", None),
+    ("GET", "/agent/v1/products/merchants/m_1/variant/v_1", None),
+    ("GET", "/agent/v1/product-groups/resolve", None),
+    ("GET", "/agent/v1/product-groups/resolve-by-product-id", None),
+    ("GET", "/agent/v1/product-groups/pg_1", None),
+]
+
+
+def test_every_scope_pattern_has_an_example():
+    assert len(_ROUTE_EXAMPLES) == len(sc.SYNTHETIC_READ_ROUTES)
+    for (method, pattern), (ex_method, path, _op) in zip(sc.SYNTHETIC_READ_ROUTES, _ROUTE_EXAMPLES):
+        assert method == ex_method and pattern.match(path), path
+
+
+@pytest.mark.parametrize("index", range(len(_ROUTE_EXAMPLES)))
+def test_each_scope_pattern_is_anchored_at_both_ends(index):
+    method, pattern = sc.SYNTHETIC_READ_ROUTES[index]
+    _m, path, op = _ROUTE_EXAMPLES[index]
+    assert sc.synthetic_scope_allows(method, path, op) is True
+    for bad in (f"/x{path}", f"{path}/extra", f"{path}/", f"x{path}"):
+        assert not pattern.match(bad), bad
+        assert sc.synthetic_scope_allows(method, bad, op) is False, bad
+
+
+def test_the_middleware_scopes_on_the_routed_path_not_the_url(key_owner):
+    """Under a root_path (a mount or proxy prefix) the URL path carries the prefix; the router matches on
+    scope["path"], and so does the scope check."""
+    res = TestClient(_probe_app(), root_path="/pfx").get(PROBE_PATH, headers=_headers())
+    assert res.json()["synthetic"] is True
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_a_real_call_with_no_credentials_is_still_refused_before_anything_is_served(monkeypatch, shopify_admin, cached):
+    """The credentials check now runs after the variant cache read; for a real call it must still refuse
+    on a hit as on a miss, before get_product_details or any Admin GET."""
+    from fastapi import BackgroundTasks, HTTPException
+
+    import routes.agent_products as products
+
+    served: List[str] = []
+
+    async def no_token(**k):
+        return None, None
+
+    class Redis:
+        async def get(self, key):
+            return "pid_1" if cached else None
+
+        async def set(self, *a, **k):
+            return True
+
+    async def details(**k):
+        served.append(k["product_id"])
+        return {"status": "success", "product": {"id": k["product_id"]}}
+
+    monkeypatch.setattr(products, "resolve_shopify_admin_access_token", no_token)
+    monkeypatch.setattr(products, "get_redis_client", lambda: Redis())
+    monkeypatch.setattr(products, "get_product_details", details)
+    req = Request({"type": "http", "method": "GET", "path": "/x", "headers": [], "query_string": b""})
+
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(products.get_product_details_by_variant(req, "merch_x", "4455", BackgroundTasks(), _Ctx()))
+    assert err.value.status_code == 400
+    assert err.value.headers == {"X-Error-Code": "INVALID_STORE_CONFIG"}
+    assert (served, shopify_admin) == ([], [])
