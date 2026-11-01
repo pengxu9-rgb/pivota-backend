@@ -1006,8 +1006,12 @@ def test_a_served_url_that_is_not_the_destination_is_not_called_read(monkeypatch
     row = _drain_row()
     row["canonical_url"] = f"https://{HOST}/products/another-product"
     run = _Refresh(monkeypatch, row)
+    crawled = run.stored["last_crawled_at"]
     result = run.catalogue(_seed_read(_product(p50="85.00")))
     assert run.last_update()["read_the_served_product"] is False
+    # Not a read of the served product: neither clock moves, and the column is not named.
+    assert run.stored["last_crawled_at"] == crawled and run.stored["last_page_read_at"] is None
+    assert all("last_page_read_at" not in q for q, _ in run.sql)
     assert run.observations == [] and result["destination_refresh"]["reason"] == "not_the_served_url"
     assert not run.projections and "extracted_at" not in run.stored["seed_data"]["snapshot"]
 
