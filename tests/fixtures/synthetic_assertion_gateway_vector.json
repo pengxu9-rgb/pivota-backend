@@ -1,0 +1,10 @@
+{
+  "_comment": "Produced by the gateway signer (PIVOTA-Agent src/guardrails/syntheticCallers.js signSyntheticAssertion). Test values only.",
+  "secret": "test-synthetic-assertion-secret-not-real",
+  "api_key": "ak_live_0000000000000000000000000000000000000000000000000000000000000000",
+  "iat": 1761955200,
+  "caller": "https://auth.example.invalid|eval-client-test",
+  "gw_request_id": "5f0c6f7e-9d1a-4c3b-8e2f-0a1b2c3d4e5f",
+  "kfp": "cc42470f1e61d3a2b8d5053251e67f08",
+  "token": "v1.eyJjIjoiaHR0cHM6Ly9hdXRoLmV4YW1wbGUuaW52YWxpZHxldmFsLWNsaWVudC10ZXN0IiwiciI6IjVmMGM2ZjdlLTlkMWEtNGMzYi04ZTJmLTBhMWIyYzNkNGU1ZiIsImlhdCI6MTc2MTk1NTIwMCwianRpIjoic01fR1VRdENfOGs0TW1NdyIsImtmcCI6ImNjNDI0NzBmMWU2MWQzYTJiOGQ1MDUzMjUxZTY3ZjA4In0.OEEd39w685gS_XYiMcS07HOUVIPLooahf8J_pqjs1sU"
+}

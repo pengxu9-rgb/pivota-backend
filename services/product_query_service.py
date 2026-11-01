@@ -37,6 +37,7 @@ from db.products import get_cached_products, upsert_product_cache
 from models.standard_product import StandardProduct, ProductListResponse
 from adapters.merchant_api_adapter import MerchantAPIAdapter
 from core.reliability.budget import RequestBudget
+from services.synthetic_call import is_synthetic_call
 
 logger = logging.getLogger(__name__)
 
@@ -272,8 +273,9 @@ async def get_products_hybrid(
                     return stale_products, "cache_stale_no_config", None
             return products, "cache", None
         
-        # Step 2: Decide query path
-        if config.realtime_enabled and config.api_endpoint and not force_cache_only:
+        # Step 2: Decide query path. Our own eval traffic (services/synthetic_call.py) makes no merchant
+        # API call and refreshes no cache row: it takes the cache path below.
+        if config.realtime_enabled and config.api_endpoint and not force_cache_only and not is_synthetic_call():
             if budget_enabled and request_budget and request_budget.expired():
                 logger.warning(
                     f"[REALTIME] Budget exhausted before upstream call for {merchant_id}, using cache fallback"

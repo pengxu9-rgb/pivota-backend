@@ -4,6 +4,7 @@ from sqlalchemy.sql import func
 from typing import Any, Dict, List, Optional
 
 from db.database import metadata, database
+from services.synthetic_call import is_synthetic_call
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ async def log_product_events(rows: List[Dict[str, Any]]) -> None:
       - merchant_id, platform, platform_product_id
       - ranking_score, position, quality_content_score, quality_model_readiness
     """
-    if not rows:
+    if not rows or is_synthetic_call():
         return
 
     # Filter out completely empty rows defensively

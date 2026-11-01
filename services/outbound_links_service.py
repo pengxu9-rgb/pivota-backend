@@ -16,6 +16,7 @@ from sqlalchemy import and_, desc, func, or_, select
 
 from db.database import database
 from db.outbound_links import outbound_link_rules, outbound_click_events, outbound_link_allowed_domains
+from services.synthetic_call import is_synthetic_call
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
     PVT_PRODUCT_ID,
@@ -127,6 +128,16 @@ def normalize_market(market: Optional[str]) -> str:
 # ---------------------------------------------------------------------------------------------
 
 TOKEN_MARKET_OBSERVED_KEY = "market_observed"
+
+#: Set (to 1) on every link minted inside our own eval traffic (services/synthetic_call.py), and only
+#: there, so every other token is byte-identical to before. Signed with the rest of the token, so
+#: nothing a caller sends can set it. A followed /r (and /impression) carrying it writes nothing and
+#: builds no warm-handoff cart. It is a top-level key, never in `ctx`, which the click rows copy.
+TOKEN_SYNTHETIC_KEY = "syn"
+
+
+def token_is_synthetic(payload: Dict[str, Any]) -> bool:
+    return isinstance(payload, dict) and payload.get(TOKEN_SYNTHETIC_KEY) == 1
 
 # THE ONE NORMALISER now lives in the leaf `utils.market_code` so the fact store, the sweep, the
 # ops route and the Reap rail can bind the SAME function without importing this module. It is
@@ -577,6 +588,7 @@ def make_redirect_token(payload: Dict[str, Any], ttl_seconds: int = 7 * 24 * 360
         "v": 0,
         "t": "redirect",
         **payload,
+        **({TOKEN_SYNTHETIC_KEY: 1} if is_synthetic_call() else {}),
         "iat": now,
         "exp": now + int(ttl_seconds),
     }

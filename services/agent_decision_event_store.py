@@ -18,6 +18,7 @@ from db._jsonb_safe import _json_safe
 from db.database import database
 from services.catalog_identity import is_content_key
 from services.protocols import DEFAULT_PROTOCOL, validate_protocol
+from services.synthetic_call import is_synthetic_call
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,10 @@ def _ensure_worker() -> None:
 
 
 async def _enqueue(op: str, payload: Dict[str, Any]) -> None:
+    # Checked here, not in the flusher: _flush_loop runs in a fresh context (spawn_isolated) and
+    # cannot see the request's synthetic verdict (services/synthetic_call.py).
+    if is_synthetic_call():
+        return
     _ensure_worker()
     assert _QUEUE is not None
     try:

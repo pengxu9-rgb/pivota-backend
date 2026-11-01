@@ -24,6 +24,7 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from middleware.cors import TieredCORSMiddleware, resolve_trusted_origins
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.usage_logger import UsageLoggerMiddleware
+from middleware.synthetic_call import SyntheticCallMiddleware
 from middleware.structured_logging import (
     StructuredLoggingMiddleware,
     install_uvicorn_access_log_redaction,
@@ -997,6 +998,10 @@ app.add_middleware(
 
 # Add structured logging middleware (logs all requests in JSON format)
 app.add_middleware(StructuredLoggingMiddleware)
+
+# Our own eval traffic (services/synthetic_call.py). Registered after the usage logger and the rate
+# limiter, so it wraps them: the verdict is set before anything they write after call_next.
+app.add_middleware(SyntheticCallMiddleware)
 
 # Add unified error handler middleware (formats errors + includes request id)
 app.add_middleware(ErrorHandlerMiddleware)

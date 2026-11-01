@@ -12,7 +12,25 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Optional, Tuple
 
 from fastapi import HTTPException
 
+from services.synthetic_call import current_synthetic_call, reset_synthetic_call, set_synthetic_call
 from utils.logger import logger
+
+
+def _bind_synthetic_verdict(coro_factory: "TaskCoroutine") -> "TaskCoroutine":
+    """The factory, run under the ENQUEUING request's synthetic verdict (services/synthetic_call.py).
+
+    A queued task is started from inside whichever task just finished, so it would otherwise inherit
+    that request's context: a real search could skip its writes, or an eval search make them."""
+    verdict = current_synthetic_call()
+
+    async def _run():
+        token = set_synthetic_call(verdict)
+        try:
+            return await coro_factory()
+        finally:
+            reset_synthetic_call(token)
+
+    return _run
 
 
 TaskCoroutine = Callable[[], Awaitable[Any]]
@@ -222,6 +240,7 @@ class AgentTaskManager:
         the result or exception. If the queue is full, budgets exceeded,
         or single-flight is violated, this method raises HTTPException.
         """
+        coro_factory = _bind_synthetic_verdict(coro_factory)
         async with self._lock:
             # Idempotency: when a request_id is provided and we have an existing
             # task for it, return the same task_id and future.
