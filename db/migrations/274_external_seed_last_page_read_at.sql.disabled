@@ -1,0 +1,27 @@
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
+-- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true'), so no deploy
+-- applies this file; the suffix also keeps it out of the boot runner wherever the full startup runs.
+--
+-- RUNBOOK (out of band, one-off job, controller slot): BEFORE EXTERNAL_REFERRAL_REFRESH_CATALOGUE_ENABLED
+-- is switched on, not before the merge. Nothing reads or writes the column until the lane runs, and a
+-- lane run that does not find it stays off (`external_referral_readiness._page_read_column_ready`).
+--   * ADD COLUMN without a default is a catalogue-only change, but it takes ACCESS EXCLUSIVE on the
+--     table for that instant: run it with a lock_timeout, outside the refresh, sweep and drain runs,
+--     and retry on a timeout.
+--   * No backfill. A NULL column falls back to last_crawled_at, which every refresh before the lane
+--     set from a page read; the lane's first catalogue read of a seed copies that value in.
+--
+-- 274: when the seed refresh last read the seed's PAGE (`services.external_seed_catalogue_refresh`).
+-- The catalogue price lane re-prices a seed from its store's /products.json and moves last_crawled_at
+-- without reading the page, so the page read it defers to every page_max_age_days() needs a stamp of
+-- its own. It cannot live in seed_data: the retailer-ingest drain's upsert replaces seed_data whole
+-- (`apply._SEED_UPSERT_SQL`) on its ~120 h re-enqueue, and never names this column.
+--   * a page read of the served product in a lane run sets it to NOW();
+--   * a catalogue read sets it to COALESCE(last_page_read_at, last_crawled_at), read from the row as it
+--     was before the statement's own last_crawled_at = NOW().
+-- schema-guard-exempt: read and written only by a catalogue-lane run that has checked the column exists (flag default off); kept off the self-heal so no boot path races ACCESS EXCLUSIVE.
+
+ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_page_read_at TIMESTAMPTZ;
+
+COMMENT ON COLUMN external_product_seeds.last_page_read_at IS
+  'When the seed refresh last read this seed''s page (the catalogue lane carries it across its own reads). NULL = no catalogue read yet: last_crawled_at is the page read.';
