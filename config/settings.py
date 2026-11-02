@@ -590,7 +590,8 @@ class Settings(BaseSettings):
     # own part alone. Nothing reads them yet. These are properties, not fields, so BaseSettings never
     # parses them: a value it would reject would otherwise fail Settings() at import and take down web
     # and every job. Only "true" (any case) turns a flag on; anything else is off. A limit that is not
-    # an integer, or is outside its bounds, falls back to its default.
+    # an integer, or is outside its bounds, falls back to its default. Each is read from the env on
+    # every access and has no setter: tests change one with monkeypatch.setenv, not setattr.
     # D7 kill switches. A stop row for a market acts as if the first three were off there.
     @property
     def deal_lane_emit_enabled(self) -> bool:
