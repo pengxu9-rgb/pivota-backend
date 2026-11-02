@@ -257,13 +257,14 @@ def test_off_reads_the_first_offer_as_before_and_shadow_logs_the_difference(monk
     assert _price(url, _html(TWO_SIZES))[0] == 85.0, "an unknown mode is off"
 
 
-def test_a_product_group_without_variant_links_leaves_a_variant_url_to_the_meta_price():
-    """Every variant node holds a lone offer, none linked: the URL's variant cannot be told from the first node."""
+def test_a_product_group_without_variant_links_refuses_a_variant_url_meta_included():
+    """Every variant node holds a lone offer, none linked: the URL's variant cannot be told from the first node, and
+    on a group page the meta price is the store's first available size for a variant it no longer lists."""
     group = _group(sold_out_first=True)
     for node in group["hasVariant"]:
         node["offers"].pop("url")
     amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=group, og_price="34.00"))
-    assert (amount, price_read["source"]) == (34.0, "meta")
+    assert (amount, price_read["status"]) == (None, "url_variant_unidentifiable")
     # A URL naming no variant is still the first not sold out.
     assert _price(PAGE, _html([], jsonld=group))[0] == 34.0
 
@@ -282,3 +283,110 @@ def test_a_group_of_one_variant_is_priced_by_its_lone_offer():
     group["hasVariant"][0]["offers"].pop("url")
     amount, _, _, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=group))
     assert amount == 85.0
+
+
+
+# ---- review r2 of #2690: the page answers for the URL's variant; off pinned; stock; modes ---------------------------
+
+
+def _review_node(price: str) -> Dict[str, Any]:
+    """A review app's Product node: one offer, no link, scored like the product's."""
+    return {"@type": "Product", "name": "Example Serum", "image": f"https://cdn.{HOST}/r.jpg", "description": "Reviews.",
+            "offers": {"@type": "Offer", "price": price, "priceCurrency": "USD", "availability": IN}}
+
+
+def test_off_reads_the_first_offer_on_a_sold_out_first_page_and_on_a_variant_url(monkeypatch):
+    """What goes live at merge: exactly base's first offer (review r2 Q17)."""
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "off")
+    amount, _, _, extracted = _price(PAGE, _html([_offer(V50, "85.00", OUT), _offer(V15, "34.00", IN)]))
+    assert (amount, extracted["availability"]) == (85.0, "out_of_stock")
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html(TWO_SIZES))
+    assert (amount, price_read["status"]) == (85.0, "parsed")
+
+
+def test_the_node_naming_the_urls_variant_prices_it_over_a_higher_scored_one():
+    """A linked group plus a review app's one-offer node at 85; the URL names the 34 variant (review r2 X8)."""
+    page = [_group(sold_out_first=False), _review_node("85.00")]
+    amount, _, _, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=page))
+    assert amount == 34.0
+
+
+def test_a_link_refusal_holds_against_another_nodes_lone_offer():
+    """The URL names a variant the linked group does not list; the review node's lone offer is not the answer (X9)."""
+    page = [_group(sold_out_first=False), _review_node("85.00")]
+    amount, _, price_read, _ = _price(f"{PAGE}?variant=41000000000099", _html([], jsonld=page, og_price="85.00"))
+    assert (amount, price_read["status"]) == (None, "url_variant_not_listed")
+
+
+def test_a_lone_offer_is_the_products_only_when_it_is_the_only_node_with_offers():
+    page = [{"@type": "Product", "name": "Example Serum", "offers": [_offer(V50, "85.00", link=False, sku="A"),
+                                                                    _offer(V15, "34.00", link=False, sku="B")]},
+            _review_node("85.00")]
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=page, og_price="34.00"))
+    assert (amount, price_read["source"]) == (34.0, "meta"), "unidentified: the meta price, not the review node's"
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=page))
+    assert (amount, price_read["status"]) == (None, "url_variant_unidentifiable"), "counted apart from a page with no price"
+
+
+def test_past_a_sold_out_first_offer_a_stated_in_stock_one_beats_one_stating_nothing():
+    offers = [_offer(V50, "85.00", OUT), _offer("41000000000030", "30.00", None), _offer(V15, "34.00", IN)]
+    assert _price(PAGE, _html(offers))[0] == 34.0
+    # A first offer stating nothing is still the first, as before.
+    assert _price(PAGE, _html([_offer(V50, "85.00", None), _offer(V15, "34.00", IN)]))[0] == 85.0
+    # Nothing stated in stock: the first not stated sold out.
+    assert _price(PAGE, _html([_offer(V50, "85.00", OUT), _offer(V15, "34.00", None)]))[0] == 34.0
+
+
+def test_a_group_past_a_sold_out_first_variant_prefers_one_stated_in_stock():
+    group = _group(sold_out_first=True)
+    unknown = json.loads(json.dumps(group["hasVariant"][1]))
+    unknown["offers"].pop("availability")
+    unknown["offers"]["price"] = "30.00"
+    unknown["offers"]["url"] = f"{PAGE}?variant=41000000000030"
+    group["hasVariant"].insert(1, unknown)
+    assert _price(PAGE, _html([], jsonld=group))[0] == 34.0
+
+
+@pytest.mark.parametrize("raw, mode", [(" On ", "on"), ("SHADOW", "shadow"), ("off", "off"), ("1", "off"), ("", "off")])
+def test_the_mode_is_read_trimmed_and_case_blind(monkeypatch, raw, mode):
+    from services.external_offers_service import url_variant_pick_mode
+
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, raw)
+    assert url_variant_pick_mode() == mode
+
+
+def test_shadow_logs_a_difference_in_stock_alone_and_never_breaks_a_read(monkeypatch):
+    from utils import logger as shared
+
+    lines: List[str] = []
+    monkeypatch.setattr(shared.logger, "warning", lambda msg, *args, **kw: lines.append(msg % args if args else msg))
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "shadow")
+    same_price = [_offer(V50, "34.00", OUT), _offer(V15, "34.00", IN)]  # base: sold out; the pick: in stock
+    assert _price(PAGE, _html(same_price))[0] == 34.0
+    (line,) = [m for m in lines if "page_offer_pick_shadow" in m]
+    fields = json.loads(line.split(" ", 1)[1])
+    assert (fields["served_availability"], fields["picked_availability"]) == ("out_of_stock", "in_stock")
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("log pipeline down")
+
+    monkeypatch.setattr(shared.logger, "warning", boom)
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html(TWO_SIZES))
+    assert (amount, price_read["status"]) == (85.0, "parsed"), "shadow serves base, whatever the log does"
+
+
+def test_two_nodes_each_with_a_lone_offer_leave_the_urls_variant_unidentified():
+    page = [{"@type": "Product", "name": "Example Serum", "image": f"https://cdn.{HOST}/a.jpg", "description": "A.",
+             "offers": _offer(V50, "85.00", link=False, sku="A")},
+            _review_node("50.00")]
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=page))
+    assert (amount, price_read["status"]) == (None, "url_variant_unidentifiable")
+
+
+def test_a_variant_group_with_one_priced_node_still_cannot_name_the_urls_variant():
+    group = _group(sold_out_first=False)
+    for node in group["hasVariant"]:
+        node["offers"].pop("url")
+    group["hasVariant"][1].pop("offers")
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=group, og_price="34.00"))
+    assert (amount, price_read["status"]) == (None, "url_variant_unidentifiable")
