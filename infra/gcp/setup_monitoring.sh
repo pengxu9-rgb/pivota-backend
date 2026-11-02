@@ -602,40 +602,52 @@ upsert "prod: load balancer 5xx" "$(promql_policy \
 # drain and Reap policies above already use 0s for the same reason: a sparse count writes no run of
 # points for a duration timer to watch.
 #
-# AD HOC JOBS ARE EXCLUDED; every other failed attempt pages. With 0s, a one-off that exits non-zero
+# AD HOC JOBS ARE EXCLUDED; every other failed execution pages. With 0s, a one-off that exits non-zero
 # ON PURPOSE (a GATE_CLOSED, a refused migration, an exit-3/4/5 verdict) or on a typo would page too:
-# 2026-10-03..11-02 that was 61 of 201 failed 5-minute windows, across 46 ad hoc jobs. An ad hoc job
+# 2026-10-03..11-02 that was 62 of 201 failed 5-minute windows, across 47 ad hoc jobs. An ad hoc job
 # is owned by whoever launched it and watched by them; nobody else can act on its failure. Excluded:
-#   .+-[0-9]+-[0-9]+  the name scripts/ops/run_oneoff_job.sh gives every job ($JOB_PREFIX-$$-$RANDOM,
-#                     e.g. oneoff-43396-3521, census-seeds-43121-1210; deploy_worker.sh's probe too).
-#                     42 jobs (one never failed in a 5-minute window), 41 windows in the 30 days.
-#   .+-20YYMMDD[hhmmss][-...]  a job named for its launch date, by hand (catalog-priority-preview-20261003,
-#                     krave-schema-256-ro-20261004-prod; in the last week also sgc-census*-2026103108...
-#                     and deal-census-adr027-20261029115547, which did not fail). 2 more jobs, 2 windows.
-#   oneoff-           run_oneoff_job.sh's default JOB_PREFIX (all 11 seen also match the suffix rule).
-#   verify-           ad hoc verification jobs (verify-lb-ck-20261027-d4d2cc3f; restore_to_cloudsql.sh's
-#                     verify-import-$$; deploy_worker.sh's verify-worker-$$-$RANDOM). 3 jobs, 3 windows
-#                     (verify-lb-ck-... is the one the suffix rule misses).
+#   .+-[0-9]+         a name ending in a number: scripts/ops/run_oneoff_job.sh's $JOB_PREFIX-$$-$RANDOM
+#                     (oneoff-43396-3521, census-seeds-43121-1210), deploy_worker.sh's
+#                     verify-worker-$$-$RANDOM, restore_to_cloudsql.sh's killconns-$$ and verify-import-$$,
+#                     and hand-named runs like reap-iconic-catalog-<hash>-1004210000. 44 jobs, 43 windows.
+#   .+-20YYMMDD[hhmmss][-...]  a job named for its launch date, by hand: krave-schema-256-ro-20261004-prod
+#                     and verify-lb-ck-20261027-<hash> are the two the rule above misses; in the last week
+#                     also sgc-census*-2026103108... and deal-census-adr027-20261029115547 (no failures).
+#   oneoff-           run_oneoff_job.sh's default JOB_PREFIX (all 11 seen also end in a number).
+#   verify-           ad hoc verification jobs (3 seen, all also caught above).
 #   eval-             eval-sql-runner, the eval-clone SQL runner, whose gates exit non-zero. 1 job, 17 windows.
 # Read back 2026-11-02 (timeSeries.list, read-only): Monitoring accepts this exact filter; of the 61
-# jobs with a failed attempt in the 30 days it keeps 15 - all 13 scheduled ones that failed - and drops
-# 46 (every one ad hoc, none with a Cloud Scheduler trigger). Two one-off names fit none of these and
-# still page (2 windows in 30 days: reap-iconic-catalog-<hash>-<digits>, relgraph-health-<hash>).
-# A NEW SCHEDULED JOB MUST NOT be named like these: ending in -<digits>-<digits>, carrying a -20YYMMDD
-# date, or starting with oneoff-, verify- or eval- would make its failures silent.
-# tests/test_monitoring_policy_snapshot.py checks every job name the infra scripts provision or
-# schedule, and the triggers live in prod on 2026-11-02, against the exclusions.
+# jobs with a failed attempt in the 30 days it keeps 14 - all 13 scheduled ones that failed - and drops
+# 47 (every one ad hoc, none with a Cloud Scheduler trigger). One one-off name fits none of these and
+# still pages (relgraph-health-<hash>, 1 window in 30 days).
+# A NEW SCHEDULED JOB MUST NOT be named like these: ending in -<digits>, carrying a -20YYMMDD date, or
+# starting with oneoff-, verify- or eval- would make its failures silent.
+# tests/test_monitoring_policy_snapshot.py checks every literal job name infra/gcp/ and scripts/ create,
+# schedule or execute, and the triggers live in prod on 2026-11-02, against the exclusions; and checks
+# that the templated ad hoc names there (killconns-$$, verify-import-$$, ...) ARE excluded.
 #
-# With --max-retries 1 a failed scheduled run can be two incidents. The incident closes when the 300s
-# window rolls past the failed point (~5 minutes), so for a nightly job it is one email per failure.
+# ONE INCIDENT PER FAILED EXECUTION, about. A first attempt that fails and is retried is recorded as
+# result="retried", not "failed" (read back for relgraph-sync 2026-10-31: attempt 0 retried at 11:11Z,
+# attempt 1 failed at 11:42Z), so only the LAST attempt counts here, and a retry that succeeds pages
+# nothing. In the 30 days to 2026-11-02 every failing job had at most one failed attempt per 5 minutes,
+# so with these exclusions prod would have had 136 incidents, ~4.5 a day: 90 from the three scheduled
+# jobs that failed every day (external-seed-sentinel-nongrowth, store-audit-commerce-reprobe-enqueue,
+# store-audit-ucp-reprobe-enqueue), relgraph-sync 19, the rest 1-5 each. The incident closes when the
+# 300s window rolls past the failed point (~5 minutes): one email per failed execution, plus its close.
 # RENOTIFY 3600s is for a job that keeps failing (reviews-invitation-send runs every minute: the
 # window never empties and the incident stays open), so one missed email is not the only page.
+#
+# STAGING TOO: environment_policy_body() renames this same body to "staging: Cloud Run job failing", so
+# the next `setup_monitoring.sh staging` gives staging the same 0s, renotify and exclusions, paging the
+# staging channel (by default whoever runs the script). Its 7 failed attempts in the same 30 days were
+# all ad hoc and excluded: 0 incidents.
+#
 # A job that fails and then stays SILENT - never runs again - is invisible here; for relgraph-sync
-# that is "prod: relgraph-sync has not succeeded in a day" below.
+# that is "prod: relgraph-sync has not succeeded in a day" at the end of this file.
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
-  "A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). Ad hoc jobs are not watched (names ending -<digits>-<digits> as scripts/ops/run_oneoff_job.sh makes them, names carrying a -20YYMMDD launch date, or names starting oneoff-, verify- or eval-): whoever launched one owns its failure. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled run can open two incidents, one per attempt. The incident closes about 5 minutes after the failed attempt; while a job keeps failing it stays open and repeats hourly. Read the execution's logs: \`gcloud run jobs executions list --job JOB --region us-west1\`. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
-  'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed" AND NOT resource.label.job_name = monitoring.regex.full_match(".+-[0-9]+-[0-9]+") AND NOT resource.label.job_name = monitoring.regex.full_match(".+-20[0-9]{6}([0-9]{6})?(-.+)?") AND NOT resource.label.job_name = starts_with("oneoff-") AND NOT resource.label.job_name = starts_with("verify-") AND NOT resource.label.job_name = starts_with("eval-")' \
+  "A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). Ad hoc jobs are not watched (names ending -<digits>, as scripts/ops/run_oneoff_job.sh makes them, names carrying a -20YYMMDD launch date, or names starting oneoff-, verify- or eval-): whoever launched one owns its failure. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a page, when this policy needed the failure to hold for 5 minutes. Only an execution's LAST attempt counts (a retried attempt is result=retried), so a failed execution opens one incident and a retry that succeeds opens none. The incident closes about 5 minutes after the failed attempt; while a job keeps failing it stays open and repeats hourly. Read the execution's logs: \`gcloud run jobs executions list --job JOB --region us-west1\`. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
+  'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed" AND NOT resource.label.job_name = monitoring.regex.full_match(".+-[0-9]+") AND NOT resource.label.job_name = monitoring.regex.full_match(".+-20[0-9]{6}([0-9]{6})?(-.+)?") AND NOT resource.label.job_name = starts_with("oneoff-") AND NOT resource.label.job_name = starts_with("verify-") AND NOT resource.label.job_name = starts_with("eval-")' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.
@@ -689,67 +701,6 @@ if names.count(sys.argv[2]) != 1:
 retire_policy "prod: relgraph-sync running over two hours" "prod: relgraph-sync running over five hours"
 # The four-hour name lived only in this change's review (never reconciled); retired in case a run wrote it.
 retire_policy "prod: relgraph-sync running over four hours" "prod: relgraph-sync running over five hours"
-
-# "Did YESTERDAY'S relgraph-sync run succeed?", asked every minute from 00:00Z to 10:00Z. The two
-# policies above see a job that fails or runs long; neither sees a job that does not RUN - scheduler
-# paused or deleted, trigger auth broken, job deleted - and a job-failing incident closes about 5
-# minutes after its failure, so one missed email is the only trace of a failed night. This one stays
-# open through the morning, every morning after a night with no success.
-#
-# THE QUERY: the count of SUCCEEDED executions of relgraph-sync over the last 24h is 0, and the UTC
-# hour is before 10.
-#   * `or vector(0)`: a DELTA metric has no samples at all in a window with no completions (zeros
-#     are written only next to a completion), so the sum is an EMPTY vector, not 0, and `== 0` alone
-#     could never fire. Read back 2026-11-02 (PromQL query API, read-only): the bare sum answered an
-#     empty vector at 2026-10-23T00:05Z and 2026-10-28T05:00Z. `or vector(0)` turns "no series" -
-#     job never ran, job deleted, metric gone - into 0, which fires.
-#   * sum_over_time, not increase()/rate(): the same per-minute DELTA samples as the Reap heartbeat
-#     below (see its note); increase() reads every drop to 0 as a counter reset.
-#   * result="succeeded" is the label value Cloud Run writes (read back 2026-11-02: "succeeded" and
-#     "failed" are the two series for relgraph-sync).
-#
-# WHY A TIME-OF-DAY GATE AND NOT A ~26h WINDOW. A normal night finishes 11:00-14:30Z, so two
-# consecutive successes can be ~27h apart (more when a retry succeeds); a "no success in the last W
-# hours" check without a gate needs W plus its duration over that to never fire on a normal night. The platform caps the reach
-# at 25h ("the sum of your retest window, alignment period, and any time shift caused by using the
-# offset modifier must be at most 25 hours", monitoring/promql/promql-in-alerting), so that design
-# is impossible. With the gate the question is exact instead:
-#   - the run starts 10:37Z (setup_scheduler.sh: sched relgraph-sync-cron "37 10 * * *"), and with
-#     --task-timeout 21600s and --max-retries 1 its LAST possible success is ~22:40Z the same day;
-#   - so for any time T from 00:00Z to 10:00Z, the window [T-24h, T] starts between 00:00Z and
-#     10:00Z the day before: it holds ALL of yesterday's run (from 10:37Z) and NONE of the day
-#     before's (which ended by ~22:40Z two days back). 0 successes in it means yesterday's run did
-#     not succeed. Reach: 24h + 300s duration = 24h05m, under the 25h cap.
-#   tests/test_monitoring_policy_snapshot.py pins the cron, timeout and retries this leans on.
-#
-# BACKTEST, 2026-09-22..2026-11-02 (query_range over this exact query, read-only): it fires the
-# morning after every night with no successful execution - 09-28/29/30, 10-03..10-09 and
-# 10-23..11-01 - and on no other morning.
-#
-# WHAT IT CANNOT DO.
-#   * It fires at ~00:05Z, up to ~12h after the failure; "Cloud Run job failing" is the fast page.
-#   * It CLOSES at 10:00Z every day, fixed or not (the gate ends), and the close sends a "resolved"
-#     email. If the next run fails too, it re-opens at ~00:05Z the next day. A closed incident is not
-#     a successful run: check the execution list.
-#   * Any successful relgraph-sync execution in the window counts, a manual one included, so a manual
-#     success at 08:00Z hides a failed scheduled run the night before.
-#   * A run that exits 0 having done nothing useful is a success here (relgraph-health exists for that).
-#   * A deliberate pause of relgraph-sync-cron fires it every morning: snooze it for the pause.
-#   * It is prod only: setup_scheduler.sh creates every trigger paused by default (PAUSED=1), and
-#     over a paused staging trigger this would page every morning.
-#   * Moving the cron outside ~10:00-11:50Z (it must start after the gate closes and be able to end
-#     by midnight), or raising the timeout or retries so a run can succeed after midnight, breaks the
-#     arithmetic above; the pinning test fails first.
-# RENOTIFY 14400s: open 00:05-10:00Z, so ~3 emails per failed night (00:05, 04:05, 08:05).
-if [ "$ENV" = prod ]; then
-upsert "prod: relgraph-sync has not succeeded in a day" "$(promql_policy \
-  "prod: relgraph-sync has not succeeded in a day" \
-  "no succeeded relgraph-sync execution in the 24h before a 00:00-10:00Z check" \
-  "relgraph-sync (daily at 10:37Z) has had NO successful execution in the last 24 hours: yesterday's run failed both attempts or never started (scheduler paused or deleted, trigger auth broken, job deleted). A normal run succeeds by about 14:30Z. This is checked from 00:00Z to 10:00Z only: it opens at ~00:05Z, repeats every 4 hours, and closes at 10:00Z WHETHER OR NOT the job was fixed; it re-opens the next morning if that night fails too. A manual successful run counts. Read \`gcloud run jobs executions list --job relgraph-sync --region us-west1 --project pivota-prod\` and the failed execution's logs; also check \`gcloud scheduler jobs describe relgraph-sync-cron --location us-west1 --project pivota-prod\` (state, last attempt status). For a deliberate pause, snooze this policy." \
-  '((sum(sum_over_time(run_googleapis_com:job_completed_execution_count{monitored_resource="cloud_run_job",job_name="relgraph-sync",result="succeeded"}[24h])) or vector(0)) == 0) and on() (hour() < 10)' \
-  300s 60s 3600s 14400s \
-  'SUBJECT=relgraph-sync: no successful run in the last 24 hours')"
-fi
 
 upsert "prod: Cloud SQL connections high" "$(policy \
   "prod: Cloud SQL connections high" \
@@ -873,6 +824,75 @@ upsert_on_new_metric "prod: Reap buyer contact retention blocked" "$(policy \
   "The poller counted contact_retention_blocked >= 1: a resolving, needs_enrollment or quoting purchase whose buyer contact the retention cap (REAP_AGENTIC_CONTACT_MAX_AGE_SECONDS) erased. The purchase and its payment evidence remain, and it makes no new quote or checkout. Usually the buyer has not come back yet. Its owner view says contact_reentry_required=true, and only the buyer's own agent can restore contact: POST /agent/v2/commerce/reap/purchases/{purchase_id}/resume with the identical original request, which needs the create gate on. If nobody resumes within REAP_AGENTIC_CONTACT_REENTRY_WINDOW_SECONDS (default 86400, 24 h), measured from contact_purged_at (when the contact was erased), the poller ends a row with no dispatch evidence as contact_reentry_lapsed (needs_enrollment to expired, resolving or quoting to failed) and it leaves this count. A row whose checkout dispatch is unresolved (dispatch_started, or legacy unknown) cannot be resumed; in quoting it is also counted as checkout needs human, so work it there. Do not copy old PII, edit the row, blindly retry or create a replacement. Runbook: docs/runbooks/reap_agentic_purchase.md, Contact-paused purchases." \
   'metric.type="logging.googleapis.com/user/reap_agentic_poll_contact" AND resource.type="cloud_run_revision"' \
   ALIGN_SUM REDUCE_SUM resource.label.service_name COMPARISON_GT 0 900s 0s 3600s)"
+
+# LAST, after every other policy and retirement, on purpose: hour() in a PromQL ALERT condition was
+# checked only through the read-only query API, not by a policy create. If the create refuses it, check()
+# aborts the run here - with every other policy already reconciled - instead of leaving the ones after it
+# unwritten. (A deferred new-metric policy's NOT CREATED notice below is then not printed; re-run.)
+#
+# "Did YESTERDAY'S relgraph-sync run succeed?", asked every minute from 00:00Z to 10:00Z. The policies
+# "Cloud Run job failing" and "running over five hours" see a job that fails or runs long; neither sees a job that does not RUN - scheduler
+# paused or deleted, trigger auth broken, job deleted - and a job-failing incident closes about 5
+# minutes after its failure, so one missed email is the only trace of a failed night. This one stays
+# open through the morning, every morning after a night with no success.
+#
+# THE QUERY: the count of SUCCEEDED executions of relgraph-sync over the last 24h is 0, and the UTC
+# hour is before 10.
+#   * `or vector(0)`: a DELTA metric has no samples at all in a window with no completions (zeros
+#     are written only next to a completion), so the sum is an EMPTY vector, not 0, and `== 0` alone
+#     could never fire. Read back 2026-11-02 (PromQL query API, read-only): the bare sum answered an
+#     empty vector at 2026-10-23T00:05Z and 2026-10-28T05:00Z. `or vector(0)` turns "no series" -
+#     job never ran, job deleted, metric gone - into 0, which fires.
+#   * sum_over_time, not increase()/rate(): the same per-minute DELTA samples as the Reap heartbeat
+#     ("went silent", above; see its note); increase() reads every drop to 0 as a counter reset.
+#   * result="succeeded" is the label value Cloud Run writes (read back 2026-11-02: "succeeded" and
+#     "failed" are the two series for relgraph-sync).
+#
+# WHY A TIME-OF-DAY GATE AND NOT A ~26h WINDOW. A normal night finishes 11:00-14:30Z, so two
+# consecutive successes can be ~27h apart (more when a retry succeeds); a "no success in the last W
+# hours" check without a gate needs W plus its duration over that to never fire on a normal night. The platform caps the reach
+# at 25h ("the sum of your retest window, alignment period, and any time shift caused by using the
+# offset modifier must be at most 25 hours", monitoring/promql/promql-in-alerting), so that design
+# is impossible. With the gate the question is exact instead:
+#   - the run starts 10:37Z (setup_scheduler.sh: sched relgraph-sync-cron "37 10 * * *"), and with
+#     --task-timeout 21600s and --max-retries 1 its LAST possible success is ~22:40Z the same day
+#     (live config read back 2026-11-02: timeoutSeconds 21600, maxRetries 1, cron "37 10 * * *" UTC);
+#   - so for any time T from 00:00Z to 10:00Z, the window [T-24h, T] starts between 00:00Z and
+#     10:00Z the day before: it holds ALL of yesterday's run (from 10:37Z) and NONE of the day
+#     before's (which ended by ~22:40Z two days back). 0 successes in it means yesterday's run did
+#     not succeed. Reach: 24h + 300s duration = 24h05m, under the 25h cap.
+#   tests/test_monitoring_policy_snapshot.py pins the cron, timeout and retries this leans on.
+#
+# BACKTEST, 2026-09-22..2026-11-02 (query_range over this exact query, read-only): it fires the
+# morning after every night with no successful execution - 09-28/29/30, 10-03..10-09 and
+# 10-23..11-01 - and on no other morning.
+#
+# WHAT IT CANNOT DO.
+#   * It fires at ~00:05Z, up to ~12h after the failure; "Cloud Run job failing" is the fast page.
+#   * It CLOSES at 10:00Z every day, fixed or not (the gate ends), and the close sends a "resolved"
+#     email. If the next run fails too, it re-opens at ~00:05Z the next day. A closed incident is not
+#     a successful run: check the execution list.
+#   * Any successful relgraph-sync execution in the window counts, a manual one included, so a manual
+#     success at 08:00Z hides a failed scheduled run the night before.
+#   * A run that exits 0 having done nothing useful is a success here. NOTHING covers that today:
+#     relgraph-health (setup_scheduler.sh) would check the graph, but relgraph-health-cron has no live
+#     trigger in prod (read back 2026-11-02).
+#   * A deliberate pause of relgraph-sync-cron fires it every morning: snooze it for the pause.
+#   * It is prod only: setup_scheduler.sh creates every trigger paused by default (PAUSED=1), and
+#     over a paused staging trigger this would page every morning.
+#   * Moving the cron outside ~10:00-11:50Z (it must start after the gate closes and be able to end
+#     by midnight), or raising the timeout or retries so a run can succeed after midnight, breaks the
+#     arithmetic above; the pinning test fails first.
+# RENOTIFY 14400s: open 00:05-10:00Z, so ~3 emails per failed night (00:05, 04:05, 08:05).
+if [ "$ENV" = prod ]; then
+upsert "prod: relgraph-sync has not succeeded in a day" "$(promql_policy \
+  "prod: relgraph-sync has not succeeded in a day" \
+  "no succeeded relgraph-sync execution in the 24h before a 00:00-10:00Z check" \
+  "relgraph-sync (daily at 10:37Z) has had NO successful execution in the last 24 hours: yesterday's run failed both attempts or never started (scheduler paused or deleted, trigger auth broken, job deleted). A normal run succeeds by about 14:30Z. This is checked from 00:00Z to 10:00Z only: it opens at ~00:05Z, repeats every 4 hours, and closes at 10:00Z WHETHER OR NOT the job was fixed; it re-opens the next morning if that night fails too. A manual successful run counts. Read \`gcloud run jobs executions list --job relgraph-sync --region us-west1 --project pivota-prod\` and the failed execution's logs; also check \`gcloud scheduler jobs describe relgraph-sync-cron --location us-west1 --project pivota-prod\` (state, last attempt status). For a deliberate pause, snooze this policy." \
+  '((sum(sum_over_time(run_googleapis_com:job_completed_execution_count{monitored_resource="cloud_run_job",job_name="relgraph-sync",result="succeeded"}[24h])) or vector(0)) == 0) and on() (hour() < 10)' \
+  300s 60s 3600s 14400s \
+  'SUBJECT=relgraph-sync: no successful run in the last 24 hours')"
+fi
 
 echo
 echo "channel : $ALERT_EMAIL"
