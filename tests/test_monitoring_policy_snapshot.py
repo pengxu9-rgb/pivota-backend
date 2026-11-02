@@ -33,7 +33,8 @@ JOB_FAILING_FILTER_BASE = ('metric.type="run.googleapis.com/job/completed_task_a
                            'resource.type="cloud_run_job" AND metric.label.result="failed"')
 # Ad hoc jobs, 2026-11-02: read from the 30-day failure backtest and the launchers' naming, not guessed.
 JOB_FAILING_EXCLUSIONS = [
-    ('regex', '.+-[0-9]+-[0-9]+'),                    # scripts/ops/run_oneoff_job.sh: $JOB_PREFIX-$$-$RANDOM
+    ('regex', '.+-[0-9]+'),                           # ends in a number: run_oneoff_job.sh's $JOB_PREFIX-$$-$RANDOM,
+                                                      # restore_to_cloudsql.sh's killconns-$$ / verify-import-$$
     ('regex', '.+-20[0-9]{6}([0-9]{6})?(-.+)?'),      # named for its launch date by hand
     ('prefix', 'oneoff-'),                            # run_oneoff_job.sh's default JOB_PREFIX
     ('prefix', 'verify-'),                            # ad hoc verification jobs
@@ -45,13 +46,14 @@ JOB_FAILING_FILTER = JOB_FAILING_FILTER_BASE + ''.join(
     for kind, v in JOB_FAILING_EXCLUSIONS)
 JOB_FAILING_DOC = (
     'A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). '
-    'Ad hoc jobs are not watched (names ending -<digits>-<digits> as scripts/ops/run_oneoff_job.sh makes '
+    'Ad hoc jobs are not watched (names ending -<digits>, as scripts/ops/run_oneoff_job.sh makes '
     'them, names carrying a -20YYMMDD launch date, or names starting oneoff-, verify- or eval-): whoever '
     'launched one owns its failure. '
     'reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is '
     'otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a '
-    'page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled '
-    'run can open two incidents, one per attempt. The incident closes about 5 minutes after the failed '
+    'page, when this policy needed the failure to hold for 5 minutes. Only an execution\'s LAST attempt '
+    'counts (a retried attempt is result=retried), so a failed execution opens one incident and a retry '
+    'that succeeds opens none. The incident closes about 5 minutes after the failed '
     'attempt; while a job keeps failing it stays open and repeats hourly. Read the execution\'s logs: '
     '`gcloud run jobs executions list --job JOB --region us-west1`. For retailer-ingest-drain, a failure '
     'here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages '
@@ -179,15 +181,47 @@ LIVE_SCHEDULED_JOBS_2026_11_02 = [
 ]
 
 
+_JOB_SOURCES = [*sorted((ROOT / 'infra/gcp').glob('*.sh')), *sorted((ROOT / 'scripts').rglob('*.sh')),
+                *sorted((ROOT / 'scripts').rglob('*.py'))]
+_NAME = r'"?([a-z][a-zA-Z0-9$_{}:-]*[a-zA-Z0-9$}])"?'
+
+
+def _job_names_in_scripts():
+    """(literal, templated) job names that infra/gcp/ and scripts/ schedule, create, execute or assign
+    to a *JOB* variable, quoted or not. A TEMPLATED name carries a shell expansion ($$, $RANDOM,
+    $JOB_PREFIX): an ad hoc job made per run. A literal one is a standing job."""
+    found = set()
+    for script in _JOB_SOURCES:
+        text = script.read_text(errors='replace')
+        found |= set(re.findall(r'^\s*sched \S+ "[^"]+" ([a-z0-9-]+)', text, re.M))
+        found |= set(re.findall(r'^\s*mk\w*job ([a-z0-9-]+) ', text, re.M))
+        found |= set(re.findall(r'^\s*(?:export\s+|local\s+)?[A-Z_]*JOB[A-Z_]*=' + _NAME + r'\s*(?:#.*)?$', text, re.M))
+        found |= set(re.findall(r'run jobs (?:create|deploy|update|execute|replace) ' + _NAME + r'(?=\s)', text))
+    literal = {n for n in found if '$' not in n}
+    templated = {n for n in found if '$' in n and not n.startswith('$')}
+    return literal, templated
+
+
 def _provisioned_job_names():
-    """Every literal job name the infra scripts schedule or create."""
-    names = set()
-    for script in sorted((ROOT / 'infra/gcp').glob('*.sh')):
-        text = script.read_text()
-        names |= set(re.findall(r'^\s*sched \S+ "[^"]+" ([a-z0-9-]+)', text, re.M))
-        names |= set(re.findall(r'^\s*mk\w*job ([a-z0-9-]+) ', text, re.M))
-        names |= set(re.findall(r'^\s*[A-Z_]*JOB=([a-z][a-z0-9-]+)\s*$', text, re.M))
-    return names
+    return _job_names_in_scripts()[0]
+
+
+def _instantiate(template):
+    """A templated name as it runs: $$ -> a PID, $RANDOM -> a number, ${JOB_PREFIX...} -> its default."""
+    name = template.replace('$JOB_PREFIX', 'oneoff').replace('$RANDOM', '4200').replace('$$', '43396')
+    assert '$' not in name, template
+    return name
+
+
+def test_the_job_name_parser_finds_quoted_assignments_and_scripts():
+    """The parser must see quoted X_JOB="..." assignments and scripts/, not only infra/gcp/ literals."""
+    literal, templated = _job_names_in_scripts()
+    # quoted, templated, in infra/gcp/ and scripts/ops/
+    assert {'killconns-$$', 'verify-import-$$', 'verify-worker-$$-$RANDOM'} <= templated, sorted(templated)
+    # literal jobs named only under scripts/ (a backfill job, an ops re-run of a scheduled one)
+    assert {'backfill-stale-pdp-overlays', 'agent-pdp-orphan-reaper'} <= literal, sorted(literal)
+    # unquoted X_JOB= in infra/gcp/
+    assert {'reap-cart-proof-mirror', 'reap-cart-proof-enrichment', 'merchant-purchasability-sweep'} <= literal
 
 
 def test_ad_hoc_jobs_are_excluded_from_job_failing_and_no_scheduled_job_is():
@@ -212,6 +246,12 @@ def test_ad_hoc_jobs_are_excluded_from_job_failing_and_no_scheduled_job_is():
     launcher = (ROOT / 'scripts/ops/run_oneoff_job.sh').read_text()
     assert 'JOB="$JOB_PREFIX-$$-$RANDOM"' in launcher and 'JOB_PREFIX="${JOB_PREFIX:-oneoff}"' in launcher
     assert _excluded('oneoff-12345-6789') and _excluded('anything-1-2')
+    # Every TEMPLATED (per-run, ad hoc) job name in the scripts is excluded once instantiated: killconns-$$
+    # (restore_to_cloudsql.sh) matched no rule before 2026-11-02 and would have paged.
+    _, templated = _job_names_in_scripts()
+    assert 'killconns-$$' in templated
+    for template in sorted(templated | {'$JOB_PREFIX-$$-$RANDOM'}):
+        assert _excluded(_instantiate(template)), template
     doc = generated_policies()[JOB_FAILING_NAME]['documentation']['content']
     assert 'owns its failure' in doc
 
@@ -270,6 +310,9 @@ def test_relgraph_has_not_succeeded_gate_holds_exactly_one_night_within_the_look
     duration_s = int(generated_policies()[RELGRAPH_SUCCESS_NAME]['conditions'][0]
                      ['conditionPrometheusQueryLanguage']['duration'].rstrip('s'))
     assert range_h * 3600 + duration_s <= 25 * 3600
+    # REPO config, not prod's: this assumes what the 2026-11-02 read-only readback confirmed live
+    # (`gcloud run jobs describe relgraph-sync`: timeoutSeconds 21600, maxRetries 1; relgraph-sync-cron
+    # "37 10 * * *" Etc/UTC, ENABLED). A hand change in prod is not seen here; re-read it before relying on it.
     start_min, timeout_s, attempts = _relgraph_schedule()
     assert (start_min, timeout_s, attempts) == (10 * 60 + 37, 21600, 2)
     latest_success_min = start_min + attempts * timeout_s // 60 + 15  # + container start, retry, metric lag
@@ -281,13 +324,20 @@ def test_relgraph_has_not_succeeded_gate_holds_exactly_one_night_within_the_look
     assert latest_success_min < day
 
 
-def test_relgraph_has_not_succeeded_is_prod_only_and_written_by_plain_upsert():
+def test_relgraph_has_not_succeeded_is_prod_only_last_and_written_by_plain_upsert():
     """Staging triggers are created paused; there it would page every morning. A system metric is
-    visible to Monitoring at once, so the plain writer is right (no NEW_METRIC wait)."""
+    visible to Monitoring at once, so the plain writer is right (no NEW_METRIC wait). It is the LAST
+    policy write and after every retirement: hour() in an alert condition is unproven by a create, and a
+    refusal aborts the run at check(), which must not leave any other policy unreconciled."""
     source = (ROOT / 'infra/gcp/setup_monitoring.sh').read_text()
     at = source.index(f'upsert "{RELGRAPH_SUCCESS_NAME}"')
     assert source.rindex('\nif [ "$ENV" = prod ]; then\n', 0, at) > source.rindex('\nfi\n', 0, at)
-    assert source.index('\nfi\n', at) < source.index('\nupsert', at + 1)
+    end = source.index('\nfi\n', at)
+    tail = source[end:]
+    for writer in ('\nupsert ', '\nupsert_on_new_metric ', '\nretire_policy ', '\nupsert_log_metric '):
+        assert writer not in tail, writer
+    writes = [m.group(1) for m in re.finditer(r'^(?:upsert|upsert_on_new_metric) "([^"]+)"', source, re.M)]
+    assert writes[-1] == RELGRAPH_SUCCESS_NAME
 
 
 # Fields the API assigns or manages; everything else the upsert's delete+create writes (or wipes).

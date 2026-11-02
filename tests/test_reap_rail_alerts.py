@@ -1109,7 +1109,14 @@ def test_the_script_wires_the_first_run_safely(source):
                       STUCK_POLICY, FAILING_POLICY, SILENT_POLICY,
                       "prod: Reap checkout needs human reconciliation",
                       "prod: Reap buyer contact retention blocked"]
-    assert body.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
+    # ONE deliberate exception (2026-11-02): "relgraph-sync has not succeeded in a day" is the LAST write,
+    # after every waiting-path policy, because its hour() is unproven by a create and a refusal aborts
+    # the run at check(); last, it cannot leave anything else unwritten. A deferral is not an abort, so
+    # it is still written after one.
+    last_plain = '\nupsert "prod: relgraph-sync has not succeeded in a day"'
+    others = body.replace(last_plain, '\n#moved')
+    assert others.rindex('\nupsert "') < body.index('\nupsert_on_new_metric "')
+    assert body.index(last_plain) > body.rindex('\nupsert_on_new_metric "')
     assert not re.search(r'^upsert "prod: Reap', body, re.M)
     # Ten minutes by default, shared: 20 tries of 30 s.
     assert 'NEW_METRIC_TRIES="${NEW_METRIC_TRIES:-20}"' in body
@@ -1256,4 +1263,7 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
     # attempt (duration 0s, was 300s), renotifies hourly, excludes ad hoc job names from its filter, and
     # its documentation says so (relgraph-sync failed every night 2026-10-22..31 unpaged). The other eight
     # render byte-identically to 6e0a665c...
-    assert digest == "14fca76a25f54209969327fda920a8e9dc7b5c232741f15681437629153f9973"
+    # 2026-11-02 follow-up: re-pinned for the same policy only: its numeric-suffix exclusion widened from
+    # -<digits>-<digits> to -<digits> (restore_to_cloudsql.sh's killconns-$$ matched nothing) and its
+    # documentation says a retried attempt does not count. The other eight are unchanged.
+    assert digest == "8b56ac274acc7972cabd0e1393ef826fadb6ab3f595d9af76eee19fa10198b08"
