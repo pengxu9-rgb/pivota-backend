@@ -847,3 +847,159 @@ def test_the_lanes_own_refusals_are_reported_even_when_the_planner_declines_the_
     result = _sync(monkeypatch, fake)
     assert result["variant_status"] == "no_listing_offer" and fake.updates == []
     assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 1}
+
+
+# ------------------------------------------------------------ a seed variant keyed by its JSON-LD link (2026-11-02)
+#
+# The mirror census found offer rows `variant_not_on_seed` only because the seed stores the variant's id as its page's
+# JSON-LD `@id`, "/products/<handle>?variant=<N>#offer", while the offer row names the bare N. Keyed with the extractor's
+# own-product link rule (`_offer_shopify_variant_id`) and the whole-value `gid://` form.
+
+from urllib.parse import urlparse as _urlparse  # noqa: E402
+
+V_A, V_B = "47761881301179", "47761881301180"
+HOST = _urlparse(DEST).hostname
+HANDLE = DEST.rsplit("/", 1)[1]
+OWN_LINK = f"/products/{HANDLE}?variant={V_B}#offer"
+
+
+def _variant_offer(vid=V_B):
+    return _offer("of_v2", sku=f"{PK}::v:{V_B}", vid=vid)
+
+
+def _writes_v2(price=38):
+    return [{"offer_id": "of_v2", "price": price, "currency": "USD"}]
+
+
+@pytest.mark.parametrize("stored_id", [
+    OWN_LINK,  # the JSON-LD @id the seed's own page emits
+    f"https://{HOST}/products/{HANDLE}?variant={V_B}",  # the same, absolute
+    f"https://www.{HOST}/products/{HANDLE}?variant={V_B}",  # www is the same storefront
+    f"//{HOST}/products/{HANDLE}?variant={V_B}",  # protocol-relative
+    f"gid://shopify/ProductVariant/{V_B}",
+    V_B,
+])
+def test_a_seed_variant_matches_its_offer_however_its_own_page_spells_the_id(stored_id):
+    seed = _seed(seed_variants=[{"variant_id": stored_id, "price_amount": 38, "price_currency": "USD"}])
+    assert _plan(seed, [_variant_offer()])["writes"] == _writes_v2()
+
+
+@pytest.mark.parametrize("stored_id", [
+    f"/products/another-product?variant={V_B}#offer",  # a link to ANOTHER product's handle
+    f"https://other-store.example/products/{HANDLE}?variant={V_B}",  # another storefront
+    f"//other-store.example/products/{HANDLE}?variant={V_B}",
+    # Not a gid as a whole value: a plan's price, a longer path, trailing junk, a gid inside another URL.
+    f"gid://shopify/ProductVariant/{V_B}?selling_plan=7001",
+    f"gid://shopify/ProductVariant/{V_B}/extra",
+    f"gid://shopify/ProductVariant/{V_B}abc",
+    f"https://other-store.example/products/x?ref=gid://shopify/ProductVariant/{V_B}",
+])
+def test_a_link_or_gid_naming_another_product_or_more_never_matches(stored_id):
+    seed = _seed(seed_variants=[{"variant_id": stored_id, "price_amount": 38, "price_currency": "USD"}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_not_on_seed": 1}
+
+
+def test_the_canonical_product_is_the_seeds_own_too_even_on_another_host():
+    canonical = f"https://shop.other-host.example/products/{HANDLE}"
+    seed = _seed(canonical_url=canonical,
+                 seed_variants=[{"variant_id": f"{canonical}?variant={V_B}", "price_amount": 38, "price_currency": "USD"}])
+    assert _plan(seed, [_variant_offer()])["writes"] == _writes_v2()
+    # Without that canonical, the same link is another storefront's.
+    plan = _plan(_seed(seed_variants=seed["seed_variants"]), [_variant_offer()])
+    assert plan["skips"] == {"variant_not_on_seed": 1}
+
+
+def test_a_relative_link_is_read_against_the_served_url_first():
+    # The canonical names the product under another handle on another host: read against it, the seed's own
+    # "/products/<handle>" link would be a product it does not serve.
+    seed = _seed(canonical_url="https://shop.other-host.example/products/renamed-handle",
+                 seed_variants=[{"variant_id": OWN_LINK, "price_amount": 38, "price_currency": "USD"}])
+    assert _plan(seed, [_variant_offer()])["writes"] == _writes_v2()
+    assert mod._attached_variant_id(OWN_LINK, (DEST,)) == V_B
+    assert mod._attached_variant_id(OWN_LINK, ()) == OWN_LINK, "no page of its own: the link stays as written"
+
+
+def test_two_spellings_of_one_id_at_one_price_are_one_entry_and_at_two_are_ambiguous():
+    same = _seed(seed_variants=[{"variant_id": OWN_LINK, "price_amount": 38}, {"variant_id": V_B, "price_amount": 38}])
+    assert _plan(same, [_variant_offer()])["writes"] == _writes_v2()
+    differ = _seed(seed_variants=[{"variant_id": OWN_LINK, "price_amount": 38}, {"variant_id": V_B, "price_amount": 40}])
+    plan = _plan(differ, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"ambiguous_variant_identity": 1}
+    # Written twice the same way, it is ambiguous as it always was.
+    twice = _seed(seed_variants=[{"variant_id": V_B, "price_amount": 38}, {"variant_id": V_B, "price_amount": 38}])
+    assert _plan(twice, [_variant_offer()])["skips"] == {"ambiguous_variant_identity": 1}
+
+
+@pytest.mark.parametrize("conflicting_price, writes", [
+    (38, True),  # the two-id entry agrees with the clean one: the clean one writes
+    (99, False),  # it prices that id otherwise: the id is refused, as before
+    (None, False),  # it states no price: nothing vouches the clean price against it
+])
+def test_an_entry_naming_two_ids_vetoes_a_clean_one_only_when_it_disagrees(conflicting_price, writes):
+    """{link N, shopify_variant_id W} beside a clean N entry (Option B)."""
+    conflicting = {"variant_id": OWN_LINK, "shopify_variant_id": V_A}
+    if conflicting_price is not None:
+        conflicting["price_amount"] = conflicting_price
+    seed = _seed(seed_variants=[conflicting, {"variant_id": V_B, "price_amount": 38}])
+    plan = _plan(seed, [_variant_offer()])
+    if writes:
+        assert plan["writes"] == _writes_v2()
+    else:
+        assert plan["writes"] == [] and plan["skips"] == {"variant_identity_conflict": 1}
+    # W is named by the two-id entry alone: refused whatever the price.
+    plan = _plan(seed, [_offer("of_v1", sku=f"{PK}::v:{V_A}", vid=V_A)])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_identity_conflict": 1}
+
+
+def test_base_conflicts_in_seeds_with_no_link_keep_their_rule():
+    """[{variant_id A, shopify_variant_id N, 99}, {variant_id N, 38}]: refused as on base."""
+    seed = _seed(seed_variants=[{"variant_id": V_A, "shopify_variant_id": V_B, "price_amount": 99},
+                                {"variant_id": V_B, "price_amount": 38}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_identity_conflict": 1}
+
+
+def test_a_second_spelling_carrying_its_own_refusal_never_merges():
+    seed = _seed(seed_variants=[{"variant_id": OWN_LINK, "price_amount": 38},
+                                {"variant_id": V_B, "price_amount": 38, "price_currency": "EUR"}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"ambiguous_variant_identity": 1}
+
+
+def test_spellings_accumulate_so_a_repeated_one_is_still_ambiguous():
+    seed = _seed(seed_variants=[{"variant_id": OWN_LINK, "price_amount": 38}, {"variant_id": V_B, "price_amount": 38},
+                                {"variant_id": V_B, "price_amount": 38}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"ambiguous_variant_identity": 1}
+
+
+@pytest.mark.parametrize("plan_link", [
+    f"/products/{HANDLE}?variant={V_B}&selling_plan=7001#offer",
+    f"/products/{HANDLE}?selling_plan_id=7001&variant={V_B}",
+])
+def test_a_subscription_plans_link_names_no_variant(plan_link):
+    seed = _seed(seed_variants=[{"variant_id": plan_link, "price_amount": 30, "price_currency": "USD"}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_not_on_seed": 1}
+    assert mod._attached_variant_id(plan_link, (DEST,)) == plan_link
+
+
+@pytest.mark.parametrize("offer_vid, writes", [
+    (OWN_LINK, True),  # an offer row spelled as the seed's own link
+    (f"gid://shopify/ProductVariant/{V_B}", True),
+    (f"/products/another-product?variant={V_B}#offer", False),  # another product's link
+])
+def test_an_offer_rows_id_is_read_the_same_way(offer_vid, writes):
+    seed = _seed(seed_variants=[{"variant_id": V_B, "price_amount": 38, "price_currency": "USD"}])
+    plan = _plan(seed, [_variant_offer(offer_vid)])
+    assert plan["writes"] == (_writes_v2() if writes else [])
+    if not writes:
+        assert plan["skips"] == {"variant_not_on_seed": 1}
+
+
+def test_an_id_already_refused_keeps_its_first_reason():
+    seed = _seed(seed_variants=[{"variant_id": V_B, "price_amount": 38, "price_currency": "EUR"},
+                                {"variant_id": OWN_LINK, "shopify_variant_id": V_A, "price_amount": 99}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_currency_mismatch": 1}
