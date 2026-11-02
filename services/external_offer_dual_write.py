@@ -710,10 +710,39 @@ def _current_price(offer: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _attached_variant_id(value: Any) -> str:
+def _seed_product_refs(seed: Dict[str, Any]) -> frozenset:
+    """The seed's own Shopify product, as (host, handle), from the URLs it serves (`_shopify_product_ref`)."""
+    from services.external_offers_service import _shopify_product_ref
+
+    refs = {_shopify_product_ref(str(u)) for u in (seed.get("destination_url"), seed.get("canonical_url")) if u}
+    return frozenset(r for r in refs if r)
+
+
+def _attached_variant_id(value: Any, own_products: frozenset = frozenset()) -> str:
+    """ONE spelling for a variant id, the reconcile's (`routes.employee_products._variant_id_spellings`): the digits
+    of a `gid://` id, and the `?variant=` digits of a link-shaped id (the JSON-LD `@id` a seed often stores,
+    "/products/<handle>?variant=<N>#offer"). Anything else as written.
+
+    A LINK COUNTS ONLY ON THE SEED'S OWN PRODUCT (`own_products`, its (host, handle)): a `?variant=` on another
+    product's link -- a related product, a bundle component -- names that product's variant, and is left as
+    written, so it stays `variant_not_on_seed` rather than matching by accident.
+    """
+    from routes.employee_products import _variant_id_spellings
+    from services.handover_variant_identity import url_named_variant_id
+
     text = str(value or "").strip()
-    match = re.fullmatch(r"gid://shopify/ProductVariant/([0-9]+)", text)
-    return match.group(1) if match else text
+    if not text:
+        return ""
+    if url_named_variant_id(text):
+        from urllib.parse import urljoin
+
+        from services.external_offers_service import _shopify_product_ref
+
+        hosts = sorted({host for host, _ in own_products})
+        if not hosts or _shopify_product_ref(urljoin(f"https://{hosts[0]}/", text)) not in own_products:
+            return text
+    spellings = _variant_id_spellings(text)
+    return spellings[0] if spellings else text
 
 
 def plan_attached_listing_offer_writes(
@@ -773,8 +802,11 @@ def plan_attached_listing_offer_writes(
     )
     variant_prices: Dict[str, Optional[float]] = {}
     variant_refusals: Dict[str, str] = {}
+    own_products = _seed_product_refs(seed)
     for variant in _served_seed_variants(seed):
-        ids = {_attached_variant_id(variant.get(k)) for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
+        # Two spellings of one id are one id; two ids are still a conflict (below).
+        ids = {_attached_variant_id(variant.get(k), own_products)
+               for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
         if len(ids) > 1:
             for vid in ids:
                 variant_refusals[vid] = "variant_identity_conflict"
@@ -823,7 +855,7 @@ def plan_attached_listing_offer_writes(
                 _skip("no_seed_price")
                 continue
         else:
-            vid = _attached_variant_id(offer.get("source_variant_id"))
+            vid = _attached_variant_id(offer.get("source_variant_id"), own_products)
             if vid in variant_refusals:
                 _skip(variant_refusals[vid])
                 continue

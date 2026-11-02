@@ -847,3 +847,73 @@ def test_the_lanes_own_refusals_are_reported_even_when_the_planner_declines_the_
     result = _sync(monkeypatch, fake)
     assert result["variant_status"] == "no_listing_offer" and fake.updates == []
     assert result["offer_skips"] == {"mirror_variants_mirror_other_seller": 1}
+
+
+# ------------------------------------------------------------ a seed variant keyed by its JSON-LD link (2026-11-02)
+#
+# The mirror census found 397 rows `variant_not_on_seed` only because the seed stores the variant's id as its
+# page's JSON-LD `@id`, "/products/<handle>?variant=<N>#offer", while the offer row names the bare N. Keyed with
+# the reconcile's own spelling (`routes.employee_products._variant_id_spellings`), on the seed's OWN product only.
+
+V_A, V_B = "47761881301179", "47761881301180"
+
+
+def _variant_offer():
+    return _offer("of_v2", sku=f"{PK}::v:{V_B}", vid=V_B)
+
+
+@pytest.mark.parametrize("stored_id", [
+    f"/products/pdrn-peel-shot?variant={V_B}#offer",  # the JSON-LD @id the seed's own page emits
+    f"https://missha.us/products/pdrn-peel-shot?variant={V_B}",  # the same, absolute
+    f"https://www.missha.us/products/pdrn-peel-shot?variant={V_B}",  # www is the same storefront
+    f"gid://shopify/ProductVariant/{V_B}",
+    V_B,
+])
+def test_a_seed_variant_matches_its_offer_however_its_own_page_spells_the_id(stored_id):
+    seed = _seed(seed_variants=[{"variant_id": stored_id, "price_amount": 38, "price_currency": "USD"}])
+    assert _plan(seed, [_variant_offer()])["writes"] == [{"offer_id": "of_v2", "price": 38, "currency": "USD"}]
+
+
+@pytest.mark.parametrize("stored_id", [
+    f"/products/another-product?variant={V_B}#offer",  # a link to ANOTHER product's handle
+    f"https://other-store.example/products/pdrn-peel-shot?variant={V_B}",  # another storefront
+])
+def test_a_link_naming_another_products_variant_never_matches(stored_id):
+    seed = _seed(seed_variants=[{"variant_id": stored_id, "price_amount": 38, "price_currency": "USD"}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_not_on_seed": 1}
+
+
+def test_two_spellings_of_one_id_are_one_id_and_two_ids_still_conflict():
+    one = _seed(seed_variants=[{"variant_id": f"/products/pdrn-peel-shot?variant={V_B}#offer",
+                                "shopify_variant_id": V_B, "price_amount": 38}])
+    assert _plan(one, [_variant_offer()])["writes"] == [{"offer_id": "of_v2", "price": 38, "currency": "USD"}]
+    two = _seed(seed_variants=[{"variant_id": f"/products/pdrn-peel-shot?variant={V_A}#offer",
+                                "shopify_variant_id": V_B, "price_amount": 38}])
+    plan = _plan(two, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"variant_identity_conflict": 1}
+
+
+def test_two_variants_spelling_one_id_two_ways_are_still_ambiguous():
+    seed = _seed(seed_variants=[{"variant_id": f"/products/pdrn-peel-shot?variant={V_B}#offer", "price_amount": 38},
+                                {"variant_id": V_B, "price_amount": 38}])
+    plan = _plan(seed, [_variant_offer()])
+    assert plan["writes"] == [] and plan["skips"] == {"ambiguous_variant_identity": 1}
+
+
+def test_a_link_id_counts_only_on_a_product_the_seed_serves():
+    link = f"/products/pdrn-peel-shot?variant={V_B}#offer"
+    own = mod._seed_product_refs(_seed())
+    assert own == frozenset({("missha.us", "pdrn-peel-shot")})
+    assert mod._attached_variant_id(link, own) == V_B
+    assert mod._attached_variant_id(link, frozenset()) == link, "no product of its own: the link stays as written"
+    assert mod._attached_variant_id(f"gid://shopify/ProductVariant/{V_B}", frozenset()) == V_B
+    assert mod._attached_variant_id("  ", own) == ""
+    # A short ?variant= on an absolute link is not a Shopify variant id (the reconcile's rule).
+    assert mod._attached_variant_id("https://missha.us/products/pdrn-peel-shot?variant=1001", own).endswith("variant=1001")
+
+
+def test_an_offer_row_naming_its_variant_as_a_gid_still_matches():
+    offer = _offer("of_v2", sku=f"{PK}::v:{V_B}", vid=f"gid://shopify/ProductVariant/{V_B}")
+    seed = _seed(seed_variants=[{"variant_id": V_B, "price_amount": 38, "price_currency": "USD"}])
+    assert _plan(seed, [offer])["writes"] == [{"offer_id": "of_v2", "price": 38, "currency": "USD"}]
