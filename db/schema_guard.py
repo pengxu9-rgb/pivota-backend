@@ -4405,6 +4405,16 @@ async def ensure_required_schema_light() -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # mig 276 (ADR-027), SQLite ONLY: a local database created before the click Table named
+            # these. Postgres gets them by hand (276 is .sql.disabled and schema-guard-exempt), never
+            # here: a boot-time ALTER would race ACCESS EXCLUSIVE on the table `/r` writes per click.
+            for _deal_column in ("discount_code VARCHAR(255)", "discount_carried BOOLEAN"):
+                try:
+                    await database.execute(
+                        text(f"ALTER TABLE surface_click_events ADD COLUMN {_deal_column}")
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             # Self-heal EVERY table in REQUIRED_SCHEMA, not a hardcoded subset:
             # /health fails closed on any missing required column, so a spec
             # entry without a matching heal here leaves a fresh sqlite dev/test

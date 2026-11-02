@@ -103,14 +103,14 @@ def test_a_deal_that_ends_before_its_verification_expires_is_valid_until_it_ends
 def test_the_lowest_effective_price_wins_before_the_larger_code():
     # A smaller code on a variant whose automatic discount still applies is the cheaper buyer price.
     small_code = _candidate(deal_id="deal_b", code="FIVE", ref_discount_amount=Decimal("2"),
-                            ref_automatic_discounts=[{"title": "Autumn", "amount": "6"}], ref_subtotal=Decimal("34"))
+                            ref_automatic_discounts=[{"title": "Autumn", "type": "line", "amount": "6"}], ref_subtotal=Decimal("34"))
     big_code = _candidate(deal_id="deal_a", code="TEN", ref_discount_amount=Decimal("4"))
     decision, _ = _decide([big_code, small_code])
     assert (decision.code, decision.estimated_effective_price) == ("FIVE", Decimal("32"))
 
 
 def test_at_equal_price_the_larger_code_then_the_later_expiry_then_the_fresher_check_win():
-    automatic = [{"title": "Autumn", "amount": "2"}]
+    automatic = [{"title": "Autumn", "type": "line", "amount": "2"}]
     smaller_code = _candidate(deal_id="deal_a", code="TWO", ref_discount_amount=Decimal("2"),
                               ref_automatic_discounts=automatic)
     larger_code = _candidate(deal_id="deal_z", code="FOUR")
@@ -127,6 +127,29 @@ def test_at_equal_price_the_larger_code_then_the_later_expiry_then_the_fresher_c
     assert _decide([twin_a, twin_b])[0].deal_id == "deal_a"
 
 
+def test_a_larger_code_beats_a_later_expiry_and_a_later_expiry_beats_a_fresher_check():
+    # Neighbouring rank keys pulling in opposite directions: the earlier key decides.
+    larger_sooner = _candidate(deal_id="deal_z", code="BIG", ref_discount_amount=Decimal("4"),
+                               expires_at=NOW + timedelta(hours=2))
+    smaller_later = _candidate(deal_id="deal_a", code="SMALL", ref_discount_amount=Decimal("2"),
+                               ref_automatic_discounts=[{"title": "A", "type": "line", "amount": "2"}],
+                               expires_at=NOW + timedelta(hours=20))
+    assert _decide([smaller_later, larger_sooner])[0].code == "BIG"
+    later_staler = _candidate(deal_id="deal_z", code="LATER", verified_at=NOW - timedelta(hours=3),
+                              expires_at=NOW + timedelta(hours=20))
+    sooner_fresher = _candidate(deal_id="deal_a", code="FRESHER", verified_at=NOW - timedelta(minutes=5),
+                                expires_at=NOW + timedelta(hours=10))
+    assert _decide([sooner_fresher, later_staler])[0].code == "LATER"
+
+
+def test_unreadable_rows_are_reported_not_hidden():
+    assert dld.decide([], _ctx(), ON, NOW, require_price_match=True, unreadable_rows=1) == (
+        None, "no_emittable_deal:row_unreadable",
+    )
+    decision, reason = dld.decide([_candidate()], _ctx(), ON, NOW, require_price_match=True, unreadable_rows=2)
+    assert (reason, decision.deal_id) == ("ok", "deal_a")
+
+
 # ---- the effective price (D4) ---------------------------------------------------------------------
 
 
@@ -137,8 +160,15 @@ def test_the_effective_price_is_the_unit_price_less_every_allocation_whatever_th
     assert decision.estimated_effective_price == Decimal("36.00")
 
 
+def test_order_and_same_currency_automatic_allocations_count():
+    automatic = [{"title": "A", "type": "order", "amount": "1", "currency": "USD"},
+                 {"title": "B", "type": "line", "amount": "1"}]
+    decision, _ = _decide([_candidate(ref_automatic_discounts=automatic, ref_subtotal=Decimal("38"))])
+    assert (decision.automatic_amount, decision.estimated_effective_price) == (Decimal("2"), Decimal("34.00"))
+
+
 def test_automatic_allocations_are_part_of_the_price_never_the_codes_saving():
-    candidate = _candidate(ref_automatic_discounts=[{"title": "Autumn", "amount": "2.00"}], ref_subtotal=Decimal("38"))
+    candidate = _candidate(ref_automatic_discounts=[{"title": "Autumn", "type": "line", "amount": "2.00"}], ref_subtotal=Decimal("38"))
     decision, _ = _decide([candidate])
     assert (decision.estimated_effective_price, decision.discount_amount, decision.automatic_amount) == (
         Decimal("34.00"), Decimal("4.00"), Decimal("2.00"),
@@ -154,7 +184,14 @@ def test_a_subtotal_outside_effective_to_unit_is_not_a_one_unit_cart(subtotal):
 
 @pytest.mark.parametrize(
     "automatic",
-    [None, "[]", [5], [{"title": "x"}], [{"amount": "NaN"}], [{"amount": "-1"}], [{"amount": "Infinity"}]],
+    [
+        None, "[]", [5], [{"title": "x"}],
+        [{"type": "line", "amount": "NaN"}], [{"type": "line", "amount": "-1"}],
+        [{"type": "line", "amount": "Infinity"}],
+        [{"amount": "2"}],  # untyped
+        [{"type": "shipping", "amount": "2"}],  # a shipping allocation is never off the unit price
+        [{"type": "order", "amount": "2", "currency": "SGD"}],  # another currency
+    ],
 )
 def test_an_unreadable_automatic_list_is_refused(automatic):
     assert _decide([_candidate(ref_automatic_discounts=automatic)]) == (
@@ -434,6 +471,19 @@ async def test_a_failed_read_is_no_deal_never_an_exception(db, monkeypatch, whic
     assert await dld.resolve_deal_decision(_ctx()) == (None, "read_failed")
     ref = {"deal_id": "deal_a", "variant_id": "4401", "market": "US"}
     assert await dld.recheck_deal_reference(ref, _ctx()) == (None, "read_failed")
+
+
+async def test_a_row_this_code_cannot_parse_is_row_unreadable_not_read_failed(db, monkeypatch):
+    await _seed(db)
+    real = dld._candidate
+
+    def _breaks_on_one(row):
+        if row["deal_id"] == "deal_a":
+            raise KeyError("renamed_column")
+        return real(row)
+
+    monkeypatch.setattr(dld, "_candidate", _breaks_on_one)
+    assert await dld.resolve_deal_decision(_ctx()) == (None, "no_emittable_deal:row_unreadable")
 
 
 async def test_a_naive_now_is_refused_before_any_read(db):

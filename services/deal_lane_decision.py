@@ -31,17 +31,20 @@ allocations the arithmetic does not rely on; a subtotal outside [effective price
 reference cart is not what this assumes, and the deal is refused. Every amount must be finite.
 
 Fail closed: any rule that cannot be checked, a malformed row, or a failed read returns no decision
-with a reason, never an exception. Nothing here writes, and with either flag off nothing is read.
+with a reason, never an exception. The one exception is a caller passing a naive `now`, a programming
+error that raises ValueError. Nothing here writes, and with either flag off nothing is read.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import parse_qs, quote, urlparse
 
 from sqlalchemy import and_, exists, select
 
@@ -113,7 +116,8 @@ class DealCandidate:
     ref_discount_amount: Optional[Decimal]
     ref_currency: Optional[str]
     # The automatic allocations on the reference cart, as the verifier writes them: a list of
-    # {"title": str, "amount": "<decimal>"}; [] when there were none. Anything else is refused.
+    # {"title": str, "type": "line" | "order", "amount": "<decimal>", "currency"?: ref_currency};
+    # [] when there were none. Shipping allocations are never listed. Anything else is refused.
     ref_automatic_discounts: Any = field(default_factory=list)
 
 
@@ -219,14 +223,23 @@ def _finite(value: Any) -> Optional[Decimal]:
     return number if number.is_finite() else None
 
 
-def automatic_total(value: Any) -> Optional[Decimal]:
+_AUTOMATIC_TYPES = ("line", "order")
+
+
+def automatic_total(value: Any, currency: Optional[str]) -> Optional[Decimal]:
     """The sum of the reference cart's automatic allocations, or None when they are not a list of
-    finite, non-negative amounts (fail closed: an unreadable list could hide a discount)."""
+    line or order allocations with finite, non-negative amounts in `currency` (absent = the cart's).
+    Fail closed: an unreadable list could hide a discount, and a shipping or foreign-currency
+    amount must never be taken off the unit price."""
     if not isinstance(value, list):
         return None
     total = Decimal(0)
     for item in value:
-        amount = _finite(item.get("amount")) if isinstance(item, Mapping) else None
+        if not isinstance(item, Mapping) or item.get("type") not in _AUTOMATIC_TYPES:
+            return None
+        if item.get("currency") is not None and item.get("currency") != currency:
+            return None
+        amount = _finite(item.get("amount"))
         if amount is None or amount < 0:
             return None
         total += amount
@@ -279,7 +292,7 @@ def candidate_reason(
     unit, subtotal, code_amount = (
         _finite(candidate.ref_unit_price), _finite(candidate.ref_subtotal), _finite(candidate.ref_discount_amount)
     )
-    automatic = automatic_total(candidate.ref_automatic_discounts)
+    automatic = automatic_total(candidate.ref_automatic_discounts, candidate.ref_currency)
     if unit is None or subtotal is None or code_amount is None or automatic is None:
         return "reference_cart_incomplete"
     effective = unit - code_amount - automatic
@@ -307,7 +320,7 @@ def _decision(candidate: DealCandidate) -> DealDecision:
         ceilings.append(_aware(candidate.ends_at))
     unit = _finite(candidate.ref_unit_price)
     code_amount = _finite(candidate.ref_discount_amount)
-    automatic = automatic_total(candidate.ref_automatic_discounts)
+    automatic = automatic_total(candidate.ref_automatic_discounts, candidate.ref_currency)
     return DealDecision(
         deal_id=candidate.deal_id,
         variant_id=candidate.variant_id,
@@ -344,8 +357,10 @@ def decide(
     now: datetime,
     *,
     require_price_match: bool,
+    unreadable_rows: int = 0,
 ) -> Tuple[Optional[DealDecision], str]:
-    """The pure decision: (decision, "ok") or (None, reason)."""
+    """The pure decision: (decision, "ok") or (None, reason). `unreadable_rows` counts rows the read
+    could not parse; they are reported as `row_unreadable`, never silently dropped."""
     now = _require_aware(now)
     for reason in (_flags_reason(switches), _lane_reason(ctx)):
         if reason:
@@ -355,7 +370,7 @@ def decide(
     if switches.seller_opted_out:
         return None, "seller_opted_out"
     passing: List[DealDecision] = []
-    rejected = set()
+    rejected = {"row_unreadable"} if unreadable_rows else set()
     for candidate in candidates:
         reason = candidate_reason(candidate, ctx, now, require_price_match=require_price_match)
         if reason is None:
@@ -416,9 +431,9 @@ def _candidate(row: Mapping[str, Any]) -> DealCandidate:
     )
 
 
-async def _read_candidates(
+async def _read_candidate_rows(
     *, seller_id: str, variant_id: str, market: str, deal_id: Optional[str] = None
-) -> List[DealCandidate]:
+) -> List[Mapping[str, Any]]:
     o, v = observed_store_offers, observed_store_offer_verifications
     conditions = [
         o.c.seller_id == seller_id,
@@ -436,7 +451,21 @@ async def _read_candidates(
         v.c.ref_unit_price, v.c.ref_subtotal, v.c.ref_discount_amount, v.c.ref_currency,
         v.c.ref_automatic_discounts,
     ).select_from(o.join(v, o.c.deal_id == v.c.deal_id)).where(and_(*conditions))
-    return [_candidate(row) for row in await database.fetch_all(query)]
+    return list(await database.fetch_all(query))
+
+
+def _parse_rows(rows: Iterable[Mapping[str, Any]]) -> Tuple[List[DealCandidate], int]:
+    """Rows as candidates, OUTSIDE the read's error handling: a row this code cannot parse (a
+    renamed column, a bad value) is counted as unreadable and logged, never a silent read failure."""
+    candidates: List[DealCandidate] = []
+    unreadable = 0
+    for row in rows:
+        try:
+            candidates.append(_candidate(row))
+        except Exception as exc:  # noqa: BLE001 - one bad row must not hide the others
+            unreadable += 1
+            logger.warning("deal decision: unreadable deal row: %s", type(exc).__name__)
+    return candidates, unreadable
 
 
 async def _stopped_or_opted_out(*, market: str, seller_id: str) -> Tuple[bool, bool]:
@@ -460,16 +489,19 @@ async def _resolve(
     market = market_registry.normalize_market(ctx.pin_country)
     try:
         stopped, opted_out = await _stopped_or_opted_out(market=market, seller_id=seller_id)
-        candidates: List[DealCandidate] = []
+        rows: List[Mapping[str, Any]] = []
         if not (stopped or opted_out):
-            candidates = await _read_candidates(
+            rows = await _read_candidate_rows(
                 seller_id=seller_id, variant_id=str(ctx.variant_id).strip(), market=market, deal_id=deal_id
             )
     except Exception as exc:  # noqa: BLE001 - a failed read is no deal, never a failed click-out
         logger.warning("deal decision: read failed, no deal emitted: %s", type(exc).__name__)
         return None, "read_failed"
+    candidates, unreadable = _parse_rows(rows)
     switches = current_switches(market_stopped=stopped, seller_opted_out=opted_out)
-    return decide(candidates, ctx, switches, now, require_price_match=require_price_match)
+    return decide(
+        candidates, ctx, switches, now, require_price_match=require_price_match, unreadable_rows=unreadable
+    )
 
 
 async def resolve_deal_decision(
@@ -502,3 +534,82 @@ async def recheck_deal_reference(
     if market_registry.normalize_market(ref["market"]) != market_registry.normalize_market(ctx.pin_country):
         return None, "reference_other_market"
     return await _resolve(ctx, now=now, require_price_match=False, deal_id=ref["deal_id"])
+
+
+# ---- the link ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DealOffer:
+    """What a mint site knows about the offer, for `_make_external_redirect_url` to resolve a deal
+    against the link it actually composes (its variant, quantity and pin)."""
+
+    # ADR-009: the seller of record, i.e. catalog_merchants.merchant_id (a connected store's own
+    # merchant id). The verifier writes the same key as observed_store_offers.seller_id.
+    seller_id: Optional[str]
+    # The market the BUYER's request named, raw (None when it named none).
+    buyer_market: Any
+    observed_unit_price: Any = None
+    observed_currency: Optional[str] = None
+
+
+_CART_PATH = re.compile(r"^/cart/(\d+):1$")
+
+
+def cart_dest_matches(dest: str, *, variant_id: str, market: str) -> bool:
+    """True when `dest` is the Shopify cart permalink for ONE unit of `variant_id`, pinned with
+    `country=` to `market` and carrying no discount yet: the only destination `/r` appends a
+    deal-lane code to. Never a product page, never a warm-handoff continue_url."""
+    try:
+        parsed = urlparse(str(dest or ""))
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.netloc:
+        return False
+    path = _CART_PATH.match(parsed.path or "")
+    if not path or path.group(1) != str(variant_id or "").strip():
+        return False
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    if "discount" in params:
+        return False
+    return params.get("country") == [market_registry.normalize_market(market)] and bool(market)
+
+
+def append_discount(dest: str, code: str) -> str:
+    """`discount=<code>` on a cart permalink, the code percent-encoded."""
+    sep = "&" if "?" in dest else "?"
+    return f"{dest}{sep}discount={quote(str(code).strip(), safe='')}"
+
+
+@dataclass(frozen=True)
+class ClickDeal:
+    dest: str
+    carried: bool
+    reason: str
+
+
+async def deal_destination_at_click(payload: Mapping[str, Any], dest: str) -> ClickDeal:
+    """`/r`'s re-check: the signed destination with `discount=` appended when the token's deal
+    reference still passes every rule, else the signed destination unchanged. Never raises."""
+    try:
+        ref = parse_deal_reference(payload.get(TOKEN_DEAL_REF_KEY))
+        if ref is None:
+            return ClickDeal(dest, False, "bad_reference")
+        pin = market_registry.normalize_market(payload.get("cart_country"))
+        if not cart_dest_matches(dest, variant_id=ref["variant_id"], market=pin):
+            return ClickDeal(dest, False, "dest_not_the_verified_cart")
+        ctx = payload.get("ctx") if isinstance(payload.get("ctx"), Mapping) else {}
+        deal_ctx = DealContext(
+            seller_id=str(ctx.get("merchant_id") or "").strip() or None,
+            variant_id=ref["variant_id"],
+            platform="shopify",  # the destination is a Shopify cart permalink (checked above)
+            quantity=1,
+            pin_country=pin,
+        )
+        decision, reason = await recheck_deal_reference(ref, deal_ctx)
+        if decision is None:
+            return ClickDeal(dest, False, reason)
+        return ClickDeal(append_discount(dest, decision.code), True, "ok")
+    except Exception as exc:  # noqa: BLE001 - the buyer always gets the signed destination
+        logger.warning("deal decision: click-time re-check failed: %s", type(exc).__name__)
+        return ClickDeal(dest, False, "recheck_failed")
