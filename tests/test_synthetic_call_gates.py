@@ -169,10 +169,19 @@ def test_on_the_invoke_route_only_the_read_operations_are_synthetic(key_owner, o
     assert res.json()["operation"] == operation, "the route still reads the body"
 
 
-def test_a_money_path_with_a_valid_assertion_writes_as_a_real_call(key_owner, caplog):
-    with caplog.at_level("WARNING", logger="middleware.synthetic_call"):
-        assert TestClient(_probe_app()).post("/agent/v2/orders", headers=_headers()).json()["synthetic"] is False
-    assert any('"reason": "op_not_allowed"' in r.getMessage() for r in caplog.records)
+def _capture(monkeypatch, level: str) -> List[str]:
+    """What utils.logger (the logger production keeps) is asked to write at this level."""
+    from utils.logger import logger as pivota_logger
+
+    lines: List[str] = []
+    monkeypatch.setattr(pivota_logger, level, lambda msg, *a, **k: lines.append(msg % a if a else msg))
+    return lines
+
+
+def test_a_money_path_with_a_valid_assertion_writes_as_a_real_call(monkeypatch, key_owner):
+    warned = _capture(monkeypatch, "warning")
+    assert TestClient(_probe_app()).post("/agent/v2/orders", headers=_headers()).json()["synthetic"] is False
+    assert any('"reason": "op_not_allowed"' in line for line in warned)
 
 
 def test_an_eval_client_registered_to_a_partner_is_never_synthetic(key_owner):
@@ -180,33 +189,68 @@ def test_an_eval_client_registered_to_a_partner_is_never_synthetic(key_owner):
     assert TestClient(_probe_app()).get(PROBE_PATH, headers=_headers()).json()["synthetic"] is False
 
 
-def test_accepted_and_rejected_lines_name_the_request_never_the_header(monkeypatch, key_owner, caplog):
-    from utils.logger import logger as pivota_logger
-
-    accepted: List[str] = []
-    monkeypatch.setattr(pivota_logger, "info", lambda msg, *a, **k: accepted.append(msg % a if a else msg))
+def test_accepted_and_rejected_lines_name_the_request_never_the_header(monkeypatch, key_owner):
+    accepted = _capture(monkeypatch, "info")
+    warned = _capture(monkeypatch, "warning")
     TestClient(_probe_app()).get(PROBE_PATH, headers=_headers())
     [line] = [x for x in accepted if x.startswith("synthetic_assertion_accepted ")]
     fields = json.loads(line.split(" ", 1)[1])
     assert fields == {
+        "verdict": "accepted",
         "gw_request_id": VECTOR["gw_request_id"],
         "synthetic_caller": VECTOR["caller"],
         "method": "GET",
         "path": PROBE_PATH,
         "op": None,
+        "body_request_id": None,
     }
 
     key_owner["agent_id"] = PARTNER_AGENT_ID
-    with caplog.at_level("WARNING", logger="middleware.synthetic_call"):
-        TestClient(_probe_app()).get(PROBE_PATH, headers=_headers())
-    [rejected] = [r.getMessage() for r in caplog.records if "synthetic_assertion_rejected" in r.getMessage()]
+    TestClient(_probe_app()).get(PROBE_PATH, headers=_headers())
+    [rejected] = [x for x in warned if x.startswith("synthetic_assertion_rejected ")]
     assert json.loads(rejected.split(" ", 1)[1]) == {
+        "verdict": "rejected:not_service_caller",
         "reason": "not_service_caller",
         "method": "GET",
         "path": PROBE_PATH,
         "op": None,
+        "body_request_id": None,
     }
     assert VECTOR["token"] not in rejected and VECTOR["token"] not in line
+
+
+@pytest.mark.parametrize(
+    "body_id, logged",
+    [("gw-body-1", "gw-body-1"), ("x" * 129, None), ("has space", None), (7, None), (None, None)],
+)
+def test_an_invoke_verdict_line_carries_the_bodys_request_id_beside_the_verified_one(monkeypatch, key_owner, body_id, logged):
+    accepted = _capture(monkeypatch, "info")
+    body = {"operation": "offers.resolve", "payload": {}}
+    if body_id is not None:
+        body["request_context"] = {"request_id": body_id}
+    res = TestClient(_probe_app()).post("/agent/shop/v1/invoke", json=body, headers=_headers())
+    assert res.json()["synthetic"] is True
+    assert res.json()["operation"] == "offers.resolve", "the route still reads the body"
+    [line] = [x for x in accepted if x.startswith("synthetic_assertion_accepted ")]
+    fields = json.loads(line.split(" ", 1)[1])
+    assert fields["gw_request_id"] == VECTOR["gw_request_id"], "the verified id, never the body's"
+    assert fields["body_request_id"] == logged
+    assert fields["op"] == "offers.resolve"
+
+
+def test_a_request_without_the_header_logs_no_verdict_and_its_body_is_not_read(monkeypatch, key_owner):
+    import middleware.synthetic_call as mw
+
+    accepted = _capture(monkeypatch, "info")
+    warned = _capture(monkeypatch, "warning")
+
+    async def must_not_read(request):
+        raise AssertionError("a request without the header must not have its body read")
+
+    monkeypatch.setattr(mw, "_invoke_fields", must_not_read)
+    res = TestClient(_probe_app()).post("/agent/shop/v1/invoke", json={"operation": "offers.resolve", "payload": {}})
+    assert res.json()["synthetic"] is False
+    assert not [x for x in accepted + warned if x.startswith("synthetic_assertion_")]
 
 
 def test_the_middleware_wraps_everything_that_writes_after_the_route():
@@ -890,7 +934,7 @@ def test_the_shop_currency_read_is_cache_only_for_a_synthetic_call(monkeypatch, 
     assert asked == ([] if is_synthetic else ["merch_x"])
 
 
-def test_with_no_secret_the_header_is_not_even_read(monkeypatch, key_owner, caplog):
+def test_with_no_secret_the_header_is_not_even_read(monkeypatch, key_owner):
     monkeypatch.delenv(sc.SYNTHETIC_ASSERTION_SECRET_ENV)
 
     async def boom(*a, **k):
@@ -899,13 +943,13 @@ def test_with_no_secret_the_header_is_not_even_read(monkeypatch, key_owner, capl
     import middleware.synthetic_call as mw
 
     monkeypatch.setattr(mw, "resolve_synthetic_call", boom)
-    monkeypatch.setattr(mw, "_invoke_operation", boom)
-    with caplog.at_level("WARNING", logger="middleware.synthetic_call"):
-        res = TestClient(_probe_app()).post(
-            "/agent/shop/v1/invoke", json={"operation": "find_products_multi", "payload": {}}, headers=_headers()
-        )
+    monkeypatch.setattr(mw, "_invoke_fields", boom)
+    lines = _capture(monkeypatch, "info") + _capture(monkeypatch, "warning")
+    res = TestClient(_probe_app()).post(
+        "/agent/shop/v1/invoke", json={"operation": "find_products_multi", "payload": {}}, headers=_headers()
+    )
     assert res.json()["synthetic"] is False and res.json()["operation"] == "find_products_multi"
-    assert not [r for r in caplog.records if "synthetic_assertion" in r.getMessage()]
+    assert not [x for x in lines if "synthetic_assertion" in x]
 
 
 @pytest.mark.parametrize(
