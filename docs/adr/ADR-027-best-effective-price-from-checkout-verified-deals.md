@@ -134,7 +134,7 @@ What one verification proves, and what it does not:
 - **Shopify, not connected, with no such relationship:** these deals stay stored and unverified until both of these are true:
   - tokenless Storefront carts are confirmed to support the cart mutations we need. Phase 0a answered this from Shopify's documentation only; it has not been tried against any store;
   - testing codes against non-connected stores with no program relationship (Q13) has been separately and explicitly approved by peng (Q2, Q10). **Testing is off until then.** The verifier refuses such hosts unless `DEAL_VERIFY_NONCONNECTED_ENABLED` (default off) is set, and the flag stays unset until that approval.
-- **Any merchant that exposes a UCP checkout (amendment 3):** a UCP `create_checkout` for one unit of the variant in the deal's market, with the code in `discounts.codes`, signed with our agent profile, and never completed. The result is read from `discounts.applied` (the code's allocation, and automatic ones marked `automatic`) and from `messages` (a rejected code). It follows the same permission rules as a Storefront cart: a connected store, a joined program (Q13), or Q2's approval for a store with no relationship. Its `verified_via` is `ucp_checkout`.
+- **Any merchant that exposes a UCP checkout (amendment 3):** a UCP `create_checkout` for one unit of the variant in the deal's market, with the code in `discounts.codes`, signed with our agent profile, and never completed. The result is read from `discounts.applied` (the code's allocation, and automatic ones marked `automatic`) and from `messages` (a rejected code). It follows the same permission rules as a Storefront cart: a connected store, a joined program (Q13), or Q2's approval for a store with no relationship. Like every reference cart, it counts against the per-host daily cap and is paced jointly with the crawl jobs (the testing policy and egress rules below). Its `verified_via` is `ucp_checkout`.
 - **Other platforms:** the deal stays stored and unverified.
 
 **Testing policy (a hard limit, enforced in code):**
@@ -286,8 +286,10 @@ Where Pivota completes the order on the merchant's checkout (ADR-028):
   - a tried code never makes a deal `checkout_verified`, and never feeds what is displayed to anyone else;
   - before checkout, no unverified or eligibility-unknown code is emitted in any form: no price, no badge, no teaser (D4, Q3 unchanged).
 - **Programs.** In a program's tracked session, only the codes Q14 allows for that program are tried. A code from the merchant's own site is never tried there, and a program that excludes coupon or deal publishers gets the session with no code (ADR-028 D3, Q12).
-- **The `/r` lanes** below (cart permalink, network link) carry codes only for offers Pivota cannot complete.
-- **Reconciliation, per lane.** A completed-lane failure signal is an order whose confirmed checkout showed the code but whose merchant order does not. Completed-lane orders are counted **separately**: they never arm or satisfy Q6's 50-order measurement gate, or the D7 stop rule, for the `/r` lanes. Each lane has its own window, gate and stop row.
+- **The `/r` lanes** (cart permalink, network link; "One decision at issue time, one re-check at click time" and Q14) carry codes only for offers Pivota cannot complete.
+- **Programs' feed codes** are tried only in that program's tracked session, never in an untracked or unattributed completion: a network can credit an order by its code alone (Q9, Q12).
+- **False savings on this lane.** A completed-lane false-savings signal is a verified effective price displayed before checkout whose code the merchant's checkout then did not apply, for that variant and market. Q6's measurement gate for this lane counts those signals.
+- **Reconciliation, per lane.** A completed-lane failure signal is also an order whose confirmed checkout showed the code but whose merchant order does not. Completed-lane orders are counted **separately**: they never arm or satisfy Q6's 50-order measurement gate, or the D7 stop rule, for the `/r` lanes. Each lane has its own window, gate and stop row.
 
 #### One decision at issue time, one re-check at click time
 
@@ -340,7 +342,7 @@ Four independent flags, all default off, each able to stop its part alone. The t
 - `DEAL_VERIFY_JOB_ENABLED`: the verifier job runs.
 
 **Stop rule (automatic).**
-- **Cadence:** a scheduled check runs **hourly**, over the last **14 days**, **per market**. A stop row stops that market only.
+- **Cadence:** a scheduled check runs **hourly**, over the last **14 days**, **per market and lane** (amendment 3). A stop row stops that market on that lane only.
 - **Rate trigger:** once the window has at least **50 reconciled orders** carrying an issued code, a rate of **2% or higher** writes a stop row. At 50 orders that is a single failure. **This hair trigger is intended**: a stop fails safe, because it only hides deals until a person looks.
 - **Absolute trigger:** **3 or more failure signals in 14 days** writes a stop row at any volume, armed or not.
 - **Before the rate trigger arms:** while the window has fewer than 50 reconciled orders, a person reviews every failure signal **weekly**. Expected volume from about 21 connected stores may keep the rate trigger unarmed for a long time; the absolute trigger and the weekly review are the guards until it arms.
@@ -544,7 +546,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - The buyer checks out in the agent front, and Pivota completes the order on the merchant's checkout (ADR-028). The buyer is sent to the merchant only when no offer for the product can be completed.
    - Deal codes therefore ride, first, the checkout Pivota completes ("The completed-checkout lane", D7). The `/r` lanes keep carrying codes for offers Pivota cannot complete.
    - Pre-verification (D3) keeps driving what is displayed before checkout, and a UCP checkout, created and never completed, is a verification route.
-   - **Exemptions recorded with this amendment** (part of ADR-028's acceptance): a code tried in the buyer's own completed order is exempt from D3's testing policy, Q2's approval and Q13's permission, within the limits in "The completed-checkout lane". An eligibility-limited code is never tried; a tried code is never evidence for anyone else; nothing unverified is emitted before checkout.
+   - **Exemptions recorded with this amendment** (part of ADR-028's acceptance): a code tried in the buyer's own completed order is exempt from D3's testing policy, Q2's approval and Q13's permission, within the limits in "The completed-checkout lane". An eligibility-limited code is never tried; a tried code is never evidence for anyone else; nothing unverified is emitted before checkout; a program's feed code is tried only in that program's tracked session.
 16. **Between lanes, a completable offer ranks first, for the same product.**
    - A completable offer ranks above click-out offers **for the same product**, even at a higher price (ADR-028 D1). This overrides Q6 between lanes.
    - Among the completable offers for that product, Q6 orders them: by the served price, and by the verified effective price only once Q6's measurement gate has opened for that lane.

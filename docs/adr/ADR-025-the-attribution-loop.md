@@ -105,6 +105,8 @@ partner has already settled to Pivota**.
 
 ### D6. The primary lane: a payment partner completes the checkout with an agentic token
 
+> **Superseded in part by ADR-028 (2026-11-02):** the primary lane is now the agent-completed checkout defined there. The payment-partner lanes below remain routes under ADR-028 D2 when they meet every rule in its D3 to D9.
+
 Most orders are expected to run through a **payment partner** (Reap today; any Visa Intelligent
 Commerce / Mastercard Agent Pay partner later). The partner completes the purchase at the merchant
 with the buyer's agentic token. Reap has **two lanes**, and they differ on links 3 and 4:

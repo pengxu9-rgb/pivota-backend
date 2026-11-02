@@ -46,14 +46,15 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
   - whether an offer carries our attribution never affects its rank (ADR-025 Q4). An offer completed without commission (D4) ranks like any other completable offer;
   - completability orders **sellers within one product** only. It never reorders products in a recommendation slate.
 - A product with no completable offer is served as today, with click-outs.
-- **Falling back at completion time.** A route that fails **before payment** (the merchant does not recognize the agent, the item is unavailable, the checkout errors) may fall back to the next completable offer for the product. That offer's own total needs **a new buyer confirmation** (D7) before anything is paid. Only when no completable offer remains is the buyer offered a click-out.
+- **Falling back at completion time.** A route that fails **before payment** (the merchant does not recognize the agent, the item is unavailable, the checkout errors) may fall back to the next completable offer for the product. Nothing MUST be paid on that offer before **a new buyer confirmation** of its own total (D7). Only when no completable offer remains is the buyer offered a click-out.
 - **A payment decline is not a fallback.** It MUST stop and return to the buyer. The credential MUST NOT be retried at another merchant: retrying one card across merchants is the card-testing pattern.
 
 ### D2. Two completion routes, chosen per merchant
 
 - **Protocol route:** the merchant's agentic checkout protocol, at the trust tier the merchant requires: UCP `complete_checkout`, ACP, and others as ADR-014 adapters. Payment goes through the protocol's payment handler.
 - **Browser route:** a headless browser, ours or a payment partner's, completes the merchant's storefront checkout, paying with the buyer's agent payment token from a card network's agent program (Visa Intelligent Commerce, Mastercard Agent Pay).
-- **Choosing a route,** per seller and market:
+  - A payment partner's runner cannot be held to Pivota's code. Pivota MUST NOT dispatch an order to a partner's browser runner unless the partner's contractual equivalents of D5 to D7 (identity, challenges, guest checkout, card data, the mandate) are recorded for that partner.
+- **Choosing a route,** per seller and market (review rule, pending owner acceptance; refines Q4):
   1. the route with the **lower buyer total** wins. Routes can differ, for example in shipping options or in which codes they accept;
   2. at an **equal buyer total**, a route that carries our authorized attribution (D3); when both do, the protocol route;
   3. when no route carries attribution, any route that completes, without commission (D4).
@@ -67,6 +68,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
   - **The session carries ADR-027 Q14's code rules for that program:**
     - only the codes Q14 allows for it (listed for our account, in date, ours or open to all publishers);
     - never a code from the merchant's own site in a program's tracked session;
+    - a program's feed code MUST be tried only in that program's tracked session, never in an untracked or unattributed completion: a network can credit an order by its code alone (ADR-027 Q9, Q12);
     - a program that excludes coupon or deal publishers gets the tracked session with no code.
 - **Protocol route.** Attribution counts only where the protocol or the network carries it to the order: an attribution field the merchant records, or a network conversion interface that accepts our click id. It is checked per merchant or program before a route is marked as carrying attribution.
 - **Agentic affiliate networks:** treated the same way. A recorded program with terms that allow agent-placed orders.
@@ -86,25 +88,27 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 ### D5. Identity, the browser route and probes
 
 - Every completion request MUST be signed with Pivota's agent identity: protocol signatures (UCP signed and token tiers) and, on the browser route, the card networks' agent recognition (Trusted Agent Protocol, Agent Pay, HTTP message signatures).
-- **When the browser route may run.** It MUST run on a merchant only when one of these holds:
+- **When the browser route may run (the run condition).** It MUST run on a merchant only when one of these holds:
   - the merchant, or its edge, **verifies** our signature (verified recognition, observed and recorded);
-  - the merchant's written permission, or a protocol that grants agent checkout.
+  - the merchant's written permission;
+  - a protocol grant that the merchant's protocol terms explicitly extend to browser completion. A protocol grant authorizes that protocol's own route; it is not permission for the browser route unless those terms explicitly cover browser completion.
 
-  Not being challenged is **not** permission.
+  Not being challenged is **not** permission. Until the owner decision on robots and terms below is made, the stricter interim rule applies.
 - **What the browser route MUST NOT do:**
   - solve a CAPTCHA, rotate addresses, or disguise its user agent or fingerprint;
-  - continue after any CAPTCHA, bot challenge, block, or 3-D Secure or other issuer step-up. It MUST stop. It MUST NOT route the challenge to a solver, to a person, or to the buyer;
+  - continue after any CAPTCHA, bot challenge or block, or any 3-D Secure or other issuer step-up raised **during the merchant's checkout**. It MUST stop. It MUST NOT route the challenge to a solver, to a person, or to the buyer. (The card program's own buyer approval of a payment, before the checkout, belongs to the enrolment and is not such a challenge.);
   - create an account, sign in, or use a buyer's password. Guest checkout only.
 - After a challenge or block, that merchant is not completable on the browser route. It is re-enabled only on **evidence**, never on elapsed time: verified recognition, or the merchant's written permission.
 - A merchant that opts out MUST NOT be completed on either route.
-- **Probes,** which establish D1's and D2's facts:
-  - background jobs only;
-  - on the crawl egress, paced jointly with every other crawl job;
-  - a per-host daily cap counted in the database;
-  - no tracking links and no payment;
-  - the opt-out denylist applies;
-  - attempts per real order are capped too.
-- **Open owner decision: robots and terms.** Storefront `robots.txt` defaults usually disallow cart and checkout paths, and store terms may restrict automated access. peng decides, before the browser route takes its first order, whether a buyer-initiated, signed agent completing that buyer's own order is treated as outside `robots.txt` (which governs crawlers), and how store terms are checked. Until then the browser route runs only under written permission or a protocol grant.
+- **Probes,** which establish D1's and D2's facts. A probe:
+  - MUST run as a background job only;
+  - MUST leave by the crawl egress, paced jointly with every other crawl job;
+  - MUST stay under a per-host daily cap counted in the database;
+  - MUST NOT follow a tracking link or make a payment;
+  - MUST NOT run on a merchant on the opt-out denylist;
+  - on the browser route, MUST run only on a merchant that meets the run condition above. Elsewhere a probe reads only the merchant's protocol profile.
+- Attempts per real order MUST be capped.
+- **Open owner decision: robots and terms.** Storefront `robots.txt` defaults usually disallow cart and checkout paths, and store terms may restrict automated access. The decision owner decides, before the browser route takes its first order, whether a buyer-initiated, signed agent completing that buyer's own order is treated as outside `robots.txt` (which governs crawlers), and how store terms are checked. **Until then, the browser route MUST run only under the merchant's written permission or a protocol grant whose terms explicitly cover browser completion (see the run condition above); verified recognition alone is not enough.**
 
 ### D6. Money and card data: non-custodial, tokens only
 
@@ -121,7 +125,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 - **Every code attempt finishes before confirmation.** Before any payment, the agent front shows what the merchant's checkout itself returned, after all code attempts (D8): the seller of record, the items, the codes and automatic discounts applied, shipping, tax, the currency and the total.
 - **The confirmation is a cart mandate** under the buyer's consent (ADR-012-agent-transaction-rail-boundary). It binds the seller of record, the items, the currency and the total.
 - Payment MUST be for **exactly** that mandate.
-- **Any change re-asks:** tax, shipping, a code applied or rejected, an item, the currency or the total. Each needs a new confirmation.
+- **Any change re-asks:** tax, shipping, a code applied or rejected, an item, the currency or the total. Payment MUST NOT proceed on any change without a new confirmation.
 - **Above the consent's spending ceiling, payment MUST stop.** That needs a new consent, not just a re-confirmation.
 - **An over-capture** (the merchant charging more than the confirmed total) is a failure. It is alerted and handled as an incident.
 - The buyer's contact and delivery details are entered in the merchant's checkout only with the buyer's explicit consent for that order.
@@ -135,7 +139,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
   - an eligibility-limited code MUST NOT be tried;
   - in a program's tracked session, only the codes D3 allows.
 - **A tried code is not evidence for anyone else.** It never makes a deal `checkout_verified`, and never feeds what is displayed to other buyers.
-- A code the checkout rejects is removed before confirmation. A code dropped after confirmation means a new confirmation (D7).
+- A code the checkout rejects is removed before confirmation. After a code is dropped following confirmation, payment MUST NOT proceed without a new confirmation (D7).
 
 ### D9. Switches and failure handling
 
