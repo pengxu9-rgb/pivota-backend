@@ -602,8 +602,31 @@ upsert "prod: load balancer 5xx" "$(promql_policy \
 # drain and Reap policies above already use 0s for the same reason: a sparse count writes no run of
 # points for a duration timer to watch.
 #
-# Every failed attempt of every job in the project now pages, ad hoc one-off jobs included; with
-# --max-retries 1 a failed scheduled run can be two incidents. The incident closes when the 300s
+# AD HOC JOBS ARE EXCLUDED; every other failed attempt pages. With 0s, a one-off that exits non-zero
+# ON PURPOSE (a GATE_CLOSED, a refused migration, an exit-3/4/5 verdict) or on a typo would page too:
+# 2026-10-03..11-02 that was 61 of 201 failed 5-minute windows, across 46 ad hoc jobs. An ad hoc job
+# is owned by whoever launched it and watched by them; nobody else can act on its failure. Excluded:
+#   .+-[0-9]+-[0-9]+  the name scripts/ops/run_oneoff_job.sh gives every job ($JOB_PREFIX-$$-$RANDOM,
+#                     e.g. oneoff-43396-3521, census-seeds-43121-1210; deploy_worker.sh's probe too).
+#                     42 jobs (one never failed in a 5-minute window), 41 windows in the 30 days.
+#   .+-20YYMMDD[hhmmss][-...]  a job named for its launch date, by hand (catalog-priority-preview-20261003,
+#                     krave-schema-256-ro-20261004-prod; in the last week also sgc-census*-2026103108...
+#                     and deal-census-adr027-20261029115547, which did not fail). 2 more jobs, 2 windows.
+#   oneoff-           run_oneoff_job.sh's default JOB_PREFIX (all 11 seen also match the suffix rule).
+#   verify-           ad hoc verification jobs (verify-lb-ck-20261027-d4d2cc3f; restore_to_cloudsql.sh's
+#                     verify-import-$$; deploy_worker.sh's verify-worker-$$-$RANDOM). 3 jobs, 3 windows
+#                     (verify-lb-ck-... is the one the suffix rule misses).
+#   eval-             eval-sql-runner, the eval-clone SQL runner, whose gates exit non-zero. 1 job, 17 windows.
+# Read back 2026-11-02 (timeSeries.list, read-only): Monitoring accepts this exact filter; of the 61
+# jobs with a failed attempt in the 30 days it keeps 15 - all 13 scheduled ones that failed - and drops
+# 46 (every one ad hoc, none with a Cloud Scheduler trigger). Two one-off names fit none of these and
+# still page (2 windows in 30 days: reap-iconic-catalog-<hash>-<digits>, relgraph-health-<hash>).
+# A NEW SCHEDULED JOB MUST NOT be named like these: ending in -<digits>-<digits>, carrying a -20YYMMDD
+# date, or starting with oneoff-, verify- or eval- would make its failures silent.
+# tests/test_monitoring_policy_snapshot.py checks every job name the infra scripts provision or
+# schedule, and the triggers live in prod on 2026-11-02, against the exclusions.
+#
+# With --max-retries 1 a failed scheduled run can be two incidents. The incident closes when the 300s
 # window rolls past the failed point (~5 minutes), so for a nightly job it is one email per failure.
 # RENOTIFY 3600s is for a job that keeps failing (reviews-invitation-send runs every minute: the
 # window never empties and the incident stays open), so one missed email is not the only page.
@@ -611,8 +634,8 @@ upsert "prod: load balancer 5xx" "$(promql_policy \
 # that is "prod: relgraph-sync has not succeeded in a day" below.
 upsert "prod: Cloud Run job failing" "$(policy \
   "prod: Cloud Run job failing" \
-  "A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled run can open two incidents, one per attempt. The incident closes about 5 minutes after the failed attempt; while a job keeps failing it stays open and repeats hourly. Read the execution's logs: \`gcloud run jobs executions list --job JOB --region us-west1\`. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
-  'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed"' \
+  "A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). Ad hoc jobs are not watched (names ending -<digits>-<digits> as scripts/ops/run_oneoff_job.sh makes them, names carrying a -20YYMMDD launch date, or names starting oneoff-, verify- or eval-): whoever launched one owns its failure. reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled run can open two incidents, one per attempt. The incident closes about 5 minutes after the failed attempt; while a job keeps failing it stays open and repeats hourly. Read the execution's logs: \`gcloud run jobs executions list --job JOB --region us-west1\`. For retailer-ingest-drain, a failure here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages that end held or failed exit 0 and page through their own retailer-ingest policies instead." \
+  'metric.type="run.googleapis.com/job/completed_task_attempt_count" AND resource.type="cloud_run_job" AND metric.label.result="failed" AND NOT resource.label.job_name = monitoring.regex.full_match(".+-[0-9]+-[0-9]+") AND NOT resource.label.job_name = monitoring.regex.full_match(".+-20[0-9]{6}([0-9]{6})?(-.+)?") AND NOT resource.label.job_name = starts_with("oneoff-") AND NOT resource.label.job_name = starts_with("verify-") AND NOT resource.label.job_name = starts_with("eval-")' \
   ALIGN_SUM REDUCE_SUM resource.label.job_name COMPARISON_GT 0 300s 0s 3600s 3600s)"
 
 # A 300s alignment covers several 60s samples; empty windows must not reset the duration timer.

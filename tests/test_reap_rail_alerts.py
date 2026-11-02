@@ -1253,6 +1253,7 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
     # project/forwarding-rule/backend labels and sets ERROR severity plus an identifying subject.
     # The other eight render byte-identically; the LB threshold and timing are unchanged.
     # 2026-11-02: re-pinned for ONE deliberate change, "Cloud Run job failing" now opens on one failed
-    # attempt (duration 0s, was 300s), renotifies hourly, and its documentation says so (relgraph-sync
-    # failed every night 2026-10-22..31 unpaged). The other eight render byte-identically to 6e0a665c...
-    assert digest == "4304029fc992993a502a90f8f61083628ac4598f8c22597e8218e7dc0933a3e7"
+    # attempt (duration 0s, was 300s), renotifies hourly, excludes ad hoc job names from its filter, and
+    # its documentation says so (relgraph-sync failed every night 2026-10-22..31 unpaged). The other eight
+    # render byte-identically to 6e0a665c...
+    assert digest == "14fca76a25f54209969327fda920a8e9dc7b5c232741f15681437629153f9973"

@@ -29,8 +29,25 @@ LB_DOC = (
 )
 
 JOB_FAILING_NAME = 'prod: Cloud Run job failing'
+JOB_FAILING_FILTER_BASE = ('metric.type="run.googleapis.com/job/completed_task_attempt_count" AND '
+                           'resource.type="cloud_run_job" AND metric.label.result="failed"')
+# Ad hoc jobs, 2026-11-02: read from the 30-day failure backtest and the launchers' naming, not guessed.
+JOB_FAILING_EXCLUSIONS = [
+    ('regex', '.+-[0-9]+-[0-9]+'),                    # scripts/ops/run_oneoff_job.sh: $JOB_PREFIX-$$-$RANDOM
+    ('regex', '.+-20[0-9]{6}([0-9]{6})?(-.+)?'),      # named for its launch date by hand
+    ('prefix', 'oneoff-'),                            # run_oneoff_job.sh's default JOB_PREFIX
+    ('prefix', 'verify-'),                            # ad hoc verification jobs
+    ('prefix', 'eval-'),                              # eval-sql-runner
+]
+JOB_FAILING_FILTER = JOB_FAILING_FILTER_BASE + ''.join(
+    f' AND NOT resource.label.job_name = monitoring.regex.full_match("{v}")' if kind == 'regex'
+    else f' AND NOT resource.label.job_name = starts_with("{v}")'
+    for kind, v in JOB_FAILING_EXCLUSIONS)
 JOB_FAILING_DOC = (
     'A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). '
+    'Ad hoc jobs are not watched (names ending -<digits>-<digits> as scripts/ops/run_oneoff_job.sh makes '
+    'them, names carrying a -20YYMMDD launch date, or names starting oneoff-, verify- or eval-): whoever '
+    'launched one owns its failure. '
     'reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is '
     'otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a '
     'page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled '
@@ -50,7 +67,7 @@ RELGRAPH_SUCCESS_QUERY = (
 
 def reviewed_policy(live):
     """Keep the historical readback intact; permit only the reviewed changes: the LB identity/severity
-    change (2026-10-27) and the job-failing duration 0s + hourly renotify (2026-11-02)."""
+    change (2026-10-27) and the job-failing duration 0s + hourly renotify + ad hoc exclusions (2026-11-02)."""
     expected = json.loads(json.dumps(live))
     if expected['displayName'] == LB_NAME:
         expected['severity'] = 'ERROR'
@@ -59,6 +76,8 @@ def reviewed_policy(live):
     if expected['displayName'] == JOB_FAILING_NAME:
         expected['documentation']['content'] = JOB_FAILING_DOC
         expected['conditions'][0]['conditionThreshold']['duration'] = '0s'
+        assert expected['conditions'][0]['conditionThreshold']['filter'] == JOB_FAILING_FILTER_BASE
+        expected['conditions'][0]['conditionThreshold']['filter'] = JOB_FAILING_FILTER
         expected['alertStrategy']['notificationChannelStrategy'] = [{
             'notificationChannelNames': expected['notificationChannels'], 'renotifyInterval': '3600s'}]
     return expected
@@ -122,15 +141,15 @@ def test_relgraph_occupancy_alert_shape_and_current_sizing():
 def test_one_failed_job_attempt_opens_an_incident():
     """2026-10-22..31: relgraph-sync failed both attempts every night and nobody was paged. A failed
     attempt is ONE sparse 5-minute point; a 300s duration asks it to hold the condition for 300s, which
-    it does only on the boundary. Duration 0s: one point opens an incident. Everything else - the
-    unscoped filter, the 300s ALIGN_SUM window, the job_name grouping, GT 0, autoclose - is unchanged."""
+    it does only on the boundary. Duration 0s: one point opens an incident. Ad hoc jobs are excluded
+    (below). Everything else - the 300s ALIGN_SUM window, the job_name grouping, GT 0, autoclose - is
+    unchanged."""
     live = next(p for p in LIVE if p['displayName'] == JOB_FAILING_NAME)
     policy = generated_policies()[JOB_FAILING_NAME]
     condition = policy['conditions'][0]['conditionThreshold']
     assert condition['duration'] == '0s'
-    assert condition == {**live['conditions'][0]['conditionThreshold'], 'duration': '0s', 'thresholdValue': 0}
-    assert condition['filter'] == ('metric.type="run.googleapis.com/job/completed_task_attempt_count" AND '
-                                   'resource.type="cloud_run_job" AND metric.label.result="failed"')
+    assert condition == {**live['conditions'][0]['conditionThreshold'], 'duration': '0s', 'thresholdValue': 0,
+                         'filter': JOB_FAILING_FILTER}
     assert condition['aggregations'] == [{'alignmentPeriod': '300s', 'perSeriesAligner': 'ALIGN_SUM',
                                           'crossSeriesReducer': 'REDUCE_SUM',
                                           'groupByFields': ['resource.label.job_name']}]
@@ -140,6 +159,61 @@ def test_one_failed_job_attempt_opens_an_incident():
         'autoClose': '3600s',
         'notificationChannelStrategy': [{'notificationChannelNames': live['notificationChannels'],
                                          'renotifyInterval': '3600s'}]}
+
+
+def _excluded(job_name):
+    return any(re.fullmatch(v, job_name) if kind == 'regex' else job_name.startswith(v)
+               for kind, v in JOB_FAILING_EXCLUSIONS)
+
+
+# Every Cloud Scheduler trigger live in pivota-prod (us-west1), read back 2026-11-02, by target job.
+LIVE_SCHEDULED_JOBS_2026_11_02 = [
+    'agent-pdp-orphan-reaper', 'audit-domainless-offer-currency', 'commerce-index-checkout-validation',
+    'commerce-index-insight-refresh', 'commerce-index-relgraph', 'commerce-index-search-index',
+    'content-canonical-election', 'derive-offer-market-currency', 'external-referral-refresh',
+    'external-seed-destination-sweep', 'external-seed-sentinel-nongrowth', 'merchant-purchasability-sweep',
+    'pdp-identity-graph-backfill', 'reap-cart-proof-enrichment', 'reap-cart-proof-mirror', 'relgraph-sync',
+    'retailer-ingest-drain', 'reviews-invitation-send', 'store-audit-commerce-probe',
+    'store-audit-commerce-reprobe-enqueue', 'store-audit-ucp-probe', 'store-audit-ucp-reprobe-enqueue',
+    'tierb-cart-link-eligibility',
+]
+
+
+def _provisioned_job_names():
+    """Every literal job name the infra scripts schedule or create."""
+    names = set()
+    for script in sorted((ROOT / 'infra/gcp').glob('*.sh')):
+        text = script.read_text()
+        names |= set(re.findall(r'^\s*sched \S+ "[^"]+" ([a-z0-9-]+)', text, re.M))
+        names |= set(re.findall(r'^\s*mk\w*job ([a-z0-9-]+) ', text, re.M))
+        names |= set(re.findall(r'^\s*[A-Z_]*JOB=([a-z][a-z0-9-]+)\s*$', text, re.M))
+    return names
+
+
+def test_ad_hoc_jobs_are_excluded_from_job_failing_and_no_scheduled_job_is():
+    """With duration 0s every failed ad hoc job would page, and some exit non-zero on purpose (a
+    GATE_CLOSED, a refused migration, an exit-3/4/5 verdict). Their owner is whoever launched them. A
+    scheduled job matching an exclusion would fail SILENTLY: the relgraph-sync outage again."""
+    condition = generated_policies()[JOB_FAILING_NAME]['conditions'][0]['conditionThreshold']
+    assert condition['filter'] == JOB_FAILING_FILTER
+    provisioned = _provisioned_job_names()
+    for required in ['relgraph-sync', 'reviews-invitation-send', 'retailer-ingest-drain',
+                     'external-seed-sentinel-nongrowth', 'merchant-purchasability-sweep',
+                     'tierb-cart-link-eligibility', 'reap-cart-proof-mirror', 'store-audit-ucp-probe']:
+        assert required in provisioned, required  # the parser still finds the scripts' jobs
+    for name in sorted(provisioned | set(LIVE_SCHEDULED_JOBS_2026_11_02)):
+        assert not _excluded(name), f'{name} is scheduled or provisioned, and the job-failing policy ignores it'
+    # The ad hoc names the 30-day backtest (2026-10-03..11-02) saw fail, one per rule, are excluded.
+    for name in ['oneoff-43396-3521', 'census-seeds-43121-1210', 'relgraph-source-probe4-64372-153',
+                 'catalog-priority-preview-20261003', 'krave-schema-256-ro-20261004-prod',
+                 'verify-lb-ck-20261027-d4d2cc3f', 'eval-sql-runner', 'sgc-census8-20261101130459']:
+        assert _excluded(name), name
+    # The launcher's naming is what the first rule is derived from.
+    launcher = (ROOT / 'scripts/ops/run_oneoff_job.sh').read_text()
+    assert 'JOB="$JOB_PREFIX-$$-$RANDOM"' in launcher and 'JOB_PREFIX="${JOB_PREFIX:-oneoff}"' in launcher
+    assert _excluded('oneoff-12345-6789') and _excluded('anything-1-2')
+    doc = generated_policies()[JOB_FAILING_NAME]['documentation']['content']
+    assert 'owns its failure' in doc
 
 
 def test_the_renotify_argument_leaves_every_other_threshold_policy_as_it_was():

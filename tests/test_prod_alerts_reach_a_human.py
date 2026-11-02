@@ -339,12 +339,19 @@ def test_the_drain_alerts_exist_and_fire_on_one_event(source) -> None:
 
 
 def test_a_drain_crash_is_still_the_job_failing_policy(source) -> None:
-    """An unexpected exception exits 1: the generic policy must not be scoped to other jobs."""
+    """An unexpected exception exits 1: the generic policy must not be scoped to other jobs. The only
+    job_name clauses allowed are EXCLUSIONS of ad hoc names (2026-11-02), and the drain is not one."""
     body = _uncommented(source)
     at = body.index('metric.type="run.googleapis.com/job/completed_task_attempt_count"')
     line = body[at: body.index("\n", at)]
     assert 'metric.label.result="failed"' in line
-    assert "job_name" not in line, "the job-failing policy is scoped; the drain would page nowhere"
+    clauses = re.findall(r"(NOT )?resource\.label\.job_name = (\w+(?:\.\w+)*)\(\"([^\"]+)\"\)", line)
+    assert line.count("job_name") == len(clauses) >= 1
+    for negated, fn, value in clauses:
+        assert negated, "the job-failing policy is scoped; the drain would page nowhere"
+        assert fn in ("starts_with", "monitoring.regex.full_match"), fn
+        assert not ("retailer-ingest-drain".startswith(value) if fn == "starts_with"
+                    else re.fullmatch(value, "retailer-ingest-drain")), value
 
 
 def test_one_failed_job_attempt_pages_a_human(source) -> None:
