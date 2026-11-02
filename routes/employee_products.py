@@ -5328,60 +5328,16 @@ def _read_offer_money_disagrees(a: Tuple[Optional[float], Optional[str]], b: Tup
     return (a[0] is not None and b[0] is not None and a[0] != b[0]) or (a[1] is not None and b[1] is not None and a[1] != b[1])
 
 
-def _reconcile_seed_variants_with_read(
-    stored: List[Dict[str, Any]],
-    read: List[Dict[str, Any]],
-    *,
-    product_amount: Optional[float],
-    product_currency: Optional[str],
-    product_availability: Optional[str],
-    census: Optional[Dict[str, Any]],
-    refused_currencies: Iterable[str] = (),
-    product_title: Optional[str] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Write what this refresh re-read into the STORED variants the builders serve.
+def _pair_stored_variants_with_read(
+    stored: List[Dict[str, Any]], read_variants: List[Dict[str, Any]], product_title: Optional[str]
+) -> Tuple[List[Optional[int]], Dict[int, int], set]:
+    """Which read offer each stored variant re-reads: the pairing of `_reconcile_seed_variants_with_read`,
+    shared with the catalogue lane's big-move guard so both judge the same pairs.
 
-    THE BUG THIS CLOSES. The refresh corrected the `price_amount`/`availability` columns and
-    stamped `snapshot.extracted_at`, but the serving builders price and stock every offer from
-    the stored variants -- which the refresh left alone. Prod 2026-09-25: eyurs Round Lab
-    sunscreen re-crawled to 17.0/in_stock, served 16.0/out-of-stock with `price_trusted: true`.
-
-    READ WHAT THE EXTRACTOR EMITS, NOT WHAT A PAGE CONTAINS. `_extract_jsonld_variants` keeps
-    the first offer per id and drops the rest, and an AggregateOffer arrives as one `offer_1`
-    at `lowPrice`; the product-level price is `offers[0]` or `lowPrice`. A first version of this
-    function guarded against duplicate ids and sibling sizes on the list it was handed, where
-    neither can appear, and rewrote a 50ml stored at 32 to the 30ml's 20 (review of #2340). The
-    extractor now marks each read variant (`price_exact`, `offer_aggregate`, `id_collided`) and
-    hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
-
-    WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
-      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`; failing any key
-        match, the offer's link, `_read_variant_link`: one read variant carries the id, no
-        other stored variant claims it, and the extractor saw no other offer under that id) to
-        an offer that is not an AggregateOffer. Its price is taken only when
-        it is that offer's own `price` (not a range bound), positive, finite, and in a
-        currency the offer itself states that matches the variant's; its stock whenever the
-        page stated one;
-      * or, when the seed stores exactly ONE variant, the product-level values the caller
-        re-read this run (`product_amount` is None unless the column price was re-read), when
-        the census shows they cannot belong to another variant: one distinct offer, or every
-        distinct offer agrees, with no range and nothing truncated.
-    No inference from a shared price: "every shade was 34 and the page says 35" does not say
-    what the other shades cost.
-
-    Returns (new variant list, report). The input list is not mutated. `not_re_read` lists
-    only variants that carry something the builders serve as a fact (a price, or an explicit
-    availability); a bare variant with neither inherits the product values and needs no read.
-    `replaced` records every field this call changed, before and after, per variant, so an
-    overwrite can be undone.
+    Returns (`claims`: per stored variant, the position of its read offer or None; `claimants`: per read
+    position, how many stored variants name it; `read_barcodes`: the ids the page states as barcodes).
     """
-    from utils.crawled_price import parse_crawled_price, decimal_hint_from_currency
-
     read_by_id: Dict[str, List[int]] = {}
-    read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
-    read_native = set().union(*(_canonical_native_variant_ids(rv) for rv in read_variants)) if read_variants else set()
-    read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
-                       for k in ("price_currency", "currency") if rv.get(k)}
     read_by_link: Dict[str, List[int]] = {}
     read_by_barcode: Dict[str, List[int]] = {}
     for pos, rv in enumerate(read_variants):
@@ -5450,6 +5406,63 @@ def _reconcile_seed_variants_with_read(
             for other in (read_by_link.get(i) or []) + (read_by_barcode.get(i) or [])
         ):
             claims[idx] = None
+    return claims, claimants, read_barcodes
+
+
+def _reconcile_seed_variants_with_read(
+    stored: List[Dict[str, Any]],
+    read: List[Dict[str, Any]],
+    *,
+    product_amount: Optional[float],
+    product_currency: Optional[str],
+    product_availability: Optional[str],
+    census: Optional[Dict[str, Any]],
+    refused_currencies: Iterable[str] = (),
+    product_title: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Write what this refresh re-read into the STORED variants the builders serve.
+
+    THE BUG THIS CLOSES. The refresh corrected the `price_amount`/`availability` columns and
+    stamped `snapshot.extracted_at`, but the serving builders price and stock every offer from
+    the stored variants -- which the refresh left alone. Prod 2026-09-25: eyurs Round Lab
+    sunscreen re-crawled to 17.0/in_stock, served 16.0/out-of-stock with `price_trusted: true`.
+
+    READ WHAT THE EXTRACTOR EMITS, NOT WHAT A PAGE CONTAINS. `_extract_jsonld_variants` keeps
+    the first offer per id and drops the rest, and an AggregateOffer arrives as one `offer_1`
+    at `lowPrice`; the product-level price is `offers[0]` or `lowPrice`. A first version of this
+    function guarded against duplicate ids and sibling sizes on the list it was handed, where
+    neither can appear, and rewrote a 50ml stored at 32 to the 30ml's 20 (review of #2340). The
+    extractor now marks each read variant (`price_exact`, `offer_aggregate`, `id_collided`) and
+    hands a `census` of the distinct offers; this function trusts nothing those do not vouch for.
+
+    WHAT COUNTS AS A RE-READ of a stored variant, and nothing else does:
+      * an UNAMBIGUOUS identifier match (see `_seed_variant_identifiers`; failing any key
+        match, the offer's link, `_read_variant_link`: one read variant carries the id, no
+        other stored variant claims it, and the extractor saw no other offer under that id) to
+        an offer that is not an AggregateOffer. Its price is taken only when
+        it is that offer's own `price` (not a range bound), positive, finite, and in a
+        currency the offer itself states that matches the variant's; its stock whenever the
+        page stated one;
+      * or, when the seed stores exactly ONE variant, the product-level values the caller
+        re-read this run (`product_amount` is None unless the column price was re-read), when
+        the census shows they cannot belong to another variant: one distinct offer, or every
+        distinct offer agrees, with no range and nothing truncated.
+    No inference from a shared price: "every shade was 34 and the page says 35" does not say
+    what the other shades cost.
+
+    Returns (new variant list, report). The input list is not mutated. `not_re_read` lists
+    only variants that carry something the builders serve as a fact (a price, or an explicit
+    availability); a bare variant with neither inherits the product values and needs no read.
+    `replaced` records every field this call changed, before and after, per variant, so an
+    overwrite can be undone.
+    """
+    from utils.crawled_price import parse_crawled_price, decimal_hint_from_currency
+
+    read_variants = [rv for rv in (read or []) if isinstance(rv, dict)] if isinstance(census, dict) else []
+    read_native = set().union(*(_canonical_native_variant_ids(rv) for rv in read_variants)) if read_variants else set()
+    read_currencies = {str(rv[k]).strip().upper() for rv in read_variants
+                       for k in ("price_currency", "currency") if rv.get(k)}
+    claims, claimants, read_barcodes = _pair_stored_variants_with_read(stored, read_variants, product_title)
 
     product_cur = (str(product_currency or "").strip().upper() or None)
     refused = {str(c).strip().upper() for c in refused_currencies or () if c}
@@ -5787,17 +5800,104 @@ def _catalogue_read_is_for(dest: Optional[str], catalogue_read: Any) -> bool:
     return bool(handle) and handle == catalogue_read.handle and crawl_politeness.host_of(str(dest or "")) == catalogue_read.host
 
 
-def _catalogue_price_move_guarded(row: Dict[str, Any], catalogue_read: Any) -> bool:
-    """Whether the catalogue's reading of this row moved any price past the lane's ratio from the stored one,
-    like for like (`services.external_seed_catalogue_refresh.catalogue_price_move_guarded`)."""
+def _served_variant_container(seed_data: Dict[str, Any]) -> Dict[str, Any]:
+    """THE LIST THE BUILDER SERVES, wherever it lives: the top-level `variants`, else `snapshot.variants`
+    (`routes/agent_api._seed_variants` and `services/external_seed_stock` fall back the same way)."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data.get("snapshot"), dict) else {}
+    if not isinstance(seed_data.get("variants"), list) and isinstance(snapshot.get("variants"), list):
+        return snapshot
+    return seed_data
+
+
+def _served_variant_list(top_level: Any, snapshot_level: Any) -> List[Dict[str, Any]]:
+    """`_served_variant_container`'s list, for a caller that holds the two lists apart (the dry run's columns)."""
+    chosen = top_level if isinstance(top_level, list) else snapshot_level if isinstance(snapshot_level, list) else []
+    return [v for v in chosen if isinstance(v, dict)]
+
+
+def catalogue_price_move_guarded(
+    stored_amount: Any,
+    stored_currency: Any,
+    stored_variants: List[Dict[str, Any]],
+    snapshot: Any,
+    *,
+    url: Any,
+    product_title: Optional[str] = None,
+    ratio_limit: Optional[float] = None,
+) -> bool:
+    """Whether the catalogue's reading of a seed moved a price past the lane's ratio, either way, from what is
+    stored (`services.external_seed_catalogue_refresh.max_price_ratio`).
+
+    Judged on the pairs the reconcile itself would write (`_pair_stored_variants_with_read`, over the list the
+    builder serves, each stored price read with the serving precedence `_seed_variant_stored_price`):
+      * the variant the catalogue priced the row with (the URL's `?variant=`, else the first in stock, as the
+        lane chooses it), against the stored variant the reconcile pairs with it, or against the row's own
+        price when none is paired;
+      * every other paired variant, against its read.
+    One past the ratio is enough. Only positive prices are compared, and only in the catalogue's currency (a
+    row or variant in another is left to the refresh, which refuses it; one naming none is compared, since the
+    refresh takes the catalogue's). A catalogue variant no stored variant pairs with is not judged: there is
+    nothing stored to move from, and the reconcile writes nothing to it either.
+    """
     from services import external_seed_catalogue_refresh as catalogue_lane
 
-    return catalogue_lane.catalogue_price_move_guarded(
+    limit = ratio_limit if ratio_limit is not None else catalogue_lane.max_price_ratio()
+    incoming_cur = str(getattr(snapshot, "price_currency", None) or "").strip().upper()
+    evidence = getattr(snapshot, "evidence", None)
+    read = [rv for rv in (evidence.get("variants") or []) if isinstance(rv, dict)] if isinstance(evidence, dict) else []
+
+    def same_currency(currency: Any) -> bool:
+        cur = str(currency or "").strip().upper()
+        return not cur or not incoming_cur or cur == incoming_cur
+
+    def positive(value: Any) -> Optional[float]:
+        amount = None if isinstance(value, bool) else _as_price(value)
+        return amount if amount is not None and amount > 0 else None
+
+    def moved(stored: Optional[float], incoming: Optional[float]) -> bool:
+        if stored is None or incoming is None:
+            return False
+        ratio = incoming / stored
+        return ratio > limit or ratio < 1.0 / limit
+
+    def stored_price_of(v: Dict[str, Any]) -> Optional[float]:
+        if not same_currency(v.get("currency") or v.get("price_currency")):
+            return None
+        return positive(_seed_variant_stored_price(v))
+
+    def read_price_of(rv: Dict[str, Any]) -> Optional[float]:
+        if not same_currency(rv.get("price_currency") or rv.get("currency")):
+            return None
+        return positive(rv.get("price_amount"))
+
+    stored = [v for v in stored_variants or [] if isinstance(v, dict)]
+    claims, claimants, _ = _pair_stored_variants_with_read(stored, read, product_title) if read else ([], {}, set())
+    # A read offer two stored variants both name is ambiguous for both: the reconcile re-reads neither.
+    paired = {pos: idx for idx, pos in enumerate(claims) if pos is not None and claimants.get(pos) == 1}
+
+    selected_id = catalogue_lane.url_variant_id(url)
+    chosen = catalogue_lane._selected(read, selected_id) if read and selected_id is not None else None
+    chosen_pos = next((pos for pos, rv in enumerate(read) if rv is chosen), None)
+    headline_in = positive(getattr(snapshot, "price_amount", None))
+    if chosen_pos is not None and chosen_pos in paired:
+        headline_stored = stored_price_of(stored[paired[chosen_pos]])
+    else:
+        headline_stored = positive(stored_amount) if same_currency(stored_currency) else None
+    if moved(headline_stored, headline_in):
+        return True
+    return any(moved(stored_price_of(stored[idx]), read_price_of(read[pos])) for pos, idx in paired.items())
+
+
+def _catalogue_price_move_guarded(row: Dict[str, Any], catalogue_read: Any) -> bool:
+    """`catalogue_price_move_guarded` for a stored row, over the list its builder serves."""
+    seed_data = _ensure_json_obj(row.get("seed_data"))
+    return catalogue_price_move_guarded(
         row.get("price_amount"),
         row.get("price_currency"),
-        _seed_variants(_ensure_json_obj(row.get("seed_data"))),
+        [v for v in (_served_variant_container(seed_data).get("variants") or []) if isinstance(v, dict)],
         getattr(catalogue_read, "snapshot", None),
         url=row.get("destination_url"),
+        product_title=row.get("title") or seed_data.get("title"),
     )
 
 
@@ -5927,6 +6027,7 @@ async def _refresh_external_seed_by_id(
                 "error": f"destination_unavailable: http {exc.status_code}",
                 "domain": report_host or None,
                 "destination_refresh": {"status": "not_observed", "reason": "not_the_served_url"},
+                **({"catalogue_fallback": catalogue_fallback} if catalogue_fallback else {}),
             }
         observation = destination_liveness.classify_destination(
             requested_url=dest,
@@ -5950,6 +6051,7 @@ async def _refresh_external_seed_by_id(
             "error": f"destination_unavailable: http {exc.status_code}",
             "domain": report_host or None,
             "destination_refresh": destination_refresh,
+            **({"catalogue_fallback": catalogue_fallback} if catalogue_fallback else {}),
         }
     except crawl_global_pacer.GlobalPaceStopped:
         # NOT AN ATTEMPT (review M1, 2026-10-17): the run's global pacer refused to send the request
@@ -5965,6 +6067,7 @@ async def _refresh_external_seed_by_id(
             "status": "degraded",
             "error": f"snapshot_failed: {str(exc)[:200]}",
             "domain": report_host or None,
+            **({"catalogue_fallback": catalogue_fallback} if catalogue_fallback else {}),
         }
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
@@ -6367,12 +6470,7 @@ async def _refresh_external_seed_by_id(
         # THE LIST THE BUILDER SERVES, wherever it lives. `routes/agent_api._seed_variants` (and
         # `services/external_seed_stock`) fall back to `snapshot.variants` when the seed has no
         # top-level list; reconciling only the top level left that list stale AND stamped fresh.
-        served_container = (
-            seed_data["snapshot"]
-            if not isinstance(seed_data.get("variants"), list)
-            and isinstance(seed_data["snapshot"].get("variants"), list)
-            else seed_data
-        )
+        served_container = _served_variant_container(seed_data)
         reconciled, variant_refresh = _reconcile_seed_variants_with_read(
             [v for v in (served_container.get("variants") or []) if isinstance(v, dict)],
             snap_variants or [],

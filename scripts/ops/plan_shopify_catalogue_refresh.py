@@ -165,7 +165,12 @@ def price_ratio_stats(ratios):
 
 def compare_seed(seed, read):
     """How the catalogue's reading of one seed compares to what it stores (the latest page read)."""
-    from routes.employee_products import _foreign_refresh_variant_currencies, _reconcile_seed_variants_with_read
+    from routes.employee_products import (
+        _foreign_refresh_variant_currencies,
+        _reconcile_seed_variants_with_read,
+        _served_variant_list,
+        catalogue_price_move_guarded,
+    )
     from services.external_offers_service import seed_variants_from_evidence
 
     snap = read.snapshot
@@ -191,10 +196,8 @@ def compare_seed(seed, read):
             out["price"] = "moved_within_10pct"
         else:
             out["price"] = "moved_over_10pct"
-    variants = _json(seed.get("variants"))
-    if not isinstance(variants, list):
-        variants = _json(seed.get("snapshot_variants"))
-    stored_variants = [v for v in (variants or []) if isinstance(v, dict)]
+    # The list the builder serves, as the job reads it (`_served_variant_container`).
+    stored_variants = _served_variant_list(_json(seed.get("variants")), _json(seed.get("snapshot_variants")))
     takes_product = out["price"] in ("agree", "none_stored") or out["price"].startswith("moved")
     # The refresh's own bar on the variants: a stored variant priced in a currency the read is not.
     refused = _foreign_refresh_variant_currencies(
@@ -213,11 +216,10 @@ def compare_seed(seed, read):
     )
     out["variants"] = "all_re_read" if not report["not_re_read_count"] else "not_all_re_read"
     out["variants_changed"] = report["changed"]
-    # The lane's own big-move guard (`catalogue_price_move_guarded`): such a seed gets its page read instead.
-    from services.external_seed_catalogue_refresh import catalogue_price_move_guarded
-
+    # The job's own big-move guard (`catalogue_price_move_guarded`): such a seed gets its page read instead.
     out["move_guarded"] = catalogue_price_move_guarded(
-        seed.get("price_amount"), seed.get("price_currency"), stored_variants, snap, url=seed.get("destination_url")
+        seed.get("price_amount"), seed.get("price_currency"), stored_variants, snap,
+        url=seed.get("destination_url"), product_title=seed.get("title"),
     )
     return out
 

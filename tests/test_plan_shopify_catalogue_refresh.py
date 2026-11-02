@@ -257,3 +257,20 @@ def test_a_host_line_counts_the_moves_the_job_would_guard_and_only_those(monkeyp
     # A wider ratio (the env) lets the same move through.
     monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, "2")
     assert mod.plan_host(HOST, catalogue, [*fresh, due], now=now)["move_guarded"] == 0
+
+
+def test_the_dry_run_guards_like_for_like_as_the_job_does():
+    """The planner judges the same pairs the job does: a column holding another variant's price than the URL names
+    is not a move; one variant alone moving past the ratio is (review r2 D13)."""
+    mod = _module()
+    from tests.test_external_seed_catalogue_refresh import V15, V50
+
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = seed["seed_data"]["variants"]
+    on_15 = {**seed, "destination_url": f"{seed['destination_url']}?variant={V15}"}  # the column holds the 50 mL's 80
+    assert mod.compare_seed(on_15, _seed_read(_product(p50="85.00", p15="34.00"), url=on_15["destination_url"]))["move_guarded"] is False
+    assert mod.compare_seed(seed, _seed_read(_product(p50="85.00", p15="80.00")))["move_guarded"] is True
+    # A seed serving its snapshot's list is judged on that list.
+    snap_only = {**seed, "variants": None, "snapshot_variants": seed["seed_data"]["variants"]}
+    assert mod.compare_seed(snap_only, _seed_read(_product(p50="85.00", p15="80.00")))["move_guarded"] is True
+    assert {V50, V15} <= {v["variant_id"] for v in seed["variants"]}
