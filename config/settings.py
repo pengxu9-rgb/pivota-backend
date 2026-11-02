@@ -571,6 +571,39 @@ class Settings(BaseSettings):
         os.getenv("OUTBOUND_WARM_HANDOFF_TIMEOUT_SECONDS", "2.5") or "2.5"
     )
 
+    # ---- Deal lane (docs/adr/ADR-027-best-effective-price-from-checkout-verified-deals.md) ----
+    # Checkout-verified deals: storage in db/deal_lane.py. Every flag is DEFAULT OFF and each stops its
+    # own part alone. Nothing reads them yet. (BaseSettings also parses the env var by field name, so
+    # any pydantic truthy value turns a flag on, not only "true".)
+    # D7 kill switches. A stop row for a market acts as if the first three were off there.
+    deal_lane_emit_enabled: bool = (
+        os.getenv("DEAL_LANE_EMIT_ENABLED", "false").strip().lower() == "true"
+    )
+    deal_lane_ranking_enabled: bool = (
+        os.getenv("DEAL_LANE_RANKING_ENABLED", "false").strip().lower() == "true"
+    )
+    # `/r` appends `discount=` (or, on the network lane, switches to the coded link).
+    deal_lane_discount_param_enabled: bool = (
+        os.getenv("DEAL_LANE_DISCOUNT_PARAM_ENABLED", "false").strip().lower() == "true"
+    )
+    deal_verify_job_enabled: bool = (
+        os.getenv("DEAL_VERIFY_JOB_ENABLED", "false").strip().lower() == "true"
+    )
+    # D3 testing scope. Non-connected stores with no program relationship: off until Q2's separate
+    # approval. Joined programs' feed codes: off until Q13's permission rows exist (Phase 2).
+    deal_verify_nonconnected_enabled: bool = (
+        os.getenv("DEAL_VERIFY_NONCONNECTED_ENABLED", "false").strip().lower() == "true"
+    )
+    deal_verify_program_enabled: bool = (
+        os.getenv("DEAL_VERIFY_PROGRAM_ENABLED", "false").strip().lower() == "true"
+    )
+    # D3 hard limits: reference carts per host per UTC day (counted in deal_verify_host_daily_carts),
+    # and the ceiling on a verification's life.
+    deal_verify_max_carts_per_host_per_day: int = int(
+        os.getenv("DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY", "20") or "20"
+    )
+    deal_verify_ttl_hours: int = int(os.getenv("DEAL_VERIFY_TTL_HOURS", "24") or "24")
+
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
     # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.

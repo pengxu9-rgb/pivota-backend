@@ -46,6 +46,7 @@ import db.canonical_commerce  # noqa: F401  (register canonical commerce tables 
 import db.commerce_interactions  # noqa: F401  (register canonical interaction ledger tables in metadata)
 import db.merchant_collector_tokens  # noqa: F401  (register collector token registry tables in metadata)
 import db.commerce_attribution  # noqa: F401  (register commerce attribution tables in metadata)
+import db.deal_lane  # noqa: F401  (register the deal lane's tables in metadata; ADR-027, nothing reads them yet)
 import db.agent_share  # noqa: F401  (register agent share rate + ledger tables in metadata)
 import db.agent_oauth_clients  # noqa: F401  (register the provisioned OAuth client -> agent table in metadata)
 import db.gmv_invoice_credits  # noqa: F401  (register the GMV invoice credit table in metadata)
