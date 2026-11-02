@@ -29,6 +29,7 @@ from services.outbound_links_service import (
     token_is_synthetic,
 )
 from config.settings import settings
+from services.deal_lane_decision import TOKEN_DEAL_REF_KEY, deal_destination_at_click
 from services.outbound_warm_handoff import (
     evaluate_warm_eligibility,
     memo_get,
@@ -189,6 +190,19 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     if token_is_synthetic(payload):
         return RedirectResponse(url=dest, status_code=302)
 
+    # ADR-027 D7: a deal-lane code travels ONLY on this hop. The token signs a deal reference, never
+    # the code; `/r` re-checks it now (flags, stop row, opt-out, verification, TTL) and appends
+    # `discount=` only to the verified variant's pinned cart. Expired and synthetic tokens returned
+    # above with their signed `dest`, which never holds a code. What happened is recorded on the
+    # click row (`discount_carried`) and why on its context (`deal_reason`).
+    if TOKEN_DEAL_REF_KEY in payload:
+        click_deal = await deal_destination_at_click(payload, dest)
+        dest = click_deal.dest
+        payload["discount_carried"] = click_deal.carried
+        deal_ctx = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
+        deal_ctx["deal_reason"] = click_deal.reason
+        payload["ctx"] = deal_ctx
+
     # Warm-handoff click lane (Pivota_Warm_Handoff_Click_Lane_Spec_2026-07-22.md; flag-gated,
     # DEFAULT OFF — flag off is byte-identical to the cold redirect below). An eligible cold
     # brand redirect is upgraded at click time to a PRE-BUILT cart on the brand's own Shopify
@@ -216,7 +230,8 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
     # widening and still inside their 7-day TTL — that tail is not closed. See
     # docs/runbooks/outbound_warm_handoff_rollout.md.
     warm_redirect_url: Optional[str] = None
-    if settings.outbound_warm_handoff_enabled:
+    # Never on a carried code: a warm continue_url would replace the cart the code rides on.
+    if settings.outbound_warm_handoff_enabled and not payload.get("discount_carried"):
         # The WHOLE lane is throw-guarded: an unexpected error anywhere in eligibility,
         # memo, or resolve must degrade to the cold redirect — never a 500 on a real click.
         try:

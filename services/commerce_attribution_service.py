@@ -73,7 +73,7 @@ def new_click_id() -> str:
 _CLICK_COLUMN_MAX = {
     "click_id": 64, "merchant_id": 50, "surface": 64, "commerce_surface": 64,
     "canonical_product_id": 64, "canonical_variant_id": 64, "source_channel": 128,
-    "agent_id": 64, "dest_domain": 256,
+    "agent_id": 64, "dest_domain": 256, "discount_code": 255,
 }
 
 #: What traffic taxonomy writes when it has no agent. Stored as NULL here: the funnel reads
@@ -101,6 +101,9 @@ class IssuedClick:
     #: The link that carries this click, as handed to the caller. NOT stored: a lane that mints
     #: before it decides what to serve uses it to record only the clicks it actually served.
     link: Optional[str] = None
+    #: ADR-027: the deal-lane code this link may carry. `/r` appends it only if its click-time
+    #: re-check passes, and records whether it did (discount_carried). Never a buyer-typed code.
+    discount_code: Optional[str] = None
 
 
 def _fits(column: str, value: Any) -> Optional[str]:
@@ -141,6 +144,7 @@ def _issued_row(click: IssuedClick, now: datetime) -> Optional[Dict[str, Any]]:
         "destination_url": str(click.destination_url or "").strip() or None,
         "dest_domain": _fits("dest_domain", click.dest_domain),
         "context": dict(click.context) if click.context else None,
+        "discount_code": _fits("discount_code", click.discount_code),
         "impression_count": 0,
         "click_count": 0,
         "issued_at": now,
@@ -477,6 +481,14 @@ async def record_surface_event(
     fill["user_agent"] = common_values["user_agent"]
     fill["ip"] = common_values["ip"]
     fill["updated_at"] = now
+    # ADR-027 D7: `/r` says whether it appended the deal-lane code on THIS click. Once any click
+    # carried it, the row stays TRUE (an order may carry the code); FALSE only fills a gap.
+    if event_type == "click" and isinstance(token_payload.get("discount_carried"), bool):
+        fill["discount_carried"] = (
+            True
+            if token_payload["discount_carried"]
+            else func.coalesce(surface_click_events.c.discount_carried, False)
+        )
     await database.execute(
         surface_click_events.update().where(surface_click_events.c.click_id == click_id).values(**fill)
     )

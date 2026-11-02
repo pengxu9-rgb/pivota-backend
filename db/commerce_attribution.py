@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Index,
@@ -52,6 +53,12 @@ surface_click_events = Table(
     # Migration 239 (ADR-025 D1): when the click id was ISSUED to an agent. NULL = a legacy row
     # first written by `/r` at click time. Written only by commerce_attribution_service.issue_clicks.
     Column("issued_at", DateTime(timezone=True), nullable=True),
+    # Migration 276 (ADR-027 D6/D7), HAND-APPLIED: prod has these only because 276 was applied
+    # before this Table named them. discount_code is the deal-lane code the issued link may carry
+    # (issue_clicks); discount_carried is whether `/r` appended it (TRUE once any click carried it,
+    # FALSE when every click dropped it, NULL when never followed). Only TRUE can be a failure signal.
+    Column("discount_code", String(255), nullable=True),
+    Column("discount_carried", Boolean, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False),
 )
