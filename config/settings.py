@@ -64,6 +64,20 @@ def resolve_public_api_base_url() -> str:
             return normalized
     return DEFAULT_PUBLIC_API_BASE_URL
 
+def _deal_flag(name: str) -> bool:
+    """A deal-lane flag (ADR-027): on only for "true", any case. Everything else, garbage included, is off."""
+    return (os.getenv(name) or "").strip().lower() == "true"
+
+
+def _deal_int(name: str, *, default: int, low: int, high: int) -> int:
+    """A deal-lane limit: `default` unless the env holds an integer within [low, high]."""
+    try:
+        value = int((os.getenv(name) or "").strip())
+    except ValueError:
+        return default
+    return value if low <= value <= high else default
+
+
 class Settings(BaseSettings):
     """Application settings"""
     
@@ -570,6 +584,50 @@ class Settings(BaseSettings):
     outbound_warm_handoff_timeout_seconds: float = float(
         os.getenv("OUTBOUND_WARM_HANDOFF_TIMEOUT_SECONDS", "2.5") or "2.5"
     )
+
+    # ---- Deal lane (docs/adr/ADR-027-best-effective-price-from-checkout-verified-deals.md) ----
+    # Checkout-verified deals: storage in db/deal_lane.py. Every flag is DEFAULT OFF and each stops its
+    # own part alone. Nothing reads them yet. These are properties, not fields, so BaseSettings never
+    # parses them: a value it would reject would otherwise fail Settings() at import and take down web
+    # and every job. Only "true" (any case) turns a flag on; anything else is off. A limit that is not
+    # an integer, or is outside its bounds, falls back to its default.
+    # D7 kill switches. A stop row for a market acts as if the first three were off there.
+    @property
+    def deal_lane_emit_enabled(self) -> bool:
+        return _deal_flag("DEAL_LANE_EMIT_ENABLED")
+
+    @property
+    def deal_lane_ranking_enabled(self) -> bool:
+        return _deal_flag("DEAL_LANE_RANKING_ENABLED")
+
+    # `/r` appends `discount=` (or, on the network lane, switches to the coded link).
+    @property
+    def deal_lane_discount_param_enabled(self) -> bool:
+        return _deal_flag("DEAL_LANE_DISCOUNT_PARAM_ENABLED")
+
+    @property
+    def deal_verify_job_enabled(self) -> bool:
+        return _deal_flag("DEAL_VERIFY_JOB_ENABLED")
+
+    # D3 testing scope. Non-connected stores with no program relationship: off until Q2's separate
+    # approval. Joined programs' feed codes: off until Q13's permission rows exist (Phase 2).
+    @property
+    def deal_verify_nonconnected_enabled(self) -> bool:
+        return _deal_flag("DEAL_VERIFY_NONCONNECTED_ENABLED")
+
+    @property
+    def deal_verify_program_enabled(self) -> bool:
+        return _deal_flag("DEAL_VERIFY_PROGRAM_ENABLED")
+
+    # D3 hard limits: reference carts per host per UTC day (counted in deal_verify_host_daily_carts),
+    # and the life of a verification, whose 24h is a ceiling, never a promise.
+    @property
+    def deal_verify_max_carts_per_host_per_day(self) -> int:
+        return _deal_int("DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY", default=20, low=1, high=100)
+
+    @property
+    def deal_verify_ttl_hours(self) -> int:
+        return _deal_int("DEAL_VERIFY_TTL_HOURS", default=24, low=1, high=24)
 
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an

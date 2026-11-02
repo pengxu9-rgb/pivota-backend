@@ -1,0 +1,28 @@
+-- HAND-APPLIED ONLY (the *.sql.disabled suffix is load-bearing). Prod deploys do NOT run startup
+-- migrations (main.startup() returns early in fast mode, SKIP_HEAVY_STARTUP_INIT='true'), so no deploy
+-- applies this file; the suffix also keeps it out of the boot runner wherever the full startup runs.
+--
+-- RUNBOOK (out of band, one-off job, controller slot): apply in staging and prod BEFORE the PR that adds
+-- these columns to db/commerce_attribution.surface_click_events merges. That PR is the first reader and
+-- writer (`issue_click` writes discount_code, `/r` fills discount_carried); until then nothing names them.
+--   * ADD COLUMN without a default is a catalogue-only change, but it takes ACCESS EXCLUSIVE on the
+--     table for that instant, and `/r` writes this table on every click. Queued behind a long reader it
+--     would block every write behind it. The file bounds that wait itself (SET LOCAL lock_timeout below),
+--     so run its statements in ONE transaction (db.sql_migrations.split_statements; on autocommit SET
+--     LOCAL is a no-op) and retry the whole file on a lock timeout.
+--   * No backfill. NULL is the right value for every existing row: no link carried a deal-lane code.
+--
+-- 276: the deal-lane code on the click row (ADR-027 D6, D7).
+--   discount_code     the deal-lane code the issued link may carry, written by issue_click at issue time.
+--                     NULL = the link carries no deal-lane code. A code a buyer typed is never stored here.
+--   discount_carried  filled by `/r` on the same row when the link is followed: TRUE when `/r` appended
+--                     the code (or served the coded network link), FALSE when its click-time re-check
+--                     dropped it. NULL = never followed, or followed on an expired token (not logged).
+--                     Only TRUE rows can produce a failure signal (D7 reconciliation).
+-- schema-guard-exempt: no backend code names these columns until they are applied by hand; the PR that adds them to the Table follows the apply, and is kept off the self-heal so no boot path races ACCESS EXCLUSIVE on a table /r writes on every click.
+
+SET LOCAL lock_timeout = '3s';
+
+ALTER TABLE surface_click_events
+  ADD COLUMN IF NOT EXISTS discount_code VARCHAR(255),
+  ADD COLUMN IF NOT EXISTS discount_carried BOOLEAN;
