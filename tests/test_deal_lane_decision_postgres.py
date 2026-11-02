@@ -72,7 +72,7 @@ def _ctx(**overrides):
     return DealContext(**base)
 
 
-async def _seed(db, deal_id="dlr_a", code="GLOW10", discount="4.00", state="checkout_verified"):
+async def _seed(db, deal_id="dlr_a", code="GLOW10", discount="4.00", state="checkout_verified", unit="40.00"):
     from db.deal_lane import observed_store_offer_key
 
     now = datetime.now(timezone.utc)
@@ -96,8 +96,9 @@ async def _seed(db, deal_id="dlr_a", code="GLOW10", discount="4.00", state="chec
         """
         INSERT INTO observed_store_offer_verifications
           (deal_id, variant_id, state, verified_at, expires_at, verified_via, authorized_by,
-           ref_unit_price, ref_subtotal, ref_discount_amount, ref_currency)
-        VALUES (:deal_id, '4401', :state, :verified_at, :expires_at, :via, :auth, 40.00, 40.00, :discount, 'USD')
+           ref_unit_price, ref_subtotal, ref_discount_amount, ref_currency, ref_automatic_discounts)
+        VALUES (:deal_id, '4401', :state, :verified_at, :expires_at, :via, :auth, CAST(:unit AS NUMERIC), 40.00,
+                CAST(:discount AS NUMERIC), 'USD', '[]'::jsonb)
         """,
         {
             "deal_id": deal_id,
@@ -106,7 +107,8 @@ async def _seed(db, deal_id="dlr_a", code="GLOW10", discount="4.00", state="chec
             "expires_at": now + timedelta(hours=23) if verified else None,
             "via": "shopify_storefront_connected" if verified else None,
             "auth": "connected" if verified else None,
-            "discount": Decimal(discount),
+            "discount": discount,
+            "unit": unit,
         },
     )
 
@@ -156,3 +158,19 @@ async def test_a_verification_set_back_to_unverified_drops_the_code_at_click_tim
         "UPDATE observed_store_offer_verifications SET state = 'unverified' WHERE deal_id = 'dlr_a'"
     )
     assert await recheck_deal_reference(REF, click_ctx) == (None, "no_deal")
+
+
+async def test_a_nan_amount_postgres_stores_is_refused_and_never_hides_a_good_deal(db):
+    """NUMERIC stores 'NaN', and 'NaN' > 0 is true in Postgres, so the verified-is-complete CHECK
+    lets it in. The decision must refuse it without raising."""
+    from services.deal_lane_decision import recheck_deal_reference, resolve_deal_decision
+
+    await _seed(db)
+    await _seed(db, "dlr_nan", code="NANCODE", discount="NaN")
+    await _seed(db, "dlr_nan_unit", code="NANUNIT", unit="NaN")
+    decision, reason = await resolve_deal_decision(_ctx())
+    assert (reason, decision.deal_id) == ("ok", "dlr_a")
+    click_ctx = _ctx(observed_unit_price=None, observed_currency=None)
+    for deal_id in ("dlr_nan", "dlr_nan_unit"):
+        ref = {"deal_id": deal_id, "variant_id": "4401", "market": "US"}
+        assert await recheck_deal_reference(ref, click_ctx) == (None, "no_emittable_deal:reference_cart_incomplete")

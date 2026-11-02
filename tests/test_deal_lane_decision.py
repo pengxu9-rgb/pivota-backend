@@ -44,6 +44,7 @@ def _candidate(**overrides) -> dld.DealCandidate:
         ref_subtotal=Decimal("40.00"),
         ref_discount_amount=Decimal("4.00"),
         ref_currency="USD",
+        ref_automatic_discounts=[],
     )
     base.update(overrides)
     return dld.DealCandidate(**base)
@@ -80,9 +81,10 @@ def test_a_verified_published_code_rides_a_pinned_one_unit_cart():
     decision, reason = _decide()
     assert reason == "ok"
     assert (decision.deal_id, decision.variant_id, decision.market, decision.code) == ("deal_a", "4401", "US", "GLOW10")
-    assert (decision.estimated_effective_price, decision.discount_amount, decision.currency) == (
-        Decimal("36.00"), Decimal("4.00"), "USD",
+    assert (decision.estimated_effective_price, decision.discount_amount, decision.automatic_amount) == (
+        Decimal("36.00"), Decimal("4.00"), Decimal("0"),
     )
+    assert (decision.currency, decision.ref_unit_price) == ("USD", Decimal("40.00"))
     assert decision.valid_until == NOW + timedelta(hours=22)
     assert (decision.basis, decision.lane) == ("checkout_verified", "shopify_cart_permalink")
 
@@ -98,14 +100,98 @@ def test_a_deal_that_ends_before_its_verification_expires_is_valid_until_it_ends
     assert decision.valid_until == NOW + timedelta(hours=3)
 
 
-def test_the_largest_verified_allocation_wins_and_ties_break_by_deal_id():
-    small = _candidate(deal_id="deal_b", code="FIVE", ref_discount_amount=Decimal("2"))
-    big = _candidate(deal_id="deal_c", code="TEN", ref_discount_amount=Decimal("4"))
-    twin = _candidate(deal_id="deal_a", code="TENTOO", ref_discount_amount=Decimal("4"))
-    decision, _ = _decide([small, big, twin])
-    assert decision.deal_id == "deal_a"
-    decision, _ = _decide([small, big])
-    assert decision.code == "TEN"
+def test_the_lowest_effective_price_wins_before_the_larger_code():
+    # A smaller code on a variant whose automatic discount still applies is the cheaper buyer price.
+    small_code = _candidate(deal_id="deal_b", code="FIVE", ref_discount_amount=Decimal("2"),
+                            ref_automatic_discounts=[{"title": "Autumn", "amount": "6"}], ref_subtotal=Decimal("34"))
+    big_code = _candidate(deal_id="deal_a", code="TEN", ref_discount_amount=Decimal("4"))
+    decision, _ = _decide([big_code, small_code])
+    assert (decision.code, decision.estimated_effective_price) == ("FIVE", Decimal("32"))
+
+
+def test_at_equal_price_the_larger_code_then_the_later_expiry_then_the_fresher_check_win():
+    automatic = [{"title": "Autumn", "amount": "2"}]
+    smaller_code = _candidate(deal_id="deal_a", code="TWO", ref_discount_amount=Decimal("2"),
+                              ref_automatic_discounts=automatic)
+    larger_code = _candidate(deal_id="deal_z", code="FOUR")
+    assert _decide([smaller_code, larger_code])[0].code == "FOUR"
+    early = _candidate(deal_id="deal_a", code="EARLY", expires_at=NOW + timedelta(hours=5))
+    late = _candidate(deal_id="deal_z", code="LATE", expires_at=NOW + timedelta(hours=6))
+    assert _decide([early, late])[0].code == "LATE"
+    stale = _candidate(deal_id="deal_a", code="STALE", verified_at=NOW - timedelta(hours=3),
+                       expires_at=NOW + timedelta(hours=6))
+    fresh = _candidate(deal_id="deal_z", code="FRESH", verified_at=NOW - timedelta(hours=1),
+                       expires_at=NOW + timedelta(hours=6))
+    assert _decide([stale, fresh])[0].code == "FRESH"
+    twin_a, twin_b = _candidate(deal_id="deal_b", code="B"), _candidate(deal_id="deal_a", code="A")
+    assert _decide([twin_a, twin_b])[0].deal_id == "deal_a"
+
+
+# ---- the effective price (D4) ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("subtotal", ["40.00", "36.00"])
+def test_the_effective_price_is_the_unit_price_less_every_allocation_whatever_the_subtotal(subtotal):
+    # Whether the platform's subtotal already includes the allocation must not change the answer.
+    decision, _ = _decide([_candidate(ref_subtotal=Decimal(subtotal))])
+    assert decision.estimated_effective_price == Decimal("36.00")
+
+
+def test_automatic_allocations_are_part_of_the_price_never_the_codes_saving():
+    candidate = _candidate(ref_automatic_discounts=[{"title": "Autumn", "amount": "2.00"}], ref_subtotal=Decimal("38"))
+    decision, _ = _decide([candidate])
+    assert (decision.estimated_effective_price, decision.discount_amount, decision.automatic_amount) == (
+        Decimal("34.00"), Decimal("4.00"), Decimal("2.00"),
+    )
+
+
+@pytest.mark.parametrize("subtotal", ["5", "35.99", "40.01", "100"])
+def test_a_subtotal_outside_effective_to_unit_is_not_a_one_unit_cart(subtotal):
+    assert _decide([_candidate(ref_subtotal=Decimal(subtotal))]) == (
+        None, "no_emittable_deal:reference_cart_inconsistent",
+    )
+
+
+@pytest.mark.parametrize(
+    "automatic",
+    [None, "[]", [5], [{"title": "x"}], [{"amount": "NaN"}], [{"amount": "-1"}], [{"amount": "Infinity"}]],
+)
+def test_an_unreadable_automatic_list_is_refused(automatic):
+    assert _decide([_candidate(ref_automatic_discounts=automatic)]) == (
+        None, "no_emittable_deal:reference_cart_incomplete",
+    )
+
+
+@pytest.mark.parametrize("column", ["ref_unit_price", "ref_subtotal", "ref_discount_amount"])
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity")])
+def test_a_non_finite_amount_is_refused_and_never_raises(column, value):
+    assert _decide([_candidate(**{column: value})]) == (None, "no_emittable_deal:reference_cart_incomplete")
+    # And it never hides a good deal for the same variant.
+    decision, reason = _decide([_candidate(deal_id="deal_bad", **{column: value}), _candidate()])
+    assert (reason, decision.deal_id) == ("ok", "deal_a")
+
+
+def test_a_non_finite_observed_price_is_not_a_price():
+    assert _decide(ctx=_ctx(observed_unit_price=Decimal("NaN"))) == (None, "no_emittable_deal:price_unobserved")
+
+
+# ---- the TTL ceiling (D3) -------------------------------------------------------------------------
+
+
+def test_a_stored_expiry_cannot_outlive_the_ttl(monkeypatch):
+    monkeypatch.delenv("DEAL_VERIFY_TTL_HOURS", raising=False)
+    old = _candidate(verified_at=NOW - timedelta(days=30), expires_at=NOW + timedelta(hours=1))
+    assert _decide([old]) == (None, "no_emittable_deal:verification_past_ttl")
+    long_lived = _candidate(verified_at=NOW - timedelta(hours=2), expires_at=NOW + timedelta(hours=30))
+    assert _decide([long_lived])[0].valid_until == NOW + timedelta(hours=22)
+
+
+def test_lowering_the_ttl_reaches_rows_already_stored(monkeypatch):
+    assert _decide()[1] == "ok"  # verified 2h ago
+    monkeypatch.setenv("DEAL_VERIFY_TTL_HOURS", "1")
+    assert _decide() == (None, "no_emittable_deal:verification_past_ttl")
+    monkeypatch.setenv("DEAL_VERIFY_TTL_HOURS", "3")
+    assert _decide()[0].valid_until == NOW + timedelta(hours=1)
 
 
 # ---- every rule, one at a time --------------------------------------------------------------------
@@ -137,6 +223,9 @@ def test_switches(switches, reason):
         # No pin = the market was defaulted, not declared (`_cart_country_pin`).
         (dict(pin_country=None), "market_not_pinned"),
         (dict(pin_country="ZZ"), "market_not_pinned"),
+        # Listed but not served by the registry (acquisition-only today).
+        (dict(pin_country="AU"), "market_not_served"),
+        (dict(pin_country="JP"), "market_not_served"),
     ],
 )
 def test_the_link_must_be_a_pinned_one_unit_shopify_cart(ctx, reason):
@@ -169,16 +258,39 @@ def test_the_link_must_be_a_pinned_one_unit_shopify_cart(ctx, reason):
         (dict(starts_at=NOW + timedelta(minutes=1)), "not_started"),
         (dict(ends_at=NOW), "ended"),
         (dict(ref_currency="SGD"), "currency_not_market"),
+        (dict(ref_currency="SGD", currency=None), "currency_not_market"),  # the registry's currency
+        (dict(ref_currency="SGD", currency="SGD"), "currency_not_market"),
         (dict(ref_currency=None), "currency_not_market"),
         (dict(currency="EUR"), "currency_not_market"),
         (dict(ref_discount_amount=Decimal("0")), "reference_cart_incomplete"),
         (dict(ref_discount_amount=Decimal("40.00")), "reference_cart_incomplete"),  # nothing left to pay
         (dict(ref_subtotal=None), "reference_cart_incomplete"),
         (dict(ref_unit_price=None), "reference_cart_incomplete"),
+        (dict(ref_discount_amount=Decimal("-1")), "reference_cart_incomplete"),
     ],
 )
 def test_a_deal_that_breaks_one_rule_is_not_emitted(overrides, reason):
     assert _decide([_candidate(**overrides)]) == (None, f"no_emittable_deal:{reason}")
+
+
+def test_the_boundaries_are_inclusive_at_the_start():
+    assert _decide([_candidate(verified_at=NOW, expires_at=NOW + timedelta(hours=1))])[1] == "ok"
+    assert _decide([_candidate(starts_at=NOW)])[1] == "ok"
+
+
+def test_the_row_market_is_compared_normalised():
+    assert _decide([_candidate(market=" us ")])[0].market == "US"
+
+
+def test_a_served_market_other_than_us_uses_its_own_currency():
+    ctx = _ctx(pin_country="SG", observed_currency="SGD")
+    decision, reason = _decide([_candidate(market="SG", currency="SGD", ref_currency="SGD")], ctx=ctx)
+    assert (reason, decision.currency) == ("ok", "SGD")
+
+
+def test_a_naive_now_from_a_caller_is_refused():
+    with pytest.raises(ValueError):
+        dld.decide([_candidate()], _ctx(), ON, NOW.replace(tzinfo=None), require_price_match=True)
 
 
 def test_naive_timestamps_from_the_database_are_utc():
@@ -194,7 +306,7 @@ def test_naive_timestamps_from_the_database_are_utc():
         (dict(observed_currency=None), "price_unobserved"),
         (dict(observed_unit_price=Decimal("39.99")), "price_changed"),
         (dict(observed_currency="SGD"), "price_changed"),
-        (dict(observed_unit_price="garbage"), "price_changed"),
+        (dict(observed_unit_price="garbage"), "price_unobserved"),
     ],
 )
 def test_at_issue_time_the_observed_price_must_equal_the_reference_cart(ctx, reason):
@@ -288,7 +400,7 @@ async def _seed(database, deal_id="deal_a", *, code="GLOW10", discount="4.00", *
         expires_at=datetime.now(timezone.utc) + timedelta(hours=23),
         verified_via="shopify_storefront_connected", authorized_by="connected",
         ref_unit_price=Decimal("40.00"), ref_subtotal=Decimal("40.00"),
-        ref_discount_amount=Decimal(discount), ref_currency="USD",
+        ref_discount_amount=Decimal(discount), ref_currency="USD", ref_automatic_discounts=[],
     )
     row.update(verification)
     await database.execute(observed_store_offer_verifications.insert().values(**row))
@@ -299,6 +411,34 @@ async def test_resolve_reads_the_verified_deal(db):
     await _seed(db, "deal_b", code="FIVE", discount="2.00")
     decision, reason = await dld.resolve_deal_decision(_ctx())
     assert (reason, decision.code, decision.estimated_effective_price) == ("ok", "GLOW10", Decimal("36.00"))
+
+
+async def test_resolve_refuses_a_price_that_moved_since_the_reference_cart(db):
+    await _seed(db)
+    assert await dld.resolve_deal_decision(_ctx(observed_unit_price=Decimal("41"))) == (
+        None, "no_emittable_deal:price_changed",
+    )
+    assert await dld.resolve_deal_decision(_ctx(observed_unit_price=None)) == (
+        None, "no_emittable_deal:price_unobserved",
+    )
+
+
+@pytest.mark.parametrize("which", ["fetch_one", "fetch_all"])
+async def test_a_failed_read_is_no_deal_never_an_exception(db, monkeypatch, which):
+    await _seed(db)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr(dld.database, which, _boom)
+    assert await dld.resolve_deal_decision(_ctx()) == (None, "read_failed")
+    ref = {"deal_id": "deal_a", "variant_id": "4401", "market": "US"}
+    assert await dld.recheck_deal_reference(ref, _ctx()) == (None, "read_failed")
+
+
+async def test_a_naive_now_is_refused_before_any_read(db):
+    with pytest.raises(ValueError):
+        await dld.resolve_deal_decision(_ctx(), now=NOW.replace(tzinfo=None))
 
 
 async def test_resolve_ignores_rows_that_are_not_verified(db):
