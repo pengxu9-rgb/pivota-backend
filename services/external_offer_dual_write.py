@@ -733,9 +733,18 @@ def _attached_variant_id(value: Any, page_urls: Tuple[str, ...] = ()) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if url_named_variant_id(text):
+    if "variant=" in text:
+        from urllib.parse import parse_qs, urlparse
+
         from services.external_offers_service import _offer_shopify_variant_id
 
+        try:
+            query = parse_qs(urlparse(text).query, keep_blank_values=True)
+        except ValueError:
+            return text
+        # A subscription plan's link prices the plan, not the variant: it names no variant here.
+        if any(key.lower() in ("selling_plan", "selling_plan_id") for key in query) or not url_named_variant_id(text):
+            return text
         return (_offer_shopify_variant_id({"url": text}, {}, page_urls) if page_urls else None) or text
     match = _GID_VARIANT.fullmatch(text)
     return match.group(1) if match else text
@@ -801,13 +810,17 @@ def plan_attached_listing_offer_writes(
     page_urls = _seed_page_urls(seed)
     # Per id: the spellings that named it, its price, and whether one entry alone may vouch for it.
     spellings_of: Dict[str, set] = {}
-    conflicted: set = set()
+    # Per id named by an entry that names two: that entry's price (None when it states none).
+    conflicted: Dict[str, list] = {}
     for variant in _served_seed_variants(seed):
         raws = {str(variant.get(k)).strip() for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
         ids = {_attached_variant_id(raw, page_urls) for raw in raws}
         if len(ids) > 1:
-            # This ENTRY names two variants: it vouches for neither. A separate entry for one of them still counts.
-            conflicted |= ids
+            # This ENTRY names two variants: it vouches for neither. A separate entry for one of them still counts,
+            # unless this one prices that id differently or states no price (judged below).
+            entry_price = _positive_price(variant_own_price(variant))
+            for vid in ids:
+                conflicted.setdefault(vid, []).append(entry_price)
             continue
         vid = next(iter(ids), "")
         if not vid:
@@ -836,8 +849,14 @@ def plan_attached_listing_offer_writes(
         if refusal:
             variant_refusals[vid] = refusal
         variant_prices[vid] = price
-    for vid in conflicted - set(spellings_of):
-        variant_refusals[vid] = "variant_identity_conflict"
+    for vid, prices in conflicted.items():
+        if vid in variant_refusals:
+            continue
+        clean = variant_prices.get(vid)
+        if vid not in spellings_of or clean is None or any(
+            p is None or round(p, 2) != round(clean, 2) for p in prices
+        ):
+            variant_refusals[vid] = "variant_identity_conflict"
 
     writes = []
     refused = []
