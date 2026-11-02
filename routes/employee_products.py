@@ -5787,6 +5787,16 @@ def _catalogue_read_is_for(dest: Optional[str], catalogue_read: Any) -> bool:
     return bool(handle) and handle == catalogue_read.handle and crawl_politeness.host_of(str(dest or "")) == catalogue_read.host
 
 
+def _catalogue_price_move_guarded(row: Dict[str, Any], catalogue_read: Any) -> bool:
+    """Whether the catalogue price for this row moved past the lane's ratio from the stored one
+    (`services.external_seed_catalogue_refresh.catalogue_price_move_guarded`)."""
+    from services import external_seed_catalogue_refresh as catalogue_lane
+
+    return catalogue_lane.catalogue_price_move_guarded(
+        row.get("price_amount"), row.get("price_currency"), getattr(catalogue_read, "snapshot", None)
+    )
+
+
 def _catalogue_page_read_due(row: Dict[str, Any]) -> Optional[str]:
     """Why this row must have its PAGE read even though the batch handed it a catalogue read, or None
     (`services.external_seed_catalogue_refresh.page_read_due`, on the row as it is at its turn)."""
@@ -5885,6 +5895,10 @@ async def _refresh_external_seed_by_id(
         due = _catalogue_page_read_due(row)
         if due:
             catalogue_read, catalogue_fallback = None, f"page_read_due:{due}"
+    if catalogue_read is not None and _catalogue_price_move_guarded(row, catalogue_read):
+        # A BIG MOVE IS CHECKED ON THE PAGE. Past the lane's ratio either way, the catalogue cannot tell an
+        # end of sale from another size or variant: the seed is read as without the lane.
+        catalogue_read, catalogue_fallback = None, "price_move_guarded"
     content_read = catalogue_read is None
     try:
         if catalogue_read is not None:

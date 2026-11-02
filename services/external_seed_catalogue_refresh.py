@@ -81,6 +81,13 @@ MIN_SEEDS_ENV = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_MIN_SEEDS"
 MIN_SEEDS_DEFAULT = 3
 PAGE_MAX_AGE_ENV = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_PAGE_MAX_AGE_DAYS"
 PAGE_MAX_AGE_DEFAULT_DAYS = 30
+#: A catalogue price this many times the stored one, or less than its reciprocal, is not taken: the seed gets
+#: its page read instead (`catalogue_price_move_guarded`). The dry run found such moves mixing ends of sales
+#: with what look like another size or variant, which the catalogue alone cannot tell apart.
+MAX_PRICE_RATIO_ENV = "EXTERNAL_REFERRAL_REFRESH_CATALOGUE_MAX_PRICE_RATIO"
+MAX_PRICE_RATIO_DEFAULT = 1.5
+MAX_PRICE_RATIO_MIN = 1.1
+MAX_PRICE_RATIO_MAX = 5.0
 
 #: `seed_data.snapshot.read_source` and `evidence.read_source` of a catalogue-priced refresh.
 READ_SOURCE = "products_json"
@@ -134,6 +141,42 @@ def catalogue_min_seeds() -> int:
     except ValueError:
         return MIN_SEEDS_DEFAULT
     return max(1, value)
+
+
+def max_price_ratio() -> float:
+    """The largest catalogue/stored price ratio (either way) the lane takes. Clamped; garbage is the default."""
+    raw = str(os.getenv(MAX_PRICE_RATIO_ENV) or "").strip()
+    try:
+        value = float(raw) if raw else MAX_PRICE_RATIO_DEFAULT
+    except ValueError:
+        return MAX_PRICE_RATIO_DEFAULT
+    if value != value:  # NaN
+        return MAX_PRICE_RATIO_DEFAULT
+    return min(MAX_PRICE_RATIO_MAX, max(MAX_PRICE_RATIO_MIN, value))
+
+
+def catalogue_price_move_guarded(
+    stored_amount: Any, stored_currency: Any, snapshot: Any, *, ratio_limit: Optional[float] = None
+) -> bool:
+    """Whether the catalogue's price for a seed moved too far from the stored one to be taken (either way).
+
+    Only a comparable pair is judged: both positive, in the same currency. Anything else is left to the
+    refresh's own price rules (a missing or other-currency price is refused or filled there)."""
+    raw_incoming = getattr(snapshot, "price_amount", None)
+    try:
+        stored = float(stored_amount) if stored_amount is not None else None
+        incoming = float(raw_incoming) if raw_incoming is not None else None
+    except (TypeError, ValueError):
+        return False
+    if stored is None or incoming is None or not stored > 0 or not incoming > 0:
+        return False
+    stored_cur = str(stored_currency or "").strip().upper()
+    incoming_cur = str(getattr(snapshot, "price_currency", None) or "").strip().upper()
+    if not stored_cur or stored_cur != incoming_cur:
+        return False
+    limit = ratio_limit if ratio_limit is not None else max_price_ratio()
+    ratio = incoming / stored
+    return ratio > limit or ratio < 1.0 / limit
 
 
 def page_max_age_days() -> int:
@@ -635,9 +678,11 @@ __all__ = (
     "catalogue_handle",
     "catalogue_min_seeds",
     "catalogue_price",
+    "catalogue_price_move_guarded",
     "catalogue_refresh_enabled",
     "catalogue_snapshot",
     "decide_host_currency",
+    "max_price_ratio",
     "page_max_age_days",
     "page_read_due",
     "pages_worth_reading",

@@ -88,6 +88,11 @@ def test_a_seed_is_compared_with_the_lanes_reading_and_the_real_reconcile():
     assert other["price"] == "other_currency"
     none = mod.compare_seed({**seed, "price_amount": None}, _seed_read())
     assert none["price"] == "none_stored"
+    # The lane's big-move guard, as the refresh applies it: past 1.5x either way the page is read instead.
+    assert moved["move_guarded"] is False and agree["move_guarded"] is False
+    assert mod.compare_seed(seed, _seed_read(_product(p50="265.00")))["move_guarded"] is True
+    assert mod.compare_seed(seed, _seed_read(_product(p50="50.00")))["move_guarded"] is True
+    assert none["move_guarded"] is False and other["move_guarded"] is False
 
 
 def test_a_host_line_counts_matches_reasons_and_samples_disagreements():
@@ -209,13 +214,14 @@ def test_the_summary_folds_every_host_line_and_names_the_offset_hosts():
     totals = mod.new_totals(2, 6)
     ok = SimpleNamespace(status="ok", proof="base_and_cart")
     offset = {"n": 3, "median": 1.05, "p10": 1.05, "p90": 1.05, "offset_suspected": True}
-    mod.fold_host_line(totals, "a.example", ok, {"matched": 3, "price": {"moved_within_10pct": 3},
+    mod.fold_host_line(totals, "a.example", ok, {"matched": 3, "move_guarded": 1, "price": {"moved_within_10pct": 3},
                                                  "variants": {"all_re_read": 3}, "page_read_due": {"page_read_too_old": 1},
                                                  "price_ratio": offset})
     mod.fold_host_line(totals, "b.example", SimpleNamespace(status="currency_conflict", proof=None),
                        {"matched": 0, "price": {}, "variants": {}, "page_read_due": {},
                         "price_ratio": {**offset, "n": 0, "offset_suspected": False}})
     assert (totals["hosts_read"], totals["hosts_priceable"], totals["matched"]) == (2, 1, 3)
+    assert totals["move_guarded"] == 1, "a host line without the count adds none"
     assert totals["host_status"] == {"ok": 1, "currency_conflict": 1} and totals["proof"] == {"base_and_cart": 1}
     assert totals["page_read_due"] == {"page_read_too_old": 1}
     assert totals["offset_suspected_hosts"] == [{"host": "a.example", **offset}]
@@ -226,6 +232,8 @@ def test_the_go_no_go_figures():
     totals = {"matched": 50, "variants": {"all_re_read": 49, "not_all_re_read": 1},
               "price": {"agree": 45, "moved_over_10pct": 5}, "offset_suspected_hosts": [{"host": "a"}],
               "proof": {"base_and_page_cookie": 3, "base_and_cart": 1}}
-    assert mod.go_no_go(totals) == {"not_all_re_read_share": 0.02, "moved_over_10pct_share": 0.1,
-                                    "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
+    assert mod.go_no_go({**totals, "move_guarded": 2}) == {
+        "not_all_re_read_share": 0.02, "moved_over_10pct_share": 0.1, "move_guarded_share": 0.04,
+        "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
+    assert mod.go_no_go(totals)["move_guarded_share"] == 0.0
     assert mod.go_no_go({**totals, "matched": 0})["not_all_re_read_share"] is None

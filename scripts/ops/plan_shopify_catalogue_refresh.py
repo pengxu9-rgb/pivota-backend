@@ -21,7 +21,8 @@ seed on it with the lane's own rule (`seed_catalogue_read`). Then, per host:
 And the cost: origin requests made (the pacer's count) per seed matched, against the page read's ~1.3.
 
 GO / NO-GO for the flag (the `summary` line's `go_no_go`, judged by a person): `not_all_re_read_share` about 0;
-`offset_suspected_hosts` empty; `moved_over_10pct` explained by the samples; `proof` mostly
+`offset_suspected_hosts` empty; `moved_over_10pct` explained by the samples, less the `move_guarded` seeds the lane
+sends to their page read; `proof` mostly
 base_and_page_cookie (base_and_cart is the residual risk: a cookie-less page vouched for by another response).
 It writes nothing: no seed, no snapshot, no offer. The database is read in READ ONLY transactions with a
 statement timeout and closed before the first fetch.
@@ -212,6 +213,10 @@ def compare_seed(seed, read):
     )
     out["variants"] = "all_re_read" if not report["not_re_read_count"] else "not_all_re_read"
     out["variants_changed"] = report["changed"]
+    # The lane's own big-move guard (`catalogue_price_move_guarded`): such a seed gets its page read instead.
+    from services.external_seed_catalogue_refresh import catalogue_price_move_guarded
+
+    out["move_guarded"] = catalogue_price_move_guarded(stored_amount, stored_cur, snap)
     return out
 
 
@@ -221,7 +226,7 @@ def plan_host(host, catalogue, seeds, *, now=None):
 
     reasons, prices, variants, due = {}, {}, {}, {}
     sample, ratios = [], []
-    matched = 0
+    matched = guarded = 0
     now = now or _now_utc()
     max_age = lane.page_max_age_days()
     for seed in seeds:
@@ -236,10 +241,11 @@ def plan_host(host, catalogue, seeds, *, now=None):
         compared = compare_seed(seed, read)
         _bump(prices, compared["price"])
         _bump(variants, compared["variants"])
+        guarded += int(compared["move_guarded"])
         ratios.append(compared.get("ratio"))
         if compared["price"] not in ("agree",) and len(sample) < SAMPLE:
             sample.append(compared)
-    return {**catalogue.summary(), "seeds": len(seeds), "matched": matched, "reasons": reasons,
+    return {**catalogue.summary(), "seeds": len(seeds), "matched": matched, "move_guarded": guarded, "reasons": reasons,
             "price": prices, "variants": variants, "price_ratio": price_ratio_stats(ratios),
             "page_read_due": due, "sample": sample}
 
@@ -260,7 +266,7 @@ async def read_only_transaction(conn, timeout_ms):
 
 def new_totals(hosts_planned, seeds):
     return {"hosts_planned": hosts_planned, "hosts_read": 0, "hosts_priceable": 0, "seeds": seeds,
-            "matched": 0, "host_status": {}, "price": {}, "variants": {}, "page_read_due": {}, "proof": {},
+            "matched": 0, "move_guarded": 0, "host_status": {}, "price": {}, "variants": {}, "page_read_due": {}, "proof": {},
             "offset_suspected_hosts": [], "stopped": None}
 
 
@@ -272,6 +278,7 @@ def fold_host_line(totals, host, catalogue, line):
     _bump(totals["host_status"], catalogue.status)
     totals["hosts_priceable"] += int(catalogue.status == STATUS_OK)
     totals["matched"] += line["matched"]
+    totals["move_guarded"] += line.get("move_guarded", 0)
     for key in ("price", "variants", "page_read_due"):
         for k, n in line[key].items():
             _bump(totals[key], k, n)
@@ -287,6 +294,8 @@ def go_no_go(totals):
     return {
         "not_all_re_read_share": round(totals["variants"].get("not_all_re_read", 0) / matched, 4) if matched else None,
         "moved_over_10pct_share": round(totals["price"].get("moved_over_10pct", 0) / matched, 4) if matched else None,
+        # Of those, the share the lane's big-move guard sends to their page read instead.
+        "move_guarded_share": round(totals.get("move_guarded", 0) / matched, 4) if matched else None,
         "offset_suspected_hosts": len(totals["offset_suspected_hosts"]),
         "hosts_priced_on_cart_proof": totals["proof"].get("base_and_cart", 0),
     }
