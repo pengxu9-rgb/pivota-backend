@@ -271,8 +271,8 @@ A verified deal may show an effective price only on a lane that both carries the
 | **Coded network link handed out directly** (no `/r` hop) | **No** | — | Never handed out. A coded network link reaches a buyer only through `/r`'s click-time switch (Q14), because a link handed out directly cannot be recalled |
 | **Referral link** (the card's `/r` destination is a product page, not a cart, for example when the purchasability gate declines the cart) | **No** | — | Not emitted. `/r` never appends a code to a referral destination |
 | **Reap cart-link** (ADR-025 D6b) | **No.** `validate_cart_link` deliberately refuses `discount=`, and Reap's callers never pass a code | — | **Excluded.** Carrying a code there needs a change to Reap's allowlist, which is a separate decision with its own review |
-| **Pivota-completed merchant checkout** (ADR-028: the protocol route or the browser route; the merchant's payment provider charges an agent payment token) | Yes: Pivota enters the code in the checkout it completes | The merchant checkout's own result before payment, shown to and confirmed by the buyer (ADR-028 D7) | **Yes, the main lane** wherever an offer is completable (amendment 3, Q15). See "The completed-checkout lane" below |
-| **UCP delegated checkout / Reap variant lane** | Superseded for completion by the completed-checkout lane above | — | A UCP checkout is also a verification route (D3), created and never completed |
+| **Pivota-completed merchant checkout** (ADR-028: the protocol route or the browser route; the merchant's payment provider charges an agent payment token) | Yes: Pivota enters the code in the checkout it completes | Before checkout: D3 verification, as on every lane. At checkout: the merchant checkout's own result, confirmed by the buyer (ADR-028 D7) | **Yes, the main lane** wherever an offer is completable (amendment 3, Q15). See "The completed-checkout lane" below |
+| **UCP delegated checkout / payment-partner variant lane** | Superseded for completion by the completed-checkout lane above | — | A UCP checkout is also a verification route (D3), created and never completed |
 | **Affiliate-network seller** (`authorized_feed`) | Only if the network's deep link can carry it | The carrier follows ADR-025's evidence route (network link with our click id as sub-id), plus written program terms allowing code and click together, plus that program's carrier check (Q14) | Excluded in v1. When added, the carrier is the network link (Q9, Q14) |
 | **Handed-out `pdp_url`** (an agent passes the product page on) | No | — | No effective price. The effective price is attached to the code-carrying link only, never to the bare `pdp_url` |
 | **Other click-outs** (non-Shopify web checkout; the buyer types the code) | Only by the buyer | A verification on that same checkout (UCP, Phase 2) | Excluded in v1 |
@@ -280,11 +280,14 @@ A verified deal may show an effective price only on a lane that both carries the
 #### The completed-checkout lane (amendment 3, ADR-028)
 
 Where Pivota completes the order on the merchant's checkout (ADR-028):
-- Pivota enters the code itself. The merchant checkout's result before payment, which the buyer sees and confirms (ADR-028 D7), is the evidence for that order. A code the checkout rejects is removed, and nothing is paid on a price the checkout did not show.
-- On this lane only, Pivota may also try a D2-source code that is unverified, or whose eligibility is unknown, in the buyer's own checkout. Entering a published code in a buyer's real order is not a test cart, so D3's testing policy and Q2's approval do not apply to it. Display does not change: before checkout, nothing unverified is shown as a price (D4, Q3).
-- Codes from a program travel with that program's tracking in the same session (ADR-028 D3, Q12).
-- The `/r` lanes below (cart permalink, network link) carry codes only for offers Pivota cannot complete.
-- Reconciliation is simpler here: the order Pivota completed shows directly whether the code applied. The D7 failure signal counts an order whose confirmed checkout showed the code but whose merchant order does not.
+- **Pivota enters the code itself.** "Best" means the lowest buyer total, never the highest commission (ADR-028 D8). Every code attempt finishes before the buyer's confirmation (ADR-028 D7). That confirmed result is the evidence for this order, and a code dropped after it means a new confirmation.
+- **Trying a code in the buyer's own order** (recorded under Q15). On this lane only, Pivota may try a D2-source code that is unverified, or whose eligibility is unknown, in the buyer's own checkout. It is the buyer's real order, not a test cart, so D3's testing policy, Q2's approval and Q13's permission do not apply to that attempt. The limits:
+  - an eligibility-limited code (`new_customer_only`, `once_per_customer`, `segment_limited`, `usage_limited`) is never tried;
+  - a tried code never makes a deal `checkout_verified`, and never feeds what is displayed to anyone else;
+  - before checkout, no unverified or eligibility-unknown code is emitted in any form: no price, no badge, no teaser (D4, Q3 unchanged).
+- **Programs.** In a program's tracked session, only the codes Q14 allows for that program are tried. A code from the merchant's own site is never tried there, and a program that excludes coupon or deal publishers gets the session with no code (ADR-028 D3, Q12).
+- **The `/r` lanes** below (cart permalink, network link) carry codes only for offers Pivota cannot complete.
+- **Reconciliation, per lane.** A completed-lane failure signal is an order whose confirmed checkout showed the code but whose merchant order does not. Completed-lane orders are counted **separately**: they never arm or satisfy Q6's 50-order measurement gate, or the D7 stop rule, for the `/r` lanes. Each lane has its own window, gate and stop row.
 
 #### One decision at issue time, one re-check at click time
 
@@ -460,7 +463,7 @@ That shows peng whether a failed gate means few deals or few connections.
    - Ranking may start only after the false-savings rate has been measured, meaning at least 50 reconciled orders in the window, and is under the D7 stop threshold.
    - When on, a verified deal may change only the **order of sellers within one product**, by the buyer's effective price. It never changes the order of products in a recommendation slate.
    - What Pivota earns on a seller never enters the ranking (ADR-025 Q4). Effective price is a fact about the buyer's cost, not about our relationship with the seller.
-   - Amended by Q16: between lanes, a completable offer ranks first. This rule then applies among the completable offers.
+   - Amended by Q16: between lanes, for the same product, a completable offer ranks first. This rule then orders the completable offers for that product.
 7. **Phase 0 base: wait for the ledger.**
    - The gate is computed on the gateway's recommendation ledger after 7 full days of data. No provisional base.
    - The threshold stays 10.0% of distinct recommended offers, per market.
@@ -541,7 +544,9 @@ That shows peng whether a failed gate means few deals or few connections.
    - The buyer checks out in the agent front, and Pivota completes the order on the merchant's checkout (ADR-028). The buyer is sent to the merchant only when no offer for the product can be completed.
    - Deal codes therefore ride, first, the checkout Pivota completes ("The completed-checkout lane", D7). The `/r` lanes keep carrying codes for offers Pivota cannot complete.
    - Pre-verification (D3) keeps driving what is displayed before checkout, and a UCP checkout, created and never completed, is a verification route.
-16. **Between lanes, a completable offer ranks first.**
-   - A completable offer ranks above click-out offers for the same product, even at a higher price (ADR-028 D1). This overrides Q6 between lanes.
-   - Among completable offers, Q6 applies: the buyer's price first.
+   - **Exemptions recorded with this amendment** (part of ADR-028's acceptance): a code tried in the buyer's own completed order is exempt from D3's testing policy, Q2's approval and Q13's permission, within the limits in "The completed-checkout lane". An eligibility-limited code is never tried; a tried code is never evidence for anyone else; nothing unverified is emitted before checkout.
+16. **Between lanes, a completable offer ranks first, for the same product.**
+   - A completable offer ranks above click-out offers **for the same product**, even at a higher price (ADR-028 D1). This overrides Q6 between lanes.
+   - Among the completable offers for that product, Q6 orders them: by the served price, and by the verified effective price only once Q6's measurement gate has opened for that lane.
+   - Completability orders sellers within one product only. It never reorders products in a recommendation slate.
    - Whether an offer carries our attribution never affects its rank (ADR-025 Q4). An offer Pivota can complete without commission ranks like any other completable offer (ADR-028 D4).
