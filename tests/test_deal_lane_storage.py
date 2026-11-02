@@ -6,7 +6,6 @@ built from the migration itself: tests/test_deal_lane_storage_postgres.py."""
 from __future__ import annotations
 
 import os
-import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -370,28 +369,27 @@ def test_migration_276_is_hand_applied_bounded_and_off_the_self_heal():
         "  ADD COLUMN IF NOT EXISTS discount_carried BOOLEAN",
     ]
     assert "schema-guard-exempt:" in body
+    # Off the Postgres self-heal: a boot-time ALTER would race ACCESS EXCLUSIVE on the table `/r`
+    # writes per click. Only the SQLite branch (local databases) heals them.
     guard = (_REPO / "db" / "schema_guard.py").read_text()
-    assert "discount_code" not in guard and "discount_carried" not in guard
+    assert "ADD COLUMN IF NOT EXISTS discount_code" not in guard
+    assert "ADD COLUMN IF NOT EXISTS discount_carried" not in guard
+    sqlite_branch = guard[guard.index("        if IS_SQLITE:"):]
+    assert "discount_code VARCHAR(255)" in sqlite_branch and "discount_carried BOOLEAN" in sqlite_branch
+    assert "discount_code VARCHAR(255)" not in guard[: guard.index("        if IS_SQLITE:")]
 
 
-def test_the_click_row_does_not_name_the_276_columns_until_they_are_applied():
-    """Every select(surface_click_events) names every Table column. Putting these on the Table before
-    migration 276 is applied in prod would fail those selects on UndefinedColumn. The PR that adds them
-    here (and the first writer) follows the hand apply; update this pin in that PR."""
-    assert {"discount_code", "discount_carried"}.isdisjoint(surface_click_events.c.keys())
-    # discount_carried is new everywhere; discount_code is a common word (quotes carry buyer codes), so
-    # it counts only in a file that also names the click table, raw SQL included.
-    offenders = []
-    for path in _REPO.rglob("*.py"):
-        rel = path.relative_to(_REPO).as_posix()
-        if rel.startswith(("tests/", ".venv/", "venv/")) or "/site-packages/" in rel:
-            continue
-        source = path.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"\bdiscount_carried\b", source) or (
-            "surface_click_events" in source and re.search(r"\bdiscount_code\b", source)
-        ):
-            offenders.append(rel)
-    assert offenders == []
+def test_the_click_row_names_the_276_columns_with_276s_types():
+    """276 was applied by hand before the Table named these (every select(surface_click_events) names
+    every Table column). The Table must say exactly what 276 adds."""
+    from sqlalchemy import Boolean, String
+
+    code, carried = surface_click_events.c.discount_code, surface_click_events.c.discount_carried
+    assert isinstance(code.type, String) and code.type.length == 255 and code.nullable
+    assert isinstance(carried.type, Boolean) and carried.nullable
+    body = _MIG_276.read_text()
+    assert "ADD COLUMN IF NOT EXISTS discount_code VARCHAR(255)" in body
+    assert "ADD COLUMN IF NOT EXISTS discount_carried BOOLEAN" in body
 
 
 # ---- flags ---------------------------------------------------------------------------------------

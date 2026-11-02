@@ -2,8 +2,8 @@
 declares (create_all builds the model at prod boot, so the two must agree), its constraints and
 cascades hold, and hand-applied migration 276 adds the click-row columns in one bounded transaction.
 
-276 runs against a stand-in surface_click_events in a private schema: the shared table stays as the
-model declares it, because no backend code may name those columns before the hand apply.
+276 runs against a stand-in surface_click_events in a private schema, so applying and reverting it here
+never changes the shared table other suites build from the model.
 
     DATABASE_URL=postgresql://pgtest@127.0.0.1:55433/pivota_deal_dialect_check \\
         .venv/bin/python -m pytest tests/test_deal_lane_storage_postgres.py
@@ -343,9 +343,3 @@ async def test_migration_276_adds_the_click_columns_in_one_bounded_transaction(d
     await _in_schema_276(db, _DOWN_276)
     assert await _columns_276(db) == {}
     await _in_schema_276(db, _DOWN_276)  # a re-run of the down file is safe too
-    # The shared table is untouched.
-    shared = await db.fetch_val(
-        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' "
-        "AND table_name = 'surface_click_events' AND column_name IN ('discount_code', 'discount_carried')"
-    )
-    assert shared == 0

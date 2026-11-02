@@ -112,6 +112,7 @@ from services.outbound_links_service import (
     extract_shopify_numeric_variant_id,
     get_allowed_domains_for_market,
     is_destination_domain_allowed,
+    market_is_observed,
     REFERRAL_CLICK_PARAM,
     SHOPIFY_CART_CLICK_ATTRIBUTE,
     make_redirect_token,
@@ -142,6 +143,14 @@ from services.handover_variant_identity import (
 from services.shopify_variant_identity import (
     sole_stamped_variant_id,
     storefront_is_shopify,
+)
+from services.deal_lane_decision import (
+    TOKEN_DEAL_REF_KEY,
+    DealContext,
+    DealDecision,
+    DealOffer,
+    cart_dest_matches,
+    resolve_deal_decision,
 )
 from services.commerce_attribution_service import (
     PVT_CLICK_ID,
@@ -7700,9 +7709,11 @@ async def _attach_connected_product_redirects(
                 continue  # no derivable merchant destination — never fabricate one
 
             variant_id: Optional[str] = None
+            variant_price: Any = None
             for v in p.get("variants") or []:
                 if isinstance(v, dict) and str(v.get("variant_id") or v.get("id") or "").strip():
                     variant_id = str(v.get("variant_id") or v.get("id")).strip()
+                    variant_price = v.get("price")
                     break
 
             # Decided BEFORE the mint. `cart_variant_id` is the cart's ONLY input (see the note
@@ -7753,6 +7764,19 @@ async def _attach_connected_product_redirects(
                     cart_variant_id=cart_variant_id,
                     shop_domain=shop_domain,
                     platform=platform or None,
+                    # ADR-027 Phase 1's population: a connected Shopify store (ADR-009 seller of
+                    # record = its merchant id), resolved against the buyer's declared market.
+                    # A deal pins that market; no deal leaves the link exactly as before.
+                    deal_offer=(
+                        DealOffer(
+                            seller_id=merchant_id,
+                            buyer_market=request_market,
+                            observed_unit_price=variant_price,
+                            observed_currency=p.get("currency"),
+                        )
+                        if platform == "shopify" and cart_variant_id
+                        else None
+                    ),
                 )
                 mint_cache[cache_key] = redirect_url
             if redirect_url:
@@ -12128,6 +12152,11 @@ async def _make_external_redirect_url(
     # today) leaves the link exactly as before. A pin is signed into the token as `cart_country`
     # so a re-derive from the token applies the same one.
     cart_country: Optional[str] = None,
+    # ADR-027: the offer a checkout-verified deal may ride on. None (every caller but the connected
+    # catalog cards today) changes nothing. With it, the deal is resolved against the link THIS mint
+    # composes; a decision pins the cart to its market, signs its reference (never the code) into
+    # the token and records the code on the issued click. No decision = the link exactly as before.
+    deal_offer: Optional[DealOffer] = None,
 ) -> Optional[str]:
     if not destination_url.startswith(("http://", "https://")):
         return None
@@ -12136,6 +12165,17 @@ async def _make_external_redirect_url(
     # surface_click_events row (via the signed token ctx) and the merchant order (via the
     # destination). Reusing a caller-supplied id keeps redirect caches idempotent.
     stable_click_id = str(click_id or "").strip() or new_click_id()
+
+    requested_pin = _cart_country_pin(cart_country, market_observed)
+    deal_decision = await _resolve_mint_deal(
+        deal_offer,
+        requested_pin=requested_pin,
+        platform=platform,
+        cart_variant_id=cart_variant_id,
+        quantity=quantity,
+    )
+    # A decision exists only for the buyer's declared market, which equals any pin already asked for.
+    pin_country = requested_pin or (deal_decision.market if deal_decision else None)
 
     # Join strategy:
     #   cart_permalink -> Shopify store + numeric variant id known: the id rides in
@@ -12155,13 +12195,17 @@ async def _make_external_redirect_url(
         cart_variant_id=cart_variant_id,
         click_id=stable_click_id,
         quantity=quantity,
-        pin_country=_cart_country_pin(cart_country, market_observed),
+        pin_country=pin_country,
     )
     join_mode = composed["join_mode"]
-    applied_cart_country = (
-        _cart_country_pin(cart_country, market_observed) if composed["cart_url"] else None
-    )
+    applied_cart_country = pin_country if composed["cart_url"] else None
     dest = composed["primary"]
+    # The deal rides only the link it was decided for: the verified variant's one-unit cart, pinned
+    # to the verification market. Anything else (no cart could be built) drops it.
+    if deal_decision is not None and not cart_dest_matches(
+        dest, variant_id=deal_decision.variant_id, market=deal_decision.market
+    ):
+        deal_decision = None
 
     runtime_allowed_domains = allowed_domains
     if runtime_allowed_domains is None:
@@ -12209,6 +12253,8 @@ async def _make_external_redirect_url(
             **({TOKEN_MARKET_OBSERVED_KEY: True} if market_observed is True else {}),
             # Only when a cart was pinned, so every other token is byte-identical to before.
             **({TOKEN_CART_COUNTRY_KEY: applied_cart_country} if applied_cart_country else {}),
+            # The deal's REFERENCE, re-checked by `/r`; never the code (tokens are not encrypted).
+            **({TOKEN_DEAL_REF_KEY: deal_decision.reference()} if deal_decision else {}),
             "dest": dest,
             "ctx": enriched_ctx,
         }
@@ -12226,8 +12272,43 @@ async def _make_external_redirect_url(
             dest_domain=url_domain(dest) or None,
             context=dict(enriched_ctx),
             link=link,
+            discount_code=deal_decision.code if deal_decision else None,
         ))
     return link
+
+
+async def _resolve_mint_deal(
+    deal_offer: Optional[DealOffer],
+    *,
+    requested_pin: Optional[str],
+    platform: Optional[str],
+    cart_variant_id: Optional[str],
+    quantity: int,
+) -> Optional[DealDecision]:
+    """The deal a mint may attach (ADR-027 D7), or None. Resolved against the buyer's DECLARED
+    market (`_cart_country_pin`); a mint that already pins another market gets none. Never raises:
+    a failure here is a link without a deal, never a missing link."""
+    if deal_offer is None:
+        return None
+    try:
+        deal_pin = _cart_country_pin(deal_offer.buyer_market, market_is_observed(deal_offer.buyer_market))
+        if deal_pin is None or (requested_pin is not None and requested_pin != deal_pin):
+            return None
+        decision, _reason = await resolve_deal_decision(
+            DealContext(
+                seller_id=deal_offer.seller_id,
+                variant_id=cart_variant_id,
+                platform=platform,
+                quantity=quantity,
+                pin_country=deal_pin,
+                observed_unit_price=deal_offer.observed_unit_price,
+                observed_currency=deal_offer.observed_currency,
+            )
+        )
+        return decision
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deal lane: mint-time decision failed, no deal attached: %s", type(exc).__name__)
+        return None
 
 
 def _seed_attribution_from_redirect(
