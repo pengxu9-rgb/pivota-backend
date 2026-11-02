@@ -5788,12 +5788,16 @@ def _catalogue_read_is_for(dest: Optional[str], catalogue_read: Any) -> bool:
 
 
 def _catalogue_price_move_guarded(row: Dict[str, Any], catalogue_read: Any) -> bool:
-    """Whether the catalogue price for this row moved past the lane's ratio from the stored one
-    (`services.external_seed_catalogue_refresh.catalogue_price_move_guarded`)."""
+    """Whether the catalogue's reading of this row moved any price past the lane's ratio from the stored one,
+    like for like (`services.external_seed_catalogue_refresh.catalogue_price_move_guarded`)."""
     from services import external_seed_catalogue_refresh as catalogue_lane
 
     return catalogue_lane.catalogue_price_move_guarded(
-        row.get("price_amount"), row.get("price_currency"), getattr(catalogue_read, "snapshot", None)
+        row.get("price_amount"),
+        row.get("price_currency"),
+        _seed_variants(_ensure_json_obj(row.get("seed_data"))),
+        getattr(catalogue_read, "snapshot", None),
+        url=row.get("destination_url"),
     )
 
 

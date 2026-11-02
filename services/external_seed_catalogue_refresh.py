@@ -155,28 +155,80 @@ def max_price_ratio() -> float:
     return min(MAX_PRICE_RATIO_MAX, max(MAX_PRICE_RATIO_MIN, value))
 
 
-def catalogue_price_move_guarded(
-    stored_amount: Any, stored_currency: Any, snapshot: Any, *, ratio_limit: Optional[float] = None
-) -> bool:
-    """Whether the catalogue's price for a seed moved too far from the stored one to be taken (either way).
-
-    Only a comparable pair is judged: both positive, in the same currency. Anything else is left to the
-    refresh's own price rules (a missing or other-currency price is refused or filled there)."""
-    raw_incoming = getattr(snapshot, "price_amount", None)
+def _positive_amount(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     try:
-        stored = float(stored_amount) if stored_amount is not None else None
-        incoming = float(raw_incoming) if raw_incoming is not None else None
+        amount = float(value) if value is not None else None
     except (TypeError, ValueError):
+        return None
+    return amount if amount is not None and amount > 0 and amount == amount else None
+
+
+def _moved_past(stored: Optional[float], incoming: Optional[float], limit: float) -> bool:
+    if stored is None or incoming is None:
         return False
-    if stored is None or incoming is None or not stored > 0 or not incoming > 0:
-        return False
-    stored_cur = str(stored_currency or "").strip().upper()
-    incoming_cur = str(getattr(snapshot, "price_currency", None) or "").strip().upper()
-    if not stored_cur or stored_cur != incoming_cur:
-        return False
-    limit = ratio_limit if ratio_limit is not None else max_price_ratio()
     ratio = incoming / stored
     return ratio > limit or ratio < 1.0 / limit
+
+
+def catalogue_price_move_guarded(
+    stored_amount: Any,
+    stored_currency: Any,
+    stored_variants: Any,
+    snapshot: Any,
+    *,
+    url: Any,
+    ratio_limit: Optional[float] = None,
+) -> bool:
+    """Whether the catalogue's reading of a seed moved a price too far from what is stored to be taken.
+
+    Judged price by price, like for like, and true when ANY one moved past the ratio either way:
+      * the price the catalogue chose for the URL (its `?variant=`, else the first variant in stock), against
+        the stored variant with the same id, or against the row's own price when no stored variant has it;
+      * every variant the catalogue read, against the stored variant with the same id.
+    Only positive amounts are compared, and only in the catalogue's currency (a stored price or variant that
+    names another currency is left to the refresh, which refuses it). A row that names no currency is
+    compared: the refresh takes the catalogue's currency for it.
+    """
+    limit = ratio_limit if ratio_limit is not None else max_price_ratio()
+    incoming_cur = str(getattr(snapshot, "price_currency", None) or "").strip().upper()
+    evidence = getattr(snapshot, "evidence", None)
+    read = [v for v in ((evidence or {}).get("variants") or []) if isinstance(v, dict)] if isinstance(evidence, dict) else []
+
+    def same_currency(currency: Any) -> bool:
+        cur = str(currency or "").strip().upper()
+        return not cur or not incoming_cur or cur == incoming_cur
+
+    stored_by_id: Dict[str, Dict[str, Any]] = {}
+    for v in stored_variants if isinstance(stored_variants, list) else []:
+        if isinstance(v, dict):
+            vid = str(v.get("variant_id") or v.get("id") or "").strip()
+            if vid and vid not in stored_by_id:
+                stored_by_id[vid] = v
+
+    def stored_price_of(v: Dict[str, Any]) -> Optional[float]:
+        if not same_currency(v.get("currency") or v.get("price_currency")):
+            return None
+        return _positive_amount(v.get("price_amount"))
+
+    # The headline: the variant the catalogue priced the row with.
+    selected_id = url_variant_id(url)
+    chosen = _selected(read, selected_id) if read and selected_id is not None else None
+    headline_in = _positive_amount(getattr(snapshot, "price_amount", None))
+    twin = stored_by_id.get(str(chosen["variant_id"])) if chosen else None
+    if twin is not None:
+        headline_stored = stored_price_of(twin)
+    else:
+        headline_stored = _positive_amount(stored_amount) if same_currency(stored_currency) else None
+    if _moved_past(headline_stored, headline_in, limit):
+        return True
+    # Every variant the catalogue read, against its stored twin.
+    for v in read:
+        twin = stored_by_id.get(str(v.get("variant_id") or ""))
+        if twin is not None and _moved_past(stored_price_of(twin), _positive_amount(v.get("price_amount")), limit):
+            return True
+    return False
 
 
 def page_max_age_days() -> int:

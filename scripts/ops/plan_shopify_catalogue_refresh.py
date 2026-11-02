@@ -216,7 +216,9 @@ def compare_seed(seed, read):
     # The lane's own big-move guard (`catalogue_price_move_guarded`): such a seed gets its page read instead.
     from services.external_seed_catalogue_refresh import catalogue_price_move_guarded
 
-    out["move_guarded"] = catalogue_price_move_guarded(stored_amount, stored_cur, snap)
+    out["move_guarded"] = catalogue_price_move_guarded(
+        seed.get("price_amount"), seed.get("price_currency"), stored_variants, snap, url=seed.get("destination_url")
+    )
     return out
 
 
@@ -241,7 +243,8 @@ def plan_host(host, catalogue, seeds, *, now=None):
         compared = compare_seed(seed, read)
         _bump(prices, compared["price"])
         _bump(variants, compared["variants"])
-        guarded += int(compared["move_guarded"])
+        # The job only reaches the guard for a seed not due its page read.
+        guarded += int(compared["move_guarded"] and not why_due)
         ratios.append(compared.get("ratio"))
         if compared["price"] not in ("agree",) and len(sample) < SAMPLE:
             sample.append(compared)

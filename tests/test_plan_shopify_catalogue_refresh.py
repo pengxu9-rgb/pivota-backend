@@ -237,3 +237,23 @@ def test_the_go_no_go_figures():
         "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
     assert mod.go_no_go(totals)["move_guarded_share"] == 0.0
     assert mod.go_no_go({**totals, "matched": 0})["not_all_re_read_share"] is None
+
+
+def test_a_host_line_counts_the_moves_the_job_would_guard_and_only_those(monkeypatch):
+    """Like the job: a seed due its page read never reaches the guard, so it is not counted; the ratio is the env's."""
+    mod = _module()
+    from tests.test_external_seed_catalogue_refresh import _read_host
+    from services import external_seed_catalogue_refresh as lane
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    catalogue = _read_host([[_product(p50="130.00")]], wanted=(HANDLE, "x", "y"))  # 80 -> 130: past 1.5x
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = seed["seed_data"]["variants"]
+    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    fresh = [{**seed, "id": f"s{i}", "last_crawled_at": now - timedelta(days=2)} for i in range(2)]
+    due = {**seed, "id": "s-due", "last_crawled_at": now - timedelta(days=45)}
+    line = mod.plan_host(HOST, catalogue, [*fresh, due], now=now)
+    assert line["matched"] == 3 and line["move_guarded"] == 2, "the due seed is read from its page anyway"
+    # A wider ratio (the env) lets the same move through.
+    monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, "2")
+    assert mod.plan_host(HOST, catalogue, [*fresh, due], now=now)["move_guarded"] == 0

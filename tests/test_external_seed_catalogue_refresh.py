@@ -961,22 +961,9 @@ def test_a_page_read_after_a_catalogue_read_takes_its_own_source_back(monkeypatc
 def test_the_urls_variant_prices_the_column(monkeypatch):
     row = _drain_row()
     row["destination_url"] = row["canonical_url"] = DEST + "?variant=" + V15
-    row["price_amount"] = 32.0  # the URL's variant, as a page read of it stored it
     run = _Refresh(monkeypatch, row)
     run.catalogue(_seed_read(_product(p50="85.00", p15="34.00"), url=row["destination_url"]))
     assert run.stored["price_amount"] == 34.0
-
-
-def test_a_column_holding_another_variants_price_is_settled_by_the_page(monkeypatch):
-    """The column holds the 50 mL price while the URL names the 15 mL: the catalogue's 34 against the stored 80
-    is past the guard, so the page decides (it prices the URL's variant too). It costs a page read, not the fix."""
-    row = _drain_row()
-    row["destination_url"] = row["canonical_url"] = DEST + "?variant=" + V15
-    run = _Refresh(monkeypatch, row)
-    run.page = _page_snapshot(80, 32)
-    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00"), url=row["destination_url"]))
-    assert result["catalogue_fallback"] == "price_move_guarded" and result["read_source"] == "page"
-    assert run.fetched == [row["destination_url"]]
 
 
 def _writes(run: "_Refresh") -> List[Dict[str, Any]]:
@@ -1282,32 +1269,50 @@ def test_migration_274_bounds_its_own_lock_wait_before_the_alter() -> None:
 
 
 # ---- the big-move guard -------------------------------------------------------------------------------------
-# Past MAX_PRICE_RATIO either way the catalogue cannot tell an end of sale from another size or variant (the
-# 11-01 dry run: 26 -> 87 and 79 -> 140 next to plain markdowns), so the seed gets its page read instead.
+# Past MAX_PRICE_RATIO either way the catalogue cannot tell an end of sale from another size or variant, so the
+# seed gets its page read instead. Judged like for like: the catalogue's chosen variant against the stored
+# variant with the same id (the row's price only when none has it), and every variant read against its twin.
+
+
+def _snap(amount, currency="USD", variants=()):
+    return SimpleNamespace(price_amount=amount, price_currency=currency,
+                           evidence={"variants": [{"variant_id": vid, "price_amount": a, "availability": "in_stock"}
+                                                  for vid, a in variants]})
+
+
+def _stored(*pairs, currency=None):
+    return [{"variant_id": vid, "price_amount": a, **({"currency": currency} if currency else {})} for vid, a in pairs]
 
 
 @pytest.mark.parametrize(
-    "stored, cur, incoming, incoming_cur, guarded",
+    "column, cur, stored, snap, url, guarded",
     [
-        (26.0, "USD", 87.0, "USD", True),  # 3.3x up
-        (78.95, "USD", 139.99, "USD", True),  # 1.77x up
-        (80.0, "USD", 120.01, "USD", True),  # just past 1.5x
-        (80.0, "USD", 120.0, "USD", False),  # exactly 1.5x: taken
-        (80.0, "USD", 96.0, "USD", False),  # 1.2x: an end of sale, taken
-        (80.0, "USD", 53.0, "USD", True),  # below 1/1.5
-        (80.0, "USD", 54.0, "USD", False),  # 0.675x: taken
-        (80.0, "USD", 260.0, "CAD", False),  # another currency: the refresh's own rule refuses it
-        (None, "USD", 260.0, "USD", False),  # nothing stored: filled as before
-        (0.0, "USD", 260.0, "USD", False),
-        (80.0, "USD", None, "USD", False),
-        (80.0, None, 260.0, "USD", False),
-        ("garbage", "USD", 260.0, "USD", False),
+        # No stored variant has the chosen id: the row's price is the comparison.
+        (26.0, "USD", [], _snap(87.0, variants=[("1", 87.0)]), DEST, True),
+        (78.95, "USD", [], _snap(139.99, variants=[("1", 139.99)]), DEST, True),
+        (80.0, "USD", [], _snap(120.01, variants=[("1", 120.01)]), DEST, True),
+        (80.0, "USD", [], _snap(120.0, variants=[("1", 120.0)]), DEST, False),  # exactly 1.5x: taken
+        (1.5, "USD", [], _snap(1.0, variants=[("1", 1.0)]), DEST, False),  # exactly 1/1.5: taken
+        (80.0, "USD", [], _snap(53.0, variants=[("1", 53.0)]), DEST, True),
+        (80.0, "USD", [], _snap(96.0, variants=[("1", 96.0)]), DEST, False),
+        (26.0, None, [], _snap(87.0, variants=[("1", 87.0)]), DEST, True),  # a row naming no currency is judged
+        (80.0, "CAD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),  # the refresh refuses it itself
+        (80.0, "USD", [], _snap(0.0, variants=[("1", 0.0)]), DEST, False),  # non-positive: the refresh's rule
+        (None, "USD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),
+        ("garbage", "USD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),
+        # The URL names the 15 mL; the column holds the 50 mL's 80; the stored 15 mL is 32. Like for like: 34/32.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 32.0)), _snap(34.0, variants=[(V50, 85.0), (V15, 34.0)]),
+         f"{DEST}?variant={V15}", False),
+        # Every variant read is judged: the headline agrees, the 15 mL went 32 -> 80.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 32.0)), _snap(85.0, variants=[(V50, 85.0), (V15, 80.0)]), DEST, True),
+        # A stored variant in another currency is not a comparison.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 3.2), currency="JPY"), _snap(85.0, variants=[(V50, 85.0), (V15, 34.0)]),
+         DEST, False),
     ],
 )
-def test_a_move_past_the_ratio_either_way_is_guarded(monkeypatch, stored, cur, incoming, incoming_cur, guarded):
+def test_a_move_past_the_ratio_either_way_is_guarded_like_for_like(monkeypatch, column, cur, stored, snap, url, guarded):
     monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
-    snap = SimpleNamespace(price_amount=incoming, price_currency=incoming_cur)
-    assert lane.catalogue_price_move_guarded(stored, cur, snap) is guarded
+    assert lane.catalogue_price_move_guarded(column, cur, stored, snap, url=url) is guarded
 
 
 @pytest.mark.parametrize("raw, ratio", [("", 1.5), ("2", 2.0), ("1.01", 1.1), ("50", 5.0), ("x", 1.5), ("nan", 1.5)])
@@ -1316,31 +1321,68 @@ def test_the_ratio_is_configurable_within_a_safe_range(monkeypatch, raw, ratio):
     assert lane.max_price_ratio() == ratio
 
 
-@pytest.mark.parametrize("p50, guarded", [("265.00", True), ("50.00", True), ("96.00", False), ("56.00", False)])
-def test_a_big_move_is_read_from_the_page_instead(monkeypatch, p50, guarded):
+@pytest.mark.parametrize("p50, p15, guarded", [
+    ("265.00", "32.00", True),  # the headline 80 -> 265
+    ("50.00", "32.00", True),  # 80 -> 50
+    ("85.00", "80.00", True),  # the 15 mL 32 -> 80: a variant alone is enough
+    ("96.00", "32.00", False),
+    ("56.00", "30.00", False),
+])
+def test_a_big_move_is_read_from_the_page_instead(monkeypatch, p50, p15, guarded):
     run = _Refresh(monkeypatch, _drain_row())
     run.page_read(80, 32)
     if guarded:
         run.page = _page_snapshot(80, 32)
-    result = run.catalogue(_seed_read(_product(p50=p50, p15="32.00")))
+    result = run.catalogue(_seed_read(_product(p50=p50, p15=p15)))
     if guarded:
         assert result["catalogue_fallback"] == "price_move_guarded"
         assert result["read_source"] == "page" and run.fetched == [DEST, DEST], "the page was read in this call"
-        assert run.stored["price_amount"] == 80.0, "the catalogue's price was not taken"
+        assert run.stored["price_amount"] == 80.0 and run.variants[V15]["price_amount"] == 32.0, "nothing of the catalogue's was taken"
     else:
         assert result.get("catalogue_fallback") is None
         assert result["read_source"] == lane.READ_SOURCE and run.fetched == [DEST], "no page fetch"
-        assert run.stored["price_amount"] == float(p50)
+        assert run.stored["price_amount"] == float(p50) and run.variants[V15]["price_amount"] == float(p15)
 
 
-def test_the_batch_counts_a_guarded_move_with_the_other_fallbacks(monkeypatch):
-    """The job's summary already reports `catalogue.fallbacks` by reason; the guard is one of them."""
-    import routes.employee_products as mod
+def test_a_column_holding_another_variants_price_is_corrected_by_the_catalogue(monkeypatch):
+    """The URL names the 15 mL while the column holds the 50 mL's 80. Like for like the 15 mL moved 32 -> 34, so the
+    catalogue's 34 is taken: the column is corrected, not sent to a page read that would price the 50 mL again."""
+    row = _drain_row()
+    row["destination_url"] = row["canonical_url"] = DEST + "?variant=" + V15
+    run = _Refresh(monkeypatch, row)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00"), url=row["destination_url"]))
+    assert result.get("catalogue_fallback") is None and result["read_source"] == lane.READ_SOURCE
+    assert run.stored["price_amount"] == 34.0, "the column now holds the URL's variant"
+    assert run.fetched == []
 
+
+def test_a_seed_due_its_page_read_is_due_first_whatever_its_move(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=31)
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read(_product(p50="265.00")))
+    assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_TOO_OLD
+
+
+def test_the_guard_reads_the_ratio_from_the_env(monkeypatch):
     run = _Refresh(monkeypatch, _drain_row())
     run.page_read(80, 32)
     run.page = _page_snapshot(80, 32)
     monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, "1.1")
     assert run.catalogue(_seed_read(_product(p50="90.00")))["catalogue_fallback"] == "price_move_guarded"
-    assert mod._catalogue_price_move_guarded({"price_amount": 80, "price_currency": "USD"},
-                                             SimpleNamespace(snapshot=SimpleNamespace(price_amount=90.0, price_currency="USD")))
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV)
+    run.page = None
+    assert run.catalogue(_seed_read(_product(p50="90.00"))).get("catalogue_fallback") is None
+
+
+
+def test_the_batch_counts_a_guarded_seed_even_when_its_page_read_degrades(monkeypatch):
+    """The real batch: a seed the guard sent to its page read is counted under catalogue.fallbacks, whatever the
+    page read then answered."""
+    def result(seed_id, kwargs):
+        guarded = kwargs.get("catalogue_read") is not None and seed_id in ("s1", "s3")
+        return {"status": "degraded" if seed_id == "s3" else "success", "price_refresh": {"status": "unchanged"},
+                "projection": {}, "read_source": "page" if guarded or not kwargs.get("catalogue_read") else lane.READ_SOURCE,
+                "catalogue_fallback": "price_move_guarded" if guarded else None}
+
+    summary, _, _ = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a", "c")}, refresh_result=result)
+    assert summary["catalogue"]["fallbacks"] == {"price_move_guarded": 2}

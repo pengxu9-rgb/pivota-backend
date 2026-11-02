@@ -2334,12 +2334,13 @@ async def run_external_referral_refresh_batch(
                 result = await refresh_seed_by_id(seed_id, **refresh_kwargs)
             status = str(result.get("status") or "success")
             outcome = status
+            # Counted whatever the row's outcome: a seed sent back to its page read can still end degraded.
+            if catalogue_read is not None and result.get("catalogue_fallback"):
+                _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
             if status == "success":
                 refreshed += 1
                 if result.get("read_source") == catalogue_lane.READ_SOURCE:
                     catalogue_rows_read += 1
-                if catalogue_read is not None and result.get("catalogue_fallback"):
-                    _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
                 if result.get("snapshot_from_cache"):
                     refreshed_from_cache += 1
                 # isinstance, not truthiness: a truthy non-dict here used to raise
