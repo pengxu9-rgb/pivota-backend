@@ -1194,7 +1194,7 @@ def test_no_plain_upsert_reads_a_log_metric(source):
     body = _uncommented(source)
     calls = re.findall(r'^(upsert|upsert_on_new_metric) "([^"]+)" "\$\((?:policy|promql_policy) (.*?)\)"$',
                        body, re.S | re.M)
-    assert len(calls) == 15, [n for _, n, _ in calls]
+    assert len(calls) == 16, [n for _, n, _ in calls]
     first_policy = min(body.index('\nupsert "'), body.index('\nupsert_on_new_metric "'))
     readers = 0
     for writer, name, args in calls:
@@ -1252,4 +1252,7 @@ def test_the_nine_existing_policies_render_exactly_as_before_this_change():
     # 2026-10-27: re-pinned for ONE deliberate change, "load balancer 5xx" now retains
     # project/forwarding-rule/backend labels and sets ERROR severity plus an identifying subject.
     # The other eight render byte-identically; the LB threshold and timing are unchanged.
-    assert digest == "6e0a665c2701e2a0006f24c3c267f1ceb0baba116459ed2062eafed2282e1a5c"
+    # 2026-11-02: re-pinned for ONE deliberate change, "Cloud Run job failing" now opens on one failed
+    # attempt (duration 0s, was 300s), renotifies hourly, and its documentation says so (relgraph-sync
+    # failed every night 2026-10-22..31 unpaged). The other eight render byte-identically to 6e0a665c...
+    assert digest == "4304029fc992993a502a90f8f61083628ac4598f8c22597e8218e7dc0933a3e7"

@@ -28,14 +28,39 @@ LB_DOC = (
     'failure. An unassigned backend can indicate an edge routing failure.'
 )
 
+JOB_FAILING_NAME = 'prod: Cloud Run job failing'
+JOB_FAILING_DOC = (
+    'A Cloud Run job task attempt FAILED (one failed attempt opens this; the job is named in the incident). '
+    'reviews-invitation-send runs every minute and relgraph-sync daily; a persistent failure in either is '
+    'otherwise completely silent - relgraph-sync failed every night from 2026-10-22 to 2026-10-31 without a '
+    'page, when this policy needed the failure to hold for 5 minutes. With max-retries 1 a failed scheduled '
+    'run can open two incidents, one per attempt. The incident closes about 5 minutes after the failed '
+    'attempt; while a job keeps failing it stays open and repeats hourly. Read the execution\'s logs: '
+    '`gcloud run jobs executions list --job JOB --region us-west1`. For retailer-ingest-drain, a failure '
+    'here is an UNEXPECTED exception (the run is recorded as outcome=error in retailer_ingest_runs); stages '
+    'that end held or failed exit 0 and page through their own retailer-ingest policies instead.'
+)
+RELGRAPH_SUCCESS_NAME = 'prod: relgraph-sync has not succeeded in a day'
+RELGRAPH_SUCCESS_QUERY = (
+    '((sum(sum_over_time(run_googleapis_com:job_completed_execution_count'
+    '{monitored_resource="cloud_run_job",job_name="relgraph-sync",result="succeeded"}[24h])) '
+    'or vector(0)) == 0) and on() (hour() < 10)'
+)
+
 
 def reviewed_policy(live):
-    """Keep the historical readback intact; permit only the reviewed LB identity/severity change."""
+    """Keep the historical readback intact; permit only the reviewed changes: the LB identity/severity
+    change (2026-10-27) and the job-failing duration 0s + hourly renotify (2026-11-02)."""
     expected = json.loads(json.dumps(live))
     if expected['displayName'] == LB_NAME:
         expected['severity'] = 'ERROR'
         expected['documentation'].update(content=LB_DOC, subject=LB_SUBJECT)
         expected['conditions'][0]['conditionPrometheusQueryLanguage']['query'] = LB_QUERY
+    if expected['displayName'] == JOB_FAILING_NAME:
+        expected['documentation']['content'] = JOB_FAILING_DOC
+        expected['conditions'][0]['conditionThreshold']['duration'] = '0s'
+        expected['alertStrategy']['notificationChannelStrategy'] = [{
+            'notificationChannelNames': expected['notificationChannels'], 'renotifyInterval': '3600s'}]
     return expected
 
 
@@ -91,6 +116,104 @@ def test_relgraph_occupancy_alert_shape_and_current_sizing():
                    'continuous occupancy of five hours']:
         assert phrase in policy['documentation']['content']
     assert policy['notificationChannels'] == LIVE[0]['notificationChannels']
+
+
+
+def test_one_failed_job_attempt_opens_an_incident():
+    """2026-10-22..31: relgraph-sync failed both attempts every night and nobody was paged. A failed
+    attempt is ONE sparse 5-minute point; a 300s duration asks it to hold the condition for 300s, which
+    it does only on the boundary. Duration 0s: one point opens an incident. Everything else - the
+    unscoped filter, the 300s ALIGN_SUM window, the job_name grouping, GT 0, autoclose - is unchanged."""
+    live = next(p for p in LIVE if p['displayName'] == JOB_FAILING_NAME)
+    policy = generated_policies()[JOB_FAILING_NAME]
+    condition = policy['conditions'][0]['conditionThreshold']
+    assert condition['duration'] == '0s'
+    assert condition == {**live['conditions'][0]['conditionThreshold'], 'duration': '0s', 'thresholdValue': 0}
+    assert condition['filter'] == ('metric.type="run.googleapis.com/job/completed_task_attempt_count" AND '
+                                   'resource.type="cloud_run_job" AND metric.label.result="failed"')
+    assert condition['aggregations'] == [{'alignmentPeriod': '300s', 'perSeriesAligner': 'ALIGN_SUM',
+                                          'crossSeriesReducer': 'REDUCE_SUM',
+                                          'groupByFields': ['resource.label.job_name']}]
+    assert policy['displayName'] == live['displayName']  # same name: the upsert replaces it in place
+    assert policy['notificationChannels'] == live['notificationChannels']
+    assert policy['alertStrategy'] == {
+        'autoClose': '3600s',
+        'notificationChannelStrategy': [{'notificationChannelNames': live['notificationChannels'],
+                                         'renotifyInterval': '3600s'}]}
+
+
+def test_the_renotify_argument_leaves_every_other_threshold_policy_as_it_was():
+    """`policy` gained an optional RENOTIFY; without it the alert strategy is autoClose alone."""
+    for name, policy in generated_policies().items():
+        if name in (JOB_FAILING_NAME, RELGRAPH_SUCCESS_NAME) or 'conditionThreshold' not in policy['conditions'][0]:
+            continue
+        assert set(policy['alertStrategy']) == {'autoClose'}, name
+
+
+def _relgraph_schedule():
+    """(start minute of day UTC, task timeout s, attempts) of relgraph-sync, from setup_scheduler.sh."""
+    scheduler = (ROOT / 'infra/gcp/setup_scheduler.sh').read_text()
+    (minute, hour), = re.findall(r'^sched relgraph-sync-cron "(\d+) (\d+) \* \* \*" relgraph-sync$', scheduler, re.M)
+    job = scheduler.split('\nmkjob relgraph-sync ', 1)[1].split('\n\n', 1)[0]
+    (timeout,) = re.findall(r'--task-timeout (\d+)s', job)
+    assert '--max-retries' not in job, 'relgraph-sync overrides max-retries; re-derive the gate'
+    mkjob = scheduler.split('\nmkjob(){', 1)[1].split('\n}', 1)[0]
+    (retries,) = re.findall(r'--max-retries (\d+)', mkjob)
+    return int(hour) * 60 + int(minute), int(timeout), int(retries) + 1
+
+
+def test_relgraph_has_not_succeeded_policy_reads_succeeded_executions_and_pages():
+    policy = generated_policies()[RELGRAPH_SUCCESS_NAME]
+    assert policy['displayName'] == RELGRAPH_SUCCESS_NAME
+    assert policy['notificationChannels'] == LIVE[0]['notificationChannels']
+    (condition,) = policy['conditions']
+    promql = condition['conditionPrometheusQueryLanguage']
+    # A system metric: its descriptor exists, so validation stays ON and catches a typo.
+    assert promql == {'query': RELGRAPH_SUCCESS_QUERY, 'duration': '300s', 'evaluationInterval': '60s'}
+    query = promql['query']
+    assert 'run_googleapis_com:job_completed_execution_count{' in query
+    assert 'job_name="relgraph-sync"' in query and 'result="succeeded"' in query
+    # No completions in the window = NO SAMPLES (a DELTA), an empty vector rather than 0: without the
+    # fallback the policy could never fire on a job that stopped running.
+    assert 'or vector(0)) == 0' in query
+    assert 'increase(' not in query and 'rate(' not in query
+    (strategy,) = policy['alertStrategy']['notificationChannelStrategy']
+    assert strategy == {'notificationChannelNames': policy['notificationChannels'], 'renotifyInterval': '14400s'}
+    assert policy['alertStrategy']['autoClose'] == '3600s'
+    assert policy['documentation']['subject'] == 'relgraph-sync: no successful run in the last 24 hours'
+    doc = policy['documentation']['content']
+    for phrase in ['closes at 10:00Z WHETHER OR NOT', 'A manual successful run counts', 'snooze']:
+        assert phrase in doc
+
+
+def test_relgraph_has_not_succeeded_gate_holds_exactly_one_night_within_the_look_back_limit():
+    """For T in [00:00Z, gate), [T - range, T] must hold ALL of yesterday's run and NONE of the day
+    before's, and range + duration must stay within the documented 25 hours."""
+    query = RELGRAPH_SUCCESS_QUERY
+    (range_h,) = map(int, re.findall(r'\[(\d+)h\]', query))
+    (gate_h,) = map(int, re.findall(r'hour\(\) < (\d+)\)', query))
+    assert 'offset' not in query
+    duration_s = int(generated_policies()[RELGRAPH_SUCCESS_NAME]['conditions'][0]
+                     ['conditionPrometheusQueryLanguage']['duration'].rstrip('s'))
+    assert range_h * 3600 + duration_s <= 25 * 3600
+    start_min, timeout_s, attempts = _relgraph_schedule()
+    assert (start_min, timeout_s, attempts) == (10 * 60 + 37, 21600, 2)
+    latest_success_min = start_min + attempts * timeout_s // 60 + 15  # + container start, retry, metric lag
+    day = 24 * 60
+    # The latest window start (gate - range, i.e. yesterday at the gate hour) is before yesterday's run.
+    assert gate_h * 60 - range_h * 60 + day <= start_min
+    # The earliest window start (midnight - range) is after the day-before's last possible success.
+    assert latest_success_min - day < 0 - range_h * 60 + day
+    assert latest_success_min < day
+
+
+def test_relgraph_has_not_succeeded_is_prod_only_and_written_by_plain_upsert():
+    """Staging triggers are created paused; there it would page every morning. A system metric is
+    visible to Monitoring at once, so the plain writer is right (no NEW_METRIC wait)."""
+    source = (ROOT / 'infra/gcp/setup_monitoring.sh').read_text()
+    at = source.index(f'upsert "{RELGRAPH_SUCCESS_NAME}"')
+    assert source.rindex('\nif [ "$ENV" = prod ]; then\n', 0, at) > source.rindex('\nfi\n', 0, at)
+    assert source.index('\nfi\n', at) < source.index('\nupsert', at + 1)
 
 
 # Fields the API assigns or manages; everything else the upsert's delete+create writes (or wipes).
