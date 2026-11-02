@@ -18,7 +18,7 @@ from services import crawl_global_pacer
 from services import crawl_identity
 from services import crawl_politeness
 from services import shopify_edge_pacer
-from utils.availability_vocabulary import IN_STOCK, normalize_availability
+from utils.availability_vocabulary import OUT_OF_STOCK, normalize_availability
 from utils.crawled_price import (
     agreed_hint,
     decimal_hint_from_currency,
@@ -1707,37 +1707,42 @@ def _variant_parent_names(parsed_objs: list[Any]) -> Dict[int, str]:
     return names
 
 
-def _url_selected_variant(url: Any) -> Optional[str]:
-    """The variant the URL selects: "" when it names none, its digits when it names one, None when its
-    `?variant=` cannot be read as one variant (two values, or not digits). The catalogue lane reads a URL the
-    same way (`services.external_seed_catalogue_refresh.url_variant_id`)."""
-    try:
-        values = {v.strip() for k, v in parse_qsl(urlparse(str(url or "")).query, keep_blank_values=True) if k == "variant"}
-    except ValueError:
-        return None
-    if not values:
-        return ""
-    if len(values) != 1:
-        return None
-    (value,) = values
-    return value if value.isascii() and value.isdigit() else None
+# WHICH OFFER PRICES THE PRODUCT (`_pick_product_offer`), behind EXTERNAL_OFFER_URL_VARIANT_PICK, read per call:
+#   off     (default) the first offer, as before;
+#   shadow  the first offer is still served; where the URL-variant pick would read another price (or none), one
+#           `page_offer_pick_shadow` line says so, to size the change on real refreshes before it serves;
+#   on      the URL-variant pick serves.
+URL_VARIANT_PICK_ENV = "EXTERNAL_OFFER_URL_VARIANT_PICK"
+_URL_VARIANT_PICK_MODES = ("off", "shadow", "on")
 
 
-def _offer_variant_ref(offer: Dict[str, Any], page_urls: Tuple[str, ...]) -> Optional[str]:
-    """The variant an offer names, as digits: its own-product `?variant=` link (`_offer_shopify_variant_id`), else an
-    id field that is all digits (a SKU like "ABC-50ML" names no variant id). None when it names none."""
+def url_variant_pick_mode() -> str:
+    raw = str(os.getenv(URL_VARIANT_PICK_ENV) or "").strip().lower()
+    return raw if raw in _URL_VARIANT_PICK_MODES else "off"
+
+
+def _offer_variant_refs(offer: Dict[str, Any], page_urls: Tuple[str, ...]) -> Tuple[Optional[str], Optional[str]]:
+    """(the variant the offer LINKS on this page's own product, an all-digit id it carries), each as digits or None.
+
+    Only the link is evidence of WHICH variant an offer is (`_offer_shopify_variant_id`). An all-digit id field
+    may be the variant id, but is as often a barcode or an MPN, so it can confirm a match and never refuse one.
+    """
     item = _offer_item(offer)
-    linked = _offer_shopify_variant_id(offer, item, page_urls) if page_urls else None
-    if linked:
-        return linked
+    link = _offer_shopify_variant_id(offer, item, page_urls) if page_urls else None
+    digits = None
     for node in (offer, item):
         for key in _OFFER_ID_KEYS:
             raw = node.get(key)
-            if raw not in (None, "") and not isinstance(raw, (dict, list, bool)):
+            if digits is None and raw not in (None, "") and not isinstance(raw, (dict, list, bool)):
                 text = str(raw).strip()
                 if text.isascii() and text.isdigit():
-                    return text
-    return None
+                    digits = text
+    return link, digits
+
+
+def _not_sold_out(offer: Dict[str, Any]) -> bool:
+    """Not stated sold out: an offer that states no availability is not skipped for it."""
+    return _availability_from_raw(str(offer.get("availability") or "").strip() or None) != OUT_OF_STOCK
 
 
 def _pick_product_offer(
@@ -1747,34 +1752,56 @@ def _pick_product_offer(
 
     THE URL'S VARIANT PRICES THE PAGE. A seed's URL can name one size (`?variant=`) while the page lists every
     size; taking the first listed priced the 15 mL URL at the 50 mL's price, every night. So:
-      * the URL names a variant: the offer that names it ("url_variant"); when the offers name variants and
-        none is that one, NO offer ("url_variant_not_listed", the page is refused, never guessed); when no
-        offer names any variant, none either ("url_variant_unidentifiable"), and the page's own meta price
-        (rendered for the selected variant) is read instead;
-      * the URL names none (or cannot be read): the first offer in stock, else the first offer
+      * the URL names a variant: the offer that names it, by its own-product link or an all-digit id
+        ("url_variant"). When the offers LINK variants on this product and none is that one, no offer
+        ("url_variant_not_listed": the page is refused, never guessed). Otherwise, a lone offer is the
+        product's ("single_offer"), and among several none is ("url_variant_unidentifiable"): the page's
+        meta price, which the store renders for the selected variant, is read instead;
+      * the URL names none (or cannot be read): the first offer not stated sold out, else the first
         ("first_available"), which is the variant the store selects and the catalogue lane takes.
     """
     if not candidates:
         return None, None
     if selected:
-        refs = [_offer_variant_ref(o, page_urls) for o in candidates]
-        match = next((o for o, ref in zip(candidates, refs) if ref == selected), None)
+        refs = [_offer_variant_refs(o, page_urls) for o in candidates]
+        match = next((o for o, (link, digits) in zip(candidates, refs) if selected in (link, digits)), None)
         if match is not None:
             return match, "url_variant"
-        if any(refs):
+        if any(link for link, _ in refs):
             return None, "url_variant_not_listed"
+        if len(candidates) == 1:
+            return candidates[0], "single_offer"
         return None, "url_variant_unidentifiable"
-    in_stock = next(
-        (o for o in candidates if _availability_from_raw(str(o.get("availability") or "").strip() or None) == IN_STOCK),
-        None,
-    )
-    return (in_stock or candidates[0]), "first_available"
+    first = next((o for o in candidates if _not_sold_out(o)), None)
+    return (first or candidates[0]), "first_available"
+
+
+def _variant_siblings(parsed_objs: list[Any]) -> Dict[int, list]:
+    """`id(variant node) -> its ProductGroup's hasVariant list`, in page order (see `_variant_parent_names`)."""
+    out: Dict[int, list] = {}
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            children = node.get("hasVariant")
+            if isinstance(children, dict):
+                children = [children]
+            if isinstance(children, list):
+                kids = [c for c in children if isinstance(c, dict)]
+                for child in kids:
+                    out[id(child)] = kids
+    return out
 
 
 def _extract_jsonld_offer(
-    parsed_objs: list[Any], *, selected_variant: Optional[str] = None, page_urls: Tuple[str, ...] = ()
+    parsed_objs: list[Any], *, selected_variant: Optional[str] = None, page_urls: Tuple[str, ...] = (),
+    url_variant_pick: bool = False,
 ) -> Dict[str, Any]:
+    """The product-level JSON-LD reading. `url_variant_pick` chooses the product's offer with `_pick_product_offer`
+    (the URL's variant); without it, the first offer, as before."""
     best: Dict[str, Any] = {}
+    best_node: Any = None
+    entries: Dict[int, Dict[str, Any]] = {}
     parent_names = _variant_parent_names(parsed_objs)
     for root in parsed_objs:
         for node in _iter_jsonld_nodes(root):
@@ -1811,8 +1838,14 @@ def _extract_jsonld_offer(
             # price as the product's. The first offer that is not a plan; none when all are.
             offer_list = offers if isinstance(offers, list) else ([offers] if isinstance(offers, dict) else [])
             plans, _ = _selling_plan_reasons(offer_list, name if isinstance(name, str) else None)
-            candidates = [o for o in offer_list if isinstance(o, dict) and id(o) not in plans]
-            offers, picked_by = _pick_product_offer(candidates, selected_variant, page_urls)
+            picked_by = None
+            if url_variant_pick:
+                candidates = [o for o in offer_list if isinstance(o, dict) and id(o) not in plans]
+                offers, picked_by = _pick_product_offer(candidates, selected_variant, page_urls)
+            elif plans:
+                offers = next((o for o in offer_list if isinstance(o, dict) and id(o) not in plans), None)
+            elif isinstance(offers, list) and offers:
+                offers = offers[0]
             price = None
             currency = None
             availability = None
@@ -1836,9 +1869,9 @@ def _extract_jsonld_offer(
             if availability:
                 score += 1
 
-            if score and score > best.get("_score", 0):
+            if score:
                 rating_value, rating_count = _parse_aggregate_rating(node)
-                best = {
+                entry = {
                     "_score": score,
                     # How the product's offer was chosen (`_pick_product_offer`); None for a node with no offers.
                     "offer_picked_by": picked_by,
@@ -1856,7 +1889,29 @@ def _extract_jsonld_offer(
                     "rating_value": rating_value,
                     "rating_count": rating_count,
                 }
+                entries[id(node)] = entry
+                if score > best.get("_score", 0):
+                    best, best_node = entry, node
 
+    siblings = _variant_siblings(parsed_objs).get(id(best_node)) or [] if best_node is not None else []
+    if url_variant_pick and selected_variant and len(siblings) > 1 and best.get("offer_picked_by") == "single_offer":
+        # A ProductGroup's variants are one node each, so every node holds a lone offer: a lone offer is not the
+        # product's when its siblings are other variants. The URL's variant is unidentified here; the meta price
+        # (rendered for the selected variant) is read instead.
+        best = {**best, "price_raw": None, "price_exact": False, "currency": None, "availability_raw": None,
+                "offer_picked_by": "url_variant_unidentifiable"}
+    if url_variant_pick and not selected_variant and best_node is not None:
+        # A ProductGroup's variants are one node each, one offer per node: the first node wins on score, sold out
+        # or not. The store selects the first variant not sold out, so does this (and so does the catalogue lane).
+        if siblings and _availability_from_raw(best.get("availability_raw")) == OUT_OF_STOCK:
+            for sibling in siblings:
+                entry = entries.get(id(sibling))
+                if (entry and entry.get("price_raw") and entry.get("currency")
+                        and _availability_from_raw(entry.get("availability_raw")) != OUT_OF_STOCK):
+                    best = entry
+                    break
+
+    best = dict(best)
     best.pop("_score", None)
     return best
 
@@ -2111,6 +2166,28 @@ def _read_product_price(
     return first_refusal or {"amount": None, "source": None, "raw": None, "status": "empty", "decimal_hint": None}
 
 
+def _log_offer_pick_shadow(url: str, served: Dict[str, Any], picked: Dict[str, Any]) -> None:
+    """EXTERNAL_OFFER_URL_VARIANT_PICK=shadow: one line where the URL-variant pick would read the product otherwise."""
+    if (served.get("price_raw"), served.get("availability_raw")) == (picked.get("price_raw"), picked.get("availability_raw")):
+        return
+    try:
+        from utils.logger import logger
+
+        logger.warning(
+            "page_offer_pick_shadow %s",
+            json.dumps({
+                "host": (urlparse(str(url)).hostname or "").lower() or None,
+                "served_price": served.get("price_raw"),
+                "picked_price": picked.get("price_raw"),
+                "picked_by": picked.get("offer_picked_by"),
+                "served_availability": _availability_from_raw(served.get("availability_raw")),
+                "picked_availability": _availability_from_raw(picked.get("availability_raw")),
+            }, default=str),
+        )
+    except Exception:  # noqa: BLE001 -- a log line never fails a read
+        pass
+
+
 def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     p = _MetaParser()
     p.feed(html)
@@ -2133,10 +2210,20 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     signals = _page_price_signals(p, html)
 
     parsed_jsonld = _parse_jsonld_texts(p.jsonld)
-    selected_variant = _url_selected_variant(base_url)
-    jsonld = _extract_jsonld_offer(parsed_jsonld, selected_variant=selected_variant, page_urls=(canonical, base_url))
+    pick_mode = url_variant_pick_mode()
+    jsonld = _extract_jsonld_offer(parsed_jsonld)
+    if pick_mode != "off":
+        from services.external_seed_catalogue_refresh import url_variant_id
+
+        picked = _extract_jsonld_offer(
+            parsed_jsonld, selected_variant=url_variant_id(base_url), page_urls=(canonical, base_url), url_variant_pick=True,
+        )
+        if pick_mode == "on":
+            jsonld = picked
+        else:
+            _log_offer_pick_shadow(base_url, jsonld, picked)
     if jsonld.get("offer_picked_by") == "url_variant_not_listed":
-        # The page lists its variants and not the one the URL names: the meta price is the store's fallback
+        # The page LINKS its variants and not the one the URL names: the meta price is the store's fallback
         # variant's, not this one's. Nothing is read; the refresh keeps what it stores.
         price = None
     jsonld_image_urls = _extract_jsonld_image_urls(parsed_jsonld, canonical)

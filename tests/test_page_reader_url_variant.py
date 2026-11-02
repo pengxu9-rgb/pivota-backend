@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from services.external_offers_service import _extract_from_html, snapshot_price_fields
+from services.external_offers_service import URL_VARIANT_PICK_ENV, _extract_from_html, snapshot_price_fields
 
 HOST = "brand.example"
 HANDLE = "example-serum"
@@ -23,8 +23,19 @@ IN = "https://schema.org/InStock"
 OUT = "https://schema.org/OutOfStock"
 
 
-def _offer(vid: str, price: str, availability: str = IN, *, link: bool = True, sku: Optional[str] = None) -> Dict[str, Any]:
-    offer: Dict[str, Any] = {"@type": "Offer", "price": price, "priceCurrency": "USD", "availability": availability}
+@pytest.fixture(autouse=True)
+def _pick_on(monkeypatch):
+    """The URL-variant pick serves (EXTERNAL_OFFER_URL_VARIANT_PICK=on); the off and shadow modes have their own tests."""
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "on")
+
+
+def _offer(vid: str, price: str, availability: Optional[str] = IN, *, link: bool = True, sku: Optional[str] = None,
+           mpn: Optional[str] = None) -> Dict[str, Any]:
+    offer: Dict[str, Any] = {"@type": "Offer", "price": price, "priceCurrency": "USD"}
+    if availability is not None:
+        offer["availability"] = availability
+    if mpn is not None:
+        offer["mpn"] = mpn
     if link:
         offer["url"] = f"{PAGE}?variant={vid}"
     if sku is not None:
@@ -32,12 +43,13 @@ def _offer(vid: str, price: str, availability: str = IN, *, link: bool = True, s
     return offer
 
 
-def _html(offers: List[Dict[str, Any]], *, og_price: Optional[str] = None) -> str:
-    product = {"@context": "https://schema.org", "@type": "Product", "name": "Example Serum",
-               "image": f"https://cdn.{HOST}/serum.jpg", "description": "A serum.", "offers": offers}
+def _html(offers: List[Dict[str, Any]], *, og_price: Optional[str] = None, canonical: str = PAGE, jsonld: Any = None) -> str:
+    product = jsonld if jsonld is not None else {
+        "@context": "https://schema.org", "@type": "Product", "name": "Example Serum",
+        "image": f"https://cdn.{HOST}/serum.jpg", "description": "A serum.", "offers": offers}
     meta = (f'<meta property="og:price:amount" content="{og_price}"><meta property="og:price:currency" content="USD">'
             if og_price else "")
-    return (f'<html><head><title>Example Serum</title><link rel="canonical" href="{PAGE}">{meta}'
+    return (f'<html><head><title>Example Serum</title><link rel="canonical" href="{canonical}">{meta}'
             f'<script type="application/ld+json">{json.dumps(product)}</script></head><body></body></html>')
 
 
@@ -159,3 +171,114 @@ def asyncio_run(coro):
     import asyncio
 
     return asyncio.run(coro)
+
+
+
+# ---- review of #2690: an id field confirms, only a link refuses; groups; modes --------------------------------------
+
+
+def test_a_lone_offer_carrying_a_barcode_as_sku_prices_a_variant_url():
+    """The P1: one offer, a 13-digit barcode sku, no link. Not evidence of another variant: it is the product."""
+    offers = [_offer(V15, "28.00", link=False, sku="8809123456789")]
+    for og in (None, "28.00"):
+        amount, _, price_read, extracted = _price(f"{PAGE}?variant={V15}", _html(offers, og_price=og))
+        assert (amount, price_read["status"], extracted["availability"]) == (28.0, "parsed", "in_stock")
+
+
+def test_numeric_ids_that_are_not_the_urls_variant_never_refuse_the_page():
+    """Several offers, numeric MPNs, no links: they cannot be told apart, so the meta price (rendered for the
+    selected variant) prices the URL; nothing is refused."""
+    offers = [_offer(V50, "85.00", link=False, mpn="1234567"), _offer(V15, "34.00", link=False, mpn="7654321")]
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html(offers, og_price="34.00"))
+    assert (amount, price_read["source"], price_read["status"]) == (34.0, "meta", "parsed")
+
+
+def test_a_link_on_the_offered_item_names_the_variant():
+    offers = [{"@type": "Offer", "price": "85.00", "priceCurrency": "USD", "availability": IN,
+               "itemOffered": {"@type": "Product", "url": f"{PAGE}?variant={V50}"}},
+              {"@type": "Offer", "price": "34.00", "priceCurrency": "USD", "availability": IN,
+               "itemOffered": {"@type": "Product", "url": f"{PAGE}?variant={V15}"}}]
+    amount, _, _, _ = _price(f"{PAGE}?variant={V15}", _html(offers))
+    assert amount == 34.0
+
+
+def test_the_fetched_url_names_the_product_when_the_canonical_does_not():
+    """A canonical pointing at a collection: the product is the URL that was fetched."""
+    amount, _, _, _ = _price(f"{PAGE}?variant={V15}", _html(TWO_SIZES, canonical=f"https://{HOST}/collections/serums"))
+    assert amount == 34.0
+
+
+def test_an_offer_stating_no_availability_is_not_skipped_for_it():
+    """First not stated sold out: as before when the page states nothing."""
+    amount, _, _, _ = _price(PAGE, _html([_offer(V50, "85.00", None), _offer(V15, "34.00", IN)]))
+    assert amount == 85.0
+
+
+def _group(sold_out_first: bool) -> Dict[str, Any]:
+    def variant(vid, price, availability):
+        return {"@type": "Product", "name": f"{price} size", "sku": f"SERUM-{vid[-2:]}",
+                "offers": {"@type": "Offer", "price": price, "priceCurrency": "USD", "availability": availability,
+                           "url": f"{PAGE}?variant={vid}"}}
+    return {"@context": "https://schema.org", "@type": "ProductGroup", "name": "Example Serum",
+            "hasVariant": [variant(V50, "85.00", OUT if sold_out_first else IN), variant(V15, "34.00", IN)]}
+
+
+def test_a_product_group_is_priced_at_its_first_variant_not_sold_out():
+    amount, _, _, extracted = _price(PAGE, _html([], jsonld=_group(sold_out_first=True)))
+    assert amount == 34.0 and extracted["availability"] == "in_stock"
+    amount, _, _, _ = _price(PAGE, _html([], jsonld=_group(sold_out_first=False)))
+    assert amount == 85.0
+    # And a variant URL is that variant's, sold out or not.
+    amount, _, _, _ = _price(f"{PAGE}?variant={V50}", _html([], jsonld=_group(sold_out_first=True)))
+    assert amount == 85.0
+
+
+def test_off_reads_the_first_offer_as_before_and_shadow_logs_the_difference(monkeypatch):
+    from utils import logger as shared
+
+    lines: List[str] = []
+    monkeypatch.setattr(shared.logger, "warning", lambda msg, *args, **kw: lines.append(msg % args if args else msg))
+    url = f"{PAGE}?variant={V15}"
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "off")
+    assert _price(url, _html(TWO_SIZES))[0] == 85.0
+    monkeypatch.delenv(URL_VARIANT_PICK_ENV)
+    assert _price(url, _html(TWO_SIZES))[0] == 85.0, "off is the default"
+    assert not [m for m in lines if "page_offer_pick_shadow" in m], "off logs nothing"
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "shadow")
+    assert _price(url, _html(TWO_SIZES))[0] == 85.0, "shadow serves the first offer"
+    shadow = [m for m in lines if "page_offer_pick_shadow" in m]
+    assert len(shadow) == 1
+    assert json.loads(shadow[0].split(" ", 1)[1]) == {
+        "host": HOST, "served_price": "85.00", "picked_price": "34.00", "picked_by": "url_variant",
+        "served_availability": "in_stock", "picked_availability": "in_stock"}
+    _price(PAGE, _html(TWO_SIZES))  # both pick the 50 mL: no line
+    assert len([m for m in lines if "page_offer_pick_shadow" in m]) == 1
+    monkeypatch.setenv(URL_VARIANT_PICK_ENV, "garbage")
+    assert _price(url, _html(TWO_SIZES))[0] == 85.0, "an unknown mode is off"
+
+
+def test_a_product_group_without_variant_links_leaves_a_variant_url_to_the_meta_price():
+    """Every variant node holds a lone offer, none linked: the URL's variant cannot be told from the first node."""
+    group = _group(sold_out_first=True)
+    for node in group["hasVariant"]:
+        node["offers"].pop("url")
+    amount, _, price_read, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=group, og_price="34.00"))
+    assert (amount, price_read["source"]) == (34.0, "meta")
+    # A URL naming no variant is still the first not sold out.
+    assert _price(PAGE, _html([], jsonld=group))[0] == 34.0
+
+
+def test_a_named_sold_out_variant_in_a_group_keeps_its_own_price():
+    """The URL names the 50 mL, which is linked and sold out; the 15 mL's node carries no link. Still the 50 mL."""
+    group = _group(sold_out_first=True)
+    group["hasVariant"][1]["offers"].pop("url")
+    amount, _, _, extracted = _price(f"{PAGE}?variant={V50}", _html([], jsonld=group))
+    assert amount == 85.0 and extracted["availability"] == "out_of_stock"
+
+
+def test_a_group_of_one_variant_is_priced_by_its_lone_offer():
+    group = _group(sold_out_first=False)
+    group["hasVariant"] = group["hasVariant"][:1]
+    group["hasVariant"][0]["offers"].pop("url")
+    amount, _, _, _ = _price(f"{PAGE}?variant={V15}", _html([], jsonld=group))
+    assert amount == 85.0
