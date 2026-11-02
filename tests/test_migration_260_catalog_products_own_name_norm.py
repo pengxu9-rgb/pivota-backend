@@ -54,11 +54,13 @@ def test_both_files_are_invisible_to_the_boot_runner_and_say_why() -> None:
     # files carry no marker and stay out of everything.
     assert HAND_APPLIED_MARKER == "-- HAND-APPLIED ONLY"
     # (270/271 are the next hand-applied files: offers.resolve's seed indexes, see their own tests;
-    # 274 is the catalogue lane's page-read column, tests/test_external_seed_catalogue_refresh*.)
+    # 274 is the catalogue lane's page-read column, tests/test_external_seed_catalogue_refresh*;
+    # 276 is the deal lane's click-row columns, tests/test_deal_lane_storage*.)
     assert [Path(f).name for f in list_hand_applied_migration_files(str(REPO))] == [
         UP_260.name, UP_261.name, "270_external_seed_active_any_trgm_indexes.sql.disabled",
         "271_external_seed_active_seed_title_trgm_index.sql.disabled",
         "274_external_seed_last_page_read_at.sql.disabled",
+        "276_surface_click_events_discount_code.sql.disabled",
     ]
     assert not (set(Path(f).name for f in list_hand_applied_migration_files(str(REPO))) & active)
     assert UP_260.exists() and UP_261.exists()

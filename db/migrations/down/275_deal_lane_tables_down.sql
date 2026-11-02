@@ -8,4 +8,4 @@ DROP TABLE IF EXISTS deal_program_permission_hosts;
 DROP TABLE IF EXISTS deal_program_permissions;
 DROP TABLE IF EXISTS deal_verify_host_daily_carts;
 DROP TABLE IF EXISTS deal_lane_stops;
-DROP TABLE IF EXISTS deal_seller_optouts;
+DROP TABLE IF EXISTS deal_lane_optout;

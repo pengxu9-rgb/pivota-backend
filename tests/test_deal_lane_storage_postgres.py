@@ -31,6 +31,7 @@ _DOWN_275 = _MIG / "down" / "275_deal_lane_tables_down.sql"
 _MIG_276 = _MIG / "276_surface_click_events_discount_code.sql.disabled"
 _DOWN_276 = _MIG / "down" / "276_surface_click_events_discount_code_down.sql"
 _SCHEMA_276 = f"deal276_{os.getpid()}"
+_SCHEMA_MODEL = f"dealmodel_{os.getpid()}"
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 
 
@@ -45,7 +46,7 @@ def _tables():
         deal_lane.deal_network_links,
         deal_lane.deal_verify_host_daily_carts,
         deal_lane.deal_lane_stops,
-        deal_lane.deal_seller_optouts,
+        deal_lane.deal_lane_optout,
     )
 
 
@@ -82,9 +83,13 @@ async def db():
     try:
         yield database
     finally:
+        # A test that failed half-way through a down file can leave a table missing: clean what exists,
+        # and never raise here, or the stranded connection fails every file after this one.
         for table in reversed(_tables()):
-            await database.execute(f"DELETE FROM {table.name}")
+            if await database.fetch_val("SELECT to_regclass(:t)", {"t": table.name}) is not None:
+                await database.execute(f"DELETE FROM {table.name}")
         await database.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA_276} CASCADE")
+        await database.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA_MODEL} CASCADE")
         if not was_connected:
             await database.disconnect()
 
@@ -151,40 +156,67 @@ async def _refused(coro, constraint: str):
 # ---- the migration builds the model --------------------------------------------------------------
 
 
-async def test_migration_275_builds_exactly_the_model_columns(db):
+async def _describe(db, schema: str):
+    """Every column, constraint and index of the deal tables in `schema`, schema names stripped."""
+
+    def unqualified(text):
+        return text.replace(f"{schema}.", "").replace("public.", "") if text else text
+
+    out = {}
     for table in _tables():
-        rows = await db.fetch_all(
-            "SELECT column_name, is_nullable FROM information_schema.columns "
-            "WHERE table_schema = 'public' AND table_name = :t",
-            {"t": table.name},
+        columns = await db.fetch_all(
+            "SELECT column_name, data_type, character_maximum_length, numeric_precision, numeric_scale, "
+            "is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema = :s AND table_name = :t",
+            {"s": schema, "t": table.name},
         )
-        built = {r["column_name"]: r["is_nullable"] == "YES" for r in rows}
-        declared = {c.name: bool(c.nullable) for c in table.columns}
-        assert built == declared, table.name
+        constraints = await db.fetch_all(
+            "SELECT c.conname, pg_get_constraintdef(c.oid) AS def FROM pg_constraint c "
+            "JOIN pg_class r ON r.oid = c.conrelid JOIN pg_namespace n ON n.oid = r.relnamespace "
+            "WHERE n.nspname = :s AND r.relname = :t",
+            {"s": schema, "t": table.name},
+        )
+        indexes = await db.fetch_all(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = :s AND tablename = :t",
+            {"s": schema, "t": table.name},
+        )
+        out[table.name] = {
+            "columns": {r["column_name"]: tuple(r[k] for k in r.keys() if k != "column_name") for r in columns},
+            "constraints": {r["conname"]: unqualified(r["def"]) for r in constraints},
+            "indexes": {r["indexname"]: unqualified(r["indexdef"]) for r in indexes},
+        }
+    return out
 
 
-async def test_migration_275_builds_the_model_constraints_and_indexes(db):
-    from sqlalchemy import CheckConstraint
+async def test_migration_275_builds_exactly_what_create_all_builds_at_boot(db):
+    """Prod gets these tables from create_all (main imports db.deal_lane); the SQL gates and every
+    environment that runs migrations get them from 275. Column types, lengths, precision, defaults,
+    nullability, every constraint's definition and every index's definition must agree."""
+    from sqlalchemy import create_engine
 
-    for table in _tables():
-        rows = await db.fetch_all(
-            "SELECT conname FROM pg_constraint WHERE contype = 'c' AND conrelid = to_regclass(:t)",
-            {"t": table.name},
-        )
-        built = {r["conname"] for r in rows}
-        declared = {c.name for c in table.constraints if isinstance(c, CheckConstraint)}
-        assert built == declared, table.name
-        index_rows = await db.fetch_all(
-            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = :t",
-            {"t": table.name},
-        )
-        built_indexes = {r["indexname"] for r in index_rows}
-        assert {i.name for i in table.indexes} <= built_indexes, table.name
+    from db.database import metadata
+
+    await db.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA_MODEL} CASCADE")
+    await db.execute(f"CREATE SCHEMA {_SCHEMA_MODEL}")
+    engine = create_engine(DATABASE_URL.replace("postgres://", "postgresql://", 1))
+    try:
+        with engine.begin() as conn:
+            conn = conn.execution_options(schema_translate_map={None: _SCHEMA_MODEL})
+            metadata.create_all(conn, tables=list(_tables()))
+    finally:
+        engine.dispose()
+
+    from_migration = await _describe(db, "public")
+    from_model = await _describe(db, _SCHEMA_MODEL)
+    assert all(from_migration[t]["columns"] for t in from_migration)
+    for table in from_migration:
+        assert from_migration[table] == from_model[table], table
 
 
 async def test_migration_275_is_idempotent_and_its_down_file_drops_everything(db):
     await _run_file(db, _MIG_275)
     await _run_file(db, _DOWN_275)
+    await _run_file(db, _DOWN_275)  # a re-run of the down file is safe too
     for table in _tables():
         assert await db.fetch_val("SELECT to_regclass(:t)", {"t": table.name}) is None
     await _run_file(db, _MIG_275)
@@ -247,7 +279,7 @@ async def test_one_active_stop_per_market_on_postgres(db):
         "uq_deal_lane_stops_active_market",
     )
     await db.execute(
-        "UPDATE deal_lane_stops SET cleared_at = :now, cleared_by = 'peng' WHERE stop_id = 's1'", {"now": NOW}
+        "UPDATE deal_lane_stops SET cleared_at = :now, cleared_by = 'operator_a' WHERE stop_id = 's1'", {"now": NOW}
     )
     await db.execute("INSERT INTO deal_lane_stops (stop_id, market, stop_trigger) VALUES ('s3', 'US', 'rate')")
 
@@ -258,7 +290,7 @@ async def test_a_program_permission_cascades_to_its_hosts(db):
         INSERT INTO deal_program_permissions
           (program_id, network, membership_status, permission_source, permission_ref, permission_dated,
            confirmed_at, confirmed_by, reconfirm_by)
-        VALUES ('prog_1', 'network_a', 'active', 'program_terms', 'terms', :now, :now, 'peng', :later)
+        VALUES ('prog_1', 'network_a', 'active', 'program_terms', 'terms', :now, :now, 'operator_a', :later)
         """,
         {"now": NOW, "later": NOW + timedelta(days=90)},
     )
@@ -310,6 +342,7 @@ async def test_migration_276_adds_the_click_columns_in_one_bounded_transaction(d
 
     await _in_schema_276(db, _DOWN_276)
     assert await _columns_276(db) == {}
+    await _in_schema_276(db, _DOWN_276)  # a re-run of the down file is safe too
     # The shared table is untouched.
     shared = await db.fetch_val(
         "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' "

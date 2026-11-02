@@ -314,8 +314,8 @@ Index(
 
 
 # D2: a seller that asked once is never tested, and its deals are never shown.
-deal_seller_optouts = Table(
-    "deal_seller_optouts",
+deal_lane_optout = Table(
+    "deal_lane_optout",
     metadata,
     Column("seller_id", String(128), primary_key=True),
     Column("reason", Text, nullable=True),

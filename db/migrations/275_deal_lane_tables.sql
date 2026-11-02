@@ -11,7 +11,7 @@
 --                                       network links `/r` chooses between (Q14).
 --   deal_verify_host_daily_carts        the per-host, per-UTC-day reference-cart counter (D3 cap).
 --   deal_lane_stops                     stop rows, one active per market (D7 stop rule).
---   deal_seller_optouts                 sellers that asked never to be tested or shown (D2).
+--   deal_lane_optout                 sellers that asked never to be tested or shown (D2).
 --
 -- No table references an existing table, so creating them locks nothing that serves traffic.
 -- Also declared in db/deal_lane.py; create_all creates them at startup (prod does not apply numbered
@@ -197,7 +197,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_lane_stops_active_market
   ON deal_lane_stops (market)
   WHERE cleared_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS deal_seller_optouts (
+CREATE TABLE IF NOT EXISTS deal_lane_optout (
   seller_id     VARCHAR(128) PRIMARY KEY,
   reason        TEXT,
   requested_at  TIMESTAMPTZ NOT NULL,

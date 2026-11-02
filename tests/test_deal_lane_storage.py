@@ -6,6 +6,7 @@ built from the migration itself: tests/test_deal_lane_storage_postgres.py."""
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from db.sql_migrations import (  # noqa: E402
     list_hand_applied_migration_files,
     list_migration_files,
     needs_autocommit,
+    split_statements,
 )
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -39,7 +41,7 @@ TABLES = (
     deal_lane.deal_network_links,
     deal_lane.deal_verify_host_daily_carts,
     deal_lane.deal_lane_stops,
-    deal_lane.deal_seller_optouts,
+    deal_lane.deal_lane_optout,
 )
 NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -103,6 +105,10 @@ def _rejected(conn, table, row):
     with pytest.raises(IntegrityError):
         with conn.begin_nested():
             conn.execute(insert(table).values(**row))
+
+
+def _sql_only(statement: str) -> str:
+    return "\n".join(line for line in statement.splitlines() if not line.lstrip().startswith("--")).strip()
 
 
 # ---- registration --------------------------------------------------------------------------------
@@ -250,7 +256,7 @@ def _permission(**overrides):
         "permission_ref": "terms read 2026-11-02",
         "permission_dated": NOW,
         "confirmed_at": NOW,
-        "confirmed_by": "peng",
+        "confirmed_by": "operator_a",
         "reconfirm_by": NOW + timedelta(days=90),
     }
     row.update(overrides)
@@ -326,15 +332,15 @@ def test_a_market_has_at_most_one_active_stop_and_only_a_person_clears_it(conn):
     conn.execute(
         table.update()
         .where(table.c.stop_id == "stop_1")
-        .values(cleared_at=NOW, cleared_by="peng", clear_note="reviewed")
+        .values(cleared_at=NOW, cleared_by="operator_a", clear_note="reviewed")
     )
     conn.execute(insert(table).values(stop_id="stop_6", market="US", stop_trigger="rate"))
 
 
 def test_an_opt_out_is_one_row_per_seller(conn):
-    table = deal_lane.deal_seller_optouts
-    conn.execute(insert(table).values(seller_id="seller_a", requested_at=NOW, recorded_by="peng"))
-    _rejected(conn, table, {"seller_id": "seller_a", "requested_at": NOW, "recorded_by": "peng"})
+    table = deal_lane.deal_lane_optout
+    conn.execute(insert(table).values(seller_id="seller_a", requested_at=NOW, recorded_by="operator_a"))
+    _rejected(conn, table, {"seller_id": "seller_a", "requested_at": NOW, "recorded_by": "operator_a"})
 
 
 # ---- migrations ----------------------------------------------------------------------------------
@@ -355,7 +361,14 @@ def test_migration_276_is_hand_applied_bounded_and_off_the_self_heal():
     assert is_hand_applied_migration(str(_MIG_276))
     assert str(_MIG_276) in list_hand_applied_migration_files()
     assert needs_autocommit(body) is False  # SET LOCAL needs the transaction
-    assert "SET LOCAL lock_timeout" in body
+    # The bound is the file's FIRST statement, so it covers the ALTER (the header prose mentions it too).
+    statements = [_sql_only(stmt) for stmt in split_statements(body)]
+    assert statements == [
+        "SET LOCAL lock_timeout = '3s'",
+        "ALTER TABLE surface_click_events\n"
+        "  ADD COLUMN IF NOT EXISTS discount_code VARCHAR(255),\n"
+        "  ADD COLUMN IF NOT EXISTS discount_carried BOOLEAN",
+    ]
     assert "schema-guard-exempt:" in body
     guard = (_REPO / "db" / "schema_guard.py").read_text()
     assert "discount_code" not in guard and "discount_carried" not in guard
@@ -366,45 +379,73 @@ def test_the_click_row_does_not_name_the_276_columns_until_they_are_applied():
     migration 276 is applied in prod would fail those selects on UndefinedColumn. The PR that adds them
     here (and the first writer) follows the hand apply; update this pin in that PR."""
     assert {"discount_code", "discount_carried"}.isdisjoint(surface_click_events.c.keys())
+    # discount_carried is new everywhere; discount_code is a common word (quotes carry buyer codes), so
+    # it counts only in a file that also names the click table, raw SQL included.
     offenders = []
     for path in _REPO.rglob("*.py"):
         rel = path.relative_to(_REPO).as_posix()
         if rel.startswith(("tests/", ".venv/", "venv/")) or "/site-packages/" in rel:
             continue
-        if "discount_carried" in path.read_text(encoding="utf-8", errors="ignore"):
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"\bdiscount_carried\b", source) or (
+            "surface_click_events" in source and re.search(r"\bdiscount_code\b", source)
+        ):
             offenders.append(rel)
     assert offenders == []
 
 
 # ---- flags ---------------------------------------------------------------------------------------
 
-_FLAG_ENV = (
-    "DEAL_LANE_EMIT_ENABLED",
-    "DEAL_LANE_RANKING_ENABLED",
-    "DEAL_LANE_DISCOUNT_PARAM_ENABLED",
-    "DEAL_VERIFY_JOB_ENABLED",
-    "DEAL_VERIFY_NONCONNECTED_ENABLED",
-    "DEAL_VERIFY_PROGRAM_ENABLED",
-    "DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY",
-    "DEAL_VERIFY_TTL_HOURS",
-)
+_FLAGS = {
+    "DEAL_LANE_EMIT_ENABLED": "deal_lane_emit_enabled",
+    "DEAL_LANE_RANKING_ENABLED": "deal_lane_ranking_enabled",
+    "DEAL_LANE_DISCOUNT_PARAM_ENABLED": "deal_lane_discount_param_enabled",
+    "DEAL_VERIFY_JOB_ENABLED": "deal_verify_job_enabled",
+    "DEAL_VERIFY_NONCONNECTED_ENABLED": "deal_verify_nonconnected_enabled",
+    "DEAL_VERIFY_PROGRAM_ENABLED": "deal_verify_program_enabled",
+}
+_LIMITS = {
+    "DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY": ("deal_verify_max_carts_per_host_per_day", 20, 1, 100),
+    "DEAL_VERIFY_TTL_HOURS": ("deal_verify_ttl_hours", 24, 1, 24),
+}
 
 
-def test_every_deal_lane_flag_defaults_off(monkeypatch, tmp_path):
-    from config.settings import Settings
-
-    for name in _FLAG_ENV:
+@pytest.fixture
+def clean_env(monkeypatch, tmp_path):
+    for name in (*_FLAGS, *_LIMITS):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)  # no .env file
+    return monkeypatch
+
+
+def test_every_deal_lane_flag_defaults_off(clean_env):
+    from config.settings import Settings
+
     s = Settings()
-    assert not any(
-        (
-            s.deal_lane_emit_enabled,
-            s.deal_lane_ranking_enabled,
-            s.deal_lane_discount_param_enabled,
-            s.deal_verify_job_enabled,
-            s.deal_verify_nonconnected_enabled,
-            s.deal_verify_program_enabled,
-        )
-    )
+    assert [getattr(s, attr) for attr in _FLAGS.values()] == [False] * len(_FLAGS)
     assert (s.deal_verify_max_carts_per_host_per_day, s.deal_verify_ttl_hours) == (20, 24)
+
+
+@pytest.mark.parametrize("env_name", list(_FLAGS))
+@pytest.mark.parametrize("value,on", [("true", True), (" TRUE ", True), ("1", False), ("yes", False),
+                                      ("garbage", False), ("", False), ("false", False)])
+def test_a_deal_flag_is_on_only_for_true_and_garbage_never_breaks_settings(clean_env, env_name, value, on):
+    from config.settings import Settings
+
+    clean_env.setenv(env_name, value)
+    s = Settings()  # a value a pydantic bool would reject must not fail here: every process imports it
+    assert getattr(s, _FLAGS[env_name]) is on
+    assert [getattr(s, a) for n, a in _FLAGS.items() if n != env_name] == [False] * (len(_FLAGS) - 1)
+
+
+@pytest.mark.parametrize("env_name", list(_LIMITS))
+def test_a_deal_limit_outside_its_bounds_falls_back_to_its_default(clean_env, env_name):
+    from config.settings import Settings
+
+    attr, default, low, high = _LIMITS[env_name]
+    for value in ("abc", "", "2.5", str(low - 1), str(high + 1), "-5"):
+        clean_env.setenv(env_name, value)
+        assert getattr(Settings(), attr) == default, value
+    for value in (str(low), str(high)):
+        clean_env.setenv(env_name, value)
+        assert getattr(Settings(), attr) == int(value), value
