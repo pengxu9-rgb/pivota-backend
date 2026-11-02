@@ -339,12 +339,46 @@ def test_the_drain_alerts_exist_and_fire_on_one_event(source) -> None:
 
 
 def test_a_drain_crash_is_still_the_job_failing_policy(source) -> None:
-    """An unexpected exception exits 1: the generic policy must not be scoped to other jobs."""
+    """An unexpected exception exits 1: the generic policy must not be scoped to other jobs. The only
+    job_name clauses allowed are EXCLUSIONS of ad hoc names (2026-11-02), and the drain is not one."""
     body = _uncommented(source)
     at = body.index('metric.type="run.googleapis.com/job/completed_task_attempt_count"')
     line = body[at: body.index("\n", at)]
     assert 'metric.label.result="failed"' in line
-    assert "job_name" not in line, "the job-failing policy is scoped; the drain would page nowhere"
+    clauses = re.findall(r"(NOT )?resource\.label\.job_name = (\w+(?:\.\w+)*)\(\"([^\"]+)\"\)", line)
+    assert line.count("job_name") == len(clauses) >= 1
+    for negated, fn, value in clauses:
+        assert negated, "the job-failing policy is scoped; the drain would page nowhere"
+        assert fn in ("starts_with", "monitoring.regex.full_match"), fn
+        assert not ("retailer-ingest-drain".startswith(value) if fn == "starts_with"
+                    else re.fullmatch(value, "retailer-ingest-drain")), value
+
+
+def test_one_failed_job_attempt_pages_a_human(source) -> None:
+    """2026-10-22..31: relgraph-sync failed both attempts ten nights running and nobody heard. A failed
+    attempt is one sparse 5-minute point; the condition must open on it (DURATION 0s), and the open
+    incident must repeat to the channel (RENOTIFY) while a job keeps failing."""
+    body = _uncommented(source)
+    at = body.index('metric.type="run.googleapis.com/job/completed_task_attempt_count"')
+    args = body[body.index("\n", at) + 1: body.index(")\"", at)].split()
+    assert args == ["ALIGN_SUM", "REDUCE_SUM", "resource.label.job_name", "COMPARISON_GT", "0",
+                    "300s", "0s", "3600s", "3600s"], args
+
+
+def test_a_relgraph_sync_that_stops_succeeding_pages_a_human(source) -> None:
+    """A job that never runs fails no attempt. The success check covers that, in prod, through the
+    same channel as every other policy (the generator appends "$CHANNEL" to every body)."""
+    body = _uncommented(source)
+    call = body.split('upsert "prod: relgraph-sync has not succeeded in a day" "$(promql_policy', 1)[1]
+    call = call.split(')"\n', 1)[0]
+    assert 'run_googleapis_com:job_completed_execution_count{' in call
+    assert 'job_name="relgraph-sync",result="succeeded"' in call
+    assert "or vector(0)" in call
+    prod_block = body.rsplit('if [ "$ENV" = prod ]; then', 1)
+    assert 'upsert "prod: relgraph-sync has not succeeded in a day"' in prod_block[1].split("\nfi\n", 1)[0]
+    # The raw source: _uncommented drops the generator's JSON lines (they open with a quote).
+    generator = source.split("promql_policy() {", 1)[1].split("\n}\n", 1)[0]
+    assert '"notificationChannels": [channel]' in generator and '"$@" "$CHANNEL"' in generator
 
 
 def test_the_drain_metrics_are_idempotent(source) -> None:

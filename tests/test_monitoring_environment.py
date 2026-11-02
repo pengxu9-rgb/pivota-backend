@@ -177,7 +177,8 @@ def test_staging_never_probes_prod_and_scopes_regular_and_reap_policies(tmp_path
     assert not state.get("uptimeCheckConfigs")
     assert state["notificationChannels"][0]["displayName"] == "pivota staging alerts"
     policies = state["alertPolicies"]
-    assert len(policies) == 13  # 8 project policies, 5 Reap policies; no host/TLS
+    assert len(policies) == 13  # 8 project policies, 5 Reap policies; no host/TLS, no relgraph success check
+    assert not any("has not succeeded" in p["displayName"] for p in policies)
     assert all(p["displayName"].startswith("staging:") for p in policies)
     assert not any("prod:" in json.dumps(p) for p in policies)
     assert sum("Reap" in p["displayName"] for p in policies) == 5
@@ -192,8 +193,17 @@ def test_production_names_hosts_and_policy_shapes_are_preserved(tmp_path):
         "api.pivota.cc", "gateway.pivota.cc", "mcp.pivota.cc", "commerce.mcp.pivota.cc",
         "ucp.pivota.cc", "acp.pivota.cc",
     }
-    assert len(state["alertPolicies"]) == 15
+    assert len(state["alertPolicies"]) == 16
     assert all(p["displayName"].startswith("prod:") for p in state["alertPolicies"])
+    # Prod only: staging's triggers are created paused, and there it would page every morning.
+    (success,) = [p for p in state["alertPolicies"]
+                  if p["displayName"] == "prod: relgraph-sync has not succeeded in a day"]
+    assert success["notificationChannels"] == [state["notificationChannels"][0]["name"]]
+    query = success["conditions"][0]["conditionPrometheusQueryLanguage"]["query"]
+    assert 'job_name="relgraph-sync"' in query and 'result="succeeded"' in query
+    (failing,) = [p for p in state["alertPolicies"] if p["displayName"] == "prod: Cloud Run job failing"]
+    assert failing["conditions"][0]["conditionThreshold"]["duration"] == "0s"
+    assert failing["notificationChannels"] == [state["notificationChannels"][0]["name"]]
 
 
 @pytest.mark.parametrize("env", ["staging", "prod"])
@@ -236,7 +246,7 @@ WAITING_POLICIES = [
 ]
 
 
-@pytest.mark.parametrize("env, plain", [("prod", 6), ("staging", 4)])
+@pytest.mark.parametrize("env, plain", [("prod", 7), ("staging", 4)])
 def test_a_brand_new_project_writes_every_other_policy_and_defers_the_rest(tmp_path, env, plain):
     """THE 2026-10-08 FAILURE, END TO END. Monitoring cannot see ANY metric this script creates (a
     brand-new project's first run). Every policy that does not read one is still written, every one
@@ -254,12 +264,12 @@ def test_a_brand_new_project_writes_every_other_policy_and_defers_the_rest(tmp_p
 
 def test_a_metric_that_becomes_visible_within_the_budget_is_waited_for(tmp_path):
     """Rejected once per metric, then accepted: the run waits (the retry budget is shared), writes all
-    fifteen and exits 0."""
+    sixteen and exits 0."""
     state, proc = run_script(tmp_path, "prod", return_process=True, extra_env={
         "MONITORING_UNSEEN_METRICS": SCRIPT_METRICS, "MONITORING_UNSEEN_REJECTS": "1",
         "NEW_METRIC_TRIES": "20", "NEW_METRIC_RETRY_SECONDS": "0"})
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert len(state["alertPolicies"]) == 15 and "NOT CREATED" not in proc.stderr
+    assert len(state["alertPolicies"]) == 16 and "NOT CREATED" not in proc.stderr
     # Every metric this script creates is read by some policy ("went silent" reads the report metric through
     # PromQL), so each was really rejected once and really waited for.
     assert state["rejected"] == {m: 1 for m in SCRIPT_METRICS.split(",")}
