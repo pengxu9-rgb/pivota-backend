@@ -88,6 +88,11 @@ def test_a_seed_is_compared_with_the_lanes_reading_and_the_real_reconcile():
     assert other["price"] == "other_currency"
     none = mod.compare_seed({**seed, "price_amount": None}, _seed_read())
     assert none["price"] == "none_stored"
+    # The lane's big-move guard, as the refresh applies it: past 1.5x either way the page is read instead.
+    assert moved["move_guarded"] is False and agree["move_guarded"] is False
+    assert mod.compare_seed(seed, _seed_read(_product(p50="265.00")))["move_guarded"] is True
+    assert mod.compare_seed(seed, _seed_read(_product(p50="50.00")))["move_guarded"] is True
+    assert none["move_guarded"] is False and other["move_guarded"] is False
 
 
 def test_a_host_line_counts_matches_reasons_and_samples_disagreements():
@@ -209,13 +214,14 @@ def test_the_summary_folds_every_host_line_and_names_the_offset_hosts():
     totals = mod.new_totals(2, 6)
     ok = SimpleNamespace(status="ok", proof="base_and_cart")
     offset = {"n": 3, "median": 1.05, "p10": 1.05, "p90": 1.05, "offset_suspected": True}
-    mod.fold_host_line(totals, "a.example", ok, {"matched": 3, "price": {"moved_within_10pct": 3},
+    mod.fold_host_line(totals, "a.example", ok, {"matched": 3, "move_guarded": 1, "price": {"moved_within_10pct": 3},
                                                  "variants": {"all_re_read": 3}, "page_read_due": {"page_read_too_old": 1},
                                                  "price_ratio": offset})
     mod.fold_host_line(totals, "b.example", SimpleNamespace(status="currency_conflict", proof=None),
                        {"matched": 0, "price": {}, "variants": {}, "page_read_due": {},
                         "price_ratio": {**offset, "n": 0, "offset_suspected": False}})
     assert (totals["hosts_read"], totals["hosts_priceable"], totals["matched"]) == (2, 1, 3)
+    assert totals["move_guarded"] == 1, "a host line without the count adds none"
     assert totals["host_status"] == {"ok": 1, "currency_conflict": 1} and totals["proof"] == {"base_and_cart": 1}
     assert totals["page_read_due"] == {"page_read_too_old": 1}
     assert totals["offset_suspected_hosts"] == [{"host": "a.example", **offset}]
@@ -226,6 +232,45 @@ def test_the_go_no_go_figures():
     totals = {"matched": 50, "variants": {"all_re_read": 49, "not_all_re_read": 1},
               "price": {"agree": 45, "moved_over_10pct": 5}, "offset_suspected_hosts": [{"host": "a"}],
               "proof": {"base_and_page_cookie": 3, "base_and_cart": 1}}
-    assert mod.go_no_go(totals) == {"not_all_re_read_share": 0.02, "moved_over_10pct_share": 0.1,
-                                    "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
+    assert mod.go_no_go({**totals, "move_guarded": 2}) == {
+        "not_all_re_read_share": 0.02, "moved_over_10pct_share": 0.1, "move_guarded_share": 0.04,
+        "offset_suspected_hosts": 1, "hosts_priced_on_cart_proof": 1}
+    assert mod.go_no_go(totals)["move_guarded_share"] == 0.0
     assert mod.go_no_go({**totals, "matched": 0})["not_all_re_read_share"] is None
+
+
+def test_a_host_line_counts_the_moves_the_job_would_guard_and_only_those(monkeypatch):
+    """Like the job: a seed due its page read never reaches the guard, so it is not counted; the ratio is the env's."""
+    mod = _module()
+    from tests.test_external_seed_catalogue_refresh import _read_host
+    from services import external_seed_catalogue_refresh as lane
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    catalogue = _read_host([[_product(p50="130.00")]], wanted=(HANDLE, "x", "y"))  # 80 -> 130: past 1.5x
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = seed["seed_data"]["variants"]
+    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    fresh = [{**seed, "id": f"s{i}", "last_crawled_at": now - timedelta(days=2)} for i in range(2)]
+    due = {**seed, "id": "s-due", "last_crawled_at": now - timedelta(days=45)}
+    line = mod.plan_host(HOST, catalogue, [*fresh, due], now=now)
+    assert line["matched"] == 3 and line["move_guarded"] == 2, "the due seed is read from its page anyway"
+    # A wider ratio (the env) lets the same move through.
+    monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, "2")
+    assert mod.plan_host(HOST, catalogue, [*fresh, due], now=now)["move_guarded"] == 0
+
+
+def test_the_dry_run_guards_like_for_like_as_the_job_does():
+    """The planner judges the same pairs the job does: a column holding another variant's price than the URL names
+    is not a move; one variant alone moving past the ratio is (review r2 D13)."""
+    mod = _module()
+    from tests.test_external_seed_catalogue_refresh import V15, V50
+
+    seed = {**_drain_row(), "snapshot_variants": None}
+    seed["variants"] = seed["seed_data"]["variants"]
+    on_15 = {**seed, "destination_url": f"{seed['destination_url']}?variant={V15}"}  # the column holds the 50 mL's 80
+    assert mod.compare_seed(on_15, _seed_read(_product(p50="85.00", p15="34.00"), url=on_15["destination_url"]))["move_guarded"] is False
+    assert mod.compare_seed(seed, _seed_read(_product(p50="85.00", p15="80.00")))["move_guarded"] is True
+    # A seed serving its snapshot's list is judged on that list.
+    snap_only = {**seed, "variants": None, "snapshot_variants": seed["seed_data"]["variants"]}
+    assert mod.compare_seed(snap_only, _seed_read(_product(p50="85.00", p15="80.00")))["move_guarded"] is True
+    assert {V50, V15} <= {v["variant_id"] for v in seed["variants"]}

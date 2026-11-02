@@ -448,7 +448,10 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     assert (summary["hosts_read"], summary["hosts_priceable"], summary["matched"]) == (1, 1, 3)
     # meta.json + 3 catalogue pages (the third, empty, ends it: "gone" is not listed).
     assert summary["origin_requests"] == 4 and summary["requests_per_matched_seed"] == 1.333
+    # Every seed here is due its page read, which the job gives it before any guard: nothing is counted guarded.
+    assert host["move_guarded"] == 0 and summary["move_guarded"] == 0
     assert summary["go_no_go"] == {"not_all_re_read_share": 0.0, "moved_over_10pct_share": 0.3333,
+                                   "move_guarded_share": 0.0,
                                    "offset_suspected_hosts": 0, "hosts_priced_on_cart_proof": 0}
 
     after = [dict(r) for r in await scoped_db.fetch_all(

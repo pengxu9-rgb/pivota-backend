@@ -1266,3 +1266,230 @@ def test_migration_274_bounds_its_own_lock_wait_before_the_alter() -> None:
     assert statements[0] == "SET LOCAL lock_timeout = '3s'"
     assert statements[1].startswith("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS last_page_read_at")
     assert needs_autocommit(sql) is False
+
+
+# ---- the big-move guard -------------------------------------------------------------------------------------
+# Past MAX_PRICE_RATIO either way the catalogue cannot tell an end of sale from another size or variant, so the
+# seed gets its page read instead. Judged like for like: the catalogue's chosen variant against the stored
+# variant with the same id (the row's price only when none has it), and every variant read against its twin.
+
+
+def _snap(amount, currency="USD", variants=()):
+    return SimpleNamespace(price_amount=amount, price_currency=currency,
+                           evidence={"variants": [{"variant_id": vid, "price_amount": a, "availability": "in_stock"}
+                                                  for vid, a in variants]})
+
+
+def _stored(*pairs, currency=None):
+    return [{"variant_id": vid, "price_amount": a, **({"currency": currency} if currency else {})} for vid, a in pairs]
+
+
+@pytest.mark.parametrize(
+    "column, cur, stored, snap, url, guarded",
+    [
+        # No stored variant has the chosen id: the row's price is the comparison.
+        (26.0, "USD", [], _snap(87.0, variants=[("1", 87.0)]), DEST, True),
+        (78.95, "USD", [], _snap(139.99, variants=[("1", 139.99)]), DEST, True),
+        (80.0, "USD", [], _snap(120.01, variants=[("1", 120.01)]), DEST, True),
+        (80.0, "USD", [], _snap(120.0, variants=[("1", 120.0)]), DEST, False),  # exactly 1.5x: taken
+        (1.5, "USD", [], _snap(1.0, variants=[("1", 1.0)]), DEST, False),  # exactly 1/1.5: taken
+        (80.0, "USD", [], _snap(53.0, variants=[("1", 53.0)]), DEST, True),
+        (80.0, "USD", [], _snap(96.0, variants=[("1", 96.0)]), DEST, False),
+        (26.0, None, [], _snap(87.0, variants=[("1", 87.0)]), DEST, True),  # a row naming no currency is judged
+        (80.0, "CAD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),  # the refresh refuses it itself
+        (80.0, "USD", [], _snap(0.0, variants=[("1", 0.0)]), DEST, False),  # non-positive: the refresh's rule
+        (None, "USD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),
+        ("garbage", "USD", [], _snap(260.0, variants=[("1", 260.0)]), DEST, False),
+        # The URL names the 15 mL; the column holds the 50 mL's 80; the stored 15 mL is 32. Like for like: 34/32.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 32.0)), _snap(34.0, variants=[(V50, 85.0), (V15, 34.0)]),
+         f"{DEST}?variant={V15}", False),
+        # Every variant read is judged: the headline agrees, the 15 mL went 32 -> 80.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 32.0)), _snap(85.0, variants=[(V50, 85.0), (V15, 80.0)]), DEST, True),
+        # A stored variant in another currency is not a comparison.
+        (80.0, "USD", _stored((V50, 80.0), (V15, 3.2), currency="JPY"), _snap(85.0, variants=[(V50, 85.0), (V15, 34.0)]),
+         DEST, False),
+    ],
+)
+def test_a_move_past_the_ratio_either_way_is_guarded_like_for_like(monkeypatch, column, cur, stored, snap, url, guarded):
+    from routes.employee_products import catalogue_price_move_guarded
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    assert catalogue_price_move_guarded(column, cur, stored, snap, url=url) is guarded
+
+
+@pytest.mark.parametrize(
+    "stored, guarded",
+    [
+        # The reconcile's own pairing: a stored twin under any spelling it matches is a twin (review r2 P2-1).
+        ([{"variant_id": f"gid://shopify/ProductVariant/{V15}", "price_amount": 32.0}], True),
+        ([{"variant_id": f"/products/{HANDLE}?variant={V15}#offer", "price_amount": 32.0}], True),
+        ([{"variant_id": V15, "price": 32.0}], True),  # the serving precedence: `price` when no `price_amount` (P2-2)
+        ([{"variant_id": V15, "amount": "32.00"}], True),
+        ([{"variant_id": V15, "price_amount": True}], False),  # a boolean is not a price (D07)
+        # Two stored variants naming one read offer: the reconcile re-reads neither, so neither is judged (D14).
+        ([{"variant_id": V15, "price_amount": 80.0}, {"variant_id": V15, "price_amount": 32.0}], False),
+        ([{"variant_id": V15, "price_amount": 32.0}, {"variant_id": V15, "price_amount": 80.0}], False),
+    ],
+)
+def test_the_guard_pairs_and_prices_variants_as_the_reconcile_does(monkeypatch, stored, guarded):
+    from routes.employee_products import catalogue_price_move_guarded
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    # The URL names the 50 mL (agreeing); the 15 mL went 32 -> 80 in the catalogue.
+    snap = _snap(85.0, variants=[(V50, 85.0), (V15, 80.0)])
+    assert catalogue_price_move_guarded(85.0, "USD", stored, snap, url=f"{DEST}?variant={V50}") is guarded
+
+
+@pytest.mark.parametrize("raw, ratio", [("", 1.5), ("2", 2.0), ("1.01", 1.1), ("50", 5.0), ("x", 1.5), ("nan", 1.5)])
+def test_the_ratio_is_configurable_within_a_safe_range(monkeypatch, raw, ratio):
+    monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, raw)
+    assert lane.max_price_ratio() == ratio
+
+
+@pytest.mark.parametrize("p50, p15, guarded", [
+    ("265.00", "32.00", True),  # the headline 80 -> 265
+    ("50.00", "32.00", True),  # 80 -> 50
+    ("85.00", "80.00", True),  # the 15 mL 32 -> 80: a variant alone is enough
+    ("96.00", "32.00", False),
+    ("56.00", "30.00", False),
+])
+def test_a_big_move_is_read_from_the_page_instead(monkeypatch, p50, p15, guarded):
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+    if guarded:
+        run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read(_product(p50=p50, p15=p15)))
+    if guarded:
+        assert result["catalogue_fallback"] == "price_move_guarded"
+        assert result["read_source"] == "page" and run.fetched == [DEST, DEST], "the page was read in this call"
+        # The page read wrote the page's own prices, which here are the stored ones.
+        assert run.stored["price_amount"] == 80.0 and run.variants[V15]["price_amount"] == 32.0
+    else:
+        assert result.get("catalogue_fallback") is None
+        assert result["read_source"] == lane.READ_SOURCE and run.fetched == [DEST], "no page fetch"
+        assert run.stored["price_amount"] == float(p50) and run.variants[V15]["price_amount"] == float(p15)
+
+
+def test_a_column_holding_another_variants_price_is_corrected_by_the_catalogue(monkeypatch):
+    """The URL names the 15 mL while the column holds the 50 mL's 80. Like for like the 15 mL moved 32 -> 34, so the
+    catalogue's 34 is taken: the column is corrected, not sent to a page read that would price the 50 mL again."""
+    row = _drain_row()
+    row["destination_url"] = row["canonical_url"] = DEST + "?variant=" + V15
+    run = _Refresh(monkeypatch, row)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00"), url=row["destination_url"]))
+    assert result.get("catalogue_fallback") is None and result["read_source"] == lane.READ_SOURCE
+    assert run.stored["price_amount"] == 34.0, "the column now holds the URL's variant"
+    assert run.fetched == []
+
+
+def test_a_seed_due_its_page_read_is_due_first_whatever_its_move(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row(), page_read_days_ago=31)
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read(_product(p50="265.00")))
+    assert result["catalogue_fallback"] == "page_read_due:" + lane.DUE_TOO_OLD
+
+
+def test_the_guard_reads_the_ratio_from_the_env(monkeypatch):
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+    run.page = _page_snapshot(80, 32)
+    monkeypatch.setenv(lane.MAX_PRICE_RATIO_ENV, "1.1")
+    assert run.catalogue(_seed_read(_product(p50="90.00")))["catalogue_fallback"] == "price_move_guarded"
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV)
+    run.page = None
+    assert run.catalogue(_seed_read(_product(p50="90.00"))).get("catalogue_fallback") is None
+
+
+
+def test_the_batch_counts_a_guarded_seed_even_when_its_page_read_degrades(monkeypatch):
+    """The real batch: a seed the guard sent to its page read is counted under catalogue.fallbacks, whatever the
+    page read then answered."""
+    def result(seed_id, kwargs):
+        guarded = kwargs.get("catalogue_read") is not None and seed_id in ("s1", "s3")
+        return {"status": "degraded" if seed_id == "s3" else "success", "price_refresh": {"status": "unchanged"},
+                "projection": {}, "read_source": "page" if guarded or not kwargs.get("catalogue_read") else lane.READ_SOURCE,
+                "catalogue_fallback": "price_move_guarded" if guarded else None}
+
+    summary, _, _ = _batch(monkeypatch, SEEDS, catalogues={HOST: _ok_catalogue("a", "c")}, refresh_result=result)
+    assert summary["catalogue"]["fallbacks"] == {"price_move_guarded": 2}
+
+
+def test_a_row_serving_its_snapshot_variants_is_guarded_on_those(monkeypatch):
+    """No top-level list: the builder serves `snapshot.variants`, and the reconcile writes there (review r2 P2-3)."""
+    row = _drain_row()
+    row["seed_data"].setdefault("snapshot", {})["variants"] = row["seed_data"].pop("variants")
+    run = _Refresh(monkeypatch, row)
+    run.page = _page_snapshot(80, 32)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="80.00")))  # only the 15 mL moved, 32 -> 80
+    assert result["catalogue_fallback"] == "price_move_guarded"
+
+
+def test_a_guarded_seed_whose_page_read_fails_still_reports_the_fallback(monkeypatch):
+    """Through the real route: the guard sends the seed to its page, the page cannot be read, and the degraded
+    answer still says why the catalogue was not used (review r2 P2-4)."""
+    import routes.employee_products as mod
+
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+
+    async def unreachable(*, url, observed=None, **_kw):
+        run.fetched.append(url)
+        raise RuntimeError("connect timeout")
+
+    async def stamp(_seed_id):
+        return None
+
+    monkeypatch.setattr(mod, "resolve_external_offer", unreachable)
+    monkeypatch.setattr(mod, "_stamp_crawl_attempt", stamp)
+    result = run.catalogue(_seed_read(_product(p50="265.00")))
+    assert result["status"] == "degraded" and result["catalogue_fallback"] == "price_move_guarded"
+    assert run.fetched[-1] == DEST
+
+
+@pytest.mark.parametrize("twin", [{"variant_id": V50}, {"variant_id": V50, "price_amount": True}, {"variant_id": V50, "price": ""}])
+def test_a_twin_with_no_comparable_price_falls_back_to_the_column(monkeypatch, twin):
+    """The URL names the 50 mL, whose stored twin carries no usable price: the column (80) is the comparison, so
+    a catalogue 265 is guarded instead of written to the column and filled into the twin (review r3 P2)."""
+    from routes.employee_products import catalogue_price_move_guarded
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    snap = _snap(265.0, variants=[(V50, 265.0)])
+    assert catalogue_price_move_guarded(80.0, "USD", [twin], snap, url=f"{DEST}?variant={V50}") is True
+    assert catalogue_price_move_guarded(80.0, "USD", [twin], _snap(84.0, variants=[(V50, 84.0)]), url=f"{DEST}?variant={V50}") is False
+
+
+def test_a_row_holding_both_lists_is_judged_on_the_one_its_builder_serves(monkeypatch):
+    """Top level and snapshot both present: the builder serves the top level (`_served_variant_container`), so the
+    15 mL's stored 32 -> 34 is the comparison, not the snapshot's stale 80 (review r3 E07)."""
+    row = _drain_row()
+    row["seed_data"].setdefault("snapshot", {})["variants"] = [
+        {"variant_id": V50, "price_amount": 80.0}, {"variant_id": V15, "price_amount": 80.0}]
+    run = _Refresh(monkeypatch, row)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
+    assert result.get("catalogue_fallback") is None and result["read_source"] == lane.READ_SOURCE
+
+
+@pytest.mark.parametrize("served_elsewhere", [False, True])
+def test_a_guarded_seed_whose_page_answers_404_still_reports_the_fallback(monkeypatch, served_elsewhere):
+    """Both 404 arms of the page read (the served URL, and a destination the row no longer serves) carry the
+    fallback, like the unreachable one (review r3 G10/G11)."""
+    import routes.employee_products as mod
+    from services.external_offers_service import ExternalOfferUnavailable
+
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+
+    async def gone(*, url, observed=None, **_kw):
+        run.fetched.append(url)
+        raise ExternalOfferUnavailable(status_code=404, url=url)
+
+    async def stamp(_seed_id):
+        return None
+
+    monkeypatch.setattr(mod, "resolve_external_offer", gone)
+    monkeypatch.setattr(mod, "_stamp_crawl_attempt", stamp)
+    if served_elsewhere:
+        monkeypatch.setattr(mod.destination_liveness, "destination_of", lambda _row: "https://brand.example/products/moved")
+    result = run.catalogue(_seed_read(_product(p50="265.00")))
+    assert result["status"] == "degraded" and result["catalogue_fallback"] == "price_move_guarded"
+    assert ("not_the_served_url" in str(result.get("destination_refresh"))) is served_elsewhere
