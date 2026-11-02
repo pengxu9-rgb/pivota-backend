@@ -710,39 +710,35 @@ def _current_price(offer: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _seed_product_refs(seed: Dict[str, Any]) -> frozenset:
-    """The seed's own Shopify product, as (host, handle), from the URLs it serves (`_shopify_product_ref`)."""
-    from services.external_offers_service import _shopify_product_ref
-
-    refs = {_shopify_product_ref(str(u)) for u in (seed.get("destination_url"), seed.get("canonical_url")) if u}
-    return frozenset(r for r in refs if r)
+def _seed_page_urls(seed: Dict[str, Any]) -> Tuple[str, ...]:
+    """The URLs of the seed's own product page, the served one first: what a link-shaped id is read against."""
+    return tuple(str(u).strip() for u in (seed.get("destination_url"), seed.get("canonical_url")) if u and str(u).strip())
 
 
-def _attached_variant_id(value: Any, own_products: frozenset = frozenset()) -> str:
-    """ONE spelling for a variant id, the reconcile's (`routes.employee_products._variant_id_spellings`): the digits
-    of a `gid://` id, and the `?variant=` digits of a link-shaped id (the JSON-LD `@id` a seed often stores,
+_GID_VARIANT = re.compile(r"gid://shopify/ProductVariant/([0-9]+)")
+
+
+def _attached_variant_id(value: Any, page_urls: Tuple[str, ...] = ()) -> str:
+    """ONE spelling for a variant id: the digits of a `gid://shopify/ProductVariant/<N>` id (the whole value), and
+    the `?variant=` digits of a link-shaped id (the JSON-LD `@id` a seed often stores,
     "/products/<handle>?variant=<N>#offer"). Anything else as written.
 
-    A LINK COUNTS ONLY ON THE SEED'S OWN PRODUCT (`own_products`, its (host, handle)): a `?variant=` on another
-    product's link -- a related product, a bundle component -- names that product's variant, and is left as
-    written, so it stays `variant_not_on_seed` rather than matching by accident.
+    A LINK COUNTS ONLY ON THE SEED'S OWN PRODUCT, by the extractor's own rule (`_offer_shopify_variant_id`: read
+    against the served URL, on the product of its served or canonical URL, www-insensitive, digits only). A
+    `?variant=` on another product's link -- a related product, a bundle component -- names that product's
+    variant, and is left as written, so it stays `variant_not_on_seed` rather than matching by accident.
     """
-    from routes.employee_products import _variant_id_spellings
     from services.handover_variant_identity import url_named_variant_id
 
     text = str(value or "").strip()
     if not text:
         return ""
     if url_named_variant_id(text):
-        from urllib.parse import urljoin
+        from services.external_offers_service import _offer_shopify_variant_id
 
-        from services.external_offers_service import _shopify_product_ref
-
-        hosts = sorted({host for host, _ in own_products})
-        if not hosts or _shopify_product_ref(urljoin(f"https://{hosts[0]}/", text)) not in own_products:
-            return text
-    spellings = _variant_id_spellings(text)
-    return spellings[0] if spellings else text
+        return (_offer_shopify_variant_id({"url": text}, {}, page_urls) if page_urls else None) or text
+    match = _GID_VARIANT.fullmatch(text)
+    return match.group(1) if match else text
 
 
 def plan_attached_listing_offer_writes(
@@ -802,31 +798,46 @@ def plan_attached_listing_offer_writes(
     )
     variant_prices: Dict[str, Optional[float]] = {}
     variant_refusals: Dict[str, str] = {}
-    own_products = _seed_product_refs(seed)
+    page_urls = _seed_page_urls(seed)
+    # Per id: the spellings that named it, its price, and whether one entry alone may vouch for it.
+    spellings_of: Dict[str, set] = {}
+    conflicted: set = set()
     for variant in _served_seed_variants(seed):
-        # Two spellings of one id are one id; two ids are still a conflict (below).
-        ids = {_attached_variant_id(variant.get(k), own_products)
-               for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
+        raws = {str(variant.get(k)).strip() for k in ("variant_id", "id", "shopify_variant_id") if variant.get(k)}
+        ids = {_attached_variant_id(raw, page_urls) for raw in raws}
         if len(ids) > 1:
-            for vid in ids:
-                variant_refusals[vid] = "variant_identity_conflict"
+            # This ENTRY names two variants: it vouches for neither. A separate entry for one of them still counts.
+            conflicted |= ids
             continue
         vid = next(iter(ids), "")
         if not vid:
             continue
-        if vid in variant_prices:
-            variant_refusals[vid] = "ambiguous_variant_identity"
-            continue
+        refusal = None
         own_currencies = {currency_code(variant.get(k)) for k in ("price_currency", "currency")
                           if variant.get(k)}
         if own_currencies and own_currencies != {currency}:
-            variant_refusals[vid] = "variant_currency_mismatch"
+            refusal = "variant_currency_mismatch"
         price = _positive_price(variant_own_price(variant))
         aliases = [_positive_price(variant_own_price({k: variant[k], "currency": currency}))
                    for k in ("price_amount", "price", "list_price") if variant.get(k) not in (None, "")]
         if price is not None and any(p is None or round(p, 2) != round(price, 2) for p in aliases):
-            variant_refusals[vid] = "variant_price_alias_conflict"
+            refusal = "variant_price_alias_conflict"
+        if vid in spellings_of:
+            # A second entry for one id. The same id SPELLED TWO WAYS (its link and its bare digits) at the same
+            # price is one entry; written twice alike, or at another price, it is ambiguous, as it always was.
+            earlier = variant_prices.get(vid)
+            same_price = (price is None and earlier is None) or (
+                price is not None and earlier is not None and round(price, 2) == round(earlier, 2))
+            if (raws & spellings_of[vid]) or not same_price or refusal or vid in variant_refusals:
+                variant_refusals[vid] = "ambiguous_variant_identity"
+            spellings_of[vid] |= raws
+            continue
+        spellings_of[vid] = set(raws)
+        if refusal:
+            variant_refusals[vid] = refusal
         variant_prices[vid] = price
+    for vid in conflicted - set(spellings_of):
+        variant_refusals[vid] = "variant_identity_conflict"
 
     writes = []
     refused = []
@@ -855,7 +866,7 @@ def plan_attached_listing_offer_writes(
                 _skip("no_seed_price")
                 continue
         else:
-            vid = _attached_variant_id(offer.get("source_variant_id"), own_products)
+            vid = _attached_variant_id(offer.get("source_variant_id"), page_urls)
             if vid in variant_refusals:
                 _skip(variant_refusals[vid])
                 continue
