@@ -137,6 +137,8 @@ def test_a_partner_key_cannot_mark_its_own_traffic_synthetic(key_owner):
     ["no_header", "other_key", "no_key", "no_secret", "expired", "tampered"],
 )
 def test_anything_else_is_an_ordinary_call(monkeypatch, key_owner, case):
+    infos = _capture(monkeypatch, "info")
+    warnings = _capture(monkeypatch, "warning")
     headers = _headers()
     if case == "no_header":
         headers.pop(sc.SYNTHETIC_ASSERTION_HEADER)
@@ -155,6 +157,16 @@ def test_anything_else_is_an_ordinary_call(monkeypatch, key_owner, case):
         "rid": None,
         "in_task": False,
     }
+    lines = [x for x in infos + warnings if x.startswith("synthetic_assertion_")]
+    if case in ("no_header", "no_secret"):
+        assert lines == [], "no header, or no secret configured: no line at all"
+        return
+    # Exactly one line across both levels, and it is the rejected one, naming its reason.
+    assert [x for x in infos if x.startswith("synthetic_assertion_")] == []
+    [line] = lines
+    assert line.startswith("synthetic_assertion_rejected ")
+    fields = json.loads(line.split(" ", 1)[1])
+    assert fields["reason"] and fields["verdict"] == f"rejected:{fields['reason']}"
 
 
 @pytest.mark.parametrize(
@@ -194,6 +206,7 @@ def test_accepted_and_rejected_lines_name_the_request_never_the_header(monkeypat
     warned = _capture(monkeypatch, "warning")
     TestClient(_probe_app()).get(PROBE_PATH, headers=_headers())
     [line] = [x for x in accepted if x.startswith("synthetic_assertion_accepted ")]
+    assert not [x for x in warned if x.startswith("synthetic_assertion_")], "exactly one line across both levels"
     fields = json.loads(line.split(" ", 1)[1])
     assert fields == {
         "verdict": "accepted",
@@ -221,7 +234,7 @@ def test_accepted_and_rejected_lines_name_the_request_never_the_header(monkeypat
 
 @pytest.mark.parametrize(
     "body_id, logged",
-    [("gw-body-1", "gw-body-1"), ("x" * 129, None), ("has space", None), (7, None), (None, None)],
+    [("gw-body-1", "gw-body-1"), ("x" * 128, "x" * 128), ("x" * 129, None), ("has space", None), ("abc\n", None), ("", None), (7, None), (None, None)],
 )
 def test_an_invoke_verdict_line_carries_the_bodys_request_id_beside_the_verified_one(monkeypatch, key_owner, body_id, logged):
     accepted = _capture(monkeypatch, "info")
@@ -944,12 +957,13 @@ def test_with_no_secret_the_header_is_not_even_read(monkeypatch, key_owner):
 
     monkeypatch.setattr(mw, "resolve_synthetic_call", boom)
     monkeypatch.setattr(mw, "_invoke_fields", boom)
-    lines = _capture(monkeypatch, "info") + _capture(monkeypatch, "warning")
+    infos = _capture(monkeypatch, "info")
+    warnings = _capture(monkeypatch, "warning")
     res = TestClient(_probe_app()).post(
         "/agent/shop/v1/invoke", json={"operation": "find_products_multi", "payload": {}}, headers=_headers()
     )
     assert res.json()["synthetic"] is False and res.json()["operation"] == "find_products_multi"
-    assert not [x for x in lines if "synthetic_assertion" in x]
+    assert not [x for x in infos + warnings if "synthetic_assertion" in x]
 
 
 @pytest.mark.parametrize(

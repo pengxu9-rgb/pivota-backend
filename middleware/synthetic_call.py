@@ -8,12 +8,13 @@ anything that writes after call_next. It is one more BaseHTTPMiddleware layer on
 a request without the header, or any request while no secret is configured, costs one lookup and is
 never logged (anyone can send the header).
 
-THE VERDICT LINE. A request that carries the header logs exactly one line through utils.logger, the logger
-production keeps: `synthetic_assertion_accepted` (INFO) or `synthetic_assertion_rejected` (WARNING), each with
+THE VERDICT LINE. While a secret is configured, a request that carries the header logs exactly one line
+through utils.logger, the logger production keeps: `synthetic_assertion_accepted` (INFO) or `synthetic_assertion_rejected` (WARNING), each with
 `verdict` (`accepted` | `rejected:<reason>`). An accepted line names the gateway request id the VERIFIED
 assertion carries; an invoke body's own request id is a separate, unverified field (`body_request_id`). A hop
 that arrives without the header is not logged here: the gateway logs every hop it makes for a synthetic call
-(`synthetic_hop`), so a missing marker is counted there, and real traffic costs nothing extra.
+(`synthetic_hop`, PIVOTA-Agent #2532), so a missing marker is counted there, and real traffic costs nothing
+extra.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from utils.logger import logger as pivota_logger
 _MAX_INVOKE_BODY = 2 * 1024 * 1024
 
 
-_BODY_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_BODY_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
 
 async def _invoke_fields(request: Request) -> Tuple[Optional[str], Optional[str]]:
@@ -61,7 +62,7 @@ async def _invoke_fields(request: Request) -> Tuple[Optional[str], Optional[str]
         rid = ctx.get("request_id") if isinstance(ctx, dict) else None
         return (
             op if isinstance(op, str) else None,
-            rid if isinstance(rid, str) and _BODY_ID_RE.match(rid) else None,
+            rid if isinstance(rid, str) and _BODY_ID_RE.fullmatch(rid) else None,
         )
     except Exception:  # noqa: BLE001 -- an unreadable body is out of scope, never a failed request
         return None, None
