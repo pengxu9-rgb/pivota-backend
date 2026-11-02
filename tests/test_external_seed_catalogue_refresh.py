@@ -1444,3 +1444,52 @@ def test_a_guarded_seed_whose_page_read_fails_still_reports_the_fallback(monkeyp
     result = run.catalogue(_seed_read(_product(p50="265.00")))
     assert result["status"] == "degraded" and result["catalogue_fallback"] == "price_move_guarded"
     assert run.fetched[-1] == DEST
+
+
+@pytest.mark.parametrize("twin", [{"variant_id": V50}, {"variant_id": V50, "price_amount": True}, {"variant_id": V50, "price": ""}])
+def test_a_twin_with_no_comparable_price_falls_back_to_the_column(monkeypatch, twin):
+    """The URL names the 50 mL, whose stored twin carries no usable price: the column (80) is the comparison, so
+    a catalogue 265 is guarded instead of written to the column and filled into the twin (review r3 P2)."""
+    from routes.employee_products import catalogue_price_move_guarded
+
+    monkeypatch.delenv(lane.MAX_PRICE_RATIO_ENV, raising=False)
+    snap = _snap(265.0, variants=[(V50, 265.0)])
+    assert catalogue_price_move_guarded(80.0, "USD", [twin], snap, url=f"{DEST}?variant={V50}") is True
+    assert catalogue_price_move_guarded(80.0, "USD", [twin], _snap(84.0, variants=[(V50, 84.0)]), url=f"{DEST}?variant={V50}") is False
+
+
+def test_a_row_holding_both_lists_is_judged_on_the_one_its_builder_serves(monkeypatch):
+    """Top level and snapshot both present: the builder serves the top level (`_served_variant_container`), so the
+    15 mL's stored 32 -> 34 is the comparison, not the snapshot's stale 80 (review r3 E07)."""
+    row = _drain_row()
+    row["seed_data"].setdefault("snapshot", {})["variants"] = [
+        {"variant_id": V50, "price_amount": 80.0}, {"variant_id": V15, "price_amount": 80.0}]
+    run = _Refresh(monkeypatch, row)
+    result = run.catalogue(_seed_read(_product(p50="85.00", p15="34.00")))
+    assert result.get("catalogue_fallback") is None and result["read_source"] == lane.READ_SOURCE
+
+
+@pytest.mark.parametrize("served_elsewhere", [False, True])
+def test_a_guarded_seed_whose_page_answers_404_still_reports_the_fallback(monkeypatch, served_elsewhere):
+    """Both 404 arms of the page read (the served URL, and a destination the row no longer serves) carry the
+    fallback, like the unreachable one (review r3 G10/G11)."""
+    import routes.employee_products as mod
+    from services.external_offers_service import ExternalOfferUnavailable
+
+    run = _Refresh(monkeypatch, _drain_row())
+    run.page_read(80, 32)
+
+    async def gone(*, url, observed=None, **_kw):
+        run.fetched.append(url)
+        raise ExternalOfferUnavailable(status_code=404, url=url)
+
+    async def stamp(_seed_id):
+        return None
+
+    monkeypatch.setattr(mod, "resolve_external_offer", gone)
+    monkeypatch.setattr(mod, "_stamp_crawl_attempt", stamp)
+    if served_elsewhere:
+        monkeypatch.setattr(mod.destination_liveness, "destination_of", lambda _row: "https://brand.example/products/moved")
+    result = run.catalogue(_seed_read(_product(p50="265.00")))
+    assert result["status"] == "degraded" and result["catalogue_fallback"] == "price_move_guarded"
+    assert ("not_the_served_url" in str(result.get("destination_refresh"))) is served_elsewhere

@@ -5832,7 +5832,7 @@ def catalogue_price_move_guarded(
     builder serves, each stored price read with the serving precedence `_seed_variant_stored_price`):
       * the variant the catalogue priced the row with (the URL's `?variant=`, else the first in stock, as the
         lane chooses it), against the stored variant the reconcile pairs with it, or against the row's own
-        price when none is paired;
+        price when none is paired or the paired one carries no comparable price;
       * every other paired variant, against its read.
     One past the ratio is enough. Only positive prices are compared, and only in the catalogue's currency (a
     row or variant in another is left to the refresh, which refuses it; one naming none is compared, since the
@@ -5879,9 +5879,9 @@ def catalogue_price_move_guarded(
     chosen = catalogue_lane._selected(read, selected_id) if read and selected_id is not None else None
     chosen_pos = next((pos for pos, rv in enumerate(read) if rv is chosen), None)
     headline_in = positive(getattr(snapshot, "price_amount", None))
-    if chosen_pos is not None and chosen_pos in paired:
-        headline_stored = stored_price_of(stored[paired[chosen_pos]])
-    else:
+    # The paired twin's price, else (no twin, or a twin with no comparable price) the row's own.
+    headline_stored = stored_price_of(stored[paired[chosen_pos]]) if chosen_pos in paired else None
+    if headline_stored is None:
         headline_stored = positive(stored_amount) if same_currency(stored_currency) else None
     if moved(headline_stored, headline_in):
         return True
@@ -5897,7 +5897,8 @@ def _catalogue_price_move_guarded(row: Dict[str, Any], catalogue_read: Any) -> b
         [v for v in (_served_variant_container(seed_data).get("variants") or []) if isinstance(v, dict)],
         getattr(catalogue_read, "snapshot", None),
         url=row.get("destination_url"),
-        product_title=row.get("title") or seed_data.get("title"),
+        # The title the reconcile is handed: the seed's, else the read's.
+        product_title=seed_data.get("title") or getattr(getattr(catalogue_read, "snapshot", None), "title", None),
     )
 
 
