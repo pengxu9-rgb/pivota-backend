@@ -120,8 +120,10 @@ async def list_due_ucp_routes(
         )
         return [dict(row) for row in rows or []]
     except Exception as exc:  # noqa: BLE001
+        # Not "nothing is due": the selector could not look. Returning [] made a broken job print
+        # due: 0 and exit 0 every run, invisible to the job-failure alert (2026-11-02).
         logger.warning("scheduled_ucp_reprobe: due-route query failed: %s", exc)
-        return []
+        raise
 
 
 async def run_scheduled_ucp_reprobes() -> Dict[str, Any]:

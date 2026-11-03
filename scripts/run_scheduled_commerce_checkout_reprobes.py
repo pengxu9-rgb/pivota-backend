@@ -16,11 +16,18 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from db.database import database  # noqa: E402
 from jobs.scheduled_commerce_checkout_reprobe_job import run_scheduled_commerce_checkout_reprobes  # noqa: E402
 
 
 async def main() -> None:
-    result = await run_scheduled_commerce_checkout_reprobes()
+    # Like every other job entrypoint: the selector queries through the shared `database`, which
+    # nothing else connects in a job process (an unconnected backend asserts "not running").
+    await database.connect()
+    try:
+        result = await run_scheduled_commerce_checkout_reprobes()
+    finally:
+        await database.disconnect()
     logging.getLogger(__name__).info("scheduled_commerce_checkout_reprobes %s", json.dumps(result, sort_keys=True))
 
 
