@@ -68,8 +68,10 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from config.settings import settings
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
+from services import deal_code_capture
 from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
@@ -153,6 +155,9 @@ async def run_daily_external_referral_refresh(
         # Only with the flag on, so the summary is unchanged while the pacer is dark. Every fetch
         # of this job reaches the shared budget through `crawl_politeness.await_slot`.
         summary["shopify_edge_pacer"] = shopify_edge_pacer.stats()
+    if settings.deal_code_capture_shadow:
+        # ADR-027 code collection, shadow: what the promo regions of the pages this run read printed.
+        summary["deal_code_capture"] = deal_code_capture.stats()
     return summary
 
 
@@ -335,6 +340,8 @@ def main() -> int:
     print("PRICE_REFRESH " + json.dumps(price_refresh_line(summary), separators=(",", ":"), default=str))
     # Same reason, for the IP breaker and the 429/503 header aggregate: one filterable line a night.
     print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
+    if "deal_code_capture" in summary:
+        print("DEAL_CODE_CAPTURE " + json.dumps(summary["deal_code_capture"], separators=(",", ":"), default=str))
     # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
     print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})

@@ -630,6 +630,12 @@ class Settings(BaseSettings):
     def deal_verify_ttl_hours(self) -> int:
         return _deal_int("DEAL_VERIFY_TTL_HOURS", default=24, low=1, high=24)
 
+    # Shadow capture of merchant-published codes from store pages the refresh already downloads
+    # (services/deal_code_capture.py): counts and logs, writes nothing. Set on the refresh job only.
+    @property
+    def deal_code_capture_shadow(self) -> bool:
+        return _deal_flag("DEAL_CODE_CAPTURE_SHADOW")
+
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
     # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.
