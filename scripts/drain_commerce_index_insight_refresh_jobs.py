@@ -6,8 +6,17 @@ import asyncio
 import json
 import os
 
-from db.database import database
-from services.commerce_index_insight_refresh_service import request_next_insight_refresh
+import sys
+from pathlib import Path
+
+# Run as `python scripts/<this>.py` (the Cloud Run Job's command), Python puts scripts/ on
+# sys.path, not the repo root, so the repo's packages were not importable (ModuleNotFoundError).
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from db.database import database  # noqa: E402
+from services.commerce_index_insight_refresh_service import request_next_insight_refresh  # noqa: E402
 
 
 async def _main() -> int:
