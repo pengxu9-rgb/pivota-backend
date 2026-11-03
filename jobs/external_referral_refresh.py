@@ -137,6 +137,9 @@ async def run_daily_external_referral_refresh(
     ip_challenge_window_seconds: Optional[float] = None,
     ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
+    if settings.deal_code_capture_shadow:
+        # The counters are per run: a process that runs the job twice must not report the first run again.
+        deal_code_capture.reset_stats()
     summary = await run_external_referral_refresh_batch(
         refresh_seed_by_id=_refresh_unbounded,
         limit=limit,
