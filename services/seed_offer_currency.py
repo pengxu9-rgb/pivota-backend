@@ -144,6 +144,38 @@ class SeedOfferCurrencyRefused(ValueError):
     caller can report it apart from a real failure (`refused_currency`)."""
 
 
+def seed_offer_market(seed: Mapping[str, Any], currency: Optional[str]) -> str:
+    """The market an offer copied off `seed` in `currency` is declared for: the one market that
+    currency prices (services/region_pricing), NEVER the seed's own `market`.
+
+    external_product_seeds.market is a serving PARTITION, not a destination: an SG, JP or AU store's
+    seed is stamped 'US' and keeps its true price_currency (catalog_enrichment_agent.ingestion
+    SEED_PARTITION_MARKET). Copying it onto the offer stamped JPY, SGD and AUD offers market 'US'.
+    So the offer's market comes from its currency, and require_market_currency holds by construction:
+
+      * a seed with no market at all is still refused: it is not a seed any serving lane reads;
+      * no currency (an unpriced seed that states none): the partition, as before. Such an offer
+        carries no money to mislabel, and `currency = market` has no currency to disagree with;
+      * a currency no single market is priced in (EUR prices several, an unmapped code prices none):
+        refused, never defaulted.
+
+    USD prices US only, so a USD seed in the 'US' partition writes exactly what it wrote before."""
+    # Imported here: region_pricing is a serving module, and this one stays importable on its own.
+    from services.region_pricing import market_for_pricing_currency, require_market_currency
+
+    partition = str(seed.get("market") or "").strip().upper()
+    if not partition:
+        raise SeedOfferCurrencyRefused("refusing a seed offer: the seed has no market")
+    if currency is None:
+        return partition
+    market = market_for_pricing_currency(currency)
+    if market is None:
+        raise SeedOfferCurrencyRefused(
+            f"refusing a seed offer: no single market is priced in {currency}, so the offer's market is unknown"
+        )
+    return require_market_currency(market, currency)
+
+
 def seed_currency_sql(alias: str) -> str:
     """`seed_currency_of` in SQL for an external_product_seeds alias; NULL means the seed states no
     currency. The same text as the gateway's seedCurrencySql (PIVOTA-Agent#2467).

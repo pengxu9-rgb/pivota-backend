@@ -448,7 +448,59 @@ async def test_a_priced_seed_writes_its_own_currency_and_market(monkeypatch):
     monkeypatch.setattr(mod, "database", fake)
     await mod.upsert_catalog_offer_from_seed_row(_REAL_PK, _priced_seed(), merchant_id=_REAL_SELLER)
     params = fake.executed[0]["params"]
-    assert (params["currency"], params["market"], params["list_price"]) == ("SGD", "US", 38.0)
+    # The market is the one its currency prices, not the seed's 'US' serving partition.
+    assert (params["currency"], params["market"], params["list_price"]) == ("SGD", "SG", 38.0)
+
+
+# ── the offer's market is its currency's, never the seed partition ──────────────────────────────
+# external_product_seeds.market is the 'US' serving partition for SG, JP and AU stores' seeds too
+# (catalog_enrichment_agent.ingestion SEED_PARTITION_MARKET). Copied onto the offer, it stamped JPY,
+# SGD and AUD offers market 'US'.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("currency, market", [
+    ("USD", "US"), ("SGD", "SG"), ("JPY", "JP"), ("AUD", "AU"), ("KRW", "KR"), ("GBP", "GB"),
+    ("CAD", "CA"), ("HKD", "HK"), ("SEK", "SE"), (" jpy ", "JP"),
+])
+async def test_a_priced_offer_is_declared_for_its_currencys_market(monkeypatch, currency, market):
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    await mod.upsert_catalog_offer_from_seed_row(
+        _REAL_PK, _priced_seed(price_currency=currency, market="US"), merchant_id=_REAL_SELLER
+    )
+    params = fake.executed[0]["params"]
+    assert (params["currency"], params["market"]) == (currency.strip().upper(), market)
+
+
+def test_a_usd_seed_writes_market_us_whatever_its_partition_says():
+    assert mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(price_currency="USD"), 1.0) == ("USD", "US")
+    assert mod.seed_offer_currency_and_market(
+        _REAL_PK, _priced_seed(price_currency="USD", market="sg"), 1.0
+    ) == ("USD", "US")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("currency", ["EUR", "eur", "QAR", "XXX"])
+async def test_a_currency_no_single_market_is_priced_in_writes_no_offer(monkeypatch, currency):
+    """EUR prices several markets and QAR none: the offer's market is unknown, so nothing is
+    written (and the offer already stored is left alone), never a defaulted 'US'."""
+    fake = FakeDB()
+    monkeypatch.setattr(mod, "database", fake)
+    with pytest.raises(mod.SeedOfferCurrencyRefused, match="no single market is priced in"):
+        await mod.upsert_catalog_offer_from_seed_row(
+            _REAL_PK, _priced_seed(price_currency=currency), merchant_id=_REAL_SELLER
+        )
+    assert fake.executed == []
+
+
+def test_an_unpriced_seed_follows_the_same_rule():
+    # No amount and no currency: no money to mislabel, so the partition stays, as before.
+    assert mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(price_currency=None), None) == (None, "US")
+    # No amount but a stated currency: that currency's market.
+    assert mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(price_currency="JPY"), None) == ("JPY", "JP")
+    with pytest.raises(mod.SeedOfferCurrencyRefused, match="no single market is priced in EUR"):
+        mod.seed_offer_currency_and_market(_REAL_PK, _priced_seed(price_currency="EUR"), None)
 
 
 @pytest.mark.asyncio

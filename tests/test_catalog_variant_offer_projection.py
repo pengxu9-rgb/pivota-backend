@@ -194,6 +194,28 @@ def test_seed_scope_uses_current_seller_domain_listing_and_market():
     )
 
 
+def test_seed_scope_declares_the_market_the_mirror_offer_writer_declares():
+    """The mirror offer is declared for its currency's market (seed_offer_market), not the seed's
+    'US' partition, so the scope asks for that market and a template written by it matches."""
+    seed = {
+        "seller_ref": "m",
+        "domain": "brand.example",
+        "market": "US",
+        "destination_url": "https://brand.example/products/x",
+    }
+    assert seed_scope(P, dict(seed, price_currency="JPY"))["seed_market"] == "JP"
+    assert seed_scope(P, dict(seed, price_currency="USD"))["seed_market"] == "US"
+    # the page read stands in for a missing column, as in seed_currency_of
+    assert seed_scope(P, dict(seed, seed_data={"snapshot": {"price_currency": "AUD"}}))["seed_market"] == "AU"
+    # no currency at all: the partition, as before
+    assert seed_scope(P, seed)["seed_market"] == "US"
+    # a currency no single market is priced in, or a column that disagrees with its page read
+    assert seed_scope(P, dict(seed, price_currency="EUR")) is None
+    jp = seed_scope(P, dict(seed, price_currency="JPY"))
+    assert plan_offers(dict(P, **jp), V, S, [dict(T[0], market="US")], [])[0] == []
+    assert plan_offers(dict(P, **jp), V, S, [dict(T[0], market="JP")], [])[0] != []
+
+
 def test_missing_seller_ref_requires_matching_observed_seller_identity():
     from services.seller_identity import resolve_seed_seller_identity
 

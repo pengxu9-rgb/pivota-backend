@@ -96,6 +96,17 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+def market_for_pricing_currency(currency: Optional[str]) -> Optional[str]:
+    """The ONE market priced in `currency` (the inverse of REGION_PRICING_CURRENCY), or None.
+
+    None when no market is priced in it, and when SEVERAL are (EUR prices FR, HR and FI): a currency
+    shared by markets does not say which one an offer is for, and picking one would be a default.
+    `currency` is read as the SQL reads one (trimmed, upper-cased)."""
+    code = str(currency or "").strip().upper()
+    markets = [market for market, priced_in in REGION_PRICING_CURRENCY.items() if priced_in == code]
+    return markets[0] if code and len(markets) == 1 else None
+
+
 #: Multi-market storefronts ADR Phase 2: markets whose offers are ACQUIRED (stored with their real market
 #: and currency, catalog_offers.market 'AU'/'JP') but never served. The retailer_ingest lane allowlists them
 #: (services/retailer_ingest/pipeline.py) and index_pipeline_state refuses to serve a product priced ONLY

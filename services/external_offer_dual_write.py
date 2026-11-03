@@ -51,6 +51,7 @@ from services.seed_offer_currency import (
     currency_code,
     seed_currency_of,
     seed_currency_sql,
+    seed_offer_market,
     snapshot_currency_of,
 )
 from services.storefront_currency import normalize_domain, plausible_domain
@@ -323,16 +324,21 @@ def seed_offer_currency_and_market(
     offer whose currency is not the seed's. A seed with no amount writes an unpriced offer, carrying
     the seed's currency only when its column and page read agree (or one is stated alone).
 
+    THE MARKET is the one the currency prices (seed_offer_market), never the seed's own `market`,
+    which is the 'US' serving partition for SG, JP and AU stores too: copied onto the offer, it
+    stamped JPY, SGD and AUD offers market 'US'. EUR (several markets) is refused. A USD seed writes
+    market 'US', as before.
+
     Public so the mirror's chain write can run it BEFORE its canonical-sku upsert, and a refused seed
     leaves no half-written chain behind.
     """
-    market = str(row_dict.get("market") or "").strip().upper()
-    if not market:
+    if not str(row_dict.get("market") or "").strip():
         raise SeedOfferCurrencyRefused(
             f"external_offer_dual_write: refusing offer write with no seed market (product_key={product_key})"
         )
     if amount is None:
-        return seed_currency_of(row_dict), market
+        currency = seed_currency_of(row_dict)
+        return currency, _offer_market(product_key, row_dict, currency)
     # Normalised as the readers read it (currency_code: SQL's upper(trim()), spaces only), so the
     # writer never stores a code the readers would read differently (PR controller review of #2657).
     column = currency_code(row_dict.get("price_currency"))
@@ -355,7 +361,14 @@ def seed_offer_currency_and_market(
             f"external_offer_dual_write: refusing offer write: the seed's payload hides its page read "
             f"(product_key={product_key})"
         )
-    return currency, market
+    return currency, _offer_market(product_key, row_dict, currency)
+
+
+def _offer_market(product_key: str, row_dict: Dict[str, Any], currency: Optional[str]) -> str:
+    try:
+        return seed_offer_market(row_dict, currency)
+    except ValueError as exc:
+        raise SeedOfferCurrencyRefused(f"external_offer_dual_write: {exc} (product_key={product_key})") from None
 
 
 def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
