@@ -6,23 +6,29 @@ not the announcement bars and promo banners where stores print them, and the cur
 on purpose. The page refresh (`external_offers_service.resolve_external_offer`) already downloads each
 store page, so reading its promo regions costs no extra request to any store.
 
-WHAT IT READS. Only the first `_BODY_BUDGET` characters from `<body` (bars sit at the top), and in them only
+WHAT IT READS. Only the first `_BODY_BUDGET` characters from the `<body` tag after `</head>` (a `<body` inside a
+head script is not it; bars sit at the top), and in them only
 the text of elements that NAME a promo region: a whole class or id token (or the tag name) such as
 announcement / announcement-bar, promo-bar, promo-banner, top-bar, marquee, ticker-bar, header-message,
 site-banner, notification-bar, free-shipping-bar, or an aria-label "Announcement(s)". A bare "banner" is
 not one (hero banners hold product copy), a token that only contains a name ("product-sticker",
 "desktop-bar") is not one, and html / body / main / header are never a region root, so a body class like
-`has-announcement-bar` cannot turn the whole page into one. Script, style, noscript, template and svg
+`has-announcement-bar` cannot turn the whole page into one. State and wrapper tokens are not names either:
+a has-/with-/is-/no-/show-/hide- prefix, a `--` modifier, or a -container/-wrapper/-wrap/-outer/-holder
+suffix (`page-wrapper has-announcement-bar`, `announcement-bar--visible`, `with-top-bar`); the bar inside
+such a wrapper names itself. Script, style, noscript, template and svg
 content is skipped. Hidden text IS read: we parse markup, not the rendering, and a rotating bar keeps its
 other slides hidden.
 
 WHAT IS A CODE. An all-caps or digit token after "use/enter/apply code", or after "promo/discount/coupon/
-voucher code:", with at least one letter (four, if it has no digit), not a stop word ("USE CODE BELOW"),
-not followed by "shade"/"swatch"/"tone" (a shade name, "NC20 shade"), not a gift-card style token
-(three or more dash groups, or "gift card" next to it). Its shape and the phrase that introduced it are
+voucher code:", with at least one letter, not a stop word ("USE CODE BELOW", "USE CODE IN-STORE"), not
+followed by "shade"/"swatch"/"tone" (a shade name, "NC20 shade"), not a gift-card number (three or more
+dash-separated groups of four, 1234-5678-ABCD) or an XXXX placeholder. "Gift card" near a code is a hint,
+not a rejection: "Excludes gift cards" is one of the commonest bar disclaimers. Its shape and the phrase that introduced it are
 counted separately, so shade-like short tokens (NC20) stay visible in the numbers. Around it, the terms
 the region states: percent or amount off, free shipping, a minimum spend, and eligibility hints (new
-customers, sign-up, once per customer, exclusions); each stated term goes to the NEAREST code. Those are
+customers, sign-up, once per customer, exclusions, gift cards); each stated term goes to the NEAREST code,
+and a percent outside 1-100 is not a term ("0% off then 20% off" reads 20). Those are
 metadata only (ADR-027 D2): a code is evidence of nothing until a checkout applies it.
 
 BOUNDED. The parse is linear (open-tag counts, implicit closing of p/li/option/dt/dd/tr/td/th, depth cap
@@ -59,6 +65,12 @@ _REGION_TOKEN_RE = re.compile(
 )
 # aria-label is prose ("Top bar menu"), so only the announcement label itself counts.
 _REGION_LABEL_RE = re.compile(r"^\s*announcements?(?:\s+bar)?\s*$", re.IGNORECASE)
+# A class/id token that states a page's state or wraps the bar ("has-announcement-bar", "announcement-bar--visible",
+# "page-announcement-container") is not a region name; the bar inside it names itself. Only a TRAILING `--` modifier
+# counts: Shopify's section ids carry `--<id>__` before the name ("shopify-section-sections--1__announcement-bar").
+_STATE_TOKEN_RE = re.compile(
+    r"^(?:has|with|is|no|show|hide)[-_]|--[^_]*$|[-_](?:container|wrapper|wrap|outer|holder)$", re.IGNORECASE
+)
 _NEVER_REGION_ROOTS = frozenset({"html", "body", "main", "header"})
 _VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
                         "track", "wbr"})
@@ -71,6 +83,7 @@ _INLINE_TAGS = frozenset({"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data"
 # A new one of these closes an open one of the same tag on top of the stack, as browsers do; without it
 # a page of unclosed <p>/<li> grows the stack without bound.
 _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "th"})
+_HEAD_END_RE = re.compile(r"</head\s*>", re.IGNORECASE)
 _BODY_START_RE = re.compile(r"<body[\s>/]", re.IGNORECASE)
 _BODY_BUDGET = 200_000
 _MAX_DEPTH = 512
@@ -87,17 +100,21 @@ _CODE_RES = (
         r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)\s*[:：]\s*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
 )
 # All-caps prose after "use code" ("USE CODE BELOW FOR 10% OFF") is not a code.
+# Compared with dashes removed, so IN-STORE is INSTORE.
 _STOP_CODES = frozenset({
-    "ABOVE", "AFTER", "AGAIN", "ALL", "ALSO", "AND", "ANY", "APPLIED", "APPLY", "AT", "AUTO", "AUTOMATIC",
-    "AUTOMATICALLY", "BEFORE", "BELOW", "CART", "CHECKOUT", "CODE", "CODES", "COUPON", "DISCOUNT", "DURING",
-    "ENDS", "ENTER", "EXPIRES", "EXTRA", "FOR", "FREE", "FROM", "HERE", "INSTORE", "NEEDED", "NONE", "NOW",
-    "OFF", "ONLINE", "ONLY", "ORDER", "ORDERS", "PLUS", "PROMO", "REQUIRED", "SALE", "SHIPPING", "SITE",
-    "SITEWIDE", "STORE", "THAT", "THE", "THIS", "TODAY", "TOMORROW", "TONIGHT", "UPON", "USE", "VALID",
-    "VOUCHER", "WEEKEND", "WHEN", "WHILE", "WITH", "YOUR",
+    "ABOVE", "ADD", "AFTER", "AGAIN", "ALL", "ALSO", "ALWAYS", "AND", "ANY", "APPLIED", "APPLY", "ARE", "AT",
+    "ATCHECKOUT", "AUTO", "AUTOMATIC", "AUTOMATICALLY", "BEFORE", "BELOW", "BUT", "CAN", "CART", "CHECKOUT",
+    "CODE", "CODES", "COUPON", "DISCOUNT", "DURING", "EACH", "EMAIL", "EMAILED", "ENDS", "ENTER", "ENTIRE",
+    "EVERY", "EXPIRES", "EXTRA", "FIRST", "FOR", "FREE", "FROM", "GET", "HAS", "HERE", "INSIDE", "INSTEAD",
+    "INSTORE", "ITEM", "ITEMS", "ITS", "LATER", "LISTED", "MANUALLY", "NEEDED", "NEW", "NEXT", "NONE", "NOT",
+    "NOW", "OFF", "ONCE", "ONE", "ONLINE", "ONLY", "ORDER", "ORDERS", "OUR", "OUT", "OWN", "PER", "PLUS",
+    "PROMO", "PROVIDED", "PURCHASE", "RECEIVED", "REQUIRED", "SALE", "SELECT", "SELECTED", "SHIPPING", "SHOWN",
+    "SITE", "SITEWIDE", "SOON", "STORE", "STOREWIDE", "THAT", "THE", "THIS", "TODAY", "TOMORROW", "TONIGHT",
+    "TOO", "TWICE", "TWO", "UPON", "USE", "VALID", "VIA", "VOUCHER", "WEEKEND", "WHEN", "WHILE", "WITH", "YET",
+    "YOU", "YOUR",
 })
-_SHADE_AFTER_RE = re.compile(r"\s*(?:shades?|swatch(?:es)?|tones?|colou?rs?|finish)\b", re.IGNORECASE)
-_GIFT_CARD_RE = re.compile(r"(?i)\bgift\s*cards?\b")
-_GIFT_CARD_SPAN = 40
+_SHADE_AFTER_RE = re.compile(r"\s{0,3}(?:shades?|swatch(?:es)?|tones?|colou?rs?|finish)\b", re.IGNORECASE)
+_GIFT_CARD_NUMBER_RE = re.compile(r"[A-Z0-9]{4}(?:-[A-Z0-9]{4}){2,}")
 _SHORT_ALNUM_RE = re.compile(r"[A-Z]{1,2}\d{1,3}")
 
 _PERCENT_RE = re.compile(r"\b(\d{1,3})\s?%\s?(?i:off)\b")
@@ -112,7 +129,8 @@ _HINTS = (
     ("new_customer_only", re.compile(r"(?i)\b(?:first|1st)\s+(?:order|purchase)|new\s+customers?\b")),
     ("segment_limited", re.compile(r"(?i)\b(?:sign\s*up|subscribe|subscriber|newsletter|members?\b|join\s+our)")),
     ("once_per_customer", re.compile(r"(?i)\bonce\s+per\s+customer|one\s+(?:use|time)\s+(?:per|only)|single[- ]use")),
-    ("has_exclusions", re.compile(r"(?i)\bexclud(?:es|ing)|not\s+valid\s+on|exclusions?\s+apply")),
+    ("has_exclusions", re.compile(r"(?i)\bexclud(?:es|ed|ing)|not\s+valid\s+on|exclusions?\s+apply")),
+    ("mentions_gift_card", re.compile(r"(?i)\bgift\s*cards?\b")),
 )
 _WINDOW = 90
 
@@ -128,7 +146,7 @@ def _names_region(tag: str, attrs: List[Any]) -> bool:
     label = None
     for k, v in attrs:
         if k in ("class", "id"):
-            tokens.extend(str(v or "").split())
+            tokens.extend(t for t in str(v or "").split() if not _STATE_TOKEN_RE.search(t))
         elif k == "aria-label":
             label = str(v or "")
     if any(_REGION_TOKEN_RE.search(t) for t in tokens):
@@ -212,8 +230,10 @@ class _Scan:
 def _scan(html: Any) -> _Scan:
     if not isinstance(html, str):
         return _Scan(regions=[])
-    body = _BODY_START_RE.search(html)
-    start = body.start() if body else 0
+    head_end = _HEAD_END_RE.search(html)
+    after_head = head_end.end() if head_end else 0
+    body = _BODY_START_RE.search(html, after_head)
+    start = body.start() if body else after_head
     parser = _RegionParser()
     too_deep = False
     try:
@@ -248,15 +268,11 @@ def _shape(code: str) -> str:
 
 
 def _is_code(code: str, text: str, start: int, end: int) -> bool:
-    if len(code) < 3 or code.upper() in _STOP_CODES or not any(ch.isalpha() for ch in code):
+    if len(code) < 3 or code.upper().replace("-", "") in _STOP_CODES or not any(ch.isalpha() for ch in code):
         return False
-    if _shape(code) == "letters" and len(code) < 4:
+    if _GIFT_CARD_NUMBER_RE.fullmatch(code) or set(code) <= {"X"}:  # 1234-5678-ABCD, or an "XXXX" placeholder
         return False
-    if code.count("-") >= 2 or set(code) <= {"X"}:  # gift-card style groups, or an "XXXX" placeholder
-        return False
-    if _SHADE_AFTER_RE.match(text, end):
-        return False
-    return not _GIFT_CARD_RE.search(text[max(0, start - _GIFT_CARD_SPAN): end + _GIFT_CARD_SPAN])
+    return not _SHADE_AFTER_RE.match(text, end)
 
 
 def _nearest(spans: List[Tuple[int, int]], start: int, end: int) -> Optional[int]:
@@ -290,6 +306,8 @@ def codes_in_region(text: str) -> List[CapturedCode]:
     # Each stated term goes to the nearest code within the window, never to every code in it.
     def assign(pattern: "re.Pattern[str]", key: str) -> None:
         for occurrence in pattern.finditer(text):
+            if key == "percent" and not 1 <= int(occurrence.group(1)) <= 100:
+                continue  # "0% off" or "150% off" is not a term; a later valid one still is
             owner = _nearest(spans, occurrence.start(), occurrence.end())
             if owner is None:
                 continue
@@ -314,7 +332,7 @@ def codes_in_region(text: str) -> List[CapturedCode]:
         captured = CapturedCode(code=code, kind=None, value=None, currency_symbol=None, min_subtotal=None,
                                 shape=_shape(code), form=form)
         percent, amount = t["percent"], t["amount"]
-        if percent is not None and 1 <= int(percent.group(1)) <= 100:
+        if percent is not None:
             captured.kind, captured.value = "percent", percent.group(1)
         elif amount is not None:
             captured.kind, captured.value, captured.currency_symbol = "amount", amount.group(2), amount.group(1)

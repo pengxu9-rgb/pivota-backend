@@ -46,6 +46,7 @@ def _codes(html):
         ('<div class="ticker-bar">', "</div>"),
         ('<marquee>', "</marquee>"),
         ('<div class="shopify-section announcement-bar color-scheme-1">', "</div>"),  # one token of several
+        ('<div id="shopify-section-sections--1656__announcement-bar">', "</div>"),  # a section id, not a modifier
     ],
 )
 def test_promo_regions_are_found_by_class_id_tag_or_label(opening, closing):
@@ -259,6 +260,11 @@ def test_the_refresh_job_reports_the_shadow_counts_only_with_the_flag(monkeypatc
         '<div class="banner">Use code BAN10</div>',  # a bare banner is a hero, not a promo bar
         '<div class="hero-banner">Use code HERO10</div>',
         '<div class="promo-barcode">Use code BCD10</div>',  # a name must END the token or precede -/_
+        '<button aria-label="Close announcement">Use code BTN10</button>',  # the label must BE the name
+        '<div class="page-wrapper has-announcement-bar">Use code WRAP10</div>',  # state and wrapper tokens
+        '<div class="announcement-bar--visible">Use code WRAP20</div>',
+        '<section class="with-top-bar">Use code WRAP30</section>',
+        '<div id="page-announcement-container">Use code WRAP40</div>',
     ],
 )
 def test_a_name_inside_another_word_or_a_bare_banner_is_not_a_region(html):
@@ -274,6 +280,13 @@ def test_a_page_root_whose_class_names_a_bar_is_not_one_region(root):
         f"</{root}>"
     )
     assert set(_codes(html)) == {"BAR10"}
+
+
+@pytest.mark.parametrize("root", ["body", "main", "header", "html"])
+def test_a_page_root_is_never_a_region_even_when_its_class_is_the_bar_name(root):
+    # A plain token, not a has-/with- state class: only the root rule keeps the product copy out.
+    html = f'<{root} class="announcement-bar"><div class="product__description">Use code DESC10</div></{root}>'
+    assert _codes(html) == {}
 
 
 @pytest.mark.parametrize("tag", ["script", "style", "noscript", "template", "svg"])
@@ -370,10 +383,20 @@ def test_the_min_spend_pattern_does_not_backtrack_on_blank_runs():
         "USE CODE TODAY ONLY",
         "Apply code NC20 shade swatch",  # a shade name, not a code
         "Use code NW15 tone",
-        "Enter code 1234-5678-ABCD on your gift card",  # gift-card style groups
-        "Use code ABCD1234 to redeem your gift card",
+        "Enter code 1234-5678-ABCD",  # a gift-card number: dash groups of four
         "Enter code XXXX at checkout",  # a placeholder
-        "Use code ABC for a treat",  # letters only, too short
+        "USE CODE NEXT TIME",
+        "USE CODE SHOWN",
+        "USE CODE IN-STORE",
+        "ENTER CODE LATER",
+        "APPLY CODE MANUALLY",
+        "USE CODE FIRST ORDER",
+        "USE CODE EVERY TIME",
+        "USE CODE ATCHECKOUT",
+        "USE CODE INSTEAD",
+        "USE CODE ALWAYS",
+        "USE CODE SOON",
+        "USE CODE YOU LOVE",
     ],
 )
 def test_prose_shades_gift_cards_and_placeholders_are_not_codes(text):
@@ -481,3 +504,63 @@ def test_the_job_prints_its_capture_line_only_with_the_flag(monkeypatch, capsys,
     job.main()
     lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("DEAL_CODE_CAPTURE ")]
     assert len(lines) == (1 if flag else 0)
+
+
+# ---- re-review of b6debd7f4 --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,code",
+    [
+        ("Use code SAVE20 for 20% off. Excludes gift cards.", "SAVE20"),
+        ("Use code SAVE20 - not valid on gift cards", "SAVE20"),
+        ("Use code HOLIDAY15 on everything (gift cards excluded)", "HOLIDAY15"),
+    ],
+)
+def test_a_gift_card_disclaimer_keeps_the_code_and_becomes_a_hint(text, code):
+    c = _codes(f'<div class="announcement-bar">{text}</div>')[code]
+    assert c.hints == ["has_exclusions", "mentions_gift_card"]
+
+
+@pytest.mark.parametrize("code", ["VIP", "JOY", "GET-10-OFF", "BLACK-FRIDAY-20", "SUMMER-20", "10OFF", "TAKE5"])
+def test_short_and_dashed_codes_are_codes(code):
+    assert set(_codes(f'<div class="announcement-bar">Use code {code} at checkout</div>')) == {code}
+
+
+def test_a_wrapper_state_class_does_not_hide_the_bar_inside_it():
+    html = (
+        '<div class="page-wrapper has-announcement-bar"><div class="announcement-bar">Use code BAR10</div>'
+        '<div class="product__description">Use code DESC10 for 10% off</div></div>'
+    )
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_a_stray_end_tag_inside_a_bar_does_not_close_the_bar():
+    # The second </b> has nothing open to close; it must not pop the bar itself.
+    assert set(_codes('<div class="announcement-bar"><b>Hi</b></b> Use code SAVE10</div>')) == {"SAVE10"}
+
+
+@pytest.mark.parametrize(
+    "text,kind,value",
+    [
+        ("Use code ZERO1 for 0% off", None, None),
+        ("Use code BIG1 for 1100% off", None, None),  # never "100" out of 1100
+        ("Use code SAVE10 for 0% off then 20% off", "percent", "20"),  # the first VALID percent wins
+    ],
+)
+def test_only_a_percent_from_1_to_100_is_a_term(text, kind, value):
+    c = next(iter(_codes(f'<div class="announcement-bar">{text}</div>').values()))
+    assert (c.kind, c.value) == (kind, value)
+
+
+def test_a_body_tag_inside_a_head_script_is_not_the_body():
+    html = (
+        '<html><head><script>document.write("<body>")</script><script>' + "x" * 250_000 + "</script></head>"
+        '<body><div class="announcement-bar">Use code TOP10</div></body></html>'
+    )
+    assert set(_codes(html)) == {"TOP10"}
+
+
+def test_a_custom_element_starting_with_body_is_not_the_body():
+    html = '<div class="announcement-bar">Use code TOP10</div><body-scroll-lock></body-scroll-lock>'
+    assert set(_codes(html)) == {"TOP10"}
