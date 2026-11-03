@@ -29,7 +29,8 @@ async def db():
     # Another gate file may have created the table first, narrower (the gate shares one
     # database per process), so the CREATE above can be a no-op: add every column used here.
     await database.execute("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data jsonb")
-    for column in ("id", "attached_product_key", "status", "seller_ref", "domain", "canonical_url", "destination_url", "market"):
+    for column in ("id", "attached_product_key", "status", "seller_ref", "domain", "canonical_url", "destination_url", "market",
+                   "price_currency"):
         await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {column} text")
     await database.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_skus_source_identity_v2 ON catalog_skus(merchant_id,platform,product_key,source_variant_id)"
