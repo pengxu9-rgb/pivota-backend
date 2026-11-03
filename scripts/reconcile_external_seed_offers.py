@@ -187,11 +187,17 @@ async def run_reconcile(*, apply: bool, limit: int, sample_limit: int) -> Dict[s
         to_repair = to_repair[:limit]
 
     repaired = 0
+    # A mirror offer declared for another market than its currency's is left stale by the writer: not a
+    # repair, and counted so the rows to re-stamp are visible.
+    frozen_market_mismatch = 0
     for seed_id in to_repair:
         result = await sync_offer_for_seed(seed_id)
         if result.get("status") == "synced":
             repaired += 1
+        elif result.get("status") == "frozen_market_mismatch":
+            frozen_market_mismatch += 1
     report["repaired"] = repaired
+    report["frozen_market_mismatch"] = frozen_market_mismatch
     report["remaining_missing"] = await _count(MISSING_COUNT_SQL, count_params)
     report["remaining_drift"] = await _count(DRIFT_COUNT_SQL, count_params)
     return report

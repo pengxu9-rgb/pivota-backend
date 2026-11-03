@@ -465,6 +465,26 @@ def test_refusals_from_either_lane_reach_the_spike_rule_through_the_real_helper(
     assert summary["status"] == "degraded"
 
 
+def test_a_frozen_mirror_offer_is_counted_through_the_real_helper_and_not_written(monkeypatch):
+    """`frozen_market_mismatch` as the writer returns it (the mirror's stored offer is declared for another
+    market, so the upsert left it stale): not a write, a structural skip, and counted on its own -- each one
+    is a row to re-stamp."""
+    frozen = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "frozen_market_mismatch",
+                                                  "target": "mirror"}))
+    wrote = asyncio.run(_projected(monkeypatch, {"seed_id": "eps_x", "status": "synced", "target": "mirror"}))
+    assert frozen.get("skip_frozen_market_mismatch") == 1 and not frozen.get("projected")
+
+    def _row(projection):
+        row = _ok(projected=0)
+        row["projection"] = dict(projection)
+        return row
+
+    summary = _run(monkeypatch, [_row(frozen) for _ in range(3)] + [_row(wrote) for _ in range(97)], limit=100)
+    assert summary["projections_frozen_market_mismatch"] == 3
+    assert summary["projection_structural_skips"] == 3
+    assert summary["projections_written"] == 97
+
+
 def test_projections_that_should_write_and_write_nothing_still_degrade(monkeypatch):
     """Structural skips leave the denominator; the rest still have to land something while
     prices move."""
@@ -497,6 +517,7 @@ def test_the_structural_share_rule_directly(monkeypatch):
 
     assert OFFER_SYNC_STRUCTURAL_SKIP_STATUSES == {
         "no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency",
+        "frozen_market_mismatch",
     }
     base = dict(failed=0, stopped_early=False, attempted_count=10, origin_reads=10,
                 price_changes=3, projections_attempted=10)

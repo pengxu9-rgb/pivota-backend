@@ -75,7 +75,7 @@ OFFER_MODE = "redirect"
 
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
 # returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
-# no_mirror_product, synced, refused_currency, error -- and, for an attached seed with no mirror
+# no_mirror_product, synced, frozen_market_mismatch, refused_currency, error -- and, for an attached seed with no mirror
 # (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed, refused_currency,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
 # `target` says which (`mirror` or `attached`).
@@ -96,8 +96,13 @@ OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 # its amount in (services/seed_offer_currency), so the writer writes nothing rather than a default.
 # That is the seed's shape, not a failed write: 1,254 active seeds on 10-19, every night until a
 # read agrees with the column.
+#
+# `frozen_market_mismatch` (2026-11-04): the mirror's stored offer is declared for another market than the one the
+# writer now declares (stamped before it declared the currency's market), so the upsert's guard leaves it stale. The
+# fix is a re-stamp of those rows, not a retry, so a night of them does not fail the batch; it is counted on its own
+# (`projections_frozen_market_mismatch`).
 OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
-    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency"}
+    {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency", "frozen_market_mismatch"}
 )
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
@@ -294,6 +299,7 @@ MIRROR_OFFER_UPSERT_SQL = """
         WHERE catalog_offers.suppressed_at IS NULL AND catalog_offers.suppression_reason IS NULL
           AND catalog_offers.market=EXCLUDED.market
           AND NOT (COALESCE(catalog_offers.offer_payload,CAST('{}' AS jsonb)) ? 'price_repair')
+        RETURNING catalog_offers.offer_id
 """
 MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK = _without_price_check(MIRROR_OFFER_UPSERT_SQL, (
     ("offer_payload, price_checked_at)", "offer_payload)"),
@@ -379,13 +385,33 @@ def seed_offer_amount(row_dict: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+# What `upsert_catalog_offer_from_seed_row` did to the mirror offer row.
+MIRROR_OFFER_WRITTEN = "written"
+# The stored row is declared for another market than the one this write declares (a row stamped before the
+# writer declared the currency's market, 2026-11-04): the upsert's guard leaves it untouched, so its price,
+# stock and price_checked_at go stale until the row is re-stamped. Never a write.
+MIRROR_OFFER_FROZEN_MARKET_MISMATCH = "frozen_market_mismatch"
+# The stored row is held by another rule of the guard (suppressed, or under a price repair): left as it was.
+MIRROR_OFFER_HELD = "held"
+
+
+async def _unwritten_mirror_offer_outcome(offer_id: str, market: str) -> str:
+    """Why the upsert's guard left the stored row alone: a market mismatch, or one of its other holds."""
+    stored = await database.fetch_one(
+        "SELECT market FROM catalog_offers WHERE offer_id = :offer_id", {"offer_id": offer_id}
+    )
+    if stored and str(dict(stored).get("market") or "") != market:
+        return MIRROR_OFFER_FROZEN_MARKET_MISMATCH
+    return MIRROR_OFFER_HELD
+
+
 async def upsert_catalog_offer_from_seed_row(
     product_key: str,
     row_dict: Dict[str, Any],
     *,
     merchant_id: str,
     price_read: bool = False,
-) -> None:
+) -> str:
     """Write / refresh the canonical offer row carrying price + currency +
     availability for one external seed. `price_amount` is mapped 1:1 to all
     three pricing columns (the seed carries only the displayed retailer price).
@@ -402,6 +428,10 @@ async def upsert_catalog_offer_from_seed_row(
     just read from the served page (see `sync_offer_for_seed`), and only then is
     `price_checked_at` stamped. Otherwise the row keeps its stamp, and migration
     246's trigger forgets it if this write moves the price.
+
+    Returns what happened to the row: MIRROR_OFFER_WRITTEN (inserted or refreshed),
+    MIRROR_OFFER_FROZEN_MARKET_MISMATCH (the stored row is declared for another market, so the guard left
+    it stale) or MIRROR_OFFER_HELD (suppressed, or under a price repair).
     """
     if not merchant_id or merchant_id == "external_seed":
         raise ValueError(
@@ -442,7 +472,8 @@ async def upsert_catalog_offer_from_seed_row(
         "canonical_url": row_dict.get("canonical_url"),
         "domain": row_dict.get("domain"),
         "external_seed_id": row_dict.get("id"),
-        "market": row_dict.get("market"),
+        # The market the row is declared for, as the column says; the seed's own partition stays on the seed.
+        "market": market_value,
     }
     # source_domain makes the offer visible to the domain-keyed machinery
     # (scripts/audit_offer_currency.py's scan keys on this column, and the
@@ -466,7 +497,9 @@ async def upsert_catalog_offer_from_seed_row(
             source_domain_value = host
             break
     with_check = await price_check_column_present()
-    await database.execute(
+    # RETURNING, because `execute` reports no row count: a row the ON CONFLICT guard leaves alone
+    # returns nothing, and is not a write.
+    written_row = await database.fetch_one(
         MIRROR_OFFER_UPSERT_SQL if with_check else MIRROR_OFFER_UPSERT_SQL_WITHOUT_PRICE_CHECK,
         {
             "offer_id": offer_id,
@@ -500,6 +533,9 @@ async def upsert_catalog_offer_from_seed_row(
             **({"price_read": bool(price_read)} if with_check else {}),
         },
     )
+    outcome = (
+        MIRROR_OFFER_WRITTEN if written_row else await _unwritten_mirror_offer_outcome(offer_id, market_value)
+    )
 
     # Repair newly priced variants without overwriting existing supply or stamping freshness.
     from services.catalog_variant_offer_projection import (
@@ -511,6 +547,7 @@ async def upsert_catalog_offer_from_seed_row(
         or as_json(row_dict.get("snapshot_variants"))
     ):
         await project_missing_variant_offers(product_key, apply=True, db=database)
+    return outcome
 
 
 _SEED_OFFER_COLUMNS = (
@@ -1191,7 +1228,7 @@ async def sync_offer_for_seed(
 
         product_key = mirror["product_key"]
         try:
-            await upsert_catalog_offer_from_seed_row(
+            outcome = await upsert_catalog_offer_from_seed_row(
                 product_key, seed, merchant_id=mirror["merchant_id"],
                 price_read=price_was_read(attached_price_source, currency_read),
             )
@@ -1200,7 +1237,12 @@ async def sync_offer_for_seed(
             # written. Its own status, so refresh counters and readiness can tell it from an exception.
             logger.warning({"event": "external_offer_dual_write_refused_currency", "seed_id": seed_id, "reason": str(refused)})
             return {"seed_id": seed_id, "status": "refused_currency", "product_key": product_key, "error": str(refused)}
-        result = {"seed_id": seed_id, "status": "synced", "product_key": product_key, "target": "mirror"}
+        if outcome == MIRROR_OFFER_FROZEN_MARKET_MISMATCH:
+            # The stored row is declared for another market: nothing was written, so it is not `synced`.
+            logger.warning({"event": "external_offer_dual_write_frozen_market_mismatch", "seed_id": seed_id,
+                            "product_key": product_key})
+        status = "frozen_market_mismatch" if outcome == MIRROR_OFFER_FROZEN_MARKET_MISMATCH else "synced"
+        result = {"seed_id": seed_id, "status": status, "product_key": product_key, "target": "mirror"}
         if attached_price_source == "refresh" and mirror_variant_reprice_enabled():
             # The variant rows the PDP prices from (see `sync_mirror_variant_offers`). The mirror row
             # is already written, so a failure here is reported beside it, never instead of it.

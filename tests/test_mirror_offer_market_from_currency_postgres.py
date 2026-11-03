@@ -130,7 +130,7 @@ async def _write(monkeypatch, db, price, currency):
     from services import external_offer_dual_write as mod
 
     monkeypatch.setattr(mod, "database", db)
-    await mod.upsert_catalog_offer_from_seed_row(PK, _seed(price, currency), merchant_id=SELLER)
+    return await mod.upsert_catalog_offer_from_seed_row(PK, _seed(price, currency), merchant_id=SELLER)
 
 
 async def _offers(db):
@@ -142,9 +142,11 @@ async def _offers(db):
 
 
 async def test_a_jpy_seed_in_the_us_partition_writes_and_refreshes_market_jp(db, monkeypatch):
-    await _write(monkeypatch, db, 1800, "JPY")
+    from services import external_offer_dual_write as mod
+
+    assert await _write(monkeypatch, db, 1800, "JPY") == mod.MIRROR_OFFER_WRITTEN
     assert await _offers(db) == [("JP", "JPY", 1800.0)]
-    await _write(monkeypatch, db, 1650, "JPY")
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_WRITTEN
     assert await _offers(db) == [("JP", "JPY", 1650.0)]
 
 
@@ -155,8 +157,8 @@ async def test_an_old_us_stamp_freezes_until_re_stamped_then_refreshes(db, monke
     # The shape the old writer left in prod: the same offer, stamped with the seed's partition.
     await db.execute("UPDATE catalog_offers SET market = 'US' WHERE product_key = :pk", {"pk": PK})
 
-    await _write(monkeypatch, db, 1650, "JPY")
-    # Frozen: not refreshed, and no second row beside it (the offer id is the product's).
+    # Frozen: not refreshed, and no second row beside it (the offer id is the product's). The writer says so.
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_FROZEN_MARKET_MISMATCH
     assert await _offers(db) == [("US", "JPY", 1800.0)]
 
     # The re-stamp (market := the currency's market) ...
@@ -165,8 +167,43 @@ async def test_an_old_us_stamp_freezes_until_re_stamped_then_refreshes(db, monke
         {"oid": mod.derive_mirror_offer_id(PK)},
     )
     # ... and the next write refreshes it again.
-    await _write(monkeypatch, db, 1650, "JPY")
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_WRITTEN
     assert await _offers(db) == [("JP", "JPY", 1650.0)]
+
+
+async def test_a_suppressed_row_is_held_not_frozen(db, monkeypatch):
+    from services import external_offer_dual_write as mod
+
+    await _write(monkeypatch, db, 1800, "JPY")
+    await db.execute(
+        "UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'fixture' WHERE product_key = :pk",
+        {"pk": PK},
+    )
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_HELD
+    assert await _offers(db) == [("JP", "JPY", 1800.0)]
+
+
+async def test_a_refresh_of_a_frozen_row_reports_it_and_is_not_synced(db, monkeypatch):
+    """sync_offer_for_seed, end to end on the real upsert: a frozen row is `frozen_market_mismatch`, not `synced`."""
+    from services import external_offer_dual_write as mod
+
+    await _write(monkeypatch, db, 1800, "JPY")
+    await db.execute("UPDATE catalog_offers SET market = 'US' WHERE product_key = :pk", {"pk": PK})
+    await db.execute(
+        "INSERT INTO external_product_seeds(id, external_product_id, destination_url, domain, price_amount, "
+        "price_currency, availability, market, status) VALUES('seed_offer_market', 'ext_offer_market', "
+        "'https://store.example/products/item', 'store.example', 1650, 'JPY', 'in_stock', 'US', 'active')"
+    )
+
+    async def _mirror(seed_id):
+        return {"product_key": PK, "merchant_id": SELLER}
+
+    monkeypatch.setattr(mod, "resolve_mirror_product", _mirror)
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
+    result = await mod.sync_offer_for_seed("seed_offer_market")
+    assert result["status"] == "frozen_market_mismatch"
+    assert result["status"] not in mod.OFFER_SYNC_WRITTEN_STATUSES
+    assert await _offers(db) == [("US", "JPY", 1800.0)]
 
 
 async def test_a_usd_seed_writes_and_refreshes_market_us(db, monkeypatch):

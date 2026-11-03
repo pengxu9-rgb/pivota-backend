@@ -452,6 +452,13 @@ async def test_ensure_external_seed_merchant_upserts_singleton(monkeypatch) -> N
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(mirror_module, "database", DummyDB())
 
     await _ensure_external_seed_merchant()
@@ -476,6 +483,13 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
     class DummyDB:
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
+
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
 
     monkeypatch.setattr(mirror_module, "database", DummyDB())
 
@@ -547,6 +561,13 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::merch_obs_abc123::external_seed::ext_abc"
@@ -600,6 +621,13 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::external_seed::external_seed::ext_xyz"
@@ -627,3 +655,22 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
     # currency writes an unpriced offer with no currency, never a USD label.
     assert params["currency"] is None
     assert params["market"] == "US"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome, chain", [
+    ("written", "written"), ("held", "written"), ("frozen_market_mismatch", "frozen_market_mismatch"),
+])
+async def test_a_frozen_mirror_offer_is_its_own_chain_outcome(monkeypatch, outcome, chain) -> None:
+    """The offer writer leaves a row declared for another market stale (services/external_offer_dual_write
+    MIRROR_OFFER_FROZEN_MARKET_MISMATCH): the chain says so, so the apply counts it apart from a write."""
+    async def _sku(*_a, **_k):
+        return None
+
+    async def _offer(*_a, **_k):
+        return outcome
+
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_sku_for_mirror_row", _sku)
+    monkeypatch.setattr(mirror_module, "_shared_upsert_offer", _offer)
+    row = {"id": "eps_1", "price_amount": 1800, "price_currency": "JPY", "market": "US"}
+    assert await mirror_module._write_mirror_chain("prod::m::external_seed::p", row, merchant_id="merch_obs_x") == chain

@@ -79,6 +79,7 @@ from services.external_offer_dual_write import (
     derive_mirror_offer_id as _shared_offer_id,
     derive_mirror_sku_key as _shared_sku_key,
     upsert_catalog_offer_from_seed_row as _shared_upsert_offer,
+    MIRROR_OFFER_FROZEN_MARKET_MISMATCH,
     seed_offer_amount,
     seed_offer_currency_and_market,
 )
@@ -786,7 +787,9 @@ async def _upsert_canonical_sku_for_mirror_row(
 
 
 async def _write_mirror_chain(product_key: str, row_dict: Dict[str, Any], *, merchant_id: str) -> str:
-    """The canonical sku and offer for one mirrored seed, or neither: "written" or "refused_currency".
+    """The canonical sku and offer for one mirrored seed, or neither: "written", "refused_currency", or
+    "frozen_market_mismatch" (the sku is written, but the stored offer is declared for another market, so the
+    offer writer left it stale: services/external_offer_dual_write.MIRROR_OFFER_FROZEN_MARKET_MISMATCH).
 
     Refused BEFORE any write (PR controller review of #2652). A priced seed with no currency or
     market of its own, or whose column and page read disagree (services/seed_offer_currency),
@@ -799,15 +802,15 @@ async def _write_mirror_chain(product_key: str, row_dict: Dict[str, Any], *, mer
         print(f"REFUSED currency for product_key={product_key}: {refused}", file=sys.stderr)
         return "refused_currency"
     await _upsert_canonical_sku_for_mirror_row(product_key, row_dict, merchant_id=merchant_id)
-    await _upsert_canonical_offer_for_mirror_row(product_key, row_dict, merchant_id=merchant_id)
-    return "written"
+    outcome = await _upsert_canonical_offer_for_mirror_row(product_key, row_dict, merchant_id=merchant_id)
+    return "frozen_market_mismatch" if outcome == MIRROR_OFFER_FROZEN_MARKET_MISMATCH else "written"
 
 
 async def _upsert_canonical_offer_for_mirror_row(
     product_key: str,
     row_dict: Dict[str, Any],
     merchant_id: str = MERCHANT_ID,
-) -> None:
+) -> str:
     """Phase 7d: write the canonical offer row carrying price + currency
     + availability. This is the field that fixes the "all prices zero"
     bug observed in chat-mode canonical_chain results — once Path B
@@ -818,7 +821,7 @@ async def _upsert_canonical_offer_for_mirror_row(
     `price_amount` from external_product_seeds is mapped 1:1 to all
     three pricing columns (no spread between list/effective/best on
     this path — the seed has only the displayed retailer price)."""
-    await _shared_upsert_offer(product_key, row_dict, merchant_id=merchant_id)
+    return await _shared_upsert_offer(product_key, row_dict, merchant_id=merchant_id)
 
 
 def _compute_mirror_lifecycle_stage(
@@ -1459,6 +1462,8 @@ async def _apply(limit: int) -> Dict[str, Any]:
     # Seeds whose chain was refused for want of a currency (or market) they can vouch for: counted
     # apart from a failed write, which is a defect, where a refusal is the seed's shape.
     chain_refused_currency = 0
+    # Seeds whose offer the writer left stale because the stored row is declared for another market.
+    chain_frozen_market_mismatch = 0
     for row in rows or []:
         row_dict = dict(row)
         external_product_id = str(row_dict.get("external_product_id") or "")
@@ -1858,10 +1863,13 @@ async def _apply(limit: int) -> Dict[str, Any]:
         product_key_for_chain = product_key
         if product_key_for_chain:
             try:
-                if await _write_mirror_chain(
+                chain = await _write_mirror_chain(
                     product_key_for_chain, row_dict, merchant_id=seller_merchant_id
-                ) == "refused_currency":
+                )
+                if chain == "refused_currency":
                     chain_refused_currency += 1
+                elif chain == "frozen_market_mismatch":
+                    chain_frozen_market_mismatch += 1
             except Exception as exc:
                 # Don't break the whole apply if one row's chain fails
                 # — log and continue. The next --apply pass will retry
@@ -1953,7 +1961,8 @@ async def _apply(limit: int) -> Dict[str, Any]:
             "(set MIRROR_UNRESOLVED_VERTICAL_FAIL_THRESHOLD to adjust).",
             file=sys.stderr,
         )
-    return {"inserted": inserted, "vertical_guard": guard, "chain_refused_currency": chain_refused_currency}
+    return {"inserted": inserted, "vertical_guard": guard, "chain_refused_currency": chain_refused_currency,
+            "chain_frozen_market_mismatch": chain_frozen_market_mismatch}
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:
@@ -1996,6 +2005,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         "catalog_products_visible_quality_with_sig",
         "inserted_catalog_products",
         "chain_refused_currency",
+        "chain_frozen_market_mismatch",
         "post_apply_missing_catalog_products",
         "post_apply_catalog_products_total",
         "post_apply_catalog_products_with_sig",
@@ -2070,6 +2080,8 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                 # Seeds whose chain was refused for want of a currency they can vouch for
                 # (services/seed_offer_currency): not failures, but a count worth watching.
                 "chain_refused_currency": apply_result.get("chain_refused_currency", 0),
+                # Mirror offers left stale because the stored row is declared for another market: rows to re-stamp.
+                "chain_frozen_market_mismatch": apply_result.get("chain_frozen_market_mismatch", 0),
                 "post_apply_missing_catalog_products": after_totals.get("missing_catalog_products"),
                 "post_apply_catalog_products_total": after_totals.get("catalog_products_total"),
                 "post_apply_catalog_products_with_sig": after_totals.get("catalog_products_with_sig"),
