@@ -395,11 +395,17 @@ MIRROR_OFFER_FROZEN_MARKET_MISMATCH = "frozen_market_mismatch"
 # proposed at all (its product or SKU is not live): left as it was.
 MIRROR_OFFER_HELD = "held"
 
+# The guard's holds, as the upsert states them: the row suppressed or under a price repair, or its product or SKU
+# not live (the INSERT ... WHERE EXISTS then proposes no row, so nothing conflicts and nothing is written).
 _UNWRITTEN_MIRROR_OFFER_SQL = """
-SELECT market,
-       (suppressed_at IS NOT NULL OR suppression_reason IS NOT NULL
-        OR COALESCE(offer_payload, CAST('{}' AS jsonb)) ? 'price_repair') AS held
-FROM catalog_offers WHERE offer_id = :offer_id
+SELECT co.market,
+       (co.suppressed_at IS NOT NULL OR co.suppression_reason IS NOT NULL
+        OR COALESCE(co.offer_payload, CAST('{}' AS jsonb)) ? 'price_repair'
+        OR NOT EXISTS (SELECT 1 FROM catalog_products p JOIN catalog_skus s ON s.product_key = p.product_key
+                       WHERE p.product_key = co.product_key AND s.sku_key = co.sku_key
+                         AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+                         AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL)) AS held
+FROM catalog_offers co WHERE co.offer_id = :offer_id
 """
 
 
