@@ -111,3 +111,30 @@ def test_idle_claim_returns_204_through_the_http_layer(monkeypatch):
     )
     assert response.status_code == 204
     assert response.content == b""
+
+
+async def test_a_cart_receipt_on_a_run_without_a_product_key_is_refused_and_logs_its_code(monkeypatch, caplog):
+    # 2026-11-04: a scheduled probe's receipt was answered 409 and the worker logged only
+    # "receipt_rejected"; the code never reached any log. It must now be visible.
+    import logging
+
+    from fastapi import HTTPException
+
+    from routes import store_audit_commerce_probe_internal as commerce_module
+
+    async def claimed(**_kwargs):
+        return {"audit_run_id": "audit-123", "merchant_id": "merchant:jolse", "product_key": None}
+
+    async def evidence(**_kwargs):
+        return "evidence-1"
+
+    monkeypatch.setattr(commerce_module, "get_claimed_verification_run", claimed)
+    monkeypatch.setattr(commerce_module, "insert_evidence_item", evidence)
+    caplog.set_level(logging.WARNING, logger=commerce_module.__name__)
+
+    with pytest.raises(HTTPException) as refused:
+        await commerce_module._persist_receipt(_receipt())
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {"error": "PRODUCT_NOT_RESOLVED"}
+    assert "store_audit_commerce_probe_conflict code=PRODUCT_NOT_RESOLVED verify=verify-1" in caplog.text

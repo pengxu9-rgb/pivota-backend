@@ -10,7 +10,6 @@ before payment and never places an order.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
@@ -27,13 +26,13 @@ from db.audit_evidence import (
     has_in_flight_verification_for_route,
     upsert_execution_route,
 )
-from db.database import database
 from db.merchant_audit_runs import (
     record_audit_run_completed,
     record_audit_run_started,
 )
 from routes.store_audit_public_intake import normalize_store_domain
 from services.brand_claim_service import merchant_owns_domain
+from services.store_audit_probe_identity import probe_product_key as _product_identity
 from utils.auth import get_current_merchant
 
 router = APIRouter(
@@ -106,29 +105,6 @@ def _target(value: str) -> tuple[str, str]:
     # variant tokens and analytics parameters out of worker claims.
     clean = f"https://{parsed.hostname.lower()}{parsed.path or '/'}"
     return domain, clean
-
-
-async def _product_identity(*, merchant_id: str, url: str) -> str:
-    try:
-        row = await database.fetch_one(
-            """
-            SELECT product_key
-              FROM catalog_products
-             WHERE merchant_id = :merchant_id
-               AND canonical_url IS NOT NULL
-               AND split_part(canonical_url, '?', 1) = :url
-               AND suppression_reason IS NULL
-             ORDER BY updated_at DESC NULLS LAST
-             LIMIT 1
-            """,
-            {"merchant_id": merchant_id, "url": url},
-        )
-    except Exception:  # noqa: BLE001 - URL audits do not require catalog sync
-        row = None
-    if row and row.get("product_key"):
-        return str(row["product_key"])
-    digest = hashlib.sha256(f"{merchant_id}|{url}".encode()).hexdigest()[:24]
-    return f"url_probe:{digest}"
 
 
 def _empty_steps(status_value: StepStatus = "not_run") -> List[StoreReadinessStep]:

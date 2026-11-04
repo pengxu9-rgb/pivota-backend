@@ -84,6 +84,7 @@ async def run_scheduled_commerce_checkout_reprobes() -> Dict[str, Any]:
         has_in_flight_verification_for_merchant,
     )
     from services.commerce_capability_resolver import checkout_audit_decision
+    from services.store_audit_probe_identity import probe_product_key
 
     now = datetime.now(timezone.utc)
     candidates = await list_merchant_storefront_candidates()
@@ -105,8 +106,14 @@ async def run_scheduled_commerce_checkout_reprobes() -> Dict[str, Any]:
             summary["deduped"] += 1
             continue
         try:
+            # Without a product_key the receipt route refuses the cart evidence every completed
+            # journey carries (409 PRODUCT_NOT_RESOLVED), so only timeouts could ever be recorded.
+            # The worker starts from the route's endpoint, which is also the claim's target_url.
+            product_key = await probe_product_key(
+                merchant_id=merchant_id, url=str(route.get("endpoint_normalized") or ""),
+            )
             verify_id = await enqueue_verification_run(
-                audit_run_id=audit_run_id, merchant_id=merchant_id,
+                audit_run_id=audit_run_id, merchant_id=merchant_id, product_key=product_key,
                 execution_route_id=route_id, verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
                 max_retries=1,
                 idempotency_key=merchant_reprobe_idempotency_key(
