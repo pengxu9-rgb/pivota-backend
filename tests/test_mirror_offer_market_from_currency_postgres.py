@@ -183,6 +183,36 @@ async def test_a_suppressed_row_is_held_not_frozen(db, monkeypatch):
     assert await _offers(db) == [("JP", "JPY", 1800.0)]
 
 
+@pytest.mark.parametrize("hold_sql", [
+    "UPDATE catalog_offers SET suppressed_at = NOW(), suppression_reason = 'fixture' WHERE product_key = :pk",
+    "UPDATE catalog_offers SET suppressed_at = NOW() WHERE product_key = :pk",
+    "UPDATE catalog_offers SET offer_payload = CAST('{\"price_repair\": {}}' AS jsonb) WHERE product_key = :pk",
+    "UPDATE catalog_skus SET suppressed_at = NOW(), suppression_reason = 'fixture' WHERE product_key = :pk",
+    "UPDATE catalog_products SET suppression_reason = 'fixture' WHERE product_key = :pk",
+])
+async def test_a_held_row_the_old_writer_also_stamped_us_is_held_not_frozen(db, monkeypatch, hold_sql):
+    """A hold outranks the mismatch: re-stamping a suppressed or price-repaired row would not make it refresh,
+    so it is not counted with the rows to re-stamp (PR controller review of #2701)."""
+    from services import external_offer_dual_write as mod
+
+    await _write(monkeypatch, db, 1800, "JPY")
+    await db.execute("UPDATE catalog_offers SET market = 'US' WHERE product_key = :pk", {"pk": PK})
+    await db.execute(hold_sql, {"pk": PK})
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_HELD
+    assert await _offers(db) == [("US", "JPY", 1800.0)]
+
+
+async def test_a_stored_lowercase_market_is_a_mismatch(db, monkeypatch):
+    """The guard compares markets as stored (catalog_offers.market = EXCLUDED.market), so a stored 'jp' against a
+    written 'JP' is not refreshed, and the outcome says frozen, as the guard saw it."""
+    from services import external_offer_dual_write as mod
+
+    await _write(monkeypatch, db, 1800, "JPY")
+    await db.execute("UPDATE catalog_offers SET market = 'jp' WHERE product_key = :pk", {"pk": PK})
+    assert await _write(monkeypatch, db, 1650, "JPY") == mod.MIRROR_OFFER_FROZEN_MARKET_MISMATCH
+    assert await _offers(db) == [("jp", "JPY", 1800.0)]
+
+
 async def test_a_refresh_of_a_frozen_row_reports_it_and_is_not_synced(db, monkeypatch):
     """sync_offer_for_seed, end to end on the real upsert: a frozen row is `frozen_market_mismatch`, not `synced`."""
     from services import external_offer_dual_write as mod

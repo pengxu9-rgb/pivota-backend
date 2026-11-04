@@ -597,3 +597,22 @@ def test_the_attached_update_records_who_vouched_for_the_read():
     for sql in (mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, mod.ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK):
         assert "'{price_read_source}'" in sql
         assert "to_jsonb(CAST(:read_source AS text))" in sql
+
+
+@pytest.mark.parametrize("stored, expected", [
+    (None, "held"),
+    ({"market": "US", "held": True}, "held"),
+    ({"market": "US", "held": False}, "frozen_market_mismatch"),
+    ({"market": "JP", "held": False}, "held"),
+])
+@pytest.mark.asyncio
+async def test_an_unwritten_mirror_offer_reports_its_hold_before_a_market_mismatch(monkeypatch, stored, expected):
+    """_unwritten_mirror_offer_outcome: a suppressed or price-repaired row is `held` even when it is also
+    stamped for another market; only an unheld row in another market is `frozen_market_mismatch`."""
+    class Probe:
+        async def fetch_one(self, sql, params):
+            assert "price_repair" in sql and "suppression_reason" in sql and params == {"offer_id": "of_1"}
+            return stored
+
+    monkeypatch.setattr(mod, "database", Probe())
+    assert await mod._unwritten_mirror_offer_outcome("of_1", "JP") == expected
