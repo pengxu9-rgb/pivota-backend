@@ -234,6 +234,43 @@ async def test_mirror_apply_refuses_the_whole_chain_and_counts_it(monkeypatch, s
     assert result["chain_refused_currency"] == (1 if refused else 0)
 
 
+@pytest.mark.parametrize("outcome, frozen", [("frozen_market_mismatch", 1), ("written", 0), ("held", 0)])
+async def test_mirror_apply_counts_a_frozen_offer(monkeypatch, outcome, frozen) -> None:
+    """BEHAVIOURAL: one real `_apply` pass. The offer writer left the stored row stale because it is declared
+    for another market (services/external_offer_dual_write MIRROR_OFFER_FROZEN_MARKET_MISMATCH): the pass
+    counts it in `chain_frozen_market_mismatch`, apart from the refusals."""
+    seed_row = {
+        "id": "seed_apply_jpy", "external_product_id": "ext_apply_jpy", "attached_product_key": None,
+        "market": "US", "tool": "*", "title": "Glow Cushion Set", "availability": "in_stock",
+        "price_amount": 1800, "price_currency": "JPY", "seed_data": {"snapshot": {"brand": "Brand"}},
+        "image_url": None, "updated_at": None, "duplicate_count": 1, "rn": 1, "mirrored_description": "A set.",
+        "mirrored_brand": "Brand", "mirrored_product_type": "Serum", "mirrored_category": "skincare",
+        "domain": "brand.com", "canonical_url": "https://brand.com/products/set", "destination_url": None,
+    }
+    fake = _MirrorApplyDb(seed_row)
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    async def _seller(**kwargs):
+        return "merch_obs_apply"
+
+    async def _offer(product_key, row_dict, merchant_id=None):
+        return outcome
+
+    import services.product_group_autogrouper as autogrouper
+    monkeypatch.setattr(mirror_module, "database", fake)
+    monkeypatch.setattr(mirror_module, "ensure_observed_seller", _seller)
+    monkeypatch.setattr(autogrouper, "ensure_singleton_group_membership", _noop)
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_sku_for_mirror_row", _noop)
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_offer_for_mirror_row", _offer)
+    monkeypatch.setattr(mirror_module, "backlink_seed_to_product", _noop)
+    monkeypatch.setattr(mirror_module, "_make_servable_enabled", lambda: False)
+    result = await mirror_module._apply(limit=1)
+    assert result["chain_frozen_market_mismatch"] == frozen
+    assert result["chain_refused_currency"] == 0
+
+
 async def test_mirror_run_reports_the_chain_refusals(monkeypatch) -> None:
     """`_apply`'s refusal count reaches the --apply report's totals (PR controller review of #2652:
     it was counted and then dropped). A night of refusals is visible next to `inserted_catalog_products`."""
@@ -250,7 +287,7 @@ async def test_mirror_run_reports_the_chain_refusals(monkeypatch) -> None:
         return {"ok": True, "totals": {"legacy_external_seed_catalog_rows": 0}, "warnings": []}
 
     async def _apply(limit):
-        return {"inserted": 3, "vertical_guard": {}, "chain_refused_currency": 2}
+        return {"inserted": 3, "vertical_guard": {}, "chain_refused_currency": 2, "chain_frozen_market_mismatch": 4}
 
     monkeypatch.setattr(mirror_module, "database", _Db())
     monkeypatch.setattr(mirror_module, "_build_report", _report)
@@ -258,6 +295,7 @@ async def test_mirror_run_reports_the_chain_refusals(monkeypatch) -> None:
     report = await mirror_module._run(argparse.Namespace(sample_limit=0, limit=10, apply=True))
     assert report["totals"]["inserted_catalog_products"] == 3
     assert report["totals"]["chain_refused_currency"] == 2
+    assert report["totals"]["chain_frozen_market_mismatch"] == 4
 
 
 def test_mirror_insert_classifies_category_path() -> None:
@@ -452,6 +490,13 @@ async def test_ensure_external_seed_merchant_upserts_singleton(monkeypatch) -> N
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(mirror_module, "database", DummyDB())
 
     await _ensure_external_seed_merchant()
@@ -476,6 +521,13 @@ async def test_upsert_canonical_sku_writes_path_C_compatible_shape(monkeypatch) 
     class DummyDB:
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
+
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
 
     monkeypatch.setattr(mirror_module, "database", DummyDB())
 
@@ -547,6 +599,13 @@ async def test_upsert_canonical_offer_carries_price_amount_into_three_columns(mo
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::merch_obs_abc123::external_seed::ext_abc"
@@ -600,6 +659,13 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
         async def execute(self, sql, params):
             executed.append({"sql": str(sql), "params": dict(params)})
 
+        async def fetch_one(self, sql, params=None):
+            # The mirror upsert runs with RETURNING; anything else (the column probe) is unanswered.
+            if "INSERT INTO catalog_offers" not in str(sql):
+                raise RuntimeError("no such read in this test")
+            executed.append({"sql": str(sql), "params": dict(params)})
+            return {"offer_id": params["offer_id"]}
+
     monkeypatch.setattr(dual_write_module, "database", DummyDB())
 
     pk = "prod::external_seed::external_seed::ext_xyz"
@@ -627,3 +693,22 @@ async def test_upsert_canonical_offer_handles_null_price_gracefully(monkeypatch)
     # currency writes an unpriced offer with no currency, never a USD label.
     assert params["currency"] is None
     assert params["market"] == "US"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome, chain", [
+    ("written", "written"), ("held", "written"), ("frozen_market_mismatch", "frozen_market_mismatch"),
+])
+async def test_a_frozen_mirror_offer_is_its_own_chain_outcome(monkeypatch, outcome, chain) -> None:
+    """The offer writer leaves a row declared for another market stale (services/external_offer_dual_write
+    MIRROR_OFFER_FROZEN_MARKET_MISMATCH): the chain says so, so the apply counts it apart from a write."""
+    async def _sku(*_a, **_k):
+        return None
+
+    async def _offer(*_a, **_k):
+        return outcome
+
+    monkeypatch.setattr(mirror_module, "_upsert_canonical_sku_for_mirror_row", _sku)
+    monkeypatch.setattr(mirror_module, "_shared_upsert_offer", _offer)
+    row = {"id": "eps_1", "price_amount": 1800, "price_currency": "JPY", "market": "US"}
+    assert await mirror_module._write_mirror_chain("prod::m::external_seed::p", row, merchant_id="merch_obs_x") == chain

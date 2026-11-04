@@ -21,6 +21,7 @@ from services.catalog_offer_writer_guard import guard_catalog_offer_rows
 from services.catalog_offer_link_repair import plan_hash
 from services.variant_identity import MERCHANT_ISSUED, variant_id_provenance
 from services.offer_seller_identity import normalize_host
+from services.seed_offer_currency import seed_currency_of, seed_offer_market
 from services.seller_identity import resolve_seed_seller_identity
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,8 @@ WHERE product_key=:pk AND source_system=:src AND platform='external_seed'
 AND suppressed_at IS NULL AND suppression_reason IS NULL
 """
 SEED_SQL = """
-SELECT seed_data, seller_ref, domain, canonical_url, destination_url, market FROM external_product_seeds
+SELECT seed_data, seller_ref, domain, canonical_url, destination_url, market, price_currency
+FROM external_product_seeds
 WHERE attached_product_key=:pk AND status='active' AND id::text=:seed_id
 """
 SKUS_SQL = """
@@ -148,8 +150,13 @@ def seed_scope(product, seed):
         or declared not in (None, domain)
         or not listings
         or any(item is None or item[0] != domain for item in listings)
-        or not seed.get("market")
     ):
+        return None
+    # The market the mirror offer writer declares for this seed (seed_offer_market: its currency's
+    # market, never the seed's 'US' partition), so a template written by it matches.
+    try:
+        seed_market = seed_offer_market(seed, seed_currency_of(seed))
+    except ValueError:
         return None
     seller = str(seed.get("seller_ref") or "").strip()
     if not seller:
@@ -164,7 +171,7 @@ def seed_scope(product, seed):
             return None
     if seller != product["merchant_id"]:
         return None
-    return {"seed_listing_identities": set(listings), "seed_market": seed["market"]}
+    return {"seed_listing_identities": set(listings), "seed_market": seed_market}
 
 
 def own_availability(variant):

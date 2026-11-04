@@ -275,6 +275,10 @@ class FakeDB:
 
     async def fetch_one(self, sql, params=None):
         s = str(sql)
+        if "INSERT INTO catalog_offers" in s:
+            # The mirror upsert (RETURNING): recorded with the writes, and it wrote its row.
+            self.executed.append(s)
+            return {"offer_id": params["offer_id"]}
         if "FROM external_product_seeds" in s:
             return dict(self.seed) if self.seed else None
         if "FROM catalog_products" in s:
@@ -597,9 +601,9 @@ MPK = MIRROR["product_key"]
 
 
 def _mirror_offer(offer_id, *, sku, vid, price=13.6, source_ref=DEST, payload_seed=None, source_product_id="ext_74e14bd6",
-                  merchant=None, market="US"):
+                  merchant=None, market="US", currency="USD"):
     return {**_offer(offer_id, sku=sku, vid=vid, merchant=merchant or MIRROR["merchant_id"], source_ref=source_ref,
-                     payload_seed=payload_seed, price=price),
+                     payload_seed=payload_seed, price=price, currency=currency),
             "market": market, "read_product": json.dumps({"source_product_id": source_product_id})}
 
 
@@ -766,6 +770,29 @@ def test_a_row_in_another_market_is_never_written(monkeypatch):
     _patch_projection(monkeypatch, project)
     result = _sync(monkeypatch, fake)
     assert [u["offer_id"] for u in fake.updates] == ["of_us"]
+    assert result["offer_skips"] == {"mirror_variants_mirror_market_mismatch": 1}
+
+
+def test_a_jpy_seed_reprices_its_jp_variant_rows_and_not_an_old_us_stamp(monkeypatch):
+    """A JP store's seed sits in the 'US' serving partition and is priced in JPY. Its mirror's variant rows are
+    declared for the market the mirror upsert declares, the currency's (JP), never the partition: a JP row takes
+    the read, a row still stamped with the partition is the market mismatch the upsert also refuses."""
+    jpy_variants = json.dumps([
+        {"variant_id": "47761881301179", "price_amount": 1800},
+        {"variant_id": "47761881301180", "price_amount": 2600},
+    ])
+    fake, project = _mirror_fake(
+        price_amount=1800, price_currency="JPY", seed_variants=jpy_variants,
+        mirror_offers=[
+            _mirror_offer("of_jp", sku=f"{MPK}::v:47761881301179", vid="47761881301179", price=1700,
+                          market="JP", currency="JPY"),
+            _mirror_offer("of_us_stamp", sku=f"{MPK}::v:47761881301180", vid="47761881301180", price=2500,
+                          market="US", currency="JPY"),
+        ],
+    )
+    _patch_projection(monkeypatch, project)
+    result = _sync(monkeypatch, fake)
+    assert [(u["offer_id"], u["price"]) for u in fake.updates] == [("of_jp", 1800)]
     assert result["offer_skips"] == {"mirror_variants_mirror_market_mismatch": 1}
 
 

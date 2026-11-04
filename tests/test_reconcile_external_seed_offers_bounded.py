@@ -139,3 +139,23 @@ async def test_dry_run_is_the_default_and_writes_nothing(fake_db):
     assert report["apply"] is False
     assert report["repaired"] == 0
     assert "remaining_drift" not in report, "a dry run must not re-measure as if it had repaired"
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_mirror_offer_is_not_a_repair_and_is_counted(fake_db, monkeypatch):
+    """sync_offer_for_seed's `frozen_market_mismatch`: the stored row is declared for another market, so
+    nothing was written. It is not `repaired`; it is counted, the rows a re-stamp has to move."""
+    from services import external_offer_dual_write as dual_write
+
+    fake_db(missing_rows=3, drift_rows=0, orphan_rows=0, missing_total=3, drift_total=0, orphan_total=0)
+    statuses = iter(["synced", "frozen_market_mismatch", "frozen_market_mismatch"])
+
+    async def _sync(seed_id, **_k):
+        return {"seed_id": seed_id, "status": next(statuses)}
+
+    monkeypatch.setattr(dual_write, "sync_offer_for_seed", _sync)
+    # --apply switches the writer on in os.environ; registered first so the test leaves it as it was.
+    monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "true")
+    report = await rec.run_reconcile(apply=True, limit=10, sample_limit=2)
+    assert report["repaired"] == 1
+    assert report["frozen_market_mismatch"] == 2

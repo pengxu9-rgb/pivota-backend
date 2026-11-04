@@ -679,11 +679,13 @@ def _acquisition_only_priced(row: Dict[str, Any]) -> bool:
     """True for a product whose priced offers include one DECLARED for an acquisition market (AU/JP) and
     none in a currency a served region expects: stored, never served (multi-market storefronts ADR Phase 2).
 
-    NARROW ON PURPOSE. It needs `has_acquisition_market_offer`, which only a retailer_ingest AU/JP job can
-    make TRUE, so every row that existed before that lane wrote one -- the GBP/EUR/JPY no_us_offer residue
-    stamped market 'US' included -- classifies exactly as before, flag on or off. It is NOT
-    has_serving_region_offer made unconditional. A row computed by a query that lacks the column (None)
-    is left alone."""
+    NARROW ON PURPOSE. It needs `has_acquisition_market_offer`, which an offer DECLARED for AU/JP makes
+    TRUE: a retailer_ingest AU/JP job's, or (since 2026-11-04) a seed mirror offer priced in JPY or AUD, which
+    its writer declares for the market its currency is priced in. Such a product has no offer in a served
+    region's currency, so with ENABLE_KBEAUTY_AGENT_DECISION_GATES on (web, worker) it was already
+    `no_us_offer`; only a process running with the gates off now refuses it where it did not. It is NOT
+    has_serving_region_offer made unconditional: the GBP/EUR residue stamped market 'US' classifies as
+    before, flag on or off. A row computed by a query that lacks the column (None) is left alone."""
     if not row.get("has_acquisition_market_offer"):
         return False
     return not row.get("has_serving_region_offer", row.get("has_us_offer"))
