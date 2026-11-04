@@ -47,6 +47,7 @@ def _codes(html):
         ('<marquee>', "</marquee>"),
         ('<div class="shopify-section announcement-bar color-scheme-1">', "</div>"),  # one token of several
         ('<div id="shopify-section-sections--1656__announcement-bar">', "</div>"),  # a section id, not a modifier
+        ('<div class="announcement-bar announcement-bar-open">', "</div>"),  # a state token beside a name
     ],
 )
 def test_promo_regions_are_found_by_class_id_tag_or_label(opening, closing):
@@ -731,11 +732,42 @@ def test_the_body_starts_at_the_first_body_tag_or_body_content_outside_head_raw_
     assert set(_codes(html)) == {"BAR10"}
 
 
-def test_a_head_past_the_scan_limit_falls_back_to_the_page_start(monkeypatch):
+def test_a_head_past_the_scan_limit_starts_the_body_at_the_limit(monkeypatch):
     monkeypatch.setattr(dcc, "_HEAD_SCAN_LIMIT", 100)
     html = "<html><head><style>" + "a" * 500 + '</style></head><body><div class="announcement-bar">Use code BAR10</div>'
-    assert dcc._body_start(html) == 0
-    assert set(_codes(html)) == {"BAR10"}  # the region parser skips the style itself
+    assert dcc._body_start(html) == 100
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_a_short_page_with_only_head_tags_starts_at_the_page_start():
+    assert dcc._body_start("<html><head><title>x</title></head>") == 0
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        '<img src="p.gif" height="1" width="1">',  # a tracking pixel outside noscript
+        "<shopify-analytics></shopify-analytics>",  # a custom element
+        "<noscript>",  # an unclosed noscript
+        '<div id="tracking"></div>',
+    ],
+)
+def test_a_stray_tag_in_a_large_head_does_not_end_the_head(stray):
+    html = (
+        "<html><head>" + stray + "<script>" + "x" * 250_000 + "</script></head>"
+        '<body><div class="announcement-bar">Use code BAR10</div></body></html>'
+    )
+    assert html[dcc._body_start(html):].startswith("<body>")
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_with_no_body_tag_the_body_starts_at_the_first_tag_a_head_cannot_hold():
+    html = (
+        "<html><head><title>x</title><meta charset=utf-8><link rel=x href=y><base href=z><style>a{}</style>"
+        "<script>var a;</script><template><p>t</p></template><noscript><img src=p.gif></noscript></head>"
+        '<img src="logo.png"><div class="announcement-bar">Use code BAR10</div>'
+    )
+    assert dcc._body_start(html) == html.index('<img src="logo.png">')
 
 
 def test_the_body_start_offset_counts_lines():
@@ -750,4 +782,13 @@ def test_finding_the_body_is_linear_up_to_the_head_scan_limit(unit):
     html = "<html><head>" + unit * (dcc._HEAD_SCAN_LIMIT // len(unit))
     started = time.perf_counter()
     dcc._body_start(html)
-    assert time.perf_counter() - started < 5.0  # about 1 s on a laptop for 2 MB of "<"
+    assert time.perf_counter() - started < 5.0  # about 0.5 s on a laptop for 1 MB of "<"
+
+
+def test_entities_in_a_head_cost_nothing_to_scan():
+    import time
+
+    html = "<html><head>" + "&" * dcc._HEAD_SCAN_LIMIT
+    started = time.perf_counter()
+    dcc._body_start(html)
+    assert time.perf_counter() - started < 0.2  # ~0.1 ms; was ~0.5 s per MB with convert_charrefs=False

@@ -7,14 +7,14 @@ on purpose. The page refresh (`external_offers_service.resolve_external_offer`) 
 store page, so reading its promo regions costs no extra request to any store.
 
 WHAT IT READS. Only the first `_BODY_BUDGET` characters from where the body starts (bars sit at the top): the
-first `<body>` tag, or the first tag that cannot be in a head, found by parsing the head as markup, so a
-`<body` or `</head>` inside a script is not it. In them, only the text of elements that NAME a promo region: a
-whole class or id token (or the tag name) such as announcement / announcement-bar, promo-bar, promo-banner,
-top-bar, marquee, ticker-bar, header-message, site-banner, notification-bar, free-shipping-bar, or an
-aria-label "Announcement(s)". A bare "banner" is not one (hero banners hold product copy), a token that only
-contains a name ("product-sticker", "desktop-bar") is not one, and html / body / main / header are never a
-region root, so a body class like `has-announcement-bar` cannot turn the whole page into one. A page-state
-token is never a name: a has-/with-/is-/no-/show-/hide- prefix or a single-dash state suffix
+first `<body>` tag (or, on a page without one, the first tag that cannot be in a head), found by parsing the
+head as markup, so a `<body` or `</head>` inside a script is not it. In them, only the text of elements that
+NAME a promo region: a whole class or id token (or the tag name) such as announcement / announcement-bar,
+promo-bar, promo-banner, top-bar, marquee, ticker-bar, header-message, site-banner, notification-bar,
+free-shipping-bar, or an aria-label "Announcement(s)". A bare "banner" is not one (hero banners hold product
+copy), a token that only contains a name ("product-sticker", "desktop-bar") is not one, and html / body / main
+/ header are never a region root, so a body class like `has-announcement-bar` cannot turn the whole page into
+one. A page-state token is never a name: a has-/with-/is-/no-/show-/hide- prefix or a single-dash state suffix
 (`announcement-bar-visible`, `top-bar-open`, `marquee-enabled`). A wrapper or modifier token
 (`announcement-bar-container`, `announcement-area`, `announcement-bar--sticky`) is a FALLBACK region: its text
 counts only when nothing inside it names a region, so a bar that names itself inside a wrapper is read alone,
@@ -107,9 +107,9 @@ _INLINE_TAGS = frozenset({"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data"
 # A new one of these closes an open one of the same tag on top of the stack, as browsers do; without it
 # a page of unclosed <p>/<li> grows the stack without bound.
 _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "th"})
-# Tags a head may hold; any other start tag outside them opens the body, as browsers do.
+# Tags a head may hold. On a page with no <body> tag, the first other start tag is where the body starts.
 _HEAD_TAGS = frozenset({"html", "head", "title", "base", "link", "meta", "style", "script", "noscript", "template"})
-_HEAD_SCAN_LIMIT = 2_000_000
+_HEAD_SCAN_LIMIT = 1_000_000  # realistic heads are well under; 1 MB of bare "<" costs ~0.5 s
 _BODY_BUDGET = 200_000
 _MAX_DEPTH = 512
 _MAX_REGION_CHARS = 4000
@@ -286,23 +286,35 @@ class _BodyFound(Exception):
 
 
 class _BodyLocator(HTMLParser):
-    """Stops at the first <body> tag, or the first start tag a head cannot hold. Script and style are parsed
-    as raw text, so a `<body` or `</head>` inside one is not seen; tags inside noscript/template (a tracking
-    pixel's <img>) do not open the body."""
+    """Stops at the first <body> start tag. Script and style are parsed as raw text, so a `<body` or `</head>`
+    inside one is not seen. A stray tag in the head (a tracking pixel's <img>, a custom element) does not end
+    the search: the first tag a head cannot hold, outside noscript/template, is only remembered as where the
+    body starts on a page with no <body> tag."""
 
     def __init__(self) -> None:
-        super().__init__(convert_charrefs=False)
+        super().__init__(convert_charrefs=True)  # False makes a run of "&" cost ~0.5 s per MB
         self._hidden = 0
+        self.implicit_start: Optional[Tuple[int, int]] = None
 
     def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
+        if tag == "body":
+            raise _BodyFound()
         if tag in ("noscript", "template"):
             self._hidden += 1
-        elif not self._hidden and tag not in _HEAD_TAGS:  # <body> itself is not a head tag
-            raise _BodyFound()
+        elif not self._hidden and tag not in _HEAD_TAGS and self.implicit_start is None:
+            self.implicit_start = self.getpos()
 
     def handle_endtag(self, tag: str) -> None:
         if tag in ("noscript", "template") and self._hidden:
             self._hidden -= 1
+
+
+def _offset(html: str, position: Tuple[int, int]) -> int:
+    line, column = position
+    offset = 0
+    for _ in range(line - 1):
+        offset = html.index("\n", offset) + 1
+    return offset + column
 
 
 def _body_start(html: str) -> int:
@@ -310,12 +322,11 @@ def _body_start(html: str) -> int:
     try:
         locator.feed(html[:_HEAD_SCAN_LIMIT])  # no close(): it only flushes what is left as text, never a tag
     except _BodyFound:
-        line, column = locator.getpos()
-        offset = 0
-        for _ in range(line - 1):
-            offset = html.index("\n", offset) + 1
-        return offset + column
-    return 0
+        return _offset(html, locator.getpos())
+    if locator.implicit_start is not None:
+        return _offset(html, locator.implicit_start)
+    # Nothing but head up to the limit: the body, if any, starts after it.
+    return _HEAD_SCAN_LIMIT if len(html) > _HEAD_SCAN_LIMIT else 0
 
 
 @dataclass
