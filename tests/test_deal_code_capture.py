@@ -47,6 +47,7 @@ def _codes(html):
         ('<marquee>', "</marquee>"),
         ('<div class="shopify-section announcement-bar color-scheme-1">', "</div>"),  # one token of several
         ('<div id="shopify-section-sections--1656__announcement-bar">', "</div>"),  # a section id, not a modifier
+        ('<div class="announcement-bar announcement-bar-open">', "</div>"),  # a state token beside a name
     ],
 )
 def test_promo_regions_are_found_by_class_id_tag_or_label(opening, closing):
@@ -261,10 +262,13 @@ def test_the_refresh_job_reports_the_shadow_counts_only_with_the_flag(monkeypatc
         '<div class="hero-banner">Use code HERO10</div>',
         '<div class="promo-barcode">Use code BCD10</div>',  # a name must END the token or precede -/_
         '<button aria-label="Close announcement">Use code BTN10</button>',  # the label must BE the name
-        '<div class="page-wrapper has-announcement-bar">Use code WRAP10</div>',  # state and wrapper tokens
-        '<div class="announcement-bar--visible">Use code WRAP20</div>',
+        '<div class="page-wrapper has-announcement-bar">Use code WRAP10</div>',  # page-state tokens
         '<section class="with-top-bar">Use code WRAP30</section>',
-        '<div id="page-announcement-container">Use code WRAP40</div>',
+        '<div class="no-top-bar">Use code WRAP50</div>',
+        '<div class="page announcement-bar-visible"><div class="rte">Use code WRAP60</div></div>',
+        '<div class="announcement-bar-active"><div class="rte">Use code WRAP61</div></div>',
+        '<div class="layout marquee-enabled"><div class="rte">Use code WRAP62</div></div>',
+        '<div class="site top-bar-open"><div class="rte">Use code WRAP63</div></div>',
     ],
 )
 def test_a_name_inside_another_word_or_a_bare_banner_is_not_a_region(html):
@@ -283,9 +287,11 @@ def test_a_page_root_whose_class_names_a_bar_is_not_one_region(root):
 
 
 @pytest.mark.parametrize("root", ["body", "main", "header", "html"])
-def test_a_page_root_is_never_a_region_even_when_its_class_is_the_bar_name(root):
-    # A plain token, not a has-/with- state class: only the root rule keeps the product copy out.
-    html = f'<{root} class="announcement-bar"><div class="product__description">Use code DESC10</div></{root}>'
+@pytest.mark.parametrize("cls", ["announcement-bar", "announcement-bar--visible", "announcement-bar-container"])
+def test_a_page_root_is_never_a_region_even_when_its_class_is_the_bar_name(root, cls):
+    # A name, modifier or wrapper token, not a has-/with- state class: only the root rule keeps the product
+    # copy out, for a fallback region as for a named one.
+    html = f'<{root} class="{cls}"><div class="product__description">Use code DESC10</div></{root}>'
     assert _codes(html) == {}
 
 
@@ -599,22 +605,29 @@ def test_a_long_class_token_is_checked_in_linear_time(token):
 
 
 @pytest.mark.parametrize(
-    "token,state",
+    "token,kind",
     [
-        ("announcement-bar--sticky", True),
-        ("x--a--b", True),
-        ("shopify-section-sections--1__announcement-bar", False),
-        ("a--b_c--d", True),  # the LAST modifier has no underscore after it
-        ("a--b_c", False),
-        ("has-announcement-bar", True),
-        ("announcement-bar-container", True),
-        ("announcement-bar", False),
-        ("casino-announcement-bar", False),  # a state word only counts at the start
-        ("announcement-bar-container__inner", False),  # a wrapper word only counts at the end
+        ("announcement-bar--sticky", "wrapper"),
+        ("announcement-bar--visible", "wrapper"),  # a modifier on the bar itself, not a page state
+        ("x--a--b", "wrapper"),
+        ("shopify-section-sections--1__announcement-bar", "name"),
+        ("a--b_c--d", "wrapper"),  # the LAST modifier has no underscore after it
+        ("a--b_c", "name"),
+        ("has-announcement-bar", "state"),
+        ("no-top-bar", "state"),
+        ("hide-announcement-bar--x", "state"),  # a leading state wins over a modifier
+        ("announcement-bar-visible", "state"),
+        ("top-bar-open", "state"),
+        ("announcement-bar-container", "wrapper"),
+        ("announcement-area", "wrapper"),
+        ("announcement-bar", "name"),
+        ("casino-announcement-bar", "name"),  # a state word only counts at the start
+        ("announcement-bar-container__inner", "name"),  # a wrapper word only counts at the end
+        ("announcement-bar-visible__text", "name"),  # a state word only counts at the end
     ],
 )
-def test_state_tokens_are_a_leading_state_a_trailing_modifier_or_a_wrapper_suffix(token, state):
-    assert dcc._is_state_token(token) is state
+def test_a_token_is_a_page_state_a_wrapper_or_a_name(token, kind):
+    assert dcc._token_kind(token) == kind
 
 
 @pytest.mark.parametrize(
@@ -632,3 +645,150 @@ def test_a_head_past_the_budget_with_no_body_tag_reads_from_the_end_of_the_head(
     )
     assert set(_codes(html)) == {"TOP10"}
     assert dcc._scan(html).over_budget is False
+
+
+@pytest.mark.parametrize(
+    "cls",
+    ["announcement-bar--sticky", "announcement-wrapper", "announcement-bar-container", "promo-bar-wrap",
+     "top-bar-holder", "announcement-area"],
+)
+def test_a_bar_named_only_by_a_wrapper_or_modifier_is_a_fallback_region(cls):
+    html = f'<body><div class="{cls}">Use code BAR10 for 10% off</div></body>'
+    assert {k: c.region for k, c in _codes(html).items()} == {"BAR10": "fallback"}
+
+
+def test_a_wrapper_with_a_named_bar_inside_reads_only_the_bar():
+    html = (
+        '<body><div class="announcement-bar-container"><div class="announcement-bar__message">Use code BAR10</div>'
+        '<div class="rte">Use code WRAP10</div></div></body>'
+    )
+    assert {k: c.region for k, c in _codes(html).items()} == {"BAR10": "named"}
+
+
+def test_a_modifier_only_slide_inside_a_wrapper_is_read_once_as_a_fallback():
+    html = (
+        '<body><div class="announcement-bar-wrapper"><div class="announcement-bar__item--active">'
+        "Use code SLIDE10</div></div></body>"
+    )
+    assert dcc.promo_regions(html) == ["Use code SLIDE10"]
+    assert {k: c.region for k, c in _codes(html).items()} == {"SLIDE10": "fallback"}
+
+
+def test_a_named_bar_wins_a_code_also_seen_in_a_fallback_and_both_are_counted_by_region(capsys):
+    html = (
+        '<body><div class="announcement-bar">Use code BAR10</div>'
+        '<div class="top-bar-holder">Use code BAR10. Use code HOLD10</div></body>'
+    )
+    assert {k: c.region for k, c in _codes(html).items()} == {"BAR10": "named", "HOLD10": "fallback"}
+    dcc.capture_shadow(html, url="https://a.example", market="US", page_currency=None)
+    s = dcc.stats()
+    assert (s["pages_with_region"], s["by_region"]) == (1, {"named": 1, "fallback": 1})
+    assert '"region":"fallback"' in capsys.readouterr().out
+
+
+def test_a_fallback_region_reads_all_of_its_text_when_a_modifier_slide_sits_inside_it():
+    html = (
+        '<body><div class="announcement-bar-container"><div class="announcement-bar--a">Use code ONE10</div>'
+        '<div class="rte">Use code TWO10</div></div></body>'
+    )
+    assert dcc.promo_regions(html) == ["Use code ONE10 Use code TWO10"]
+
+
+def test_block_tags_separate_words_in_a_fallback_region():
+    assert set(_codes('<body><div class="promo-bar-wrap"><p>Use code SAVE</p><p>10 more</p></div></body>')) == {"SAVE"}
+
+
+def test_text_after_a_fallback_region_closes_is_not_read():
+    html = '<body><div class="promo-bar-wrap">Free gift</div><div class="rte">Use code DESC10</div></body>'
+    assert (dcc.promo_regions(html), _codes(html)) == (["Free gift"], {})
+
+
+def test_a_page_with_only_a_fallback_region_counts_as_a_page_with_a_region():
+    dcc.capture_shadow('<body><div class="promo-bar-wrap">Free gift</div></body>', url="https://a.example",
+                       market="US", page_currency=None)
+    assert dcc.stats()["pages_with_region"] == 1
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        # no </head>: a <body> inside a head script is not the body; the real one 210 KB later is
+        '<html><head><script>var t="<body>";</script><style>' + "a" * 210_000 + "</style><body>{bar}",
+        # omitted </head>: a "</head>" in a body script after the bar does not move the start past it
+        '<html><head><title>x</title><body>{bar}<script>var s="</head>";</script>',
+        # an iframe srcdoc holding a whole document after the bar
+        '<html><head><title>x</title><body>{bar}<iframe srcdoc="<html><head></head><body>hi</body></html>"></iframe>',
+        # a <body> inside the head (malformed) still starts the body
+        "<html><head><body>{bar}</head>",
+        # no <body> tag: the first tag a head cannot hold starts it
+        "<html><head></head>{bar}",
+        "<html><head><title>x</title>{bar}",
+        # a tracking pixel's <img> inside a head noscript does not start the body
+        '<html><head><noscript><img src="p.gif"></noscript><style>' + "a" * 210_000 + "</style></head><body>{bar}",
+    ],
+)
+def test_the_body_starts_at_the_first_body_tag_or_body_content_outside_head_raw_text(html):
+    html = html.format(bar='<div class="announcement-bar">Use code BAR10</div>')
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_a_head_past_the_scan_limit_starts_the_body_at_the_limit(monkeypatch):
+    monkeypatch.setattr(dcc, "_HEAD_SCAN_LIMIT", 100)
+    html = "<html><head><style>" + "a" * 500 + '</style></head><body><div class="announcement-bar">Use code BAR10</div>'
+    assert dcc._body_start(html) == 100
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_a_short_page_with_only_head_tags_starts_at_the_page_start():
+    assert dcc._body_start("<html><head><title>x</title></head>") == 0
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        '<img src="p.gif" height="1" width="1">',  # a tracking pixel outside noscript
+        "<shopify-analytics></shopify-analytics>",  # a custom element
+        "<noscript>",  # an unclosed noscript
+        '<div id="tracking"></div>',
+    ],
+)
+def test_a_stray_tag_in_a_large_head_does_not_end_the_head(stray):
+    html = (
+        "<html><head>" + stray + "<script>" + "x" * 250_000 + "</script></head>"
+        '<body><div class="announcement-bar">Use code BAR10</div></body></html>'
+    )
+    assert html[dcc._body_start(html):].startswith("<body>")
+    assert set(_codes(html)) == {"BAR10"}
+
+
+def test_with_no_body_tag_the_body_starts_at_the_first_tag_a_head_cannot_hold():
+    html = (
+        "<html><head><title>x</title><meta charset=utf-8><link rel=x href=y><base href=z><style>a{}</style>"
+        "<script>var a;</script><template><p>t</p></template><noscript><img src=p.gif></noscript></head>"
+        '<img src="logo.png"><div class="announcement-bar">Use code BAR10</div>'
+    )
+    assert dcc._body_start(html) == html.index('<img src="logo.png">')
+
+
+def test_the_body_start_offset_counts_lines():
+    html = "<html>\n<head>\n<title>x</title>\n</head>\n<body class='a'>\n"
+    assert html[dcc._body_start(html):].startswith("<body")
+
+
+@pytest.mark.parametrize("unit", ["<", "&", "< ", "<meta name=x>", "<noscript>"])
+def test_finding_the_body_is_linear_up_to_the_head_scan_limit(unit):
+    import time
+
+    html = "<html><head>" + unit * (dcc._HEAD_SCAN_LIMIT // len(unit))
+    started = time.perf_counter()
+    dcc._body_start(html)
+    assert time.perf_counter() - started < 5.0  # about 0.5 s on a laptop for 1 MB of "<"
+
+
+def test_entities_in_a_head_cost_nothing_to_scan():
+    import time
+
+    html = "<html><head>" + "&" * dcc._HEAD_SCAN_LIMIT
+    started = time.perf_counter()
+    dcc._body_start(html)
+    assert time.perf_counter() - started < 0.2  # ~0.1 ms; was ~0.5 s per MB with convert_charrefs=False
