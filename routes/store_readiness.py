@@ -32,7 +32,11 @@ from db.merchant_audit_runs import (
 )
 from routes.store_audit_public_intake import normalize_store_domain
 from services.brand_claim_service import merchant_owns_domain
-from services.store_audit_probe_identity import probe_product_key as _product_identity
+from services.store_audit_probe_identity import (
+    SUBJECT_TYPE_STORE_READINESS,
+    probe_product_key as _product_identity,
+    store_readiness_idempotency_key,
+)
 from utils.auth import get_current_merchant
 
 router = APIRouter(
@@ -40,7 +44,6 @@ router = APIRouter(
     tags=["store-readiness"],
 )
 
-SUBJECT_TYPE_STORE_READINESS = "store_readiness"
 STEP_NAMES = (
     "storefront_access", "product_search", "product_detail",
     "add_to_cart", "shipping_address", "checkout",
@@ -237,7 +240,7 @@ async def run_store_readiness(
         audit_run_id=run_id, merchant_id=merchant_id, product_key=product_key,
         execution_route_id=route_id,
         verifier_id=VERIFIER_COMMERCE_CHECKOUT_PROBE,
-        max_retries=1, idempotency_key=f"store_readiness:{run_id}",
+        max_retries=1, idempotency_key=store_readiness_idempotency_key(run_id),
     )
     if not verify_id:
         await record_audit_run_completed(

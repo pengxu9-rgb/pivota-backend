@@ -92,3 +92,18 @@ def test_store_readiness_uses_this_rule():
     from routes import store_readiness as sr
 
     assert sr._product_identity is identity.probe_product_key
+
+
+def test_the_store_readiness_idempotency_key_is_what_the_receipt_recognises():
+    key = identity.store_readiness_idempotency_key("audit-123")
+    assert identity.is_store_readiness_probe(key)
+    # The scheduled selector's real key, so a change to either side shows here.
+    from datetime import datetime, timezone
+
+    from jobs.scheduled_commerce_checkout_reprobe_job import merchant_reprobe_idempotency_key
+
+    scheduled = merchant_reprobe_idempotency_key(
+        merchant_id="merchant:sacr-a", scheduled_at=datetime(2026, 11, 4, 3, 45, tzinfo=timezone.utc),
+    )
+    assert not identity.is_store_readiness_probe(scheduled)
+    assert not identity.is_store_readiness_probe(None)

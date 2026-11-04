@@ -123,7 +123,7 @@ async def test_a_cart_receipt_on_a_run_without_a_product_key_is_refused_and_logs
     from routes import store_audit_commerce_probe_internal as commerce_module
 
     async def claimed(**_kwargs):
-        return {"audit_run_id": "audit-123", "merchant_id": "merchant:jolse", "product_key": None}
+        return {"audit_run_id": "audit-123", "merchant_id": "merchant:sacr-a", "product_key": None}
 
     async def evidence(**_kwargs):
         return "evidence-1"
