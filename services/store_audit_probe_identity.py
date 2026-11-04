@@ -10,13 +10,33 @@ storefront route) both use this one rule.
 from __future__ import annotations
 
 import hashlib
+from urllib.parse import urlsplit
 
 from db.database import database
+
+
+def probe_url(url: str) -> str:
+    """The URL a probe is keyed on, normalized like execution_routes.endpoint_normalized (lowercase
+    host, no query or fragment, no trailing slash), which is the target_url the worker is handed.
+    Store Readiness submits ``…/products/x/`` and the selector reads ``…/products/x`` back from the
+    route: both must reach the same key."""
+    raw = str(url or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return raw
+    if not host:
+        return raw
+    netloc = host if port in (None, 443) else f"{host}:{port}"
+    return f"https://{netloc}{parsed.path.rstrip('/') or '/'}"
 
 
 async def probe_product_key(*, merchant_id: str, url: str) -> str:
     """The catalog product at ``url`` when the merchant's catalog has one, else a stable
     ``url_probe:`` key for "the probe that started at this URL"."""
+    key_url = probe_url(url)
     try:
         row = await database.fetch_one(
             """
@@ -24,16 +44,18 @@ async def probe_product_key(*, merchant_id: str, url: str) -> str:
               FROM catalog_products
              WHERE merchant_id = :merchant_id
                AND canonical_url IS NOT NULL
-               AND split_part(canonical_url, '?', 1) = :url
+               AND split_part(canonical_url, '?', 1) IN (:url, :url_slash)
                AND suppression_reason IS NULL
              ORDER BY updated_at DESC NULLS LAST
              LIMIT 1
             """,
-            {"merchant_id": merchant_id, "url": url},
+            {"merchant_id": merchant_id, "url": key_url, "url_slash": key_url.rstrip("/") + "/"},
         )
     except Exception:  # noqa: BLE001 - URL audits do not require catalog sync
         row = None
-    if row and row.get("product_key"):
+    # Index, not .get(): a databases Postgres Record has no dict .get, and calling it raised outside
+    # the try, so a URL that WAS in the catalog failed the whole enqueue.
+    if row is not None and row["product_key"]:
         return str(row["product_key"])
-    digest = hashlib.sha256(f"{merchant_id}|{url}".encode()).hexdigest()[:24]
+    digest = hashlib.sha256(f"{merchant_id}|{key_url}".encode()).hexdigest()[:24]
     return f"url_probe:{digest}"

@@ -48,8 +48,8 @@ async def test_scheduled_run_is_enqueued_with_the_probe_product_key(monkeypatch)
     }.items():
         monkeypatch.setenv(name, value)
     route = {
-        "merchant_id": "merchant:jolse", "execution_route_id": "route-1",
-        "last_audit_run_id": "audit-1", "endpoint_normalized": "https://jolse.example/",
+        "merchant_id": "merchant:sacr-a", "execution_route_id": "route-1",
+        "last_audit_run_id": "audit-1", "endpoint_normalized": "https://sacr-a.example/",
     }
 
     async def candidates(**_kwargs):
@@ -83,6 +83,6 @@ async def test_scheduled_run_is_enqueued_with_the_probe_product_key(monkeypatch)
 
     assert summary["enqueued"] == 1
     # Keyed on the URL the worker is handed (the claim's target_url is the route's endpoint).
-    assert keyed == [("merchant:jolse", "https://jolse.example/")]
+    assert keyed == [("merchant:sacr-a", "https://sacr-a.example/")]
     assert enqueued[0]["product_key"] == "url_probe:abc"
     assert enqueued[0]["execution_route_id"] == "route-1"

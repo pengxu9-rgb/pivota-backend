@@ -321,11 +321,14 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
         raise _conflict("VERIFICATION_NOT_CLAIMED", receipt.verification_run_id)
     # Dedicated Store Readiness runs are intentionally absent from visibility
     # audit history, but still get a truthful terminal lifecycle in their
-    # owning table. Scheduled legacy probes point at other subject types and
-    # must not rewrite those audit results.
+    # owning table. Only the Store Readiness probe itself may complete it: a
+    # scheduled re-probe reuses the route's last_audit_run_id, which is that
+    # same Store Readiness run, and must not rewrite the merchant's result.
     try:
         from db.merchant_audit_runs import fetch_audit_run_by_id, record_audit_run_completed
-        parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
+        parent = None
+        if str(claimed.get("idempotency_key") or "").startswith("store_readiness:"):
+            parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
         if (
             parent
             and parent.get("merchant_id") == merchant_id
