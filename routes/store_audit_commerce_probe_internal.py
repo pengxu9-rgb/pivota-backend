@@ -8,6 +8,7 @@ and verification-run terminal transitions.
 from __future__ import annotations
 
 import hmac
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
@@ -38,6 +39,8 @@ from db.audit_evidence import (
 from db.database import database
 from services.commerce_capability_resolver import resolve_merchant_capability
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/internal/store-audit/commerce-probes",
     tags=["store-audit-internal"],
@@ -49,6 +52,14 @@ _SENSITIVE_VALUE = re.compile(
     r"payment|email|phone|address)\s*[=:]\s*\S+)",
     re.IGNORECASE,
 )
+
+
+def _conflict(code: str, verify_id: str) -> HTTPException:
+    # The 409 body reaches only the worker, which logs its status alone, so the reason was
+    # invisible (2026-11-04: a rejected receipt read only as "receipt_rejected"). WARNING, because
+    # prod drops INFO from module loggers. The run id prefix is enough to find the row.
+    logger.warning("store_audit_commerce_probe_conflict code=%s verify=%s", code, str(verify_id or "")[:8])
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": code})
 
 
 def _enabled() -> bool:
@@ -217,7 +228,7 @@ async def claim_commerce_probe(
             verify_id=str(claimed["verify_id"]), worker_id=payload.worker_id,
             error_message="commerce_probe_claim_missing_merchant_storefront_route",
         )
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "TARGET_UNAVAILABLE"})
+        raise _conflict("TARGET_UNAVAILABLE", str(claimed["verify_id"]))
     retry_count = int(claimed.get("retry_count") or 0)
     verify_id = str(claimed["verify_id"])
     return CommerceProbeClaimResponse(
@@ -254,10 +265,10 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
         previous_evidence = dict((previous or {}).get("evidence_jsonb") or {})
         if previous and previous_evidence.get("probe_id") == receipt.probe_id:
             return CommerceProbeReceiptResponse(verification_status=str(previous["status"]))
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "VERIFICATION_NOT_CLAIMED"})
+        raise _conflict("VERIFICATION_NOT_CLAIMED", receipt.verification_run_id)
     merchant_id = str(claimed.get("merchant_id") or "")
     if not merchant_id or merchant_id.startswith("prospect_"):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "MERCHANT_NOT_RESOLVED"})
+        raise _conflict("MERCHANT_NOT_RESOLVED", receipt.verification_run_id)
     product_key = str(claimed.get("product_key") or "") or None
     evidence_ids: list[str] = []
     if receipt.platform:
@@ -286,7 +297,7 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
         evidence_ids.append(evidence_id)
     if receipt.cart:
         if not product_key:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "PRODUCT_NOT_RESOLVED"})
+            raise _conflict("PRODUCT_NOT_RESOLVED", receipt.verification_run_id)
         evidence_id = await insert_evidence_item(
             audit_run_id=receipt.audit_run_id, merchant_id=merchant_id, product_key=product_key,
             evidence_type=EVIDENCE_TYPE_COMMERCE_CARTABILITY, evidence_level=EVIDENCE_LEVEL_TESTED,
@@ -307,14 +318,17 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
         resulting_status = await mark_verification_failed_with_retry(verify_id=receipt.verification_run_id, worker_id=receipt.worker_id, error_message=receipt.outcome_code or "commerce_probe_failed", evidence_jsonb=evidence_jsonb)
         completed = resulting_status in {"pending", "exhausted_retries"}
     if not completed:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"error": "VERIFICATION_NOT_CLAIMED"})
+        raise _conflict("VERIFICATION_NOT_CLAIMED", receipt.verification_run_id)
     # Dedicated Store Readiness runs are intentionally absent from visibility
     # audit history, but still get a truthful terminal lifecycle in their
-    # owning table. Scheduled legacy probes point at other subject types and
-    # must not rewrite those audit results.
+    # owning table. Only the Store Readiness probe itself may complete it: a
+    # scheduled re-probe reuses the route's last_audit_run_id, which is that
+    # same Store Readiness run, and must not rewrite the merchant's result.
     try:
         from db.merchant_audit_runs import fetch_audit_run_by_id, record_audit_run_completed
-        parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
+        parent = None
+        if str(claimed.get("idempotency_key") or "").startswith("store_readiness:"):
+            parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
         if (
             parent
             and parent.get("merchant_id") == merchant_id
