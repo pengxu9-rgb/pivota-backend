@@ -24,12 +24,13 @@ WHAT IS A CODE. An all-caps or digit token after "use/enter/apply code", or afte
 voucher code:", with at least one letter, not a stop word ("USE CODE BELOW", "USE CODE IN-STORE"), not
 followed by "shade"/"swatch"/"tone" (a shade name, "NC20 shade"), not a gift-card number (three or more
 dash-separated groups of four, 1234-5678-ABCD) or an XXXX placeholder. "Gift card" near a code is a hint,
-not a rejection: "Excludes gift cards" is one of the commonest bar disclaimers. Its shape and the phrase that introduced it are
-counted separately, so shade-like short tokens (NC20) stay visible in the numbers. Around it, the terms
-the region states: percent or amount off, free shipping, a minimum spend, and eligibility hints (new
-customers, sign-up, once per customer, exclusions, gift cards); each stated term goes to the NEAREST code,
-and a percent outside 1-100 is not a term ("0% off then 20% off" reads 20). Those are
-metadata only (ADR-027 D2): a code is evidence of nothing until a checkout applies it.
+not a rejection: "Excludes gift cards" is one of the commonest bar disclaimers. Its shape and the phrase
+that introduced it are counted separately, so shade-like short tokens (NC20) and three-letter codes (VIP)
+stay visible in the numbers. Around it, the terms the region states: percent or amount off, free
+shipping, a minimum spend, and eligibility hints (new customers, sign-up, once per customer, exclusions,
+gift cards); each stated term goes to the NEAREST code, and a percent outside 1-100 is not a term
+("0% off then 20% off" reads 20). Those are metadata only (ADR-027 D2): a code is evidence of nothing
+until a checkout applies it.
 
 BOUNDED. The parse is linear (open-tag counts, implicit closing of p/li/option/dt/dd/tr/td/th, depth cap
 `_MAX_DEPTH`), a region keeps at most `_MAX_REGION_CHARS`, a page at most `_MAX_CODES_PER_PAGE` codes, and
@@ -68,9 +69,20 @@ _REGION_LABEL_RE = re.compile(r"^\s*announcements?(?:\s+bar)?\s*$", re.IGNORECAS
 # A class/id token that states a page's state or wraps the bar ("has-announcement-bar", "announcement-bar--visible",
 # "page-announcement-container") is not a region name; the bar inside it names itself. Only a TRAILING `--` modifier
 # counts: Shopify's section ids carry `--<id>__` before the name ("shopify-section-sections--1__announcement-bar").
-_STATE_TOKEN_RE = re.compile(
-    r"^(?:has|with|is|no|show|hide)[-_]|--[^_]*$|[-_](?:container|wrapper|wrap|outer|holder)$", re.IGNORECASE
-)
+# No regex for the modifier: `--[^_]*$` rescans to the end from every `--` and a long dash run makes it quadratic.
+_STATE_PREFIX_RE = re.compile(r"(?:has|with|is|no|show|hide)[-_]", re.IGNORECASE)
+_WRAPPER_SUFFIX_RE = re.compile(r"[-_](?:container|wrapper|wrap|outer|holder)$", re.IGNORECASE)
+
+
+def _is_state_token(token: str) -> bool:
+    modifier = token.rfind("--")
+    return (
+        bool(_STATE_PREFIX_RE.match(token))
+        or (modifier >= 0 and "_" not in token[modifier:])
+        or bool(_WRAPPER_SUFFIX_RE.search(token))
+    )
+
+
 _NEVER_REGION_ROOTS = frozenset({"html", "body", "main", "header"})
 _VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
                         "track", "wbr"})
@@ -99,18 +111,20 @@ _CODE_RES = (
     ("labelled", re.compile(
         r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)\s*[:：]\s*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
 )
-# All-caps prose after "use code" ("USE CODE BELOW FOR 10% OFF") is not a code.
-# Compared with dashes removed, so IN-STORE is INSTORE.
+# All-caps prose after "use code" ("USE CODE BELOW FOR 10% OFF", "PROMO CODE: TBA") is not a code.
+# Compared with dashes removed, so IN-STORE is INSTORE and MON-FRI is MONFRI.
 _STOP_CODES = frozenset({
-    "ABOVE", "ADD", "AFTER", "AGAIN", "ALL", "ALSO", "ALWAYS", "AND", "ANY", "APPLIED", "APPLY", "ARE", "AT",
-    "ATCHECKOUT", "AUTO", "AUTOMATIC", "AUTOMATICALLY", "BEFORE", "BELOW", "BUT", "CAN", "CART", "CHECKOUT",
-    "CODE", "CODES", "COUPON", "DISCOUNT", "DURING", "EACH", "EMAIL", "EMAILED", "ENDS", "ENTER", "ENTIRE",
-    "EVERY", "EXPIRES", "EXTRA", "FIRST", "FOR", "FREE", "FROM", "GET", "HAS", "HERE", "INSIDE", "INSTEAD",
-    "INSTORE", "ITEM", "ITEMS", "ITS", "LATER", "LISTED", "MANUALLY", "NEEDED", "NEW", "NEXT", "NONE", "NOT",
-    "NOW", "OFF", "ONCE", "ONE", "ONLINE", "ONLY", "ORDER", "ORDERS", "OUR", "OUT", "OWN", "PER", "PLUS",
-    "PROMO", "PROVIDED", "PURCHASE", "RECEIVED", "REQUIRED", "SALE", "SELECT", "SELECTED", "SHIPPING", "SHOWN",
-    "SITE", "SITEWIDE", "SOON", "STORE", "STOREWIDE", "THAT", "THE", "THIS", "TODAY", "TOMORROW", "TONIGHT",
-    "TOO", "TWICE", "TWO", "UPON", "USE", "VALID", "VIA", "VOUCHER", "WEEKEND", "WHEN", "WHILE", "WITH", "YET",
+    "ABOVE", "ADD", "AFTER", "AGAIN", "ALL", "ALSO", "ALWAYS", "AND", "ANY", "APP", "APPLIED", "APPLY", "ARE", "ASAP",
+    "ASK", "AT", "ATCHECKOUT", "AUTO", "AUTOMATIC", "AUTOMATICALLY", "BAG", "BEFORE", "BELOW", "BEST", "BIG", "BOX",
+    "BUT", "CAN", "CART", "CHECKOUT", "CODE", "CODES", "COUPON", "DAY", "DISCOUNT", "DURING", "EACH", "EMAIL",
+    "EMAILED", "ENDS", "ENTER", "ENTIRE", "ETC", "EVERY", "EVERYWHERE", "EXP", "EXPIRES", "EXTRA", "FAQ", "FIELD",
+    "FIRST", "FOR", "FREE", "FROM", "GET", "HAS", "HERE", "HOT", "HOW", "INSIDE", "INSTEAD", "INSTORE", "ITEM",
+    "ITEMS", "ITS", "LATER", "LINK", "LISTED", "MANUALLY", "MAX", "MAY", "MEMBERS", "MIN", "MONFRI", "NEEDED", "NEW",
+    "NEXT", "NONE", "NOT", "NOW", "OFF", "ONCE", "ONE", "ONLINE", "ONLY", "ORDER", "ORDERS", "OUR", "OUT", "OWN",
+    "PER", "PLUS", "PROMO", "PROVIDED", "PURCHASE", "RECEIVED", "REQUIRED", "SALE", "SAT", "SEE", "SELECT",
+    "SELECTED", "SENT", "SHIPPING", "SHOWN", "SITE", "SITEWIDE", "SOON", "SPF", "STORE", "STOREWIDE", "TBA", "TBD",
+    "TCS", "THAT", "THE", "THEN", "THIS", "THRU", "TIL", "TODAY", "TOMORROW", "TONIGHT", "TOO", "TOP", "TWICE", "TWO",
+    "UNTIL", "UPON", "UPS", "USE", "VALID", "VIA", "VOUCHER", "WEB", "WEEKEND", "WHEN", "WHILE", "WHY", "WITH", "YET",
     "YOU", "YOUR",
 })
 _SHADE_AFTER_RE = re.compile(r"\s{0,3}(?:shades?|swatch(?:es)?|tones?|colou?rs?|finish)\b", re.IGNORECASE)
@@ -146,7 +160,7 @@ def _names_region(tag: str, attrs: List[Any]) -> bool:
     label = None
     for k, v in attrs:
         if k in ("class", "id"):
-            tokens.extend(t for t in str(v or "").split() if not _STATE_TOKEN_RE.search(t))
+            tokens.extend(t for t in str(v or "").split() if not _is_state_token(t))
         elif k == "aria-label":
             label = str(v or "")
     if any(_REGION_TOKEN_RE.search(t) for t in tokens):
@@ -257,13 +271,13 @@ class CapturedCode:
     min_subtotal: Optional[str]
     hints: List[str] = field(default_factory=list)
     snippet: str = ""
-    shape: str = ""  # letters | short_alnum (shade-like, e.g. NC20) | alnum
+    shape: str = ""  # short_letters (VIP, USA) | letters | short_alnum (shade-like, e.g. NC20) | alnum
     form: str = ""  # use_code ("use/enter/apply code X") | labelled ("promo code: X")
 
 
 def _shape(code: str) -> str:
     if not any(ch.isdigit() for ch in code):
-        return "letters"
+        return "short_letters" if len(code) <= 3 else "letters"
     return "short_alnum" if _SHORT_ALNUM_RE.fullmatch(code) else "alnum"
 
 

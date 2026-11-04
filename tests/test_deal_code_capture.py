@@ -397,6 +397,14 @@ def test_the_min_spend_pattern_does_not_backtrack_on_blank_runs():
         "USE CODE ALWAYS",
         "USE CODE SOON",
         "USE CODE YOU LOVE",
+        "USE CODE: NEW",
+        "PROMO CODE: TBA",
+        "USE CODE MON-FRI",
+        "USE CODE SEE DETAILS",
+        "USE CODE SENT TO YOUR INBOX",
+        "USE CODE FIELD AT CHECKOUT",
+        "USE CODE MEMBERS ONLY",
+        "USE CODE ASAP",
     ],
 )
 def test_prose_shades_gift_cards_and_placeholders_are_not_codes(text):
@@ -404,14 +412,20 @@ def test_prose_shades_gift_cards_and_placeholders_are_not_codes(text):
 
 
 def test_shape_and_form_are_reported_so_shade_like_codes_stay_visible():
-    html = '<div class="announcement-bar">Use code BF25 today. Promo code: WELCOME. Use code GLOW20.</div>'
+    html = (
+        '<div class="announcement-bar">Use code BF25 today. Promo code: WELCOME. Use code GLOW20. '
+        "Use code VIP.</div>"
+    )
     codes = _codes(html)
     assert {k: (c.shape, c.form) for k, c in codes.items()} == {
         "BF25": ("short_alnum", "use_code"), "WELCOME": ("letters", "labelled"), "GLOW20": ("alnum", "use_code"),
+        "VIP": ("short_letters", "use_code"),
     }
     dcc.capture_shadow(html, url="https://a.example", market="US", page_currency=None)
     s = dcc.stats()
-    assert (s["by_shape"], s["by_form"]) == ({"short_alnum": 1, "letters": 1, "alnum": 1}, {"use_code": 2, "labelled": 1})
+    assert (s["by_shape"], s["by_form"]) == (
+        {"short_alnum": 1, "letters": 1, "alnum": 1, "short_letters": 1}, {"use_code": 3, "labelled": 1}
+    )
 
 
 def test_a_code_split_by_inline_tags_is_joined_and_block_tags_still_separate_words():
@@ -522,7 +536,14 @@ def test_a_gift_card_disclaimer_keeps_the_code_and_becomes_a_hint(text, code):
     assert c.hints == ["has_exclusions", "mentions_gift_card"]
 
 
-@pytest.mark.parametrize("code", ["VIP", "JOY", "GET-10-OFF", "BLACK-FRIDAY-20", "SUMMER-20", "10OFF", "TAKE5"])
+@pytest.mark.parametrize(
+    "code",
+    [
+        "VIP", "JOY", "GET-10-OFF", "BLACK-FRIDAY-20", "SUMMER-20", "10OFF", "TAKE5",
+        "SAVE-2024",  # two groups of four is a code; only three or more is a gift-card number
+        "SAVE5-1234-5678",  # groups of four inside a longer token are not a gift-card number
+    ],
+)
 def test_short_and_dashed_codes_are_codes(code):
     assert set(_codes(f'<div class="announcement-bar">Use code {code} at checkout</div>')) == {code}
 
@@ -564,3 +585,50 @@ def test_a_body_tag_inside_a_head_script_is_not_the_body():
 def test_a_custom_element_starting_with_body_is_not_the_body():
     html = '<div class="announcement-bar">Use code TOP10</div><body-scroll-lock></body-scroll-lock>'
     assert set(_codes(html)) == {"TOP10"}
+
+
+# Sized so the bar after it still falls inside the body budget.
+@pytest.mark.parametrize("token", ["-" * 190_000 + "_", "x--" * 63_000 + "_"], ids=["dashes", "x-dash-dash"])
+def test_a_long_class_token_is_checked_in_linear_time(token):
+    import time
+
+    html = f'<html><head></head><body><div class="{token}">x</div><div class="announcement-bar">Use code BAR10</div>'
+    started = time.perf_counter()
+    assert set(_codes(html)) == {"BAR10"}
+    assert time.perf_counter() - started < 1.0  # was 52-102 s at abb21bbe8
+
+
+@pytest.mark.parametrize(
+    "token,state",
+    [
+        ("announcement-bar--sticky", True),
+        ("x--a--b", True),
+        ("shopify-section-sections--1__announcement-bar", False),
+        ("a--b_c--d", True),  # the LAST modifier has no underscore after it
+        ("a--b_c", False),
+        ("has-announcement-bar", True),
+        ("announcement-bar-container", True),
+        ("announcement-bar", False),
+        ("casino-announcement-bar", False),  # a state word only counts at the start
+        ("announcement-bar-container__inner", False),  # a wrapper word only counts at the end
+    ],
+)
+def test_state_tokens_are_a_leading_state_a_trailing_modifier_or_a_wrapper_suffix(token, state):
+    assert dcc._is_state_token(token) is state
+
+
+@pytest.mark.parametrize(
+    "code,shape",
+    [("VIP", "short_letters"), ("BOGO", "letters"), ("NC20", "short_alnum"), ("GLOW20", "alnum")],
+)
+def test_three_letter_codes_have_their_own_shape(code, shape):
+    assert dcc._shape(code) == shape
+
+
+def test_a_head_past_the_budget_with_no_body_tag_reads_from_the_end_of_the_head():
+    html = (
+        "<html><head><style>" + "a" * 210_000 + "</style></head>"
+        '<div class="announcement-bar">Use code TOP10</div></html>'
+    )
+    assert set(_codes(html)) == {"TOP10"}
+    assert dcc._scan(html).over_budget is False
