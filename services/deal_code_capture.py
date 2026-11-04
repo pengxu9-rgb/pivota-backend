@@ -6,19 +6,21 @@ not the announcement bars and promo banners where stores print them, and the cur
 on purpose. The page refresh (`external_offers_service.resolve_external_offer`) already downloads each
 store page, so reading its promo regions costs no extra request to any store.
 
-WHAT IT READS. Only the first `_BODY_BUDGET` characters from the `<body` tag after `</head>` (a `<body` inside a
-head script is not it; bars sit at the top), and in them only
-the text of elements that NAME a promo region: a whole class or id token (or the tag name) such as
-announcement / announcement-bar, promo-bar, promo-banner, top-bar, marquee, ticker-bar, header-message,
-site-banner, notification-bar, free-shipping-bar, or an aria-label "Announcement(s)". A bare "banner" is
-not one (hero banners hold product copy), a token that only contains a name ("product-sticker",
-"desktop-bar") is not one, and html / body / main / header are never a region root, so a body class like
-`has-announcement-bar` cannot turn the whole page into one. State and wrapper tokens are not names either:
-a has-/with-/is-/no-/show-/hide- prefix, a `--` modifier, or a -container/-wrapper/-wrap/-outer/-holder
-suffix (`page-wrapper has-announcement-bar`, `announcement-bar--visible`, `with-top-bar`); the bar inside
-such a wrapper names itself. Script, style, noscript, template and svg
-content is skipped. Hidden text IS read: we parse markup, not the rendering, and a rotating bar keeps its
-other slides hidden.
+WHAT IT READS. Only the first `_BODY_BUDGET` characters from where the body starts (bars sit at the top): the
+first `<body>` tag, or the first tag that cannot be in a head, found by parsing the head as markup, so a
+`<body` or `</head>` inside a script is not it. In them, only the text of elements that NAME a promo region: a
+whole class or id token (or the tag name) such as announcement / announcement-bar, promo-bar, promo-banner,
+top-bar, marquee, ticker-bar, header-message, site-banner, notification-bar, free-shipping-bar, or an
+aria-label "Announcement(s)". A bare "banner" is not one (hero banners hold product copy), a token that only
+contains a name ("product-sticker", "desktop-bar") is not one, and html / body / main / header are never a
+region root, so a body class like `has-announcement-bar` cannot turn the whole page into one. A page-state
+token is never a name: a has-/with-/is-/no-/show-/hide- prefix or a single-dash state suffix
+(`announcement-bar-visible`, `top-bar-open`, `marquee-enabled`). A wrapper or modifier token
+(`announcement-bar-container`, `announcement-area`, `announcement-bar--sticky`) is a FALLBACK region: its text
+counts only when nothing inside it names a region, so a bar that names itself inside a wrapper is read alone,
+and a bar named only by its wrapper or modifier class is still read. Codes from a fallback region are counted
+apart (`by_region`). Script, style, noscript, template and svg content is skipped. Hidden text IS read: we
+parse markup, not the rendering, and a rotating bar keeps its other slides hidden.
 
 WHAT IS A CODE. An all-caps or digit token after "use/enter/apply code", or after "promo/discount/coupon/
 voucher code:", with at least one letter, not a stop word ("USE CODE BELOW", "USE CODE IN-STORE"), not
@@ -66,21 +68,31 @@ _REGION_TOKEN_RE = re.compile(
 )
 # aria-label is prose ("Top bar menu"), so only the announcement label itself counts.
 _REGION_LABEL_RE = re.compile(r"^\s*announcements?(?:\s+bar)?\s*$", re.IGNORECASE)
-# A class/id token that states a page's state or wraps the bar ("has-announcement-bar", "announcement-bar--visible",
-# "page-announcement-container") is not a region name; the bar inside it names itself. Only a TRAILING `--` modifier
-# counts: Shopify's section ids carry `--<id>__` before the name ("shopify-section-sections--1__announcement-bar").
-# No regex for the modifier: `--[^_]*$` rescans to the end from every `--` and a long dash run makes it quadratic.
+# A class/id token that states the PAGE's state ("has-announcement-bar", "announcement-bar-visible") is never a
+# region name: it often sits on a wrapper around the whole page. A token that wraps or modifies the bar
+# ("announcement-bar-container", "announcement-bar--sticky") is a fallback name: see _RegionParser. Only a TRAILING
+# `--` modifier counts: Shopify's section ids carry `--<id>__` before the name
+# ("shopify-section-sections--1__announcement-bar"). No regex for the modifier: `--[^_]*$` rescans to the end from
+# every `--` and a long dash run makes it quadratic.
 _STATE_PREFIX_RE = re.compile(r"(?:has|with|is|no|show|hide)[-_]", re.IGNORECASE)
-_WRAPPER_SUFFIX_RE = re.compile(r"[-_](?:container|wrapper|wrap|outer|holder)$", re.IGNORECASE)
+_STATE_SUFFIX_RE = re.compile(
+    r"[-_](?:visible|active|open|opened|enabled|closed|hidden|shown|dismissed)$", re.IGNORECASE
+)
+_WRAPPER_SUFFIX_RE = re.compile(r"[-_](?:container|wrapper|wrap|outer|holder|area)$", re.IGNORECASE)
 
 
-def _is_state_token(token: str) -> bool:
+def _token_kind(token: str) -> str:
+    """state (never a name) | wrapper (a fallback name) | name."""
+    if _STATE_PREFIX_RE.match(token):
+        return "state"
     modifier = token.rfind("--")
-    return (
-        bool(_STATE_PREFIX_RE.match(token))
-        or (modifier >= 0 and "_" not in token[modifier:])
-        or bool(_WRAPPER_SUFFIX_RE.search(token))
-    )
+    if modifier >= 0 and "_" not in token[modifier:]:
+        return "wrapper"  # before the state suffix: "announcement-bar--visible" modifies the bar itself
+    if _STATE_SUFFIX_RE.search(token):
+        return "state"
+    if _WRAPPER_SUFFIX_RE.search(token):
+        return "wrapper"
+    return "name"
 
 
 _NEVER_REGION_ROOTS = frozenset({"html", "body", "main", "header"})
@@ -95,8 +107,9 @@ _INLINE_TAGS = frozenset({"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data"
 # A new one of these closes an open one of the same tag on top of the stack, as browsers do; without it
 # a page of unclosed <p>/<li> grows the stack without bound.
 _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "th"})
-_HEAD_END_RE = re.compile(r"</head\s*>", re.IGNORECASE)
-_BODY_START_RE = re.compile(r"<body[\s>/]", re.IGNORECASE)
+# Tags a head may hold; any other start tag outside them opens the body, as browsers do.
+_HEAD_TAGS = frozenset({"html", "head", "title", "base", "link", "meta", "style", "script", "noscript", "template"})
+_HEAD_SCAN_LIMIT = 2_000_000
 _BODY_BUDGET = 200_000
 _MAX_DEPTH = 512
 _MAX_REGION_CHARS = 4000
@@ -153,33 +166,45 @@ class _TooDeep(Exception):
     pass
 
 
-def _names_region(tag: str, attrs: List[Any]) -> bool:
-    # The tag itself (a theme's custom element, e.g. <announcement-bar>), each class and id token, and an
-    # aria-label naming it ("Announcement").
-    tokens = [tag]
+def _region_kind(tag: str, attrs: List[Any]) -> Optional[str]:
+    """named | fallback | None. Named by the tag itself (a theme's custom element, e.g. <announcement-bar>), a
+    class or id name token, or an aria-label naming it ("Announcement"); fallback when only a wrapper or
+    modifier token names it."""
+    named = bool(_REGION_TOKEN_RE.search(tag))
+    wrapped = False
     label = None
     for k, v in attrs:
         if k in ("class", "id"):
-            tokens.extend(t for t in str(v or "").split() if not _is_state_token(t))
+            for token in str(v or "").split():
+                if not _REGION_TOKEN_RE.search(token):
+                    continue
+                kind = _token_kind(token)
+                named = named or kind == "name"
+                wrapped = wrapped or kind == "wrapper"
         elif k == "aria-label":
             label = str(v or "")
-    if any(_REGION_TOKEN_RE.search(t) for t in tokens):
-        return True
-    return label is not None and bool(_REGION_LABEL_RE.match(label))
+    if named or (label is not None and _REGION_LABEL_RE.match(label)):
+        return "named"
+    return "fallback" if wrapped else None
 
 
 class _RegionParser(HTMLParser):
-    """Collects the text of every element that names a promo region, nested elements included. Linear: open
-    tags are counted per name, so a stray end tag costs O(1), and every pop pays for its own push."""
+    """Collects the text of every element that names a promo region, nested elements included, and of every
+    fallback region with no named region inside it. Linear: open tags are counted per name, so a stray end
+    tag costs O(1), and every pop pays for its own push."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.regions: List[str] = []
+        self.fallback_regions: List[str] = []
         self._stack: List[str] = []
         self._open: Dict[str, int] = {}
         self._region_depth: Optional[int] = None
         self._skip_depth: Optional[int] = None
         self._buffer: List[str] = []
+        self._fallback_depth: Optional[int] = None
+        self._fallback_buffer: List[str] = []
+        self._fallback_has_named = False
 
     def _push(self, tag: str) -> None:
         if len(self._stack) >= _MAX_DEPTH:
@@ -194,16 +219,22 @@ class _RegionParser(HTMLParser):
         if self._skip_depth is not None and depth <= self._skip_depth:
             self._skip_depth = None
         if self._region_depth is not None and depth <= self._region_depth:
-            text = re.sub(r"\s+", " ", "".join(self._buffer)).strip()
-            if text:
-                self.regions.append(text[:_MAX_REGION_CHARS])
+            _flush(self._buffer, self.regions)
             self._region_depth = None
             self._buffer = []
+        if self._fallback_depth is not None and depth <= self._fallback_depth:
+            if not self._fallback_has_named:
+                _flush(self._fallback_buffer, self.fallback_regions)
+            self._fallback_depth = None
+            self._fallback_buffer = []
         return closed
 
     def _separate(self, tag: str) -> None:
-        if self._region_depth is not None and self._skip_depth is None and tag not in _INLINE_TAGS:
-            self._buffer.append(" ")
+        if self._skip_depth is None and tag not in _INLINE_TAGS:
+            if self._region_depth is not None:
+                self._buffer.append(" ")
+            if self._fallback_depth is not None:
+                self._fallback_buffer.append(" ")
 
     def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
         self._separate(tag)
@@ -215,10 +246,17 @@ class _RegionParser(HTMLParser):
         depth = len(self._stack)
         if self._skip_depth is None and tag in _SKIP_TAGS:
             self._skip_depth = depth
-        if (self._region_depth is None and self._skip_depth is None and tag not in _NEVER_REGION_ROOTS
-                and _names_region(tag, attrs)):
+        if self._region_depth is not None or self._skip_depth is not None or tag in _NEVER_REGION_ROOTS:
+            return
+        kind = _region_kind(tag, attrs)
+        if kind == "named":
             self._region_depth = depth
             self._buffer = []
+            self._fallback_has_named = True
+        elif kind == "fallback" and self._fallback_depth is None:
+            self._fallback_depth = depth
+            self._fallback_buffer = []
+            self._fallback_has_named = False
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _VOID_TAGS or not self._open.get(tag):
@@ -230,13 +268,60 @@ class _RegionParser(HTMLParser):
                 break
 
     def handle_data(self, data: str) -> None:
-        if self._region_depth is not None and self._skip_depth is None:
-            self._buffer.append(data)
+        if self._skip_depth is None:
+            if self._region_depth is not None:
+                self._buffer.append(data)
+            if self._fallback_depth is not None:
+                self._fallback_buffer.append(data)
+
+
+def _flush(buffer: List[str], into: List[str]) -> None:
+    text = re.sub(r"\s+", " ", "".join(buffer)).strip()
+    if text:
+        into.append(text[:_MAX_REGION_CHARS])
+
+
+class _BodyFound(Exception):
+    pass
+
+
+class _BodyLocator(HTMLParser):
+    """Stops at the first <body> tag, or the first start tag a head cannot hold. Script and style are parsed
+    as raw text, so a `<body` or `</head>` inside one is not seen; tags inside noscript/template (a tracking
+    pixel's <img>) do not open the body."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
+        if tag in ("noscript", "template"):
+            self._hidden += 1
+        elif not self._hidden and tag not in _HEAD_TAGS:  # <body> itself is not a head tag
+            raise _BodyFound()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("noscript", "template") and self._hidden:
+            self._hidden -= 1
+
+
+def _body_start(html: str) -> int:
+    locator = _BodyLocator()
+    try:
+        locator.feed(html[:_HEAD_SCAN_LIMIT])  # no close(): it only flushes what is left as text, never a tag
+    except _BodyFound:
+        line, column = locator.getpos()
+        offset = 0
+        for _ in range(line - 1):
+            offset = html.index("\n", offset) + 1
+        return offset + column
+    return 0
 
 
 @dataclass
 class _Scan:
     regions: List[str]
+    fallback_regions: List[str] = field(default_factory=list)
     over_budget: bool = False
     too_deep: bool = False
 
@@ -244,10 +329,7 @@ class _Scan:
 def _scan(html: Any) -> _Scan:
     if not isinstance(html, str):
         return _Scan(regions=[])
-    head_end = _HEAD_END_RE.search(html)
-    after_head = head_end.end() if head_end else 0
-    body = _BODY_START_RE.search(html, after_head)
-    start = body.start() if body else after_head
+    start = _body_start(html)
     parser = _RegionParser()
     too_deep = False
     try:
@@ -255,11 +337,13 @@ def _scan(html: Any) -> _Scan:
         parser.close()
     except _TooDeep:
         too_deep = True
-    return _Scan(regions=parser.regions, over_budget=len(html) - start > _BODY_BUDGET, too_deep=too_deep)
+    return _Scan(regions=parser.regions, fallback_regions=parser.fallback_regions,
+                 over_budget=len(html) - start > _BODY_BUDGET, too_deep=too_deep)
 
 
 def promo_regions(html: Any) -> List[str]:
-    return _scan(html).regions
+    scan = _scan(html)
+    return scan.regions + scan.fallback_regions
 
 
 @dataclass
@@ -273,6 +357,7 @@ class CapturedCode:
     snippet: str = ""
     shape: str = ""  # short_letters (VIP, USA) | letters | short_alnum (shade-like, e.g. NC20) | alnum
     form: str = ""  # use_code ("use/enter/apply code X") | labelled ("promo code: X")
+    region: str = "named"  # named | fallback (only a wrapper or modifier class named it)
 
 
 def _shape(code: str) -> str:
@@ -362,14 +447,17 @@ def codes_in_region(text: str) -> List[CapturedCode]:
 
 
 def _page_codes(scan: _Scan) -> Tuple[List[CapturedCode], bool]:
-    """The page's distinct codes (first seen wins), at most `_MAX_CODES_PER_PAGE`; and whether it hit the cap."""
+    """The page's distinct codes (first seen wins, named regions first), at most `_MAX_CODES_PER_PAGE`; and
+    whether it hit the cap."""
     out: Dict[str, CapturedCode] = {}
-    for region in scan.regions:
-        for captured in codes_in_region(region):
+    regions = [(text, "named") for text in scan.regions] + [(text, "fallback") for text in scan.fallback_regions]
+    for text, region in regions:
+        for captured in codes_in_region(text):
             if captured.code.upper() in out:
                 continue
             if len(out) >= _MAX_CODES_PER_PAGE:
                 return list(out.values()), True
+            captured.region = region
             out[captured.code.upper()] = captured
     return list(out.values()), False
 
@@ -392,7 +480,8 @@ def reset_stats() -> None:
         _STATS.update({
             "pages_scanned": 0, "pages_with_region": 0, "pages_with_code": 0, "codes_seen": 0,
             "pages_over_budget": 0, "pages_too_deep": 0, "pages_codes_capped": 0,
-            "by_kind": {}, "by_hint": {}, "by_shape": {}, "by_form": {}, "by_market": {}, "errors": 0,
+            "by_kind": {}, "by_hint": {}, "by_shape": {}, "by_form": {}, "by_region": {}, "by_market": {},
+            "errors": 0,
         })
         _HOST_CODES.clear()
         _HOSTS_WITH_CODES.clear()
@@ -436,7 +525,7 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
             _STATS["pages_over_budget"] += int(scan.over_budget)
             _STATS["pages_too_deep"] += int(scan.too_deep)
             _STATS["pages_codes_capped"] += int(capped)
-            if scan.regions:
+            if scan.regions or scan.fallback_regions:
                 _STATS["pages_with_region"] += 1
             if codes:
                 _STATS["pages_with_code"] += 1
@@ -449,6 +538,7 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
                     _bump(_STATS["by_kind"], captured.kind)
                     _bump(_STATS["by_shape"], captured.shape)
                     _bump(_STATS["by_form"], captured.form)
+                    _bump(_STATS["by_region"], captured.region)
                     for hint in captured.hints or ["none"]:
                         _bump(_STATS["by_hint"], hint)
     except Exception as exc:  # noqa: BLE001 - shadow capture never costs a page refresh
