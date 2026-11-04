@@ -20,6 +20,7 @@ _ENV_AT_IMPORT = os.getenv(ips._SERVING_REGIONS_ENV, "").strip()
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
     has_offer_priced_for_region_sql,
+    market_for_pricing_currency,
     normalize_region,
     pricing_currency_for_region,
     region_currency_predicate,
@@ -292,3 +293,25 @@ class TestServingPricingRegions:
             "cp.product_key", ips.serving_pricing_regions()
         )
         assert "'SGD'" in sql
+
+
+# --- the inverse: the one market a currency prices --------------------------
+
+
+@pytest.mark.parametrize("currency, market", [
+    ("USD", "US"), ("SGD", "SG"), ("JPY", "JP"), ("AUD", "AU"), ("KRW", "KR"), ("GBP", "GB"),
+    ("CAD", "CA"), ("HKD", "HK"), ("SEK", "SE"), (" sgd ", "SG"),
+])
+def test_a_currency_priced_in_one_market_names_it(currency, market):
+    assert market_for_pricing_currency(currency) == market
+
+
+@pytest.mark.parametrize("currency", ["EUR", "QAR", "", "  ", None, "US"])
+def test_a_currency_priced_in_several_markets_or_none_names_none(currency):
+    assert market_for_pricing_currency(currency) is None
+
+
+def test_the_inverse_agrees_with_the_map():
+    for market, currency in REGION_PRICING_CURRENCY.items():
+        shared = sum(1 for priced_in in REGION_PRICING_CURRENCY.values() if priced_in == currency) > 1
+        assert market_for_pricing_currency(currency) == (None if shared else market)

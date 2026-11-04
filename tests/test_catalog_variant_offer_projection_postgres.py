@@ -29,7 +29,8 @@ async def db():
     # Another gate file may have created the table first, narrower (the gate shares one
     # database per process), so the CREATE above can be a no-op: add every column used here.
     await database.execute("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS seed_data jsonb")
-    for column in ("id", "attached_product_key", "status", "seller_ref", "domain", "canonical_url", "destination_url", "market"):
+    for column in ("id", "attached_product_key", "status", "seller_ref", "domain", "canonical_url", "destination_url", "market",
+                   "price_currency"):
         await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {column} text")
     await database.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_skus_source_identity_v2 ON catalog_skus(merchant_id,platform,product_key,source_variant_id)"
@@ -420,3 +421,37 @@ async def test_a_switched_off_projection_writes_no_offers_from_the_promoter(db, 
     monkeypatch.delenv("CATALOG_VARIANT_OFFER_PROJECTION_ENABLED")
     on = await promoter.promote_variants_for_group(group_id="projection-on", apply=True)
     assert on.variant_offers_created == 2
+
+
+async def _as_jpy_listing(db, template_market):
+    """The fixture listing as a JP store's: its seed sits in the 'US' serving partition with JPY money
+    (column, variants and SKUs), and the mirror template is stamped `template_market`."""
+    await db.execute("UPDATE external_product_seeds SET price_currency='JPY' WHERE id=:seed", {"seed": SEED})
+    await db.execute(
+        """UPDATE external_product_seeds SET seed_data=jsonb_set(seed_data,'{snapshot,variants}',
+        (SELECT jsonb_agg(jsonb_set(v,'{currency}','"JPY"')) FROM jsonb_array_elements(seed_data#>'{snapshot,variants}') v))
+        WHERE id=:seed""",
+        {"seed": SEED},
+    )
+    await db.execute("UPDATE catalog_skus SET currency='JPY' WHERE product_key=:pk", {"pk": PK})
+    await db.execute(
+        "UPDATE catalog_offers SET currency='JPY', market=:market WHERE offer_id='projection-template'",
+        {"market": template_market},
+    )
+
+
+async def test_a_jpy_seed_in_the_us_partition_projects_at_its_currencys_market(db):
+    """The seed scope reads the seed's price_currency (SEED_SQL) and asks for the market the mirror
+    offer writer declares for it (JP), not the 'US' partition, so a JP template projects JP variants."""
+    await _as_jpy_listing(db, "JP")
+    result = await mod.project_missing_variant_offers(PK, apply=True, db=db)
+    assert result["inserted"] == 2
+    rows = await db.fetch_all(
+        "SELECT market, currency FROM catalog_offers WHERE source_system=:src", {"src": mod.SOURCE}
+    )
+    assert {(r["market"], r["currency"]) for r in rows} == {("JP", "JPY")}
+
+
+async def test_an_old_us_stamped_jpy_template_projects_nothing(db):
+    await _as_jpy_listing(db, "US")
+    assert (await mod.project_missing_variant_offers(PK, apply=True, db=db))["inserted"] == 0

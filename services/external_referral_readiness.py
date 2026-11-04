@@ -2737,6 +2737,9 @@ async def run_external_referral_refresh_batch(
         # Seeds whose offer the writer refused for want of a currency they can vouch for (a subset of
         # the structural skips, counted on its own because a spike degrades the run).
         "projections_refused_currency": int(proj_skips.get("refused_currency") or 0),
+        # Mirror offers left stale because the stored row is declared for another market (a subset of the
+        # structural skips): each one is a row to re-stamp.
+        "projections_frozen_market_mismatch": int(proj_skips.get("frozen_market_mismatch") or 0),
         # Written rows by target: `mirror` (the seed's mirror product) or `attached` (the
         # canonical's offer for the seed's listing).
         "projection_writes": dict(sorted(proj_writes.items())),

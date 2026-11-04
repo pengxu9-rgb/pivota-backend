@@ -21,10 +21,16 @@ WHAT THE PREDICATE ASKS, and what it deliberately does not:
     2b) and does not exist yet. The predicate is named for what it actually asks
     so no caller can mistake the two.
 
-  * REGION IS NEVER INFERRED FROM CURRENCY, in either direction. This map reads
-    region -> expected currency and is not invertible: USD is priced by stores in
-    many countries, and a KR/HK exporter legitimately prices in USD (see
-    services/storefront_currency: market and currency are "different axes").
+  * REGION IS INFERRED FROM CURRENCY IN ONE PLACE ONLY. This map reads region ->
+    expected currency, and a currency does not name a store's country: USD is
+    priced by stores in many countries, and a KR/HK exporter legitimately prices in
+    USD (see services/storefront_currency: market and currency are "different
+    axes"). The one inverse, market_for_pricing_currency, declares the market a
+    mirror offer copied off a seed is for (services/seed_offer_currency.
+    seed_offer_market), because the seed's own market is a serving partition, not
+    its store's. It answers the market a currency is priced IN, never where the
+    store sits: a KR exporter's USD offer is declared for US, the market it can be
+    priced for. A currency several regions share (EUR) has no answer.
 
   * NO CONVERSION, EVER. This is a membership test on a currency code. Nothing
     here compares or converts amounts across currencies — ADR-024 commitment 5,
@@ -96,6 +102,17 @@ def pricing_currency_for_region(region: str) -> str:
         ) from None
 
 
+def market_for_pricing_currency(currency: Optional[str]) -> Optional[str]:
+    """The ONE market priced in `currency` (the inverse of REGION_PRICING_CURRENCY), or None.
+
+    None when no market is priced in it, and when SEVERAL are (EUR prices FR, HR and FI): a currency
+    shared by markets does not say which one an offer is for, and picking one would be a default.
+    `currency` is read as the SQL reads one (trimmed, upper-cased)."""
+    code = str(currency or "").strip().upper()
+    markets = [market for market, priced_in in REGION_PRICING_CURRENCY.items() if priced_in == code]
+    return markets[0] if code and len(markets) == 1 else None
+
+
 #: Multi-market storefronts ADR Phase 2: markets whose offers are ACQUIRED (stored with their real market
 #: and currency, catalog_offers.market 'AU'/'JP') but never served. The retailer_ingest lane allowlists them
 #: (services/retailer_ingest/pipeline.py) and index_pipeline_state refuses to serve a product priced ONLY
@@ -106,9 +123,10 @@ ACQUISITION_MARKETS = ("AU", "JP")
 def acquisition_market_offer_exists_sql(product_key_expr: str, *, alias: str = "co") -> str:
     """``EXISTS`` a priced, unsuppressed offer DECLARED for an acquisition market (catalog_offers.market).
 
-    Only the retailer_ingest lane writes such a stamp (it declares its job's market; every other writer
-    leaves the column's DEFAULT 'US'), so this is FALSE for every row that existed before that lane wrote
-    an AU/JP job -- which is what makes the serving rule built on it a zero-change rule for them."""
+    Two writers declare such a stamp: the retailer_ingest lane (its job's market) and, since 2026-11-04, the
+    seed mirror's offer writer (the market its currency is priced in: JPY -> JP, AUD -> AU). A product priced
+    only so has no offer in a served region's currency, so the agent decision gates already refused it
+    (`no_us_offer`) on every process that runs them; this rule refuses it on the ones that do not."""
     markets = ", ".join(f"'{m}'" for m in ACQUISITION_MARKETS)
     return priced_offer_exists_sql(
         product_key_expr, alias=alias,
@@ -125,11 +143,12 @@ def require_market_currency(market: str, currency: Optional[str]) -> str:
     writes market='US' siblings). Refusing here is the write-time half of ADR-024 Phase 0 item 2;
     services/catalog_invariant_checks' market/currency disagreement is the same rule at rest.
 
-    Writers that never declare a market (every other lane: the column's DEFAULT 'US' is not a
-    declaration) do not call this -- the older SG rows (market 'US', currency 'SGD', e.g. jsmbeauty.sg) came
-    from such a lane. The retailer_ingest lane declares market 'SG' for SG stores since 2026-09-29, keeping
-    the SEED partition at 'US' (external_product_seeds.market is a hard serving partition). An unknown
-    market or a missing currency is refused, never defaulted."""
+    Writers that never declare a market (the column's DEFAULT 'US' is not a declaration) do not call this
+    -- the older SG rows (market 'US', currency 'SGD', e.g. jsmbeauty.sg) came from such a lane, and so did
+    the seed mirror's offers until 2026-11-04, when its writer began declaring the market its currency is
+    priced in (services/seed_offer_currency.seed_offer_market). The retailer_ingest lane declares market 'SG'
+    for SG stores since 2026-09-29, keeping the SEED partition at 'US' (external_product_seeds.market is a
+    hard serving partition). An unknown market or a missing currency is refused, never defaulted."""
     normalized = normalize_region(market)
     expected = pricing_currency_for_region(normalized)
     got = str(currency or "").strip().upper()
