@@ -12,11 +12,13 @@ from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse, urlun
 import httpx
 from sqlalchemy import and_, select, update
 
+from config.settings import settings
 from db.database import database
 from db.external_offers import external_offer_snapshots
 from services import crawl_global_pacer
 from services import crawl_identity
 from services import crawl_politeness
+from services import deal_code_capture
 from services import shopify_edge_pacer
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 from utils.crawled_price import (
@@ -2612,6 +2614,10 @@ async def resolve_external_offer(
         domain = _domain(canonical_url) or _domain(url_norm)
 
         amount, currency, price_read = snapshot_price_fields(extracted)
+        # ADR-027 code collection, SHADOW: count the codes this page's promo regions print, from the HTML
+        # already in hand (no extra request). Writes nothing; never raises; off unless the job sets the flag.
+        if settings.deal_code_capture_shadow:
+            deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()
