@@ -27,7 +27,13 @@ def _ts(days_ago: float) -> str:
     return (NOW - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50):
+def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, serving_regions=None):
+    """`serving_regions`: PIVOTA_SERVING_PRICING_REGIONS for the run (it may only narrow the market registry's served
+    markets); None leaves it unset, so the registry's list applies, as on a job that does not set it."""
+    if serving_regions is None:
+        monkeypatch.delenv("PIVOTA_SERVING_PRICING_REGIONS", raising=False)
+    else:
+        monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", serving_regions)
     conn = sqlite3.connect(":memory:")
     conn.execute(
         "CREATE TABLE external_product_seeds (id TEXT, status TEXT, attached_product_key TEXT,"
@@ -108,18 +114,70 @@ def test_the_fresh_window_is_48_hours_by_default_and_tunable(monkeypatch) -> Non
     assert ids == ["eps_read_1d", "eps_read_3d"]
 
 
-def test_a_seed_not_priced_in_its_markets_currency_waits_behind_served_ones(monkeypatch) -> None:
-    """The seed lane serves a row only in its market's currency, and a refresh refuses to switch
-    currency, so a mismatched row cannot become servable by being read. It is kept, not dropped:
-    a NULL currency can still be filled."""
+def test_a_seed_not_priced_in_a_served_currency_waits_behind_served_ones(monkeypatch) -> None:
+    """A row in a currency no served region prices is not served, and a refresh refuses to switch currency, so a
+    mismatched row cannot become servable by being read. It is kept, not dropped: a NULL currency can still be
+    filled."""
     ids = _candidates(monkeypatch, [
-        {"id": "eps_sgd_in_us", "price_currency": "SGD", "last_crawl_attempt_at": None},
+        {"id": "eps_aud_in_us", "price_currency": "AUD", "last_crawl_attempt_at": None},
         {"id": "eps_null_currency", "price_currency": None, "last_crawl_attempt_at": None},
         {"id": "eps_usd", "last_crawl_attempt_at": _ts(2)},
         {"id": "eps_jpy_in_jp", "market": "JP", "price_currency": "JPY", "last_crawl_attempt_at": _ts(1)},
-    ])
+    ], serving_regions="US,SG")
     assert ids[:2] == ["eps_usd", "eps_jpy_in_jp"]
-    assert set(ids[2:]) == {"eps_sgd_in_us", "eps_null_currency"}
+    assert set(ids[2:]) == {"eps_aud_in_us", "eps_null_currency"}
+
+
+# SG rows live in the US partition on purpose. On the partition's currency alone, every stale SGD seed sorted behind
+# every stale USD one, and with the run's limit under the stale served tier it was never read (2,696 parked seeds on
+# 2026-11-05). A served pricing region's currency is a served currency.
+_SG_CASE = [
+    {"id": "eps_sgd_in_us", "price_currency": "SGD", "last_crawl_attempt_at": _ts(30), "last_crawled_at": _ts(30)},
+    {"id": "eps_aud_in_us", "price_currency": "AUD", "last_crawl_attempt_at": _ts(40), "last_crawled_at": _ts(40)},
+] + [
+    {"id": f"eps_usd_{i}", "last_crawl_attempt_at": _ts(1 + i / 10), "last_crawled_at": _ts(5)} for i in range(5)
+]
+
+
+def test_with_sg_served_an_sgd_seed_in_the_us_partition_is_in_the_served_tier(monkeypatch) -> None:
+    ids = _candidates(monkeypatch, _SG_CASE, serving_regions="US,SG", limit=3)
+    # Oldest attempt first within the stale served tier: the SGD seed (30 days) heads it; AUD stays parked.
+    assert ids[0] == "eps_sgd_in_us"
+    assert "eps_aud_in_us" not in ids
+
+
+def test_the_registry_alone_serves_sg_when_the_env_is_unset(monkeypatch) -> None:
+    ids = _candidates(monkeypatch, _SG_CASE, serving_regions=None, limit=3)
+    assert ids[0] == "eps_sgd_in_us"
+
+
+def test_with_us_only_served_the_sgd_seed_stays_parked(monkeypatch) -> None:
+    ids = _candidates(monkeypatch, _SG_CASE, serving_regions="US", limit=5)
+    assert ids == [f"eps_usd_{i}" for i in (4, 3, 2, 1, 0)]
+
+
+@pytest.mark.parametrize("env, expected", [("US", {"USD"}), ("US,SG", {"USD", "SGD"}), (" sg , us ", {"USD", "SGD"})])
+def test_served_region_currencies_follow_the_serving_regions(monkeypatch, env, expected) -> None:
+    monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", env)
+    assert module.served_region_currencies() == frozenset(expected)
+
+
+def test_served_region_currencies_fail_safe_to_none(monkeypatch) -> None:
+    """A region config that does not load, or names no region, leaves the tier on the partition's currency alone:
+    never "every currency served"."""
+    import services.index_pipeline_state_service as ips
+
+    def _boom():
+        raise ValueError("registry did not load")
+
+    monkeypatch.setattr(ips, "serving_pricing_regions", _boom)
+    assert module.served_region_currencies() == frozenset()
+    monkeypatch.setattr(ips, "serving_pricing_regions", lambda: [])
+    assert module.served_region_currencies() == frozenset()
+    # And an env that tries to WIDEN the registry raises in serving_pricing_regions: also nothing served.
+    monkeypatch.undo()
+    monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", "US,ZZ")
+    assert module.served_region_currencies() == frozenset()
 
 
 def test_quarantined_suppressed_and_retired_seeds_are_not_candidates(monkeypatch) -> None:
@@ -158,4 +216,25 @@ def test_the_limit_applies_after_the_tiers(monkeypatch) -> None:
     ],
 )
 def test_refresh_queue_tier(is_fresh, market, currency, expected) -> None:
+    """With no served currencies passed (the fail-safe default), the partition's currency alone is served."""
     assert module.refresh_queue_tier(is_fresh=is_fresh, market=market, price_currency=currency) == expected
+
+
+@pytest.mark.parametrize(
+    "market, currency, served, expected",
+    [
+        ("US", "SGD", {"USD"}, (0, 1)),
+        ("US", "SGD", {"USD", "SGD"}, (0, 0)),
+        ("US", " sgd ", {"USD", "SGD"}, (0, 0)),
+        ("US", "AUD", {"USD", "SGD"}, (0, 1)),
+        ("EU-DE", "EUR", {"USD", "SGD"}, (0, 1)),
+        ("US", None, {"USD", "SGD"}, (0, 1)),
+        ("US", "", {"USD", "SGD", ""}, (0, 1)),
+        ("JP", "JPY", {"USD", "SGD"}, (0, 0)),
+        ("SG", "USD", {"usd"}, (0, 0)),
+    ],
+)
+def test_refresh_queue_tier_with_served_region_currencies(market, currency, served, expected) -> None:
+    assert module.refresh_queue_tier(
+        is_fresh=False, market=market, price_currency=currency, served_currencies=served
+    ) == expected

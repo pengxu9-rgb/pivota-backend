@@ -12,7 +12,7 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException
 from urllib.parse import urlparse
@@ -39,6 +39,7 @@ from services.external_seed_search import (
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
+from services.region_pricing import pricing_currency_for_region_or_none
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -1871,19 +1872,45 @@ def _refresh_fresh_hours() -> float:
     return value if math.isfinite(value) and value >= 0 else _FRESH_HOURS_DEFAULT
 
 
-def refresh_queue_tier(*, is_fresh: bool, market: Any, price_currency: Any) -> Tuple[int, int]:
+def served_region_currencies() -> FrozenSet[str]:
+    """The currencies the served pricing regions price in: `serving_pricing_regions()` (the market registry's served
+    markets, which PIVOTA_SERVING_PRICING_REGIONS may only narrow), the list every serving path reads, each mapped
+    through region_pricing. E.g. {'USD', 'SGD'}.
+
+    FAILS SAFE TO EMPTY, loudly: an empty list, or a registry or env that does not load, leaves the refresh tier on
+    the partition's currency alone (`refresh_queue_tier` with no served currencies), never "every currency served".
+    """
+    try:
+        from services.index_pipeline_state_service import serving_pricing_regions
+
+        regions = list(serving_pricing_regions() or [])
+    except Exception as exc:
+        logger.warning("external referral refresh: no served pricing regions (%s); the queue tier uses the "
+                       "partition's currency alone", exc)
+        return frozenset()
+    return frozenset(c for c in (pricing_currency_for_region_or_none(r) for r in regions) if c)
+
+
+def refresh_queue_tier(
+    *, is_fresh: bool, market: Any, price_currency: Any, served_currencies: Iterable[str] = ()
+) -> Tuple[int, int]:
     """Where a candidate sits in the refresh queue. Pure; lower sorts first.
 
-    Stale before fresh, then a row priced in its own market's currency before one that is not.
-    The second key is the seed lane's currency filter (`seed_serving_currency`, Peng 2026-09-26):
-    a row in the wrong currency is not served, and a refresh cannot make it so, because
-    `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is
-    kept rather than dropped. A NULL currency can still be filled by a read, and SG rows live in
-    the US partition on purpose.
+    Stale before fresh, then a row priced in a SERVED currency before one that is not. A served currency is the
+    partition's own (`seed_serving_currency(market)`, Peng 2026-09-26) or, since 2026-11-05, the currency of any
+    served pricing region (`served_currencies`, from `served_region_currencies()`). SG rows live in the US
+    partition on purpose, so on the partition alone every SGD seed sorted behind every stale USD one, and with the
+    run's limit under the stale served tier it was never read (2,696 parked seeds, 2026-11-05).
+
+    A row in a currency no served region prices is still not served, and a refresh cannot make it so, because
+    `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is kept rather than
+    dropped. A NULL currency can still be filled by a read.
     """
     expected = seed_serving_currency(market)
     currency = str(price_currency or "").strip().upper()
-    served_currency = expected is not None and currency == expected
+    # Blank codes never enter `served`, and no market's currency is blank, so a row with no currency is never served.
+    served = {str(c).strip().upper() for c in served_currencies if str(c or "").strip()}
+    served_currency = (expected is not None and currency == expected) or currency in served
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
@@ -1907,7 +1934,8 @@ async def get_external_referral_refresh_candidate_seed_ids(
       * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
       * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
 
-    ORDER: `refresh_queue_tier` (stale before fresh, served currency before not), then within a
+    ORDER: `refresh_queue_tier` (stale before fresh, a served currency -- the partition's or any served pricing
+    region's -- before not), then within a
     tier `last_crawl_attempt_at` NULLS FIRST, as before. The tier uses `last_crawled_at`, the
     origin-read clock. The within-tier order uses the ATTEMPT clock, so a seed that can never be
     read still rotates behind the others instead of heading the queue forever (migration 202). The
@@ -1954,6 +1982,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
         scope_values,
     )
     ranked: List[Tuple[Tuple[int, int], str]] = []
+    served_currencies = served_region_currencies()
     for row in rows or []:
         row_dict = _row_to_dict(row)
         seed_id = str(row_dict.get("id") or "").strip()
@@ -1963,6 +1992,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
             is_fresh=bool(int(row_dict.get("is_fresh") or 0)),
             market=row_dict.get("market"),
             price_currency=row_dict.get("price_currency"),
+            served_currencies=served_currencies,
         )
         ranked.append((tier, seed_id))
     ranked.sort(key=lambda item: item[0])  # stable: keeps the SQL order inside a tier
