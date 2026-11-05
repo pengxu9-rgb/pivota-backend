@@ -268,3 +268,59 @@ async def test_a_run_without_a_product_key_still_refuses_cart_evidence_and_keeps
         "SELECT count(*) FROM evidence_items WHERE merchant_id = :m", {"m": MERCHANT},
     )
     assert kept == 0
+
+
+async def test_a_store_readiness_probe_still_completes_its_own_run(store_audit_db, monkeypatch):
+    # The other side of the parent-run rule: Store Readiness enqueues with its own idempotency key,
+    # and its receipt must complete its audit run. Ties the enqueue to the receipt end to end.
+    from routes import store_readiness as sr
+    from routes.store_audit_commerce_probe_internal import receive_commerce_probe_receipt
+
+    async def owns(_merchant_id, _domain):
+        return True
+
+    monkeypatch.setattr(sr, "merchant_owns_domain", owns)
+    started = await sr.run_store_readiness(sr.StoreReadinessRunRequest(product_url=PRODUCT_URL), merchant_id=MERCHANT)
+    claim = await _claim(store_audit_db)
+    assert claim.audit_run_id == started.audit_run_id
+
+    response = await receive_commerce_probe_receipt(_completed_journey(claim), x_internal_key=KEY)
+
+    assert response.verification_status == "succeeded"
+    parent = await store_audit_db.fetch_one(
+        "SELECT status, subject_type, report_jsonb FROM merchant_audit_runs WHERE run_id = :r", {"r": started.audit_run_id},
+    )
+    assert parent["subject_type"] == "store_readiness"
+    assert parent["status"] == "succeeded"
+    assert parent["report_jsonb"] is not None and "store_readiness" in str(parent["report_jsonb"])
+
+
+async def test_a_suppressed_catalog_row_is_never_the_key(store_audit_db):
+    from services.store_audit_probe_identity import probe_product_key, probe_url
+
+    import hashlib
+
+    # Only a suppressed row at the URL: no catalog key.
+    await store_audit_db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url, "
+        "suppression_reason, updated_at) VALUES (:k, :m, 'shopify', :k, 'sacr suppressed', :u, 'non_product_listing', now())",
+        {"k": f"{CATALOG_KEY}_suppressed", "m": MERCHANT, "u": PRODUCT_URL},
+    )
+    expected = "url_probe:" + hashlib.sha256(f"{MERCHANT}|{probe_url(PRODUCT_URL)}".encode()).hexdigest()[:24]
+    assert await probe_product_key(merchant_id=MERCHANT, url=PRODUCT_URL) == expected
+
+    # An older live row at the same URL wins over the newer suppressed one.
+    await store_audit_db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url, "
+        "updated_at) VALUES (:k, :m, 'shopify', :k, 'sacr live', :u, now() - interval '2 days')",
+        {"k": CATALOG_KEY, "m": MERCHANT, "u": PRODUCT_URL},
+    )
+    assert await probe_product_key(merchant_id=MERCHANT, url=PRODUCT_URL + "/") == CATALOG_KEY
+
+    # Two live rows at one URL: the most recently updated one.
+    await store_audit_db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url, "
+        "updated_at) VALUES (:k, :m, 'shopify', :k, 'sacr live newer', :u, now() - interval '1 day')",
+        {"k": f"{CATALOG_KEY}_newer", "m": MERCHANT, "u": PRODUCT_URL + "?variant=2"},
+    )
+    assert await probe_product_key(merchant_id=MERCHANT, url=PRODUCT_URL) == f"{CATALOG_KEY}_newer"

@@ -38,6 +38,7 @@ from db.audit_evidence import (
 )
 from db.database import database
 from services.commerce_capability_resolver import resolve_merchant_capability
+from services.store_audit_probe_identity import SUBJECT_TYPE_STORE_READINESS, is_store_readiness_probe
 
 logger = logging.getLogger(__name__)
 
@@ -327,12 +328,12 @@ async def _persist_receipt(receipt: CommerceProbeReceipt) -> CommerceProbeReceip
     try:
         from db.merchant_audit_runs import fetch_audit_run_by_id, record_audit_run_completed
         parent = None
-        if str(claimed.get("idempotency_key") or "").startswith("store_readiness:"):
+        if is_store_readiness_probe(claimed.get("idempotency_key")):
             parent = await fetch_audit_run_by_id(run_id=receipt.audit_run_id)
         if (
             parent
             and parent.get("merchant_id") == merchant_id
-            and parent.get("subject_type") == "store_readiness"
+            and parent.get("subject_type") == SUBJECT_TYPE_STORE_READINESS
         ):
             await record_audit_run_completed(
                 run_id=receipt.audit_run_id,

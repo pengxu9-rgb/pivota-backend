@@ -14,6 +14,20 @@ from urllib.parse import urlsplit
 
 from db.database import database
 
+# Store Readiness's own verification run is the only one that may complete its parent audit run (a
+# scheduled re-probe reuses that run id). Enqueue and receipt both read these, so renaming one side
+# cannot silently stop merchants' Store Readiness runs from ever completing.
+SUBJECT_TYPE_STORE_READINESS = "store_readiness"
+STORE_READINESS_IDEMPOTENCY_PREFIX = "store_readiness:"
+
+
+def store_readiness_idempotency_key(run_id: str) -> str:
+    return f"{STORE_READINESS_IDEMPOTENCY_PREFIX}{run_id}"
+
+
+def is_store_readiness_probe(idempotency_key: object) -> bool:
+    return str(idempotency_key or "").startswith(STORE_READINESS_IDEMPOTENCY_PREFIX)
+
 
 def probe_url(url: str) -> str:
     """The URL a probe is keyed on, normalized like execution_routes.endpoint_normalized (lowercase
