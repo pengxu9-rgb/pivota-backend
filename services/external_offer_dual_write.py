@@ -391,16 +391,43 @@ MIRROR_OFFER_WRITTEN = "written"
 # writer declared the currency's market, 2026-11-04): the upsert's guard leaves it untouched, so its price,
 # stock and price_checked_at go stale until the row is re-stamped. Never a write.
 MIRROR_OFFER_FROZEN_MARKET_MISMATCH = "frozen_market_mismatch"
-# The stored row is held by another rule of the guard (suppressed, or under a price repair): left as it was.
+# The stored row is held by another rule of the guard (suppressed, or under a price repair), or no row was
+# proposed at all (its product or SKU is not live): left as it was.
 MIRROR_OFFER_HELD = "held"
+
+# The guard's holds, as the upsert states them: the row suppressed or under a price repair, or its product or SKU
+# not live (the INSERT ... WHERE EXISTS then proposes no row, so nothing conflicts and nothing is written).
+_UNWRITTEN_MIRROR_OFFER_SQL = """
+SELECT co.market,
+       (co.suppressed_at IS NOT NULL OR co.suppression_reason IS NOT NULL
+        OR COALESCE(co.offer_payload, CAST('{}' AS jsonb)) ? 'price_repair'
+        OR NOT EXISTS (SELECT 1 FROM catalog_products p JOIN catalog_skus s ON s.product_key = p.product_key
+                       WHERE p.product_key = co.product_key AND s.sku_key = co.sku_key
+                         AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
+                         AND s.suppressed_at IS NULL AND s.suppression_reason IS NULL)) AS held
+FROM catalog_offers co WHERE co.offer_id = :offer_id
+"""
 
 
 async def _unwritten_mirror_offer_outcome(offer_id: str, market: str) -> str:
-    """Why the upsert's guard left the stored row alone: a market mismatch, or one of its other holds."""
-    stored = await database.fetch_one(
-        "SELECT market FROM catalog_offers WHERE offer_id = :offer_id", {"offer_id": offer_id}
-    )
-    if stored and str(dict(stored).get("market") or "") != market:
+    """Why the upsert's guard left the stored row alone: one of its holds, or else a market mismatch.
+
+    The holds come FIRST: a suppressed (or price-repaired) row the old writer also stamped 'US' would never be
+    refreshed by a re-stamp either, so it is not one to re-stamp, and counting it frozen would inflate that
+    count (PR controller review of #2701).
+
+    Read after the upsert, not with it: a re-stamp that commits between the two statements makes one report
+    `held` where the guard saw a mismatch. A transaction around both would close that, but this runs from
+    seed_data_writer under callers that gather on one shared connection (databases 0.7: interleaved
+    BEGIN/SAVEPOINT), so the outcome stays a separate read; the next refresh reports the row correctly.
+    """
+    stored = await database.fetch_one(_UNWRITTEN_MIRROR_OFFER_SQL, {"offer_id": offer_id})
+    if not stored:
+        return MIRROR_OFFER_HELD
+    stored = dict(stored)
+    if stored.get("held"):
+        return MIRROR_OFFER_HELD
+    if str(stored.get("market") or "") != market:
         return MIRROR_OFFER_FROZEN_MARKET_MISMATCH
     return MIRROR_OFFER_HELD
 
