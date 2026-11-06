@@ -64,7 +64,6 @@ from services.outbound_links_service import (
     request_market_observed,
     TOKEN_MARKET_OBSERVED_KEY,
 )
-from services.external_seed_destination_liveness import HANDLELESS_SHADOW_KEY
 from services.external_seed_stock import (
     seed_stock,
     seed_stock_fields,
@@ -4048,13 +4047,7 @@ async def _build_external_seed_product(
         "external_seed_id": seed_id,
         "external_redirect_url": external_redirect_url,
         "disclosure_text": str(disclosure_text or DEFAULT_DISCLOSURE_TEXT),
-        # The seed's data, without the refresh's internal state: the handle-less read rule's per-row decision
-        # (its refusal reasons) is ours, not the product's, and a partner agent reads this card.
-        **(
-            {"seed_data": {k: v for k, v in seed_data.items() if k != HANDLELESS_SHADOW_KEY}}
-            if not requires_live_verification
-            else {}
-        ),
+        **({"seed_data": seed_data} if not requires_live_verification else {}),
         "external_referral_status": {
             "status": str(getattr(gate_status, "status", "") or "unknown"),
             "gating_policy_version": str(

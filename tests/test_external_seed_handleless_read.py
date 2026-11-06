@@ -14,7 +14,6 @@ import asyncio
 import copy
 import importlib.util
 import json
-import os
 import pathlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -172,6 +171,12 @@ def _refresh(
     }
 
 
+def _no_decision_in_the_row(seed_data: Dict[str, Any]) -> bool:
+    """Nothing the rule decided reaches the stored row: `seed_data` is served to partner agents whole."""
+    text = json.dumps(seed_data, default=str)
+    return "handleless" not in text and "would_read" not in text and "refusal" not in text
+
+
 def _assert_not_read(out: Dict[str, Any], refusal: str) -> None:
     result = out["result"]
     assert result["handleless_read"]["refusal"] == refusal, result["handleless_read"]
@@ -181,6 +186,7 @@ def _assert_not_read(out: Dict[str, Any], refusal: str) -> None:
     assert out["written"]["read_the_served_product"] is False
     assert not out["projected"]
     assert all(obs.verdict != liveness.VERDICT_LIVE for obs in out["recorded"])
+    assert _no_decision_in_the_row(out["seed_data"])
 
 
 def _assert_read(out: Dict[str, Any], *, price: float = 25.0, by: Optional[str] = None) -> None:
@@ -195,6 +201,7 @@ def _assert_read(out: Dict[str, Any], *, price: float = 25.0, by: Optional[str] 
     assert [obs.verdict for obs in out["recorded"]] == [liveness.VERDICT_LIVE]
     assert out["recorded"][0].corroborated is False
     assert out["projected"]
+    assert _no_decision_in_the_row(out["seed_data"])
 
 
 # --------------------------------------------------------------------------- reads
@@ -204,7 +211,6 @@ def test_a_page_naming_the_served_url_reads_writes_the_price_and_live(monkeypatc
     out = _refresh(monkeypatch, html=_page(_product(url=URL)))
     _assert_read(out, by="url")
     assert out["seed_data"]["snapshot"]["extracted_at"], "a read with every variant re-read is fresh"
-    assert out["seed_data"]["handleless_shadow"]["would_read"] is True
 
 
 def test_a_read_adopts_only_the_pricing_products_variants(monkeypatch) -> None:
@@ -422,7 +428,7 @@ def test_a_review_widget_product_with_no_offers_is_not_a_second_product(monkeypa
 # --------------------------------------------------------------------------- shadow and off
 
 
-def test_shadow_keeps_a_frozen_dead_row_exactly_as_it_is_but_for_its_marker(monkeypatch) -> None:
+def test_shadow_writes_exactly_what_off_writes_and_keeps_a_frozen_dead_row(monkeypatch) -> None:
     frozen = dict(destination_verdict=liveness.VERDICT_REDIRECTED_OFF_PRODUCT, destination_failure_streak=1,
                   destination_checked_at="2026-08-27T00:00:00+00:00")
     html = _page(_product(url=URL))
@@ -437,15 +443,13 @@ def test_shadow_keeps_a_frozen_dead_row_exactly_as_it_is_but_for_its_marker(monk
         assert [obs.verdict for obs in out["recorded"]] == [liveness.VERDICT_UNVERIFIABLE]
         current = {"destination_failure_streak": 1, "destination_corroborated_dead_at": None}
         assert liveness.next_streak_state(current, out["recorded"][0], CHECKED_AT) == (1, None)
-    # Every value the UPDATE writes is the off run's, but the marker.
-    marker = shadow["seed_data"].pop("handleless_shadow")
-    assert set(marker) == {"at", "would_read", "refusal"} and marker["would_read"] is True and marker["refusal"] is None
-    assert "handleless_shadow" not in off["seed_data"]
+    # Every value the UPDATE writes is the off run's: shadow writes nothing of its own.
     for out in (shadow, off):  # the content audit stamps its own clock
         (out["seed_data"].get("review_summary") or {}).pop("audited_at", None)
     assert shadow["seed_data"] == off["seed_data"]
     assert {k: v for k, v in shadow["written"].items() if k != "seed_data"} == \
         {k: v for k, v in off["written"].items() if k != "seed_data"}
+    assert _no_decision_in_the_row(shadow["seed_data"])
 
 
 def test_on_resets_a_frozen_dead_row_to_live(monkeypatch) -> None:
@@ -456,20 +460,19 @@ def test_on_resets_a_frozen_dead_row_to_live(monkeypatch) -> None:
     assert liveness.next_streak_state(current, out["recorded"][0], CHECKED_AT) == (0, None)
 
 
-def test_shadow_records_its_refusal_in_the_marker(monkeypatch) -> None:
+def test_shadow_reports_its_refusal_in_the_result_only(monkeypatch) -> None:
     out = _refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(redirect_hops=1), mode="shadow")
-    assert out["seed_data"]["handleless_shadow"]["refusal"] == "redirect"
-    assert out["seed_data"]["handleless_shadow"]["would_read"] is False
+    assert out["result"]["handleless_read"]["refusal"] == "redirect"
+    assert out["result"]["handleless_read"]["would_read"] is False
+    assert _no_decision_in_the_row(out["seed_data"])
 
 
 @pytest.mark.parametrize("mode", ["off", "unset"])
-def test_off_leaves_an_existing_marker_alone_and_decides_nothing(monkeypatch, mode: str) -> None:
-    stored = {"at": "2026-11-06T00:00:00+00:00", "would_read": True, "refusal": None}
-    row = _seed_row(seed_data={"title": SEED_TITLE, "handleless_shadow": stored})
-    out = _refresh(monkeypatch, row=row, html=_page(_product(url=URL)), mode=mode)
+def test_off_decides_nothing(monkeypatch, mode: str) -> None:
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), mode=mode)
     assert out["result"]["handleless_read"] is None
-    assert out["seed_data"]["handleless_shadow"] == stored
     assert out["result"]["price_refresh"]["status"] == "not_read"
+    assert _no_decision_in_the_row(out["seed_data"])
 
 
 def test_a_url_with_a_product_handle_is_not_decided(monkeypatch) -> None:
@@ -477,7 +480,7 @@ def test_a_url_with_a_product_handle_is_not_decided(monkeypatch) -> None:
     row = _seed_row(destination_url=url, canonical_url=url)
     out = _refresh(monkeypatch, row=row, html=_page(_product(url=url)), observed=_observed(url))
     assert out["result"]["handleless_read"] is None
-    assert "handleless_shadow" not in out["seed_data"]
+    assert _no_decision_in_the_row(out["seed_data"])
     assert out["written"]["read_the_served_product"] is True
 
 
@@ -488,7 +491,7 @@ def test_a_url_with_a_product_handle_that_did_not_read_is_not_decided_either(mon
     observed = _observed(url, final_url="https://shop.example/collections/all", redirect_hops=1)
     out = _refresh(monkeypatch, row=row, html=_page(_product()), observed=observed, mode=mode)
     assert out["result"]["handleless_read"] is None
-    assert "handleless_shadow" not in out["seed_data"]
+    assert _no_decision_in_the_row(out["seed_data"])
     assert out["written"]["read_the_served_product"] is False
 
 
@@ -719,63 +722,6 @@ def test_the_job_prints_its_line_only_for_a_run_that_decided_a_row() -> None:
     assert handleless_read_line({"handleless_read": block}) == block
 
 
-# --------------------------------------------------------------------------- nothing serves the marker
-
-
-def test_nothing_outside_its_definition_names_the_shadow_marker() -> None:
-    """`seed_data.handleless_shadow` is written by the refresh and read by a census only: no serving builder,
-    job or script names it (the gateway is checked in its own repo). Code uses `HANDLELESS_SHADOW_KEY`; the
-    refresh writes under it and the agent card strips it (`test_the_agent_card_never_carries_the_marker`)."""
-    assert liveness.HANDLELESS_SHADOW_KEY == "handleless_shadow"
-    users = []
-    hits = []
-    for top in ("routes", "services", "jobs", "scripts", "db", "utils", "models", "api", "app"):
-        base = REPO / top
-        if not base.is_dir():
-            continue
-        for path in base.rglob("*"):
-            if path.suffix not in (".py", ".sql", ".js", ".ts") or not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if "handleless_shadow" in text:
-                hits.append(str(path.relative_to(REPO)))
-            if "HANDLELESS_SHADOW_KEY" in text:
-                users.append(str(path.relative_to(REPO)))
-    assert hits == [os.path.join("services", "external_seed_destination_liveness.py")]
-    assert sorted(users) == sorted([
-        os.path.join("services", "external_seed_destination_liveness.py"),
-        os.path.join("routes", "employee_products.py"),
-        os.path.join("routes", "agent_api.py"),
-    ])
-
-
-async def test_the_agent_card_never_carries_the_marker(monkeypatch) -> None:
-    """A partner agent reads the card's `seed_data`: the refresh's per-row decision is internal state."""
-    import routes.agent_api as agent_api
-
-    async def _gate(row, **kwargs):
-        return (False, None)
-
-    monkeypatch.setattr(agent_api, "should_block_external_referral_runtime", _gate)
-    now = datetime.now(timezone.utc).isoformat()
-    row = _seed_row(
-        destination_url="https://shop.example/products/barrier-cream",
-        canonical_url="https://shop.example/products/barrier-cream",
-        destination_checked_at=now, destination_http_status=200, destination_verdict="live",
-        seed_data={"title": SEED_TITLE, "brand": "Brand", "snapshot": {"extracted_at": now},
-                   liveness.HANDLELESS_SHADOW_KEY: {"at": now, "would_read": False, "refusal": "identity"}},
-    )
-
-    class _Req:
-        base_url = "https://api.example/"
-
-    card = await agent_api._build_external_seed_product(req=_Req(), seed_row=row, allowed_domains=["shop.example"])
-    assert card is not None and isinstance(card.get("seed_data"), dict), card
-    assert liveness.HANDLELESS_SHADOW_KEY not in card["seed_data"]
-    assert card["seed_data"]["brand"] == "Brand", "the rest of the seed's data still rides"
-    assert row["seed_data"][liveness.HANDLELESS_SHADOW_KEY]["refusal"] == "identity", "the stored row is untouched"
-
-
 # --------------------------------------------------------------------------- review of #2720 (controller, 11-07)
 
 
@@ -799,7 +745,7 @@ def test_a_rule_that_raises_keeps_todays_observation_and_the_rows_update(monkeyp
                                                 "would_flip_healthy": False}
     assert out["result"]["status"] == "success"
     assert [obs.verdict for obs in out["recorded"]] == [liveness.VERDICT_UNVERIFIABLE]
-    assert out["seed_data"]["handleless_shadow"]["refusal"] == "error"
+    assert _no_decision_in_the_row(out["seed_data"])
 
 
 def _query_row(url: str) -> Dict[str, Any]:

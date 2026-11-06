@@ -6679,15 +6679,9 @@ async def _refresh_external_seed_by_id(
             seed_data["snapshot"].pop("extracted_at", None)
 
     if handleless_read is not None:
-        # THE ONLY WRITE `shadow` ADDS (and `on` keeps): what the rule decided for this row, in this same UPDATE's
-        # seed_data, so a read-only census can count the served and sole-price cards a flip would touch. A fixed
-        # shape -- no URL, title or evidence -- and read by nothing that serves. With the flag off it is left as it
-        # is, so turning the flag off writes nothing.
-        seed_data[destination_liveness.HANDLELESS_SHADOW_KEY] = {
-            "at": _to_iso(datetime.now(timezone.utc)),
-            "would_read": bool(handleless_read.get("would_read")),
-            "refusal": handleless_read.get("refusal"),
-        }
+        # NOTHING ABOUT THE DECISION IS WRITTEN TO THE ROW: `seed_data` reaches partner agents whole (the gateway's
+        # product builder keeps unknown keys), and refusal reasons are internal state. It is counted per host by the
+        # batch, from this result.
         handleless_read["would_flip_healthy"] = bool(handleless_read.get("would_read")) and _content_stale_for_serving(
             _ensure_json_obj(row.get("seed_data"))
         )
