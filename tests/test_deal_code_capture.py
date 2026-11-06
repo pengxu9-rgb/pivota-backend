@@ -792,3 +792,162 @@ def test_entities_in_a_head_cost_nothing_to_scan():
     started = time.perf_counter()
     dcc._body_start(html)
     assert time.perf_counter() - started < 0.2  # ~0.1 ms; was ~0.5 s per MB with convert_charrefs=False
+
+
+# ---- diagnostics: counts only ------------------------------------------------------------------------------
+
+
+def _diag_stats(html):
+    dcc.capture_shadow(html, url="https://a.example/p", market="US", page_currency=None)
+    return dcc.stats()
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        ("Use code welcome10 for 10% off", "lower_with_digit"),
+        ("Use code welcome for 10% off", "lower_letters"),
+        ("Shop with code SAVE10 today", "wording"),  # all caps, but not a strict phrase
+        ("Code: GLOW15", "wording"),
+        ("USE CODE BELOW", "stop"),
+        ("Use code 2024 at checkout", "no_letter"),
+        ("Use code NC20 shade", "rejected"),  # a shade name
+        ("Use code XXXX", "rejected"),  # a placeholder
+    ],
+)
+def test_each_relaxed_token_the_strict_matcher_missed_is_counted_by_reason(text, reason):
+    s = _diag_stats(f'<body><div class="announcement-bar">{text}</div></body>')
+    assert (s["pages_relaxed_code_match"], s["by_miss"], s["codes_seen"]) == (1, {reason: 1}, 0)
+
+
+def test_a_captured_code_is_not_a_miss_and_a_token_is_counted_once_per_page():
+    s = _diag_stats(
+        '<body><div class="announcement-bar">Use code SAVE10. Use code save20. Code: save20</div>'
+        '<div class="top-bar-holder">with code save20</div></body>'
+    )
+    assert (s["codes_seen"], s["by_miss"]) == (1, {"lower_with_digit": 1})
+
+
+def test_named_and_fallback_only_pages_are_counted_apart():
+    _diag_stats('<body><div class="announcement-bar">Free shipping</div></body>')
+    _diag_stats('<body><div class="promo-bar-wrap">Free shipping</div></body>')
+    _diag_stats('<body><div class="rte">Free shipping</div></body>')
+    s = dcc.stats()
+    assert (s["pages_with_region"], s["pages_with_named_region"], s["pages_with_fallback_region_only"]) == (2, 1, 1)
+
+
+def test_a_region_mentioning_code_without_a_token_counts_only_the_mention():
+    s = _diag_stats('<body><div class="announcement-bar">Codes sent by email</div></body>')
+    assert (s["pages_region_mentions_code"], s["pages_relaxed_code_match"], s["by_miss"]) == (1, 0, {})
+
+
+def test_a_strict_phrase_outside_any_region_is_counted_from_the_html():
+    html = (
+        '<html><head><script type="application/json">{"text":"Use code SAVE10 for 10% off"}</script></head>'
+        '<body><div class="announcement-bar">Free shipping</div><div class="rte">Promo code: X1</div></body>'
+    )
+    s = _diag_stats(html)
+    assert (s["pages_code_phrase_in_html"], s["pages_region_mentions_code"], s["codes_seen"]) == (1, 0, 0)
+    assert _diag_stats('<body><div class="rte">no phrase here</div></body>')["pages_code_phrase_in_html"] == 1
+
+
+def test_a_region_name_past_the_body_window_is_counted_only_for_a_name_token():
+    filler = "<p>filler</p>" * 20_000
+    s = _diag_stats(f'<body>{filler}<div class="announcement-bar">Use code LATE10</div></body>')
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"], s["codes_seen"]) == (1, 1, 0)
+    for cls in ("has-announcement-bar", "product-card"):  # a state token, or no region name at all
+        dcc.reset_stats()
+        assert _diag_stats(f'<body>{filler}<div class="{cls}">x</div></body>')["pages_named_region_past_budget"] == 0
+    dcc.reset_stats()
+    s = _diag_stats('<body><div class="announcement-bar">x</div></body>')  # inside the window
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "length,bucket", [(39, "lt40"), (40, "40_199"), (199, "40_199"), (200, "200_999"), (999, "200_999"), (1000, "1000_plus")]
+)
+def test_each_region_length_is_bucketed(length, bucket):
+    s = _diag_stats(f'<body><div class="announcement-bar">{"a" * length}</div></body>')
+    assert s["by_region_chars"] == {bucket: 1}
+
+
+def test_diagnostics_never_put_text_in_the_log_or_the_counters(capsys):
+    # No strict code, so no page line: the misses below are counted, never printed or kept.
+    html = '<body><div class="announcement-bar">with code hidden99, Code: SECRET10, use code below</div></body>'
+    s = _diag_stats(html)
+    assert s["by_miss"] == {"lower_with_digit": 1, "wording": 1, "stop": 1}
+    assert capsys.readouterr().out == ""
+    blob = json.dumps(s).lower()
+    assert "hidden99" not in blob and "secret10" not in blob and "below" not in blob
+
+
+def test_a_failing_diagnosis_moves_no_counter(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(dcc, "_diagnose", boom)
+    s = _diag_stats('<body><div class="announcement-bar">Use code SAVE10</div></body>')
+    assert (s["errors"], s["pages_scanned"], s["codes_seen"]) == (1, 0, 0)
+
+
+def test_reset_clears_the_diagnostic_counters():
+    _diag_stats('<body><div class="announcement-bar">with code save10</div></body>')
+    dcc.reset_stats()
+    s = dcc.stats()
+    assert (s["pages_relaxed_code_match"], s["by_miss"], s["by_region_chars"], s["pages_with_named_region"]) == (0, {}, {}, 0)
+
+
+@pytest.mark.parametrize(
+    "unit",
+    ["use ", "use" + " " * 10, "code ", "code: ", "promo code ", 'class="', "class='announcement-bar ", 'id="a ', "<p>x</p>"],
+)
+def test_the_diagnostics_are_linear_on_hostile_pages(unit):
+    import io
+    import time
+    from contextlib import redirect_stdout
+
+    html = "<body>" + unit * (2_400_000 // len(unit))
+    started = time.perf_counter()
+    with redirect_stdout(io.StringIO()):
+        dcc.capture_shadow(html, url="https://a.example/p", market="US", page_currency=None)
+    assert time.perf_counter() - started < 5.0
+    assert dcc.stats()["errors"] == 0
+
+
+@pytest.mark.parametrize("text", ["Barcodes on the box", "Unicode support", "Encoded"])
+def test_code_only_counts_as_a_whole_word(text):
+    assert _diag_stats(f'<body><div class="announcement-bar">{text}</div></body>')["pages_region_mentions_code"] == 0
+
+
+def test_a_labelled_phrase_in_a_script_is_counted_from_the_html():
+    html = '<html><head><script>var t="Discount code: SPRING";</script></head><body><div class="rte">x</div></body>'
+    assert _diag_stats(html)["pages_code_phrase_in_html"] == 1
+
+
+def test_a_fallback_only_page_is_diagnosed_like_a_named_one():
+    s = _diag_stats('<body><div class="promo-bar-wrap">Shop with code save10</div></body>')
+    assert (s["pages_with_fallback_region_only"], s["pages_region_mentions_code"], s["by_miss"], s["by_region_chars"]) == (
+        1, 1, {"lower_with_digit": 1}, {"lt40": 1})
+
+
+def test_a_page_with_named_and_fallback_regions_is_not_fallback_only():
+    s = _diag_stats('<body><div class="announcement-bar">a</div><div class="promo-bar-wrap">b</div></body>')
+    assert (s["pages_with_named_region"], s["pages_with_fallback_region_only"]) == (1, 0)
+
+
+def test_a_bar_inside_the_window_of_a_long_page_is_not_past_the_budget():
+    filler = "<p>filler</p>" * 20_000
+    s = _diag_stats(f'<body><div class="announcement-bar">x</div>{filler}</body>')
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 0)
+
+
+def test_the_past_budget_search_stops_at_its_limit(monkeypatch):
+    monkeypatch.setattr(dcc, "_DIAG_SCAN_LIMIT", 1_000)
+    filler = "<p>filler</p>" * 16_000
+    s = _diag_stats(f'<body>{filler}' + "<p>more</p>" * 500 + '<div class="announcement-bar">x</div></body>')
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 0)
+
+
+def test_a_trailing_underscore_does_not_turn_a_captured_code_into_a_miss():
+    s = _diag_stats('<body><div class="announcement-bar">Use code SAVE10_ today</div></body>')
+    assert (s["codes_seen"], s["by_miss"]) == (1, {})
