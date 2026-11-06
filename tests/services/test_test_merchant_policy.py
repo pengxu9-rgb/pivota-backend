@@ -92,9 +92,57 @@ async def test_a_failed_resolve_is_not_cached():
     down = _FakeDB(raise_exc=True)
     await pol.get_excluded_merchant_ids(down, env={}, now=1000.0)
     up = _FakeDB(rows=[{"merchant_id": "m_demo"}])
-    ids = await pol.get_excluded_merchant_ids(up, env={}, now=1001.0)  # well inside the TTL
+    later = 1000.0 + pol._FAILURE_BACKOFF_SECONDS + 1  # past the backoff, well inside the TTL
+    ids = await pol.get_excluded_merchant_ids(up, env={}, now=later)
     assert up.calls == 1                                                 # retried, not cached
     assert "m_demo" in ids
+
+
+async def test_an_empty_successful_resolve_is_cached():
+    # "No demo stores" is a real answer, unlike a failure: one scan per TTL.
+    db = _FakeDB(rows=[])
+    await pol.get_excluded_merchant_ids(db, env={}, now=1000.0)
+    await pol.get_excluded_merchant_ids(db, env={}, now=1100.0)
+    assert db.calls == 1
+
+
+async def test_a_failed_resolve_backs_off_before_retrying():
+    good = _FakeDB(rows=[{"merchant_id": "m_demo"}])
+    await pol.get_excluded_merchant_ids(good, env={}, now=0.0)
+    down = _FakeDB(raise_exc=True)
+    t0 = 1000.0                                   # cache expired
+    await pol.get_excluded_merchant_ids(down, env={}, now=t0)
+    assert down.calls == 1
+    inside = t0 + pol._FAILURE_BACKOFF_SECONDS - 0.5
+    ids = await pol.get_excluded_merchant_ids(down, env={}, now=inside)
+    assert down.calls == 1                        # no second DB attempt inside the window
+    assert "m_demo" in ids                        # last good set still served
+    assert "merch_efbc46b4619cfbdf" in ids
+    after = t0 + pol._FAILURE_BACKOFF_SECONDS + 0.5
+    await pol.get_excluded_merchant_ids(down, env={}, now=after)
+    assert down.calls == 2                        # retried once the window passed
+    up = _FakeDB(rows=[{"merchant_id": "m_demo2"}])
+    ids = await pol.get_excluded_merchant_ids(up, env={}, now=after + pol._FAILURE_BACKOFF_SECONDS + 1)
+    assert up.calls == 1 and "m_demo2" in ids     # recovery clears the failure state
+    await pol.get_excluded_merchant_ids(up, env={}, now=after + pol._FAILURE_BACKOFF_SECONDS + 2)
+    assert up.calls == 1                          # and the good result is cached again
+
+
+async def test_a_persistent_failure_warns_once_per_interval(caplog):
+    import logging
+
+    down = _FakeDB(raise_exc=True)
+    step = pol._FAILURE_BACKOFF_SECONDS + 1
+    with caplog.at_level(logging.WARNING, logger=pol.__name__):
+        for i in range(4):                        # 4 real attempts inside one warn interval
+            await pol.get_excluded_merchant_ids(down, env={}, now=1000.0 + i * step)
+        assert down.calls == 4
+        warned = [r for r in caplog.records if "demo-domain resolve FAILED" in r.getMessage()]
+        assert len(warned) == 1
+        await pol.get_excluded_merchant_ids(down, env={}, now=1000.0 + pol._WARN_INTERVAL_SECONDS + 1)
+        warned = [r for r in caplog.records if "demo-domain resolve FAILED" in r.getMessage()]
+        assert len(warned) == 2
+        assert "3 earlier failures suppressed" in warned[1].getMessage()
 
 
 async def test_a_failed_resolve_keeps_the_last_good_set():

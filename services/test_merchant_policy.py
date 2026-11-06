@@ -96,6 +96,17 @@ _CACHE_TTL_SECONDS = 300.0
 _cache_value: Optional[Set[str]] = None
 _cache_at: float = 0.0
 
+# After a FAILED lookup, wait this long before the next DB attempt. Without it,
+# every uncached search re-queries merchant_stores during an outage, and under
+# pool saturation each attempt can sit out the pool's checkout timeout.
+_FAILURE_BACKOFF_SECONDS = 10.0
+_failed_at: Optional[float] = None
+
+# A persistent failure must not log a traceback per search.
+_WARN_INTERVAL_SECONDS = 60.0
+_last_warn_at: Optional[float] = None
+_suppressed_warnings = 0
+
 
 def _env_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
     raw = (env or os.environ).get(_ENV_VAR, "") or ""
@@ -108,24 +119,20 @@ def static_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
     return set(KNOWN_TEST_MERCHANT_IDS) | _env_ids(env)
 
 
-async def _resolve_demo_domain_merchant_ids(database) -> Optional[Set[str]]:
+async def _resolve_demo_domain_merchant_ids(database) -> Set[str]:
     """merchant_ids whose connected store domain marks them a demo rig.
 
-    Returns None on any DB error, so the caller can tell a failed lookup from
-    "no demo stores" and does not cache the failure.
+    Raises on a DB error; `get_excluded_merchant_ids` owns the fail-soft
+    handling (backoff, rate-limited warning, last-good set).
     """
-    try:
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT merchant_id
-            FROM merchant_stores
-            WHERE lower(coalesce(domain, '')) LIKE :prefix
-            """,
-            {"prefix": f"{DEMO_DOMAIN_PREFIX}%"},
-        )
-    except Exception:
-        logger.warning("test_merchant_policy: demo-domain resolve FAILED", exc_info=True)
-        return None
+    rows = await database.fetch_all(
+        """
+        SELECT DISTINCT merchant_id
+        FROM merchant_stores
+        WHERE lower(coalesce(domain, '')) LIKE :prefix
+        """,
+        {"prefix": f"{DEMO_DOMAIN_PREFIX}%"},
+    )
     out: Set[str] = set()
     for r in rows or []:
         mid = None
@@ -150,30 +157,57 @@ async def get_excluded_merchant_ids(
     is returned (used by pure/sync callers).
 
     Fail-soft, never crashes: on a failed lookup it returns the static set plus
-    the last good demo-domain set (if any). A FAILED lookup is never cached:
-    caching it as the empty set would let demo rigs list for a whole TTL window
-    after one DB blip. The next call retries.
+    the last good demo-domain set (if any). A FAILED lookup is never cached as
+    the demo set: caching it as the empty set would let demo rigs list for a
+    whole TTL window after one DB blip. Instead the next DB attempt waits
+    _FAILURE_BACKOFF_SECONDS, and the warning is rate-limited to one per
+    _WARN_INTERVAL_SECONDS with a count of the ones it suppressed.
     """
-    global _cache_value, _cache_at
+    global _cache_value, _cache_at, _failed_at
     static = static_test_merchant_ids(env)
     if database is None:
         return static
     ts = time.monotonic() if now is None else now
     if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
         return static | _cache_value
-    resolved = await _resolve_demo_domain_merchant_ids(database)
-    if resolved is None:
+    if _failed_at is not None and (ts - _failed_at) < _FAILURE_BACKOFF_SECONDS:
         return static | (_cache_value or set())
+    try:
+        resolved = await _resolve_demo_domain_merchant_ids(database)
+    except Exception:
+        _failed_at = ts
+        _warn_resolve_failed(ts)
+        return static | (_cache_value or set())
+    _failed_at = None
     _cache_value = resolved
     _cache_at = ts
     return static | resolved
 
 
+def _warn_resolve_failed(ts: float) -> None:
+    global _last_warn_at, _suppressed_warnings
+    if _last_warn_at is not None and (ts - _last_warn_at) < _WARN_INTERVAL_SECONDS:
+        _suppressed_warnings += 1
+        return
+    logger.warning(
+        "test_merchant_policy: demo-domain resolve FAILED; serving static ids + %s last-good "
+        "demo ids (%s earlier failures suppressed)",
+        len(_cache_value or ()),
+        _suppressed_warnings,
+        exc_info=True,
+    )
+    _last_warn_at = ts
+    _suppressed_warnings = 0
+
+
 def reset_cache() -> None:
-    """Test hook — drop the memoized demo-domain set."""
-    global _cache_value, _cache_at
+    """Test hook — drop the memoized demo-domain set and the failure state."""
+    global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings
     _cache_value = None
     _cache_at = 0.0
+    _failed_at = None
+    _last_warn_at = None
+    _suppressed_warnings = 0
 
 
 def _merchant_id_of(product: Any) -> str:
