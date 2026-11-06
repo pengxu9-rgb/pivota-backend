@@ -70,7 +70,10 @@ def test_the_access_line_of_an_oauth_callback_carries_neither_code_nor_state(acc
         ("id_token=j&refresh_token=r", "id_token=[REDACTED]&refresh_token=[REDACTED]"),
         ("client_secret=s", "client_secret=[REDACTED]"),
         ("webhook_secret=s&secret_key=t", "webhook_secret=[REDACTED]&secret_key=[REDACTED]"),
-        ("apikey=a&api-key=b&access_key=c&private_key=d", "apikey=[REDACTED]&api-key=[REDACTED]&access_key=[REDACTED]&private_key=[REDACTED]"),
+        (
+            "apikey=a&api-key=b&access_key=c&private_key=d",
+            "apikey=[REDACTED]&api-key=[REDACTED]&access_key=[REDACTED]&private_key=[REDACTED]",
+        ),
         ("client_assertion=j&assertion=k", "client_assertion=[REDACTED]&assertion=[REDACTED]"),
         # Repeats are each redacted.
         ("state=a&state=b", "state=[REDACTED]&state=[REDACTED]"),
@@ -122,3 +125,51 @@ def test_the_app_logger_redacts_the_same_keys():
     out = _redact_query_params({"code": CODE, "state": STATE, "ticket": "t", "shop": "a.myshopify.com"})
 
     assert out == {"code": "[REDACTED]", "state": "[REDACTED]", "ticket": "[REDACTED]", "shop": "a.myshopify.com"}
+
+
+TOKEN = "r3fresh-SHOULD-NOT-APPEAR"
+SIG = "s1g-SHOULD-NOT-APPEAR"
+
+
+@pytest.mark.parametrize("status", [200, 400])
+def test_the_middleware_writes_no_secret_from_a_callback_query(caplog, status):
+    """End to end through `StructuredLoggingMiddleware`, not the helper: a
+    middleware that logged `dict(request.query_params)` would pass the helper
+    test above and fail here. Mixed-case and substring keys go through the same
+    rule, and look-alike keys (`keyword`, `codename`) stay readable."""
+    import json
+
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+
+    from middleware.structured_logging import StructuredLoggingMiddleware
+
+    app = FastAPI()
+
+    @app.get("/oauth/callback")
+    async def _callback():
+        return JSONResponse({"ok": status == 200}, status_code=status)
+
+    app.add_middleware(StructuredLoggingMiddleware)
+    query = (
+        f"Code={CODE}&refresh_token={TOKEN}&state={STATE}&X-Goog-Signature={SIG}"
+        "&keyword=lipstick&codename=atlas&shop=a.myshopify.com"
+    )
+
+    with caplog.at_level(logging.INFO, logger="structured_logs"):
+        assert TestClient(app).get(f"/oauth/callback?{query}").status_code == status
+
+    entries = [json.loads(r.getMessage()) for r in caplog.records if r.name == "structured_logs"]
+    assert len(entries) == 1, "the middleware wrote no request log; this test proves nothing"
+    for secret in (CODE, TOKEN, STATE, SIG):
+        assert secret not in caplog.text
+    assert entries[0]["query_params"] == {
+        "Code": "[REDACTED]",
+        "refresh_token": "[REDACTED]",
+        "state": "[REDACTED]",
+        "X-Goog-Signature": "[REDACTED]",
+        "keyword": "lipstick",
+        "codename": "atlas",
+        "shop": "a.myshopify.com",
+    }
