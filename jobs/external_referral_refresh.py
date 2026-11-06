@@ -185,6 +185,10 @@ PRICE_REFRESH_KEYS = (
     "price_skipped_unreadable",
     "price_unreadable_reasons",
     "price_unreadable_top_hosts",
+    # Rows whose price was NOT re-read because their host answered HTTP 423 three times in a row
+    # (`_HOST_LOCKED_TRIP_DEFAULT`): beside the price outcomes, since they are prices left as they were.
+    "skipped_for_host_423",
+    "host_423_stamped",
 )
 
 
