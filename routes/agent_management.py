@@ -982,10 +982,8 @@ async def get_agent_merchant_authorizations(
     """
     Get list of merchants this agent is authorized to access.
 
-    A merchant's contact_email is returned only where this agent has a (non-deleted) order with
-    it, the same rule GET /agent/v1/merchants applies. With allowed_merchants NULL the list is
-    every approved merchant, so returning the address unconditionally handed any agent account
-    the contact email of up to 100 merchants it has never traded with.
+    contact_email is returned only where this agent has a non-deleted order with the merchant,
+    the same rule GET /agent/v1/merchants applies.
     """
     try:
         # Verify access
