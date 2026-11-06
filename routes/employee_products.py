@@ -6676,7 +6676,7 @@ async def _refresh_external_seed_by_id(
         # seed_data, so a read-only census can count the served and sole-price cards a flip would touch. A fixed
         # shape -- no URL, title or evidence -- and read by nothing that serves. With the flag off it is left as it
         # is, so turning the flag off writes nothing.
-        seed_data["handleless_shadow"] = {
+        seed_data[destination_liveness.HANDLELESS_SHADOW_KEY] = {
             "at": _to_iso(datetime.now(timezone.utc)),
             "would_read": bool(handleless_read.get("would_read")),
             "refusal": handleless_read.get("refusal"),

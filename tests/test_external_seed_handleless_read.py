@@ -701,9 +701,12 @@ def test_the_job_prints_its_line_only_for_a_run_that_decided_a_row() -> None:
 # --------------------------------------------------------------------------- nothing serves the marker
 
 
-def test_nothing_outside_the_refresh_writer_names_the_shadow_marker() -> None:
+def test_nothing_outside_its_definition_names_the_shadow_marker() -> None:
     """`seed_data.handleless_shadow` is written by the refresh and read by a census only: no serving builder,
-    job or script names it (the gateway is checked in its own repo)."""
+    job or script names it (the gateway is checked in its own repo). Code uses `HANDLELESS_SHADOW_KEY`; the
+    refresh writes under it and the agent card strips it (`test_the_agent_card_never_carries_the_marker`)."""
+    assert liveness.HANDLELESS_SHADOW_KEY == "handleless_shadow"
+    users = []
     hits = []
     for top in ("routes", "services", "jobs", "scripts", "db", "utils", "models", "api", "app"):
         base = REPO / top
@@ -712,6 +715,41 @@ def test_nothing_outside_the_refresh_writer_names_the_shadow_marker() -> None:
         for path in base.rglob("*"):
             if path.suffix not in (".py", ".sql", ".js", ".ts") or not path.is_file():
                 continue
-            if "handleless_shadow" in path.read_text(encoding="utf-8", errors="ignore"):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            if "handleless_shadow" in text:
                 hits.append(str(path.relative_to(REPO)))
-    assert hits == [os.path.join("routes", "employee_products.py")]
+            if "HANDLELESS_SHADOW_KEY" in text:
+                users.append(str(path.relative_to(REPO)))
+    assert hits == [os.path.join("services", "external_seed_destination_liveness.py")]
+    assert sorted(users) == sorted([
+        os.path.join("services", "external_seed_destination_liveness.py"),
+        os.path.join("routes", "employee_products.py"),
+        os.path.join("routes", "agent_api.py"),
+    ])
+
+
+async def test_the_agent_card_never_carries_the_marker(monkeypatch) -> None:
+    """A partner agent reads the card's `seed_data`: the refresh's per-row decision is internal state."""
+    import routes.agent_api as agent_api
+
+    async def _gate(row, **kwargs):
+        return (False, None)
+
+    monkeypatch.setattr(agent_api, "should_block_external_referral_runtime", _gate)
+    now = datetime.now(timezone.utc).isoformat()
+    row = _seed_row(
+        destination_url="https://shop.example/products/barrier-cream",
+        canonical_url="https://shop.example/products/barrier-cream",
+        destination_checked_at=now, destination_http_status=200, destination_verdict="live",
+        seed_data={"title": SEED_TITLE, "brand": "Brand", "snapshot": {"extracted_at": now},
+                   liveness.HANDLELESS_SHADOW_KEY: {"at": now, "would_read": False, "refusal": "identity"}},
+    )
+
+    class _Req:
+        base_url = "https://api.example/"
+
+    card = await agent_api._build_external_seed_product(req=_Req(), seed_row=row, allowed_domains=["shop.example"])
+    assert card is not None and isinstance(card.get("seed_data"), dict), card
+    assert liveness.HANDLELESS_SHADOW_KEY not in card["seed_data"]
+    assert card["seed_data"]["brand"] == "Brand", "the rest of the seed's data still rides"
+    assert row["seed_data"][liveness.HANDLELESS_SHADOW_KEY]["refusal"] == "identity", "the stored row is untouched"

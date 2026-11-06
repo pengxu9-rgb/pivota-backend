@@ -337,6 +337,9 @@ def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
 #   G6 `price_move`       outside [0.5x, 2x] of the stored price in the same currency.
 # A refusal, and every `shadow` decision, returns the observation the caller already had: nothing changes.
 HANDLELESS_READ_ENV = "EXTERNAL_SEED_HANDLELESS_READ"
+# The `seed_data` key the refresh records each decision under, in shadow and on (`{at, would_read, refusal}`).
+# INTERNAL STATE: a read-only census counts it; no serving builder reads it, and the agent card strips it.
+HANDLELESS_SHADOW_KEY = "handleless_shadow"
 HANDLELESS_READ_MODES = ("off", "shadow", "on")
 HANDLELESS_REFUSALS = (
     "cache", "status", "challenge", "redirect_unknown", "redirect", "segment", "no_product", "structure",
