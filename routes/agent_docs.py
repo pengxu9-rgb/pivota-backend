@@ -186,6 +186,9 @@ def _derive_agent_routes(request: Request) -> List[Dict[str, Any]]:
             continue
         if not _is_documented_agent_path(path):
             continue
+        # Same surface as the OpenAPI schema, which leaves out include_in_schema=False routes.
+        if not getattr(route, "include_in_schema", True):
+            continue
         description = ((getattr(route, "endpoint", None).__doc__ or "").strip().splitlines() or [""])[0]
         for method in methods:
             endpoints.append(

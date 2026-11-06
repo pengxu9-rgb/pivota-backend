@@ -980,7 +980,10 @@ async def get_agent_merchant_authorizations(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get list of merchants this agent is authorized to access
+    Get list of merchants this agent is authorized to access.
+
+    contact_email is returned only where this agent has a non-deleted order with the merchant,
+    the same rule GET /agent/v1/merchants applies.
     """
     try:
         # Verify access
@@ -1053,7 +1056,8 @@ async def get_agent_merchant_authorizations(
                     "merchant_id": m["merchant_id"],
                     "business_name": m["business_name"],
                     "status": m["status"],
-                    "contact_email": m["contact_email"],
+                    # Only where this agent has a trading relationship (see docstring).
+                    "contact_email": m["contact_email"] if int(m["total_orders"] or 0) > 0 else None,
                     "store_url": m["store_url"],
                     "region": m["region"],
                     "total_orders": m["total_orders"],

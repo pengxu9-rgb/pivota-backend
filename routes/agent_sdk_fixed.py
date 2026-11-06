@@ -644,76 +644,15 @@ async def health_check():
 # AUTHENTICATION
 # ============================================================================
 
-class AgentAuthRequest(BaseModel):
-    agent_name: str
-    agent_email: str
-    company: Optional[str] = "Independent"
-    description: Optional[str] = None
-
-@router.post("/auth")
-async def generate_api_key(request: AgentAuthRequest):
-    """Generate or retrieve agent API key"""
-    try:
-        # Check if agent exists
-        check_query = "SELECT agent_id, api_key FROM agents WHERE email = :email"
-        existing = await database.fetch_one(check_query, {"email": request.agent_email})
-        
-        if existing:
-            return {
-                "status": "success",
-                "message": "Agent already exists",
-                "agent_id": existing["agent_id"],
-                "api_key": existing["api_key"],
-                "rate_limit": {
-                    "requests_per_minute": 1000,
-                    "tier": "standard"
-                }
-            }
-        
-        # Generate new agent
-        agent_id = f"agent_{secrets.token_hex(8)}"
-        api_key = f"ak_live_{secrets.token_hex(32)}"
-        
-        # Insert with full schema
-        insert_query = """
-            INSERT INTO agents (
-                agent_id, name, email, company, use_case, api_key, 
-                status, created_at, request_count, success_rate, rate_limit
-            )
-            VALUES (
-                :agent_id, :name, :email, :company, :use_case, :api_key,
-                :status, :created_at, :request_count, :success_rate, :rate_limit
-            )
-        """
-        
-        await database.execute(insert_query, {
-            "agent_id": agent_id,
-            "name": request.agent_name,
-            "email": request.agent_email,
-            "company": request.company,
-            "use_case": request.description or "General API access",
-            "api_key": api_key,
-            "status": "active",
-            "created_at": datetime.now(),
-            "request_count": 0,
-            "success_rate": 0,
-            "rate_limit": 1000
-        })
-        
-        return {
-            "status": "success",
-            "message": "API key generated successfully",
-            "agent_id": agent_id,
-            "api_key": api_key,
-            "rate_limit": {
-                "requests_per_minute": 1000,
-                "tier": "standard"
-            }
-        }
-    
-    except Exception as e:
-        logger.error(f"Failed to generate API key: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate API key: {str(e)}")
+# RETIRED (501). Agent keys are issued by POST /agent/account/register (routes/agent_account.py)
+# and rotated through the authenticated key routes. Takes no body: 501 for any payload, never 422.
+@router.post("/auth", include_in_schema=False)
+async def generate_api_key():
+    """Retired: answers 501, reads and writes nothing."""
+    raise HTTPException(
+        status_code=501,
+        detail="Agent key issuance here is retired; register through POST /agent/account/register",
+    )
 
 # ============================================================================
 # MERCHANTS
