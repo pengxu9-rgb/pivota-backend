@@ -2438,6 +2438,11 @@ async def run_external_referral_refresh_batch(
     # ambiguous separator rather than guessing; an unread currency is no longer invented). By
     # reason, so a rising count points at the signal the extractor is missing.
     price_skipped_unreadable = 0
+    # A success that did not read the product we serve (routes/employee_products._read_the_served_product:
+    # a canonical or redirect naming another product, a 200 challenge, a cached fallback, a URL with no
+    # product handle). Its price and stock are not written; counted so a host that never reads is visible.
+    price_not_read = 0
+    availability_not_read = 0
     price_unreadable_reasons: Dict[str, int] = {}
     price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
@@ -2476,6 +2481,7 @@ async def run_external_referral_refresh_batch(
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
+        nonlocal price_not_read, availability_not_read
         nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
         nonlocal pdp_refreshed, pdp_errored, catalogue_rows_read
         outcome = "failed"
@@ -2531,6 +2537,8 @@ async def run_external_referral_refresh_batch(
                     price_unreadable_hosts[host or "unknown"] = price_unreadable_hosts.get(host or "unknown", 0) + 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
+                elif price_status == "not_read":
+                    price_not_read += 1
                 proj = result.get("projection")
                 if isinstance(proj, dict):
                     proj_attempted += int(proj.get("attempted") or 0)
@@ -2552,6 +2560,8 @@ async def run_external_referral_refresh_batch(
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
+                elif isinstance(availability, dict) and availability.get("status") == "not_read":
+                    availability_not_read += 1
             elif status == "degraded":
                 degraded += 1
                 # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
@@ -3036,6 +3046,8 @@ async def run_external_referral_refresh_batch(
         "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
         "price_skipped_non_positive": price_skipped_non_positive,
         "price_skipped_unreadable": price_skipped_unreadable,
+        "price_not_read": price_not_read,
+        "availability_not_read": availability_not_read,
         "price_unreadable_reasons": price_unreadable_reasons,
         # Which hosts' pages the extractor would not price, so night one says WHERE (a host whose
         # pages name no currency shows up here every night until it is looked at).

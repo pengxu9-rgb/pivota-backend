@@ -1,4 +1,4 @@
-"""GET /agents/{agent_id}/merchants contact-email rule on the PRODUCTION dialect.
+"""GET /agents/{agent_id}/merchants contact_email rule on the PRODUCTION dialect.
 
     DATABASE_URL=postgresql://postgres:postgres@localhost:5432/<fresh db> \\
         .venv/bin/python -m pytest tests/test_agent_merchant_authorizations_contact_email_postgres.py
@@ -30,32 +30,32 @@ if _IS_PG:
     from tests.test_agent_merchant_authorizations_contact_email import *  # noqa: F401,F403,E402
     from tests.test_agent_merchant_authorizations_contact_email import (  # noqa: E402
         AGENT,
+        M_DELETED_ORDER,
         M_FRESH,
         M_ORDERED,
+        M_OTHERS,
         M_PENDING,
         _agent_token,
         _email,
         _get,
         _ours,
+        _set_allowed,
         _rows,  # noqa: F401  (fixture by name)
     )
 
     async def test_a_restricted_agent_sees_a_contact_email_only_where_it_has_ordered(_rows):
-        import json
-
-        from db.database import database
-
-        await database.execute(
-            "UPDATE agents SET allowed_merchants = CAST(:m AS JSON) WHERE agent_id = :a",
-            {"m": json.dumps([M_ORDERED, M_FRESH, M_PENDING]), "a": AGENT},
-        )
+        allowed = [M_ORDERED, M_FRESH, M_PENDING, M_OTHERS, M_DELETED_ORDER]
+        await _set_allowed(AGENT, allowed)
         resp = await _get(AGENT, _agent_token(AGENT))
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["access_type"] == "restricted"
         ours = _ours(body)
         # Restricted lists the named merchants whatever their status.
-        assert set(ours) == {M_ORDERED, M_FRESH, M_PENDING}
+        assert set(ours) == set(allowed)
         assert ours[M_ORDERED]["contact_email"] == _email(M_ORDERED)
         assert ours[M_PENDING]["contact_email"] == _email(M_PENDING)  # AGENT ordered there too
-        assert ours[M_FRESH]["contact_email"] is None
+        # Never ordered, only another agent ordered, or only a deleted order: no address.
+        for mid in (M_FRESH, M_OTHERS, M_DELETED_ORDER):
+            assert ours[mid]["contact_email"] is None, mid
+            assert ours[mid]["total_orders"] == 0, mid

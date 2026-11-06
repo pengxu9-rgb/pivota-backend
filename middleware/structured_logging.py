@@ -10,6 +10,7 @@ from datetime import datetime
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Any, Dict, Optional
+from urllib.parse import unquote_plus
 import logging
 
 logger = logging.getLogger("structured_logs")
@@ -38,7 +39,54 @@ _SENSITIVE_QUERY_KEYS = {
     "key",
     "secret",
     "password",
+    # OAuth redirect values. An authorization `code` plus our stored PKCE
+    # verifier is a token, and `state` is what binds a callback to the browser
+    # that started it; both arrive as query parameters on every OAuth callback
+    # this app serves (Amazon, Search Console, store connections today; the
+    # Shop account link next). `ticket` is a single-use link-start credential;
+    # `hmac` signs a Shopify install redirect.
+    "code",
+    "state",
+    "code_verifier",
+    "nonce",
+    "ticket",
+    "hmac",
+    "client_secret",
+    "client_assertion",
+    "assertion",
+    "apikey",
+    "api-key",
+    "access_key",
+    "private_key",
 }
+
+
+def _is_sensitive_query_key(key: str) -> bool:
+    kl = (key or "").lower()
+    return kl in _SENSITIVE_QUERY_KEYS or "token" in kl or "sig" in kl or "secret" in kl
+
+
+def redact_sensitive_query_values(query: str) -> str:
+    """A raw query string safe to log: values of sensitive keys replaced.
+
+    Works on the RAW string, not a parsed dict, so every pair that is not
+    sensitive is kept byte for byte (order, encoding, blank values, repeats).
+    The key is percent-decoded only to decide whether it is sensitive, so
+    `%63ode=` cannot smuggle a code past the check.
+    """
+    raw = str(query or "")
+    if not raw:
+        return raw
+    changed = False
+    out = []
+    for pair in raw.split("&"):
+        key, eq, _value = pair.partition("=")
+        if eq and _is_sensitive_query_key(unquote_plus(key)):
+            out.append(f"{key}=[REDACTED]")
+            changed = True
+        else:
+            out.append(pair)
+    return "&".join(out) if changed else raw
 
 
 # Routes whose URL *PATH* carries a shared secret, as `(prefix, segments_to_keep)`.
@@ -106,7 +154,8 @@ _UVICORN_ACCESS_PATH_INDEX = 2
 
 
 class UvicornAccessPathRedactionFilter(logging.Filter):
-    """Rewrite a `uvicorn.access` record's PATH through :func:`redact_path`.
+    """Rewrite a `uvicorn.access` record's path and query through
+    :func:`redact_path` and :func:`redact_sensitive_query_values`.
 
     A filter rather than a formatter: a formatter would have to be installed on
     every handler uvicorn (or a deployment's `--log-config`) happens to attach,
@@ -127,19 +176,20 @@ class UvicornAccessPathRedactionFilter(logging.Filter):
         raw = args[_UVICORN_ACCESS_PATH_INDEX]
         if not isinstance(raw, str):
             return True
-        # `full_path` carries the query string. The path half is what
-        # `redact_path` understands, so it is split off first — and the query
-        # half is left as it is, because query-secret redaction is the app
-        # logger's concern (`_redact_query_params`) and the one route that ever
-        # took a credential there now takes it in a header
-        # (tests/test_operations_authz_and_jwt_secret_enforcement.py).
+        # `full_path` carries the query string. The path half goes through
+        # `redact_path`; the query half through `redact_sensitive_query_values`, the same
+        # key rule the app logger applies to `query_params`. The query half used
+        # to be left as it was, on the reasoning that no route took a credential
+        # there — but every OAuth callback does (`code`, `state`), and this is
+        # the one channel that writes it for the 302s and 400s too.
         path, separator, query = raw.partition("?")
-        redacted = redact_path(path)
-        if redacted == path:
+        redacted_path = redact_path(path)
+        redacted_query = redact_sensitive_query_values(query)
+        if redacted_path == path and redacted_query == query:
             return True
         record.args = (
             *args[:_UVICORN_ACCESS_PATH_INDEX],
-            redacted + separator + query,
+            redacted_path + separator + redacted_query,
             *args[_UVICORN_ACCESS_PATH_INDEX + 1 :],
         )
         return True
@@ -169,8 +219,7 @@ def _sha256_16(value: str) -> str:
 def _redact_query_params(params: Dict[str, str]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for k, v in (params or {}).items():
-        kl = (k or "").lower()
-        if kl in _SENSITIVE_QUERY_KEYS or "token" in kl or "sig" in kl:
+        if _is_sensitive_query_key(k):
             out[k] = "[REDACTED]"
         else:
             out[k] = v

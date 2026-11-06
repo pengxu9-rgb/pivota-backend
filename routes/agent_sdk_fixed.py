@@ -644,25 +644,9 @@ async def health_check():
 # AUTHENTICATION
 # ============================================================================
 
-# RETIRED (501). POST /agent/v1/auth took no credentials of any kind. Given an email it ran
-# `SELECT agent_id, api_key FROM agents WHERE email = :email` and returned that row's
-# agents.api_key to the caller; given an unknown email it minted an agent and returned a new key.
-# - The lookup branch handed whatever agents.api_key holds to anyone who knew (or guessed) an
-#   agent's email. For hash-only agents that is the `redacted:<agent_id>` marker, which is not a
-#   credential (db/agents.py); for any legacy row that still holds a plaintext key, it was that
-#   agent's live key.
-# - The mint branch wrote a legacy agents schema (name, company, use_case, status,
-#   request_count) and skipped agent_name / agent_type / api_key_hash (NOT NULL), and it stored
-#   the plaintext key in agents.api_key without writing the key table. Auth reads the sha256 in
-#   the key table and consults agents.api_key only when no key table exists or
-#   AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK is on (default off), so even a row it managed to
-#   write would hold a key that does not authenticate.
-# - Its 500 echoed the database error text to the anonymous caller.
-# Nothing calls it: no portal, gateway, SDK or doc references the path, and prod request logs
-# show no traffic to it. Agents register through POST /agent/account/register
-# (routes/agent_account.py), which mints the key hash-only, and rotate it through the
-# authenticated key routes. It takes no body, so it answers 501 for any payload rather than 422.
-@router.post("/auth")
+# RETIRED (501). Agent keys are issued by POST /agent/account/register (routes/agent_account.py)
+# and rotated through the authenticated key routes. Takes no body: 501 for any payload, never 422.
+@router.post("/auth", include_in_schema=False)
 async def generate_api_key():
     """Retired: answers 501, reads and writes nothing."""
     raise HTTPException(
