@@ -1208,6 +1208,7 @@ def _fetch_with_observed(
     status_code: int,
     final_url: str,
     headers: Optional[Dict[str, str]] = None,
+    history: Any = "absent",
 ) -> Dict[str, Any]:
     """Drive the REAL `_fetch_html` and return what it stamped into `observed`."""
     from services import external_offers_service as eos
@@ -1216,6 +1217,8 @@ def _fetch_with_observed(
         pass
 
     resp = _Resp()
+    if history != "absent":
+        resp.history = history
     resp.status_code = status_code
     resp.headers = {"content-type": "text/html", **(headers or {})}
     resp.encoding = "utf-8"
@@ -1275,6 +1278,24 @@ def test_fetch_html_reports_the_FINAL_url_after_a_redirect(
     )
     assert observed["final_url"] == "https://brand.com/collections/all"
     assert observed["status_code"] == 200
+
+
+def test_fetch_html_reports_how_many_redirects_it_followed(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """An A -> B -> A chain ends on the URL it asked for: only the hop count shows it (the handle-less read rule)."""
+    hops = _fetch_with_observed(
+        monkeypatch, status_code=200, final_url="https://brand.com/products/x", history=[object(), object()]
+    )
+    none = _fetch_with_observed(monkeypatch, status_code=200, final_url="https://brand.com/products/x", history=[])
+    assert hops["redirect_hops"] == 2
+    assert none["redirect_hops"] == 0
+
+
+def test_fetch_html_leaves_the_redirect_count_unknown_when_the_response_has_no_history(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """Unknown, never 0: `classify_handleless_read` refuses a missing count."""
+    observed = _fetch_with_observed(monkeypatch, status_code=200, final_url="https://brand.com/products/x")
+    assert "redirect_hops" not in observed
 
 
 def test_fetch_html_reports_a_404_before_it_raises(monkeypatch: "pytest.MonkeyPatch") -> None:

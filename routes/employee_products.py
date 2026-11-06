@@ -40,9 +40,11 @@ from services import seed_served_url
 from services.external_offers_service import (
     IMAGE_URLS_SCOPE_DECLARED,
     ExternalOfferUnavailable,
+    _normalize_url as _normalize_offer_url,
     resolve_external_offer,
     seed_variants_from_evidence,
 )
+from services.outbound_warm_handoff import extract_product_handle
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
@@ -66,6 +68,7 @@ from services.external_seed_audit import (
     summarize_audit_results,
 )
 from services.external_referral_readiness import (
+    EXTERNAL_REFERRAL_STALE_DAYS,
     fetch_merchant_referral_inventory,
     filter_referral_inventory_rows,
     get_merchant_referral_domains,
@@ -5935,6 +5938,86 @@ def _refresh_read_outcome(
     return catalogue_read.observation, True
 
 
+def _handleless_read_outcome(
+    row: Dict[str, Any],
+    dest: Optional[str],
+    observed: Dict[str, Any],
+    observation: Optional["destination_liveness.DestinationObservation"],
+    read: bool,
+    *,
+    evidence: Any,
+    price_amount: Any,
+    price_currency: Any,
+    mode: str,
+) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool, Optional[Dict[str, Any]]]:
+    """(observation, read, what the handle-less read rule decided) for a page fetch of the served URL.
+
+    A served URL with no product handle is never a read under `_read_the_served_product` (`classify_destination`
+    cannot say which product a `/shop/<x>.html` is). `destination_liveness.classify_handleless_read` lets the page
+    say it, behind `EXTERNAL_SEED_HANDLELESS_READ` (`mode`, passed in: the refresh reads the env, the preview
+    takes a flag). ONE function for the refresh and its preview
+    (`scripts/ops/refresh_seeds_with_unverified_variants.py --simulate`), as `_read_the_served_product` is.
+
+    Nothing to decide -- `off`, a fetch that already read the product, no observation of the served URL, or a URL
+    that names a handle -- returns the inputs and None. Otherwise the decision's observation and read (`today`'s,
+    unchanged, on any refusal and in `shadow`) and {mode, would_read, refusal[, segment][, identity_by]}.
+    The CONTENT gate (`page_read_is_the_product`) never comes here: a handle-less read refreshes price, stock and
+    variants, never the copy or the gallery.
+    """
+    if mode not in ("shadow", "on") or read or observation is None:
+        return observation, read, None
+    if not dest or extract_product_handle(str(dest)):
+        return observation, read, None
+    try:
+        requested = _normalize_offer_url(str(dest))
+    except ValueError:
+        return observation, read, None
+    seed_data = _ensure_json_obj(row.get("seed_data"))
+    decision = destination_liveness.classify_handleless_read(
+        requested_url=requested,
+        observed=observed,
+        evidence=evidence,
+        today=observation,
+        mode=mode,
+        seed_title=row.get("title"),
+        seed_brand=seed_data.get("brand"),
+        fresh_amount=price_amount,
+        fresh_currency=price_currency,
+        stored_amount=row.get("price_amount"),
+        stored_currency=row.get("price_currency"),
+    )
+    info: Dict[str, Any] = {"mode": mode, "would_read": decision.would_read, "refusal": decision.refusal}
+    if decision.segment:
+        info["segment"] = decision.segment
+    if decision.identity_by:
+        info["identity_by"] = decision.identity_by
+    return decision.observation, decision.read, info
+
+
+def _handleless_read_variants(variants: Optional[List[Dict[str, Any]]], evidence: Any) -> List[Dict[str, Any]]:
+    """The page variants a handle-less read may use: only the pricing product's own (`jsonld_identity.variant_ids`,
+    its offers and its group's `hasVariant` subtree). Anything else the page lists -- a data-attribute payload, an
+    unpriced widget -- may be another product's. None listed: none used."""
+    identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+    ids = {str(v) for v in (identity.get("variant_ids") or [])} if isinstance(identity, dict) else set()
+    return [v for v in (variants or []) if isinstance(v, dict) and str(v.get("variant_id") or "").strip() in ids]
+
+
+def _content_stale_for_serving(seed_data: Dict[str, Any]) -> bool:
+    """The row's stored `snapshot.extracted_at` is missing or older than the readiness gate's stale window."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data.get("snapshot"), dict) else {}
+    raw = snapshot.get("extracted_at")
+    try:
+        stamped = datetime.fromisoformat(str(raw).replace("Z", "+00:00")) if raw else None
+    except ValueError:
+        stamped = None
+    if stamped is None:
+        return True
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+    return stamped < datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
+
+
 async def _refresh_external_seed_by_id(
     seed_id: str,
     *,
@@ -6105,6 +6188,23 @@ async def _refresh_external_seed_by_id(
     # `classify_destination` is pure, so deciding this early costs nothing.
     served_url = destination_liveness.destination_of(row)
     observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
+    # A SERVED URL WITH NO PRODUCT HANDLE: the page may say which product it is (`_handleless_read_outcome`).
+    # Part of the same one decision, so every gate below follows it. A catalogue read never gets here (it is
+    # keyed by a handle).
+    handleless_read: Optional[Dict[str, Any]] = None
+    if catalogue_read is None:
+        observation, read_the_served_product, handleless_read = _handleless_read_outcome(
+            row,
+            dest,
+            observed,
+            observation,
+            read_the_served_product,
+            evidence=getattr(snapshot, "evidence", None) if snapshot else None,
+            price_amount=getattr(snapshot, "price_amount", None) if snapshot else None,
+            price_currency=getattr(snapshot, "price_currency", None) if snapshot else None,
+            mode=destination_liveness.handleless_read_mode(),
+        )
+    handleless_reads = bool(handleless_read) and read_the_served_product
 
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
@@ -6143,6 +6243,10 @@ async def _refresh_external_seed_by_id(
     # The page's variants as a SEED would store them; `snap_variants` keeps the per-read
     # provenance marks the reconcile below reads.
     adoptable_variants = seed_variants_from_evidence(evidence)
+    if handleless_reads:
+        # A handle-less read adopts and re-reads ONLY the pricing product's own variants.
+        snap_variants = _handleless_read_variants(snap_variants, evidence)
+        adoptable_variants = _handleless_read_variants(adoptable_variants, evidence) or None
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
@@ -6567,6 +6671,20 @@ async def _refresh_external_seed_by_id(
             # vouch for values nobody re-read tonight.
             seed_data["snapshot"].pop("extracted_at", None)
 
+    if handleless_read is not None:
+        # THE ONLY WRITE `shadow` ADDS (and `on` keeps): what the rule decided for this row, in this same UPDATE's
+        # seed_data, so a read-only census can count the served and sole-price cards a flip would touch. A fixed
+        # shape -- no URL, title or evidence -- and read by nothing that serves. With the flag off it is left as it
+        # is, so turning the flag off writes nothing.
+        seed_data["handleless_shadow"] = {
+            "at": _to_iso(datetime.now(timezone.utc)),
+            "would_read": bool(handleless_read.get("would_read")),
+            "refusal": handleless_read.get("refusal"),
+        }
+        handleless_read["would_flip_healthy"] = bool(handleless_read.get("would_read")) and _content_stale_for_serving(
+            _ensure_json_obj(row.get("seed_data"))
+        )
+
     served_canonical, served_domain = _next_served_canonical(
         row,
         dest,
@@ -6737,6 +6855,9 @@ async def _refresh_external_seed_by_id(
         "availability_refresh": availability_refresh,
         "variant_refresh": variant_refresh,
         "destination_refresh": destination_refresh,
+        # What the handle-less read rule decided (`_handleless_read_outcome`), or None: the flag is off, or the
+        # served URL names a handle. The batch counts it once per row, from here.
+        "handleless_read": handleless_read,
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,
