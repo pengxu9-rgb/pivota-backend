@@ -103,7 +103,17 @@ def test_every_table_is_registered_but_main_does_not_import_the_module_yet():
     would freeze this shape in prod; the first writer PR adds the import (module docstring)."""
     for table in TABLES:
         assert metadata.tables[table.name] is table
-    assert "import db.shop_account_links" not in (_REPO / "main.py").read_text()
+    # Import main in a FRESH interpreter and look at what got loaded. A string check on main.py
+    # misses `from db import shop_account_links`, `from db.shop_account_links import ...` and any
+    # transitive import through a module main imports, and each of those registers the tables.
+    import subprocess
+
+    probe = "import sys, main; print('db.shop_account_links' in sys.modules)"
+    proc = subprocess.run(
+        [sys.executable, "-c", probe], cwd=_REPO, env=dict(os.environ), capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines()[-1] == "False"
 
 
 def test_no_column_could_hold_a_raw_checkout_id_continue_url_or_access_token():
@@ -327,3 +337,28 @@ def test_the_aad_helpers_name_the_row_and_its_owner():
     assert a != sal.refresh_token_aad(link_id="l1", pivota_account_id="acct_1", agent_client_id="cli_2")
     assert a != sal.refresh_token_aad(link_id="l2", pivota_account_id="acct_1", agent_client_id="cli_1")
     assert sal.code_verifier_aad(attempt_id="l1", pivota_account_id="acct_1", agent_client_id="cli_1") != a
+
+
+def test_the_aad_context_is_unambiguous_when_an_id_contains_a_colon():
+    """With a ":" join, ("X:Y", "Z") and ("X", "Y:Z") sealed under the same context."""
+    a = sal.refresh_token_aad(link_id="X:Y", pivota_account_id="Z", agent_client_id="W")
+    b = sal.refresh_token_aad(link_id="X", pivota_account_id="Y:Z", agent_client_id="W")
+    assert a != b
+    c = sal.code_verifier_aad(attempt_id='a"],["b', pivota_account_id="Z", agent_client_id="W")
+    assert c != sal.code_verifier_aad(attempt_id="a", pivota_account_id="b", agent_client_id="Z")
+
+
+@pytest.mark.parametrize("bad", ["", None])
+def test_an_empty_aad_part_is_refused(bad):
+    with pytest.raises(ValueError):
+        sal.refresh_token_aad(link_id=bad, pivota_account_id="acct_1", agent_client_id="cli_1")
+
+
+def test_a_live_link_cannot_borrow_another_shop_accounts_claim(conn):
+    """The FK alone is satisfied here: (hash("other"), acct_1) IS a claim. Only
+    ck_shop_account_links_live_is_claimed (claimed_sub_hash = shop_sub_hash) stops a link for SUB
+    riding on another Shop account's claim, which would bypass one-account-per-Shop-account for SUB."""
+    other = sal.sha256_hex("other")
+    conn.execute(insert(sal.shop_account_claims).values(shop_sub_hash=other, pivota_account_id="acct_1"))
+
+    _rejected(conn, sal.shop_account_links, _link(claimed_sub_hash=other))

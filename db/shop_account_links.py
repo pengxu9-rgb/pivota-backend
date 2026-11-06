@@ -31,11 +31,18 @@ freeze this shape in prod before its first writer exists, and every change after
 hand-applied ALTER. The first writer PR adds `import db.shop_account_links` to main.py. Until then
 these tables exist only where migrations run (CI, the dialect gate, local), from
 db/migrations/277_shop_account_links.sql.
+
+NEVER EDIT 277 TO CHANGE THIS SHAPE. Wherever 277 has run (CI databases, local, and any
+environment that runs full init), the migration runner records its checksum and will NOT re-run an
+edited file (db/sql_migrations.py: it logs "checksum changed" and skips). A column, constraint or
+index change before or after the first writer is a NEW migration (278+) plus the matching change
+here, and the parity test in tests/test_shop_account_links_storage_postgres.py keeps the two equal.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 
 from sqlalchemy import (
     CheckConstraint,
@@ -71,11 +78,20 @@ def refresh_token_aad(*, link_id: str, pivota_account_id: str, agent_client_id: 
     """The `utils.token_cipher` context a link's refresh token is sealed under. It names the row AND
     its owner, so a ciphertext moved to another row, or a row re-pointed at another account or
     client in the database, no longer decrypts."""
-    return f"shop_account_links.refresh_token:{link_id}:{pivota_account_id}:{agent_client_id}"
+    return _aad("shop_account_links.refresh_token", link_id, pivota_account_id, agent_client_id)
 
 
 def code_verifier_aad(*, attempt_id: str, pivota_account_id: str, agent_client_id: str) -> str:
-    return f"shop_link_attempts.code_verifier:{attempt_id}:{pivota_account_id}:{agent_client_id}"
+    return _aad("shop_link_attempts.code_verifier", attempt_id, pivota_account_id, agent_client_id)
+
+
+def _aad(column: str, *parts: str) -> str:
+    # JSON, not a ":" join: with a join, ("X:Y", "Z") and ("X", "Y:Z") give the same context, so the
+    # binding would rest on no id ever containing ":". JSON quotes and escapes each part.
+    for part in parts:
+        if not isinstance(part, str) or not part:
+            raise ValueError("every AAD part must be a non-empty string")
+    return column + ":" + json.dumps(list(parts), separators=(",", ":"))
 
 
 def _hash_len(column: str, table: str) -> CheckConstraint:

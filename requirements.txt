@@ -10,7 +10,7 @@ pydantic
 pydantic-settings
 alembic      # optional for migrations later
 aiosqlite    # required for sqlite async driver
-PyJWT        # for JWT token handling
+PyJWT>=2.10,<3  # JWT handling; services/buyer_access_token.py relies on 2.x aud/require/leeway semantics
 jinja2       # for HTML templates
 websockets   # for WebSocket support
 aiohttp      # for async HTTP requests in admin routes

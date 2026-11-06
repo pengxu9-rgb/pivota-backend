@@ -100,6 +100,8 @@ def filter_sensitive_data(event, hint):
             "x-shopify-access-token",
             # services/synthetic_call.py: a key-bound credential, replayable within its window.
             "x-pivota-synthetic-assertion",
+            # services/buyer_access_token.py: the buyer's own pb-oauth-as access token.
+            "x-pivota-buyer-token",
         }
 
         if isinstance(headers, dict):
