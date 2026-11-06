@@ -369,7 +369,10 @@ async def test_no_fresh_route_means_not_listed(_rows):
         assert not [k for k in ours if k[0] == domain], domain
 
 
-@pytest.mark.parametrize("domain", [D_DISABLED, D_DEV, D_DEMO, D_WHOLESALE, D_ENVX])
+# Fixed ids: the domains carry a per-process random suffix, and the sharded sweep requires every
+# shard to collect the same test ids.
+@pytest.mark.parametrize("domain", [D_DISABLED, D_DEV, D_DEMO, D_WHOLESALE, D_ENVX],
+                         ids=["disabled", "dev_store", "demo_prefix", "wholesale", "env_excluded"])
 async def test_structural_and_operator_exclusions_never_list(_rows, _rail_on, domain):
     _, ours = await _all_ours(_app())
     assert not [k for k in ours if k[0] == domain]
