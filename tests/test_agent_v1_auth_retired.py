@@ -1,9 +1,6 @@
-"""POST /agent/v1/auth is retired (501) and touches nothing.
+"""POST /agent/v1/auth is retired: 501 for any payload, a fixed body, and no database access.
 
-It took no credentials. For a known email it returned that agent's agents.api_key column (a
-live key on any legacy row still holding plaintext); for an unknown one it minted an agent
-whose key could not authenticate. It now answers 501 for any payload and must never reach the
-database. Drives the real router on a minimal app (never `main`, never TestClient).
+Drives the real router on a minimal app (never `main`, never TestClient).
 """
 
 from __future__ import annotations
@@ -71,7 +68,11 @@ async def _post(**kwargs):
 async def test_auth_answers_501_and_never_reads_or_writes(no_db, kwargs):
     resp = await _post(**kwargs)
     assert resp.status_code == 501, resp.text
-    body = resp.json()
-    assert "/agent/account/register" in body["detail"]
-    assert "api_key" not in body
+    assert resp.json() == {
+        "detail": "Agent key issuance here is retired; register through POST /agent/account/register"
+    }
     assert no_db.calls == []
+
+
+def test_the_retired_route_is_not_in_the_openapi_schema():
+    assert "/agent/v1/auth" not in _app().openapi()["paths"]
