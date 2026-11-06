@@ -662,9 +662,51 @@ async def test_a_build_that_never_finishes_is_a_bounded_503(_rows, monkeypatch):
     try:
         resp = await asyncio.wait_for(_get(_app()), 5)
         assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "15"
         assert "secret" not in resp.text
     finally:
         directory.reset_cache()  # cancels the stuck build
+
+
+async def test_the_503_keeps_retry_after_through_the_error_middleware(_rows, monkeypatch):
+    from middleware.error_handler import ErrorHandlerMiddleware
+    from services import agent_merchant_directory as directory
+
+    gate = asyncio.Event()  # never set
+
+    async def _stuck():
+        await gate.wait()
+
+    monkeypatch.setattr(directory, "BUILD_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(directory, "_build", _stuck)
+    app = _app()
+    app.add_middleware(ErrorHandlerMiddleware)
+    try:
+        resp = await asyncio.wait_for(_get(app), 5)
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "15"
+    finally:
+        directory.reset_cache()
+
+
+async def test_a_stuck_build_never_serves_a_clean_build_past_the_stale_window(_rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+
+    await directory.merchant_facts(now=1000.0)
+    gate = asyncio.Event()  # never set
+
+    async def _stuck():
+        await gate.wait()
+
+    monkeypatch.setattr(directory, "BUILD_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(directory, "_build", _stuck)
+    try:
+        with pytest.raises(directory.DirectoryUnavailable):
+            await asyncio.wait_for(
+                directory.merchant_facts(now=1000.0 + directory.STALE_SERVE_SECONDS + 1), 5
+            )
+    finally:
+        directory.reset_cache()
 
 
 async def test_a_build_that_never_finishes_serves_the_last_clean_one(_rows, monkeypatch):

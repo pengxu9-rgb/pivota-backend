@@ -864,7 +864,11 @@ async def _list_protocol_merchants(*, context: AgentContext, market: Optional[st
             agent_id=str(context.agent_id), allowed_merchants=context.allowed_merchants, market=market_key
         )
     except directory.DirectoryUnavailable:
-        raise HTTPException(status_code=503, detail="Merchant directory is being rebuilt; retry shortly")
+        raise HTTPException(
+            status_code=503,
+            detail="Merchant directory is being rebuilt; retry shortly",
+            headers={"Retry-After": "15"},
+        )
     except Exception:
         logger.error("Failed to list protocol merchants", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list merchants")

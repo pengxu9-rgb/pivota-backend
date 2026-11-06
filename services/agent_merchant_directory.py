@@ -98,10 +98,12 @@ EXCLUDED_DOMAINS_ENV = "AGENT_MERCHANT_DIRECTORY_EXCLUDED_DOMAINS"
 CACHE_TTL_SECONDS = 300.0
 #: How long any caller waits for a build. A build normally takes a second or two; one that is
 #: stuck (a gate that never releases) must not hold every request open. On timeout the caller gets
-#: the last clean build if there is one, else `DirectoryUnavailable` (the route's 503).
+#: the last clean build while it is younger than STALE_SERVE_SECONDS, else `DirectoryUnavailable`
+#: (the route's 503). A stuck build is not retried while it runs, so without that age bound one
+#: stuck build would serve an ever older directory until the process restarts.
 BUILD_WAIT_SECONDS = 15.0
-#: After a FAILED build, the last clean build is served while it is younger than this. It had every
-#: exclusion applied when it was built, so serving it is safer than serving nothing.
+#: After a FAILED or TIMED-OUT build, the last clean build is served while it is younger than this.
+#: It had every exclusion applied when it was built, so serving it is safer than serving nothing.
 STALE_SERVE_SECONDS = 1800.0
 
 
@@ -382,8 +384,8 @@ async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts,
     A clean build is cached for CACHE_TTL_SECONDS; a degraded one is returned and not cached.
     Concurrent callers on one event loop share one build, which runs in its own task: a caller
     that is cancelled (a client disconnect) never cancels it, and every caller's wait is bounded
-    by BUILD_WAIT_SECONDS. A failed build falls back to the last clean one while it is younger than
-    STALE_SERVE_SECONDS."""
+    by BUILD_WAIT_SECONDS. A failed or timed-out build falls back to the last clean one while it is
+    younger than STALE_SERVE_SECONDS."""
     global _inflight
     clock = time.monotonic() if now is None else now
     if _cache is not None and clock - _cache[0] < CACHE_TTL_SECONDS:
@@ -398,7 +400,7 @@ async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts,
     try:
         return await asyncio.wait_for(asyncio.shield(task), BUILD_WAIT_SECONDS)
     except asyncio.TimeoutError:
-        if _cache is not None:
+        if _cache is not None and clock - _cache[0] < STALE_SERVE_SECONDS:
             logger.warning("agent_merchant_directory: build still running; serving the last clean build")
             return _cache[1]
         raise DirectoryUnavailable("the merchant directory is still being built") from None
