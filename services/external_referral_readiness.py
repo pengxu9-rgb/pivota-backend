@@ -167,8 +167,8 @@ def _host_challenge_trip() -> int:
 # it never counts as "no answer". Measured 2026-11-02..05: one host answered 423 to all 621 rows the
 # refresh asked of it over 39 runs (0 origin reads, ~8 s a row, ~1,200 s a day), every row of it.
 # The likeliest meaning is a firewall lock on our egress address, so this stops asking that ONE host
-# for the run and retires nothing; a 423 on many unrelated hosts at once is the IP's business
-# (`crawl_ip_throttle`), not this breaker's.
+# for the run and retires nothing. A 423 on many unrelated hosts at once would point at the address
+# itself; `crawl_ip_throttle` has NO 423 rule today, so that case would need one there, not here.
 #
 # ITS SKIPPED ROWS ARE STAMPED, UNLIKE THE OTHER HOST SKIPS. A 429 or a challenge is a throttle that
 # passes, so those skips keep their place and lead the next run. A host that locks every request does
@@ -2656,11 +2656,19 @@ async def run_external_referral_refresh_batch(
                 "external referral refresh: %s gave no answer %d rows in a row (%s); skipping "
                 "its remaining rows this run", host, unreachable_streak[host], outcome_bucket,
             )
-        # 423 ("Locked"), row after row: stop asking for the rest of the run. Any other answer, a read
-        # included, breaks the streak; an exception or an unprocessable seed says nothing about it.
+        # 423 ("Locked"), row after row: stop asking for the rest of the run. Only a REAL ANSWER breaks
+        # the streak: a read that reached the origin, or another HTTP status (a challenge included).
+        # A timeout, a connection/DNS/TLS failure, a pacer or robots refusal, a cached snapshot, an
+        # exception or an unprocessable seed says nothing about the lock and leaves the streak alone;
+        # otherwise a host alternating 423 and timeouts would trip neither this breaker nor the
+        # no-answer one (each resets the other's streak).
         if outcome == "degraded" and outcome_bucket == "http_423":
             locked_streak[host] = locked_streak.get(host, 0) + 1
-        elif outcome in ("success", "degraded"):
+        elif (
+            outcome == "success" and not (isinstance(result, dict) and result.get("snapshot_from_cache"))
+        ) or (
+            outcome == "degraded" and (outcome_bucket.startswith("http_") or outcome_bucket == "bot_challenge")
+        ):
             locked_streak[host] = 0
         if (
             host not in locked_hosts

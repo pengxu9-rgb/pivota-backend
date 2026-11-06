@@ -6,7 +6,10 @@ answer, so it is never "no answer".
 
 Pinned here, against the REAL batch with an injected refresher:
   * three 423s in a row trip the host for the rest of the run; its remaining rows are skipped;
-  * any other answer (a read, a 404) breaks the streak, so mixed answers below the trip never trip;
+  * only a REAL answer breaks the streak: a read that reached the origin, or another HTTP status
+    (a 404, a 403 challenge). A timeout, a pacer/robots refusal, a cached snapshot, an exception or
+    an unprocessable seed leaves it alone, so 423s around them still add up;
+  * the streak is per host, and a host another breaker already holds is left to that breaker;
   * the trip is per run: the next run asks the host again and needs three new 423s;
   * other hosts are untouched, serial or concurrent;
   * the skipped rows ARE stamped (`last_crawl_attempt_at` only), unlike every other host skip, and
@@ -21,6 +24,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 import pytest
+from fastapi import HTTPException
 
 import jobs.external_referral_refresh as job
 import services.crawl_politeness as cp
@@ -33,6 +37,18 @@ def _ok() -> Dict[str, Any]:
 
 def _http(host: str, code: int) -> Dict[str, Any]:
     return {"status": "degraded", "error": f"destination_unavailable: http {code}", "domain": host}
+
+
+def _timeout(host: str) -> Dict[str, Any]:
+    return {"status": "degraded", "error": "snapshot_failed: ReadTimeout: timed out", "domain": host}
+
+
+def _paced(host: str) -> Dict[str, Any]:
+    return {"status": "degraded", "error": "snapshot_failed: CrawlDelayTooLong: crawl delay too long", "domain": host}
+
+
+def _cached() -> Dict[str, Any]:
+    return {**_ok(), "snapshot_from_cache": True}
 
 
 def _no_answer(host: str) -> Dict[str, Any]:
@@ -129,6 +145,7 @@ def test_three_423s_in_a_row_skip_the_rest_of_the_hosts_rows_and_stamp_them(monk
         [423, 423, 200, 423, 423, 200, 423, 423],  # a read breaks the streak
         [423, 423, 404, 423, 423, 404, 423, 423],  # so does any other answer
         [423, 200, 423, 200, 423, 200, 423, 200],
+        [423, 403, 423, 423],  # a 403 is an answer too
     ],
 )
 def test_mixed_answers_below_the_trip_never_trip(monkeypatch, pattern) -> None:
@@ -230,3 +247,95 @@ def test_the_counters_reach_the_summary_line_and_price_refresh(monkeypatch) -> N
     assert (line["skipped_for_host_423"], line["host_423_stamped"]) == (2, 2)
     # Skipped rows leave the yield's denominator, like every other host skip.
     assert summary["attempted_count"] == 3
+
+
+# ---- controller review of be#2716 (2026-11-06): the reviewer's probes, ported ----------------------------
+
+
+def test_two_hosts_each_below_the_trip_never_trip(monkeypatch) -> None:
+    # Interleaved, each host answers 423 twice then reads: neither has three in a row (a streak counted
+    # across hosts would trip on the third 423 of the run).
+    hosts = [LOCKED, OTHER, LOCKED, OTHER, LOCKED, OTHER]
+    summary, started, ids, stamped, _q = _drive(
+        monkeypatch, hosts,
+        answers={LOCKED: [_http(LOCKED, 423)] * 2 + [_ok()], OTHER: [_http(OTHER, 423)] * 2 + [_ok()]},
+    )
+    assert started == ids and summary["host_423_skips"] == {} and stamped == []
+
+
+class _NotedOnce(dict):
+    """A refresh result that, when the batch first reads it, records the answer in the pacing layer as
+    the fetch would have (`crawl_politeness.note_response`)."""
+
+    def __init__(self, base: Dict[str, Any], status: int, headers: Dict[str, str]) -> None:
+        super().__init__(base)
+        self._note = (status, headers)
+        self._seen = False
+
+    def get(self, key, default=None):
+        if not self._seen:
+            self._seen = True
+            cp.note_response(f"https://{LOCKED}/products/x", self._note[0], headers=self._note[1])
+        return super().get(key, default)
+
+
+def test_a_423_challenge_is_left_to_the_challenge_breaker_and_not_stamped(monkeypatch) -> None:
+    seq = [_NotedOnce(_http(LOCKED, 423), 423, {"cf-mitigated": "challenge"}) for _ in range(8)]
+    summary, started, ids, stamped, _q = _drive(monkeypatch, [LOCKED] * 8, answers={LOCKED: seq})
+    assert started == ids[:3]
+    assert summary["skipped_for_host_challenge"] == 5
+    assert summary["skipped_for_host_423"] == 0 and stamped == []
+
+
+def test_a_host_the_429_breaker_holds_is_left_to_it_and_not_stamped(monkeypatch) -> None:
+    # The pacing layer saw a 429 streak (e.g. robots.txt) on the same rows that answered 423: both trip on
+    # the third row, and the 429 breaker, checked first, keeps the host. Its skips stay unstamped.
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_HOST_BLOCK_TRIP", "3")
+    seq = [_NotedOnce(_http(LOCKED, 423), 429, {}) for _ in range(8)]
+    summary, started, ids, stamped, _q = _drive(monkeypatch, [LOCKED] * 8, answers={LOCKED: seq})
+    assert started == ids[:3]
+    assert summary["skipped_for_host_backoff"] == 5
+    assert summary["skipped_for_host_423"] == 0 and stamped == []
+
+
+@pytest.mark.parametrize(
+    "between,unreachable_skips",
+    [
+        (_timeout, 0),  # a timeout says nothing about the lock (and a 423 resets the no-answer streak)
+        (_paced, 0),  # nor does a pacer or robots refusal
+        (lambda host: _cached(), 0),  # nor a cached snapshot served as a success
+    ],
+)
+def test_a_non_answer_between_423s_leaves_the_streak_alone(monkeypatch, between, unreachable_skips) -> None:
+    seq = [_http(LOCKED, 423), between(LOCKED)] * 6
+    summary, started, ids, stamped, _q = _drive(monkeypatch, [LOCKED] * 12, answers={LOCKED: seq})
+    assert started == ids[:5], "423, x, 423, x, 423: three 423s in a row as far as the lock is concerned"
+    assert (summary["skipped_for_host_423"], stamped) == (7, ids[5:])
+    assert summary["skipped_for_unreachable_host"] == unreachable_skips
+
+
+def test_an_unprocessable_seed_leaves_the_streak_alone(monkeypatch) -> None:
+    seq: List[Any] = [
+        _http(LOCKED, 423), _http(LOCKED, 423), HTTPException(status_code=404, detail="SEED_NOT_FOUND"),
+        _http(LOCKED, 423),
+    ]
+    summary, started, ids, stamped, _q = _drive(monkeypatch, [LOCKED] * 6, answers={LOCKED: seq})
+    assert summary["unprocessable"] == 1
+    assert started == ids[:4] and (summary["skipped_for_host_423"], stamped) == (2, ids[4:])
+
+
+def test_the_streak_does_not_carry_into_the_next_run(monkeypatch) -> None:
+    # Two 423s end one run; the next run's single 423 must not make three.
+    _drive(monkeypatch, [LOCKED] * 2, answers={LOCKED: [_http(LOCKED, 423)] * 2})
+    summary, started, ids, stamped, _q = _drive(
+        monkeypatch, [LOCKED] * 4, answers={LOCKED: [_http(LOCKED, 423)] + [_ok()] * 3},
+    )
+    assert started == ids and summary["skipped_for_host_423"] == 0 and stamped == []
+
+
+def test_a_challenge_answer_between_423s_breaks_the_streak(monkeypatch) -> None:
+    challenged = {"status": "degraded", "error": "destination_unavailable: cloudflare challenge page", "domain": LOCKED}
+    assert err._degraded_reason_bucket(challenged["error"]) == "bot_challenge"
+    seq = [_http(LOCKED, 423), _http(LOCKED, 423), challenged] * 3
+    summary, started, ids, stamped, _q = _drive(monkeypatch, [LOCKED] * 9, answers={LOCKED: seq})
+    assert started == ids and summary["skipped_for_host_423"] == 0 and stamped == []
