@@ -276,6 +276,17 @@ async def test_a_slow_failure_backs_off_from_when_it_failed(monkeypatch):
     assert db.calls == 2
 
 
+async def _prime_expired_cache(demo_id: str) -> None:
+    """A last-good demo set that is already past its TTL on the clock the policy reads.
+
+    Relative to `pol.time.monotonic()`, NOT an absolute 0.0: on Linux monotonic counts
+    from boot, so on a freshly booted CI runner t=0 can still be inside the 300 s TTL.
+    The cache then looked fresh, the leader never queried, and `started.wait()` hung
+    the sweep shard for its whole 30 min budget."""
+    stale = pol.time.monotonic() - pol._CACHE_TTL_SECONDS - 1
+    await pol.get_excluded_merchant_ids(_FakeDB(rows=[{"merchant_id": demo_id}]), env={}, now=stale)
+
+
 class _GatedDB(_FakeDB):
     """fetch_all waits for `release`, so callers can pile up behind one attempt."""
 
@@ -295,7 +306,7 @@ class _GatedDB(_FakeDB):
 
 async def _pile_up(db, n=50):
     leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
-    await db.started.wait()
+    await asyncio.wait_for(db.started.wait(), 5.0)
     followers = [asyncio.create_task(pol.get_excluded_merchant_ids(db, env={})) for _ in range(n - 1)]
     await asyncio.sleep(0)
     db.release.set()
@@ -321,7 +332,7 @@ async def test_concurrent_callers_share_one_successful_attempt():
 async def test_a_cancelled_follower_does_not_cancel_the_shared_attempt():
     db = _GatedDB(rows=[{"merchant_id": "m_demo"}])
     leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
-    await db.started.wait()
+    await asyncio.wait_for(db.started.wait(), 5.0)
     follower = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
     await asyncio.sleep(0)
     follower.cancel()
@@ -337,7 +348,7 @@ async def test_cancelling_one_follower_leaves_the_other_followers_served():
     # other follower a CancelledError, which `except Exception` callers do not catch.
     db = _GatedDB(rows=[{"merchant_id": "m_demo"}])
     leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
-    await db.started.wait()
+    await asyncio.wait_for(db.started.wait(), 5.0)
     followers = [asyncio.create_task(pol.get_excluded_merchant_ids(db, env={})) for _ in range(3)]
     await asyncio.sleep(0)
     followers[0].cancel()
@@ -350,8 +361,8 @@ async def test_cancelling_one_follower_leaves_the_other_followers_served():
 async def test_followers_of_a_failed_attempt_get_the_last_good_set_and_do_not_warn(caplog):
     import logging
 
-    await pol.get_excluded_merchant_ids(_FakeDB(rows=[{"merchant_id": "m_old"}]), env={}, now=0.0)
-    db = _GatedDB(raise_exc=True)                 # real clock: the cache from t=0 is long expired
+    await _prime_expired_cache("m_old")
+    db = _GatedDB(raise_exc=True)
     with caplog.at_level(logging.WARNING, logger=pol.__name__):
         results = await _pile_up(db, n=10)
     assert db.calls == 1
@@ -363,10 +374,10 @@ async def test_followers_of_a_failed_attempt_get_the_last_good_set_and_do_not_wa
 async def test_a_follower_stops_waiting_after_the_bound(monkeypatch):
     # The leader's connection never answers. Followers must not wait with it.
     monkeypatch.setattr(pol, "_FOLLOWER_WAIT_SECONDS", 0.2)
-    await pol.get_excluded_merchant_ids(_FakeDB(rows=[{"merchant_id": "m_old"}]), env={}, now=0.0)
+    await _prime_expired_cache("m_old")
     db = _GatedDB(rows=[{"merchant_id": "m_new"}])
     leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
-    await db.started.wait()
+    await asyncio.wait_for(db.started.wait(), 5.0)
     ids = await asyncio.wait_for(pol.get_excluded_merchant_ids(db, env={}), 2.0)
     assert "merch_efbc46b4619cfbdf" in ids and "m_old" in ids   # static + last good
     assert db.calls == 1                          # no second attempt on timeout
