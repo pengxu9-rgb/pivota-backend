@@ -5047,6 +5047,17 @@ def _read_the_served_product(
     return observation, read
 
 
+def _snapshot_price_facts(
+    amount: Any, currency: Any, availability: Any, *, read: bool
+) -> Dict[str, Any]:
+    """The price and stock a refresh writes into `seed_data.snapshot`: the fetched ones on a read of
+    the served product, nothing otherwise, so the stored copies stand. They are the same claim as the
+    `price_amount` / `price_currency` / `availability` columns and follow the same rule."""
+    if not read:
+        return {}
+    return {"price_amount": amount, "price_currency": currency, "availability": availability}
+
+
 _canonical_for_destination = seed_served_url.canonical_for_destination
 
 
@@ -6071,6 +6082,27 @@ async def _refresh_external_seed_by_id(
             **({"catalogue_fallback": catalogue_fallback} if catalogue_fallback else {}),
         }
 
+    # ONE DECISION, made before anything is written: did this fetch read the product we serve?
+    # The price, currency and availability columns, their copies in `seed_data.snapshot`, the
+    # freshness stamps, the variant reconcile, the projection and the liveness observation below
+    # all derive from it. The price block used to run BEFORE this was known and wrote the fetched
+    # page's price whatever it was -- a canonical naming another product, a 200 redirect onto
+    # another handle, a 200 bot challenge, a cached fallback, a URL with no product handle -- and
+    # the serving lanes read `price_amount` first. Deriving "did we read it" twice is the
+    # twin-implementation drift this file keeps paying for.
+    #
+    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
+    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
+    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
+    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
+    # The success path then runs normally. `observed["status_code"]` is the only proof that
+    # anything actually left the process -- and `_same_destination` is the only proof it went
+    # to the URL we serve rather than a legacy `destination_url` we do not.
+    # (See `_read_the_served_product` for why a status code alone is not a reading.)
+    # `classify_destination` is pure, so deciding this early costs nothing.
+    served_url = destination_liveness.destination_of(row)
+    observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
+
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
     snap_title = getattr(snapshot, "title", None) if snapshot else None
@@ -6141,9 +6173,8 @@ async def _refresh_external_seed_by_id(
         # which reader priced the row last (a page read removes it).
         seed_data["snapshot"].update(
             {
-                "price_amount": snap_price_amount,
-                "price_currency": snap_price_currency,
-                "availability": snap_availability,
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
                 "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
                 or _to_iso(datetime.now(timezone.utc)),
                 "read_source": evidence.get("read_source") if isinstance(evidence, dict) else None,
@@ -6158,9 +6189,8 @@ async def _refresh_external_seed_by_id(
                 "title": snap_title,
                 "description": snap_description,
                 "image_url": snap_image_url,
-                "price_amount": snap_price_amount,
-                "price_currency": snap_price_currency,
-                "availability": snap_availability,
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
                 # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
                 # (..., last_checked_at, evidence, override_*) -- so this getattr has always
                 # returned None and this key has always been written as null. Nothing read it,
@@ -6324,7 +6354,14 @@ async def _refresh_external_seed_by_id(
         if isinstance(price_read, dict) and price_read.get("status") not in (None, "", "parsed", "empty")
         else None
     )
-    if fresh_amount is None and unreadable_reason:
+    if not read_the_served_product:
+        # NOT A READ OF THE PRODUCT WE SERVE, so the page's price is not this seed's: it may be
+        # another product's (a canonical or a redirect naming another handle), a challenge page's,
+        # a cached copy's, or a page we cannot tell is the product (no handle in the URL). The
+        # stored pair stands. Counted apart from every other status, which describe a READ.
+        next_amount, next_currency = prev_amount, prev_currency
+        price_status = "not_read"
+    elif fresh_amount is None and unreadable_reason:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_unreadable"
     elif fresh_amount is None:
@@ -6391,7 +6428,11 @@ async def _refresh_external_seed_by_id(
         else None
     )
     next_availability = fresh_availability or prev_availability
-    if fresh_availability is None:
+    if not read_the_served_product:
+        # Same rule as the price: a page that is not the served product says nothing about its stock.
+        next_availability = prev_availability
+        availability_status = "not_read"
+    elif fresh_availability is None:
         availability_status = "unavailable"
     elif prev_availability is None:
         availability_status = "filled"
@@ -6416,24 +6457,6 @@ async def _refresh_external_seed_by_id(
         "amount": next_amount,
         "currency": next_currency,
     }
-
-    # HOISTED so the stamp and the liveness observation below are gated on ONE decision.
-    # Deriving "did we reach the origin" twice is the twin-implementation drift this file
-    # keeps paying for, and here the two copies would disagree about whether a row is fresh.
-    #
-    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
-    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
-    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
-    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
-    # The success path then runs normally. `observed["status_code"]` is the only proof that
-    # anything actually left the process -- and `_same_destination` is the only proof it went
-    # to the URL we serve rather than a legacy `destination_url` we do not.
-    # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
-    # liveness verdict below all derive from THIS (see `_read_the_served_product` for why a
-    # status code alone is not a reading). `classify_destination` is pure, so hoisting it costs
-    # nothing and removes the twin-implementation drift this file keeps paying for.
-    served_url = destination_liveness.destination_of(row)
-    observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
 
     # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
     #
