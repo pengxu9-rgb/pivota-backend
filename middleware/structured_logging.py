@@ -18,7 +18,8 @@ logger = logging.getLogger("structured_logs")
 #: Request headers never logged as sent. The synthetic-call assertion is a signed, key-bound credential
 #: (services/synthetic_call.py): a logged copy is replayable within its window by anyone holding the key.
 REDACTED_HEADER_NAMES = frozenset(
-    {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie", "x-pivota-synthetic-assertion"}
+    {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie", "x-pivota-synthetic-assertion",
+     "x-pivota-buyer-token"}
 )
 
 
