@@ -13,6 +13,7 @@ are faked (as #2629's own tests do). The token half alone is tests/test_offer_li
 from __future__ import annotations
 
 import copy
+import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -205,14 +206,16 @@ def test_a_live_out_of_stock_read_gets_no_cart(monkeypatch, client, _assertion_l
     assert _logged(_assertion_log)["accepted"] == 1
 
 
-def test_an_unlocked_offers_cart_is_preflighted_at_the_live_price(monkeypatch, client):
+def test_an_unlocked_offers_cart_is_preflighted_at_the_live_price(monkeypatch, client, caplog):
     from services import checkout_preflight as cp
+
+    caplog.set_level(logging.WARNING)
 
     asked = []
 
     async def counting_preflight(offer):
         asked.append(offer)
-        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+        return cp.PreflightVerdict(outcome=cp.OK, reason="ok", would_block=False, mode=cp.mode())
 
     monkeypatch.setattr(cp, "preflight_and_record", counting_preflight)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
@@ -222,6 +225,7 @@ def test_an_unlocked_offers_cart_is_preflighted_at_the_live_price(monkeypatch, c
     assert len(asked) == 1
     assert asked[0]["merchant_effective_price"] == LIVE_PRICE
     assert asked[0]["execution_spec"]["variant_id"] == _ATTACHED_B_VID
+    _assert_no_preflight_raised(caplog)
 
 
 def test_the_purchasability_gate_still_declines_a_browse_only_store(monkeypatch, client):
@@ -507,20 +511,23 @@ def test_an_accepted_read_with_no_cart_identity_gets_a_cart_on_vid(monkeypatch, 
     assert _logged(_assertion_log) == {"received": 1, "accepted": 1, "rejected": {}}
 
 
-def test_the_vid_cart_is_preflighted(monkeypatch, client):
+def test_the_vid_cart_is_preflighted(monkeypatch, client, caplog):
     from services import checkout_preflight as cp
+
+    caplog.set_level(logging.WARNING)
 
     asked = []
 
     async def counting_preflight(offer):
         asked.append(offer)
-        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+        return cp.PreflightVerdict(outcome=cp.OK, reason="ok", would_block=False, mode=cp.mode())
 
     monkeypatch.setattr(cp, "preflight_and_record", counting_preflight)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
     [offer], _ = _resolve(monkeypatch, client, _no_cart_identity_row(), tokens=[_token(vid=V1)])
     assert [a["execution_spec"]["variant_id"] for a in asked] == [V1]
     assert asked[0]["merchant_effective_price"] == LIVE_PRICE
+    _assert_no_preflight_raised(caplog)
 
 
 def test_a_vid_cart_the_preflight_refuses_is_withdrawn(monkeypatch, client):
@@ -977,6 +984,13 @@ def test_the_pin_must_be_the_reads_market():
 # ------------------------------------------------------------------------------------ dry-run preflight
 
 
+def _assert_no_preflight_raised(caplog) -> None:
+    """The route catches anything a preflight raises and carries on (fail-open in shadow), so a
+    stub that cannot build its verdict would go unnoticed. Its warning is the only trace."""
+    raised = [r.getMessage() for r in caplog.records if "preflight raised" in r.getMessage()]
+    assert raised == [], raised
+
+
 def _counting_preflight(monkeypatch, mode):
     from services import checkout_preflight as cp
 
@@ -984,31 +998,41 @@ def _counting_preflight(monkeypatch, mode):
 
     async def counting(offer):
         asked.append(offer)
-        return cp.PreflightVerdict(outcome=cp.ALLOW, reason="ok", would_block=False, mode=cp.mode())
+        return cp.PreflightVerdict(outcome=cp.OK, reason="ok", would_block=False, mode=cp.mode())
 
     monkeypatch.setattr(cp, "preflight_and_record", counting)
     monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", mode)
     return asked
 
 
-def test_a_shadow_preflight_is_skipped_on_a_dry_run(monkeypatch, client):
+def test_a_shadow_preflight_is_skipped_on_a_dry_run(monkeypatch, client, caplog):
+    caplog.set_level(logging.WARNING)
     asked = _counting_preflight(monkeypatch, "shadow")
-    real, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)])
+    # One token for both passes: `checked_at` and `expected_total_expires_at` are read off its
+    # `iat`, so two tokens minted either side of a second boundary would differ there.
+    toks = [_token(vid=V1)]
+    real, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=toks)
     n_real = len(asked)
     assert n_real == 2, "both carts (fresh and unlocked) are preflighted on a real pass"
-    dry, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)], dry_run=True)
+    dry, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=toks, dry_run=True)
     assert len(asked) == n_real, "no merchant egress, no observation row, on a dry run"
     assert {k: _shape(o) for k, o in dry.items()} == {k: _shape(o) for k, o in real.items()}
+    _assert_no_preflight_raised(caplog)
 
 
-def test_an_enforcing_preflight_still_runs_on_a_dry_run(monkeypatch, client):
+def test_an_enforcing_preflight_still_runs_on_a_dry_run(monkeypatch, client, caplog):
     """Enforcing, the preflight can change the answer, and a dry run must answer identically."""
+    caplog.set_level(logging.WARNING)
     asked = _counting_preflight(monkeypatch, "enforce")
-    _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)], dry_run=True)
+    dry, _, _ = _resolve_rows_recording_issues(monkeypatch, client, tokens=[_token(vid=V1)], dry_run=True)
     assert len(asked) == 2
+    assert dry[SEED_ID]["execution_spec"]["cart_url"], "an allowed verdict keeps the unlocked cart"
+    _assert_no_preflight_raised(caplog)
 
 
-def test_a_dry_run_flag_without_tokens_still_preflights(monkeypatch, client):
+def test_a_dry_run_flag_without_tokens_still_preflights(monkeypatch, client, caplog):
+    caplog.set_level(logging.WARNING)
     asked = _counting_preflight(monkeypatch, "shadow")
     _resolve_rows_recording_issues(monkeypatch, client, dry_run=True)
     assert len(asked) == 1, "the fresh offer's cart; the flagged one has none"
+    _assert_no_preflight_raised(caplog)
