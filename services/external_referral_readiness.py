@@ -1862,6 +1862,28 @@ _FRESH_HOURS_DEFAULT = 48.0
 # SQL LIMIT, and the queue is now tiered in Python over every eligible row, so this is a sanity cap.
 _CANDIDATE_LIMIT_CAP = 30000
 
+# THE PER-HOST CAP on one run's candidate cut. Without it a backlog on one host fills the whole cut: when a served
+# region's currency started counting as served (2026-11-05), 2,632 never-refreshed SGD seeds on 17 hosts moved to
+# the head of the queue, and the next 1,300-row cut would have been all of them, 1,009 on ONE host, with no stale
+# USD row at all. A host is read one request at a time, so those rows are also the slowest way to spend the run,
+# and one host breaker trip would waste most of it. At 200 the same backlog drains in about eight runs while the
+# rest of each cut goes on refreshing every other host.
+#
+# DEFERRED ROWS ARE NOT STAMPED: they are left out of the cut, so they keep their place and lead the next run.
+# An unset, blank, malformed, non-positive or non-finite value falls back to the default, never to "no cap".
+_MAX_ROWS_PER_HOST_DEFAULT = 200
+
+
+def _refresh_max_rows_per_host() -> int:
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", "").strip()
+    try:
+        value = float(raw) if raw else float(_MAX_ROWS_PER_HOST_DEFAULT)
+    except ValueError:
+        return _MAX_ROWS_PER_HOST_DEFAULT
+    if not math.isfinite(value) or value < 1:
+        return _MAX_ROWS_PER_HOST_DEFAULT
+    return int(value)
+
 
 def _refresh_fresh_hours() -> float:
     raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_FRESH_HOURS", "").strip()
@@ -1942,6 +1964,11 @@ async def get_external_referral_refresh_candidate_seed_ids(
     SQL keeps that order and a stable Python sort applies the tiers on top.
 
     `updated_at` stays only as the last tiebreak (see migration 202 for why it never leads).
+
+    THE CUT takes at most `_refresh_max_rows_per_host()` rows per host (`crawl_politeness.host_of` on the
+    destination URL, the key the run paces and breaks on), in queue order; a row over its host's cap is skipped and
+    the next row in the queue takes its place. A row with no host is never capped. An operator's targeted
+    `seed_ids` list is not capped: it is at most 200 ids, named on purpose.
     """
     normalized_limit = max(1, min(int(limit or 500), _CANDIDATE_LIMIT_CAP))
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(hours=_refresh_fresh_hours())
@@ -1969,7 +1996,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
         scope_values.update(refresh_market=str(market).strip().upper(), refresh_currency=expected)
     rows = await database.fetch_all(
         f"""
-        SELECT id, market, price_currency,
+        SELECT id, market, price_currency, destination_url,
                CASE WHEN last_crawled_at IS NOT NULL AND last_crawled_at >= :fresh_cutoff
                     THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
@@ -1981,7 +2008,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
         """,
         scope_values,
     )
-    ranked: List[Tuple[Tuple[int, int], str]] = []
+    ranked: List[Tuple[Tuple[int, int], str, str]] = []
     served_currencies = served_region_currencies()
     for row in rows or []:
         row_dict = _row_to_dict(row)
@@ -1994,9 +2021,31 @@ async def get_external_referral_refresh_candidate_seed_ids(
             price_currency=row_dict.get("price_currency"),
             served_currencies=served_currencies,
         )
-        ranked.append((tier, seed_id))
+        ranked.append((tier, seed_id, crawl_politeness.host_of(str(row_dict.get("destination_url") or ""))))
     ranked.sort(key=lambda item: item[0])  # stable: keeps the SQL order inside a tier
-    return [seed_id for _tier, seed_id in ranked[:normalized_limit]]
+    if seed_ids is not None:
+        return [seed_id for _tier, seed_id, _host in ranked[:normalized_limit]]
+    per_host_cap = _refresh_max_rows_per_host()
+    per_host: Counter = Counter()
+    cut: List[str] = []
+    deferred = 0
+    for _tier, seed_id, host in ranked:
+        if len(cut) >= normalized_limit:
+            break
+        if host:
+            if per_host[host] >= per_host_cap:
+                deferred += 1
+                continue
+            per_host[host] += 1
+        cut.append(seed_id)
+    if deferred:
+        # WARNING, not INFO: nothing configures the root logger, so a plain module logger's INFO never reaches the
+        # job's logs, and this line is how a catch-up is watched draining.
+        logger.warning(
+            "external referral refresh: %d candidate rows deferred past the %d-rows-per-host cap (%d hosts at the cap)",
+            deferred, per_host_cap, sum(1 for n in per_host.values() if n >= per_host_cap),
+        )
+    return cut
 
 
 # The wall-clock ceiling for one refresh run, and it is not a nicety. Every row here is a

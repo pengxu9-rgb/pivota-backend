@@ -27,7 +27,8 @@ def _ts(days_ago: float) -> str:
     return (NOW - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, serving_regions=None):
+def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, serving_regions=None,
+                max_rows_per_host=None, seed_ids=None, market=None):
     """`serving_regions`: PIVOTA_SERVING_PRICING_REGIONS for the run (it may only narrow the market registry's served
     markets); None leaves it unset, so the registry's list applies, as on a job that does not set it."""
     if serving_regions is None:
@@ -35,10 +36,11 @@ def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, 
     else:
         monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", serving_regions)
     conn = sqlite3.connect(":memory:")
+    conn.create_function("btrim", 1, lambda v: None if v is None else str(v).strip())  # the targeted scope's Postgres
     conn.execute(
         "CREATE TABLE external_product_seeds (id TEXT, status TEXT, attached_product_key TEXT,"
         " domain TEXT, market TEXT, price_currency TEXT, last_crawl_attempt_at TEXT,"
-        " last_crawled_at TEXT, updated_at TEXT)"
+        " last_crawled_at TEXT, updated_at TEXT, destination_url TEXT)"
     )
     conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
     conn.execute(
@@ -51,10 +53,11 @@ def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, 
             "market": "US", "price_currency": "USD", "last_crawl_attempt_at": None,
             "last_crawled_at": None, "updated_at": "2026-01-01 00:00:00", **seed,
         }
+        row.setdefault("destination_url", f"https://{row['domain']}/products/{row['id']}")
         conn.execute(
             "INSERT INTO external_product_seeds VALUES (:id, :status, :attached_product_key,"
             " :domain, :market, :price_currency, :last_crawl_attempt_at, :last_crawled_at,"
-            " :updated_at)",
+            " :updated_at, :destination_url)",
             row,
         )
     conn.executemany(
@@ -78,7 +81,12 @@ def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, 
 
     monkeypatch.setattr(module.database, "fetch_all", fetch_all)
     monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_FRESH_HOURS", raising=False)
-    return asyncio.run(module.get_external_referral_refresh_candidate_seed_ids(limit=limit))
+    if max_rows_per_host is None:
+        monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", max_rows_per_host)
+    scope = {} if seed_ids is None else {"seed_ids": seed_ids, "market": market}
+    return asyncio.run(module.get_external_referral_refresh_candidate_seed_ids(limit=limit, **scope))
 
 
 def test_an_unattached_seed_on_any_domain_is_a_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,3 +246,117 @@ def test_refresh_queue_tier_with_served_region_currencies(market, currency, serv
     assert module.refresh_queue_tier(
         is_fresh=False, market=market, price_currency=currency, served_currencies=served
     ) == expected
+
+
+# ---- the per-host cap on the cut (2026-11-06) ----
+
+def _backlog(host: str, n: int, *, currency: str = "SGD", prefix: str = "eps_sg", days_ago: float = 60.0):
+    """`n` never-read rows on one host, each attempted earlier than the next, so they lead the queue in id order."""
+    return [
+        {"id": f"{prefix}_{i:03d}", "domain": host, "price_currency": currency,
+         "last_crawl_attempt_at": _ts(days_ago - i * 0.001)}
+        for i in range(n)
+    ]
+
+
+def test_one_hosts_backlog_takes_at_most_the_cap_and_the_queue_fills_the_rest(monkeypatch) -> None:
+    """The catch-up shape: an old SGD backlog on one host leads the queue. Without the cap it filled the cut; with it
+    the host takes `cap` rows, in queue order, and the stale USD rows behind it get the freed slots."""
+    seeds = _backlog("big.example", 6) + [
+        {"id": f"eps_us_{i}", "domain": f"us{i}.example", "last_crawl_attempt_at": _ts(5 - i * 0.1),
+         "last_crawled_at": _ts(9)}
+        for i in range(3)
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=5, serving_regions="US,SG", max_rows_per_host="2")
+    assert ids == ["eps_sg_000", "eps_sg_001", "eps_us_0", "eps_us_1", "eps_us_2"]
+
+
+def test_without_the_cap_env_the_default_still_caps(monkeypatch) -> None:
+    """Unset means the default (200), never unlimited."""
+    seeds = _backlog("big.example", 205) + [
+        {"id": "eps_us_tail", "domain": "us.example", "last_crawl_attempt_at": _ts(5), "last_crawled_at": _ts(9)}
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=300, serving_regions="US,SG")
+    assert module._MAX_ROWS_PER_HOST_DEFAULT == 200
+    assert len(ids) == 201
+    assert ids[:200] == [f"eps_sg_{i:03d}" for i in range(200)]
+    assert ids[-1] == "eps_us_tail"
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "0", "-3", "nan", "inf", "0.5"])
+def test_a_bad_cap_falls_back_to_the_default_not_to_no_cap(monkeypatch, raw) -> None:
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raw)
+    assert module._refresh_max_rows_per_host() == module._MAX_ROWS_PER_HOST_DEFAULT
+
+
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("50", 50), ("75.9", 75), (" 300 ", 300)])
+def test_a_good_cap_is_read(monkeypatch, raw, expected) -> None:
+    monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raw)
+    assert module._refresh_max_rows_per_host() == expected
+
+
+def test_deferred_rows_keep_their_place_and_lead_the_next_cut(monkeypatch) -> None:
+    """A deferred row is left out of the cut, so nothing stamps it: once the first rows have been attempted, the
+    deferred ones are the oldest on the host and come next, ahead of every younger row."""
+    seeds = _backlog("big.example", 4) + [
+        {"id": "eps_us_young", "domain": "us.example", "last_crawl_attempt_at": _ts(1), "last_crawled_at": _ts(9)}
+    ]
+    first = _candidates(monkeypatch, seeds, limit=3, serving_regions="US,SG", max_rows_per_host="2")
+    assert first == ["eps_sg_000", "eps_sg_001", "eps_us_young"]
+    attempted = {s: _ts(0.01) for s in first}  # the run stamps what it attempted, and only that
+    seeds_after = [{**s, **({"last_crawl_attempt_at": attempted[s["id"]]} if s["id"] in attempted else {})}
+                   for s in seeds]
+    second = _candidates(monkeypatch, seeds_after, limit=3, serving_regions="US,SG", max_rows_per_host="2")
+    assert second[:2] == ["eps_sg_002", "eps_sg_003"]
+
+
+def test_the_cap_keys_on_the_destination_urls_host_not_the_domain_column(monkeypatch) -> None:
+    """`crawl_politeness.host_of`: lower-cased, port and userinfo dropped; a www. host is its own host, as the pacer
+    keys it. The domain column plays no part."""
+    seeds = [
+        {"id": "eps_a", "domain": "x.example", "destination_url": "https://Shop.Example:443/p/a",
+         "last_crawl_attempt_at": _ts(9)},
+        {"id": "eps_b", "domain": "y.example", "destination_url": "https://u:p@shop.example/p/b",
+         "last_crawl_attempt_at": _ts(8)},
+        {"id": "eps_c", "domain": "shop.example", "destination_url": "https://www.shop.example/p/c",
+         "last_crawl_attempt_at": _ts(7)},
+        {"id": "eps_d", "domain": "shop.example", "destination_url": "https://other.example/p/d",
+         "last_crawl_attempt_at": _ts(6)},
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1")
+    assert ids == ["eps_a", "eps_c", "eps_d"]
+
+
+def test_rows_with_no_host_are_never_capped(monkeypatch) -> None:
+    seeds = [
+        {"id": f"eps_nohost_{i}", "destination_url": url, "last_crawl_attempt_at": _ts(9 - i)}
+        for i, url in enumerate([None, "", "not a url", "/relative/path"])
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1")
+    assert ids == [f"eps_nohost_{i}" for i in range(4)]
+
+
+def test_the_cap_applies_across_tiers_in_queue_order(monkeypatch) -> None:
+    """The cap counts a host's rows in the order the cut takes them, so a host's stale rows use its slots before its
+    fresh ones."""
+    seeds = [
+        {"id": "eps_fresh_old_attempt", "domain": "h.example", "last_crawl_attempt_at": _ts(9),
+         "last_crawled_at": _ts(1)},
+        {"id": "eps_stale", "domain": "h.example", "last_crawl_attempt_at": _ts(2), "last_crawled_at": _ts(9)},
+        {"id": "eps_other", "domain": "o.example", "last_crawl_attempt_at": _ts(1), "last_crawled_at": _ts(1)},
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1")
+    assert ids == ["eps_stale", "eps_other"]
+
+
+def test_a_targeted_operator_list_is_not_capped(monkeypatch) -> None:
+    seeds = _backlog("big.example", 3, currency="USD", prefix="eps_t")
+    ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1",
+                      seed_ids=["eps_t_000", "eps_t_001", "eps_t_002"], market="US")
+    assert ids == ["eps_t_000", "eps_t_001", "eps_t_002"]
+
+
+def test_the_limit_still_bounds_the_cut_under_the_cap(monkeypatch) -> None:
+    seeds = [{"id": f"eps_h{i}", "domain": f"h{i}.example", "last_crawl_attempt_at": _ts(9 - i * 0.1)}
+             for i in range(10)]
+    assert _candidates(monkeypatch, seeds, limit=4, max_rows_per_host="1") == [f"eps_h{i}" for i in range(4)]
