@@ -137,8 +137,8 @@ def test_a_seed_not_priced_in_a_served_currency_waits_behind_served_ones(monkeyp
 
 
 # SG rows live in the US partition on purpose. On the partition's currency alone, every stale SGD seed sorted behind
-# every stale USD one, and with the run's limit under the stale served tier it was never read (2,696 parked seeds on
-# 2026-11-05). A served pricing region's currency is a served currency.
+# every stale USD one, and with the run's limit under the stale served tier it was never read (2,632 SGD seeds in the
+# US partition, census 2026-11-06). A served pricing region's currency is a served currency in a served partition.
 _SG_CASE = [
     {"id": "eps_sgd_in_us", "price_currency": "SGD", "last_crawl_attempt_at": _ts(30), "last_crawled_at": _ts(30)},
     {"id": "eps_aud_in_us", "price_currency": "AUD", "last_crawl_attempt_at": _ts(40), "last_crawled_at": _ts(40)},
@@ -239,7 +239,13 @@ def test_refresh_queue_tier(is_fresh, market, currency, expected) -> None:
         ("US", None, {"USD", "SGD"}, (0, 1)),
         ("US", "", {"USD", "SGD", ""}, (0, 1)),
         ("JP", "JPY", {"USD", "SGD"}, (0, 0)),
-        ("SG", "USD", {"usd"}, (0, 0)),
+        # A region's currency is served only in a partition whose own currency is served: the partitions the
+        # served regions read.
+        ("SG", "USD", {"usd", "sgd"}, (0, 0)),
+        ("SG", "USD", {"usd"}, (0, 1)),
+        ("JP", "USD", {"USD", "SGD"}, (0, 1)),
+        ("AU", "SGD", {"USD", "SGD"}, (0, 1)),
+        ("EU-DE", "USD", {"USD", "SGD"}, (0, 1)),
     ],
 )
 def test_refresh_queue_tier_with_served_region_currencies(market, currency, served, expected) -> None:
@@ -272,27 +278,40 @@ def test_one_hosts_backlog_takes_at_most_the_cap_and_the_queue_fills_the_rest(mo
 
 
 def test_without_the_cap_env_the_default_still_caps(monkeypatch) -> None:
-    """Unset means the default (200), never unlimited."""
+    """Unset means the default (200 at a 300-row limit), never unlimited. The tier's deferred rows come after the
+    tier's other rows."""
     seeds = _backlog("big.example", 205) + [
         {"id": "eps_us_tail", "domain": "us.example", "last_crawl_attempt_at": _ts(5), "last_crawled_at": _ts(9)}
+    ] + [
+        {"id": f"eps_fresh_{i}", "domain": f"f{i}.example", "last_crawl_attempt_at": _ts(90),
+         "last_crawled_at": _ts(0.5)}
+        for i in range(3)
     ]
-    ids = _candidates(monkeypatch, seeds, limit=300, serving_regions="US,SG")
-    assert module._MAX_ROWS_PER_HOST_DEFAULT == 200
-    assert len(ids) == 201
+    ids = _candidates(monkeypatch, seeds, limit=203, serving_regions="US,SG")
+    assert module._default_max_rows_per_host(203) == 200
     assert ids[:200] == [f"eps_sg_{i:03d}" for i in range(200)]
-    assert ids[-1] == "eps_us_tail"
+    assert ids[200] == "eps_us_tail"
+    assert ids[201:] == ["eps_sg_200", "eps_sg_201"]  # deferred stale rows, ahead of every fresh row
+
+
+@pytest.mark.parametrize("limit, expected", [(1, 200), (500, 200), (666, 200), (667, 201), (1300, 390), (4000, 1200)])
+def test_the_default_cap_is_30_percent_of_the_limit_and_never_under_200(monkeypatch, limit, expected) -> None:
+    monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raising=False)
+    assert module._default_max_rows_per_host(limit) == expected
+    assert module._refresh_max_rows_per_host(limit) == expected
 
 
 @pytest.mark.parametrize("raw", ["", "  ", "abc", "0", "-3", "nan", "inf", "0.5"])
 def test_a_bad_cap_falls_back_to_the_default_not_to_no_cap(monkeypatch, raw) -> None:
     monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raw)
-    assert module._refresh_max_rows_per_host() == module._MAX_ROWS_PER_HOST_DEFAULT
+    assert module._refresh_max_rows_per_host(1300) == 390
+    assert module._refresh_max_rows_per_host(100) == 200
 
 
-@pytest.mark.parametrize("raw,expected", [("1", 1), ("50", 50), ("75.9", 75), (" 300 ", 300)])
-def test_a_good_cap_is_read(monkeypatch, raw, expected) -> None:
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("50", 50), ("75.9", 75), (" 300 ", 300), ("5000", 5000)])
+def test_a_good_cap_is_read_and_overrides_the_sized_default(monkeypatch, raw, expected) -> None:
     monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", raw)
-    assert module._refresh_max_rows_per_host() == expected
+    assert module._refresh_max_rows_per_host(1300) == expected
 
 
 def test_deferred_rows_keep_their_place_and_lead_the_next_cut(monkeypatch) -> None:
@@ -324,7 +343,8 @@ def test_the_cap_keys_on_the_destination_urls_host_not_the_domain_column(monkeyp
          "last_crawl_attempt_at": _ts(6)},
     ]
     ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1")
-    assert ids == ["eps_a", "eps_c", "eps_d"]
+    # eps_b shares eps_a's host, so it is deferred behind every other row of the tier.
+    assert ids == ["eps_a", "eps_c", "eps_d", "eps_b"]
 
 
 def test_rows_with_no_host_are_never_capped(monkeypatch) -> None:
@@ -336,17 +356,36 @@ def test_rows_with_no_host_are_never_capped(monkeypatch) -> None:
     assert ids == [f"eps_nohost_{i}" for i in range(4)]
 
 
-def test_the_cap_applies_across_tiers_in_queue_order(monkeypatch) -> None:
-    """The cap counts a host's rows in the order the cut takes them, so a host's stale rows use its slots before its
-    fresh ones."""
+def test_the_cap_counts_in_queue_order_so_stale_rows_use_a_hosts_slots_first(monkeypatch) -> None:
+    """The cap counts a host's rows in the order the cut takes them: a host's stale row uses its slot, and its fresh
+    row waits behind the fresh tier's other rows."""
     seeds = [
         {"id": "eps_fresh_old_attempt", "domain": "h.example", "last_crawl_attempt_at": _ts(9),
          "last_crawled_at": _ts(1)},
         {"id": "eps_stale", "domain": "h.example", "last_crawl_attempt_at": _ts(2), "last_crawled_at": _ts(9)},
         {"id": "eps_other", "domain": "o.example", "last_crawl_attempt_at": _ts(1), "last_crawled_at": _ts(1)},
     ]
-    ids = _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1")
-    assert ids == ["eps_stale", "eps_other"]
+    assert _candidates(monkeypatch, seeds, limit=10, max_rows_per_host="1") == [
+        "eps_stale", "eps_other", "eps_fresh_old_attempt"]
+    assert _candidates(monkeypatch, seeds, limit=2, max_rows_per_host="1") == ["eps_stale", "eps_other"]
+
+
+def test_a_deferred_stale_row_beats_any_lower_tier_row(monkeypatch) -> None:
+    """The cap only spreads a tier across hosts. When the stale served tier runs out of rows under the cap, its
+    deferred rows take the slots, ahead of a fresh row or a row in a currency nothing serves (review P2-2)."""
+    seeds = [
+        {"id": f"eps_big_{i}", "domain": "big.example", "last_crawl_attempt_at": _ts(9 - i * 0.1),
+         "last_crawled_at": _ts(9)}
+        for i in range(3)
+    ] + [
+        {"id": "eps_fresh", "domain": "o.example", "last_crawl_attempt_at": _ts(30), "last_crawled_at": _ts(0.5)},
+        {"id": "eps_unserved", "domain": "u.example", "price_currency": "AUD", "last_crawl_attempt_at": _ts(30),
+         "last_crawled_at": _ts(9)},
+    ]
+    ids = _candidates(monkeypatch, seeds, limit=3, max_rows_per_host="1", serving_regions="US,SG")
+    assert ids == ["eps_big_0", "eps_big_1", "eps_big_2"]
+    ids = _candidates(monkeypatch, seeds, limit=5, max_rows_per_host="1", serving_regions="US,SG")
+    assert ids == ["eps_big_0", "eps_big_1", "eps_big_2", "eps_unserved", "eps_fresh"]
 
 
 def test_a_targeted_operator_list_is_not_capped(monkeypatch) -> None:
@@ -360,3 +399,67 @@ def test_the_limit_still_bounds_the_cut_under_the_cap(monkeypatch) -> None:
     seeds = [{"id": f"eps_h{i}", "domain": f"h{i}.example", "last_crawl_attempt_at": _ts(9 - i * 0.1)}
              for i in range(10)]
     assert _candidates(monkeypatch, seeds, limit=4, max_rows_per_host="1") == [f"eps_h{i}" for i in range(4)]
+
+
+def test_a_deferral_is_logged_at_warning(monkeypatch, caplog) -> None:
+    """A plain module logger's INFO never reaches the job's logs, so the line a catch-up is watched by must be a
+    WARNING (review M18)."""
+    import logging
+
+    seeds = _backlog("big.example", 4) + [
+        {"id": f"eps_us_{i}", "domain": f"us{i}.example", "last_crawl_attempt_at": _ts(5)} for i in range(2)
+    ]
+    with caplog.at_level(logging.WARNING, logger=module.logger.name):
+        _candidates(monkeypatch, seeds, limit=3, max_rows_per_host="1", serving_regions="US,SG")
+    lines = [r for r in caplog.records if "rows-per-host cap" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    assert "3 candidate rows deferred past the 1-rows-per-host cap (on 1 hosts)" in lines[0].getMessage()
+
+
+def test_no_deferral_no_log(monkeypatch, caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=module.logger.name):
+        _candidates(monkeypatch, _backlog("big.example", 3), limit=3, max_rows_per_host="3")
+    assert not [r for r in caplog.records if "rows-per-host cap" in r.getMessage()]
+
+
+def test_an_unknown_served_region_is_dropped_not_raised(monkeypatch) -> None:
+    """The lookup is the soft one: a region the pricing table does not know prices nothing and the selector runs on
+    (review M24; the hard lookup sits outside the try and would crash the run)."""
+    import services.index_pipeline_state_service as ips
+
+    monkeypatch.setattr(ips, "serving_pricing_regions", lambda: ["US", "ZZ"])
+    assert module.served_region_currencies() == frozenset({"USD"})
+
+
+def test_the_selector_only_reads(monkeypatch) -> None:
+    """Choosing the cut writes nothing: every statement is a SELECT and no write path of the database is touched
+    (review M07). Stamping is the run's job, for the rows it attempts."""
+    seen = []
+    real_fetch_all = None
+
+    def _no_write(*_a, **_k):
+        raise AssertionError("the selector wrote")
+
+    for name in ("execute", "execute_many", "fetch_one", "fetch_val", "transaction"):
+        if hasattr(module.database, name):
+            monkeypatch.setattr(module.database, name, _no_write)
+    original_setattr = monkeypatch.setattr
+
+    def _spy_setattr(target, name, value, *a, **k):
+        if target is module.database and name == "fetch_all":
+            async def recording(query, values=None):
+                seen.append(str(query))
+                return await value(query, values)
+            return original_setattr(target, name, recording, *a, **k)
+        return original_setattr(target, name, value, *a, **k)
+
+    monkeypatch.setattr = _spy_setattr
+    try:
+        ids = _candidates(monkeypatch, _backlog("big.example", 3) + _backlog("b2.example", 2, prefix="eps_b2", days_ago=50.0),
+                          limit=4, max_rows_per_host="2")
+    finally:
+        monkeypatch.setattr = original_setattr
+    assert ids == ["eps_sg_000", "eps_sg_001", "eps_b2_000", "eps_b2_001"]
+    assert seen and all(q.lstrip().upper().startswith("SELECT") for q in seen)

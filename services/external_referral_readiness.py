@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import itertools
 import json
 import logging
 import math
@@ -1863,25 +1864,36 @@ _FRESH_HOURS_DEFAULT = 48.0
 _CANDIDATE_LIMIT_CAP = 30000
 
 # THE PER-HOST CAP on one run's candidate cut. Without it a backlog on one host fills the whole cut: when a served
-# region's currency started counting as served (2026-11-05), 2,632 never-refreshed SGD seeds on 17 hosts moved to
-# the head of the queue, and the next 1,300-row cut would have been all of them, 1,009 on ONE host, with no stale
-# USD row at all. A host is read one request at a time, so those rows are also the slowest way to spend the run,
-# and one host breaker trip would waste most of it. At 200 the same backlog drains in about eight runs while the
-# rest of each cut goes on refreshing every other host.
+# region's currency started counting as served (2026-11-05), 2,632 never-refreshed SGD seeds in the US partition, on
+# 17 hosts, moved to the head of the queue (census 2026-11-06), and the next 1,300-row cut would have been all of
+# them, 1,009 on ONE host, with no stale USD row at all. A host is read one request at a time, so those rows are also
+# the slowest way to spend the run, and one host breaker trip would waste most of it.
+#
+# SIZED FROM THE RUN'S LIMIT: max(200, ceil(0.3 * limit)), 390 at the job's 1,300. The cap is per run, so a host can
+# be re-read at most cap x runs-per-48h times inside the fresh window; at a flat 200 and ~10 runs a day a host past
+# ~4,000 served seeds could never be fresh again (simulated: an 8,000-seed host settles at ~86 h). 30% of the cut
+# still keeps a backlog on one host from taking most of a run. EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST sets it
+# outright.
 #
 # DEFERRED ROWS ARE NOT STAMPED: they are left out of the cut, so they keep their place and lead the next run.
 # An unset, blank, malformed, non-positive or non-finite value falls back to the default, never to "no cap".
-_MAX_ROWS_PER_HOST_DEFAULT = 200
+_MAX_ROWS_PER_HOST_FLOOR = 200
+_MAX_ROWS_PER_HOST_SHARE = 0.3
 
 
-def _refresh_max_rows_per_host() -> int:
+def _default_max_rows_per_host(limit: int) -> int:
+    return max(_MAX_ROWS_PER_HOST_FLOOR, math.ceil(_MAX_ROWS_PER_HOST_SHARE * max(1, int(limit))))
+
+
+def _refresh_max_rows_per_host(limit: int) -> int:
+    default = _default_max_rows_per_host(limit)
     raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", "").strip()
     try:
-        value = float(raw) if raw else float(_MAX_ROWS_PER_HOST_DEFAULT)
+        value = float(raw) if raw else float(default)
     except ValueError:
-        return _MAX_ROWS_PER_HOST_DEFAULT
+        return default
     if not math.isfinite(value) or value < 1:
-        return _MAX_ROWS_PER_HOST_DEFAULT
+        return default
     return int(value)
 
 
@@ -1920,9 +1932,13 @@ def refresh_queue_tier(
 
     Stale before fresh, then a row priced in a SERVED currency before one that is not. A served currency is the
     partition's own (`seed_serving_currency(market)`, Peng 2026-09-26) or, since 2026-11-05, the currency of any
-    served pricing region (`served_currencies`, from `served_region_currencies()`). SG rows live in the US
-    partition on purpose, so on the partition alone every SGD seed sorted behind every stale USD one, and with the
-    run's limit under the stale served tier it was never read (2,696 parked seeds, 2026-11-05).
+    served pricing region (`served_currencies`, from `served_region_currencies()`), IN A PARTITION WHOSE OWN
+    CURRENCY IS SERVED. SG rows live in the US partition on purpose, so on the partition alone every SGD seed sorted
+    behind every stale USD one, and with the run's limit under the stale served tier it was never read (2,632 SGD
+    seeds in the US partition, census 2026-11-06).
+
+    The partition condition keeps the rule to the partitions the served regions read: a USD row in the JP
+    partition is not served while JP is not, so it stays behind, as before.
 
     A row in a currency no served region prices is still not served, and a refresh cannot make it so, because
     `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is kept rather than
@@ -1932,7 +1948,7 @@ def refresh_queue_tier(
     currency = str(price_currency or "").strip().upper()
     # Blank codes never enter `served`, and no market's currency is blank, so a row with no currency is never served.
     served = {str(c).strip().upper() for c in served_currencies if str(c or "").strip()}
-    served_currency = (expected is not None and currency == expected) or currency in served
+    served_currency = expected is not None and (currency == expected or (expected in served and currency in served))
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
@@ -1965,9 +1981,11 @@ async def get_external_referral_refresh_candidate_seed_ids(
 
     `updated_at` stays only as the last tiebreak (see migration 202 for why it never leads).
 
-    THE CUT takes at most `_refresh_max_rows_per_host()` rows per host (`crawl_politeness.host_of` on the
-    destination URL, the key the run paces and breaks on), in queue order; a row over its host's cap is skipped and
-    the next row in the queue takes its place. A row with no host is never capped. An operator's targeted
+    THE CUT takes at most `_refresh_max_rows_per_host(limit)` rows per host (`crawl_politeness.host_of` on the
+    destination URL, the key the run paces and breaks on), in queue order, WITHIN EACH TIER: a row over its host's
+    cap gives its slot to the next row OF ITS OWN TIER, and only when the tier has no row left under the cap do its
+    deferred rows take the remaining slots, still ahead of any lower tier. So the cap spreads a tier across hosts
+    and never hands a stale row's slot to a fresh one. A row with no host is never capped. An operator's targeted
     `seed_ids` list is not capped: it is at most 200 ids, named on purpose.
     """
     normalized_limit = max(1, min(int(limit or 500), _CANDIDATE_LIMIT_CAP))
@@ -2025,25 +2043,36 @@ async def get_external_referral_refresh_candidate_seed_ids(
     ranked.sort(key=lambda item: item[0])  # stable: keeps the SQL order inside a tier
     if seed_ids is not None:
         return [seed_id for _tier, seed_id, _host in ranked[:normalized_limit]]
-    per_host_cap = _refresh_max_rows_per_host()
+    per_host_cap = _refresh_max_rows_per_host(normalized_limit)
     per_host: Counter = Counter()
     cut: List[str] = []
     deferred = 0
-    for _tier, seed_id, host in ranked:
+    deferred_hosts: set = set()
+    for _tier, group in itertools.groupby(ranked, key=lambda item: item[0]):
         if len(cut) >= normalized_limit:
             break
-        if host:
-            if per_host[host] >= per_host_cap:
-                deferred += 1
-                continue
-            per_host[host] += 1
-        cut.append(seed_id)
+        tier_deferred: List[Tuple[str, str]] = []
+        for _t, seed_id, host in group:
+            if len(cut) >= normalized_limit:
+                break
+            if host:
+                if per_host[host] >= per_host_cap:
+                    tier_deferred.append((seed_id, host))
+                    continue
+                per_host[host] += 1
+            cut.append(seed_id)
+        # The tier's own deferred rows, in queue order, before any lower tier's row.
+        room = max(0, normalized_limit - len(cut))
+        cut.extend(seed_id for seed_id, _host in tier_deferred[:room])
+        left_out = tier_deferred[room:]
+        deferred += len(left_out)
+        deferred_hosts.update(host for _seed_id, host in left_out)
     if deferred:
         # WARNING, not INFO: nothing configures the root logger, so a plain module logger's INFO never reaches the
         # job's logs, and this line is how a catch-up is watched draining.
         logger.warning(
-            "external referral refresh: %d candidate rows deferred past the %d-rows-per-host cap (%d hosts at the cap)",
-            deferred, per_host_cap, sum(1 for n in per_host.values() if n >= per_host_cap),
+            "external referral refresh: %d candidate rows deferred past the %d-rows-per-host cap (on %d hosts)",
+            deferred, per_host_cap, len(deferred_hosts),
         )
     return cut
 
