@@ -720,27 +720,40 @@ async def generate_api_key(request: AgentAuthRequest):
 
 @router.get("/merchants")
 async def list_merchants(
-    status: str = "active",
+    status: str = Query(
+        default="active",
+        description="Merchant status. Only 'active' is accepted with scope=available.",
+    ),
     scope: Literal["available", "mine"] = Query(
         default="available",
         description=(
-            "'available' (default): merchants this agent can search and order from. "
+            "'available' (default): approved merchants this agent can order from. "
             "'mine': only merchants this agent has already placed orders with."
         ),
     ),
-    limit: int = Query(default=50, le=100),
+    limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context)
 ):
     """List merchants for this agent.
 
-    `scope=available` is what a new agent needs to find a `merchant_id`: the
-    merchants product search treats as transactable (not deleted/rejected,
-    PSP connected), narrowed to the agent's `allowed_merchants` when that is
-    set. `scope=mine` keeps the order-history view this endpoint served
-    before. Contact email is only returned for merchants the agent has
-    ordered from, so an API key cannot pull every merchant's contact details.
+    `scope=available` is what a new agent needs to find a `merchant_id`:
+    approved, PSP-connected merchants (the PSP rule product search uses).
+    `scope=mine` keeps the order-history view this endpoint served before,
+    and is the only scope that takes another `status`. Both scopes honour the
+    agent's `allowed_merchants` the way `can_access_merchant` does: None means
+    every merchant, a list (even an empty one) means only those. (Search is
+    looser: it treats `[]` as unrestricted.)
+
+    Contact email, PSP type and created_at are returned only for merchants the
+    agent has ordered from, so an API key cannot pull every merchant's contact
+    or processor details.
     """
+    if scope == "available" and status != "active":
+        raise HTTPException(
+            status_code=422,
+            detail="scope=available lists active merchants only; use scope=mine to filter by status",
+        )
     try:
         # Map status values
         if status == "active":
@@ -756,22 +769,22 @@ async def list_merchants(
         if scope == "mine":
             where.append("o.merchant_id IS NOT NULL")
         else:
-            # Same eligibility as cross-merchant product search.
+            # The PSP rule cross-merchant product search applies.
             where.append("mo.psp_connected = TRUE")
-            allowed = context.allowed_merchants
-            if allowed is not None:
-                if not allowed:
-                    return {
-                        "status": "success",
-                        "scope": scope,
-                        "merchants": [],
-                        "pagination": {"total": 0, "limit": limit, "offset": offset, "has_more": False},
-                    }
-                names = []
-                for i, mid in enumerate(allowed):
-                    params[f"allowed_{i}"] = mid
-                    names.append(f":allowed_{i}")
-                where.append(f"mo.merchant_id IN ({', '.join(names)})")
+        allowed = context.allowed_merchants
+        if allowed is not None:
+            if not allowed:
+                return {
+                    "status": "success",
+                    "scope": scope,
+                    "merchants": [],
+                    "pagination": {"total": 0, "limit": limit, "offset": offset, "has_more": False},
+                }
+            names = []
+            for i, mid in enumerate(allowed):
+                params[f"allowed_{i}"] = mid
+                names.append(f":allowed_{i}")
+            where.append(f"mo.merchant_id IN ({', '.join(names)})")
 
         from_clause = """
             FROM merchant_onboarding mo
@@ -823,26 +836,28 @@ async def list_merchants(
                 return None
             return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
+        def _row(m: Any) -> Dict[str, Any]:
+            ordered = int(m["total_orders"] or 0) > 0
+            return {
+                "merchant_id": m["merchant_id"],
+                "business_name": m["business_name"],
+                "status": "active" if m["status"] == "approved" else m["status"],
+                "store_url": m["store_url"],
+                "website": m["website"],
+                "region": m["region"],
+                # Only where this agent has a trading relationship.
+                "contact_email": m["contact_email"] if ordered else None,
+                "psp_connected": bool(m["psp_connected"]),
+                "psp_type": m["psp_type"] if ordered else None,
+                "created_at": _created_at(m["created_at"]) if ordered else None,
+                "total_orders": int(m["total_orders"] or 0),
+                "total_gmv": float(m["total_gmv"]) if m["total_gmv"] else 0
+            }
+
         return {
             "status": "success",
             "scope": scope,
-            "merchants": [
-                {
-                    "merchant_id": m["merchant_id"],
-                    "business_name": m["business_name"],
-                    "status": "active" if m["status"] == "approved" else m["status"],
-                    "store_url": m["store_url"],
-                    "website": m["website"],
-                    "region": m["region"],
-                    "contact_email": m["contact_email"] if int(m["total_orders"] or 0) > 0 else None,
-                    "psp_connected": bool(m["psp_connected"]),
-                    "psp_type": m["psp_type"],
-                    "created_at": _created_at(m["created_at"]),
-                    "total_orders": int(m["total_orders"] or 0),
-                    "total_gmv": float(m["total_gmv"]) if m["total_gmv"] else 0
-                }
-                for m in merchants
-            ],
+            "merchants": [_row(m) for m in merchants],
             "pagination": {
                 "total": total,
                 "limit": limit,
@@ -853,7 +868,7 @@ async def list_merchants(
 
     except Exception as e:
         logger.error(f"Failed to list merchants: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list merchants: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to list merchants")
 
 # ============================================================================
 # PRODUCTS SEARCH

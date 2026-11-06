@@ -133,6 +133,10 @@ async def _rows():
     await database.execute(_order(M_ORDERED, AGENT, 999, deleted=True))
     await database.execute(_order(M_NO_PSP_ORDERED, AGENT, 5))
     await database.execute(_order(M_OTHERS, OTHER_AGENT, 50))
+    # Orders at non-approved merchants: only `scope=mine` with that status may surface them,
+    # and a deleted merchant never.
+    await database.execute(_order(M_PENDING, AGENT, 7))
+    await database.execute(_order(M_DELETED, AGENT, 8))
 
     yield
 
@@ -183,8 +187,10 @@ async def test_a_new_agent_sees_the_transactable_merchants_by_default(_rows):
     assert set(ours) == {M_ORDERED, M_FRESH, M_OTHERS}
     assert body["pagination"]["total"] >= 3
     for m in ours.values():
-        # A new agent has no orders anywhere: no contact details, no stats.
+        # A new agent has no orders anywhere: no contact or processor details, no stats.
         assert m["contact_email"] is None
+        assert m["psp_type"] is None
+        assert m["created_at"] is None
         assert m["total_orders"] == 0
         assert m["total_gmv"] == 0
         assert m["psp_connected"] is True
@@ -199,9 +205,12 @@ async def test_available_shows_the_agents_own_stats_and_email_only_where_it_orde
     assert ordered["total_orders"] == 2
     assert ordered["total_gmv"] == 30.0
     assert ordered["contact_email"] == f"owner@{M_ORDERED}.example"
+    assert ordered["psp_type"] == "stripe"
+    assert ordered["created_at"] is not None
     # Another agent's orders never leak into this agent's view.
     assert ours[M_OTHERS]["total_orders"] == 0
     assert ours[M_OTHERS]["contact_email"] is None
+    assert ours[M_OTHERS]["psp_type"] is None
     assert ours[M_FRESH]["contact_email"] is None
 
 
@@ -234,11 +243,32 @@ async def test_an_empty_allowlist_fails_closed(_rows):
     assert body["pagination"]["total"] == 0
 
 
-async def test_status_filter_still_applies(_rows):
-    ours = _ours((await _get(_app(), {"status": "pending"})).json())
+@pytest.mark.parametrize("status", ["pending", "rejected", "deleted", "suspended", "approved"])
+async def test_available_accepts_only_the_active_status(_rows, status):
+    # Any key could otherwise enumerate unapproved merchants by passing another status.
+    resp = await _get(_app(), {"status": status})
+    assert resp.status_code == 422
+
+
+async def test_mine_still_filters_by_status(_rows):
+    ours = _ours((await _get(_app(), {"scope": "mine", "status": "pending"})).json())
     assert set(ours) == {M_PENDING}
-    ours = _ours((await _get(_app(), {"status": "deleted"})).json())
+    # A deleted merchant never lists, even where the agent has orders.
+    ours = _ours((await _get(_app(), {"scope": "mine", "status": "deleted"})).json())
     assert ours == {}
+
+
+async def test_mine_honours_allowed_merchants(_rows):
+    body = (await _get(_app(allowed_merchants=[M_NO_PSP_ORDERED]), {"scope": "mine"})).json()
+    assert [m["merchant_id"] for m in body["merchants"]] == [M_NO_PSP_ORDERED]
+    body = (await _get(_app(allowed_merchants=[]), {"scope": "mine"})).json()
+    assert body["merchants"] == []
+
+
+@pytest.mark.parametrize("limit", [0, -1, 101])
+async def test_limit_is_bounded(_rows, limit):
+    resp = await _get(_app(), {"limit": limit})
+    assert resp.status_code == 422
 
 
 async def test_pagination_is_stable_and_counts_match(_rows):
