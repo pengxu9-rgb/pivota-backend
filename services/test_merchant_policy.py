@@ -25,9 +25,12 @@ Two identification signals, because rigs appear under multiple merchant_ids:
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 # Storefront-domain prefix shared with scripts/step5_working_set.py. A store
 # whose domain starts with this is a rig regardless of its merchant_id.
@@ -105,11 +108,11 @@ def static_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
     return set(KNOWN_TEST_MERCHANT_IDS) | _env_ids(env)
 
 
-async def _resolve_demo_domain_merchant_ids(database) -> Set[str]:
+async def _resolve_demo_domain_merchant_ids(database) -> Optional[Set[str]]:
     """merchant_ids whose connected store domain marks them a demo rig.
 
-    Fail-soft: on any DB error return the empty set (the static id denylist
-    still applies) — a resolver hiccup must never crash search.
+    Returns None on any DB error, so the caller can tell a failed lookup from
+    "no demo stores" and does not cache the failure.
     """
     try:
         rows = await database.fetch_all(
@@ -121,7 +124,8 @@ async def _resolve_demo_domain_merchant_ids(database) -> Set[str]:
             {"prefix": f"{DEMO_DOMAIN_PREFIX}%"},
         )
     except Exception:
-        return set()
+        logger.warning("test_merchant_policy: demo-domain resolve FAILED", exc_info=True)
+        return None
     out: Set[str] = set()
     for r in rows or []:
         mid = None
@@ -144,6 +148,11 @@ async def get_excluded_merchant_ids(
 
     Cached for _CACHE_TTL_SECONDS. When ``database`` is None only the static set
     is returned (used by pure/sync callers).
+
+    Fail-soft, never crashes: on a failed lookup it returns the static set plus
+    the last good demo-domain set (if any). A FAILED lookup is never cached:
+    caching it as the empty set would let demo rigs list for a whole TTL window
+    after one DB blip. The next call retries.
     """
     global _cache_value, _cache_at
     static = static_test_merchant_ids(env)
@@ -153,6 +162,8 @@ async def get_excluded_merchant_ids(
     if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
         return static | _cache_value
     resolved = await _resolve_demo_domain_merchant_ids(database)
+    if resolved is None:
+        return static | (_cache_value or set())
     _cache_value = resolved
     _cache_at = ts
     return static | resolved

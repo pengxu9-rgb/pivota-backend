@@ -87,6 +87,26 @@ async def test_resolver_is_fail_soft_on_db_error():
     assert "merch_reconnected_demo" not in ids
 
 
+async def test_a_failed_resolve_is_not_cached():
+    # A cached failure would let demo rigs list for a whole TTL window after one blip.
+    down = _FakeDB(raise_exc=True)
+    await pol.get_excluded_merchant_ids(down, env={}, now=1000.0)
+    up = _FakeDB(rows=[{"merchant_id": "m_demo"}])
+    ids = await pol.get_excluded_merchant_ids(up, env={}, now=1001.0)  # well inside the TTL
+    assert up.calls == 1                                                 # retried, not cached
+    assert "m_demo" in ids
+
+
+async def test_a_failed_resolve_keeps_the_last_good_set():
+    good = _FakeDB(rows=[{"merchant_id": "m_demo"}])
+    await pol.get_excluded_merchant_ids(good, env={}, now=1000.0)
+    down = _FakeDB(raise_exc=True)
+    ids = await pol.get_excluded_merchant_ids(down, env={}, now=1400.0)  # TTL expired, DB down
+    assert down.calls == 1
+    assert "m_demo" in ids                      # last good set still applies
+    assert "merch_efbc46b4619cfbdf" in ids      # static set always
+
+
 async def test_resolver_caches_within_ttl():
     db = _FakeDB(rows=[{"merchant_id": "m_demo"}])
     await pol.get_excluded_merchant_ids(db, env={}, now=1000.0)
