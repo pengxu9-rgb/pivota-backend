@@ -6,6 +6,7 @@ demo-domain resolver, and the product filter (dict + object, missing id kept).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 
 import pytest
@@ -143,6 +144,15 @@ async def test_a_persistent_failure_warns_once_per_interval(caplog):
         warned = [r for r in caplog.records if "demo-domain resolve FAILED" in r.getMessage()]
         assert len(warned) == 2
         assert "3 earlier failures suppressed" in warned[1].getMessage()
+        assert warned[0].exc_info is not None and warned[1].exc_info is not None  # traceback kept
+        # The suppressed count restarts after each emitted warning.
+        t = 1000.0 + pol._WARN_INTERVAL_SECONDS + 1
+        for i in (1, 2):
+            await pol.get_excluded_merchant_ids(down, env={}, now=t + i * step)
+        await pol.get_excluded_merchant_ids(down, env={}, now=t + 2 * pol._WARN_INTERVAL_SECONDS)
+        warned = [r for r in caplog.records if "demo-domain resolve FAILED" in r.getMessage()]
+        assert len(warned) == 3
+        assert "2 earlier failures suppressed" in warned[2].getMessage()
 
 
 async def test_a_failed_resolve_keeps_the_last_good_set():
@@ -232,3 +242,90 @@ def test_rig_list_is_pinned_and_mirrors_the_gateway_twin():
         "test) IN THE SAME DEPLOY — the two services share catalog_row_trust, "
         "so a one-sided change flaps rows public<->blocked."
     )
+
+
+class _FakeClock:
+    def __init__(self, t: float = 1000.0):
+        self.t = t
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+async def test_a_slow_failure_backs_off_from_when_it_failed(monkeypatch):
+    # Pool saturation: the attempt fails only after a 120 s checkout wait. The backoff
+    # must run from the failure, not from the attempt's start.
+    clock = _FakeClock()
+    monkeypatch.setattr(pol, "time", clock)
+
+    class _SlowDown(_FakeDB):
+        async def fetch_all(self, query, values=None):
+            self.calls += 1
+            clock.t += 120.0
+            raise RuntimeError("pool checkout timed out")
+
+    db = _SlowDown()
+    await pol.get_excluded_merchant_ids(db, env={})
+    assert db.calls == 1
+    clock.t += 1.0
+    ids = await pol.get_excluded_merchant_ids(db, env={})
+    assert db.calls == 1                          # still inside the window that began at the failure
+    assert "merch_efbc46b4619cfbdf" in ids
+    clock.t += pol._FAILURE_BACKOFF_SECONDS
+    await pol.get_excluded_merchant_ids(db, env={})
+    assert db.calls == 2
+
+
+class _GatedDB(_FakeDB):
+    """fetch_all waits for `release`, so callers can pile up behind one attempt."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+
+    async def fetch_all(self, query, values=None):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        if self._raise:
+            raise RuntimeError("db down")
+        return self._rows
+
+
+async def _pile_up(db, n=50):
+    leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
+    await db.started.wait()
+    followers = [asyncio.create_task(pol.get_excluded_merchant_ids(db, env={})) for _ in range(n - 1)]
+    await asyncio.sleep(0)
+    db.release.set()
+    return await asyncio.gather(leader, *followers)
+
+
+async def test_concurrent_callers_share_one_failing_attempt():
+    db = _GatedDB(raise_exc=True)
+    results = await _pile_up(db)
+    assert db.calls == 1
+    assert all("merch_efbc46b4619cfbdf" in r for r in results)
+
+
+async def test_concurrent_callers_share_one_successful_attempt():
+    # A cold start must not hand the followers static-only: they get the demo leg too.
+    db = _GatedDB(rows=[{"merchant_id": "m_demo"}])
+    results = await _pile_up(db)
+    assert db.calls == 1
+    assert all("m_demo" in r and "merch_efbc46b4619cfbdf" in r for r in results)
+
+
+async def test_a_cancelled_follower_does_not_cancel_the_shared_attempt():
+    db = _GatedDB(rows=[{"merchant_id": "m_demo"}])
+    leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
+    await db.started.wait()
+    follower = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
+    await asyncio.sleep(0)
+    follower.cancel()
+    db.release.set()
+    assert "m_demo" in await leader
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+    assert db.calls == 1

@@ -308,8 +308,13 @@ async def _rig_rows(fail_after: Optional[str] = None):
 @pytest.fixture
 async def _rigs(_rows, monkeypatch):
     monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
+    # Checked around EVERY rig test, not only in the dedicated teardown tests: those run
+    # after earlier rig tests, so a schema change one of them left behind would already
+    # be part of their "before".
+    before = await _db_state()
     async with _rig_rows() as rigs:
         yield rigs
+    assert (await _db_state()) == before, "rig teardown left the shared DB changed"
 
 
 async def _columns(table: str) -> list:
