@@ -299,7 +299,8 @@ async def _pile_up(db, n=50):
     followers = [asyncio.create_task(pol.get_excluded_merchant_ids(db, env={})) for _ in range(n - 1)]
     await asyncio.sleep(0)
     db.release.set()
-    return await asyncio.gather(leader, *followers)
+    # Bounded: a future that never resolves must fail the test, not hang the suite.
+    return await asyncio.wait_for(asyncio.gather(leader, *followers), 5.0)
 
 
 async def test_concurrent_callers_share_one_failing_attempt():
@@ -325,7 +326,79 @@ async def test_a_cancelled_follower_does_not_cancel_the_shared_attempt():
     await asyncio.sleep(0)
     follower.cancel()
     db.release.set()
-    assert "m_demo" in await leader
+    assert "m_demo" in await asyncio.wait_for(leader, 5.0)
     with pytest.raises(asyncio.CancelledError):
         await follower
     assert db.calls == 1
+
+
+async def test_cancelling_one_follower_leaves_the_other_followers_served():
+    # Without shield, one cancellation would cancel the shared future and hand every
+    # other follower a CancelledError, which `except Exception` callers do not catch.
+    db = _GatedDB(rows=[{"merchant_id": "m_demo"}])
+    leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
+    await db.started.wait()
+    followers = [asyncio.create_task(pol.get_excluded_merchant_ids(db, env={})) for _ in range(3)]
+    await asyncio.sleep(0)
+    followers[0].cancel()
+    db.release.set()
+    results = await asyncio.wait_for(asyncio.gather(leader, *followers[1:]), 5.0)
+    assert all("m_demo" in r for r in results)
+    assert db.calls == 1
+
+
+async def test_followers_of_a_failed_attempt_get_the_last_good_set_and_do_not_warn(caplog):
+    import logging
+
+    await pol.get_excluded_merchant_ids(_FakeDB(rows=[{"merchant_id": "m_old"}]), env={}, now=0.0)
+    db = _GatedDB(raise_exc=True)                 # real clock: the cache from t=0 is long expired
+    with caplog.at_level(logging.WARNING, logger=pol.__name__):
+        results = await _pile_up(db, n=10)
+    assert db.calls == 1
+    assert all("m_old" in r and "merch_efbc46b4619cfbdf" in r for r in results)
+    warned = [r for r in caplog.records if "demo-domain resolve FAILED" in r.getMessage()]
+    assert len(warned) == 1                       # the leader's failure only
+
+
+async def test_a_follower_stops_waiting_after_the_bound(monkeypatch):
+    # The leader's connection never answers. Followers must not wait with it.
+    monkeypatch.setattr(pol, "_FOLLOWER_WAIT_SECONDS", 0.2)
+    await pol.get_excluded_merchant_ids(_FakeDB(rows=[{"merchant_id": "m_old"}]), env={}, now=0.0)
+    db = _GatedDB(rows=[{"merchant_id": "m_new"}])
+    leader = asyncio.create_task(pol.get_excluded_merchant_ids(db, env={}))
+    await db.started.wait()
+    ids = await asyncio.wait_for(pol.get_excluded_merchant_ids(db, env={}), 2.0)
+    assert "merch_efbc46b4619cfbdf" in ids and "m_old" in ids   # static + last good
+    assert db.calls == 1                          # no second attempt on timeout
+    assert not leader.done()                      # the leader is unaffected
+    db.release.set()
+    assert "m_new" in await asyncio.wait_for(leader, 5.0)
+
+
+async def test_the_inflight_slot_is_cleared_after_every_attempt():
+    await pol.get_excluded_merchant_ids(_FakeDB(rows=[]), env={}, now=0.0)
+    assert pol._inflight is None
+    await pol.get_excluded_merchant_ids(_FakeDB(raise_exc=True), env={}, now=1000.0)
+    assert pol._inflight is None
+
+
+async def test_a_stale_inflight_from_another_loop_is_not_joined():
+    other = asyncio.new_event_loop()
+    try:
+        pol._inflight = other.create_future()     # pending, but not on this loop
+        db = _FakeDB(rows=[{"merchant_id": "m_demo"}])
+        ids = await asyncio.wait_for(pol.get_excluded_merchant_ids(db, env={}), 2.0)
+        assert db.calls == 1 and "m_demo" in ids  # ran its own lookup instead
+    finally:
+        pol.reset_cache()
+        other.close()
+
+
+def test_reset_cache_clears_the_inflight_slot():
+    loop = asyncio.new_event_loop()
+    try:
+        pol._inflight = loop.create_future()
+        pol.reset_cache()
+        assert pol._inflight is None
+    finally:
+        loop.close()
