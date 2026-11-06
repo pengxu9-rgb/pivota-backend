@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import itertools
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from fastapi import HTTPException
 from urllib.parse import urlparse
@@ -39,6 +40,7 @@ from services.external_seed_search import (
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
+from services.region_pricing import pricing_currency_for_region_or_none
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -1861,6 +1863,39 @@ _FRESH_HOURS_DEFAULT = 48.0
 # SQL LIMIT, and the queue is now tiered in Python over every eligible row, so this is a sanity cap.
 _CANDIDATE_LIMIT_CAP = 30000
 
+# THE PER-HOST CAP on one run's candidate cut. Without it a backlog on one host fills the whole cut: when a served
+# region's currency started counting as served (2026-11-05), 2,632 never-refreshed SGD seeds in the US partition, on
+# 17 hosts, moved to the head of the queue (census 2026-11-06), and the next 1,300-row cut would have been all of
+# them, 1,009 on ONE host, with no stale USD row at all. A host is read one request at a time, so those rows are also
+# the slowest way to spend the run, and one host breaker trip would waste most of it.
+#
+# SIZED FROM THE RUN'S LIMIT: max(200, ceil(0.3 * limit)), 390 at the job's 1,300. The cap is per run, so a host can
+# be re-read at most cap x runs-per-48h times inside the fresh window; at a flat 200 and ~10 runs a day a host past
+# ~4,000 served seeds could never be fresh again (simulated: an 8,000-seed host settles at ~86 h). 30% of the cut
+# still keeps a backlog on one host from taking most of a run. EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST sets it
+# outright.
+#
+# DEFERRED ROWS ARE NOT STAMPED: they are left out of the cut, so they keep their place and lead the next run.
+# An unset, blank, malformed, non-positive or non-finite value falls back to the default, never to "no cap".
+_MAX_ROWS_PER_HOST_FLOOR = 200
+_MAX_ROWS_PER_HOST_SHARE = 0.3
+
+
+def _default_max_rows_per_host(limit: int) -> int:
+    return max(_MAX_ROWS_PER_HOST_FLOOR, math.ceil(_MAX_ROWS_PER_HOST_SHARE * max(1, int(limit))))
+
+
+def _refresh_max_rows_per_host(limit: int) -> int:
+    default = _default_max_rows_per_host(limit)
+    raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_MAX_ROWS_PER_HOST", "").strip()
+    try:
+        value = float(raw) if raw else float(default)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < 1:
+        return default
+    return int(value)
+
 
 def _refresh_fresh_hours() -> float:
     raw = os.getenv("EXTERNAL_REFERRAL_REFRESH_FRESH_HOURS", "").strip()
@@ -1871,19 +1906,49 @@ def _refresh_fresh_hours() -> float:
     return value if math.isfinite(value) and value >= 0 else _FRESH_HOURS_DEFAULT
 
 
-def refresh_queue_tier(*, is_fresh: bool, market: Any, price_currency: Any) -> Tuple[int, int]:
+def served_region_currencies() -> FrozenSet[str]:
+    """The currencies the served pricing regions price in: `serving_pricing_regions()` (the market registry's served
+    markets, which PIVOTA_SERVING_PRICING_REGIONS may only narrow), the list every serving path reads, each mapped
+    through region_pricing. E.g. {'USD', 'SGD'}.
+
+    FAILS SAFE TO EMPTY, loudly: an empty list, or a registry or env that does not load, leaves the refresh tier on
+    the partition's currency alone (`refresh_queue_tier` with no served currencies), never "every currency served".
+    """
+    try:
+        from services.index_pipeline_state_service import serving_pricing_regions
+
+        regions = list(serving_pricing_regions() or [])
+    except Exception as exc:
+        logger.warning("external referral refresh: no served pricing regions (%s); the queue tier uses the "
+                       "partition's currency alone", exc)
+        return frozenset()
+    return frozenset(c for c in (pricing_currency_for_region_or_none(r) for r in regions) if c)
+
+
+def refresh_queue_tier(
+    *, is_fresh: bool, market: Any, price_currency: Any, served_currencies: Iterable[str] = ()
+) -> Tuple[int, int]:
     """Where a candidate sits in the refresh queue. Pure; lower sorts first.
 
-    Stale before fresh, then a row priced in its own market's currency before one that is not.
-    The second key is the seed lane's currency filter (`seed_serving_currency`, Peng 2026-09-26):
-    a row in the wrong currency is not served, and a refresh cannot make it so, because
-    `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is
-    kept rather than dropped. A NULL currency can still be filled by a read, and SG rows live in
-    the US partition on purpose.
+    Stale before fresh, then a row priced in a SERVED currency before one that is not. A served currency is the
+    partition's own (`seed_serving_currency(market)`, Peng 2026-09-26) or, since 2026-11-05, the currency of any
+    served pricing region (`served_currencies`, from `served_region_currencies()`), IN A PARTITION WHOSE OWN
+    CURRENCY IS SERVED. SG rows live in the US partition on purpose, so on the partition alone every SGD seed sorted
+    behind every stale USD one, and with the run's limit under the stale served tier it was never read (2,632 SGD
+    seeds in the US partition, census 2026-11-06).
+
+    The partition condition keeps the rule to the partitions the served regions read: a USD row in the JP
+    partition is not served while JP is not, so it stays behind, as before.
+
+    A row in a currency no served region prices is still not served, and a refresh cannot make it so, because
+    `_refresh_external_seed_by_id` refuses a currency switch (`skipped_currency_mismatch`). It is kept rather than
+    dropped. A NULL currency can still be filled by a read.
     """
     expected = seed_serving_currency(market)
     currency = str(price_currency or "").strip().upper()
-    served_currency = expected is not None and currency == expected
+    # Blank codes never enter `served`, and no market's currency is blank, so a row with no currency is never served.
+    served = {str(c).strip().upper() for c in served_currencies if str(c or "").strip()}
+    served_currency = expected is not None and (currency == expected or (expected in served and currency in served))
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
@@ -1907,13 +1972,21 @@ async def get_external_referral_refresh_candidate_seed_ids(
       * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
       * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
 
-    ORDER: `refresh_queue_tier` (stale before fresh, served currency before not), then within a
+    ORDER: `refresh_queue_tier` (stale before fresh, a served currency -- the partition's or any served pricing
+    region's -- before not), then within a
     tier `last_crawl_attempt_at` NULLS FIRST, as before. The tier uses `last_crawled_at`, the
     origin-read clock. The within-tier order uses the ATTEMPT clock, so a seed that can never be
     read still rotates behind the others instead of heading the queue forever (migration 202). The
     SQL keeps that order and a stable Python sort applies the tiers on top.
 
     `updated_at` stays only as the last tiebreak (see migration 202 for why it never leads).
+
+    THE CUT takes at most `_refresh_max_rows_per_host(limit)` rows per host (`crawl_politeness.host_of` on the
+    destination URL, the key the run paces and breaks on), in queue order, WITHIN EACH TIER: a row over its host's
+    cap gives its slot to the next row OF ITS OWN TIER, and only when the tier has no row left under the cap do its
+    deferred rows take the remaining slots, still ahead of any lower tier. So the cap spreads a tier across hosts
+    and never hands a stale row's slot to a fresh one. A row with no host is never capped. An operator's targeted
+    `seed_ids` list is not capped: it is at most 200 ids, named on purpose.
     """
     normalized_limit = max(1, min(int(limit or 500), _CANDIDATE_LIMIT_CAP))
     fresh_cutoff = datetime.now(timezone.utc) - timedelta(hours=_refresh_fresh_hours())
@@ -1941,7 +2014,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
         scope_values.update(refresh_market=str(market).strip().upper(), refresh_currency=expected)
     rows = await database.fetch_all(
         f"""
-        SELECT id, market, price_currency,
+        SELECT id, market, price_currency, destination_url,
                CASE WHEN last_crawled_at IS NOT NULL AND last_crawled_at >= :fresh_cutoff
                     THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
@@ -1953,7 +2026,8 @@ async def get_external_referral_refresh_candidate_seed_ids(
         """,
         scope_values,
     )
-    ranked: List[Tuple[Tuple[int, int], str]] = []
+    ranked: List[Tuple[Tuple[int, int], str, str]] = []
+    served_currencies = served_region_currencies()
     for row in rows or []:
         row_dict = _row_to_dict(row)
         seed_id = str(row_dict.get("id") or "").strip()
@@ -1963,10 +2037,44 @@ async def get_external_referral_refresh_candidate_seed_ids(
             is_fresh=bool(int(row_dict.get("is_fresh") or 0)),
             market=row_dict.get("market"),
             price_currency=row_dict.get("price_currency"),
+            served_currencies=served_currencies,
         )
-        ranked.append((tier, seed_id))
+        ranked.append((tier, seed_id, crawl_politeness.host_of(str(row_dict.get("destination_url") or ""))))
     ranked.sort(key=lambda item: item[0])  # stable: keeps the SQL order inside a tier
-    return [seed_id for _tier, seed_id in ranked[:normalized_limit]]
+    if seed_ids is not None:
+        return [seed_id for _tier, seed_id, _host in ranked[:normalized_limit]]
+    per_host_cap = _refresh_max_rows_per_host(normalized_limit)
+    per_host: Counter = Counter()
+    cut: List[str] = []
+    deferred = 0
+    deferred_hosts: set = set()
+    for _tier, group in itertools.groupby(ranked, key=lambda item: item[0]):
+        if len(cut) >= normalized_limit:
+            break
+        tier_deferred: List[Tuple[str, str]] = []
+        for _t, seed_id, host in group:
+            if len(cut) >= normalized_limit:
+                break
+            if host:
+                if per_host[host] >= per_host_cap:
+                    tier_deferred.append((seed_id, host))
+                    continue
+                per_host[host] += 1
+            cut.append(seed_id)
+        # The tier's own deferred rows, in queue order, before any lower tier's row.
+        room = max(0, normalized_limit - len(cut))
+        cut.extend(seed_id for seed_id, _host in tier_deferred[:room])
+        left_out = tier_deferred[room:]
+        deferred += len(left_out)
+        deferred_hosts.update(host for _seed_id, host in left_out)
+    if deferred:
+        # WARNING, not INFO: nothing configures the root logger, so a plain module logger's INFO never reaches the
+        # job's logs, and this line is how a catch-up is watched draining.
+        logger.warning(
+            "external referral refresh: %d candidate rows deferred past the %d-rows-per-host cap (on %d hosts)",
+            deferred, per_host_cap, len(deferred_hosts),
+        )
+    return cut
 
 
 # The wall-clock ceiling for one refresh run, and it is not a nicety. Every row here is a

@@ -256,25 +256,36 @@ async def test_the_census_program_is_safe_to_pass_inline(scoped_db):
     assert chr(64) not in text
 
 
+_STALE_SERVED = [
+    # stale, served currency: never attempted first (NULLS FIRST), then oldest attempt;
+    # equal attempt stamps fall back to updated_at, i.e. insertion order here
+    "s_never_new", "s_never_old", "s_gt90", "s_30_90", "s_7_30",
+    "s_dead_4", "s_flaky_4", "s_dead_3", "s_flaky_3", "s_stale_2", "s_dead_2", "s_flaky_2",
+    "s_stale_1", "s_dead_1", "s_flaky_1", "s_stale_0", "s_dead_0",
+]
+_FRESH_SERVED = ["s_attached", "s_lt7", "s_oos", "s_contradicted", "s_snapshot_oos", "s_top_oos"]
+
+
 @pytest.mark.asyncio
-async def test_the_refresh_selector_runs_on_postgres(scoped_db, monkeypatch):
+@pytest.mark.parametrize("serving_regions, expected_tail", [
+    # The registry serves US and SG (no env): an SGD seed in the US partition is a served currency, so it waits
+    # with the fresh served rows in their own order, not behind them.
+    (None, ["s_sgd", "s_jp", "s_flaky_0"]),
+    # US only: SGD is no served region's currency, so the fresh SGD row comes last.
+    ("US", ["s_jp", "s_flaky_0", "s_sgd"]),
+])
+async def test_the_refresh_selector_runs_on_postgres(scoped_db, monkeypatch, serving_regions, expected_tail):
     import services.external_referral_readiness as module
 
     await _load(scoped_db)
     monkeypatch.setattr(module, "database", scoped_db)
     monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_FRESH_HOURS", raising=False)
+    if serving_regions is None:
+        monkeypatch.delenv("PIVOTA_SERVING_PRICING_REGIONS", raising=False)
+    else:
+        monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", serving_regions)
     ids = await module.get_external_referral_refresh_candidate_seed_ids(limit=100)
 
-    assert ids == [
-        # stale, served currency: never attempted first (NULLS FIRST), then oldest attempt;
-        # equal attempt stamps fall back to updated_at, i.e. insertion order here
-        "s_never_new", "s_never_old", "s_gt90", "s_30_90", "s_7_30",
-        "s_dead_4", "s_flaky_4", "s_dead_3", "s_flaky_3", "s_stale_2", "s_dead_2", "s_flaky_2",
-        "s_stale_1", "s_dead_1", "s_flaky_1", "s_stale_0", "s_dead_0",
-        # fresh (read inside 48h): they wait
-        "s_attached", "s_lt7", "s_oos", "s_contradicted", "s_snapshot_oos", "s_top_oos", "s_jp",
-        "s_flaky_0",
-        # fresh AND not in its market's currency: last
-        "s_sgd",
-    ]
+    # fresh (read inside 48h) rows wait behind every stale one
+    assert ids == _STALE_SERVED + _FRESH_SERVED + expected_tail
     # never: quarantined, suppressed, or inactive (retired, and every r_ row)
