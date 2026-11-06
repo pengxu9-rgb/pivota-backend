@@ -5,7 +5,7 @@ Properly handles all database schema issues and edge cases
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 from datetime import datetime
 from db.database import database
 from routes.agent_auth import AgentContext, get_agent_context
@@ -721,78 +721,111 @@ async def generate_api_key(request: AgentAuthRequest):
 @router.get("/merchants")
 async def list_merchants(
     status: str = "active",
+    scope: Literal["available", "mine"] = Query(
+        default="available",
+        description=(
+            "'available' (default): merchants this agent can search and order from. "
+            "'mine': only merchants this agent has already placed orders with."
+        ),
+    ),
     limit: int = Query(default=50, le=100),
     offset: int = Query(default=0, ge=0),
     context: AgentContext = Depends(get_agent_context)
 ):
-    """List connected merchants - FIXED to only query existing columns"""
+    """List merchants for this agent.
+
+    `scope=available` is what a new agent needs to find a `merchant_id`: the
+    merchants product search treats as transactable (not deleted/rejected,
+    PSP connected), narrowed to the agent's `allowed_merchants` when that is
+    set. `scope=mine` keeps the order-history view this endpoint served
+    before. Contact email is only returned for merchants the agent has
+    ordered from, so an API key cannot pull every merchant's contact details.
+    """
     try:
         # Map status values
         if status == "active":
             db_status = "approved"
         else:
             db_status = status
-        
-        # Query merchants this agent has interacted with (via orders)
-        # Only show merchants where agent has created orders
+
+        params: Dict[str, Any] = {"status": db_status, "agent_id": context.agent_id}
+        where = [
+            "mo.status = :status",
+            "mo.status NOT IN ('deleted', 'rejected')",
+        ]
+        if scope == "mine":
+            where.append("o.merchant_id IS NOT NULL")
+        else:
+            # Same eligibility as cross-merchant product search.
+            where.append("mo.psp_connected = TRUE")
+            allowed = context.allowed_merchants
+            if allowed is not None:
+                if not allowed:
+                    return {
+                        "status": "success",
+                        "scope": scope,
+                        "merchants": [],
+                        "pagination": {"total": 0, "limit": limit, "offset": offset, "has_more": False},
+                    }
+                names = []
+                for i, mid in enumerate(allowed):
+                    params[f"allowed_{i}"] = mid
+                    names.append(f":allowed_{i}")
+                where.append(f"mo.merchant_id IN ({', '.join(names)})")
+
+        from_clause = """
+            FROM merchant_onboarding mo
+            LEFT JOIN (
+                SELECT merchant_id,
+                       COUNT(order_id) AS total_orders,
+                       SUM(CASE WHEN payment_status = 'paid' THEN total ELSE 0 END) AS total_gmv
+                FROM orders
+                WHERE agent_id = :agent_id
+                  AND (is_deleted IS NULL OR is_deleted = FALSE)
+                GROUP BY merchant_id
+            ) o ON o.merchant_id = mo.merchant_id
+            WHERE """ + "\n              AND ".join(where)
+
         query = """
-            SELECT DISTINCT
-                mo.merchant_id, 
-                mo.business_name, 
+            SELECT
+                mo.merchant_id,
+                mo.business_name,
                 mo.status,
                 mo.store_url,
                 mo.website,
                 mo.region,
                 mo.contact_email,
                 COALESCE(mo.psp_connected, CASE WHEN EXISTS (
-                    SELECT 1 FROM merchant_psps mp 
+                    SELECT 1 FROM merchant_psps mp
                     WHERE mp.merchant_id = mo.merchant_id AND mp.status = 'active'
                 ) THEN true ELSE false END) AS psp_connected,
                 COALESCE(mo.psp_type, (
-                    SELECT mp.provider FROM merchant_psps mp 
+                    SELECT mp.provider FROM merchant_psps mp
                     WHERE mp.merchant_id = mo.merchant_id AND mp.status = 'active'
                     ORDER BY mp.connected_at DESC LIMIT 1
                 )) AS psp_type,
                 mo.created_at,
-                COUNT(o.order_id) as total_orders,
-                SUM(CASE WHEN o.payment_status = 'paid' THEN o.total ELSE 0 END) as total_gmv
-            FROM merchant_onboarding mo
-            INNER JOIN orders o ON o.merchant_id = mo.merchant_id
-            WHERE mo.status = :status
-            AND mo.status != 'deleted'
-            AND o.agent_id = :agent_id
-            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-            GROUP BY mo.merchant_id, mo.business_name, mo.status, mo.store_url, 
-                     mo.website, mo.region, mo.contact_email, mo.psp_connected, 
-                     mo.psp_type, mo.created_at
-            ORDER BY total_orders DESC, mo.business_name
+                COALESCE(o.total_orders, 0) AS total_orders,
+                COALESCE(o.total_gmv, 0) AS total_gmv
+        """ + from_clause + """
+            ORDER BY COALESCE(o.total_orders, 0) DESC, mo.business_name, mo.merchant_id
             LIMIT :limit OFFSET :offset
         """
-        
-        merchants = await database.fetch_all(query, {
-            "status": db_status,
-            "agent_id": context.agent_id,
-            "limit": limit,
-            "offset": offset
-        })
-        
-        # Get total count (only merchants this agent has ordered from)
-        count_query = """
-            SELECT COUNT(DISTINCT mo.merchant_id) as total
-            FROM merchant_onboarding mo
-            INNER JOIN orders o ON o.merchant_id = mo.merchant_id
-            WHERE mo.status = :status
-            AND mo.status != 'deleted'
-            AND o.agent_id = :agent_id
-            AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
-        """
-        total_result = await database.fetch_one(count_query, {
-            "status": db_status,
-            "agent_id": context.agent_id
-        })
-        
+
+        merchants = await database.fetch_all(query, {**params, "limit": limit, "offset": offset})
+        total_result = await database.fetch_one(
+            "SELECT COUNT(*) AS total " + from_clause, params
+        )
+        total = int(total_result["total"]) if total_result and total_result["total"] else 0
+
+        def _created_at(value: Any) -> Optional[str]:
+            if not value:
+                return None
+            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
         return {
             "status": "success",
+            "scope": scope,
             "merchants": [
                 {
                     "merchant_id": m["merchant_id"],
@@ -801,23 +834,23 @@ async def list_merchants(
                     "store_url": m["store_url"],
                     "website": m["website"],
                     "region": m["region"],
-                    "contact_email": m["contact_email"],
-                    "psp_connected": m["psp_connected"],
+                    "contact_email": m["contact_email"] if int(m["total_orders"] or 0) > 0 else None,
+                    "psp_connected": bool(m["psp_connected"]),
                     "psp_type": m["psp_type"],
-                    "created_at": m["created_at"].isoformat() if m["created_at"] else None,
-                    "total_orders": m["total_orders"],
+                    "created_at": _created_at(m["created_at"]),
+                    "total_orders": int(m["total_orders"] or 0),
                     "total_gmv": float(m["total_gmv"]) if m["total_gmv"] else 0
                 }
                 for m in merchants
             ],
             "pagination": {
-                "total": total_result["total"] if total_result else 0,
+                "total": total,
                 "limit": limit,
                 "offset": offset,
-                "has_more": (total_result["total"] if total_result else 0) > offset + limit
+                "has_more": total > offset + limit
             }
         }
-    
+
     except Exception as e:
         logger.error(f"Failed to list merchants: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list merchants: {str(e)}")
