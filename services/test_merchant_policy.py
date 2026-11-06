@@ -25,6 +25,7 @@ Two identification signals, because rigs appear under multiple merchant_ids:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -100,7 +101,13 @@ _cache_at: float = 0.0
 # every uncached search re-queries merchant_stores during an outage, and under
 # pool saturation each attempt can sit out the pool's checkout timeout.
 _FAILURE_BACKOFF_SECONDS = 10.0
-_failed_at: Optional[float] = None
+_failed_at: Optional[float] = None  # when the last attempt FINISHED failing
+
+# Single flight: while one lookup is running, other callers await it instead of
+# starting their own. Its result is the resolved set, or None for a failure.
+# Without this, a lookup that is slow to fail (pool checkout timeout) lets every
+# caller in that window start another one.
+_inflight: Optional["asyncio.Future[Optional[Set[str]]]"] = None
 
 # A persistent failure must not log a traceback per search.
 _WARN_INTERVAL_SECONDS = 60.0
@@ -163,24 +170,45 @@ async def get_excluded_merchant_ids(
     _FAILURE_BACKOFF_SECONDS, and the warning is rate-limited to one per
     _WARN_INTERVAL_SECONDS with a count of the ones it suppressed.
     """
-    global _cache_value, _cache_at, _failed_at
+    global _cache_value, _cache_at, _failed_at, _inflight
     static = static_test_merchant_ids(env)
     if database is None:
         return static
-    ts = time.monotonic() if now is None else now
+
+    def _clock() -> float:
+        return time.monotonic() if now is None else now
+
+    ts = _clock()
     if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
         return static | _cache_value
     if _failed_at is not None and (ts - _failed_at) < _FAILURE_BACKOFF_SECONDS:
         return static | (_cache_value or set())
+
+    loop = asyncio.get_running_loop()
+    if _inflight is not None and not _inflight.done() and _inflight.get_loop() is loop:
+        # shield: a cancelled waiter must not cancel the shared attempt.
+        joined = await asyncio.shield(_inflight)
+        return static | (joined if joined is not None else (_cache_value or set()))
+
+    fut: "asyncio.Future[Optional[Set[str]]]" = loop.create_future()
+    _inflight = fut
+    resolved: Optional[Set[str]] = None
     try:
         resolved = await _resolve_demo_domain_merchant_ids(database)
     except Exception:
-        _failed_at = ts
-        _warn_resolve_failed(ts)
+        # Stamp when the attempt FINISHED: a lookup that fails after a long pool
+        # wait must still back off for the full window from that point.
+        _failed_at = _clock()
+        _warn_resolve_failed(_failed_at)
         return static | (_cache_value or set())
+    finally:
+        if not fut.done():
+            fut.set_result(resolved)
+        if _inflight is fut:
+            _inflight = None
     _failed_at = None
     _cache_value = resolved
-    _cache_at = ts
+    _cache_at = _clock()
     return static | resolved
 
 
@@ -202,10 +230,11 @@ def _warn_resolve_failed(ts: float) -> None:
 
 def reset_cache() -> None:
     """Test hook — drop the memoized demo-domain set and the failure state."""
-    global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings
+    global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings, _inflight
     _cache_value = None
     _cache_at = 0.0
     _failed_at = None
+    _inflight = None
     _last_warn_at = None
     _suppressed_warnings = 0
 
