@@ -679,15 +679,22 @@ async def list_merchants(
     status: str = Query(
         default="active",
         description=(
-            "Merchant status. scope=available accepts only 'active' (or its alias 'approved')."
+            "Merchant status. scope=available and scope=native accept only 'active' "
+            "(or its alias 'approved')."
         ),
     ),
-    scope: Literal["available", "mine"] = Query(
+    scope: Literal["available", "native", "mine"] = Query(
         default="available",
         description=(
-            "'available' (default): approved merchants this agent can order from. "
-            "'mine': only merchants this agent has already placed orders with."
+            "'available' (default): merchants a purchase can reach through a checkout "
+            "protocol, one row per merchant domain and market, with the routes it can take. "
+            "'native': merchants integrated through the Pivota merchant portal. "
+            "'mine': portal merchants this agent has already placed orders with."
         ),
+    ),
+    market: Optional[str] = Query(
+        default=None,
+        description="ISO 3166-1 alpha-2 market, e.g. US. scope=available only.",
     ),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -695,30 +702,41 @@ async def list_merchants(
 ):
     """List merchants for this agent.
 
-    `scope=available` is what a new agent needs to find a `merchant_id`:
-    approved, PSP-connected merchants (the PSP rule product search uses).
-    `scope=mine` keeps the order-history view this endpoint served before,
-    and is the only scope that takes another `status`. Both scopes honour the
-    agent's `allowed_merchants` the way `can_access_merchant` does: None means
-    every merchant, a list (even an empty one) means only those. (The legacy
-    search lane is looser: it treats `[]` as unrestricted, and with
+    `scope=available` (the default) is the protocol directory
+    (services/agent_merchant_directory.py): merchants no portal integration
+    knows, reached through a payment partner's checkout or a prefilled cart the
+    buyer finishes. Rows are keyed by `merchant_domain` + `market` — the pair a
+    purchase names — and carry `checkout_routes`. The agent's
+    `allowed_merchants` is matched against the domain.
+
+    `scope=native` is the portal list: approved, PSP-connected merchants (the
+    PSP rule product search uses), each with a `merchant_id`. `scope=mine`
+    keeps the order-history view this endpoint served before, and is the only
+    scope that takes another `status`. Both honour the agent's
+    `allowed_merchants` the way `can_access_merchant` does: None means every
+    merchant, a list (even an empty one) means only those. (The legacy search
+    lane is looser: it treats `[]` as unrestricted, and with
     `search_all_merchants=true` it bypasses an allowlist of exactly
     `["external_seed"]`.)
 
-    Both scopes drop test/demo rigs (`services/test_merchant_policy`, the same
-    exclusion the shop-gateway lanes apply), so a rig never lists as a real
-    merchant. Source quarantines are not applied: they gate offer rows by
+    `native` and `mine` drop test/demo rigs (`services/test_merchant_policy`,
+    the same exclusion the shop-gateway lanes apply), so a rig never lists as a
+    real merchant. Source quarantines are not applied: they gate offer rows by
     storefront host and price provenance, and this list carries no offers.
 
     Contact email, PSP type and created_at are returned only for merchants the
     agent has ordered from, so an API key cannot pull every merchant's contact
     or processor details.
     """
-    if scope == "available" and status not in ("active", "approved"):
+    if scope in ("available", "native") and status not in ("active", "approved"):
         raise HTTPException(
             status_code=422,
-            detail="scope=available lists active merchants only; use scope=mine to filter by status",
+            detail=f"scope={scope} lists active merchants only; use scope=mine to filter by status",
         )
+    if market is not None and scope != "available":
+        raise HTTPException(status_code=422, detail="market filters scope=available only")
+    if scope == "available":
+        return await _list_protocol_merchants(context=context, market=market, limit=limit, offset=offset)
     try:
         # Map status values
         if status in ("active", "approved"):
@@ -848,6 +866,35 @@ async def list_merchants(
     except Exception as e:
         logger.error(f"Failed to list merchants: {e}")
         raise HTTPException(status_code=500, detail="Failed to list merchants")
+
+async def _list_protocol_merchants(*, context: AgentContext, market: Optional[str], limit: int, offset: int):
+    from services import agent_merchant_directory as directory
+
+    if market is not None:
+        market_key = market.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", market_key):
+            raise HTTPException(status_code=422, detail="market must be an ISO 3166-1 alpha-2 code")
+    else:
+        market_key = None
+    try:
+        rows = await directory.list_for_agent(
+            agent_id=str(context.agent_id), allowed_merchants=context.allowed_merchants, market=market_key
+        )
+    except Exception:
+        logger.error("Failed to list protocol merchants", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list merchants")
+    total = len(rows)
+    return {
+        "status": "success",
+        "scope": "available",
+        "merchants": rows[offset:offset + limit],
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": total > offset + limit,
+        },
+    }
 
 # ============================================================================
 # PRODUCTS SEARCH
