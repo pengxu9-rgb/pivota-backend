@@ -432,15 +432,24 @@ def test_a_data_attribute_payload_the_de_dupe_collapsed_proves_nothing(monkeypat
 
 
 def test_adopted_page_variants_never_carry_the_read_marks(monkeypatch):
-    """A seed with no variants adopts the page's, even on a cached fallback the reconcile skips."""
+    """A seed with no variants adopts the page's on a read, and the stored list carries no read marks."""
     from services.external_offers_service import READ_PROVENANCE_KEYS
 
     row = _seed_row(variants=None, price=20.0, availability="in_stock")
-    _, stored = _refresh(monkeypatch, row, _page([_offer(20, IN, sku="a"), _offer(32, IN, sku="b")]), reached=False)
+    _, stored = _refresh(monkeypatch, row, _page([_offer(20, IN, sku="a"), _offer(32, IN, sku="b")]))
 
     adopted = stored["seed_data"]["variants"]
     assert [v["variant_id"] for v in adopted] == ["a", "b"]
     assert not any(k in v for v in adopted for k in READ_PROVENANCE_KEYS)
+
+
+def test_a_cached_fallback_adopts_no_page_variants(monkeypatch):
+    """Not a read of the served product (controller review of #2713): the cached page's variants are not
+    adopted, because `_seed_primary_price` would serve their price ahead of the column the refresh kept."""
+    row = _seed_row(variants=None, price=20.0, availability="in_stock")
+    _, stored = _refresh(monkeypatch, row, _page([_offer(20, IN, sku="a"), _offer(32, IN, sku="b")]), reached=False)
+
+    assert not stored["seed_data"].get("variants")
 
 
 def test_a_single_variant_is_not_restated_at_a_sibling_sizes_price(monkeypatch):
