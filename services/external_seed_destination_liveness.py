@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
 import unicodedata
 
 import httpx
@@ -344,6 +344,8 @@ HANDLELESS_READ_MODES = ("off", "shadow", "on")
 HANDLELESS_REFUSALS = (
     "cache", "status", "challenge", "redirect_unknown", "redirect", "segment", "no_product", "structure",
     "identity_url_mismatch", "identity", "price", "price_source", "price_inexact", "price_move",
+    # The rule itself raised (`routes/employee_products._handleless_read_outcome` keeps today's observation).
+    "error",
 )
 HANDLELESS_LISTING_SEGMENTS = frozenset({
     "collections", "collection", "category", "categories", "c", "search", "pages", "blogs", "blog",
@@ -352,11 +354,26 @@ HANDLELESS_LISTING_SEGMENTS = frozenset({
 HANDLELESS_PRICE_MOVE_BOUNDS = (0.5, 2.0)
 HANDLELESS_TITLE_DICE_MIN = 0.6
 HANDLELESS_LIVE_NOTE = "same destination, no product handle; jsonld identity by {by}"
+# A price text that states the bottom of a range ("From $19", "Starting at", "ab 19 €", "19円~", "19,000원부터").
+_FROM_PRICE_RE = re.compile(r"\bfrom\b|\bstarting\b|\bstarts\b|\bab\b|à partir|a partir|\bdesde\b|\bdès\b|[~〜]|から|起|부터|이상")
 # Words that name no product: dropped from both titles before they are compared.
 _TITLE_STOPWORDS = frozenset({
-    "the", "and", "set", "a", "an", "of", "for", "with", "in", "by", "new",
-    "ml", "l", "g", "kg", "mg", "oz", "fl", "floz", "lb", "lbs", "pcs", "pc", "ea", "pack", "count", "ct", "x",
+    "the", "and", "a", "an", "of", "for", "with", "in", "by", "new",
+    "ml", "l", "g", "kg", "mg", "oz", "fl", "floz", "lb", "lbs", "ea", "x",
 })
+# Words that make a title name ANOTHER ITEM of the same product line: a pack, a set, a refill, a mini, a kit.
+# One title carrying one the other lacks refuses, however close the rest is ("Barrier Cream" / "Barrier Cream
+# 2 Pack"). So does a different pack count (`_PACK_COUNT_RE`).
+_ITEM_FORM_WORDS = frozenset({
+    "pack", "packs", "pk", "set", "sets", "kit", "kits", "bundle", "duo", "trio", "refill", "refills", "mini",
+    "minis", "travel", "sample", "samples", "jumbo", "deluxe", "value", "gift", "multipack", "pcs", "pieces",
+    "count", "ct",
+})
+_ITEM_FORM_WORDS_CJK = ("세트", "리필", "미니", "기획", "듀오", "샘플", "セット", "詰め替え", "つめかえ", "ミニ", "サンプル", "套装", "替换装")
+_PACK_COUNT_RE = re.compile(
+    r"(\d+)\s*-?\s*(?:pk|packs?|pcs|pc|pieces|count|ct|개입|개|枚入|枚|本入|本|個入|個|入)(?![a-z])"
+    r"|(?:x|×)\s*(\d+)(?![\d.])|(?<![\d.])(\d+)\s*(?:x|×)(?![a-z\d])"
+)
 # What KIND of product a title names. Two titles that each carry a kind word the other lacks are siblings
 # ("Barrier Cream" / "Barrier Toner"), whatever their overlap.
 _PRODUCT_KIND_WORDS = frozenset({
@@ -399,17 +416,34 @@ class HandlelessDecision:
 
 
 def _url_parts(url: Any) -> Optional[Tuple[str, str, str, str]]:
-    """(scheme, host with one leading www. folded, unquoted path without a trailing /, unquoted query)."""
+    """(scheme, host with one leading www. folded, unquoted path without a trailing /, unquoted query), or None
+    for a URL that does not parse (a bad port `:abc` / `:99999` raises only when `.port` is read)."""
     try:
         parsed = urlparse(str(url or "").strip())
+        host = _fold_www(parsed.hostname or "")
+        port = parsed.port
     except Exception:  # noqa: BLE001 - an unparsable URL matches nothing
         return None
-    host = _fold_www(parsed.hostname or "")
     if not host:
         return None
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
+    if port:
+        host = f"{host}:{port}"
     return (parsed.scheme.lower(), host, unquote(parsed.path or "").rstrip("/"), unquote(parsed.query or ""))
+
+
+# Query keys that name no product: tracking, attribution, and the variant (the URL variant pick owns it).
+_IDENTITY_IGNORED_QUERY_KEYS = frozenset({
+    "gclid", "fbclid", "yclid", "msclkid", "dclid", "gbraid", "wbraid", "ttclid", "igshid", "srsltid", "mc_cid",
+    "mc_eid", "_ga", "_gl", "ref", "ref_", "referrer", "source", "src", "aff", "affiliate", "variant",
+})
+
+
+def _identity_query(query: str) -> Tuple[Tuple[str, str], ...]:
+    """The query pairs that can name a product (`/item.php?id=5`): tracking keys and `variant` dropped."""
+    pairs = parse_qsl(query or "", keep_blank_values=True)
+    kept = {(k.strip().lower(), v.strip()) for k, v in pairs
+            if not k.strip().lower().startswith("utm_") and k.strip().lower() not in _IDENTITY_IGNORED_QUERY_KEYS}
+    return tuple(sorted(kept))
 
 
 def _same_fetched_url(sent: Any, final: Any) -> bool:
@@ -419,9 +453,14 @@ def _same_fetched_url(sent: Any, final: Any) -> bool:
 
 
 def _same_product_url(candidate: Any, served: Any) -> bool:
-    """Does the page's own product URL name the served page? Host and path only: the query picks a variant."""
+    """Does the page's own product URL name the served page? Host, path AND the query pairs that can name a
+    product (`_identity_query`): a handle-less URL often carries its product id there (`/item.php?id=5`). Tracking
+    keys and `variant` are ignored; any other difference is another page."""
     left, right = _url_parts(candidate), _url_parts(served)
-    return left is not None and right is not None and left[1:3] == right[1:3]
+    return (
+        left is not None and right is not None and left[1:3] == right[1:3]
+        and _identity_query(left[3]) == _identity_query(right[3])
+    )
 
 
 def _listing_segment(url: Any) -> Optional[str]:
@@ -473,13 +512,28 @@ def _brand_tokens(*brands: Any) -> Set[str]:
 _KIND_TOKENS = frozenset(_PRODUCT_KIND_WORDS) | frozenset(
     gram for word in _PRODUCT_KIND_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
 )
+_ITEM_FORM_TOKENS = frozenset(_ITEM_FORM_WORDS) | frozenset(
+    gram for word in _ITEM_FORM_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
+)
+
+
+def _pack_counts(text: Any) -> Set[int]:
+    """The pack counts a title states ("2 Pack", "3pcs", "x2", "2개입"), a count of 1 dropped."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    counts: Set[int] = set()
+    for match in _PACK_COUNT_RE.finditer(norm):
+        raw = next((g for g in match.groups() if g), None)
+        if raw and int(raw) > 1:
+            counts.add(int(raw))
+    return counts
 
 
 def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence[Any] = ()) -> bool:
     """The title path of G4: the seed's title, brand dropped, names at least 2 informative words (Latin words and
     CJK words together) or 3 CJK bigrams; the two titles' Dice coefficient is at least `HANDLELESS_TITLE_DICE_MIN`;
     and they are not siblings (each carries a product-kind word the other lacks: "Barrier Cream" / "Barrier Toner",
-    which share two words of three)."""
+    which share two words of three); nor does one name a pack, set, refill or mini the other does not, or another
+    pack count."""
     drop = _brand_tokens(*brands)
     seed, words, bigrams, runs = _title_tokens(seed_title, drop)
     page = _title_tokens(page_name, drop)[0]
@@ -488,6 +542,9 @@ def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence
     if not page:
         return False
     if (seed - page) & _KIND_TOKENS and (page - seed) & _KIND_TOKENS:
+        return False
+    if (seed ^ page) & _ITEM_FORM_TOKENS or _pack_counts(seed_title) != _pack_counts(page_name):
+        # A pack, set, refill or mini of the product is another item with another price.
         return False
     dice = 2.0 * len(seed & page) / (len(seed) + len(page))
     return dice >= HANDLELESS_TITLE_DICE_MIN
@@ -567,10 +624,10 @@ def _handleless_refusal(
     if price_read.get("source") != "jsonld":
         return "price_source", None, identity_by
     census = evidence.get("variant_census") if isinstance(evidence.get("variant_census"), dict) else {}
-    if identity.get("offer_kind") not in ("single", "list") or census.get("product_price_exact") is not True:
+    if identity.get("offer_kind") != "single" or census.get("product_price_exact") is not True:
         return "price_inexact", None, identity_by
-    exact = identity.get("exact_price_count")
-    if isinstance(exact, int) and exact > 1 and identity.get("offer_picked_by") != "url_variant":
+    if _FROM_PRICE_RE.search(unicodedata.normalize("NFKC", str(price_read.get("raw") or "")).casefold()):
+        # "From $19.00" is the bottom of a range, not this product's price.
         return "price_inexact", None, identity_by
     # G6
     try:

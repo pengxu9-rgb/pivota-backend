@@ -2316,8 +2316,9 @@ def _jsonld_identity(
     its `name`. Additive evidence, read by nothing else:
       * `priced_identities` -- distinct products on the page that carry a priced offer. A ProductGroup and its
         `hasVariant` children (or an `isVariantOf` parent) are ONE product; nodes naming the same `url` or `@id` are
-        one; a Product with no priced offer (a review widget, an aggregate rating) is not counted; a priced Offer
-        outside every Product counts on its own;
+        one UNLESS they carry another name or another exact price (a bundle that names the served URL too); a
+        Product with no priced offer (a review widget, an aggregate rating) is not counted; a priced Offer outside
+        every Product counts on its own;
       * `listing_types` -- the `JSONLD_LISTING_TYPES` seen anywhere on the page;
       * the PRICING node (the one whose reading `_extract_jsonld_offer` returned): its `url`, `@id`, `name` (as the
         reading names it: a variant by its group), `brand`, its group's `url`, `offer_kind` (single / aggregate /
@@ -2370,14 +2371,56 @@ def _jsonld_identity(
         aliases.add(_identity_key(pricing, base_url))
         if group_of(pricing) is not None:
             aliases.add(_identity_key(group_of(pricing), base_url))
+    def name_of(node: Dict[str, Any]) -> Optional[str]:
+        group = group_of(node)
+        for source in ((group, node) if group is not None else (node,)):
+            name = source.get("name") if isinstance(source, dict) else None
+            if isinstance(name, str) and name.strip():
+                return name.strip().casefold()
+        return None
+
+    def exact_prices_of(offers: list[Dict[str, Any]]) -> Set[str]:
+        return {
+            str(_raw_price_value(o.get("price"))) for o in offers
+            if not _is_aggregate_offer(o) and _raw_price_value(o.get("price")) is not None
+        }
+
+    pricing_group = group_of(pricing) if pricing is not None else None
+    pricing_name = str(entry.get("title") or "").strip().casefold() or None
+    pricing_prices = exact_prices_of([pricing] if pricing is not None and _is_offer_node(pricing)
+                                     else (_node_offer_list(pricing) if pricing is not None else []))
+
+    def same_family(node: Dict[str, Any]) -> bool:
+        """The pricing node itself, its group, or a sibling variant of that group: one product by construction."""
+        return node is pricing or (pricing_group is not None and (node is pricing_group or group_of(node) is pricing_group))
+
+    def conflicts(name: Optional[str], prices: Set[str]) -> bool:
+        """A node under the pricing product's url / @id that is not that product: another name, or another price.
+        Two different products can both name the served URL (a bundle beside the item); merging them would let
+        the higher-scoring one price the page."""
+        return bool((name and pricing_name and name != pricing_name)
+                    or (prices and pricing_prices and prices != pricing_prices))
+
     identities: Set[Tuple[str, Any]] = set()
     for node in product_nodes:
         if any(_offer_is_priced(o) for o in _node_offer_list(node)):
             key = key_of(node)
-            identities.add(("pricing", None) if key in aliases or _identity_key(node, base_url) in aliases else key)
+            if not (key in aliases or _identity_key(node, base_url) in aliases):
+                identities.add(key)
+            elif same_family(node) or not conflicts(name_of(node), exact_prices_of(_node_offer_list(node))):
+                identities.add(("pricing", None))
+            else:
+                identities.add(("conflict", id(node)))
     for offer in bare_offers:
         key = _identity_key(offer, base_url)
-        identities.add(("pricing", None) if offer is pricing or key in aliases else key)
+        if offer is pricing:
+            identities.add(("pricing", None))
+        elif key not in aliases:
+            identities.add(key)
+        elif conflicts(None, exact_prices_of([offer])):
+            identities.add(("conflict", id(offer)))
+        else:
+            identities.add(("pricing", None))
     if pricing is not None and (_is_offer_node(pricing) and _offer_is_priced(pricing)):
         identities.add(("pricing", None))
 

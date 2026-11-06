@@ -774,3 +774,196 @@ async def test_the_agent_card_never_carries_the_marker(monkeypatch) -> None:
     assert liveness.HANDLELESS_SHADOW_KEY not in card["seed_data"]
     assert card["seed_data"]["brand"] == "Brand", "the rest of the seed's data still rides"
     assert row["seed_data"][liveness.HANDLELESS_SHADOW_KEY]["refusal"] == "identity", "the stored row is untouched"
+
+
+# --------------------------------------------------------------------------- review of #2720 (controller, 11-07)
+
+
+@pytest.mark.parametrize(
+    "requested,final",
+    [("https://shop.example:abc/shop/barrier-cream.html", URL), (URL, "https://shop.example:99999/shop/barrier-cream.html")],
+    ids=["bad_port_sent", "bad_port_final"],
+)
+def test_a_bad_port_refuses_rather_than_raises(requested: str, final: str) -> None:
+    decision = _decide(requested_url=requested, observed=_observed(final_url=final))
+    assert (decision.read, decision.refusal) == (False, "redirect")
+
+
+def test_a_rule_that_raises_keeps_todays_observation_and_the_rows_update(monkeypatch) -> None:
+    def boom(**_kwargs):
+        raise ValueError("bad port")
+
+    monkeypatch.setattr(liveness, "classify_handleless_read", boom)
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), mode="shadow")
+    assert out["result"]["handleless_read"] == {"mode": "shadow", "would_read": False, "refusal": "error",
+                                                "would_flip_healthy": False}
+    assert out["result"]["status"] == "success"
+    assert [obs.verdict for obs in out["recorded"]] == [liveness.VERDICT_UNVERIFIABLE]
+    assert out["seed_data"]["handleless_shadow"]["refusal"] == "error"
+
+
+def _query_row(url: str) -> Dict[str, Any]:
+    return _seed_row(destination_url=url, canonical_url=url)
+
+
+def test_a_product_url_naming_another_id_in_the_query_refuses(monkeypatch) -> None:
+    served = "https://shop.example/item.php?id=5"
+    html = _page(_product(name="Completely Different Toner", url="/item.php?id=6", offers=_offer("30.00", sku="T-6")))
+    out = _refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served))
+    _assert_not_read(out, "identity_url_mismatch")
+
+
+def test_a_product_url_with_the_same_id_and_only_tracking_or_variant_keys_reads(monkeypatch) -> None:
+    served = "https://shop.example/item.php?id=5"
+    html = _page(_product(url="/item.php?id=5&utm_source=feed&variant=2&gclid=x"))
+    _assert_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)), by="url")
+
+
+def test_a_product_url_dropping_the_served_id_refuses(monkeypatch) -> None:
+    served = "https://shop.example/item.php?id=5"
+    html = _page(_product(url="/item.php"))
+    _assert_not_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)),
+                     "identity_url_mismatch")
+
+
+def test_two_different_products_naming_the_served_url_refuse(monkeypatch) -> None:
+    bundle = _product(name="Brand Bundle Kit Deluxe", url=URL, offers=_offer("38.00", sku="KIT-1"),
+                      description="Everything", image="https://cdn.example.com/kit.jpg")
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), bundle)), "structure")
+
+
+def test_the_same_url_at_another_price_refuses_even_unnamed(monkeypatch) -> None:
+    twin = {"@context": "https://schema.org", "@type": "Product", "url": URL, "offers": _offer("38.00", sku="X")}
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), twin)), "structure")
+
+
+def test_one_product_declared_twice_is_one_product(monkeypatch) -> None:
+    _assert_read(_refresh(monkeypatch, html=_page(_product(url=URL), _product(url=URL))), by="url")
+
+
+@pytest.mark.parametrize(
+    "page_name",
+    ["Brand Ceramide Barrier Cream 2 Pack", "Brand Ceramide Barrier Cream Refill", "Brand Ceramide Barrier Cream Mini",
+     "Brand Ceramide Barrier Cream Set", "Brand Ceramide Barrier Cream 3pcs"],
+)
+def test_a_pack_set_refill_or_mini_of_the_product_refuses(monkeypatch, page_name: str) -> None:
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(name=page_name))), "identity")
+
+
+def test_a_from_price_refuses(monkeypatch) -> None:
+    html = _page(_product(url=URL, offers=_offer("From $19.00", sku="CR-50")))
+    snap = _snapshot_from_html(URL, html)
+    assert snap.price_amount == 19.0, "the extractor reads the number; the rule must refuse it"
+    _assert_not_read(_refresh(monkeypatch, html=html), "price_inexact")
+
+
+def test_several_offers_at_one_price_still_refuse(monkeypatch) -> None:
+    offers = [_offer("25.00", sku="CR-50"), _offer("25.00", sku="CR-50B")]
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL, offers=offers))), "price_inexact")
+
+
+def test_an_offer_with_only_a_low_price_refuses(monkeypatch) -> None:
+    offers = {"@type": "Offer", "lowPrice": "25.00", "priceCurrency": "USD", "availability": "https://schema.org/InStock"}
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL, offers=offers))), "price_inexact")
+
+
+@pytest.mark.parametrize(
+    "final",
+    ["https://www.shop.example/shop/barrier-cream.html", URL + "/"],
+    ids=["www_folded", "trailing_slash_folded"],
+)
+def test_g1_forgives_www_and_a_trailing_slash(monkeypatch, final: str) -> None:
+    _assert_read(_refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(final_url=final)))
+
+
+def test_g1_refuses_a_final_url_with_another_query(monkeypatch) -> None:
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(final_url=URL + "?page=2"))
+    _assert_not_read(out, "redirect")
+
+
+def test_a_bare_priced_offer_is_a_second_product(monkeypatch) -> None:
+    bare = {"@context": "https://schema.org", "@type": "Offer", "price": "9.00", "priceCurrency": "USD",
+            "url": "https://shop.example/shop/other.html"}
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), bare)), "structure")
+
+
+def test_the_groups_url_names_the_product_when_its_variants_name_none(monkeypatch) -> None:
+    group = {
+        "@context": "https://schema.org", "@type": "ProductGroup", "name": "A Name The Seed Does Not Share", "url": URL,
+        "hasVariant": [
+            {"@type": "Product", "name": "50 ml", "offers": _offer("25.00", sku="CR-50")},
+            {"@type": "Product", "name": "100 ml", "offers": _offer("40.00", sku="CR-100")},
+        ],
+    }
+    _assert_read(_refresh(monkeypatch, html=_page(group)), by="url")
+
+
+def test_titles_are_nfkc_normalized(monkeypatch) -> None:
+    row = _seed_row(title="Ｂｒａｎｄ Ｃｅｒａｍｉｄｅ Ｂａｒｒｉｅｒ Ｃｒｅａｍ")
+    _assert_read(_refresh(monkeypatch, row=row, html=_page(_product())), by="title")
+
+
+def test_the_re_read_list_is_the_pricing_products_too(monkeypatch) -> None:
+    # Two stored variants (with one, the reconcile treats it as the product and gives it the product's price).
+    stored = [{"variant_id": "OTHER-1", "title": "Other", "price_amount": 9.0, "price_currency": "USD",
+               "availability": "in_stock"},
+              {"variant_id": "CR-50", "title": "50 ml", "price_amount": 20.0, "price_currency": "USD",
+               "availability": "in_stock"}]
+    other = json.dumps([{"id": "OTHER-1", "price": "12.00", "price_currency": "USD", "name": "Other Serum 30 ml"}])
+    html = _page(_product(url=URL), body=f"<div data-product-skus-value='{other}'></div>")
+    row = _seed_row(seed_data={"title": SEED_TITLE, "brand": "Brand", "variants": stored})
+    out = _refresh(monkeypatch, row=row, html=html)
+    assert out["result"]["handleless_read"]["would_read"] is True
+    by_id = {str(v.get("variant_id")): v for v in out["seed_data"].get("variants") or []}
+    assert by_id["OTHER-1"]["price_amount"] == 9.0, "another product's data-attribute price is never re-read in"
+    # The extractor prefers the data-attribute list here (better variant titles), and none of it is the pricing
+    # product's: nothing is re-read from it, so both stored variants keep their prices and the row is not fresh.
+    assert by_id["CR-50"]["price_amount"] == 20.0
+    assert out["result"]["variant_refresh"].get("not_re_read_count") == 2
+    assert "extracted_at" not in out["seed_data"]["snapshot"]
+
+
+def test_variant_ids_come_from_the_pricing_subtree_only(monkeypatch) -> None:
+    widget = {"@context": "https://schema.org", "@type": "Product", "name": "Reviews",
+              "offers": {"@type": "Offer", "sku": "W-1", "availability": "https://schema.org/InStock"}}
+    identity = eos._extract_from_html(URL, _page(_product(url=URL), widget))["jsonld_identity"]
+    assert identity["priced_identities"] == 1
+    assert identity["variant_ids"] == ["CR-50"]
+
+
+def test_the_batch_counts_the_handleless_decisions_the_refresh_returns(monkeypatch) -> None:
+    import jobs.external_referral_refresh as job
+    import services.external_referral_readiness as err
+
+    produced = {
+        "reads": _refresh(monkeypatch, html=_page(_product(url=URL)), mode="shadow")["result"],
+        "redirect": _refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(redirect_hops=1),
+                             mode="shadow")["result"],
+    }
+    ids = list(produced)
+    monkeypatch.setattr(err, "get_external_referral_refresh_candidate_seed_ids", lambda *a, **k: asyncio.sleep(0, result=ids))
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda _ids: asyncio.sleep(0, result={i: "shop.example" for i in ids}))
+
+    async def scripted_refresh(seed_id, **_kwargs):
+        return produced[seed_id]
+
+    summary = asyncio.run(err.run_external_referral_refresh_batch(refresh_seed_by_id=scripted_refresh, limit=10))
+    block = summary["handleless_read"]
+    assert block["mode"] == "shadow"
+    assert block["totals"] == {"decided": 2, "would_read": 1, "would_flip_healthy": 1, "refused:redirect": 1}
+    assert block["top_hosts"]["shop.example"]["decided"] == 2
+    assert job.handleless_read_line(summary) == block
+
+
+def test_no_pricing_node_refuses_whatever_else_the_evidence_says() -> None:
+    snap = _snapshot_from_html(URL, _page(_product(url=URL)))
+    evidence = copy.deepcopy(snap.evidence)
+    evidence["jsonld_identity"]["pricing_node"] = False
+    assert _decide(evidence=evidence).refusal == "no_product"
+
+
+def test_a_price_the_reader_did_not_parse_refuses_even_with_an_amount() -> None:
+    snap = _snapshot_from_html(URL, _page(_product(url=URL)))
+    evidence = copy.deepcopy(snap.evidence)
+    evidence["price_read"]["status"] = "ambiguous_separator"
+    assert _decide(evidence=evidence, fresh_amount=25.0).refusal == "price"

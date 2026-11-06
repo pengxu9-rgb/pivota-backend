@@ -5973,19 +5973,26 @@ def _handleless_read_outcome(
     except ValueError:
         return observation, read, None
     seed_data = _ensure_json_obj(row.get("seed_data"))
-    decision = destination_liveness.classify_handleless_read(
-        requested_url=requested,
-        observed=observed,
-        evidence=evidence,
-        today=observation,
-        mode=mode,
-        seed_title=row.get("title"),
-        seed_brand=seed_data.get("brand"),
-        fresh_amount=price_amount,
-        fresh_currency=price_currency,
-        stored_amount=row.get("price_amount"),
-        stored_currency=row.get("price_currency"),
-    )
+    try:
+        decision = destination_liveness.classify_handleless_read(
+            requested_url=requested,
+            observed=observed,
+            evidence=evidence,
+            today=observation,
+            mode=mode,
+            seed_title=row.get("title"),
+            seed_brand=seed_data.get("brand"),
+            fresh_amount=price_amount,
+            fresh_currency=price_currency,
+            stored_amount=row.get("price_amount"),
+            stored_currency=row.get("price_currency"),
+        )
+    except Exception:  # noqa: BLE001 - THE RULE MUST NEVER COST A ROW ITS REFRESH
+        # A raise here would fail the row before its UPDATE, so it would head the queue every night. Today's
+        # observation and no read, as for any refusal; counted as `refused:error`.
+        logger.warning("handle-less read rule raised for seed_id=%r; kept today's observation",
+                       row.get("id"), exc_info=True)
+        decision = destination_liveness.HandlelessDecision(observation, False, False, "error")
     info: Dict[str, Any] = {"mode": mode, "would_read": decision.would_read, "refusal": decision.refusal}
     if decision.segment:
         info["segment"] = decision.segment
