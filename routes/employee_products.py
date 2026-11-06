@@ -6083,13 +6083,16 @@ async def _refresh_external_seed_by_id(
         }
 
     # ONE DECISION, made before anything is written: did this fetch read the product we serve?
-    # The price, currency and availability columns, their copies in `seed_data.snapshot`, the
-    # freshness stamps, the variant reconcile, the projection and the liveness observation below
-    # all derive from it. The price block used to run BEFORE this was known and wrote the fetched
-    # page's price whatever it was -- a canonical naming another product, a 200 redirect onto
-    # another handle, a 200 bot challenge, a cached fallback, a URL with no product handle -- and
-    # the serving lanes read `price_amount` first. Deriving "did we read it" twice is the
-    # twin-implementation drift this file keeps paying for.
+    # Everything below that states a price or stock derives from it: the price, currency and
+    # availability columns, their copies in `seed_data.snapshot` and `seed_data.availability`, the
+    # adoption of the page's variants, the variant reconcile, the freshness stamps, the projection,
+    # the catalogue lane's `read_source` and the liveness observation. The price block used to run
+    # BEFORE this was known and wrote the fetched page's price whatever it was -- a canonical naming
+    # another product, a 200 redirect onto another handle, a 200 bot challenge, a cached fallback, a
+    # URL with no product handle -- and the serving lanes read `price_amount` (and a stored variant's
+    # price ahead of it) first. NOT gated here, as before: the snapshot's title, copy, image and
+    # canonical from a page fetch, and the curated fills (title, description, image_url when empty).
+    # Deriving "did we read it" twice is the twin-implementation drift this file keeps paying for.
     #
     # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
     # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
@@ -6177,7 +6180,10 @@ async def _refresh_external_seed_by_id(
                                         read=read_the_served_product),
                 "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
                 or _to_iso(datetime.now(timezone.utc)),
-                "read_source": evidence.get("read_source") if isinstance(evidence, dict) else None,
+                # Which reader priced the row last: only a reader that read it (a catalogue entry for another
+                # destination than the one we serve priced nothing here).
+                **({"read_source": evidence.get("read_source") if isinstance(evidence, dict) else None}
+                   if read_the_served_product else {}),
             }
         )
     else:
@@ -6252,7 +6258,7 @@ async def _refresh_external_seed_by_id(
             # kept forever; the seed's `image_url` stays (review of #2621).
             seed_data["image_urls"] = []
             seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
-    if not seed_data.get("availability"):
+    if read_the_served_product and not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     # The currencies the stored variants are priced in BEFORE this read is adopted (the adoption may
     # replace them with the read's): an empty row currency below is filled only in one of them.
@@ -6263,6 +6269,12 @@ async def _refresh_external_seed_by_id(
     # Keep the stored variants; the reconcile below is barred from these currencies too.
     variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
     if variant_adoption_refused:
+        pass
+    elif not read_the_served_product:
+        # NOT A READ OF THE SERVED PRODUCT: its variants are another page's (a redirect onto another
+        # handle lists THAT product's sizes and prices), and `_seed_primary_price` serves a stored
+        # variant's price ahead of the column -- so adopting them would change the served price the
+        # column rule above just refused to change. The stored list stands.
         pass
     elif not content_read:
         # A catalogue read RE-PRICES the stored variants (the reconcile below); it never replaces the
