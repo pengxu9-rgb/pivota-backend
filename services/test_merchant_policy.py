@@ -109,6 +109,12 @@ _failed_at: Optional[float] = None  # when the last attempt FINISHED failing
 # caller in that window start another one.
 _inflight: Optional["asyncio.Future[Optional[Set[str]]]"] = None
 
+# A follower waits at most this long for the shared lookup, then serves static +
+# last good. Without a bound, one leader stuck on a dead connection (command
+# timeout up to 600 s in prod) would stall the rig filter on every uncached
+# search in the instance; the leader alone still waits on its own query.
+_FOLLOWER_WAIT_SECONDS = 3.0
+
 # A persistent failure must not log a traceback per search.
 _WARN_INTERVAL_SECONDS = 60.0
 _last_warn_at: Optional[float] = None
@@ -186,8 +192,12 @@ async def get_excluded_merchant_ids(
 
     loop = asyncio.get_running_loop()
     if _inflight is not None and not _inflight.done() and _inflight.get_loop() is loop:
-        # shield: a cancelled waiter must not cancel the shared attempt.
-        joined = await asyncio.shield(_inflight)
+        # shield: neither a cancelled follower nor the timeout may cancel the shared
+        # attempt. On timeout, serve what we have rather than start a second one.
+        try:
+            joined = await asyncio.wait_for(asyncio.shield(_inflight), _FOLLOWER_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            joined = None
         return static | (joined if joined is not None else (_cache_value or set()))
 
     fut: "asyncio.Future[Optional[Set[str]]]" = loop.create_future()
