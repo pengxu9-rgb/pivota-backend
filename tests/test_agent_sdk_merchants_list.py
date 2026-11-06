@@ -2,13 +2,10 @@
 
 Since 2025-10-28 the endpoint listed only merchants the calling agent had already ordered
 from, so every new partner's documented first call returned `merchants: []` and gave them no
-`merchant_id` to order with. The portal list is `scope=native`: the merchants
+`merchant_id` to order with. The default scope is now `available`: the merchants
 cross-merchant product search treats as transactable (not deleted/rejected, psp_connected),
 narrowed to the agent's `allowed_merchants` when that is set. `scope=mine` keeps the
 order-history view. A merchant's contact email is returned only where the agent has orders.
-The DEFAULT scope, `available`, is the protocol directory, tested in
-tests/test_agent_sdk_merchants_protocol.py; every request here names its scope (`_get`
-sends `native` unless the case says otherwise).
 
 Drives the real route on a minimal app (never `main`, never TestClient) against the test DB.
 """
@@ -367,7 +364,7 @@ async def _db_state() -> dict:
 
 
 async def _assert_rigs_are_eligible_but_for_the_exclusion(rigs) -> None:
-    """Guard against a vacuous pass: every rig row must otherwise qualify for `native`."""
+    """Guard against a vacuous pass: every rig row must otherwise qualify for `available`."""
     for mid in rigs.values():
         row = await database.fetch_one(
             "SELECT status, psp_connected FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
@@ -395,7 +392,7 @@ def _app(allowed_merchants=None, agent_id=AGENT):
 async def _get(app, params=None):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
-        resp = await client.get("/agent/v1/merchants", params={"limit": 100, "scope": "native", **(params or {})})
+        resp = await client.get("/agent/v1/merchants", params={"limit": 100, **(params or {})})
     return resp
 
 
@@ -403,11 +400,11 @@ def _ours(body):
     return {m["merchant_id"]: m for m in body["merchants"] if m["merchant_id"] in MERCHANTS}
 
 
-async def test_a_new_agent_sees_the_transactable_portal_merchants_in_native(_rows):
+async def test_a_new_agent_sees_the_transactable_merchants_by_default(_rows):
     resp = await _get(_app(agent_id=f"agent_ml_brand_new_{RUN}"))
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["scope"] == "native"
+    assert body["scope"] == "available"
     ours = _ours(body)
     # Approved + PSP connected, whether or not anyone ordered there.
     assert set(ours) == {M_ORDERED, M_FRESH, M_OTHERS}
@@ -423,7 +420,7 @@ async def test_a_new_agent_sees_the_transactable_portal_merchants_in_native(_row
         assert m["status"] == "active"
 
 
-async def test_native_shows_the_agents_own_stats_and_email_only_where_it_ordered(_rows):
+async def test_available_shows_the_agents_own_stats_and_email_only_where_it_ordered(_rows):
     ours = _ours((await _get(_app())).json())
     assert set(ours) == {M_ORDERED, M_FRESH, M_OTHERS}
     ordered = ours[M_ORDERED]
@@ -456,7 +453,7 @@ async def test_mine_is_empty_for_a_new_agent(_rows):
     assert body["pagination"]["total"] == 0
 
 
-async def test_allowed_merchants_narrows_native(_rows):
+async def test_allowed_merchants_narrows_available(_rows):
     body = (await _get(_app(allowed_merchants=[M_FRESH, M_NO_PSP, M_DELETED]))).json()
     # Only allowlisted AND transactable.
     assert [m["merchant_id"] for m in body["merchants"]] == [M_FRESH]
@@ -470,7 +467,7 @@ async def test_an_empty_allowlist_fails_closed(_rows):
 
 
 @pytest.mark.parametrize("status", ["pending", "rejected", "deleted", "suspended"])
-async def test_native_accepts_only_the_active_status(_rows, status):
+async def test_available_accepts_only_the_active_status(_rows, status):
     # Any key could otherwise enumerate unapproved merchants by passing another status.
     resp = await _get(_app(), {"status": status})
     assert resp.status_code == 422
@@ -514,7 +511,7 @@ async def test_an_unknown_scope_is_rejected(_rows):
     assert resp.status_code == 422
 
 
-async def test_approved_is_an_alias_for_active_in_native(_rows):
+async def test_approved_is_an_alias_for_active_in_available(_rows):
     active = (await _get(_app())).json()
     approved = await _get(_app(), {"status": "approved"})
     assert approved.status_code == 200
@@ -534,7 +531,7 @@ async def test_has_more_is_false_on_the_last_full_page(_rows):
     assert tail["has_more"] is False
 
 
-@pytest.mark.parametrize("scope", ["available", "native", "mine"])
+@pytest.mark.parametrize("scope", ["available", "mine"])
 async def test_an_empty_allowlist_returns_before_touching_the_db(_rows, monkeypatch, scope):
     # SQLite accepts `IN ()`, so without this only the Postgres twin would catch a lost
     # early return.
@@ -559,7 +556,7 @@ async def test_a_db_error_is_not_echoed_to_the_caller(_rows, monkeypatch):
     assert resp.json()["detail"] == "Failed to list merchants"
 
 
-async def test_test_and_demo_rigs_never_list_in_native(_rigs):
+async def test_test_and_demo_rigs_never_list_in_available(_rigs):
     await _assert_rigs_are_eligible_but_for_the_exclusion(_rigs)
     for agent in (AGENT, f"agent_ml_brand_new_{RUN}"):
         ids = {m["merchant_id"] for m in (await _get(_app(agent_id=agent))).json()["merchants"]}
