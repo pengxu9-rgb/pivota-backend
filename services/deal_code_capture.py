@@ -47,9 +47,11 @@ DIAGNOSTICS, COUNTS ONLY (never region or code text): why a page with a promo re
 page: a named region vs only a fallback one; a region that mentions "code" in any case; a region where a
 RELAXED pattern (any case, any phrasing: "with code save10", "Code: X") finds a token, and for each such
 token the strict matcher did not capture, why (`by_miss`: stop word, lowercase with/without a digit, no
-letter, rejected as a shade/gift card/placeholder, or wording the strict phrases do not cover); a strict
-phrase anywhere in the HTML, scripts and section JSON included (a bar rendered by script); a region-name
-class/id past the body window; and each region's length (`by_region_chars`).
+letter, rejected as a shade/gift card/placeholder, a strict code past the page cap, or wording the strict
+phrases do not cover); a strict phrase anywhere in the HTML, scripts and section JSON included (a bar
+rendered by script); a region-name class/id in a start tag at or past the last `_WINDOW_EDGE` chars of the
+body window (cut or unread); and each region's length (`by_region_chars`). A diagnostics failure counts in
+`diagnosis_errors` and leaves the page's capture as it was.
 """
 
 from __future__ import annotations
@@ -491,13 +493,19 @@ def capture_codes(html: Any) -> List[CapturedCode]:
 _CODE_WORD_RE = re.compile(r"(?i)\bcodes?\b")
 # A code-like token after the word "code" in any case and any phrasing. Region text has single spaces.
 _RELAXED_CODE_RE = re.compile(r"(?i)\bcode\b\s{0,3}[:：]?\s{0,3}[\"'“‘]?([a-z0-9][a-z0-9_-]{2,19})\b")
-# The strict matcher's phrases, any case, anywhere in the HTML. Bounded gaps: no backtracking on blank runs.
+# The strict matcher's phrases, any case, anywhere in the HTML. Gaps up to 40 whitespace chars cover a
+# phrase wrapped across indented source lines; bounded, so a blank run costs at most 40 steps per start.
 _CODE_PHRASE_RE = re.compile(
-    r"(?i)\b(?:(?:use|enter|apply)\s{1,3}(?:the\s{1,3})?(?:(?:promo|discount|coupon|voucher)\s{1,3})?code\b"
-    r"|(?:promo|discount|coupon|voucher)\s{0,3}code\s{0,3}[:：])"
+    r"(?i)\b(?:(?:use|enter|apply)\s{1,40}(?:the\s{1,40})?(?:(?:promo|discount|coupon|voucher)\s{1,40})?code\b"
+    r"|(?:promo|discount|coupon|voucher)\s{0,40}code\s{0,40}[:：])"
 )
-_ATTR_RE = re.compile(r"""(?i)\b(?:class|id)\s{0,3}=\s{0,3}["']([^"'<>]{1,300})["']""")
+# A start tag, and a class/id attribute inside it after whitespace or a quote: not `el.id = "..."` in a
+# script, `[class="..."]` in a stylesheet, `data-section-id="..."`, or text.
+_TAG_RE = re.compile(r"<[a-zA-Z][^<>]{0,2000}>")
+_ATTR_RE = re.compile(r"""(?i)(?<=[\s"'/])(?:class|id)\s{0,40}=\s{0,40}["']([^"'<>]{1,300})["']""")
 _DIAG_SCAN_LIMIT = 2_000_000
+# A bar tag this close to the window's end has its text cut (or none): counted as past the window.
+_WINDOW_EDGE = 300
 _REGION_CHAR_BUCKETS = ((40, "lt40"), (200, "40_199"), (1000, "200_999"))
 
 
@@ -507,6 +515,7 @@ class _Diagnosis:
     relaxed_match: bool = False
     code_phrase_in_html: bool = False
     named_region_past_budget: bool = False
+    failed: bool = False
     misses: List[str] = field(default_factory=list)
     region_chars: List[str] = field(default_factory=list)
 
@@ -523,6 +532,14 @@ def _miss_reason(token: str, text: str, start: int, end: int) -> str:
     return "wording"
 
 
+def _named_region_tag_past(html: str, start: int, end: int) -> bool:
+    for tag in _TAG_RE.finditer(html, start, end):
+        for attr in _ATTR_RE.finditer(tag.group(0)):
+            if any(_REGION_TOKEN_RE.search(t) and _token_kind(t) == "name" for t in attr.group(1).split()):
+                return True
+    return False
+
+
 def _region_chars(text: str) -> str:
     for limit, name in _REGION_CHAR_BUCKETS:
         if len(text) < limit:
@@ -530,11 +547,15 @@ def _region_chars(text: str) -> str:
     return "1000_plus"
 
 
-def _diagnose(html: str, scan: _Scan, captured: List[CapturedCode]) -> _Diagnosis:
+def _diagnose(html: str, scan: _Scan, captured: List[CapturedCode], capped: bool = False) -> _Diagnosis:
     diagnosis = _Diagnosis()
+    texts = scan.regions + scan.fallback_regions
     taken = {c.code.upper() for c in captured}
+    # On a capped page, strict codes past the cap are not misses: they get their own reason (captured ones
+    # are skipped before it is asked).
+    past_cap = {c.code.upper() for text in texts for c in codes_in_region(text)} if capped else set()
     seen = set()
-    for text in scan.regions + scan.fallback_regions:
+    for text in texts:
         diagnosis.region_chars.append(_region_chars(text))
         diagnosis.region_mentions_code = diagnosis.region_mentions_code or bool(_CODE_WORD_RE.search(text))
         for match in _RELAXED_CODE_RE.finditer(text):
@@ -545,12 +566,12 @@ def _diagnose(html: str, scan: _Scan, captured: List[CapturedCode]) -> _Diagnosi
             if token.upper() in taken or token.upper() in seen:
                 continue
             seen.add(token.upper())
-            diagnosis.misses.append(_miss_reason(token, text, start, start + len(token)))
+            reason = "past_cap" if token.upper() in past_cap else _miss_reason(token, text, start, start + len(token))
+            diagnosis.misses.append(reason)
     diagnosis.code_phrase_in_html = bool(_CODE_PHRASE_RE.search(html, 0, _DIAG_SCAN_LIMIT))
-    for attr in _ATTR_RE.finditer(html, scan.window_end, scan.window_end + _DIAG_SCAN_LIMIT):  # empty if in budget
-        if any(_REGION_TOKEN_RE.search(t) and _token_kind(t) == "name" for t in attr.group(1).split()):
-            diagnosis.named_region_past_budget = True
-            break
+    if scan.over_budget:
+        diagnosis.named_region_past_budget = _named_region_tag_past(
+            html, max(0, scan.window_end - _WINDOW_EDGE), scan.window_end + _DIAG_SCAN_LIMIT)
     return diagnosis
 
 
@@ -573,7 +594,7 @@ def reset_stats() -> None:
             # Diagnostics (counts only): see the module docstring.
             "pages_with_named_region": 0, "pages_with_fallback_region_only": 0, "pages_region_mentions_code": 0,
             "pages_relaxed_code_match": 0, "pages_code_phrase_in_html": 0, "pages_named_region_past_budget": 0,
-            "by_miss": {}, "by_region_chars": {},
+            "by_miss": {}, "by_region_chars": {}, "diagnosis_errors": 0,
         })
         _HOST_CODES.clear()
         _HOSTS_WITH_CODES.clear()
@@ -600,7 +621,13 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
     try:
         scan = _scan(html)
         codes, capped = _page_codes(scan)
-        diagnosis = _diagnose(html, scan, codes) if isinstance(html, str) else _Diagnosis()
+        diagnosis = _Diagnosis()
+        if isinstance(html, str):
+            try:  # a diagnostics failure never costs the page's capture
+                diagnosis = _diagnose(html, scan, codes, capped)
+            except Exception as exc:  # noqa: BLE001
+                diagnosis = _Diagnosis(failed=True)
+                logger.warning("deal code capture diagnosis failed: %s", type(exc).__name__)
         host = (urlparse(url).hostname or "").lower()
         host = host[4:] if host.startswith("www.") else host
         if codes:
@@ -626,6 +653,7 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
             _STATS["pages_relaxed_code_match"] += int(diagnosis.relaxed_match)
             _STATS["pages_code_phrase_in_html"] += int(diagnosis.code_phrase_in_html)
             _STATS["pages_named_region_past_budget"] += int(diagnosis.named_region_past_budget)
+            _STATS["diagnosis_errors"] += int(diagnosis.failed)
             for reason in diagnosis.misses:
                 _bump(_STATS["by_miss"], reason)
             for bucket in diagnosis.region_chars:

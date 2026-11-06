@@ -881,13 +881,16 @@ def test_diagnostics_never_put_text_in_the_log_or_the_counters(capsys):
     assert "hidden99" not in blob and "secret10" not in blob and "below" not in blob
 
 
-def test_a_failing_diagnosis_moves_no_counter(monkeypatch):
+def test_a_failing_diagnosis_keeps_the_page_capture_and_counts_itself(monkeypatch, capsys):
     def boom(*a, **k):
         raise RuntimeError("x")
 
     monkeypatch.setattr(dcc, "_diagnose", boom)
     s = _diag_stats('<body><div class="announcement-bar">Use code SAVE10</div></body>')
-    assert (s["errors"], s["pages_scanned"], s["codes_seen"]) == (1, 0, 0)
+    assert (s["errors"], s["diagnosis_errors"], s["pages_scanned"], s["codes_seen"], s["pages_with_region"]) == (
+        0, 1, 1, 1, 1)
+    assert (s["by_miss"], s["pages_region_mentions_code"]) == ({}, 0)
+    assert "DEAL_CODE_CAPTURE_PAGE" in capsys.readouterr().out
 
 
 def test_reset_clears_the_diagnostic_counters():
@@ -899,7 +902,11 @@ def test_reset_clears_the_diagnostic_counters():
 
 @pytest.mark.parametrize(
     "unit",
-    ["use ", "use" + " " * 10, "code ", "code: ", "promo code ", 'class="', "class='announcement-bar ", 'id="a ', "<p>x</p>"],
+    [
+        "use ", "use" + " " * 10, "code ", "code: ", "promo code ", 'class="', "class='announcement-bar ", 'id="a ',
+        "<p>x</p>", "<a ", "<a class='announcement-bar' ", " class='a' id='b' ", "use\n" + " " * 39,
+        "enter the" + " " * 41, "<a " + "x" * 2_100,
+    ],
 )
 def test_the_diagnostics_are_linear_on_hostile_pages(unit):
     import io
@@ -951,3 +958,97 @@ def test_the_past_budget_search_stops_at_its_limit(monkeypatch):
 def test_a_trailing_underscore_does_not_turn_a_captured_code_into_a_miss():
     s = _diag_stats('<body><div class="announcement-bar">Use code SAVE10_ today</div></body>')
     assert (s["codes_seen"], s["by_miss"]) == (1, {})
+
+
+_FILLER = "<p>filler</p>" * 20_000  # past the body window
+
+
+@pytest.mark.parametrize(
+    "late",
+    [
+        '<script>el.id = "announcement-bar"; el.className="x";</script>',
+        '<style>[class="top-bar"]{color:red}</style>',
+        '<div data-section-id="announcement-bar">x</div>',
+        '<pre>class="announcement-bar"</pre>',
+        '<p>id = "announcement-bar"</p>',
+        '<pre>see class="announcement-bar" in the theme</pre>',
+    ],
+)
+def test_a_region_name_outside_a_class_or_id_attribute_is_not_past_the_budget(late):
+    s = _diag_stats(f"<body>{_FILLER}{late}</body>")
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    "late",
+    [
+        '<div id="announcement-bar">x</div>',
+        "<div class='shopify-section announcement-bar'>x</div>",
+        '<div data-x="1" class="top-bar">x</div>',
+        '<div\n    class = "announcement-bar">x</div>',
+        '<div title="a"id="announcement-bar">x</div>',
+    ],
+)
+def test_a_region_name_in_a_late_class_or_id_attribute_is_past_the_budget(late):
+    s = _diag_stats(f"<body>{_FILLER}{late}</body>")
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 1)
+
+
+# A tag in the last `_WINDOW_EDGE` chars counts even when its (short) text was read: it may be cut.
+@pytest.mark.parametrize("before_end,read", [(6, 0), (20, 0), (40, 0), (299, 1)])
+def test_a_bar_cut_at_the_window_edge_is_past_the_budget(before_end, read):
+    tag = '<div class="announcement-bar">'
+    html = "<body>" + "x" * (dcc._BODY_BUDGET - before_end) + tag + "Use code EDGE10</div>" + "y" * 1_000 + "</body>"
+    assert dcc._body_start(html) == 0
+    s = _diag_stats(html)
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"], s["codes_seen"]) == (1, 1, read)
+
+
+def test_a_bar_read_whole_before_the_window_edge_is_not_past_the_budget():
+    tag = '<div class="announcement-bar">'
+    html = "<body>" + "x" * (dcc._BODY_BUDGET - 400) + tag + "Use code EDGE10</div>" + "y" * 1_000 + "</body>"
+    s = _diag_stats(html)
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"], s["codes_seen"]) == (1, 0, 1)
+
+
+def test_a_bar_near_the_end_of_a_page_inside_the_budget_is_not_past_it():
+    html = "<body>" + "x" * (dcc._BODY_BUDGET - 200) + '<div class="announcement-bar">Use code EDGE10</div></body>'
+    assert len(html) - dcc._body_start(html) <= dcc._BODY_BUDGET
+    s = _diag_stats(html)
+    assert (s["pages_over_budget"], s["pages_named_region_past_budget"], s["codes_seen"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Use\n        code",
+        "Enter the\n          discount code",
+        "apply\t\tpromo\n   code",
+        "Promo code\n      :",
+        "use" + " " * 40 + "code",
+    ],
+)
+def test_a_phrase_wrapped_across_source_lines_is_counted_from_the_html(phrase):
+    html = f'<html><head><script>var t = "{phrase} X";</script></head><body><div class="rte">x</div></body>'
+    assert _diag_stats(html)["pages_code_phrase_in_html"] == 1
+
+
+def test_a_phrase_gap_past_forty_blanks_is_not_counted():
+    html = '<body><div class="rte">use' + " " * 41 + "code and promo code" + " " * 41 + ":</div></body>"
+    assert _diag_stats(html)["pages_code_phrase_in_html"] == 0
+
+
+def test_the_phrase_search_stops_at_its_limit(monkeypatch):
+    monkeypatch.setattr(dcc, "_DIAG_SCAN_LIMIT", 1_000)
+    s = _diag_stats("<body>" + "<p>x</p>" * 200 + "<p>Use code LATE10</p></body>")
+    assert s["pages_code_phrase_in_html"] == 0
+    dcc.reset_stats()
+    assert _diag_stats("<body><p>Use code LATE10</p></body>")["pages_code_phrase_in_html"] == 1
+
+
+def test_strict_codes_past_the_page_cap_are_not_wording_misses():
+    codes = [f"SAVE{n}" for n in range(10, 10 + dcc._MAX_CODES_PER_PAGE + 2)]
+    text = " ".join(f"Use code {c}." for c in codes) + " Shop with code WORD99."
+    s = _diag_stats(f'<body><div class="announcement-bar">{text}</div></body>')
+    assert (s["pages_codes_capped"], s["codes_seen"]) == (1, dcc._MAX_CODES_PER_PAGE)
+    assert s["by_miss"] == {"past_cap": 2, "wording": 1}
