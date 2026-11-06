@@ -481,14 +481,17 @@ def test_audit_queue_hides_stale_description_for_blocked_seed(
     assert payload["items"][0]["seed"]["description"] == ""
 
 
+@pytest.mark.parametrize("read", [True, False], ids=["a_read", "not_a_read"])
 def test_refresh_external_seed_replaces_stale_localized_description_and_variants(
-    monkeypatch: pytest.MonkeyPatch, client: TestClient
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, read: bool
 ) -> None:
+    """A read of the served page replaces stale localized copy, the variants' included. A fetch that is not a
+    read (a cached fallback: nothing reached the origin) keeps the stored variant copy (review of #2713)."""
     import routes.employee_products as employee_products_module
 
     stored_row = _seed_row(
-        canonical_url="https://theordinary.com/de-de/uv-filters-spf-45-serum-100720.html",
-        destination_url="https://theordinary.com/de-de/uv-filters-spf-45-serum-100720.html",
+        canonical_url="https://shop.example/de-de/products/uv-filters-spf-45-serum",
+        destination_url="https://shop.example/de-de/products/uv-filters-spf-45-serum",
         seed_data={
             "title": "UV Filters SPF 45 Serum",
             "description": "Ein leichtes Sonnenschutzserum mit Lichtschutzfaktor 45.",
@@ -501,7 +504,7 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
                 }
             ],
             "snapshot": {
-                "canonical_url": "https://theordinary.com/de-de/uv-filters-spf-45-serum-100720.html",
+                "canonical_url": "https://shop.example/de-de/products/uv-filters-spf-45-serum",
                 "description": "Ein leichtes Sonnenschutzserum mit Lichtschutzfaktor 45.",
             },
         },
@@ -518,8 +521,8 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
             stored_row["seed_data"] = values["seed_data"]
 
     fake_snapshot = SimpleNamespace(
-        canonical_url="https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html",
-        domain="theordinary.com",
+        canonical_url="https://shop.example/en-us/products/uv-filters-spf-45-serum",
+        domain="shop.example",
         title="UV Filters SPF 45 Serum",
         image_url="https://cdn.example.com/en.jpg",
         price_amount=24.0,
@@ -546,7 +549,17 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
-    monkeypatch.setattr(employee_products_module, "resolve_external_offer", AsyncMock(return_value=fake_snapshot))
+    async def fake_resolve(*, url=None, observed=None, **_kwargs):
+        # A read stamps what `_fetch_html` stamps; a cached fallback stamps nothing.
+        if read and observed is not None:
+            observed.update({"status_code": 200, "final_url": url, "bot_challenged": False})
+        return fake_snapshot
+
+    monkeypatch.setattr(employee_products_module, "resolve_external_offer", fake_resolve)
+    monkeypatch.setattr(employee_products_module.destination_liveness, "record_destination_observation",
+                        AsyncMock(return_value={"status": "recorded"}))
+    monkeypatch.setattr(employee_products_module, "_project_refreshed_seed_to_serving_surfaces",
+                        AsyncMock(return_value={}))
     monkeypatch.setattr(
         employee_products_module,
         "_make_redirect_url",
@@ -566,10 +579,13 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
     # so the seed then served one page, sent buyers to another, and the refresh (which fetches
     # `destination_url`) could never read it again. Correcting a seed's locale has to move
     # `destination_url`; see `_next_served_canonical`. The page's claim is still recorded:
-    assert stored_row["canonical_url"] == "https://theordinary.com/de-de/uv-filters-spf-45-serum-100720.html"
-    assert seed_data["snapshot"]["canonical_url"] == "https://theordinary.com/en-us/uv-filters-spf-45-serum-100720.html"
+    assert stored_row["canonical_url"] == "https://shop.example/de-de/products/uv-filters-spf-45-serum"
+    assert seed_data["snapshot"]["canonical_url"] == "https://shop.example/en-us/products/uv-filters-spf-45-serum"
     assert seed_data["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
-    assert seed_data["variants"][0]["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
+    if read:
+        assert seed_data["variants"][0]["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
+    else:
+        assert seed_data["variants"][0]["description"] == "Ein leichtes Sonnenschutzserum mit Lichtschutzfaktor 45."
 
 
 def test_refresh_external_seed_clears_stale_description_when_seed_remains_blocked(

@@ -6267,7 +6267,10 @@ async def _refresh_external_seed_by_id(
         existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
     # Keep the stored variants; the reconcile below is barred from these currencies too.
-    variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
+    # Only a read adopts variants, so only a read can have that adoption refused.
+    variant_adoption_refused = (
+        _variant_adoption_refusal(foreign_currencies) if adoptable_variants and read_the_served_product else None
+    )
     if variant_adoption_refused:
         pass
     elif not read_the_served_product:

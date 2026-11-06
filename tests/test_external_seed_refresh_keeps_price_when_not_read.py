@@ -389,3 +389,12 @@ def test_the_control_a_catalogue_read_of_the_served_url_applies_price_and_stock(
     assert out["written"]["availability"] == PAGE_AVAILABILITY
     assert out["result"]["availability_refresh"]["status"] == "applied"
     assert out["snapshot"].get("read_source") == "shopify_catalogue"
+
+
+def test_a_non_read_reports_no_variant_adoption_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a read adopts variants, so a non-read whose page lists another currency has nothing refused."""
+    page = _other_products_page(evidence={"variants": [
+        {"variant_id": "111", "title": "Serum 30 ml", "price_amount": 99.0, "price_currency": "EUR",
+         "availability": "in_stock"}]})
+    out = _refresh(monkeypatch, _seed_row(), REDIRECT_ONTO_ANOTHER_PRODUCT, page)
+    assert out["result"].get("variant_adoption_refused") is None
