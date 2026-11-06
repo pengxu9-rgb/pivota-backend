@@ -60,7 +60,9 @@ variant, our price), so a listed merchant can refuse a particular item.
 ── FAILURE ──────────────────────────────────────────────────────────────────────────────────
 
 The exclusion reads (rig and rejected store domains, quarantines) RAISE: without them the
-directory cannot tell a rig from a merchant, so the route answers 500 rather than a list.
+directory cannot tell a rig from a merchant, so the build fails. The caller then gets the last
+clean build if it is younger than STALE_SERVE_SECONDS (it had every exclusion applied), else the
+route answers 500 rather than a list.
 A per-pair fact read that fails answers False for that pair (closed). That includes the two
 purchasability readers, which swallow their own database errors: their ERROR log records are
 counted while the directory is built. A build with ANY failure is served for that call and
@@ -70,7 +72,9 @@ NEVER cached, so a blip cannot pin a partial list for a cache window.
 
 Four small reads per pair, sequentially (the driver shares one connection per task). The
 per-pair facts are agent-independent and change daily at most, so a clean build is cached
-in-process for `CACHE_TTL_SECONDS`, and concurrent callers on one event loop share one build.
+in-process for `CACHE_TTL_SECONDS`, and concurrent callers on one event loop share one build,
+which runs in its own task (a cancelled caller never cancels it) and is waited on for at most
+`BUILD_WAIT_SECONDS`.
 The route composition (dials, pilot scope, allowlist, market) runs per call, after the cache.
 """
 
@@ -92,6 +96,17 @@ ROUTE_STOREFRONT = "storefront_checkout"
 
 EXCLUDED_DOMAINS_ENV = "AGENT_MERCHANT_DIRECTORY_EXCLUDED_DOMAINS"
 CACHE_TTL_SECONDS = 300.0
+#: How long any caller waits for a build. A build normally takes a second or two; one that is
+#: stuck (a gate that never releases) must not hold every request open. On timeout the caller gets
+#: the last clean build if there is one, else `DirectoryUnavailable` (the route's 503).
+BUILD_WAIT_SECONDS = 15.0
+#: After a FAILED build, the last clean build is served while it is younger than this. It had every
+#: exclusion applied when it was built, so serving it is safer than serving nothing.
+STALE_SERVE_SECONDS = 1800.0
+
+
+class DirectoryUnavailable(RuntimeError):
+    """No clean directory to serve, and the current build did not finish in time."""
 
 #: The population's two table reads (the variant lane's is the ledger's own reader). Module-level
 #: constants called directly, so tests/test_repo_sql_prepare_postgres.py plans them.
@@ -130,11 +145,16 @@ class MerchantFacts:
 
 
 _cache: Optional[Tuple[float, Tuple[MerchantFacts, ...]]] = None
-_inflight: Optional["asyncio.Future[Tuple[MerchantFacts, ...]]"] = None
+_inflight: Optional["asyncio.Task[Tuple[MerchantFacts, ...]]"] = None
 
 
 def reset_cache() -> None:
     global _cache, _inflight
+    if _inflight is not None and not _inflight.done():
+        try:
+            _inflight.cancel()
+        except RuntimeError:  # its event loop is already closed
+            pass
     _cache = None
     _inflight = None
 
@@ -333,35 +353,11 @@ async def _build() -> Tuple[Tuple[MerchantFacts, ...], List[str]]:
     return tuple(facts), failures
 
 
-async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts, ...]:
-    """Every listable (domain, market) and its facts, sorted by market then domain.
-
-    A clean build is cached for CACHE_TTL_SECONDS; a degraded one is returned and not cached.
-    Concurrent callers on one event loop share one build (single flight)."""
-    global _cache, _inflight
-    clock = time.monotonic() if now is None else now
-    if _cache is not None and clock - _cache[0] < CACHE_TTL_SECONDS:
-        return _cache[1]
-
-    loop = asyncio.get_running_loop()
-    if _inflight is not None and not _inflight.done() and _inflight.get_loop() is loop:
-        # shield: a cancelled waiter must not cancel the shared build.
-        return await asyncio.shield(_inflight)
-
-    fut: "asyncio.Future[Tuple[MerchantFacts, ...]]" = loop.create_future()
-    _inflight = fut
-    try:
-        result, failures = await _build()
-    except BaseException as exc:
-        if not fut.done():
-            fut.set_exception(exc)
-            fut.exception()  # retrieved: a build nobody else awaited must not warn
-        raise
-    finally:
-        if _inflight is fut:
-            _inflight = None
-    if not fut.done():
-        fut.set_result(result)
+async def _build_and_cache(clock: float) -> Tuple[MerchantFacts, ...]:
+    """One build, run as its OWN task: it caches a clean result itself, so the cache is written
+    even when every caller that was waiting for it has gone."""
+    global _cache
+    result, failures = await _build()
     if failures:
         logger.warning(
             "agent_merchant_directory: %d fact reads failed and answered closed (%s); not cached",
@@ -370,6 +366,49 @@ async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts,
     else:
         _cache = (clock, result)
     return result
+
+
+def _build_done(task: "asyncio.Task[Tuple[MerchantFacts, ...]]") -> None:
+    global _inflight
+    if _inflight is task:
+        _inflight = None
+    if not task.cancelled():
+        task.exception()  # retrieved: a build whose callers all left must not warn
+
+
+async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts, ...]:
+    """Every listable (domain, market) and its facts, sorted by market then domain.
+
+    A clean build is cached for CACHE_TTL_SECONDS; a degraded one is returned and not cached.
+    Concurrent callers on one event loop share one build, which runs in its own task: a caller
+    that is cancelled (a client disconnect) never cancels it, and every caller's wait is bounded
+    by BUILD_WAIT_SECONDS. A failed build falls back to the last clean one while it is younger than
+    STALE_SERVE_SECONDS."""
+    global _inflight
+    clock = time.monotonic() if now is None else now
+    if _cache is not None and clock - _cache[0] < CACHE_TTL_SECONDS:
+        return _cache[1]
+
+    loop = asyncio.get_running_loop()
+    task = _inflight
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(_build_and_cache(clock))
+        _inflight = task
+        task.add_done_callback(_build_done)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), BUILD_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        if _cache is not None:
+            logger.warning("agent_merchant_directory: build still running; serving the last clean build")
+            return _cache[1]
+        raise DirectoryUnavailable("the merchant directory is still being built") from None
+    except Exception:
+        if _cache is not None and clock - _cache[0] < STALE_SERVE_SECONDS:
+            logger.warning(
+                "agent_merchant_directory: build failed; serving the last clean build", exc_info=True
+            )
+            return _cache[1]
+        raise
 
 
 @dataclass(frozen=True)

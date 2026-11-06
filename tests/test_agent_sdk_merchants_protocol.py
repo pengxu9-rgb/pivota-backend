@@ -459,10 +459,18 @@ async def test_the_market_filter(_rows):
     assert all(m["market"] == "JP" for m in body["merchants"])
 
 
-@pytest.mark.parametrize("params", [{"market": "USA"}, {"market": "1"}, {"market": "US", "scope": "available"},
-                                    {"market": "US", "scope": "mine"}, {"status": "pending"}])
+@pytest.mark.parametrize("params", [{"market": "USA"}, {"market": "1"}, {"status": "pending"}])
 async def test_bad_market_and_status_are_rejected(_rows, params):
     assert (await _get(_app(), params)).status_code == 422
+
+
+@pytest.mark.parametrize("scope", ["available", "mine"])
+async def test_the_other_scopes_ignore_market_as_before(_rows, scope):
+    """The #2708 contract: `market` was no parameter there, so it is accepted and ignored."""
+    plain = await _get(_app(), {"scope": scope})
+    filtered = await _get(_app(), {"scope": scope, "market": "US"})
+    assert plain.status_code == filtered.status_code == 200
+    assert filtered.json() == plain.json()
 
 
 async def test_an_allowlist_matches_domains(_rows):
@@ -616,3 +624,77 @@ async def test_a_db_error_is_not_echoed_to_the_caller(_rows, monkeypatch):
     assert resp.status_code == 500
     assert "secret_detail" not in resp.text
     assert resp.json()["detail"] == "Failed to list merchants"
+
+
+async def test_a_cancelled_caller_does_not_cancel_the_shared_build(_rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+
+    real = directory._build
+    started = asyncio.Event()
+
+    async def _slow():
+        started.set()
+        await asyncio.sleep(0.1)
+        return await real()
+
+    monkeypatch.setattr(directory, "_build", _slow)
+    callers = [asyncio.ensure_future(directory.merchant_facts()) for _ in range(3)]
+    await started.wait()
+    callers[0].cancel()
+    done = await asyncio.gather(*callers, return_exceptions=True)
+    assert isinstance(done[0], asyncio.CancelledError)
+    for result in done[1:]:
+        assert not isinstance(result, BaseException), result
+        assert D_CARD in {f.merchant_domain for f in result}
+    assert directory._cache is not None  # the build finished and cached for nobody's request
+
+
+async def test_a_build_that_never_finishes_is_a_bounded_503(_rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+
+    gate = asyncio.Event()  # never set
+
+    async def _stuck():
+        await gate.wait()
+
+    monkeypatch.setattr(directory, "BUILD_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(directory, "_build", _stuck)
+    try:
+        resp = await asyncio.wait_for(_get(_app()), 5)
+        assert resp.status_code == 503
+        assert "secret" not in resp.text
+    finally:
+        directory.reset_cache()  # cancels the stuck build
+
+
+async def test_a_build_that_never_finishes_serves_the_last_clean_one(_rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+
+    clean = await directory.merchant_facts(now=1000.0)
+    gate = asyncio.Event()  # never set
+
+    async def _stuck():
+        await gate.wait()
+
+    monkeypatch.setattr(directory, "BUILD_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(directory, "_build", _stuck)
+    try:
+        late = 1000.0 + directory.CACHE_TTL_SECONDS + 1
+        assert await asyncio.wait_for(directory.merchant_facts(now=late), 5) == clean
+    finally:
+        directory.reset_cache()
+
+
+async def test_a_failed_build_serves_a_recent_clean_one_then_fails_closed(_rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+
+    clean = await directory.merchant_facts(now=1000.0)
+
+    async def _boom():
+        raise RuntimeError("merchant_stores unreadable")
+
+    monkeypatch.setattr(directory, "_build", _boom)
+    recent = 1000.0 + directory.CACHE_TTL_SECONDS + 1
+    assert await directory.merchant_facts(now=recent) == clean
+    with pytest.raises(RuntimeError):
+        await directory.merchant_facts(now=1000.0 + directory.STALE_SERVE_SECONDS + 1)

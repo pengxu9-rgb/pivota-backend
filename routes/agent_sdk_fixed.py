@@ -678,7 +678,7 @@ async def list_merchants(
     ),
     market: Optional[str] = Query(
         default=None,
-        description="ISO 3166-1 alpha-2 market, e.g. US. scope=protocol only.",
+        description="ISO 3166-1 alpha-2 market, e.g. US. Filters scope=protocol; ignored by the other scopes.",
     ),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -717,8 +717,7 @@ async def list_merchants(
             status_code=422,
             detail=f"scope={scope} lists active merchants only; use scope=mine to filter by status",
         )
-    if market is not None and scope != "protocol":
-        raise HTTPException(status_code=422, detail="market filters scope=protocol only")
+    # `market` filters scope=protocol only; the other scopes ignore it, as they did before it existed.
     if scope == "protocol":
         return await _list_protocol_merchants(context=context, market=market, limit=limit, offset=offset)
     try:
@@ -864,6 +863,8 @@ async def _list_protocol_merchants(*, context: AgentContext, market: Optional[st
         rows = await directory.list_for_agent(
             agent_id=str(context.agent_id), allowed_merchants=context.allowed_merchants, market=market_key
         )
+    except directory.DirectoryUnavailable:
+        raise HTTPException(status_code=503, detail="Merchant directory is being rebuilt; retry shortly")
     except Exception:
         logger.error("Failed to list protocol merchants", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to list merchants")
