@@ -106,16 +106,22 @@ def test_malformed_envelopes_are_refused(ring, bad):
         TokenCipher.from_key_ring(ring).decrypt(bad, aad=AAD)
 
 
+# Fixed bytes, not os.urandom: parametrize values become test ids, and the
+# sharded CI sweep requires every shard to collect the same ids.
 @pytest.mark.parametrize(
     "raw, needle",
     [
-        ("", "is not set"),
-        ("   ,  ", "is not set"),
-        ("nokid", "must be '<kid>:<base64url key>'"),
-        ("bad kid!:AAAA", "must be '<kid>:<base64url key>'"),
-        ("k1:" + base64.urlsafe_b64encode(os.urandom(16)).decode(), "must decode to 32 bytes"),
-        ("k1:@@@@", "is not base64url"),
-        (_entry("k1", os.urandom(32)) + "," + _entry("k1", os.urandom(32)), "repeats key id"),
+        pytest.param("", "is not set", id="empty"),
+        pytest.param("   ,  ", "is not set", id="blank-entries"),
+        pytest.param("nokid", "must be '<kid>:<base64url key>'", id="no-separator"),
+        pytest.param("bad kid!:AAAA", "must be '<kid>:<base64url key>'", id="bad-kid"),
+        pytest.param(
+            "k1:" + base64.urlsafe_b64encode(b"\x01" * 16).decode(), "must decode to 32 bytes", id="short-key"
+        ),
+        pytest.param("k1:@@@@", "is not base64url", id="not-base64url"),
+        pytest.param(
+            _entry("k1", b"\x02" * 32) + "," + _entry("k1", b"\x03" * 32), "repeats key id", id="repeated-kid"
+        ),
     ],
 )
 def test_a_missing_or_malformed_ring_refuses_to_build(raw, needle):
