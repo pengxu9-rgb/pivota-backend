@@ -28,4 +28,4 @@ pytestmark = pytest.mark.skipif(
 
 if _IS_PG:
     from tests.test_agent_sdk_merchants_list import *  # noqa: F401,F403,E402
-    from tests.test_agent_sdk_merchants_list import _rows  # noqa: E402,F401  (fixture by name)
+    from tests.test_agent_sdk_merchants_list import _rigs, _rows  # noqa: E402,F401  (fixtures by name)

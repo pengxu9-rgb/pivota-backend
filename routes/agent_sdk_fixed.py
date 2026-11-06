@@ -55,6 +55,7 @@ from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from routes.agent_auth import log_agent_request
 from services import agent_search_gateway_proxy
+from services.test_merchant_policy import get_excluded_merchant_ids, static_test_merchant_ids
 from config.settings import settings as _app_settings
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
@@ -722,7 +723,9 @@ async def generate_api_key(request: AgentAuthRequest):
 async def list_merchants(
     status: str = Query(
         default="active",
-        description="Merchant status. Only 'active' is accepted with scope=available.",
+        description=(
+            "Merchant status. scope=available accepts only 'active' (or its alias 'approved')."
+        ),
     ),
     scope: Literal["available", "mine"] = Query(
         default="available",
@@ -742,21 +745,28 @@ async def list_merchants(
     `scope=mine` keeps the order-history view this endpoint served before,
     and is the only scope that takes another `status`. Both scopes honour the
     agent's `allowed_merchants` the way `can_access_merchant` does: None means
-    every merchant, a list (even an empty one) means only those. (Search is
-    looser: it treats `[]` as unrestricted.)
+    every merchant, a list (even an empty one) means only those. (The legacy
+    search lane is looser: it treats `[]` as unrestricted, and with
+    `search_all_merchants=true` it bypasses an allowlist of exactly
+    `["external_seed"]`.)
+
+    Both scopes drop test/demo rigs (`services/test_merchant_policy`, the same
+    exclusion the shop-gateway lanes apply), so a rig never lists as a real
+    merchant. Source quarantines are not applied: they gate offer rows by
+    storefront host and price provenance, and this list carries no offers.
 
     Contact email, PSP type and created_at are returned only for merchants the
     agent has ordered from, so an API key cannot pull every merchant's contact
     or processor details.
     """
-    if scope == "available" and status != "active":
+    if scope == "available" and status not in ("active", "approved"):
         raise HTTPException(
             status_code=422,
             detail="scope=available lists active merchants only; use scope=mine to filter by status",
         )
     try:
         # Map status values
-        if status == "active":
+        if status in ("active", "approved"):
             db_status = "approved"
         else:
             db_status = status
@@ -785,6 +795,20 @@ async def list_merchants(
                 params[f"allowed_{i}"] = mid
                 names.append(f":allowed_{i}")
             where.append(f"mo.merchant_id IN ({', '.join(names)})")
+
+        # Test/demo rigs. Fail-soft like the gateway lanes, but never fail open:
+        # if the demo-domain lookup breaks, the baked-in + env ids still apply.
+        try:
+            excluded = await get_excluded_merchant_ids(database)
+        except Exception:
+            logger.warning("list_merchants: test-merchant resolve failed; static ids only", exc_info=True)
+            excluded = static_test_merchant_ids()
+        if excluded:
+            ex_names = []
+            for i, mid in enumerate(sorted(excluded)):
+                params[f"excluded_{i}"] = mid
+                ex_names.append(f":excluded_{i}")
+            where.append(f"mo.merchant_id NOT IN ({', '.join(ex_names)})")
 
         from_clause = """
             FROM merchant_onboarding mo

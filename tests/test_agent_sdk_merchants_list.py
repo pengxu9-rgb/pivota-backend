@@ -36,6 +36,7 @@ M_PENDING = f"merch_ml_pending_{RUN}"      # pending review
 M_DELETED = f"merch_ml_deleted_{RUN}"      # deleted
 M_OTHERS = f"merch_ml_others_{RUN}"        # approved, PSP on, only OTHER_AGENT ordered
 M_NO_PSP_ORDERED = f"merch_ml_nopsp_ord_{RUN}"  # PSP off, but AGENT ordered (shows in `mine`)
+M_NULL_PSP = f"merch_ml_nullpsp_{RUN}"     # approved, psp_connected NULL: not transactable
 
 MERCHANTS = {
     M_ORDERED: ("approved", True),
@@ -45,6 +46,7 @@ MERCHANTS = {
     M_DELETED: ("deleted", True),
     M_OTHERS: ("approved", True),
     M_NO_PSP_ORDERED: ("approved", False),
+    M_NULL_PSP: ("approved", None),
 }
 ALL_IDS = list(MERCHANTS)
 
@@ -69,6 +71,41 @@ async def _table_exists(name: str) -> bool:
             {"n": name},
         )
     return row is not None
+
+
+def _merchant_row(mid, status="approved", psp=True):
+    from db.merchant_onboarding import merchant_onboarding
+
+    return merchant_onboarding.insert().values(
+        merchant_id=mid,
+        business_name=f"Biz {mid}",
+        store_url=f"https://{mid}.example",
+        contact_email=f"owner@{mid}.example",
+        region="US",
+        status=status,
+        psp_connected=psp,
+        psp_type="stripe" if psp else None,
+        operating_mode="storefront",
+        apm_enabled=False,
+    )
+
+
+def _order(mid, agent, total, paid=True, deleted=False):
+    from db.orders import orders
+
+    return orders.insert().values(
+        order_id=f"ord_ml_{uuid.uuid4().hex[:12]}",
+        merchant_id=mid,
+        agent_id=agent,
+        customer_email="buyer@example.com",
+        shipping_address=json.dumps({"country": "US"}),
+        items=json.dumps([]),
+        subtotal=total,
+        total=total,
+        currency="USD",
+        payment_status="paid" if paid else "unpaid",
+        is_deleted=deleted,
+    )
 
 
 @pytest.fixture
@@ -98,35 +135,7 @@ async def _rows():
     )
 
     for mid, (status, psp) in MERCHANTS.items():
-        await database.execute(
-            merchant_onboarding.insert().values(
-                merchant_id=mid,
-                business_name=f"Biz {mid}",
-                store_url=f"https://{mid}.example",
-                contact_email=f"owner@{mid}.example",
-                region="US",
-                status=status,
-                psp_connected=psp,
-                psp_type="stripe" if psp else None,
-                operating_mode="storefront",
-                apm_enabled=False,
-            )
-        )
-
-    def _order(mid, agent, total, paid=True, deleted=False):
-        return orders.insert().values(
-            order_id=f"ord_ml_{uuid.uuid4().hex[:12]}",
-            merchant_id=mid,
-            agent_id=agent,
-            customer_email="buyer@example.com",
-            shipping_address=json.dumps({"country": "US"}),
-            items=json.dumps([]),
-            subtotal=total,
-            total=total,
-            currency="USD",
-            payment_status="paid" if paid else "unpaid",
-            is_deleted=deleted,
-        )
+        await database.execute(_merchant_row(mid, status, psp))
 
     await database.execute(_order(M_ORDERED, AGENT, 30))
     await database.execute(_order(M_ORDERED, AGENT, 20, paid=False))
@@ -148,6 +157,70 @@ async def _rows():
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     if not was_connected and database.is_connected:
         await database.disconnect()
+
+
+# Test/demo rigs (services/test_merchant_policy): one baked-in id, one env-listed id, one
+# caught only by its demo storefront domain. All approved, PSP-connected, and AGENT has
+# ordered from each, so nothing but the rig exclusion can keep them out of either scope.
+R_ENV = f"merch_ml_envrig_{RUN}"
+R_DEMO = f"merch_ml_demorig_{RUN}"
+DEMO_DOMAIN = f"pivota-review-demo-ml-{RUN}.myshopify.com"
+
+
+def _known_rig_id() -> str:
+    from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+
+    return sorted(KNOWN_TEST_MERCHANT_IDS)[0]
+
+
+@pytest.fixture
+async def _rigs(_rows, monkeypatch):
+    from services import test_merchant_policy
+
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
+    test_merchant_policy.reset_cache()
+    r_known = _known_rig_id()
+    # The shared dialect-gate DB may already hold this real id; only touch it if absent.
+    known_was_absent = (
+        await database.fetch_one(
+            "SELECT 1 AS x FROM merchant_onboarding WHERE merchant_id = :m", {"m": r_known}
+        )
+        is None
+    )
+    stores_created = not await _table_exists("merchant_stores")
+    await database.execute(
+        "CREATE TABLE IF NOT EXISTS merchant_stores ("
+        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
+        "platform VARCHAR(50) NOT NULL, name VARCHAR(255) NOT NULL, domain VARCHAR(255), "
+        "api_key TEXT, status VARCHAR(50) DEFAULT 'connected', "
+        "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE "
+        "DEFAULT CURRENT_TIMESTAMP)"
+    )
+    store_id = f"st_ml_{RUN}"
+    await database.execute(
+        "INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain) "
+        "VALUES (:s, :m, 'shopify', 'demo', :d)",
+        {"s": store_id, "m": R_DEMO, "d": DEMO_DOMAIN},
+    )
+    rig_ids = [R_ENV, R_DEMO] + ([r_known] if known_was_absent else [])
+    for mid in rig_ids:
+        await database.execute(_merchant_row(mid))
+    for mid in [R_ENV, R_DEMO, r_known]:
+        await database.execute(_order(mid, AGENT, 11))
+
+    yield {"known": r_known, "env": R_ENV, "demo": R_DEMO}
+
+    params = {f"m{i}": mid for i, mid in enumerate([R_ENV, R_DEMO, r_known])}
+    in_list = ", ".join(f":m{i}" for i in range(3))
+    await database.execute(
+        f"DELETE FROM orders WHERE agent_id = :a AND merchant_id IN ({in_list})", {**params, "a": AGENT}
+    )
+    for mid in rig_ids:
+        await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid})
+    await database.execute("DELETE FROM merchant_stores WHERE store_id = :s", {"s": store_id})
+    if stores_created:
+        await database.execute("DROP TABLE IF EXISTS merchant_stores")
+    test_merchant_policy.reset_cache()
 
 
 def _app(allowed_merchants=None, agent_id=AGENT):
@@ -243,7 +316,7 @@ async def test_an_empty_allowlist_fails_closed(_rows):
     assert body["pagination"]["total"] == 0
 
 
-@pytest.mark.parametrize("status", ["pending", "rejected", "deleted", "suspended", "approved"])
+@pytest.mark.parametrize("status", ["pending", "rejected", "deleted", "suspended"])
 async def test_available_accepts_only_the_active_status(_rows, status):
     # Any key could otherwise enumerate unapproved merchants by passing another status.
     resp = await _get(_app(), {"status": status})
@@ -286,3 +359,82 @@ async def test_pagination_is_stable_and_counts_match(_rows):
 async def test_an_unknown_scope_is_rejected(_rows):
     resp = await _get(_app(), {"scope": "everything"})
     assert resp.status_code == 422
+
+
+async def test_approved_is_an_alias_for_active_in_available(_rows):
+    active = (await _get(_app())).json()
+    approved = await _get(_app(), {"status": "approved"})
+    assert approved.status_code == 200
+    assert _ours(approved.json()) == _ours(active)
+
+
+async def test_null_psp_connected_is_not_transactable(_rows):
+    ours = _ours((await _get(_app())).json())
+    assert M_NULL_PSP not in ours
+
+
+async def test_has_more_is_false_on_the_last_full_page(_rows):
+    app = _app(allowed_merchants=[M_ORDERED, M_FRESH, M_OTHERS])
+    exact = (await _get(app, {"limit": 3})).json()["pagination"]
+    assert exact == {"total": 3, "limit": 3, "offset": 0, "has_more": False}
+    tail = (await _get(app, {"limit": 2, "offset": 1})).json()["pagination"]
+    assert tail["has_more"] is False
+
+
+@pytest.mark.parametrize("scope", ["available", "mine"])
+async def test_an_empty_allowlist_returns_before_touching_the_db(_rows, monkeypatch, scope):
+    # SQLite accepts `IN ()`, so without this only the Postgres twin would catch a lost
+    # early return.
+    async def _boom(*a, **k):
+        raise AssertionError("an empty allowlist must not query")
+
+    monkeypatch.setattr(database, "fetch_all", _boom)
+    monkeypatch.setattr(database, "fetch_one", _boom)
+    resp = await _get(_app(allowed_merchants=[]), {"scope": scope})
+    assert resp.status_code == 200
+    assert resp.json()["merchants"] == []
+
+
+async def test_a_db_error_is_not_echoed_to_the_caller(_rows, monkeypatch):
+    async def _boom(*a, **k):
+        raise RuntimeError('relation "merchant_onboarding_secret_detail" does not exist')
+
+    monkeypatch.setattr(database, "fetch_all", _boom)
+    resp = await _get(_app())
+    assert resp.status_code == 500
+    assert "secret_detail" not in resp.text
+    assert resp.json()["detail"] == "Failed to list merchants"
+
+
+async def test_test_and_demo_rigs_never_list_in_available(_rigs):
+    for agent in (AGENT, f"agent_ml_brand_new_{RUN}"):
+        ids = {m["merchant_id"] for m in (await _get(_app(agent_id=agent))).json()["merchants"]}
+        assert not ids & set(_rigs.values()), ids & set(_rigs.values())
+        if agent == AGENT:
+            assert M_ORDERED in ids
+
+
+async def test_test_and_demo_rigs_never_list_in_mine(_rigs):
+    ids = {m["merchant_id"] for m in (await _get(_app(), {"scope": "mine"})).json()["merchants"]}
+    assert not ids & set(_rigs.values())
+    assert M_ORDERED in ids
+
+
+async def test_an_allowlist_cannot_reach_a_rig(_rigs):
+    body = (await _get(_app(allowed_merchants=list(_rigs.values()) + [M_FRESH]))).json()
+    assert [m["merchant_id"] for m in body["merchants"]] == [M_FRESH]
+    assert body["pagination"]["total"] == 1
+
+
+async def test_a_failed_rig_lookup_still_applies_the_static_ids(_rigs, monkeypatch):
+    import routes.agent_sdk_fixed as mod
+
+    async def _boom(*a, **k):
+        raise RuntimeError("resolver down")
+
+    monkeypatch.setattr(mod, "get_excluded_merchant_ids", _boom)
+    ids = {m["merchant_id"] for m in (await _get(_app())).json()["merchants"]}
+    # Baked-in and env ids still excluded; only the domain leg is lost.
+    assert _rigs["known"] not in ids
+    assert _rigs["env"] not in ids
+    assert _rigs["demo"] in ids
