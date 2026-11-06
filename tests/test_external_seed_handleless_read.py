@@ -523,6 +523,27 @@ def test_a_handleless_read_never_changes_the_copy_or_the_gallery(monkeypatch) ->
     assert out["seed_data"]["image_urls"] == ["https://cdn.example.com/stored-1.jpg"]
 
 
+# --------------------------------------------------------------------------- flag off: the extractor is inert
+
+
+def test_an_unparsable_product_url_never_costs_the_page_its_read(monkeypatch) -> None:
+    """The identity evidence is new; an exception building it would send `resolve_external_offer` to its cached
+    snapshot and stop the page being read at all, flag or no flag. The price is the one the page always gave."""
+    broken = _product(url="http://[::1", offers=_offer("25.00", sku="CR-50"))
+    extracted = eos._extract_from_html(URL, _page(broken))
+    assert extracted["price_amount"] == 25.0
+    assert extracted["jsonld_identity"] == {"unavailable": True, "pricing_node": False}
+    out = _refresh(monkeypatch, html=_page(broken))
+    _assert_not_read(out, "no_product")
+
+
+def test_an_unparsable_url_in_the_evidence_refuses_rather_than_raises() -> None:
+    snap = _snapshot_from_html(URL, _page(_product(url=URL)))
+    evidence = copy.deepcopy(snap.evidence)
+    evidence["jsonld_identity"]["url"] = "http://[::1"
+    assert _decide(evidence=evidence).refusal == "identity_url_mismatch"
+
+
 # --------------------------------------------------------------------------- the pure rule
 
 

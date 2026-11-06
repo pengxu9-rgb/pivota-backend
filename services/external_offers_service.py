@@ -2607,11 +2607,23 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
             "product_price_exact": bool(jsonld.get("price_exact")) if price_read.get("source") == "jsonld" else True,
         },
         # Which product priced the page (`_jsonld_identity`): read only by the handle-less read rule.
-        "jsonld_identity": _jsonld_identity(
+        "jsonld_identity": _safe_jsonld_identity(
             parsed_jsonld, pricing_node, jsonld, base_url=base_url, signals=signals, page_urls=(canonical, base_url)
         ),
     }
     return out
+
+
+def _safe_jsonld_identity(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """`_jsonld_identity`, or `{"unavailable": True}` when the page's JSON-LD breaks it (an unparsable `url`).
+
+    THIS EVIDENCE MUST NEVER COST A READ. `_extract_from_html` raising sends `resolve_external_offer` to its cached
+    snapshot (`from_cache`), so an exception here would stop a page from being read at all, whatever the flag. With
+    no pricing node in the evidence, the handle-less read rule refuses (`no_product`)."""
+    try:
+        return _jsonld_identity(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - see above
+        return {"unavailable": True, "pricing_node": False}
 
 
 # Marks a snapshot whose `image_urls` holds only images the page declares as the product's

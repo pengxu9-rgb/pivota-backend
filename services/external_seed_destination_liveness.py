@@ -540,7 +540,10 @@ def _handleless_refusal(
     candidate = None
     for raw in (identity.get("url"), identity.get("id"), identity.get("group_url")):
         if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#"):
-            candidate = urljoin(str(base), raw.strip()).split("#", 1)[0]
+            try:
+                candidate = urljoin(str(base), raw.strip()).split("#", 1)[0]
+            except ValueError:  # an unparsable URL names nothing we can match: refused, never raised
+                return "identity_url_mismatch", None, None
             break
     if candidate:
         if not _same_product_url(candidate, requested_url):
