@@ -24,7 +24,7 @@ def _sqlite(seeds, products):
     conn.execute(
         "CREATE TABLE external_product_seeds (id TEXT, status TEXT, attached_product_key TEXT,"
         " domain TEXT, market TEXT, price_currency TEXT,"
-        " last_crawl_attempt_at TEXT, last_crawled_at TEXT, updated_at TEXT)"
+        " last_crawl_attempt_at TEXT, last_crawled_at TEXT, updated_at TEXT, destination_url TEXT)"
     )
     conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
     conn.execute(
@@ -33,7 +33,7 @@ def _sqlite(seeds, products):
     )
     conn.executemany(
         "INSERT INTO external_product_seeds VALUES"
-        " (?, 'active', ?, 'brand.com', 'US', 'USD', ?, NULL, '2026-01-01')",
+        " (?, 'active', ?, 'brand.com', 'US', 'USD', ?, NULL, '2026-01-01', 'https://brand.com/products/p')",
         seeds,
     )
     conn.executemany("INSERT INTO catalog_products VALUES (?, ?)", products)
