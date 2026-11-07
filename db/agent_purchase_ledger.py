@@ -373,6 +373,30 @@ _SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL = """
 """
 
 
+#: A2A purchases with no parent, oldest first. The create route writes the parent after the child
+#: commits, best effort; a parent that was not written leaves the purchase invisible to the event
+#: detector (it reads parents), so the detector heals these before it reads.
+_SELECT_A2A_MISSING_PARENTS_SQL = """
+    SELECT r.id
+      FROM a2a_rail_purchases r
+     WHERE NOT EXISTS (
+            SELECT 1 FROM agent_purchases p
+             WHERE p.rail = 'a2a' AND p.rail_purchase_id = r.id
+           )
+     ORDER BY r.created_at, r.id
+     LIMIT :limit
+"""
+
+
+async def backfill_a2a_parents(*, limit: int = 50) -> int:
+    """Give up to `limit` parentless A2A purchases a parent, oldest first (see `backfill_reap_parents`).
+    Returns how many it examined."""
+    rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, {"limit": _clamp(limit, maximum=5000)})
+    for row in rows:
+        await ensure_a2a_parent(row["id"], basis="backfill")
+    return len(rows)
+
+
 async def heal_a2a_parents_for_owner(
     agent_id: str, agent_user_ref_hash: str, *, limit: int = 100
 ) -> int:

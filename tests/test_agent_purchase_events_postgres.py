@@ -156,6 +156,47 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
     assert got & set(made) == {live, fresh}
 
 
+async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
+    from db.database import database
+    import db.a2a_rail_ledger as a2a_ledger
+    import db.agent_purchase_events as events_db
+    import db.agent_purchase_ledger as purchases
+
+    made = []
+
+    async def purchase(state, set_sql="", parent=True):
+        ap = (await a2a_ledger.create_purchase(
+            agent_id="agent_pg_a2a", agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
+            checkout_url="https://brand.example/cart/1:1?attributes[pivota_click_id]=c1",
+            currency="USD", our_price_minor=4650, consent_version="v1",
+        ))["id"]
+        await database.execute(f"UPDATE a2a_rail_purchases SET state = :s{set_sql} WHERE id = :i",
+                               {"s": state, "i": ap})
+        made.append(await purchases.ensure_a2a_parent(ap) if parent else ap)
+        return made[-1]
+
+    page = ", buyer_action_url = 'https://pay.rail.test/a'"
+    live = await purchase("awaiting_authorization", page + ", buyer_action_kind = 'approval'"
+                          ", buyer_action_expires_at = now() + interval '1 hour'")
+    await purchase("awaiting_authorization", page + ", buyer_action_kind = 'approval'"
+                   ", buyer_action_expires_at = now() - interval '1 minute'")
+    await purchase("needs_payment_method", page + ", buyer_action_kind = 'approval'"
+                   ", buyer_action_expires_at = now() + interval '1 hour'")
+    await purchase("quoting")
+    await purchase("completed", ", state_entered_at = now() - interval '3 days', updated_at = now()")
+    fresh = await purchase("failed", ", updated_at = now() - interval '3 days'")
+    orphan = await purchase("completed", parent=False)
+    # Only this test's rows are judged: the dialect gate shares one database across test files.
+    got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
+    assert got & set(made) == {live, fresh}
+    assert await purchases.backfill_a2a_parents(limit=5000) >= 1
+    healed = await database.fetch_one(
+        "SELECT id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id = :i", {"i": orphan})
+    assert healed is not None
+    got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
+    assert healed["id"] in got
+
+
 async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():
     from db.database import database
     import db.agent_purchase_events as events_db

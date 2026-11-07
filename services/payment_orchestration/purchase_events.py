@@ -9,8 +9,12 @@ Two steps, run by jobs/agent_purchase_events.py on the worker:
              services.agent_webhook_service.emit_agent_webhook_event with its stored event_id, which
              signs, POSTs and schedules retries. Every delivery of one event carries the same id.
 
-Reads the rail ledgers; never writes them. Dark unless AGENT_PURCHASE_WEBHOOKS_ENABLED is on (and the
-ledger dial, AGENT_PURCHASE_LEDGER_ENABLED, since the events hang off its rows).
+Every rail is detected: Reap and the A2A token rail, each by its own candidate read with the same
+rules. Reads the rail ledgers; never writes them. The one write outside the event table is the parent
+heal: an A2A purchase whose parent row the create route did not manage to write gets it here (the same
+idempotent write the unified read uses), because detection reads parents. Dark unless
+AGENT_PURCHASE_WEBHOOKS_ENABLED is on (and the ledger dial, AGENT_PURCHASE_LEDGER_ENABLED, since the
+events hang off its rows).
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from collections import Counter
 from typing import Any, Dict
 
 import db.agent_purchase_events as events_db
+import db.agent_purchase_ledger as purchases_db
 from services import webhook_delivery_gate
 from services.payment_orchestration import purchase_view
 from services.payment_orchestration.rails import unified_state
@@ -55,10 +60,24 @@ def _json_ready(body: Dict[str, Any]) -> Dict[str, Any]:
     return jsonable_encoder(body)
 
 
+#: Parentless A2A purchases healed per run before the candidate read (the create route writes the
+#: parent best effort; a purchase without one would never be told about).
+HEAL_A2A_PARENTS_PER_RUN = 50
+
+
 async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int]:
-    """Write one event per (purchase, rail state) that warrants one. Returns counts by outcome."""
+    """Write one event per (purchase, rail state) that warrants one, for every rail. Returns counts by
+    outcome. `limit` bounds each rail's candidate read."""
     counts: Counter = Counter()
-    for parent in await events_db.reap_candidates(lookback_hours=lookback_hours, limit=limit):
+    try:
+        healed = await purchases_db.backfill_a2a_parents(limit=HEAL_A2A_PARENTS_PER_RUN)
+        if healed:
+            counts["a2a_parent_healed"] += healed
+    except Exception as exc:  # noqa: BLE001 - a failed heal must not stop detection for the rest
+        logger.warning("agent_purchase_events: a2a parent heal failed error_type=%s", type(exc).__name__)
+    candidates = await events_db.reap_candidates(lookback_hours=lookback_hours, limit=limit)
+    candidates += await events_db.a2a_candidates(lookback_hours=lookback_hours, limit=limit)
+    for parent in candidates:
         try:
             outcome = await _detect_one(parent)
         except Exception as exc:  # noqa: BLE001 - one bad row must not stall every row after it
