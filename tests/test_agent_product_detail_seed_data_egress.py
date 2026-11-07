@@ -138,7 +138,7 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def _get_detail(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: Dict[str, Any]) -> Dict[str, Any]:
+def _detail_response(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: Dict[str, Any]):
     import routes.agent_api as agent_api_module
 
     async def fake_fetch_one(query: str, values=None):
@@ -153,7 +153,11 @@ def _get_detail(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: Dict[s
         "should_block_external_referral_runtime",
         AsyncMock(return_value=(False, None)),
     )
-    res = client.get("/agent/v1/products/external_seed/ext_test_1", headers={"X-API-Key": "test-api-key"})
+    return client.get("/agent/v1/products/external_seed/ext_test_1", headers={"X-API-Key": "test-api-key"})
+
+
+def _get_detail(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: Dict[str, Any]) -> Dict[str, Any]:
+    res = _detail_response(monkeypatch, client, row)
     assert res.status_code == 200, res.text
     return res.json()["product"]
 
@@ -344,3 +348,115 @@ def test_product_projection_is_a_copy_and_drops_an_empty_projection() -> None:
     assert out == {"id": "p1"}
     assert product == {"id": "p1", "seed_data": {"price_read": {"a": 1}}}
     assert product["seed_data"] is stored
+
+
+# --- review follow-ups (be#2726 P3s) ------------------------------------------------------------------
+
+
+def test_variant_fields_with_list_values_are_dropped() -> None:
+    """S4: every allowlisted variant field must be a scalar; a list-valued one is dropped, and a variant
+    left with nothing is dropped too."""
+    projected = project_seed_data(
+        {
+            "variants": [
+                {"variant_id": ["v1", "v2"], "sku": ["SKU-1"], "stock": [7], "availability": "in_stock"},
+                {"variant_id": ["v3"], "title": "Retinol 0.3%"},
+            ]
+        }
+    )
+    assert projected == {"variants": [{"availability": "in_stock"}]}
+
+
+def test_variant_identity_fields_each_survive_alone() -> None:
+    """Every identity/stock name on the allowlist narrows to itself; a near-name does not ride along."""
+    for field in ("selected_variant_id", "id", "availability_status", "variant_gid", "option_name", "sku"):
+        projected = project_seed_data({"variants": [{field: "x", f"{field}_raw": "internal"}]})
+        assert projected == {"variants": [{field: "x"}]}, field
+
+
+def test_image_field_names_and_object_url_keys() -> None:
+    """imageUrl at the top level and on the snapshot; image objects keep url / image_url / imageUrl / src
+    and nothing else (I7: a non-string URL is dropped)."""
+    projected = project_seed_data(
+        {
+            "imageUrl": "https://example.com/top.jpg",
+            "snapshot": {"imageUrl": "https://example.com/snap.jpg"},
+            "images": [
+                {"image_url": "https://example.com/a.jpg", "width": 10},
+                {"imageUrl": "https://example.com/b.jpg", "source": "crawl"},
+                {"url": 123},
+                {"url": ["https://example.com/c.jpg"]},
+                {"src": {"href": "https://example.com/d.jpg"}},
+            ],
+        }
+    )
+    assert projected == {
+        "imageUrl": "https://example.com/top.jpg",
+        "images": [{"image_url": "https://example.com/a.jpg"}, {"imageUrl": "https://example.com/b.jpg"}],
+        "snapshot": {"imageUrl": "https://example.com/snap.jpg"},
+    }
+
+
+def test_image_projection_leaves_its_input_unchanged() -> None:
+    """C6."""
+    stored = {
+        "images": [{"url": "https://example.com/a.jpg", "alt": "x"}, "https://example.com/b.jpg"],
+        "image": {"src": "https://example.com/c.jpg", "read_at": "2026-11-06"},
+    }
+    before = copy.deepcopy(stored)
+    projected = project_seed_data(stored)
+    assert stored == before
+    assert projected["images"][0] is not stored["images"][0]
+    projected["images"][0]["url"] = "changed"
+    projected["image"]["src"] = "changed"
+    assert stored == before
+
+
+def test_a_snapshot_stored_as_json_text_is_parsed_then_projected() -> None:
+    snapshot = {
+        "description": "A light gel moisturiser.",
+        "image_url": "https://example.com/snap.jpg",
+        "variants": [{"variant_id": "v1", "title": "50ml", "price_amount": 12.0}],
+        "price_read_source": "jsonld",
+    }
+    projected = project_seed_data({"snapshot": json.dumps(snapshot)})
+    assert projected == {
+        "snapshot": {
+            "image_url": "https://example.com/snap.jpg",
+            "description": "A light gel moisturiser.",
+            "variants": [{"variant_id": "v1"}],
+        }
+    }
+    for not_an_object in ("not json", "[1, 2]", '"a string"', "", "   "):
+        assert project_seed_data({"snapshot": not_an_object}) is None, not_an_object
+
+
+def test_a_pathologically_deep_text_snapshot_is_dropped_not_raised() -> None:
+    """P3-4: json.loads raises RecursionError on very deep text; one bad row must not fail the page."""
+    deep = '{"a":' + "[" * 5000 + "]" * 5000 + "}"
+    assert project_seed_data({"title": "x", "snapshot": deep}) is None
+
+
+def test_detail_route_projects_a_text_snapshot(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    seed_data = _internal_seed_data()
+    seed_data["snapshot"] = json.dumps(seed_data["snapshot"])
+    product = _get_detail(monkeypatch, client, _seed_row(seed_data))
+    _assert_only_allowlisted(product["seed_data"])
+    assert product["seed_data"]["snapshot"]["description"] == "A light gel moisturiser."
+    assert "price_read_source" not in json.dumps(product["seed_data"])
+
+
+def test_detail_route_fails_safe_when_the_projection_raises(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """A raise in the projection is a 500 that carries no seed_data, never the unprojected product."""
+    import routes.agent_api as agent_api_module
+
+    def boom(_product: Any) -> Any:
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(agent_api_module, "project_product_seed_data", boom)
+    res = _detail_response(monkeypatch, client, _seed_row(_internal_seed_data()))
+    assert res.status_code == 500
+    for word in ("seed_data", "price_read", "variant_refresh", "seller_internal_1"):
+        assert word not in res.text, word
