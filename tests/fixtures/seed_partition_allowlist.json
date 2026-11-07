@@ -1,0 +1,423 @@
+{
+  "_doc": [
+    "Known sites where code reads external_product_seeds.market (a storage partition) as a market or currency.",
+    "Checked by tests/test_seed_partition_is_not_a_market.py: a hit not listed fails, and a listed entry that no longer hits fails.",
+    "A PR that moves a site onto services.seed_serving deletes its entry. Keyed (file, qualname, rule), never by line.",
+    "finding: an ID from the 2026-11-06 partition audit, N<k> for a site the scanner found beyond it, OK-partition for a legitimate partition use, N/A for a hit that is not the seed partition at all."
+  ],
+  "entries": [
+    {
+      "file": "jobs/merchant_purchasability_sweep.py",
+      "qualname": "_cart_mint_lane",
+      "rule": "P",
+      "finding": "J1",
+      "reason": "WRONG: the cart-mint lane keys the probe (host, market) by the seed's partition, so hosts reached only through SGD seeds are probed for US, never SG."
+    },
+    {
+      "file": "routes/agent_api.py",
+      "qualname": "_build_external_seed_product",
+      "rule": "P",
+      "finding": "A2",
+      "reason": "WRONG: the seed->product /r token is minted with market = the row's partition ('US' for an SGD seed) when serving_market is SG."
+    },
+    {
+      "file": "routes/agent_sdk_fixed.py",
+      "qualname": "_build_external_seed_product",
+      "rule": "P",
+      "finding": "A3",
+      "reason": "OK-partition until ADR-026 P4: a US-only lane; the USD currency rule filters SGD rows out before the token is minted with the partition."
+    },
+    {
+      "file": "routes/agent_sdk_fixed.py",
+      "qualname": "_load_external_seed_products_for_search",
+      "rule": "P",
+      "finding": "A3",
+      "reason": "OK-partition until ADR-026 P4: the US-only lane binds partition 'US' and reads the per-market allowlist by the row's partition."
+    },
+    {
+      "file": "routes/agent_sdk_fixed.py",
+      "qualname": "_load_external_seed_products_for_search.<locals>._build_guarded",
+      "rule": "P",
+      "finding": "A3",
+      "reason": "OK-partition until ADR-026 P4: allowlist_by_market is looked up by the row's partition inside the US-only lane."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_build_prefetched_external_seed_wrappers",
+      "rule": "P",
+      "finding": "N1",
+      "reason": "NEW, WRONG (label): prefetched seed candidates are minted with token market = the candidate's partition; for an SG buyer it is an unobserved 'US' click (require_same keeps the gate from reading it as observed). Moves with G6 in PR2."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_group_shadow_answer",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: snap['market'] is the request's market_hint captured for the shadow comparison, a buyer market."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_group_shadow_compute",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: snap['market'] is the request's market_hint captured for the shadow comparison, a buyer market."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_handle_find_products_multi_inner",
+      "rule": "P",
+      "finding": "G6",
+      "reason": "WRONG: the multi lane mints /r with token market = row partition and market_observed from the buyer, so an SG buyer's SGD seed click is an observed 'US' click."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_handle_offers_resolve.<locals>._append_external_offers_from_seed_rows",
+      "rule": "P",
+      "finding": "G7",
+      "reason": "WRONG: used_market = row partition or market_hint stamps seed-offer tokens and attributed destinations 'US' for an SG caller."
+    },
+    {
+      "file": "routes/agent_shop_gateway.py",
+      "qualname": "_handle_offers_resolve.<locals>._fetch_external_seed_rows_by_internal_identity",
+      "rule": "S",
+      "finding": "G1",
+      "reason": "WRONG for an SG buyer: the identity fallback binds market = :market_hint, and the SG partition is empty."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_build_external_seed_offers",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): employee/PDP seed offers emit market = row partition next to the row's own currency, and the token carries it."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_build_external_seed_offers_for_external_product_id",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): employee/PDP seed offers emit market = row partition next to the row's own currency, and the token carries it."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_import_external_seeds_csv_text",
+      "rule": "P",
+      "finding": "E1",
+      "reason": "WRONG: the seed CSV import checks validate_market_currency on the row's market, so an SGD seed in partition 'US' is rejected."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_import_external_seeds_csv_text",
+      "rule": "S",
+      "finding": "E1",
+      "reason": "Writer convention (moves with E1): the CSV import looks up its upsert target by market = the declared market, the 'partition = currency market' side."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "_refresh_external_seed_by_id",
+      "rule": "P",
+      "finding": "N2",
+      "reason": "NEW, WRONG (label): the per-seed refresh hands the partition to resolve_external_offer as its market (snapshot cache key, shadow deal-capture label) and to the localized-copy guards (en-us expected for an SG seed)."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "create_external_seed",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): the created seed's redirect token is minted with the declared or stored partition, not the row's currency market."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "create_external_seed",
+      "rule": "S",
+      "finding": "E1",
+      "reason": "Writer convention (moves with E1): create disables sibling seeds by market = the declared market and binds the declared market as the partition."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "get_external_seed",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): the employee seed view mints its redirect token with market = row partition."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "list_attached_external_links",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): attached external links are minted with market = row partition."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "refresh_external_seed",
+      "rule": "P",
+      "finding": "E2",
+      "reason": "WRONG (label): the refresh endpoint mints its redirect token with the refreshed row's partition."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "update_external_seed",
+      "rule": "S",
+      "finding": "E1",
+      "reason": "Writer convention (moves with E1): the editor writes a declared market into the partition column (SET market = :market)."
+    },
+    {
+      "file": "scripts/audit_crawl_seed_recall_scope.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "The collision check reads the seed natural key (market, external_product_id, tool); the partition is part of the unique key, no currency or serving decision."
+    },
+    {
+      "file": "scripts/backfill_offer_market_currency.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "N/A",
+      "reason": "Not the seed partition: market = :mkt is catalog_offers.market in an UPDATE SET; the seed table only appears in a domain subquery."
+    },
+    {
+      "file": "scripts/backfill_shopify_variant_ids.py",
+      "qualname": "run",
+      "rule": "P",
+      "finding": "J2",
+      "reason": "WRONG: the store fetch country and the currency a cart proof must read in come from the row's partition, so SG stores are read as US."
+    },
+    {
+      "file": "scripts/beauty_ranking_audit.py",
+      "qualname": "_build_report",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: the market is the eval case's (or --market) buyer market; its partition use is the N3 entry."
+    },
+    {
+      "file": "scripts/beauty_ranking_audit.py",
+      "qualname": "_fetch_external_seed_rows_sync",
+      "rule": "S",
+      "finding": "N3",
+      "reason": "NEW, LATENT: the operator ranking audit binds a buyer market as the partition (P1/A1 shape), so a SG case reads an empty partition."
+    },
+    {
+      "file": "scripts/cleanup_csv_import_market_inconsistencies.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "J6",
+      "reason": "LATENT, destructive if re-run: 'wrong currency' = offer currency != USD where eps.market = 'US' would null SGD offer prices."
+    },
+    {
+      "file": "scripts/mirror_external_seeds_to_catalog_products.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "J8",
+      "reason": "LATENT: the group winner order prefers eps.market = 'US' (the partition), not the USD row."
+    },
+    {
+      "file": "scripts/onboard_external_brand_from_crawl.py",
+      "qualname": "resolve_cohort_currencies",
+      "rule": "P",
+      "finding": "J7",
+      "reason": "LATENT (writer convention): the onboard script reads each item's declared market as the partition and requires that market's currency."
+    },
+    {
+      "file": "scripts/ops/external_seed_currency_probe.py",
+      "qualname": "probe.<locals>.one_host",
+      "rule": "P",
+      "finding": "N4",
+      "reason": "NEW, LATENT: the one-off currency probe assumes a host's stored default currency from the partition (USD for an SG host)."
+    },
+    {
+      "file": "scripts/ops/external_seed_freshness_census.py",
+      "qualname": "classify",
+      "rule": "P",
+      "finding": "J4",
+      "reason": "WRONG: served = price_currency == serving_currency(row partition), so SGD seeds count as not served in the census."
+    },
+    {
+      "file": "scripts/ops/external_seed_price_parse_census.py",
+      "qualname": "summarise",
+      "rule": "P",
+      "finding": "J4",
+      "reason": "WRONG: the price-parse census decides served by the partition's currency, so SG misreads are never counted."
+    },
+    {
+      "file": "scripts/ops/plan_shopify_catalogue_refresh.py",
+      "qualname": "plan_host",
+      "rule": "P",
+      "finding": "OK-partition",
+      "reason": "Label only, no currency or gate decision: the dry-run planner stamps the partition on the catalogue snapshot's market field; currency comes from the host catalogue."
+    },
+    {
+      "file": "scripts/ops/relgraph_freshness_refresh.py",
+      "qualname": "plan",
+      "rule": "P",
+      "finding": "J3",
+      "reason": "WRONG for an SG manifest: the plan passes the manifest market as the partition, so every SG product is unrefreshable."
+    },
+    {
+      "file": "scripts/ops/relgraph_freshness_refresh.py",
+      "qualname": "plan",
+      "rule": "S",
+      "finding": "J3",
+      "reason": "WRONG for an SG manifest: the seed lookup binds market = :market (empty SG partition)."
+    },
+    {
+      "file": "scripts/ops/relgraph_freshness_refresh.py",
+      "qualname": "run",
+      "rule": "P",
+      "finding": "J3",
+      "reason": "WRONG for an SG manifest: --apply hands the manifest market to the targeted refresh (R2), which drops SG seeds again."
+    },
+    {
+      "file": "scripts/ops/relgraph_freshness_refresh.py",
+      "qualname": "validate_manifest",
+      "rule": "P",
+      "finding": "J3",
+      "reason": "Part of J3: the manifest's market is checked against seed_serving_currency before it is used as a partition."
+    },
+    {
+      "file": "scripts/ops_refresh_external_seeds.py",
+      "qualname": "main_async.<locals>._worker",
+      "rule": "P",
+      "finding": "N2",
+      "reason": "NEW, WRONG (label): the ops refresh preview hands the seed's partition to the preview endpoint as its market (the N2 page-read path)."
+    },
+    {
+      "file": "scripts/recover_seed_data_from_catalog_extract.py",
+      "qualname": "extract_product",
+      "rule": "P",
+      "finding": "J5",
+      "reason": "WRONG (minor): the recovery tool sends the partition as the extractor's market, which can plant a USD copy in seed_data."
+    },
+    {
+      "file": "scripts/repair_external_seed_offer_mainline.py",
+      "qualname": "<module>",
+      "rule": "S",
+      "finding": "J8",
+      "reason": "LATENT: the mainline repair prefers eps.market = 'US' (the partition) when it picks a seed."
+    },
+    {
+      "file": "scripts/repair_meitu_metal_serum_gloss.py",
+      "qualname": "run",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "A one-off repair that pins one seed by its natural key in the partition it was written to ('US'); no currency or serving decision."
+    },
+    {
+      "file": "services/catalog_enrichment_agent/apply.py",
+      "qualname": "_refuse_offer_market_currency_mismatch",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: catalog_offers rows' declared market checked by require_market_currency at the write chokepoint."
+    },
+    {
+      "file": "services/catalog_variant_price_repair.py",
+      "qualname": "plan_product",
+      "rule": "P",
+      "finding": "L3",
+      "reason": "LATENT, correct guard: a legacy 'US'+SGD catalog offer fails require_market_currency and is skipped until the restamp."
+    },
+    {
+      "file": "services/external_referral_readiness.py",
+      "qualname": "evaluate_external_referral_seed",
+      "rule": "P",
+      "finding": "R4",
+      "reason": "WRONG (label), gate UNSURE: seed_market = the partition feeds the tracked link's UTM market and the per-market domain allowlist lookup."
+    },
+    {
+      "file": "services/external_referral_readiness.py",
+      "qualname": "get_external_referral_refresh_candidate_seed_ids",
+      "rule": "P",
+      "finding": "R1",
+      "reason": "OK (#2706 model) but partition-based: refresh_queue_tier takes the row's partition as market; moves to seed_row_served in PR3."
+    },
+    {
+      "file": "services/external_referral_readiness.py",
+      "qualname": "get_external_referral_refresh_candidate_seed_ids",
+      "rule": "S",
+      "finding": "R2",
+      "reason": "WRONG: targeted refresh binds upper(trim(market)) = :refresh_market and the partition's currency, so no SGD seed can be targeted."
+    },
+    {
+      "file": "services/external_seed_audit.py",
+      "qualname": "audit_external_seed_row",
+      "rule": "P",
+      "finding": "AU1",
+      "reason": "WRONG: the locale_market_mismatch blocker expects MARKET_LOCALE_SEGMENT[row partition] (en-us) for SG seeds."
+    },
+    {
+      "file": "services/external_seed_search.py",
+      "qualname": "fetch_external_seed_rows",
+      "rule": "S",
+      "finding": "A1/S1",
+      "reason": "OK-partition until ADR-026 P4: the shared seed read binds market = :market; callers that pass a buyer market here (A1, P1) get an empty SG partition."
+    },
+    {
+      "file": "services/identity_cross_merchant_match.py",
+      "qualname": "Planner.__init__",
+      "rule": "P",
+      "finding": "L3",
+      "reason": "LATENT, correct guard: listings are scoped by catalog_offers.market; legacy 'US'+SGD offers are held until the restamp."
+    },
+    {
+      "file": "services/outbound_links_service.py",
+      "qualname": "resolve_outbound_link",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: input['market'] is the outbound-link request/token market; the minting callers carry their own entries."
+    },
+    {
+      "file": "services/pdp_governance_service.py",
+      "qualname": "_confirmed_external_seed_offers",
+      "rule": "S",
+      "finding": "PG1",
+      "reason": "WRONG (internal): the PDP subject's market is bound as the seed partition, so an SG subject finds no seed."
+    },
+    {
+      "file": "services/pdp_governance_service.py",
+      "qualname": "_external_seed_near_match_candidates",
+      "rule": "S",
+      "finding": "PG1",
+      "reason": "WRONG (internal): the PDP subject's market is bound as the seed partition, so an SG subject finds no seed."
+    },
+    {
+      "file": "services/pdp_governance_service.py",
+      "qualname": "_fetch_external_seed_by_product_id",
+      "rule": "S",
+      "finding": "PG1",
+      "reason": "WRONG (internal): the PDP subject's market is bound as the seed partition, so an SG subject finds no seed."
+    },
+    {
+      "file": "services/pdp_governance_service.py",
+      "qualname": "_seed_recent_pdp_subjects_postgres",
+      "rule": "P",
+      "finding": "PG1",
+      "reason": "Feeds PG1: the PDP subject's market is taken from seed_data's copied market, which the PG1 lookups then bind as the partition."
+    },
+    {
+      "file": "services/pdp_governance_service.py",
+      "qualname": "seed_recent_pdp_subjects",
+      "rule": "P",
+      "finding": "PG1",
+      "reason": "Feeds PG1: the PDP subject's market is taken from seed_data's copied market, which the PG1 lookups then bind as the partition."
+    },
+    {
+      "file": "services/pivot_query_service.py",
+      "qualname": "_build_external_item_from_candidate",
+      "rule": "P",
+      "finding": "P2",
+      "reason": "LATENT: the OfferNode market is seed_data.market or the row partition or 'US'; becomes WRONG once P1 lets SGD rows through."
+    },
+    {
+      "file": "services/pivot_query_service.py",
+      "qualname": "_build_incentive_node",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: incentive['market'] is the incentive row's own market."
+    },
+    {
+      "file": "services/retailer_ingest/pipeline.py",
+      "qualname": "validate_options",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: options['market'] is the ingest job's configured market, checked against its required currency."
+    }
+  ]
+}

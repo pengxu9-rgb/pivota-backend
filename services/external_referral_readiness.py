@@ -43,7 +43,9 @@ from services.external_seed_search import (
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
-from services.region_pricing import pricing_currency_for_region_or_none
+# served_region_currencies moved to services.seed_serving (2026-11-06); re-exported under its old name so its
+# callers here and their tests are unchanged.
+from services.seed_serving import served_currencies as served_region_currencies
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -1992,25 +1994,6 @@ def _refresh_fresh_hours() -> float:
     except ValueError:
         return _FRESH_HOURS_DEFAULT
     return value if math.isfinite(value) and value >= 0 else _FRESH_HOURS_DEFAULT
-
-
-def served_region_currencies() -> FrozenSet[str]:
-    """The currencies the served pricing regions price in: `serving_pricing_regions()` (the market registry's served
-    markets, which PIVOTA_SERVING_PRICING_REGIONS may only narrow), the list every serving path reads, each mapped
-    through region_pricing. E.g. {'USD', 'SGD'}.
-
-    FAILS SAFE TO EMPTY, loudly: an empty list, or a registry or env that does not load, leaves the refresh tier on
-    the partition's currency alone (`refresh_queue_tier` with no served currencies), never "every currency served".
-    """
-    try:
-        from services.index_pipeline_state_service import serving_pricing_regions
-
-        regions = list(serving_pricing_regions() or [])
-    except Exception as exc:
-        logger.warning("external referral refresh: no served pricing regions (%s); the queue tier uses the "
-                       "partition's currency alone", exc)
-        return frozenset()
-    return frozenset(c for c in (pricing_currency_for_region_or_none(r) for r in regions) if c)
 
 
 def refresh_queue_tier(
