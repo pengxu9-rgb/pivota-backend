@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Tuple
 HOSTED_HOST = "pay.vic-enabler.test"
 
 
-class FakeEvonetVic:
+class FakeProviderVic:
     def __init__(self) -> None:
         self.orders: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Tuple[str, Any]] = []
@@ -30,10 +30,12 @@ class FakeEvonetVic:
         #: When True a submit is RECORDED and then answered with `fail_next`'s fault (an unseen create).
         self.record_before_fault = True
         self.page_seconds = 900
+        #: Order ids handed out for the next new orders, in turn (else `prov_ord_NNNN`).
+        self.order_ids: List[str] = []
 
     # ── the script ──────────────────────────────────────────────────────────────────────────
 
-    def fail_next(self, op: str, fault: Any) -> "FakeEvonetVic":
+    def fail_next(self, op: str, fault: Any) -> "FakeProviderVic":
         self._faults[op].append(fault)
         return self
 
@@ -58,7 +60,7 @@ class FakeEvonetVic:
             return await self._fault(fault)
         if ref not in self.orders:
             self.orders[ref] = {
-                "order_id": f"evo_ord_{len(self.orders) + 1:04d}",
+                "order_id": self.order_ids.pop(0) if self.order_ids else f"prov_ord_{len(self.orders) + 1:04d}",
                 "client_reference": ref,
                 "amount_minor": body["amount_minor"],
                 "currency": body["currency"],

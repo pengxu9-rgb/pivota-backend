@@ -446,7 +446,7 @@ def test_search_fails_safe_when_the_projection_raises(
     def boom(_products: Any) -> Any:
         raise RuntimeError("projection failed")
 
-    monkeypatch.setattr(agent_api_module, "strip_products_internal_seed_data", boom)
+    monkeypatch.setattr(agent_api_module, "serve_search_products", boom)
     _patch_search(monkeypatch, [_seed_row(_search_seed_data())])
     res = client.get(url, headers={"X-API-Key": "test-api-key"})
     if "merchant_id=external_seed" in url:

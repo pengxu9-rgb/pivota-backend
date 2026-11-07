@@ -35,6 +35,7 @@ test in tests/test_agent_purchase_ledger_postgres.py holds that.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from typing import Any, Dict, List, Mapping, Optional
@@ -44,6 +45,8 @@ from db.database import IS_POSTGRES, database
 # Generic row decoders, shared with the Reap ledger rather than copied: jsonb arrives as text on
 # raw SQL and SQLite timestamps arrive as text; both come out of here as Python values.
 from db.reap_agentic_ledger import _decode_dt, _decode_json
+
+logger = logging.getLogger(__name__)
 
 AGENT_PURCHASE_LEDGER_ENABLED_ENV = "AGENT_PURCHASE_LEDGER_ENABLED"
 _TRUTHY = frozenset({"1", "true", "on", "yes"})
@@ -407,15 +410,28 @@ _SELECT_A2A_MISSING_PARENTS_SQL_SQLITE = """
 
 async def backfill_a2a_parents(*, limit: int = 50, lookback_hours: int = 72) -> int:
     """Give up to `limit` parentless A2A purchases that entered their state within `lookback_hours` a
-    parent, oldest first (see `backfill_reap_parents`). Returns how many it examined."""
+    parent, oldest first (see `backfill_reap_parents`). Returns how many it gave a parent.
+
+    Each row is healed on its own: a row whose parent cannot be written is logged and skipped, so it
+    does not stop the rows after it (the detector runs this on every tick, and the row would fail
+    again on each one). It keeps its place in the order and is tried again next run. Call it OUTSIDE a
+    transaction (the detector, its job and the scheduler open none): each statement then commits on
+    its own, so on Postgres a row's failed statement does not leave the connection in an aborted
+    transaction that would fail every row after it."""
     values = {"limit": _clamp(limit, maximum=5000), "lookback_hours": max(1, min(24 * 30, int(lookback_hours)))}
     if IS_POSTGRES:
         rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, values)
     else:
         rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL_SQLITE, values)
+    healed = 0
     for row in rows:
-        await ensure_a2a_parent(row["id"], basis="backfill")
-    return len(rows)
+        try:
+            if await ensure_a2a_parent(row["id"], basis="backfill") is not None:
+                healed += 1
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the heal of the rest
+            logger.warning("agent_purchase_ledger: a2a parent heal failed purchase=%s error_type=%s",
+                           row["id"], type(exc).__name__)
+    return healed
 
 
 async def heal_a2a_parents_for_owner(

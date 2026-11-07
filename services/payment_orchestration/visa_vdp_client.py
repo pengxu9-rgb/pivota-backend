@@ -25,12 +25,22 @@ operator can see a credential was sent at all. There is no flag that turns this 
 merchant-key pass-through (VIC can encrypt the credential to a MERCHANT's key, so we would carry
 ciphertext we cannot read) would be a separate, reviewed path, and is not this module.
 
+Beyond those names, the stripper also drops values by SHAPE, whatever key holds them: any JOSE compact
+string (a JWS or JWE, which carries a token base64url-encoded where no digit rule can see it) and any
+Luhn-valid 13-19 digit run, including under keys the A2A rail treats as digits-expected.
+
 TRANSPORT HYGIENE, as in `a2a_rail` and `reap_agentic_client`:
-- requests go only to Visa's three published hosts;
+- requests go only to Visa's three published hosts, checked on every built URL;
+- `production` needs its own second switch, VISA_VDP_ALLOW_PRODUCTION;
 - no environment proxy or netrc;
 - redirects are never followed;
 - response bodies are read with a hard size cap;
-- no body, password, key, token or certificate is ever logged.
+- no body, password, key, token or certificate is ever logged. X-Pay puts the API key in the URL
+  query, and httpx logs request URLs at INFO, so a filter on the httpx/httpcore loggers redacts
+  `apikey` in every record they emit;
+- secret-bearing dataclasses keep their secrets out of `repr` (Sentry runs in the web process).
+
+Encrypted answers must carry our MLE key id (`kid`) and a fresh `iat`, or they are refused.
 
 Dark by default: `from_env()` returns None unless VISA_VDP_ENABLED is on and an auth mode is fully
 configured. Secrets arrive as PEM / string env values (mounted from Secret Manager), never files in
@@ -46,20 +56,23 @@ import hmac
 import json
 import logging
 import os
+import re
 import ssl
 import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
-from services.payment_orchestration.a2a_rail import _strip_credentials
+from services.payment_orchestration.a2a_rail import _has_card_number, _strip_credentials
 
 logger = logging.getLogger(__name__)
 
 VISA_VDP_ENABLED_ENV = "VISA_VDP_ENABLED"
 #: sandbox | cert | production
 VISA_VDP_ENV_ENV = "VISA_VDP_ENV"
+#: A second, separate switch: `production` is refused unless this is also on.
+VISA_VDP_ALLOW_PRODUCTION_ENV = "VISA_VDP_ALLOW_PRODUCTION"
 # Two-way SSL
 VISA_VDP_MTLS_CERT_PEM_ENV = "VISA_VDP_MTLS_CERT_PEM"
 VISA_VDP_MTLS_KEY_PEM_ENV = "VISA_VDP_MTLS_KEY_PEM"
@@ -85,6 +98,45 @@ ALLOWED_HOSTS: FrozenSet[str] = frozenset(HOSTS.values())
 HELLO_WORLD_PATH = "/vdp/helloworld"
 DEFAULT_TIMEOUT_S = 30.0
 MAX_BODY_BYTES = 1024 * 1024
+#: An encrypted answer's `iat` (epoch ms) may differ from our clock by at most this much.
+MLE_MAX_SKEW_S = 300
+
+
+# ── log redaction ────────────────────────────────────────────────────────────────────────────────
+
+_APIKEY_IN_TEXT_RE = re.compile(r"(?i)(apikey=)[^&\s\"'<>]+")
+_REDACTED_LOGGERS = ("httpx", "httpcore", "httpcore.connection", "httpcore.http11", "httpcore.http2",
+                     "httpcore.proxy")
+
+
+class _RedactApiKeyFilter(logging.Filter):
+    """Rewrites any `apikey=<value>` in a record to `apikey=[redacted]`. Installed on the loggers httpx
+    and httpcore emit on, because httpx logs every request URL at INFO and X-Pay's key is in the query.
+    A logger's filters run only for records created on that logger, so each one is named."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:  # a malformed record is left for logging itself to report
+            return True
+        if "apikey=" in text.lower():
+            record.msg = _APIKEY_IN_TEXT_RE.sub(r"\1[redacted]", text)
+            record.args = None
+        return True
+
+
+_REDACT_FILTER = _RedactApiKeyFilter()
+
+
+def install_log_redaction() -> None:
+    """Idempotent; runs at import and again before every request (a test or job may reset logging)."""
+    for name in _REDACTED_LOGGERS:
+        target = logging.getLogger(name)
+        if _REDACT_FILTER not in target.filters:
+            target.addFilter(_REDACT_FILTER)
+
+
+install_log_redaction()
 
 #: VIC credential containers, canonicalised as `a2a_rail` does (lower case, no `_`, `-`, `.`). The
 #: A2A stripper already removes `encryptedSignedPayload` (it contains "crypt"), cryptograms, PANs and
@@ -183,8 +235,18 @@ def mle_encrypt(plaintext: str, server_cert_pem: str, key_id: str, *, iat_ms: Op
     return ".".join((protected, _b64u(encrypted_key), _b64u(iv), _b64u(ciphertext), _b64u(tag)))
 
 
-def mle_decrypt(jwe: str, client_key_pem: str) -> str:
-    """Plaintext of a JWE compact string encrypted to our MLE key. Raises ValueError on any defect."""
+def mle_decrypt(
+    jwe: str,
+    client_key_pem: str,
+    *,
+    expected_kid: Optional[str] = None,
+    now_ms: Optional[int] = None,
+    max_skew_s: Optional[int] = None,
+) -> str:
+    """Plaintext of a JWE compact string encrypted to our MLE key. Raises ValueError on any defect.
+
+    With `expected_kid`, the header's `kid` must equal it. With `max_skew_s`, the header's `iat`
+    (epoch ms) must be present and within that many seconds of `now_ms` (default: the clock)."""
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -198,8 +260,17 @@ def mle_decrypt(jwe: str, client_key_pem: str) -> str:
         header = json.loads(_b64u_decode(protected))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ValueError("unreadable JWE header") from exc
-    if header.get("alg") != "RSA-OAEP-256" or header.get("enc") != "A128GCM":
+    if not isinstance(header, dict) or header.get("alg") != "RSA-OAEP-256" or header.get("enc") != "A128GCM":
         raise ValueError("unexpected JWE algorithms")
+    if expected_kid is not None and header.get("kid") != expected_kid:
+        raise ValueError("JWE kid is not our MLE key id")
+    if max_skew_s is not None:
+        iat = header.get("iat")
+        if isinstance(iat, bool) or not isinstance(iat, int):
+            raise ValueError("JWE has no usable iat")
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        if abs(now - iat) > int(max_skew_s) * 1000:
+            raise ValueError("JWE iat is outside the allowed clock skew")
     oaep = padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
     try:
         cek = _load_private_key(client_key_pem).decrypt(_b64u_decode(enc_key), oaep)
@@ -218,15 +289,41 @@ def _canon(key: Any) -> str:
     return str(key).lower().replace("_", "").replace("-", "").replace(".", "")
 
 
+#: A JOSE compact serialization (JWS: 3 parts, JWE: 5 parts). Its protected header is a JSON object,
+#: so the first part always starts `eyJ` (base64url of `{"`). Searched, not anchored: a prefix such as
+#: `Bearer ` must not hide one.
+_JOSE_COMPACT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*")
+
+
+def _is_credential_shaped(value: Any) -> bool:
+    """A value that may carry a credential whatever key it sits under: a JOSE compact string, or a
+    Luhn-valid 13-19 digit run (in a string or an integer)."""
+    if isinstance(value, str):
+        return bool(_JOSE_COMPACT_RE.search(value)) or _has_card_number(value)
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return _has_card_number(str(abs(value)))
+    if isinstance(value, float) and value.is_integer():
+        return _has_card_number(str(int(abs(value))))
+    return False
+
+
 def strip_vic_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
-    """`value` without VIC credential containers, then through the A2A stripper. (copy, removed)."""
+    """`value` without VIC credential containers or credential-shaped values, then through the A2A
+    stripper. Returns (copy, removed)."""
     removed = 0
     if depth > 64:
+        return None, 1
+    if depth == 0 and _is_credential_shaped(value):
         return None, 1
     if isinstance(value, dict):
         kept: Dict[str, Any] = {}
         for key, item in value.items():
-            if _canon(key) in _VIC_CREDENTIAL_KEYS:
+            if _canon(key) in _VIC_CREDENTIAL_KEYS or _is_credential_shaped(str(key)):
+                removed += 1
+                continue
+            if _is_credential_shaped(item):
                 removed += 1
                 continue
             kept[key], count = strip_vic_credentials(item, depth + 1)
@@ -235,6 +332,10 @@ def strip_vic_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
     elif isinstance(value, list):
         items = []
         for item in value:
+            if _is_credential_shaped(item):
+                items.append(None)
+                removed += 1
+                continue
             cleaned, count = strip_vic_credentials(item, depth + 1)
             items.append(cleaned)
             removed += count
@@ -248,25 +349,27 @@ def strip_vic_credentials(value: Any, depth: int = 0) -> Tuple[Any, int]:
 # ── the client ───────────────────────────────────────────────────────────────────────────────────
 
 
+# repr=False on every credential field: a dataclass repr would otherwise print the key PEM, password
+# or shared secret into a traceback, a `%r` log line, or a Sentry frame-locals capture.
 @dataclass(frozen=True)
 class MtlsAuth:
-    cert_pem: str
-    key_pem: str
-    user_id: str
-    password: str
+    cert_pem: str = field(repr=False)
+    key_pem: str = field(repr=False)
+    user_id: str = field(repr=False)
+    password: str = field(repr=False)
 
 
 @dataclass(frozen=True)
 class XPayAuth:
-    api_key: str
-    shared_secret: str
+    api_key: str = field(repr=False)
+    shared_secret: str = field(repr=False)
 
 
 @dataclass(frozen=True)
 class MleKeys:
     key_id: str
-    server_cert_pem: str
-    client_key_pem: str
+    server_cert_pem: str = field(repr=False)
+    client_key_pem: str = field(repr=False)
 
 
 def _ssl_context(mtls: MtlsAuth) -> ssl.SSLContext:
@@ -305,6 +408,8 @@ class VisaVdpClient:
         env = str(environment or "").strip().lower()
         if env not in HOSTS:
             raise VisaVdpConfigError(f"{VISA_VDP_ENV_ENV} must be one of {sorted(HOSTS)}")
+        if env == "production" and not _truthy(VISA_VDP_ALLOW_PRODUCTION_ENV):
+            raise VisaVdpConfigError(f"production needs {VISA_VDP_ALLOW_PRODUCTION_ENV}=on as well")
         if mtls is None and xpay is None:
             raise VisaVdpConfigError("configure two-way SSL, X-Pay, or both")
         self.environment = env
@@ -367,6 +472,16 @@ class VisaVdpClient:
         else:
             raise ValueError("auth must be 'mtls' or 'xpay'")
         url = f"{self._base}{path}" + (f"?{query}" if query else "")
+        parts = urlsplit(url)
+        if (
+            parts.scheme != "https"
+            or parts.hostname not in ALLOWED_HOSTS
+            or parts.hostname != HOSTS[self.environment]
+            or parts.port is not None
+            or parts.username is not None
+            or parts.password is not None
+        ):
+            raise ValueError("built URL is not on this environment's Visa host")
         return url, headers, (payload.encode("utf-8") if payload is not None else None)
 
     async def request(
@@ -382,6 +497,7 @@ class VisaVdpClient:
         is `outcome_unknown`: for a write the caller must read state, never resend."""
         import httpx
 
+        install_log_redaction()
         mode = auth or ("mtls" if self._mtls is not None else "xpay")
         url, headers, content = self._prepare(method.upper(), path, body, auth=mode, encrypt=encrypt)
         started = self._clock()
@@ -417,7 +533,10 @@ class VisaVdpClient:
                 return self._done(VdpResult(status, outcome="mle_error", correlation_id=correlation,
                                             notes=["encrypted answer but no MLE key"]), path, started)
             try:
-                parsed = json.loads(mle_decrypt(parsed["encData"], self._mle.client_key_pem))
+                parsed = json.loads(mle_decrypt(
+                    parsed["encData"], self._mle.client_key_pem,
+                    expected_kid=self._mle.key_id, max_skew_s=MLE_MAX_SKEW_S,
+                ))
             except ValueError:
                 return self._done(VdpResult(status, outcome="mle_error", correlation_id=correlation), path, started)
         cleaned, removed = strip_vic_credentials(parsed)
@@ -445,8 +564,12 @@ class VisaVdpClient:
         return result
 
 
+def _truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in _TRUTHY
+
+
 def is_enabled() -> bool:
-    return (os.getenv(VISA_VDP_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+    return _truthy(VISA_VDP_ENABLED_ENV)
 
 
 def _env(name: str) -> str:
