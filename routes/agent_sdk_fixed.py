@@ -663,15 +663,22 @@ async def list_merchants(
     status: str = Query(
         default="active",
         description=(
-            "Merchant status. scope=available accepts only 'active' (or its alias 'approved')."
+            "Merchant status. scope=available and scope=protocol accept only 'active' "
+            "(or its alias 'approved')."
         ),
     ),
-    scope: Literal["available", "mine"] = Query(
+    scope: Literal["available", "mine", "protocol"] = Query(
         default="available",
         description=(
             "'available' (default): approved merchants this agent can order from. "
-            "'mine': only merchants this agent has already placed orders with."
+            "'mine': only merchants this agent has already placed orders with. "
+            "'protocol': merchants a purchase reaches through a checkout protocol, one row "
+            "per merchant domain and market, with the checkout routes it can take."
         ),
+    ),
+    market: Optional[str] = Query(
+        default=None,
+        description="ISO 3166-1 alpha-2 market, e.g. US. Filters scope=protocol; ignored by the other scopes.",
     ),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -697,12 +704,22 @@ async def list_merchants(
     Contact email, PSP type and created_at are returned only for merchants the
     agent has ordered from, so an API key cannot pull every merchant's contact
     or processor details.
+
+    `scope=protocol` is the protocol directory (services/agent_merchant_directory.py):
+    merchants no portal integration knows, reached through a payment partner's
+    checkout or a prefilled cart the buyer finishes. Rows are keyed by
+    `merchant_domain` + `market` (the pair a purchase names) and carry
+    `checkout_routes`; there is no `merchant_id`. The agent's `allowed_merchants`
+    is matched against the domain, not the merchant id the purchase route checks.
     """
-    if scope == "available" and status not in ("active", "approved"):
+    if scope in ("available", "protocol") and status not in ("active", "approved"):
         raise HTTPException(
             status_code=422,
-            detail="scope=available lists active merchants only; use scope=mine to filter by status",
+            detail=f"scope={scope} lists active merchants only; use scope=mine to filter by status",
         )
+    # `market` filters scope=protocol only; the other scopes ignore it, as they did before it existed.
+    if scope == "protocol":
+        return await _list_protocol_merchants(context=context, market=market, limit=limit, offset=offset)
     try:
         # Map status values
         if status in ("active", "approved"):
@@ -832,6 +849,41 @@ async def list_merchants(
     except Exception as e:
         logger.error(f"Failed to list merchants: {e}")
         raise HTTPException(status_code=500, detail="Failed to list merchants")
+
+async def _list_protocol_merchants(*, context: AgentContext, market: Optional[str], limit: int, offset: int):
+    from services import agent_merchant_directory as directory
+
+    if market is not None:
+        market_key = market.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", market_key):
+            raise HTTPException(status_code=422, detail="market must be an ISO 3166-1 alpha-2 code")
+    else:
+        market_key = None
+    try:
+        rows = await directory.list_for_agent(
+            agent_id=str(context.agent_id), allowed_merchants=context.allowed_merchants, market=market_key
+        )
+    except directory.DirectoryUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Merchant directory is being rebuilt; retry shortly",
+            headers={"Retry-After": "15"},
+        )
+    except Exception:
+        logger.error("Failed to list protocol merchants", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list merchants")
+    total = len(rows)
+    return {
+        "status": "success",
+        "scope": "protocol",
+        "merchants": rows[offset:offset + limit],
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": total > offset + limit,
+        },
+    }
 
 # ============================================================================
 # PRODUCTS SEARCH
