@@ -104,12 +104,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
 from services.payment_orchestration import a2a_rail, vic_order
+from services.payment_orchestration import router as rail_router
 
 logger = logging.getLogger(__name__)
 
@@ -949,6 +951,29 @@ async def _start_vic_order(s: _Step) -> str:
 
 
 VIC_QUOTE_WAIT = "waiting_on_quote"
+#: A quote that did not come (`retry`) or could not be read (`unrecognised`) is asked again with a growing
+#: gap (`POLL_RETRY` doubling, at most this), not every minute until the expiry sweep. The count of
+#: consecutive misses rides in last_error_code as `vic_quote:<kind>:<n>`.
+VIC_QUOTE_BACKOFF_MAX_SECONDS = 1800
+#: An answer that keeps coming back unreadable is the provider's contract, not a blip: after this many in
+#: a row the purchase fails (`vic_quote_unrecognised`). Nothing billable exists, so failing is safe.
+VIC_QUOTE_UNRECOGNISED_LIMIT = 5
+_VIC_QUOTE_MISS_RE = re.compile(r"(?:^|:)vic_quote:(retry|unrecognised):([0-9]{1,4})$")
+
+
+def _vic_quote_misses(row: Mapping[str, Any], kind: str) -> int:
+    """How many quotes in a row came back `kind` before this one (0 when the last code is another)."""
+    match = _VIC_QUOTE_MISS_RE.search(str(row.get("last_error_code") or ""))
+    return int(match[2]) if match and match[1] == kind else 0
+
+
+async def _vic_quote_miss(s: _Step, kind: str) -> str:
+    misses = _vic_quote_misses(s.row, kind) + 1
+    if kind == "unrecognised" and misses >= VIC_QUOTE_UNRECOGNISED_LIMIT:
+        return await _token_failed(s, "quoting", "vic_quote_unrecognised")
+    await s.release(min(POLL_RETRY * 2 ** min(misses - 1, 10), VIC_QUOTE_BACKOFF_MAX_SECONDS),
+                    f"vic_quote:{kind}:{misses}")
+    return VIC_QUOTE_WAIT
 
 
 async def _vic_quote(s: _Step) -> Optional[str]:
@@ -961,15 +986,14 @@ async def _vic_quote(s: _Step) -> Optional[str]:
     WAIT, not a failure (the ledger's expiry sweep bounds it). A quote that prices the items at anything
     but the buyer's confirmed price, or in another currency, ends the purchase: the buyer confirmed a
     price, and shipping and tax are the only additions it may grow by (shown to them, all in, on the
-    rail's page)."""
+    rail's page). So does an all-in total over the rail's cap for the currency (`vic_quote_over_limit`)."""
     row = s.row
     quote = await s.vic.quote_order(vic_order.build_quote_request(row))
     if quote.kind == "refused":
         detail = quote.error_code or quote.http_status or ""
         return await _token_failed(s, "quoting", f"vic_quote_refused:{detail}"[:64].rstrip(":"))
     if not quote.ok:
-        await s.release(POLL_RETRY, f"vic_quote:{quote.kind}")
-        return VIC_QUOTE_WAIT
+        return await _vic_quote_miss(s, "retry" if quote.kind == "retry" else "unrecognised")
     if quote.client_reference not in (None, s.id):
         logger.error("a2a_rail_worker: VIC quote names another purchase purchase=%s", s.id)
         await s.release(POLL_RETRY, "vic_quote_mismatch")
@@ -978,6 +1002,11 @@ async def _vic_quote(s: _Step) -> Optional[str]:
         return await _token_failed(s, "quoting", "vic_quote_currency_mismatch")
     if quote.items_minor != vic_order.items_amount(row):
         return await _token_failed(s, "quoting", "vic_quote_price_changed")
+    # The rail's per-currency risk cap bounds what goes out, not only the items: create checked our price
+    # x quantity, but the order asks the buyer to approve the all-in total. Shipping and tax are bounded
+    # by it too (they can only add up to the cap less the items). No cap for the currency: no order.
+    if not rail_router.amount_ok(quote.total_minor, row.get("currency")):
+        return await _token_failed(s, "quoting", "vic_quote_over_limit")
     try:
         moved = await ledger.record_quote_as_holder(
             s.id, s.worker, quote_id=quote.quote_id, quoted_total_minor=quote.total_minor,

@@ -314,12 +314,16 @@ def _require_https_url(value: Any, name: str, *, required: bool) -> Optional[str
     return text
 
 
+#: The amount columns are BIGINT: a larger value is refused here, not by the database mid-step.
+_BIGINT_MAX = 2 ** 63 - 1
+
+
 def _require_minor(value: Any, name: str, *, positive: bool = False) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer number of minor units")
-    if value < (1 if positive else 0):
+    if not (1 if positive else 0) <= value <= _BIGINT_MAX:
         raise ValueError(f"{name} is out of range")
     return value
 

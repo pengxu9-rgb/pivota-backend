@@ -29,6 +29,7 @@ import db.agent_purchase_ledger as purchases  # noqa: E402
 import jobs.a2a_rail_purchase_poll as job  # noqa: E402
 from services.payment_orchestration import a2a_purchase_view, a2a_rail, purchase_events, vic_order  # noqa: E402
 from services.payment_orchestration import a2a_rail_worker as worker  # noqa: E402
+from services.payment_orchestration import router as rail_router  # noqa: E402
 from tests.fake_provider_vic import HOSTED_HOST, FakeProviderVic  # noqa: E402
 
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
@@ -60,6 +61,7 @@ async def _db(monkeypatch):
     monkeypatch.setattr(a2a_rail, "ALLOWED_HOST_SHA256", frozenset({hashlib.sha256(RAIL_HOST.encode()).hexdigest()}))
     monkeypatch.setenv(a2a_purchase_view.HOSTED_HOSTS_ENV, hashlib.sha256(HOSTED_HOST.encode()).hexdigest())
     monkeypatch.setenv(vic_order.A2A_RAIL_VIC_ORDER_STEP_ENABLED_ENV, "1")
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "USD:100000")
     monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV, raising=False)
     if not database.is_connected:
         await database.connect()
@@ -524,13 +526,15 @@ async def test_the_quote_is_recorded_and_the_order_goes_out_with_its_all_in_tota
 
 
 @pytest.mark.parametrize("fault, code", [
-    (TimeoutError(), "vic_quote:retry"),
-    (502, "vic_quote:retry"),
-    (429, "vic_quote:retry"),
+    (TimeoutError(), "vic_quote:retry:1"),
+    (502, "vic_quote:retry:1"),
+    (429, "vic_quote:retry:1"),
     ((200, {"quote_id": "q1", "currency": "USD", "items_minor": 9300, "shipping_minor": 500,
-            "tax_minor": 340, "total_minor": 9999}), "vic_quote:unrecognised"),  # does not add up
+            "tax_minor": 340, "total_minor": 9999}), "vic_quote:unrecognised:1"),  # does not add up
     ((200, {"quote_id": "q1", "currency": "usd", "items_minor": 9300, "shipping_minor": 0,
-            "tax_minor": 0, "total_minor": 9300}), "vic_quote:unrecognised"),    # unreadable currency
+            "tax_minor": 0, "total_minor": 9300}), "vic_quote:unrecognised:1"),    # unreadable currency
+    ((200, {"quote_id": "q1", "currency": "USD", "items_minor": 9300, "shipping_minor": 2 ** 63,
+            "tax_minor": 0, "total_minor": 9300 + 2 ** 63}), "vic_quote:unrecognised:1"),  # past BIGINT
 ])
 async def test_no_quote_yet_is_a_wait_not_a_failure(a2a, fake, fault, code):
     pid = await _quoting()
@@ -545,7 +549,8 @@ async def test_no_quote_yet_is_a_wait_not_a_failure(a2a, fake, fault, code):
 
 
 @pytest.mark.parametrize("override, code", [
-    ({"items_minor": 9400, "total_minor": 10240}, "vic_quote_price_changed"),  # not the confirmed price
+    ({"items_minor": 9400, "total_minor": 10240}, "vic_quote_price_changed"),  # above the confirmed price
+    ({"items_minor": 9200, "total_minor": 10040}, "vic_quote_price_changed"),  # below it: still not it
     ({"currency": "EUR"}, "vic_quote_currency_mismatch"),
 ])
 async def test_a_quote_the_buyer_did_not_confirm_ends_the_purchase_before_any_order(a2a, fake, override, code):
@@ -554,6 +559,72 @@ async def test_a_quote_the_buyer_did_not_confirm_ends_the_purchase_before_any_or
     assert await _step(a2a, fake, pid) == "failed"
     row = await _row(pid)
     assert (row["state"], row["last_error_code"]) == ("failed", code)
+    assert fake.submits() == []
+
+
+async def test_a_quote_misses_back_off_and_an_unreadable_quote_ends_the_purchase(a2a, fake):
+    """A quote that does not come is asked again with a growing gap; one that keeps coming back unreadable
+    ends the purchase after a few tries instead of being asked every minute until the expiry sweep."""
+    pid = await _quoting()
+    gaps = []
+    for n in range(1, worker.VIC_QUOTE_UNRECOGNISED_LIMIT):
+        fake.fail_next("quote", (200, {"quote_id": "q1"}))
+        assert await _step(a2a, fake, pid) == "waiting_on_quote"
+        row = await _row(pid)
+        assert row["last_error_code"] == f"vic_quote:unrecognised:{n}"
+        gaps.append(round((worker._aware(row["next_poll_at"]) - worker._now()).total_seconds() / 60))
+    assert gaps == [1, 2, 4, 8]
+    fake.fail_next("quote", 503)  # another kind starts its own count
+    assert await _step(a2a, fake, pid) == "waiting_on_quote"
+    assert (await _row(pid))["last_error_code"] == "vic_quote:retry:1"
+    for n in range(1, worker.VIC_QUOTE_UNRECOGNISED_LIMIT):
+        fake.fail_next("quote", (200, {"quote_id": "q1"}))
+        assert await _step(a2a, fake, pid) == "waiting_on_quote"
+    fake.fail_next("quote", (200, {"quote_id": "q1"}))
+    assert await _step(a2a, fake, pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["quoted_total_minor"]) == ("failed", "vic_quote_unrecognised", None)
+    assert fake.submits() == []
+
+
+async def test_a_quote_that_never_comes_backs_off_to_a_ceiling_and_never_fails_on_its_own(a2a, fake):
+    pid = await _quoting()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'vic_quote:retry:40' WHERE id = :i",
+                           {"i": pid})
+    fake.fail_next("quote", 502)
+    assert await _step(a2a, fake, pid) == "waiting_on_quote"
+    row = await _row(pid)
+    assert row["last_error_code"] == "vic_quote:retry:41"
+    gap = (worker._aware(row["next_poll_at"]) - worker._now()).total_seconds()
+    assert worker.VIC_QUOTE_BACKOFF_MAX_SECONDS - 5 <= gap <= worker.VIC_QUOTE_BACKOFF_MAX_SECONDS
+
+
+def test_waiting_on_quote_is_a_quiet_tick():
+    assert "waiting_on_quote" in job._QUIET_OUTCOMES
+
+
+@pytest.mark.parametrize("caps, outcome", [
+    ("USD:10000", "failed"),           # the items (9300) fit the cap; the all-in quote (10140) does not
+    ("EUR:100000", "failed"),          # no cap for the purchase's currency: no order
+    (f"USD:{QUOTED}", "approval_page_issued"),  # exactly at the cap
+])
+async def test_the_rails_cap_bounds_the_all_in_quote_not_only_the_items(a2a, fake, monkeypatch, caps, outcome):
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, caps)
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == outcome
+    row = await _row(pid)
+    if outcome == "failed":
+        assert (row["last_error_code"], row["quoted_total_minor"]) == ("vic_quote_over_limit", None)
+        assert fake.submits() == []
+    else:
+        assert [o["amount_minor"] for o in fake.submits()] == [QUOTED]
+
+
+async def test_shipping_far_above_the_items_is_held_to_the_cap(a2a, fake):
+    fake.quote_override = {"shipping_minor": 930000, "total_minor": 9300 + 930000 + 340}
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "failed"
+    assert (await _row(pid))["last_error_code"] == "vic_quote_over_limit"
     assert fake.submits() == []
 
 
@@ -605,8 +676,16 @@ async def test_the_quote_is_recorded_only_on_a_held_quoting_row_with_nothing_pen
                            {"i": pid})
     assert await ledger.record_quote_as_holder(pid, W, **args) is None  # an order may be out
     await database.execute("UPDATE a2a_rail_purchases SET pending_write = NULL WHERE id = :i", {"i": pid})
+    for column, value in (("payment_token_id", "'tok_1'"), ("contact_purged_at", "CURRENT_TIMESTAMP"),
+                          ("state", "'awaiting_authorization'")):
+        await database.execute(f"UPDATE a2a_rail_purchases SET {column} = {value} WHERE id = :i", {"i": pid})
+        assert await ledger.record_quote_as_holder(pid, W, **args) is None, column
+        restore = "'quoting'" if column == "state" else "NULL"
+        await database.execute(f"UPDATE a2a_rail_purchases SET {column} = {restore} WHERE id = :i", {"i": pid})
+    assert (await _row(pid))["quoted_total_minor"] is None
     assert (await ledger.record_quote_as_holder(pid, W, **args))["quoted_total_minor"] == QUOTED
-    for bad in (dict(args, quoted_total_minor=0), dict(args, shipping_minor=None), dict(args, quote_id="4111111111111111")):
+    for bad in (dict(args, quoted_total_minor=0), dict(args, shipping_minor=None), dict(args, quote_id="4111111111111111"),
+                dict(args, quoted_total_minor=2 ** 63), dict(args, shipping_minor=2 ** 63)):
         with pytest.raises(ValueError):
             await ledger.record_quote_as_holder(pid, W, **bad)
 

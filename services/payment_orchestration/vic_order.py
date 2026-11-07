@@ -130,8 +130,13 @@ def _https(value: Any) -> Optional[str]:
     return None
 
 
+#: The largest amount read from the provider: an exact JSON integer (2^53), well inside the ledger's
+#: BIGINT columns. A larger value reads as missing, so it can never reach a write that would overflow.
+MAX_MINOR = 2 ** 53
+
+
 def _minor(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_MINOR:
         return None
     return value
 
@@ -331,7 +336,12 @@ def _items(row: Mapping[str, Any]) -> list:
 
 
 def build_quote_request(row: Mapping[str, Any]) -> Mapping[str, Any]:
-    """What the provider needs to price shipping and tax: the merchant, the items, where they go."""
+    """What the provider needs to price shipping and tax: the merchant, the items, where they go.
+
+    A purchase on this rail is ONE line (one product, a quantity). The quote answers with the aggregate
+    `items_minor` only, no lines, so the step checks it against unit x quantity (`items_amount`); that
+    is the whole check only because there is one line. A multi-line cart would need the quote to echo
+    each line."""
     return {
         "client_reference": str(row["id"]),
         "merchant": {"domain": row["merchant_domain"], "checkout_url": row["checkout_url"]},
