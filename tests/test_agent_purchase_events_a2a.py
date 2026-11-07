@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -295,3 +296,56 @@ async def test_a_refused_a2a_page_is_rechecked_and_a_republished_page_becomes_th
     assert (await purchase_events.detect()) == {"recorded": 1}
     [row] = await _events()
     assert (row["status"], row["event_id"], row["payload"]["next_action"]["url"]) == ("pending", first_id, PAGE)
+
+
+# ── the heal, row by row ─────────────────────────────────────────────────────────────────────
+
+
+async def _set_ago(ap: str, column: str, hours: int) -> None:
+    await database.execute(f"UPDATE a2a_rail_purchases SET {column} = datetime('now', '-' || :h || ' hours') WHERE id = :i",
+                           {"h": hours, "i": ap})
+
+
+async def test_a_row_whose_parent_cannot_be_written_does_not_stop_the_heal_of_the_rest(monkeypatch, caplog):
+    bad = await _purchase("completed", parent=False, merchant_order_id="2001")
+    good = await _purchase("completed", parent=False, merchant_order_id="2002")
+    await _set_ago(bad, "state_entered_at", 2)  # oldest first: the bad row is healed first
+    real = purchases.ensure_a2a_parent
+
+    async def flaky(rail_purchase_id, **kw):
+        if rail_purchase_id == bad:
+            raise RuntimeError("constraint violation")
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", flaky)
+    with caplog.at_level(logging.WARNING, logger=purchases.__name__):
+        counts = await purchase_events.detect()
+    assert counts == {"a2a_parent_healed": 1, "recorded": 1}
+    [parent] = await database.fetch_all("SELECT rail_purchase_id FROM agent_purchases")
+    assert parent["rail_purchase_id"] == good
+    [warning] = [r for r in caplog.records if "a2a parent heal failed" in r.getMessage()]
+    assert bad in warning.getMessage() and "RuntimeError" in warning.getMessage()
+    # Tried again next run, and healed once it can be.
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", real)
+    assert (await purchase_events.detect()) == {"a2a_parent_healed": 1, "recorded": 1}
+
+
+async def test_the_heal_takes_the_purchase_that_entered_its_state_first(monkeypatch):
+    monkeypatch.setattr(purchase_events, "HEAL_A2A_PARENTS_PER_RUN", 1)
+    born_first = await _purchase("quoting", parent=False)
+    entered_first = await _purchase("quoting", parent=False)
+    await _set_ago(born_first, "created_at", 10)
+    await _set_ago(born_first, "state_entered_at", 1)
+    await _set_ago(entered_first, "created_at", 6)
+    await _set_ago(entered_first, "state_entered_at", 5)
+    assert (await purchase_events.detect()).get("a2a_parent_healed") == 1
+    [parent] = await database.fetch_all("SELECT rail_purchase_id FROM agent_purchases")
+    assert parent["rail_purchase_id"] == entered_first
+
+
+@pytest.mark.parametrize("entered_hours_ago,healed", [(23, True), (25, False)])
+async def test_the_heal_window_is_the_lookback_exactly(entered_hours_ago, healed):
+    ap = await _purchase("quoting", parent=False)
+    await _set_ago(ap, "state_entered_at", entered_hours_ago)
+    assert (await purchase_events.detect(lookback_hours=24)).get("a2a_parent_healed") == (1 if healed else None)
+    assert (await database.fetch_one("SELECT id FROM agent_purchases") is not None) is healed

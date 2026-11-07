@@ -111,8 +111,8 @@ from services.payment_offer_evidence_service import (
 )
 from services.refund_observability import build_order_refund_tracking_payload
 from services.seed_data_egress_projection import (
-    project_product_seed_data,
-    strip_products_internal_seed_data,
+    serve_detail_product,
+    serve_search_products,
 )
 from services.order_confirmation_email_service import order_confirmation_email_enabled
 from db.agent_product_events import log_product_events
@@ -5902,7 +5902,7 @@ async def agent_search_products(
 
             return {
                 "status": "success",
-                "products": strip_products_internal_seed_data(paginated_products),
+                "products": serve_search_products(paginated_products),
                 "pagination": {
                     "total_count": total,
                     "limit": limit,
@@ -6302,7 +6302,7 @@ async def agent_search_products(
 
             return {
                 "status": "success",
-                "products": strip_products_internal_seed_data(paginated_products),
+                "products": serve_search_products(paginated_products),
                 "pagination": {
                     "total_count": total,
                     "limit": limit,
@@ -6829,7 +6829,7 @@ async def agent_search_products(
         
         return {
             "status": "success",
-            "products": strip_products_internal_seed_data(paginated_products),
+            "products": serve_search_products(paginated_products),
             "pagination": {
                 "total_count": total,
                 "limit": limit,
@@ -8095,11 +8095,11 @@ async def agent_get_product(
                 status_code=200,
                 merchant_id=merchant_id,
             )
-            # The stored seed_data blob is internal state; only its allowlisted projection leaves
-            # (copy-on-write: `prod` and the row it was built from keep the full blob).
+            # The stored seed_data blob is internal state; only its allowlisted projection leaves, and
+            # every string is made encodable (copy-on-write: `prod` and its row keep the full blob).
             return {
                 "status": "success",
-                "product": project_product_seed_data(prod),
+                "product": serve_detail_product(prod),
                 "metadata": {
                     "detail_source": "upstream",
                 },
