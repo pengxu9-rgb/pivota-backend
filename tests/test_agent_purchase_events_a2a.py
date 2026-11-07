@@ -259,11 +259,25 @@ async def test_the_heal_is_bounded_per_run(monkeypatch):
     assert (await purchase_events.detect()).get("a2a_parent_healed") is None
 
 
-async def test_the_heal_does_not_scan_purchases_older_than_the_lookback():
+async def test_the_heal_skips_a_purchase_that_entered_its_state_before_the_lookback():
     old = await _purchase("completed", parent=False, merchant_order_id="1005")
-    await database.execute("UPDATE a2a_rail_purchases SET created_at = '2000-01-01 00:00:00' WHERE id = :i", {"i": old})
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = '2000-01-01 00:00:00' WHERE id = :i",
+                           {"i": old})
     assert (await purchase_events.detect(lookback_hours=24)).get("a2a_parent_healed") is None
     assert await database.fetch_one("SELECT id FROM agent_purchases") is None
+
+
+@pytest.mark.parametrize("created_hours_ago", [30, 100])
+async def test_the_heal_reaches_every_purchase_the_detector_could_announce(created_hours_ago):
+    """Bounded by the detector's own clock (`state_entered_at`), not by `created_at`: a purchase created
+    before the lookback that changed state inside it is healed, and its event is recorded."""
+    ap = await _purchase("completed", parent=False, merchant_order_id="1006")
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = datetime('now', '-' || :h || ' hours') WHERE id = :i",
+                           {"h": created_hours_ago, "i": ap})
+    assert await purchase_events.detect(lookback_hours=24) == {"a2a_parent_healed": 1, "recorded": 1}
+    parent = await database.fetch_one("SELECT id, rail_purchase_id FROM agent_purchases")
+    assert parent["rail_purchase_id"] == ap
+    assert [(e["purchase_id"], e["event_type"]) for e in await _events()] == [(parent["id"], "purchase.completed")]
 
 
 async def test_a_refused_a2a_page_is_rechecked_and_a_republished_page_becomes_the_event():
