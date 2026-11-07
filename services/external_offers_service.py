@@ -2379,11 +2379,21 @@ def _jsonld_identity(
                 return name.strip().casefold()
         return None
 
-    def exact_prices_of(offers: list[Dict[str, Any]]) -> Set[str]:
-        return {
-            str(_raw_price_value(o.get("price"))) for o in offers
-            if not _is_aggregate_offer(o) and _raw_price_value(o.get("price")) is not None
-        }
+    def exact_prices_of(offers: list[Dict[str, Any]]) -> Set[Any]:
+        """The exact prices of `offers` as AMOUNTS, read as the page's own price is (`_read_price`), so `25` and
+        `"25.00"` are one price. A text the reader refuses stays as its raw text: it then differs from any amount,
+        and a conflict refuses, never merges."""
+        out: Set[Any] = set()
+        for o in offers:
+            raw = _raw_price_value(o.get("price"))
+            if _is_aggregate_offer(o) or raw is None:
+                continue
+            try:
+                amount, _ = _read_price(raw, read_currency_code(o.get("priceCurrency")), signals, jsonld=True)
+            except Exception:  # noqa: BLE001 - extractor evidence never raises
+                amount = None
+            out.add(round(float(amount), 6) if amount is not None else ("raw", str(raw)))
+        return out
 
     pricing_group = group_of(pricing) if pricing is not None else None
     pricing_name = str(entry.get("title") or "").strip().casefold() or None
@@ -2394,7 +2404,7 @@ def _jsonld_identity(
         """The pricing node itself, its group, or a sibling variant of that group: one product by construction."""
         return node is pricing or (pricing_group is not None and (node is pricing_group or group_of(node) is pricing_group))
 
-    def conflicts(name: Optional[str], prices: Set[str]) -> bool:
+    def conflicts(name: Optional[str], prices: Set[Any]) -> bool:
         """A node under the pricing product's url / @id that is not that product: another name, or another price.
         Two different products can both name the served URL (a bundle beside the item); merging them would let
         the higher-scoring one price the page."""

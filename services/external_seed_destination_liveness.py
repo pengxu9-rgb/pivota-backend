@@ -414,34 +414,45 @@ class HandlelessDecision:
     identity_by: Optional[str] = None
 
 
-def _url_parts(url: Any) -> Optional[Tuple[str, str, str, str]]:
-    """(scheme, host with one leading www. folded, unquoted path without a trailing /, unquoted query), or None
-    for a URL that does not parse (a bad port `:abc` / `:99999` raises only when `.port` is read)."""
+def _url_parts(url: Any) -> Optional[Tuple[str, str, str, Tuple[Tuple[str, str], ...]]]:
+    """(scheme, host with one leading www. folded, unquoted path without a trailing /, query pairs), or None for
+    a URL that does not parse (a bad port `:abc` / `:99999` raises only when `.port` is read). The query is SPLIT
+    before each key and value is decoded, so an encoded separator stays data: `?pid=5%26x` is one pair
+    (`pid`, `5&x`), never the two pairs of `?pid=5&x`."""
     try:
         parsed = urlparse(str(url or "").strip())
         host = _fold_www(parsed.hostname or "")
         port = parsed.port
+        query = tuple(parse_qsl(parsed.query or "", keep_blank_values=True))
     except Exception:  # noqa: BLE001 - an unparsable URL matches nothing
         return None
     if not host:
         return None
     if port:
         host = f"{host}:{port}"
-    return (parsed.scheme.lower(), host, unquote(parsed.path or "").rstrip("/"), unquote(parsed.query or ""))
+    return (parsed.scheme.lower(), host, unquote(parsed.path or "").rstrip("/"), query)
 
 
-# Query keys that name no product: tracking, attribution, and the variant (the URL variant pick owns it).
+# Query keys that name no product: utm_* and mc_* (by prefix), the ad-click ids below, and `variant`. Only
+# these. A key like `ref`, `src`, `source` or `aff` can carry the product id on a handle-less URL
+# (`/item?ref=SKU1`), so it is identity. `variant` is dropped as it is for handle URLs: the URL variant pick owns
+# it, and the read adopts only the variants the pricing product lists.
+_IDENTITY_IGNORED_QUERY_PREFIXES = ("utm_", "mc_")
 _IDENTITY_IGNORED_QUERY_KEYS = frozenset({
-    "gclid", "fbclid", "yclid", "msclkid", "dclid", "gbraid", "wbraid", "ttclid", "igshid", "srsltid", "mc_cid",
-    "mc_eid", "_ga", "_gl", "ref", "ref_", "referrer", "source", "src", "aff", "affiliate", "variant",
+    "gclid", "fbclid", "yclid", "msclkid", "dclid", "gbraid", "wbraid", "ttclid", "igshid", "srsltid", "_ga",
+    "_gl", "variant",
 })
 
 
-def _identity_query(query: str) -> Tuple[Tuple[str, str], ...]:
-    """The query pairs that can name a product (`/item.php?id=5`): tracking keys and `variant` dropped."""
-    pairs = parse_qsl(query or "", keep_blank_values=True)
-    kept = {(k.strip().lower(), v.strip()) for k, v in pairs
-            if not k.strip().lower().startswith("utm_") and k.strip().lower() not in _IDENTITY_IGNORED_QUERY_KEYS}
+def _identity_query(pairs: Sequence[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
+    """The query pairs (already split, then decoded: `_url_parts`) that can name a product (`/item.php?id=5`).
+    Keys compare case-folded; values exactly, outer spaces stripped."""
+    kept = set()
+    for key, value in pairs:
+        folded = key.strip().casefold()
+        if folded.startswith(_IDENTITY_IGNORED_QUERY_PREFIXES) or folded in _IDENTITY_IGNORED_QUERY_KEYS:
+            continue
+        kept.add((folded, value.strip()))
     return tuple(sorted(kept))
 
 
@@ -511,9 +522,17 @@ def _brand_tokens(*brands: Any) -> Set[str]:
 _KIND_TOKENS = frozenset(_PRODUCT_KIND_WORDS) | frozenset(
     gram for word in _PRODUCT_KIND_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
 )
-_ITEM_FORM_TOKENS = frozenset(_ITEM_FORM_WORDS) | frozenset(
-    gram for word in _ITEM_FORM_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
-)
+# Latin item-form words compare as words. The Korean / Japanese / Chinese ones compare as WHOLE substrings of
+# the title (`_cjk_item_forms`), never by character bigram: a bigram of サンプル (sample) is also in サンカット
+# (sun-cut) and パープル (purple), and one of セット (set) in ポケット (pocket).
+_ITEM_FORM_TOKENS = frozenset(_ITEM_FORM_WORDS)
+_ITEM_FORM_WORDS_CJK_NORM = tuple(unicodedata.normalize("NFKC", word).casefold() for word in _ITEM_FORM_WORDS_CJK)
+
+
+def _cjk_item_forms(text: Any) -> Set[str]:
+    """The CJK item-form words (`_ITEM_FORM_WORDS_CJK`) a title contains, each as a whole substring."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return {word for word in _ITEM_FORM_WORDS_CJK_NORM if word in norm}
 
 
 def _pack_counts(text: Any) -> Set[int]:
@@ -542,7 +561,11 @@ def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence
         return False
     if (seed - page) & _KIND_TOKENS and (page - seed) & _KIND_TOKENS:
         return False
-    if (seed ^ page) & _ITEM_FORM_TOKENS or _pack_counts(seed_title) != _pack_counts(page_name):
+    if (
+        (seed ^ page) & _ITEM_FORM_TOKENS
+        or _cjk_item_forms(seed_title) != _cjk_item_forms(page_name)
+        or _pack_counts(seed_title) != _pack_counts(page_name)
+    ):
         # A pack, set, refill or mini of the product is another item with another price.
         return False
     dice = 2.0 * len(seed & page) / (len(seed) + len(page))

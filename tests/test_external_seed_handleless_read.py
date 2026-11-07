@@ -15,6 +15,7 @@ import copy
 import importlib.util
 import json
 import pathlib
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -913,3 +914,154 @@ def test_a_price_the_reader_did_not_parse_refuses_even_with_an_amount() -> None:
     evidence = copy.deepcopy(snap.evidence)
     evidence["price_read"]["status"] = "ambiguous_separator"
     assert _decide(evidence=evidence, fresh_amount=25.0).refusal == "price"
+
+
+# --------------------------------------------------------------------------- controller re-review (query keys,
+# encoded separators, parsed amounts, CJK item-form words, the 7 surviving mutants)
+
+
+@pytest.mark.parametrize("key", ["ref", "src", "source", "aff", "affiliate"])
+def test_a_ref_like_query_key_is_identity(monkeypatch, key: str) -> None:
+    # A handle-less URL can carry its product id under any key: `?ref=SKU1` is not `?ref=SKU2`.
+    served = f"https://shop.example/item?{key}=SKU1"
+    other = _page(_product(name="Completely Different Toner", url=f"/item?{key}=SKU2", offers=_offer("30.00", sku="T")))
+    _assert_not_read(_refresh(monkeypatch, row=_query_row(served), html=other, observed=_observed(served)),
+                     "identity_url_mismatch")
+    same = _page(_product(url=f"/item?{key}=SKU1"))
+    _assert_read(_refresh(monkeypatch, row=_query_row(served), html=same, observed=_observed(served)), by="url")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["utm_campaign=x", "gclid=x", "fbclid=x", "yclid=x", "msclkid=x", "dclid=x", "gbraid=x", "wbraid=x",
+     "ttclid=x", "igshid=x", "srsltid=x", "mc_cid=x", "mc_eid=x", "_ga=x", "_gl=x", "variant=7"],
+)
+def test_only_tracking_click_ids_and_variant_are_dropped(monkeypatch, extra: str) -> None:
+    served = "https://shop.example/item.php?id=5"
+    html = _page(_product(url=f"/item.php?id=5&{extra}"))
+    _assert_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)), by="url")
+
+
+def test_query_keys_compare_case_folded(monkeypatch) -> None:
+    served = "https://shop.example/item.php?id=5"
+    html = _page(_product(url="/item.php?ID=5&UTM_Source=feed"))
+    _assert_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)), by="url")
+
+
+@pytest.mark.parametrize(
+    "served,product_url",
+    [("https://shop.example/item.php?pid=5&x", "/item.php?pid=5%26x"),
+     ("https://shop.example/item.php?pid=5%26x", "/item.php?pid=5&x"),
+     ("https://shop.example/item.php?a=1&b=2", "/item.php?a=1%26b%3D2")],
+    ids=["encoded_amp_on_page", "encoded_amp_served", "encoded_pair"],
+)
+def test_an_encoded_separator_is_data_not_a_separator(monkeypatch, served: str, product_url: str) -> None:
+    assert liveness._same_product_url("https://shop.example" + product_url, served) is False
+    html = _page(_product(url=product_url))
+    _assert_not_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)),
+                     "identity_url_mismatch")
+
+
+def test_an_encoded_value_matches_its_decoded_form() -> None:
+    assert liveness._same_product_url("https://shop.example/item.php?name=caf%C3%A9", "https://shop.example/item.php?name=café")
+
+
+@pytest.mark.parametrize("twin_price", [25, 25.0, "25", "25.0", "25.00"], ids=["int", "float", "text", "text_1dp", "text_2dp"])
+def test_the_same_url_at_the_same_amount_is_one_product(monkeypatch, twin_price: Any) -> None:
+    twin = _product(url=URL, offers=_offer(twin_price, sku="CR-50"))
+    _assert_read(_refresh(monkeypatch, html=_page(_product(url=URL), twin)), by="url")
+
+
+def test_the_same_url_with_another_name_at_the_same_price_refuses(monkeypatch) -> None:
+    twin = _product(name="Brand Barrier Cream Bundle Kit", url=URL, offers=_offer("25.00", sku="KIT-1"))
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), twin)), "structure")
+
+
+def test_a_bare_offer_under_the_served_url_at_another_price_refuses(monkeypatch) -> None:
+    bare = {"@context": "https://schema.org", "@type": "Offer", "price": "38.00", "priceCurrency": "USD", "url": URL}
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), bare)), "structure")
+
+
+def test_a_bare_offer_under_the_served_url_at_the_same_amount_is_the_product(monkeypatch) -> None:
+    bare = {"@context": "https://schema.org", "@type": "Offer", "price": 25, "priceCurrency": "USD", "url": URL}
+    _assert_read(_refresh(monkeypatch, html=_page(_product(url=URL), bare)), by="url")
+
+
+def test_the_same_pack_word_on_both_titles_reads(monkeypatch) -> None:
+    title = "Brand Ceramide Barrier Cream Set"
+    row = _seed_row(title=title, seed_data={"title": title, "brand": "Brand"})
+    out = _refresh(monkeypatch, row=row, html=_page(_product(name="Brand Ceramide Barrier Cream Set 50ml")))
+    _assert_read(out, by="title")
+
+
+@pytest.mark.parametrize(
+    "seed_title,page_name,match",
+    [
+        # Another item of the line: refused.
+        ("Brand 泥スムース 洗顔フォーム", "Brand 泥スムース 洗顔フォーム セット", False),
+        ("Brand 泥スムース 洗顔フォーム", "Brand 泥スムース 洗顔フォーム 詰め替え", False),
+        ("Brand 泥スムース 洗顔フォーム", "Brand 泥スムース 洗顔フォーム サンプル", False),
+        ("Brand 泥スムース 洗顔フォーム", "Brand 泥スムース 洗顔フォーム ミニ", False),
+        ("Brand 시카 진정 토너", "Brand 시카 진정 토너 세트", False),
+        ("Brand 시카 진정 토너", "Brand 시카 진정 토너 기획", False),
+        ("Brand 시카 진정 토너", "Brand 시카 진정 토너 리필", False),
+        ("Brand 시카 진정 토너", "Brand 시카 진정 토너 미니", False),
+        # A word that only SHARES characters with one: not an item-form word.
+        ("Brand 泥スムース 洗顔フォーム サンカット", "Brand 泥スムース 洗顔フォーム", True),
+        ("Brand 泥スムース 洗顔フォーム パープル", "Brand 泥スムース 洗顔フォーム", True),
+        ("Brand 泥スムース 洗顔フォーム ポケット", "Brand 泥スムース 洗顔フォーム", True),
+        # The same item-form word on both sides.
+        ("Brand 시카 진정 토너 세트", "Brand 시카 진정 토너 세트 200ml", True),
+    ],
+)
+def test_cjk_item_form_words_match_as_whole_words(seed_title: str, page_name: str, match: bool) -> None:
+    assert liveness.handleless_titles_match(seed_title, page_name, brands=("Brand",)) is match
+
+
+@pytest.mark.parametrize("page_name", ["Brand Ceramide Barrier Cream x1", "Brand Ceramide Barrier Cream 1ct",
+                                       "Brand Ceramide Barrier Cream 1개"])
+def test_a_pack_count_of_one_is_no_pack(page_name: str) -> None:
+    assert liveness.handleless_titles_match(SEED_TITLE, page_name, brands=("Brand",)) is True
+
+
+def test_another_pack_count_refuses() -> None:
+    assert liveness.handleless_titles_match(SEED_TITLE + " x2", SEED_TITLE + " x3", brands=("Brand",)) is False
+
+
+@pytest.mark.parametrize("raw", ["19円~", "¥1,900〜", "1,900円から", "19,000원부터", "19,000원 이상", "¥199起", "~$19.00"])
+def test_cjk_and_tilde_from_price_markers_refuse(raw: str) -> None:
+    snap = _snapshot_from_html(URL, _page(_product(url=URL)))
+    evidence = dict(snap.evidence, price_read=dict(snap.evidence["price_read"], raw=raw))
+    assert _decide(evidence=evidence).refusal == "price_inexact"
+    assert _decide(evidence=snap.evidence).read is True
+
+
+def test_query_values_compare_exactly(monkeypatch) -> None:
+    # Keys fold case; a VALUE is the product id and does not (`?id=AB12` is not `?id=ab12`).
+    served = "https://shop.example/item.php?id=AB12"
+    html = _page(_product(url="/item.php?id=ab12"))
+    _assert_not_read(_refresh(monkeypatch, row=_query_row(served), html=html, observed=_observed(served)),
+                     "identity_url_mismatch")
+
+
+def test_a_same_url_twin_whose_price_the_reader_refuses_is_a_conflict(monkeypatch) -> None:
+    # A price text the reader cannot read is still another price: it refuses, never merges.
+    twin = _product(url=URL, offers=_offer("25,00,0", sku="CR-50"))
+    _assert_not_read(_refresh(monkeypatch, html=_page(_product(url=URL), twin)), "structure")
+
+
+def test_a_price_reader_that_raises_on_a_twin_still_refuses_as_a_conflict(monkeypatch) -> None:
+    real = eos._read_price
+
+    def flaky(raw: Any, *args: Any, **kwargs: Any):
+        # Raise only for the identity evidence's own read, so the page's price is still read.
+        if sys._getframe(1).f_code.co_name == "exact_prices_of" and raw == "BOOM-25":
+            raise RuntimeError("reader bug")
+        return real(raw, *args, **kwargs)
+
+    monkeypatch.setattr(eos, "_read_price", flaky)
+    twin = _product(url=URL, offers=_offer("BOOM-25", sku="CR-50"))
+    snap = _snapshot_from_html(URL, _page(_product(url=URL), twin))
+    identity = snap.evidence["jsonld_identity"]
+    assert not identity.get("unavailable"), "the twin's raise must not cost the page its identity evidence"
+    assert identity["priced_identities"] == 2
