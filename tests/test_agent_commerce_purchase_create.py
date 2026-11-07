@@ -66,7 +66,8 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 2820, "currency": "USD", "marke
 
 
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
-           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs")
+           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs",
+           "a2a_rail_worker_heartbeat")
 
 
 @pytest.fixture(autouse=True)
@@ -77,12 +78,14 @@ async def _db():
         for table in _TABLES:
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         await ensure_required_schema_light()
+        await a2a_ledger.record_worker_heartbeat()  # an armed worker is ticking, unless a test says not
         yield
         return
     # On Postgres these tables are shared with other files (one gate database): emptied, never dropped.
     await ensure_required_schema_light()
     for table in _TABLES:
         await database.execute(f"DELETE FROM {table}")
+    await a2a_ledger.record_worker_heartbeat()
     # asyncpg's pool belongs to this test's event loop: give it back at the end of every test.
     try:
         yield
@@ -422,10 +425,18 @@ async def test_a_lost_key_race_to_a_reap_purchase_is_handed_to_the_reap_route(cl
 # ── routing ──────────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("change", ["rail_off", "create_off", "not_pilot", "not_proven", "no_cap", "variant_lane", "offer_code"])
+@pytest.mark.parametrize("change", ["rail_off", "create_off", "worker_down", "worker_stale", "not_pilot", "not_proven",
+                                    "currency", "no_cap", "variant_lane", "offer_code"])
 async def test_without_a_choice_an_ineligible_request_goes_to_reap_unchanged(client, stubs, monkeypatch, change):
     b = body()
-    if change == "rail_off":
+    if change == "worker_down":
+        await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    elif change == "worker_stale":
+        await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS + 60)
+    elif change == "currency":
+        stubs.facts["currency"] = "SGD"
+        b = body(expected_currency="SGD")  # SGD has a cap; the token step cannot carry it
+    elif change == "rail_off":
         monkeypatch.delenv("A2A_RAIL_ENABLED")
     elif change == "create_off":
         monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
@@ -451,10 +462,15 @@ async def test_an_explicit_reap_choice_goes_to_reap_even_when_a2a_could_take_it(
     await _nothing_written()
 
 
-@pytest.mark.parametrize("change", ["not_pilot", "not_proven", "offer_code"])
+@pytest.mark.parametrize("change", ["worker_down", "currency", "not_pilot", "not_proven", "offer_code"])
 async def test_an_explicit_a2a_choice_it_cannot_take_is_a_404_never_reap(client, stubs, monkeypatch, change):
     b = body(payment_preference={"rail": "a2a"})
-    if change == "not_pilot":
+    if change == "worker_down":
+        await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    elif change == "currency":
+        stubs.facts["currency"] = "SGD"
+        b["expected_currency"] = "SGD"
+    elif change == "not_pilot":
         CALLER.agent_id = "agent_not_in_pilot"
     elif change == "not_proven":
         monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, "")
@@ -463,7 +479,7 @@ async def test_an_explicit_a2a_choice_it_cannot_take_is_a_404_never_reap(client,
     resp = await client.post(BASE, b)
     assert resp.status_code == 404 and "not_available_on_this_rail" in resp.text
     # The reason is not in the answer: an agent cannot learn the pilot list or the merchant list from it.
-    for word in ("pilot", "proven", "offer"):
+    for word in ("pilot", "proven", "offer", "worker", "currency"):
         assert word not in resp.text
     assert stubs.reap == [] and stubs.catalog == []
     await _nothing_written()
@@ -498,11 +514,126 @@ def test_the_amount_cap_is_per_currency_and_fails_closed(monkeypatch, raw, total
 
 
 def test_the_router_names_every_rail_it_drops():
-    choice = rail_router.choose_rail(agent_id="agent_x", merchant_domain=SHOP, market_country="US", item_source="cart_link")
+    args = dict(merchant_domain=SHOP, market_country="US", item_source="cart_link", currency="USD", worker_alive=True)
+    choice = rail_router.choose_rail(agent_id="agent_x", **args)
     assert (choice.rail, choice.basis, choice.dropped) == ("reap", "orchestrator_selected_rail", {"a2a": "agent_not_in_pilot"})
-    refused = rail_router.choose_rail(agent_id="agent_x", merchant_domain=SHOP, market_country="US",
-                                      item_source="cart_link", preferred="a2a")
+    refused = rail_router.choose_rail(agent_id="agent_x", preferred="a2a", **args)
     assert (refused.rail, refused.refusal) == (None, "agent_not_in_pilot")
+
+
+@pytest.mark.parametrize("worker_alive", [False, None, True])
+def test_an_agent_outside_the_pilot_is_told_so_whatever_the_heartbeat(worker_alive):
+    # The route never reads the heartbeat for a non-pilot agent and passes False; the reason must still
+    # be the pilot, not a worker that may well be ticking.
+    args = dict(merchant_domain=SHOP, market_country="US", item_source="cart_link", currency="USD",
+                worker_alive=worker_alive)
+    assert rail_router.choose_rail(agent_id="agent_x", **args).dropped == {"a2a": "agent_not_in_pilot"}
+    assert rail_router.choose_rail(agent_id="agent_x", preferred="a2a", **args).refusal == "agent_not_in_pilot"
+
+
+@pytest.mark.parametrize("over,reason", [
+    ({"worker_alive": False}, "a2a_worker_unavailable"),
+    ({"worker_alive": None}, "a2a_worker_unavailable"),  # not a yes
+    ({"currency": "SGD"}, "currency_unsupported"),
+    ({"currency": ""}, "currency_unsupported"),
+    ({"currency": "usd"}, None),
+    ({}, None),
+], ids=["worker_down", "worker_unknown", "sgd", "no_currency", "lower_case_usd", "eligible"])
+def test_the_router_refuses_a_dead_worker_and_a_currency_the_token_cannot_carry(over, reason):
+    args = dict(agent_id=AGENT, merchant_domain=SHOP, market_country="US", item_source="cart_link",
+                currency="USD", worker_alive=True)
+    args.update(over)
+    choice = rail_router.choose_rail(**args)
+    if reason is None:
+        assert choice.rail == "a2a"
+    else:
+        assert (choice.rail, choice.dropped) == ("reap", {"a2a": reason})
+        assert rail_router.choose_rail(preferred="a2a", **args).refusal == reason
+
+
+def test_the_routers_currencies_are_the_token_steps():
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+
+    assert a2a_rail_worker.TOKEN_CURRENCIES is a2a_rail.TOKEN_CURRENCIES
+
+
+async def _age_heartbeat(*, seconds: int) -> None:
+    if IS_POSTGRES:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = now() - (:s * INTERVAL '1 second')",
+                               {"s": seconds})
+    else:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = datetime('now', '-' || :s || ' seconds')",
+                               {"s": seconds})
+
+
+async def test_a_heartbeat_inside_the_window_admits_the_rail(client, stubs):
+    await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS - 60)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a"
+
+
+async def test_an_unreadable_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch):
+    async def broken(**_kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", broken)
+    resp = await client.post(BASE, body())
+    assert resp.json() == {"handled_by": "reap"}
+    await _nothing_written()
+
+
+@pytest.mark.parametrize("why", ["rail_off", "not_pilot", "reap_chosen"])
+async def test_the_heartbeat_is_read_only_for_a_request_the_rail_could_take(client, stubs, monkeypatch, why):
+    calls = []
+
+    async def spy(**_kw):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
+    b = body()
+    if why == "rail_off":
+        monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
+    elif why == "not_pilot":
+        CALLER.agent_id = "agent_not_in_pilot"
+    else:
+        b = body(payment_preference={"rail": "reap"})
+    assert (await client.post(BASE, b)).json() == {"handled_by": "reap"}
+    assert calls == []
+
+
+async def test_a_request_the_rail_could_take_reads_the_heartbeat_once(client, stubs, monkeypatch):
+    calls = []
+    real = a2a_ledger.worker_is_alive
+
+    async def spy(**kw):
+        calls.append(1)
+        return await real(**kw)
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a" and calls == [1]
+
+
+async def test_a_slow_heartbeat_read_keeps_the_rail_closed(client, stubs, monkeypatch):
+    import asyncio
+
+    async def slow(**_kw):
+        await asyncio.sleep(5)
+        return True
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", slow)
+    monkeypatch.setattr(unified_routes, "_HEARTBEAT_READ_TIMEOUT_S", 0.05)
+    assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    await _nothing_written()
+
+
+def test_the_heartbeat_window_outlives_the_slowest_tick_cadence():
+    from services.audit_scheduler import run_deadline_for
+
+    # The job's interval is clamped to at most 600 s and a tick may run for its deadline: a window
+    # shorter than both would close the rail between two healthy ticks.
+    assert a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS >= 600 + run_deadline_for("a2a_rail_purchase_poll")
 
 
 # ── review round 1 ───────────────────────────────────────────────────────────────────────────
@@ -539,9 +670,10 @@ async def test_the_buyer_is_admitted_by_the_rails_own_rules_before_any_read(clie
     await _nothing_written()
 
 
-async def test_a_currency_with_no_cap_is_refused(client, stubs):
-    stubs.facts["currency"] = "EUR"
-    resp = await client.post(BASE, body(expected_currency="EUR"))
+async def test_a_currency_with_no_cap_is_refused(client, stubs, monkeypatch):
+    # Caps exist, but none for the shown currency (USD, the one currency the token step carries).
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "SGD:13500")
+    resp = await client.post(BASE, body())
     assert resp.status_code == 409 and "amount_over_limit" in resp.text
     await _nothing_written()
 
