@@ -521,6 +521,16 @@ def test_the_router_names_every_rail_it_drops():
     assert (refused.rail, refused.refusal) == (None, "agent_not_in_pilot")
 
 
+@pytest.mark.parametrize("worker_alive", [False, None, True])
+def test_an_agent_outside_the_pilot_is_told_so_whatever_the_heartbeat(worker_alive):
+    # The route never reads the heartbeat for a non-pilot agent and passes False; the reason must still
+    # be the pilot, not a worker that may well be ticking.
+    args = dict(merchant_domain=SHOP, market_country="US", item_source="cart_link", currency="USD",
+                worker_alive=worker_alive)
+    assert rail_router.choose_rail(agent_id="agent_x", **args).dropped == {"a2a": "agent_not_in_pilot"}
+    assert rail_router.choose_rail(agent_id="agent_x", preferred="a2a", **args).refusal == "agent_not_in_pilot"
+
+
 @pytest.mark.parametrize("over,reason", [
     ({"worker_alive": False}, "a2a_worker_unavailable"),
     ({"worker_alive": None}, "a2a_worker_unavailable"),  # not a yes
