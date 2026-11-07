@@ -1246,3 +1246,41 @@ def test_a_code_phrase_never_reaches_into_the_next_block(html):
 
 def test_a_line_break_inside_the_phrase_words_still_reads_the_code():
     assert set(_codes('<div class="announcement-bar">Use promo<br>code SAVE15 for 15% off</div>')) == {"SAVE15"}
+
+
+# ---- void and form tags inside one line of a bar (review of be#2735 delta 3, P3-R2) -------------------------------
+
+
+@pytest.mark.parametrize("html", [
+    '<div class="announcement-bar">Promo code:<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br/>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <button>SAVE15</button> for 15% off</div>',
+    '<div class="announcement-bar">Use code <label>SAVE15</label> for 15% off</div>',
+    '<div class="announcement-bar">Use code <wbr>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <input type="hidden" value="x"> SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <select><option>SAVE15</option></select> for 15% off</div>',
+])
+def test_a_void_or_form_tag_between_the_phrase_and_the_code_still_reads(html):
+    assert set(_codes(html)) == {"SAVE15"}
+
+
+def test_a_copy_code_button_inside_a_marquee_item_still_reads_and_items_stay_apart():
+    html = ('<div class="announcement-bar"><div>20% OFF USE CODE</div><div>48HOURS ONLY</div>'
+            '<div>Use code <button>SAVE15</button> for 15% off</div></div>')
+    assert set(_codes(html)) == {"SAVE15"}
+
+
+@pytest.mark.parametrize("separator", ['<img src="dot.svg">', '<svg><circle r="1"/></svg>',
+                                       '<picture><source srcset="a.webp"><img src="a.png"></picture>',
+                                       '<picture><source srcset="a.webp"></picture>'])
+def test_an_icon_between_inline_marquee_items_keeps_them_apart(separator):
+    """Review of be#2742, P3-2: images are the separators between inline marquee items, so they stay a boundary."""
+    html = (f'<div class="announcement-bar"><span>FREE SHIPPING OVER $50 USE CODE</span>{separator}'
+            '<span>SS24 COLLECTION 15% OFF</span></div>')
+    assert _codes(html) == {}
+
+
+def test_a_line_break_in_a_fallback_region_still_reads_the_code():
+    assert set(_codes('<body><div class="promo-bar-wrap">Promo code:<br>SAVE15 for 15% off</div></body>')) == {"SAVE15"}
+

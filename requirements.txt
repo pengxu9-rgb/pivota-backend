@@ -1,6 +1,7 @@
 fastapi==0.104.1
 uvicorn[standard]
 httpx<0.28
+idna>=3  # host normalisation in services/deal_code_capture_writer.py (UTS-46)
 python-dotenv
 stripe>=15,<16  # money path: bound the major so per-request stripe_version (SPT preview) cannot vanish
 SQLAlchemy==1.4.52
