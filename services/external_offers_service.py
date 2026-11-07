@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlparse, urlunparse
 
 import httpx
@@ -1819,9 +1819,24 @@ def _extract_jsonld_offer(
 ) -> Dict[str, Any]:
     """The product-level JSON-LD reading. `url_variant_pick` chooses the product's offer with `_pick_product_offer`
     (the URL's variant); without it, the first offer, as before."""
+    best, _ = _extract_jsonld_offer_and_node(
+        parsed_objs, selected_variant=selected_variant, page_urls=page_urls, url_variant_pick=url_variant_pick
+    )
+    return best
+
+
+def _extract_jsonld_offer_and_node(
+    parsed_objs: list[Any], *, selected_variant: Optional[str] = None, page_urls: Tuple[str, ...] = (),
+    url_variant_pick: bool = False,
+) -> Tuple[Dict[str, Any], Any]:
+    """`_extract_jsonld_offer`, and the JSON-LD node whose entry it returns (the PRICING node), or None.
+
+    The reading can come from another node than the best-scoring one (the URL's variant, a sibling in stock);
+    `_jsonld_identity` describes the node that actually priced the page, so it needs that node."""
     best: Dict[str, Any] = {}
     best_node: Any = None
     entries: Dict[int, Dict[str, Any]] = {}
+    node_of_entry: Dict[int, Any] = {}
     parent_names = _variant_parent_names(parsed_objs)
     for root in parsed_objs:
         for node in _iter_jsonld_nodes(root):
@@ -1910,6 +1925,7 @@ def _extract_jsonld_offer(
                     "rating_count": rating_count,
                 }
                 entries[id(node)] = entry
+                node_of_entry[id(entry)] = node
                 if score > best.get("_score", 0):
                     best, best_node = entry, node
 
@@ -1945,9 +1961,11 @@ def _extract_jsonld_offer(
                     or next((e for e in priced if _availability_from_raw(e.get("availability_raw")) != OUT_OF_STOCK), None)
                     or best)
 
+    # An `_unpriced` copy is the best-scoring node's reading with its price removed: that node still answers for it.
+    pricing_node = node_of_entry.get(id(best), best_node)
     best = dict(best)
     best.pop("_score", None)
-    return best
+    return best, pricing_node
 
 
 def _availability_from_raw(raw: Optional[str]) -> str:
@@ -2135,6 +2153,12 @@ async def _fetch_html(
             observed["status_code"] = resp.status_code
             observed["final_url"] = str(resp.url)
             observed["bot_challenged"] = bool(resp.headers.get("cf-mitigated"))
+            # How many redirects the request followed (an A -> B -> A chain ends on the URL it asked for, so
+            # `final_url` alone cannot show it). Recorded only when the response says: a missing count is
+            # UNKNOWN to its readers (`classify_handleless_read` refuses it), never 0.
+            history = getattr(resp, "history", None)
+            if isinstance(history, (list, tuple)):
+                observed["redirect_hops"] = len(history)
         # Teaches the shared Shopify-edge budget which hosts it covers, keyed by the host that
         # ANSWERED (the final URL after redirects). A no-op with its flag off.
         shopify_edge_pacer.learn_from_response(str(resp.url), resp.headers)
@@ -2231,6 +2255,226 @@ def _log_offer_pick_shadow(url: str, served: Dict[str, Any], picked: Dict[str, A
         pass
 
 
+# The JSON-LD page types that list several products. `BreadcrumbList` (an ItemList subtype) is not one:
+# nearly every product page carries it.
+JSONLD_LISTING_TYPES = ("ItemList", "OfferCatalog", "CollectionPage", "SearchResultsPage")
+_IDENTITY_TEXT_CAP = 512
+
+
+def _jsonld_types(node: Any) -> Tuple[str, ...]:
+    raw = node.get("@type") if isinstance(node, dict) else None
+    items = raw if isinstance(raw, list) else [raw]
+    return tuple(str(t).strip() for t in items if isinstance(t, str) and t.strip())
+
+
+def _is_product_node(node: Any) -> bool:
+    return any(t.lower() in ("product", "productgroup") for t in _jsonld_types(node))
+
+
+def _is_offer_node(node: Any) -> bool:
+    return any(t.lower() in ("offer", "aggregateoffer") for t in _jsonld_types(node))
+
+
+def _node_offer_list(node: Dict[str, Any]) -> list[Dict[str, Any]]:
+    offers = node.get("offers")
+    items = offers if isinstance(offers, list) else ([offers] if isinstance(offers, dict) else [])
+    return [o for o in items if isinstance(o, dict)]
+
+
+def _offer_is_priced(offer: Dict[str, Any]) -> bool:
+    return _offer_price_and_currency(offer)[0] is not None
+
+
+def _identity_text(value: Any) -> Optional[str]:
+    return value.strip()[:_IDENTITY_TEXT_CAP] if isinstance(value, str) and value.strip() else None
+
+
+def _identity_key(node: Dict[str, Any], base_url: str) -> Tuple[str, Any]:
+    """What names one product on the page: its `url` (resolved, fragment dropped), else its `@id`, else the node."""
+    url = _identity_text(node.get("url"))
+    if url:
+        return "url", urljoin(base_url, url).split("#", 1)[0]
+    node_id = _identity_text(node.get("@id"))
+    if node_id:
+        return "id", node_id
+    return "obj", id(node)
+
+
+def _jsonld_identity(
+    parsed_objs: list[Any],
+    pricing_node: Any,
+    entry: Dict[str, Any],
+    *,
+    base_url: str,
+    signals: PriceSignals,
+    page_urls: Tuple[str, ...],
+) -> Dict[str, Any]:
+    """What the page's JSON-LD says about WHICH product priced it, for `classify_handleless_read`.
+
+    A URL with no product handle cannot say which product it serves, so a refresh of one may count as a read only
+    when the page itself does: one priced product, no listing, and that product named by its own `url` / `@id` or
+    its `name`. Additive evidence, read by nothing else:
+      * `priced_identities` -- distinct products on the page that carry a priced offer. A ProductGroup and its
+        `hasVariant` children (or an `isVariantOf` parent) are ONE product; nodes naming the same `url` or `@id` are
+        one UNLESS they carry another name or another exact price (a bundle that names the served URL too); a
+        Product with no priced offer (a review widget, an aggregate rating) is not counted; a priced Offer outside
+        every Product counts on its own;
+      * `listing_types` -- the `JSONLD_LISTING_TYPES` seen anywhere on the page;
+      * the PRICING node (the one whose reading `_extract_jsonld_offer` returned): its `url`, `@id`, `name` (as the
+        reading names it: a variant by its group), `brand`, its group's `url`, `offer_kind` (single / aggregate /
+        list), `exact_price_count` (distinct exact prices among its offers), `offer_picked_by`, and `variant_ids`:
+        the ids the variant reader gives the offers of its own subtree (its group's, for a variant), which is all a
+        handle-less read may adopt.
+    """
+    groups: Dict[int, Dict[str, Any]] = {}
+    listing: Set[str] = set()
+    product_nodes: list[Dict[str, Any]] = []
+    bare_offers: list[Dict[str, Any]] = []
+    under_product: Set[int] = set()
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if not isinstance(node, dict):
+                continue
+            listing.update(t for t in _jsonld_types(node) if t in JSONLD_LISTING_TYPES)
+            children = node.get("hasVariant")
+            if isinstance(children, dict):
+                children = [children]
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        groups[id(child)] = node
+            if _is_product_node(node):
+                product_nodes.append(node)
+                for offer in _iter_jsonld_nodes(node.get("offers")):
+                    if isinstance(offer, dict):
+                        under_product.add(id(offer))
+    for root in parsed_objs:
+        for node in _iter_jsonld_nodes(root):
+            if isinstance(node, dict) and _is_offer_node(node) and id(node) not in under_product and _offer_is_priced(node):
+                bare_offers.append(node)
+
+    def group_of(node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if id(node) in groups:
+            return groups[id(node)]
+        parent = node.get("isVariantOf")
+        return parent if isinstance(parent, dict) else None
+
+    def key_of(node: Dict[str, Any]) -> Tuple[str, Any]:
+        group = group_of(node)
+        return _identity_key(group if group is not None else node, base_url)
+
+    pricing = pricing_node if isinstance(pricing_node, dict) else None
+    # The pricing product answers to every name it carries: its own url / @id and its group's.
+    aliases: Set[Tuple[str, Any]] = set()
+    if pricing is not None:
+        aliases.add(key_of(pricing))
+        aliases.add(_identity_key(pricing, base_url))
+        if group_of(pricing) is not None:
+            aliases.add(_identity_key(group_of(pricing), base_url))
+    def name_of(node: Dict[str, Any]) -> Optional[str]:
+        group = group_of(node)
+        for source in ((group, node) if group is not None else (node,)):
+            name = source.get("name") if isinstance(source, dict) else None
+            if isinstance(name, str) and name.strip():
+                return name.strip().casefold()
+        return None
+
+    def exact_prices_of(offers: list[Dict[str, Any]]) -> Set[Any]:
+        """The exact prices of `offers` as AMOUNTS, read as the page's own price is (`_read_price`), so `25` and
+        `"25.00"` are one price. A text the reader refuses stays as its raw text: it then differs from any amount,
+        and a conflict refuses, never merges."""
+        out: Set[Any] = set()
+        for o in offers:
+            raw = _raw_price_value(o.get("price"))
+            if _is_aggregate_offer(o) or raw is None:
+                continue
+            try:
+                amount, _ = _read_price(raw, read_currency_code(o.get("priceCurrency")), signals, jsonld=True)
+            except Exception:  # noqa: BLE001 - extractor evidence never raises
+                amount = None
+            out.add(round(float(amount), 6) if amount is not None else ("raw", str(raw)))
+        return out
+
+    pricing_group = group_of(pricing) if pricing is not None else None
+    pricing_name = str(entry.get("title") or "").strip().casefold() or None
+    pricing_prices = exact_prices_of([pricing] if pricing is not None and _is_offer_node(pricing)
+                                     else (_node_offer_list(pricing) if pricing is not None else []))
+
+    def same_family(node: Dict[str, Any]) -> bool:
+        """The pricing node itself, its group, or a sibling variant of that group: one product by construction."""
+        return node is pricing or (pricing_group is not None and (node is pricing_group or group_of(node) is pricing_group))
+
+    def conflicts(name: Optional[str], prices: Set[Any]) -> bool:
+        """A node under the pricing product's url / @id that is not that product: another name, or another price.
+        Two different products can both name the served URL (a bundle beside the item); merging them would let
+        the higher-scoring one price the page."""
+        return bool((name and pricing_name and name != pricing_name)
+                    or (prices and pricing_prices and prices != pricing_prices))
+
+    identities: Set[Tuple[str, Any]] = set()
+    for node in product_nodes:
+        if any(_offer_is_priced(o) for o in _node_offer_list(node)):
+            key = key_of(node)
+            if not (key in aliases or _identity_key(node, base_url) in aliases):
+                identities.add(key)
+            elif same_family(node) or not conflicts(name_of(node), exact_prices_of(_node_offer_list(node))):
+                identities.add(("pricing", None))
+            else:
+                identities.add(("conflict", id(node)))
+    for offer in bare_offers:
+        key = _identity_key(offer, base_url)
+        if offer is pricing:
+            identities.add(("pricing", None))
+        elif key not in aliases:
+            identities.add(key)
+        elif conflicts(None, exact_prices_of([offer])):
+            identities.add(("conflict", id(offer)))
+        else:
+            identities.add(("pricing", None))
+    if pricing is not None and (_is_offer_node(pricing) and _offer_is_priced(pricing)):
+        identities.add(("pricing", None))
+
+    out: Dict[str, Any] = {
+        "priced_identities": len(identities),
+        "listing_types": sorted(listing),
+        "pricing_node": pricing is not None,
+    }
+    if pricing is None:
+        return out
+    group = group_of(pricing)
+    offers = [pricing] if _is_offer_node(pricing) else _node_offer_list(pricing)
+    plans, _ = _selling_plan_reasons(offers, entry.get("title"))
+    offers = [o for o in offers if id(o) not in plans]
+    if not offers:
+        offer_kind = None
+    elif any(_is_aggregate_offer(o) for o in offers):
+        offer_kind = "aggregate"
+    else:
+        offer_kind = "single" if len(offers) == 1 else "list"
+    exact_prices = {
+        str(_raw_price_value(o.get("price"))) for o in offers
+        if not _is_aggregate_offer(o) and _raw_price_value(o.get("price")) is not None
+    }
+    subtree = group if group is not None and id(pricing) in groups else pricing
+    subtree_variants, _ = _extract_jsonld_variants_with_census([subtree], signals, page_urls=page_urls)
+    out.update(
+        {
+            "url": _identity_text(pricing.get("url")),
+            "id": _identity_text(pricing.get("@id")),
+            "group_url": _identity_text(group.get("url")) if group is not None else None,
+            "name": entry.get("title"),
+            "brand": entry.get("brand"),
+            "offer_kind": offer_kind,
+            "exact_price_count": len(exact_prices),
+            "offer_picked_by": entry.get("offer_picked_by"),
+            "variant_ids": sorted(
+                {str(v.get("variant_id")).strip() for v in subtree_variants if str(v.get("variant_id") or "").strip()}
+            ),
+        }
+    )
+    return out
+
+
 def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
     p = _MetaParser()
     p.feed(html)
@@ -2254,15 +2498,15 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
 
     parsed_jsonld = _parse_jsonld_texts(p.jsonld)
     pick_mode = url_variant_pick_mode()
-    jsonld = _extract_jsonld_offer(parsed_jsonld)
+    jsonld, pricing_node = _extract_jsonld_offer_and_node(parsed_jsonld)
     if pick_mode != "off":
         from services.external_seed_catalogue_refresh import url_variant_id
 
-        picked = _extract_jsonld_offer(
+        picked, picked_node = _extract_jsonld_offer_and_node(
             parsed_jsonld, selected_variant=url_variant_id(base_url), page_urls=(canonical, base_url), url_variant_pick=True,
         )
         if pick_mode == "on":
-            jsonld = picked
+            jsonld, pricing_node = picked, picked_node
         else:
             _log_offer_pick_shadow(base_url, jsonld, picked)
     if jsonld.get("offer_picked_by") in _META_UNTRUSTED_PICKS:
@@ -2415,8 +2659,24 @@ def _extract_from_html(base_url: str, html: str) -> Dict[str, Any]:
             # AggregateOffer bound), else a meta-tag `product:price:amount`, which names one price.
             "product_price_exact": bool(jsonld.get("price_exact")) if price_read.get("source") == "jsonld" else True,
         },
+        # Which product priced the page (`_jsonld_identity`): read only by the handle-less read rule.
+        "jsonld_identity": _safe_jsonld_identity(
+            parsed_jsonld, pricing_node, jsonld, base_url=base_url, signals=signals, page_urls=(canonical, base_url)
+        ),
     }
     return out
+
+
+def _safe_jsonld_identity(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """`_jsonld_identity`, or `{"unavailable": True}` when the page's JSON-LD breaks it (an unparsable `url`).
+
+    THIS EVIDENCE MUST NEVER COST A READ. `_extract_from_html` raising sends `resolve_external_offer` to its cached
+    snapshot (`from_cache`), so an exception here would stop a page from being read at all, whatever the flag. With
+    no pricing node in the evidence, the handle-less read rule refuses (`no_product`)."""
+    try:
+        return _jsonld_identity(*args, **kwargs)
+    except Exception:  # noqa: BLE001 - see above
+        return {"unavailable": True, "pricing_node": False}
 
 
 # Marks a snapshot whose `image_urls` holds only images the page declares as the product's
@@ -2466,6 +2726,30 @@ def snapshot_price_fields(extracted: Dict[str, Any]) -> Tuple[Optional[float], O
         price_read["status"] = "currency_unread"
         amount = None
     return amount, currency, price_read
+
+
+def evidence_identity_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """The `jsonld_identity` part of a snapshot's `evidence` (see `_jsonld_identity`), from one `_extract_from_html`."""
+    identity = extracted.get("jsonld_identity")
+    return {"jsonld_identity": identity} if isinstance(identity, dict) else {}
+
+
+def snapshot_evidence(extracted: Dict[str, Any], *, currency: Optional[str], price_read: Dict[str, Any]) -> Dict[str, Any]:
+    """The evidence `resolve_external_offer` stores for one `_extract_from_html` (without its fetch time and snapshot
+    id). One function, so the refresh preview and the tests judge a page on exactly what a refresh would see."""
+    evidence: Dict[str, Any] = {
+        "provider": extracted.get("evidence_provider") or "manual",
+        # Where the currency came from, as the seed refresh's canonical-offer projection
+        # (#2416) reads it: it projects only "page". There is no `market_default` any more:
+        # an unread currency voids the amount (`snapshot_price_fields`).
+        "price_currency_source": "page" if currency else "unread",
+    }
+    evidence.update(evidence_content_fields(extracted))
+    evidence.update(evidence_variant_fields(extracted))
+    evidence.update(evidence_identity_fields(extracted))
+    if price_read:
+        evidence["price_read"] = price_read
+    return evidence
 
 
 def evidence_variant_fields(extracted: Dict[str, Any]) -> Dict[str, Any]:
@@ -2623,18 +2907,10 @@ async def resolve_external_offer(
         now = _now()
         now_db = _now_db()
         evidence = {
-            "provider": extracted.get("evidence_provider") or "manual",
+            **snapshot_evidence(extracted, currency=currency, price_read=price_read),
             "fetchedAt": now.isoformat(),
             "snapshotId": (existing or {}).get("id") or rid,
-            # Where the currency came from, as the seed refresh's canonical-offer projection
-            # (#2416) reads it: it projects only "page". There is no `market_default` any more:
-            # an unread currency voids the amount (`snapshot_price_fields`).
-            "price_currency_source": "page" if currency else "unread",
         }
-        evidence.update(evidence_content_fields(extracted))
-        evidence.update(evidence_variant_fields(extracted))
-        if price_read:
-            evidence["price_read"] = price_read
         if existing:
             stmt = (
                 update(external_offer_snapshots)
