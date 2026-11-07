@@ -32,6 +32,7 @@ from services.external_seed_audit import (
 from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
+    handleless_read_mode,
 )
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import external_seed_catalogue_refresh as catalogue_lane
@@ -420,6 +421,42 @@ def batch_run_status(
 
 def _bump(counter: Dict[str, int], key: str) -> None:
     counter[key] = int(counter.get(key) or 0) + 1
+
+
+# How many hosts the handle-less read summary lists (by rows decided), beside its totals.
+HANDLELESS_TOP_HOSTS = 25
+
+
+def count_handleless_read(
+    totals: Dict[str, int], by_host: Dict[str, Dict[str, int]], host: str, info: Any
+) -> None:
+    """Count one row's handle-less read decision (`result["handleless_read"]`, from
+    routes/employee_products._handleless_read_outcome), into the run's totals and its host's counts:
+    `decided`, `would_read`, `read`, `would_flip_healthy`, `refused:<reason>`, `segment:<segment>`."""
+    if not isinstance(info, dict):
+        return
+    counters = (totals, by_host.setdefault(host or "unknown", {}))
+    keys = ["decided"]
+    if info.get("would_read"):
+        keys.append("would_read")
+        if info.get("mode") == "on":
+            keys.append("read")
+        if info.get("would_flip_healthy"):
+            keys.append("would_flip_healthy")
+    if info.get("refusal"):
+        keys.append(f"refused:{info['refusal']}")
+    if info.get("segment"):
+        keys.append(f"segment:{info['segment']}")
+    for counter in counters:
+        for key in keys:
+            _bump(counter, key)
+
+
+def handleless_read_summary(mode: str, totals: Dict[str, int], by_host: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+    """The run's handle-less read decisions: the mode, the totals, and the `HANDLELESS_TOP_HOSTS` hosts with
+    the most rows decided."""
+    top = sorted(by_host.items(), key=lambda kv: (-int(kv[1].get("decided") or 0), kv[0]))[:HANDLELESS_TOP_HOSTS]
+    return {"mode": mode, "totals": dict(sorted(totals.items())), "top_hosts": {h: dict(sorted(c.items())) for h, c in top}}
 
 
 def _degraded_reason_bucket(error: Any) -> str:
@@ -2443,6 +2480,9 @@ async def run_external_referral_refresh_batch(
     # product handle). Its price and stock are not written; counted so a host that never reads is visible.
     price_not_read = 0
     availability_not_read = 0
+    # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
+    handleless_totals: Dict[str, int] = {}
+    handleless_hosts: Dict[str, Dict[str, int]] = {}
     price_unreadable_reasons: Dict[str, int] = {}
     price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
@@ -2562,6 +2602,7 @@ async def run_external_referral_refresh_batch(
                     availability_changed += 1
                 elif isinstance(availability, dict) and availability.get("status") == "not_read":
                     availability_not_read += 1
+                count_handleless_read(handleless_totals, handleless_hosts, host, result.get("handleless_read"))
             elif status == "degraded":
                 degraded += 1
                 # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
@@ -3055,6 +3096,9 @@ async def run_external_referral_refresh_batch(
             sorted(price_unreadable_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         ),
         "availability_changed": availability_changed,
+        # Rows whose served URL names no product handle, and what EXTERNAL_SEED_HANDLELESS_READ decided for them
+        # (`count_handleless_read`): nothing is counted with the flag off.
+        "handleless_read": handleless_read_summary(handleless_read_mode(), handleless_totals, handleless_hosts),
         # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
         # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {
