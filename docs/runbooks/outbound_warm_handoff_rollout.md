@@ -8,7 +8,50 @@ flags in `config/settings.py`). Spec: `Pivota_Warm_Handoff_Click_Lane_Spec_2026-
 Read this **before widening `OUTBOUND_WARM_HANDOFF_BRANDS`**, before raising
 `OUTBOUND_WARM_HANDOFF_ROLLOUT_PCT`, and before changing `evaluate_warm_eligibility`.
 
-## State as of 2026-08-24 (verified, not assumed)
+## State as of 2026-11-07 (verified, not assumed)
+
+`OUTBOUND_WARM_HANDOFF_BRANDS` was widened from 6 to 35 brands on 2026-11-07 (`web-00745-zxr`), from
+the 2026-09-03 UCP readiness sweep: US storefronts whose own UCP endpoint reached a priced checkout
+with a `continue_url` and quoted US shipping. `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE` (below) is
+**not set** (default off). Read the deployed env before trusting either line.
+
+## Fact-driven eligibility (`OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE`, default off)
+
+The replacement for widening the allowlist by hand. With it on:
+
+- **At mint.** `offers.resolve`'s seed mint asks `db.merchant_purchasability.human_handoff_allowed`
+  for a cold link's store, keyed as `resolve_cart_permalink` keys a cart (`shop_domain or
+  destination_url`), with the buyer's market. On a fresh yes it signs `warm_fact: human_handoff`
+  into the token (`services/outbound_warm_handoff.WARM_FACT_KEY`).
+  - It is asked once per host per request, sharing the cart gate's memo.
+  - It is not asked when a knockout already decides the click: a cart, a named variant without
+    one, a purchasability or stock decline, or a live-verification flag.
+  - It needs `MERCHANT_PURCHASABILITY_ENFORCE` and a usable request market.
+- **At click.** A stamped token is warm-eligible even when its host is not allowlisted
+  (`warm_eligible: fact` on the click event ctx). The allowlist still applies, and every
+  knockout still beats the stamp. The gateway's own purchasability gate still re-asks at click
+  time.
+- **The claim.** `_cart_prefilled_claim` reads the same stamp, so a stamped cold offer answers
+  `null`, and an unstamped one keeps a provable `false`.
+
+**Why the flip is clean (Constraints 2 and 3).**
+- Stamps are written only while the flag is on. Turning it on therefore cannot falsify a
+  `cart_prefilled: false` already sent: the tokens behind those answers carry no stamp.
+- Turning it off only narrows.
+- The allowlist and the `false` state survive. Unlike an empty allowlist at 100%, `false` stays
+  wherever there is no fresh fact.
+
+**Coverage follows the purchasability sweep.** The sweep checks every host the cart minter builds a
+seed cart on, plus the Reap and connected-store lanes. A store with no fact row stays on the
+allowlist rule. Other token minters (outbound_links_service, employee_products, agent_api,
+agent_sdk, the card lanes) never stamp, so their links keep the allowlist rule alone.
+
+**Turning it on.**
+1. Set `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE=true` on backend `web`.
+2. Watch `warm_eligible` / `handoff` / `warm_reason` on `outbound_click_events.context`. The
+   instrument is the share of `warm_eligible=fact` clicks that end `handoff=warm`.
+
+## State as of 2026-08-24 (historical)
 
 | Fact | Value | How verified |
 |---|---|---|

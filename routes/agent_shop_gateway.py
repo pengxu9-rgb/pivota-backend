@@ -47,6 +47,8 @@ from services.outbound_warm_handoff import (
     STOCK_OUT_OF_STOCK,
     VARIANT_DECLINE_KEY,
     VARIANT_NOT_NAMED,
+    WARM_FACT_HUMAN_HANDOFF,
+    WARM_FACT_KEY,
     could_upgrade_at_click_time,
 )
 import db.merchant_purchasability as merchant_purchasability
@@ -5428,6 +5430,28 @@ async def _handle_offers_resolve(
                 # lane: the buyer has not chosen, which is what it was built for.
                 _named_without_cart = bool(sku_id) and not redirect_identity.get("cart_variant_id")
 
+                # FACT-DRIVEN WARM ELIGIBILITY: a cold link (no cart) whose host holds a fresh
+                # human-handoff fact is signed `warm_fact`, so the click lane may upgrade it even
+                # when the brand is not on the hand allowlist. Signed here and passed to
+                # `_cart_prefilled_claim` below, so the published claim reads the same stamp.
+                # Not asked where a knockout already decides the click (a cart, a named variant
+                # without one, a purchasability/stock decline, a live-verification flag): the
+                # stamp could change nothing there, so it must not cost a read.
+                _warm_fact = (
+                    None
+                    if (
+                        redirect_identity.get("cart_variant_id")
+                        or _named_without_cart
+                        or _purchasability_tier
+                        or _stock_declined
+                        or offer_requires_live_verification
+                    )
+                    else await _cart_purchasability.warm_fact(
+                        destination_url=str(canonical_url or destination_url),
+                        shop_domain=redirect_identity.get("shop_domain"),
+                    )
+                )
+
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -5458,6 +5482,7 @@ async def _handle_offers_resolve(
                             else {}
                         ),
                         **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
+                        **({WARM_FACT_KEY: _warm_fact} if _warm_fact else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -5523,6 +5548,7 @@ async def _handle_offers_resolve(
                     stock_declined=_stock_declined,
                     live_verification_required=bool(offer_requires_live_verification),
                     variant_declined=_named_without_cart,
+                    warm_fact=_warm_fact,
                 )
 
                 offer_spec = {
@@ -11824,6 +11850,33 @@ class _CartPurchasabilityGate:
             self.stats["declined"] += 1
         return allowed
 
+    async def warm_fact(self, *, destination_url: str, shop_domain: Optional[str]) -> Optional[str]:
+        """`human_handoff` when a COLD link's store holds a fresh human-handoff fact, else None.
+
+        Asked only with OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE on and the dial on, and only for a
+        token that will carry no cart (the caller's job). KEYED AS `resolve_cart_permalink` KEYS A
+        CART for these inputs — `shop_domain or destination_url` — because that is the host the
+        sweep records facts for ("every host the cart minter builds a seed cart on").
+        NO PLATFORM CHECK, deliberately: the cold links this exists for usually carry no platform
+        evidence (that is often WHY they are cold), and a positive fact is itself the proof — the
+        sweep only ever records one after rendering that host's Shopify checkout. A host with no
+        fact answers None at the cost of one indexed read, once per host per request. Shares the
+        per-request memo with `allows_cart`, which asks the same question of the same reader,
+        and does not touch `stats` (a cold link asked here was never a cart to decline).
+        Fails closed exactly as `human_handoff_allowed` does: no market, no fact, a stale or
+        foreign-vantage fact or a database error is None, and None changes nothing.
+        """
+        if not getattr(settings, "outbound_warm_handoff_fact_eligible", False):
+            return None
+        if not self.enforced or self.market is None:
+            return None
+        host = merchant_purchasability.normalize_domain(shop_domain or destination_url)
+        if not host:
+            return None
+        if host not in self._memo:
+            self._memo[host] = await merchant_purchasability.human_handoff_allowed(host, self.market)
+        return WARM_FACT_HUMAN_HANDOFF if self._memo[host] else None
+
     async def decline_tier(
         self,
         *,
@@ -11892,6 +11945,10 @@ def _cart_prefilled_claim(
     live_verification_required: bool = False,
     # Set when a named variant's cart was withheld as another variant's. Same road again.
     variant_declined: bool = False,
+    # The `warm_fact` the mint signed into this token, if any. It can only ADD warm eligibility,
+    # so omitting it errs toward a `False` the lane could contradict: callers that sign it MUST
+    # pass it. (The only signer, offers.resolve's seed mint, does.)
+    warm_fact: Optional[str] = None,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -11966,6 +12023,7 @@ def _cart_prefilled_claim(
             **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
             **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
             **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
+            **({WARM_FACT_KEY: warm_fact} if warm_fact else {}),
         },
         settings=settings,
     ):

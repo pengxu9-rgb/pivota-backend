@@ -6104,3 +6104,81 @@ def test_host_diversity_never_lets_a_flagged_offer_take_a_second_fresh_offers_sl
     assert sorted(o["source"]["seed_id"] for o in opted) == ["eps_spec", "eps_spec_2"]
     roomy = _resolve_two(monkeypatch, client, rows, limit=3, opt_in=True)
     assert [bool(o.get("requires_live_verification")) for o in roomy] == [False, False, True]
+
+
+# ---------------------------------------------------------------------------
+# FACT-DRIVEN WARM ELIGIBILITY at the mint (OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE)
+#
+# A cold seed link (no cart) whose store holds a fresh human-handoff fact is signed
+# `warm_fact: human_handoff`, so the click lane may upgrade it although the brand is not on the
+# hand allowlist; `cart_prefilled` then answers null (unknown) instead of a `false` the lane
+# would contradict. Real route, real mint, real claim; only the fact read is faked.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fact_lane(monkeypatch: pytest.MonkeyPatch, warm_lane):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_fact_eligible", True)
+    return warm_lane
+
+
+def test_a_cold_link_on_a_store_with_a_fresh_fact_is_stamped_and_claims_unknown(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """Product grain (no variant named): the buyer has not chosen, which is the population the
+    warm lane was built for. A named variant is pinned by the next test."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [("brand.com", "US")]
+    assert _ctx_of(offer)["warm_fact"] == "human_handoff"
+    assert offer["execution_spec"]["cart_url"] is None
+    assert offer["cart_prefilled"] is None, (
+        "the click lane may build a cart for this link, so `false` would be a claim it contradicts")
+
+
+def test_a_cold_link_without_a_fact_keeps_its_false(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [("brand.com", "US")]
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_the_flag_off_mints_exactly_what_it_minted_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    monkeypatch.setattr(fact_lane, "outbound_warm_handoff_fact_eligible", False)
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [], "a referral-only offer must not cost a query while the flag is off"
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_cart_link_is_never_stamped_and_asks_once(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """A cart already IS the upgrade: no stamp, and the cart gate's one read is reused."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    assert offer["cart_prefilled"] is True
+    assert "warm_fact" not in _ctx_of(offer)
+    assert len(calls) == 1
+
+
+def test_a_named_variant_without_a_cart_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """The variant knockout already decides the click (the lane's rebuild carries no variant),
+    so the stamp could change nothing and must not cost a read."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=False)], market="US")[0]
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False

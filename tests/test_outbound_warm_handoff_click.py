@@ -1439,3 +1439,38 @@ def test_a_token_minted_before_the_flag_existed_still_verifies_and_stays_ungated
     assert res.headers["location"] == CONTINUE_URL, "the legacy link still 302s and still warms"
     assert calls[0]["market_observed"] is None
     assert logged[0]["token_payload"]["ctx"]["warm_market"] == "none_unobserved"
+
+
+# ---- fact-driven eligibility (OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE) -------------------------------
+
+
+def test_a_fact_stamped_token_warms_a_brand_outside_the_allowlist(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    calls = _spy_resolver(monkeypatch, {"continue_url": "https://other-brand.myshopify.com/cart/c/x?key=k"})
+    logged = _spy_logger(monkeypatch)
+    dest = "https://www.other-brand.com/products/thing"
+    token = _mint_token(dest=dest, ctx={"join_mode": "referral_only", warm.WARM_FACT_KEY: warm.WARM_FACT_HUMAN_HANDOFF})
+    res = TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert len(calls) == 1
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert (ctx["handoff"], ctx["warm_eligible"]) == ("warm", "fact")
+    assert res.status_code == 302
+
+
+def test_a_fact_stamped_token_stays_cold_with_the_flag_off(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", False)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    dest = "https://www.other-brand.com/products/thing"
+    token = _mint_token(dest=dest, ctx={warm.WARM_FACT_KEY: warm.WARM_FACT_HUMAN_HANDOFF})
+    res = TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.headers["location"] == dest
+    assert calls == []
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "not_allowlisted"
+
+
+def test_an_allowlisted_click_records_its_rule(monkeypatch) -> None:
+    _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    TestClient(app).get(f"/r?token={_mint_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert logged[0]["token_payload"]["ctx"]["warm_eligible"] == "allowlisted"

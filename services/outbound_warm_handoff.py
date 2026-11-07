@@ -310,6 +310,27 @@ PURCHASABILITY_TIER_KEY = "purchasability_tier"
 PURCHASABILITY_BROWSE_ONLY = "browse_only"
 
 
+#: The signed-ctx key a mint stamps when the MERCHANT PURCHASABILITY fact said a HUMAN can check
+#: out at this cold link's host in the buyer's market (`db.merchant_purchasability.
+#: human_handoff_allowed`, a fresh fact from the buyer vantage). Written ONLY by offers.resolve's
+#: seed mint, ONLY while OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE is on, and only on a token with no
+#: cart. ABSENT on every other token, so every other minter keeps the allowlist rule alone.
+#:
+#: It is the mint-time answer, signed, for the same reason `join_mode` is: `offers.resolve` must
+#: answer `cart_prefilled` before the link is handed out, and an answer read from the table at
+#: CLICK time could not be known then. The gateway's own purchasability gate still re-asks at
+#: click time and can still refuse; this key can only ADD eligibility the mint proved.
+WARM_FACT_KEY = "warm_fact"
+WARM_FACT_HUMAN_HANDOFF = "human_handoff"
+
+
+def is_warm_fact_positive(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint found a fresh human-handoff fact for its host."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(WARM_FACT_KEY) or "").strip().lower() == WARM_FACT_HUMAN_HANDOFF
+
+
 def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     """True when the signed token says the mint DECLINED a cart for this merchant x market.
 
@@ -402,11 +423,22 @@ def evaluate_warm_eligibility(
         return False, "affiliate"
     if not assume_human and is_bot_user_agent(user_agent):
         return False, "bot"
+    # FACT-DRIVEN ELIGIBILITY widens the allowlist; it never narrows it. Both inputs are fixed at
+    # mint time or by this process's env, so `could_upgrade_at_click_time` (assume_human) answers
+    # exactly what a human click would get here.
+    fact_eligible = bool(getattr(settings, "outbound_warm_handoff_fact_eligible", False)) and (
+        is_warm_fact_positive(ctx)
+    )
     brands = settings.outbound_warm_handoff_brands
     if brands:
-        if not any(_host_matches(host, b) for b in brands):
+        if any(_host_matches(host, b) for b in brands):
+            eligible_reason = "allowlisted"
+        elif fact_eligible:
+            eligible_reason = "fact"
+        else:
             return False, "not_allowlisted"
-        eligible_reason = "allowlisted"
+    elif fact_eligible:
+        eligible_reason = "fact"
     elif rollout_bucket(token, settings.outbound_warm_handoff_rollout_pct):
         eligible_reason = "rollout"
     else:

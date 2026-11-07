@@ -292,6 +292,10 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 # un-gated population being invisible. Literals and country codes only, never
                 # a buyer identifier.
                 warm_ctx["warm_market"] = market_reason
+                # WHICH RULE made this click eligible (`allowlisted`, `fact` or `rollout`), on the
+                # same click-event ctx: the instrument that tells a fact-driven upgrade from a
+                # hand-allowlisted one. A literal, never a buyer identifier.
+                warm_ctx["warm_eligible"] = reason
             else:
                 warm_ctx = {"handoff": "cold", "warm_reason": reason}
             ctx_out = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
