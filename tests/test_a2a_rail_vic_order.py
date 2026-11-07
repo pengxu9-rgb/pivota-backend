@@ -1,5 +1,5 @@
 """The A2A rail's VIC order step (services/payment_orchestration/a2a_rail_worker + vic_order), on SQLite,
-through the REAL VIC client against an in-repo fake of the provider's order API (tests/evonet_vic_fake.py),
+through the REAL VIC client against an in-repo fake of the provider's order API (tests/fake_provider_vic.py),
 so classification and credential stripping are the production code's.
 
 Pinned: the order goes out once (write-ahead, never resent); the hosted page reaches the buyer through
@@ -29,7 +29,7 @@ import db.agent_purchase_ledger as purchases  # noqa: E402
 import jobs.a2a_rail_purchase_poll as job  # noqa: E402
 from services.payment_orchestration import a2a_purchase_view, a2a_rail, purchase_events, vic_order  # noqa: E402
 from services.payment_orchestration import a2a_rail_worker as worker  # noqa: E402
-from tests.evonet_vic_fake import HOSTED_HOST, FakeEvonetVic  # noqa: E402
+from tests.fake_provider_vic import HOSTED_HOST, FakeProviderVic  # noqa: E402
 
 pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres runs them from the _postgres file")
 
@@ -70,8 +70,10 @@ async def _db(monkeypatch):
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
     if IS_POSTGRES:
-        await database.execute("DELETE FROM agent_purchase_events WHERE rail = 'a2a'")
-        await database.execute("DELETE FROM agent_purchases WHERE rail = 'a2a'")
+        # EVERY rail's rows, as the SQLite arm drops the tables: `detect()` reads every rail, so a reap row
+        # another file left in the dialect gate's shared database would be counted here.
+        await database.execute("DELETE FROM agent_purchase_events")
+        await database.execute("DELETE FROM agent_purchases")
     if not IS_POSTGRES:
         yield
         return
@@ -101,7 +103,7 @@ def a2a():
 
 @pytest.fixture
 def fake():
-    return FakeEvonetVic()
+    return FakeProviderVic()
 
 
 def _a2a_client(rail):
@@ -117,16 +119,22 @@ async def _ago(column: str, seconds: int, purchase_id: str) -> None:
     await database.execute(sql, {"age": int(seconds), "i": purchase_id})
 
 
-async def _quoting(**kw) -> str:
-    """A purchase whose card is bound (the existing A2A card step), in `quoting`, with its parent row."""
+#: The locked all-in quote (items 2 x 46.50 + shipping + tax): the only amount an order is sent with.
+QUOTED = 10140
+
+
+async def _quoting(*, quoted=QUOTED, **kw) -> str:
+    """A purchase whose card is bound (the existing A2A card step), in `quoting` with its locked quote,
+    with its parent row. `quoted=None` leaves the quote unset (what the A2A rail writes today)."""
     args = dict(agent_id="agent_vic", agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
                 checkout_url="https://brand.example/cart/123:2", currency="USD", our_price_minor=4650,
                 quantity=2, product_key="ext:brand:123", product_name="Glow Serum", variant_title="30 ml",
                 buyer_email=EMAIL, shipping_address=ADDRESS)
     args.update(kw)
     pid = (await ledger.create_purchase(**args))["id"]
-    await database.execute("UPDATE a2a_rail_purchases SET state = 'quoting', payment_method_id = 'pm_active' WHERE id = :i",
-                           {"i": pid})
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET state = 'quoting', payment_method_id = 'pm_active', quoted_total_minor = :q "
+        "WHERE id = :i", {"i": pid, "q": quoted})
     await purchases.ensure_a2a_parent(pid)
     return pid
 
@@ -171,7 +179,8 @@ async def test_approve_the_order_goes_out_once_the_buyer_approves_and_the_rail_r
 
     [order] = fake.submits()
     assert order["client_reference"] == pid and order["purchase_type"] == "HITL"
-    assert (order["amount_minor"], order["currency"]) == (9300, "USD")  # 2 x 4650, what the buyer confirmed
+    # The locked all-in quote (shipping and tax included), never 2 x 4650: the buyer approves what is charged.
+    assert (order["amount_minor"], order["currency"]) == (QUOTED, "USD")
     assert order["merchant"] == {"domain": "brand.example", "checkout_url": "https://brand.example/cart/123:2"}
     assert order["items"] == [{"product_key": "ext:brand:123", "name": "Glow Serum", "variant": "30 ml",
                                "quantity": 2, "unit_amount_minor": 4650}]
@@ -179,7 +188,9 @@ async def test_approve_the_order_goes_out_once_the_buyer_approves_and_the_rail_r
 
     row = await _row(pid)
     page = fake.orders[pid]["authorization"]["hosted_url"]
-    assert (row["state"], row["order_id"], row["payment_token_id"]) == ("awaiting_authorization", "evo_ord_0001", None)
+    # The marker records that this is a VIC order (never inferred from "order id, no token").
+    assert (row["state"], row["order_id"], row["payment_token_id"]) == (
+        "awaiting_authorization", "vic:prov_ord_0001", None)
     assert (row["buyer_action_kind"], row["buyer_action_url"]) == ("approval", page)
     assert (row["pending_write"], row["claimed_by"]) == (worker.VIC_AUTHORIZATION, None)
 
@@ -262,7 +273,7 @@ async def test_timeout_an_unseen_submit_is_read_back_by_our_reference_and_never_
     assert (row["state"], row["pending_write"]) == ("quoting", worker.VIC_SUBMIT)
     assert await _step(a2a, fake, pid) == "approval_page_issued"  # read back, adopted
     row = await _row(pid)
-    assert (row["state"], row["order_id"], row["pending_write"]) == ("awaiting_authorization", "evo_ord_0001",
+    assert (row["state"], row["order_id"], row["pending_write"]) == ("awaiting_authorization", "vic:prov_ord_0001",
                                                                        worker.VIC_AUTHORIZATION)
     assert len(fake.submits()) == 1
 
@@ -425,7 +436,7 @@ async def test_an_order_the_step_cannot_send_is_never_sent(a2a, fake, columns, c
 
 async def test_an_answer_about_another_order_is_never_acted_on(a2a, fake):
     pid = await _issued(a2a, fake)
-    fake.orders[pid]["order_id"] = "evo_ord_9999"
+    fake.orders[pid]["order_id"] = "prov_ord_9999"
     fake.buyer(pid, "approved")
     assert await _step(a2a, fake, pid) == "parked"
     row = await _row(pid)
@@ -440,14 +451,54 @@ async def test_a_checkout_before_approval_is_never_acted_on(a2a, fake):
     assert (await _row(pid))["state"] == "awaiting_authorization"
 
 
-async def test_a_charge_above_the_approved_amount_completes_and_says_so(a2a, fake, caplog):
+@pytest.mark.parametrize("fields, code", [
+    ({"total_minor": QUOTED + 1}, "vic_total_over_approved"),                 # above what the buyer approved
+    ({"total_minor": QUOTED, "currency": "EUR"}, "vic_currency_mismatch"),    # another currency: not comparable
+    ({}, "vic_total_missing"),                                                # no total: consent unprovable
+])
+async def test_a_checkout_the_buyer_did_not_approve_is_held_for_a_human_never_completed(
+        a2a, fake, caplog, monkeypatch, fields, code):
+    pid = await _issued(a2a, fake)
+    await purchase_events.detect()
+    fake.buyer(pid, "approved")
+    assert await _step(a2a, fake, pid) == "buyer_approved"
+    fake.checkout(pid, "completed", order_number="100237", **fields)
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(a2a, fake, pid) == code
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["merchant_order_id"], row["final_total_minor"]) == (
+        "paying", code, None, None)
+    assert any("held for a human" in r.getMessage() for r in caplog.records)
+    await purchase_events.detect()
+    assert "purchase.completed" not in {e["event_type"] for e in await _events()}
+    # Held: every later tick parks it UNREAD, and nothing (not the dial, not a crash) replaces the code.
+    calls = len(fake.calls)
+    assert await _step(a2a, fake, pid) == "vic_held"
+    monkeypatch.delenv(vic_order.A2A_RAIL_VIC_ORDER_STEP_ENABLED_ENV)
+    assert await _step(a2a, fake, pid) == "vic_held"
+    assert len(fake.calls) == calls
+    assert worker._sticky(await _row(pid))
+    assert (await _row(pid))["last_error_code"] == code
+
+
+async def test_a_checkout_at_or_under_the_approved_amount_completes(a2a, fake):
     pid = await _issued(a2a, fake)
     fake.buyer(pid, "approved")
-    fake.checkout(pid, "completed", order_number="100237", total_minor=9301)
-    with caplog.at_level(logging.ERROR, logger=worker.__name__):
-        assert await _step(a2a, fake, pid) == "completed"
-    assert (await _row(pid))["last_error_code"] == "vic_total_over_approved"
-    assert any("above the approved amount" in r.getMessage() for r in caplog.records)
+    fake.checkout(pid, "completed", order_number="100238", total_minor=QUOTED)
+    assert await _step(a2a, fake, pid) == "completed"
+    row = await _row(pid)
+    assert (row["state"], row["final_total_minor"], row["last_error_code"]) == ("completed", QUOTED, None)
+
+
+async def test_no_locked_quote_no_order(a2a, fake):
+    """What the A2A rail writes today: no `quoted_total_minor`. The unit price x quantity leaves out shipping
+    and tax, so it is never sent as the amount: the purchase is refused before anything goes out."""
+    pid = await _quoting(quoted=None)
+    assert await _step(a2a, fake, pid) == "failed"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "vic_quote_missing", None)
+    assert fake.calls == []
+    assert vic_order.order_amount({"our_price_minor": 4650, "quantity": 2}) is None
 
 
 async def test_a_crash_between_the_move_and_the_marker_is_healed_before_the_next_poll(a2a, fake):
@@ -456,6 +507,81 @@ async def test_a_crash_between_the_move_and_the_marker_is_healed_before_the_next
                            {"i": pid})
     assert await _step(a2a, fake, pid) == "waiting_on_buyer"
     assert (await _row(pid))["pending_write"] == worker.VIC_AUTHORIZATION
+
+
+# ── a VIC order is recorded, not inferred; it has a ceiling; a crashed submit is a human's ─────
+
+
+@pytest.mark.parametrize("state", ["awaiting_authorization", "paying"])
+async def test_an_order_id_without_a_token_is_not_a_vic_order_unless_the_vic_step_wrote_it(a2a, fake, state):
+    """The token path's forget-then-re-quote leaves "order id, no token" between its two writes. Such a
+    row never takes the VIC step: only `_vic_adopt`'s `vic:` marker makes a VIC order."""
+    pid = await _quoting()
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET state = :s, order_id = 'o1', payment_token_id = NULL WHERE id = :i",
+        {"i": pid, "s": state})
+    assert not worker._is_vic_order(await _row(pid))
+    assert await _step(a2a, fake, pid) == "parked"
+    assert worker.VIC_DISABLED not in str((await _row(pid))["last_error_code"] or "")
+    assert fake.calls == []
+
+
+async def test_the_vic_marker_on_a_row_the_vic_step_did_not_make_is_never_acted_on(a2a, fake):
+    pid = await _quoting()
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET state = 'awaiting_authorization', order_id = 'o1', "
+        "pending_write = :w, pending_write_at = CURRENT_TIMESTAMP WHERE id = :i", {"i": pid, "w": worker.VIC_AUTHORIZATION})
+    assert await _step(a2a, fake, pid) == "pending_write_unreconcilable"
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("approved", [False, True])
+async def test_a_vic_order_past_its_ceiling_is_held_for_a_human_unread(a2a, fake, monkeypatch, approved):
+    pid = await _issued(a2a, fake)
+    if approved:
+        fake.buyer(pid, "approved")
+        assert await _step(a2a, fake, pid) == "buyer_approved"
+    await _ago("created_at", worker.VIC_ORDER_CEILING_SECONDS + 60, pid)
+    calls = len(fake.calls)
+    assert await _step(a2a, fake, pid) == worker.VIC_STALE
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"]) == ("paying" if approved else "awaiting_authorization",
+                                                      worker.VIC_STALE)
+    monkeypatch.delenv(vic_order.A2A_RAIL_VIC_ORDER_STEP_ENABLED_ENV)
+    assert await _step(a2a, fake, pid) == "vic_held"  # later ticks: parked unread, code kept, dial or not
+    assert (await _row(pid))["last_error_code"] == worker.VIC_STALE
+    assert len(fake.calls) == calls
+    # A tick reports the held count (the job logs every outcome that is not quiet).
+    await _ago("next_poll_at", 1, pid)
+    assert (await worker.run_tick(_a2a_client(a2a), W)).get("vic_held") == 1
+
+
+async def test_a_submit_left_by_a_crashed_step_is_a_humans_and_is_never_read_or_cleared(a2a, fake):
+    pid = await _quoting()
+    fake.fail_next("submit", TimeoutError())
+    assert await _step(a2a, fake, pid) == "outcome_unknown"
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'worker_error' WHERE id = :i", {"i": pid})
+    calls = len(fake.calls)
+    assert await _step(a2a, fake, pid) == "pending_write_unreconcilable"
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"], row["last_error_code"]) == ("quoting", worker.VIC_SUBMIT, "worker_error")
+    assert len(fake.calls) == calls
+
+
+async def test_a_submit_unreadable_for_the_whole_window_is_held_not_ended(a2a, fake):
+    pid = await _quoting()
+    fake.fail_next("submit", TimeoutError())  # the order MAY exist at the provider
+    assert await _step(a2a, fake, pid) == "outcome_unknown"
+    await _ago("pending_write_at", worker.RECONCILE_LIMIT_SECONDS + 5, pid)
+    fake.fail_next("status", 502)
+    assert await _step(a2a, fake, pid) == worker.VIC_SUBMIT_UNRESOLVED
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"], row["last_error_code"]) == (
+        "quoting", worker.VIC_SUBMIT, worker.VIC_SUBMIT_UNRESOLVED)
+    assert await ledger.expire_overdue_purchases() == 0  # the pending write keeps the sweep off it
+    calls = len(fake.calls)
+    assert await _step(a2a, fake, pid) == "vic_held"
+    assert len(fake.calls) == calls and len(fake.submits()) == 1
 
 
 # ── the dial: off changes nothing ────────────────────────────────────────────────────────────

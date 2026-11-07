@@ -1,7 +1,7 @@
 """The A2A rail's VIC order step: the client for the rail provider's Visa Intelligent Commerce order API.
 
 The provider is a VIC Agent Enabler (TR-TSP): it holds the TRID, tokenizes with VTS, hosts the card and
-passkey pages, makes the Visa calls and, by the 10-12 agreement, FILLS THE MERCHANT CHECKOUT ITSELF
+passkey pages, makes the Visa calls and FILLS THE MERCHANT CHECKOUT ITSELF
 (executor `rail_managed`). Pivota sends a confirmed order, shows the buyer the provider's hosted page,
 and then only READS STATUS until the provider reports the merchant's order number. That is all.
 
@@ -29,7 +29,7 @@ THE RULES THIS MODULE ENFORCES
 
 Dark: `from_env()` returns None unless A2A_RAIL_VIC_ORDER_STEP_ENABLED is on AND a transport is
 configured. The provider has not published this API yet, so no production transport exists: today the
-worker runs this step only against the in-repo fake (tests/evonet_vic_fake.py). The contract it is
+worker runs this step only against the in-repo fake (tests/fake_provider_vic.py). The contract it is
 written to is the one we are asking the provider for (reports/, local).
 """
 
@@ -229,22 +229,22 @@ class VicOrderClient:
 
 
 def order_amount(row: Mapping[str, Any]) -> Optional[int]:
-    """The total the buyer confirmed, in minor units: the locked quote when there is one, else the unit
-    price they consented to times the quantity. None when the row has neither."""
+    """The amount the buyer approves, in minor units: the LOCKED QUOTE (`quoted_total_minor`), the all-in
+    total with shipping and tax, or None. Never the unit price times the quantity: that subtotal leaves out
+    shipping and tax, so the checkout the rail fills would come to more than the buyer approved. No quote,
+    no order (the step refuses the purchase)."""
     quoted = row.get("quoted_total_minor")
     if isinstance(quoted, int) and not isinstance(quoted, bool) and quoted > 0:
         return quoted
-    unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
-    if isinstance(unit, bool) or not isinstance(unit, int) or not isinstance(quantity, int) or unit <= 0 or quantity <= 0:
-        return None
-    return unit * quantity
+    return None
 
 
 def build_order(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     """The order body for one purchase row, or None when the row cannot make one (the step fails it).
 
-    The provider's hosted page shows the buyer the amount they approve (`order_amount`); the provider
-    must not charge more (the contract)."""
+    `amount_minor` is the locked all-in total (`order_amount`): the amount the provider's hosted page shows
+    the buyer to approve, and a CEILING the provider must not charge above (the contract). A checkout
+    total above it is never completed here (a2a_rail_worker `_vic_checkout`)."""
     amount = order_amount(row)
     unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
     if amount is None:
