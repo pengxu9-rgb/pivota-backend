@@ -125,9 +125,9 @@ POLL_APPROVAL = 15
 #: is an orphan, and "no orphans" is a design invariant. Arm this only once a void step exists. With it
 #: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`).
 A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
-#: The currencies a token may be requested in. `token-setup` takes `amount_cents` and no currency, so
-#: the amount is minor units of whatever currency the rail assumes; only USD has been measured.
-TOKEN_CURRENCIES = frozenset({"USD"})
+#: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
+#: at create, and the token step refuses them again).
+TOKEN_CURRENCIES = a2a_rail.TOKEN_CURRENCIES
 
 PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
