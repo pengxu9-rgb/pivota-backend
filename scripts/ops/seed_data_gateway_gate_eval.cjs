@@ -152,11 +152,14 @@ function decisions(product) {
   return out;
 }
 
-function withoutKeys(value, keys) {
-  if (Array.isArray(value)) return value.map((v) => withoutKeys(v, keys));
+// The full product as the backend may serve it: the denied keys deleted, and lone surrogates replaced by
+// U+FFFD in every key and string (what serve_search_products does; String.prototype.toWellFormed).
+function servedBasis(value, keys) {
+  if (typeof value === 'string') return value.toWellFormed();
+  if (Array.isArray(value)) return value.map((v) => servedBasis(v, keys));
   if (value && typeof value === 'object') {
     const out = {};
-    for (const [k, v] of Object.entries(value)) if (!keys.has(k)) out[k] = withoutKeys(v, keys);
+    for (const [k, v] of Object.entries(value)) if (!keys.has(k)) out[k.toWellFormed()] = servedBasis(v, keys);
     return out;
   }
   return value;
@@ -166,7 +169,7 @@ const payload = JSON.parse(fs.readFileSync(casesPath, 'utf8'));
 const deniedKeys = new Set(payload.denied_keys || []);
 const result = { missing_readers: missing, cases: {} };
 for (const [name, c] of Object.entries(payload.cases)) {
-  const fullMinusDenied = { ...c.full, seed_data: withoutKeys(c.full.seed_data, deniedKeys) };
+  const fullMinusDenied = servedBasis({ ...c.full, seed_data: servedBasis(c.full.seed_data, deniedKeys) }, new Set());
   result.cases[name] = {
     full: decisions(c.full),
     stripped: decisions(c.stripped),

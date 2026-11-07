@@ -111,6 +111,7 @@ from services.payment_offer_evidence_service import (
 )
 from services.refund_observability import build_order_refund_tracking_payload
 from services.seed_data_egress_projection import (
+    replace_lone_surrogates,
     serve_detail_product,
     serve_search_products,
 )
@@ -3723,7 +3724,14 @@ async def _build_external_seed_product(
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-    snapshot = _ensure_json_obj(seed_data.get("snapshot"))
+    _raw_snapshot = seed_data.get("snapshot")
+    snapshot = _ensure_json_obj(_raw_snapshot)
+    if isinstance(_raw_snapshot, str):
+        # A snapshot stored as JSON TEXT can hold an escaped lone surrogate (a split emoji), and parsing
+        # yields a raw one. Every field copied from it below -- the URLs and the id included, which go
+        # into the UTF-8 redirect token before any response boundary -- must be encodable, or the token
+        # raises and the product is silently dropped.
+        snapshot = replace_lone_surrogates(snapshot)
     canonical_url = (
         str(seed_row.get("canonical_url") or "").strip()
         or str(snapshot.get("canonical_url") or "").strip()
@@ -5470,7 +5478,7 @@ async def agent_search_products(
 
                 return {
                     "status": "success",
-                    "products": page_items,
+                    "products": serve_search_products(page_items),
                     "pagination": {
                         # Avoid COUNT(*) in hot path; provide a lower bound.
                         "total_count": page_offset + len(page_items) + (1 if has_more else 0),

@@ -55,6 +55,7 @@ from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from routes.agent_auth import log_agent_request
 from services import agent_search_gateway_proxy
+from services.seed_data_egress_projection import serve_search_products
 from services.test_merchant_policy import get_excluded_merchant_ids, static_test_merchant_ids
 from config.settings import settings as _app_settings
 
@@ -1114,7 +1115,7 @@ async def search_products(
             )
             return {
                 "status": "success",
-                "products": page_items,
+                "products": serve_search_products(page_items),
                 "pagination": {
                     "total": total,
                     "limit": limit,
