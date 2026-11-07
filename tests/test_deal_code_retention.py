@@ -538,11 +538,13 @@ async def test_an_opted_out_host_covers_its_subdomains_and_padded_sellers_but_no
     await offer(db, "sub", seller="shop.glow.example")
     await offer(db, "padded", seller="  Glow.Example ")
     await offer(db, "lookalike", seller="notglow.example")
+    await offer(db, "evil", seller="glow.example.evil")
+    await offer(db, "evilsub", seller="x.glow.example.evil")
     await offer(db, "platform", seller="brand.myshopify.com")
     await _optout(db, "https://www.glow.example/")
     await _optout(db, "myshopify.com")
     out = await r.run(now=NOW)
-    assert await ids(db) == ["lookalike", "platform"]
+    assert await ids(db) == ["evil", "evilsub", "lookalike", "platform"]
     assert out["deleted_optout"] == 2
 
 
@@ -633,3 +635,71 @@ async def test_the_latest_of_several_applied_variants_sets_the_clock(db):
     out = await r.run(now=NOW)
     assert await ids(db) == ["variants"]
     assert out["deleted_applied_expired"] == 0
+
+
+# ── applied-grace edges (review of be#2735 delta 3, P3-R4, P3-R5) ──────────────────────────────────────────────────
+async def _raw_verification(db, name, state, **values):
+    from db.deal_lane import observed_store_offer_verifications as v
+
+    values.setdefault("updated_at", NOW)
+    await db.execute(v.insert().values(deal_id="dlc_" + name, variant_id=values.pop("variant", "1"), state=state, **values))
+
+
+async def test_a_failed_check_with_no_discount_is_not_applied(db):
+    await offer(db, "failedzero", observed_days=20)
+    await _raw_verification(db, "failedzero", "failed", verified_at=NOW - timedelta(days=8), ref_discount_amount=0,
+                            updated_at=NOW - timedelta(days=8), failure_reason="discount_code_invalid")
+    out = await r.run(now=NOW)
+    assert await ids(db) == []
+    assert out["deleted_refused"] == 1
+
+
+async def test_a_requeued_row_that_kept_its_amount_but_no_expiry_keeps_its_grace(db):
+    await offer(db, "requeued", observed_days=40)
+    await _raw_verification(db, "requeued", "unverified", verified_at=NOW - timedelta(days=29), ref_discount_amount=5,
+                            updated_at=NOW - timedelta(days=29))
+    await offer(db, "requeuedold", observed_days=40)
+    await _raw_verification(db, "requeuedold", "unverified", ref_discount_amount=5, updated_at=NOW - timedelta(days=31),
+                            verified_at=NOW - timedelta(days=31) - timedelta(hours=24, seconds=1))
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["requeued"]
+    assert out["deleted_applied_expired"] == 1
+
+
+async def test_an_expired_row_without_timestamps_runs_on_updated_at_to_the_second(db):
+    await offer(db, "edge", observed_days=60)
+    await _raw_verification(db, "edge", "expired", updated_at=NOW - timedelta(days=30))
+    await offer(db, "past", observed_days=60)
+    await _raw_verification(db, "past", "expired", updated_at=NOW - timedelta(days=30, seconds=1))
+    await r.run(now=NOW)
+    assert await ids(db) == ["edge"]
+
+
+async def test_an_expired_row_without_verified_at_runs_on_its_past_expiry(db):
+    await offer(db, "byexpiry", observed_days=60)
+    await _raw_verification(db, "byexpiry", "expired", expires_at=NOW - timedelta(days=20),
+                            updated_at=NOW - timedelta(days=40))
+    await offer(db, "byexpiryold", observed_days=60)
+    await _raw_verification(db, "byexpiryold", "expired", expires_at=NOW - timedelta(days=31),
+                            updated_at=NOW - timedelta(days=10))
+    await r.run(now=NOW)
+    assert await ids(db) == ["byexpiry"]
+
+
+async def test_a_timestamp_in_the_future_never_keeps_a_row_forever(db):
+    await offer(db, "farexpiry", observed_days=60)
+    await _raw_verification(db, "farexpiry", "expired", expires_at=NOW + timedelta(days=36500),
+                            updated_at=NOW - timedelta(days=31))
+    await offer(db, "farverified", observed_days=60)
+    await _raw_verification(db, "farverified", "expired", verified_at=NOW + timedelta(days=36500), ref_discount_amount=5,
+                            updated_at=NOW - timedelta(days=31))
+    await offer(db, "landing", observed_days=60)  # a verification written while the run is going
+    await _raw_verification(db, "landing", "checkout_verified", verified_at=NOW + timedelta(seconds=5),
+                            expires_at=NOW + timedelta(hours=24), ref_discount_amount=5,
+                            updated_at=NOW + timedelta(seconds=5), verified_via="ucp_checkout",
+                            authorized_by="q2_approval", ref_currency="USD", ref_unit_price=25, ref_subtotal=25,
+                            ref_automatic_discounts=[])
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["landing"]
+    assert out["deleted_applied_expired"] == 2
+

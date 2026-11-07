@@ -117,6 +117,11 @@ _SKIP_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
 _INLINE_TAGS = frozenset({"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "font", "i",
                           "kbd", "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time",
                           "u", "var"})
+# Void and form-level tags inside one line of a bar separate words with a SPACE, not a block boundary (review of
+# be#2735 delta 3, P3-R2): "Promo code:<br>SAVE15" and a copy-code "<button>SAVE15</button>" still read. Structural
+# blocks (div, p, li, ...) keep the line break, so a marquee item ending in "USE CODE" never joins the next item.
+_SPACE_TAGS = frozenset({"br", "wbr", "img", "svg", "button", "label", "input", "picture", "source", "select",
+                         "option"})
 # A new one of these closes an open one of the same tag on top of the stack, as browsers do; without it
 # a page of unclosed <p>/<li> grows the stack without bound.
 _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "th"})
@@ -278,10 +283,11 @@ class _RegionParser(HTMLParser):
 
     def _separate(self, tag: str) -> None:
         if self._skip_depth is None and tag not in _INLINE_TAGS:
+            mark = " " if tag in _SPACE_TAGS else _BLOCK_MARK
             if self._region_depth is not None:
-                self._buffer.append(_BLOCK_MARK)
+                self._buffer.append(mark)
             if self._fallback_depth is not None:
-                self._fallback_buffer.append(_BLOCK_MARK)
+                self._fallback_buffer.append(mark)
 
     def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
         self._separate(tag)

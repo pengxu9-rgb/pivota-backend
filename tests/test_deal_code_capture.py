@@ -1246,3 +1246,27 @@ def test_a_code_phrase_never_reaches_into_the_next_block(html):
 
 def test_a_line_break_inside_the_phrase_words_still_reads_the_code():
     assert set(_codes('<div class="announcement-bar">Use promo<br>code SAVE15 for 15% off</div>')) == {"SAVE15"}
+
+
+# ---- void and form tags inside one line of a bar (review of be#2735 delta 3, P3-R2) -------------------------------
+
+
+@pytest.mark.parametrize("html", [
+    '<div class="announcement-bar">Promo code:<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br/>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <button>SAVE15</button> for 15% off</div>',
+    '<div class="announcement-bar">Use code <img src="x.png"> SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <label>SAVE15</label> for 15% off</div>',
+    '<div class="announcement-bar">Use code <wbr>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <svg><path d="M0"/></svg> SAVE15 for 15% off</div>',
+])
+def test_a_void_or_form_tag_between_the_phrase_and_the_code_still_reads(html):
+    assert set(_codes(html)) == {"SAVE15"}
+
+
+def test_a_copy_code_button_inside_a_marquee_item_still_reads_and_items_stay_apart():
+    html = ('<div class="announcement-bar"><div>20% OFF USE CODE</div><div>48HOURS ONLY</div>'
+            '<div>Use code <button>SAVE15</button> for 15% off</div></div>')
+    assert set(_codes(html)) == {"SAVE15"}
+

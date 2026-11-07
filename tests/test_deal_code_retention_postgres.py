@@ -173,6 +173,12 @@ from tests.test_deal_code_retention import (  # noqa: E402,F401
     test_the_opt_out_trims_the_id_and_matches_a_www_stored_seller,
     test_the_refused_boundary_is_exactly_7_days_after_the_last_refusal,
     test_the_unverified_boundary_is_exactly_14_days,
+    # review of be#2735 delta 3 (P3-R4, P3-R5)
+    test_a_failed_check_with_no_discount_is_not_applied,
+    test_a_requeued_row_that_kept_its_amount_but_no_expiry_keeps_its_grace,
+    test_an_expired_row_without_timestamps_runs_on_updated_at_to_the_second,
+    test_an_expired_row_without_verified_at_runs_on_its_past_expiry,
+    test_a_timestamp_in_the_future_never_keeps_a_row_forever,
 )
 
 
@@ -215,7 +221,7 @@ async def test_the_canonical_url_fallback_reads_each_id_on_postgres(db, monkeypa
     from services import deal_code_retention as r
     from tests.test_deal_code_retention import NOW, ids, offer
 
-    monkeypatch.setattr(w, "CANONICAL_URLS_PER_ID", 2)
+    monkeypatch.setattr(w, "CANONICAL_HOSTS_PER_ID", 2)
     await db.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
         " SELECT :p || 'big' || g, 'merch_big', 'shopify', 'big' || g, 't', 'https://big.example/p/' || g"
@@ -237,3 +243,54 @@ async def test_the_canonical_url_fallback_reads_each_id_on_postgres(db, monkeypa
     out = await r.run(now=NOW)
     assert await ids(db) == ["small"]
     assert out["optout_ids_canonical_only"] == 2
+
+
+
+async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypatch):
+    """Review of be#2735 delta 3, P3-R1(b)(c): on Postgres the host is taken out of the URL in SQL (DISTINCT host,
+    ORDER BY host, LIMIT per id), so marketplace listings that sort first never hide the store's own hosts, a store on
+    a shared host is its own host, and the first hosts in host order are kept."""
+    from services import deal_code_capture_writer as w
+    from tests.test_deal_code_retention import NOW
+
+    monkeypatch.setattr(w, "CANONICAL_HOSTS_PER_ID", 4)
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " SELECT :p || 'mk' || g, 'merch_mix', 'shopify', 'mk' || g, 't', 'https://www.amazon.com/dp/' || lpad(g::text, 4, '0')"
+        " FROM generate_series(1, 300) AS g",
+        {"p": _PREFIX},
+    )
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " SELECT :p || 'own' || g, 'merch_mix', 'shopify', 'own' || g, 't', 'https://a-own.example/p/' || g"
+        " FROM generate_series(1, 300) AS g",
+        {"p": _PREFIX},
+    )
+    rows = [("z", "merch_mix", "HTTPS://user@Shop.Z-Own.Example:8443/p?x=1"), ("sq", "merch_sq", "https://brand1.square.site/p"),
+            ("o1", "merch_order", "https://d.example/p"), ("o2", "merch_order", "https://c.example/p"),
+            ("o3", "merch_order", "https://b.example/p"), ("o4", "merch_order", "https://a.example/p"),
+            ("o5", "merch_order", "https://e.example/p")]
+    for key, mid, url in rows:
+        await db.execute(
+            "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+            " VALUES (:k, :m, 'shopify', :k, 't', :u)", {"k": _PREFIX + key, "m": mid, "u": url})
+    await db.execute(  # many distinct hosts, so an unordered DISTINCT (hash) would not return the first by name
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " SELECT :p || 'ord' || g, 'merch_order', 'shopify', 'ord' || g, 't', 'https://h' || md5(g::text) || '.example/p'"
+        " FROM generate_series(1, 3000) AS g",
+        {"p": _PREFIX},
+    )
+    for mid in ("merch_mix", "merch_sq", "merch_order"):
+        await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
+                         {"s": mid, "t": NOW})
+    # With sort plans off, Postgres answers an unordered DISTINCT by hashing; only the ORDER BY keeps the first hosts.
+    # (SET LOCAL inside a transaction: the pool resets a plain SET when the connection goes back.)
+    async with db.transaction(force_rollback=True):
+        await db.execute("SET LOCAL enable_sort = off")
+        assert await db.fetch_val("SHOW enable_sort") == "off"
+        deny = await w.read_denyset()
+    assert deny.blocks("a-own.example") and deny.blocks("shop.z-own.example") and not deny.blocks("amazon.com")
+    assert deny.blocks("brand1.square.site") and not deny.blocks("other.square.site")
+    assert all(deny.blocks(f"{c}.example") for c in "abcd") and not deny.blocks("e.example")
+    assert not deny.delete
+    assert deny.counts == {"optout_ids_canonical_only": 3, "optout_ids_too_broad": 1}

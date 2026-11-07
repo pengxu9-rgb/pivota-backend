@@ -13,7 +13,8 @@ store), are never touched. The rules:
   3. refused by the store and never applied for any variant: deleted 7 days after its last refusal;
   4. applied: kept while a verification is valid; deleted 30 days after the last valid-until across its verification
      history, whatever state a lapsed verification is in now (`expired`, or back to `unverified`), each valid-until
-     clamped to verified_at + DEAL_VERIFY_TTL_HOURS;
+     clamped to verified_at + DEAL_VERIFY_TTL_HOURS; a timestamp later than the run (malformed) is not trusted and
+     the row runs on updated_at instead;
   5. the bar text (`terms_text`): cleared once a check recorded an outcome, or 14 days after the row was created.
 Every DELETE re-checks its rule's condition, so a verification that lands between the read and the delete keeps the row.
 
@@ -177,10 +178,18 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
     # (services/deal_lane_decision._ttl_ceiling), so an expires_at decades out cannot keep a row forever (P3-N4).
     grace_from = now - timedelta(days=APPLIED_GRACE_DAYS)
     ttl = timedelta(hours=settings.deal_verify_ttl_hours)
+    # A timestamp later than `now` is not evidence of validity (review of be#2735 delta 3, P3-R4): a verified_at in
+    # the future, or an expires_at in the future on a row with no usable verified_at, falls back to updated_at, so a
+    # malformed row is kept 30 days after its last update, never forever. A verification that lands while this run
+    # is going has updated_at ~ now and is kept.
+    verified_usable = and_(v.c.verified_at.isnot(None), v.c.verified_at <= now)
     within_grace = exists().where(and_(v.c.deal_id == o.c.deal_id, applied_history(), or_(
-        and_(v.c.verified_at.isnot(None), v.c.verified_at >= grace_from - ttl,
+        and_(verified_usable, v.c.verified_at >= grace_from - ttl,
              or_(v.c.expires_at.is_(None), v.c.expires_at >= grace_from)),
-        and_(v.c.verified_at.is_(None), func.coalesce(v.c.expires_at, v.c.updated_at) >= grace_from),
+        and_(or_(v.c.verified_at.is_(None), v.c.verified_at > now), or_(
+            and_(v.c.expires_at.isnot(None), v.c.expires_at <= now, v.c.expires_at >= grace_from),
+            and_(or_(v.c.expires_at.is_(None), v.c.expires_at > now), v.c.updated_at >= grace_from),
+        )),
     )))
     await step("deleted_applied_expired", _delete_where(and_(_was_applied(), not_(within_grace))))
 

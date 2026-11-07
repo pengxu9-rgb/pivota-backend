@@ -54,7 +54,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 
 from db.catalog import catalog_products
 from db.database import database
@@ -77,7 +77,10 @@ _KINDS = {"percent", "amount", "free_shipping"}
 _NOT_A_CODE_RE = re.compile(
     r"^(?:\d+(?:ST|ND|RD|TH|H|HR|HRS|AM|PM|X|PER)|\d+-?DAYS?|SPF\d+|[A-Z]\d[A-Z]"
     r"|\d+-?(?:ML|L|OZ|G|KG|LBS?|PCS?|PK|PACK|MINS?|HOURS?|WEEKS?|MONTHS?|YRS?|YEARS?|FT|IN|CM|MM|P|K|GB|TB|W|V|MAH)"
-    r"|\d+-IN-\d+|\d+(?:AM|PM)-\d+(?:AM|PM)|KN\d+|N\d{2})$|X{3,}", re.IGNORECASE)
+    r"|\d+-IN-\d+|\d+(?:AM|PM)-\d+(?:AM|PM)|KN\d+|N\d{2}"
+    # review of be#2735 delta 3, P3-R3: dimensions and drive types ("4X4"), sizes ("3XL", "2XS"), "100PCT",
+    # "360-DEGREE", ratings ("5STAR") and season labels ("2026SS", "2025FW")
+    r"|\d+X\d+|\d+X{1,3}[SL]|\d+PCT|\d+-?DEG(?:REE)?S?|\d+-?STARS?|\d{4}(?:SS|FW|AW))$|X{3,}", re.IGNORECASE)
 # The phrased forms only; the bare-"code" form is shadow-only until measured.
 _WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
 # PROVENANCE: every row this writer creates has a deal_id with this prefix, and no other writer uses it. Retention
@@ -97,10 +100,15 @@ def normalize_host(value: Optional[str]) -> str:
     elif ":" in text:
         text = text.split(":", 1)[0]
     text = text.strip().rstrip(".")
-    while text.startswith("*."):  # a wildcard spelling names the host and its subdomains (review of be#2735)
-        text = text[2:]
-    if text.startswith("www."):
-        text = text[4:]
+    while text.startswith(("*.", "www.")):  # "*.host", "www.host" and "www.*.host" all name the host (be#2735)
+        text = text[2:] if text.startswith("*.") else text[4:]
+    if text and not text.isascii():
+        # One spelling for an internationalised host (review of be#2735 delta 3, P3-R3): the unicode form becomes the
+        # punycode form a URL carries, so an opt-out entered either way covers the other.
+        try:
+            text = text.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            pass
     return text
 
 
@@ -177,11 +185,11 @@ def not_a_code(captured: "deal_code_capture.CapturedCode") -> bool:
         return True
     snippet = str(captured.snippet or "")
     at = snippet.upper().find(code.upper()) if code else -1
-    if at >= 0 and re.search(r"(?:\bexample\b|\be\.g\.|\bsuch\s+as\b|\bsample\b)", snippet[max(0, at - 40):at], re.IGNORECASE):
+    if at >= 0 and re.search(r"(?:\bexample\b|\be\.g\.|\bsuch\s+as\b|\bsample\b|\bfor\s+instance\b)", snippet[max(0, at - 40):at], re.IGNORECASE):
         return True  # "Example: use code SAVE20" (P3-N5)
     if at >= 0:
         after = snippet[at + len(code): at + len(code) + 24].lower()
-        if re.match(r"^\W{0,3}\(?\s*(?:e\.g\.|(?:for\s+)?example\b|sample\b)", after):
+        if re.match(r"^\W{0,3}\(?\s*(?:e\.g\.|(?:for\s+)?example\b|for\s+instance\b|sample\b)", after):
             return True
     return False
 
@@ -198,8 +206,12 @@ PLACEHOLDER_MERCHANT_IDS = frozenset({"external_seed"})
 # P2-N1): FAIL CLOSED for writes (every host it names is blocked) and delete nothing through it (counted).
 MAX_HOSTS_PER_OPTOUT_ID = 3
 _IN_CHUNK = 500
-# The canonical-URL fallback reads at most this many distinct URLs PER merchant id (P3-N2).
-CANONICAL_URLS_PER_ID = 200
+# The canonical-URL fallback reads at most this many distinct HOSTS per merchant id (P3-N2; review of be#2735 delta 3,
+# P3-R1(c): hosts, not URLs, so a store's own host is not crowded out by its marketplace listings or its other URLs).
+CANONICAL_HOSTS_PER_ID = 200
+# Where the database cannot take a host out of a URL in SQL (SQLite: tests and local runs), this many distinct URLs per
+# id are read and reduced to hosts here.
+CANONICAL_URLS_PER_ID_FALLBACK = 5000
 # Marketplace and platform labels (as services/canonical_source_discovery._GENERIC_DOMAINS): a canonical URL on one of
 # these names where the product is listed, not the seller's own host, so it never becomes a denied host.
 MARKETPLACE_LABELS = frozenset({
@@ -207,8 +219,14 @@ MARKETPLACE_LABELS = frozenset({
     "stylevana", "oliveyoung", "etsy", "lazada", "shopee", "coupang", "rakuten", "qoo10", "wixsite", "bigcartel",
     "squarespace",
 })
-# Shared hosts beyond services/brand_claim_service._PUBLIC_SUFFIXES: a subdomain under one is another store.
-EXTRA_SHARED_HOSTS = frozenset({"shop.app", "square.site", "mybigcommerce.com", "shopifypreview.com", "company.site"})
+# Shared hosts and registry suffixes beyond services/brand_claim_service._PUBLIC_SUFFIXES: a subdomain under one is
+# another store, and the registrable domain of a host under one sits one label deeper (review of be#2735 delta 3,
+# P3-R1(b), P3-R3).
+EXTRA_SHARED_HOSTS = frozenset({
+    "shop.app", "square.site", "mybigcommerce.com", "shopifypreview.com", "company.site",
+    "github.io", "vercel.app", "herokuapp.com", "netlify.app",
+    "com.vn", "com.ar",
+})
 # The denylist read is reused for this long within one run (P3-N6); a new run (deal_code_capture.reset_stats) rereads.
 DENYLIST_CACHE_SECONDS = 600
 
@@ -227,7 +245,8 @@ def registrable(host: Optional[str]) -> str:
     if not h or "." not in h:
         return ""
     labels = h.split(".")
-    if len(labels) >= 3 and ".".join(labels[-2:]) in _PUBLIC_SUFFIXES:
+    suffix = ".".join(labels[-2:])
+    if len(labels) >= 3 and (suffix in _PUBLIC_SUFFIXES or suffix in EXTRA_SHARED_HOSTS):
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
 
@@ -283,7 +302,7 @@ async def read_denyset() -> DenySet:
       - An id with a dot is a host: trimmed, normalised (`normalize_host`), with its www. form.
       - An id without one is a merchant id (merchant ids carry no dot): its catalog hosts, by an indexed read of
         `merchant_id IN (id as entered, trimmed, lower-case)` (source_domain). For an id whose rows carry no
-        source_domain, up to CANONICAL_URLS_PER_ID distinct canonical URLs OF THAT ID are read; their hosts block
+        source_domain, up to CANONICAL_HOSTS_PER_ID distinct canonical-URL hosts OF THAT ID are read; their hosts block
         writes only (a canonical URL may name a marketplace), and marketplace hosts are dropped (P3-N2).
       - The placeholder id never reaches the catalog (P2-3). An id whose hosts span more than MAX_HOSTS_PER_OPTOUT_ID
         registrable domains blocks writes on all of them and deletes nothing (P2-N1).
@@ -329,17 +348,10 @@ async def read_denyset() -> DenySet:
             bump("optout_ids_too_broad")
             block |= forms
             continue
-        if len(regs) > 1:
-            bump("optout_ids_multi_host")
-        delete |= forms
+        delete |= forms  # 2-3 registrable domains is a normal store: no note (review of be#2735 delta 3)
     for merchant in sorted(set(merchants) - set(confirmed)):
         spellings = sorted(merchants[merchant] | {r for r in merchants_raw if r.strip().lower() == merchant})
-        found = await database.fetch_all(
-            select(catalog_products.c.canonical_url)
-            .where(and_(catalog_products.c.merchant_id.in_(spellings), catalog_products.c.canonical_url.isnot(None)))
-            .distinct().order_by(catalog_products.c.canonical_url).limit(CANONICAL_URLS_PER_ID)
-        )
-        hosts = {normalize_host(r["canonical_url"]) for r in found}
+        hosts = await _canonical_hosts(spellings)
         hosts = {h for h in hosts if h and "." in h and not is_marketplace(h)}
         if not hosts:
             bump("optout_ids_unmapped")
@@ -349,6 +361,30 @@ async def read_denyset() -> DenySet:
             bump("optout_ids_too_broad")
         block |= set().union(*(_host_forms(h) for h in hosts))
     return DenySet(frozenset(delete), frozenset(delete | block), counts)
+
+
+def _is_sqlite() -> bool:
+    return str(getattr(database, "url", "") or "").lower().startswith("sqlite")
+
+
+# The host of an absolute URL, in SQL (Postgres: a two-argument substring is a POSIX regex with one capture group).
+_URL_HOST_PATTERN = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@]*@)?([^/:?#]+)"
+
+
+async def _canonical_hosts(spellings) -> Set[str]:
+    """Up to CANONICAL_HOSTS_PER_ID distinct hosts of one merchant id's canonical URLs, the first by host order."""
+    p = catalog_products
+    where = and_(p.c.merchant_id.in_(spellings), p.c.canonical_url.isnot(None))
+    if _is_sqlite():
+        found = await database.fetch_all(
+            select(p.c.canonical_url).where(where).distinct().order_by(p.c.canonical_url)
+            .limit(CANONICAL_URLS_PER_ID_FALLBACK))
+        hosts = sorted({normalize_host(r["canonical_url"]) for r in found} - {""})
+        return set(hosts[:CANONICAL_HOSTS_PER_ID])
+    host = func.lower(func.substring(p.c.canonical_url, _URL_HOST_PATTERN)).label("host")
+    found = await database.fetch_all(
+        select(host).where(where).distinct().order_by(host).limit(CANONICAL_HOSTS_PER_ID))
+    return {normalize_host(r["host"]) for r in found if r["host"]} - {""}
 
 
 async def denied_hosts() -> Tuple[Set[str], Dict[str, int]]:
