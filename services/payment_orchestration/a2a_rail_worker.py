@@ -40,7 +40,7 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   quoting               -> send the confirmed order (merchant, amount, USD, items, HITL), write-ahead
                            `vic.order#submit`. The answer's hosted page goes to the buyer through
                            `awaiting_authorization` (kind `approval`, so the purchase.action_required
-                           event goes out), with the rail's order id in `order_id` and NO token id.
+                           event goes out), with `vic:<the rail's order id>` in `order_id` and NO token id.
                            An unseen answer is read back by our reference, never resent.
   awaiting_authorization (a VIC order) -> the order is out at the rail and only the rail's answer ends it,
                            so the row holds the marker write `vic.order#authorization` the whole time:
@@ -50,9 +50,17 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            (failed), expired (expired), abandoned (failed).
   paying (a VIC order)  -> poll the rail's checkout: in progress (wait), completed (-> completed with
                            the merchant's order number), failed (failed). `paying` ends on no clock.
+  The amount sent is the LOCKED QUOTE (`quoted_total_minor`, all-in with shipping and tax) and nothing
+  else: no quote, no order. A checkout is completed only when its total is known, in the purchase's
+  currency and at most that amount; otherwise the order is HELD for a human in `paying`.
   Dial off: nothing more is sent for a VIC order; it stays parked (the marker keeps the sweep off it)
-  until the dial is on again or a human decides. Rows the token path made are never VIC orders: those
-  always carry a token id, and a VIC order never does.
+  until the dial is on again or a human decides. A VIC order is RECORDED, not inferred: `_vic_adopt`
+  writes `vic:<the rail's order id>` and nothing else writes that prefix. Held for a human, unread on
+  every tick: a VIC order past `VIC_ORDER_CEILING_SECONDS` (the sweep never ends it), a submit left by
+  a crashed step, a submit unreadable for the whole reconcile window, and the checkout holds above.
+  A hold stops PIVOTA; it stops nothing at the rail (there is no cancel call): the rail can still
+  complete a held order. A human resolves every hold with the rail (complete or fail it by hand,
+  refund through the provider).
 
 ── TOKENS LEFT ON ENDED PURCHASES ────────────────────────────────────────────────────────────
 
@@ -236,8 +244,9 @@ def _token_active(row: Mapping[str, Any]) -> bool:
 
 
 def _sticky(row: Mapping[str, Any]) -> bool:
-    """A marker no later write may replace: money seen (parked for good), or the token ACTIVE."""
-    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row)
+    """A marker no later write may replace: money seen (parked for good), the token ACTIVE, or a VIC order
+    held for a human (`_vic_held`)."""
+    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row) or _vic_held(row)
 
 
 class _Step:
@@ -801,6 +810,44 @@ VIC_DISABLED = "vic_order_step_disabled"
 VIC_OVERDUE_GRACE_SECONDS = 1800
 #: Seconds between polls while the rail fills the merchant checkout.
 POLL_PAYING = 30
+#: Written on a VIC order's `order_id` (`vic:<the rail's order id>`) by `_vic_adopt`, and nowhere else: the
+#: record that THIS purchase is a VIC order. Never inferred from the shape of a row (a token-path row whose
+#: token was forgotten also has an order id and no token).
+VIC_ORDER_PREFIX = "vic:"
+#: A VIC order holds a pending write or sits in `paying`, so the ledger's expiry sweep never ends it. Past
+#: this age (from creation) the step stops reading the rail and holds it for a human (`VIC_STALE`).
+VIC_ORDER_CEILING_SECONDS = 7 * 86400
+VIC_STALE = "vic_order_stale"
+#: Codes that hold a VIC order for a human: nothing more is read or sent for it, on any tick, dial or not.
+VIC_TOTAL_OVER_APPROVED = "vic_total_over_approved"
+VIC_CURRENCY_MISMATCH = "vic_currency_mismatch"
+VIC_CURRENCY_MISSING = "vic_currency_missing"
+VIC_TOTAL_MISSING = "vic_total_missing"
+VIC_APPROVED_AMOUNT_MISSING = "vic_approved_amount_missing"
+VIC_SUBMIT_UNRESOLVED = "vic_submit_unresolved"
+_VIC_HOLD_CODES = frozenset({
+    VIC_STALE, VIC_TOTAL_OVER_APPROVED, VIC_CURRENCY_MISMATCH, VIC_CURRENCY_MISSING, VIC_TOTAL_MISSING,
+    VIC_APPROVED_AMOUNT_MISSING, VIC_SUBMIT_UNRESOLVED,
+})
+
+
+def _last_code(row: Mapping[str, Any]) -> str:
+    return str(row.get("last_error_code") or "").split(":")[-1]
+
+
+def _vic_held(row: Mapping[str, Any]) -> bool:
+    return _last_code(row) in _VIC_HOLD_CODES
+
+
+def _vic_stale(row: Mapping[str, Any]) -> bool:
+    created = _aware(row.get("created_at"))
+    return created is not None and (_now() - created).total_seconds() > VIC_ORDER_CEILING_SECONDS
+
+
+def _rail_order_id(row: Mapping[str, Any]) -> Optional[str]:
+    """The rail's order id a VIC order recorded (without the marker), or None."""
+    recorded = str(row.get("order_id") or "")
+    return recorded[len(VIC_ORDER_PREFIX):] or None if recorded.startswith(VIC_ORDER_PREFIX) else None
 
 
 def _vic_on(s: _Step) -> bool:
@@ -808,11 +855,12 @@ def _vic_on(s: _Step) -> bool:
 
 
 def _is_vic_order(row: Mapping[str, Any]) -> bool:
-    """A purchase the VIC order step placed: the rail's order id and NO token id (the token path always
-    records a token before it leaves `quoting`; a VIC order never has one)."""
+    """A purchase the VIC order step placed: its order id carries the marker only `_vic_adopt` writes
+    (`VIC_ORDER_PREFIX`), and it has no token id. Recorded, not inferred: an order id with no token is
+    not enough (the token path's forget-then-re-quote leaves exactly that between its two writes)."""
     return (
         row.get("state") in ("awaiting_authorization", "paying")
-        and bool(row.get("order_id")) and not row.get("payment_token_id")
+        and _rail_order_id(row) is not None and not row.get("payment_token_id")
     )
 
 
@@ -820,8 +868,40 @@ def _vic_mismatch(s: _Step, answer: Any) -> bool:
     """The answer is not about THIS purchase's order (another reference or another order id)."""
     if answer.client_reference not in (None, s.id):
         return True
-    recorded = s.row.get("order_id")
-    return bool(recorded) and s.row.get("state") != "quoting" and answer.order_id != recorded
+    if s.row.get("state") == "quoting":
+        return False
+    return answer.order_id != _rail_order_id(s.row)
+
+
+async def _vic_hold(s: _Step, code: str) -> str:
+    """Hold a VIC order for a human: logged once, and on every later tick parked unread (`_vic_gate`)."""
+    logger.error("a2a_rail_worker: VIC order held for a human purchase=%s code=%s", s.id, code)
+    await s.release(POLL_PARKED, code)
+    return code
+
+
+async def _vic_gate(s: _Step) -> Optional[str]:
+    """What stops a VIC order before anything is read or sent, in this order; None lets the step go on.
+
+    1. Held for a human (`_VIC_HOLD_CODES`): parked unread, its code kept.
+    2. The submit's step crashed (`worker_error` with the submit pending): the house rule for any write a
+       crashed step left (`_reconcile`): a human decides, nothing clears it. Its code is kept.
+    3. Past the ceiling (`VIC_ORDER_CEILING_SECONDS`): held (`VIC_STALE`).
+    4. The dial off (the kill switch): parked, nothing read or sent; a pending write keeps the sweep off."""
+    row = s.row
+    if _vic_held(row):
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "vic_held"
+    if row.get("pending_write") == VIC_SUBMIT and _last_code(row) == "worker_error":
+        logger.error("a2a_rail_worker: pending write %s left by a crashed step purchase=%s", VIC_SUBMIT, s.id)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "pending_write_unreconcilable"
+    if _vic_stale(row):
+        return await _vic_hold(s, VIC_STALE)
+    if not _vic_on(s):
+        await s.release(POLL_PARKED, VIC_DISABLED)
+        return "parked"
+    return None
 
 
 async def _vic_park_mismatch(s: _Step) -> str:
@@ -841,8 +921,13 @@ async def _start_vic_order(s: _Step) -> str:
     if not row.get("buyer_email") or not row.get("shipping_address"):
         # The rail fills the merchant checkout: it needs where to ship and whom to tell.
         return await _token_failed(s, "quoting", "vic_contact_missing")
+    if vic_order.order_amount(row) is None:
+        # No locked all-in total (shipping and tax included): the buyer would approve a subtotal and the
+        # merchant's checkout would come to more. No order without a quote. Nothing writes the A2A quote
+        # yet, so this fails closed; once a quote writer exists, this should WAIT (park) for the lock.
+        return await _token_failed(s, "quoting", "vic_quote_missing")
     order = vic_order.build_order(row)
-    if order is None:
+    if order is None:  # pragma: no cover - build_order fails only without an amount, checked above
         return await _token_failed(s, "quoting", "vic_amount_invalid")
     if await ledger.mark_pending_write(s.id, s.worker, VIC_SUBMIT) is None:
         return "lost"
@@ -873,7 +958,7 @@ async def _vic_adopt(s: _Step, answer: Any) -> str:
     try:
         moved = await ledger.transition_as_holder(
             s.id, s.worker, from_states=["quoting"], to_state="awaiting_authorization",
-            resolves_write=VIC_SUBMIT, order_id=answer.order_id, **page)
+            resolves_write=VIC_SUBMIT, order_id=f"{VIC_ORDER_PREFIX}{answer.order_id}", **page)
     except ValueError:
         # The rail answered (so the submit is resolved) with an order id or page we will not store.
         return await _token_failed(s, "quoting", "vic_page_invalid", resolves=VIC_SUBMIT)
@@ -885,10 +970,14 @@ async def _vic_adopt(s: _Step, answer: Any) -> str:
 
 
 async def _vic_pending(s: _Step) -> str:
-    if not _vic_on(s):
-        # The dial is a kill switch: nothing is read or sent. The pending write keeps the sweep off the row.
-        await s.release(POLL_PARKED, VIC_DISABLED)
-        return "parked"
+    if s.row.get("pending_write") == VIC_AUTHORIZATION and not _is_vic_order(s.row):
+        # The marker on a row `_vic_adopt` did not make: never read or act on it. A human decides.
+        logger.error("a2a_rail_worker: VIC marker on a row that is not a VIC order purchase=%s", s.id)
+        await s.release(POLL_PARKED, "pending_write_unreconcilable")
+        return "pending_write_unreconcilable"
+    stopped = await _vic_gate(s)
+    if stopped is not None:
+        return stopped
     if s.row.get("pending_write") == VIC_SUBMIT:
         return await _vic_reconcile_submit(s)
     return await _vic_poll_authorization(s)
@@ -906,21 +995,28 @@ async def _vic_reconcile_submit(s: _Step) -> str:
         return await _vic_adopt(s, answer)
     recorded = _aware(s.row.get("pending_write_at"))
     if recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS:
-        # Nothing at the rail (or no readable answer) for the whole window. An order we never saw had no
-        # page shown to anyone, so it cannot be approved: it lapses at the rail. The purchase ends.
-        return await _token_failed(s, "quoting", "vic_order_unresolved", resolves=VIC_SUBMIT)
+        if answer.kind == "not_found":
+            # The rail says, the whole window long, that it has no such order: the submit made nothing.
+            # The purchase ends.
+            return await _token_failed(s, "quoting", "vic_order_unresolved", resolves=VIC_SUBMIT)
+        # No readable answer for the whole window: the order may exist. Never ended on a guess: held for a
+        # human, the pending write kept (so no sweep ends it either).
+        return await _vic_hold(s, VIC_SUBMIT_UNRESOLVED)
     await s.release(POLL_RETRY, f"vic_reconcile:{answer.kind}")
     return "outcome_unknown"
 
 
 async def _vic_watch(s: _Step) -> str:
-    """A VIC order waiting on the buyer with no marker (a crash between the move and the mark): mark, then poll."""
-    if not _vic_on(s):
-        await s.release(POLL_PARKED, VIC_DISABLED)
-        return "parked"
+    """A VIC order waiting on the buyer with no marker (a crash between the move and the mark): mark FIRST
+    (a local write, never a rail call), then gate, then poll. Marked before the gate so that a row the gate
+    parks or holds (dial off, past the ceiling) still keeps the expiry sweep off it: the buyer may have
+    approved on the rail's page meanwhile, and `expired` would hide that charge."""
     if await ledger.mark_pending_write(s.id, s.worker, VIC_AUTHORIZATION) is None:
         return "lost"
     s.row = {**s.row, "pending_write": VIC_AUTHORIZATION}
+    stopped = await _vic_gate(s)
+    if stopped is not None:
+        return stopped
     return await _vic_poll_authorization(s)
 
 
@@ -997,17 +1093,24 @@ async def _vic_paying(s: _Step) -> str:
 
 async def _vic_checkout(s: _Step, answer: Any) -> str:
     if answer.checkout == "completed":
+        # Completed ONLY when the rail's charged total is known, in the purchase's currency, and at most the
+        # amount the buyer approved (the locked quote the order was sent with). Anything else is held for a
+        # human in `paying`: money moved, so the purchase is neither completed nor failed on a guess.
         currency = str(s.row.get("currency") or "").upper()
-        final = answer.total_minor if answer.currency in (None, currency) else None
-        code = None if answer.merchant_order_number else "vic_order_number_missing"
-        if answer.currency not in (None, currency):
-            logger.error("a2a_rail_worker: VIC checkout charged another currency purchase=%s", s.id)
-            code = "vic_currency_mismatch"
         approved = vic_order.order_amount(s.row)
-        if final is not None and approved is not None and final > approved:
-            # Money moved: the purchase is completed all the same, and the overcharge is said loudly.
-            logger.error("a2a_rail_worker: VIC checkout total above the approved amount purchase=%s", s.id)
-            code = "vic_total_over_approved"
+        # An EXACT match only: no currency (or one the client could not read) is not "ours" by default.
+        if answer.currency is None:
+            return await _vic_hold(s, VIC_CURRENCY_MISSING)
+        if answer.currency != currency:
+            return await _vic_hold(s, VIC_CURRENCY_MISMATCH)
+        final = answer.total_minor
+        if final is None:
+            return await _vic_hold(s, VIC_TOTAL_MISSING)
+        if approved is None:
+            return await _vic_hold(s, VIC_APPROVED_AMOUNT_MISSING)
+        if final > approved:
+            return await _vic_hold(s, VIC_TOTAL_OVER_APPROVED)
+        code = None if answer.merchant_order_number else "vic_order_number_missing"
         try:
             moved = await ledger.transition_as_holder(
                 s.id, s.worker, from_states=["paying"], to_state="completed",
@@ -1096,7 +1199,8 @@ async def step(client: Any, row: Mapping[str, Any], worker: str, *, vic: Optiona
         return await _settled(s, moved, "failed")
     if state in PARKED_STATES:
         if _is_vic_order(row):
-            return await _vic_paying(s) if _vic_on(s) else await _parked(s, VIC_DISABLED)
+            stopped = await _vic_gate(s)
+            return stopped if stopped is not None else await _vic_paying(s)
         return await _parked(s)
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover - claims only return non-terminal states

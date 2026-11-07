@@ -294,7 +294,7 @@ async def create_purchase(
         offer_code = reap_routes._offer_code(req.offer_code)
         merchant_host = reap_routes._identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant_domain = reap_routes._merchant_domain_key(merchant_host)
-        product_key = reap_routes._identifier(req.product_key, "product_key", max_chars=1024)
+        product_key, hashed_product, product_url = reap_routes._product_selector(req, merchant_host)
         variant_key, hashed_variant = reap_routes._variant_selector(req)
         market_country = purchasability.normalize_market(req.buyer.shipping_address.country)
         if market_country is None:
@@ -308,7 +308,7 @@ async def create_purchase(
         buyer_email = str(req.buyer.email or "").strip()
         return_url = str(req.return_url or "").strip() or reap_routes._default_return_url()
         request_hash = reap_routes._request_hash(
-            merchant_domain=merchant_domain, product_key=product_key, variant_key=hashed_variant,
+            merchant_domain=merchant_domain, product_key=hashed_product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=buyer_email, shipping_address=shipping_address,
             return_url=return_url, item_source=req.item_source, offer_code=offer_code,
             expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency,
@@ -344,7 +344,7 @@ async def create_purchase(
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,
-            product_key=product_key, variant_key=variant_key, market_country=market_country,
+            product_key=product_key, product_url=product_url, variant_key=variant_key, market_country=market_country,
             consent_version=consent_version, buyer_email=buyer_email, shipping_address=shipping_address,
                 idempotency_key=idempotency_key, request_hash=request_hash, choice=choice,
             )
@@ -359,8 +359,9 @@ async def create_purchase(
 
 async def _open_a2a_purchase(
     *, req: CreatePurchaseRequest, agent_id: str, owner: str, merchant_host: str, merchant_domain: str,
-    product_key: str, variant_key: Optional[str], market_country: str, consent_version: str, buyer_email: str,
+    product_key: Optional[str], variant_key: Optional[str], market_country: str, consent_version: str, buyer_email: str,
     shipping_address: Mapping[str, Any], idempotency_key: str, request_hash: str, choice: "rail_router.RailChoice",
+    product_url: Optional[str] = None,
 ) -> JSONResponse:
     """The A2A rail's create: every check the Reap cart-link lane makes, in its order, then one durable
     unit (the purchase and its key). Refusals raise `PurchaseRefused`; nothing is written before them."""
@@ -378,6 +379,10 @@ async def _open_a2a_purchase(
     # The cart link must be one the storefront honours for this market (the daily Tier B verdict).
     if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market_country):
         raise reap_svc.PurchaseRefused("merchant_not_eligible")
+    if product_key is None:
+        # A `product_url` (A2A opens here; Reap resolves its own from the raw body): OUR record's key, after
+        # the replay lookup and the merchant gates, as on the Reap route.
+        product_key = await reap_routes._resolved_product_key(None, product_url, market_country)
     if req.variant_id is not None:
         # The buyer's storefront variant, resolved to the catalog's own sku (never a door's spelling).
         variant_key = await reap_routes._resolve_selected_variant_key(
