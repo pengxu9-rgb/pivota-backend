@@ -874,7 +874,7 @@ async def test_an_unseen_token_request_fails_the_purchase_instead_of_minting_aga
         [], "failed", None, "token_request_unresolved")
 
 
-async def test_paid_goes_out_on_the_approval_schedule_and_an_active_token_parks():
+async def test_paid_goes_out_on_the_approval_schedule_and_an_approved_token_ends_the_purchase():
     pid = await _approving()
     rail = Rail()
     assert await _step(rail, pid) == "waiting_on_buyer"  # too early
@@ -889,15 +889,12 @@ async def test_paid_goes_out_on_the_approval_schedule_and_an_active_token_parks(
     assert rail.sent == []
     await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[1] + 1, purchase_id=pid)
     rail = Rail().on("payment.visa-action-required#paid", _token_result())
-    assert await _step(rail, pid) == "token_active"
+    assert await _step(rail, pid) == "failed"
     row = await _row(pid)
-    assert (row["state"], row["pending_write"], row["last_error_code"]) == (
-        "awaiting_authorization", None, "paid_sent:2:visa:token_active")
-    # Parked from here on: nothing is sent again, and the marker survives the release.
-    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[3] + 1, purchase_id=pid)
-    rail = Rail()
-    assert await _step(rail, pid) == "parked"
-    assert rail.sent == [] and (await _row(pid))["last_error_code"] == "paid_sent:2:visa:token_active"
+    # The buyer approved, but nothing can pay yet: ended now, with a code that says so, never left to
+    # lapse on the page deadline. The token id stays for the void.
+    assert (row["state"], row["pending_write"], row["last_error_code"], row["payment_token_id"]) == (
+        "failed", None, "pay_step_unavailable", "ptk_1")
 
 
 async def test_an_await_answer_switches_to_polling_with_reads_only():
@@ -908,7 +905,8 @@ async def test_an_await_answer_switches_to_polling_with_reads_only():
     assert (await _row(pid))["last_error_code"] == "paid_sent:1:await"
     rail = Rail().on("payment.await#poll", _await("PENDING"), _await("ACTIVE"))
     assert await _step(rail, pid) == "waiting_on_buyer"
-    assert await _step(rail, pid) == "token_active"
+    assert await _step(rail, pid) == "failed"
+    assert (await _row(pid))["last_error_code"] == "pay_step_unavailable"
     assert rail.actions() == ["payment.await#poll", "payment.await#poll"]
     assert all(pending is None for _, _, pending in rail.sent)  # reads record no write
 
@@ -993,7 +991,7 @@ async def test_our_own_throttle_on_paid_does_not_spend_the_buyers_slots():
         assert await _step(Rail().on("payment.visa-action-required#paid", httpx.Response(429)), pid) == "rail_refused"
     row = await _row(pid)
     assert worker._paid_state(row) == (0, "visa") and row["pending_write"] is None
-    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "token_active"
+    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "failed"
 
 
 async def test_an_error_card_on_paid_means_not_yet_never_a_refusal():
@@ -1021,7 +1019,7 @@ async def test_a_crashed_step_keeps_the_approval_schedule(monkeypatch):
     await _ago("next_poll_at", 1, purchase_id=pid)
     assert (await worker.run_tick(_client(Rail()), W)).get("error") == 1
     assert (await _row(pid))["last_error_code"] == "paid_sent:0:visa:worker_error"
-    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "token_active"
+    assert await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid) == "failed"
 
 
 async def test_a_write_left_pending_by_a_crashed_step_is_never_cleared_unread(monkeypatch):
@@ -1095,9 +1093,10 @@ async def test_a_crash_never_overwrites_a_sticky_marker(monkeypatch, marker):
         pid = await _locked()
         await _step(Rail().on("payment.method-view#submit", MONEY), pid)
     else:
+        # A row parked ACTIVE by an earlier build (the marker this build still honours).
         pid = await _approving()
-        await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
-        await _step(Rail().on("payment.visa-action-required#paid", _token_result()), pid)
+        await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'paid_sent:2:visa:token_active' "
+                               "WHERE id = :i", {"i": pid})
     before = (await _row(pid))["last_error_code"]
 
     async def _blip(*a, **k):
@@ -1110,7 +1109,7 @@ async def test_a_crash_never_overwrites_a_sticky_marker(monkeypatch, marker):
     monkeypatch.setattr(worker, "step", real_step)
     assert (await _row(pid))["last_error_code"] == before
     rail = Rail()
-    assert await _step(rail, pid) in ("money_result_parked", "parked")
+    assert await _step(rail, pid) == ("money_result_parked" if marker == "money" else "failed")
     assert rail.sent == []
 
 
@@ -1169,3 +1168,129 @@ def test_the_money_exclusion_is_in_both_the_inner_and_the_outer_where(sql_name):
     inner, outer = sql[inner_start:inner_end], sql[inner_end:]
     assert clause in inner, f"{sql_name}: the inner (candidate) WHERE lost the money exclusion"
     assert clause in outer, f"{sql_name}: the outer (race guard) WHERE lost the money exclusion"
+
+
+# ── tokens left on ended purchases ───────────────────────────────────────────────────────────
+
+
+async def _ended(state, token="ptk_left"):
+    pid = (await _open())["id"]
+    await database.execute(
+        "UPDATE a2a_rail_purchases SET state = :s, payment_token_id = :t, terminal_at = CURRENT_TIMESTAMP WHERE id = :i",
+        {"s": state, "t": token, "i": pid})
+    return pid
+
+
+def test_the_orphan_states_are_the_terminal_states_that_did_not_pay():
+    assert set(ledger.ORPHAN_TOKEN_STATES) == set(ledger.TERMINAL_STATES) - {"completed"}
+
+
+async def test_only_ended_unpaid_purchases_with_a_token_are_orphans():
+    orphans = {await _ended(s) for s in ("failed", "refused", "expired")}
+    await _ended("completed")  # its token paid
+    await _ended("failed", token=None)  # no token
+    live = (await _open())["id"]
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'awaiting_authorization', payment_token_id = 'ptk_live' "
+                           "WHERE id = :i", {"i": live})  # still in flight: not an orphan
+    assert await ledger.count_orphan_tokens() == 3
+    assert {r["id"] for r in await ledger.list_orphan_tokens(limit=50)} == orphans
+
+
+async def test_without_a_voider_orphans_are_counted_and_logged_at_most_hourly(caplog, monkeypatch):
+    monkeypatch.setattr(worker, "_orphans_logged_at", None)
+    await _ended("expired")
+    clock = iter([1000.0, 1001.0, 1000.0 + worker.ORPHAN_LOG_INTERVAL_SECONDS + 1])
+    with caplog.at_level(logging.WARNING, logger=worker.__name__):
+        for _ in range(3):
+            assert await worker.void_orphan_tokens(None, clock=lambda: next(clock)) == {"orphan_tokens": 1}
+    logged = [r for r in caplog.records if "hold a live token" in r.getMessage()]
+    assert len(logged) == 2 and "no void step" in logged[0].getMessage()
+
+
+async def test_a_voider_voids_and_forgets_each_orphan_and_keeps_what_it_could_not_void():
+    good, refused, broken = await _ended("failed", "ptk_good"), await _ended("refused", "ptk_no"), await _ended("expired", "ptk_err")
+    seen = []
+
+    async def voider(row):
+        seen.append((row["id"], row["payment_token_id"], row["member_id"]))
+        if row["payment_token_id"] == "ptk_err":
+            raise RuntimeError("rail unreachable")
+        return row["payment_token_id"] == "ptk_good"
+
+    counts = await worker.void_orphan_tokens(voider)
+    assert counts == {"token_voided": 1, "token_void_failed": 2, "orphan_tokens": 2}
+    assert {pid for pid, _, _ in seen} == {good, refused, broken} and all(m.startswith("pvm_") for _, _, m in seen)
+    assert (await _row(good))["payment_token_id"] is None
+    assert (await _row(refused))["payment_token_id"] == "ptk_no" and (await _row(broken))["payment_token_id"] == "ptk_err"
+    # The agent-facing code is not rewritten by the void.
+    assert (await _row(good))["state"] == "failed"
+
+
+async def test_a_voider_answer_other_than_true_is_not_a_void():
+    pid = await _ended("failed")
+
+    async def voider(row):
+        return "yes"
+
+    assert (await worker.void_orphan_tokens(voider))["token_void_failed"] == 1
+    assert (await _row(pid))["payment_token_id"] == "ptk_left"
+
+
+async def test_forgetting_is_fenced_on_the_token_and_on_the_purchase_having_ended():
+    pid = await _ended("failed")
+    assert await ledger.forget_orphan_token(pid, "ptk_other") is None
+    live = (await _open())["id"]
+    await database.execute("UPDATE a2a_rail_purchases SET state = 'awaiting_authorization', payment_token_id = 'ptk_live' "
+                           "WHERE id = :i", {"i": live})
+    assert await ledger.forget_orphan_token(live, "ptk_live") is None
+    assert (await _row(live))["payment_token_id"] == "ptk_live"
+    assert (await ledger.forget_orphan_token(pid, "ptk_left"))["id"] == pid
+
+
+async def test_a_purchase_the_sweep_expires_keeps_its_token_for_the_void():
+    pid = await _approving()
+    await database.execute("UPDATE a2a_rail_purchases SET buyer_action_expires_at = '2000-01-01 00:00:00' WHERE id = :i",
+                           {"i": pid})
+    assert await ledger.expire_overdue_purchases() == 1
+    row = await _row(pid)
+    assert (row["state"], row["payment_token_id"]) == ("expired", "ptk_1")
+    assert await ledger.count_orphan_tokens() == 1
+
+
+async def test_the_tick_reports_orphans_and_a_failed_orphan_pass_does_not_stop_the_steps(monkeypatch):
+    await _ended("refused")
+    assert (await worker.run_tick(_client(Rail()), W)).get("orphan_tokens") == 1
+
+    async def broken(*a, **k):
+        raise RuntimeError("database blip")
+
+    monkeypatch.setattr(ledger, "count_orphan_tokens", broken)
+    pid = (await _open())["id"]
+    await _ago("next_poll_at", 1, purchase_id=pid)
+    rail = Rail().on("payment.method-view#submit", _methods()).on("payment.method-add#submit", ADD_PAGE)
+    counts = await worker.run_tick(_client(rail), W)
+    assert "orphan_tokens" not in counts and counts.get("binding_page_issued") == 1
+
+
+async def test_a_purchase_parked_active_by_an_earlier_build_ends_without_a_send_even_with_the_dial_off(monkeypatch):
+    pid = await _approving()
+    await database.execute("UPDATE a2a_rail_purchases SET last_error_code = 'paid_sent:2:visa:token_active' WHERE id = :i",
+                           {"i": pid})
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    rail = Rail()
+    assert await _step(rail, pid) == "failed"
+    row = await _row(pid)
+    assert (rail.sent, row["state"], row["last_error_code"], row["payment_token_id"]) == (
+        [], "failed", "pay_step_unavailable", "ptk_1")
+
+
+async def test_a_standing_orphan_count_alone_is_a_quiet_tick(monkeypatch, caplog):
+    async def tick(client, worker_id, **kw):
+        return {"orphan_tokens": 3}
+
+    monkeypatch.setattr(worker, "run_tick", tick)
+    monkeypatch.setenv(job.A2A_RAIL_WORKER_ENABLED_ENV, "1")
+    monkeypatch.setattr(job, "_client", _client(Rail()))
+    with caplog.at_level(logging.WARNING, logger=job.__name__):
+        await job.run_a2a_rail_purchase_poll()
+    assert not [r for r in caplog.records if r.name == job.__name__]

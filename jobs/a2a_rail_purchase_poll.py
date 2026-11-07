@@ -66,4 +66,5 @@ async def run_a2a_rail_purchase_poll() -> Dict[str, Any]:
     return counts
 
 
-_QUIET_OUTCOMES = frozenset({"parked", "waiting_on_buyer"})
+#: `orphan_tokens` is a standing count, not an event: the worker logs it itself, at most hourly.
+_QUIET_OUTCOMES = frozenset({"parked", "waiting_on_buyer", "orphan_tokens"})
