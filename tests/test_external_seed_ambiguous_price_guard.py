@@ -91,11 +91,14 @@ def test_the_extractor_prices_a_bundle_page_as_its_first_component() -> None:
 
 
 def test_a_bundle_page_priced_by_a_component_refuses() -> None:
-    assert _decide(BUNDLE_PAGE) == {"refusal": "several_products", "priced_identities": 3, "named_by": None}
+    # The pricing component's own url names ANOTHER product handle on the served host: no title can name it.
+    assert _decide(BUNDLE_PAGE) == {"refusal": "several_products", "priced_identities": 3, "named_by": None,
+                                    "url_relation": "other_product", "title_dice": 0.0}
 
 
 def test_a_bundle_page_priced_by_its_own_node_is_named_by_its_url() -> None:
-    assert _decide(NAMED_BUNDLE_PAGE) == {"refusal": None, "priced_identities": 4, "named_by": "url"}
+    assert _decide(NAMED_BUNDLE_PAGE) == {"refusal": None, "priced_identities": 4, "named_by": "url",
+                                          "url_relation": "matched", "title_dice": 1.0}
 
 
 def test_a_pricing_node_with_no_url_is_named_by_its_title() -> None:
@@ -114,7 +117,7 @@ def test_a_product_page_with_a_priced_cross_sell_is_named() -> None:
     page = _page(own, _component("Brand Barrier Cream", "barrier-cream", "14.00"))
     url = "https://shop.example/products/niacinamide-serum"
     assert _decide(page, url=url, title="Brand Niacinamide Serum") == {
-        "refusal": None, "priced_identities": 2, "named_by": "url"}
+        "refusal": None, "priced_identities": 2, "named_by": "url", "url_relation": "matched", "title_dice": 1.0}
 
 
 @pytest.mark.parametrize("html", [
@@ -148,7 +151,7 @@ def test_the_decision_never_raises(monkeypatch) -> None:
     def boom(*_a: Any, **_k: Any):
         raise RuntimeError("matcher bug")
 
-    monkeypatch.setattr(liveness, "handleless_titles_match", boom)
+    monkeypatch.setattr(liveness, "_same_product_url", boom)
     snap = _snapshot_from_html(BUNDLE, BUNDLE_PAGE)
     assert liveness.ambiguous_price_decision(evidence=snap.evidence, requested_url=BUNDLE, seed_title=BUNDLE_TITLE) is None
 
@@ -194,7 +197,8 @@ def test_shadow_reports_and_writes_exactly_what_off_writes(monkeypatch) -> None:
     shadow = _run(monkeypatch, BUNDLE_PAGE, "shadow")
     off = _run(monkeypatch, BUNDLE_PAGE, "off")
     assert shadow["result"]["ambiguous_price"] == {"mode": "shadow", "refusal": "several_products",
-                                                   "priced_identities": 3, "named_by": None}
+                                                   "priced_identities": 3, "named_by": None,
+                                                   "url_relation": "other_product", "title_dice": 0.0}
     assert _comparable(shadow) == _comparable(off)
     assert "ambiguous" not in json.dumps(shadow["seed_data"], default=str)
 
@@ -296,7 +300,8 @@ def test_the_batch_counts_per_host_and_logs_refusals_only(monkeypatch) -> None:
     hosts: Dict[str, Dict[str, int]] = {}
     state: Dict[str, int] = {}
     count_ambiguous_price(totals, hosts, state, "eps_1", "a.example",
-                          {"mode": "shadow", "refusal": "several_products", "priced_identities": 3, "named_by": None})
+                          {"mode": "shadow", "refusal": "several_products", "priced_identities": 3, "named_by": None,
+                           "url_relation": "other_product", "title_dice": 0.25})
     count_ambiguous_price(totals, hosts, state, "eps_2", "a.example",
                           {"mode": "shadow", "refusal": None, "priced_identities": 2, "named_by": "url"})
     count_ambiguous_price(totals, hosts, state, "eps_3", "b.example",
@@ -307,8 +312,10 @@ def test_the_batch_counts_per_host_and_logs_refusals_only(monkeypatch) -> None:
     assert hosts["a.example"] == {"decided": 2, "named_by:url": 1, "would_refuse": 1, "refused:several_products": 1}
     got = [json.loads(m[len("AMBIGUOUS_PRICE_DECISION "):]) for m in lines.messages]
     assert got == [
-        {"host": "a.example", "mode": "shadow", "priced_identities": 3, "refusal": "several_products", "seed_id": "eps_1"},
-        {"host": "b.example", "mode": "on", "priced_identities": 1, "refusal": "listing", "seed_id": "eps_3"},
+        {"host": "a.example", "mode": "shadow", "priced_identities": 3, "refusal": "several_products", "seed_id": "eps_1",
+         "title_dice": 0.25, "url_relation": "other_product"},
+        {"host": "b.example", "mode": "on", "priced_identities": 1, "refusal": "listing", "seed_id": "eps_3",
+         "title_dice": None, "url_relation": None},
     ]
     assert all("http" not in m and "?" not in m for m in lines.messages)
     summary = ambiguous_price_summary("shadow", totals, hosts, state)
@@ -403,7 +410,8 @@ def test_the_job_prints_nothing_for_a_run_that_decided_no_row() -> None:
 # --------------------------------------------------------------------------- creation
 
 
-def _create(monkeypatch, html: str, mode: str, **body: Any) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+def _create(monkeypatch, html: str, mode: str, *, existing: Optional[List[Dict[str, Any]]] = None,
+            **body: Any) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     import routes.employee_products as ep
     import utils.logger as ul
 
@@ -420,15 +428,15 @@ def _create(monkeypatch, html: str, mode: str, **body: Any) -> Tuple[Dict[str, A
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=_snapshot_from_html(BUNDLE, html)))
-    monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=[]))
+    monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=copy.deepcopy(existing or [])))
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
     monkeypatch.setattr(ep, "_derive_seed_seller_columns", AsyncMock(return_value=(None, None)))
     monkeypatch.setattr(ep, "_make_redirect_url", AsyncMock(return_value="https://api.pivota.cc/r?token=t"))
+    request_body = {"destination_url": BUNDLE, "market": "US", "title": BUNDLE_TITLE, "brand": "Brand", **body}
     response = asyncio.run(
         ep.create_external_seed(
-            ep.CreateExternalSeedRequest(**{"destination_url": BUNDLE, "market": "US", "title": BUNDLE_TITLE,
-                                            "brand": "Brand", **body}),
+            ep.CreateExternalSeedRequest(**{k: v for k, v in request_body.items() if v is not None}),
             request=SimpleNamespace(),
             current_user={"employee_id": "emp_test"},
         )
@@ -445,7 +453,8 @@ def test_creation_off_and_shadow_take_the_components_price_as_before(monkeypatch
     assert response["snapshot_price_refused"] is None
     if mode == "shadow":
         assert [json.loads(m.split(" ", 1)[1]) for m in messages] == [
-            {"mode": "shadow", "priced_identities": 3, "refusal": "several_products"}]
+            {"mode": "shadow", "priced_identities": 3, "refusal": "several_products", "title_dice": 0.0,
+             "url_relation": "other_product"}]
     else:
         assert messages == []
 
@@ -484,3 +493,143 @@ def test_creation_on_prices_a_bundle_its_own_node_prices(monkeypatch) -> None:
     response, write, _ = _create(monkeypatch, NAMED_BUNDLE_PAGE, "on")
     assert (write["price_amount"], write["price_currency"]) == (48.0, "USD")
     assert response["snapshot_price_refused"] is None
+
+
+
+# --------------------------------------------------------------------------- review of be#2746 (controller, 11-07)
+
+
+def _claiming_bundle_page() -> str:
+    """Every component names the served page as its own url (a theme that stamps the page url on each node)."""
+    nodes = []
+    for comp in COMPONENTS:
+        node = dict(comp)
+        node["url"] = BUNDLE
+        nodes.append(node)
+    return _page(*nodes)
+
+
+def test_p2_1_a_seed_created_without_a_title_is_refused_by_its_urls(monkeypatch) -> None:
+    # `title` falls back to the page's, the pricing node's own name: it must never name the node by itself.
+    response, write, _ = _create(monkeypatch, BUNDLE_PAGE, "on", title=None)
+    assert (write["price_amount"], response["snapshot_price_refused"]["reason"]) == (None, "ambiguous_product")
+
+
+def test_p2_1_an_untitled_bundle_its_own_node_prices_is_priced(monkeypatch) -> None:
+    response, write, _ = _create(monkeypatch, NAMED_BUNDLE_PAGE, "on", title=None)
+    assert (write["price_amount"], response["snapshot_price_refused"]) == (48.0, None)
+
+
+def test_p2_1_a_node_whose_url_names_another_handle_is_refused_whatever_its_name() -> None:
+    # The seed's title even matches the component's name: the component's own url says it is another product.
+    decision = _decide(BUNDLE_PAGE, title="Brand Niacinamide Serum")
+    assert (decision["refusal"], decision["url_relation"]) == ("several_products", "other_product")
+
+
+def test_p2_1_a_collection_path_url_of_the_same_handle_is_not_another_product() -> None:
+    served = "https://shop.example/collections/skin/products/niacinamide-serum"
+    page = _page(_component("Brand Niacinamide Serum", "niacinamide-serum", "6.00"),
+                 _component("Brand Barrier Cream", "barrier-cream", "14.00"))
+    decision = _decide(page, url=served, title="Brand Niacinamide Serum")
+    assert (decision["url_relation"], decision["named_by"], decision["refusal"]) == ("mismatch", "title", None)
+
+
+def test_p2_2_the_extractor_counts_nodes_that_claim_the_served_url() -> None:
+    snap = _snapshot_from_html(BUNDLE, _claiming_bundle_page())
+    assert snap.evidence["jsonld_identity"]["url_conflicts"] == 2
+    assert _snapshot_from_html(BUNDLE, NAMED_BUNDLE_PAGE).evidence["jsonld_identity"]["url_conflicts"] == 0
+
+
+def test_p2_2_a_url_several_products_claim_names_nothing_and_the_title_decides() -> None:
+    decision = _decide(_claiming_bundle_page())
+    assert (decision["url_relation"], decision["named_by"], decision["refusal"]) == (
+        "matched", None, "several_products")
+
+
+def test_p2_2_a_claimed_url_still_reads_when_the_title_names_the_pricing_node() -> None:
+    decision = _decide(_claiming_bundle_page(), title="Brand Niacinamide Serum")
+    assert (decision["named_by"], decision["refusal"]) == ("title", None)
+
+
+def test_p2_2_the_refresh_refuses_a_claimed_url_bundle(monkeypatch) -> None:
+    out = _run(monkeypatch, _claiming_bundle_page(), "on")
+    assert out["result"]["price_refresh"]["status"] == "skipped_ambiguous_product"
+    assert out["written"]["price_amount"] == STORED_PRICE
+
+
+def test_p2_3_an_employee_amount_keeps_the_pages_currency(monkeypatch) -> None:
+    _, on, _ = _create(monkeypatch, BUNDLE_PAGE, "on", price_amount=48.0)
+    _, off, _ = _create(monkeypatch, BUNDLE_PAGE, "off", price_amount=48.0)
+    assert (on["price_amount"], on["price_currency"]) == (48.0, "USD") == (off["price_amount"], off["price_currency"])
+
+
+def test_p2_3_an_employee_currency_alone_stores_no_amount(monkeypatch) -> None:
+    _, write, _ = _create(monkeypatch, BUNDLE_PAGE, "on", price_currency="USD")
+    assert (write["price_amount"], write["price_currency"]) == (None, "USD")
+
+
+def _stored_bundle_row() -> Dict[str, Any]:
+    row = _bundle_row(price_amount=6.0)
+    row["seed_data"]["snapshot"]["extracted_at"] = "2026-11-06T12:00:00+00:00"
+    return row
+
+
+def test_p3_3_a_re_create_keeps_the_stored_price_and_drops_its_stamp(monkeypatch) -> None:
+    response, write, _ = _create(monkeypatch, BUNDLE_PAGE, "on", existing=[_stored_bundle_row()])
+    assert response["snapshot_price_refused"]["reason"] == "ambiguous_product"
+    assert write["price_amount"] == 6.0, "a re-create keeps the row's stored price (stated, not corrected)"
+    assert "extracted_at" not in write["seed_data"]["snapshot"]
+
+
+def test_p3_3_an_off_re_create_keeps_its_stamp(monkeypatch) -> None:
+    _, write, _ = _create(monkeypatch, BUNDLE_PAGE, "off", existing=[_stored_bundle_row()])
+    assert write["seed_data"]["snapshot"].get("extracted_at") == "2026-11-06T12:00:00+00:00"
+
+
+def test_p3_4_a_re_create_without_a_brand_uses_the_stored_one(monkeypatch) -> None:
+    import routes.employee_products as ep
+
+    seen: List[Any] = []
+    real = ep.destination_liveness.ambiguous_price_decision
+
+    def spy(**kwargs: Any):
+        seen.append(kwargs.get("seed_brand"))
+        return real(**kwargs)
+
+    monkeypatch.setattr(ep.destination_liveness, "ambiguous_price_decision", spy)
+    _create(monkeypatch, BUNDLE_PAGE, "on", existing=[_stored_bundle_row()], brand=None)
+    assert seen == ["Brand"]
+
+
+@pytest.mark.parametrize("mode", ["on", "shadow", "off"])
+def test_p3_2_price_refresh_counts_the_guards_refusals_in_its_own_bucket(monkeypatch, mode: str) -> None:
+    import jobs.external_referral_refresh as job
+
+    produced = {"eps_bundle": _run(monkeypatch, BUNDLE_PAGE, mode)["result"]}
+    line = job.price_refresh_line(_batch(monkeypatch, produced))
+    if mode == "off":
+        assert "price_skipped_ambiguous" not in line
+    else:
+        assert line["price_skipped_ambiguous"] == (1 if mode == "on" else 0)
+
+
+def test_p2_1_a_node_url_on_another_host_is_a_mismatch_not_another_product() -> None:
+    # Only a handle on the SERVED host says "another product of this store"; another host is just another page,
+    # and the title may still name the node.
+    other_host = dict(COMPONENTS[0])
+    other_host["url"] = "https://brand.example/products/niacinamide-serum"
+    decision = _decide(_page(other_host, *COMPONENTS[1:]), title="Brand Niacinamide Serum")
+    assert (decision["url_relation"], decision["named_by"]) == ("mismatch", "title")
+
+
+def test_p2_1_an_untitled_seed_on_a_url_less_bundle_is_refused(monkeypatch) -> None:
+    # No node carries a url, so only a title can name the pricing node; the page's own title (the pricing node's
+    # name) must not be that title, or the node names itself and its price is stored.
+    nodes = []
+    for comp in COMPONENTS:
+        node = dict(comp)
+        node.pop("url")
+        nodes.append(node)
+    response, write, _ = _create(monkeypatch, _page(*nodes), "on", title=None)
+    assert write["price_amount"] is None
+    assert response["snapshot_price_refused"]["reason"] == "ambiguous_product"

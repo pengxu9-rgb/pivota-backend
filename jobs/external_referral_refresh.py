@@ -223,7 +223,11 @@ def unconfirmed_hide_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
-    return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+    line = {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+    if "price_skipped_ambiguous" in summary:
+        # The ambiguous-price guard's own bucket, only with its flag on or in shadow.
+        line["price_skipped_ambiguous"] = summary["price_skipped_ambiguous"]
+    return line
 
 
 def ip_throttle_line(summary: Dict[str, Any]) -> Dict[str, Any]:

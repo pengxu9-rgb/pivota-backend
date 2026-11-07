@@ -787,11 +787,17 @@ def ambiguous_price_decision(
     seed_brand: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """None when the page is not ambiguous: no identity evidence, one priced product, no listing. Absence of
-    evidence never refuses. Otherwise {refusal, priced_identities, named_by}:
-      * `named_by`: "url" when the pricing node's own `url` / `@id` / group url is the served URL
-        (`_same_product_url`), "title" when its name matches the seed's title (`handleless_titles_match`), else None;
-      * `refusal`: None when the pricing node is named; else "listing" for a listing page, "several_products" for a
-        page with more than one priced product.
+    evidence never refuses. Otherwise {refusal, priced_identities, named_by, url_relation, title_dice}:
+      * `url_relation`: "matched" when the pricing node's own `url` / `@id` / group url is the served URL
+        (`_same_product_url`); "other_product" when one names ANOTHER product handle on the served host
+        (`extract_product_handle`, both sides); "mismatch" when it names another page; "none" without one;
+      * `named_by`: "url" when it matched AND no other priced node claims that url (`jsonld_identity.url_conflicts`:
+        a bundle page whose every component names the page proves nothing by url); else "title" when the node's name
+        matches `seed_title` (`handleless_titles_match`); never for "other_product" (the node says it is another
+        product); else None. `seed_title` is the title the caller vouches for: at creation the employee's own, never
+        the page's (which would name the node by itself);
+      * `refusal`: None when named; else "listing" for a listing page, "several_products" otherwise;
+      * `title_dice`: the Dice coefficient of the two titles (brand words dropped), reporting only; None without both.
     Pure, no env. NEVER RAISES (it runs inside the refresh, where a raise fails the row): anything odd is None."""
     try:
         identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
@@ -802,26 +808,55 @@ def ambiguous_price_decision(
         listing = bool(identity.get("listing_types"))
         if count <= 1 and not listing:
             return None
-        named_by: Optional[str] = None
+        conflicts = identity.get("url_conflicts")
+        conflicts = conflicts if isinstance(conflicts, int) and not isinstance(conflicts, bool) else 0
+        served_parts = _url_parts(requested_url)
+        served_handle = (extract_product_handle(str(requested_url or "")) or "").lower()
+        relation = "none"
         base = str(final_url or requested_url or "")
         for raw in (identity.get("url"), identity.get("id"), identity.get("group_url")):
-            if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#"):
-                try:
-                    candidate = urljoin(base, raw.strip()).split("#", 1)[0]
-                except ValueError:
-                    continue
-                if _same_product_url(candidate, requested_url):
-                    named_by = "url"
-                    break
-        if named_by is None:
-            name = identity.get("name")
-            if isinstance(name, str) and name.strip() and handleless_titles_match(
-                seed_title, name, brands=(seed_brand, identity.get("brand"))
-            ):
-                named_by = "title"
+            if not (isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#")):
+                continue
+            try:
+                candidate = urljoin(base, raw.strip()).split("#", 1)[0]
+            except ValueError:
+                continue
+            if _same_product_url(candidate, requested_url):
+                relation = "matched"
+                break
+            parts = _url_parts(candidate)
+            handle = (extract_product_handle(candidate) or "").lower()
+            if (served_handle and handle and handle != served_handle and parts is not None
+                    and served_parts is not None and parts[1] == served_parts[1]):
+                relation = "other_product"
+            elif relation == "none":
+                relation = "mismatch"
+        name = identity.get("name")
+        brands = (seed_brand, identity.get("brand"))
+        named_by: Optional[str] = None
+        if relation == "matched" and conflicts == 0:
+            named_by = "url"
+        elif relation != "other_product" and isinstance(name, str) and name.strip() and handleless_titles_match(
+            seed_title, name, brands=brands
+        ):
+            named_by = "title"
         refusal = None if named_by else ("listing" if listing else "several_products")
-        return {"refusal": refusal, "priced_identities": count, "named_by": named_by}
+        return {"refusal": refusal, "priced_identities": count, "named_by": named_by, "url_relation": relation,
+                "title_dice": _title_dice(seed_title, name, brands)}
     except Exception:  # noqa: BLE001 - the guard must never cost a row its refresh
+        return None
+
+
+def _title_dice(seed_title: Any, page_name: Any, brands: Sequence[Any]) -> Optional[float]:
+    """The Dice coefficient `handleless_titles_match` computes, brand words dropped, rounded; None without both titles.
+    Reporting only. Never raises."""
+    try:
+        if not (isinstance(page_name, str) and page_name.strip()):
+            return None
+        drop = _brand_tokens(*brands)
+        seed, page = _title_tokens(seed_title, drop)[0], _title_tokens(page_name, drop)[0]
+        return round(2.0 * len(seed & page) / (len(seed) + len(page)), 3) if seed and page else None
+    except Exception:  # noqa: BLE001 - reporting only
         return None
 
 

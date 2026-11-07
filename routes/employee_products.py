@@ -4314,6 +4314,7 @@ async def create_external_seed(
     # (`destination_liveness.ambiguous_price_decision`) gives the seed neither its price nor its variants (the snapshot
     # keeps no price either); a field the employee stated stands. `shadow` only logs the decision.
     ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
+    ambiguous_refused_at_create = False
     if ambiguous_mode != "off" and snapshot is not None and snapshot_price_refused is None:
         try:
             requested_for_guard: Optional[str] = _normalize_offer_url(str(dest))
@@ -4323,8 +4324,13 @@ async def create_external_seed(
             decision = destination_liveness.ambiguous_price_decision(
                 evidence=evidence,
                 requested_url=requested_for_guard,
-                seed_title=title,
-                seed_brand=(body.brand or "").strip() or None,
+                # ONLY THE EMPLOYEE'S OWN TITLE: `title` falls back to the page's, which is the pricing node's name, so
+                # the node would name itself. With no stated title the page is decided by its urls alone.
+                seed_title=(body.title or "").strip() or None,
+                # As G4 does: the stated brand, else the one this seed already stores.
+                seed_brand=(body.brand or "").strip()
+                or _ensure_json_obj(existing_dict.get("seed_data")).get("brand")
+                or None,
             ) if requested_for_guard else None
         except Exception:  # noqa: BLE001 - the guard must never cost a creation
             logger.warning("ambiguous-price guard raised at creation; priced as without it", exc_info=True)
@@ -4332,10 +4338,13 @@ async def create_external_seed(
         if decision is not None and decision.get("refusal"):
             _log_ambiguous_price_at_create(ambiguous_mode, decision)
             if ambiguous_mode == "on":
+                ambiguous_refused_at_create = True
+                # The AMOUNT is what is ambiguous, never the currency (the currency check above passed): an amount
+                # the employee stated keeps the page's currency beside it, so no amount is stored without one.
                 if body.price_amount is None:
                     price_amount = None
-                if not (body.price_currency or "").strip():
-                    price_currency = None
+                    if not (body.price_currency or "").strip():
+                        price_currency = None
                 snapshot_price_refused = {
                     "reason": "ambiguous_product",
                     "refusal": decision.get("refusal"),
@@ -4444,6 +4453,10 @@ async def create_external_seed(
                 "availability": snap_availability,
             }
         )
+        if ambiguous_refused_at_create:
+            # A re-create keeps the row's stored price (it is the one this page cannot vouch for): the stamp an earlier
+            # read left would vouch for it, so it goes, as the refresh's refusal does.
+            seed_data["snapshot"].pop("extracted_at", None)
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
             seed_data["snapshot"].pop("description_refused_source", None)
@@ -6055,7 +6068,8 @@ def _log_ambiguous_price_at_create(mode: str, decision: Dict[str, Any]) -> None:
     try:
         from utils.logger import logger as pivota_log
 
-        line = {"mode": mode, "refusal": decision.get("refusal"), "priced_identities": decision.get("priced_identities")}
+        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice")}
+        line["mode"] = mode
         pivota_log.info("AMBIGUOUS_PRICE_CREATE " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a creation
         return

@@ -737,6 +737,10 @@ def count_ambiguous_price(
             "mode": info.get("mode"),
             "refusal": refusal,
             "priced_identities": info.get("priced_identities"),
+            # What a reviewer needs to tell a bundle from a false refusal: how the node's url relates to the served
+            # one, and how close the titles are. Still no URL and no title.
+            "url_relation": info.get("url_relation"),
+            "title_dice": info.get("title_dice"),
         }
         pivota_log.info("AMBIGUOUS_PRICE_DECISION " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a row its count
@@ -2576,6 +2580,8 @@ async def run_external_referral_refresh_batch(
     # a canonical or redirect naming another product, a 200 challenge, a cached fallback, a URL with no
     # product handle). Its price and stock are not written; counted so a host that never reads is visible.
     price_not_read = 0
+    # Refused by the ambiguous-price guard (`on`): another product's price, kept apart from `not_read`.
+    price_skipped_ambiguous = 0
     availability_not_read = 0
     # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
     handleless_totals: Dict[str, int] = {}
@@ -2627,7 +2633,7 @@ async def run_external_referral_refresh_batch(
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
-        nonlocal price_not_read, availability_not_read
+        nonlocal price_not_read, availability_not_read, price_skipped_ambiguous
         nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
         nonlocal pdp_refreshed, pdp_errored, catalogue_rows_read
         outcome = "failed"
@@ -2692,6 +2698,8 @@ async def run_external_referral_refresh_batch(
                     price_unavailable += 1
                 elif price_status == "not_read":
                     price_not_read += 1
+                elif price_status == "skipped_ambiguous_product":
+                    price_skipped_ambiguous += 1
                 proj = result.get("projection")
                 if isinstance(proj, dict):
                     proj_attempted += int(proj.get("attempted") or 0)
@@ -3208,6 +3216,7 @@ async def run_external_referral_refresh_batch(
         "price_skipped_non_positive": price_skipped_non_positive,
         "price_skipped_unreadable": price_skipped_unreadable,
         "price_not_read": price_not_read,
+        **({"price_skipped_ambiguous": price_skipped_ambiguous} if ambiguous_mode != "off" else {}),
         "availability_not_read": availability_not_read,
         "price_unreadable_reasons": price_unreadable_reasons,
         # Which hosts' pages the extractor would not price, so night one says WHERE (a host whose
