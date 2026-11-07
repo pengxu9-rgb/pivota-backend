@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import os
 import sys
+from collections import Counter
 from typing import List, Optional
 
 
@@ -41,10 +42,12 @@ async def run(args: argparse.Namespace) -> int:
         await ledger.ensure_agent_purchase_schema()
         total = 0
         for batch in range(args.max_batches):
-            examined = await ledger.backfill_reap_parents(limit=args.batch)
-            total += examined
-            print(f"batch={batch} parented={examined} total={total}")
-            if examined == 0:
+            tally: Counter = Counter()
+            parented = await ledger.backfill_reap_parents(limit=args.batch, tally=tally)
+            total += parented
+            print(f"batch={batch} parented={parented} total={total} failed={tally['failed']} "
+                  f"skipped_after_failure={tally['deferred']} stopped={tally['stopped']}")
+            if parented == 0:
                 break
         return 0
     finally:

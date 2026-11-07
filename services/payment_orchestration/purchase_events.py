@@ -69,13 +69,19 @@ async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int
     """Write one event per (purchase, rail state) that warrants one, for every rail. Returns counts by
     outcome. `limit` bounds EACH rail's candidate read (a run judges at most `limit` per rail)."""
     counts: Counter = Counter()
+    heal: Counter = Counter()
     try:
         healed = await purchases_db.backfill_a2a_parents(
-            limit=HEAL_A2A_PARENTS_PER_RUN, lookback_hours=lookback_hours)
+            limit=HEAL_A2A_PARENTS_PER_RUN, lookback_hours=lookback_hours, tally=heal)
         if healed:
             counts["a2a_parent_healed"] += healed
     except Exception as exc:  # noqa: BLE001 - a failed heal must not stop detection for the rest
         logger.warning("agent_purchase_events: a2a parent heal failed error_type=%s", type(exc).__name__)
+    # Rows the heal could not give a parent (`failed`), is still waiting to retry (`deferred`), and
+    # whether it gave up after failures in a row (`stopped`): see db/agent_purchase_ledger.py.
+    for outcome, n in heal.items():
+        if n:
+            counts[f"a2a_parent_heal_{outcome}"] += n
     candidates = []
     # Each rail's read on its own: one rail's table being unreadable must not silence the other rail's
     # events (nor, in the job, the hand-over of events already recorded).

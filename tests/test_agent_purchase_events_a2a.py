@@ -50,6 +50,15 @@ async def _db():
 
 
 @pytest.fixture(autouse=True)
+def heal_clock(monkeypatch):
+    """A clock the test moves, and an empty heal retry memory (it is per process)."""
+    now = [1000.0]
+    monkeypatch.setattr(purchases, "_clock", lambda: now[0])
+    monkeypatch.setattr(purchases, "_heal_deferred_until", {})
+    return now
+
+
+@pytest.fixture(autouse=True)
 def _page_host(monkeypatch):
     monkeypatch.setenv(a2a_purchase_view.HOSTED_HOSTS_ENV, hashlib.sha256(PAGE_HOST.encode()).hexdigest())
 
@@ -306,7 +315,7 @@ async def _set_ago(ap: str, column: str, hours: int) -> None:
                            {"h": hours, "i": ap})
 
 
-async def test_a_row_whose_parent_cannot_be_written_does_not_stop_the_heal_of_the_rest(monkeypatch, caplog):
+async def test_a_row_whose_parent_cannot_be_written_does_not_stop_the_heal_of_the_rest(monkeypatch, caplog, heal_clock):
     bad = await _purchase("completed", parent=False, merchant_order_id="2001")
     good = await _purchase("completed", parent=False, merchant_order_id="2002")
     await _set_ago(bad, "state_entered_at", 2)  # oldest first: the bad row is healed first
@@ -320,14 +329,68 @@ async def test_a_row_whose_parent_cannot_be_written_does_not_stop_the_heal_of_th
     monkeypatch.setattr(purchases, "ensure_a2a_parent", flaky)
     with caplog.at_level(logging.WARNING, logger=purchases.__name__):
         counts = await purchase_events.detect()
-    assert counts == {"a2a_parent_healed": 1, "recorded": 1}
+    assert counts == {"a2a_parent_healed": 1, "a2a_parent_heal_failed": 1, "recorded": 1}
     [parent] = await database.fetch_all("SELECT rail_purchase_id FROM agent_purchases")
     assert parent["rail_purchase_id"] == good
     [warning] = [r for r in caplog.records if "a2a parent heal failed" in r.getMessage()]
     assert bad in warning.getMessage() and "RuntimeError" in warning.getMessage()
-    # Tried again next run, and healed once it can be.
+    # Left alone (and counted) while it waits to retry; healed once the wait is over.
     monkeypatch.setattr(purchases, "ensure_a2a_parent", real)
+    assert (await purchase_events.detect()) == {"a2a_parent_heal_deferred": 1}
+    heal_clock[0] += purchases.HEAL_RETRY_AFTER_SECONDS
     assert (await purchase_events.detect()) == {"a2a_parent_healed": 1, "recorded": 1}
+
+
+async def test_a_row_that_keeps_failing_does_not_hold_up_the_heal_budget(monkeypatch):
+    monkeypatch.setattr(purchase_events, "HEAL_A2A_PARENTS_PER_RUN", 1)
+    bad = await _purchase("quoting", parent=False)
+    good = await _purchase("quoting", parent=False)
+    await _set_ago(bad, "state_entered_at", 2)  # oldest first
+    real = purchases.ensure_a2a_parent
+
+    async def flaky(rail_purchase_id, **kw):
+        if rail_purchase_id == bad:
+            raise RuntimeError("constraint violation")
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", flaky)
+    assert (await purchase_events.detect()) == {"a2a_parent_heal_failed": 1}
+    assert (await purchase_events.detect()) == {"a2a_parent_healed": 1, "a2a_parent_heal_deferred": 1}
+    [parent] = await database.fetch_all("SELECT rail_purchase_id FROM agent_purchases")
+    assert parent["rail_purchase_id"] == good
+
+
+async def test_the_heal_gives_up_after_failures_in_a_row_and_says_so(monkeypatch, caplog):
+    stop = purchases.HEAL_STOP_AFTER_FAILURES_IN_A_ROW
+    for n in range(stop + 1):
+        ap = await _purchase("quoting", parent=False)
+        await _set_ago(ap, "state_entered_at", stop + 1 - n)
+
+    async def broken(rail_purchase_id, **kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", broken)
+    with caplog.at_level(logging.WARNING, logger=purchases.__name__):
+        assert (await purchase_events.detect()) == {"a2a_parent_heal_failed": stop, "a2a_parent_heal_stopped": 1}
+    assert len([r for r in caplog.records if r.name == purchases.__name__]) == stop + 1
+    assert (await purchase_events.detect()) == {"a2a_parent_heal_failed": 1, "a2a_parent_heal_deferred": stop}
+
+
+async def test_the_owner_heal_skips_a_row_it_cannot_parent_and_heals_the_rest(monkeypatch):
+    older = await _purchase("quoting", parent=False)
+    newer = await _purchase("quoting", parent=False)
+    await _set_ago(older, "created_at", 2)
+    real = purchases.ensure_a2a_parent
+
+    async def flaky(rail_purchase_id, **kw):
+        if rail_purchase_id == newer:  # newest first: tried first
+            raise RuntimeError("constraint violation")
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", flaky)
+    assert await purchases.heal_a2a_parents_for_owner(AGENT, OWNER) == 1
+    [parent] = await database.fetch_all("SELECT rail_purchase_id FROM agent_purchases")
+    assert parent["rail_purchase_id"] == older
 
 
 async def test_the_heal_takes_the_purchase_that_entered_its_state_first(monkeypatch):

@@ -27,7 +27,8 @@ unique index, so any number of concurrent healers leave exactly one row.
 
 This module opens no database transactions (same reason as the Reap ledger:
 databases==0.7.0 scopes connections by ContextVar, so a held transaction swallows concurrent
-tasks' writes). Every statement is a module-level string literal passed by name, with dialect splits as
+tasks' writes). The one nesting it does: a healer called inside a caller's transaction gives each
+row a SAVEPOINT (see HEALING, ONE ROW AT A TIME). Every statement is a module-level string literal passed by name, with dialect splits as
 `if`/`else` statements, so the PREPARE gate (tests/test_repo_sql_prepare_postgres.py) plans each one; a
 test in tests/test_agent_purchase_ledger_postgres.py holds that.
 """
@@ -37,8 +38,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
-from typing import Any, Dict, List, Mapping, Optional
+from collections import Counter
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from db.database import IS_POSTGRES, database
 
@@ -350,16 +353,108 @@ def _clamp(limit: Any, *, maximum: int) -> int:
     return max(1, min(maximum, int(limit)))
 
 
-async def backfill_reap_parents(*, limit: int = 500) -> int:
-    """Give up to `limit` parentless Reap purchases a parent, oldest first. Returns how many it
-    examined; each of them has a parent afterwards (this call's, or a concurrent healer's).
-    Run until it returns 0."""
-    rows = await database.fetch_all(
-        _SELECT_REAP_MISSING_PARENTS_SQL, {"limit": _clamp(limit, maximum=5000)}
-    )
+# ── HEALING, ONE ROW AT A TIME ───────────────────────────────────────────────────────────────
+#
+# Every healer below (the two backfills and the two owner heals) gives each row its own attempt:
+#   * A row whose parent cannot be written is logged and skipped; the rows after it are still healed.
+#   * It is then left alone for `HEAL_RETRY_AFTER_SECONDS` (in this process), so a row that fails every
+#     time neither logs on every detector tick nor holds its oldest-first place in the per-run budget:
+#     the read fetches that many more rows, and the skipped ones do not count against `limit`.
+#   * `HEAL_STOP_AFTER_FAILURES_IN_A_ROW` failures in a row end the run (database trouble, or a CHECK
+#     the parent cannot meet): a few lines per run instead of one per row. The rows tried are deferred,
+#     so the next run starts after them.
+#   * Inside a caller's transaction each row gets a SAVEPOINT, so on Postgres a row's failed statement
+#     rolls back only that row instead of aborting the transaction -- which would fail every later row
+#     and make the caller's COMMIT a silent rollback. Outside one (the detector, the routes, the
+#     script: the normal case) nothing is opened: this module opens no transaction of its own.
+
+#: Seconds a row whose parent could not be written is skipped by every healer in this process.
+HEAL_RETRY_AFTER_SECONDS = 600.0
+#: Failures in a row that end a heal run.
+HEAL_STOP_AFTER_FAILURES_IN_A_ROW = 5
+#: Deferred rows remembered at most; past it the oldest entry is forgotten (that row is just retried).
+_HEAL_DEFERRED_MAX = 1000
+_heal_deferred_until: Dict[Tuple[str, str], float] = {}
+_clock: Callable[[], float] = time.monotonic
+
+
+def _deferred_ids(rail: str) -> frozenset:
+    """This rail's rows that are being skipped now; expired entries are dropped on the way."""
+    now = _clock()
+    for key in [key for key, until in _heal_deferred_until.items() if until <= now]:
+        del _heal_deferred_until[key]
+    return frozenset(rail_purchase_id for (r, rail_purchase_id) in _heal_deferred_until if r == rail)
+
+
+def _defer(rail: str, rail_purchase_id: str) -> None:
+    _heal_deferred_until.pop((rail, rail_purchase_id), None)
+    while len(_heal_deferred_until) >= _HEAL_DEFERRED_MAX:
+        del _heal_deferred_until[next(iter(_heal_deferred_until))]
+    _heal_deferred_until[(rail, rail_purchase_id)] = _clock() + HEAL_RETRY_AFTER_SECONDS
+
+
+def _in_transaction() -> bool:
+    """Whether this task's connection holds an open `databases` transaction (0.7.0 keeps them on the
+    connection's stack; tests/test_agent_purchase_ledger.py pins that this still reads it)."""
+    return bool(database.connection()._transaction_stack)
+
+
+async def _heal_rows(
+    rail: str,
+    rows: Sequence[Mapping[str, Any]],
+    ensure: Callable[..., Awaitable[Optional[str]]],
+    *,
+    deferred: frozenset,
+    limit: int,
+    tally: Counter,
+) -> int:
+    """Give each row a parent with `ensure`, one at a time (the rules above). Returns how many rows now
+    have one. `tally` gains `failed`, `deferred` (skipped, still within their retry wait) and `stopped`."""
+    savepoint = _in_transaction()
+    healed = attempted = failures_in_a_row = 0
     for row in rows:
-        await ensure_reap_parent(row["id"], basis="backfill")
-    return len(rows)
+        rail_purchase_id = str(row["id"])
+        if rail_purchase_id in deferred:
+            tally["deferred"] += 1
+            continue
+        if attempted >= limit:
+            break
+        attempted += 1
+        try:
+            if savepoint:
+                async with database.transaction():  # nested, so a SAVEPOINT
+                    parent = await ensure(rail_purchase_id, basis="backfill")
+            else:
+                parent = await ensure(rail_purchase_id, basis="backfill")
+        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the heal of the rest
+            failures_in_a_row += 1
+            tally["failed"] += 1
+            _defer(rail, rail_purchase_id)
+            logger.warning("agent_purchase_ledger: %s parent heal failed purchase=%s error_type=%s",
+                           rail, rail_purchase_id, type(exc).__name__)
+            if failures_in_a_row >= HEAL_STOP_AFTER_FAILURES_IN_A_ROW:
+                tally["stopped"] += 1
+                logger.warning("agent_purchase_ledger: %s parent heal stopped after %d failures in a row",
+                               rail, failures_in_a_row)
+                break
+            continue
+        failures_in_a_row = 0
+        if parent is not None:
+            healed += 1
+    return healed
+
+
+
+async def backfill_reap_parents(*, limit: int = 500, tally: Optional[Counter] = None) -> int:
+    """Give up to `limit` parentless Reap purchases a parent, oldest first, row by row (see HEALING,
+    ONE ROW AT A TIME). Returns how many now have one (this call's, or a concurrent healer's). Run
+    until it returns 0; a row that fails is in `tally["failed"]` and is not retried for a while."""
+    deferred = _deferred_ids("reap")
+    rows = await database.fetch_all(
+        _SELECT_REAP_MISSING_PARENTS_SQL, {"limit": _clamp(limit + len(deferred), maximum=5000)}
+    )
+    return await _heal_rows("reap", rows, ensure_reap_parent, deferred=deferred,
+                            limit=_clamp(limit, maximum=5000), tally=tally if tally is not None else Counter())
 
 
 _SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL = """
@@ -408,65 +503,58 @@ _SELECT_A2A_MISSING_PARENTS_SQL_SQLITE = """
 """
 
 
-async def backfill_a2a_parents(*, limit: int = 50, lookback_hours: int = 72) -> int:
+async def backfill_a2a_parents(
+    *, limit: int = 50, lookback_hours: int = 72, tally: Optional[Counter] = None
+) -> int:
     """Give up to `limit` parentless A2A purchases that entered their state within `lookback_hours` a
-    parent, oldest first (see `backfill_reap_parents`). Returns how many it gave a parent.
-
-    Each row is healed on its own: a row whose parent cannot be written is logged and skipped, so it
-    does not stop the rows after it (the detector runs this on every tick, and the row would fail
-    again on each one). It keeps its place in the order and is tried again next run. Call it OUTSIDE a
-    transaction (the detector, its job and the scheduler open none): each statement then commits on
-    its own, so on Postgres a row's failed statement does not leave the connection in an aborted
-    transaction that would fail every row after it."""
-    values = {"limit": _clamp(limit, maximum=5000), "lookback_hours": max(1, min(24 * 30, int(lookback_hours)))}
+    parent, oldest first, row by row (see HEALING, ONE ROW AT A TIME). Returns how many it gave a
+    parent. A row that fails is counted in `tally["failed"]`, skipped by the next runs for
+    `HEAL_RETRY_AFTER_SECONDS` without using up `limit`, then tried again in its place."""
+    deferred = _deferred_ids("a2a")
+    values = {"limit": _clamp(limit + len(deferred), maximum=5000),
+              "lookback_hours": max(1, min(24 * 30, int(lookback_hours)))}
     if IS_POSTGRES:
         rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, values)
     else:
         rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL_SQLITE, values)
-    healed = 0
-    for row in rows:
-        try:
-            if await ensure_a2a_parent(row["id"], basis="backfill") is not None:
-                healed += 1
-        except Exception as exc:  # noqa: BLE001 - one bad row must not stop the heal of the rest
-            logger.warning("agent_purchase_ledger: a2a parent heal failed purchase=%s error_type=%s",
-                           row["id"], type(exc).__name__)
-    return healed
+    return await _heal_rows("a2a", rows, ensure_a2a_parent, deferred=deferred,
+                            limit=_clamp(limit, maximum=5000), tally=tally if tally is not None else Counter())
 
 
 async def heal_a2a_parents_for_owner(
     agent_id: str, agent_user_ref_hash: str, *, limit: int = 100
 ) -> int:
     """The owner-scoped heal for the A2A token rail, newest first (see `heal_reap_parents_for_owner`)."""
+    deferred = _deferred_ids("a2a")
     rows = await database.fetch_all(
         _SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL,
         {
             "agent_id": agent_id,
             "agent_user_ref_hash": agent_user_ref_hash,
-            "limit": _clamp(limit, maximum=500),
+            "limit": _clamp(limit + len(deferred), maximum=500),
         },
     )
-    for row in rows:
-        await ensure_a2a_parent(row["id"], basis="backfill")
-    return len(rows)
+    return await _heal_rows("a2a", rows, ensure_a2a_parent, deferred=deferred,
+                            limit=_clamp(limit, maximum=500), tally=Counter())
 
 
 async def heal_reap_parents_for_owner(
     agent_id: str, agent_user_ref_hash: str, *, limit: int = 100
 ) -> int:
     """The same backfill, scoped to one owner and NEWEST first (the order the list pages in), so the
-    first page is complete the first time it is read rather than after the next backfill run."""
+    first page is complete the first time it is read rather than after the next backfill run. Row by
+    row (see HEALING, ONE ROW AT A TIME); returns how many now have a parent."""
+    deferred = _deferred_ids("reap")
     rows = await database.fetch_all(
         _SELECT_REAP_MISSING_PARENTS_FOR_OWNER_SQL,
         {
             "agent_id": agent_id,
             "agent_user_ref_hash": agent_user_ref_hash,
-            "limit": _clamp(limit, maximum=500),
+            "limit": _clamp(limit + len(deferred), maximum=500),
         },
     )
-    for row in rows:
-        await ensure_reap_parent(row["id"], basis="backfill")
-    return len(rows)
+    return await _heal_rows("reap", rows, ensure_reap_parent, deferred=deferred,
+                            limit=_clamp(limit, maximum=500), tally=Counter())
 
 
 # ── owner-scoped reads ───────────────────────────────────────────────────────────────────────
