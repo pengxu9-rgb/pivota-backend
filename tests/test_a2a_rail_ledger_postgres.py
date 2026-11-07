@@ -23,6 +23,7 @@ _REPO = Path(__file__).resolve().parent.parent
 _MIGRATION = _REPO / "db/migrations/268_a2a_rail_ledger.sql"
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs")
+_MIGRATION_278 = _REPO / "db/migrations/278_a2a_rail_worker_heartbeat.sql"
 AGENT = "agent_a2a_pg"
 PAGE = "https://pay.rail.test/approve/1"
 
@@ -99,6 +100,29 @@ async def test_the_self_heal_builds_the_same_schema_as_migration_268():
     await ledger.ensure_a2a_rail_schema()
     assert [await _fingerprint(t) for t in _TABLES] == from_migration
     assert await _rail_check() == migrated_check
+
+
+async def test_the_self_heal_builds_the_same_heartbeat_as_migration_278_and_it_ages_out():
+    from db.database import database
+    from db.sql_migrations import split_statements
+    import db.a2a_rail_ledger as ledger
+
+    await database.execute("DROP TABLE IF EXISTS a2a_rail_worker_heartbeat")
+    for statement in split_statements(_MIGRATION_278.read_text(encoding="utf-8")):
+        await database.execute(statement)
+    from_migration = await _fingerprint("a2a_rail_worker_heartbeat")
+    assert [name for name, _ in from_migration[2]] == ["ck_a2a_rail_worker_heartbeat_one"]
+    await database.execute("DROP TABLE IF EXISTS a2a_rail_worker_heartbeat")
+    await ledger.ensure_a2a_rail_schema()
+    assert await _fingerprint("a2a_rail_worker_heartbeat") == from_migration
+    assert await ledger.worker_is_alive() is False
+    await ledger.record_worker_heartbeat()
+    await ledger.record_worker_heartbeat()
+    assert await ledger.worker_is_alive() is True
+    await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = now() - interval '901 seconds'")
+    assert await ledger.worker_is_alive() is False
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_worker_heartbeat"))["n"] == 1
+    await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
 
 
 async def test_the_parent_heal_widens_an_old_rail_check_and_keeps_rows():
