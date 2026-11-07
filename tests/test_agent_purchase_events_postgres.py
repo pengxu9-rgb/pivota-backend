@@ -189,7 +189,7 @@ async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
     # Only this test's rows are judged: the dialect gate shares one database across test files.
     got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
     assert got & set(made) == {live, fresh}
-    assert await purchases.backfill_a2a_parents(limit=5000) >= 1
+    assert await purchases.backfill_a2a_parents(limit=5000, lookback_hours=24) >= 1
     healed = await database.fetch_one(
         "SELECT id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id = :i", {"i": orphan})
     assert healed is not None

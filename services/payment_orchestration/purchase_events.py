@@ -67,16 +67,24 @@ HEAL_A2A_PARENTS_PER_RUN = 50
 
 async def detect(*, lookback_hours: int = 24, limit: int = 200) -> Dict[str, int]:
     """Write one event per (purchase, rail state) that warrants one, for every rail. Returns counts by
-    outcome. `limit` bounds each rail's candidate read."""
+    outcome. `limit` bounds EACH rail's candidate read (a run judges at most `limit` per rail)."""
     counts: Counter = Counter()
     try:
-        healed = await purchases_db.backfill_a2a_parents(limit=HEAL_A2A_PARENTS_PER_RUN)
+        healed = await purchases_db.backfill_a2a_parents(
+            limit=HEAL_A2A_PARENTS_PER_RUN, lookback_hours=lookback_hours)
         if healed:
             counts["a2a_parent_healed"] += healed
     except Exception as exc:  # noqa: BLE001 - a failed heal must not stop detection for the rest
         logger.warning("agent_purchase_events: a2a parent heal failed error_type=%s", type(exc).__name__)
-    candidates = await events_db.reap_candidates(lookback_hours=lookback_hours, limit=limit)
-    candidates += await events_db.a2a_candidates(lookback_hours=lookback_hours, limit=limit)
+    candidates = []
+    # Each rail's read on its own: one rail's table being unreadable must not silence the other rail's
+    # events (nor, in the job, the hand-over of events already recorded).
+    for rail, read in (("reap", events_db.reap_candidates), ("a2a", events_db.a2a_candidates)):
+        try:
+            candidates += await read(lookback_hours=lookback_hours, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent_purchase_events: %s candidate read failed error_type=%s", rail, type(exc).__name__)
+            counts[f"{rail}_read_failed"] += 1
     for parent in candidates:
         try:
             outcome = await _detect_one(parent)

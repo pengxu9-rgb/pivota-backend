@@ -373,13 +373,27 @@ _SELECT_A2A_MISSING_PARENTS_FOR_OWNER_SQL = """
 """
 
 
-#: A2A purchases with no parent, oldest first. The create route writes the parent after the child
-#: commits, best effort; a parent that was not written leaves the purchase invisible to the event
-#: detector (it reads parents), so the detector heals these before it reads.
+#: A2A purchases with no parent, created within the lookback, oldest first. The create route writes the
+#: parent after the child commits, best effort; a parent that was not written leaves the purchase
+#: invisible to the event detector (it reads parents), so the detector heals these before it reads.
+#: Bounded by `created_at` so a tick does not scan the whole table: an older purchase has had every
+#: run since to be healed (and the owner read heals it too).
 _SELECT_A2A_MISSING_PARENTS_SQL = """
     SELECT r.id
       FROM a2a_rail_purchases r
-     WHERE NOT EXISTS (
+     WHERE r.created_at > clock_timestamp() - (:lookback_hours * INTERVAL '1 hour')
+       AND NOT EXISTS (
+            SELECT 1 FROM agent_purchases p
+             WHERE p.rail = 'a2a' AND p.rail_purchase_id = r.id
+           )
+     ORDER BY r.created_at, r.id
+     LIMIT :limit
+"""
+_SELECT_A2A_MISSING_PARENTS_SQL_SQLITE = """
+    SELECT r.id
+      FROM a2a_rail_purchases r
+     WHERE r.created_at > datetime('now', '-' || :lookback_hours || ' hours')
+       AND NOT EXISTS (
             SELECT 1 FROM agent_purchases p
              WHERE p.rail = 'a2a' AND p.rail_purchase_id = r.id
            )
@@ -388,10 +402,14 @@ _SELECT_A2A_MISSING_PARENTS_SQL = """
 """
 
 
-async def backfill_a2a_parents(*, limit: int = 50) -> int:
-    """Give up to `limit` parentless A2A purchases a parent, oldest first (see `backfill_reap_parents`).
-    Returns how many it examined."""
-    rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, {"limit": _clamp(limit, maximum=5000)})
+async def backfill_a2a_parents(*, limit: int = 50, lookback_hours: int = 72) -> int:
+    """Give up to `limit` parentless A2A purchases created within `lookback_hours` a parent, oldest
+    first (see `backfill_reap_parents`). Returns how many it examined."""
+    values = {"limit": _clamp(limit, maximum=5000), "lookback_hours": max(1, min(24 * 30, int(lookback_hours)))}
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, values)
+    else:
+        rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL_SQLITE, values)
     for row in rows:
         await ensure_a2a_parent(row["id"], basis="backfill")
     return len(rows)

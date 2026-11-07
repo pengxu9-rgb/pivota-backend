@@ -200,3 +200,84 @@ def test_the_page_kinds_in_the_candidate_read_are_the_views():
     for sql in (events_db._A2A_CANDIDATES_SQL, events_db._A2A_CANDIDATES_SQL_SQLITE):
         pairs = set(re.findall(r"r\.state = '(\w+)' AND r\.buyer_action_kind = '(\w+)'", sql))
         assert pairs == want
+
+
+# ── review round 1 ───────────────────────────────────────────────────────────────────────────
+
+
+async def _reap_failed() -> str:
+    import db.reap_agentic_ledger as reap_ledger
+
+    rp = (await reap_ledger.create_purchase(
+        buyer_ref="bref_ada", agent_id=AGENT, agent_user_ref_hash=OWNER, merchant_domain="brand.example",
+        product_key="pk_1", product_name="Glow Serum", quantity=1, currency="USD", our_price_minor=4250,
+    ))["id"]
+    await database.execute("UPDATE reap_agentic_purchases SET state = 'failed' WHERE id = :i", {"i": rp})
+    return await purchases.ensure_reap_parent(rp)
+
+
+async def test_an_unreadable_a2a_table_does_not_silence_reap_events():
+    reap_pp = await _reap_failed()
+    await database.execute("DROP TABLE a2a_rail_purchases")
+    counts = await purchase_events.detect()
+    assert counts == {"a2a_read_failed": 1, "recorded": 1}
+    assert [(e["purchase_id"], e["rail"]) for e in await _events()] == [(reap_pp, "reap")]
+
+
+async def test_the_job_hands_over_recorded_events_even_when_detection_fails(monkeypatch):
+    import jobs.agent_purchase_events as job
+    import services.agent_webhook_service as webhooks
+    from services import webhook_delivery_gate
+
+    await _reap_failed()
+    await purchase_events.detect()  # one pending event, recorded before the failure below
+    sent = []
+
+    async def emit(agent_id, *, event_type, payload, request_id=None, event_id=None):
+        sent.append(event_id)
+        return {"status": "delivered", "delivery_id": "whd_x"}
+
+    async def broken(**_kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", emit)
+    monkeypatch.setattr(webhook_delivery_gate, "delivery_enabled", lambda *a, **k: True)
+    monkeypatch.setattr(purchase_events, "detect", broken)
+    monkeypatch.setenv(purchase_events.AGENT_PURCHASE_WEBHOOKS_ENABLED_ENV, "1")
+    monkeypatch.setenv(purchases.AGENT_PURCHASE_LEDGER_ENABLED_ENV, "1")
+    result = await job.run_agent_purchase_events()
+    assert result["detected"] == {"detect_failed": 1} and result["handed"] == {"handed_over": 1}
+    assert len(sent) == 1
+
+
+async def test_the_heal_is_bounded_per_run(monkeypatch):
+    monkeypatch.setattr(purchase_events, "HEAL_A2A_PARENTS_PER_RUN", 2)
+    for _ in range(3):
+        await _purchase("quoting", parent=False)
+    assert (await purchase_events.detect()).get("a2a_parent_healed") == 2
+    assert (await purchase_events.detect()).get("a2a_parent_healed") == 1
+    assert (await purchase_events.detect()).get("a2a_parent_healed") is None
+
+
+async def test_the_heal_does_not_scan_purchases_older_than_the_lookback():
+    old = await _purchase("completed", parent=False, merchant_order_id="1005")
+    await database.execute("UPDATE a2a_rail_purchases SET created_at = '2000-01-01 00:00:00' WHERE id = :i", {"i": old})
+    assert (await purchase_events.detect(lookback_hours=24)).get("a2a_parent_healed") is None
+    assert await database.fetch_one("SELECT id FROM agent_purchases") is None
+
+
+async def test_a_refused_a2a_page_is_rechecked_and_a_republished_page_becomes_the_event():
+    pp = await _purchase("awaiting_authorization", buyer_action_kind="approval",
+                         buyer_action_url="https://evil.example/approve", buyer_action_expires_at=FUTURE)
+    assert (await purchase_events.detect()) == {"no_action": 1}
+    [row] = await _events()
+    first_id = row["event_id"]
+    age = "UPDATE agent_purchase_events SET checked_at = datetime('now', '-600 seconds')"
+    await database.execute(age)
+    assert (await purchase_events.detect()) == {"no_action": 1}  # re-checked, still refused
+    ap = (await database.fetch_one("SELECT rail_purchase_id FROM agent_purchases WHERE id = :p", {"p": pp}))[0]
+    await database.execute("UPDATE a2a_rail_purchases SET buyer_action_url = :u WHERE id = :i", {"u": PAGE, "i": ap})
+    await database.execute(age)
+    assert (await purchase_events.detect()) == {"recorded": 1}
+    [row] = await _events()
+    assert (row["status"], row["event_id"], row["payload"]["next_action"]["url"]) == ("pending", first_id, PAGE)
