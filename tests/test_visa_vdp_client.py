@@ -234,6 +234,56 @@ def test_credential_shaped_values_are_stripped_under_any_key():
     assert result.credential_fields_stripped == 9
 
 
+def _b64(text, *, url=False, pad=True):
+    raw = (base64.urlsafe_b64encode if url else base64.b64encode)(text.encode()).decode()
+    return raw if pad else raw.rstrip("=")
+
+
+@pytest.mark.parametrize("name,value", [
+    ("flattened JSON JWS", {"protected": "eyJhbGciOiJSUzI1NiJ9", "payload": _b64('{"t":"x"}', url=True),
+                            "signature": "c2ln"}),
+    ("general JSON JWS", {"payload": "e30", "signatures": [{"protected": "e30", "signature": "c2ln"}]}),
+    ("JSON JWE", {"protected": "e30", "iv": "aXY", "ciphertext": "Y3Q", "tag": "dGFn"}),
+    ("dot-less base64url JSON", _b64(json.dumps({"token": DPAN}), url=True, pad=False)),
+    ("unpadded base64 of a DPAN", _b64(DPAN, pad=False)),
+    ("padded base64url of a DPAN", _b64(DPAN, url=True)),
+    ("dot-split DPAN", "4895.3700.1200.3478"),
+    ("dash-split DPAN", "4895-3700-1200-3478"),
+])
+def test_encoded_and_split_credentials_are_stripped(name, value):
+    cleaned, removed = vdp.strip_vic_credentials({"keep": "ok", "x": value})
+    assert cleaned == {"keep": "ok"} and removed == 1, name
+
+
+@pytest.mark.parametrize("text", [
+    "monkeyJumps.v1.json", "see eyJustText.here.now", "keyJ.a.b", "v2.3.1", "order 1234", "2026-11-07T04:00:00Z", "https://sandbox.api.visa.com/vdp/helloworld",
+    "ins_abcdefghijklmnop", "paymentAccountReference", "APPROVED",
+])
+def test_ordinary_text_is_kept(text):
+    cleaned, removed = vdp.strip_vic_credentials({"x": text})
+    assert cleaned == {"x": text} and removed == 0
+
+
+def test_jose_is_matched_only_as_a_whole_token_with_a_real_header():
+    jws = _jws({"a": 1})
+    assert vdp._has_jose(jws) and vdp._has_jose("Bearer " + jws) and vdp._has_jose(f"[{jws}]")
+    assert not vdp._has_jose("x" + jws)  # glued to a word: not a whole token
+    fake_header = vdp._b64u(b'{"typ":"x"}') + ".a.b"  # JSON header without alg/enc
+    assert not vdp._has_jose(fake_header)
+
+
+def test_a_credential_shaped_dict_key_is_dropped():
+    cleaned, removed = vdp.strip_vic_credentials({DPAN: "v", _jws({"a": 1}): "w", "ok": 1})
+    assert cleaned == {"ok": 1} and removed == 2
+
+
+def test_a_luhn_valid_order_id_is_dropped_fail_closed():
+    # Documented trade-off: a numeric id that passes Luhn goes too, as a string or an int.
+    for value in (DPAN, int(DPAN), float(int(DPAN))):
+        cleaned, removed = vdp.strip_vic_credentials({"orderId": value, "status": "OK"})
+        assert cleaned == {"status": "OK"} and removed == 1
+
+
 def test_a_bare_credential_body_is_stripped():
     cleaned, removed = vdp.strip_vic_credentials(_jws({"token": DPAN}))
     assert cleaned is None and removed == 1
@@ -250,6 +300,13 @@ def test_xpay_api_key_never_reaches_any_log(caplog, level):
     assert sentinel not in caplog.text  # ... and the key is not in any record
     assert all(sentinel not in r.getMessage() for r in caplog.records)
     assert "apikey=[redacted]" in caplog.text
+
+
+def test_upper_case_apikey_is_redacted(caplog):
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("httpx").info("GET %s", "https://sandbox.api.visa.com/vdp/helloworld?APIKEY=UPPER1&ApiKey=MIXED2")
+    assert "UPPER1" not in caplog.text and "MIXED2" not in caplog.text
+    assert caplog.text.count("[redacted]") == 2
 
 
 def test_redaction_covers_httpcore_loggers_and_keeps_other_records(caplog):
@@ -279,6 +336,39 @@ def test_encrypted_answer_with_another_kid_or_a_stale_iat_is_refused(visa_mle):
         client, _ = _client(_json(200, {"encData": answer}), mle=keys)
         result = asyncio.run(client.hello_world())
         assert result.outcome == "mle_error" and result.body is None
+
+
+def _jwe_with_header(header, server_cert_pem):
+    """A JWE built like mle_encrypt but with an arbitrary protected header (e.g. a string iat)."""
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    protected = vdp._b64u(json.dumps(header).encode())
+    cek = AESGCM.generate_key(bit_length=128)
+    iv = os.urandom(12)
+    oaep = padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    enc_key = vdp._load_public_key(server_cert_pem).encrypt(cek, oaep)
+    sealed = AESGCM(cek).encrypt(iv, b"{}", protected.encode())
+    return ".".join((protected, vdp._b64u(enc_key), vdp._b64u(iv), vdp._b64u(sealed[:-16]), vdp._b64u(sealed[-16:])))
+
+
+def test_a_string_iat_is_refused(visa_mle):
+    now = int(time.time() * 1000)
+    jwe = _jwe_with_header({"alg": "RSA-OAEP-256", "enc": "A128GCM", "kid": "kid-1", "iat": str(now)},
+                           visa_mle["server_cert"])
+    with pytest.raises(ValueError):
+        vdp.mle_decrypt(jwe, visa_mle["server_key"], expected_kid="kid-1", max_skew_s=300)
+    assert vdp.mle_decrypt(jwe, visa_mle["server_key"]) == "{}"  # unchecked when not asked
+
+
+def test_mle_error_on_a_2xx_is_flagged_outcome_unknown(visa_mle):
+    keys = vdp.MleKeys("kid-1", visa_mle["server_cert"], visa_mle["client_key"])
+    answer = vdp.mle_encrypt("{}", visa_mle["client_cert"], "kid-2")
+    ok_client, _ = _client(_json(200, {"encData": answer}), mle=keys)
+    result = asyncio.run(ok_client.hello_world())
+    assert result.outcome == "mle_error" and any("outcome unknown" in n for n in result.notes)
+    err_client, _ = _client(_json(400, {"encData": answer}), mle=keys)
+    assert not any("outcome unknown" in n for n in asyncio.run(err_client.hello_world()).notes)
 
 
 def test_mle_decrypt_checks_kid_and_iat_only_when_asked(visa_mle):
@@ -337,6 +427,14 @@ def test_paths_cannot_escape_the_host(path):
     client, _ = _client(_json(200, {}))
     with pytest.raises(ValueError):
         asyncio.run(client.request("GET", path))
+
+
+@pytest.mark.parametrize("path", ["/vdp/hello\tworld", "/vdp/hello\r\nX-Evil: 1", "/vdp/hello world", "/vdp/\x00"])
+def test_a_path_with_control_characters_is_a_result_not_an_exception(path):
+    client, rec = _client(_json(200, {}))
+    result = asyncio.run(client.request("GET", path))
+    assert result.outcome == "invalid_request" and result.status is None and not result.ok
+    assert rec.requests == []
 
 
 def test_redirect_is_not_followed():
@@ -413,6 +511,24 @@ def test_job_gate_open_only_when_every_mode_answers(clean_env, monkeypatch, caps
     monkeypatch.setattr(vdp, "from_env", lambda: real(transport=httpx.MockTransport(_json(401, {"x": 1}))))
     assert job.main() == 1
     assert json.loads(capsys.readouterr().out)["gate"] == "CLOSED"
+
+
+def test_job_restores_the_http_logger_levels(clean_env, monkeypatch, capsys):
+    clean_env.setenv(vdp.VISA_VDP_ENABLED_ENV, "on")
+    clean_env.setenv(vdp.VISA_VDP_API_KEY_ENV, "K")
+    clean_env.setenv(vdp.VISA_VDP_SHARED_SECRET_ENV, "S")
+    real = vdp.from_env
+    monkeypatch.setattr(vdp, "from_env", lambda: real(transport=httpx.MockTransport(_json(200, {"m": 1}))))
+    before = {n: logging.getLogger(n).level for n in ("httpx", "httpcore")}
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    try:
+        job.main()
+        capsys.readouterr()
+        assert logging.getLogger("httpx").level == logging.DEBUG
+        assert logging.getLogger("httpcore").level == before["httpcore"]
+    finally:
+        for n, level in before.items():
+            logging.getLogger(n).setLevel(level)
 
 
 def test_job_not_configured_exits_2(clean_env, capsys):
