@@ -6182,8 +6182,9 @@ async def _refresh_external_seed_by_id(
     # BEFORE this was known and wrote the fetched page's price whatever it was -- a canonical naming
     # another product, a 200 redirect onto another handle, a 200 bot challenge, a cached fallback, a
     # URL with no product handle -- and the serving lanes read `price_amount` (and a stored variant's
-    # price ahead of it) first. NOT gated here, as before: the snapshot's title, copy, image and
-    # canonical from a page fetch, and the curated fills (title, description, image_url when empty).
+    # price ahead of it) first. The page's COPY (the snapshot's title, copy, image, gallery and canonical, the
+    # curated fills and the row's title / image_url fills) follows the content gate instead (`page_read_is_the_product`,
+    # below): a fetch that is not a read of the served product writes none of it.
     # Deriving "did we read it" twice is the twin-implementation drift this file keeps paying for.
     #
     # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
@@ -6300,8 +6301,8 @@ async def _refresh_external_seed_by_id(
             }
         )
     elif not page_read_is_the_product:
-        # A PAGE THAT IS NOT A READ OF THE SERVED PRODUCT WRITES NO COPY. A redirect onto another handle, a
-        # canonical naming another product, a cached fallback or a challenge page answered this fetch: its title,
+        # A PAGE THAT IS NOT A READ OF THE SERVED PRODUCT WRITES NO COPY. A redirect onto another handle, a 200
+        # bot challenge, a cached fallback or a fetch that reached nothing answered this fetch: its title,
         # copy, image and canonical are another page's, and the gateway serves `snapshot.description` AHEAD of the
         # seed's own. Only what the catalogue lane writes is written: the price facts and the clock. A handle-less
         # read (EXTERNAL_SEED_HANDLELESS_READ `on`) also lands here: it reads price, stock and variants, never the
@@ -6767,8 +6768,10 @@ async def _refresh_external_seed_by_id(
             "read_canonical_url": row.get("canonical_url"),
             "canonical_url": served_canonical,
             "domain": served_domain,
-            "title": snap_title,
-            "image_url": snap_image_url,
+            # The row's columns fill an EMPTY title / image (COALESCE above) and serving falls back to them: only from
+            # a page that is the served product, as the copy above.
+            "title": None if (content_read and not page_read_is_the_product) else snap_title,
+            "image_url": None if (content_read and not page_read_is_the_product) else snap_image_url,
             "price_amount": next_amount,
             "price_currency": next_currency,
             "availability": next_availability,

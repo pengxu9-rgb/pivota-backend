@@ -78,6 +78,8 @@ def test_a_page_that_is_not_a_read_fills_no_empty_field(monkeypatch, case: str) 
     assert not seed_data.get("title")
     assert not seed_data.get("description")
     assert not seed_data.get("image_url")
+    # The row's columns are filled by COALESCE and serving falls back to them: nothing is offered to fill them.
+    assert (out["written"]["title"], out["written"]["image_url"]) == (None, None)
 
 
 def test_the_read_twin_writes_the_pages_copy(monkeypatch) -> None:
@@ -102,6 +104,8 @@ def test_the_read_twin_fills_empty_fields(monkeypatch) -> None:
     assert seed_data["title"] == "Brand Ceramide Barrier Cream 50ml"
     assert seed_data["description"] == "A rich ceramide cream, reformulated."
     assert seed_data["image_url"] == "https://cdn.example.com/cream-new.jpg"
+    assert (out["written"]["title"], out["written"]["image_url"]) == (
+        "Brand Ceramide Barrier Cream 50ml", "https://cdn.example.com/cream-new.jpg")
 
 
 def test_a_not_read_page_keeps_the_stored_read_source(monkeypatch) -> None:
@@ -121,11 +125,17 @@ def test_a_not_read_page_keeps_the_stored_description_refused_source(monkeypatch
 
 
 def test_the_stale_description_cleanup_still_runs_on_a_not_read_page(monkeypatch) -> None:
-    # Clearing stale copy on a blocked seed imports nothing from the page: it is not gated with the copy writes.
+    # Clearing stale copy on a blocked seed imports nothing from the page: it is not gated with the copy writes. With
+    # the snapshot's blank description kept (it was replaced by the other page's before), the cleanup now fires on a
+    # not-read fetch of a blocked seed too, and clears the variants' copy as well, under its own rule.
     row = _row()
     row["seed_data"]["snapshot"].update(description="", diagnostics={"failure_category": "no_product_urls"})
+    row["seed_data"]["variants"] = [{"variant_id": "v-1", "sku": "CR-50", "title": "50ml",
+                                     "description": "Stale localized copy."}]
     out = _refresh(monkeypatch, row=copy.deepcopy(row), html=_other_page(), observed={}, mode="off")
     assert out["seed_data"].get("description") is None
+    assert out["seed_data"]["variants"][0].get("description") is None
+    assert out["seed_data"]["snapshot"].get("description") == ""
 
 
 def test_a_handleless_read_prices_the_row_but_writes_no_copy(monkeypatch) -> None:
@@ -143,3 +153,7 @@ def test_a_handleless_read_prices_the_row_but_writes_no_copy(monkeypatch) -> Non
     assert {k: snapshot.get(k) for k in ("title", "description", "image_url")} == {
         k: STORED_SNAPSHOT[k] for k in ("title", "description", "image_url")}
     assert "read_source" not in snapshot
+    # It READ the price and stock: the snapshot's price facts are the page's (read=True), not the stored ones.
+    assert (snapshot.get("price_amount"), snapshot.get("price_currency")) == (25.0, "USD")
+    assert snapshot.get("availability") == "in_stock"
+    assert (out["written"]["title"], out["written"]["image_url"]) == (None, None)
