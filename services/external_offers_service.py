@@ -19,6 +19,7 @@ from services import crawl_global_pacer
 from services import crawl_identity
 from services import crawl_politeness
 from services import deal_code_capture
+from services import deal_code_capture_writer
 from services import shopify_edge_pacer
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 from utils.crawled_price import (
@@ -2891,7 +2892,9 @@ async def resolve_external_offer(
         # milliseconds while looking like the host was down. The sibling destination sweep
         # passes 0 explicitly; until now the content refresh could not, because there was no
         # parameter between it and here. Default None keeps the live route exactly as it was.
-        html, _ct = await _fetch_html(url_norm, observed=observed, max_wait=max_wait)
+        # The caller's out-param when it passed one; otherwise our own, so the capture writer can read `final_url`.
+        fetch_observed = observed if observed is not None else {}
+        html, _ct = await _fetch_html(url_norm, observed=fetch_observed, max_wait=max_wait)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
@@ -2899,9 +2902,17 @@ async def resolve_external_offer(
 
         amount, currency, price_read = snapshot_price_fields(extracted)
         # ADR-027 code collection, SHADOW: count the codes this page's promo regions print, from the HTML
-        # already in hand (no extra request). Writes nothing; never raises; off unless the job sets the flag.
+        # already in hand (no extra request). Never raises; off unless the job sets the flag. With
+        # DEAL_CODE_CAPTURE_WRITE on too, the codes are recorded as unverified merchant_published rows
+        # (services/deal_code_capture_writer.py): storage only, never verified or served from there.
         if settings.deal_code_capture_shadow:
-            deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
+            captured_codes = deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
+            if captured_codes and settings.deal_code_capture_write:
+                # Where the fetch ENDED: a page another host served is not this seller's (review of be#2732).
+                await deal_code_capture_writer.record(
+                    captured_codes, url=url_norm, market=market_norm, page_currency=currency,
+                    final_url=fetch_observed.get("final_url"),
+                )
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()

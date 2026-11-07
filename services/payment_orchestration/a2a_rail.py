@@ -128,6 +128,8 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
+    # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
+    "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
 })
 #: Key fragments that only ever name an authentication credential (`paymentCryptogram`, `cavv`,
 #: `authenticationValue`, ...), matched as substrings of the canonical key.

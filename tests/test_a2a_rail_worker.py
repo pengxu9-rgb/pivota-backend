@@ -1396,3 +1396,29 @@ async def test_a_token_from_a_purchase_that_ended_long_ago_is_neither_voided_nor
     pid = await _ended("expired")
     await _ago("terminal_at", ledger.ORPHAN_MAX_AGE_SECONDS + 3600, purchase_id=pid)
     assert await ledger.count_orphan_tokens() == 0 and await ledger.list_orphan_tokens(limit=10) == []
+
+
+# ── review round 1 follow-ups ────────────────────────────────────────────────────────────────
+
+
+async def test_an_orphan_is_kept_for_the_rails_whole_token_lifetime():
+    """An unbounded authorisation on the rail lasts 30 days: a token from a purchase that ended 30 days
+    ago may still be live, so it is still counted and offered to a voider."""
+    assert ledger.ORPHAN_MAX_AGE_SECONDS >= 30 * 86400
+    pid = await _ended("expired")
+    await _ago("terminal_at", 30 * 86400 - 3600, purchase_id=pid)
+    assert await ledger.count_orphan_tokens() == 1
+    assert [r["id"] for r in await ledger.list_orphan_tokens(limit=10)] == [pid]
+
+
+async def test_the_tick_hands_its_voider_to_the_orphan_pass():
+    pid = await _ended("failed", "ptk_tick")
+    seen = []
+
+    async def voider(row):
+        seen.append(row["payment_token_id"])
+        return True
+
+    counts = await worker.run_tick(_client(Rail()), W, voider=voider)
+    assert seen == ["ptk_tick"] and counts.get("token_voided") == 1 and "orphan_tokens" not in counts
+    assert (await _row(pid))["payment_token_id"] is None

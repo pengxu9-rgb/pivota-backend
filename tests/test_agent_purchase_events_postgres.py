@@ -186,6 +186,8 @@ async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
     await purchase("completed", ", state_entered_at = now() - interval '3 days', updated_at = now()")
     fresh = await purchase("failed", ", updated_at = now() - interval '3 days'")
     orphan = await purchase("completed", parent=False)
+    old_born = await purchase("completed", ", created_at = now() - interval '30 hours'", parent=False)
+    settled = await purchase("completed", ", state_entered_at = now() - interval '3 days'", parent=False)
     # Only this test's rows are judged: the dialect gate shares one database across test files.
     got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
     assert got & set(made) == {live, fresh}
@@ -195,6 +197,11 @@ async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
     assert healed is not None
     got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
     assert healed["id"] in got
+    # The heal is bounded by the detector's clock (state_entered_at), not by created_at.
+    parents = {row["rail_purchase_id"] for row in await database.fetch_all(
+        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
+        {"a": old_born, "b": settled})}
+    assert parents == {old_born}
 
 
 async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():
