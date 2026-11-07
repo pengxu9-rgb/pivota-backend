@@ -103,7 +103,7 @@ async def test_bar_text_clearing_and_the_literal_prefix_on_postgres(db):
 
     await offer(db, "young")
     await offer(db, "checked")
-    await verification(db, "checked", "unverified")
+    await verification(db, "checked", "failed")
     key = observed_store_offer_key(seller_id="glow.example", market="US", code="LOOKALIKE", platform_rule_ref=None, program_id=None)
     await db.execute(o.insert().values(deal_id="dlcXlookalike", deal_key=key, seller_id="glow.example", market="US",
                                        code="LOOKALIKE", kind="percent", value=10, source="merchant_published",
@@ -146,3 +146,53 @@ async def test_the_writers_opt_out_check_binds_its_host_on_postgres(db, optout_i
     await _catalog_row(db, 2, merchant="merch_obs_other", source_domain="other.example")
     await db.execute(deal_lane_optout.insert().values(seller_id=optout_id, requested_at=NOW, recorded_by="test"))
     assert await w._opted_out("glow.example") is hit
+
+
+# The rules' exact boundaries and the verification lifecycle, executed on Postgres (TIMESTAMPTZ) with this file's `db`
+# fixture. Only cases that write no catalog_products rows: those are shared across gate files.
+from tests.test_deal_code_retention import (  # noqa: E402,F401
+    test_a_code_refused_twice_is_kept_7_days_after_the_LAST_refusal,
+    test_a_delete_re_checks_its_condition,
+    test_a_lapsed_verification_keeps_the_30_day_grace_whatever_its_state_now,
+    test_a_recent_refusal_keeps_a_row_not_seen_for_more_than_14_days,
+    test_a_refused_row_once_applied_follows_the_applied_clock_not_the_refusal_clock,
+    test_an_expired_verification_counts_as_applied_even_without_verified_at,
+    test_an_applied_row_with_a_refused_variant_follows_the_applied_clock,
+    test_an_opted_out_host_covers_its_subdomains_and_padded_sellers_but_not_look_alikes_or_platforms,
+    test_the_applied_boundary_is_exactly_30_days_after_the_last_valid_until,
+    test_the_bar_text_boundary_is_exactly_14_days_after_creation,
+    test_the_opt_out_trims_the_id_and_matches_a_www_stored_seller,
+    test_the_refused_boundary_is_exactly_7_days_after_the_last_refusal,
+    test_the_unverified_boundary_is_exactly_14_days,
+)
+
+
+async def test_the_opt_out_rule_stays_cheap_at_scale(db):
+    """Review of be#2735, P2-1: 30k catalog rows, 2k crawl rows and 3 opt-outs took 44 s with the correlated predicate.
+    The denied host set is read once, so the whole run stays well under a few seconds."""
+    import time
+
+    from services import deal_code_retention as r
+    from tests.test_deal_code_retention import NOW
+
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, source_domain)"
+        " SELECT :p || g, 'dcr_m' || (g % 3000), 'shopify', 'dcr' || g, 't', 'h' || (g % 3000) || '.example'"
+        " FROM generate_series(1, 30000) AS g",
+        {"p": _PREFIX},
+    )
+    await db.execute(
+        "INSERT INTO observed_store_offers (deal_id, deal_key, seller_id, market, code, kind, value, source, observed_at)"
+        " SELECT 'dlc_perf' || g, md5('perf' || g), 's' || g || '.example', 'US', 'C' || g, 'percent', 10,"
+        " 'merchant_published', :now FROM generate_series(1, 2000) AS g",
+        {"now": NOW},
+    )
+    for optout in ("dcr_m5", "merch_nomatch", "nomatch.example"):
+        await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
+                         {"s": optout, "t": NOW})
+    started = time.monotonic()
+    out = await r.run(now=NOW)
+    elapsed = time.monotonic() - started
+    assert "errors" not in out, out
+    assert not any(out.values()), out
+    assert elapsed < 5, f"retention took {elapsed:.1f}s"

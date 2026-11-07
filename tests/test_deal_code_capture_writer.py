@@ -107,7 +107,9 @@ async def test_a_second_sighting_refreshes_the_observation_never_identity_or_ver
     assert second["observed_at"] >= first["observed_at"]
     assert second["created_at"] == first["created_at"]
     assert len(await db.fetch_all(v.select())) == 1
-    assert dcc.stats()["writes"] == {"inserted": 1, "updated": 1}
+    # The bar text follows the row's own discount: a sighting stating another value does not replace it.
+    assert second["terms_text"] == "Get 15% off with code SAVE15"
+    assert dcc.stats()["writes"] == {"inserted": 1, "updated": 1, "terms_differ": 1}
 
 
 async def test_no_row_without_a_stated_kind_or_with_an_unreadable_value(db):
@@ -150,6 +152,7 @@ async def test_a_database_failure_is_counted_and_never_raised(db, monkeypatch, c
         raise RuntimeError("db down")
 
     monkeypatch.setattr(w.database, "fetch_one", boom)
+    monkeypatch.setattr(w.database, "fetch_all", boom)
     caplog.set_level(logging.WARNING)
     await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
     # The first read is the opt-out check, which fails closed.
@@ -228,7 +231,7 @@ async def test_an_opt_out_check_that_cannot_be_read_writes_nothing(db, monkeypat
     async def boom(*a, **k):
         raise RuntimeError("catalog unreadable SAVE15")
 
-    monkeypatch.setattr(w.database, "fetch_one", boom)  # the opt-out check is the first read
+    monkeypatch.setattr(w.database, "fetch_all", boom)  # the opt-out check is the first read
     caplog.set_level(logging.WARNING)
     await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
     monkeypatch.undo()
@@ -262,11 +265,15 @@ async def test_an_insert_that_loses_the_race_becomes_an_update(db, monkeypatch):
         return await real(query, *a, **k)
 
     monkeypatch.setattr(w.database, "fetch_one", stale_first_look)
+    monkeypatch.setattr(dcc, "MAX_WRITES_PER_HOST_PER_RUN", 1)
     dcc.reset_stats()
-    await w.record([captured(value="20")], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    await w.record([captured()], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
     (r,) = await rows(db)
     assert r["source_url"] == "https://glow.example/q"
     assert dcc.stats()["writes"] == {"updated": 1}
+    # The lost race wrote no new row, so it gave its slot back (be#2732 P3-E): the host's one new row still fits.
+    await w.record([captured(code="NEW22")], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    assert dcc.stats()["writes"] == {"updated": 1, "inserted": 1}
 
 
 async def test_a_row_another_source_owns_is_never_overwritten(db):
@@ -376,3 +383,149 @@ async def test_a_later_sighting_never_changes_the_restriction_flags(db):
     await w.record([captured(hints=[])], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
     (r,) = await rows(db)
     assert r["new_customer_only"] in (True, 1)
+
+
+# ── digit tokens that are not codes (review of be#2732, P3-K) ──────────────────────────────────────────────────────
+@pytest.mark.parametrize("token", ["48HRS", "24HR", "48H", "1ST", "2ND", "3RD", "4TH", "3PM", "10AM", "2-DAY", "2DAY",
+                                   "3DAYS", "3X", "1PER", "XXXX-1234", "SPF50", "B2B", "D2C"])
+async def test_a_digit_token_that_names_something_else_is_not_written(db, token):
+    await w.record([captured(code=token, snippet=f"Get 15% off with code {token}")], url="https://glow.example/p",
+                   final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_not_a_code": 1}
+
+
+@pytest.mark.parametrize("snippet", ["Get 15% off with code ABC123 (example)", "Get 15% off with code ABC123, e.g. at checkout",
+                                     "Get 15% off with code ABC123 — for example only"])
+async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
+    await w.record([captured(code="ABC123", snippet=snippet)], url="https://glow.example/p",
+                   final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_not_a_code": 1}
+
+
+@pytest.mark.parametrize("token", ["50OFF", "20OFF", "4EVER", "COVID19", "W10", "SAVE15", "B2B10X1"])
+async def test_ambiguous_digit_codes_stores_really_use_are_written(db, token):
+    await w.record([captured(code=token, snippet=f"Get 15% off with code {token} today")], url="https://glow.example/p",
+                   final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert [r["code"] for r in await rows(db)] == [token]
+
+
+async def test_a_letters_and_dash_token_is_not_written(db):
+    await w.record([captured(code="IN-APP", snippet="Get 15% off with code IN-APP")], url="https://glow.example/p",
+                   final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_no_digit": 1}
+
+
+# ── the opt-out normalises every side (review of be#2732, P3-I) ────────────────────────────────────────────────────
+async def _optout(db, seller_id):
+    from db.deal_lane import deal_lane_optout
+
+    await db.execute(deal_lane_optout.insert().values(seller_id=seller_id, requested_at=datetime.now(timezone.utc), recorded_by="test"))
+
+
+async def _catalog(db, i, merchant, domain=None, url=None):
+    from db.catalog import catalog_products
+
+    await db.execute(catalog_products.insert().values(product_key=f"p{i}", merchant_id=merchant, platform="shopify",
+                                                      source_product_id=str(i), source_domain=domain, canonical_url=url, title="t"))
+
+
+@pytest.mark.parametrize("optout,catalog", [
+    ("  glow.example  ", None),
+    ("GLOW.EXAMPLE.", None),
+    ("https://www.glow.example/collections/all?x=1", None),
+    ("glow.example:443", None),
+    ("merch_obs_glow", ("merch_obs_glow", "  WWW.Glow.Example.  ", None)),
+    ("merch_obs_glow", ("merch_obs_glow", "glow.example:8443", None)),
+    (" merch_obs_glow ", ("merch_obs_glow", "glow.example", None)),
+    ("merch_obs_glow", ("merch_obs_glow", None, "https://www.glow.example/products/toner")),
+])
+async def test_the_opt_out_matches_whatever_form_each_side_was_entered_in(db, optout, catalog):
+    if catalog:
+        await _catalog(db, 1, *catalog)
+    await _optout(db, optout)
+    await w.record([captured()], url="https://glow.example./p", final_url="https://glow.example./p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_optout": 1}
+
+
+async def test_an_opted_out_host_covers_its_subdomains_but_not_a_shared_platform_or_a_look_alike(db):
+    await _optout(db, "glow.example")
+    await _optout(db, "myshopify.com")
+    await w.record([captured()], url="https://shop.glow.example/p", final_url="https://shop.glow.example/p", market="US", page_currency="USD")
+    await w.record([captured()], url="https://notglow.example/p", final_url="https://notglow.example/p", market="US", page_currency="USD")
+    await w.record([captured()], url="https://brand.myshopify.com/p", final_url="https://brand.myshopify.com/p", market="US", page_currency="USD")
+    assert sorted(r["seller_id"] for r in await rows(db)) == ["brand.myshopify.com", "notglow.example"]
+
+
+async def test_negative_controls_the_merchant_and_the_host_must_both_match(db):
+    # The opted-out merchant's catalog names another host; another merchant's catalog names this host.
+    await _catalog(db, 1, "merch_obs_glow", "other.example")
+    await _catalog(db, 2, "merch_obs_someone", "glow.example")
+    await _optout(db, "merch_obs_glow")
+    await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert [r["seller_id"] for r in await rows(db)] == ["glow.example"]
+
+
+async def test_the_placeholder_and_a_too_broad_merchant_id_never_block_a_host(db):
+    await _catalog(db, 1, "external_seed", "glow.example")
+    for i, host in enumerate(["a.example", "b.example", "c.example", "glow.example"]):
+        await _catalog(db, 10 + i, "merch_wide", host)
+    await _optout(db, "external_seed")
+    await _optout(db, "merch_wide")
+    await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    assert [r["seller_id"] for r in await rows(db)] == ["glow.example"]
+
+
+# ── a later sighting adds a restriction, never clears one; the bar text is never emptied (be#2732, P3-F) ───────────
+async def test_a_later_sighting_adds_a_restriction_and_never_clears_one(db):
+    await w.record([captured(hints=["new_customer_only"], snippet="15% off your first order with code SAVE15")],
+                   url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    await w.record([captured(snippet="Get 15% off with code SAVE15")], url="https://glow.example/q",
+                   final_url="https://glow.example/q", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["new_customer_only"] is True or r["new_customer_only"] == 1
+    await w.record([captured(hints=["once_per_customer"])], url="https://glow.example/r",
+                   final_url="https://glow.example/r", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert bool(r["once_per_customer"]) and bool(r["new_customer_only"])
+
+
+async def test_an_empty_snippet_never_empties_the_bar_text(db):
+    await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    await w.record([captured(snippet="")], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["terms_text"] == "Get 15% off with code SAVE15"
+    assert r["source_url"] == "https://glow.example/q"
+
+
+async def test_a_re_sighting_does_not_restore_bar_text_retention_cleared(db):
+    from db.deal_lane import observed_store_offer_verifications as v, observed_store_offers as o
+
+    await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    (first,) = await rows(db)
+    await db.execute(v.insert().values(deal_id=first["deal_id"], variant_id="1", state="failed", failure_reason="x"))
+    await db.execute(o.update().values(terms_text=None))
+    await w.record([captured()], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["terms_text"] is None and r["source_url"] == "https://glow.example/q"
+    # A queued, unchecked verification does not stop the refresh.
+    await db.execute(v.delete())
+    await db.execute(v.insert().values(deal_id=first["deal_id"], variant_id="1", state="unverified"))
+    await w.record([captured()], url="https://glow.example/r", final_url="https://glow.example/r", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["terms_text"] == "Get 15% off with code SAVE15"
+
+
+async def test_a_re_sighting_does_not_restore_bar_text_after_14_days(db):
+    from datetime import timedelta
+
+    from db.deal_lane import observed_store_offers as o
+
+    await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    await db.execute(o.update().values(terms_text=None, created_at=datetime.now(timezone.utc) - timedelta(days=15)))
+    await w.record([captured()], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["terms_text"] is None

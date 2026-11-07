@@ -675,6 +675,13 @@ def take_write_slot(host: str) -> Optional[str]:
         return None
 
 
+def release_write_slot(host: str) -> None:
+    """Give back a slot taken for an insert that wrote no new row (it lost a race and became an update)."""
+    with _LOCK:
+        if _WRITE_HOSTS.get(host, 0) > 0:
+            _WRITE_HOSTS[host] -= 1
+
+
 reset_stats()
 
 
