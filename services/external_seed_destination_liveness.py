@@ -1199,6 +1199,8 @@ UNCONFIRMED_RECHECK_SQL = """
      FOR UPDATE
 """
 
+UNCONFIRMED_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '2s'"
+
 #: What `on` would hide for one candidate (shadow): its mirror products nobody has suppressed yet.
 UNCONFIRMED_WOULD_HIDE_SQL = """
     SELECT COUNT(*) AS n
@@ -1236,6 +1238,12 @@ async def apply_unconfirmed_hides(
     under `UNCONFIRMED_DEAD_REASON` through the pending machinery (mirror products, then their offers). `shadow`
     writes nothing and reports what `on` would have hidden. A row that fails is counted and never raises.
 
+    RUN IT ALONE, after every refresh of the run has returned (the batch calls it after `_run_workers`). The
+    `databases` library shares ONE connection between tasks gathered on the same Database, so a writer running
+    concurrently in this process would not be blocked by the FOR UPDATE below: it could answer live between the
+    re-check and the hide on the same connection, leaving the row hidden behind a live verdict. A writer in ANOTHER
+    process (the web route, the sweep) has its own connection and waits for the commit, then lifts.
+
     Counts (per host and in total): `candidates`, `braked` (candidates the brake held), `would_hide` (unbraked
     candidates) and, in shadow, `would_hide_products` (their mirror products still unsuppressed); in `on`,
     `hidden_rows` (rows whose hide moved a product), `hidden_products`, `hidden_offers`, `nothing_moved` (the
@@ -1269,6 +1277,9 @@ async def apply_unconfirmed_hides(
                         bump(out, "would_hide_products", int((dict(row) if row else {}).get("n") or 0))
                         continue
                     async with database.transaction():
+                        # A seed row held longer than this (a stuck writer, a lock cycle) is an `errors` row, not
+                        # a stalled run. LOCAL: it ends with this transaction.
+                        await database.execute(UNCONFIRMED_LOCK_TIMEOUT_SQL)
                         row = await database.fetch_one(UNCONFIRMED_RECHECK_SQL, {"id": seed_id})
                         if not _still_a_candidate(row, dead_404_since):
                             bump(out, "changed")

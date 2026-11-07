@@ -466,6 +466,9 @@ class _RecheckDb:
         return []
 
     async def execute(self, query, params=None):
+        if query == liveness.UNCONFIRMED_LOCK_TIMEOUT_SQL:
+            self.log.append("lock_timeout")
+            return
         raise AssertionError("the apply step writes only through the pending machinery")
 
 
@@ -515,20 +518,21 @@ def test_on_hides_each_unbraked_candidate_under_its_own_reason(monkeypatch) -> N
 
 def test_the_re_check_and_the_hide_share_one_transaction_with_the_row_locked(monkeypatch) -> None:
     summary, _, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on", rows={"s1": _still()})
-    assert db.log == ["begin", "recheck", "suppress", "commit"]
+    assert db.log == ["begin", "lock_timeout", "recheck", "suppress", "commit"]
     assert any("FOR UPDATE" in q for q in db.queries)
+    assert liveness.UNCONFIRMED_LOCK_TIMEOUT_SQL.startswith("SET LOCAL lock_timeout")
 
 
 def test_a_refused_re_check_commits_without_hiding(monkeypatch) -> None:
     _, supp, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on",
                          rows={"s1": _still(destination_verdict="live")})
-    assert db.log == ["begin", "recheck", "commit"] and supp.suppressed == []
+    assert db.log == ["begin", "lock_timeout", "recheck", "commit"] and supp.suppressed == []
 
 
 def test_a_failed_hide_rolls_back_and_is_counted(monkeypatch) -> None:
     summary, _, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on", rows={"s1": _still()},
                             fail_for=("prod::s1",))
-    assert db.log == ["begin", "recheck", "suppress", "rollback"]
+    assert db.log == ["begin", "lock_timeout", "recheck", "suppress", "rollback"]
     assert summary["totals"]["errors"] == 1
 
 
@@ -708,3 +712,43 @@ def test_only_the_refresh_batch_applies_the_hide() -> None:
     readiness = (REPO / "services/external_referral_readiness.py").read_text()
     assert len(re.findall(r"await apply_unconfirmed_hides\(", readiness)) == 1
 
+
+
+def test_the_apply_step_runs_alone_after_every_refresh_of_the_run(monkeypatch) -> None:
+    """databases shares one connection across tasks gathered on a Database, which a FOR UPDATE does not block: the
+    apply step must start only once every refresh of the run has returned."""
+    import services.external_referral_readiness as err
+
+    monkeypatch.setenv(liveness.UNCONFIRMED_HIDE_ENV, "on")
+    produced = {f"s{i}": _PRODUCED["s404"] for i in range(6)}
+    ids = list(produced)
+    monkeypatch.setattr(err, "get_external_referral_refresh_candidate_seed_ids",
+                        lambda *a, **k: asyncio.sleep(0, result=ids))
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts",
+                        lambda _ids: asyncio.sleep(0, result={i: f"h{i}.example" for i in ids}))
+    events: List[str] = []
+
+    async def scripted_refresh(seed_id, **_kwargs):
+        events.append(f"start:{seed_id}")
+        await asyncio.sleep(0.01)
+        events.append(f"end:{seed_id}")
+        return produced[seed_id]
+
+    async def fake_apply(by_host, *, mode):
+        events.append("apply")
+        return {"mode": mode, "totals": {}, "top_hosts": {}}
+
+    monkeypatch.setattr(err, "apply_unconfirmed_hides", fake_apply)
+    asyncio.run(err.run_external_referral_refresh_batch(refresh_seed_by_id=scripted_refresh, limit=10))
+    assert events.count("apply") == 1 and events[-1] == "apply"
+    assert sum(1 for e in events if e.startswith("end:")) == len(ids)
+
+
+def test_the_reason_ends_in_pending_so_ingest_counts_a_hidden_row_as_coming_back() -> None:
+    """retailer_ingest treats a `*_pending` suppression as self-lifting (LIVE), never as retired."""
+    from services.retailer_ingest.pipeline import _superseded_row_retired
+
+    assert liveness.UNCONFIRMED_DEAD_REASON.endswith("_pending")
+    hidden = {"suppressed_at": NOW, "suppression_reason": liveness.UNCONFIRMED_DEAD_REASON}
+    assert _superseded_row_retired(hidden) is False
+    assert _superseded_row_retired({"suppressed_at": NOW, "suppression_reason": liveness.SUPPRESSION_REASON}) is True

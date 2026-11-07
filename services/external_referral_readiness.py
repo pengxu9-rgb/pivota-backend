@@ -2914,7 +2914,9 @@ async def run_external_referral_refresh_batch(
     with crawl_ip_throttle.installed(ip_breaker), crawl_global_pacer.installed(pacer):
         await _run_workers(_worker, concurrency)
     host_423_stamped = await _stamp_crawl_attempts(locked_skipped_ids) if locked_skipped_ids else 0
-    # AFTER the run, when every host's share of hard 404s is known (the brake), never per row.
+    # AFTER the run, when every host's share of hard 404s is known (the brake), never per row. And ALONE: every worker
+    # has returned, so no refresh of this run shares the apply step's connection (`databases` hands tasks gathered on
+    # one Database the same connection, which a FOR UPDATE does not block). See `apply_unconfirmed_hides`.
     unconfirmed_hide = (
         await apply_unconfirmed_hides(unconfirmed_hosts, mode=unconfirmed_mode)
         if unconfirmed_mode != "off" else {"mode": "off", "totals": {}, "top_hosts": {}}
