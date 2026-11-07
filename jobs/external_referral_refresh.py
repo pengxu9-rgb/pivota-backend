@@ -203,6 +203,15 @@ def handleless_read_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return block
 
 
+def ambiguous_price_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run's ambiguous-price guard decisions (EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD), as the one `AMBIGUOUS_PRICE`
+    log line carries them, or None when the flag is off or the run decided no row."""
+    block = summary.get("ambiguous_price")
+    if not isinstance(block, dict) or not (block.get("totals") or {}).get("decided"):
+        return None
+    return block
+
+
 def unconfirmed_hide_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """The run's unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE), as the one `UNCONFIRMED_HIDE` log
     line carries it, or None when the flag is off or the run recorded no observation."""
@@ -214,7 +223,11 @@ def unconfirmed_hide_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
-    return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+    line = {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
+    if "price_skipped_ambiguous" in summary:
+        # The ambiguous-price guard's own bucket, only with its flag on or in shadow.
+        line["price_skipped_ambiguous"] = summary["price_skipped_ambiguous"]
+    return line
 
 
 def ip_throttle_line(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -379,6 +392,10 @@ def main() -> int:
     line = unconfirmed_hide_line(summary)
     if line is not None:
         print("UNCONFIRMED_HIDE " + json.dumps(line, separators=(",", ":"), default=str))
+    # And for the ambiguous-price guard: only with the flag on or in shadow, on a run that decided a row.
+    line = ambiguous_price_line(summary)
+    if line is not None:
+        print("AMBIGUOUS_PRICE " + json.dumps(line, separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659

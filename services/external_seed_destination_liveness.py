@@ -755,6 +755,111 @@ def should_retire(verdict: str, failure_streak: int) -> bool:
     return verdict in CONFIRMED_DEAD_VERDICTS and int(failure_streak or 0) >= RETIREMENT_STREAK
 
 
+# --------------------------------------------------------------------------- the ambiguous-price guard
+#
+# A PAGE THAT LISTS SEVERAL PRICED PRODUCTS PRICES THE SEED AS WHICHEVER ONE SCORED BEST.
+# `external_offers_service._extract_jsonld_offer_and_node` scores every JSON-LD Product alone and keeps the first of
+# equals, so on a bundle page ("The ... Collection") the first fully described COMPONENT priced and named the seed:
+# served bundle cards carried one component's price (2026-11-07). `jsonld_identity.priced_identities` already counts
+# the distinct priced products a page carries (a ProductGroup and its variants are one); only the handle-less rule
+# read it. `ambiguous_price_decision` lets every reader ask: on a page with more than one priced product (or a
+# listing), does the PRICING node name THIS seed's product -- by its own `url` / `@id` (the served URL) or, without
+# one, by its name (`handleless_titles_match`, the handle-less rule's G4 title path)? No: the page's price is not
+# this seed's. Behind `EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD` (off | shadow | on, read per call).
+
+AMBIGUOUS_PRICE_GUARD_ENV = "EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD"
+AMBIGUOUS_PRICE_GUARD_MODES = ("off", "shadow", "on")
+AMBIGUOUS_PRICE_REFUSALS = ("several_products", "listing")
+
+
+def ambiguous_price_guard_mode() -> str:
+    """`EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD`, read per call: off (default) | shadow | on."""
+    raw = str(os.getenv(AMBIGUOUS_PRICE_GUARD_ENV) or "").strip().lower()
+    return raw if raw in AMBIGUOUS_PRICE_GUARD_MODES else "off"
+
+
+def ambiguous_price_decision(
+    *,
+    evidence: Any,
+    requested_url: Any,
+    final_url: Any = None,
+    seed_title: Any,
+    seed_brand: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """None when the page is not ambiguous: no identity evidence, one priced product, no listing. Absence of
+    evidence never refuses. Otherwise {refusal, priced_identities, named_by, url_relation, title_dice}:
+      * `url_relation`: "matched" when the pricing node's own `url` / `@id` / group url is the served URL
+        (`_same_product_url`); "other_product" when one names ANOTHER product handle on the served host
+        (`extract_product_handle`, both sides); "mismatch" when it names another page; "none" without one;
+      * `named_by`: "url" when it matched AND no other priced node claims that url (`jsonld_identity.url_conflicts`:
+        a bundle page whose every component names the page proves nothing by url); else "title" when the node's name
+        matches `seed_title` (`handleless_titles_match`); never for "other_product" (the node says it is another
+        product); else None. `seed_title` is the title the caller vouches for: at creation the employee's own, never
+        the page's (which would name the node by itself);
+      * `refusal`: None when named; else "listing" for a listing page, "several_products" otherwise;
+      * `title_dice`: the Dice coefficient of the two titles (brand words dropped), reporting only; None without both.
+    Pure, no env. NEVER RAISES (it runs inside the refresh, where a raise fails the row): anything odd is None."""
+    try:
+        identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+        if not isinstance(identity, dict) or not identity.get("pricing_node"):
+            return None
+        count = identity.get("priced_identities")
+        count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+        listing = bool(identity.get("listing_types"))
+        if count <= 1 and not listing:
+            return None
+        conflicts = identity.get("url_conflicts")
+        conflicts = conflicts if isinstance(conflicts, int) and not isinstance(conflicts, bool) else 0
+        served_parts = _url_parts(requested_url)
+        served_handle = (extract_product_handle(str(requested_url or "")) or "").lower()
+        relation = "none"
+        base = str(final_url or requested_url or "")
+        for raw in (identity.get("url"), identity.get("id"), identity.get("group_url")):
+            if not (isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#")):
+                continue
+            try:
+                candidate = urljoin(base, raw.strip()).split("#", 1)[0]
+            except ValueError:
+                continue
+            if _same_product_url(candidate, requested_url):
+                relation = "matched"
+                break
+            parts = _url_parts(candidate)
+            handle = (extract_product_handle(candidate) or "").lower()
+            if (served_handle and handle and handle != served_handle and parts is not None
+                    and served_parts is not None and parts[1] == served_parts[1]):
+                relation = "other_product"
+            elif relation == "none":
+                relation = "mismatch"
+        name = identity.get("name")
+        brands = (seed_brand, identity.get("brand"))
+        named_by: Optional[str] = None
+        if relation == "matched" and conflicts == 0:
+            named_by = "url"
+        elif relation != "other_product" and isinstance(name, str) and name.strip() and handleless_titles_match(
+            seed_title, name, brands=brands
+        ):
+            named_by = "title"
+        refusal = None if named_by else ("listing" if listing else "several_products")
+        return {"refusal": refusal, "priced_identities": count, "named_by": named_by, "url_relation": relation,
+                "title_dice": _title_dice(seed_title, name, brands)}
+    except Exception:  # noqa: BLE001 - the guard must never cost a row its refresh
+        return None
+
+
+def _title_dice(seed_title: Any, page_name: Any, brands: Sequence[Any]) -> Optional[float]:
+    """The Dice coefficient `handleless_titles_match` computes, brand words dropped, rounded; None without both titles.
+    Reporting only. Never raises."""
+    try:
+        if not (isinstance(page_name, str) and page_name.strip()):
+            return None
+        drop = _brand_tokens(*brands)
+        seed, page = _title_tokens(seed_title, drop)[0], _title_tokens(page_name, drop)[0]
+        return round(2.0 * len(seed & page) / (len(seed) + len(page)), 3) if seed and page else None
+    except Exception:  # noqa: BLE001 - reporting only
+        return None
+
+
 # --------------------------------------------------------------------------- stage 2: probe
 
 async def probe_destination(
