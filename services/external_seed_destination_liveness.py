@@ -41,7 +41,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+import unicodedata
 
 import httpx
 
@@ -313,6 +314,405 @@ def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
     if landed_host and _fold_www(landed_host) != _fold_www(wanted.hostname or ""):
         return _OFF_SITE_OTHER_HOST
     return ""
+
+
+# --------------------------------------------------------------------------- handle-less reads
+
+# A 200 on a served URL with no product handle (`/shop/<x>.html`, `/p/<sku>`) is `unverifiable` to
+# `classify_destination`: the URL cannot say which product it is, so the refresh never read such a seed
+# (no price, stock or variant refresh, ever). `classify_handleless_read` lets the PAGE say it, under
+# guards that each refuse on their own, and the refusal always wins:
+#   G0 `cache`            the evidence is a cached snapshot's, not this fetch's;
+#   G1 `status` / `challenge` / `redirect_unknown` / `redirect`
+#                         not 2xx, a challenge, an unknown or non-zero redirect count, or a final URL that is
+#                         not the one we sent;
+#   G2 `segment`          a root path, or a listing segment anywhere in the path (a cheap pre-filter);
+#   G3 `no_product` / `structure`
+#                         no priced JSON-LD product, or more than one, or a listing type on the page;
+#   G4 `identity_url_mismatch` / `identity`
+#                         the pricing product's own url / @id names another page, or (with none) its name
+#                         does not match the seed's title;
+#   G5 `price` / `price_source` / `price_inexact`
+#                         no exact JSON-LD price of that product;
+#   G6 `price_move`       outside [0.5x, 2x] of the stored price in the same currency.
+# A refusal, and every `shadow` decision, returns the observation the caller already had: nothing changes.
+HANDLELESS_READ_ENV = "EXTERNAL_SEED_HANDLELESS_READ"
+# Nothing about a decision is written to the seed row (its `seed_data` reaches partner agents whole): the refresh
+# batch counts decisions per host (`external_referral_readiness.count_handleless_read`).
+HANDLELESS_READ_MODES = ("off", "shadow", "on")
+HANDLELESS_REFUSALS = (
+    "cache", "status", "challenge", "redirect_unknown", "redirect", "segment", "no_product", "structure",
+    "identity_url_mismatch", "identity", "price", "price_source", "price_inexact", "price_move",
+    # The rule itself raised (`routes/employee_products._handleless_read_outcome` keeps today's observation).
+    "error",
+)
+HANDLELESS_LISTING_SEGMENTS = frozenset({
+    "collections", "collection", "category", "categories", "c", "search", "pages", "blogs", "blog",
+    "brands", "brand", "cart", "account", "sale",
+})
+HANDLELESS_PRICE_MOVE_BOUNDS = (0.5, 2.0)
+HANDLELESS_TITLE_DICE_MIN = 0.6
+HANDLELESS_LIVE_NOTE = "same destination, no product handle; jsonld identity by {by}"
+# A price text that states the bottom of a range ("From $19", "Starting at", "ab 19 €", "19円~", "19,000원부터").
+_FROM_PRICE_RE = re.compile(r"\bfrom\b|\bstarting\b|\bstarts\b|\bab\b|à partir|a partir|\bdesde\b|\bdès\b|[~〜]|から|起|부터|이상")
+# Words that name no product: dropped from both titles before they are compared.
+_TITLE_STOPWORDS = frozenset({
+    "the", "and", "a", "an", "of", "for", "with", "in", "by", "new",
+    "ml", "l", "g", "kg", "mg", "oz", "fl", "floz", "lb", "lbs", "ea", "x",
+})
+# Words that make a title name ANOTHER ITEM of the same product line: a pack, a set, a refill, a mini, a kit.
+# One title carrying one the other lacks refuses, however close the rest is ("Barrier Cream" / "Barrier Cream
+# 2 Pack"). So does a different pack count (`_PACK_COUNT_RE`).
+_ITEM_FORM_WORDS = frozenset({
+    "pack", "packs", "pk", "set", "sets", "kit", "kits", "bundle", "duo", "trio", "refill", "refills", "mini",
+    "minis", "travel", "sample", "samples", "jumbo", "deluxe", "value", "gift", "multipack", "pcs", "pieces",
+    "count", "ct",
+})
+_ITEM_FORM_WORDS_CJK = ("세트", "리필", "미니", "기획", "듀오", "샘플", "セット", "詰め替え", "つめかえ", "ミニ", "サンプル", "套装", "替换装")
+_PACK_COUNT_RE = re.compile(
+    r"(\d+)\s*-?\s*(?:pk|packs?|pcs|pc|pieces|count|ct|개입|개|枚入|枚|本入|本|個入|個|入)(?![a-z])"
+    r"|(?:x|×)\s*(\d+)(?![\d.])|(?<![\d.])(\d+)\s*(?:x|×)(?![a-z\d])"
+)
+# What KIND of product a title names. Two titles that each carry a kind word the other lacks are siblings
+# ("Barrier Cream" / "Barrier Toner"), whatever their overlap.
+_PRODUCT_KIND_WORDS = frozenset({
+    "cream", "toner", "serum", "essence", "ampoule", "cleanser", "cleansing", "foam", "gel", "lotion", "emulsion",
+    "mask", "masks", "pad", "pads", "patch", "patches", "mist", "oil", "balm", "sunscreen", "sunblock", "spf",
+    "stick", "cushion", "foundation", "primer", "powder", "concealer", "tint", "lipstick", "gloss", "liner",
+    "mascara", "shampoo", "conditioner", "scrub", "peel", "exfoliator", "moisturizer", "moisturiser", "eye",
+    "lip", "body", "hand", "hair", "soap", "wash", "spray", "palette", "blush", "bronzer", "highlighter",
+    "perfume", "fragrance", "deodorant", "brush", "sponge", "refill",
+})
+# The same, in Korean and Japanese (compared as character bigrams, so a kind word is the set of its bigrams).
+_PRODUCT_KIND_WORDS_CJK = (
+    "토너", "크림", "세럼", "에센스", "앰플", "클렌저", "클렌징", "폼", "젤", "로션", "마스크", "패드", "미스트",
+    "오일", "밤", "선크림", "쿠션", "파운데이션", "샴푸", "스크럽", "립",
+    "化粧水", "乳液", "美容液", "クリーム", "洗顔", "マスク", "パック", "日焼け止め", "オイル", "ジェル", "ローション",
+    "クレンジング", "セラム", "シャンプー", "リップ",
+)
+_CJK_RE = re.compile(r"[぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿ᄀ-ᇿ㄰-㆏가-힯]+")
+_WORD_RE = re.compile(r"[^\W_]+")
+
+
+def handleless_read_mode() -> str:
+    """`EXTERNAL_SEED_HANDLELESS_READ`, read per call: off (default) | shadow | on."""
+    raw = str(os.getenv(HANDLELESS_READ_ENV) or "").strip().lower()
+    return raw if raw in HANDLELESS_READ_MODES else "off"
+
+
+@dataclass(frozen=True)
+class HandlelessDecision:
+    observation: Optional[DestinationObservation]
+    # Did this fetch read the served product? True only in `on` mode with no refusal.
+    read: bool
+    # Would it, with the rule on (no refusal)? Same in every mode.
+    would_read: bool
+    refusal: Optional[str]
+    # The listing segment G2 refused on ("root" for an empty path).
+    segment: Optional[str] = None
+    # How G4 named the product: "url" (its own url / @id) or "title".
+    identity_by: Optional[str] = None
+
+
+def _url_parts(url: Any) -> Optional[Tuple[str, str, str, Tuple[Tuple[str, str], ...]]]:
+    """(scheme, host with one leading www. folded, unquoted path without a trailing /, query pairs), or None for
+    a URL that does not parse (a bad port `:abc` / `:99999` raises only when `.port` is read). The query is SPLIT
+    before each key and value is decoded, so an encoded separator stays data: `?pid=5%26x` is one pair
+    (`pid`, `5&x`), never the two pairs of `?pid=5&x`."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = _fold_www(parsed.hostname or "")
+        port = parsed.port
+        query = tuple(parse_qsl(parsed.query or "", keep_blank_values=True))
+    except Exception:  # noqa: BLE001 - an unparsable URL matches nothing
+        return None
+    if not host:
+        return None
+    if port:
+        host = f"{host}:{port}"
+    return (parsed.scheme.lower(), host, unquote(parsed.path or "").rstrip("/"), query)
+
+
+# Query keys that name no product: utm_* and mc_* (by prefix), the ad-click ids below, and `variant`. Only
+# these. A key like `ref`, `src`, `source` or `aff` can carry the product id on a handle-less URL
+# (`/item?ref=SKU1`), so it is identity. `variant` is dropped as it is for handle URLs: the URL variant pick owns
+# it, and the read adopts only the variants the pricing product lists.
+_IDENTITY_IGNORED_QUERY_PREFIXES = ("utm_", "mc_")
+_IDENTITY_IGNORED_QUERY_KEYS = frozenset({
+    "gclid", "fbclid", "yclid", "msclkid", "dclid", "gbraid", "wbraid", "ttclid", "igshid", "srsltid", "_ga",
+    "_gl", "variant",
+})
+
+
+def _identity_query(pairs: Sequence[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
+    """The query pairs (already split, then decoded: `_url_parts`) that can name a product (`/item.php?id=5`).
+    Keys compare case-folded; values exactly, outer spaces stripped."""
+    kept = set()
+    for key, value in pairs:
+        folded = key.strip().casefold()
+        if folded.startswith(_IDENTITY_IGNORED_QUERY_PREFIXES) or folded in _IDENTITY_IGNORED_QUERY_KEYS:
+            continue
+        kept.add((folded, value.strip()))
+    return tuple(sorted(kept))
+
+
+def _same_fetched_url(sent: Any, final: Any) -> bool:
+    """Did the response answer the URL we SENT? httpx re-encodes a non-ASCII path, so both paths are unquoted."""
+    left, right = _url_parts(sent), _url_parts(final)
+    return left is not None and left == right
+
+
+def _same_product_url(candidate: Any, served: Any) -> bool:
+    """Does the page's own product URL name the served page? Host, path AND the query pairs that can name a
+    product (`_identity_query`): a handle-less URL often carries its product id there (`/item.php?id=5`). Tracking
+    keys and `variant` are ignored; any other difference is another page."""
+    left, right = _url_parts(candidate), _url_parts(served)
+    return (
+        left is not None and right is not None and left[1:3] == right[1:3]
+        and _identity_query(left[3]) == _identity_query(right[3])
+    )
+
+
+def _listing_segment(url: Any) -> Optional[str]:
+    parts = _url_parts(url)
+    path = parts[2] if parts else ""
+    segments = [seg.lower() for seg in path.split("/") if seg]
+    if not segments:
+        return "root"
+    return next((seg for seg in segments if seg in HANDLELESS_LISTING_SEGMENTS), None)
+
+
+def _cjk_grams(run: str) -> Set[str]:
+    return {run[i:i + 2] for i in range(len(run) - 1)} if len(run) > 1 else {run}
+
+
+def _title_tokens(text: Any, drop: Set[str]) -> Tuple[Set[str], int, int, int]:
+    """(tokens, Latin words, CJK bigrams, CJK runs): NFKC + casefold, Latin text by word, CJK runs by character
+    bigram. Brand tokens (`drop`), stop words and anything holding a digit (sizes) are dropped. A CJK run is one
+    space-separated word, as Korean writes them."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    tokens: Set[str] = set()
+    words = bigrams = runs = 0
+    for run in _CJK_RE.findall(norm):
+        grams = _cjk_grams(run) - drop
+        if grams:
+            runs += 1
+        tokens |= grams
+        bigrams += len(grams)
+    for word in _WORD_RE.findall(_CJK_RE.sub(" ", norm)):
+        if word in drop or word in _TITLE_STOPWORDS or any(ch.isdigit() for ch in word):
+            continue
+        if word not in tokens:
+            tokens.add(word)
+            words += 1
+    return tokens, words, bigrams, runs
+
+
+def _brand_tokens(*brands: Any) -> Set[str]:
+    out: Set[str] = set()
+    for brand in brands:
+        if isinstance(brand, dict):
+            brand = brand.get("name")
+        if isinstance(brand, str) and brand.strip():
+            toks = _title_tokens(brand, set())[0]
+            out |= toks
+    return out
+
+
+_KIND_TOKENS = frozenset(_PRODUCT_KIND_WORDS) | frozenset(
+    gram for word in _PRODUCT_KIND_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
+)
+# Latin item-form words compare as words. The Korean / Japanese / Chinese ones compare as WHOLE substrings of
+# the title (`_cjk_item_forms`), never by character bigram: a bigram of サンプル (sample) is also in サンカット
+# (sun-cut) and パープル (purple), and one of セット (set) in ポケット (pocket).
+_ITEM_FORM_TOKENS = frozenset(_ITEM_FORM_WORDS)
+_ITEM_FORM_WORDS_CJK_NORM = tuple(unicodedata.normalize("NFKC", word).casefold() for word in _ITEM_FORM_WORDS_CJK)
+
+
+def _cjk_item_forms(text: Any) -> Set[str]:
+    """The CJK item-form words (`_ITEM_FORM_WORDS_CJK`) a title contains, each as a whole substring."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return {word for word in _ITEM_FORM_WORDS_CJK_NORM if word in norm}
+
+
+def _pack_counts(text: Any) -> Set[int]:
+    """The pack counts a title states ("2 Pack", "3pcs", "x2", "2개입"), a count of 1 dropped."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    counts: Set[int] = set()
+    for match in _PACK_COUNT_RE.finditer(norm):
+        raw = next((g for g in match.groups() if g), None)
+        if raw and int(raw) > 1:
+            counts.add(int(raw))
+    return counts
+
+
+def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence[Any] = ()) -> bool:
+    """The title path of G4: the seed's title, brand dropped, names at least 2 informative words (Latin words and
+    CJK words together) or 3 CJK bigrams; the two titles' Dice coefficient is at least `HANDLELESS_TITLE_DICE_MIN`;
+    and they are not siblings (each carries a product-kind word the other lacks: "Barrier Cream" / "Barrier Toner",
+    which share two words of three); nor does one name a pack, set, refill or mini the other does not, or another
+    pack count."""
+    drop = _brand_tokens(*brands)
+    seed, words, bigrams, runs = _title_tokens(seed_title, drop)
+    page = _title_tokens(page_name, drop)[0]
+    if words + runs < 2 and bigrams < 3:
+        return False
+    if not page:
+        return False
+    if (seed - page) & _KIND_TOKENS and (page - seed) & _KIND_TOKENS:
+        return False
+    if (
+        (seed ^ page) & _ITEM_FORM_TOKENS
+        or _cjk_item_forms(seed_title) != _cjk_item_forms(page_name)
+        or _pack_counts(seed_title) != _pack_counts(page_name)
+    ):
+        # A pack, set, refill or mini of the product is another item with another price.
+        return False
+    dice = 2.0 * len(seed & page) / (len(seed) + len(page))
+    return dice >= HANDLELESS_TITLE_DICE_MIN
+
+
+def _handleless_refusal(
+    *,
+    requested_url: str,
+    observed: Dict[str, Any],
+    evidence: Dict[str, Any],
+    seed_title: Any,
+    seed_brand: Any,
+    fresh_amount: Any,
+    fresh_currency: Any,
+    stored_amount: Any,
+    stored_currency: Any,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(refusal, listing segment, identity_by): the first guard that refuses, in order, or (None, None, how)."""
+    # G0
+    if observed.get("from_cache"):
+        return "cache", None, None
+    # G1
+    status = observed.get("status_code")
+    if not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300:
+        return "status", None, None
+    if observed.get("bot_challenged"):
+        return "challenge", None, None
+    hops = observed.get("redirect_hops")
+    if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
+        return "redirect_unknown", None, None
+    if hops > 0 or not _same_fetched_url(requested_url, observed.get("final_url")):
+        return "redirect", None, None
+    # G2
+    segment = _listing_segment(requested_url)
+    if segment:
+        return "segment", segment, None
+    # G3
+    identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+    if not isinstance(identity, dict) or not identity.get("pricing_node"):
+        return "no_product", None, None
+    if identity.get("listing_types"):
+        return "structure", None, None
+    count = identity.get("priced_identities")
+    if not isinstance(count, int) or count < 1:
+        return "no_product", None, None
+    if count > 1:
+        return "structure", None, None
+    # G4
+    base = observed.get("final_url") or requested_url
+    candidate = None
+    for raw in (identity.get("url"), identity.get("id"), identity.get("group_url")):
+        if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#"):
+            try:
+                candidate = urljoin(str(base), raw.strip()).split("#", 1)[0]
+            except ValueError:  # an unparsable URL names nothing we can match: refused, never raised
+                return "identity_url_mismatch", None, None
+            break
+    if candidate:
+        if not _same_product_url(candidate, requested_url):
+            return "identity_url_mismatch", None, None
+        identity_by = "url"
+    else:
+        name = identity.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return "identity", None, None
+        if not handleless_titles_match(seed_title, name, brands=(seed_brand, identity.get("brand"))):
+            return "identity", None, None
+        identity_by = "title"
+    # G5
+    price_read = evidence.get("price_read") if isinstance(evidence.get("price_read"), dict) else {}
+    try:
+        amount = float(fresh_amount) if fresh_amount is not None else None
+    except (TypeError, ValueError):
+        amount = None
+    if amount is None or not amount > 0 or price_read.get("status") != "parsed" or not fresh_currency:
+        return "price", None, identity_by
+    if price_read.get("source") != "jsonld":
+        return "price_source", None, identity_by
+    census = evidence.get("variant_census") if isinstance(evidence.get("variant_census"), dict) else {}
+    if identity.get("offer_kind") != "single" or census.get("product_price_exact") is not True:
+        return "price_inexact", None, identity_by
+    if _FROM_PRICE_RE.search(unicodedata.normalize("NFKC", str(price_read.get("raw") or "")).casefold()):
+        # "From $19.00" is the bottom of a range, not this product's price.
+        return "price_inexact", None, identity_by
+    # G6
+    try:
+        stored = float(stored_amount) if stored_amount is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    same_currency = str(stored_currency or "").strip().upper() == str(fresh_currency or "").strip().upper()
+    if stored is not None and stored > 0 and same_currency:
+        low, high = HANDLELESS_PRICE_MOVE_BOUNDS
+        if not low * stored <= amount <= high * stored:
+            return "price_move", None, identity_by
+    return None, None, identity_by
+
+
+def classify_handleless_read(
+    *,
+    requested_url: str,
+    observed: Dict[str, Any],
+    evidence: Any,
+    today: Optional[DestinationObservation],
+    mode: str,
+    seed_title: Any,
+    seed_brand: Any = None,
+    fresh_amount: Any = None,
+    fresh_currency: Any = None,
+    stored_amount: Any = None,
+    stored_currency: Any = None,
+) -> HandlelessDecision:
+    """May this fetch of a served URL with NO product handle count as a read of the served product?
+
+    `requested_url` is the URL the fetch SENT (`external_offers_service._normalize_url` of the destination);
+    `observed` is `_fetch_html`'s out-parameter; `evidence` the snapshot's (`snapshot_evidence`); `today` the
+    observation the caller already has (`classify_destination`'s). See the guard list above.
+
+    A refusal, and `shadow`, return `today` and no read: EXACTLY what the caller had. Only `on` with every guard
+    passing returns `live` (uncorroborated: it can reset a streak and lift a pending hide, never advance or retire)
+    and a read. Pure: no I/O, no env (the caller passes `mode`).
+    """
+    refusal, segment, identity_by = _handleless_refusal(
+        requested_url=requested_url,
+        observed=observed or {},
+        evidence=evidence if isinstance(evidence, dict) else {},
+        seed_title=seed_title,
+        seed_brand=seed_brand,
+        fresh_amount=fresh_amount,
+        fresh_currency=fresh_currency,
+        stored_amount=stored_amount,
+        stored_currency=stored_currency,
+    )
+    if refusal is None and today is not None and today.verdict != VERDICT_UNVERIFIABLE:
+        # Never over an observation that said something: a 2xx handle-less fetch is `unverifiable` today.
+        refusal = "status"
+    would_read = refusal is None
+    if would_read and mode == "on":
+        observation = DestinationObservation(
+            VERDICT_LIVE,
+            int(observed["status_code"]),
+            observed.get("final_url"),
+            HANDLELESS_LIVE_NOTE.format(by=identity_by),
+            corroborated=False,
+        )
+        return HandlelessDecision(observation, True, True, None, segment, identity_by)
+    return HandlelessDecision(today, False, would_read, refusal, segment, identity_by)
 
 
 def should_retire(verdict: str, failure_streak: int) -> bool:

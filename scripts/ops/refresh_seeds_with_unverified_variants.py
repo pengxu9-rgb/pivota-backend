@@ -31,7 +31,8 @@ read the page -- the re-run for rows a throttled host refused. Every mode walks 
 round-robin across domains (see `_interleave_hosts`).
 
 `--simulate` fetches the same URL the refresh does and applies the refresh's own "did we read
-the served product" rule (`_read_the_served_product`); a row it cannot read is `not_read`,
+the served product" rules (`_read_the_served_product`, then `_handleless_read_outcome` for a URL
+with no product handle, under `--handleless-mode`); a row it cannot read is `not_read`,
 exactly as `--apply` would leave it. It approximates only the column decision (a positive
 price in the row's own currency); the full rules live in
 `routes/employee_products._refresh_external_seed_by_id`.
@@ -140,14 +141,21 @@ def _interleave_hosts(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-async def _simulate(row_id: str) -> Dict[str, Any]:
-    """What the fixed refresh would write to one row's variants. Fetches; writes nothing."""
+async def _simulate(row_id: str, handleless_mode: str = "off") -> Dict[str, Any]:
+    """What the fixed refresh would write to one row's variants. Fetches; writes nothing.
+
+    `handleless_mode` is EXTERNAL_SEED_HANDLELESS_READ as the refresh would run with it, passed explicitly (this
+    never reads the operator's env). The page is extracted FIRST, into the evidence a refresh would see
+    (`snapshot_evidence`), and then judged by the refresh's own two functions: `_read_the_served_product` and
+    `_handleless_read_outcome`."""
     import routes.employee_products as ep
     from services.external_offers_service import (
         _extract_from_html,
         _fetch_html,
         _normalize_url,
         evidence_variant_fields,
+        snapshot_evidence,
+        snapshot_price_fields,
     )
 
     row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": row_id})
@@ -160,11 +168,21 @@ async def _simulate(row_id: str) -> Dict[str, Any]:
     url = _normalize_url(str(dest))
     observed: Dict[str, Any] = {}
     html, _ = await _fetch_html(url, observed=observed, max_wait=0)
-    _, read = ep._read_the_served_product(row, dest, observed)
-    if not read:
-        return {"status": "not_read", "replaced": [], "not_re_read_count": 0}
     extracted = _extract_from_html(url, html)
+    page_amount, page_currency, price_read = snapshot_price_fields(extracted)
+    evidence = snapshot_evidence(extracted, currency=page_currency, price_read=price_read)
+    observation, read = ep._read_the_served_product(row, dest, observed)
+    _, read, handleless = ep._handleless_read_outcome(
+        row, dest, observed, observation, read,
+        evidence=evidence, price_amount=page_amount, price_currency=page_currency, mode=handleless_mode,
+    )
+    extra = {"handleless_read": handleless} if handleless is not None else {}
+    if not read:
+        return {"status": "not_read", "replaced": [], "not_re_read_count": 0, **extra}
     fields = evidence_variant_fields(extracted)
+    if handleless is not None:
+        # The refresh's own rule: a handle-less read re-reads only the pricing product's variants.
+        fields["variants"] = ep._handleless_read_variants(fields.get("variants"), evidence)
     market = str(row.get("market") or "US").upper()
     fresh_cur = (extracted.get("price_currency") or ("JPY" if market == "JP" else "USD")).upper()
     col_cur = str(row.get("price_currency") or "").strip().upper() or None
@@ -183,7 +201,7 @@ async def _simulate(row_id: str) -> Dict[str, Any]:
         # What the refresh passes: the barcode bridge accepts a read titled as the product.
         product_title=seed_data.get("title") or extracted.get("title"),
     )
-    return report
+    return {**report, **extra}
 
 
 async def _run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -210,9 +228,10 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
         if args.simulate:
             outcomes_sim: collections.Counter = collections.Counter()
             samples: List[Dict[str, Any]] = []
+            handleless: collections.Counter = collections.Counter()
             for row in rows:
                 try:
-                    report = await _simulate(row["id"])
+                    report = await _simulate(row["id"], args.handleless_mode)
                 except Exception as exc:  # noqa: BLE001 - one unreachable page must not end the preview
                     outcomes_sim[f"{row['cohort']}:error:{type(exc).__name__}"] += 1
                     continue
@@ -221,10 +240,14 @@ async def _run(args: argparse.Namespace) -> Dict[str, Any]:
                     or ("all_re_read" if not report["not_re_read_count"] else "not_all_re_read")
                 )
                 outcomes_sim[f"{row['cohort']}:{verdict}:{'writes' if report['replaced'] else 'no_write'}"] += 1
+                decided = report.get("handleless_read")
+                if isinstance(decided, dict):
+                    handleless["would_read" if decided.get("would_read") else f"refused:{decided.get('refusal')}"] += 1
                 if report["replaced"] and len(samples) < 40:
                     samples.append({"id": row["id"], "replaced": report["replaced"][:3]})
             summary["outcomes"] = dict(outcomes_sim)
             summary["replaced_samples"] = samples
+            summary["handleless_read"] = {"mode": args.handleless_mode, **dict(handleless)}
             return summary
 
         outcomes: collections.Counter = collections.Counter()
@@ -256,6 +279,13 @@ def _parser() -> argparse.ArgumentParser:
         type=_parse_since,
         default=None,
         help="ISO time: only rows attempted since then whose attempt did not read the page",
+    )
+    parser.add_argument(
+        "--handleless-mode",
+        choices=("off", "shadow", "on"),
+        default="off",
+        help="--simulate only: judge handle-less URLs as the refresh would with EXTERNAL_SEED_HANDLELESS_READ=<mode> "
+        "(the env is never read here)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--simulate", action="store_true", help="FETCH, reconcile in memory, write nothing")

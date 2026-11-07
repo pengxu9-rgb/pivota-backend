@@ -210,9 +210,20 @@ CREATE INDEX IF NOT EXISTS idx_a2a_rail_purchases_due
     ON a2a_rail_purchases (state, next_poll_at)
 """
 
+# Migration 278: the worker's heartbeat. ONE row, stamped at the start of every armed tick, so the
+# create route (which runs on another service and cannot see the worker's settings) can tell whether
+# anything will ever advance a purchase it opens.
+_CREATE_WORKER_HEARTBEAT_PG = """
+CREATE TABLE IF NOT EXISTS a2a_rail_worker_heartbeat (
+    id SMALLINT PRIMARY KEY CONSTRAINT ck_a2a_rail_worker_heartbeat_one CHECK (id = 1),
+    ticked_at TIMESTAMPTZ NOT NULL
+)
+"""
+_CREATE_WORKER_HEARTBEAT_SQLITE = _CREATE_WORKER_HEARTBEAT_PG.replace("TIMESTAMPTZ", "TIMESTAMP")
+
 
 async def ensure_a2a_rail_schema() -> None:
-    """Self-heal parity with migration 268. Idempotent; called at every startup."""
+    """Self-heal parity with migrations 268 and 278. Idempotent; called at every startup."""
     if IS_POSTGRES:
         await database.execute(_CREATE_BUYER_REFS_PG)
         await database.execute(_CREATE_PURCHASES_PG)
@@ -222,9 +233,11 @@ async def ensure_a2a_rail_schema() -> None:
 
         for statement in (_CREATE_BUYER_REFS_OWNER_INDEX, _CREATE_PURCHASES_OWNER_INDEX, _CREATE_PURCHASES_DUE_INDEX):
             await _ensure_index(statement)
+        await database.execute(_CREATE_WORKER_HEARTBEAT_PG)
     else:
         await database.execute(_CREATE_BUYER_REFS_SQLITE)
         await database.execute(_CREATE_PURCHASES_SQLITE)
+        await database.execute(_CREATE_WORKER_HEARTBEAT_SQLITE)
         await database.execute(_CREATE_BUYER_REFS_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_OWNER_INDEX)
         await database.execute(_CREATE_PURCHASES_DUE_INDEX)
@@ -903,6 +916,47 @@ async def purge_stale_contact(*, max_age_seconds: int = CONTACT_RETENTION_SECOND
     else:
         rows = await database.fetch_all(_PURGE_CONTACT_SQL_SQLITE, values)
     return len(rows)
+
+
+# ── the worker's heartbeat ───────────────────────────────────────────────────────────────────
+#
+# Stamped by jobs/a2a_rail_purchase_poll at the start of every tick that will step purchases (the job
+# armed AND the rail client configured). Read by the create route: a purchase opened while nothing
+# ticks never advances, never expires (the sweep runs in the tick) and never has its contact purged.
+_RECORD_HEARTBEAT_SQL = """
+    INSERT INTO a2a_rail_worker_heartbeat (id, ticked_at) VALUES (1, clock_timestamp())
+    ON CONFLICT (id) DO UPDATE SET ticked_at = excluded.ticked_at
+"""
+_RECORD_HEARTBEAT_SQL_SQLITE = _RECORD_HEARTBEAT_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+_WORKER_ALIVE_SQL = """
+    SELECT 1 AS alive FROM a2a_rail_worker_heartbeat
+     WHERE id = 1 AND ticked_at > clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+"""
+_WORKER_ALIVE_SQL_SQLITE = """
+    SELECT 1 AS alive FROM a2a_rail_worker_heartbeat
+     WHERE id = 1 AND ticked_at > datetime('now', '-' || :max_age_seconds || ' seconds')
+"""
+#: How old the last tick may be for the worker to count as running. Above the job's longest interval
+#: (A2A_RAIL_POLL_INTERVAL_SECONDS is clamped to 600) plus a tick's run deadline (300 s).
+WORKER_HEARTBEAT_MAX_AGE_SECONDS = 900
+
+
+async def record_worker_heartbeat() -> None:
+    if IS_POSTGRES:
+        await database.execute(_RECORD_HEARTBEAT_SQL)
+    else:
+        await database.execute(_RECORD_HEARTBEAT_SQL_SQLITE)
+
+
+async def worker_is_alive(*, max_age_seconds: int = WORKER_HEARTBEAT_MAX_AGE_SECONDS) -> bool:
+    """True when an armed worker tick started within `max_age_seconds`. Raises on a database error:
+    the caller decides (the create route treats it as not alive)."""
+    values = {"max_age_seconds": _limit(max_age_seconds, 7 * 86400)}
+    if IS_POSTGRES:
+        row = await database.fetch_one(_WORKER_ALIVE_SQL, values)
+    else:
+        row = await database.fetch_one(_WORKER_ALIVE_SQL_SQLITE, values)
+    return row is not None
 
 
 # ── a challenge while paying ─────────────────────────────────────────────────────────────────
