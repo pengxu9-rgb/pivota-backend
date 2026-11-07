@@ -546,6 +546,23 @@ async def test_only_an_armed_configured_tick_stamps_the_heartbeat(monkeypatch):
     assert await ledger.worker_is_alive() and len(ticks) == 1
 
 
+async def test_every_armed_tick_refreshes_the_heartbeat(monkeypatch):
+    async def tick(client, worker_id, **kw):
+        return {}
+
+    monkeypatch.setattr(worker, "run_tick", tick)
+    monkeypatch.setenv(job.A2A_RAIL_WORKER_ENABLED_ENV, "1")
+    monkeypatch.setattr(job, "_client", _client(Rail()))
+    await job.run_a2a_rail_purchase_poll()
+    if IS_POSTGRES:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = now() - interval '2000 seconds'")
+    else:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = datetime('now', '-2000 seconds')")
+    assert not await ledger.worker_is_alive()
+    await job.run_a2a_rail_purchase_poll()
+    assert await ledger.worker_is_alive()
+
+
 async def test_a_failed_heartbeat_write_does_not_stop_the_tick(monkeypatch):
     ticks = []
 

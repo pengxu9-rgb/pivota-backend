@@ -572,7 +572,8 @@ async def test_an_unreadable_heartbeat_keeps_the_rail_closed(client, stubs, monk
     await _nothing_written()
 
 
-async def test_the_heartbeat_is_not_read_while_the_rail_is_off(client, stubs, monkeypatch):
+@pytest.mark.parametrize("why", ["rail_off", "not_pilot", "reap_chosen"])
+async def test_the_heartbeat_is_read_only_for_a_request_the_rail_could_take(client, stubs, monkeypatch, why):
     calls = []
 
     async def spy(**_kw):
@@ -580,9 +581,49 @@ async def test_the_heartbeat_is_not_read_while_the_rail_is_off(client, stubs, mo
         return True
 
     monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
-    monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
-    assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    b = body()
+    if why == "rail_off":
+        monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
+    elif why == "not_pilot":
+        CALLER.agent_id = "agent_not_in_pilot"
+    else:
+        b = body(payment_preference={"rail": "reap"})
+    assert (await client.post(BASE, b)).json() == {"handled_by": "reap"}
     assert calls == []
+
+
+async def test_a_request_the_rail_could_take_reads_the_heartbeat_once(client, stubs, monkeypatch):
+    calls = []
+    real = a2a_ledger.worker_is_alive
+
+    async def spy(**kw):
+        calls.append(1)
+        return await real(**kw)
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a" and calls == [1]
+
+
+async def test_a_slow_heartbeat_read_keeps_the_rail_closed(client, stubs, monkeypatch):
+    import asyncio
+
+    async def slow(**_kw):
+        await asyncio.sleep(5)
+        return True
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", slow)
+    monkeypatch.setattr(unified_routes, "_HEARTBEAT_READ_TIMEOUT_S", 0.05)
+    assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    await _nothing_written()
+
+
+def test_the_heartbeat_window_outlives_the_slowest_tick_cadence():
+    from services.audit_scheduler import run_deadline_for
+
+    # The job's interval is clamped to at most 600 s and a tick may run for its deadline: a window
+    # shorter than both would close the rail between two healthy ticks.
+    assert a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS >= 600 + run_deadline_for("a2a_rail_purchase_poll")
 
 
 # ── review round 1 ───────────────────────────────────────────────────────────────────────────

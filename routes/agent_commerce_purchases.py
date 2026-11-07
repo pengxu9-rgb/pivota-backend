@@ -245,14 +245,20 @@ async def _a2a_accepted(purchase_id: str, agent_id: str, owner: str) -> JSONResp
     })
 
 
-async def _a2a_worker_alive() -> bool:
-    """The A2A worker's heartbeat, read only while the rail's create dials are on (otherwise the router
-    refuses the rail before it would look). A failed read is "not alive": the rail is not offered."""
-    if not rail_router.a2a_create_dials_on():
+#: The heartbeat read is one indexed row; past this it counts as unreadable.
+_HEARTBEAT_READ_TIMEOUT_S = 1.0
+
+
+async def _a2a_worker_alive(*, agent_id: str, preferred: Optional[str]) -> bool:
+    """The A2A worker's heartbeat, read only for a request the A2A rail could take: its create dials on,
+    the agent on its pilot list, and Reap not chosen explicitly (otherwise the router answers before it
+    would look, and every create would pay for a read). A failed or slow read is "not alive": the rail
+    is not offered."""
+    if not rail_router.a2a_create_dials_on() or preferred == "reap" or agent_id not in rail_router.pilot_agents():
         return False
     try:
-        return await a2a_ledger.worker_is_alive()
-    except Exception as exc:  # noqa: BLE001
+        return await asyncio.wait_for(a2a_ledger.worker_is_alive(), _HEARTBEAT_READ_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - timeouts included
         logger.warning("agent_purchases: a2a worker heartbeat unreadable error_type=%s", type(exc).__name__)
         return False
 
@@ -322,11 +328,12 @@ async def create_purchase(
             # the router, so its answer cannot be told apart by whether the merchant is on a rail's list.
             raise reap_svc.PurchaseRefused(
                 "invalid_request", "expected_unit_price_minor and expected_currency are required")
+        preferred = req.payment_preference.rail if req.payment_preference else None
         choice = rail_router.choose_rail(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country,
             item_source=req.item_source, currency=str(req.expected_currency or ""),
-            worker_alive=await _a2a_worker_alive(), has_offer_code=offer_code is not None,
-            preferred=req.payment_preference.rail if req.payment_preference else None,
+            worker_alive=await _a2a_worker_alive(agent_id=agent_id, preferred=preferred),
+            has_offer_code=offer_code is not None, preferred=preferred,
         )
         if choice.rail == "reap":
             return await reap_routes.start_reap_purchase(request, context, agent_user)
