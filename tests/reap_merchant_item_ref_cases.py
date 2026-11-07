@@ -760,3 +760,25 @@ async def test_a_stored_url_that_is_not_printable_ascii_is_not_a_page(monkeypatc
     await add_seed("dirty-twin", url=stored, attached=PRODUCT + "-dirty-twin")
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
+
+
+async def test_a_punycode_storefront_seed_resolves(monkeypatch):
+    """N4 does not hide an IDN store: its host is stored and sent as punycode (ASCII), so both sides agree."""
+    await seed(monkeypatch)
+    host = "xn--jdydll-fua.example"
+    page = "https://" + host + "/products/lip-ink"
+    await add_product(PRODUCT + "-puny")
+    await add_seed("puny-seed", url=page, domain=host, attached=PRODUCT + "-puny")
+    normalized = merchant_item.normalize_product_url("https://WWW." + host.upper() + "/products/lip-ink/", host)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT + "-puny"
+
+
+@pytest.mark.parametrize("sent", ["https://judydoll.com/products/l%C3%A9vre", "https://judydoll.com/products/l%c3%a9vre"])
+async def test_a_percent_encoded_page_resolves(monkeypatch, sent):
+    """N4 does not hide a non-ASCII page stored percent-encoded (ASCII): the same encoding resolves it, hex case
+    folded. (The same page stored RAW is no page: `test_a_stored_url_that_is_not_printable_ascii_is_not_a_page`.)"""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-encoded")
+    await add_seed("encoded-seed", url="https://judydoll.com/products/l%C3%A9vre", attached=PRODUCT + "-encoded")
+    normalized = merchant_item.normalize_product_url(sent, DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT + "-encoded"
