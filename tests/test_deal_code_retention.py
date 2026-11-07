@@ -48,11 +48,13 @@ async def db(monkeypatch):
             await database.disconnect()
 
 
-async def offer(db, deal_id, *, seller="glow.example", code=None, source="merchant_published", observed_days=0,
-                created_days=0, terms="Get 15% off with code X"):
+async def offer(db, name, *, seller="glow.example", code=None, source="merchant_published", observed_days=0,
+                created_days=0, terms="Get 15% off with code X", crawl=True):
     from db.deal_lane import observed_store_offer_key, observed_store_offers as o
 
-    code = code or deal_id.upper()
+    # Crawl rows carry the writer's own deal_id prefix; `crawl=False` is a merchant_published row entered another way.
+    deal_id = ("dlc_" if crawl else "dl_") + name
+    code = code or name.upper()
     key = observed_store_offer_key(seller_id=seller, market="US", code=code, platform_rule_ref=None,
                                    program_id="prog_1" if source == "authorized_feed" else None)
     await db.execute(o.insert().values(
@@ -63,8 +65,10 @@ async def offer(db, deal_id, *, seller="glow.example", code=None, source="mercha
     ))
 
 
-async def verification(db, deal_id, state, *, updated_days=0, expires_days=None, variant="44012345678901"):
+async def verification(db, name, state, *, updated_days=0, expires_days=None, variant="44012345678901"):
     from db.deal_lane import observed_store_offer_verifications as v
+
+    deal_id = "dlc_" + name
 
     values = dict(deal_id=deal_id, variant_id=variant, state=state, updated_at=NOW - timedelta(days=updated_days))
     if state == "checkout_verified":
@@ -80,7 +84,7 @@ async def verification(db, deal_id, state, *, updated_days=0, expires_days=None,
 async def ids(db):
     from db.deal_lane import observed_store_offers as o
 
-    return sorted(row["deal_id"] for row in await db.fetch_all(o.select()))
+    return sorted(row["deal_id"].split("_", 1)[1] for row in await db.fetch_all(o.select()))
 
 
 async def test_unverified_rows_go_14_days_after_they_were_last_seen(db):
@@ -141,7 +145,7 @@ async def test_bar_text_is_cleared_once_checked_or_after_14_days(db):
     await verification(db, "checked", "unverified")
     await offer(db, "oldtext", observed_days=1, created_days=15)
     out = await r.run(now=NOW)
-    texts = {row["deal_id"]: row["terms_text"] for row in await db.fetch_all(o.select())}
+    texts = {row["deal_id"].split("_", 1)[1]: row["terms_text"] for row in await db.fetch_all(o.select())}
     assert texts == {"young": "Get 15% off with code X", "checked": None, "oldtext": None}
     assert out["cleared_terms_text"] == 2
 
@@ -225,3 +229,28 @@ async def test_the_refresh_job_runs_retention_whatever_the_write_flag_says(db, m
     summary = await job.run_daily_external_referral_refresh(limit=1)
     assert summary["deal_code_retention"]["deleted_unverified"] == 1
     assert await ids(db) == []
+
+
+
+async def test_a_merchant_published_row_the_crawl_writer_did_not_create_is_never_touched(db):
+    from db.deal_lane import observed_store_offers as o
+
+    await offer(db, "handentered", observed_days=60, created_days=60, crawl=False)
+    await offer(db, "crawled", observed_days=60, created_days=60)
+    out = await r.run(now=NOW)
+    rows = {row["deal_id"]: row for row in await db.fetch_all(o.select())}
+    assert list(rows) == ["dl_handentered"]
+    assert rows["dl_handentered"]["terms_text"] == "Get 15% off with code X"
+    assert out["deleted_unverified"] == 1
+
+
+async def test_the_prefix_is_matched_literally_not_as_a_like_wildcard(db):
+    from db.deal_lane import observed_store_offer_key, observed_store_offers as o
+
+    # "dlcX..." would match an unescaped LIKE 'dlc_%'.
+    key = observed_store_offer_key(seller_id="glow.example", market="US", code="LOOKALIKE", platform_rule_ref=None, program_id=None)
+    await db.execute(o.insert().values(deal_id="dlcXlookalike", deal_key=key, seller_id="glow.example", market="US",
+                                       code="LOOKALIKE", kind="percent", value=10, source="merchant_published",
+                                       observed_at=NOW - timedelta(days=60), created_at=NOW - timedelta(days=60)))
+    await r.run(now=NOW)
+    assert [row["deal_id"] for row in await db.fetch_all(o.select())] == ["dlcXlookalike"]

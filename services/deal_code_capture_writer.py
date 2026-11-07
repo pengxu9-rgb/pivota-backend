@@ -65,6 +65,10 @@ _KINDS = {"percent", "amount", "free_shipping"}
 # The phrased forms only; the bare-"code" form is shadow-only until measured.
 _WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
 _MAX_MERCHANT_IDS = 20
+# PROVENANCE: every row this writer creates has a deal_id with this prefix, and no other writer uses it. Retention
+# (services/deal_code_retention.py) deletes only such rows, and this writer refreshes only such rows, so a
+# merchant_published row entered by hand, from a connected store or by any other path is never touched by either.
+CRAWL_DEAL_ID_PREFIX = "dlc_"
 
 
 def seller_id_for(url: str) -> Optional[str]:
@@ -210,7 +214,7 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
                     try:
                         await database.execute(
                             observed_store_offers.insert().values(
-                                deal_id="dl_" + uuid.uuid4().hex, deal_key=key, observed_at=now,
+                                deal_id=CRAWL_DEAL_ID_PREFIX + uuid.uuid4().hex, deal_key=key, observed_at=now,
                                 created_at=now, updated_at=now, **values,
                             )
                         )
@@ -225,13 +229,15 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
                         )
                         if existing is None:
                             raise
-                if existing["source"] != "merchant_published":
+                if existing["source"] != "merchant_published" or not str(existing["deal_id"]).startswith(CRAWL_DEAL_ID_PREFIX):
+                    # Another source, or a merchant_published row this writer did not create: never overwritten.
                     deal_code_capture.bump_write("skipped_other_source")
                     continue
                 await database.execute(
                     observed_store_offers.update()
                     .where(and_(observed_store_offers.c.deal_key == key,
-                                observed_store_offers.c.source == "merchant_published"))
+                                observed_store_offers.c.source == "merchant_published",
+                                observed_store_offers.c.deal_id.like(CRAWL_DEAL_ID_PREFIX + "%")))
                     .values(**observation, observed_at=now, updated_at=now)
                 )
                 deal_code_capture.bump_write("updated")

@@ -1,7 +1,9 @@
 """Retention of crawled discount codes (ADR-027 Q18, peng 2026-11-07), enforced at the end of every refresh run.
 
-Applies ONLY to `merchant_published` rows in `observed_store_offers` (and their verification rows); feed, automatic and
-channel rows are never touched. The rules:
+Applies ONLY to rows the crawl writer created (services/deal_code_capture_writer.py): `source = 'merchant_published'`
+AND a deal_id that starts with the writer's own prefix (CRAWL_DEAL_ID_PREFIX, "dlc_"), and to their verification rows.
+Feed, automatic and channel rows, and any merchant_published row entered another way (by hand, from a connected
+store), are never touched. The rules:
   1. a seller on the opt-out denylist: every one of its rows is deleted at once, matched by the seller id the denylist
      names, that id without/with "www.", and the hosts the catalog holds for an opted-out merchant id (Q20);
   2. found and never verified, not seen again: deleted 14 days after it was last seen (`observed_at`);
@@ -31,6 +33,7 @@ from sqlalchemy import and_, exists, func, not_, or_, select
 from db.catalog import catalog_products
 from db.database import database
 from db.deal_lane import deal_lane_optout, observed_store_offer_verifications as v, observed_store_offers as o
+from services.deal_code_capture_writer import CRAWL_DEAL_ID_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +52,9 @@ def paused() -> bool:
 
 
 def _ours():
-    return o.c.source == _SOURCE
+    # The crawl writer's own rows only: its source AND its deal_id prefix ("_" escaped: it is a LIKE wildcard).
+    escaped = CRAWL_DEAL_ID_PREFIX.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
+    return and_(o.c.source == _SOURCE, o.c.deal_id.like(escaped + "%", escape="\\"))
 
 
 def _has_state(state: str):
@@ -57,6 +62,7 @@ def _has_state(state: str):
 
 
 async def _delete_ids(ids: List[str]) -> int:
+    ids = [i for i in ids if str(i).startswith(CRAWL_DEAL_ID_PREFIX)]  # belt and braces: never another writer's id
     if not ids:
         return 0
     await database.execute(v.delete().where(v.c.deal_id.in_(ids)))

@@ -77,7 +77,7 @@ async def test_a_captured_code_becomes_one_unverified_merchant_published_row(db)
     assert r["source"] == "merchant_published"
     assert r["source_url"] == "https://www.Glow.example/products/toner"
     assert r["terms_text"] == "Get 15% off with code SAVE15"
-    assert r["deal_id"].startswith("dl_")
+    assert r["deal_id"].startswith("dlc_"), "the crawl writer's own provenance prefix"
     assert dcc.stats()["writes"] == {"inserted": 1}
 
 
@@ -305,3 +305,17 @@ async def test_a_write_failure_logs_the_error_type_only(db, monkeypatch, caplog)
     assert dcc.stats()["writes"] == {"errors": 1}
     assert "RuntimeError" in caplog.text
     assert "SAVE15" not in caplog.text and "insert failed" not in caplog.text
+
+
+
+async def test_a_merchant_published_row_this_writer_did_not_create_is_never_refreshed(db):
+    from db.deal_lane import observed_store_offer_key, observed_store_offers as o
+
+    now = datetime.now(timezone.utc)
+    key = observed_store_offer_key(seller_id="glow.example", market="US", code="SAVE15", platform_rule_ref=None, program_id=None)
+    await db.execute(o.insert().values(deal_id="dl_handentered", deal_key=key, seller_id="glow.example", market="US",
+                                       code="SAVE15", kind="amount", value=5, source="merchant_published", observed_at=now))
+    await w.record([captured()], url="https://glow.example/p", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert (r["deal_id"], r["kind"]) == ("dl_handentered", "amount")
+    assert dcc.stats()["writes"] == {"skipped_other_source": 1}
