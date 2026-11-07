@@ -22,8 +22,9 @@ and a bar named only by its wrapper or modifier class is still read. Codes from 
 apart (`by_region`). Script, style, noscript, template and svg content is skipped. Hidden text IS read: we
 parse markup, not the rendering, and a rotating bar keeps its other slides hidden.
 
-WHAT IS A CODE. An all-caps or digit token after "use/enter/apply code", or after "promo/discount/coupon/
-voucher code:", with at least one letter, not a stop word ("USE CODE BELOW", "USE CODE IN-STORE"), not
+WHAT IS A CODE. An all-caps or digit token after "use/enter/apply code", after "promo/discount/coupon/
+voucher code:", after "with/using code" (form `with_code`), or right after the word "code" ("Code: X", "code X";
+form `after_code`), with at least one letter, not a stop word ("USE CODE BELOW", "USE CODE IN-STORE"), not
 followed by "shade"/"swatch"/"tone" (a shade name, "NC20 shade"), not a gift-card number (three or more
 dash-separated groups of four, 1234-5678-ABCD) or an XXXX placeholder. "Gift card" near a code is a hint,
 not a rejection: "Excludes gift cards" is one of the commonest bar disclaimers. Its shape and the phrase
@@ -38,10 +39,12 @@ BOUNDED. The parse is linear (open-tag counts, implicit closing of p/li/option/d
 `_MAX_DEPTH`), a region keeps at most `_MAX_REGION_CHARS`, a page at most `_MAX_CODES_PER_PAGE` codes, and
 a snippet at most 160 characters, so a page's log line stays far under Cloud Logging's 256 KB entry limit.
 
-SHADOW ONLY, behind DEAL_CODE_CAPTURE_SHADOW (default off; set on the refresh job alone). With it on, each
+SHADOW, behind DEAL_CODE_CAPTURE_SHADOW (default off; set on the refresh job alone). With it on, each
 page with a code logs one `DEAL_CODE_CAPTURE_PAGE` JSON line and the counters below accumulate for the
-job's summary. Nothing is written to `observed_store_offers` here; writing waits for the shadow numbers.
-Every failure is swallowed: capture can never cost a page refresh.
+job's summary. Nothing is written here: `capture_shadow` returns the page's codes, and the separate writer
+(services/deal_code_capture_writer.py, its own flag DEAL_CODE_CAPTURE_WRITE) records them in
+`observed_store_offers` as unverified merchant_published rows. Every failure is swallowed: capture can never
+cost a page refresh.
 
 DIAGNOSTICS, COUNTS ONLY (never region or code text): why a page with a promo region yields no code. Per
 page: a named region vs only a fallback one; a region that mentions "code" in any case; a region where a
@@ -120,7 +123,9 @@ _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "
 # Tags a head may hold. On a page with no <body> tag, the first other start tag is where the body starts.
 _HEAD_TAGS = frozenset({"html", "head", "title", "base", "link", "meta", "style", "script", "noscript", "template"})
 _HEAD_SCAN_LIMIT = 1_000_000  # realistic heads are well under; 1 MB of bare "<" costs ~0.5 s
-_BODY_BUDGET = 200_000
+# Raised from 200_000 (2026-11-07): 10-20% of scanned pages had a named bar starting past the old window
+# (`pages_named_region_past_budget`). The parse is linear; the head scan limit above is unchanged.
+_BODY_BUDGET = 500_000
 _MAX_DEPTH = 512
 _MAX_REGION_CHARS = 4000
 _MAX_CODES_PER_PAGE = 20
@@ -133,6 +138,14 @@ _CODE_RES = (
         r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     ("labelled", re.compile(
         r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)\s*[:：]\s*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
+    # Widened 2026-11-07 from the shadow diagnostics (by_miss "wording": all-caps codes after "code" that the two
+    # forms above miss — "with code SAVE10", "Code: WELCOME15", "Extra 20% off code SPRING20"). Listed AFTER them,
+    # so a code they read keeps their form; each new form is counted apart in `by_form`.
+    ("with_code", re.compile(
+        r"\b(?i:with|using)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*[:：]?\s*"
+        r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
+    ("after_code", re.compile(
+        r"\b(?i:code)\b[ \t]{0,3}[:：]?[ \t]{0,3}[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
 )
 # All-caps prose after "use code" ("USE CODE BELOW FOR 10% OFF", "PROMO CODE: TBA") is not a code.
 # Compared with dashes removed, so IN-STORE is INSTORE and MON-FRI is MONFRI.
@@ -378,7 +391,7 @@ class CapturedCode:
     hints: List[str] = field(default_factory=list)
     snippet: str = ""
     shape: str = ""  # short_letters (VIP, USA) | letters | short_alnum (shade-like, e.g. NC20) | alnum
-    form: str = ""  # use_code ("use/enter/apply code X") | labelled ("promo code: X")
+    form: str = ""  # use_code ("use/enter/apply code X") | labelled ("promo code: X") | with_code | after_code
     region: str = "named"  # named | fallback (only a wrapper or modifier class named it)
 
 
@@ -416,6 +429,10 @@ def codes_in_region(text: str) -> List[CapturedCode]:
             start = match.start(1) + (len(raw) - len(raw.lstrip("-_")))
             end = start + len(code)
             if code.upper() in seen or not _is_code(code, text, start, end):
+                continue
+            # A bare "code X" is the loosest form: a shade-like short token there ("code: NC20") is not read as a
+            # code. The phrased forms keep their wider reading ("use code VIP2" stays a code).
+            if form == "after_code" and _SHORT_ALNUM_RE.fullmatch(code):
                 continue
             seen.add(code.upper())
             matches.append((code, start, end, form))
@@ -595,6 +612,8 @@ def reset_stats() -> None:
             "pages_with_named_region": 0, "pages_with_fallback_region_only": 0, "pages_region_mentions_code": 0,
             "pages_relaxed_code_match": 0, "pages_code_phrase_in_html": 0, "pages_named_region_past_budget": 0,
             "by_miss": {}, "by_region_chars": {}, "diagnosis_errors": 0,
+            # The writer's counts (DEAL_CODE_CAPTURE_WRITE): inserted, updated, skipped_*, errors.
+            "writes": {},
         })
         _HOST_CODES.clear()
         _HOSTS_WITH_CODES.clear()
@@ -616,8 +635,10 @@ def _bump(bucket: Dict[str, int], key: Optional[str]) -> None:
     bucket[name] = bucket.get(name, 0) + 1
 
 
-def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[str]) -> None:
-    """Count and log the codes in this page's promo regions. Never raises; writes nothing."""
+def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[str]) -> List[CapturedCode]:
+    """Count and log the codes in this page's promo regions, and return them (empty on any failure). Never
+    raises; writes nothing."""
+    codes: List[CapturedCode] = []
     try:
         scan = _scan(html)
         codes, capped = _page_codes(scan)
@@ -676,3 +697,12 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
         with _LOCK:
             _STATS["errors"] = _STATS.get("errors", 0) + 1
         logger.warning("deal code capture failed: %s", type(exc).__name__)
+        return []
+    return codes
+
+
+def bump_write(key: str, n: int = 1) -> None:
+    """The writer's counters (services/deal_code_capture_writer.py), in the same summary: `writes`."""
+    with _LOCK:
+        writes = _STATS.setdefault("writes", {})
+        writes[key] = writes.get(key, 0) + n

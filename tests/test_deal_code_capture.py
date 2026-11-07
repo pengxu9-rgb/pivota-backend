@@ -331,7 +331,7 @@ def test_only_the_top_of_the_body_is_read_and_the_head_does_not_count():
     head = "<head><script>" + "x" * 300_000 + "</script></head>"
     top = '<div class="announcement-bar">Use code TOP10</div>'
     deep = '<div class="announcement-bar">Use code DEEP10</div>'
-    html = f"<html>{head}<body>{top}" + "<p>filler</p>" * 20_000 + f"{deep}</body></html>"
+    html = f"<html>{head}<body>{top}" + "<p>filler</p>" * (dcc._BODY_BUDGET // 13 + 4_000) + f"{deep}</body></html>"
     assert set(_codes(html)) == {"TOP10"}
     dcc.capture_shadow(html, url="https://a.example", market="US", page_currency=None)
     assert dcc.stats()["pages_over_budget"] == 1
@@ -807,8 +807,9 @@ def _diag_stats(html):
     [
         ("Use code welcome10 for 10% off", "lower_with_digit"),
         ("Use code welcome for 10% off", "lower_letters"),
-        ("Shop with code SAVE10 today", "wording"),  # all caps, but not a strict phrase
-        ("Code: GLOW15", "wording"),
+        # Since the widened forms (2026-11-07), "with code SAVE10" and "Code: GLOW15" are captures. What is left as
+        # "wording" is a shade-like short token after a bare "code", which the loosest form refuses.
+        ("Code: NC20", "wording"),
         ("USE CODE BELOW", "stop"),
         ("Use code 2024 at checkout", "no_letter"),
         ("Use code NC20 shade", "rejected"),  # a shade name
@@ -852,7 +853,7 @@ def test_a_strict_phrase_outside_any_region_is_counted_from_the_html():
 
 
 def test_a_region_name_past_the_body_window_is_counted_only_for_a_name_token():
-    filler = "<p>filler</p>" * 20_000
+    filler = "<p>filler</p>" * (dcc._BODY_BUDGET // 13 + 4_000)
     s = _diag_stats(f'<body>{filler}<div class="announcement-bar">Use code LATE10</div></body>')
     assert (s["pages_over_budget"], s["pages_named_region_past_budget"], s["codes_seen"]) == (1, 1, 0)
     for cls in ("has-announcement-bar", "product-card"):  # a state token, or no region name at all
@@ -873,12 +874,12 @@ def test_each_region_length_is_bucketed(length, bucket):
 
 def test_diagnostics_never_put_text_in_the_log_or_the_counters(capsys):
     # No strict code, so no page line: the misses below are counted, never printed or kept.
-    html = '<body><div class="announcement-bar">with code hidden99, Code: SECRET10, use code below</div></body>'
+    html = '<body><div class="announcement-bar">with code hidden99, Code: NC20, use code below</div></body>'
     s = _diag_stats(html)
     assert s["by_miss"] == {"lower_with_digit": 1, "wording": 1, "stop": 1}
     assert capsys.readouterr().out == ""
     blob = json.dumps(s).lower()
-    assert "hidden99" not in blob and "secret10" not in blob and "below" not in blob
+    assert "hidden99" not in blob and "nc20" not in blob and "below" not in blob
 
 
 def test_a_failing_diagnosis_keeps_the_page_capture_and_counts_itself(monkeypatch, capsys):
@@ -943,14 +944,14 @@ def test_a_page_with_named_and_fallback_regions_is_not_fallback_only():
 
 
 def test_a_bar_inside_the_window_of_a_long_page_is_not_past_the_budget():
-    filler = "<p>filler</p>" * 20_000
+    filler = "<p>filler</p>" * (dcc._BODY_BUDGET // 13 + 4_000)
     s = _diag_stats(f'<body><div class="announcement-bar">x</div>{filler}</body>')
     assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 0)
 
 
 def test_the_past_budget_search_stops_at_its_limit(monkeypatch):
     monkeypatch.setattr(dcc, "_DIAG_SCAN_LIMIT", 1_000)
-    filler = "<p>filler</p>" * 16_000
+    filler = "<p>filler</p>" * (dcc._BODY_BUDGET // 13 + 600)
     s = _diag_stats(f'<body>{filler}' + "<p>more</p>" * 500 + '<div class="announcement-bar">x</div></body>')
     assert (s["pages_over_budget"], s["pages_named_region_past_budget"]) == (1, 0)
 
@@ -960,7 +961,7 @@ def test_a_trailing_underscore_does_not_turn_a_captured_code_into_a_miss():
     assert (s["codes_seen"], s["by_miss"]) == (1, {})
 
 
-_FILLER = "<p>filler</p>" * 20_000  # past the body window
+_FILLER = "<p>filler</p>" * (dcc._BODY_BUDGET // 13 + 4_000)  # past the body window
 
 
 @pytest.mark.parametrize(
@@ -1048,7 +1049,139 @@ def test_the_phrase_search_stops_at_its_limit(monkeypatch):
 
 def test_strict_codes_past_the_page_cap_are_not_wording_misses():
     codes = [f"SAVE{n}" for n in range(10, 10 + dcc._MAX_CODES_PER_PAGE + 2)]
-    text = " ".join(f"Use code {c}." for c in codes) + " Shop with code WORD99."
+    text = " ".join(f"Use code {c}." for c in codes) + " Code: NC20."
     s = _diag_stats(f'<body><div class="announcement-bar">{text}</div></body>')
     assert (s["pages_codes_capped"], s["codes_seen"]) == (1, dcc._MAX_CODES_PER_PAGE)
     assert s["by_miss"] == {"past_cap": 2, "wording": 1}
+
+
+# ---- widened phrases (2026-11-07, from the by_miss "wording" diagnostics) --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bar,code,form",
+    [
+        ("Get 15% off with code SAVE15", "SAVE15", "with_code"),
+        ("Free shipping using promo code SHIPFREE", "SHIPFREE", "with_code"),
+        ("20% off with the discount code: SPRING20", "SPRING20", "labelled"),  # labelled reads it first
+        ("15% off with the code SAVE15", "SAVE15", "with_code"),
+        ("Extra 20% off sitewide - code SPRING20", "SPRING20", "after_code"),
+        ("Code: WELCOME15 for 15% off your order", "WELCOME15", "after_code"),
+        ("CODE WEEKEND25 | 25% OFF", "WEEKEND25", "after_code"),
+        ("Use code SAVE10 for 10% off", "SAVE10", "use_code"),  # an older form keeps its label
+        ("Promo code: VIP", "VIP", "labelled"),
+        ("Use code NC2B for 10% off", "NC2B", "use_code"),
+    ],
+)
+def test_the_widened_forms_read_codes_the_strict_ones_missed(bar, code, form):
+    got = _codes(f'<body><div class="announcement-bar">{bar}</div></body>')
+    assert code in got, got
+    assert got[code].form == form
+
+
+@pytest.mark.parametrize(
+    "bar",
+    [
+        "Discount code required at checkout",  # lowercase prose is never a code
+        "Enter your ZIP CODE 90210 to see delivery",  # no letter
+        "SEE CODE BELOW",  # a stop word
+        "CODESALE starts now",  # "code" must be a whole word
+        "CODEWORD20 is our collection",  # the same, with a tail no stop word would refuse
+        "Use code NC20 shade for a match",  # a shade
+        "Scan the QR code ABOVE",  # a stop word
+        "Gift card code: 1234-5678-ABCD-9999",  # a gift-card number
+        "Code: NC20",  # a shade-like short token after a bare "code"
+        "code N25 matches",  # the same
+    ],
+)
+def test_the_widened_forms_do_not_read_prose_shades_or_gift_cards(bar):
+    assert _codes(f'<body><div class="announcement-bar">{bar}</div></body>') == {}
+
+
+def test_the_widened_form_reads_terms_like_the_others():
+    got = _codes('<body><div class="announcement-bar">Get 15% off orders over $50 with code SAVE15</div></body>')
+    c = got["SAVE15"]
+    assert (c.kind, c.value, c.min_subtotal) == ("percent", "15", "50")
+
+
+def test_a_wording_miss_is_now_a_capture():
+    html = '<body><div class="announcement-bar">Get 15% off with code SAVE15</div></body>'
+    codes = dcc.capture_shadow(html, url="https://glow.example/p", market="US", page_currency="USD")
+    assert [c.code for c in codes] == ["SAVE15"]
+    s = dcc.stats()
+    assert s["codes_seen"] == 1
+    assert s["by_form"] == {"with_code": 1}
+    assert "wording" not in s["by_miss"]
+
+
+def test_the_window_now_reaches_a_bar_past_200k_chars():
+    assert dcc._BODY_BUDGET == 500_000
+    html = "<body>" + "x" * 300_000 + '<div class="announcement-bar">Use code DEEP10</div></body>'
+    assert "DEEP10" in _codes(html)
+
+
+def test_capture_shadow_returns_the_codes_and_nothing_on_failure(monkeypatch):
+    got = dcc.capture_shadow('<body><div class="announcement-bar">Use code GLOW20</div></body>',
+                             url="https://a.example", market="US", page_currency="USD")
+    assert [c.code for c in got] == ["GLOW20"]
+    monkeypatch.setattr(dcc, "_scan", lambda html: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert dcc.capture_shadow("<body></body>", url="https://a.example", market="US", page_currency="USD") == []
+    assert dcc.stats()["errors"] == 1
+
+
+def test_the_write_flag_defaults_off(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.delenv("DEAL_CODE_CAPTURE_WRITE", raising=False)
+    assert settings.deal_code_capture_write is False
+    for v in ("1", "yes", "on"):  # only "true" turns a DEAL_* flag on
+        monkeypatch.setenv("DEAL_CODE_CAPTURE_WRITE", v)
+        assert settings.deal_code_capture_write is False
+    monkeypatch.setenv("DEAL_CODE_CAPTURE_WRITE", "TRUE")
+    assert settings.deal_code_capture_write is True
+
+
+@pytest.mark.parametrize("shadow,write,expect_write", [
+    ("true", "true", True), ("true", None, False), (None, "true", False), ("true", "false", False),
+])
+def test_the_page_refresh_records_codes_only_with_both_flags(monkeypatch, shadow, write, expect_write):
+    import services.external_offers_service as svc
+
+    for name, value in (("DEAL_CODE_CAPTURE_SHADOW", shadow), ("DEAL_CODE_CAPTURE_WRITE", write)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    page = '<html><head></head><body><div class="announcement-bar">Use code GLOW20 for 20% off</div></body></html>'
+    recorded = []
+
+    async def fake_fetch_html(url, **kwargs):
+        return page, "text/html"
+
+    async def no_existing(*a, **k):
+        return None
+
+    async def spy_record(codes, **kwargs):
+        recorded.append(([c.code for c in codes], kwargs))
+        raise RuntimeError("stop after the hook")
+
+    monkeypatch.setattr(svc, "_fetch_html", fake_fetch_html)
+    monkeypatch.setattr(svc, "_get_snapshot_row", no_existing)
+    monkeypatch.setattr(svc.deal_code_capture_writer, "record", spy_record)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("no database here")
+
+    monkeypatch.setattr(svc.database, "execute", _boom)
+    monkeypatch.setattr(svc.database, "fetch_one", _boom)
+    try:
+        asyncio.run(svc.resolve_external_offer(market="us", url="https://brand.example/products/toner", force_refresh=True))
+    except Exception:
+        pass
+    if expect_write:
+        assert len(recorded) == 1
+        codes, kwargs = recorded[0]
+        assert codes == ["GLOW20"]
+        assert (kwargs["url"], kwargs["market"]) == ("https://brand.example/products/toner", "US")
+    else:
+        assert recorded == []

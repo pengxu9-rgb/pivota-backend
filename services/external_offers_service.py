@@ -19,6 +19,7 @@ from services import crawl_global_pacer
 from services import crawl_identity
 from services import crawl_politeness
 from services import deal_code_capture
+from services import deal_code_capture_writer
 from services import shopify_edge_pacer
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 from utils.crawled_price import (
@@ -2899,9 +2900,13 @@ async def resolve_external_offer(
 
         amount, currency, price_read = snapshot_price_fields(extracted)
         # ADR-027 code collection, SHADOW: count the codes this page's promo regions print, from the HTML
-        # already in hand (no extra request). Writes nothing; never raises; off unless the job sets the flag.
+        # already in hand (no extra request). Never raises; off unless the job sets the flag. With
+        # DEAL_CODE_CAPTURE_WRITE on too, the codes are recorded as unverified merchant_published rows
+        # (services/deal_code_capture_writer.py): storage only, never verified or served from there.
         if settings.deal_code_capture_shadow:
-            deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
+            captured_codes = deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
+            if captured_codes and settings.deal_code_capture_write:
+                await deal_code_capture_writer.record(captured_codes, url=url_norm, market=market_norm, page_currency=currency)
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()
