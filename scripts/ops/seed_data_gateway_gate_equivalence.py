@@ -8,7 +8,11 @@ category, brand and strict-intent hard constraints, the hold contracts, the "X-f
 the canonical price. This script builds products the way the backend builder does (top-level fields plus
 seed_data, with internal state at every depth), strips each one with the real backend function, runs the
 GATEWAY'S OWN gate functions (scripts/ops/seed_data_gateway_gate_eval.cjs over a PIVOTA-Agent tree) on
-the full and the stripped product, and exits 1 unless every decision is identical.
+the full and the stripped product, and exits 1 unless every decision is identical. Readers whose output
+is the product's TEXT (the raw / wide / safety texts, the ingredient source text, the rich variants) are
+compared against the full product with exactly the denied keys deleted, so nothing but those keys may
+change them. A reader missing from the gateway tree fails the run, as does a case whose full product no
+longer exercises the gate it exists for (EXPECTED_FULL).
 
     python scripts/ops/seed_data_gateway_gate_equivalence.py --gateway-dir <PIVOTA-Agent tree>
         [--node node] [--node-require <guard.cjs>] [--json-out out.json]
@@ -23,7 +27,12 @@ in CI). Cases: the be#2727 review's (scratchpad repro make_cases.py: A/A2 vitami
 category_path / catalog_category_path, B fragrance via category_path, C source_unavailable contract, D
 non-merch hold, E retinoid in a non-title variant key, F retinoid in a variant title) plus retinoids
 named only in seed_data's snapshot, ingredient lists, ingredient_intel, tags and variant options, a
-stand-in, holds on the snapshot, a seed-only price, a lipstick, and a JSON-text snapshot.
+stand-in, holds on the snapshot, a seed-only price, a lipstick, and a JSON-text snapshot; plus the be#2730
+review's (r2730/make_cases_2730.py): category paths only on the snapshot, holds nested in variants, seed
+URLs whose slug / query / scheme / backslash names a retinoid (the URLs must reach the net as stored), a
+variant destination_url with ?variant=, a variant image url, a URL field holding a list, seed-only fit
+attributes / local authority / rich PDP / schema paths / variant prices, a weak pregnancy anti-aging
+product, and cart proofs + variant provenance.
 """
 
 from __future__ import annotations
@@ -43,7 +52,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from services.seed_data_egress_projection import strip_product_internal_seed_data  # noqa: E402
+from services.seed_data_egress_projection import (  # noqa: E402
+    INTERNAL_STATE_KEYS,
+    strip_product_internal_seed_data,
+)
 
 EVALUATOR = Path(__file__).resolve().with_name("seed_data_gateway_gate_eval.cjs")
 
@@ -208,6 +220,87 @@ def build_cases() -> Dict[str, Dict[str, Any]]:
             {"title": "Hydrating Gel Cream", "category_path": "beauty/skincare/moisturize/gel",
              "inci_list": "Aqua, Glycerin"},
         ),
+        # --- the be#2730 review's cases ---
+        "R1_category_paths_only_on_snapshot": _product(
+            "snap-cat", "Vitamin A Capsules",
+            {"snapshot": {"category_path": "beauty/fragrance/unisex",
+                          "catalog_category_path": "beauty/skincare/treat/serum"}},
+        ),
+        "R2_holds_nested_in_variants": _product(
+            "var-hold", "Hydrating Gel Cream",
+            {"variants": [{"variant_id": "7", "availability": "out_of_stock", "in_stock": False,
+                           "source_unavailable_v1": hold}],
+             "snapshot": {"variants": [{"variant_id": "7", "availability": "out_of_stock",
+                                        "transaction_readiness_blocker_v1": hold}]}},
+        ),
+        "R3_relative_seed_canonical_names_retinoid": _product(
+            "rel-1", "Night Renewal Serum", {"canonical_url": "/products/retinol-night-serum"},
+        ),
+        "R4_seed_url_query_names_retinoid": _product(
+            "q-1", "Night Renewal Serum",
+            {"destination_url": "https://shop.example/products/night?variant=1&strength=Retinol%200.5"},
+        ),
+        "R5_non_http_seed_url_names_retinoid": _product(
+            "ftp-1", "Night Renewal Serum", {"external_url": "ftp://shop.example/retinol-serum"},
+        ),
+        "R6_backslash_seed_url_names_retinoid": _product(
+            "bs-1", "Night Renewal Serum",
+            {"snapshot": {"canonical_url": "https://shop.example\\products\\retinol-serum"}},
+        ),
+        "R7_variant_destination_url_variant_param": _product(
+            "vd-1", "Gel Cream",
+            {"variants": [{"variant_id": "45253610242298", "title": "30ml", "availability": "in_stock",
+                           "destination_url": "https://shop.example/products/gel?variant=45253610242298&utm_source=x"}]},
+        ),
+        "R8_variant_url_image_candidate": _product(
+            "vu-1", "Gel Cream",
+            {"variants": [{"variant_id": "1", "url": "https://cdn.example/v1.jpg?width=600"}],
+             "snapshot": {"images": [{"url": "https://cdn.example/a.jpg?v=2"}]}},
+            image_url=None, image_urls=[],
+        ),
+        "R9_url_field_holding_a_list": _product(
+            "ul-1", "Gel Cream", {"destination_url": ["https://shop.example/p?utm=1"]},
+        ),
+        "R10_fit_attributes_seed_only": _product(
+            "fit-1", "Daily Sunscreen",
+            {"spf_rating": "SPF 50", "pa_rating": "PA++++", "texture": "gel", "finish": "matte",
+             "description": "light gel SPF 50"},
+        ),
+        "R11_local_authority_seed_only": _product(
+            "kb-1", "Rice Toner",
+            {"brand_origin_country": "KR", "available_markets": ["US", "KR"], "retailer_country": "US"},
+        ),
+        "R12_rich_pdp_seed_only": _product(
+            "rp-1", "Gel Cream",
+            {"variants": [{"variant_id": "1", "title": "50ml", "price_amount": 20}],
+             "pdp_ingredients_raw": "Aqua, Retinol",
+             "pdp_details_sections": [{"title": "How to use", "body": "apply"}]},
+            variants=[],
+        ),
+        "R13_pdp_schema_seed_paths": _product(
+            "ps-1", "Lip Tint",
+            {"catalog_category_path": "beauty/makeup/lips/tint",
+             "snapshot": {"catalog_category_path": "beauty/makeup/lips/tint"}},
+        ),
+        "R14_price_in_seed_variants_only": _product(
+            "pv-1", "Gel Cream",
+            {"price_amount": 21, "price_currency": "USD",
+             "variants": [{"variant_id": "1", "price_amount": 21, "price_currency": "USD"}]},
+            price=None, currency=None, variants=[{"id": "pv-1:1", "variant_id": "1", "title": "Default"}],
+        ),
+        "R15_weak_pregnancy_anti_aging": _product(
+            "pg-1", "Firming Serum", {"key_ingredients": ["Peptides"], "inci_list": "Aqua, Retinyl Palmitate"},
+        ),
+        "R16_cart_proof_and_variant_provenance": _product(
+            "cp-1", "Gel Cream",
+            {"snapshot": {
+                "shopify_cart_proof": {"variant_id": "1", "checked_at": "t",
+                                       "product_js_url": "https://shop.example/products/gel.js"},
+                "shopify_cart_variant_proofs": [{"variant_id": "1", "live": True}],
+                "variants": [{"variant_id": "1", "variant_id_provenance": "merchant_issued",
+                              "url_source": "shade_fold", "url": "https://shop.example/products/gel?variant=1"}]},
+             "pdp_matcher": {"decision": "matched"}},
+        ),
     }
     cases: Dict[str, Dict[str, Any]] = {}
     for name, product in base.items():
@@ -244,6 +337,11 @@ EXPECTED_FULL = {
     "M_holds_on_snapshot": ("hard_none", ["source_unavailable_or_non_merchandise"]),
     "N_price_only_in_seed_data": ("canonical_price", {"amount": 24, "currency": "USD"}),
     "O_lipstick_via_category_path": ("category_path_text", "beauty/makeup/lips/lipstick"),
+    "R3_relative_seed_canonical_names_retinoid": ("retinoid_for_safety", True),
+    "R4_seed_url_query_names_retinoid": ("retinoid_for_safety", True),
+    "R5_non_http_seed_url_names_retinoid": ("retinoid_for_safety", True),
+    "R6_backslash_seed_url_names_retinoid": ("retinoid_for_safety", True),
+    "R14_price_in_seed_variants_only": ("canonical_price", {"amount": 21, "currency": "USD"}),
 }
 
 
@@ -251,30 +349,29 @@ def run(gateway_dir: Path, *, node: str = "node", node_require: Optional[List[st
         cases: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[Dict[str, Any], List[str]]:
     """-> (gate decisions per case, mismatch descriptions). An empty mismatch list means identical."""
     cases = cases if cases is not None else build_cases()
-    payload = {}
+    payload: Dict[str, Any] = {"denied_keys": sorted(INTERNAL_STATE_KEYS), "cases": {}}
     for name, full in cases.items():
         before = copy.deepcopy(full)
         stripped = strip_product_internal_seed_data(full)
         if full != before:
             raise AssertionError(f"{name}: the strip mutated its input")
-        payload[name] = {"full": full, "stripped": stripped}
+        payload["cases"][name] = {"full": full, "stripped": stripped}
     with tempfile.TemporaryDirectory() as tmp:
         cases_path = Path(tmp) / "cases.json"
         cases_path.write_text(json.dumps(payload), encoding="utf-8")
         cmd = [node]
         for module in node_require or []:
             cmd += ["--require", module]
-        cmd += [str(EVALUATOR), str(gateway_dir), str(cases_path)]
+        out_path = Path(tmp) / "result.json"
+        cmd += [str(EVALUATOR), str(gateway_dir), str(cases_path), str(out_path)]
         env = dict(os.environ)
         env.setdefault("NODE_ENV", "test")
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
-    if proc.returncode != 0:
-        raise RuntimeError(f"gate evaluator failed ({proc.returncode}): {proc.stderr[-4000:]}")
-    line = next((l for l in reversed(proc.stdout.splitlines()) if l.startswith("{")), None)
-    if line is None:
-        raise RuntimeError(f"gate evaluator printed no result: {proc.stdout[-2000:]} {proc.stderr[-2000:]}")
-    decisions = json.loads(line)
-    mismatches: List[str] = []
+        if proc.returncode != 0 or not out_path.exists():
+            raise RuntimeError(f"gate evaluator failed ({proc.returncode}): {proc.stderr[-4000:]}")
+        result = json.loads(out_path.read_text(encoding="utf-8"))
+    decisions = result.get("cases") or {}
+    mismatches: List[str] = [f"reader missing from the gateway tree: {n}" for n in result.get("missing_readers") or []]
     for name, (gate, expected) in EXPECTED_FULL.items():
         got = (decisions.get(name) or {}).get("full", {}).get(gate)
         if got != expected:
@@ -289,6 +386,11 @@ def run(gateway_dir: Path, *, node: str = "node", node_require: Optional[List[st
             stripped_value = got["stripped"].get(gate)
             if full_value != stripped_value:
                 mismatches.append(f"{name} / {gate}: full={json.dumps(full_value)} stripped={json.dumps(stripped_value)}")
+        for reader, full_text in got["full_texts"].items():
+            stripped_text = got["stripped_texts"].get(reader)
+            if full_text != stripped_text:
+                mismatches.append(f"{name} / {reader} (text): full-minus-denied={json.dumps(full_text)[:300]} "
+                                  f"stripped={json.dumps(stripped_text)[:300]}")
     return decisions, mismatches
 
 

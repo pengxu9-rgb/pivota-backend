@@ -5,7 +5,7 @@ GET /agent/v1/products/search (agent_sdk_fixed, which delegates to agent_api.age
 GET /agent/v1/beauty/products/search (agent_api) served external-seed products with the stored seed_data
 attached whole. Each of agent_search_products' three returns (fast mode, browse standard, search
 standard) now strips the internal-state keys at every depth (services/seed_data_egress_projection.py,
-DENYLIST) and cuts URL fields to scheme://host/path. EVERYTHING ELSE IS KEPT: the gateway gates on this
+DENYLIST). EVERYTHING ELSE IS KEPT AS STORED, URLs included (the retinoid net reads them as text): the gateway gates on this
 response before its own egress projection (category paths, hold contracts, every variant string, the
 retinoid safety text), so dropping anything else could turn a gated product into a served one. The
 gateway's own gates are run on full vs stripped products by scripts/ops/seed_data_gateway_gate_equivalence.py
@@ -58,8 +58,12 @@ _INTERNAL_KEYS = {
     "manual_overrides",
     "utm_template",
     "seller_ref",
+    "shopify_cart_proof",
+    "shopify_cart_variant_proofs",
+    "variant_id_provenance",
+    "url_source",
+    "pdp_matcher",
 }
-_URL_KEYS = {"external_url", "canonical_url", "destination_url"}
 # Values that exist only under internal keys: none may appear anywhere in a response's seed_data.
 _INTERNAL_MARKERS = (
     "INTERNAL-price-read",
@@ -70,7 +74,8 @@ _INTERNAL_MARKERS = (
     "INTERNAL-override",
     "INTERNAL-seller",
     "INTERNAL-purchase",
-    "utm_source=",
+    "INTERNAL-cart-proof",
+    "utm_medium={tool}",
     "pvt_click_id",
 )
 
@@ -122,6 +127,8 @@ def _search_seed_data() -> Dict[str, Any]:
             "variant_refresh_last_write": {"at": "INTERNAL-refresh"},
             "description_refused_source": "INTERNAL-provenance",
             "price_writeback": {"purchase_id": "INTERNAL-purchase"},
+            "shopify_cart_proof": {"checked_at": "INTERNAL-cart-proof"},
+            "shopify_cart_variant_proofs": [{"live": "INTERNAL-cart-proof"}],
         },
         "variants": [
             {
@@ -133,6 +140,8 @@ def _search_seed_data() -> Dict[str, Any]:
                 "url": "https://shop.example/products/night-serum?variant=1",
                 "shade": "Clear",
                 "variant_refresh_status": "INTERNAL-refresh",
+                "variant_id_provenance": "INTERNAL-provenance",
+                "url_source": "INTERNAL-provenance",
             },
             {"variant_id": "v2", "title": "100ml", "price_amount": 19.99, "price_currency": "USD"},
         ],
@@ -155,6 +164,7 @@ def _search_seed_data() -> Dict[str, Any]:
         "seller_ref": "INTERNAL-seller",
         "description_source": "INTERNAL-provenance",
         "image_urls_source": "INTERNAL-provenance",
+        "pdp_matcher": {"decision": "INTERNAL-provenance"},
     }
 
 
@@ -176,7 +186,7 @@ def _at(value: Any, path: Tuple[Any, ...]) -> Any:
 
 
 def _assert_stripped_from(full: Dict[str, Any], served: Dict[str, Any]) -> None:
-    """served == full minus the internal keys, with URL fields cut: checked leaf by leaf."""
+    """served == full minus the internal keys, everything else (URLs included) unchanged: leaf by leaf."""
     served_wire = json.dumps(served)
     for marker in _INTERNAL_MARKERS:
         assert marker not in served_wire, marker
@@ -185,10 +195,6 @@ def _assert_stripped_from(full: Dict[str, Any], served: Dict[str, Any]) -> None:
     for path, value in _leaves(full):
         keys = [k for k in path if isinstance(k, str)]
         if set(keys) & _INTERNAL_KEYS:
-            continue
-        if keys and keys[-1] in _URL_KEYS:
-            got = _at(served, path)
-            assert "?" not in got and "#" not in got and "@" not in got, (path, got)
             continue
         assert _at(served, path) == value, path
 
@@ -327,24 +333,28 @@ def test_search_keeps_every_input_the_gateway_gates_read(
     assert seed["price_amount"] == 12.34 and seed["commerce_facts_v1"] == {"spf_rating": "50", "texture": "gel"}
 
 
-def test_search_cuts_url_fields_at_every_depth(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+def test_search_keeps_seed_data_urls_as_stored(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    """be#2730 review P1-1: the retinoid net reads these URLs as text (a relative path, a query or a
+    non-http slug can name the retinoid), and they publish nothing the product's own top-level
+    destination_url does not. So they are served exactly as stored."""
     seed_data = _search_seed_data()
-    seed_data["ingredient_intel"]["external_url"] = "javascript:alert(1)"
-    seed_data["variants"][1]["destination_url"] = "https://[2001:db8::1]:8443/p/x?ref=1"
+    stored_urls = {
+        ("canonical_url",): "/products/retinol-night-serum",
+        ("external_url",): "ftp://shop.example/retinol-serum",
+        ("snapshot", "destination_url"): "https://shop.example\\products\\retinol-serum",
+        ("variants", 1, "destination_url"): "https://shop.example/p?variant=1&strength=Retinol%200.5#x",
+    }
+    for path, url in stored_urls.items():
+        _at(seed_data, path[:-1])[path[-1]] = url
     _patch_search(monkeypatch, [_seed_row(seed_data)])
     url = "/agent/v1/products/search?query=example.com&limit=20&offset=0&in_stock_only=false"
     (product,) = _external_products(client.get(url, headers={"X-API-Key": "test-api-key"}))
     seed = product["seed_data"]
 
-    assert seed["destination_url"] == "https://shop.example/products/night-serum"
-    assert seed["snapshot"]["canonical_url"] == "https://shop.example:8443/p/night-serum"
-    assert seed["variants"][1]["destination_url"] == "https://[2001:db8::1]:8443/p/x"
-    assert "external_url" not in seed["ingredient_intel"]
-    wire = json.dumps(seed)
-    for word in ("utm_", "PUB1", "user:pw", "#x", "javascript:"):
-        assert word not in wire, word
-    # The product's own attributed link (what agents follow) is the builder's, unchanged.
-    assert "pvt_click_id=" in product["destination_url"]
+    for path, stored in stored_urls.items():
+        assert _at(seed, path) == stored, path
+    assert seed["destination_url"] == _search_seed_data()["destination_url"]
+    assert "utm_template" not in seed  # the one attribution secret stays denied
 
 
 def test_search_strips_inside_a_snapshot_stored_as_json_text(
@@ -529,12 +539,45 @@ def test_a_text_snapshot_that_is_not_a_json_object_is_dropped() -> None:
         assert strip_internal_seed_data({"title": "x", "snapshot": text}) == {"title": "x"}, text
 
 
-def test_url_cut_edges() -> None:
-    from services.seed_data_egress_projection import _clean_url
+# --- lone surrogates (be#2730 review P2-1) ------------------------------------------------------------
 
-    assert _clean_url("https://shop.example\\@evil.example/p") is None  # host ambiguity: dropped
-    # Path-borne tracking survives the cut (documented): only query, fragment and userinfo go.
-    assert _clean_url("https://shop.example/p;jsessionid=ABC?x=1#y") == "https://shop.example/p;jsessionid=ABC"
-    assert _clean_url("https://[2001:db8::1]/p?q=1") == "https://[2001:db8::1]/p"
-    assert _clean_url("ftp://shop.example/p") is None
-    assert _clean_url("https:///p") is None
+_LONE_SURROGATE_SNAPSHOT = json.dumps({"description": "Glow \ud83d", "title": "Night \udc00 Serum", "price_read": 1})
+
+
+@pytest.mark.parametrize("url,expected_path", _CASES)
+def test_search_with_a_lone_surrogate_in_a_text_snapshot_still_renders(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, url: str, expected_path: str
+) -> None:
+    """jsonb holds the ESCAPE (what JS writes for a split emoji); parsing the text yields a raw lone
+    surrogate, which would fail the response's encode after the route returned: a 500 for the page."""
+    seed_data = _search_seed_data()
+    seed_data["snapshot"] = _LONE_SURROGATE_SNAPSHOT
+    _patch_search(monkeypatch, [_seed_row(seed_data)])
+    res = client.get(url, headers={"X-API-Key": "test-api-key"})
+    assert res.status_code == 200, res.text[:300]
+    (product,) = _external_products(res)
+    served = json.loads(product["seed_data"]["snapshot"])
+    assert served == {"description": "Glow \ufffd", "title": "Night \ufffd Serum"}
+
+
+def test_strip_replaces_lone_surrogates_in_every_string_and_key() -> None:
+    stripped = strip_internal_seed_data({"a\ud83d": ["x\udc00", {"k": "ok \U0001F600"}]})
+    assert stripped == {"a\ufffd": ["x\ufffd", {"k": "ok \U0001F600"}]}
+    json.dumps(stripped, ensure_ascii=False).encode("utf-8")  # encodes
+
+
+def test_strip_keeps_everything_down_to_its_bound() -> None:
+    """Mutant D2 (bound 64 -> 20): a real but deep structure at depth 40 survives whole."""
+    deep: Dict[str, Any] = {"leaf": "kept-at-40"}
+    for _ in range(40):
+        deep = {"n": deep}
+    stripped = strip_internal_seed_data({"title": "x", "deep": deep})
+    assert "kept-at-40" in json.dumps(stripped)
+
+
+def test_a_reserialised_text_snapshot_is_ascii_escaped() -> None:
+    """Defence in depth behind the surrogate replacement: the text form never carries a raw non-ASCII
+    character either (the gateway never parses a string snapshot, so the escaping changes no reader)."""
+    stripped = strip_internal_seed_data({"snapshot": json.dumps({"title": "Crème \U0001F600", "audit": {"a": 1}})})
+    assert stripped["snapshot"].isascii()
+    assert json.loads(stripped["snapshot"]) == {"title": "Crème \U0001F600"}

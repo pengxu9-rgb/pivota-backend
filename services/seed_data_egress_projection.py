@@ -29,14 +29,20 @@ serves the product. The two routes use two DIFFERENT rules, on purpose:
    except INTERNAL_STATE_KEYS below, removed at every depth (seed_data, snapshot, variants[], any nested
    object). scripts/ops/seed_data_gateway_gate_equivalence.py runs the gateway's own gate functions on
    the full and the stripped product and fails unless every decision is identical.
-   URLs: external_url / canonical_url / destination_url, at any depth, are cut to
-   scheme://host[:port]/path (query, fragment and userinfo removed), so tracking, affiliate and
-   attribution parameters never ride along; a non-http(s) URL is dropped. Tracking that lives in the PATH
-   (`;jsessionid=...`, `/ref=...`, a deep-link host carrying its target in the path) survives the cut.
-   No gateway reader on this hop reads a seed_data URL's query (its `?variant=` readers read the
-   product's own top-level destination_url, which is untouched).
-   A snapshot stored as JSON text is stripped inside the text and re-serialised (its type is kept, so the
-   gateway reads it exactly as before minus the denied keys); text that is not a JSON object is dropped.
+   URLs are KEPT AS STORED. The gateway's retinoid net reads seed_data's external_url / canonical_url /
+   destination_url as text (a slug, a relative path or a query can name the retinoid), so cutting them
+   would weaken it (be#2730 review P1-1); and they publish nothing the product's own top-level
+   destination_url / external_url (the same merchant URL, with its query) does not already. The one
+   attribution secret, utm_template, is denied.
+   A snapshot stored as JSON text is stripped inside the text and re-serialised ASCII-escaped (its type is
+   kept, so the gateway, which never parses a string snapshot, reads it exactly as before minus the denied
+   keys); text that is not a JSON object is dropped.
+
+LONE SURROGATES. jsonb cannot hold a raw lone surrogate, but JSON TEXT inside it can hold the escape
+(`\\ud83d`, what JS writes for a split emoji), and parsing that text yields one. A raw lone surrogate in a
+response makes the JSON response fail to ENCODE after the route has returned -- a 500 for the whole page,
+past every handler and fallback (be#2730 review P2-1). So every string either rule emits has lone
+surrogates replaced (U+FFFD), and the re-serialised text snapshot is ASCII-escaped.
 
 COPY-ON-WRITE. Both rules build new containers and never mutate their input, so the stored row and any
 cache holding the built product (the external-seed search cache shares product objects across requests)
@@ -46,8 +52,8 @@ keep the full blob. When nothing is left the key is dropped rather than sent as 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlsplit, urlunsplit
 
 # =========================================================================================================
 # 1. Detail route: allowlist
@@ -71,6 +77,15 @@ SEED_VARIANT_FIELDS = (
 _SCALAR_TYPES = (str, int, float, bool)
 
 
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _safe_str(value: str) -> str:
+    """The string with every lone surrogate replaced by one U+FFFD, so the response can always encode.
+    (Python never holds a VALID pair as two surrogates: json.loads joins an escaped pair into one char.)"""
+    return _LONE_SURROGATE.sub("\ufffd", value)
+
+
 def _object(value: Any) -> Optional[Dict[str, Any]]:
     """A dict, or a JSON-object string parsed into one (routes.agent_api._ensure_json_obj's rule: ANY
     parse failure -- a ValueError, or a RecursionError on pathologically deep text -- is "not an
@@ -88,21 +103,21 @@ def _object(value: Any) -> Optional[Dict[str, Any]]:
 
 def _scalar(value: Any) -> Optional[Any]:
     if isinstance(value, str):
-        return value if value.strip() else None
+        return _safe_str(value) if value.strip() else None
     if isinstance(value, _SCALAR_TYPES):
         return value
     return None
 
 
 def _text(value: Any) -> Optional[str]:
-    return value if isinstance(value, str) and value.strip() else None
+    return _safe_str(value) if isinstance(value, str) and value.strip() else None
 
 
 def _image_item(value: Any) -> Optional[Any]:
     if isinstance(value, str):
-        return value if value.strip() else None
+        return _safe_str(value) if value.strip() else None
     if isinstance(value, dict):
-        kept = {k: value[k] for k in SEED_IMAGE_OBJECT_URL_FIELDS if _text(value.get(k)) is not None}
+        kept = {k: _text(value.get(k)) for k in SEED_IMAGE_OBJECT_URL_FIELDS if _text(value.get(k)) is not None}
         return kept or None
     return None
 
@@ -206,6 +221,12 @@ def project_product_seed_data(product: Any) -> Any:
 #:   review / audit state     review_summary, review_status, audit, audit_quarantine
 #:                            (employee_products._SEED_DATA_REVIEW_PRESERVE_KEYS)
 #:   operator / attribution   manual_overrides, utm_template, seller_ref
+#:   cart / matcher proofs    shopify_cart_proof, shopify_cart_variant_proofs (backfill_shopify_variant_ids),
+#:                            variant_id_provenance, url_source (employee_products variant writers),
+#:                            pdp_matcher (services/pdp_matcher/runner)
+#: KNOWN, NOT DENIED: gateway-written state (external_seed_snapshot_contract, pdp_field_quality_summary,
+#: provenance, review_required, identity_status, *_v1 contracts, reviewed_*_patch_v1, ...) -- some of it is
+#: read by gateway gates, so each needs the equivalence check before it may be denied.
 #: Adding a key here is safe only if no gateway gate reads it: the gate-equivalence script proves that
 #: for the gates it runs.
 INTERNAL_STATE_KEYS = frozenset(
@@ -237,35 +258,18 @@ INTERNAL_STATE_KEYS = frozenset(
         "manual_overrides",
         "utm_template",
         "seller_ref",
+        "shopify_cart_proof",
+        "shopify_cart_variant_proofs",
+        "variant_id_provenance",
+        "url_source",
+        "pdp_matcher",
     }
 )
-URL_FIELDS = frozenset({"external_url", "canonical_url", "destination_url"})
 TEXT_JSON_FIELDS = frozenset({"snapshot"})
 
 # A bound on nesting, far beyond any real seed_data, so a pathological blob can never exhaust the stack
 # (and fail the whole search page). A subtree below it is dropped: nothing reads that deep.
 _MAX_STRIP_DEPTH = 64
-
-
-def _clean_url(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    if "\\" in value:
-        # urlsplit and a browser disagree on the host of `https://a.example\@b.example/p`: drop it rather
-        # than publish a host the URL does not name.
-        return None
-    try:
-        parts = urlsplit(value.strip())
-        host = parts.hostname
-        port = parts.port
-    except ValueError:
-        return None
-    if parts.scheme.lower() not in ("http", "https") or not host:
-        return None
-    if ":" in host:  # IPv6 literal: keep its brackets
-        host = f"[{host}]"
-    netloc = f"{host}:{port}" if port else host
-    return urlunsplit((parts.scheme.lower(), netloc, parts.path, "", ""))
 
 
 _DROP = object()
@@ -281,23 +285,22 @@ def _strip(value: Any, depth: int) -> Any:
         for key, item in value.items():
             if key in INTERNAL_STATE_KEYS:
                 continue
-            if key in URL_FIELDS and isinstance(item, str):
-                cleaned = _clean_url(item)
-                if cleaned is not None:
-                    out[key] = cleaned
-                continue
+            if isinstance(key, str):
+                key = _safe_str(key)
             if key in TEXT_JSON_FIELDS and isinstance(item, str):
                 parsed = _object(item)
                 if parsed is None:
                     continue  # text that is not a JSON object: nothing can be stripped inside it
                 stripped = _strip(parsed, depth + 1)
                 if stripped is not _DROP:
-                    out[key] = json.dumps(stripped, ensure_ascii=False)
+                    out[key] = json.dumps(stripped)  # ASCII-escaped: no raw lone surrogate
                 continue
             stripped = _strip(item, depth + 1)
             if stripped is not _DROP:
                 out[key] = stripped
         return out
+    if isinstance(value, str):
+        return _safe_str(value)
     if isinstance(value, list):
         items = []
         for item in value:

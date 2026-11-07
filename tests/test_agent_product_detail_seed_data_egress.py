@@ -460,3 +460,30 @@ def test_detail_route_fails_safe_when_the_projection_raises(
     assert res.status_code == 500
     for word in ("seed_data", "price_read", "variant_refresh", "seller_internal_1"):
         assert word not in res.text, word
+
+
+def test_detail_route_with_a_lone_surrogate_in_a_text_snapshot_still_renders(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """be#2730 review P2-1: the kept snapshot.description carried a raw lone surrogate and the response
+    failed to encode (500). Kept strings replace it with U+FFFD."""
+    seed_data = _internal_seed_data()
+    seed_data["snapshot"] = json.dumps({"description": "Glow \ud83d", "image_url": "https://example.com/\udc00.jpg"})
+    res = _detail_response(monkeypatch, client, _seed_row(seed_data))
+    assert res.status_code == 200, res.text[:300]
+    snapshot = res.json()["product"]["seed_data"]["snapshot"]
+    assert snapshot == {"description": "Glow \ufffd", "image_url": "https://example.com/\ufffd.jpg"}
+
+
+def test_detail_projection_replaces_lone_surrogates_in_every_kept_string() -> None:
+    projected = project_seed_data(
+        {
+            "image_urls": ["https://example.com/\ud83d.jpg"],
+            "images": [{"url": "https://example.com/\udc00.jpg"}],
+            "variants": [{"variant_id": "v\ud83d", "option_name": "Shade \udc00"}],
+            "derived": {"recall": {"retrieval_summary": "Gel \ud83d"}},
+        }
+    )
+    wire = json.dumps(projected, ensure_ascii=False)
+    wire.encode("utf-8")  # encodes
+    assert wire.count("\ufffd") == 5
