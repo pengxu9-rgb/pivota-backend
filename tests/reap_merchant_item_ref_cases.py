@@ -6,6 +6,8 @@ stays in force. The fixture is the selection-prepare suite's (one seed, one mirr
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from db.database import IS_POSTGRES, database
@@ -18,7 +20,9 @@ from reap_selection_prepare_cases import (  # noqa: F401  (prepare_seed_cleanup 
     unchanged_state,
 )
 
-URL = "https://judydoll.com/products/lip-ink"
+URL = f"https://{DOMAIN}/products/lip-ink"
+#: The fixture's store host spelled in mixed case (the shared fixture owns the host; nothing here spells it).
+MIXED = DOMAIN.title()
 CREATE = "/agent/v2/commerce/reap/purchases"
 DOOR = "/agent/v2/commerce/purchases"
 
@@ -41,7 +45,7 @@ async def add_product(product_key, *, suppressed=False, source_system="shopify_i
     await database.execute(
         "INSERT INTO catalog_products (product_key,merchant_id,platform,source_product_id,title,brand,source_domain,"
         "source_system,source_ref,seed_kind,suppression_reason) VALUES (:pk,'merch_other','shopify',:pk,'Other',"
-        "'Judydoll',:domain,:source,:ref,'self',:reason)",
+        "'Brand A',:domain,:source,:ref,'self',:reason)",
         {"pk": product_key, "domain": DOMAIN, "source": source_system, "ref": source_ref,
          "reason": "test_suppressed" if suppressed else None},
     )
@@ -53,6 +57,13 @@ async def add_seed(seed_id, *, url=URL, attached=None, market="US", domain=DOMAI
         "VALUES (:id,'active',:domain,:market,:url,:pk,'{}')",
         {"id": seed_id, "domain": domain, "market": market, "url": url, "pk": attached},
     )
+
+
+def pilot_scope(agent_id, product_key):
+    """A complete pilot scope (every key the scope reader requires) for this fixture's store."""
+    return json.dumps({"agent_ids": [agent_id], "merchant_domains": [DOMAIN], "markets": ["US"],
+                       "product_keys": [product_key], "quantities": [1], "variant_keys": ["shopify:" + VARIANT],
+                       "currency": "USD", "max_total_minor": 100000})
 
 
 def forbid_sql(patches):
@@ -77,11 +88,11 @@ async def test_prepare_by_product_url_is_exactly_the_product_key_witness(client,
 
 
 @pytest.mark.parametrize("spelling", [
-    "https://www.judydoll.com/products/lip-ink",
-    "https://judydoll.com/products/lip-ink/",
-    "HTTPS://JudyDoll.com/products/Lip-Ink?variant=49819267301653#reviews",
-    "http://judydoll.com/products/lip-ink",
-    "https://judydoll.com:443/products/lip-ink",
+    f"https://www.{DOMAIN}/products/lip-ink",
+    f"https://{DOMAIN}/products/lip-ink/",
+    f"HTTPS://{MIXED}/products/Lip-Ink?variant=49819267301653#reviews",
+    f"http://{DOMAIN}/products/lip-ink",
+    f"https://{DOMAIN}:443/products/lip-ink",
 ])
 async def test_prepare_resolves_every_spelling_of_the_same_page(client, monkeypatch, spelling):
     await seed(monkeypatch)
@@ -92,22 +103,22 @@ async def test_prepare_resolves_every_spelling_of_the_same_page(client, monkeypa
 
 @pytest.mark.parametrize("bad", [
     "https://other-store.example/products/lip-ink",       # another store
-    "https://uk.judydoll.com/products/lip-ink",           # a subdomain is another store
-    "https://judydoll.com.evil.example/products/lip-ink",  # a lookalike
+    f"https://uk.{DOMAIN}/products/lip-ink",           # a subdomain is another store
+    f"https://{DOMAIN}.evil.example/products/lip-ink",  # a lookalike
     "https://127.0.0.1/products/lip-ink",                  # an IP literal
-    "https://judydoll.com/",                               # no product page
-    "https://judydoll.com",
-    "ftp://judydoll.com/products/lip-ink",
-    "judydoll.com/products/lip-ink",
-    "https://buyer:pw" + chr(64) + "judydoll.com/products/lip-ink",  # userinfo
-    "https://judydoll.com:8443/products/lip-ink",          # a non-default port
-    "https://judydoll.com/products/lip ink",               # whitespace inside
-    "https://judydoll.com/products/lip-ink\u0000",         # NUL
-    "https://judydoll.com/products/lip\u200b-ink",         # zero-width space (a format character)
-    "\u00a0https://judydoll.com/products/lip-ink",         # NBSP, never silently trimmed
-    " https://judydoll.com/products/lip-ink",              # leading space, never silently trimmed
-    "https://judydoll.com/products/lip-ink\u00e9",         # raw non-ASCII (Python and SQL fold it apart)
-    "https://judydoll.com/" + "a" * 2100,                  # longer than the cap
+    f"https://{DOMAIN}/",                               # no product page
+    f"https://{DOMAIN}",
+    f"ftp://{DOMAIN}/products/lip-ink",
+    f"{DOMAIN}/products/lip-ink",
+    "https://buyer:pw" + chr(64) + f"{DOMAIN}/products/lip-ink",  # userinfo
+    f"https://{DOMAIN}:8443/products/lip-ink",          # a non-default port
+    f"https://{DOMAIN}/products/lip ink",               # whitespace inside
+    f"https://{DOMAIN}/products/lip-ink\u0000",         # NUL
+    f"https://{DOMAIN}/products/lip\u200b-ink",         # zero-width space (a format character)
+    f"\u00a0https://{DOMAIN}/products/lip-ink",         # NBSP, never silently trimmed
+    f" https://{DOMAIN}/products/lip-ink",              # leading space, never silently trimmed
+    f"https://{DOMAIN}/products/lip-ink\u00e9",         # raw non-ASCII (Python and SQL fold it apart)
+    f"https://{DOMAIN}/" + "a" * 2100,                  # longer than the cap
 ])
 async def test_prepare_refuses_an_unusable_product_url_before_any_sql(client, monkeypatch, bad):
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
@@ -136,7 +147,7 @@ async def test_prepare_needs_exactly_one_product_selector(client, monkeypatch, s
 
 async def test_a_page_with_no_seed_is_row_not_found(client, monkeypatch):
     await seed(monkeypatch)
-    response = await client.post(BASE, json=url_body("https://judydoll.com/products/another-thing"))
+    response = await client.post(BASE, json=url_body(f"https://{DOMAIN}/products/another-thing"))
     assert response.status_code == 409 and error(response) == "row_not_found", response.text
 
 
@@ -153,7 +164,7 @@ async def test_a_seed_of_another_market_is_not_this_buyers_product(client, monke
 async def test_like_wildcards_in_the_path_are_literal(client, monkeypatch, wildcard_path):
     """`_` and `%` are SQL LIKE wildcards: unescaped, `lip_ink` would match the stored `lip-ink`."""
     await seed(monkeypatch)
-    response = await client.post(BASE, json=url_body("https://judydoll.com" + wildcard_path))
+    response = await client.post(BASE, json=url_body(f"https://{DOMAIN}" + wildcard_path))
     assert response.status_code == 409 and error(response) == "row_not_found", response.text
 
 
@@ -203,9 +214,9 @@ async def test_an_unattached_seed_names_nothing_even_with_a_live_mirror(monkeypa
 async def test_a_seed_matched_by_its_canonical_url_resolves(monkeypatch):
     await seed(monkeypatch)
     await database.execute(
-        "UPDATE external_product_seeds SET canonical_url='https://judydoll.com/products/lip-ink-canonical', "
-        "destination_url='https://judydoll.com/collections/x?utm=1' WHERE id=:id", {"id": SEED})
-    normalized = merchant_item.normalize_product_url("https://judydoll.com/products/lip-ink-canonical", DOMAIN)
+        f"UPDATE external_product_seeds SET canonical_url='https://{DOMAIN}/products/lip-ink-canonical', "
+        f"destination_url='https://{DOMAIN}/collections/x?utm=1' WHERE id=:id", {"id": SEED})
+    normalized = merchant_item.normalize_product_url(f"https://{DOMAIN}/products/lip-ink-canonical", DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
 
 
@@ -222,7 +233,7 @@ async def test_the_path_match_is_anchored_so_a_longer_page_never_crowds_the_cap(
     a cap of one and answer `product_ambiguous` for a page with exactly one seed."""
     await seed(monkeypatch)
     await add_product(PRODUCT + "-mini")
-    await add_seed("mini-seed", url="https://judydoll.com/products/lip-ink-mini", attached=PRODUCT + "-mini")
+    await add_seed("mini-seed", url=f"https://{DOMAIN}/products/lip-ink-mini", attached=PRODUCT + "-mini")
     monkeypatch.setattr(merchant_item, "MAX_SEED_CANDIDATES", 1)
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
@@ -374,10 +385,10 @@ async def test_an_unescaped_wildcard_never_widens_the_candidate_read(monkeypatch
     """`%` in the caller's path must be literal in SQL too, not only in the exact comparison: a wildcard
     that widened the read past the cap would answer `product_ambiguous` for a page with no seed at all."""
     await seed(monkeypatch)
-    await add_seed("wild-a", url="https://judydoll.com/products/aaa-1", attached=PRODUCT)
-    await add_seed("wild-b", url="https://judydoll.com/products/aaa-2", attached=PRODUCT)
+    await add_seed("wild-a", url=f"https://{DOMAIN}/products/aaa-1", attached=PRODUCT)
+    await add_seed("wild-b", url=f"https://{DOMAIN}/products/aaa-2", attached=PRODUCT)
     monkeypatch.setattr(merchant_item, "MAX_SEED_CANDIDATES", 1)
-    normalized = merchant_item.normalize_product_url("https://judydoll.com/products/aaa%", DOMAIN)
+    normalized = merchant_item.normalize_product_url(f"https://{DOMAIN}/products/aaa%", DOMAIN)
     with pytest.raises(svc.PurchaseRefused) as refused:
         await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US")
     assert refused.value.reason == "row_not_found"
@@ -451,10 +462,7 @@ async def test_create_for_a_merchant_we_never_enabled_is_refused_like_a_key_requ
 async def test_a_pilot_that_excludes_the_agent_refuses_before_any_resolution(client, monkeypatch):
     await seed(monkeypatch)
     witness = (await client.post(BASE, json=url_body())).json()["selection"]
-    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", (
-        '{"agent_ids":["agent_not_this_one"],"merchant_domains":["judydoll.com"],"markets":["US"],'
-        '"product_keys":["%s"],"quantities":[1],"variant_keys":["shopify:%s"],"currency":"USD",'
-        '"max_total_minor":100000}' % (PRODUCT, VARIANT)))
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", pilot_scope("agent_not_this_one", PRODUCT))
     forbid_resolution(monkeypatch)
     for path, request in ((BASE, url_body()), (CREATE, url_create_body(witness, "pilot-agent"))):
         response = await client.post(path, json=request)
@@ -465,10 +473,7 @@ async def test_a_pilot_that_excludes_the_agent_refuses_before_any_resolution(cli
 async def test_a_pilot_that_lists_another_product_refuses_the_resolved_one(client, monkeypatch, prepare_auth_agent):
     await seed(monkeypatch)
     witness = (await client.post(BASE, json=url_body())).json()["selection"]
-    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", (
-        '{"agent_ids":["%s"],"merchant_domains":["judydoll.com"],"markets":["US"],'
-        '"product_keys":["prod::some-other-product"],"quantities":[1],"variant_keys":["shopify:%s"],'
-        '"currency":"USD","max_total_minor":100000}' % (prepare_auth_agent, VARIANT)))
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", pilot_scope(prepare_auth_agent, "prod::some-other-product"))
     real = merchant_item.resolve_product_key
     calls = []
 
@@ -490,7 +495,7 @@ async def test_a_pilot_that_lists_another_product_refuses_the_resolved_one(clien
 
 def test_a_pilot_pre_check_that_names_a_product_is_refused():
     with pytest.raises(svc.PurchaseRefused) as refused:
-        svc.enforce_pilot_scope(agent_id="a", merchant_domain="judydoll.com", market_country="US",
+        svc.enforce_pilot_scope(agent_id="a", merchant_domain=DOMAIN, market_country="US",
                                 product_key=PRODUCT, quantity=1, resolved=False, product_pending=True)
     assert refused.value.reason == "invalid_request"
 
@@ -595,8 +600,8 @@ async def test_a_destination_beside_a_different_canonical_page_is_not_the_seeds_
     await seed(monkeypatch)
     await database.execute(
         "UPDATE external_product_seeds SET canonical_url=:c, destination_url=:d WHERE id=:id",
-        {"c": URL, "d": "https://judydoll.com/products/a-different-page", "id": SEED})
-    response = await client.post(BASE, json=url_body("https://judydoll.com/products/a-different-page"))
+        {"c": URL, "d": f"https://{DOMAIN}/products/a-different-page", "id": SEED})
+    response = await client.post(BASE, json=url_body(f"https://{DOMAIN}/products/a-different-page"))
     assert response.status_code == 409 and error(response) == "row_not_found", response.text
     assert (await client.post(BASE, json=url_body())).json()["selection"]["product_key"] == PRODUCT
 
@@ -613,7 +618,7 @@ async def test_the_left_side_of_the_match_is_the_whole_host_and_path(client, mon
     (`/en-gb/products/lip-ink`) under the same store, attached to another product, is not this page."""
     await seed(monkeypatch)
     await add_product(PRODUCT + "-gb")
-    await add_seed("gb-seed", url="https://judydoll.com/en-gb/products/lip-ink", attached=PRODUCT + "-gb")
+    await add_seed("gb-seed", url=f"https://{DOMAIN}/en-gb/products/lip-ink", attached=PRODUCT + "-gb")
     response = await client.post(BASE, json=url_body())
     assert response.status_code == 200, response.text
     assert response.json()["selection"]["product_key"] == PRODUCT
@@ -644,7 +649,7 @@ async def test_a_retry_with_another_spelling_of_the_same_page_replays(client, mo
         raise AssertionError("a replay resolved the product URL")
     monkeypatch.setattr(merchant_item, "resolve_product_key", unresolvable)
     respelled = url_create_body(
-        witness, "two-spellings", url="HTTPS://WWW.JudyDoll.com/products/Lip-Ink/?variant=" + VARIANT + "#reviews")
+        witness, "two-spellings", url=f"HTTPS://WWW.{MIXED}/products/Lip-Ink/?variant=" + VARIANT + "#reviews")
     again = await client.post(CREATE, json=respelled)
     assert again.status_code == 202 and again.json()["purchase_id"] == created.json()["purchase_id"], again.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
@@ -654,25 +659,63 @@ async def test_a_retry_with_another_spelling_of_the_same_page_replays(client, mo
 
 
 @pytest.mark.parametrize("tail", [
-    "?variant%3D111", "?variant[]=111", "?a=1;variant=111", "?a=1&amp;variant=111", "#variant=111",
-    "?x=variant%3D111", "?%76ariant=111", "?VARIANT=111", "?variant=0" + VARIANT, "?variant=",
-    "?variant", "?variant_title=red", "?variant=+" + VARIANT, "?variant=" + VARIANT + "&variant=111",
-    "?variant=%2531%2531%2531", "?a=1&#118;ariant=111", "?variant=" + VARIANT + "x", "?variant=" + VARIANT + "1",
+    "?variant[]=111", "?a=1;variant=111", "?a=1&amp;variant=111", "#variant=111", "#a=1;variant=111",
+    "?%76ariant=111", "?VARIANT=111", "?variant=0" + VARIANT, "?variant=", "?variant",
+    "?variant=+" + VARIANT, "?variant=" + VARIANT + "&variant=111", "?variant=%2531%2531%2531",
+    "?variant=" + VARIANT + "x", "?variant=" + VARIANT + "1",
+    "?variant=" + VARIANT + "%3Bx", "?variant=" + VARIANT + "%23x", "?variant=" + VARIANT + "%26x=1",
+    "?%2576ariant=111",              # D1: a key that needs a SECOND decoding round to read `variant`
+    "?%26%23118%3Bariant=111",       # an HTML entity behind percent-encoding
 ])
 def test_every_spelling_of_another_variant_in_the_url_is_refused(tail):
-    """N1: the cross-check reads every `variant` in the decoded query and fragment, not only an exact
-    `&`-separated key; a form it cannot read as exactly `variant=<variant_id>` is refused."""
+    """N1: every key that DECODES to `variant` (any case, either section, `;` or `&` separated) must have
+    exactly `variant_id` as its decoded value; the value is split off before decoding, so an encoded
+    separator stays inside it."""
     with pytest.raises(svc.PurchaseRefused) as refused:
         merchant_item.check_url_variant(URL + tail, VARIANT)
     assert refused.value.reason == "invalid_request"
+    assert "does not match variant_id" in str(refused.value)
+
+
+@pytest.mark.parametrize("tail", ["?variant%3D111", "?variant%3D" + VARIANT, "?VARIANT%3d111"])
+def test_a_variant_key_hiding_its_value_behind_an_encoded_equals_is_refused_as_unreadable(tail):
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        merchant_item.check_url_variant(URL + tail, VARIANT)
+    assert refused.value.reason == "invalid_request" and "cannot read" in str(refused.value)
+
+
+def test_an_encoding_deeper_than_the_lane_reads_is_refused_not_half_decoded():
+    """P3-1: five levels of `%25` still change after the last round; refused, never matched half-decoded."""
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        merchant_item.check_url_variant(URL + "?%2525252576ariant=111", VARIANT)
+    assert refused.value.reason == "invalid_request" and "deeper" in str(refused.value)
+    merchant_item.check_url_variant(URL + "?%25252576ariant=" + VARIANT, VARIANT)  # four levels: read
 
 
 @pytest.mark.parametrize("tail", [
     "", "?variant=" + VARIANT, "?variant[]=" + VARIANT, "#variant=" + VARIANT, "?a=1;variant=" + VARIANT,
-    "?variant%3D" + VARIANT, "?variant=" + VARIANT + "&utm_source=x#reviews", "?utm_source=x",
+    "?Variant=" + VARIANT, "?variant=" + VARIANT + "&utm_source=x#reviews", "?utm_source=x",
+    "?variant=" + VARIANT + ";utm=1",              # T2: `;` ends the value
+    "?%2576ariant=" + VARIANT,                     # D1: two rounds, agreeing
+    "?variant=%3" + VARIANT[0] + VARIANT[1:],      # the VALUE is decoded too: `%34…` is `4…`
+    # P3-4: `variant` that is not a variant KEY, as a store reads it
+    "?utm_content=variant_test", "#variant-picker", "?variant=" + VARIANT + "&utm_content=variant_a",
+    "?sections=product-variant-picker", "?variant_title=red", "?x=variant%3D111", "?a=1&#118;ariant=111",
 ])
-def test_the_agreeing_variant_in_any_spelling_is_accepted(tail):
+def test_the_agreeing_variant_and_other_parameters_are_accepted(tail):
     merchant_item.check_url_variant(URL + tail, VARIANT)
+
+
+async def test_a_card_url_with_a_variant_word_in_another_parameter_is_bought(client, monkeypatch):
+    """P3-4 at the route: an A/B `utm_content=variant_a` on the card's URL is not a variant; the purchase
+    buys exactly `variant_id`."""
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body(URL + "?utm_content=variant_a#variant-picker"))).json()["selection"]
+    created = await client.post(CREATE, json=url_create_body(witness, "utm-variant-word",
+                                                             url=URL + "?utm_content=variant_a#variant-picker"))
+    assert created.status_code == 202, created.text
+    row = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases"))
+    assert row["variant_key"] == "shopify:" + VARIANT
 
 
 async def test_prepare_refuses_a_hidden_disagreeing_variant_before_any_sql(client, monkeypatch):
@@ -722,7 +765,7 @@ async def test_the_python_compare_reads_the_seeds_page_not_either_column(client,
     await add_product(PRODUCT + "-gb-page")
     await add_seed("gb-page-seed", attached=PRODUCT + "-gb-page")
     await database.execute("UPDATE external_product_seeds SET canonical_url=:c WHERE id='gb-page-seed'",
-                           {"c": "https://judydoll.com/en-gb/products/lip-ink"})
+                           {"c": f"https://{DOMAIN}/en-gb/products/lip-ink"})
     response = await client.post(BASE, json=url_body())
     assert response.status_code == 200, response.text
     assert response.json()["selection"]["product_key"] == PRODUCT
@@ -752,8 +795,8 @@ async def test_a_twin_whose_stored_url_has_spaces_is_still_a_twin(client, monkey
 
 @pytest.mark.parametrize("stored", [URL + "\t", "\n" + URL, URL + "\u00e9", URL.replace("lip-", "lip\u200b-")])
 async def test_a_stored_url_that_is_not_printable_ascii_is_not_a_page(monkeypatch, stored):
-    """N4: the other side of the one rule. A tab, a newline or a non-ASCII character in a stored URL makes it no
-    page at all (no caller URL can equal it), in the compare whatever the SQL read finds."""
+    """N4: the other side of the one rule. A tab, a newline or a non-ASCII character in the part a stored URL is
+    COMPARED by (scheme, host, path) makes it no page (no caller URL can equal it), whatever the SQL read finds."""
     assert merchant_item._normalized(stored) is None
     await seed(monkeypatch)
     await add_product(PRODUCT + "-dirty-twin")
@@ -765,7 +808,7 @@ async def test_a_stored_url_that_is_not_printable_ascii_is_not_a_page(monkeypatc
 async def test_a_punycode_storefront_seed_resolves(monkeypatch):
     """N4 does not hide an IDN store: its host is stored and sent as punycode (ASCII), so both sides agree."""
     await seed(monkeypatch)
-    host = "xn--jdydll-fua.example"
+    host = "xn--shp-a-xxa.example"
     page = "https://" + host + "/products/lip-ink"
     await add_product(PRODUCT + "-puny")
     await add_seed("puny-seed", url=page, domain=host, attached=PRODUCT + "-puny")
@@ -773,12 +816,36 @@ async def test_a_punycode_storefront_seed_resolves(monkeypatch):
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT + "-puny"
 
 
-@pytest.mark.parametrize("sent", ["https://judydoll.com/products/l%C3%A9vre", "https://judydoll.com/products/l%c3%a9vre"])
+@pytest.mark.parametrize("sent", [f"https://{DOMAIN}/products/l%C3%A9vre", f"https://{DOMAIN}/products/l%c3%a9vre"])
 async def test_a_percent_encoded_page_resolves(monkeypatch, sent):
     """N4 does not hide a non-ASCII page stored percent-encoded (ASCII): the same encoding resolves it, hex case
     folded. (The same page stored RAW is no page: `test_a_stored_url_that_is_not_printable_ascii_is_not_a_page`.)"""
     await seed(monkeypatch)
     await add_product(PRODUCT + "-encoded")
-    await add_seed("encoded-seed", url="https://judydoll.com/products/l%C3%A9vre", attached=PRODUCT + "-encoded")
+    await add_seed("encoded-seed", url=f"https://{DOMAIN}/products/l%C3%A9vre", attached=PRODUCT + "-encoded")
     normalized = merchant_item.normalize_product_url(sent, DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT + "-encoded"
+
+
+@pytest.mark.parametrize("dirty_query", ["?ref=caf\u00e9", "?a=1\tb", "#caf\u00e9"])
+async def test_a_dirty_query_on_a_stored_url_is_dropped_unread(monkeypatch, dirty_query):
+    """P3-3: the query and fragment are dropped by the compare, so a raw non-ASCII or tab there does not make a
+    stored URL less of a page: the product's only seed still resolves, and such a twin is still a twin."""
+    await seed(monkeypatch)
+    await database.execute("UPDATE external_product_seeds SET destination_url=:u WHERE id=:id",
+                           {"u": URL + dirty_query, "id": SEED})
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
+    await add_product(PRODUCT + "-dirty-query-twin")
+    await add_seed("dirty-query-twin", url=URL + dirty_query, attached=PRODUCT + "-dirty-query-twin")
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US")
+    assert refused.value.reason == "product_ambiguous"
+
+
+def test_the_callers_whole_url_stays_printable_ascii():
+    """The caller's URL is checked whole (its query included) before anything else; only the STORED side
+    reads past a dirty query."""
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        merchant_item.normalize_product_url(URL + "?ref=caf\u00e9", DOMAIN)
+    assert refused.value.reason == "invalid_request"

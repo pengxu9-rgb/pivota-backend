@@ -30,8 +30,8 @@ done here, on one normalisation applied to both sides (`normalize_product_url`).
 
 THE PAGE NAMES A PRODUCT, NEVER A VARIANT. A URL purchase names its variant by `variant_id`, required
 beside `product_url` (the route's selector rule). A variant in the URL is not ignored: every `variant`
-anywhere in its decoded query or fragment must be exactly `variant=<variant_id>`, or the request is
-refused (`check_url_variant`). Otherwise a variant-grain seed (`?variant=A`) would answer a caller's
+key in its query or fragment (decoded, any case) must have exactly `<variant_id>` as its value, or the
+request is refused (`check_url_variant`). Otherwise a variant-grain seed (`?variant=A`) would answer a caller's
 `?variant=B` with the record that proves only A.
 
 FAILS CLOSED. A seed whose `domain` is NULL or not lowercase is not read (`row_not_found`): the writers
@@ -109,11 +109,14 @@ def _normalized(url: Any) -> Optional[str]:
     ones, so the comparison is symmetric by construction.
 
     A stored value is trimmed of SPACES only (what SQL `trim()` removes in both dialects, so the
-    candidate read finds every value accepted here), and is then a page only if it is printable ASCII,
-    as the caller's must be. A stored URL with a tab, a newline or a non-ASCII character is not a page:
-    no caller URL could equal it, and the SQL read and this compare agree on it."""
+    candidate read finds every value accepted here). Then the part the comparison keeps -- scheme, host
+    and path, everything before the first `?` or `#` -- must be printable ASCII, as the caller's whole
+    URL must be: a tab, a newline or a raw non-ASCII character THERE means no caller URL can equal it, so
+    it is not a page. The query and fragment are dropped unread, so a stored `.../p?ref=café` IS the
+    caller's `.../p`, exactly as the SQL read (which does not look past the path) treats it."""
     text = str(url or "").strip(" ")
-    if not text or any(not 0x21 <= ord(ch) <= 0x7E for ch in text):
+    compared = re.split(r"[?#]", text, maxsplit=1)[0]
+    if not text or any(not 0x21 <= ord(ch) <= 0x7E for ch in compared):
         return None
     try:
         parts = urlsplit(text)
@@ -157,46 +160,53 @@ def normalize_product_url(product_url: str, merchant_host: str) -> str:
     return normalized
 
 
-#: The ONE spelling of a variant a URL may carry: `variant=<digits>` (optionally `variant[]=`), ending
-#: the query/fragment or followed by a separator.
-_URL_VARIANT_RE = re.compile(r"variant(?:\[\])?=([0-9]+)(?=$|[&;#])")
+#: The query or fragment keys that name a variant (after decoding, case-folded). Shopify reads `variant`.
+_VARIANT_KEYS = frozenset({"variant", "variant[]"})
+
+#: Decoding rounds a key or value may need (percent-encoding, `+`, HTML entities). A store decodes once;
+#: past this the text is refused, never accepted half-decoded.
+_MAX_DECODE_ROUNDS = 4
 
 
-def _decoded_tail(product_url: str) -> str:
-    """The URL's query and fragment, lowercased and decoded until stable (percent-encoding, `+`, HTML
-    entities such as `&amp;`), so no encoding of a variant hides it from `check_url_variant`."""
-    parts = urlsplit(product_url)
-    text = parts.query + "#" + parts.fragment
-    for _ in range(4):
+def _decoded(text: str) -> str:
+    """`text` decoded until stable, or `invalid_request` when it is still changing after
+    `_MAX_DECODE_ROUNDS` rounds (an encoding this lane will not chase)."""
+    for _ in range(_MAX_DECODE_ROUNDS + 1):
         decoded = html.unescape(unquote_plus(text))
         if decoded == text:
-            break
+            return text
         text = decoded
-    return text.lower()
+    raise PurchaseRefused("invalid_request", "product_url is encoded deeper than this lane reads")
 
 
 def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
-    """Refuse a URL that names, or might name, a variant other than the request's `variant_id`.
+    """Refuse a URL whose query or fragment names a variant other than the request's `variant_id`.
 
-    The request must carry a `variant_id`. Then every occurrence of `variant` anywhere in the URL's
-    decoded query or fragment (a key, a key inside another value, `variant[]`, a `;`-separated one, one
-    behind `&amp;`, one in the fragment) must be exactly `variant=<variant_id>`; any other spelling --
-    another id, leading zeros, a blank, a non-digit, a key such as `variant_title` -- is
-    `invalid_request`. Strict on purpose: the cross-check is there to catch a door whose `variant_id`
-    disagrees with the page its buyer saw, and a form it cannot read is refused, not ignored. Call it
-    after `normalize_product_url` has accepted the URL."""
+    The request must carry a `variant_id`. The query and the fragment are each read as a parameter list,
+    split on `&` and `;` BEFORE anything is decoded, so an encoded separator inside a value stays part of
+    that value. Each key is then decoded (`_decoded`) and case-folded; a key that is `variant` or
+    `variant[]` must have a value that decodes to exactly `variant_id`, else `invalid_request`
+    ("does not match": another id, leading zeros, a blank, a missing value, `<id>;x` spelled `%3B`). A key
+    that decodes to `variant=...` (an encoded `=`) is refused as unreadable. Every other parameter --
+    `utm_content=variant_a`, `sections=product-variant-picker`, a fragment word such as `variant-picker`
+    -- is not a variant key and is ignored, as a store ignores it. Call it after `normalize_product_url`
+    has accepted the URL."""
     if variant_id is None:
         raise PurchaseRefused("invalid_request", "a product_url purchase names its variant by variant_id")
     try:
-        tail = _decoded_tail(product_url)
+        parts = urlsplit(product_url)
     except ValueError:
         raise PurchaseRefused("invalid_request", "product_url is not a usable URL") from None
-    start = tail.find("variant")
-    while start != -1:
-        named = _URL_VARIANT_RE.match(tail, start)
-        if named is None or named.group(1) != variant_id:
-            raise PurchaseRefused("invalid_request", "product_url names another variant than variant_id")
-        start = tail.find("variant", start + 1)
+    for section in (parts.query, parts.fragment):
+        for piece in re.split(r"[&;]", section):
+            raw_key, has_value, raw_value = piece.partition("=")
+            name, encoded_equals, _ = _decoded(raw_key).lower().partition("=")
+            if name not in _VARIANT_KEYS:
+                continue
+            if encoded_equals:
+                raise PurchaseRefused("invalid_request", "product_url's variant is in a form this lane cannot read")
+            if not has_value or _decoded(raw_value) != variant_id:
+                raise PurchaseRefused("invalid_request", "product_url's variant does not match variant_id")
 
 
 def _is_ip_literal(host: str) -> bool:
