@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import httpx
 import pytest
@@ -200,7 +201,118 @@ def test_logs_carry_shape_only(caplog):
     assert "2026-11-07T04:00:00" not in caplog.text
 
 
+def _jws(claims):
+    head = vdp._b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    return f"{head}.{vdp._b64u(json.dumps(claims).encode())}.{vdp._b64u(b'sig')}"
+
+
+def test_credential_shaped_values_are_stripped_under_any_key():
+    jws = _jws({"token": DPAN, "cryptogram": CRYPTOGRAM})
+    jwe = "eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMTI4R0NNIn0.ZW5j.aXY.Y3Q.dGFn"
+    body = {
+        "instructionId": "ins_1",
+        "status": "APPROVED",
+        "panLastFour": "3478",
+        "payload": jws,
+        "credential": jws,
+        "data": {"jws": jws, "note": "kept"},
+        "auth": "Bearer " + jws,
+        "items": [jws, "fine", jwe],
+        "orderNumber": DPAN,
+        "orderNumberInt": int(DPAN),
+        "blob": jwe,
+    }
+    client, _ = _client(_json(200, body))
+    result = asyncio.run(client.request("POST", "/vacp/v1/instructions/ins_1/credentials", {"a": 1}))
+    flat = json.dumps(result.body)
+    for secret in (jws, jwe, DPAN, jws.split(".")[1], "eyJhbGci"):
+        assert secret not in flat
+    assert result.body["instructionId"] == "ins_1" and result.body["status"] == "APPROVED"
+    assert result.body["panLastFour"] == "3478" and result.body["data"]["note"] == "kept"
+    assert result.body["items"][1] == "fine"
+    # payload, credential, data.jws, auth, items[0], items[2], orderNumber, orderNumberInt, blob
+    assert result.credential_fields_stripped == 9
+
+
+def test_a_bare_credential_body_is_stripped():
+    cleaned, removed = vdp.strip_vic_credentials(_jws({"token": DPAN}))
+    assert cleaned is None and removed == 1
+
+
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO])
+def test_xpay_api_key_never_reaches_any_log(caplog, level):
+    sentinel = "SENTINELKEY0123456789"
+    client, rec = _client(_json(200, {"message": "helloworld"}), mtls=None, xpay=vdp.XPayAuth(sentinel, "S1"))
+    with caplog.at_level(level):  # root: every logger, httpx's included
+        assert asyncio.run(client.hello_world()).ok
+    assert rec.requests[0].url.params["apikey"] == sentinel  # it was sent ...
+    assert any(r.name == "httpx" for r in caplog.records)  # ... httpx did log the request ...
+    assert sentinel not in caplog.text  # ... and the key is not in any record
+    assert all(sentinel not in r.getMessage() for r in caplog.records)
+    assert "apikey=[redacted]" in caplog.text
+
+
+def test_redaction_covers_httpcore_loggers_and_keeps_other_records(caplog):
+    with caplog.at_level(logging.DEBUG):
+        logging.getLogger("httpcore.http11").debug("send url=%s", "https://sandbox.api.visa.com/x?apikey=SENT1&a=1")
+        logging.getLogger("httpx").info("unrelated %s", "line")
+    assert "SENT1" not in caplog.text and "apikey=[redacted]&a=1" in caplog.text
+    assert "unrelated line" in caplog.text
+
+
+def test_secret_dataclasses_keep_secrets_out_of_repr():
+    shown = repr(vdp.MtlsAuth("CERTPEM", "KEYPEM", "USERID", "PASSWD")) + repr(vdp.XPayAuth("APIKEY", "SHARED"))
+    shown += repr(vdp.MleKeys("kid-1", "SERVERCERT", "CLIENTKEY"))
+    for secret in ("CERTPEM", "KEYPEM", "USERID", "PASSWD", "APIKEY", "SHARED", "SERVERCERT", "CLIENTKEY"):
+        assert secret not in shown
+    assert "kid-1" in shown
+
+
+# ── MLE answer checks ────────────────────────────────────────────────────────────────────────────
+
+
+def test_encrypted_answer_with_another_kid_or_a_stale_iat_is_refused(visa_mle):
+    keys = vdp.MleKeys("kid-1", visa_mle["server_cert"], visa_mle["client_key"])
+    other_kid = vdp.mle_encrypt('{"s":1}', visa_mle["client_cert"], "kid-2")
+    stale = vdp.mle_encrypt('{"s":1}', visa_mle["client_cert"], "kid-1", iat_ms=int(time.time() * 1000) - 3_600_000)
+    for answer in (other_kid, stale):
+        client, _ = _client(_json(200, {"encData": answer}), mle=keys)
+        result = asyncio.run(client.hello_world())
+        assert result.outcome == "mle_error" and result.body is None
+
+
+def test_mle_decrypt_checks_kid_and_iat_only_when_asked(visa_mle):
+    jwe = vdp.mle_encrypt("x", visa_mle["server_cert"], "kid-1", iat_ms=1_000_000)
+    assert vdp.mle_decrypt(jwe, visa_mle["server_key"]) == "x"
+    assert vdp.mle_decrypt(jwe, visa_mle["server_key"], expected_kid="kid-1", now_ms=1_000_000 + 299_000,
+                           max_skew_s=300) == "x"
+    with pytest.raises(ValueError):
+        vdp.mle_decrypt(jwe, visa_mle["server_key"], expected_kid="kid-9")
+    with pytest.raises(ValueError):
+        vdp.mle_decrypt(jwe, visa_mle["server_key"], now_ms=1_000_000 + 301_000, max_skew_s=300)
+
+
 # ── transport hygiene ────────────────────────────────────────────────────────────────────────────
+
+
+def test_production_needs_its_own_switch(monkeypatch):
+    monkeypatch.delenv(vdp.VISA_VDP_ALLOW_PRODUCTION_ENV, raising=False)
+    with pytest.raises(vdp.VisaVdpConfigError) as err:
+        vdp.VisaVdpClient("production", xpay=vdp.XPayAuth("K", "S"), transport=httpx.MockTransport(lambda r: None))
+    assert vdp.VISA_VDP_ALLOW_PRODUCTION_ENV in str(err.value)
+    monkeypatch.setenv(vdp.VISA_VDP_ALLOW_PRODUCTION_ENV, "on")
+    assert vdp.VisaVdpClient("production", xpay=vdp.XPayAuth("K", "S"),
+                             transport=httpx.MockTransport(lambda r: None)).environment == "production"
+
+
+@pytest.mark.parametrize("base", ["https://evil.test", "http://sandbox.api.visa.com", "https://api.visa.com",
+                                  "https://sandbox.api.visa.com:8443", "https://u:p@sandbox.api.visa.com"])
+def test_built_url_must_be_this_environments_visa_host(base):
+    client, rec = _client(_json(200, {}))
+    client._base = base
+    with pytest.raises(ValueError):
+        asyncio.run(client.hello_world())
+    assert rec.requests == []
 
 
 def test_unknown_environment_and_missing_auth_are_config_errors():
@@ -212,7 +324,8 @@ def test_unknown_environment_and_missing_auth_are_config_errors():
 
 @pytest.mark.parametrize("env,host", [("sandbox", "sandbox.api.visa.com"), ("cert", "cert.api.visa.com"),
                                       ("production", "api.visa.com")])
-def test_each_environment_has_one_fixed_host(env, host):
+def test_each_environment_has_one_fixed_host(env, host, monkeypatch):
+    monkeypatch.setenv(vdp.VISA_VDP_ALLOW_PRODUCTION_ENV, "on")
     rec = Recorder(_json(200, {}))
     client = vdp.VisaVdpClient(env, xpay=vdp.XPayAuth("K", "S"), transport=httpx.MockTransport(rec))
     asyncio.run(client.hello_world())
