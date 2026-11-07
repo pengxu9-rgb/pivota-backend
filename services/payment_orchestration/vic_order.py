@@ -5,6 +5,9 @@ passkey pages, makes the Visa calls and FILLS THE MERCHANT CHECKOUT ITSELF
 (executor `rail_managed`). Pivota sends a confirmed order, shows the buyer the provider's hosted page,
 and then only READS STATUS until the provider reports the merchant's order number. That is all.
 
+  quote_order(request)  -> the provider's quote: the items at the buyer's confirmed prices, the merchant's
+                           shipping and tax, and the all-in total. Creates nothing billable and shows no
+                           page: safe to repeat (no write-ahead).
   submit_order(order)   -> the provider's order id and its hosted page (the buyer approves there with a
                            Visa passkey). A maybe-write: an answer nobody saw is read back by
                            `order_status`, never resent.
@@ -74,6 +77,8 @@ def is_enabled() -> bool:
 class VicOrderTransport(Protocol):
     """The provider's wire. Each call returns (http status, parsed JSON body or None) or raises on a
     transport failure (a timeout is `asyncio.TimeoutError` / `TimeoutError`)."""
+
+    async def quote_order(self, body: Mapping[str, Any]) -> Tuple[int, Any]: ...
 
     async def submit_order(self, body: Mapping[str, Any]) -> Tuple[int, Any]: ...
 
@@ -166,6 +171,60 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
     return answer
 
 
+@dataclass
+class VicQuote:
+    """One classified quote answer. Only these fields leave the module.
+
+    kind:
+      ok            a well-formed quote: every amount present and non-negative, the items positive, and
+                    total = items + shipping + tax
+      refused       the provider definitely will not quote this order (4xx, a non-retryable error)
+      retry         no answer (timeout, transport, 5xx, throttle): ask again later
+      unrecognised  a 200 whose body is not the contract's shape (or whose amounts do not add up)
+    """
+
+    kind: str
+    http_status: Optional[int] = None
+    quote_id: Optional[str] = None
+    client_reference: Optional[str] = None
+    currency: Optional[str] = None
+    items_minor: Optional[int] = None
+    shipping_minor: Optional[int] = None
+    tax_minor: Optional[int] = None
+    total_minor: Optional[int] = None
+    error_code: Optional[str] = None
+    credential_fields_stripped: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.kind == "ok"
+
+
+def parse_quote(body: Any, stripped: int = 0) -> VicQuote:
+    """The allowlisted read of an ALREADY-STRIPPED quote body. Pure."""
+    if not isinstance(body, Mapping):
+        return VicQuote(kind="unrecognised", credential_fields_stripped=stripped)
+    quote = VicQuote(
+        kind="ok",
+        quote_id=_ref(body.get("quote_id")),
+        client_reference=_ref(body.get("client_reference")),
+        currency=body.get("currency") if isinstance(body.get("currency"), str)
+        and _CURRENCY_RE.match(body["currency"]) else None,
+        items_minor=_minor(body.get("items_minor")),
+        shipping_minor=_minor(body.get("shipping_minor")),
+        tax_minor=_minor(body.get("tax_minor")),
+        total_minor=_minor(body.get("total_minor")),
+        credential_fields_stripped=stripped,
+    )
+    amounts = (quote.items_minor, quote.shipping_minor, quote.tax_minor, quote.total_minor)
+    if (
+        quote.quote_id is None or quote.currency is None or any(a is None for a in amounts)
+        or not quote.items_minor or quote.total_minor != quote.items_minor + quote.shipping_minor + quote.tax_minor
+    ):
+        quote.kind = "unrecognised"
+    return quote
+
+
 def _error_code(body: Any) -> Tuple[Optional[str], Optional[bool]]:
     error = body.get("error") if isinstance(body, Mapping) and isinstance(body.get("error"), Mapping) else None
     if error is None:
@@ -181,6 +240,22 @@ class VicOrderClient:
     def __init__(self, transport: VicOrderTransport, *, timeout_s: float = 30.0) -> None:
         self._transport = transport
         self._timeout_s = float(timeout_s)
+
+    async def quote_order(self, request: Mapping[str, Any]) -> VicQuote:
+        """Ask for the all-in total. Creates nothing billable: safe to repeat."""
+        try:
+            status, raw = await asyncio.wait_for(self._transport.quote_order(dict(request)), self._timeout_s)
+        except Exception as exc:  # noqa: BLE001 - no answer: ask again later
+            return self._done("quote", VicQuote(kind="retry"), exc)
+        body, stripped = a2a_rail._strip_credentials(raw)
+        if status == 200:
+            quote = parse_quote(body, stripped)
+            quote.http_status = status
+            return self._done("quote", quote)
+        code, retryable = _error_code(body)
+        refused = 400 <= status < 500 and status not in _RETRYABLE_4XX and retryable is not True
+        return self._done("quote", VicQuote(kind="refused" if refused else "retry", http_status=status,
+                                            error_code=code, credential_fields_stripped=stripped))
 
     async def submit_order(self, order: Mapping[str, Any]) -> VicAnswer:
         """Send ONE confirmed order. A maybe-write (rule 3)."""
@@ -220,11 +295,12 @@ class VicOrderClient:
         return self._done("status", VicAnswer(kind=kind, http_status=status, error_code=code,
                                               credential_fields_stripped=stripped))
 
-    def _done(self, op: str, answer: VicAnswer, exc: Optional[BaseException] = None) -> VicAnswer:
+    def _done(self, op: str, answer: Any, exc: Optional[BaseException] = None) -> Any:
         logger.info(
             "vic_order: op=%s kind=%s http_status=%s approval=%s checkout=%s stripped=%s error_type=%s",
-            op, answer.kind, answer.http_status, answer.approval_status, answer.checkout,
-            answer.credential_fields_stripped, type(exc).__name__ if exc is not None else None,
+            op, answer.kind, answer.http_status, getattr(answer, "approval_status", None),
+            getattr(answer, "checkout", None), answer.credential_fields_stripped,
+            type(exc).__name__ if exc is not None else None,
         )
         if answer.credential_fields_stripped:
             # The contract forbids credentials in any answer: a count, never a value.
@@ -235,9 +311,39 @@ class VicOrderClient:
         return answer
 
 
+def items_amount(row: Mapping[str, Any]) -> Optional[int]:
+    """The items at the price the buyer confirmed (unit x quantity), in minor units, or None. A quote must
+    price the items at exactly this: shipping and tax are the only additions."""
+    unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
+    if isinstance(unit, bool) or not isinstance(unit, int) or not isinstance(quantity, int) or unit <= 0 or quantity <= 0:
+        return None
+    return unit * quantity
+
+
+def _items(row: Mapping[str, Any]) -> list:
+    return [{
+        "product_key": row.get("product_key"),
+        "name": row.get("product_name"),
+        "variant": row.get("variant_title"),
+        "quantity": row.get("quantity") or 1,
+        "unit_amount_minor": row.get("our_price_minor"),
+    }]
+
+
+def build_quote_request(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """What the provider needs to price shipping and tax: the merchant, the items, where they go."""
+    return {
+        "client_reference": str(row["id"]),
+        "merchant": {"domain": row["merchant_domain"], "checkout_url": row["checkout_url"]},
+        "currency": str(row["currency"]).upper(),
+        "items": _items(row),
+        "shipping_address": row.get("shipping_address"),
+    }
+
+
 def order_amount(row: Mapping[str, Any]) -> Optional[int]:
-    """The amount the buyer approves, in minor units: the LOCKED QUOTE (`quoted_total_minor`), the all-in
-    total with shipping and tax, or None. Never the unit price times the quantity: that subtotal leaves out
+    """The amount the buyer approves, in minor units: the provider's QUOTE recorded on the row
+    (`quoted_total_minor`), the all-in total with shipping and tax, or None. Never the unit price times the quantity: that subtotal leaves out
     shipping and tax, so the checkout the rail fills would come to more than the buyer approved. No quote,
     no order (the step refuses the purchase)."""
     quoted = row.get("quoted_total_minor")
@@ -253,8 +359,7 @@ def build_order(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     the buyer to approve, and a CEILING the provider must not charge above (the contract). A checkout
     total above it is never completed here (a2a_rail_worker `_vic_checkout`)."""
     amount = order_amount(row)
-    unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
-    if amount is None:
+    if amount is None or not row.get("quote_id"):
         return None
     return {
         "client_reference": str(row["id"]),
@@ -262,15 +367,10 @@ def build_order(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
         "payment_method_id": str(row["payment_method_id"]),
         "purchase_type": PURCHASE_TYPE_HITL,
         "merchant": {"domain": row["merchant_domain"], "checkout_url": row["checkout_url"]},
+        "quote_id": str(row["quote_id"]),
         "amount_minor": amount,
         "currency": str(row["currency"]).upper(),
-        "items": [{
-            "product_key": row.get("product_key"),
-            "name": row.get("product_name"),
-            "variant": row.get("variant_title"),
-            "quantity": quantity,
-            "unit_amount_minor": unit,
-        }],
+        "items": _items(row),
         "buyer": {"email": row.get("buyer_email"), "shipping_address": row.get("shipping_address")},
     }
 

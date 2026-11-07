@@ -119,13 +119,14 @@ async def _ago(column: str, seconds: int, purchase_id: str) -> None:
     await database.execute(sql, {"age": int(seconds), "i": purchase_id})
 
 
-#: The locked all-in quote (items 2 x 46.50 + shipping + tax): the only amount an order is sent with.
+#: The fake provider's all-in quote: items 2 x 46.50 + shipping 5.00 + tax 3.40. The only amount an order
+#: is sent with.
 QUOTED = 10140
 
 
-async def _quoting(*, quoted=QUOTED, **kw) -> str:
-    """A purchase whose card is bound (the existing A2A card step), in `quoting` with its locked quote,
-    with its parent row. `quoted=None` leaves the quote unset (what the A2A rail writes today)."""
+async def _quoting(*, quoted=None, **kw) -> str:
+    """A purchase whose card is bound (the existing A2A card step), in `quoting`, with its parent row.
+    `quoted` presets a stale `quoted_total_minor` (the step must quote afresh, never reuse it)."""
     args = dict(agent_id="agent_vic", agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
                 checkout_url="https://brand.example/cart/123:2", currency="USD", our_price_minor=4650,
                 quantity=2, product_key="ext:brand:123", product_name="Glow Serum", variant_title="30 ml",
@@ -403,6 +404,11 @@ async def test_the_client_strips_every_leaked_field_and_reads_only_the_contracts
     assert answer.ok and answer.credential_fields_stripped == 3 * LEAK_FIELDS  # + checkout
     for needle in (DPAN, CRYPTO, DCVV):
         assert needle not in repr(answer)
+    quote = await client.quote_order({"client_reference": "ap_" + "a" * 24, "currency": "USD",
+                                      "items": [{"unit_amount_minor": 100, "quantity": 1}]})
+    assert quote.ok and quote.credential_fields_stripped == LEAK_FIELDS and quote.total_minor == 940
+    for needle in (DPAN, CRYPTO, DCVV):
+        assert needle not in repr(quote)
 
 
 def test_dynamic_cvv_keys_are_credentials_to_the_shared_stripper():
@@ -497,15 +503,112 @@ async def test_a_checkout_at_or_under_the_approved_amount_completes(a2a, fake):
     assert (row["state"], row["final_total_minor"], row["last_error_code"]) == ("completed", QUOTED, None)
 
 
-async def test_no_locked_quote_no_order(a2a, fake):
-    """What the A2A rail writes today: no `quoted_total_minor`. The unit price x quantity leaves out shipping
-    and tax, so it is never sent as the amount: the purchase is refused before anything goes out."""
-    pid = await _quoting(quoted=None)
+# ── the quote: the all-in total the order goes out with ─────────────────────────────────────
+
+
+async def test_the_quote_is_recorded_and_the_order_goes_out_with_its_all_in_total(a2a, fake):
+    pid = await _quoting(quoted=4650)  # a stale total on the row is never reused: quoted afresh
+    assert await _step(a2a, fake, pid) == "approval_page_issued"
+    [quote] = fake.quotes()
+    assert quote["client_reference"] == pid and quote["currency"] == "USD"
+    assert quote["shipping_address"] == ADDRESS and quote["items"][0]["unit_amount_minor"] == 4650
+    assert "buyer" not in quote and "payment_method_id" not in quote  # pricing needs no email or card
+    row = await _row(pid)
+    assert (row["quote_id"], row["quoted_total_minor"], row["shipping_minor"], row["tax_minor"]) == (
+        "prov_q_0001", QUOTED, 500, 340)
+    [order] = fake.submits()
+    assert (order["quote_id"], order["amount_minor"]) == ("prov_q_0001", QUOTED)
+    # The agent sees the all-in total before the buyer approves it.
+    totals = a2a_purchase_view.build_view(row)["totals"]
+    assert (totals["quoted_total_minor"], totals["shipping_minor"], totals["tax_minor"]) == (QUOTED, 500, 340)
+
+
+@pytest.mark.parametrize("fault, code", [
+    (TimeoutError(), "vic_quote:retry"),
+    (502, "vic_quote:retry"),
+    (429, "vic_quote:retry"),
+    ((200, {"quote_id": "q1", "currency": "USD", "items_minor": 9300, "shipping_minor": 500,
+            "tax_minor": 340, "total_minor": 9999}), "vic_quote:unrecognised"),  # does not add up
+    ((200, {"quote_id": "q1", "currency": "usd", "items_minor": 9300, "shipping_minor": 0,
+            "tax_minor": 0, "total_minor": 9300}), "vic_quote:unrecognised"),    # unreadable currency
+])
+async def test_no_quote_yet_is_a_wait_not_a_failure(a2a, fake, fault, code):
+    pid = await _quoting()
+    fake.fail_next("quote", fault)
+    assert await _step(a2a, fake, pid) == "waiting_on_quote"
+    row = await _row(pid)
+    assert (row["state"], row["last_error_code"], row["pending_write"], row["quoted_total_minor"]) == (
+        "quoting", code, None, None)
+    assert fake.submits() == []
+    assert await _step(a2a, fake, pid) == "approval_page_issued"  # quoted on the next step, then sent
+    assert len(fake.submits()) == 1
+
+
+@pytest.mark.parametrize("override, code", [
+    ({"items_minor": 9400, "total_minor": 10240}, "vic_quote_price_changed"),  # not the confirmed price
+    ({"currency": "EUR"}, "vic_quote_currency_mismatch"),
+])
+async def test_a_quote_the_buyer_did_not_confirm_ends_the_purchase_before_any_order(a2a, fake, override, code):
+    fake.quote_override = override
+    pid = await _quoting()
     assert await _step(a2a, fake, pid) == "failed"
     row = await _row(pid)
-    assert (row["state"], row["last_error_code"], row["pending_write"]) == ("failed", "vic_quote_missing", None)
-    assert fake.calls == []
-    assert vic_order.order_amount({"our_price_minor": 4650, "quantity": 2}) is None
+    assert (row["state"], row["last_error_code"]) == ("failed", code)
+    assert fake.submits() == []
+
+
+async def test_a_quote_refused_ends_the_purchase(a2a, fake):
+    pid = await _quoting()
+    fake.fail_next("quote", (422, {"error": {"code": "unshippable_address", "retryable": False}}))
+    assert await _step(a2a, fake, pid) == "failed"
+    assert (await _row(pid))["last_error_code"] == "vic_quote_refused:unshippable_address"
+    assert fake.submits() == []
+
+
+async def test_a_quote_for_another_purchase_is_never_recorded(a2a, fake):
+    fake.quote_override = {"client_reference": "ap_" + "z" * 24}
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "waiting_on_quote"
+    row = await _row(pid)
+    assert (row["quoted_total_minor"], row["last_error_code"]) == (None, "vic_quote_mismatch")
+    assert fake.submits() == []
+
+
+async def test_a_quote_left_by_a_crash_before_the_order_is_quoted_again_and_sent_once(a2a, fake, monkeypatch):
+    pid = await _quoting()
+
+    real, crashed = worker.ledger.mark_pending_write, []
+
+    async def crash_once(*args, **kwargs):
+        if not crashed:
+            crashed.append(1)
+            raise RuntimeError("the step died after recording the quote, before the order's write-ahead")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(worker.ledger, "mark_pending_write", crash_once)
+    with pytest.raises(RuntimeError):
+        await _step(a2a, fake, pid)
+    assert (await _row(pid))["quote_id"] == "prov_q_0001" and fake.submits() == []
+    await database.execute("UPDATE a2a_rail_purchases SET claimed_by = NULL, claimed_at = NULL WHERE id = :i",
+                           {"i": pid})  # the stale-claim requeue
+    assert await _step(a2a, fake, pid) == "approval_page_issued"
+    assert (await _row(pid))["quote_id"] == "prov_q_0002"  # a fresh quote, never the one left behind
+    assert [o["quote_id"] for o in fake.submits()] == ["prov_q_0002"]
+
+
+async def test_the_quote_is_recorded_only_on_a_held_quoting_row_with_nothing_pending():
+    pid = await _quoting()
+    args = dict(quote_id="q1", quoted_total_minor=QUOTED, shipping_minor=500, tax_minor=340)
+    assert await ledger.record_quote_as_holder(pid, W, **args) is None  # not held
+    await _claim(pid)
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write = 'vic.order#submit' WHERE id = :i",
+                           {"i": pid})
+    assert await ledger.record_quote_as_holder(pid, W, **args) is None  # an order may be out
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write = NULL WHERE id = :i", {"i": pid})
+    assert (await ledger.record_quote_as_holder(pid, W, **args))["quoted_total_minor"] == QUOTED
+    for bad in (dict(args, quoted_total_minor=0), dict(args, shipping_minor=None), dict(args, quote_id="4111111111111111")):
+        with pytest.raises(ValueError):
+            await ledger.record_quote_as_holder(pid, W, **bad)
 
 
 async def test_a_crash_between_the_move_and_the_marker_is_healed_before_the_next_poll(a2a, fake):
