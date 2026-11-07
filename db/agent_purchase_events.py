@@ -388,20 +388,75 @@ _REAP_CANDIDATES_SQL_SQLITE = """
      LIMIT :limit
 """
 
+#: A2A token rail purchases, by the same rules as Reap's: the CURRENT state warrants an event and has
+#: none yet, entered within the lookback, and an action state only while its buyer page is attached,
+#: is the kind that state asks for, and is not past its deadline (the view's own conditions, so a row
+#: the view would answer "no page" for is not re-read every tick). The state list must equal the
+#: A2A rail states `EVENT_FOR_STATE` maps; a test pins it.
+_A2A_CANDIDATES_SQL = """
+    SELECT p.id, p.rail, p.executor, p.rail_purchase_id, p.agent_id, p.agent_user_ref_hash,
+           p.routing_plan, p.created_at, r.state AS rail_state
+      FROM agent_purchases p
+      JOIN a2a_rail_purchases r ON r.id = p.rail_purchase_id
+     WHERE p.rail = 'a2a'
+       AND p.agent_id IS NOT NULL
+       AND p.agent_user_ref_hash IS NOT NULL
+       AND r.state IN ('needs_payment_method', 'awaiting_authorization', 'completed', 'failed', 'refused', 'expired')
+       AND r.state_entered_at > clock_timestamp() - (:lookback_hours * INTERVAL '1 hour')
+       AND (r.state NOT IN ('needs_payment_method', 'awaiting_authorization') OR (
+            r.buyer_action_url IS NOT NULL
+            AND (r.buyer_action_expires_at IS NULL OR r.buyer_action_expires_at > clock_timestamp())
+            AND ((r.state = 'needs_payment_method' AND r.buyer_action_kind = 'card_binding')
+                 OR (r.state = 'awaiting_authorization' AND r.buyer_action_kind = 'approval'))
+       ))
+       AND NOT EXISTS (
+            SELECT 1 FROM agent_purchase_events e
+             WHERE e.purchase_id = p.id AND e.rail_state = r.state
+               AND NOT (e.status = 'skipped' AND e.skip_reason = 'no_action'
+                        AND e.checked_at < clock_timestamp() - (:recheck_seconds * INTERVAL '1 second'))
+           )
+     ORDER BY r.state_entered_at, p.id
+     LIMIT :limit
+"""
+_A2A_CANDIDATES_SQL_SQLITE = """
+    SELECT p.id, p.rail, p.executor, p.rail_purchase_id, p.agent_id, p.agent_user_ref_hash,
+           p.routing_plan, p.created_at, r.state AS rail_state
+      FROM agent_purchases p
+      JOIN a2a_rail_purchases r ON r.id = p.rail_purchase_id
+     WHERE p.rail = 'a2a'
+       AND p.agent_id IS NOT NULL
+       AND p.agent_user_ref_hash IS NOT NULL
+       AND r.state IN ('needs_payment_method', 'awaiting_authorization', 'completed', 'failed', 'refused', 'expired')
+       AND r.state_entered_at > datetime('now', '-' || :lookback_hours || ' hours')
+       AND (r.state NOT IN ('needs_payment_method', 'awaiting_authorization') OR (
+            r.buyer_action_url IS NOT NULL
+            AND (r.buyer_action_expires_at IS NULL OR r.buyer_action_expires_at > CURRENT_TIMESTAMP)
+            AND ((r.state = 'needs_payment_method' AND r.buyer_action_kind = 'card_binding')
+                 OR (r.state = 'awaiting_authorization' AND r.buyer_action_kind = 'approval'))
+       ))
+       AND NOT EXISTS (
+            SELECT 1 FROM agent_purchase_events e
+             WHERE e.purchase_id = p.id AND e.rail_state = r.state
+               AND NOT (e.status = 'skipped' AND e.skip_reason = 'no_action'
+                        AND e.checked_at < datetime('now', '-' || :recheck_seconds || ' seconds'))
+           )
+     ORDER BY r.state_entered_at, p.id
+     LIMIT :limit
+"""
+
 #: How long a `no_action` skip stands before the purchase is looked at again (same state).
 NO_ACTION_RECHECK_SECONDS = 300
 
 
-async def reap_candidates(*, lookback_hours: int = 24, limit: int = 200) -> List[Dict[str, Any]]:
-    params = {
+def _candidate_params(lookback_hours: int, limit: int) -> Dict[str, Any]:
+    return {
         "lookback_hours": max(1, int(lookback_hours)),
         "limit": max(1, min(1000, int(limit))),
         "recheck_seconds": int(NO_ACTION_RECHECK_SECONDS),
     }
-    if IS_POSTGRES:
-        rows = await database.fetch_all(_REAP_CANDIDATES_SQL, params)
-    else:
-        rows = await database.fetch_all(_REAP_CANDIDATES_SQL_SQLITE, params)
+
+
+def _candidates(rows: Any) -> List[Dict[str, Any]]:
     out = []
     for row in rows:
         item = dict(row)
@@ -409,3 +464,21 @@ async def reap_candidates(*, lookback_hours: int = 24, limit: int = 200) -> List
         item["created_at"] = _decode_dt(item.get("created_at"))
         out.append(item)
     return out
+
+
+async def reap_candidates(*, lookback_hours: int = 24, limit: int = 200) -> List[Dict[str, Any]]:
+    params = _candidate_params(lookback_hours, limit)
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_REAP_CANDIDATES_SQL, params)
+    else:
+        rows = await database.fetch_all(_REAP_CANDIDATES_SQL_SQLITE, params)
+    return _candidates(rows)
+
+
+async def a2a_candidates(*, lookback_hours: int = 24, limit: int = 200) -> List[Dict[str, Any]]:
+    params = _candidate_params(lookback_hours, limit)
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_A2A_CANDIDATES_SQL, params)
+    else:
+        rows = await database.fetch_all(_A2A_CANDIDATES_SQL_SQLITE, params)
+    return _candidates(rows)
