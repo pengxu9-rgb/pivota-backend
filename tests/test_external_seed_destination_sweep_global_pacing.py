@@ -141,6 +141,8 @@ def _sweep(monkeypatch, client, seeds, *, concurrency: Optional[int] = None, **k
     # test_the_env_and_flag_defaults, which passes nothing.
     if kwargs.pop("shipped_defaults", False) is False:
         kwargs.setdefault("ip_challenge_trip_hosts", 3)
+    # Extra fields the fake writer returns for an observation (the real writer's lift counts, for example).
+    record_extra = kwargs.pop("record_extra", None)
     recorded: List[str] = []
 
     async def fake_candidates(limit):
@@ -148,7 +150,8 @@ def _sweep(monkeypatch, client, seeds, *, concurrency: Optional[int] = None, **k
 
     async def fake_record(seed_id, observation, *, now=None, suppress=False):
         recorded.append(seed_id)
-        return {"seed_id": seed_id, "verdict": observation.verdict, "retire": False}
+        return {"seed_id": seed_id, "verdict": observation.verdict, "retire": False,
+                **(record_extra(observation) if record_extra else {})}
 
     async def fake_retire(seed_id, observation, *, now=None):
         return {"retired": True}
@@ -480,6 +483,8 @@ _KEYS_BEFORE = {
     "candidates", "dead_first_candidates", "hosts", "hosts_unverifiable", "listed", "probed",
     "dead_links_found", "seeds_retired", "pending_suppressed", "pending_lifted", "verdicts",
     "catalogue_status",
+    # be#2725: the sweep never hides under the unconfirmed-dead reason, but it lifts it.
+    "unconfirmed_lifted",
 }
 
 
@@ -492,6 +497,17 @@ def test_the_summary_keeps_its_keys_and_adds_the_pacing_ones(monkeypatch, vclock
     assert summary["breaker_trips"] == 0 and summary["stopped"] is None
     assert liveness.coverage_alarm(summary) is None
     json.dumps(summary)
+
+
+def test_the_summary_counts_the_unconfirmed_dead_lifts_the_writer_reports(monkeypatch, vclock) -> None:
+    """be#2725: the sweep never hides under the unconfirmed-dead reason, but its live answers lift it."""
+    def extra(observation):
+        return {"unconfirmed_lifted": 1, "pending_lifted": 1} if observation.verdict == liveness.VERDICT_LIVE else {}
+
+    summary, recorded, _p = _sweep(monkeypatch, _Client(vclock), _seeds(["a.example", "b.example"]), record_extra=extra)
+    live = summary["verdicts"].get(liveness.VERDICT_LIVE, 0)
+    assert live >= 1
+    assert summary["unconfirmed_lifted"] == live == summary["pending_lifted"]
 
 
 # ===================================================================== review 2026-10-17 (be#2641)
