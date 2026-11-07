@@ -101,6 +101,41 @@ PENDING_SUPPRESSION_FLAG = "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED"
 def pending_suppression_enabled() -> bool:
     return str(os.getenv(PENDING_SUPPRESSION_FLAG) or "").strip().lower() in {"1", "true", "yes", "on"}
 
+
+# THE UNCONFIRMED-DEAD HIDE (design rev 1, 11-06). The pending step above needs a CORROBORATED dead
+# observation, which only the sweep makes, and only on a host whose catalogue it can read. A served card
+# on a host with no readable catalogue therefore kept serving a link that answered 404 night after night.
+# This second, reversible reason hides it on REPETITION instead: the served URL answered 404 or 410 on
+# two observations at least `UNCONFIRMED_DEAD_MIN_GAP` apart (measured from the start of the run of 404s,
+# `destination_dead_404_since`, never from `destination_checked_at`, which each 404 re-stamps), with no
+# read of the page since the run began.
+#   * The writer only DECIDES (`unconfirmed_hide_candidate` in its result). The hide is applied by the
+#     refresh BATCH, per host, after the run (`apply_unconfirmed_hides`), so a host answering 404 to most of
+#     what we asked this run (a redesign, a domain move, a WAF) is braked rather than emptied.
+#   * Lifted exactly like the pending reason: by any answer from the origin that is not confirmed dead, on
+#     any lane, whatever the flag says.
+#   * Never converted to the final reason by itself; a retirement (two CORROBORATED observations) takes a
+#     row hidden under it over, as it takes the pending reason over.
+# Ends in `_pending`, as every self-lifting reason does: readers that tell a reversible hide from a final one key
+# on that suffix (services/retailer_ingest/pipeline._superseded_row_retired).
+UNCONFIRMED_DEAD_REASON = "external_seed_destination_dead_unconfirmed_pending"
+UNCONFIRMED_HIDE_ENV = "EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE"
+UNCONFIRMED_HIDE_MODES = ("off", "shadow", "on")
+UNCONFIRMED_DEAD_MIN_GAP = timedelta(hours=24)
+# A 404 or 410 from the origin. `redirected_off_product` is excluded: a wall can produce it.
+UNCONFIRMED_DEAD_STATUSES = frozenset({404, 410})
+# The host brake: a host with at least this many rows that reached the origin this run, more than this
+# share of them hard 404s, hides nothing this run.
+UNCONFIRMED_BRAKE_MIN_REACHED = 5
+UNCONFIRMED_BRAKE_MAX_DEAD_SHARE = 0.5
+UNCONFIRMED_TOP_HOSTS = 25
+
+
+def unconfirmed_hide_mode() -> str:
+    """`EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE`, read per call: off (default) | shadow | on."""
+    raw = str(os.getenv(UNCONFIRMED_HIDE_ENV) or "").strip().lower()
+    return raw if raw in UNCONFIRMED_HIDE_MODES else "off"
+
 PAGE_LIMIT = 250
 MAX_CATALOGUE_PAGES = 80
 # Hosts run concurrently; the politeness gate paces PER HOST, so this widens the sweep without
@@ -1028,7 +1063,8 @@ async def record_destination_observation(
     row = await database.fetch_one(
         """
         SELECT destination_checked_at, destination_verdict, destination_failure_streak,
-               destination_corroborated_dead_at, status
+               destination_corroborated_dead_at, status, destination_http_status,
+               destination_dead_404_since, last_crawled_at
         FROM external_product_seeds
         WHERE id = :id
         """,
@@ -1038,6 +1074,7 @@ async def record_destination_observation(
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
     next_streak, next_corroborated_dead_at = next_streak_state(current, observation, stamp)
+    dead_404_since = next_dead_404_since(current, observation, stamp)
 
     await database.execute(
         """
@@ -1052,6 +1089,7 @@ async def record_destination_observation(
             END,
             destination_failure_streak = :streak,
             destination_corroborated_dead_at = :corroborated_dead_at,
+            destination_dead_404_since = :dead_404_since,
             destination_checked_at = CASE
                 WHEN CAST(:reached_origin AS BOOLEAN) THEN :checked_at
                 ELSE destination_checked_at
@@ -1064,6 +1102,7 @@ async def record_destination_observation(
             "http_status": observation.http_status,
             "streak": next_streak,
             "corroborated_dead_at": next_corroborated_dead_at,
+            "dead_404_since": dead_404_since,
             "reached_origin": bool(observation.reached_origin),
             "checked_at": stamp,
         },
@@ -1077,6 +1116,12 @@ async def record_destination_observation(
         "checked_at": stamp.isoformat() if observation.reached_origin else None,
         "retire": retire,
     }
+    # THE UNCONFIRMED-DEAD HIDE IS ONLY DECIDED HERE, never applied: the refresh batch applies it per host
+    # after its run (`apply_unconfirmed_hides`), so this writer, which sees one row, cannot hide a host's
+    # whole catalogue on a host-wide 404. Decided only with the flag on or in shadow; nothing is written.
+    if unconfirmed_hide_mode() != "off" and unconfirmed_hide_candidate(current, observation, stamp, dead_404_since):
+        result["unconfirmed_hide_candidate"] = True
+        result["dead_404_since"] = _as_utc(dead_404_since).isoformat()
     # THE PENDING STEP. Hide on a corroborated confirmed-dead observation that leaves the streak
     # at 1 or more (retirement itself handles 2); lift on any answer from the origin that the
     # page is alive. NOT gated on the streak this observation reset: the reset above has already
@@ -1096,11 +1141,171 @@ async def record_destination_observation(
         )
         result["pending_suppressed"] = len(moved["products"])
     elif observation.reached_origin and not observation.confirmed_dead:
+        mirror_keys = await _mirror_product_keys(seed_id)
         moved = await destination_dead_suppression.lift_pending(
-            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, db=database,
+            mirror_keys, reason=PENDING_SUPPRESSION_REASON, db=database,
         )
         result["pending_lifted"] = len(moved["products"])
+        # The unconfirmed-dead reason lifts on the same answer, flag or no flag, on every lane: the
+        # single-seed refresh route and the sweep never hide under it, but they do lift it.
+        unconfirmed = await destination_dead_suppression.lift_pending(
+            mirror_keys, reason=UNCONFIRMED_DEAD_REASON, db=database,
+        )
+        result["unconfirmed_lifted"] = len(unconfirmed["products"])
     return result
+
+
+def count_unconfirmed_observation(
+    by_host: Dict[str, Dict[str, Any]], host: str, seed_id: str, destination_refresh: Any
+) -> None:
+    """Count one refresh row's observation for the unconfirmed-dead hide, under its host: `observed`,
+    `reached_origin`, `dead_404` (a hard 404), `lifted` (rows whose mirror this answer un-hid) and the
+    candidates (`record_destination_observation`'s `unconfirmed_hide_candidate`), kept with the run start
+    they were decided on so the apply step can check the row has not moved since."""
+    if not isinstance(destination_refresh, dict) or not destination_refresh.get("verdict"):
+        return
+    counts = by_host.setdefault(host or "unknown", {"observed": 0, "reached_origin": 0, "dead_404": 0,
+                                                    "lifted": 0, "candidates": []})
+    counts["observed"] += 1
+    if destination_refresh.get("checked_at") is None:
+        return
+    counts["reached_origin"] += 1
+    if (destination_refresh.get("verdict") == VERDICT_DEAD_404
+            and destination_refresh.get("http_status") in UNCONFIRMED_DEAD_STATUSES):
+        counts["dead_404"] += 1
+    if int(destination_refresh.get("unconfirmed_lifted") or 0) > 0:
+        counts["lifted"] += 1
+    if destination_refresh.get("unconfirmed_hide_candidate"):
+        counts["candidates"].append((seed_id, destination_refresh.get("dead_404_since")))
+
+
+def unconfirmed_host_braked(counts: Dict[str, Any]) -> bool:
+    """The host brake: at least `UNCONFIRMED_BRAKE_MIN_REACHED` rows reached the origin this run and more than
+    `UNCONFIRMED_BRAKE_MAX_DEAD_SHARE` of them were hard 404s. A redesign, a domain move or a WAF answering 404
+    to us looks like that; one product taken down does not."""
+    reached = int(counts.get("reached_origin") or 0)
+    dead = int(counts.get("dead_404") or 0)
+    return reached >= UNCONFIRMED_BRAKE_MIN_REACHED and dead > UNCONFIRMED_BRAKE_MAX_DEAD_SHARE * reached
+
+
+#: The candidate is re-read before it is hidden: still active, still in the SAME run of hard 404s it was
+#: decided on, and still unread since that run began. Anything else moved it after the decision. FOR UPDATE, in
+#: the same transaction as the hide: an observation that answers live meanwhile waits for the hide to commit,
+#: then lifts it; one that wrote first is seen here and nothing is hidden.
+UNCONFIRMED_RECHECK_SQL = """
+    SELECT status, destination_verdict, destination_http_status, destination_dead_404_since, last_crawled_at
+      FROM external_product_seeds
+     WHERE id = :id
+     FOR UPDATE
+"""
+
+UNCONFIRMED_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '2s'"
+
+#: What `on` would hide for one candidate (shadow): its mirror products nobody has suppressed yet.
+UNCONFIRMED_WOULD_HIDE_SQL = """
+    SELECT COUNT(*) AS n
+      FROM catalog_products
+     WHERE source_ref = :id
+       AND source_system = :source_system
+       AND suppressed_at IS NULL
+"""
+
+
+def _still_a_candidate(row: Any, dead_404_since: Any) -> bool:
+    if not row:
+        return False
+    current = dict(row)
+    since = current.get("destination_dead_404_since")
+    if (
+        current.get("status") != "active"
+        or current.get("destination_verdict") != VERDICT_DEAD_404
+        or current.get("destination_http_status") not in UNCONFIRMED_DEAD_STATUSES
+        or since is None
+        or dead_404_since is None
+        or _as_utc(since) != _as_utc(dead_404_since)
+    ):
+        return False
+    last_read = current.get("last_crawled_at")
+    return last_read is None or _as_utc(last_read) < _as_utc(since)
+
+
+async def apply_unconfirmed_hides(
+    by_host: Dict[str, Dict[str, Any]], *, mode: str, now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """THE ONLY PLACE THE UNCONFIRMED-DEAD HIDE IS WRITTEN. Called by the refresh batch after its run with the
+    per-host counts `count_unconfirmed_observation` kept. For each host the brake decides (`unconfirmed_host_braked`);
+    an unbraked host's candidates are hidden with `mode == "on"`, each re-checked first (`UNCONFIRMED_RECHECK_SQL`),
+    under `UNCONFIRMED_DEAD_REASON` through the pending machinery (mirror products, then their offers). `shadow`
+    writes nothing and reports what `on` would have hidden. A row that fails is counted and never raises.
+
+    RUN IT ALONE, after every refresh of the run has returned (the batch calls it after `_run_workers`). The
+    `databases` library shares ONE connection between tasks gathered on the same Database, so a writer running
+    concurrently in this process would not be blocked by the FOR UPDATE below: it could answer live between the
+    re-check and the hide on the same connection, leaving the row hidden behind a live verdict. A writer in ANOTHER
+    process (the web route, the sweep) has its own connection and waits for the commit, then lifts.
+
+    Counts (per host and in total): `candidates`, `braked` (candidates the brake held), `would_hide` (unbraked
+    candidates) and, in shadow, `would_hide_products` (their mirror products still unsuppressed); in `on`,
+    `hidden_rows` (rows whose hide moved a product), `hidden_products`, `hidden_offers`, `nothing_moved` (the
+    mirror was already suppressed, or there is none), `changed` (the re-check refused) and `errors`.
+
+    Returns {"mode", "totals", "top_hosts"} (`UNCONFIRMED_TOP_HOSTS` hosts by candidates, then hard 404s).
+    """
+    stamp = now or _now()
+    totals: Dict[str, int] = {}
+    hosts: Dict[str, Dict[str, int]] = {}
+
+    def bump(counter: Dict[str, int], key: str, n: int = 1) -> None:
+        if n:
+            counter[key] = int(counter.get(key) or 0) + n
+
+    for host, counts in by_host.items():
+        candidates = list(counts.get("candidates") or [])
+        out = {k: int(counts.get(k) or 0) for k in ("observed", "reached_origin", "dead_404", "lifted")}
+        out["candidates"] = len(candidates)
+        braked = bool(candidates) and unconfirmed_host_braked(counts)
+        if braked:
+            out["braked"] = len(candidates)
+        elif candidates:
+            out["would_hide"] = len(candidates)
+            for seed_id, dead_404_since in candidates:
+                try:
+                    if mode != "on":
+                        row = await database.fetch_one(
+                            UNCONFIRMED_WOULD_HIDE_SQL, {"id": seed_id, "source_system": MIRROR_SOURCE_SYSTEM}
+                        )
+                        bump(out, "would_hide_products", int((dict(row) if row else {}).get("n") or 0))
+                        continue
+                    async with database.transaction():
+                        # A seed row held longer than this (a stuck writer, a lock cycle) is an `errors` row, not
+                        # a stalled run. LOCAL: it ends with this transaction.
+                        await database.execute(UNCONFIRMED_LOCK_TIMEOUT_SQL)
+                        row = await database.fetch_one(UNCONFIRMED_RECHECK_SQL, {"id": seed_id})
+                        if not _still_a_candidate(row, dead_404_since):
+                            bump(out, "changed")
+                            continue
+                        moved = await destination_dead_suppression.suppress_pending(
+                            await _mirror_product_keys(seed_id), reason=UNCONFIRMED_DEAD_REASON, stamp=stamp,
+                            db=database,
+                        )
+                except Exception:  # noqa: BLE001 - one row's failure never costs the run its summary
+                    logger.warning("unconfirmed-dead hide failed for one row", exc_info=True)
+                    bump(out, "errors")
+                    continue
+                if moved["products"]:
+                    bump(out, "hidden_rows")
+                    bump(out, "hidden_products", len(moved["products"]))
+                    bump(out, "hidden_offers", len(moved["offers"]))
+                else:
+                    bump(out, "nothing_moved")
+        for key, value in out.items():
+            bump(totals, key, value)
+        hosts[host] = {k: v for k, v in out.items() if v}
+    bump(totals, "braked_hosts", sum(1 for h in hosts.values() if h.get("braked")))
+    top = sorted(
+        hosts.items(), key=lambda kv: (-int(kv[1].get("candidates") or 0), -int(kv[1].get("dead_404") or 0), kv[0])
+    )[:UNCONFIRMED_TOP_HOSTS]
+    return {"mode": mode, "totals": dict(sorted(totals.items())), "top_hosts": dict(top)}
 
 
 #: The seed -> mirror link is the PAIR (source_ref, source_system); see retirement below.
@@ -1156,6 +1361,63 @@ def next_streak_state(
         # streak was really earned earlier, so this can only delay a retirement.
         return streak, stamp
     return streak, corroborated_dead_at
+
+
+def is_hard_404(observation: DestinationObservation) -> bool:
+    """A 404 or 410 from the origin, recorded as `dead_404`."""
+    return bool(
+        observation.reached_origin
+        and observation.verdict == VERDICT_DEAD_404
+        and observation.http_status in UNCONFIRMED_DEAD_STATUSES
+    )
+
+
+def next_dead_404_since(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime
+) -> Optional[Any]:
+    """`destination_dead_404_since` after `observation`. Pure.
+
+    An `unverifiable` observation moves nothing. Any other answer that is not a hard 404 clears it. A hard 404
+    continues a run ONLY when the stored verdict is itself a hard 404: it keeps the stored start, or, when the
+    column predates the run, starts it at `destination_checked_at` (that check was a 404 of this run, so the run
+    began then or earlier: the gap can only come out short). Otherwise it starts a run now. A stored start
+    under a stored `live` (a writer on an older image answered live without clearing it) is not a run: keeping
+    it would make 404 -> live -> 404 a candidate, the ping-pong the rule excludes.
+    """
+    if not observation.reached_origin:
+        return current.get("destination_dead_404_since")
+    if not is_hard_404(observation):
+        return None
+    stored_hard_404 = (
+        current.get("destination_verdict") == VERDICT_DEAD_404
+        and current.get("destination_http_status") in UNCONFIRMED_DEAD_STATUSES
+    )
+    if not stored_hard_404:
+        return stamp
+    since = current.get("destination_dead_404_since")
+    if since is not None:
+        return since
+    return current.get("destination_checked_at") or stamp
+
+
+def unconfirmed_hide_candidate(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime, dead_404_since: Optional[Any]
+) -> bool:
+    """Would the unconfirmed-dead hide take this row? Pure. All of:
+
+    * this observation is a hard 404 (`is_hard_404`) that the sweep did not corroborate (a corroborated one
+      takes the pending path instead);
+    * the run of hard 404s it belongs to began at least `UNCONFIRMED_DEAD_MIN_GAP` ago, so the row answered
+      404 at least twice, a day or more apart;
+    * nothing read the page since the run began (`last_crawled_at` is NULL or earlier).
+    """
+    if not is_hard_404(observation) or observation.corroborated or dead_404_since is None:
+        return False
+    since = _as_utc(dead_404_since)
+    if _as_utc(stamp) - since < UNCONFIRMED_DEAD_MIN_GAP:
+        return False
+    last_read = current.get("last_crawled_at")
+    return last_read is None or _as_utc(last_read) < since
 
 
 def _gap_anchor(current: Dict[str, Any]) -> Optional[Any]:
@@ -1252,7 +1514,7 @@ async def retire_seed_for_dead_destination(
             updated_at = NOW()
         WHERE source_ref = :id
           AND source_system = :source_system
-          AND (suppressed_at IS NULL OR suppression_reason = :pending_reason)
+          AND (suppressed_at IS NULL OR suppression_reason IN (:pending_reason, :unconfirmed_reason))
         RETURNING product_key
         """,
         {
@@ -1262,6 +1524,8 @@ async def retire_seed_for_dead_destination(
             # A row hidden by the pending step is OURS: retirement takes it over (and its pending
             # offers become ordinary cascaded offers below) instead of leaving it pending forever.
             "pending_reason": PENDING_SUPPRESSION_REASON,
+            # So is a row hidden by the unconfirmed-dead step: two corroborated observations outrank it.
+            "unconfirmed_reason": UNCONFIRMED_DEAD_REASON,
             # `source_ref` ALONE IS NOT THE LINK. services/external_offer_dual_write states the
             # contract: "catalog_products.source_ref = external_product_seeds.id WITH THIS
             # source_system — that pair is the stable seed->product link", and
@@ -1287,7 +1551,7 @@ async def retire_seed_for_dead_destination(
     # database than the statement above.
     gated_keys = [str(row["product_key"]) for row in (suppressed or [])]
     relabeled = await destination_dead_suppression.relabel_pending_offers(
-        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, db=database
+        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, also_reason=UNCONFIRMED_DEAD_REASON, db=database
     )
     cascaded = relabeled + await cascade_offer_suppression(gated_keys, db=database)
     logger.info(
@@ -1479,6 +1743,7 @@ async def run_destination_sweep(
         "seeds_retired": 0,
         "pending_suppressed": 0,
         "pending_lifted": 0,
+        "unconfirmed_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
         # Probes whose final URL was on ANOTHER host but still named a product handle (a domain
         # move, classified as usual; see `DestinationObservation.cross_host`).
@@ -1568,6 +1833,7 @@ async def run_destination_sweep(
                 )
                 summary["pending_suppressed"] += int(result.get("pending_suppressed") or 0)
                 summary["pending_lifted"] += int(result.get("pending_lifted") or 0)
+                summary["unconfirmed_lifted"] += int(result.get("unconfirmed_lifted") or 0)
                 if observation.confirmed_dead:
                     summary["dead_links_found"] += 1
                 if retire and result.get("retire"):
@@ -1650,6 +1916,12 @@ __all__: Iterable[str] = (
     "RETIREMENT_STREAK",
     "PENDING_SUPPRESSION_FLAG",
     "PENDING_SUPPRESSION_REASON",
+    "UNCONFIRMED_DEAD_REASON",
+    "UNCONFIRMED_HIDE_ENV",
+    "apply_unconfirmed_hides",
+    "count_unconfirmed_observation",
+    "unconfirmed_hide_candidate",
+    "unconfirmed_hide_mode",
     "SUPPRESSION_REASON",
     "VERDICT_DEAD_404",
     "VERDICT_LIVE",
