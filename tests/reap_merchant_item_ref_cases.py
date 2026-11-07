@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from db.database import database
+from db.database import IS_POSTGRES, database
+from db import reap_agentic_ledger as ledger
 import routes.agent_commerce_reap as reap
 import services.merchant_item_resolver as merchant_item
 import services.reap_agentic_purchase as svc
@@ -137,6 +138,9 @@ async def test_a_page_with_no_seed_is_row_not_found(client, monkeypatch):
 
 async def test_a_seed_of_another_market_is_not_this_buyers_product(client, monkeypatch):
     await seed(monkeypatch)
+    # Eligible in SG too, so the request passes the merchant gates and reaches resolution.
+    await database.execute("INSERT INTO tierb_cart_link_eligibility (shop_domain,market,verdict,checked_at) "
+                           "VALUES (:d,'SG','ELIGIBLE',CURRENT_TIMESTAMP)", {"d": DOMAIN})
     response = await client.post(BASE, json=url_body(market_country="SG"))
     assert response.status_code == 409 and error(response) == "row_not_found", response.text
 
@@ -173,12 +177,49 @@ async def test_a_suppressed_attachment_names_nothing_and_never_falls_back_to_the
         "UPDATE external_product_seeds SET attached_product_key='prod::suppressed' WHERE id=:id", {"id": SEED})
     response = await client.post(BASE, json=url_body())
     assert response.status_code == 409 and error(response) == "row_not_found", response.text
+    # At the resolver itself too (the catalog load downstream would also refuse a suppressed product).
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US")
+    assert refused.value.reason == "row_not_found"
 
 
-async def test_an_unattached_seed_resolves_to_its_mirror(monkeypatch):
-    await seed(monkeypatch)
+async def test_an_unattached_seed_names_nothing_even_with_a_live_mirror(monkeypatch):
+    """The lane buys a mirror only when its seed is attached to it, so an unattached seed's mirror is not
+    an answer (the reviewer's probe: prepare by URL then refused `row_variant_unverified`)."""
+    await seed(monkeypatch)  # PRODUCT is SEED's mirror (source_ref = SEED)
     await database.execute(
         "UPDATE external_product_seeds SET attached_product_key=NULL WHERE id=:id", {"id": SEED})
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US")
+    assert refused.value.reason == "row_not_found"
+
+
+async def test_a_seed_matched_by_its_canonical_url_resolves(monkeypatch):
+    await seed(monkeypatch)
+    await database.execute(
+        "UPDATE external_product_seeds SET canonical_url='https://judydoll.com/products/lip-ink-canonical', "
+        "destination_url='https://judydoll.com/collections/x?utm=1' WHERE id=:id", {"id": SEED})
+    normalized = merchant_item.normalize_product_url("https://judydoll.com/products/lip-ink-canonical", DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
+
+
+async def test_a_seed_that_spells_its_store_www_is_found(monkeypatch):
+    await seed(monkeypatch)
+    await database.execute(
+        "UPDATE external_product_seeds SET domain=:d WHERE id=:id", {"d": "www." + DOMAIN, "id": SEED})
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
+
+
+async def test_the_path_match_is_anchored_so_a_longer_page_never_crowds_the_cap(monkeypatch):
+    """`/products/lip-ink` must not read `/products/lip-ink-mini`: unanchored, that second seed would fill
+    a cap of one and answer `product_ambiguous` for a page with exactly one seed."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-mini")
+    await add_seed("mini-seed", url="https://judydoll.com/products/lip-ink-mini", attached=PRODUCT + "-mini")
+    monkeypatch.setattr(merchant_item, "MAX_SEED_CANDIDATES", 1)
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
 
@@ -206,17 +247,6 @@ async def test_a_live_attachment_wins_over_the_mirror(monkeypatch):
         "UPDATE external_product_seeds SET attached_product_key='prod::enriched' WHERE id=:id", {"id": SEED})
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
     assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == "prod::enriched"
-
-
-async def test_a_seed_with_two_live_mirrors_is_ambiguous(monkeypatch):
-    await seed(monkeypatch)
-    await database.execute(
-        "UPDATE external_product_seeds SET attached_product_key=NULL WHERE id=:id", {"id": SEED})
-    await add_product(PRODUCT + "-mirror-twin", source_system="external_product_seeds_mirror_v1", source_ref=SEED)
-    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
-    with pytest.raises(svc.PurchaseRefused) as refused:
-        await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US")
-    assert refused.value.reason == "product_ambiguous"
 
 
 async def test_a_read_that_fills_the_candidate_cap_is_refused_not_trusted(monkeypatch):
@@ -315,11 +345,9 @@ async def test_both_doors_fingerprint_a_product_url_request_identically(client, 
 
 
 async def test_the_door_resolves_a_product_url_before_opening_on_the_a2a_rail(client, monkeypatch, door_mounted):
-    """The A2A rail opens in the door itself (Reap re-reads the raw body): it must be handed OUR record's
-    key, resolved after the replay lookup, never the URL and never None."""
-    import routes.agent_commerce_purchases as unified
+    """The A2A rail opens in the door itself (Reap re-reads the raw body): its catalog load must be handed
+    OUR record's key, resolved after the replay lookup and the merchant gates, never the URL and never None."""
     from services.payment_orchestration import router as rail_router
-    from fastapi.responses import JSONResponse
 
     await seed(monkeypatch)
     witness = (await client.post(BASE, json=url_body())).json()["selection"]
@@ -327,15 +355,15 @@ async def test_the_door_resolves_a_product_url_before_opening_on_the_a2a_rail(cl
     monkeypatch.setenv("AGENT_PURCHASE_LEDGER_ENABLED", "1")
     monkeypatch.setattr(rail_router, "choose_rail", lambda **kwargs: rail_router.RailChoice(
         rail="a2a", basis="orchestrator_selected_rail"))
-    opened = {}
+    loaded = {}
 
-    async def fake_open(**kwargs):
-        opened.update(kwargs)
-        return JSONResponse(status_code=202, content={"purchase_id": "pp_" + "0" * 24})
-    monkeypatch.setattr(unified, "_open_a2a_purchase", fake_open)
+    async def stop_at_the_load(**kwargs):
+        loaded.update(kwargs)
+        raise svc.PurchaseRefused("row_unpriced")
+    monkeypatch.setattr(reap, "_load_cart_link_item", stop_at_the_load)
     response = await client.post(DOOR, json=url_create_body(witness, "door-a2a"))
-    assert response.status_code == 202, response.text
-    assert opened["product_key"] == PRODUCT
+    assert error(response) == "row_unpriced", response.text
+    assert loaded["product_key"] == PRODUCT
 
 
 async def test_an_unescaped_wildcard_never_widens_the_candidate_read(monkeypatch):
@@ -351,11 +379,125 @@ async def test_an_unescaped_wildcard_never_widens_the_candidate_read(monkeypatch
     assert refused.value.reason == "row_not_found"
 
 
-def test_a_url_fingerprint_can_never_equal_a_product_key_fingerprint():
-    """A `product_key` spelled like a normalised URL must not replay (or be replayed by) a URL request."""
+def test_a_url_fingerprint_differs_from_the_same_string_sent_as_a_product_key():
+    """The prefix keeps a URL request apart from a `product_key` equal to its normalised URL. (A key spelled
+    `product_url:<url>` would hash alike, exactly as one spelled `variant_id:<n>` does for variants; replay is
+    scoped to one owner and one idempotency key, so that is the caller replaying itself.)"""
     from types import SimpleNamespace
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
     by_url = reap._product_selector(SimpleNamespace(product_url=URL, product_key=None), DOMAIN)
     by_key = reap._product_selector(SimpleNamespace(product_url=None, product_key=normalized), DOMAIN)
     assert by_url[1] != by_key[1]
     assert (by_url[0], by_url[2]) == (None, normalized) and by_key[0] == normalized
+
+
+
+# ── the merchant gates come before any resolution (review P2) ───────────────────────────────────
+
+
+def forbid_resolution(monkeypatch):
+    async def forbidden(**kwargs):
+        raise AssertionError("the product URL was resolved before the merchant gates")
+    monkeypatch.setattr(merchant_item, "resolve_product_key", forbidden)
+
+
+async def test_prepare_for_a_merchant_we_never_enabled_is_refused_like_a_key_request(client, monkeypatch):
+    await seed(monkeypatch)
+    await database.execute("DELETE FROM tierb_cart_link_eligibility")
+    by_key = await client.post(BASE, json=body())
+    forbid_resolution(monkeypatch)
+    by_url = await client.post(BASE, json=url_body())
+    assert by_key.status_code == by_url.status_code == 409
+    assert error(by_key) == error(by_url) == "merchant_not_eligible", by_url.text
+
+
+async def test_create_for_a_merchant_we_never_enabled_is_refused_like_a_key_request(client, monkeypatch):
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    await database.execute("DELETE FROM tierb_cart_link_eligibility")
+    forbid_resolution(monkeypatch)
+    response = await client.post(CREATE, json=url_create_body(witness, "never-enabled"))
+    assert response.status_code == 409 and error(response) == "merchant_not_eligible", response.text
+
+
+async def test_a_pilot_that_excludes_the_agent_refuses_before_any_resolution(client, monkeypatch):
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", (
+        '{"agent_ids":["agent_not_this_one"],"merchant_domains":["judydoll.com"],"markets":["US"],'
+        '"product_keys":["%s"],"quantities":[1],"variant_keys":["shopify:%s"],"currency":"USD",'
+        '"max_total_minor":100000}' % (PRODUCT, VARIANT)))
+    forbid_resolution(monkeypatch)
+    for path, request in ((BASE, url_body()), (CREATE, url_create_body(witness, "pilot-agent"))):
+        response = await client.post(path, json=request)
+        # A pilot refusal answers as the dark rail does (the route never tells a prober who is enrolled).
+        assert response.status_code == 404 and error(response) == "not_available_on_this_rail", response.text
+
+
+async def test_a_pilot_that_lists_another_product_refuses_the_resolved_one(client, monkeypatch, prepare_auth_agent):
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    monkeypatch.setenv("REAP_AGENTIC_PILOT_SCOPE", (
+        '{"agent_ids":["%s"],"merchant_domains":["judydoll.com"],"markets":["US"],'
+        '"product_keys":["prod::some-other-product"],"quantities":[1],"variant_keys":["shopify:%s"],'
+        '"currency":"USD","max_total_minor":100000}' % (prepare_auth_agent, VARIANT)))
+    real = merchant_item.resolve_product_key
+    calls = []
+
+    async def spy(**kwargs):
+        calls.append(kwargs)
+        return await real(**kwargs)
+    monkeypatch.setattr(merchant_item, "resolve_product_key", spy)
+
+    async def no_load(**kwargs):
+        raise AssertionError("an out-of-pilot product reached the catalog load")
+    monkeypatch.setattr(reap, "_load_cart_link_item", no_load)
+    for path, request in ((BASE, url_body()), (CREATE, url_create_body(witness, "pilot-product"))):
+        before = len(calls)
+        response = await client.post(path, json=request)
+        assert response.status_code == 404 and error(response) == "not_available_on_this_rail", response.text
+        assert len(calls) == before + 1  # refused on the RESOLVED key, after the pre-check passed
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+
+def test_a_pilot_pre_check_that_names_a_product_is_refused():
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        svc.enforce_pilot_scope(agent_id="a", merchant_domain="judydoll.com", market_country="US",
+                                product_key=PRODUCT, quantity=1, resolved=False, product_pending=True)
+    assert refused.value.reason == "invalid_request"
+
+
+# ── resume (review P2: untested) ────────────────────────────────────────────────────────────────
+
+
+async def test_a_purchase_made_by_product_url_resumes_by_resolving_the_url_again(client, monkeypatch):
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    original = url_create_body(witness, "by-url-resume")
+    created = await client.post(CREATE, json=original)
+    assert created.status_code == 202, created.text
+    pid = created.json()["purchase_id"]
+    aged = ("clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')")
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={aged} WHERE id=:id", {"id": pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    resumed = await client.post(CREATE + f"/{pid}/resume", json=original)
+    assert resumed.status_code == 200, resumed.text
+    assert (await ledger.get_purchase_internal(pid))["contact_revision"] == 1
+
+
+async def test_a_url_resume_whose_page_now_names_another_record_is_a_changed_selection(client, monkeypatch):
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    original = url_create_body(witness, "by-url-resume-moved")
+    created = await client.post(CREATE, json=original)
+    assert created.status_code == 202, created.text
+    pid = created.json()["purchase_id"]
+    aged = ("clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')")
+    await database.execute(f"UPDATE reap_agentic_purchases SET created_at={aged} WHERE id=:id", {"id": pid})
+    assert await ledger.scrub_reconciling_purchase_pii() == [pid]
+    await add_product(PRODUCT + "-moved")
+    await database.execute(
+        "UPDATE external_product_seeds SET attached_product_key=:pk WHERE id=:id", {"pk": PRODUCT + "-moved", "id": SEED})
+    resumed = await client.post(CREATE + f"/{pid}/resume", json=original)
+    assert resumed.status_code == 409, resumed.text
+    assert (await ledger.get_purchase_internal(pid))["contact_revision"] in (0, None)

@@ -13,21 +13,27 @@ proof: everything the purchase uses after this point is read from OUR record, ex
 (`routes.agent_commerce_reap._seed_storefront_host`). So the lane's rule that "no caller URL is
 accepted" holds: the caller's URL picks a record, it does not describe one.
 
-HOW. Our record of a served product is reached from its seed, by the two links the 2026-11-07 census
-measured (3,000 serving-pool seeds: 92.7% resolvable, US 93.1%):
-  1. the seed's `attached_product_key` (100% of the sample were attached; 70% to an enrichment-ingested
-     product rather than their own mirror). An attachment to a SUPPRESSED product names nothing: the
-     catalog withdrew it, search does not serve such a seed (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`), and
-     falling back to the seed's mirror would bring the withdrawn product back. Else, for a seed with NO
-     attachment,
-  2. the seed's mirror, `catalog_products.source_ref = <seed id>` under the mirror source system.
-The seed is found by its storefront (`domain`, indexed) and market, then by its product URL: a SQL
-`LIKE` on the path narrows the rows and the exact comparison is done here, on one normalisation applied
-to both sides (`normalize_product_url`).
+HOW. Our record of a served product is the one its seed is ATTACHED to (`attached_product_key`, live).
+The 2026-11-07 census (3,000 serving-pool seeds) found every sampled seed attached: 30% to their own
+mirror, 70% to an enrichment-ingested product; 92.7% resolved to one record and an unambiguous variant
+(US 93.1%). Only the attachment is used, for two reasons:
+  * the cart-link lane buys a mirror product only when the seed is attached to it
+    (`routes.agent_commerce_reap._CART_SEED_VARIANT_SQL`), so a seed's unattached mirror could never
+    complete a purchase, and answering with its key would only move the refusal later;
+  * an attachment to a SUPPRESSED product names nothing: the catalog withdrew it, and search does not
+    serve such a seed (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`).
+The seed is found by its storefront (`domain`, indexed) and market, then by its product URL: a SQL `LIKE`
+anchored on the path (it must end the stored URL or be followed by `/`, `?` or `#`) narrows the rows, and
+the exact comparison is done here, on one normalisation applied to both sides (`normalize_product_url`).
 
-EXACTLY ONE RECORD OR A REFUSAL. No seed, or no live record: `row_not_found`, the answer the lane already
-gives for a product that is not under this domain. More than one distinct record (two seeds of one URL
-attached to different products, or a seed with two mirrors): `product_ambiguous`. Never a pick.
+FAILS CLOSED. A seed whose `domain` is NULL or not lowercase is not read (`row_not_found`): the writers
+lowercase it, and a seed placed by its URL alone is reachable by `product_key` as before. Paths are
+compared case-folded (Shopify handles are lowercase); two pages differing only in case resolve to a
+refusal or to a record the buyer's `variant_id` must then match.
+
+EXACTLY ONE RECORD OR A REFUSAL. No seed, or no live attached record: `row_not_found`, the answer the lane
+already gives for a product that is not under this domain. More than one distinct record (two seeds of one
+URL attached to different products): `product_ambiguous`. Never a pick.
 """
 from __future__ import annotations
 
@@ -37,7 +43,6 @@ from typing import Any, List, Optional, Set
 from urllib.parse import urlsplit
 
 from db.database import database
-from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
 from services.reap_agentic_purchase import PurchaseRefused
 
 logger = logging.getLogger(__name__)
@@ -60,8 +65,14 @@ _SEED_SQL = """
      WHERE e.status = 'active'
        AND e.domain IN (:domain_apex, :domain_www)
        AND upper(e.market) = :market_country
-       AND (lower(e.canonical_url) LIKE :path_like ESCAPE '!'
-            OR lower(e.destination_url) LIKE :path_like ESCAPE '!')
+       AND (lower(e.canonical_url) LIKE :path_end ESCAPE '!'
+            OR lower(e.canonical_url) LIKE :path_slash ESCAPE '!'
+            OR lower(e.canonical_url) LIKE :path_query ESCAPE '!'
+            OR lower(e.canonical_url) LIKE :path_fragment ESCAPE '!'
+            OR lower(e.destination_url) LIKE :path_end ESCAPE '!'
+            OR lower(e.destination_url) LIKE :path_slash ESCAPE '!'
+            OR lower(e.destination_url) LIKE :path_query ESCAPE '!'
+            OR lower(e.destination_url) LIKE :path_fragment ESCAPE '!')
      ORDER BY e.id
      LIMIT :limit
 """
@@ -71,15 +82,6 @@ _LIVE_PRODUCT_SQL = """
       FROM catalog_products p
      WHERE p.product_key = :product_key
        AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
-"""
-
-_LIVE_MIRROR_SQL = """
-    SELECT p.product_key
-      FROM catalog_products p
-     WHERE p.source_ref = :seed_id AND p.source_system = :source_system
-       AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
-     ORDER BY p.product_key
-     LIMIT 2
 """
 
 
@@ -160,7 +162,10 @@ async def resolve_product_key(*, normalized_url: str, market_country: str) -> st
             "domain_apex": apex,
             "domain_www": "www." + apex,
             "market_country": str(market_country or "").upper(),
-            "path_like": "%" + _like_escape(path) + "%",
+            "path_end": "%" + _like_escape(path),
+            "path_slash": "%" + _like_escape(path) + "/%",
+            "path_query": "%" + _like_escape(path) + "?%",
+            "path_fragment": "%" + _like_escape(path) + "#%",
             "limit": MAX_SEED_CANDIDATES + 1,
         },
     )
@@ -173,19 +178,11 @@ async def resolve_product_key(*, normalized_url: str, market_country: str) -> st
     keys: Set[str] = set()
     for seed in seeds:
         attached = str(seed.get("attached_product_key") or "").strip()
-        if attached:
-            # Attached: that product or nothing (see the module docstring), never the mirror.
-            live = await database.fetch_one(_LIVE_PRODUCT_SQL, {"product_key": attached})
-            if live is not None:
-                keys.add(str(dict(live)["product_key"]))
-            continue
-        mirrors = await database.fetch_all(
-            _LIVE_MIRROR_SQL, {"seed_id": str(seed["id"]), "source_system": MIRROR_SOURCE_SYSTEM}
-        )
-        if len(mirrors) > 1:
-            raise PurchaseRefused("product_ambiguous", "a seed for this product URL has two catalog products")
-        if mirrors:
-            keys.add(str(dict(mirrors[0])["product_key"]))
+        if not attached:
+            continue  # unattached: nothing the lane could buy (see the module docstring)
+        live = await database.fetch_one(_LIVE_PRODUCT_SQL, {"product_key": attached})
+        if live is not None:
+            keys.add(str(dict(live)["product_key"]))
     if not keys:
         raise PurchaseRefused("row_not_found", "no catalog product for this product URL")
     if len(keys) > 1:

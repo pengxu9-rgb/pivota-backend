@@ -1928,7 +1928,8 @@ async def _load_cart_link_item(
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
     The buyer/agent supplies only catalog keys. No caller URL, price, Shopify variant, or seller
-    identity is accepted. Mirrored seeds need an attached product and a sole variant proven by
+    identity is accepted HERE: a caller's `product_url` is only a lookup key, resolved to a catalog key
+    before this load (services/merchant_item_resolver.py), and never reaches it. Mirrored seeds need an attached product and a sole variant proven by
     storefront evidence. Numeric operator input alone cannot authorize a purchase.
 
     ENRICHMENT rows (option 2) take `_load_enrichment_cart_link_item` instead, and only while
@@ -2947,11 +2948,11 @@ async def prepare_reap_purchase_selection(
         market = purchasability.normalize_market(req.market_country)
         if market is None:
             raise svc.PurchaseRefused("invalid_request")
-        product_key = await _resolved_product_key(product_key, product_url, market)
         agent_id = str(context.agent_id)
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
             product_key=product_key, quantity=req.quantity, resolved=False,
+            product_pending=product_key is None,
         )
         if svc.is_cart_link_enrichment_enabled():
             # PostgreSQL refuses CREATE TABLE IF NOT EXISTS in a read-only transaction even when
@@ -2970,6 +2971,13 @@ async def prepare_reap_purchase_selection(
             await _refuse_if_merchant_disabled(merchant_domain=merchant_domain, market_country=market)
             if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if product_key is None:
+                # Inside the snapshot, after the merchant gates (see create).
+                product_key = await _resolved_product_key(None, product_url, market)
+                svc.enforce_pilot_scope(
+                    agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
+                    product_key=product_key, quantity=req.quantity, resolved=False,
+                )
             product = await database.fetch_one(
                 _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_host}
             )
@@ -3233,13 +3241,14 @@ async def start_reap_purchase(
                 "invalid_request", "expected_unit_price_minor and expected_currency are required"
             )
 
-        # A NEW attempt: a `product_url` now becomes OUR record's key, and nothing downstream sees the URL.
-        product_key = await _resolved_product_key(product_key, product_url, market_country)
-
+        # A `product_url` request is pre-checked here (everything but the product), and resolved to OUR
+        # record inside the cart-link branch, AFTER the merchant-level gates, so its refusal for a merchant
+        # we never enabled is the same `merchant_not_*` a `product_key` request gets, with no catalog read.
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain,
             market_country=str(shipping_address.get("country") or ""),
             product_key=product_key, quantity=req.quantity, resolved=False,
+            product_pending=product_key is None,
         )
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
@@ -3288,6 +3297,14 @@ async def start_reap_purchase(
                 merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if product_key is None:
+                # A NEW attempt: the `product_url` becomes OUR record's key; nothing downstream sees the URL.
+                product_key = await _resolved_product_key(None, product_url, market_country)
+                svc.enforce_pilot_scope(
+                    agent_id=agent_id, merchant_domain=merchant_domain,
+                    market_country=str(shipping_address.get("country") or ""),
+                    product_key=product_key, quantity=req.quantity, resolved=False,
+                )
             if req.variant_id is not None:
                 variant_key = await _resolve_selected_variant_key(
                     merchant_domain=merchant_host, product_key=product_key,
@@ -3461,8 +3478,11 @@ async def start_reap_purchase(
         return _refused(exc)
 
 
-async def _validate_resume_selection(req, row, merchant, host, product, variant, market):
-    """Fresh admission for the SAME immutable item and price; creates no buyer/click/attempt."""
+async def _validate_resume_selection(req, row, merchant, host, product, variant, market, *, product_url=None):
+    """Fresh admission for the SAME immutable item and price; creates no buyer/click/attempt.
+
+    A `product_url` request (`product` None) is resolved after the merchant gates, as on create; the
+    record it names must be the row's, or `resume_selection_changed`."""
     if purchasability.is_enforcement_enabled() and not await purchasability.is_purchasable(merchant, market):
         raise svc.PurchaseRefused("merchant_not_purchasable")
     if req.item_source == "cart_link":
@@ -3471,6 +3491,8 @@ async def _validate_resume_selection(req, row, merchant, host, product, variant,
         await _refuse_if_merchant_disabled(merchant_domain=merchant, market_country=market)
         if not await tierb_eligibility.is_cart_link_eligible(host, market):
             raise svc.PurchaseRefused("merchant_not_eligible")
+        if product is None:
+            product = await _resolved_product_key(None, product_url, market)
         if req.variant_id is not None:
             variant = await _resolve_selected_variant_key(
                 merchant_domain=host, product_key=product, variant_id=req.variant_id, market_country=market)
@@ -3559,9 +3581,8 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         if linked is None or linked["reap_buyer_ref"] != row.get("buyer_ref"):
             raise svc.PurchaseRefused("buyer_unlinked")
         market = purchasability.normalize_market(req.buyer.shipping_address.country)
-        # Same record or `resume_selection_changed` (the selection check compares it with the row's).
-        product = await _resolved_product_key(product, product_url, market)
-        await _validate_resume_selection(req, row, merchant, host, product, variant, market)
+        await _validate_resume_selection(req, row, merchant, host, product, variant, market,
+                                         product_url=product_url)
         email, address = svc._validated_buyer(svc.BuyerContact(email=email, shipping_address=address))
         restored = await continuation.restore_contact(row, agent_id=agent, owner_hash=owner,
             request_key=key, request_hash=request_hash, email=email, address=address, offer_code=offer)

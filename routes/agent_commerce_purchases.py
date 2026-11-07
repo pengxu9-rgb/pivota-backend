@@ -321,13 +321,10 @@ async def create_purchase(
             # WARNING, not INFO: prod drops module-logger INFO, and an operator needs to see why.
             logger.warning("agent_purchases: explicit rail refused agent=%s reason=%s", agent_id, choice.refusal)
             raise reap_svc.PurchaseRefused("not_available_on_this_rail")
-        # A2A opens here (Reap resolves its own, from the raw body): a `product_url` becomes OUR record's
-        # key now, after the replay lookup, as on the Reap route.
-        product_key = await reap_routes._resolved_product_key(product_key, product_url, market_country)
         try:
             return await _open_a2a_purchase(
                 req=req, agent_id=agent_id, owner=owner, merchant_host=merchant_host, merchant_domain=merchant_domain,
-            product_key=product_key, variant_key=variant_key, market_country=market_country,
+            product_key=product_key, product_url=product_url, variant_key=variant_key, market_country=market_country,
             consent_version=consent_version, buyer_email=buyer_email, shipping_address=shipping_address,
                 idempotency_key=idempotency_key, request_hash=request_hash, choice=choice,
             )
@@ -342,8 +339,9 @@ async def create_purchase(
 
 async def _open_a2a_purchase(
     *, req: CreatePurchaseRequest, agent_id: str, owner: str, merchant_host: str, merchant_domain: str,
-    product_key: str, variant_key: Optional[str], market_country: str, consent_version: str, buyer_email: str,
+    product_key: Optional[str], variant_key: Optional[str], market_country: str, consent_version: str, buyer_email: str,
     shipping_address: Mapping[str, Any], idempotency_key: str, request_hash: str, choice: "rail_router.RailChoice",
+    product_url: Optional[str] = None,
 ) -> JSONResponse:
     """The A2A rail's create: every check the Reap cart-link lane makes, in its order, then one durable
     unit (the purchase and its key). Refusals raise `PurchaseRefused`; nothing is written before them."""
@@ -361,6 +359,10 @@ async def _open_a2a_purchase(
     # The cart link must be one the storefront honours for this market (the daily Tier B verdict).
     if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market_country):
         raise reap_svc.PurchaseRefused("merchant_not_eligible")
+    if product_key is None:
+        # A `product_url` (A2A opens here; Reap resolves its own from the raw body): OUR record's key, after
+        # the replay lookup and the merchant gates, as on the Reap route.
+        product_key = await reap_routes._resolved_product_key(None, product_url, market_country)
     if req.variant_id is not None:
         # The buyer's storefront variant, resolved to the catalog's own sku (never a door's spelling).
         variant_key = await reap_routes._resolve_selected_variant_key(
