@@ -406,6 +406,8 @@ async def _ensure_external_seeds_table() -> None:
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;",
         # Migration 266 / schema_guard: the retirement gap's clock, read on every observation.
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;",
+        # Migration 279 / schema_guard: the hard-404 run clock, read and written on every observation.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_dead_404_since TIMESTAMPTZ;",
     ]):
         deferred |= not await _execute_heal(statement)
     # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
@@ -5998,6 +6000,18 @@ def _handleless_read_outcome(
         info["segment"] = decision.segment
     if decision.identity_by:
         info["identity_by"] = decision.identity_by
+    if mode == "shadow":
+        # SHADOW ONLY: the evidence a reviewer needs before `on` (title dice, price ratio), which the batch logs
+        # as one HANDLELESS_DECISION line per row. Never read by a guard; `on` and `off` carry nothing new.
+        info["detail"] = destination_liveness.handleless_decision_detail(
+            evidence=evidence,
+            seed_title=row.get("title"),
+            seed_brand=seed_data.get("brand"),
+            fresh_amount=price_amount,
+            fresh_currency=price_currency,
+            stored_amount=row.get("price_amount"),
+            stored_currency=row.get("price_currency"),
+        )
     return decision.observation, decision.read, info
 
 

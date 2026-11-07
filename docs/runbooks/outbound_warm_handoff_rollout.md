@@ -8,7 +8,83 @@ flags in `config/settings.py`). Spec: `Pivota_Warm_Handoff_Click_Lane_Spec_2026-
 Read this **before widening `OUTBOUND_WARM_HANDOFF_BRANDS`**, before raising
 `OUTBOUND_WARM_HANDOFF_ROLLOUT_PCT`, and before changing `evaluate_warm_eligibility`.
 
-## State as of 2026-08-24 (verified, not assumed)
+## State as of 2026-11-07 (verified, not assumed)
+
+`OUTBOUND_WARM_HANDOFF_BRANDS` was widened from 6 to 35 brands on 2026-11-07 (`web-00745-zxr`), from
+the 2026-09-03 UCP readiness sweep: US storefronts whose own UCP endpoint reached a priced checkout
+with a `continue_url` and quoted US shipping. `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE` (below) is
+**not set** (default off). Read the deployed env before trusting either line.
+
+## Fact-driven eligibility (`OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE`, default off)
+
+The replacement for widening the allowlist by hand. With it on:
+
+- **At mint.** `offers.resolve`'s seed mint asks `db.merchant_purchasability.human_handoff_allowed`
+  about a cold link's **destination host** (the host the click lane builds its cart on), with the
+  buyer's market. On a fresh yes it signs `warm_fact: human_handoff` into the token
+  (`services/outbound_warm_handoff.WARM_FACT_KEY`).
+  - Never the seed's `domain` column. It can name another store, and a fact about that store must
+    never authorize a cart on this one (be#2729 review P1).
+  - It is asked once per host per request, sharing the cart gate's memo.
+  - It needs `OUTBOUND_WARM_HANDOFF_ENABLED`, `MERCHANT_PURCHASABILITY_ENFORCE` and a usable
+    request market.
+  - It is asked only when the market the token will be signed with (the seed row's listing
+    market) is the request market. Some seed queries serve a row listed elsewhere (a CA-listed
+    USD row on a US request, or a `'*'` row); those get no stamp, so the click re-check always
+    asks the market the mint asked (be#2729 delta P3-A).
+  - It is never asked where the stamp could change nothing or would undo a refusal
+    (`_warm_fact_skip_reason`): a cart, a named variant without one, a purchasability or stock
+    decline, a live-verification flag, an enforced preflight refusal, `in_stock: false`, or an
+    affiliate destination.
+- **At click.** A stamped token is eligible even when its host is not allowlisted. **The click
+  then re-asks the same fact** (`warm_fact_recheck`) for the destination host and the token's
+  market, under its own 0.5 s deadline (`WARM_FACT_RECHECK_TIMEOUT_S`). Anything but a fresh yes
+  keeps the cold redirect, and `warm_reason` says why:
+  - `fact_lapsed`: the read answered no. That is either no fresh fact now, or the reader
+    failing closed on ANY database error, including asyncpg's own command timeout:
+    `human_handoff_allowed` catches every error, logs
+    `merchant_purchasability: human_handoff_allowed failed; withholding the cart`, and answers
+    no. So `fact_lapsed` is an upper bound on real lapses, not a count of them;
+  - `fact_no_market`: the token has no observed ISO-2 market;
+  - `fact_no_host`: the destination has no host;
+  - `fact_timeout`: the read missed the 0.5 s deadline before the reader answered. A database
+    timeout the reader catches first reads as `fact_lapsed` (above).
+  - This is the backstop for the stamp outliving its fact, because the gateway's own gate
+    (`MERCHANT_PURCHASABILITY_GATE_ENABLED`) is not guaranteed to be armed.
+  - The allowlist still applies, and every knockout still beats the stamp.
+  - While the flag is on, the click event ctx records `warm_eligible` (`allowlisted` / `fact` /
+    `rollout`). With the flag off, the ctx is byte-identical to before.
+- **The claim.** `_cart_prefilled_claim` reads the same stamp, so a stamped cold offer answers
+  `null`, and an unstamped one keeps a provable `false`.
+
+**Why the flip is clean (Constraints 2 and 3).**
+- Stamps are written only while the flag is on. Turning it on therefore cannot falsify a
+  `cart_prefilled: false` already sent: the tokens behind those answers carry no stamp.
+- Turning it off only narrows.
+- The allowlist and the `false` state survive. Unlike an empty allowlist at 100%, `false` stays
+  wherever there is no fresh fact.
+
+**Coverage follows the purchasability sweep.** The sweep checks every host the cart minter builds a
+seed cart on, plus the Reap and connected-store lanes. A store with no fact row stays on the
+allowlist rule. Other token minters (outbound_links_service, employee_products, agent_api,
+agent_sdk, the card lanes) never stamp, so their links keep the allowlist rule alone.
+
+**Turning it on.**
+1. Set `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE=true` on backend `web`.
+2. Watch `warm_eligible` / `handoff` / `warm_reason` on `outbound_click_events.context`. The
+   instruments are:
+   - the share of `warm_eligible=fact` clicks that end `handoff=warm`;
+   - the count of `warm_reason=fact_lapsed`, read NEXT TO the count of
+     `human_handoff_allowed failed` log lines on `web` over the same window. Those failures
+     (including database command timeouts) land in `fact_lapsed` too. The log line is shared
+     with the mint and the cart gate, so it over-counts re-check failures: zero lines means
+     `fact_lapsed` is all real lapses, and any lines mean the lapse count is an upper bound.
+     `fact_no_market` and `fact_no_host` are counted apart;
+   - the share of fact clicks that end `warm_reason=fact_timeout`. Any sustained share means
+     the re-check is costing buyers their warm cart on a slow pool: look at pool latency before
+     reading anything else, and turn the flag off if it persists.
+
+## State as of 2026-08-24 (historical)
 
 | Fact | Value | How verified |
 |---|---|---|

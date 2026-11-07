@@ -210,6 +210,15 @@ def handleless_read_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return block
 
 
+def unconfirmed_hide_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run's unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE), as the one `UNCONFIRMED_HIDE` log
+    line carries it, or None when the flag is off or the run recorded no observation."""
+    block = summary.get("unconfirmed_hide")
+    if not isinstance(block, dict) or block.get("mode") == "off" or not (block.get("totals") or {}).get("observed"):
+        return None
+    return block
+
+
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
     return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
@@ -373,6 +382,10 @@ def main() -> int:
     line = handleless_read_line(summary)
     if line is not None:
         print("HANDLELESS_READ " + json.dumps(line, separators=(",", ":"), default=str))
+    # And for the unconfirmed-dead hide: only with the flag on or in shadow, on a run that observed a row.
+    line = unconfirmed_hide_line(summary)
+    if line is not None:
+        print("UNCONFIRMED_HIDE " + json.dumps(line, separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659

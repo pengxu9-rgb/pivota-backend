@@ -32,16 +32,19 @@ from services.external_seed_audit import (
 from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
+    apply_unconfirmed_hides,
+    count_unconfirmed_observation,
     handleless_read_mode,
+    unconfirmed_hide_mode,
 )
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import external_seed_catalogue_refresh as catalogue_lane
 from services.external_seed_search import (
-    SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
 from services.region_pricing import pricing_currency_for_region_or_none
+from utils.logger import logger as pivota_logger
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -452,11 +455,66 @@ def count_handleless_read(
             _bump(counter, key)
 
 
-def handleless_read_summary(mode: str, totals: Dict[str, int], by_host: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+# At most this many HANDLELESS_DECISION lines per run; the rest are counted (`decision_lines.suppressed`).
+HANDLELESS_DECISION_LOG_MAX = 500
+
+
+def handleless_decision_line(seed_id: Any, host: Any, info: Any) -> Optional[Dict[str, Any]]:
+    """One SHADOW decision as a reviewer reads it, or None (not a decision, or not shadow: `on` and `off` log
+    nothing). Ids, the host and the decision only: no URL, so no query string or token can reach the log."""
+    if not isinstance(info, dict) or info.get("mode") != "shadow":
+        return None
+    detail = info.get("detail") if isinstance(info.get("detail"), dict) else {}
+    return {
+        "seed_id": str(seed_id) if seed_id is not None else None,
+        "host": str(host or "unknown"),
+        "would_read": bool(info.get("would_read")),
+        "would_flip_healthy": bool(info.get("would_flip_healthy")),
+        "refusal": info.get("refusal"),
+        "segment": info.get("segment"),
+        "identity_by": info.get("identity_by"),
+        "title_dice": detail.get("title_dice"),
+        "price_ratio": detail.get("price_ratio"),
+    }
+
+
+def log_handleless_decision(lines: Dict[str, int], seed_id: Any, host: Any, info: Any) -> None:
+    """Log one SHADOW decision as a `HANDLELESS_DECISION {json}` line through the `pivota` logger (the one prod
+    keeps at INFO), at most `HANDLELESS_DECISION_LOG_MAX` per run (`lines` counts `logged` / `suppressed`).
+    NEVER RAISES: it runs inside the row's try, where a raise would count a refreshed row as failed."""
+    try:
+        line = handleless_decision_line(seed_id, host, info)
+        if line is None:
+            return
+        if int(lines.get("logged") or 0) >= HANDLELESS_DECISION_LOG_MAX:
+            lines["suppressed"] = int(lines.get("suppressed") or 0) + 1
+            return
+        lines["logged"] = int(lines.get("logged") or 0) + 1
+        pivota_logger.info("HANDLELESS_DECISION " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its count
+        return
+
+
+def handleless_read_summary(
+    mode: str,
+    totals: Dict[str, int],
+    by_host: Dict[str, Dict[str, int]],
+    decision_lines: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """The run's handle-less read decisions: the mode, the totals, and the `HANDLELESS_TOP_HOSTS` hosts with
-    the most rows decided."""
+    the most rows decided; in shadow also `decision_lines` ({logged, suppressed}, `log_handleless_decision`)."""
     top = sorted(by_host.items(), key=lambda kv: (-int(kv[1].get("decided") or 0), kv[0]))[:HANDLELESS_TOP_HOSTS]
-    return {"mode": mode, "totals": dict(sorted(totals.items())), "top_hosts": {h: dict(sorted(c.items())) for h, c in top}}
+    out: Dict[str, Any] = {
+        "mode": mode,
+        "totals": dict(sorted(totals.items())),
+        "top_hosts": {h: dict(sorted(c.items())) for h, c in top},
+    }
+    if mode == "shadow" and decision_lines is not None:
+        out["decision_lines"] = {
+            "logged": int(decision_lines.get("logged") or 0),
+            "suppressed": int(decision_lines.get("suppressed") or 0),
+        }
+    return out
 
 
 def _degraded_reason_bucket(error: Any) -> str:
@@ -2038,6 +2096,25 @@ def refresh_queue_tier(
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
+#: The refresh queue's suppressed-product filter: the seed lane's (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`), except that a
+#: product suppressed ONLY under the unconfirmed-dead reason keeps its seed in the queue. The mirror back-links each
+#: seed's `attached_product_key` to its own mirror product, which is exactly what that hide suppresses; dropping the
+#: seed from the queue would leave nothing to observe it again (the sweep cannot read those hosts' catalogues), so
+#: the hide could never lift. The serving lanes keep the seed lane's filter. The reason is spelled out (a literal, for
+#: the repo's static PREPARE sweep); a test pins it to `external_seed_destination_liveness.UNCONFIRMED_DEAD_REASON`.
+REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN = """
+AND (
+  external_product_seeds.attached_product_key IS NULL
+  OR external_product_seeds.attached_product_key NOT IN (
+    SELECT seed_cp.product_key FROM catalog_products seed_cp
+    WHERE seed_cp.suppressed_at IS NOT NULL AND seed_cp.product_key IS NOT NULL
+      AND (seed_cp.suppression_reason IS NULL
+           OR seed_cp.suppression_reason <> 'external_seed_destination_dead_unconfirmed_pending')
+  )
+)
+"""
+
+
 async def get_external_referral_refresh_candidate_seed_ids(
     limit: int = 500, *, seed_ids: Optional[Sequence[str]] = None, market: Optional[str] = None
 ) -> List[str]:
@@ -2053,8 +2130,11 @@ async def get_external_referral_refresh_candidate_seed_ids(
     every active seed the seed lane can serve is a candidate.
 
     NOT candidates, filtered in SQL with the seed lane's own fragments:
-      * a seed attached to a SUPPRESSED catalog product (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
-        Measured prod 2026-09-27: 682. Lifting the suppression puts it back, near the head;
+      * a seed attached to a SUPPRESSED catalog product (`REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN`, the seed lane's
+        SEED_SUPPRESSED_PRODUCT_ANTI_JOIN with one exception). Measured prod 2026-09-27: 682. Lifting the
+        suppression puts it back, near the head. THE EXCEPTION: a product hidden under the unconfirmed-dead reason
+        stays a candidate, because this refresh is the only lane that can lift it (the sweep cannot read those
+        hosts' catalogues) and a hide nothing re-observes is not reversible;
       * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
       * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
 
@@ -2105,7 +2185,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
                     THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
         WHERE status = 'active'
-        {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
+        {REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN}
         {build_seed_quarantine_anti_join()}
         {scope_sql}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
@@ -2483,6 +2563,12 @@ async def run_external_referral_refresh_batch(
     # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
     handleless_totals: Dict[str, int] = {}
     handleless_hosts: Dict[str, Dict[str, int]] = {}
+    # In shadow, one HANDLELESS_DECISION log line per decided row, bounded per run (`log_handleless_decision`).
+    handleless_lines: Dict[str, int] = {}
+    # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): each host's observations this run and its
+    # candidates, applied (or, in shadow, reported) after the run by `apply_unconfirmed_hides`.
+    unconfirmed_mode = unconfirmed_hide_mode()
+    unconfirmed_hosts: Dict[str, Dict[str, Any]] = {}
     price_unreadable_reasons: Dict[str, int] = {}
     price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
@@ -2544,6 +2630,9 @@ async def run_external_referral_refresh_batch(
                 result = await refresh_seed_by_id(seed_id, **refresh_kwargs)
             status = str(result.get("status") or "success")
             outcome = status
+            if unconfirmed_mode != "off":
+                # Every outcome: a 404 comes back `degraded`, a read `success`.
+                count_unconfirmed_observation(unconfirmed_hosts, host, seed_id, result.get("destination_refresh"))
             # Counted whatever the row's outcome: a seed sent back to its page read can still end degraded.
             if catalogue_read is not None and result.get("catalogue_fallback"):
                 _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
@@ -2603,6 +2692,7 @@ async def run_external_referral_refresh_batch(
                 elif isinstance(availability, dict) and availability.get("status") == "not_read":
                     availability_not_read += 1
                 count_handleless_read(handleless_totals, handleless_hosts, host, result.get("handleless_read"))
+                log_handleless_decision(handleless_lines, seed_id, host, result.get("handleless_read"))
             elif status == "degraded":
                 degraded += 1
                 # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
@@ -2883,6 +2973,13 @@ async def run_external_referral_refresh_batch(
     with crawl_ip_throttle.installed(ip_breaker), crawl_global_pacer.installed(pacer):
         await _run_workers(_worker, concurrency)
     host_423_stamped = await _stamp_crawl_attempts(locked_skipped_ids) if locked_skipped_ids else 0
+    # AFTER the run, when every host's share of hard 404s is known (the brake), never per row. And ALONE: every worker
+    # has returned, so no refresh of this run shares the apply step's connection (`databases` hands tasks gathered on
+    # one Database the same connection, which a FOR UPDATE does not block). See `apply_unconfirmed_hides`.
+    unconfirmed_hide = (
+        await apply_unconfirmed_hides(unconfirmed_hosts, mode=unconfirmed_mode)
+        if unconfirmed_mode != "off" else {"mode": "off", "totals": {}, "top_hosts": {}}
+    )
     if ip_breaker.tripped:
         logger.warning(
             "external referral refresh: IP throttled at %s (trip %d of %d, %d distinct hosts); the "
@@ -3098,7 +3195,12 @@ async def run_external_referral_refresh_batch(
         "availability_changed": availability_changed,
         # Rows whose served URL names no product handle, and what EXTERNAL_SEED_HANDLELESS_READ decided for them
         # (`count_handleless_read`): nothing is counted with the flag off.
-        "handleless_read": handleless_read_summary(handleless_read_mode(), handleless_totals, handleless_hosts),
+        "handleless_read": handleless_read_summary(
+            handleless_read_mode(), handleless_totals, handleless_hosts, handleless_lines
+        ),
+        # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): per host and in total, what the run
+        # observed, its candidates, what it hid (`on`) or would have (`shadow`), and what the host brake held.
+        "unconfirmed_hide": unconfirmed_hide,
         # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
         # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {

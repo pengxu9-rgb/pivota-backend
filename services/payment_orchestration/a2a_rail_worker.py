@@ -23,13 +23,53 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            because every purchase needs the buyer's own approval.
   awaiting_authorization -> tell the rail the buyer may be done (`paid`) on a spaced schedule
                            (APPROVAL_SCHEDULE), then poll the await card if the rail answers with one.
-                           ACTIVE for this token: PARKED (`token_active`) until the pay step exists.
-                           FAILED: `failed`.
+                           ACTIVE for this token: the buyer approved, but there is no pay step yet, so
+                           the purchase cannot finish: FAILED now (`pay_step_unavailable`), not left to
+                           lapse on the page deadline as if the buyer had not approved. FAILED: `failed`.
   quoting, not locked; paying -> PARKED (`shop_protocol_pending`). The quote, the order lock and the pay
                            depend on the rail's order protocol, which is not settled; nothing here
                            guesses at a step that can move money. The lifetime ceiling in the ledger's
-                           sweep ends a parked purchase, and the approval page's deadline ends a purchase
-                           whose token is ACTIVE but never paid (the token id stays on the row).
+                           sweep ends a parked purchase.
+
+── THE VIC ORDER STEP (its own dial, A2A_RAIL_VIC_ORDER_STEP_ENABLED, default OFF) ─────────────
+
+  With the dial on and a VIC client given (services/payment_orchestration/vic_order), the rail's VIC
+  order API replaces the token step and the park above. The rail fills the merchant checkout itself;
+  Pivota sends the order and then only READS STATUS. No payment credential reaches this module.
+
+  quoting               -> send the confirmed order (merchant, amount, USD, items, HITL), write-ahead
+                           `vic.order#submit`. The answer's hosted page goes to the buyer through
+                           `awaiting_authorization` (kind `approval`, so the purchase.action_required
+                           event goes out), with `vic:<the rail's order id>` in `order_id` and NO token id.
+                           An unseen answer is read back by our reference, never resent.
+  awaiting_authorization (a VIC order) -> the order is out at the rail and only the rail's answer ends it,
+                           so the row holds the marker write `vic.order#authorization` the whole time:
+                           the expiry sweep never ends a row with a pending write, so a buyer who
+                           approves at the page's last second cannot find the purchase expired here
+                           while the rail pays. Poll: pending (wait), approved (-> paying), declined
+                           (failed), expired (expired), abandoned (failed).
+  paying (a VIC order)  -> poll the rail's checkout: in progress (wait), completed (-> completed with
+                           the merchant's order number), failed (failed). `paying` ends on no clock.
+  The amount sent is the LOCKED QUOTE (`quoted_total_minor`, all-in with shipping and tax) and nothing
+  else: no quote, no order. A checkout is completed only when its total is known, in the purchase's
+  currency and at most that amount; otherwise the order is HELD for a human in `paying`.
+  Dial off: nothing more is sent for a VIC order; it stays parked (the marker keeps the sweep off it)
+  until the dial is on again or a human decides. A VIC order is RECORDED, not inferred: `_vic_adopt`
+  writes `vic:<the rail's order id>` and nothing else writes that prefix. Held for a human, unread on
+  every tick: a VIC order past `VIC_ORDER_CEILING_SECONDS` (the sweep never ends it), a submit left by
+  a crashed step, a submit unreadable for the whole reconcile window, and the checkout holds above.
+  A hold stops PIVOTA; it stops nothing at the rail (there is no cancel call): the rail can still
+  complete a held order. A human resolves every hold with the rail (complete or fail it by hand,
+  refund through the provider).
+
+── TOKENS LEFT ON ENDED PURCHASES ────────────────────────────────────────────────────────────
+
+  A purchase that ends (failed, refused, expired) holding a `payment_token_id` keeps the id: that token
+  is live on the rail until it is voided or lapses. Every tick COUNTS them (`orphan_tokens`, logged at
+  WARNING at most once an hour while any exist) and, when the job is given a `voider`, voids them and
+  forgets the id (`forget_orphan_token`). The rail offers no per-token void today, so the job passes
+  none: they are counted, never silently dropped. A completed purchase's token was used to pay: not an
+  orphan.
 
 ── THE WRITE DISCIPLINE (the rail cannot deduplicate: a new idempotency key per call) ──────────
 
@@ -62,10 +102,10 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
-from services.payment_orchestration import a2a_rail
+from services.payment_orchestration import a2a_rail, vic_order
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +165,12 @@ POLL_APPROVAL = 15
 #: is an orphan, and "no orphans" is a design invariant. Arm this only once a void step exists. With it
 #: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`).
 A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
-#: The currencies a token may be requested in. `token-setup` takes `amount_cents` and no currency, so
-#: the amount is minor units of whatever currency the rail assumes; only USD has been measured.
-TOKEN_CURRENCIES = frozenset({"USD"})
+#: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
+#: at create, and the token step refuses them again).
+TOKEN_CURRENCIES = a2a_rail.TOKEN_CURRENCIES
+
+#: The code an approved purchase ends with while no pay step exists (the order protocol's).
+PAY_STEP_UNAVAILABLE = "pay_step_unavailable"
 
 PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
@@ -201,15 +244,18 @@ def _token_active(row: Mapping[str, Any]) -> bool:
 
 
 def _sticky(row: Mapping[str, Any]) -> bool:
-    """A marker no later write may replace: money seen (parked for good), or the token ACTIVE."""
-    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row)
+    """A marker no later write may replace: money seen (parked for good), the token ACTIVE, or a VIC order
+    held for a human (`_vic_held`)."""
+    return "money_result_seen" in str(row.get("last_error_code") or "") or _token_active(row) or _vic_held(row)
 
 
 class _Step:
     """One claimed purchase, its client and its conversations."""
 
-    def __init__(self, client: Any, row: Mapping[str, Any], worker: str):
+    def __init__(self, client: Any, row: Mapping[str, Any], worker: str, vic: Optional[Any] = None):
         self.client, self.row, self.worker = client, row, worker
+        #: The VIC order client (vic_order.VicOrderClient), or None: the VIC order step is off.
+        self.vic = vic
         self.id = str(row["id"])
         self.context = client.context_for(str(row["member_id"]), self.id)
         # Card-list reads go in a conversation of their own, so a read never lands in the middle of
@@ -592,10 +638,7 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
             return await _token_failed(s, "awaiting_authorization", "token_mismatch", resolves=action)
         status = str(((card or page).data.get("status") if (card or page) is not None else "") or "").upper()
         if card is not None and status == "ACTIVE":
-            if action is not None:
-                await ledger.clear_pending_write(s.id, s.worker, action)
-            await s.release(POLL_PARKED, f"paid_sent:{count}:{variant}:token_active")
-            return "token_active"
+            return await _pay_step_unavailable(s, resolves=action)
         if status == "FAILED":
             return await _token_failed(s, "awaiting_authorization", "token_failed", resolves=action)
         if card is not None or page is not None:
@@ -633,6 +676,17 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
         await s.release(POLL_RETRY, f"paid_sent:{count - 1}:{variant}:{_code('rail_refused', result)}"[:64].rstrip(":"))
         return "rail_refused"
     return await _unresolved_write(s, action, result, code=f"paid_sent:{count}:{variant}")
+
+
+async def _pay_step_unavailable(s: _Step, *, resolves: Optional[str] = None) -> str:
+    """The buyer approved and the token is ACTIVE, but no pay step exists (the order protocol's), so
+    this purchase cannot finish. It ends now, with a code that says so; the token id stays on the row
+    as an orphan for the void (`void_orphan_tokens`)."""
+    logger.warning("a2a_rail_worker: token approved with no pay step purchase=%s; failed", s.id)
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["awaiting_authorization"], to_state="failed", resolves_write=resolves,
+        last_error_code=PAY_STEP_UNAVAILABLE)
+    return await _settled(s, moved, "failed")
 
 
 async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optional[str] = None) -> str:
@@ -743,12 +797,348 @@ async def _parked(s: _Step, reason: str = "shop_protocol_pending") -> str:
     return "parked"
 
 
+# ── the VIC order step ───────────────────────────────────────────────────────────────────────
+
+#: The order submit: a maybe-write. Its unseen answer is read back by our reference, never resent.
+VIC_SUBMIT = "vic.order#submit"
+#: The marker an order out at the rail holds while the buyer decides: only the rail's answer resolves it.
+VIC_AUTHORIZATION = "vic.order#authorization"
+_VIC_WRITES = frozenset({VIC_SUBMIT, VIC_AUTHORIZATION})
+VIC_DISABLED = "vic_order_step_disabled"
+#: How long past the page's deadline the rail may still say `pending` before it is reported (the rail
+#: must expire its own page: a `pending` past it is a contract break, logged, never acted on here).
+VIC_OVERDUE_GRACE_SECONDS = 1800
+#: Seconds between polls while the rail fills the merchant checkout.
+POLL_PAYING = 30
+#: Written on a VIC order's `order_id` (`vic:<the rail's order id>`) by `_vic_adopt`, and nowhere else: the
+#: record that THIS purchase is a VIC order. Never inferred from the shape of a row (a token-path row whose
+#: token was forgotten also has an order id and no token).
+VIC_ORDER_PREFIX = "vic:"
+#: A VIC order holds a pending write or sits in `paying`, so the ledger's expiry sweep never ends it. Past
+#: this age (from creation) the step stops reading the rail and holds it for a human (`VIC_STALE`).
+VIC_ORDER_CEILING_SECONDS = 7 * 86400
+VIC_STALE = "vic_order_stale"
+#: Codes that hold a VIC order for a human: nothing more is read or sent for it, on any tick, dial or not.
+VIC_TOTAL_OVER_APPROVED = "vic_total_over_approved"
+VIC_CURRENCY_MISMATCH = "vic_currency_mismatch"
+VIC_CURRENCY_MISSING = "vic_currency_missing"
+VIC_TOTAL_MISSING = "vic_total_missing"
+VIC_APPROVED_AMOUNT_MISSING = "vic_approved_amount_missing"
+VIC_SUBMIT_UNRESOLVED = "vic_submit_unresolved"
+_VIC_HOLD_CODES = frozenset({
+    VIC_STALE, VIC_TOTAL_OVER_APPROVED, VIC_CURRENCY_MISMATCH, VIC_CURRENCY_MISSING, VIC_TOTAL_MISSING,
+    VIC_APPROVED_AMOUNT_MISSING, VIC_SUBMIT_UNRESOLVED,
+})
+
+
+def _last_code(row: Mapping[str, Any]) -> str:
+    return str(row.get("last_error_code") or "").split(":")[-1]
+
+
+def _vic_held(row: Mapping[str, Any]) -> bool:
+    return _last_code(row) in _VIC_HOLD_CODES
+
+
+def _vic_stale(row: Mapping[str, Any]) -> bool:
+    created = _aware(row.get("created_at"))
+    return created is not None and (_now() - created).total_seconds() > VIC_ORDER_CEILING_SECONDS
+
+
+def _rail_order_id(row: Mapping[str, Any]) -> Optional[str]:
+    """The rail's order id a VIC order recorded (without the marker), or None."""
+    recorded = str(row.get("order_id") or "")
+    return recorded[len(VIC_ORDER_PREFIX):] or None if recorded.startswith(VIC_ORDER_PREFIX) else None
+
+
+def _vic_on(s: _Step) -> bool:
+    return s.vic is not None and vic_order.is_enabled()
+
+
+def _is_vic_order(row: Mapping[str, Any]) -> bool:
+    """A purchase the VIC order step placed: its order id carries the marker only `_vic_adopt` writes
+    (`VIC_ORDER_PREFIX`), and it has no token id. Recorded, not inferred: an order id with no token is
+    not enough (the token path's forget-then-re-quote leaves exactly that between its two writes)."""
+    return (
+        row.get("state") in ("awaiting_authorization", "paying")
+        and _rail_order_id(row) is not None and not row.get("payment_token_id")
+    )
+
+
+def _vic_mismatch(s: _Step, answer: Any) -> bool:
+    """The answer is not about THIS purchase's order (another reference or another order id)."""
+    if answer.client_reference not in (None, s.id):
+        return True
+    if s.row.get("state") == "quoting":
+        return False
+    return answer.order_id != _rail_order_id(s.row)
+
+
+async def _vic_hold(s: _Step, code: str) -> str:
+    """Hold a VIC order for a human: logged once, and on every later tick parked unread (`_vic_gate`)."""
+    logger.error("a2a_rail_worker: VIC order held for a human purchase=%s code=%s", s.id, code)
+    await s.release(POLL_PARKED, code)
+    return code
+
+
+async def _vic_gate(s: _Step) -> Optional[str]:
+    """What stops a VIC order before anything is read or sent, in this order; None lets the step go on.
+
+    1. Held for a human (`_VIC_HOLD_CODES`): parked unread, its code kept.
+    2. The submit's step crashed (`worker_error` with the submit pending): the house rule for any write a
+       crashed step left (`_reconcile`): a human decides, nothing clears it. Its code is kept.
+    3. Past the ceiling (`VIC_ORDER_CEILING_SECONDS`): held (`VIC_STALE`).
+    4. The dial off (the kill switch): parked, nothing read or sent; a pending write keeps the sweep off."""
+    row = s.row
+    if _vic_held(row):
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "vic_held"
+    if row.get("pending_write") == VIC_SUBMIT and _last_code(row) == "worker_error":
+        logger.error("a2a_rail_worker: pending write %s left by a crashed step purchase=%s", VIC_SUBMIT, s.id)
+        await ledger.release_claim(s.id, s.worker, next_poll_at=_later(POLL_PARKED))
+        return "pending_write_unreconcilable"
+    if _vic_stale(row):
+        return await _vic_hold(s, VIC_STALE)
+    if not _vic_on(s):
+        await s.release(POLL_PARKED, VIC_DISABLED)
+        return "parked"
+    return None
+
+
+async def _vic_park_mismatch(s: _Step) -> str:
+    # Never act on an answer about another order. The pending write (if any) stays, so no sweep ends it.
+    logger.error("a2a_rail_worker: VIC answer names another order purchase=%s; parked for a human", s.id)
+    await s.release(POLL_PARKED, "vic_order_mismatch")
+    return "parked"
+
+
+async def _start_vic_order(s: _Step) -> str:
+    """Send the confirmed order. Mints nothing here and charges nothing: the buyer approves on the rail's page."""
+    row = s.row
+    if str(row.get("currency") or "").upper() not in vic_order.ORDER_CURRENCIES:
+        return await _token_failed(s, "quoting", "vic_currency_unsupported")
+    if not row.get("payment_method_id"):
+        return await _token_failed(s, "quoting", "vic_method_missing")
+    if not row.get("buyer_email") or not row.get("shipping_address"):
+        # The rail fills the merchant checkout: it needs where to ship and whom to tell.
+        return await _token_failed(s, "quoting", "vic_contact_missing")
+    if vic_order.order_amount(row) is None:
+        # No locked all-in total (shipping and tax included): the buyer would approve a subtotal and the
+        # merchant's checkout would come to more. No order without a quote. Nothing writes the A2A quote
+        # yet, so this fails closed; once a quote writer exists, this should WAIT (park) for the lock.
+        return await _token_failed(s, "quoting", "vic_quote_missing")
+    order = vic_order.build_order(row)
+    if order is None:  # pragma: no cover - build_order fails only without an amount, checked above
+        return await _token_failed(s, "quoting", "vic_amount_invalid")
+    if await ledger.mark_pending_write(s.id, s.worker, VIC_SUBMIT) is None:
+        return "lost"
+    answer = await s.vic.submit_order(order)
+    if answer.ok:
+        if _vic_mismatch(s, answer):
+            return await _vic_park_mismatch(s)
+        return await _vic_adopt(s, answer)
+    if answer.kind == "refused":
+        detail = answer.error_code or answer.http_status or ""
+        return await _token_failed(s, "quoting", f"vic_order_refused:{detail}"[:64].rstrip(":"), resolves=VIC_SUBMIT)
+    # Unseen: the order may exist at the rail. The write stays pending; the next step reads it back.
+    await s.release(POLL_RETRY, "vic_order_outcome_unknown")
+    return "outcome_unknown"
+
+
+async def _vic_adopt(s: _Step, answer: Any) -> str:
+    """The rail has the order: record its id, put the buyer on its page, and hold the marker."""
+    page: Dict[str, Any] = {}
+    if answer.approval_status == "pending":
+        if not answer.hosted_url:
+            # An order the buyer has nowhere to approve: it lapses at the rail unapproved.
+            return await _token_failed(s, "quoting", "vic_page_missing", resolves=VIC_SUBMIT)
+        page = dict(buyer_action_kind="approval", buyer_action_url=answer.hosted_url,
+                    buyer_action_expires_at=_later(_page_seconds(answer.hosted_url_expires_in)))
+    # Any other authorization (seen only when an unseen submit is read back): adopted with no page, and
+    # the next poll applies it.
+    try:
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["quoting"], to_state="awaiting_authorization",
+            resolves_write=VIC_SUBMIT, order_id=f"{VIC_ORDER_PREFIX}{answer.order_id}", **page)
+    except ValueError:
+        # The rail answered (so the submit is resolved) with an order id or page we will not store.
+        return await _token_failed(s, "quoting", "vic_page_invalid", resolves=VIC_SUBMIT)
+    if moved is not None and moved.get("claimed_by") == s.worker:
+        # Still held (a live state keeps the lease): the marker goes on before the lease goes back. If this
+        # is lost (a crash), the next step on the row puts it on before it polls (`_vic_watch`).
+        await ledger.mark_pending_write(s.id, s.worker, VIC_AUTHORIZATION)
+    return await _settled(s, moved, "approval_page_issued" if page else "vic_order_adopted")
+
+
+async def _vic_pending(s: _Step) -> str:
+    if s.row.get("pending_write") == VIC_AUTHORIZATION and not _is_vic_order(s.row):
+        # The marker on a row `_vic_adopt` did not make: never read or act on it. A human decides.
+        logger.error("a2a_rail_worker: VIC marker on a row that is not a VIC order purchase=%s", s.id)
+        await s.release(POLL_PARKED, "pending_write_unreconcilable")
+        return "pending_write_unreconcilable"
+    stopped = await _vic_gate(s)
+    if stopped is not None:
+        return stopped
+    if s.row.get("pending_write") == VIC_SUBMIT:
+        return await _vic_reconcile_submit(s)
+    return await _vic_poll_authorization(s)
+
+
+async def _vic_reconcile_submit(s: _Step) -> str:
+    """A submit whose answer nobody saw. READ the order back by our reference; never send it again."""
+    if s.row.get("state") != "quoting":  # pragma: no cover - the submit is only ever sent from quoting
+        await s.release(POLL_PARKED, "pending_write_unreconcilable")
+        return "pending_write_unreconcilable"
+    answer = await s.vic.order_status(s.id)
+    if answer.ok:
+        if _vic_mismatch(s, answer):
+            return await _vic_park_mismatch(s)
+        return await _vic_adopt(s, answer)
+    recorded = _aware(s.row.get("pending_write_at"))
+    if recorded is not None and (_now() - recorded).total_seconds() > RECONCILE_LIMIT_SECONDS:
+        if answer.kind == "not_found":
+            # The rail says, the whole window long, that it has no such order: the submit made nothing.
+            # The purchase ends.
+            return await _token_failed(s, "quoting", "vic_order_unresolved", resolves=VIC_SUBMIT)
+        # No readable answer for the whole window: the order may exist. Never ended on a guess: held for a
+        # human, the pending write kept (so no sweep ends it either).
+        return await _vic_hold(s, VIC_SUBMIT_UNRESOLVED)
+    await s.release(POLL_RETRY, f"vic_reconcile:{answer.kind}")
+    return "outcome_unknown"
+
+
+async def _vic_watch(s: _Step) -> str:
+    """A VIC order waiting on the buyer with no marker (a crash between the move and the mark): mark FIRST
+    (a local write, never a rail call), then gate, then poll. Marked before the gate so that a row the gate
+    parks or holds (dial off, past the ceiling) still keeps the expiry sweep off it: the buyer may have
+    approved on the rail's page meanwhile, and `expired` would hide that charge."""
+    if await ledger.mark_pending_write(s.id, s.worker, VIC_AUTHORIZATION) is None:
+        return "lost"
+    s.row = {**s.row, "pending_write": VIC_AUTHORIZATION}
+    stopped = await _vic_gate(s)
+    if stopped is not None:
+        return stopped
+    return await _vic_poll_authorization(s)
+
+
+async def _vic_status(s: _Step) -> Tuple[Optional[Any], Optional[str]]:
+    """(answer, None) for a readable answer about this order, else (None, the outcome already settled)."""
+    answer = await s.vic.order_status(s.id)
+    if not answer.ok:
+        if answer.kind == "not_found":
+            # The rail gave us this order and now does not know it: a contract break, logged, retried.
+            logger.warning("a2a_rail_worker: VIC order not found at the rail purchase=%s", s.id)
+        await s.release(POLL_RETRY, f"vic_status:{answer.kind}")
+        return None, "rail_read_failed"
+    if _vic_mismatch(s, answer):
+        return None, await _vic_park_mismatch(s)
+    return answer, None
+
+
+async def _vic_inconsistent(s: _Step, answer: Any) -> str:
+    logger.error("a2a_rail_worker: VIC status inconsistent purchase=%s state=%s approval=%s checkout=%s",
+                 s.id, s.row.get("state"), answer.approval_status, answer.checkout)
+    await s.release(POLL_PARKED, "vic_status_inconsistent")
+    return "parked"
+
+
+async def _vic_poll_authorization(s: _Step) -> str:
+    """The buyer is on the rail's page. Read the order (a read), and apply the rail's answer."""
+    if s.row.get("state") != "awaiting_authorization":  # pragma: no cover - the marker is only set there
+        await s.release(POLL_PARKED, "pending_write_unreconcilable")
+        return "pending_write_unreconcilable"
+    answer, settled = await _vic_status(s)
+    if answer is None:
+        return settled
+    status = answer.approval_status
+    if status != "approved" and answer.checkout not in (None, "not_started"):
+        # The rail is checking out an order the buyer has not approved: never act on that.
+        return await _vic_inconsistent(s, answer)
+    if status == "pending":
+        expires = _aware(s.row.get("buyer_action_expires_at"))
+        if expires is not None and (_now() - expires).total_seconds() > VIC_OVERDUE_GRACE_SECONDS:
+            logger.warning("a2a_rail_worker: VIC order still pending long past its page purchase=%s", s.id)
+            await s.release(POLL_APPROVAL, "vic_authorization_overdue")
+            return "waiting_on_buyer"
+        await s.release(POLL_APPROVAL)
+        return "waiting_on_buyer"
+    if status == "approved":
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["awaiting_authorization"], to_state="paying",
+            resolves_write=VIC_AUTHORIZATION)
+        if moved is not None and moved.get("claimed_by") == s.worker and answer.checkout in ("completed", "failed"):
+            # The same answer already carries the checkout's end: apply it now.
+            s.row = moved
+            return await _vic_checkout(s, answer)
+        return await _settled(s, moved, "buyer_approved")
+    ended = {
+        "declined": ("failed", "vic_authorization_declined"),
+        "expired": ("expired", "vic_authorization_expired"),
+        "abandoned": ("failed", "vic_buyer_abandoned"),
+    }[status]
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["awaiting_authorization"], to_state=ended[0],
+        resolves_write=VIC_AUTHORIZATION, last_error_code=ended[1])
+    return await _settled(s, moved, ended[0])
+
+
+async def _vic_paying(s: _Step) -> str:
+    """The buyer approved; the rail is filling the merchant checkout. Read its progress."""
+    answer, settled = await _vic_status(s)
+    if answer is None:
+        return settled
+    if answer.approval_status != "approved":
+        return await _vic_inconsistent(s, answer)
+    return await _vic_checkout(s, answer)
+
+
+async def _vic_checkout(s: _Step, answer: Any) -> str:
+    if answer.checkout == "completed":
+        # Completed ONLY when the rail's charged total is known, in the purchase's currency, and at most the
+        # amount the buyer approved (the locked quote the order was sent with). Anything else is held for a
+        # human in `paying`: money moved, so the purchase is neither completed nor failed on a guess.
+        currency = str(s.row.get("currency") or "").upper()
+        approved = vic_order.order_amount(s.row)
+        # An EXACT match only: no currency (or one the client could not read) is not "ours" by default.
+        if answer.currency is None:
+            return await _vic_hold(s, VIC_CURRENCY_MISSING)
+        if answer.currency != currency:
+            return await _vic_hold(s, VIC_CURRENCY_MISMATCH)
+        final = answer.total_minor
+        if final is None:
+            return await _vic_hold(s, VIC_TOTAL_MISSING)
+        if approved is None:
+            return await _vic_hold(s, VIC_APPROVED_AMOUNT_MISSING)
+        if final > approved:
+            return await _vic_hold(s, VIC_TOTAL_OVER_APPROVED)
+        code = None if answer.merchant_order_number else "vic_order_number_missing"
+        try:
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["paying"], to_state="completed",
+                merchant_order_id=answer.merchant_order_number,
+                merchant_order_status_url=answer.merchant_order_status_url,
+                final_total_minor=final, last_error_code=code)
+        except ValueError:
+            # An order reference we will not store. Money moved: completed, without it, and said so.
+            moved = await ledger.transition_as_holder(
+                s.id, s.worker, from_states=["paying"], to_state="completed",
+                final_total_minor=final, last_error_code="vic_order_reference_invalid")
+        return await _settled(s, moved, "completed")
+    if answer.checkout == "failed":
+        moved = await ledger.transition_as_holder(
+            s.id, s.worker, from_states=["paying"], to_state="failed", last_error_code="vic_checkout_failed")
+        return await _settled(s, moved, "failed")
+    await s.release(POLL_PAYING)
+    return "placing"
+
+
 def token_step_enabled() -> bool:
     return (os.getenv(A2A_RAIL_TOKEN_STEP_ENABLED_ENV) or "").strip().lower() in {"1", "true", "on", "yes"}
 
 
 async def _quoting(s: _Step) -> str:
     row = s.row
+    if _vic_on(s) and not row.get("payment_token_id"):
+        return await _start_vic_order(s)
     if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
         if not token_step_enabled():
             return await _parked(s, "token_step_disabled")
@@ -759,14 +1149,15 @@ async def _quoting(s: _Step) -> str:
 
 
 async def _awaiting_authorization(s: _Step) -> str:
+    if _is_vic_order(s.row):
+        return await _vic_watch(s)
+    if _token_active(s.row):
+        # Parked by an earlier build with the token ACTIVE (`...:token_active`): the buyer approved and
+        # nothing can pay. Ended the way an ACTIVE answer is now; nothing is sent.
+        return await _pay_step_unavailable(s)
     if not token_step_enabled():
         # The token dial is a KILL SWITCH: off means nothing more is sent for a token, including for purchases
         # already waiting on the buyer's approval (no `paid`, no await poll). The page's deadline ends them.
-        await s.release(POLL_PARKED)
-        return "parked"
-    if _token_active(s.row):
-        # The buyer approved and the token is ACTIVE; the pay step is the order protocol's. Parked with
-        # the marker kept (no new code), so no later claim sends `paid` again.
         await s.release(POLL_PARKED)
         return "parked"
     return await _authorizing(s)
@@ -780,15 +1171,20 @@ _STEPS: Dict[str, Callable[[_Step], Any]] = {
 }
 
 
-async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
-    """Take one step on a purchase this worker has claimed. Returns the outcome name."""
-    s = _Step(client, row, worker)
+async def step(client: Any, row: Mapping[str, Any], worker: str, *, vic: Optional[Any] = None) -> str:
+    """Take one step on a purchase this worker has claimed. Returns the outcome name. `vic` is the VIC
+    order client; the VIC order step runs only with it AND its dial on."""
+    s = _Step(client, row, worker, vic)
     if "money_result_seen" in str(row.get("last_error_code") or ""):
         # An answer said money moved where none should have. Parked for a human, for good: nothing is
         # read, reconciled, resent or cleared here, whatever is pending.
         logger.error("a2a_rail_worker: purchase=%s still parked after a money-result answer", s.id)
         await ledger.release_claim(s.id, worker, next_poll_at=_later(POLL_PARKED))
         return "money_result_parked"
+    if row.get("pending_write") in _VIC_WRITES:
+        # Before `_reconcile`: a VIC order's pending write is resolved by READING the rail's order (its
+        # status), which is safe after any crash; nothing here resends a VIC write.
+        return await _vic_pending(s)
     if row.get("pending_write"):
         return await _reconcile(s)
     state = str(row.get("state") or "")
@@ -802,12 +1198,58 @@ async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
             s.id, worker, from_states=[state], to_state="failed", last_error_code="contact_purged")
         return await _settled(s, moved, "failed")
     if state in PARKED_STATES:
+        if _is_vic_order(row):
+            stopped = await _vic_gate(s)
+            return stopped if stopped is not None else await _vic_paying(s)
         return await _parked(s)
     handler = _STEPS.get(state)
     if handler is None:  # pragma: no cover - claims only return non-terminal states
         await s.release(POLL_PARKED, "no_step_for_state")
         return "no_step"
     return await handler(s)
+
+
+#: Voids one orphaned token on the rail. Given the ended row (it has `payment_token_id` and `member_id`);
+#: True ONLY when the rail definitely reports THAT token void (or already void). False or a raise leaves
+#: the row as it is, to be tried again next tick, so a voider must be safe to call twice (two ticks may
+#: race for one orphan: there is no claim on an ended row). NEVER a card-wide revoke (the rail's
+#: remove-method revokes every token on the buyer's card and disables the card): a voider names one token.
+#: Calls are made only while the token step's dial (the kill switch) is on.
+Voider = Callable[[Mapping[str, Any]], Awaitable[bool]]
+#: Orphans voided per tick, at most.
+VOID_BATCH = 10
+#: The orphan count is logged at WARNING at most this often (per process) while any exist.
+ORPHAN_LOG_INTERVAL_SECONDS = 3600.0
+_orphans_logged_at: Optional[float] = None
+
+
+async def void_orphan_tokens(
+    voider: Optional[Voider], *, clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, int]:
+    """Tokens left on ended purchases: void them when a voider is given, count them always."""
+    global _orphans_logged_at
+    counts: Dict[str, int] = {}
+    if voider is not None and token_step_enabled():
+        for row in await ledger.list_orphan_tokens(limit=VOID_BATCH):
+            try:
+                voided = await voider(row) is True
+            except Exception as exc:  # noqa: BLE001 - one failed void must not stop the rest
+                logger.warning("a2a_rail_worker: token void failed purchase=%s error_type=%s",
+                               row.get("id"), type(exc).__name__)
+                voided = False
+            if voided and await ledger.forget_orphan_token(str(row["id"]), str(row["payment_token_id"])) is not None:
+                counts["token_voided"] = counts.get("token_voided", 0) + 1
+            else:
+                counts["token_void_failed"] = counts.get("token_void_failed", 0) + 1
+    left = await ledger.count_orphan_tokens()
+    if left:
+        counts["orphan_tokens"] = left
+        now = clock()
+        if _orphans_logged_at is None or now - _orphans_logged_at >= ORPHAN_LOG_INTERVAL_SECONDS:
+            _orphans_logged_at = now
+            logger.warning("a2a_rail_worker: %d ended purchase(s) hold a live token%s", left,
+                           "" if voider is not None else " (no void step on the rail)")
+    return counts
 
 
 async def run_tick(
@@ -817,8 +1259,11 @@ async def run_tick(
     limit: int = 10,
     budget_seconds: float = 60.0,
     clock: Callable[[], float] = time.monotonic,
+    voider: Optional[Voider] = None,
+    vic: Optional[Any] = None,
 ) -> Dict[str, int]:
-    """One scheduler tick: the sweeps, then up to `limit` claimed steps within the budget."""
+    """One scheduler tick: the sweeps (and the orphan-token pass), then up to `limit` claimed steps
+    within the budget. `vic` is the VIC order client (None: the VIC order step is off)."""
     counts: Dict[str, int] = {}
 
     def bump(name: str, n: int = 1) -> None:
@@ -837,6 +1282,11 @@ async def run_tick(
                 bump(name, moved)
         except Exception as exc:  # noqa: BLE001 - a sweep failing must not stop the steps
             logger.warning("a2a_rail_worker: %s sweep failed error_type=%s", name, type(exc).__name__)
+    try:
+        for name, n in (await void_orphan_tokens(voider)).items():
+            bump(name, n)
+    except Exception as exc:  # noqa: BLE001 - the orphan pass failing must not stop the steps
+        logger.warning("a2a_rail_worker: orphan token pass failed error_type=%s", type(exc).__name__)
     deadline = clock() + max(0.0, budget_seconds)
     rows = await ledger.claim_due_purchases(worker, limit=limit)
     pending = list(rows)
@@ -847,7 +1297,8 @@ async def run_tick(
                 bump("deferred", len(pending))
                 break
             try:
-                bump(await step(client, row, worker))
+                # The call is the pre-VIC one unless a VIC client is given: with the step off, nothing changes.
+                bump(await (step(client, row, worker, vic=vic) if vic is not None else step(client, row, worker)))
             except Exception as exc:  # noqa: BLE001 - one purchase failing must not stop the rest
                 logger.warning("a2a_rail_worker: step failed purchase=%s error_type=%s", row["id"], type(exc).__name__)
                 try:

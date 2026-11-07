@@ -134,6 +134,30 @@ def test_the_migration_holds_the_modules_ddl():
         assert squash(getattr(ledger, name)) in squash(migration), name
 
 
+def test_migration_278_holds_the_heartbeat_ddl():
+    migration = (_REPO / "db/migrations/278_a2a_rail_worker_heartbeat.sql").read_text("utf-8")
+    squash = lambda text: " ".join(text.split())  # noqa: E731
+    assert squash(ledger._CREATE_WORKER_HEARTBEAT_PG).rstrip() in squash(migration)
+    assert "schema-guard-exempt:" in migration
+    down = (_REPO / "db/migrations/down/278_a2a_rail_worker_heartbeat_down.sql").read_text("utf-8")
+    assert "DROP TABLE IF EXISTS a2a_rail_worker_heartbeat" in down
+
+
+async def test_the_heartbeat_is_one_row_and_ages_out():
+    await database.execute("DROP TABLE IF EXISTS a2a_rail_worker_heartbeat")
+    await ensure_required_schema_light()
+    assert await ledger.worker_is_alive() is False  # never ticked
+    await ledger.record_worker_heartbeat()
+    await ledger.record_worker_heartbeat()
+    assert (await database.fetch_one("SELECT COUNT(*) AS n FROM a2a_rail_worker_heartbeat"))["n"] == 1
+    assert await ledger.worker_is_alive() is True
+    await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = datetime('now', '-901 seconds')")
+    assert await ledger.worker_is_alive() is False
+    assert await ledger.worker_is_alive(max_age_seconds=1000) is True
+    with pytest.raises(Exception):
+        await database.execute("INSERT INTO a2a_rail_worker_heartbeat (id, ticked_at) VALUES (2, CURRENT_TIMESTAMP)")
+
+
 def test_no_statement_opens_a_transaction_or_is_composed_at_call_time():
     source = (_REPO / "db/a2a_rail_ledger.py").read_text("utf-8")
     assert "database.transaction" not in source
