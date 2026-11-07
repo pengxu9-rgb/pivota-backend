@@ -29,9 +29,10 @@ must end the stored URL or be followed by `/`, `?` or `#`) narrows the rows, and
 done here, on one normalisation applied to both sides (`normalize_product_url`).
 
 THE PAGE NAMES A PRODUCT, NEVER A VARIANT. A URL purchase names its variant by `variant_id`, required
-beside `product_url` (the route's selector rule). A `variant=` in the URL's query is not ignored: it must
-BE that `variant_id`, or the request is refused (`check_url_variant`). Otherwise a variant-grain seed
-(`?variant=A`) would answer a caller's `?variant=B` with the record that proves only A.
+beside `product_url` (the route's selector rule). A variant in the URL is not ignored: every `variant`
+anywhere in its decoded query or fragment must be exactly `variant=<variant_id>`, or the request is
+refused (`check_url_variant`). Otherwise a variant-grain seed (`?variant=A`) would answer a caller's
+`?variant=B` with the record that proves only A.
 
 FAILS CLOSED. A seed whose `domain` is NULL or not lowercase is not read (`row_not_found`): the writers
 lowercase it, and a seed placed by its URL alone is reachable by `product_key` as before. Paths are
@@ -44,10 +45,12 @@ URL attached to different products): `product_ambiguous`. Never a pick.
 """
 from __future__ import annotations
 
+import html
 import ipaddress
 import logging
+import re
 from typing import Any, List, Optional, Set
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 from db.database import database
 from services.reap_agentic_purchase import PurchaseRefused
@@ -78,10 +81,10 @@ _SEED_SQL = """
      WHERE e.status = 'active'
        AND e.domain IN (:domain_apex, :domain_www)
        AND upper(e.market) = :market_country
-       AND (lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_end ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_slash ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_query ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_fragment ESCAPE '!')
+       AND (lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_end ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_slash ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_query ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_fragment ESCAPE '!')
      ORDER BY e.id
      LIMIT :limit
 """
@@ -103,9 +106,14 @@ def _bare_host(host: str) -> str:
 def _normalized(url: Any) -> Optional[str]:
     """`<bare host><path>` for an http(s) URL, path lowercased with trailing slashes and any query or
     fragment dropped; None for anything that is not one. One rule for the caller's URL and the stored
-    ones, so the comparison is symmetric by construction."""
-    text = str(url or "").strip()
-    if not text:
+    ones, so the comparison is symmetric by construction.
+
+    A stored value is trimmed of SPACES only (what SQL `trim()` removes in both dialects, so the
+    candidate read finds every value accepted here), and is then a page only if it is printable ASCII,
+    as the caller's must be. A stored URL with a tab, a newline or a non-ASCII character is not a page:
+    no caller URL could equal it, and the SQL read and this compare agree on it."""
+    text = str(url or "").strip(" ")
+    if not text or any(not 0x21 <= ord(ch) <= 0x7E for ch in text):
         return None
     try:
         parts = urlsplit(text)
@@ -149,19 +157,46 @@ def normalize_product_url(product_url: str, merchant_host: str) -> str:
     return normalized
 
 
-def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
-    """Refuse a URL whose query names a variant other than the request's `variant_id` (`invalid_request`).
+#: The ONE spelling of a variant a URL may carry: `variant=<digits>` (optionally `variant[]=`), ending
+#: the query/fragment or followed by a separator.
+_URL_VARIANT_RE = re.compile(r"variant(?:\[\])?=([0-9]+)(?=$|[&;#])")
 
-    `variant=` (any case, every occurrence) must equal `variant_id` exactly; the request must name one.
-    Call it after `normalize_product_url` has accepted the URL."""
+
+def _decoded_tail(product_url: str) -> str:
+    """The URL's query and fragment, lowercased and decoded until stable (percent-encoding, `+`, HTML
+    entities such as `&amp;`), so no encoding of a variant hides it from `check_url_variant`."""
+    parts = urlsplit(product_url)
+    text = parts.query + "#" + parts.fragment
+    for _ in range(4):
+        decoded = html.unescape(unquote_plus(text))
+        if decoded == text:
+            break
+        text = decoded
+    return text.lower()
+
+
+def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
+    """Refuse a URL that names, or might name, a variant other than the request's `variant_id`.
+
+    The request must carry a `variant_id`. Then every occurrence of `variant` anywhere in the URL's
+    decoded query or fragment (a key, a key inside another value, `variant[]`, a `;`-separated one, one
+    behind `&amp;`, one in the fragment) must be exactly `variant=<variant_id>`; any other spelling --
+    another id, leading zeros, a blank, a non-digit, a key such as `variant_title` -- is
+    `invalid_request`. Strict on purpose: the cross-check is there to catch a door whose `variant_id`
+    disagrees with the page its buyer saw, and a form it cannot read is refused, not ignored. Call it
+    after `normalize_product_url` has accepted the URL."""
     if variant_id is None:
         raise PurchaseRefused("invalid_request", "a product_url purchase names its variant by variant_id")
     try:
-        pairs = parse_qsl(urlsplit(product_url).query, keep_blank_values=True)
+        tail = _decoded_tail(product_url)
     except ValueError:
         raise PurchaseRefused("invalid_request", "product_url is not a usable URL") from None
-    if any(name.lower() == "variant" and value != variant_id for name, value in pairs):
-        raise PurchaseRefused("invalid_request", "product_url names another variant than variant_id")
+    start = tail.find("variant")
+    while start != -1:
+        named = _URL_VARIANT_RE.match(tail, start)
+        if named is None or named.group(1) != variant_id:
+            raise PurchaseRefused("invalid_request", "product_url names another variant than variant_id")
+        start = tail.find("variant", start + 1)
 
 
 def _is_ip_literal(host: str) -> bool:

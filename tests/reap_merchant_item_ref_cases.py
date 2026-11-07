@@ -383,22 +383,24 @@ async def test_an_unescaped_wildcard_never_widens_the_candidate_read(monkeypatch
     assert refused.value.reason == "row_not_found"
 
 
-def test_a_url_fingerprint_differs_from_the_same_string_sent_as_a_product_key():
+def test_a_url_fingerprint_differs_from_the_same_string_sent_as_a_product_key(monkeypatch):
     """The versioned prefix keeps a URL request apart from a `product_key` equal to its normalised URL, and a
     key (or a sku key) spelled with a fingerprint prefix is refused, so no key request hashes like a URL or
     `variant_id` one."""
     from types import SimpleNamespace
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    cart = dict(item_source="cart_link")
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
-    by_url = reap._product_selector(SimpleNamespace(product_url=URL, product_key=None, variant_id=VARIANT), DOMAIN)
-    by_key = reap._product_selector(SimpleNamespace(product_url=None, product_key=normalized), DOMAIN)
+    by_url = reap._product_selector(SimpleNamespace(product_url=URL, product_key=None, variant_id=VARIANT, **cart), DOMAIN)
+    by_key = reap._product_selector(SimpleNamespace(product_url=None, product_key=normalized, **cart), DOMAIN)
     assert by_url[1] == "product_url:v1:" + normalized and by_url[1] != by_key[1]
     assert (by_url[0], by_url[2]) == (None, normalized) and by_key[0] == normalized
     for spelled in (by_url[1], "product_url:" + normalized):
         with pytest.raises(svc.PurchaseRefused) as refused:
-            reap._product_selector(SimpleNamespace(product_url=None, product_key=spelled), DOMAIN)
+            reap._product_selector(SimpleNamespace(product_url=None, product_key=spelled, **cart), DOMAIN)
         assert refused.value.reason == "invalid_request"
     with pytest.raises(svc.PurchaseRefused) as refused:
-        reap._variant_selector(SimpleNamespace(variant_id=None, variant_key="variant_id:" + VARIANT))
+        reap._variant_selector(SimpleNamespace(variant_id=None, variant_key="variant_id:" + VARIANT, **cart))
     assert refused.value.reason == "invalid_request"
 
 
@@ -646,3 +648,115 @@ async def test_a_retry_with_another_spelling_of_the_same_page_replays(client, mo
     again = await client.post(CREATE, json=respelled)
     assert again.status_code == 202 and again.json()["purchase_id"] == created.json()["purchase_id"], again.text
     assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1
+
+
+# ── follow-up (delta review N1-N4) ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("tail", [
+    "?variant%3D111", "?variant[]=111", "?a=1;variant=111", "?a=1&amp;variant=111", "#variant=111",
+    "?x=variant%3D111", "?%76ariant=111", "?VARIANT=111", "?variant=0" + VARIANT, "?variant=",
+    "?variant", "?variant_title=red", "?variant=+" + VARIANT, "?variant=" + VARIANT + "&variant=111",
+    "?variant=%2531%2531%2531", "?a=1&#118;ariant=111", "?variant=" + VARIANT + "x", "?variant=" + VARIANT + "1",
+])
+def test_every_spelling_of_another_variant_in_the_url_is_refused(tail):
+    """N1: the cross-check reads every `variant` in the decoded query and fragment, not only an exact
+    `&`-separated key; a form it cannot read as exactly `variant=<variant_id>` is refused."""
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        merchant_item.check_url_variant(URL + tail, VARIANT)
+    assert refused.value.reason == "invalid_request"
+
+
+@pytest.mark.parametrize("tail", [
+    "", "?variant=" + VARIANT, "?variant[]=" + VARIANT, "#variant=" + VARIANT, "?a=1;variant=" + VARIANT,
+    "?variant%3D" + VARIANT, "?variant=" + VARIANT + "&utm_source=x#reviews", "?utm_source=x",
+])
+def test_the_agreeing_variant_in_any_spelling_is_accepted(tail):
+    merchant_item.check_url_variant(URL + tail, VARIANT)
+
+
+async def test_prepare_refuses_a_hidden_disagreeing_variant_before_any_sql(client, monkeypatch):
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
+    with monkeypatch.context() as patches:
+        forbid_sql(patches)
+        response = await client.post(BASE, json=url_body(URL + "?a=1;variant=111"))
+    assert response.status_code == 400 and error(response) == "invalid_request", response.text
+
+
+def test_the_prefix_refusals_are_dark_off_the_cart_link_lane_or_with_its_dial_off(monkeypatch):
+    """N2: a fingerprint-prefixed key is refused only where a URL or `variant_id` request can exist (the hash
+    holds `item_source`); everywhere else such a key answers exactly as before these selectors."""
+    from types import SimpleNamespace
+    spelled_product, spelled_variant = "product_url:abc", "variant_id:" + VARIANT
+    for item_source, dial in (("cart_link", "0"), ("reap_variant", "1"), ("reap_variant", "0")):
+        monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", dial)
+        request = SimpleNamespace(product_url=None, product_key=spelled_product, variant_id=None,
+                                  variant_key=spelled_variant, item_source=item_source)
+        assert reap._product_selector(request, DOMAIN) == (spelled_product, spelled_product, None)
+        assert reap._variant_selector(request) == (spelled_variant, spelled_variant)
+
+
+async def test_a_variant_lane_create_with_a_prefixed_key_answers_as_any_unknown_key(client, monkeypatch):
+    """N2, at the route: with the cart-link dial off, a `reap_variant` create naming `product_url:…` gets the
+    same answer as one naming any other key we do not have, not a new 400."""
+    await seed(monkeypatch)
+    monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "0")
+    witness = (await client.post(BASE, json=body())).json().get("selection") or {
+        "merchant_domain": DOMAIN, "product_key": PRODUCT, "variant_id": VARIANT, "variant_key": SKU,
+        "quantity": 1, "unit_price_minor": 1000, "currency": "USD"}
+    answers = []
+    for n, key in enumerate(("product_url:abc", "prod::not-in-the-catalog")):
+        request = create_body(witness, f"prefixed-dark-{n}", by="variant_key")
+        request.update(item_source="reap_variant", product_key=key)
+        request.pop("variant_key")
+        response = await client.post(CREATE, json=request)
+        answers.append((response.status_code, error(response)))
+    assert answers[0] == answers[1] and answers[0] != (400, "invalid_request"), answers
+
+
+async def test_the_python_compare_reads_the_seeds_page_not_either_column(client, monkeypatch):
+    """N3 (C4): a seed whose PAGE is `/en-gb/products/lip-ink` and whose destination is this page, attached to
+    another product. SQL reads it (the LIKE is anchored on the right only); only the Python compare of the
+    seed's page, not of either column, keeps it out."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-gb-page")
+    await add_seed("gb-page-seed", attached=PRODUCT + "-gb-page")
+    await database.execute("UPDATE external_product_seeds SET canonical_url=:c WHERE id='gb-page-seed'",
+                           {"c": "https://judydoll.com/en-gb/products/lip-ink"})
+    response = await client.post(BASE, json=url_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"]["product_key"] == PRODUCT
+
+
+async def test_the_python_compare_holds_the_host(client, monkeypatch):
+    """N3 (C7): a seed of this store's `domain` whose stored page is on ANOTHER host with the same path. The
+    domain filter reads it; only the host in the exact compare keeps it out."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-other-host")
+    await add_seed("other-host-seed", attached=PRODUCT + "-other-host",
+                   url="https://other-store.example/products/lip-ink")
+    response = await client.post(BASE, json=url_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"]["product_key"] == PRODUCT
+
+
+async def test_a_twin_whose_stored_url_has_spaces_is_still_a_twin(client, monkeypatch):
+    """N4: Python trims a stored URL's spaces, and so must the SQL read, or a twin seed of this page attached
+    to another product would be missed and the ambiguity answered with a pick."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-spaced-twin")
+    await add_seed("spaced-twin", url="  " + URL + "  ", attached=PRODUCT + "-spaced-twin")
+    response = await client.post(BASE, json=url_body())
+    assert response.status_code == 409 and error(response) == "product_ambiguous", response.text
+
+
+@pytest.mark.parametrize("stored", [URL + "\t", "\n" + URL, URL + "\u00e9", URL.replace("lip-", "lip\u200b-")])
+async def test_a_stored_url_that_is_not_printable_ascii_is_not_a_page(monkeypatch, stored):
+    """N4: the other side of the one rule. A tab, a newline or a non-ASCII character in a stored URL makes it no
+    page at all (no caller URL can equal it), in the compare whatever the SQL read finds."""
+    assert merchant_item._normalized(stored) is None
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-dirty-twin")
+    await add_seed("dirty-twin", url=stored, attached=PRODUCT + "-dirty-twin")
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
