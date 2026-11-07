@@ -26,7 +26,7 @@ def _sqlite(seeds, products):
         " domain TEXT, market TEXT, price_currency TEXT,"
         " last_crawl_attempt_at TEXT, last_crawled_at TEXT, updated_at TEXT, destination_url TEXT)"
     )
-    conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
+    conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT, suppression_reason TEXT)")
     conn.execute(
         "CREATE TABLE catalog_source_quarantine (match_type TEXT, match_value TEXT, state TEXT,"
         " expires_at TEXT)"
@@ -36,7 +36,9 @@ def _sqlite(seeds, products):
         " (?, 'active', ?, 'brand.com', 'US', 'USD', ?, NULL, '2026-01-01', 'https://brand.com/products/p')",
         seeds,
     )
-    conn.executemany("INSERT INTO catalog_products VALUES (?, ?)", products)
+    # (product_key, suppressed_at) or (product_key, suppressed_at, suppression_reason); reason defaults to another lane's.
+    conn.executemany("INSERT INTO catalog_products VALUES (?, ?, ?)",
+                     [tuple(p) + (("duplicate_offer",) if len(p) == 2 else ()) for p in products])
     return conn
 
 
@@ -89,3 +91,28 @@ def test_suppressed_seeds_do_not_consume_the_limit(monkeypatch: pytest.MonkeyPat
     ]
     ids = _candidates(monkeypatch, seeds, PRODUCTS, limit=1)
     assert ids == ["eps_live"]
+
+
+def test_a_seed_hidden_only_by_the_unconfirmed_dead_hide_stays_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refresh is the only lane that can lift that hide (the sweep cannot read those hosts' catalogues); a hide
+    that drops the seed from the queue could never lift. Every other suppression still drops it."""
+    from services.external_seed_destination_liveness import PENDING_SUPPRESSION_REASON, UNCONFIRMED_DEAD_REASON
+
+    seeds = [("eps_unconfirmed", "prod::unc", None), ("eps_pending", "prod::pend", None),
+             ("eps_no_reason", "prod::nul", None), ("eps_other", "prod::oth", None), ("eps_live", "prod::live", "2026-09-01")]
+    products = [("prod::unc", "2026-11-07 00:00:00", UNCONFIRMED_DEAD_REASON),
+                ("prod::pend", "2026-11-07 00:00:00", PENDING_SUPPRESSION_REASON),
+                ("prod::nul", "2026-11-07 00:00:00", None),
+                ("prod::oth", "2026-11-07 00:00:00", "duplicate_offer"),
+                ("prod::live", None, None)]
+    ids = _candidates(monkeypatch, seeds, products)
+    assert ids == ["eps_unconfirmed", "eps_live"]
+
+
+def test_the_refresh_filter_spells_the_unconfirmed_reason_the_writer_uses() -> None:
+    from services.external_seed_destination_liveness import UNCONFIRMED_DEAD_REASON
+    from services.external_seed_search import SEED_SUPPRESSED_PRODUCT_ANTI_JOIN
+
+    assert f"'{UNCONFIRMED_DEAD_REASON}'" in module.REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN
+    # The serving lanes keep the seed lane's filter: the exception is the refresh queue's alone.
+    assert "suppression_reason" not in SEED_SUPPRESSED_PRODUCT_ANTI_JOIN
