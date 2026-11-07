@@ -152,8 +152,7 @@ def test_shadow_counts_pages_regions_codes_and_distinct_host_codes(capsys):
 
     assert (payload["host"], payload["market"], payload["page_currency"]) == ("glow.example", "US", "USD")
     # The code itself is never printed (review of be#2732): a short hash of host+code, and its description.
-    assert payload["codes"][0]["code_hash"] == hashlib.sha256(b"glow.example|GLOW20").hexdigest()[:12]
-    assert set(payload["codes"][0]) == {"code_hash", "kind", "shape", "form", "region", "hints"}
+    assert set(payload["codes"][0]) == {"kind", "shape", "form", "region", "hints"}  # no code, no hash
     assert "GLOW20" not in lines[0]
 
 
@@ -1112,6 +1111,7 @@ def test_the_widened_forms_read_codes_the_strict_ones_missed(bar, code, form):
         "Dress code BLACK for the 20% off party",
         "Item code: QX4410 on sale",
         "Code FALL23 applies",  # no promo context at all
+        "Use code XXXX-XXXX for 10% off",  # a dashed placeholder
         "barcode A1B2C3 on 20% off items",  # "code" inside a word
         "Unicode U8FF20 sale",  # the same, after a word no noun rule names
         "Code BLACK takes 20% off",  # a colour word a bare "code" names

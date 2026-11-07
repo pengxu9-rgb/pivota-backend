@@ -184,12 +184,12 @@ async def test_the_kill_switch_stops_it(db, monkeypatch):
 
 async def test_one_rules_failure_never_stops_the_others_and_logs_counts_only(db, monkeypatch, caplog):
     await offer(db, "stale", seller="secret-shop.example", code="SECRETCODE", observed_days=20)
-    real = r._opted_out_seller_ids
+    real = r._delete_opted_out
 
     async def boom():
         raise RuntimeError("optout table gone SECRETCODE")
 
-    monkeypatch.setattr(r, "_opted_out_seller_ids", boom)
+    monkeypatch.setattr(r, "_delete_opted_out", boom)
     caplog.set_level(logging.WARNING)
     out = await r.run(now=NOW)
     assert out["errors"] == 1 and out["deleted_unverified"] == 1
@@ -197,7 +197,7 @@ async def test_one_rules_failure_never_stops_the_others_and_logs_counts_only(db,
     text = caplog.text
     assert "SECRETCODE" not in text and "secret-shop" not in text and "optout table gone" not in text
     assert "deleted_unverified" in text  # the counts are logged
-    monkeypatch.setattr(r, "_opted_out_seller_ids", real)
+    monkeypatch.setattr(r, "_delete_opted_out", real)
 
 
 async def test_nothing_raises_when_the_database_is_down(monkeypatch):
@@ -209,7 +209,7 @@ async def test_nothing_raises_when_the_database_is_down(monkeypatch):
     monkeypatch.setattr(database, "fetch_all", down)
     monkeypatch.setattr(database, "execute", down)
     out = await r.run(now=NOW)
-    assert out["errors"] == 5
+    assert out["errors"] == 5  # every rule failed, none raised
 
 
 
@@ -251,6 +251,23 @@ async def test_the_prefix_is_matched_literally_not_as_a_like_wildcard(db):
     key = observed_store_offer_key(seller_id="glow.example", market="US", code="LOOKALIKE", platform_rule_ref=None, program_id=None)
     await db.execute(o.insert().values(deal_id="dlcXlookalike", deal_key=key, seller_id="glow.example", market="US",
                                        code="LOOKALIKE", kind="percent", value=10, source="merchant_published",
-                                       observed_at=NOW - timedelta(days=60), created_at=NOW - timedelta(days=60)))
+                                       terms_text="bar text", observed_at=NOW - timedelta(days=60),
+                                       created_at=NOW - timedelta(days=60)))
     await r.run(now=NOW)
-    assert [row["deal_id"] for row in await db.fetch_all(o.select())] == ["dlcXlookalike"]
+    rows = [(row["deal_id"], row["terms_text"]) for row in await db.fetch_all(o.select())]
+    assert rows == [("dlcXlookalike", "bar text")], "neither deleted nor its bar text cleared"
+
+
+
+async def test_the_opt_out_is_case_insensitive_and_has_no_id_limit(db):
+    from db.catalog import catalog_products
+    from db.deal_lane import deal_lane_optout
+
+    for i in range(30):
+        await db.execute(catalog_products.insert().values(product_key=f"p{i}", merchant_id=f"merch_obs_{i:02d}", platform="shopify",
+                                                          source_product_id=str(i), source_domain="WWW.Glow.Example", title="t"))
+    await offer(db, "glow1")
+    await db.execute(deal_lane_optout.insert().values(seller_id="MERCH_OBS_29", requested_at=NOW, recorded_by="test"))
+    out = await r.run(now=NOW)
+    assert await ids(db) == []
+    assert out["deleted_optout"] == 1

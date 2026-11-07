@@ -59,7 +59,6 @@ body window (cut or unread); and each region's length (`by_region_chars`). A dia
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -429,7 +428,7 @@ def _shape(code: str) -> str:
 def _is_code(code: str, text: str, start: int, end: int) -> bool:
     if len(code) < 3 or code.upper().replace("-", "") in _STOP_CODES or not any(ch.isalpha() for ch in code):
         return False
-    if _GIFT_CARD_NUMBER_RE.fullmatch(code) or set(code) <= {"X"}:  # 1234-5678-ABCD, or an "XXXX" placeholder
+    if _GIFT_CARD_NUMBER_RE.fullmatch(code) or set(code.replace("-", "").replace("_", "")) <= {"X"}:  # 1234-5678-ABCD, or an "XXXX(-XXXX)" placeholder
         return False
     return not _SHADE_AFTER_RE.match(text, end)
 
@@ -710,15 +709,15 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
         host = host[4:] if host.startswith("www.") else host
         if codes:
             # Built and printed BEFORE the counters move, so a failed print leaves them untouched. NEVER the code or
-            # the bar text (review of be#2732): a short hash of host+code tells repeat sightings apart, and the
-            # rest is the code's shape, form, region, stated kind and hints.
+            # the bar text (review of be#2732): only the code's shape, form, region, stated kind and hints.
             print("DEAL_CODE_CAPTURE_PAGE " + json.dumps({
                 "host": host,
                 "market": market,
                 "page_currency": page_currency,
                 "codes_capped": capped,
+                # No hash either (review of be#2732, P3-C): an unsalted hash of a short code is recovered by a
+                # dictionary in milliseconds. Repeat sightings are counted by the summary's distinct_host_codes.
                 "codes": [{
-                    "code_hash": hashlib.sha256(f"{host}|{c.code.upper()}".encode("utf-8")).hexdigest()[:12],
                     "kind": c.kind, "shape": c.shape, "form": c.form, "region": c.region, "hints": c.hints,
                 } for c in codes],
             }, ensure_ascii=True, separators=(",", ":")), flush=True)

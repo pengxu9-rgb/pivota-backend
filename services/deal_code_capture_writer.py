@@ -17,8 +17,9 @@ WHAT IS WRITTEN, per captured code:
   - min_subtotal, new_customer_only / once_per_customer / segment_limited from the bar's hints;
                 eligibility_known stays FALSE (hints are a reading of prose, not a store's rule);
   - source_url  the page; terms_text the bar snippet (the store's own published text).
-One row per (seller, market, code): the identity key is `observed_store_offer_key`. A later sighting refreshes the
-observation fields and `observed_at`; it never touches verifications, outcomes or `created_at`.
+One row per (seller, market, code): the identity key is `observed_store_offer_key`. A later sighting refreshes only
+`observed_at`, `source_url` and `terms_text`; kind, value and restriction flags are set once at insert, and verifications,
+outcomes and `created_at` are never touched.
 
 WHAT IS NOT WRITTEN (review of be#2732):
   - a code read by the loose bare-"code" form (`after_code`): it stays in the shadow counts until its precision is
@@ -47,7 +48,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Iterable, Optional
 from urllib.parse import urlparse
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, exists, func, literal, literal_column, or_, select
 
 from db.catalog import catalog_products
 from db.database import database
@@ -64,7 +65,6 @@ _SYMBOL_CURRENCIES = {"$": {"USD", "SGD", "AUD", "CAD", "NZD", "HKD"}, "£": {"G
 _KINDS = {"percent", "amount", "free_shipping"}
 # The phrased forms only; the bare-"code" form is shadow-only until measured.
 _WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
-_MAX_MERCHANT_IDS = 20
 # PROVENANCE: every row this writer creates has a deal_id with this prefix, and no other writer uses it. Retention
 # (services/deal_code_retention.py) deletes only such rows, and this writer refreshes only such rows, so a
 # merchant_published row entered by hand, from a connected store or by any other path is never touched by either.
@@ -110,7 +110,10 @@ def row_values(captured: "deal_code_capture.CapturedCode", *, url: str, market: 
             return None
         if captured.kind == "percent" and not (0 < value <= 100):
             return None
-        if captured.kind == "amount" and currency and currency in _SYMBOL_CURRENCIES.get(captured.currency_symbol or "", set()):
+        if captured.kind == "amount":
+            # An amount stated in another currency than the page's is not a fact about this page (P3-A): no row.
+            if not (currency and currency in _SYMBOL_CURRENCIES.get(captured.currency_symbol or "", set())):
+                return None
             row_currency = currency
     hints = set(captured.hints or [])
     min_subtotal = None
@@ -141,20 +144,31 @@ def _same_seller(a: Optional[str], b: Optional[str]) -> bool:
     return bool(a) and a == b
 
 
+def optout_predicate_sql(host_expr):
+    """True for a denylist row that names the seller whose (lower-case, www.-stripped) host is `host_expr`, a SQL
+    expression or literal (ADR-027 Q20). Driven from the small opt-out table with no limit (review of be#2732, P2-B):
+    its id equals the host or its www. form, case-insensitive; or it names a merchant id the catalog holds for that
+    host (source_domain compared case-insensitive; rows with no source_domain cannot tie a merchant to a host and never
+    match). Shared with services/deal_code_retention.py, which correlates it to each row's seller_id."""
+    host_expr = func.lower(host_expr)
+    www = literal_column("'www.'").op("||")(host_expr)
+    sid = func.lower(deal_lane_optout.c.seller_id)
+    # Explicitly correlated: only catalog_products belongs to this subquery. Without it, a host_expr that is a column of
+    # an outer query (retention's per-row check) is pulled in as a FROM here, and the EXISTS matches across every row.
+    catalog_match = exists().where(and_(
+        func.lower(catalog_products.c.merchant_id) == sid,
+        or_(func.lower(catalog_products.c.source_domain) == host_expr, func.lower(catalog_products.c.source_domain) == www),
+    )).correlate_except(catalog_products)
+    return or_(sid == host_expr, sid == www, catalog_match)
+
+
+def optout_predicate(host: str):
+    return optout_predicate_sql(literal((host or "").strip().lower()))
+
+
 async def _opted_out(seller: str) -> bool:
-    """The seller under every form ADR-027 Q20 names: its host, its www. form, and the catalog's merchant ids for the
-    host. Raises when it cannot be read (the caller fails closed)."""
-    hosts = [seller, f"www.{seller}"]
-    rows = await database.fetch_all(
-        select(catalog_products.c.merchant_id)
-        .where(catalog_products.c.source_domain.in_(hosts))
-        .distinct()
-        .limit(_MAX_MERCHANT_IDS)
-    )
-    ids = hosts + [r["merchant_id"] for r in rows if r["merchant_id"]]
-    hit = await database.fetch_one(
-        select(deal_lane_optout.c.seller_id).where(deal_lane_optout.c.seller_id.in_(ids)).limit(1)
-    )
+    """Raises when it cannot be read (the caller fails closed)."""
+    hit = await database.fetch_one(select(deal_lane_optout.c.seller_id).where(optout_predicate(seller)).limit(1))
     return hit is not None
 
 
@@ -170,13 +184,21 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
         if not seller:
             deal_code_capture.bump_write("skipped_no_seller", len(codes))
             return
-        if final_url is not None and not _same_seller(seller_id_for(final_url), seller):
-            deal_code_capture.bump_write("skipped_host_changed", len(codes))
+        # Fail closed (P3-D): without where the fetch ended we cannot know whose page this was.
+        if final_url is None or not _same_seller(seller_id_for(final_url), seller):
+            deal_code_capture.bump_write("skipped_host_changed" if final_url is not None else "skipped_no_final_url", len(codes))
             return
         loose = [c for c in codes if c.form not in _WRITTEN_FORMS]
         if loose:
             deal_code_capture.bump_write("skipped_loose_form", len(loose))
         codes = [c for c in codes if c.form in _WRITTEN_FORMS]
+        # A code with no digit stays in the shadow counts (review of be#2732, P2-A): all-caps prose after a code phrase
+        # ("USE CODE THROUGH MIDNIGHT", "Coupon code: NEWSLETTER") reads as a letters-only token far more often than
+        # stores print letters-only codes. Measured in prod before any letters-only code is written.
+        no_digit = [c for c in codes if not any(ch.isdigit() for ch in c.code)]
+        if no_digit:
+            deal_code_capture.bump_write("skipped_no_digit", len(no_digit))
+        codes = [c for c in codes if any(ch.isdigit() for ch in c.code)]
         if not codes:
             return
         try:
@@ -194,23 +216,25 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
                 if values is None:
                     deal_code_capture.bump_write("skipped_no_kind" if captured.kind not in _KINDS else "skipped_unreadable")
                     continue
-                cap = deal_code_capture.take_write_slot(seller)
-                if cap:
-                    deal_code_capture.bump_write(cap)
-                    continue
                 if values["market"] is None:
                     deal_code_capture.bump_write("no_market_evidence")
                 key = observed_store_offer_key(
                     seller_id=values["seller_id"], market=values["market"], code=values["code"],
                     platform_rule_ref=None, program_id=None,
                 )
-                observation = {k: values[k] for k in ("kind", "value", "currency", "min_subtotal", "new_customer_only",
-                                                      "once_per_customer", "segment_limited", "source_url", "terms_text")}
+                # A later sighting refreshes only WHEN and WHERE it was seen (P3-F): kind, value and the restriction flags
+                # are set once, at insert, so a sighting can never overwrite what a verifier has since established.
+                observation = {k: values[k] for k in ("source_url", "terms_text")}
                 existing = await database.fetch_one(
                     select(observed_store_offers.c.deal_id, observed_store_offers.c.source)
                     .where(observed_store_offers.c.deal_key == key)
                 )
                 if existing is None:
+                    # The per-run budget counts NEW rows only (P3-E); a repeat sighting refreshes without spending it.
+                    cap = deal_code_capture.take_write_slot(seller)
+                    if cap:
+                        deal_code_capture.bump_write(cap)
+                        continue
                     try:
                         await database.execute(
                             observed_store_offers.insert().values(
