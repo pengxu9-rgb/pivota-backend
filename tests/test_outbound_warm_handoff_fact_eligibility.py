@@ -131,11 +131,12 @@ def armed(monkeypatch):
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
     monkeypatch.setattr(app_settings, "outbound_warm_handoff_fact_eligible", True)
+    monkeypatch.setattr(app_settings, "outbound_warm_handoff_enabled", True)
     return app_settings
 
 
-async def _ask(gate, *, dest=DEST, shop_domain=None):
-    return await gate.warm_fact(destination_url=dest, shop_domain=shop_domain)
+async def _ask(gate, *, dest=DEST):
+    return await gate.warm_fact(dest)
 
 
 async def test_a_fresh_fact_is_stamped(armed, fact_reads):
@@ -155,20 +156,39 @@ async def test_no_fact_no_stamp(armed, fact_reads):
     assert len(calls) == 1
 
 
-async def test_keyed_like_the_cart_minter_shop_domain_first(armed, fact_reads):
-    """`resolve_cart_permalink` builds the cart on `shop_domain or destination_url`, and the sweep
-    records facts for the hosts the cart minter builds on, so the stamp asks the same host."""
+async def test_keyed_on_the_destination_host_only(armed, fact_reads):
+    """The click lane builds its cart on the DESTINATION host (`brand_domain = host(dest)`), so
+    the stamp asks about that host and no other. The seed's `domain` column can name another
+    store, and a fact about that one must never authorize a cart on this one (be#2729 review P1)."""
     from routes.agent_shop_gateway import _CartPurchasabilityGate
 
     calls, _ = fact_reads
-    await _ask(_CartPurchasabilityGate("US"), shop_domain="brand-store.myshopify.com")
-    assert calls == [("brand-store.myshopify.com", "US")]
+    await _ask(_CartPurchasabilityGate("US"), dest="https://shop.brand-b.com/products/x")
+    assert calls == [("shop.brand-b.com", "US")]
+
+
+async def test_the_gate_takes_no_store_domain_at_all():
+    """Structural pin: there is no `shop_domain` input left to key on by mistake."""
+    import inspect
+
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+
+    assert list(inspect.signature(_CartPurchasabilityGate.warm_fact).parameters) == ["self", "destination_url"]
 
 
 async def test_the_flag_off_never_asks(armed, fact_reads, monkeypatch):
     from routes.agent_shop_gateway import _CartPurchasabilityGate
 
     monkeypatch.setattr(armed, "outbound_warm_handoff_fact_eligible", False)
+    calls, _ = fact_reads
+    assert await _ask(_CartPurchasabilityGate("US")) is None
+    assert calls == []
+
+
+async def test_the_warm_lane_off_never_asks(armed, fact_reads, monkeypatch):
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+
+    monkeypatch.setattr(armed, "outbound_warm_handoff_enabled", False)
     calls, _ = fact_reads
     assert await _ask(_CartPurchasabilityGate("US")) is None
     assert calls == []
@@ -214,3 +234,99 @@ async def test_a_database_error_stamps_nothing(armed, monkeypatch):
 
     monkeypatch.setattr(mp.database, "fetch_one", boom)
     assert await _ask(_CartPurchasabilityGate("US")) is None
+
+
+# ---- the flag's default ---------------------------------------------------------------------------
+
+
+def test_the_flag_defaults_off():
+    """Merging deploys: the flag MUST be off unless the env names it. Checked in a fresh
+    interpreter: the default is read at import, and reloading `config.settings` here would leave
+    every module that already imported `settings` holding a stale object."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {k: v for k, v in os.environ.items() if k != "OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE"}
+    probe = "from config.settings import settings; print(settings.outbound_warm_handoff_fact_eligible)"
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert proc.stdout.strip().splitlines()[-1] == "False"
+
+
+# ---- which seed links may be asked --------------------------------------------------------------
+
+
+_BASE = dict(
+    has_cart=False,
+    named_without_cart=False,
+    purchasability_tier=None,
+    stock_declined=False,
+    live_verification_required=False,
+    preflight_refused=False,
+    in_stock=True,
+    dest=DEST,
+)
+
+
+def test_a_plain_cold_link_may_be_asked():
+    from routes.agent_shop_gateway import _warm_fact_skip_reason
+
+    assert _warm_fact_skip_reason(**_BASE) is None
+    assert _warm_fact_skip_reason(**{**_BASE, "in_stock": None}) is None, "unknown stock is not a decline"
+
+
+@pytest.mark.parametrize(
+    "override, reason",
+    [
+        ({"has_cart": True}, "cart"),
+        ({"named_without_cart": True}, "named_variant"),
+        ({"purchasability_tier": "browse_only"}, "purchasability_declined"),
+        ({"stock_declined": True}, "stock_declined"),
+        ({"live_verification_required": True}, "live_verification"),
+        ({"preflight_refused": True}, "preflight_refused"),
+        ({"in_stock": False}, "out_of_stock"),
+        ({"dest": "https://click.linksynergy.com/deeplink?murl=x"}, "affiliate"),
+    ],
+    ids=["cart", "named", "tier", "stock", "live", "preflight", "oos", "affiliate"],
+)
+def test_every_skip_arm(override, reason):
+    from routes.agent_shop_gateway import _warm_fact_skip_reason
+
+    assert _warm_fact_skip_reason(**{**_BASE, **override}) == reason
+
+
+# ---- the click-time re-check ------------------------------------------------------------------------
+
+
+async def test_the_click_time_recheck_asks_the_destination_host_and_the_token_market(fact_reads):
+    calls, answer = fact_reads
+    assert await warm.warm_fact_still_holds(dest="https://www.brand-b.com/products/x?utm=1", market="US") is True
+    assert calls == [("brand-b.com", "US")]
+    answer["value"] = False
+    assert await warm.warm_fact_still_holds(dest=DEST, market="US") is False
+
+
+@pytest.mark.parametrize("market", [None, ""])
+async def test_the_click_time_recheck_without_a_market_refuses_without_asking(fact_reads, market):
+    calls, _ = fact_reads
+    assert await warm.warm_fact_still_holds(dest=DEST, market=market) is False
+    assert calls == []
+
+
+async def test_the_click_time_recheck_fails_closed_on_a_read_error(monkeypatch):
+    import db.merchant_purchasability as mp
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(mp, "human_handoff_allowed", boom)
+    assert await warm.warm_fact_still_holds(dest=DEST, market="US") is False

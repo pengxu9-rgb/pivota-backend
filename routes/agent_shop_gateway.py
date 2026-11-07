@@ -50,6 +50,7 @@ from services.outbound_warm_handoff import (
     WARM_FACT_HUMAN_HANDOFF,
     WARM_FACT_KEY,
     could_upgrade_at_click_time,
+    is_affiliate_destination,
 )
 import db.merchant_purchasability as merchant_purchasability
 from services.offer_buyability import (
@@ -5297,6 +5298,9 @@ async def _handle_offers_resolve(
                 # kept as its own counter because it is a different question (how many
                 # hand-overs actually got a cart) and folding the two lost it.
                 _preflight_stats["candidates"] += 1
+                # Set when an ENFORCED preflight withdrew this offer's cart; the warm-fact stamp
+                # must not hand the click lane back the cart the preflight just refused.
+                _preflight_refused = False
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
@@ -5371,6 +5375,7 @@ async def _handle_offers_resolve(
                         )
                     if not _allowed:
                         _preflight_stats["degraded_to_referral"] += 1
+                        _preflight_refused = True
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
@@ -5437,19 +5442,22 @@ async def _handle_offers_resolve(
                 # Not asked where a knockout already decides the click (a cart, a named variant
                 # without one, a purchasability/stock decline, a live-verification flag): the
                 # stamp could change nothing there, so it must not cost a read.
+                # Also never for a cart the preflight refused, an item this answer calls out of
+                # stock (cold offers carry no `stock_declined` stamp, so the knockout cannot see
+                # it), or an affiliate destination (never warm-handed).
                 _warm_fact = (
                     None
-                    if (
-                        redirect_identity.get("cart_variant_id")
-                        or _named_without_cart
-                        or _purchasability_tier
-                        or _stock_declined
-                        or offer_requires_live_verification
+                    if _warm_fact_skip_reason(
+                        has_cart=bool(redirect_identity.get("cart_variant_id")),
+                        named_without_cart=_named_without_cart,
+                        purchasability_tier=_purchasability_tier,
+                        stock_declined=_stock_declined,
+                        live_verification_required=bool(offer_requires_live_verification),
+                        preflight_refused=_preflight_refused,
+                        in_stock=in_stock,
+                        dest=str(canonical_url or destination_url),
                     )
-                    else await _cart_purchasability.warm_fact(
-                        destination_url=str(canonical_url or destination_url),
-                        shop_domain=redirect_identity.get("shop_domain"),
-                    )
+                    else await _cart_purchasability.warm_fact(str(canonical_url or destination_url))
                 )
 
                 stable_click_id = new_click_id()
@@ -11850,27 +11858,32 @@ class _CartPurchasabilityGate:
             self.stats["declined"] += 1
         return allowed
 
-    async def warm_fact(self, *, destination_url: str, shop_domain: Optional[str]) -> Optional[str]:
-        """`human_handoff` when a COLD link's store holds a fresh human-handoff fact, else None.
+    async def warm_fact(self, destination_url: str) -> Optional[str]:
+        """`human_handoff` when a COLD link's DESTINATION host holds a fresh human-handoff fact.
 
-        Asked only with OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE on and the dial on, and only for a
-        token that will carry no cart (the caller's job). KEYED AS `resolve_cart_permalink` KEYS A
-        CART for these inputs — `shop_domain or destination_url` — because that is the host the
-        sweep records facts for ("every host the cart minter builds a seed cart on").
-        NO PLATFORM CHECK, deliberately: the cold links this exists for usually carry no platform
-        evidence (that is often WHY they are cold), and a positive fact is itself the proof — the
-        sweep only ever records one after rendering that host's Shopify checkout. A host with no
-        fact answers None at the cost of one indexed read, once per host per request. Shares the
-        per-request memo with `allows_cart`, which asks the same question of the same reader,
-        and does not touch `stats` (a cold link asked here was never a cart to decline).
-        Fails closed exactly as `human_handoff_allowed` does: no market, no fact, a stale or
-        foreign-vantage fact or a database error is None, and None changes nothing.
+        Asked only with the warm lane and OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE on and the dial on,
+        and only for a token that will carry no cart (the caller's job).
+
+        KEYED ON THE DESTINATION HOST, the host the click lane builds its cart on
+        (`resolve_warm_handoff` sends `brand_domain = host(dest)`), and nothing else. The seed's
+        `domain` column can name a different store (writers diverge), and a fact about that one
+        must never authorize a cart on this one. Where the sweep recorded its fact under a
+        different host, this asks a host with no fact and stamps nothing: fail closed.
+        NO PLATFORM CHECK: a positive fact is itself the proof (the sweep only records one after
+        rendering that host's Shopify checkout).
+
+        Shares the per-request memo with `allows_cart` (same reader, same normalization) and
+        does not touch `stats`. Fails closed exactly as `human_handoff_allowed` does. The click
+        lane re-asks the same question at click time, so a fact that lapses inside the token's
+        life only narrows.
         """
+        if not getattr(settings, "outbound_warm_handoff_enabled", False):
+            return None
         if not getattr(settings, "outbound_warm_handoff_fact_eligible", False):
             return None
         if not self.enforced or self.market is None:
             return None
-        host = merchant_purchasability.normalize_domain(shop_domain or destination_url)
+        host = merchant_purchasability.normalize_domain(destination_url)
         if not host:
             return None
         if host not in self._memo:
@@ -11925,6 +11938,50 @@ class _CartPurchasabilityGate:
         if tier is None:
             return redirect_identity, None
         return {**redirect_identity, "cart_variant_id": None}, tier
+
+
+def _warm_fact_skip_reason(
+    *,
+    has_cart: bool,
+    named_without_cart: bool,
+    purchasability_tier: Optional[str],
+    stock_declined: bool,
+    live_verification_required: bool,
+    preflight_refused: bool,
+    in_stock: Optional[bool],
+    dest: str,
+) -> Optional[str]:
+    """Why a seed link must NOT be asked for a `warm_fact` stamp, or None when it may be.
+
+    Each arm is a case where the stamp could only hand the click lane a cart something else
+    refused, or where the lane would never act on it, so asking would waste a read:
+      * `cart` — the link already IS the cart;
+      * `named_variant` — a named variant without its cart (the rebuild carries no variant);
+      * `purchasability_declined`, `stock_declined`, `live_verification` — the mint withheld
+        the cart and signed why; the knockout fires anyway;
+      * `preflight_refused` — an enforced preflight withdrew the cart and signs nothing, so the
+        knockout could not see it;
+      * `out_of_stock` — this answer publishes `in_stock: false`; a cold offer carries no
+        `stock_declined` stamp (that needs a cart id), so the knockout could not see it either;
+      * `affiliate` — affiliate destinations are never warm-handed.
+    """
+    if has_cart:
+        return "cart"
+    if named_without_cart:
+        return "named_variant"
+    if purchasability_tier:
+        return "purchasability_declined"
+    if stock_declined:
+        return "stock_declined"
+    if live_verification_required:
+        return "live_verification"
+    if preflight_refused:
+        return "preflight_refused"
+    if in_stock is False:
+        return "out_of_stock"
+    if is_affiliate_destination(dest):
+        return "affiliate"
+    return None
 
 
 def _cart_prefilled_claim(

@@ -20,17 +20,27 @@ with a `continue_url` and quoted US shipping. `OUTBOUND_WARM_HANDOFF_FACT_ELIGIB
 The replacement for widening the allowlist by hand. With it on:
 
 - **At mint.** `offers.resolve`'s seed mint asks `db.merchant_purchasability.human_handoff_allowed`
-  for a cold link's store, keyed as `resolve_cart_permalink` keys a cart (`shop_domain or
-  destination_url`), with the buyer's market. On a fresh yes it signs `warm_fact: human_handoff`
-  into the token (`services/outbound_warm_handoff.WARM_FACT_KEY`).
+  about a cold link's **destination host** (the host the click lane builds its cart on), with the
+  buyer's market. On a fresh yes it signs `warm_fact: human_handoff` into the token
+  (`services/outbound_warm_handoff.WARM_FACT_KEY`).
+  - Never the seed's `domain` column. It can name another store, and a fact about that store must
+    never authorize a cart on this one (be#2729 review P1).
   - It is asked once per host per request, sharing the cart gate's memo.
-  - It is not asked when a knockout already decides the click: a cart, a named variant without
-    one, a purchasability or stock decline, or a live-verification flag.
-  - It needs `MERCHANT_PURCHASABILITY_ENFORCE` and a usable request market.
-- **At click.** A stamped token is warm-eligible even when its host is not allowlisted
-  (`warm_eligible: fact` on the click event ctx). The allowlist still applies, and every
-  knockout still beats the stamp. The gateway's own purchasability gate still re-asks at click
-  time.
+  - It needs `OUTBOUND_WARM_HANDOFF_ENABLED`, `MERCHANT_PURCHASABILITY_ENFORCE` and a usable
+    request market.
+  - It is never asked where the stamp could change nothing or would undo a refusal
+    (`_warm_fact_skip_reason`): a cart, a named variant without one, a purchasability or stock
+    decline, a live-verification flag, an enforced preflight refusal, `in_stock: false`, or an
+    affiliate destination.
+- **At click.** A stamped token is eligible even when its host is not allowlisted. **The click
+  then re-asks the same fact** (`warm_fact_still_holds`) for the destination host and the token's
+  market. A lapsed fact, a missing market or a read error keeps the cold redirect
+  (`warm_reason: fact_lapsed`).
+  - This is the backstop for the stamp outliving its fact, because the gateway's own gate
+    (`MERCHANT_PURCHASABILITY_GATE_ENABLED`) is not guaranteed to be armed.
+  - The allowlist still applies, and every knockout still beats the stamp.
+  - While the flag is on, the click event ctx records `warm_eligible` (`allowlisted` / `fact` /
+    `rollout`). With the flag off, the ctx is byte-identical to before.
 - **The claim.** `_cart_prefilled_claim` reads the same stamp, so a stamped cold offer answers
   `null`, and an unstamped one keeps a provable `false`.
 
@@ -49,7 +59,8 @@ agent_sdk, the card lanes) never stamp, so their links keep the allowlist rule a
 **Turning it on.**
 1. Set `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE=true` on backend `web`.
 2. Watch `warm_eligible` / `handoff` / `warm_reason` on `outbound_click_events.context`. The
-   instrument is the share of `warm_eligible=fact` clicks that end `handoff=warm`.
+   instruments are the share of `warm_eligible=fact` clicks that end `handoff=warm`, and the
+   count of `warm_reason=fact_lapsed`.
 
 ## State as of 2026-08-24 (historical)
 

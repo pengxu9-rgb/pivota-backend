@@ -331,6 +331,30 @@ def is_warm_fact_positive(ctx: Optional[Dict[str, Any]]) -> bool:
     return str(ctx.get(WARM_FACT_KEY) or "").strip().lower() == WARM_FACT_HUMAN_HANDOFF
 
 
+async def warm_fact_still_holds(*, dest: str, market: Optional[str]) -> bool:
+    """Re-ask, AT CLICK TIME, the question a `warm_fact` stamp answered at mint.
+
+    The stamp is the mint-time answer and the token lives 7 days; a fact's window is up to 72 h
+    by default. Without this the click could act on a fact that lapsed days ago, and the
+    gateway's own gate (MERCHANT_PURCHASABILITY_GATE_ENABLED) is not guaranteed to be armed.
+    Asked for the DESTINATION host, the host the cart is built on, and the token's own market.
+    It can only NARROW: called only for a click already eligible by `fact`. Fails closed: no
+    market, no fact, a stale or foreign-vantage fact, or a read error is False.
+    """
+    if not market:
+        return False
+    host = _host_of(dest)
+    if not host:
+        return False
+    try:
+        import db.merchant_purchasability as merchant_purchasability
+
+        return bool(await merchant_purchasability.human_handoff_allowed(host, market))
+    except Exception:  # noqa: BLE001  the reader already fails closed; this guards the import
+        logger.warning("outbound_warm_handoff: fact re-check failed; keeping the cold redirect")
+        return False
+
+
 def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     """True when the signed token says the mint DECLINED a cart for this merchant x market.
 

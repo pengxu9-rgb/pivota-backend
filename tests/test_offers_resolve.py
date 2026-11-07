@@ -6182,3 +6182,45 @@ def test_a_named_variant_without_a_cart_is_never_stamped_or_asked(
     assert calls == []
     assert "warm_fact" not in _ctx_of(offer)
     assert offer["cart_prefilled"] is False
+
+
+def test_a_cold_out_of_stock_offer_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """A cold offer carries no `stock_declined` stamp (that needs a cart id), so the knockout
+    cannot see the decline; the stamp must not be asked for an item this answer calls sold out."""
+    import copy
+
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    row = _seed_row_for_exec_spec(evidence=False)
+    seed_data = copy.deepcopy(row["seed_data"])
+    for v in seed_data["snapshot"]["variants"]:
+        v["availability"] = "out_of_stock"
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"seed_data": seed_data, "availability": "out_of_stock"})
+    assert offer.get("in_stock") is False, offer.get("in_stock")
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_cart_the_enforced_preflight_refused_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """An enforced preflight withdraws the cart and signs nothing, so no knockout can see the
+    refusal at click time; a `warm_fact` stamp would hand the lane back the very cart the
+    preflight refused (be#2729 review P3-2)."""
+    import services.checkout_preflight as cp
+
+    async def refusing_preflight(offer):
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=True, product=_PRODUCT_GRAIN)
+    assert offer["execution_spec"]["cart_url"] is None, "the refused cart must be withdrawn for this to prove anything"
+    assert "warm_fact" not in _ctx_of(offer)
+    assert calls == []
+    assert offer["cart_prefilled"] is False

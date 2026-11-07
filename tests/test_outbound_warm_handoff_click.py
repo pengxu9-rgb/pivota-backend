@@ -1443,34 +1443,115 @@ def test_a_token_minted_before_the_flag_existed_still_verifies_and_stays_ungated
 
 # ---- fact-driven eligibility (OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE) -------------------------------
 
+FACT_DEST = "https://www.other-brand.com/products/thing"
 
-def test_a_fact_stamped_token_warms_a_brand_outside_the_allowlist(monkeypatch) -> None:
+
+def _fact_now(monkeypatch, answer: bool):
+    """The click-time re-check's one read, faked; records what it was asked."""
+    import db.merchant_purchasability as mp
+
+    asked = []
+
+    async def fake(domain, market):
+        asked.append((domain, market))
+        return answer
+
+    monkeypatch.setattr(mp, "human_handoff_allowed", fake)
+    return asked
+
+
+def _fact_token(**extra_payload):
+    from services.outbound_links_service import make_redirect_token
+
+    return make_redirect_token(
+        {
+            "market": "US",
+            "market_observed": True,
+            "tool": "*",
+            "dest": FACT_DEST,
+            "ctx": {"pvt_click_id": "clk_test", "join_mode": "referral_only",
+                    warm.WARM_FACT_KEY: warm.WARM_FACT_HUMAN_HANDOFF},
+            **extra_payload,
+        },
+        ttl_seconds=3600,
+    )
+
+
+def test_a_fact_stamped_token_warms_a_brand_outside_the_allowlist_when_the_fact_still_holds(monkeypatch) -> None:
     monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    asked = _fact_now(monkeypatch, True)
     calls = _spy_resolver(monkeypatch, {"continue_url": "https://other-brand.myshopify.com/cart/c/x?key=k"})
     logged = _spy_logger(monkeypatch)
-    dest = "https://www.other-brand.com/products/thing"
-    token = _mint_token(dest=dest, ctx={"join_mode": "referral_only", warm.WARM_FACT_KEY: warm.WARM_FACT_HUMAN_HANDOFF})
-    res = TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    res = TestClient(app).get(f"/r?token={_fact_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert asked == [("other-brand.com", "US")], "re-asked for the DEST host and the token's market"
     assert len(calls) == 1
     ctx = logged[0]["token_payload"]["ctx"]
     assert (ctx["handoff"], ctx["warm_eligible"]) == ("warm", "fact")
     assert res.status_code == 302
 
 
-def test_a_fact_stamped_token_stays_cold_with_the_flag_off(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", False)
+def test_a_fact_that_lapsed_after_the_mint_keeps_the_cold_redirect(monkeypatch) -> None:
+    """be#2729 review P2-1: the stamp outlives the fact; the click re-asks and only narrows."""
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    _fact_now(monkeypatch, False)
     calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
     logged = _spy_logger(monkeypatch)
-    dest = "https://www.other-brand.com/products/thing"
-    token = _mint_token(dest=dest, ctx={warm.WARM_FACT_KEY: warm.WARM_FACT_HUMAN_HANDOFF})
-    res = TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
-    assert res.headers["location"] == dest
+    res = TestClient(app).get(f"/r?token={_fact_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.headers["location"].startswith(FACT_DEST)
     assert calls == []
-    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "not_allowlisted"
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert (ctx["handoff"], ctx["warm_reason"]) == ("cold", "fact_lapsed")
 
 
-def test_an_allowlisted_click_records_its_rule(monkeypatch) -> None:
+def test_a_fact_click_without_an_observed_market_never_warms(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    asked = _fact_now(monkeypatch, True)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    token = _fact_token(market_observed=False)
+    TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert asked == [] and calls == []
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "fact_lapsed"
+
+
+def test_an_allowlisted_click_never_asks_the_fact(monkeypatch) -> None:
+    """The re-check is for `fact` clicks only; the allowlist path costs no read."""
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    asked = _fact_now(monkeypatch, False)
     _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
     logged = _spy_logger(monkeypatch)
     TestClient(app).get(f"/r?token={_mint_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert asked == []
     assert logged[0]["token_payload"]["ctx"]["warm_eligible"] == "allowlisted"
+
+
+def test_a_fact_stamped_token_stays_cold_with_the_flag_off(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", False)
+    asked = _fact_now(monkeypatch, True)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    res = TestClient(app).get(f"/r?token={_fact_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.headers["location"].startswith(FACT_DEST)
+    assert calls == [] and asked == []
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "not_allowlisted"
+
+
+def test_the_flag_off_leaves_the_click_ctx_byte_identical(monkeypatch) -> None:
+    """No `warm_eligible` key while the fact lane is off, warm or cold."""
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", False)
+    _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    TestClient(app).get(f"/r?token={_mint_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    TestClient(app).get(f"/r?token={_mint_token(dest=FACT_DEST)}", headers={"user-agent": HUMAN_UA},
+                        follow_redirects=False)
+    assert all("warm_eligible" not in entry["token_payload"]["ctx"] for entry in logged)
+    assert {entry["token_payload"]["ctx"]["handoff"] for entry in logged} == {"warm", "cold"}
+
+
+def test_a_cold_click_never_carries_warm_eligible(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    TestClient(app).get(f"/r?token={_mint_token(dest=FACT_DEST)}", headers={"user-agent": HUMAN_UA},
+                        follow_redirects=False)
+    assert "warm_eligible" not in logged[0]["token_payload"]["ctx"]
