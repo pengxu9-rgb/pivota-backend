@@ -414,7 +414,10 @@ async def backfill_a2a_parents(*, limit: int = 50, lookback_hours: int = 72) -> 
 
     Each row is healed on its own: a row whose parent cannot be written is logged and skipped, so it
     does not stop the rows after it (the detector runs this on every tick, and the row would fail
-    again on each one). It keeps its place in the order and is tried again next run."""
+    again on each one). It keeps its place in the order and is tried again next run. Call it OUTSIDE a
+    transaction (the detector, its job and the scheduler open none): each statement then commits on
+    its own, so on Postgres a row's failed statement does not leave the connection in an aborted
+    transaction that would fail every row after it."""
     values = {"limit": _clamp(limit, maximum=5000), "lookback_hours": max(1, min(24 * 30, int(lookback_hours)))}
     if IS_POSTGRES:
         rows = await database.fetch_all(_SELECT_A2A_MISSING_PARENTS_SQL, values)
