@@ -1,0 +1,346 @@
+"""GET /agent/v1/products/external_seed/{id} must not publish the stored seed_data blob.
+
+seed_data is the external-seed row's internal working state: price-read bookkeeping, variant refresh
+state, canonical resets, read provenance, review aggregates, recall internals. The partner-key detail
+route served it whole on the product (`product.seed_data`). The response now carries only the
+allowlisted projection (services/seed_data_egress_projection.py); the stored row and anything cached
+from it are never touched.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from typing import Any, Dict
+from unittest.mock import AsyncMock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from main import app
+
+
+def _internal_seed_data() -> Dict[str, Any]:
+    """A seed_data shaped like a refreshed production row: allowlisted fields next to internal ones."""
+    return {
+        # --- allowlisted ---
+        "image_url": "https://example.com/img_0.jpg",
+        "image_urls": ["https://example.com/img_1.jpg", "https://example.com/img_2.jpg"],
+        "snapshot": {
+            "description": "A light gel moisturiser.",
+            "image_url": "https://example.com/snap.jpg",
+            "variants": [
+                {
+                    "variant_id": "v1",
+                    "sku": "SKU-1",
+                    "option_name": "50ml",
+                    "stock": 7,
+                    "availability": "in_stock",
+                    # internal, inside an allowlisted container
+                    "price_amount": 12.34,
+                    "price_read": {"at": "2026-11-06T00:00:00Z", "source": "page"},
+                    "canonical_reset": True,
+                },
+            ],
+            # internal snapshot fields
+            "price_read_source": "jsonld",
+            "variant_refresh_status": "stale",
+            "raw_html_hash": "abc123",
+        },
+        "derived": {
+            "recall": {
+                "retrieval_summary": "Gel moisturiser for dry skin.",
+                "embedding_version": "v9",
+                "terms": ["gel", "moisturiser"],
+            },
+            "price_truth": {"status": "verified"},
+        },
+        "variants": [
+            {
+                "variant_id": "v1",
+                "title": "50ml",
+                "price_amount": 12.34,
+                "price_currency": "USD",
+                "availability": "in_stock",
+                "stock": {"qty": 7, "source": "page"},  # non-scalar -> dropped
+                "variant_gid": "gid://shop/ProductVariant/1",
+                "variant_refresh_last_write": "2026-11-06T00:00:00Z",
+            },
+            {
+                "variant_id": "v2",
+                "title": "100ml",
+                "price_amount": 19.99,
+                "price_currency": "USD",
+                "availability": "in_stock",
+            },
+        ],
+        # --- internal ---
+        "price_read": {"amount": 12.34, "currency": "USD", "at": "2026-11-06T00:00:00Z"},
+        "price_read_source": "jsonld",
+        "variant_refresh": {"status": "ok", "last_run": "2026-11-06T00:00:00Z"},
+        "variant_refresh_status": "stale",
+        "canonical_reset": {"at": "2026-11-01T00:00:00Z", "reason": "drift"},
+        "read_provenance": {"read_at": "2026-11-06T00:00:00Z", "via": "handleless"},
+        "refresh_status": "dead_page",
+        "review_summary": {"rating": 4.5, "count": 120},
+        "manual_overrides": {"price": True},
+        "utm_template": "utm_source=pivota",
+        "seller_ref": "seller_internal_1",
+        "description": "top-level description",
+    }
+
+
+_ALLOWED_TOP = {"image_url", "imageUrl", "image", "images", "image_urls", "snapshot", "derived", "variants"}
+_ALLOWED_SNAPSHOT = {"image_url", "imageUrl", "image", "images", "image_urls", "description", "variants"}
+_ALLOWED_VARIANT = {
+    "variant_id",
+    "variant_gid",
+    "selected_variant_id",
+    "id",
+    "sku",
+    "option_name",
+    "stock",
+    "availability",
+    "availability_status",
+}
+
+
+def _seed_row(seed_data: Any) -> Dict[str, Any]:
+    return {
+        "id": "eps_test_1",
+        "external_product_id": "ext_test_1",
+        "market": "US",
+        "tool": "*",
+        "utm_template": None,
+        "partner_type": None,
+        "disclosure_text": None,
+        "destination_url": "https://example.com/product/1",
+        "canonical_url": None,
+        "domain": "example.com",
+        "title": "Example External Product",
+        "image_url": None,
+        "price_amount": 12.34,
+        "price_currency": "USD",
+        "availability": "in_stock",
+        "seed_data": seed_data,
+        "status": "active",
+        "notes": None,
+        "created_by_employee_id": None,
+        "attached_product_key": None,
+        "attached_variant_id": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(app)
+
+
+def _get_detail(monkeypatch: pytest.MonkeyPatch, client: TestClient, row: Dict[str, Any]) -> Dict[str, Any]:
+    import routes.agent_api as agent_api_module
+
+    async def fake_fetch_one(query: str, values=None):
+        if "FROM external_product_seeds" in str(query):
+            return row
+        return None
+
+    monkeypatch.setattr(agent_api_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(agent_api_module, "is_destination_domain_allowed", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        agent_api_module,
+        "should_block_external_referral_runtime",
+        AsyncMock(return_value=(False, None)),
+    )
+    res = client.get("/agent/v1/products/external_seed/ext_test_1", headers={"X-API-Key": "test-api-key"})
+    assert res.status_code == 200, res.text
+    return res.json()["product"]
+
+
+def _assert_only_allowlisted(seed_data: Dict[str, Any]) -> None:
+    assert set(seed_data) <= _ALLOWED_TOP, set(seed_data) - _ALLOWED_TOP
+    snapshot = seed_data.get("snapshot") or {}
+    assert set(snapshot) <= _ALLOWED_SNAPSHOT, set(snapshot) - _ALLOWED_SNAPSHOT
+    derived = seed_data.get("derived")
+    if derived is not None:
+        assert derived == {"recall": {"retrieval_summary": derived["recall"]["retrieval_summary"]}}
+    for variants in (seed_data.get("variants") or [], snapshot.get("variants") or []):
+        for v in variants:
+            assert set(v) <= _ALLOWED_VARIANT, set(v) - _ALLOWED_VARIANT
+            for value in v.values():
+                assert isinstance(value, (str, int, float, bool)), value
+
+
+def test_detail_route_serves_only_the_allowlisted_seed_data(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    product = _get_detail(monkeypatch, client, _seed_row(_internal_seed_data()))
+
+    seed_data = product["seed_data"]
+    _assert_only_allowlisted(seed_data)
+    # Exactly what a consumer reads survives.
+    assert seed_data == {
+        "image_url": "https://example.com/img_0.jpg",
+        "image_urls": ["https://example.com/img_1.jpg", "https://example.com/img_2.jpg"],
+        "variants": [
+            {"variant_id": "v1", "availability": "in_stock", "variant_gid": "gid://shop/ProductVariant/1"},
+            {"variant_id": "v2", "availability": "in_stock"},
+        ],
+        "snapshot": {
+            "image_url": "https://example.com/snap.jpg",
+            "description": "A light gel moisturiser.",
+            "variants": [
+                {
+                    "variant_id": "v1",
+                    "sku": "SKU-1",
+                    "option_name": "50ml",
+                    "stock": 7,
+                    "availability": "in_stock",
+                }
+            ],
+        },
+        "derived": {"recall": {"retrieval_summary": "Gel moisturiser for dry skin."}},
+    }
+    # No internal word anywhere in the projected blob.
+    wire = json.dumps(seed_data)
+    for word in (
+        "price_read",
+        "variant_refresh",
+        "canonical_reset",
+        "read_provenance",
+        "refresh_status",
+        "review_summary",
+        "manual_overrides",
+        "seller_internal_1",
+        "embedding_version",
+        "price_truth",
+        "raw_html_hash",
+        "price_amount",
+        "dead_page",
+        "handleless",
+    ):
+        assert word not in wire, word
+
+
+def test_detail_route_product_fields_built_from_seed_data_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """The projection runs after the builder: prices, variants, images and description are built from
+    the full stored blob exactly as before."""
+    product = _get_detail(monkeypatch, client, _seed_row(_internal_seed_data()))
+    assert product["description"] == "top-level description"
+    assert product["image_urls"] == ["https://example.com/img_1.jpg", "https://example.com/img_2.jpg"]
+    assert [(v["variant_id"], v["price"]) for v in product["variants"]] == [("v1", 12.34), ("v2", 19.99)]
+
+
+def test_detail_route_never_mutates_the_stored_row(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:
+    seed_data = _internal_seed_data()
+    row = _seed_row(seed_data)
+    before = copy.deepcopy(row)
+
+    _get_detail(monkeypatch, client, row)
+    _get_detail(monkeypatch, client, row)  # a second read sees the same full blob
+
+    assert row == before
+    assert row["seed_data"] is seed_data
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"price_read": {"amount": 1}, "variant_refresh": {"status": "ok"}},  # nothing allowlisted
+        {},
+        None,
+    ],
+)
+def test_detail_route_drops_seed_data_when_nothing_allowlisted_remains(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, stored: Any
+) -> None:
+    product = _get_detail(monkeypatch, client, _seed_row(stored))
+    assert "seed_data" not in product
+
+
+def test_detail_route_seed_data_stored_as_text_is_projected_too(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient
+) -> None:
+    """Some deployments keep seed_data as TEXT; the builder parses it, and the projection applies to the
+    parsed object."""
+    product = _get_detail(monkeypatch, client, _seed_row(json.dumps(_internal_seed_data())))
+    _assert_only_allowlisted(product["seed_data"])
+    assert "price_read" not in json.dumps(product)
+
+
+# --- the projection itself -------------------------------------------------------------------------
+
+from services.seed_data_egress_projection import (  # noqa: E402
+    project_product_seed_data,
+    project_seed_data,
+)
+
+
+def test_projection_never_mutates_its_input_and_shares_no_containers() -> None:
+    stored = _internal_seed_data()
+    before = copy.deepcopy(stored)
+
+    projected = project_seed_data(stored)
+
+    assert stored == before
+    assert projected is not stored
+    assert projected["snapshot"] is not stored["snapshot"]
+    assert projected["variants"][0] is not stored["variants"][0]
+    # Editing the projection cannot reach the stored blob either.
+    projected["snapshot"]["description"] = "changed"
+    projected["variants"][0]["variant_id"] = "changed"
+    assert stored == before
+
+
+def test_projection_keeps_image_objects_only_as_their_url_strings() -> None:
+    projected = project_seed_data(
+        {
+            "images": [
+                {"url": "https://example.com/a.jpg", "alt": "x", "source": "crawl", "w": 100},
+                {"width": 10},  # no URL -> dropped
+                "https://example.com/b.jpg",
+                ["nested"],  # not an image -> dropped
+            ],
+            "image": {"src": "https://example.com/c.jpg", "read_at": "2026-11-06"},
+            "image_url": {"nested": {"url": "x"}},  # no string URL key -> dropped
+            "imageUrl": "",
+        }
+    )
+    assert projected == {
+        "images": [{"url": "https://example.com/a.jpg"}, "https://example.com/b.jpg"],
+        "image": {"src": "https://example.com/c.jpg"},
+    }
+
+
+def test_projection_text_fields_must_be_strings() -> None:
+    assert (
+        project_seed_data(
+            {
+                "snapshot": {"description": {"html": "<p>x</p>"}},
+                "derived": {"recall": {"retrieval_summary": ["a", "b"]}},
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("stored", [None, "a string", ["a", "list"], 7, {}, {"price_read": {"a": 1}}])
+def test_projection_of_nothing_allowlisted_is_none(stored: Any) -> None:
+    assert project_seed_data(stored) is None
+
+
+def test_product_without_seed_data_is_returned_as_the_same_object() -> None:
+    product = {"id": "p1", "title": "x"}
+    assert project_product_seed_data(product) is product
+
+
+def test_product_projection_is_a_copy_and_drops_an_empty_projection() -> None:
+    stored = {"price_read": {"a": 1}}
+    product = {"id": "p1", "seed_data": stored}
+    out = project_product_seed_data(product)
+    assert out == {"id": "p1"}
+    assert product == {"id": "p1", "seed_data": {"price_read": {"a": 1}}}
+    assert product["seed_data"] is stored

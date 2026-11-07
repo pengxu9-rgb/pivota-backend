@@ -8091,9 +8091,13 @@ async def agent_get_product(
                 status_code=200,
                 merchant_id=merchant_id,
             )
+            # The stored seed_data blob is internal state; only its allowlisted projection leaves
+            # (copy-on-write: `prod` and the row it was built from keep the full blob).
+            from services.seed_data_egress_projection import project_product_seed_data
+
             return {
                 "status": "success",
-                "product": prod,
+                "product": project_product_seed_data(prod),
                 "metadata": {
                     "detail_source": "upstream",
                 },
