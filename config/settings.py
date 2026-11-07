@@ -645,6 +645,13 @@ class Settings(BaseSettings):
     def deal_code_capture_shadow(self) -> bool:
         return _deal_flag("DEAL_CODE_CAPTURE_SHADOW")
 
+    # Record what the shadow capture finds in observed_store_offers (services/deal_code_capture_writer.py), as
+    # unverified merchant_published rows. Only acts while DEAL_CODE_CAPTURE_SHADOW is on too (capture runs only
+    # then). Writing is storage, not testing: nothing is verified or served from it.
+    @property
+    def deal_code_capture_write(self) -> bool:
+        return _deal_flag("DEAL_CODE_CAPTURE_WRITE")
+
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
     # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.

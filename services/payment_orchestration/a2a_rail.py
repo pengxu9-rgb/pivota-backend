@@ -69,6 +69,11 @@ ALLOWED_HOST_SHA256: FrozenSet[str] = frozenset({
     "c91cff4b3b7cf1ed9344a5334df60dc9751db61743bd7a41d082c35345097d7b",
     "a88fafbb95893904e7dcc07c3937e4119093120255ea2ca530ac27b11e865b97",
 })
+#: The currencies a token may be requested in. The rail's `token-setup` takes `amount_cents` and no
+#: currency, so the amount is minor units of whatever currency the rail assumes; only USD has been
+#: measured. The router refuses other currencies at create (`currency_unsupported`), and the worker's
+#: token step refuses them again.
+TOKEN_CURRENCIES: FrozenSet[str] = frozenset({"USD"})
 AGENT_ID = "base-orchestrator"
 MESSAGE_PATH = f"/a2a/agents/{AGENT_ID}/v1/message:send"
 TOKEN_PATH = "/orch-public/auth/token"
@@ -123,6 +128,8 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
+    # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
+    "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
 })
 #: Key fragments that only ever name an authentication credential (`paymentCryptogram`, `cavv`,
 #: `authenticationValue`, ...), matched as substrings of the canonical key.
