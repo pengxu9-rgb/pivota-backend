@@ -58,6 +58,9 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
   writes `vic:<the rail's order id>` and nothing else writes that prefix. Held for a human, unread on
   every tick: a VIC order past `VIC_ORDER_CEILING_SECONDS` (the sweep never ends it), a submit left by
   a crashed step, a submit unreadable for the whole reconcile window, and the checkout holds above.
+  A hold stops PIVOTA; it stops nothing at the rail (there is no cancel call): the rail can still
+  complete a held order. A human resolves every hold with the rail (complete or fail it by hand,
+  refund through the provider).
 
 ── TOKENS LEFT ON ENDED PURCHASES ────────────────────────────────────────────────────────────
 
@@ -818,11 +821,12 @@ VIC_STALE = "vic_order_stale"
 #: Codes that hold a VIC order for a human: nothing more is read or sent for it, on any tick, dial or not.
 VIC_TOTAL_OVER_APPROVED = "vic_total_over_approved"
 VIC_CURRENCY_MISMATCH = "vic_currency_mismatch"
+VIC_CURRENCY_MISSING = "vic_currency_missing"
 VIC_TOTAL_MISSING = "vic_total_missing"
 VIC_APPROVED_AMOUNT_MISSING = "vic_approved_amount_missing"
 VIC_SUBMIT_UNRESOLVED = "vic_submit_unresolved"
 _VIC_HOLD_CODES = frozenset({
-    VIC_STALE, VIC_TOTAL_OVER_APPROVED, VIC_CURRENCY_MISMATCH, VIC_TOTAL_MISSING,
+    VIC_STALE, VIC_TOTAL_OVER_APPROVED, VIC_CURRENCY_MISMATCH, VIC_CURRENCY_MISSING, VIC_TOTAL_MISSING,
     VIC_APPROVED_AMOUNT_MISSING, VIC_SUBMIT_UNRESOLVED,
 })
 
@@ -919,7 +923,8 @@ async def _start_vic_order(s: _Step) -> str:
         return await _token_failed(s, "quoting", "vic_contact_missing")
     if vic_order.order_amount(row) is None:
         # No locked all-in total (shipping and tax included): the buyer would approve a subtotal and the
-        # merchant's checkout would come to more. No order without a quote.
+        # merchant's checkout would come to more. No order without a quote. Nothing writes the A2A quote
+        # yet, so this fails closed; once a quote writer exists, this should WAIT (park) for the lock.
         return await _token_failed(s, "quoting", "vic_quote_missing")
     order = vic_order.build_order(row)
     if order is None:  # pragma: no cover - build_order fails only without an amount, checked above
@@ -1002,13 +1007,16 @@ async def _vic_reconcile_submit(s: _Step) -> str:
 
 
 async def _vic_watch(s: _Step) -> str:
-    """A VIC order waiting on the buyer with no marker (a crash between the move and the mark): mark, then poll."""
-    stopped = await _vic_gate(s)
-    if stopped is not None:
-        return stopped
+    """A VIC order waiting on the buyer with no marker (a crash between the move and the mark): mark FIRST
+    (a local write, never a rail call), then gate, then poll. Marked before the gate so that a row the gate
+    parks or holds (dial off, past the ceiling) still keeps the expiry sweep off it: the buyer may have
+    approved on the rail's page meanwhile, and `expired` would hide that charge."""
     if await ledger.mark_pending_write(s.id, s.worker, VIC_AUTHORIZATION) is None:
         return "lost"
     s.row = {**s.row, "pending_write": VIC_AUTHORIZATION}
+    stopped = await _vic_gate(s)
+    if stopped is not None:
+        return stopped
     return await _vic_poll_authorization(s)
 
 
@@ -1090,7 +1098,10 @@ async def _vic_checkout(s: _Step, answer: Any) -> str:
         # human in `paying`: money moved, so the purchase is neither completed nor failed on a guess.
         currency = str(s.row.get("currency") or "").upper()
         approved = vic_order.order_amount(s.row)
-        if answer.currency not in (None, currency):
+        # An EXACT match only: no currency (or one the client could not read) is not "ours" by default.
+        if answer.currency is None:
+            return await _vic_hold(s, VIC_CURRENCY_MISSING)
+        if answer.currency != currency:
             return await _vic_hold(s, VIC_CURRENCY_MISMATCH)
         final = answer.total_minor
         if final is None:

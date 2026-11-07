@@ -227,7 +227,7 @@ async def test_approve_the_order_goes_out_once_the_buyer_approves_and_the_rail_r
 async def test_an_approval_that_already_carries_the_checkouts_end_completes_in_one_step(a2a, fake):
     pid = await _issued(a2a, fake)
     fake.buyer(pid, "approved")
-    fake.checkout(pid, "completed", order_number="A-77", total_minor=9300)
+    fake.checkout(pid, "completed", order_number="A-77", total_minor=9300, currency="USD")
     assert await _step(a2a, fake, pid) == "completed"
     assert ((await _row(pid))["state"], (await _row(pid))["merchant_order_id"]) == ("completed", "A-77")
 
@@ -336,7 +336,7 @@ async def test_duplicate_poll_the_same_answer_twice_moves_the_purchase_once(a2a,
     assert await _step(a2a, fake, pid) == "placing"  # and a fresh poll of the same answer only waits
     assert (await _row(pid))["state"] == "paying"
 
-    fake.checkout(pid, "completed", order_number="100235", total_minor=9300)
+    fake.checkout(pid, "completed", order_number="100235", total_minor=9300, currency="USD")
     paying = await _claim(pid)
     assert await worker.step(_a2a_client(a2a), paying, W, vic=vic) == "completed"
     assert await worker.step(_a2a_client(a2a), paying, W, vic=vic) == "lost"
@@ -370,7 +370,7 @@ async def test_credential_fields_in_any_provider_answer_never_reach_the_ledger_t
     fake.buyer(pid, "approved")
     fake.checkout(pid, "in_progress")
     assert await _step(a2a, fake, pid) == "buyer_approved"
-    fake.checkout(pid, "completed", order_number="100236", total_minor=9300)
+    fake.checkout(pid, "completed", order_number="100236", total_minor=9300, currency="USD")
     assert await _step(a2a, fake, pid) == "completed"
     await purchase_events.detect()
 
@@ -452,9 +452,16 @@ async def test_a_checkout_before_approval_is_never_acted_on(a2a, fake):
 
 
 @pytest.mark.parametrize("fields, code", [
-    ({"total_minor": QUOTED + 1}, "vic_total_over_approved"),                 # above what the buyer approved
-    ({"total_minor": QUOTED, "currency": "EUR"}, "vic_currency_mismatch"),    # another currency: not comparable
-    ({}, "vic_total_missing"),                                                # no total: consent unprovable
+    ({"total_minor": QUOTED + 1, "currency": "USD"}, "vic_total_over_approved"),  # above what the buyer approved
+    ({"total_minor": QUOTED, "currency": "EUR"}, "vic_currency_mismatch"),        # another currency: not comparable
+    ({"currency": "USD"}, "vic_total_missing"),                                   # no total: consent unprovable
+    # No currency, or one the client cannot read, is never taken for the purchase's own.
+    ({"total_minor": QUOTED}, "vic_currency_missing"),
+    ({"total_minor": QUOTED, "currency": "usd"}, "vic_currency_missing"),
+    ({"total_minor": QUOTED, "currency": "eur"}, "vic_currency_missing"),
+    ({"total_minor": QUOTED, "currency": "EURO"}, "vic_currency_missing"),
+    ({"total_minor": QUOTED, "currency": "\u20ac"}, "vic_currency_missing"),
+    ({"total_minor": QUOTED, "currency": 978}, "vic_currency_missing"),
 ])
 async def test_a_checkout_the_buyer_did_not_approve_is_held_for_a_human_never_completed(
         a2a, fake, caplog, monkeypatch, fields, code):
@@ -484,7 +491,7 @@ async def test_a_checkout_the_buyer_did_not_approve_is_held_for_a_human_never_co
 async def test_a_checkout_at_or_under_the_approved_amount_completes(a2a, fake):
     pid = await _issued(a2a, fake)
     fake.buyer(pid, "approved")
-    fake.checkout(pid, "completed", order_number="100238", total_minor=QUOTED)
+    fake.checkout(pid, "completed", order_number="100238", total_minor=QUOTED, currency="USD")
     assert await _step(a2a, fake, pid) == "completed"
     row = await _row(pid)
     assert (row["state"], row["final_total_minor"], row["last_error_code"]) == ("completed", QUOTED, None)
@@ -541,7 +548,10 @@ async def test_a_vic_order_past_its_ceiling_is_held_for_a_human_unread(a2a, fake
     if approved:
         fake.buyer(pid, "approved")
         assert await _step(a2a, fake, pid) == "buyer_approved"
-    await _ago("created_at", worker.VIC_ORDER_CEILING_SECONDS + 60, pid)
+    # Absolute ages (the ceiling is a decision: 7 days), not ages relative to the constant.
+    await _ago("created_at", 6 * 86400, pid)
+    assert await _step(a2a, fake, pid) in ("waiting_on_buyer", "placing")  # under 7 days: read as usual
+    await _ago("created_at", 7 * 86400 + 60, pid)
     calls = len(fake.calls)
     assert await _step(a2a, fake, pid) == worker.VIC_STALE
     row = await _row(pid)
@@ -582,6 +592,53 @@ async def test_a_submit_unreadable_for_the_whole_window_is_held_not_ended(a2a, f
     calls = len(fake.calls)
     assert await _step(a2a, fake, pid) == "vic_held"
     assert len(fake.calls) == calls and len(fake.submits()) == 1
+
+
+def test_the_vic_ceiling_is_seven_days():
+    assert worker.VIC_ORDER_CEILING_SECONDS == 7 * 86400
+
+
+@pytest.mark.parametrize("rail_id", [
+    "4111111111111111",   # all digits and Luhn-valid: an order number, exempt as before the marker
+    "1234567812345670",
+    "o" * 124,            # the longest rail order id the contract allows (`vic:` + 124 = the ledger's 128)
+])
+async def test_rail_order_ids_the_marker_must_not_refuse(a2a, fake, rail_id):
+    fake.order_ids.append(rail_id)
+    pid = await _issued(a2a, fake)
+    assert (await _row(pid))["order_id"] == f"vic:{rail_id}"
+    fake.buyer(pid, "approved")
+    assert await _step(a2a, fake, pid) == "buyer_approved"  # the answer matches the recorded order
+
+
+async def test_a_rail_order_id_over_124_characters_is_not_an_order_id(a2a, fake):
+    fake.order_ids.append("o" * 125)
+    pid = await _quoting()
+    assert await _step(a2a, fake, pid) == "outcome_unknown"  # unrecognised: read back, never resent
+    row = await _row(pid)
+    assert (row["state"], row["pending_write"], row["order_id"]) == ("quoting", worker.VIC_SUBMIT, None)
+    assert len(fake.submits()) == 1
+
+
+@pytest.mark.parametrize("why", ["stale", "dial_off"])
+async def test_a_crash_before_the_marker_never_lets_the_sweep_end_the_order(a2a, fake, monkeypatch, why):
+    """A crash between the move to awaiting_authorization and the marker, then a tick that parks or holds:
+    the marker goes on FIRST, so the expiry sweep still cannot end an order the buyer may have approved."""
+    pid = await _issued(a2a, fake)
+    await database.execute("UPDATE a2a_rail_purchases SET pending_write = NULL, pending_write_at = NULL WHERE id = :i",
+                           {"i": pid})
+    if why == "stale":
+        await _ago("created_at", 7 * 86400 + 60, pid)
+    else:
+        monkeypatch.delenv(vic_order.A2A_RAIL_VIC_ORDER_STEP_ENABLED_ENV)
+    calls = len(fake.calls)
+    assert await _step(a2a, fake, pid) == (worker.VIC_STALE if why == "stale" else "parked")
+    assert (await _row(pid))["pending_write"] == worker.VIC_AUTHORIZATION
+    await _ago("buyer_action_expires_at", 3600, pid)
+    await _ago("state_entered_at", 10 * 86400, pid)
+    assert await ledger.expire_overdue_purchases() == 0
+    assert (await _row(pid))["state"] == "awaiting_authorization"
+    assert len(fake.calls) == calls
 
 
 # ── the dial: off changes nothing ────────────────────────────────────────────────────────────

@@ -30,6 +30,8 @@ class FakeProviderVic:
         #: When True a submit is RECORDED and then answered with `fail_next`'s fault (an unseen create).
         self.record_before_fault = True
         self.page_seconds = 900
+        #: Order ids handed out for the next new orders, in turn (else `prov_ord_NNNN`).
+        self.order_ids: List[str] = []
 
     # ── the script ──────────────────────────────────────────────────────────────────────────
 
@@ -58,7 +60,7 @@ class FakeProviderVic:
             return await self._fault(fault)
         if ref not in self.orders:
             self.orders[ref] = {
-                "order_id": f"prov_ord_{len(self.orders) + 1:04d}",
+                "order_id": self.order_ids.pop(0) if self.order_ids else f"prov_ord_{len(self.orders) + 1:04d}",
                 "client_reference": ref,
                 "amount_minor": body["amount_minor"],
                 "currency": body["currency"],

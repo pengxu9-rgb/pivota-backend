@@ -58,6 +58,10 @@ AUTHORIZATION_STATUSES = frozenset({"pending", "approved", "declined", "expired"
 CHECKOUT_STATUSES = frozenset({"not_started", "in_progress", "completed", "failed"})
 
 _REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
+#: The rail's order id: at most 124 characters, so the worker's `vic:` marker fits the ledger's 128 (the
+#: contract says so). A longer id is not an order id here: the answer is `unrecognised`.
+_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,124}\Z")
+_CURRENCY_RE = re.compile(r"^[A-Z]{3}\Z")
 _CODE_RE = re.compile(r"^[a-z0-9_]{1,48}\Z")
 #: 4xx answers that say nothing about the order itself: our credentials, a timeout, throttling.
 _RETRYABLE_4XX = frozenset({401, 403, 408, 429})
@@ -141,7 +145,8 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
     expires_in = auth.get("expires_in")
     answer = VicAnswer(
         kind="ok",
-        order_id=_ref(body.get("order_id")),
+        order_id=body.get("order_id") if isinstance(body.get("order_id"), str)
+        and _ORDER_ID_RE.match(body["order_id"]) else None,
         client_reference=_ref(body.get("client_reference")),
         approval_status=_word(auth.get("status"), AUTHORIZATION_STATUSES),
         hosted_url=_https(auth.get("hosted_url")),
@@ -150,8 +155,10 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
         merchant_order_number=_ref(checkout.get("order_number")),
         merchant_order_status_url=_https(checkout.get("order_status_url")),
         total_minor=_minor(checkout.get("total_minor")),
+        # Exactly three upper-case letters, or None (absent OR malformed: "usd", "EURO", 978). The worker
+        # completes a checkout only on an EXACT match with the purchase's currency; None is held.
         currency=checkout.get("currency") if isinstance(checkout.get("currency"), str)
-        and re.fullmatch(r"[A-Z]{3}", checkout["currency"]) else None,
+        and _CURRENCY_RE.match(checkout["currency"]) else None,
         credential_fields_stripped=stripped,
     )
     if answer.order_id is None or answer.approval_status is None or (checkout and answer.checkout is None):
