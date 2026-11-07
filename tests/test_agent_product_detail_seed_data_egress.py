@@ -455,7 +455,7 @@ def test_detail_route_fails_safe_when_the_projection_raises(
     def boom(_product: Any) -> Any:
         raise RuntimeError("projection failed")
 
-    monkeypatch.setattr(agent_api_module, "project_product_seed_data", boom)
+    monkeypatch.setattr(agent_api_module, "serve_detail_product", boom)
     res = _detail_response(monkeypatch, client, _seed_row(_internal_seed_data()))
     assert res.status_code == 500
     for word in ("seed_data", "price_read", "variant_refresh", "seller_internal_1"):
