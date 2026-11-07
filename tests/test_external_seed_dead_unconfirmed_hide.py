@@ -78,17 +78,21 @@ class _SeedDb:
 class _Suppression:
     """Records what the pending machinery was asked to do."""
 
-    def __init__(self, monkeypatch, *, fail_for: Tuple[str, ...] = ()) -> None:
+    def __init__(self, monkeypatch, *, fail_for: Tuple[str, ...] = (), already: Tuple[str, ...] = (),
+                 log: Optional[List[str]] = None) -> None:
         self.suppressed: List[Tuple[List[str], str]] = []
         self.lifted: List[Tuple[List[str], str]] = []
         self.fail_for = fail_for
+        self.log = log if log is not None else []
 
         async def suppress_pending(keys, *, reason, stamp, db=None):
             keys = list(keys)
+            self.log.append("suppress")
             if any(k in self.fail_for for k in keys):
                 raise RuntimeError("write failed")
             self.suppressed.append((keys, reason))
-            return {"products": keys, "offers": [f"offer::{k}" for k in keys]}
+            moved = [k for k in keys if k not in already]
+            return {"products": moved, "offers": [f"offer::{k}" for k in moved]}
 
         async def lift_pending(keys, *, reason, db=None):
             self.lifted.append((list(keys), reason))
@@ -152,6 +156,22 @@ def test_a_later_hard_404_keeps_the_run_start() -> None:
 def test_any_other_answer_from_the_origin_clears_the_run(observation) -> None:
     row = _row(destination_verdict="dead_404", destination_http_status=404, destination_dead_404_since=NOW)
     assert liveness.next_dead_404_since(row, observation, NOW + timedelta(hours=1)) is None
+
+
+@pytest.mark.parametrize(
+    "verdict,status",
+    [("live", 200), ("redirected_off_product", 200), ("redirected_to_product", 200), ("dead_404", None)],
+    ids=["live", "off_product", "to_product", "dead_without_a_status"],
+)
+def test_a_stored_start_under_a_verdict_that_is_not_a_hard_404_is_not_a_run(verdict: str, status: Any) -> None:
+    """Review P2: a writer on an older image answers live without clearing the column. 404 -> live -> 404 must
+    start a new run, not continue the old one (the ping-pong the rule excludes)."""
+    t0 = NOW - timedelta(hours=25)
+    row = _row(destination_verdict=verdict, destination_http_status=status,
+               destination_checked_at=NOW - timedelta(hours=2), destination_dead_404_since=t0)
+    since = liveness.next_dead_404_since(row, HARD_404, NOW)
+    assert since == NOW
+    assert liveness.unconfirmed_hide_candidate(row, HARD_404, NOW, since) is False
 
 
 def test_an_unverifiable_observation_moves_nothing() -> None:
@@ -278,6 +298,53 @@ def test_a_live_answer_clears_the_clock_and_lifts_both_reasons(monkeypatch) -> N
     assert result["unconfirmed_lifted"] == 1
 
 
+def test_the_ping_pong_through_an_old_writer_is_not_a_candidate(monkeypatch) -> None:
+    """404 at T0, an old-image writer answers live WITHOUT clearing the column, 404 at T0+25h: not a candidate."""
+    _Suppression(monkeypatch)
+    db = _SeedDb(_row())
+    t0 = NOW - timedelta(hours=25)
+    _observe(monkeypatch, db, HARD_404, t0)
+    db.row.update(destination_verdict="live", destination_http_status=200,
+                  destination_checked_at=t0 + timedelta(hours=10))  # the old writer: since left at t0
+    assert db.row["destination_dead_404_since"] == t0
+    result = _observe(monkeypatch, db, HARD_404, NOW)
+    assert "unconfirmed_hide_candidate" not in result
+    assert db.row["destination_dead_404_since"] == NOW
+
+
+@pytest.mark.parametrize("observation", [OFF_PRODUCT, HARD_404, CORROBORATED_404, CHALLENGE],
+                         ids=["redirected_off_product", "hard_404", "corroborated_404", "challenge"])
+def test_no_answer_that_is_not_alive_lifts_the_hide(monkeypatch, observation) -> None:
+    supp = _Suppression(monkeypatch)
+    db = _SeedDb(_row(destination_verdict="dead_404", destination_http_status=404,
+                      destination_checked_at=NOW - timedelta(hours=2),
+                      destination_dead_404_since=NOW - timedelta(days=3)))
+    result = _observe(monkeypatch, db, observation, NOW, mode="on")
+    assert supp.lifted == []
+    assert "unconfirmed_lifted" not in result
+
+
+def test_a_handleless_page_read_with_the_shape_rule_on_lifts_the_hide(monkeypatch) -> None:
+    """Design R1: a hidden HANDLE-LESS row must be able to lift. Its 200 is `unverifiable` (no handle) unless the
+    shape rule (EXTERNAL_SEED_HANDLELESS_READ=on) reads it; then the observation is live and lifts this reason."""
+    from tests.test_external_seed_handleless_read import _decide
+
+    off = _decide(mode="shadow")
+    assert off.observation is not None and off.observation.verdict == liveness.VERDICT_UNVERIFIABLE
+    on = _decide(mode="on")
+    assert on.read is True and on.observation.verdict == liveness.VERDICT_LIVE
+
+    stored = dict(destination_verdict="dead_404", destination_http_status=404,
+                  destination_checked_at=NOW - timedelta(hours=2), destination_dead_404_since=NOW - timedelta(days=3))
+    supp = _Suppression(monkeypatch)
+    _observe(monkeypatch, _SeedDb(_row(**stored)), off.observation, NOW, mode="on")
+    assert supp.lifted == [], "without the shape rule a handle-less 200 says nothing and lifts nothing"
+    db = _SeedDb(_row(**stored))
+    result = _observe(monkeypatch, db, on.observation, NOW, mode="on")
+    assert (["prod::eps_1"], REASON) in supp.lifted and result["unconfirmed_lifted"] == 1
+    assert db.row["destination_dead_404_since"] is None
+
+
 def test_a_challenge_between_two_404s_neither_breaks_the_run_nor_lifts(monkeypatch) -> None:
     supp = _Suppression(monkeypatch)
     db = _SeedDb(_row())
@@ -366,14 +433,33 @@ def _host(candidates: List[Tuple[str, str]], reached: int = 10, dead: Optional[i
 
 
 class _RecheckDb:
-    """Answers the apply step's re-check per seed id."""
+    """Answers the apply step's re-check per seed id, and shadow's would-hide count (`unsuppressed` mirrors each)."""
 
-    def __init__(self, rows: Dict[str, Optional[Dict[str, Any]]]) -> None:
+    def __init__(self, rows: Dict[str, Optional[Dict[str, Any]]], *, unsuppressed: int = 1,
+                 log: Optional[List[str]] = None) -> None:
         self.rows = rows
         self.queries: List[str] = []
+        self.unsuppressed = unsuppressed
+        self.log = log if log is not None else []
+
+    def transaction(self):
+        db = self
+
+        class _Tx:
+            async def __aenter__(self):
+                db.log.append("begin")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                db.log.append("rollback" if exc_type else "commit")
+                return False
+
+        return _Tx()
 
     async def fetch_one(self, query, params=None):
         self.queries.append(query)
+        if "COUNT(*)" in query:
+            return {"n": self.unsuppressed}
+        self.log.append("recheck")
         return self.rows.get((params or {}).get("id"))
 
     async def fetch_all(self, query, params=None):
@@ -393,9 +479,10 @@ def _still(**overrides: Any) -> Dict[str, Any]:
     return row
 
 
-def _apply(monkeypatch, by_host, mode, rows=None, fail_for=()):
-    supp = _Suppression(monkeypatch, fail_for=fail_for)
-    db = _RecheckDb(rows if rows is not None else {})
+def _apply(monkeypatch, by_host, mode, rows=None, fail_for=(), already=(), unsuppressed=1):
+    log: List[str] = []
+    supp = _Suppression(monkeypatch, fail_for=fail_for, already=already, log=log)
+    db = _RecheckDb(rows if rows is not None else {}, unsuppressed=unsuppressed, log=log)
     monkeypatch.setattr(liveness, "database", db)
     summary = _run(liveness.apply_unconfirmed_hides(by_host, mode=mode, now=NOW))
     return summary, supp, db
@@ -404,11 +491,18 @@ def _apply(monkeypatch, by_host, mode, rows=None, fail_for=()):
 def test_shadow_writes_nothing_and_reports_what_on_would_hide(monkeypatch) -> None:
     by_host = {"a.example": _host([("s1", SINCE), ("s2", SINCE)]), "b.example": _host([], reached=3, dead=0)}
     summary, supp, db = _apply(monkeypatch, by_host, "shadow", rows={"s1": _still(), "s2": _still()})
-    assert supp.suppressed == [] and db.queries == []
+    assert supp.suppressed == []
+    assert all("COUNT(*)" in q and "FOR UPDATE" not in q for q in db.queries) and len(db.queries) == 2
+    assert "begin" not in db.log
     assert summary["mode"] == "shadow"
     assert summary["totals"]["would_hide"] == 2 and "hidden_rows" not in summary["totals"]
     assert summary["top_hosts"]["a.example"] == {"observed": 10, "reached_origin": 10, "dead_404": 2,
-                                                 "candidates": 2, "would_hide": 2}
+                                                 "candidates": 2, "would_hide": 2, "would_hide_products": 2}
+
+
+def test_shadow_counts_only_mirror_products_still_unsuppressed(monkeypatch) -> None:
+    summary, _, _ = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "shadow", unsuppressed=0)
+    assert summary["totals"]["would_hide"] == 1 and "would_hide_products" not in summary["totals"]
 
 
 def test_on_hides_each_unbraked_candidate_under_its_own_reason(monkeypatch) -> None:
@@ -417,6 +511,33 @@ def test_on_hides_each_unbraked_candidate_under_its_own_reason(monkeypatch) -> N
     assert supp.suppressed == [(["prod::s1"], REASON), (["prod::s2"], REASON)]
     totals = summary["totals"]
     assert (totals["hidden_rows"], totals["hidden_products"], totals["hidden_offers"]) == (2, 2, 2)
+
+
+def test_the_re_check_and_the_hide_share_one_transaction_with_the_row_locked(monkeypatch) -> None:
+    summary, _, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on", rows={"s1": _still()})
+    assert db.log == ["begin", "recheck", "suppress", "commit"]
+    assert any("FOR UPDATE" in q for q in db.queries)
+
+
+def test_a_refused_re_check_commits_without_hiding(monkeypatch) -> None:
+    _, supp, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on",
+                         rows={"s1": _still(destination_verdict="live")})
+    assert db.log == ["begin", "recheck", "commit"] and supp.suppressed == []
+
+
+def test_a_failed_hide_rolls_back_and_is_counted(monkeypatch) -> None:
+    summary, _, db = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on", rows={"s1": _still()},
+                            fail_for=("prod::s1",))
+    assert db.log == ["begin", "recheck", "suppress", "rollback"]
+    assert summary["totals"]["errors"] == 1
+
+
+def test_a_hide_that_moves_nothing_is_not_counted_hidden(monkeypatch) -> None:
+    summary, supp, _ = _apply(monkeypatch, {"a.example": _host([("s1", SINCE)])}, "on", rows={"s1": _still()},
+                              already=("prod::s1",))
+    assert supp.suppressed == [(["prod::s1"], REASON)]
+    assert summary["totals"]["nothing_moved"] == 1
+    assert "hidden_rows" not in summary["totals"] and "hidden_products" not in summary["totals"]
 
 
 def test_a_braked_host_hides_nothing(monkeypatch) -> None:

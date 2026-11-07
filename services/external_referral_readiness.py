@@ -40,7 +40,6 @@ from services.external_seed_destination_liveness import (
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import external_seed_catalogue_refresh as catalogue_lane
 from services.external_seed_search import (
-    SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
@@ -2041,6 +2040,25 @@ def refresh_queue_tier(
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
+#: The refresh queue's suppressed-product filter: the seed lane's (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`), except that a
+#: product suppressed ONLY under the unconfirmed-dead reason keeps its seed in the queue. The mirror back-links each
+#: seed's `attached_product_key` to its own mirror product, which is exactly what that hide suppresses; dropping the
+#: seed from the queue would leave nothing to observe it again (the sweep cannot read those hosts' catalogues), so
+#: the hide could never lift. The serving lanes keep the seed lane's filter. The reason is spelled out (a literal, for
+#: the repo's static PREPARE sweep); a test pins it to `external_seed_destination_liveness.UNCONFIRMED_DEAD_REASON`.
+REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN = """
+AND (
+  external_product_seeds.attached_product_key IS NULL
+  OR external_product_seeds.attached_product_key NOT IN (
+    SELECT seed_cp.product_key FROM catalog_products seed_cp
+    WHERE seed_cp.suppressed_at IS NOT NULL AND seed_cp.product_key IS NOT NULL
+      AND (seed_cp.suppression_reason IS NULL
+           OR seed_cp.suppression_reason <> 'external_seed_destination_dead_unconfirmed_pending')
+  )
+)
+"""
+
+
 async def get_external_referral_refresh_candidate_seed_ids(
     limit: int = 500, *, seed_ids: Optional[Sequence[str]] = None, market: Optional[str] = None
 ) -> List[str]:
@@ -2056,8 +2074,11 @@ async def get_external_referral_refresh_candidate_seed_ids(
     every active seed the seed lane can serve is a candidate.
 
     NOT candidates, filtered in SQL with the seed lane's own fragments:
-      * a seed attached to a SUPPRESSED catalog product (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
-        Measured prod 2026-09-27: 682. Lifting the suppression puts it back, near the head;
+      * a seed attached to a SUPPRESSED catalog product (`REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN`, the seed lane's
+        SEED_SUPPRESSED_PRODUCT_ANTI_JOIN with one exception). Measured prod 2026-09-27: 682. Lifting the
+        suppression puts it back, near the head. THE EXCEPTION: a product hidden under the unconfirmed-dead reason
+        stays a candidate, because this refresh is the only lane that can lift it (the sweep cannot read those
+        hosts' catalogues) and a hide nothing re-observes is not reversible;
       * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
       * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
 
@@ -2108,7 +2129,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
                     THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
         WHERE status = 'active'
-        {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
+        {REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN}
         {build_seed_quarantine_anti_join()}
         {scope_sql}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST

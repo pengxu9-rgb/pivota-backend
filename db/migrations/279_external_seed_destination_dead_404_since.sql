@@ -3,7 +3,7 @@
 -- When the current run of hard 404s on a seed's served URL began.
 --
 -- services/external_seed_destination_liveness hides a served card (reversibly, reason
--- external_seed_destination_dead_unconfirmed) when its link has answered 404 or 410 on two
+-- external_seed_destination_dead_unconfirmed_pending) when its link has answered 404 or 410 on two
 -- observations at least 24h apart with no read between, on hosts whose catalogue cannot
 -- corroborate it. The 24h cannot be measured from destination_checked_at: every refresh that
 -- sees the 404 re-stamps it, so a row retried more often than daily would never show the gap.

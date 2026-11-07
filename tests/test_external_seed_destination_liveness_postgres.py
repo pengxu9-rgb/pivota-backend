@@ -731,6 +731,25 @@ async def test_two_hard_404s_a_day_apart_hide_and_a_live_answer_lifts_exactly_it
 
 
 @pytest.mark.asyncio
+async def test_shadow_counts_only_unsuppressed_mirror_products_and_writes_nothing_on_real_postgres(_db, monkeypatch):
+    from services import external_seed_destination_liveness as liveness
+
+    monkeypatch.setenv(liveness.UNCONFIRMED_HIDE_ENV, "shadow")
+    await _seed(_db, "eps_unc_sh")
+    await _mirror(_db, "eps_unc_sh", "prod::unc_sh_live")
+    await _mirror(_db, "eps_unc_sh", "prod::unc_sh_gone")
+    await _db.execute("UPDATE catalog_products SET suppressed_at = :at, suppression_reason = 'duplicate_offer'"
+                      " WHERE product_key = 'prod::unc_sh_gone'", {"at": NOW})
+    second = await _two_404s_a_day_apart(liveness, _db, "eps_unc_sh")
+    by_host: dict = {}
+    liveness.count_unconfirmed_observation(by_host, "brand.com", "eps_unc_sh", second)
+    summary = await liveness.apply_unconfirmed_hides(by_host, mode="shadow", now=NOW + timedelta(hours=26))
+    assert summary["totals"]["would_hide"] == 1 and summary["totals"]["would_hide_products"] == 1
+    assert (await _product_row(_db, "prod::unc_sh_live"))["suppressed_at"] is None
+    assert (await _product_row(_db, "prod::unc_sh_gone"))["suppression_reason"] == "duplicate_offer"
+
+
+@pytest.mark.asyncio
 async def test_the_pending_lift_never_clears_the_unconfirmed_reason_of_another_seed_on_real_postgres(_db):
     from services import destination_dead_suppression
     from services import external_seed_destination_liveness as liveness
@@ -767,38 +786,4 @@ async def test_retirement_takes_over_an_unconfirmed_row_and_its_offers_on_real_p
     await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
 
 
-@pytest.mark.asyncio
-async def test_a_two_seller_card_keeps_the_other_sellers_offer_through_the_serving_reader(_db, monkeypatch):
-    """Design R3: the hide withdraws THIS seed's mirror and its offers only. The PDP offer reader still serves the
-    other seller's offer for the same content, and the lift restores both."""
-    from db.catalog import catalog_merchants
-    from services import external_seed_destination_liveness as liveness
-    from services.agent_pdp_view_assembler import fetch_offers_for_keys
-    from tests.model_schema import ensure_model_tables
-
-    # The seed-currency guard bounds SEED-PROJECTED offers and reads seed columns this narrow table lacks; these
-    # offers are not seed-projected, and the reader's suppression filter is what is under test.
-    monkeypatch.setenv("CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD", "off")
-    monkeypatch.setenv(liveness.UNCONFIRMED_HIDE_ENV, "on")
-    await ensure_model_tables([catalog_merchants])
-    await _ensure_offers(_db)
-    await _seed(_db, "eps_unc_two")
-    await _mirror(_db, "eps_unc_two", "prod::unc_two_ours")
-    await _db.execute("INSERT INTO catalog_products (product_key, source_system) VALUES ('prod::unc_two_theirs', 'x')")
-    await _offer(_db, "two_ours", "prod::unc_two_ours")
-    await _offer(_db, "two_theirs", "prod::unc_two_theirs")
-    keys = ["prod::unc_two_ours", "prod::unc_two_theirs"]
-    before = {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)}
-    assert before == {_OFFER_PREFIX + "two_ours", _OFFER_PREFIX + "two_theirs"}
-
-    second = await _two_404s_a_day_apart(liveness, _db, "eps_unc_two")
-    by_host: dict = {}
-    liveness.count_unconfirmed_observation(by_host, "brand.com", "eps_unc_two", second)
-    await liveness.apply_unconfirmed_hides(by_host, mode="on", now=NOW + timedelta(hours=26))
-    served = {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)}
-    assert served == {_OFFER_PREFIX + "two_theirs"}
-
-    await liveness.record_destination_observation(
-        "eps_unc_two", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW + timedelta(hours=30))
-    assert {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)} == before
-    await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
+# The two-seller card, through the real PDP view assembler: tests/test_external_seed_dead_unconfirmed_hide_postgres.py
