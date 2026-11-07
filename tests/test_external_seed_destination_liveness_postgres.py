@@ -42,6 +42,8 @@ _MIGRATIONS = (
     _REPO / "db/migrations/200_external_seed_destination_liveness.sql",
     # The retirement gap's clock (destination_corroborated_dead_at); the writer reads it.
     _REPO / "db/migrations/266_external_seed_destination_corroborated_dead_at.sql",
+    # The hard-404 run clock (destination_dead_404_since); the writer reads and writes it.
+    _REPO / "db/migrations/279_external_seed_destination_dead_404_since.sql",
 )
 
 # This gate DROPS `external_product_seeds` and `catalog_products`, so it must be incapable of
@@ -75,6 +77,8 @@ CREATE TABLE external_product_seeds (
   canonical_url TEXT NULL,
   status TEXT NOT NULL DEFAULT 'active',
   notes TEXT NULL,
+  -- migration 202; the writer reads it ("no read since the run of 404s began")
+  last_crawled_at TIMESTAMPTZ NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -651,4 +655,150 @@ async def test_retirement_takes_over_a_pending_row_and_its_offers_on_real_postgr
     await liveness.record_destination_observation(
         "eps_take", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW + timedelta(days=2))
     assert (await _product_row(_db, "prod::take"))["suppression_reason"] == liveness.SUPPRESSION_REASON
+    await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
+
+
+# --------------------------------------------------------------------------- the unconfirmed-dead hide
+
+
+async def _mirror(db, seed_id: str, key: str) -> None:
+    from services.external_offer_dual_write import MIRROR_SOURCE_SYSTEM
+
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system) VALUES (:k, :id, :m)",
+        {"k": key, "id": seed_id, "m": MIRROR_SOURCE_SYSTEM},
+    )
+
+
+async def _two_404s_a_day_apart(liveness, db, seed_id: str):
+    hard_404 = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, "http_404")
+    first = await liveness.record_destination_observation(seed_id, hard_404, now=NOW)
+    again = await liveness.record_destination_observation(seed_id, hard_404, now=NOW + timedelta(hours=12))
+    second = await liveness.record_destination_observation(seed_id, hard_404, now=NOW + timedelta(hours=25))
+    assert "unconfirmed_hide_candidate" not in first and "unconfirmed_hide_candidate" not in again
+    return second
+
+
+@pytest.mark.asyncio
+async def test_two_hard_404s_a_day_apart_hide_and_a_live_answer_lifts_exactly_it_on_real_postgres(_db, monkeypatch):
+    from services import external_seed_destination_liveness as liveness
+
+    monkeypatch.setenv(liveness.UNCONFIRMED_HIDE_ENV, "on")
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_unc")
+    await _mirror(_db, "eps_unc", "prod::unc")
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, source_ref, source_system) VALUES "
+        "('prod::unc_other_door', 'eps_unc', 'some_other_intake_v3')"
+    )
+    await _offer(_db, "unc", "prod::unc")
+    await _offer(_db, "unc_theirs", "prod::unc", reason="duplicate_offer", meta='{"reconcile_pass": "x"}')
+
+    second = await _two_404s_a_day_apart(liveness, _db, "eps_unc")
+    assert second["unconfirmed_hide_candidate"] is True
+    stored = await _read(_db, "eps_unc")
+    assert stored["destination_dead_404_since"] == NOW
+    assert stored["destination_checked_at"] == NOW + timedelta(hours=25)
+    assert (await _product_row(_db, "prod::unc"))["suppressed_at"] is None, "the writer never hides"
+
+    by_host: dict = {}
+    liveness.count_unconfirmed_observation(by_host, "brand.com", "eps_unc", second)
+    summary = await liveness.apply_unconfirmed_hides(by_host, mode="on", now=NOW + timedelta(hours=26))
+    assert summary["totals"]["hidden_rows"] == 1 and summary["totals"]["hidden_products"] == 1
+
+    hidden = await _product_row(_db, "prod::unc")
+    assert hidden["suppression_reason"] == liveness.UNCONFIRMED_DEAD_REASON and hidden["suppressed_at"] is not None
+    assert (await _product_row(_db, "prod::unc_other_door"))["suppressed_at"] is None
+    offer = await _offer_row(_db, "unc")
+    assert offer["suppression_reason"] == liveness.UNCONFIRMED_DEAD_REASON
+    assert "catalog_offer_suppression" in str(offer["suppression_metadata"])
+
+    # A second apply is idempotent: nothing more moves.
+    again = await liveness.apply_unconfirmed_hides(by_host, mode="on", now=NOW + timedelta(hours=27))
+    assert again["totals"].get("hidden_products", 0) == 0
+
+    alive = liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None)
+    lifted = await liveness.record_destination_observation("eps_unc", alive, now=NOW + timedelta(hours=30))
+    assert lifted["unconfirmed_lifted"] == 1 and lifted["pending_lifted"] == 0
+    back = await _product_row(_db, "prod::unc")
+    assert back["suppressed_at"] is None and back["suppression_reason"] is None
+    offer = await _offer_row(_db, "unc")
+    assert offer["suppressed_at"] is None and offer["suppression_reason"] is None
+    theirs = await _offer_row(_db, "unc_theirs")
+    assert theirs["suppression_reason"] == "duplicate_offer" and theirs["suppressed_at"] is not None
+    assert (await _read(_db, "eps_unc"))["destination_dead_404_since"] is None
+    await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
+
+
+@pytest.mark.asyncio
+async def test_the_pending_lift_never_clears_the_unconfirmed_reason_of_another_seed_on_real_postgres(_db):
+    from services import destination_dead_suppression
+    from services import external_seed_destination_liveness as liveness
+
+    await _db.execute(
+        "INSERT INTO catalog_products (product_key, suppressed_at, suppression_reason) VALUES "
+        "('prod::unc_a', :at, :unc), ('prod::unc_b', :at, :pend)",
+        {"at": NOW, "unc": liveness.UNCONFIRMED_DEAD_REASON, "pend": liveness.PENDING_SUPPRESSION_REASON},
+    )
+    moved = await destination_dead_suppression.lift_pending(
+        ["prod::unc_a", "prod::unc_b"], reason=liveness.PENDING_SUPPRESSION_REASON, db=_db)
+    assert moved["products"] == ["prod::unc_b"]
+    assert (await _product_row(_db, "prod::unc_a"))["suppression_reason"] == liveness.UNCONFIRMED_DEAD_REASON
+
+
+@pytest.mark.asyncio
+async def test_retirement_takes_over_an_unconfirmed_row_and_its_offers_on_real_postgres(_db, monkeypatch):
+    from services import destination_dead_suppression
+    from services import external_seed_destination_liveness as liveness
+
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_unc_take")
+    await _mirror(_db, "eps_unc_take", "prod::unc_take")
+    await _offer(_db, "unc_take", "prod::unc_take")
+    await destination_dead_suppression.suppress_pending(
+        ["prod::unc_take"], reason=liveness.UNCONFIRMED_DEAD_REASON, stamp=NOW, db=_db)
+    dead = liveness.DestinationObservation(liveness.VERDICT_DEAD_404, 404, None, corroborated=True)
+    await liveness.retire_seed_for_dead_destination("eps_unc_take", dead, now=NOW + timedelta(days=1))
+
+    row = await _product_row(_db, "prod::unc_take")
+    assert row["suppression_reason"] == liveness.SUPPRESSION_REASON
+    offer = await _offer_row(_db, "unc_take")
+    assert offer["suppressed_at"] is not None and offer["suppression_reason"] == "product_suppressed"
+    await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})
+
+
+@pytest.mark.asyncio
+async def test_a_two_seller_card_keeps_the_other_sellers_offer_through_the_serving_reader(_db, monkeypatch):
+    """Design R3: the hide withdraws THIS seed's mirror and its offers only. The PDP offer reader still serves the
+    other seller's offer for the same content, and the lift restores both."""
+    from db.catalog import catalog_merchants
+    from services import external_seed_destination_liveness as liveness
+    from services.agent_pdp_view_assembler import fetch_offers_for_keys
+    from tests.model_schema import ensure_model_tables
+
+    # The seed-currency guard bounds SEED-PROJECTED offers and reads seed columns this narrow table lacks; these
+    # offers are not seed-projected, and the reader's suppression filter is what is under test.
+    monkeypatch.setenv("CANONICAL_SEED_PROJECTED_OFFER_CURRENCY_GUARD", "off")
+    monkeypatch.setenv(liveness.UNCONFIRMED_HIDE_ENV, "on")
+    await ensure_model_tables([catalog_merchants])
+    await _ensure_offers(_db)
+    await _seed(_db, "eps_unc_two")
+    await _mirror(_db, "eps_unc_two", "prod::unc_two_ours")
+    await _db.execute("INSERT INTO catalog_products (product_key, source_system) VALUES ('prod::unc_two_theirs', 'x')")
+    await _offer(_db, "two_ours", "prod::unc_two_ours")
+    await _offer(_db, "two_theirs", "prod::unc_two_theirs")
+    keys = ["prod::unc_two_ours", "prod::unc_two_theirs"]
+    before = {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)}
+    assert before == {_OFFER_PREFIX + "two_ours", _OFFER_PREFIX + "two_theirs"}
+
+    second = await _two_404s_a_day_apart(liveness, _db, "eps_unc_two")
+    by_host: dict = {}
+    liveness.count_unconfirmed_observation(by_host, "brand.com", "eps_unc_two", second)
+    await liveness.apply_unconfirmed_hides(by_host, mode="on", now=NOW + timedelta(hours=26))
+    served = {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)}
+    assert served == {_OFFER_PREFIX + "two_theirs"}
+
+    await liveness.record_destination_observation(
+        "eps_unc_two", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW + timedelta(hours=30))
+    assert {o["offer_id"] for o in await fetch_offers_for_keys(keys, db=_db)} == before
     await _db.execute("DELETE FROM catalog_offers WHERE offer_id LIKE :p", {"p": _OFFER_PREFIX + "%"})

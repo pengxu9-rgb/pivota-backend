@@ -32,7 +32,10 @@ from services.external_seed_audit import (
 from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
+    apply_unconfirmed_hides,
+    count_unconfirmed_observation,
     handleless_read_mode,
+    unconfirmed_hide_mode,
 )
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import external_seed_catalogue_refresh as catalogue_lane
@@ -2483,6 +2486,10 @@ async def run_external_referral_refresh_batch(
     # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
     handleless_totals: Dict[str, int] = {}
     handleless_hosts: Dict[str, Dict[str, int]] = {}
+    # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): each host's observations this run and its
+    # candidates, applied (or, in shadow, reported) after the run by `apply_unconfirmed_hides`.
+    unconfirmed_mode = unconfirmed_hide_mode()
+    unconfirmed_hosts: Dict[str, Dict[str, Any]] = {}
     price_unreadable_reasons: Dict[str, int] = {}
     price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
@@ -2544,6 +2551,9 @@ async def run_external_referral_refresh_batch(
                 result = await refresh_seed_by_id(seed_id, **refresh_kwargs)
             status = str(result.get("status") or "success")
             outcome = status
+            if unconfirmed_mode != "off":
+                # Every outcome: a 404 comes back `degraded`, a read `success`.
+                count_unconfirmed_observation(unconfirmed_hosts, host, seed_id, result.get("destination_refresh"))
             # Counted whatever the row's outcome: a seed sent back to its page read can still end degraded.
             if catalogue_read is not None and result.get("catalogue_fallback"):
                 _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
@@ -2883,6 +2893,11 @@ async def run_external_referral_refresh_batch(
     with crawl_ip_throttle.installed(ip_breaker), crawl_global_pacer.installed(pacer):
         await _run_workers(_worker, concurrency)
     host_423_stamped = await _stamp_crawl_attempts(locked_skipped_ids) if locked_skipped_ids else 0
+    # AFTER the run, when every host's share of hard 404s is known (the brake), never per row.
+    unconfirmed_hide = (
+        await apply_unconfirmed_hides(unconfirmed_hosts, mode=unconfirmed_mode)
+        if unconfirmed_mode != "off" else {"mode": "off", "totals": {}, "top_hosts": {}}
+    )
     if ip_breaker.tripped:
         logger.warning(
             "external referral refresh: IP throttled at %s (trip %d of %d, %d distinct hosts); the "
@@ -3099,6 +3114,9 @@ async def run_external_referral_refresh_batch(
         # Rows whose served URL names no product handle, and what EXTERNAL_SEED_HANDLELESS_READ decided for them
         # (`count_handleless_read`): nothing is counted with the flag off.
         "handleless_read": handleless_read_summary(handleless_read_mode(), handleless_totals, handleless_hosts),
+        # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): per host and in total, what the run
+        # observed, its candidates, what it hid (`on`) or would have (`shadow`), and what the host brake held.
+        "unconfirmed_hide": unconfirmed_hide,
         # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
         # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {

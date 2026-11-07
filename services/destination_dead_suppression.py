@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Iterable, List
+from typing import Any, Iterable, List, Optional
 
 from db.database import database
 from services.catalog_offer_suppression import (
@@ -81,14 +81,15 @@ FINALIZE_PRODUCTS_SQL = """
 """
 
 #: Offers we cascaded as pending become ordinary cascaded offers. Reason AND lane stamp, as the
-#: cascade module's own revert scopes them.
+#: cascade module's own revert scopes them. `also_reason` is a second reversible reason the same
+#: retirement takes over (the seed lane's unconfirmed-dead hide); it defaults to `pending_reason`.
 RELABEL_PENDING_OFFERS_SQL = """
     UPDATE catalog_offers
        SET suppression_reason = CAST(:final_reason AS text),
            updated_at = NOW()
      WHERE product_key = ANY(:product_keys)
        AND suppressed_at IS NOT NULL
-       AND suppression_reason = CAST(:pending_reason AS text)
+       AND suppression_reason IN (CAST(:pending_reason AS text), CAST(:also_reason AS text))
        AND suppression_metadata->>CAST(:lane_key AS text) = CAST(:lane AS text)
     RETURNING offer_id
 """
@@ -153,7 +154,7 @@ async def finalize_dead(
 
 
 async def relabel_pending_offers(
-    product_keys: Iterable[str], *, pending_reason: str, db: Any = None
+    product_keys: Iterable[str], *, pending_reason: str, also_reason: Optional[str] = None, db: Any = None
 ) -> List[str]:
     keys = _keys(product_keys)
     if not keys:
@@ -162,7 +163,7 @@ async def relabel_pending_offers(
     rows = await write_db.fetch_all(
         RELABEL_PENDING_OFFERS_SQL,
         {"product_keys": keys, "final_reason": PRODUCT_SUPPRESSED_REASON, "pending_reason": pending_reason,
-         "lane_key": CASCADE_LANE_KEY, "lane": CASCADE_LANE},
+         "also_reason": also_reason or pending_reason, "lane_key": CASCADE_LANE_KEY, "lane": CASCADE_LANE},
     )
     return [str(r["offer_id"]) for r in (rows or [])]
 
