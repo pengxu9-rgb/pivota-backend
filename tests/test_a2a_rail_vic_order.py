@@ -384,7 +384,7 @@ async def test_the_client_strips_every_leaked_field_and_reads_only_the_contracts
     fake.leak = LEAK
     client = vic_order.VicOrderClient(fake)
     answer = await client.submit_order({"client_reference": "ap_" + "a" * 24, "amount_minor": 100, "currency": "USD"})
-    assert answer.ok and answer.authorization == "pending" and answer.hosted_url.startswith(f"https://{HOSTED_HOST}/")
+    assert answer.ok and answer.approval_status == "pending" and answer.hosted_url.startswith(f"https://{HOSTED_HOST}/")
     assert answer.credential_fields_stripped == 2 * LEAK_FIELDS  # top level + authorization
     fake.checkout("ap_" + "a" * 24, "completed", order_number="9", total_minor=100)
     fake.buyer("ap_" + "a" * 24, "approved")

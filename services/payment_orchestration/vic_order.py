@@ -81,7 +81,7 @@ class VicAnswer:
     """One classified answer. Only these fields ever leave the module.
 
     kind:
-      ok               a well-formed order answer (`authorization` is one of AUTHORIZATION_STATUSES)
+      ok               a well-formed order answer (`approval_status` is one of AUTHORIZATION_STATUSES)
       refused          the provider definitely did not take the submit (4xx, a non-retryable error)
       not_found        the provider has no order under our reference (a read's 404)
       outcome_unknown  a submit with no definite answer: read it back, never resend
@@ -93,7 +93,7 @@ class VicAnswer:
     http_status: Optional[int] = None
     order_id: Optional[str] = None
     client_reference: Optional[str] = None
-    authorization: Optional[str] = None
+    approval_status: Optional[str] = None
     hosted_url: Optional[str] = None
     hosted_url_expires_in: Optional[int] = None
     checkout: Optional[str] = None
@@ -143,7 +143,7 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
         kind="ok",
         order_id=_ref(body.get("order_id")),
         client_reference=_ref(body.get("client_reference")),
-        authorization=_word(auth.get("status"), AUTHORIZATION_STATUSES),
+        approval_status=_word(auth.get("status"), AUTHORIZATION_STATUSES),
         hosted_url=_https(auth.get("hosted_url")),
         hosted_url_expires_in=expires_in if isinstance(expires_in, int) and not isinstance(expires_in, bool) else None,
         checkout=_word(checkout.get("status"), CHECKOUT_STATUSES) if checkout else None,
@@ -154,7 +154,7 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
         and re.fullmatch(r"[A-Z]{3}", checkout["currency"]) else None,
         credential_fields_stripped=stripped,
     )
-    if answer.order_id is None or answer.authorization is None or (checkout and answer.checkout is None):
+    if answer.order_id is None or answer.approval_status is None or (checkout and answer.checkout is None):
         answer.kind = "unrecognised"
     return answer
 
@@ -215,8 +215,8 @@ class VicOrderClient:
 
     def _done(self, op: str, answer: VicAnswer, exc: Optional[BaseException] = None) -> VicAnswer:
         logger.info(
-            "vic_order: op=%s kind=%s http_status=%s authorization=%s checkout=%s stripped=%s error_type=%s",
-            op, answer.kind, answer.http_status, answer.authorization, answer.checkout,
+            "vic_order: op=%s kind=%s http_status=%s approval=%s checkout=%s stripped=%s error_type=%s",
+            op, answer.kind, answer.http_status, answer.approval_status, answer.checkout,
             answer.credential_fields_stripped, type(exc).__name__ if exc is not None else None,
         )
         if answer.credential_fields_stripped:

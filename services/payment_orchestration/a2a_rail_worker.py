@@ -862,7 +862,7 @@ async def _start_vic_order(s: _Step) -> str:
 async def _vic_adopt(s: _Step, answer: Any) -> str:
     """The rail has the order: record its id, put the buyer on its page, and hold the marker."""
     page: Dict[str, Any] = {}
-    if answer.authorization == "pending":
+    if answer.approval_status == "pending":
         if not answer.hosted_url:
             # An order the buyer has nowhere to approve: it lapses at the rail unapproved.
             return await _token_failed(s, "quoting", "vic_page_missing", resolves=VIC_SUBMIT)
@@ -939,8 +939,8 @@ async def _vic_status(s: _Step) -> Tuple[Optional[Any], Optional[str]]:
 
 
 async def _vic_inconsistent(s: _Step, answer: Any) -> str:
-    logger.error("a2a_rail_worker: VIC status inconsistent purchase=%s state=%s authorization=%s checkout=%s",
-                 s.id, s.row.get("state"), answer.authorization, answer.checkout)
+    logger.error("a2a_rail_worker: VIC status inconsistent purchase=%s state=%s approval=%s checkout=%s",
+                 s.id, s.row.get("state"), answer.approval_status, answer.checkout)
     await s.release(POLL_PARKED, "vic_status_inconsistent")
     return "parked"
 
@@ -953,7 +953,7 @@ async def _vic_poll_authorization(s: _Step) -> str:
     answer, settled = await _vic_status(s)
     if answer is None:
         return settled
-    status = answer.authorization
+    status = answer.approval_status
     if status != "approved" and answer.checkout not in (None, "not_started"):
         # The rail is checking out an order the buyer has not approved: never act on that.
         return await _vic_inconsistent(s, answer)
@@ -990,7 +990,7 @@ async def _vic_paying(s: _Step) -> str:
     answer, settled = await _vic_status(s)
     if answer is None:
         return settled
-    if answer.authorization != "approved":
+    if answer.approval_status != "approved":
         return await _vic_inconsistent(s, answer)
     return await _vic_checkout(s, answer)
 
