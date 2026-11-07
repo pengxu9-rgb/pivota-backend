@@ -6224,3 +6224,49 @@ def test_a_cart_the_enforced_preflight_refused_is_never_stamped_or_asked(
     assert "warm_fact" not in _ctx_of(offer)
     assert calls == []
     assert offer["cart_prefilled"] is False
+
+
+def test_the_fact_is_asked_for_the_destination_host_not_the_seed_domain(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """be#2729 review P1 / delta P3-C (MF): the seed's `domain` column can name another store.
+    The click lane builds its cart on the DESTINATION host, so the mint must read that host's
+    fact; the fixture's default domain equals the dest host and could not tell them apart."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"domain": "another-store.com"})
+    assert calls == [("brand.com", "US")], calls
+    assert _ctx_of(offer)["warm_fact"] == "human_handoff"
+
+
+@pytest.mark.parametrize("listing_market", ["CA", "*"])
+def test_a_row_listed_in_another_market_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane, listing_market: str
+) -> None:
+    """be#2729 delta P3-A: the token is signed with the row's LISTING market and the click
+    re-checks that one, but the mint asks the request market. A CA-listed USD row served on a US
+    request (the attached-ref, fuzzy and group-sibling queries filter on currency only) would be
+    stamped off the US fact and re-checked against CA; a `'*'` row could never re-check at all."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"market": listing_market})
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_an_affiliate_destination_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """be#2729 delta P3-C (MK): the route hands the skip rule the offer's real destination.
+    The affiliate classifier is narrowed to this fixture's dest, so a caller that passed any
+    other string would read the fact."""
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "is_affiliate_destination", lambda dest: "brand.com/products/serum" in str(dest))
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)

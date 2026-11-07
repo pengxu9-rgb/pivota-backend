@@ -135,8 +135,30 @@ def armed(monkeypatch):
     return app_settings
 
 
-async def _ask(gate, *, dest=DEST):
-    return await gate.warm_fact(dest)
+async def _ask(gate, *, dest=DEST, signed_market="US"):
+    return await gate.warm_fact(dest, signed_market=signed_market)
+
+
+@pytest.mark.parametrize("signed_market", ["CA", "*", "", None, "USA"])
+async def test_a_token_signed_with_another_market_is_never_stamped_and_never_asked(
+    armed, fact_reads, signed_market
+):
+    """be#2729 delta P3-A: the mint asks the REQUEST market, the token is signed with the row's
+    listing market, and the click re-checks the token's. A CA-listed row on a US request must not
+    be stamped off the US fact (the click would then re-check CA), and a `'*'` row never."""
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+
+    calls, _ = fact_reads
+    assert await _ask(_CartPurchasabilityGate("US"), signed_market=signed_market) is None
+    assert calls == []
+
+
+async def test_a_token_signed_with_the_request_market_in_another_case_is_stamped(armed, fact_reads):
+    from routes.agent_shop_gateway import _CartPurchasabilityGate
+
+    calls, _ = fact_reads
+    assert await _ask(_CartPurchasabilityGate("US"), signed_market=" us ") == warm.WARM_FACT_HUMAN_HANDOFF
+    assert calls == [("not-on-the-list.com", "US")]
 
 
 async def test_a_fresh_fact_is_stamped(armed, fact_reads):
@@ -173,7 +195,7 @@ async def test_the_gate_takes_no_store_domain_at_all():
 
     from routes.agent_shop_gateway import _CartPurchasabilityGate
 
-    assert list(inspect.signature(_CartPurchasabilityGate.warm_fact).parameters) == ["self", "destination_url"]
+    assert list(inspect.signature(_CartPurchasabilityGate.warm_fact).parameters) == ["self", "destination_url", "signed_market"]
 
 
 async def test_the_flag_off_never_asks(armed, fact_reads, monkeypatch):
@@ -309,16 +331,22 @@ def test_every_skip_arm(override, reason):
 
 async def test_the_click_time_recheck_asks_the_destination_host_and_the_token_market(fact_reads):
     calls, answer = fact_reads
-    assert await warm.warm_fact_still_holds(dest="https://www.brand-b.com/products/x?utm=1", market="US") is True
+    assert await warm.warm_fact_recheck(dest="https://www.brand-b.com/products/x?utm=1", market="US") is None
     assert calls == [("brand-b.com", "US")]
     answer["value"] = False
-    assert await warm.warm_fact_still_holds(dest=DEST, market="US") is False
+    assert await warm.warm_fact_recheck(dest=DEST, market="US") == warm.FACT_LAPSED
 
 
 @pytest.mark.parametrize("market", [None, ""])
 async def test_the_click_time_recheck_without_a_market_refuses_without_asking(fact_reads, market):
     calls, _ = fact_reads
-    assert await warm.warm_fact_still_holds(dest=DEST, market=market) is False
+    assert await warm.warm_fact_recheck(dest=DEST, market=market) == warm.FACT_NO_MARKET
+    assert calls == []
+
+
+async def test_the_click_time_recheck_without_a_host_refuses_without_asking(fact_reads):
+    calls, _ = fact_reads
+    assert await warm.warm_fact_recheck(dest="not a url", market="US") == warm.FACT_NO_HOST
     assert calls == []
 
 
@@ -329,4 +357,27 @@ async def test_the_click_time_recheck_fails_closed_on_a_read_error(monkeypatch):
         raise RuntimeError("db down")
 
     monkeypatch.setattr(mp, "human_handoff_allowed", boom)
-    assert await warm.warm_fact_still_holds(dest=DEST, market="US") is False
+    assert await warm.warm_fact_recheck(dest=DEST, market="US") == warm.FACT_LAPSED
+
+
+async def test_the_click_time_recheck_has_its_own_deadline(monkeypatch):
+    """be#2729 delta P3-B: the read runs before the 302 a buyer is waiting on, so a stalled pool
+    must not hold the redirect. A read that outlives the deadline keeps the cold redirect."""
+    import asyncio
+
+    import db.merchant_purchasability as mp
+
+    async def stalled(*_a, **_k):
+        await asyncio.sleep(30)
+        return True
+
+    monkeypatch.setattr(mp, "human_handoff_allowed", stalled)
+    monkeypatch.setattr(warm, "WARM_FACT_RECHECK_TIMEOUT_S", 0.05)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert await warm.warm_fact_recheck(dest=DEST, market="US") == warm.FACT_TIMEOUT
+    assert loop.time() - started < 5
+
+
+def test_the_recheck_deadline_is_short():
+    assert 0 < warm.WARM_FACT_RECHECK_TIMEOUT_S <= 0.5

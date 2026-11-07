@@ -5457,7 +5457,9 @@ async def _handle_offers_resolve(
                         in_stock=in_stock,
                         dest=str(canonical_url or destination_url),
                     )
-                    else await _cart_purchasability.warm_fact(str(canonical_url or destination_url))
+                    else await _cart_purchasability.warm_fact(
+                        str(canonical_url or destination_url), signed_market=used_market
+                    )
                 )
 
                 stable_click_id = new_click_id()
@@ -5467,8 +5469,13 @@ async def _handle_offers_resolve(
                     # LISTED in (the column is NOT NULL, so it always "names" one); with no
                     # `market_hint` the SQL above returns rows of EVERY market, and stamping the
                     # row's would forward a listing market to the purchasability gate as the
-                    # buyer's. With a hint the SQL admits only `market = hint` or `'*'`, so this
-                    # is True exactly when it was before.
+                    # buyer's. NOTE the signed `market` is still the row's (`used_market`), and
+                    # not every query that feeds this loop filters on the hint: the identity
+                    # query admits `market = hint` or `'*'`, but the attached-ref mainline, the
+                    # fuzzy fallback and resolved-group siblings filter on currency only, so a
+                    # CA-listed USD row can serve a US request. That is pre-existing; the
+                    # `warm_fact` stamp above is therefore asked only when the signed market IS
+                    # the request market, so the click re-check asks the market the mint asked.
                     market_observed=request_market_observed(market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
@@ -11858,7 +11865,7 @@ class _CartPurchasabilityGate:
             self.stats["declined"] += 1
         return allowed
 
-    async def warm_fact(self, destination_url: str) -> Optional[str]:
+    async def warm_fact(self, destination_url: str, *, signed_market: Any) -> Optional[str]:
         """`human_handoff` when a COLD link's DESTINATION host holds a fresh human-handoff fact.
 
         Asked only with the warm lane and OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE on and the dial on,
@@ -11872,6 +11879,13 @@ class _CartPurchasabilityGate:
         NO PLATFORM CHECK: a positive fact is itself the proof (the sweep only records one after
         rendering that host's Shopify checkout).
 
+        ONLY WHEN THE TOKEN WILL CARRY THE MARKET THIS ASKS. The gate asks the REQUEST's market;
+        the token is signed with `signed_market` (the seed row's listing market), and the click
+        re-check asks the token's. Some seed queries serve a row listed in another market (a
+        CA-listed USD row on a US request) or in `'*'`; stamping those would let the click
+        re-check a different market's fact than the one the mint read. So a `signed_market`
+        that does not normalize to this request market stamps nothing and reads nothing.
+
         Shares the per-request memo with `allows_cart` (same reader, same normalization) and
         does not touch `stats`. Fails closed exactly as `human_handoff_allowed` does. The click
         lane re-asks the same question at click time, so a fact that lapses inside the token's
@@ -11882,6 +11896,8 @@ class _CartPurchasabilityGate:
         if not getattr(settings, "outbound_warm_handoff_fact_eligible", False):
             return None
         if not self.enforced or self.market is None:
+            return None
+        if merchant_purchasability.normalize_market(signed_market) != self.market:
             return None
         host = merchant_purchasability.normalize_domain(destination_url)
         if not host:

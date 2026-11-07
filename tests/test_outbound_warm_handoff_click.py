@@ -1511,7 +1511,49 @@ def test_a_fact_click_without_an_observed_market_never_warms(monkeypatch) -> Non
     token = _fact_token(market_observed=False)
     TestClient(app).get(f"/r?token={token}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
     assert asked == [] and calls == []
-    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "fact_lapsed"
+    assert logged[0]["token_payload"]["ctx"]["warm_reason"] == "fact_no_market", "not counted as a lapse"
+
+
+def test_a_fact_click_whose_recheck_times_out_keeps_the_cold_redirect(monkeypatch) -> None:
+    """be#2729 delta P3-B: the re-check runs before the 302, under its own deadline."""
+    import asyncio
+
+    import db.merchant_purchasability as mp
+
+    async def stalled(*_a, **_k):
+        await asyncio.sleep(30)
+        return True
+
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    monkeypatch.setattr(mp, "human_handoff_allowed", stalled)
+    monkeypatch.setattr(warm, "WARM_FACT_RECHECK_TIMEOUT_S", 0.05)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    res = TestClient(app).get(f"/r?token={_fact_token()}", headers={"user-agent": HUMAN_UA}, follow_redirects=False)
+    assert res.status_code == 302 and res.headers["location"].startswith(FACT_DEST)
+    assert calls == []
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert (ctx["handoff"], ctx["warm_reason"]) == ("cold", "fact_timeout")
+
+
+def test_a_rollout_click_never_asks_the_fact(monkeypatch) -> None:
+    """be#2729 delta P3-C (ML): the re-check is for `fact` clicks only; a rollout click is warmed
+    exactly as before, with no read and no chance of a fact reason."""
+    monkeypatch.setattr(settings, "outbound_warm_handoff_fact_eligible", True)
+    monkeypatch.setattr(settings, "outbound_warm_handoff_brands_raw", "")
+    monkeypatch.setattr(settings, "outbound_warm_handoff_rollout_pct", 100)
+    asked = _fact_now(monkeypatch, False)
+    calls = _spy_resolver(monkeypatch, {"continue_url": CONTINUE_URL})
+    logged = _spy_logger(monkeypatch)
+    TestClient(app).get(
+        f"/r?token={_fact_token(ctx={'pvt_click_id': 'clk_test', 'join_mode': 'referral_only'})}",
+        headers={"user-agent": HUMAN_UA},
+        follow_redirects=False,
+    )
+    assert asked == []
+    assert len(calls) == 1
+    ctx = logged[0]["token_payload"]["ctx"]
+    assert (ctx["handoff"], ctx["warm_eligible"]) == ("warm", "rollout")
 
 
 def test_an_allowlisted_click_never_asks_the_fact(monkeypatch) -> None:

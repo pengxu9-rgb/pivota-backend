@@ -28,14 +28,23 @@ The replacement for widening the allowlist by hand. With it on:
   - It is asked once per host per request, sharing the cart gate's memo.
   - It needs `OUTBOUND_WARM_HANDOFF_ENABLED`, `MERCHANT_PURCHASABILITY_ENFORCE` and a usable
     request market.
+  - It is asked only when the market the token will be signed with (the seed row's listing
+    market) is the request market. Some seed queries serve a row listed elsewhere (a CA-listed
+    USD row on a US request, or a `'*'` row); those get no stamp, so the click re-check always
+    asks the market the mint asked (be#2729 delta P3-A).
   - It is never asked where the stamp could change nothing or would undo a refusal
     (`_warm_fact_skip_reason`): a cart, a named variant without one, a purchasability or stock
     decline, a live-verification flag, an enforced preflight refusal, `in_stock: false`, or an
     affiliate destination.
 - **At click.** A stamped token is eligible even when its host is not allowlisted. **The click
-  then re-asks the same fact** (`warm_fact_still_holds`) for the destination host and the token's
-  market. A lapsed fact, a missing market or a read error keeps the cold redirect
-  (`warm_reason: fact_lapsed`).
+  then re-asks the same fact** (`warm_fact_recheck`) for the destination host and the token's
+  market, under its own 0.5 s deadline (`WARM_FACT_RECHECK_TIMEOUT_S`). Anything but a fresh yes
+  keeps the cold redirect, and `warm_reason` says why:
+  - `fact_lapsed`: the read answered no (no fresh fact now, or the reader failed closed on a
+    database error);
+  - `fact_no_market`: the token has no observed ISO-2 market;
+  - `fact_no_host`: the destination has no host;
+  - `fact_timeout`: the read missed its deadline.
   - This is the backstop for the stamp outliving its fact, because the gateway's own gate
     (`MERCHANT_PURCHASABILITY_GATE_ENABLED`) is not guaranteed to be armed.
   - The allowlist still applies, and every knockout still beats the stamp.
@@ -60,7 +69,8 @@ agent_sdk, the card lanes) never stamp, so their links keep the allowlist rule a
 1. Set `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE=true` on backend `web`.
 2. Watch `warm_eligible` / `handoff` / `warm_reason` on `outbound_click_events.context`. The
    instruments are the share of `warm_eligible=fact` clicks that end `handoff=warm`, and the
-   count of `warm_reason=fact_lapsed`.
+   count of `warm_reason=fact_lapsed` (real lapses only; `fact_no_market`, `fact_no_host` and
+   `fact_timeout` are counted apart).
 
 ## State as of 2026-08-24 (historical)
 

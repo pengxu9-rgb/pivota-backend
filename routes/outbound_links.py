@@ -32,7 +32,7 @@ from config.settings import settings
 from services.deal_lane_decision import TOKEN_DEAL_REF_KEY, deal_destination_at_click
 from services.outbound_warm_handoff import (
     evaluate_warm_eligibility,
-    warm_fact_still_holds,
+    warm_fact_recheck,
     memo_get,
     memo_set,
     resolve_warm_handoff,
@@ -266,10 +266,14 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                     payload.get("market"), payload.get("market_observed")
                 )
                 # A click eligible ONLY by a mint-time fact re-asks that fact now, for the host the
-                # cart would be built on and this token's market. It can only narrow; a lapsed,
-                # missing or unreadable fact keeps the cold redirect (`fact_lapsed`).
-                if reason == "fact" and not await warm_fact_still_holds(dest=dest, market=market_code):
-                    warm_ctx = {"handoff": "cold", "warm_reason": "fact_lapsed", "warm_market": market_reason}
+                # cart would be built on and this token's market, under its own short deadline. It
+                # can only narrow; anything but a fresh yes keeps the cold redirect, and says why
+                # (`fact_lapsed` / `fact_no_market` / `fact_no_host` / `fact_timeout`).
+                fact_cold_reason = (
+                    await warm_fact_recheck(dest=dest, market=market_code) if reason == "fact" else None
+                )
+                if fact_cold_reason:
+                    warm_ctx = {"handoff": "cold", "warm_reason": fact_cold_reason, "warm_market": market_reason}
                 else:
                     # Per-token memo: agent-platform prefetch + the real human click build ONE
                     # cart, and the human click 302s instantly off the memo. The memo is keyed on
