@@ -245,6 +245,18 @@ async def _a2a_accepted(purchase_id: str, agent_id: str, owner: str) -> JSONResp
     })
 
 
+async def _a2a_worker_alive() -> bool:
+    """The A2A worker's heartbeat, read only while the rail's create dials are on (otherwise the router
+    refuses the rail before it would look). A failed read is "not alive": the rail is not offered."""
+    if not rail_router.a2a_create_dials_on():
+        return False
+    try:
+        return await a2a_ledger.worker_is_alive()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent_purchases: a2a worker heartbeat unreadable error_type=%s", type(exc).__name__)
+        return False
+
+
 @router.post("")
 async def create_purchase(
     request: Request,
@@ -312,7 +324,8 @@ async def create_purchase(
                 "invalid_request", "expected_unit_price_minor and expected_currency are required")
         choice = rail_router.choose_rail(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country,
-            item_source=req.item_source, has_offer_code=offer_code is not None,
+            item_source=req.item_source, currency=str(req.expected_currency or ""),
+            worker_alive=await _a2a_worker_alive(), has_offer_code=offer_code is not None,
             preferred=req.payment_preference.rail if req.payment_preference else None,
         )
         if choice.rail == "reap":

@@ -65,8 +65,8 @@ async def _db(monkeypatch):
     if not database.is_connected:
         await database.connect()
     # On Postgres agent_purchases is shared with other files: only this rail's tables are dropped.
-    tables = ("a2a_rail_purchases", "a2a_rail_buyer_refs") if IS_POSTGRES else (
-        "agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs")
+    tables = ("a2a_rail_purchases", "a2a_rail_buyer_refs", "a2a_rail_worker_heartbeat") if IS_POSTGRES else (
+        "agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "a2a_rail_worker_heartbeat")
     for table in tables:
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
@@ -524,6 +524,44 @@ async def test_the_job_is_dark_until_armed_and_configured(monkeypatch):
     monkeypatch.delenv(a2a_rail.A2A_RAIL_ENABLED_ENV, raising=False)
     monkeypatch.setattr(job, "_client", None)
     assert await job.run_a2a_rail_purchase_poll() == {"skipped": "client_not_configured"}
+
+
+async def test_only_an_armed_configured_tick_stamps_the_heartbeat(monkeypatch):
+    ticks = []
+
+    async def tick(client, worker_id, **kw):
+        ticks.append(worker_id)
+        return {}
+
+    monkeypatch.setattr(worker, "run_tick", tick)
+    monkeypatch.delenv(job.A2A_RAIL_WORKER_ENABLED_ENV, raising=False)
+    await job.run_a2a_rail_purchase_poll()
+    monkeypatch.setenv(job.A2A_RAIL_WORKER_ENABLED_ENV, "1")
+    monkeypatch.setattr(job, "_client", None)
+    monkeypatch.setattr(a2a_rail, "from_env", lambda: None)
+    await job.run_a2a_rail_purchase_poll()
+    assert not await ledger.worker_is_alive() and ticks == []
+    monkeypatch.setattr(job, "_client", _client(Rail()))
+    await job.run_a2a_rail_purchase_poll()
+    assert await ledger.worker_is_alive() and len(ticks) == 1
+
+
+async def test_a_failed_heartbeat_write_does_not_stop_the_tick(monkeypatch):
+    ticks = []
+
+    async def tick(client, worker_id, **kw):
+        ticks.append(worker_id)
+        return {}
+
+    async def broken():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(worker, "run_tick", tick)
+    monkeypatch.setattr(ledger, "record_worker_heartbeat", broken)
+    monkeypatch.setenv(job.A2A_RAIL_WORKER_ENABLED_ENV, "1")
+    monkeypatch.setattr(job, "_client", _client(Rail()))
+    await job.run_a2a_rail_purchase_poll()
+    assert len(ticks) == 1
 
 
 async def test_logs_carry_no_email_member_or_page(caplog):
