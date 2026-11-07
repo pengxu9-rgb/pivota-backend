@@ -148,9 +148,13 @@ def test_shadow_counts_pages_regions_codes_and_distinct_host_codes(capsys):
     lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("DEAL_CODE_CAPTURE_PAGE ")]
     assert len(lines) == 2  # one per page WITH codes; none for the pages without
     payload = json.loads(lines[0].split(" ", 1)[1])
-    assert (payload["host"], payload["market"], payload["page_currency"], payload["codes"][0]["code"]) == (
-        "glow.example", "US", "USD", "GLOW20",
-    )
+    import hashlib
+
+    assert (payload["host"], payload["market"], payload["page_currency"]) == ("glow.example", "US", "USD")
+    # The code itself is never printed (review of be#2732): a short hash of host+code, and its description.
+    assert payload["codes"][0]["code_hash"] == hashlib.sha256(b"glow.example|GLOW20").hexdigest()[:12]
+    assert set(payload["codes"][0]) == {"code_hash", "kind", "shape", "form", "region", "hints"}
+    assert "GLOW20" not in lines[0]
 
 
 def test_shadow_never_raises_and_counts_the_error(monkeypatch):
@@ -479,7 +483,9 @@ def test_a_lone_surrogate_does_not_fail_the_log_line(capsys):
     dcc.capture_shadow('<div class="announcement-bar">\ud800 Use code SUR10</div>', url="https://a.example",
                        market="US", page_currency=None)
     assert dcc.stats()["errors"] == 0
-    assert "SUR10" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "DEAL_CODE_CAPTURE_PAGE" in out
+    assert "SUR10" not in out
 
 
 def test_bytes_are_not_parsed():
@@ -1092,6 +1098,23 @@ def test_the_widened_forms_read_codes_the_strict_ones_missed(bar, code, form):
         "Gift card code: 1234-5678-ABCD-9999",  # a gift-card number
         "Code: NC20",  # a shade-like short token after a bare "code"
         "code N25 matches",  # the same
+        # The review of be#2732's false hits for the bare form, each in a bar that also says "% off" or "sale":
+        "Product code: AB1234. Sale ends Sunday",
+        "Shade code 2N1 - 20% off all foundations",
+        "Code: 2N1 for 20% off",  # a digit-first token
+        "YOUR CODE WILL BE EMAILED - 15% off first order",
+        "Discount code CANNOT be combined. 10% off sale items",
+        "Promo code WORKS on full-price items, save 10%",
+        "Postal code SW1A1AA ships free - free shipping over $50",
+        "Your referral code FRIEND10 gives 10% off to a friend",
+        "Text code JOIN to 12345 for 10% off",
+        "Style code: FW23-118 now 30% off",
+        "Dress code BLACK for the 20% off party",
+        "Item code: QX4410 on sale",
+        "Code FALL23 applies",  # no promo context at all
+        "barcode A1B2C3 on 20% off items",  # "code" inside a word
+        "Unicode U8FF20 sale",  # the same, after a word no noun rule names
+        "Code BLACK takes 20% off",  # a colour word a bare "code" names
     ],
 )
 def test_the_widened_forms_do_not_read_prose_shades_or_gift_cards(bar):
@@ -1156,6 +1179,8 @@ def test_the_page_refresh_records_codes_only_with_both_flags(monkeypatch, shadow
     recorded = []
 
     async def fake_fetch_html(url, **kwargs):
+        if kwargs.get("observed") is not None:
+            kwargs["observed"]["final_url"] = "https://www.brand.example/products/toner?variant=1"
         return page, "text/html"
 
     async def no_existing(*a, **k):
@@ -1183,5 +1208,24 @@ def test_the_page_refresh_records_codes_only_with_both_flags(monkeypatch, shadow
         codes, kwargs = recorded[0]
         assert codes == ["GLOW20"]
         assert (kwargs["url"], kwargs["market"]) == ("https://brand.example/products/toner", "US")
+        assert kwargs["final_url"] == "https://www.brand.example/products/toner?variant=1"  # where the fetch ended
     else:
         assert recorded == []
+
+
+
+def test_a_false_bare_code_no_longer_steals_the_real_codes_terms():
+    got = _codes('<body><div class="announcement-bar">Item code: QX4410 | 10% off with code SAVE10</div></body>')
+    assert set(got) == {"SAVE10"}
+    assert (got["SAVE10"].kind, got["SAVE10"].value) == ("percent", "10")
+
+
+def test_the_bare_form_reads_a_code_only_with_a_promo_word_on_either_side():
+    assert "FALL23" in _codes('<body><div class="announcement-bar">Fall sale: code FALL23</div></body>')
+    assert "FALL23" in _codes('<body><div class="announcement-bar">Code FALL23 takes 20% off</div></body>')
+    assert "FALL23" not in _codes('<body><div class="announcement-bar">Code FALL23 applies</div></body>')
+
+
+def test_a_minimum_spend_keeps_its_own_currency_symbol():
+    got = _codes('<body><div class="announcement-bar">20% off orders over £50 with code SAVE20</div></body>')
+    assert (got["SAVE20"].min_subtotal, got["SAVE20"].min_subtotal_symbol) == ("50", "£")

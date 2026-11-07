@@ -59,6 +59,7 @@ body window (cut or unread); and each region's length (`by_region_chars`). A dia
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -161,8 +162,31 @@ _STOP_CODES = frozenset({
     "SELECTED", "SENT", "SHIPPING", "SHOWN", "SITE", "SITEWIDE", "SOON", "SPF", "STORE", "STOREWIDE", "TBA", "TBD",
     "TCS", "THAT", "THE", "THEN", "THIS", "THRU", "TIL", "TODAY", "TOMORROW", "TONIGHT", "TOO", "TOP", "TWICE", "TWO",
     "UNTIL", "UPON", "UPS", "USE", "VALID", "VIA", "VOUCHER", "WEB", "WEEKEND", "WHEN", "WHILE", "WHY", "WITH", "YET",
-    "YOU", "YOUR",
+    "YOU", "YOUR", "WILL", "CANNOT", "WORKS", "WORK", "EXPIRED", "SOLD",
 })
+# Only for the loose bare-"code" form (`after_code`): words a bare "code X" names that are not codes there
+# ("Dress code BLACK"). The phrased forms keep reading them ("use code RED" stays a code).
+_AFTER_CODE_STOP = frozenset({
+    "RED", "BLACK", "WHITE", "BLUE", "GREEN", "PINK", "NUDE", "ROSE", "GOLD", "SILVER", "BROWN", "GREY", "GRAY",
+    "BEIGE", "IVORY", "CORAL", "PEACH", "PURPLE", "ORANGE", "YELLOW", "NAVY", "CLEAR", "MATTE", "JOIN", "STOP",
+    "HELP", "YES", "NO",
+})
+# A noun right before a bare "code" that makes it some other code: product/item/style/shade/SKU/referral/postal/
+# zip/dress/country/QR/gift-card/text-message/area/access/verification/security/tracking/reference/order/model/
+# part/colour/bar codes.
+_NON_PROMO_CODE_NOUN_RE = re.compile(
+    r"(?i)\b(?:product|item|style|shade|sku|referral|refer|postal|post|zip|dress|country|qr|gift(?:\s*card)?|"
+    r"text|sms|area|access|verification|security|tracking|reference|order|model|part|colou?r|bar|discount\s+card)"
+    r"[\s:_-]{0,3}$"
+)
+# A bare "code X" is read only with a promo context near it: a percent or amount, "off", "save", "sale",
+# "discount", "promo", "coupon", "voucher", "deal", "offer", or free shipping/delivery/gift.
+_PROMO_CONTEXT_RE = re.compile(
+    r"(?i)\d{1,3}\s?%|[$£€]\s?\d|\boff\b|\bsave\b|\bsale\b|\bdiscount|\bpromo|\bcoupon|\bvoucher|\bdeals?\b|"
+    r"\boffer|\bfree\s+(?:shipping|delivery|gift)"
+)
+_AFTER_CODE_CONTEXT_BEFORE = 80
+_AFTER_CODE_CONTEXT_AFTER = 60
 _SHADE_AFTER_RE = re.compile(r"\s{0,3}(?:shades?|swatch(?:es)?|tones?|colou?rs?|finish)\b", re.IGNORECASE)
 _GIFT_CARD_NUMBER_RE = re.compile(r"[A-Z0-9]{4}(?:-[A-Z0-9]{4}){2,}")
 _SHORT_ALNUM_RE = re.compile(r"[A-Z]{1,2}\d{1,3}")
@@ -393,6 +417,7 @@ class CapturedCode:
     shape: str = ""  # short_letters (VIP, USA) | letters | short_alnum (shade-like, e.g. NC20) | alnum
     form: str = ""  # use_code ("use/enter/apply code X") | labelled ("promo code: X") | with_code | after_code
     region: str = "named"  # named | fallback (only a wrapper or modifier class named it)
+    min_subtotal_symbol: Optional[str] = None  # the currency symbol the minimum spend was stated in
 
 
 def _shape(code: str) -> str:
@@ -418,6 +443,15 @@ def _nearest(spans: List[Tuple[int, int]], start: int, end: int) -> Optional[int
     return best
 
 
+def _after_code_ok(text: str, phrase_start: int, start: int, end: int, code: str) -> bool:
+    if not code[0].isalpha() or _SHORT_ALNUM_RE.fullmatch(code) or code.upper() in _AFTER_CODE_STOP:
+        return False
+    if _NON_PROMO_CODE_NOUN_RE.search(text[max(0, phrase_start - 40):phrase_start]):
+        return False
+    window = text[max(0, phrase_start - _AFTER_CODE_CONTEXT_BEFORE):phrase_start] + " " + text[end:end + _AFTER_CODE_CONTEXT_AFTER]
+    return bool(_PROMO_CONTEXT_RE.search(window))
+
+
 def codes_in_region(text: str) -> List[CapturedCode]:
     text = text or ""
     matches: List[Tuple[str, int, int, str]] = []
@@ -430,9 +464,12 @@ def codes_in_region(text: str) -> List[CapturedCode]:
             end = start + len(code)
             if code.upper() in seen or not _is_code(code, text, start, end):
                 continue
-            # A bare "code X" is the loosest form: a shade-like short token there ("code: NC20") is not read as a
-            # code. The phrased forms keep their wider reading ("use code VIP2" stays a code).
-            if form == "after_code" and _SHORT_ALNUM_RE.fullmatch(code):
+            # A bare "code X" is the loosest form (review of be#2732: on its own it read product, style, postal,
+            # referral and item codes). It is read only when ALL hold: the token starts with a letter and is not a
+            # shade-like short token ("code: NC20", "2N1"); no non-promo noun comes right before "code"; the token is
+            # not one of the words a bare "code" names ("Dress code BLACK"); and a promo context is near. The phrased
+            # forms keep their wider reading ("use code VIP2" stays a code).
+            if form == "after_code" and not _after_code_ok(text, match.start(), start, end, code):
                 continue
             seen.add(code.upper())
             matches.append((code, start, end, form))
@@ -478,6 +515,7 @@ def codes_in_region(text: str) -> List[CapturedCode]:
             captured.kind = "free_shipping"
         if t["spend"] is not None:
             captured.min_subtotal = t["spend"].group(2)
+            captured.min_subtotal_symbol = t["spend"].group(1)
             captured.currency_symbol = captured.currency_symbol or t["spend"].group(1)
         captured.hints = [name for name, _ in _HINTS if name in t["hints"]]
         captured.snippet = re.sub(r"\s+", " ", text[max(0, start - 60): end + 90]).strip()[:_SNIPPET_CHARS]
@@ -617,6 +655,25 @@ def reset_stats() -> None:
         })
         _HOST_CODES.clear()
         _HOSTS_WITH_CODES.clear()
+        _WRITE_HOSTS.clear()
+
+
+# The writer's per-run budget (services/deal_code_capture_writer.py): rows written per host and in all, reset with the
+# counters when the job starts.
+_WRITE_HOSTS: Dict[str, int] = {}
+MAX_WRITES_PER_RUN = 1000
+MAX_WRITES_PER_HOST_PER_RUN = 20
+
+
+def take_write_slot(host: str) -> Optional[str]:
+    """None when one more row may be written for this host in this run; otherwise why not (counted by the caller)."""
+    with _LOCK:
+        if sum(_WRITE_HOSTS.values()) >= MAX_WRITES_PER_RUN:
+            return "skipped_run_cap"
+        if _WRITE_HOSTS.get(host, 0) >= MAX_WRITES_PER_HOST_PER_RUN:
+            return "skipped_host_cap"
+        _WRITE_HOSTS[host] = _WRITE_HOSTS.get(host, 0) + 1
+        return None
 
 
 reset_stats()
@@ -652,14 +709,18 @@ def capture_shadow(html: Any, *, url: str, market: str, page_currency: Optional[
         host = (urlparse(url).hostname or "").lower()
         host = host[4:] if host.startswith("www.") else host
         if codes:
-            # Built and printed BEFORE the counters move, so a failed print leaves them untouched. ASCII
-            # escapes keep a lone surrogate from failing the write.
+            # Built and printed BEFORE the counters move, so a failed print leaves them untouched. NEVER the code or
+            # the bar text (review of be#2732): a short hash of host+code tells repeat sightings apart, and the
+            # rest is the code's shape, form, region, stated kind and hints.
             print("DEAL_CODE_CAPTURE_PAGE " + json.dumps({
                 "host": host,
                 "market": market,
                 "page_currency": page_currency,
                 "codes_capped": capped,
-                "codes": [asdict(c) for c in codes],
+                "codes": [{
+                    "code_hash": hashlib.sha256(f"{host}|{c.code.upper()}".encode("utf-8")).hexdigest()[:12],
+                    "kind": c.kind, "shape": c.shape, "form": c.form, "region": c.region, "hints": c.hints,
+                } for c in codes],
             }, ensure_ascii=True, separators=(",", ":")), flush=True)
         with _LOCK:
             _STATS["pages_scanned"] += 1

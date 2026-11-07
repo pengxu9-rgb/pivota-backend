@@ -2892,7 +2892,9 @@ async def resolve_external_offer(
         # milliseconds while looking like the host was down. The sibling destination sweep
         # passes 0 explicitly; until now the content refresh could not, because there was no
         # parameter between it and here. Default None keeps the live route exactly as it was.
-        html, _ct = await _fetch_html(url_norm, observed=observed, max_wait=max_wait)
+        # The caller's out-param when it passed one; otherwise our own, so the capture writer can read `final_url`.
+        fetch_observed = observed if observed is not None else {}
+        html, _ct = await _fetch_html(url_norm, observed=fetch_observed, max_wait=max_wait)
         extracted = _extract_from_html(url_norm, html)
 
         canonical_url = _normalize_url(extracted.get("canonical_url") or url_norm)
@@ -2906,7 +2908,11 @@ async def resolve_external_offer(
         if settings.deal_code_capture_shadow:
             captured_codes = deal_code_capture.capture_shadow(html, url=url_norm, market=market_norm, page_currency=currency)
             if captured_codes and settings.deal_code_capture_write:
-                await deal_code_capture_writer.record(captured_codes, url=url_norm, market=market_norm, page_currency=currency)
+                # Where the fetch ENDED: a page another host served is not this seller's (review of be#2732).
+                await deal_code_capture_writer.record(
+                    captured_codes, url=url_norm, market=market_norm, page_currency=currency,
+                    final_url=fetch_observed.get("final_url"),
+                )
 
         rid = f"eo_{url_hash[:24]}"
         now = _now()

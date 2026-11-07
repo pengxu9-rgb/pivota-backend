@@ -20,8 +20,22 @@ WHAT IS WRITTEN, per captured code:
 One row per (seller, market, code): the identity key is `observed_store_offer_key`. A later sighting refreshes the
 observation fields and `observed_at`; it never touches verifications, outcomes or `created_at`.
 
-A seller in `deal_lane_optout` is never written (`skipped_optout`). The code itself is never logged. Every failure is
-swallowed and counted (`errors`): recording can never cost a page refresh.
+WHAT IS NOT WRITTEN (review of be#2732):
+  - a code read by the loose bare-"code" form (`after_code`): it stays in the shadow counts until its precision is
+    measured in prod (`skipped_loose_form`);
+  - any code from a page whose request was redirected to ANOTHER host: the codes are that host's, not the requested
+    seller's (`skipped_host_changed`);
+  - a seller on the opt-out denylist, matched by its host, the www. form of the host, and every merchant id the
+    catalog holds for that host (ADR-027 Q20) (`skipped_optout`). If that check cannot be read, nothing is written
+    (`skipped_optout_unreadable`): fail closed;
+  - past the per-run budget: at most MAX_WRITES_PER_HOST_PER_RUN rows per host and MAX_WRITES_PER_RUN in all
+    (`skipped_host_cap`, `skipped_run_cap`);
+  - over a row another source owns for the same identity (`skipped_other_source`).
+A minimum spend is kept only when its currency symbol agrees with the page's currency. Concurrent writers of the same
+identity resolve to one row (an insert that loses the race becomes an update).
+
+The code itself is never logged. Every failure is swallowed and counted (`errors`): recording can never cost a page
+refresh.
 """
 
 from __future__ import annotations
@@ -35,6 +49,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy import and_, select
 
+from db.catalog import catalog_products
 from db.database import database
 from db.deal_lane import deal_lane_optout, observed_store_offer_key, observed_store_offers
 from services import deal_code_capture
@@ -47,6 +62,9 @@ _MARKET_CURRENCY = {"US": "USD", "SG": "SGD"}
 # A stated amount's symbol must agree with the page's currency, or the amount has no currency.
 _SYMBOL_CURRENCIES = {"$": {"USD", "SGD", "AUD", "CAD", "NZD", "HKD"}, "£": {"GBP"}, "€": {"EUR"}}
 _KINDS = {"percent", "amount", "free_shipping"}
+# The phrased forms only; the bare-"code" form is shadow-only until measured.
+_WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
+_MAX_MERCHANT_IDS = 20
 
 
 def seller_id_for(url: str) -> Optional[str]:
@@ -91,7 +109,10 @@ def row_values(captured: "deal_code_capture.CapturedCode", *, url: str, market: 
         if captured.kind == "amount" and currency and currency in _SYMBOL_CURRENCIES.get(captured.currency_symbol or "", set()):
             row_currency = currency
     hints = set(captured.hints or [])
-    min_subtotal = _decimal(captured.min_subtotal)
+    min_subtotal = None
+    if captured.min_subtotal is not None and currency and currency in _SYMBOL_CURRENCIES.get(captured.min_subtotal_symbol or "", set()):
+        min_subtotal = _decimal(captured.min_subtotal)
+        row_currency = currency
     market_ev = market_evidence(market, page_currency)
     return {
         "seller_id": seller,
@@ -112,9 +133,31 @@ def row_values(captured: "deal_code_capture.CapturedCode", *, url: str, market: 
     }
 
 
+def _same_seller(a: Optional[str], b: Optional[str]) -> bool:
+    return bool(a) and a == b
+
+
+async def _opted_out(seller: str) -> bool:
+    """The seller under every form ADR-027 Q20 names: its host, its www. form, and the catalog's merchant ids for the
+    host. Raises when it cannot be read (the caller fails closed)."""
+    hosts = [seller, f"www.{seller}"]
+    rows = await database.fetch_all(
+        select(catalog_products.c.merchant_id)
+        .where(catalog_products.c.source_domain.in_(hosts))
+        .distinct()
+        .limit(_MAX_MERCHANT_IDS)
+    )
+    ids = hosts + [r["merchant_id"] for r in rows if r["merchant_id"]]
+    hit = await database.fetch_one(
+        select(deal_lane_optout.c.seller_id).where(deal_lane_optout.c.seller_id.in_(ids)).limit(1)
+    )
+    return hit is not None
+
+
 async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str, market: Optional[str],
-                 page_currency: Optional[str]) -> None:
-    """Write this page's captured codes. Never raises."""
+                 page_currency: Optional[str], final_url: Optional[str] = None) -> None:
+    """Write this page's captured codes. Never raises. `final_url` is where the fetch ended; a page served by another
+    host than the one requested is not written."""
     try:
         codes = list(codes or [])
         if not codes:
@@ -123,11 +166,22 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
         if not seller:
             deal_code_capture.bump_write("skipped_no_seller", len(codes))
             return
-        opted_out = await database.fetch_one(
-            select(deal_lane_optout.c.seller_id).where(deal_lane_optout.c.seller_id == seller)
-        )
-        if opted_out:
-            deal_code_capture.bump_write("skipped_optout", len(codes))
+        if final_url is not None and not _same_seller(seller_id_for(final_url), seller):
+            deal_code_capture.bump_write("skipped_host_changed", len(codes))
+            return
+        loose = [c for c in codes if c.form not in _WRITTEN_FORMS]
+        if loose:
+            deal_code_capture.bump_write("skipped_loose_form", len(loose))
+        codes = [c for c in codes if c.form in _WRITTEN_FORMS]
+        if not codes:
+            return
+        try:
+            if await _opted_out(seller):
+                deal_code_capture.bump_write("skipped_optout", len(codes))
+                return
+        except Exception as exc:  # noqa: BLE001 - an opt-out we cannot read means no write
+            deal_code_capture.bump_write("skipped_optout_unreadable", len(codes))
+            logger.warning("deal code capture write: opt-out check failed: %s", type(exc).__name__)
             return
         now = datetime.now(timezone.utc)
         for captured in codes:
@@ -136,33 +190,51 @@ async def record(codes: Iterable["deal_code_capture.CapturedCode"], *, url: str,
                 if values is None:
                     deal_code_capture.bump_write("skipped_no_kind" if captured.kind not in _KINDS else "skipped_unreadable")
                     continue
+                cap = deal_code_capture.take_write_slot(seller)
+                if cap:
+                    deal_code_capture.bump_write(cap)
+                    continue
                 if values["market"] is None:
                     deal_code_capture.bump_write("no_market_evidence")
                 key = observed_store_offer_key(
                     seller_id=values["seller_id"], market=values["market"], code=values["code"],
                     platform_rule_ref=None, program_id=None,
                 )
-                existing = await database.fetch_one(
-                    select(observed_store_offers.c.deal_id).where(observed_store_offers.c.deal_key == key)
-                )
                 observation = {k: values[k] for k in ("kind", "value", "currency", "min_subtotal", "new_customer_only",
                                                       "once_per_customer", "segment_limited", "source_url", "terms_text")}
-                if existing:
-                    await database.execute(
-                        observed_store_offers.update()
-                        .where(and_(observed_store_offers.c.deal_key == key,
-                                    observed_store_offers.c.source == "merchant_published"))
-                        .values(**observation, observed_at=now, updated_at=now)
-                    )
-                    deal_code_capture.bump_write("updated")
-                else:
-                    await database.execute(
-                        observed_store_offers.insert().values(
-                            deal_id="dl_" + uuid.uuid4().hex, deal_key=key, observed_at=now,
-                            created_at=now, updated_at=now, **values,
+                existing = await database.fetch_one(
+                    select(observed_store_offers.c.deal_id, observed_store_offers.c.source)
+                    .where(observed_store_offers.c.deal_key == key)
+                )
+                if existing is None:
+                    try:
+                        await database.execute(
+                            observed_store_offers.insert().values(
+                                deal_id="dl_" + uuid.uuid4().hex, deal_key=key, observed_at=now,
+                                created_at=now, updated_at=now, **values,
+                            )
                         )
-                    )
-                    deal_code_capture.bump_write("inserted")
+                        deal_code_capture.bump_write("inserted")
+                        continue
+                    except Exception:  # noqa: BLE001 - the driver's own unique-violation class differs per dialect
+                        # Another writer may have inserted the same identity first: then this sighting refreshes that
+                        # row. If no row exists, the insert failed for another reason and that is re-raised.
+                        existing = await database.fetch_one(
+                            select(observed_store_offers.c.deal_id, observed_store_offers.c.source)
+                            .where(observed_store_offers.c.deal_key == key)
+                        )
+                        if existing is None:
+                            raise
+                if existing["source"] != "merchant_published":
+                    deal_code_capture.bump_write("skipped_other_source")
+                    continue
+                await database.execute(
+                    observed_store_offers.update()
+                    .where(and_(observed_store_offers.c.deal_key == key,
+                                observed_store_offers.c.source == "merchant_published"))
+                    .values(**observation, observed_at=now, updated_at=now)
+                )
+                deal_code_capture.bump_write("updated")
             except Exception as exc:  # noqa: BLE001 - one code's failure never costs the others or the page
                 deal_code_capture.bump_write("errors")
                 logger.warning("deal code capture write failed: %s", type(exc).__name__)
