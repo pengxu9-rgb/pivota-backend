@@ -40,11 +40,15 @@ The replacement for widening the allowlist by hand. With it on:
   then re-asks the same fact** (`warm_fact_recheck`) for the destination host and the token's
   market, under its own 0.5 s deadline (`WARM_FACT_RECHECK_TIMEOUT_S`). Anything but a fresh yes
   keeps the cold redirect, and `warm_reason` says why:
-  - `fact_lapsed`: the read answered no (no fresh fact now, or the reader failed closed on a
-    database error);
+  - `fact_lapsed`: the read answered no. That is either no fresh fact now, or the reader
+    failing closed on ANY database error, including asyncpg's own command timeout:
+    `human_handoff_allowed` catches every error, logs
+    `merchant_purchasability: human_handoff_allowed failed; withholding the cart`, and answers
+    no. So `fact_lapsed` is an upper bound on real lapses, not a count of them;
   - `fact_no_market`: the token has no observed ISO-2 market;
   - `fact_no_host`: the destination has no host;
-  - `fact_timeout`: the read missed its deadline.
+  - `fact_timeout`: the read missed the 0.5 s deadline before the reader answered. A database
+    timeout the reader catches first reads as `fact_lapsed` (above).
   - This is the backstop for the stamp outliving its fact, because the gateway's own gate
     (`MERCHANT_PURCHASABILITY_GATE_ENABLED`) is not guaranteed to be armed.
   - The allowlist still applies, and every knockout still beats the stamp.
@@ -68,9 +72,17 @@ agent_sdk, the card lanes) never stamp, so their links keep the allowlist rule a
 **Turning it on.**
 1. Set `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE=true` on backend `web`.
 2. Watch `warm_eligible` / `handoff` / `warm_reason` on `outbound_click_events.context`. The
-   instruments are the share of `warm_eligible=fact` clicks that end `handoff=warm`, and the
-   count of `warm_reason=fact_lapsed` (real lapses only; `fact_no_market`, `fact_no_host` and
-   `fact_timeout` are counted apart).
+   instruments are:
+   - the share of `warm_eligible=fact` clicks that end `handoff=warm`;
+   - the count of `warm_reason=fact_lapsed`, read NEXT TO the count of
+     `human_handoff_allowed failed` log lines on `web` over the same window. Those failures
+     (including database command timeouts) land in `fact_lapsed` too. The log line is shared
+     with the mint and the cart gate, so it over-counts re-check failures: zero lines means
+     `fact_lapsed` is all real lapses, and any lines mean the lapse count is an upper bound.
+     `fact_no_market` and `fact_no_host` are counted apart;
+   - the share of fact clicks that end `warm_reason=fact_timeout`. Any sustained share means
+     the re-check is costing buyers their warm cart on a slow pool: look at pool latency before
+     reading anything else, and turn the flag off if it persists.
 
 ## State as of 2026-08-24 (historical)
 
