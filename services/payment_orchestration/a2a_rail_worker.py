@@ -138,6 +138,9 @@ A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
 #: the amount is minor units of whatever currency the rail assumes; only USD has been measured.
 TOKEN_CURRENCIES = frozenset({"USD"})
 
+#: The code an approved purchase ends with while no pay step exists (the order protocol's).
+PAY_STEP_UNAVAILABLE = "pay_step_unavailable"
+
 PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
 #: and `paying` is never capped (money may be moving; only the rail's answer ends it).
@@ -648,7 +651,7 @@ async def _pay_step_unavailable(s: _Step, *, resolves: Optional[str] = None) -> 
     logger.warning("a2a_rail_worker: token approved with no pay step purchase=%s; failed", s.id)
     moved = await ledger.transition_as_holder(
         s.id, s.worker, from_states=["awaiting_authorization"], to_state="failed", resolves_write=resolves,
-        last_error_code="pay_step_unavailable")
+        last_error_code=PAY_STEP_UNAVAILABLE)
     return await _settled(s, moved, "failed")
 
 
@@ -827,8 +830,11 @@ async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
 
 
 #: Voids one orphaned token on the rail. Given the ended row (it has `payment_token_id` and `member_id`);
-#: True ONLY when the rail definitely reports the token void (or already void). False or a raise leaves
-#: the row as it is, to be tried again next tick, so a voider must be safe to call twice.
+#: True ONLY when the rail definitely reports THAT token void (or already void). False or a raise leaves
+#: the row as it is, to be tried again next tick, so a voider must be safe to call twice (two ticks may
+#: race for one orphan: there is no claim on an ended row). NEVER a card-wide revoke (the rail's
+#: remove-method revokes every token on the buyer's card and disables the card): a voider names one token.
+#: Calls are made only while the token step's dial (the kill switch) is on.
 Voider = Callable[[Mapping[str, Any]], Awaitable[bool]]
 #: Orphans voided per tick, at most.
 VOID_BATCH = 10
@@ -843,7 +849,7 @@ async def void_orphan_tokens(
     """Tokens left on ended purchases: void them when a voider is given, count them always."""
     global _orphans_logged_at
     counts: Dict[str, int] = {}
-    if voider is not None:
+    if voider is not None and token_step_enabled():
         for row in await ledger.list_orphan_tokens(limit=VOID_BATCH):
             try:
                 voided = await voider(row) is True

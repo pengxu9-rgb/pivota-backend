@@ -1294,3 +1294,50 @@ async def test_a_standing_orphan_count_alone_is_a_quiet_tick(monkeypatch, caplog
     with caplog.at_level(logging.WARNING, logger=job.__name__):
         await job.run_a2a_rail_purchase_poll()
     assert not [r for r in caplog.records if r.name == job.__name__]
+
+
+# ── review round 1 ───────────────────────────────────────────────────────────────────────────
+
+
+async def test_an_approval_page_saying_active_is_not_an_approved_token():
+    """Only the token result or the await card can say the token is ACTIVE; a re-sent page cannot."""
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    page = _task(("payment.visa-action-required", {"paymentTokenId": "ptk_1", "paymentUrl": PAGE, "status": "ACTIVE"}))
+    assert await _step(Rail().on("payment.visa-action-required#paid", page), pid) == "waiting_on_buyer"
+    assert (await _row(pid))["state"] == "awaiting_authorization"
+
+
+async def test_the_job_passes_no_voider(monkeypatch):
+    """The rail has no per-token void; a job that passed one (say, a card-wide revoke) would forget
+    token ids that are still live on the rail."""
+    seen = []
+
+    async def tick(client, worker_id, **kw):
+        seen.append(kw)
+        return {}
+
+    monkeypatch.setattr(worker, "run_tick", tick)
+    monkeypatch.setenv(job.A2A_RAIL_WORKER_ENABLED_ENV, "1")
+    monkeypatch.setattr(job, "_client", _client(Rail()))
+    await job.run_a2a_rail_purchase_poll()
+    assert seen and all(kw.get("voider") is None for kw in seen)
+
+
+async def test_no_void_is_attempted_while_the_token_dial_is_off(monkeypatch):
+    pid = await _ended("failed")
+    calls = []
+
+    async def voider(row):
+        calls.append(row["id"])
+        return True
+
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    assert await worker.void_orphan_tokens(voider) == {"orphan_tokens": 1}
+    assert calls == [] and (await _row(pid))["payment_token_id"] == "ptk_left"
+
+
+async def test_a_token_from_a_purchase_that_ended_long_ago_is_neither_voided_nor_counted():
+    pid = await _ended("expired")
+    await _ago("terminal_at", ledger.ORPHAN_MAX_AGE_SECONDS + 3600, purchase_id=pid)
+    assert await ledger.count_orphan_tokens() == 0 and await ledger.list_orphan_tokens(limit=10) == []
