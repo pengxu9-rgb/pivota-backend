@@ -34,6 +34,16 @@ drops one):
 8. `sub` is present and is NOT a guest subject;
 9. `scope` contains the required scope (`pivota.account` by default);
 10. `client_id` is present, so a caller can bind state to the agent client.
+11. on a deployed platform, the signing key is the shared PEM, never the
+    dev/test ephemeral key (`not_configured` otherwise).
+
+TRUST BOUNDARY FOR ROUTES. The token's `aud` is the gateway's MCP resource, and
+the backend web service is publicly reachable, so any agent client holding a
+buyer's MCP token could call a backend route directly and skip gateway-side
+policy. That is the authority the client already has at `/mcp`, not an
+escalation, but a route that spends through a linked Shop account must ALSO
+require the gateway's service credential (`utils/gateway_oidc_auth.py`), not
+this token alone.
 
 WHAT IS NEVER DONE. The token never appears in an exception message, a log line
 or a response. A refusal carries a short code (`expired`, `bad_audience` ...)
@@ -48,12 +58,14 @@ the Shop link: `status` and `link_generation`).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Callable, FrozenSet, Optional
 
 import jwt
 from fastapi import HTTPException, Request
 
+from config.platform import is_deployed
 from services import mcp_oauth_as as core
 
 logger = logging.getLogger(__name__)
@@ -83,6 +95,13 @@ class VerifiedBuyer:
 
 
 def _public_key():
+    # A deployed verifier needs the shared PEM. With only the dev/test ephemeral
+    # key (MCP_OAUTH_AS_ALLOW_EPHEMERAL_KEY=1) every instance holds a different
+    # key under the same kid, so a token verifies only on the instance that
+    # minted it (intermittent bad_signature) and each restart signs every buyer
+    # out. Refuse that outright instead.
+    if not (os.getenv("MCP_OAUTH_AS_PRIVATE_KEY_PEM") or "").strip() and is_deployed():
+        raise BuyerTokenError("not_configured")
     try:
         return core._load_private_key().public_key()
     except core.McpOAuthAsError:
