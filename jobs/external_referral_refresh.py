@@ -194,6 +194,15 @@ PRICE_REFRESH_KEYS = (
 )
 
 
+def handleless_read_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run's handle-less read decisions, as the one `HANDLELESS_READ` log line carries them, or None when the
+    run decided none (the flag is off, or no row's served URL lacked a handle)."""
+    block = summary.get("handleless_read")
+    if not isinstance(block, dict) or not (block.get("totals") or {}).get("decided"):
+        return None
+    return block
+
+
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
     """The run's price outcomes, as the one `PRICE_REFRESH` log line carries them."""
     return {key: summary.get(key) for key in PRICE_REFRESH_KEYS}
@@ -353,6 +362,10 @@ def main() -> int:
         print("DEAL_CODE_CAPTURE " + json.dumps(summary["deal_code_capture"], separators=(",", ":"), default=str))
     # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
     print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
+    # And for the handle-less read rule (EXTERNAL_SEED_HANDLELESS_READ): only on a run that decided a row.
+    line = handleless_read_line(summary)
+    if line is not None:
+        print("HANDLELESS_READ " + json.dumps(line, separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659
