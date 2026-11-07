@@ -27,7 +27,8 @@ where the pay write-ahead lives. A merchant challenge (3DS) during `paying` is a
 `set_payment_challenge`, without leaving the state. `attempts` counts every claim outside the two
 buyer states, `paying` included: a worker must never end `paying` on an attempts cap (money may be
 moving); only the rail's answer ends it. A purchase that ends (expired, failed, refused) while it
-holds a `payment_token_id` keeps the id on purpose: the worker must void that token on the rail. A re-quote (`awaiting_authorization -> quoting`) replaces the
+holds a `payment_token_id` keeps the id on purpose: the worker must void that token on the rail
+(`list_orphan_tokens` / `forget_orphan_token`; until the rail has a void, the worker counts them). A re-quote (`awaiting_authorization -> quoting`) replaces the
 quote, order and token fields rather than keeping the stale ones, and is REFUSED while a payment
 token is recorded: the buyer may have approved it, and an abandoned authorization must be voided,
 which needs its id. The worker voids it on the rail, then `forget_voided_token`, then re-quotes.
@@ -1028,3 +1029,80 @@ async def forget_voided_token(purchase_id: str, worker_id: str, payment_token_id
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_FORGET_TOKEN_SQL, values))
     return _purchase(await database.fetch_one(_FORGET_TOKEN_SQL_SQLITE, values))
+
+
+# ── tokens left on ended purchases ───────────────────────────────────────────────────────────
+#
+# A purchase that ended without paying (failed, refused, expired) and still names a token: that token is
+# live on the rail until it is voided or lapses. A completed purchase's token paid: not an orphan.
+#: Only purchases that ended within ORPHAN_MAX_AGE_SECONDS: a token outlives its purchase by at most the
+#: rail's own token lifetime (an unbounded authorisation is 30 days), so an older one has lapsed and is
+#: neither voided nor counted (the hourly warning does not fire for ever).
+_LIST_ORPHAN_TOKENS_SQL = """
+    SELECT id, state, member_id, payment_token_id, terminal_at FROM a2a_rail_purchases
+     WHERE state IN ('failed', 'refused', 'expired')
+       AND payment_token_id IS NOT NULL
+       AND terminal_at > clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+     ORDER BY terminal_at, id
+     LIMIT :limit
+"""
+_LIST_ORPHAN_TOKENS_SQL_SQLITE = """
+    SELECT id, state, member_id, payment_token_id, terminal_at FROM a2a_rail_purchases
+     WHERE state IN ('failed', 'refused', 'expired')
+       AND payment_token_id IS NOT NULL
+       AND terminal_at > datetime('now', '-' || :max_age_seconds || ' seconds')
+     ORDER BY terminal_at, id
+     LIMIT :limit
+"""
+_COUNT_ORPHAN_TOKENS_SQL = """
+    SELECT COUNT(*) AS n FROM a2a_rail_purchases
+     WHERE state IN ('failed', 'refused', 'expired')
+       AND payment_token_id IS NOT NULL
+       AND terminal_at > clock_timestamp() - (:max_age_seconds * INTERVAL '1 second')
+"""
+_COUNT_ORPHAN_TOKENS_SQL_SQLITE = """
+    SELECT COUNT(*) AS n FROM a2a_rail_purchases
+     WHERE state IN ('failed', 'refused', 'expired')
+       AND payment_token_id IS NOT NULL
+       AND terminal_at > datetime('now', '-' || :max_age_seconds || ' seconds')
+"""
+ORPHAN_MAX_AGE_SECONDS = 31 * 86400
+#: Fenced on the token it names and on the row having ended: a voided token is forgotten only where it
+#: was an orphan. `last_error_code` is left alone (it is what the agent was told about the purchase).
+_FORGET_ORPHAN_TOKEN_SQL = """
+    UPDATE a2a_rail_purchases
+       SET payment_token_id = NULL, updated_at = clock_timestamp()
+     WHERE id = :id AND payment_token_id = :payment_token_id
+       AND state IN ('failed', 'refused', 'expired')
+    RETURNING id
+"""
+_FORGET_ORPHAN_TOKEN_SQL_SQLITE = _FORGET_ORPHAN_TOKEN_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+ORPHAN_TOKEN_STATES = _states_in(_LIST_ORPHAN_TOKENS_SQL, "WHERE state IN (")
+
+
+async def list_orphan_tokens(*, limit: int = 10) -> List[Dict[str, Any]]:
+    """Ended purchases that still name a token, oldest end first. Worker-only (carries the member id)."""
+    values = {"limit": _limit(limit, 500), "max_age_seconds": ORPHAN_MAX_AGE_SECONDS}
+    if IS_POSTGRES:
+        rows = await database.fetch_all(_LIST_ORPHAN_TOKENS_SQL, values)
+    else:
+        rows = await database.fetch_all(_LIST_ORPHAN_TOKENS_SQL_SQLITE, values)
+    return [_purchase(row) for row in rows]
+
+
+async def count_orphan_tokens() -> int:
+    values = {"max_age_seconds": ORPHAN_MAX_AGE_SECONDS}
+    if IS_POSTGRES:
+        row = await database.fetch_one(_COUNT_ORPHAN_TOKENS_SQL, values)
+    else:
+        row = await database.fetch_one(_COUNT_ORPHAN_TOKENS_SQL_SQLITE, values)
+    return int(row["n"]) if row else 0
+
+
+async def forget_orphan_token(purchase_id: str, payment_token_id: str) -> Optional[Dict[str, Any]]:
+    """Drop the token id of an ENDED purchase after its token was voided on the rail. None when the row
+    has not ended, names another token, or does not exist."""
+    values = {"id": purchase_id, "payment_token_id": _require(_RAIL_REF_RE, payment_token_id, "payment_token_id")}
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_FORGET_ORPHAN_TOKEN_SQL, values))
+    return _purchase(await database.fetch_one(_FORGET_ORPHAN_TOKEN_SQL_SQLITE, values))

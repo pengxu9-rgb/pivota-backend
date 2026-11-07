@@ -23,13 +23,22 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            because every purchase needs the buyer's own approval.
   awaiting_authorization -> tell the rail the buyer may be done (`paid`) on a spaced schedule
                            (APPROVAL_SCHEDULE), then poll the await card if the rail answers with one.
-                           ACTIVE for this token: PARKED (`token_active`) until the pay step exists.
-                           FAILED: `failed`.
+                           ACTIVE for this token: the buyer approved, but there is no pay step yet, so
+                           the purchase cannot finish: FAILED now (`pay_step_unavailable`), not left to
+                           lapse on the page deadline as if the buyer had not approved. FAILED: `failed`.
   quoting, not locked; paying -> PARKED (`shop_protocol_pending`). The quote, the order lock and the pay
                            depend on the rail's order protocol, which is not settled; nothing here
                            guesses at a step that can move money. The lifetime ceiling in the ledger's
-                           sweep ends a parked purchase, and the approval page's deadline ends a purchase
-                           whose token is ACTIVE but never paid (the token id stays on the row).
+                           sweep ends a parked purchase.
+
+── TOKENS LEFT ON ENDED PURCHASES ────────────────────────────────────────────────────────────
+
+  A purchase that ends (failed, refused, expired) holding a `payment_token_id` keeps the id: that token
+  is live on the rail until it is voided or lapses. Every tick COUNTS them (`orphan_tokens`, logged at
+  WARNING at most once an hour while any exist) and, when the job is given a `voider`, voids them and
+  forgets the id (`forget_orphan_token`). The rail offers no per-token void today, so the job passes
+  none: they are counted, never silently dropped. A completed purchase's token was used to pay: not an
+  orphan.
 
 ── THE WRITE DISCIPLINE (the rail cannot deduplicate: a new idempotency key per call) ──────────
 
@@ -62,7 +71,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
 from services.payment_orchestration import a2a_rail
@@ -128,6 +137,9 @@ A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
 #: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
 #: at create, and the token step refuses them again).
 TOKEN_CURRENCIES = a2a_rail.TOKEN_CURRENCIES
+
+#: The code an approved purchase ends with while no pay step exists (the order protocol's).
+PAY_STEP_UNAVAILABLE = "pay_step_unavailable"
 
 PARKED_STATES = frozenset({"paying"})
 #: Claims of an `opened` purchase before it fails. Waiting on the buyer is not counted (the ledger),
@@ -592,10 +604,7 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
             return await _token_failed(s, "awaiting_authorization", "token_mismatch", resolves=action)
         status = str(((card or page).data.get("status") if (card or page) is not None else "") or "").upper()
         if card is not None and status == "ACTIVE":
-            if action is not None:
-                await ledger.clear_pending_write(s.id, s.worker, action)
-            await s.release(POLL_PARKED, f"paid_sent:{count}:{variant}:token_active")
-            return "token_active"
+            return await _pay_step_unavailable(s, resolves=action)
         if status == "FAILED":
             return await _token_failed(s, "awaiting_authorization", "token_failed", resolves=action)
         if card is not None or page is not None:
@@ -633,6 +642,17 @@ async def _approval_answer(s: _Step, action: Optional[str], result: Any, count: 
         await s.release(POLL_RETRY, f"paid_sent:{count - 1}:{variant}:{_code('rail_refused', result)}"[:64].rstrip(":"))
         return "rail_refused"
     return await _unresolved_write(s, action, result, code=f"paid_sent:{count}:{variant}")
+
+
+async def _pay_step_unavailable(s: _Step, *, resolves: Optional[str] = None) -> str:
+    """The buyer approved and the token is ACTIVE, but no pay step exists (the order protocol's), so
+    this purchase cannot finish. It ends now, with a code that says so; the token id stays on the row
+    as an orphan for the void (`void_orphan_tokens`)."""
+    logger.warning("a2a_rail_worker: token approved with no pay step purchase=%s; failed", s.id)
+    moved = await ledger.transition_as_holder(
+        s.id, s.worker, from_states=["awaiting_authorization"], to_state="failed", resolves_write=resolves,
+        last_error_code=PAY_STEP_UNAVAILABLE)
+    return await _settled(s, moved, "failed")
 
 
 async def _unresolved_write(s: _Step, action: str, result: Any, *, code: Optional[str] = None) -> str:
@@ -759,14 +779,13 @@ async def _quoting(s: _Step) -> str:
 
 
 async def _awaiting_authorization(s: _Step) -> str:
+    if _token_active(s.row):
+        # Parked by an earlier build with the token ACTIVE (`...:token_active`): the buyer approved and
+        # nothing can pay. Ended the way an ACTIVE answer is now; nothing is sent.
+        return await _pay_step_unavailable(s)
     if not token_step_enabled():
         # The token dial is a KILL SWITCH: off means nothing more is sent for a token, including for purchases
         # already waiting on the buyer's approval (no `paid`, no await poll). The page's deadline ends them.
-        await s.release(POLL_PARKED)
-        return "parked"
-    if _token_active(s.row):
-        # The buyer approved and the token is ACTIVE; the pay step is the order protocol's. Parked with
-        # the marker kept (no new code), so no later claim sends `paid` again.
         await s.release(POLL_PARKED)
         return "parked"
     return await _authorizing(s)
@@ -810,6 +829,49 @@ async def step(client: Any, row: Mapping[str, Any], worker: str) -> str:
     return await handler(s)
 
 
+#: Voids one orphaned token on the rail. Given the ended row (it has `payment_token_id` and `member_id`);
+#: True ONLY when the rail definitely reports THAT token void (or already void). False or a raise leaves
+#: the row as it is, to be tried again next tick, so a voider must be safe to call twice (two ticks may
+#: race for one orphan: there is no claim on an ended row). NEVER a card-wide revoke (the rail's
+#: remove-method revokes every token on the buyer's card and disables the card): a voider names one token.
+#: Calls are made only while the token step's dial (the kill switch) is on.
+Voider = Callable[[Mapping[str, Any]], Awaitable[bool]]
+#: Orphans voided per tick, at most.
+VOID_BATCH = 10
+#: The orphan count is logged at WARNING at most this often (per process) while any exist.
+ORPHAN_LOG_INTERVAL_SECONDS = 3600.0
+_orphans_logged_at: Optional[float] = None
+
+
+async def void_orphan_tokens(
+    voider: Optional[Voider], *, clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, int]:
+    """Tokens left on ended purchases: void them when a voider is given, count them always."""
+    global _orphans_logged_at
+    counts: Dict[str, int] = {}
+    if voider is not None and token_step_enabled():
+        for row in await ledger.list_orphan_tokens(limit=VOID_BATCH):
+            try:
+                voided = await voider(row) is True
+            except Exception as exc:  # noqa: BLE001 - one failed void must not stop the rest
+                logger.warning("a2a_rail_worker: token void failed purchase=%s error_type=%s",
+                               row.get("id"), type(exc).__name__)
+                voided = False
+            if voided and await ledger.forget_orphan_token(str(row["id"]), str(row["payment_token_id"])) is not None:
+                counts["token_voided"] = counts.get("token_voided", 0) + 1
+            else:
+                counts["token_void_failed"] = counts.get("token_void_failed", 0) + 1
+    left = await ledger.count_orphan_tokens()
+    if left:
+        counts["orphan_tokens"] = left
+        now = clock()
+        if _orphans_logged_at is None or now - _orphans_logged_at >= ORPHAN_LOG_INTERVAL_SECONDS:
+            _orphans_logged_at = now
+            logger.warning("a2a_rail_worker: %d ended purchase(s) hold a live token%s", left,
+                           "" if voider is not None else " (no void step on the rail)")
+    return counts
+
+
 async def run_tick(
     client: Any,
     worker: str,
@@ -817,8 +879,10 @@ async def run_tick(
     limit: int = 10,
     budget_seconds: float = 60.0,
     clock: Callable[[], float] = time.monotonic,
+    voider: Optional[Voider] = None,
 ) -> Dict[str, int]:
-    """One scheduler tick: the sweeps, then up to `limit` claimed steps within the budget."""
+    """One scheduler tick: the sweeps (and the orphan-token pass), then up to `limit` claimed steps
+    within the budget."""
     counts: Dict[str, int] = {}
 
     def bump(name: str, n: int = 1) -> None:
@@ -837,6 +901,11 @@ async def run_tick(
                 bump(name, moved)
         except Exception as exc:  # noqa: BLE001 - a sweep failing must not stop the steps
             logger.warning("a2a_rail_worker: %s sweep failed error_type=%s", name, type(exc).__name__)
+    try:
+        for name, n in (await void_orphan_tokens(voider)).items():
+            bump(name, n)
+    except Exception as exc:  # noqa: BLE001 - the orphan pass failing must not stop the steps
+        logger.warning("a2a_rail_worker: orphan token pass failed error_type=%s", type(exc).__name__)
     deadline = clock() + max(0.0, budget_seconds)
     rows = await ledger.claim_due_purchases(worker, limit=limit)
     pending = list(rows)
