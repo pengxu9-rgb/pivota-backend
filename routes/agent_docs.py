@@ -66,29 +66,11 @@ async def docs_overview() -> Dict[str, Any]:
 async def quickstart_markdown() -> str:
     return (
         "# Pivota Agent Developer Quickstart\n\n"
-        "## Install\n\n"
-        "Python:\n\n"
+        "Plain REST with your API key in the `X-API-Key` header; no SDK is needed.\n\n"
+        "## First call\n\n"
         "```bash\n"
-        "pip install pivota-agent\n"
-        "```\n\n"
-        "TypeScript:\n\n"
-        "```bash\n"
-        "npm install pivota-agent\n"
-        "```\n\n"
-        "These SDK packages are convenience wrappers over the same production REST API and API key flow.\n\n"
-        "## Usage (Python)\n\n"
-        "```python\n"
-        "from pivota_agent import PivotaAgentClient\n"
-        "client = PivotaAgentClient(api_key=\"YOUR_API_KEY\")\n"
-        "print(client.health_check())\n"
-        "merchants = client.list_merchants(limit=5)\n"
-        "products = client.search_products(query=\"coffee\", limit=1)\n"
-        "```\n\n"
-        "## Usage (TypeScript)\n\n"
-        "```ts\n"
-        "import { PivotaAgentClient } from 'pivota-agent'\n"
-        "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
-        "const health = await client.healthCheck()\n"
+        "curl https://api.pivota.cc/agent/v1/merchants -H \"X-API-Key: YOUR_API_KEY\"\n"
+        "curl \"https://api.pivota.cc/agent/v1/products/search?query=coffee&limit=5\" -H \"X-API-Key: YOUR_API_KEY\"\n"
         "```\n\n"
         "## Ordering\n\n"
         "Every order needs a live quote: `POST /agent/v1/quotes/preview`, then `POST /agent/v1/orders/create` "
@@ -146,7 +128,8 @@ async def agent_openapi_spec(request: Request) -> Dict[str, Any]:
     return schema
 
 
-# Plain REST, so the examples hold whatever SDK a partner uses. Every order is quote-first: /orders/create
+# Plain REST, so the examples hold whatever SDK a partner uses. They are samples: they take the first
+# merchant / product / cart line without guarding for an empty list. Every order is quote-first: /orders/create
 # without a quote_id returns 400 QUOTE_REQUIRED_BEFORE_PURCHASE (routes/agent_api.py), so the examples
 # request a live quote and pass its id. GET /merchants (default scope) lists portal-integrated merchants;
 # search results from other merchants carry merchant_id "external_seed" and cannot be ordered here.

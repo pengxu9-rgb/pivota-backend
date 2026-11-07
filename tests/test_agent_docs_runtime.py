@@ -68,3 +68,5 @@ def test_served_examples_are_quote_first_and_call_only_documented_routes():
     quickstart = client.get("/agent/docs/quickstart.md").text
     assert "QUOTE_REQUIRED_BEFORE_PURCHASE" in quickstart
     assert "scope=protocol" in quickstart
+    # The examples are plain REST; the quickstart must not send partners to the SDK packages instead.
+    assert "pip install" not in quickstart and "PivotaAgentClient" not in quickstart
