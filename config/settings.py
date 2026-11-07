@@ -580,6 +580,15 @@ class Settings(BaseSettings):
     outbound_warm_handoff_rollout_pct: int = int(
         os.getenv("OUTBOUND_WARM_HANDOFF_ROLLOUT_PCT", "0") or "0"
     )
+    # FACT-DRIVEN ELIGIBILITY (default OFF). When on, a host OUTSIDE the brand allowlist is also
+    # warm-eligible if its token was minted with `warm_fact: human_handoff`: offers.resolve asked
+    # db.merchant_purchasability.human_handoff_allowed for that cold link's host and the buyer's
+    # market and got a fresh yes. The stamp is written only while this flag is on and rides inside
+    # the HMAC, so turning it on cannot falsify a `cart_prefilled: false` already sent, and turning
+    # it off only narrows. See services/outbound_warm_handoff.WARM_FACT_KEY.
+    outbound_warm_handoff_fact_eligible: bool = (
+        os.getenv("OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE", "false").strip().lower() == "true"
+    )
     # Hard ceiling on the gateway resolve call — a shopper is waiting on the 302.
     outbound_warm_handoff_timeout_seconds: float = float(
         os.getenv("OUTBOUND_WARM_HANDOFF_TIMEOUT_SECONDS", "2.5") or "2.5"
@@ -635,6 +644,13 @@ class Settings(BaseSettings):
     @property
     def deal_code_capture_shadow(self) -> bool:
         return _deal_flag("DEAL_CODE_CAPTURE_SHADOW")
+
+    # Record what the shadow capture finds in observed_store_offers (services/deal_code_capture_writer.py), as
+    # unverified merchant_published rows. Only acts while DEAL_CODE_CAPTURE_SHADOW is on too (capture runs only
+    # then). Writing is storage, not testing: nothing is verified or served from it.
+    @property
+    def deal_code_capture_write(self) -> bool:
+        return _deal_flag("DEAL_CODE_CAPTURE_WRITE")
 
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
