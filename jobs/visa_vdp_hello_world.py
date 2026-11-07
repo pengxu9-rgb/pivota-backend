@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from typing import Any, Dict, List
 
@@ -45,6 +46,11 @@ async def run() -> Dict[str, Any]:
 
 
 def main() -> int:
+    # httpx logs every request URL at INFO, and X-Pay's API key is in the query. The client already
+    # redacts it in those records; this job also keeps both loggers quiet, so an operator who turns
+    # INFO on for this process sees the job's own line and nothing else.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     summary = asyncio.run(run())
     print(json.dumps(summary, sort_keys=True))
     if summary.get("error") == "not_configured":
