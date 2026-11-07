@@ -89,7 +89,15 @@ async def quickstart_markdown() -> str:
         "import { PivotaAgentClient } from 'pivota-agent'\n"
         "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
         "const health = await client.healthCheck()\n"
-        "```\n"
+        "```\n\n"
+        "## Ordering\n\n"
+        "Every order needs a live quote: `POST /agent/v1/quotes/preview`, then `POST /agent/v1/orders/create` "
+        "with its `quote_id` (without it: `400 QUOTE_REQUIRED_BEFORE_PURCHASE`). "
+        "Full flow: `/agent/docs/examples/python` and `/agent/docs/examples/typescript`.\n\n"
+        "`GET /agent/v1/merchants` lists the portal-integrated merchants your key can order from over REST. "
+        "Other merchants are listed with `?scope=protocol` and bought through the UCP door "
+        "(`https://commerce.mcp.pivota.cc/ucp/mcp`); REST search results from them carry "
+        "`merchant_id: \"external_seed\"`, which the order call refuses.\n"
     )
 
 
@@ -138,38 +146,70 @@ async def agent_openapi_spec(request: Request) -> Dict[str, Any]:
     return schema
 
 
+# Plain REST, so the examples hold whatever SDK a partner uses. Every order is quote-first: /orders/create
+# without a quote_id returns 400 QUOTE_REQUIRED_BEFORE_PURCHASE (routes/agent_api.py), so the examples
+# request a live quote and pass its id. GET /merchants (default scope) lists portal-integrated merchants;
+# search results from other merchants carry merchant_id "external_seed" and cannot be ordered here.
 @router.get("/examples/python", response_class=PlainTextResponse)
 async def example_python() -> str:
     return (
-        "from pivota_agent import PivotaAgentClient\n\n"
-        "client = PivotaAgentClient(api_key='YOUR_API_KEY')\n"
-        "print(client.health_check())\n"
-        "merchants = client.list_merchants(limit=5)\n"
-        "search = client.search_products(query='coffee', limit=1)\n"
+        "import requests\n\n"
+        "API = 'https://api.pivota.cc/agent/v1'\n"
+        "H = {'X-API-Key': 'YOUR_API_KEY'}\n\n"
+        "# Merchants you can order from over REST (portal-integrated). Others: ?scope=protocol.\n"
+        "merchants = requests.get(f'{API}/merchants', headers=H, timeout=30).json()['merchants']\n"
+        "merchant_id = merchants[0]['merchant_id']\n\n"
+        "search = requests.get(f'{API}/products/search', headers=H, timeout=30,\n"
+        "                      params={'query': 'coffee', 'merchant_id': merchant_id, 'limit': 1}).json()\n"
         "prod = search['products'][0]\n"
-        "order = client.create_order(\n"
-        "    merchant_id=prod['merchant_id'],\n"
-        "    items=[{ 'product_id': prod['id'], 'quantity': 2, 'product_title': prod['name'], 'unit_price': float(prod['price']), 'subtotal': float(prod['price']) * 2 }],\n"
-        "    customer_email='buyer@example.com',\n"
-        "    shipping_address={ 'name': 'John Doe', 'address_line1': '123 Main St', 'city': 'SF', 'state': 'CA', 'postal_code': '94105', 'country': 'US' }\n"
-        ")\n"
+        "cart = requests.post(f'{API}/cart/validate', headers=H, timeout=30,\n"
+        "                     params={'merchant_id': merchant_id, 'shipping_country': 'US'},\n"
+        "                     json=[{'product_id': prod['id'], 'quantity': 1}]).json()\n"
+        "item = {'product_id': prod['id'], 'variant_id': cart['items'][0]['variant_id'], 'quantity': 1}\n\n"
+        "# A live quote is required before ordering.\n"
+        "quote = requests.post(f'{API}/quotes/preview', headers=H, timeout=30,\n"
+        "                      json={'merchant_id': merchant_id, 'items': [item]}).json()\n\n"
+        "order = requests.post(f'{API}/orders/create', headers=H, timeout=30, json={\n"
+        "    'quote_id': quote['quote_id'],\n"
+        "    'merchant_id': merchant_id,\n"
+        "    'items': [item],\n"
+        "    'customer_email': 'buyer@example.com',\n"
+        "    'shipping_address': {'name': 'John Doe', 'address_line1': '123 Main St', 'city': 'SF',\n"
+        "                         'state': 'CA', 'postal_code': '94105', 'country': 'US'},\n"
+        "}).json()\n"
+        "print(order)\n"
     )
 
 
 @router.get("/examples/typescript", response_class=PlainTextResponse)
 async def example_typescript() -> str:
     return (
-        "import { PivotaAgentClient } from 'pivota-agent'\n\n"
-        "const client = new PivotaAgentClient({ apiKey: process.env.PIVOTA_AGENT_API_KEY })\n"
-        "const merchants = await client.listMerchants({ limit: 5 })\n"
-        "const search = await client.searchProducts({ query: 'coffee', limit: 1 } as any)\n"
-        "const product = (search as any).products?.[0]\n"
-        "const order = await client.createOrder({\n"
-        "  merchant_id: (product as any).merchant_id,\n"
-        "  customer_email: 'buyer@example.com',\n"
-        "  items: [{ product_id: product.id, product_title: product.name, quantity: 2, unit_price: Number(product.price)||0, subtotal: (Number(product.price)||0)*2 }],\n"
-        "  shipping_address: { name: 'John Doe', address_line1: '123 Main St', city: 'SF', state: 'CA', postal_code: '94105', country: 'US' }\n"
-        "} as any)\n"
+        "const API = 'https://api.pivota.cc/agent/v1'\n"
+        "const H = { 'X-API-Key': process.env.PIVOTA_AGENT_API_KEY!, 'Content-Type': 'application/json' }\n\n"
+        "// Merchants you can order from over REST (portal-integrated). Others: ?scope=protocol.\n"
+        "const { merchants } = await (await fetch(`${API}/merchants`, { headers: H })).json()\n"
+        "const merchantId = merchants[0].merchant_id\n\n"
+        "const q = new URLSearchParams({ query: 'coffee', merchant_id: merchantId, limit: '1' })\n"
+        "const search = await (await fetch(`${API}/products/search?${q}`, { headers: H })).json()\n"
+        "const prod = search.products[0]\n"
+        "const cart = await (await fetch(`${API}/cart/validate?merchant_id=${merchantId}&shipping_country=US`, {\n"
+        "  method: 'POST', headers: H, body: JSON.stringify([{ product_id: prod.id, quantity: 1 }]),\n"
+        "})).json()\n"
+        "const item = { product_id: prod.id, variant_id: cart.items[0].variant_id, quantity: 1 }\n\n"
+        "// A live quote is required before ordering.\n"
+        "const quote = await (await fetch(`${API}/quotes/preview`, {\n"
+        "  method: 'POST', headers: H, body: JSON.stringify({ merchant_id: merchantId, items: [item] }),\n"
+        "})).json()\n\n"
+        "const order = await (await fetch(`${API}/orders/create`, {\n"
+        "  method: 'POST', headers: H, body: JSON.stringify({\n"
+        "    quote_id: quote.quote_id,\n"
+        "    merchant_id: merchantId,\n"
+        "    items: [item],\n"
+        "    customer_email: 'buyer@example.com',\n"
+        "    shipping_address: { name: 'John Doe', address_line1: '123 Main St', city: 'SF', state: 'CA', postal_code: '94105', country: 'US' },\n"
+        "  }),\n"
+        "})).json()\n"
+        "console.log(order)\n"
     )
 
 
