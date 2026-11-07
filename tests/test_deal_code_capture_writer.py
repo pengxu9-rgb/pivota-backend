@@ -387,7 +387,9 @@ async def test_a_later_sighting_never_changes_the_restriction_flags(db):
 
 # ── digit tokens that are not codes (review of be#2732, P3-K) ──────────────────────────────────────────────────────
 @pytest.mark.parametrize("token", ["48HRS", "24HR", "48H", "1ST", "2ND", "3RD", "4TH", "3PM", "10AM", "2-DAY", "2DAY",
-                                   "3DAYS", "3X", "1PER", "XXXX-1234", "SPF50", "B2B", "D2C"])
+                                   "3DAYS", "3X", "1PER", "XXXX-1234", "SPF50", "B2B", "D2C",
+                                   "48HOURS", "2-IN-1", "3PCS", "50ML", "8OZ", "2PK", "KN95", "N95", "30MIN", "2WEEKS",
+                                   "12MONTHS", "1080P", "10AM-2PM", "6FT"])
 async def test_a_digit_token_that_names_something_else_is_not_written(db, token):
     await w.record([captured(code=token, snippet=f"Get 15% off with code {token}")], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -396,7 +398,9 @@ async def test_a_digit_token_that_names_something_else_is_not_written(db, token)
 
 
 @pytest.mark.parametrize("snippet", ["Get 15% off with code ABC123 (example)", "Get 15% off with code ABC123, e.g. at checkout",
-                                     "Get 15% off with code ABC123 — for example only"])
+                                     "Get 15% off with code ABC123 — for example only",
+                                     "Example: use code ABC123 at checkout for 15% off",
+                                     "Enter a code such as ABC123 for 15% off"])
 async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
     await w.record([captured(code="ABC123", snippet=snippet)], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -469,14 +473,23 @@ async def test_negative_controls_the_merchant_and_the_host_must_both_match(db):
     assert [r["seller_id"] for r in await rows(db)] == ["glow.example"]
 
 
-async def test_the_placeholder_and_a_too_broad_merchant_id_never_block_a_host(db):
+async def test_the_placeholder_merchant_id_never_blocks_a_host(db):
     await _catalog(db, 1, "external_seed", "glow.example")
-    for i, host in enumerate(["a.example", "b.example", "c.example", "glow.example"]):
-        await _catalog(db, 10 + i, "merch_wide", host)
     await _optout(db, "external_seed")
-    await _optout(db, "merch_wide")
     await w.record([captured()], url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
     assert [r["seller_id"] for r in await rows(db)] == ["glow.example"]
+
+
+async def test_a_merchant_id_over_the_host_limit_fails_closed_for_writes(db):
+    # Review of be#2735, P2-N1: not one seller's hosts, so retention deletes nothing through it, but the writer
+    # blocks every host it names (costs recall only).
+    for i, host in enumerate(["a.example", "b.example", "c.example", "glow.example"]):
+        await _catalog(db, 10 + i, "merch_wide", host)
+    await _optout(db, "merch_wide")
+    for host in ("a.example", "glow.example", "shop.glow.example", "other.example"):
+        await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert [r["seller_id"] for r in await rows(db)] == ["other.example"]
+    assert dcc.stats()["writes"] == {"skipped_optout": 3, "inserted": 1}
 
 
 # ── a later sighting adds a restriction, never clears one; the bar text is never emptied (be#2732, P3-F) ───────────
@@ -529,3 +542,69 @@ async def test_a_re_sighting_does_not_restore_bar_text_after_14_days(db):
     await w.record([captured()], url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
     (r,) = await rows(db)
     assert r["terms_text"] is None
+
+
+
+# ── a canonical-URL host blocks writes; a marketplace host never does; each id reads its own URLs (P3-N2) ──────────
+async def test_canonical_url_hosts_block_writes_per_id_and_skip_marketplaces(db, monkeypatch):
+    monkeypatch.setattr(w, "CANONICAL_URLS_PER_ID", 2)
+    for i in range(5):  # the first id has more URLs than the per-id read
+        await _catalog(db, i, "merch_big", url=f"https://big.example/p/{i}")
+    await _catalog(db, 20, "merch_small", url="https://small.example/p/1")
+    await _catalog(db, 21, "merch_market", url="https://www.amazon.com/dp/1")
+    for mid in ("merch_big", "merch_small", "merch_market"):
+        await _optout(db, mid)
+    for host in ("big.example", "small.example", "amazon.com", "deals.amazon.com"):
+        await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert sorted(r["seller_id"] for r in await rows(db)) == ["amazon.com", "deals.amazon.com"]
+
+
+async def test_a_public_suffix_or_platform_opt_out_never_blocks_the_stores_under_it(db):
+    for optout in ("co.uk", "wixsite.com", "shop.app"):
+        await _optout(db, optout)
+    for host in ("brand9.co.uk", "s4.wixsite.com", "store.shop.app"):
+        await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert sorted(r["seller_id"] for r in await rows(db)) == ["brand9.co.uk", "s4.wixsite.com", "store.shop.app"]
+
+
+# ── the denylist is read once per run (P3-N6) ────────────────────────────────────────────────────────────────────────
+async def test_the_denylist_is_read_once_per_run(db, monkeypatch):
+    await _optout(db, "blocked.example")
+    reads = []
+    real = w.read_denyset
+
+    async def counting():
+        reads.append(1)
+        return await real()
+
+    monkeypatch.setattr(w, "read_denyset", counting)
+    for host in ("a.example", "b.example", "blocked.example"):
+        await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert len(reads) == 1
+    assert dcc.stats()["writes"] == {"inserted": 2, "skipped_optout": 1}
+    dcc.reset_stats()  # a new run reads again
+    await w.record([captured(code="NEW22")], url="https://c.example/p", final_url="https://c.example/p", market="US", page_currency="USD")
+    assert len(reads) == 2
+
+
+async def test_a_sighting_stating_another_currency_does_not_replace_the_bar_text(db):
+    # The first sighting states a $50 minimum (the row's currency is USD); the second states none (no currency).
+    await w.record([captured(spend="50", spend_symbol="$", snippet="15% off $50+ with code SAVE15")],
+                   url="https://glow.example/p", final_url="https://glow.example/p", market="US", page_currency="USD")
+    await w.record([captured(snippet="15% off everything with code SAVE15")],
+                   url="https://glow.example/q", final_url="https://glow.example/q", market="US", page_currency="USD")
+    (r,) = await rows(db)
+    assert r["currency"] == "USD"
+    assert r["terms_text"] == "15% off $50+ with code SAVE15"
+    assert dcc.stats()["writes"] == {"inserted": 1, "updated": 1, "terms_differ": 1}
+
+
+
+async def test_the_canonical_url_read_sees_past_the_first_url_of_an_id(db):
+    # Ordered by URL, this id's first is a marketplace listing; its own host comes after it.
+    await _catalog(db, 1, "merch_mix", url="https://amazon.com/dp/1")
+    await _catalog(db, 2, "merch_mix", url="https://mix.example/p/1")
+    await _optout(db, "merch_mix")
+    await w.record([captured()], url="https://mix.example/p", final_url="https://mix.example/p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_optout": 1}

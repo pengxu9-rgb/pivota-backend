@@ -4,13 +4,16 @@ Applies ONLY to rows the crawl writer created (services/deal_code_capture_writer
 AND a deal_id that starts with the writer's own prefix (CRAWL_DEAL_ID_PREFIX, "dlc_"), and to their verification rows.
 Feed, automatic and channel rows, and any merchant_published row entered another way (by hand, from a connected
 store), are never touched. The rules:
-  1. a seller on the opt-out denylist: every one of its rows is deleted at once. The denied hosts are read once per
-     run by the writer's `denied_hosts` (an id as a host or its www. form, trimmed and case-insensitive; or the catalog
-     hosts of an id as a merchant id, never a placeholder id and never one spanning many hosts) (Q20);
+  1. a seller on the opt-out denylist: every one of its rows is deleted at once, through CONFIRMED hosts only (the
+     writer's `read_denyset`, read once per run: an id as a host, its www. form and subdomains under a registrable
+     host; or the catalog source_domain hosts of a merchant id spanning at most MAX_HOSTS_PER_OPTOUT_ID registrable
+     domains) (Q20). Uncertain hosts (an over-broad id, canonical-URL hosts) block the writer but delete nothing;
+     the denylist's notes (`optout_ids_*`) reach the summary;
   2. found and never applied or refused, not seen again: deleted 14 days after it was last seen (`observed_at`);
   3. refused by the store and never applied for any variant: deleted 7 days after its last refusal;
   4. applied: kept while a verification is valid; deleted 30 days after the last valid-until across its verification
-     history, whatever state a lapsed verification is in now (`expired`, or back to `unverified`);
+     history, whatever state a lapsed verification is in now (`expired`, or back to `unverified`), each valid-until
+     clamped to verified_at + DEAL_VERIFY_TTL_HOURS;
   5. the bar text (`terms_text`): cleared once a check recorded an outcome, or 14 days after the row was created.
 Every DELETE re-checks its rule's condition, so a verification that lands between the read and the delete keeps the row.
 
@@ -33,9 +36,10 @@ from typing import Dict, List, Optional
 
 from sqlalchemy import and_, exists, func, not_, or_, select
 
+from config.settings import settings
 from db.database import database
 from db.deal_lane import observed_store_offer_verifications as v, observed_store_offers as o
-from services.deal_code_capture_writer import CRAWL_DEAL_ID_PREFIX, SHARED_PLATFORM_HOSTS, crawl_rows, denied_hosts
+from services.deal_code_capture_writer import CRAWL_DEAL_ID_PREFIX, crawl_rows, read_denyset, subdomain_anchor
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +65,11 @@ def _like_escape(text: str) -> str:
 
 def applied_history():
     """A verification row recording that the code applied at checkout, whatever its state is now (review of be#2735,
-    P2-2): a lapsed verification may go to `expired` or back to `unverified` (ADR-027), and it still counts."""
-    return or_(v.c.verified_at.isnot(None), v.c.state.in_(("checkout_verified", "expired")))
+    P2-2, P3-N4): `checkout_verified` or `expired`, or any row that kept its verified_at AND a discount amount (a
+    re-queued `unverified`, a later `failed`). A check stamped on a failure that never applied has no amount and does
+    not count. The verifier's contract: a re-queue keeps verified_at, expires_at and the reference amounts."""
+    return or_(v.c.state.in_(("checkout_verified", "expired")),
+               and_(v.c.verified_at.isnot(None), v.c.ref_discount_amount > 0))
 
 
 def checked_verification():
@@ -109,23 +116,27 @@ async def _delete_where(condition, cap: Optional[int] = None) -> int:
     return deleted
 
 
-async def _delete_opted_out() -> int:
-    """Every crawl row whose seller host the opt-out denylist covers. The denied host set is read ONCE per run,
-    uncorrelated (P2-1); then rows are deleted by membership. No opt-out rows: no further query."""
-    hosts, notes = await denied_hosts()
-    if notes:
-        logger.warning("deal code retention: opt-out ids not applied to the catalog: %s", notes)
-    if not hosts:
+async def _delete_opted_out(notes: Optional[Dict[str, int]] = None) -> int:
+    """Every crawl row whose seller the opt-out denylist covers through a CONFIRMED host (the writer's `read_denyset`):
+    read ONCE per run, uncorrelated (P2-1), then deleted by membership. Hosts that only block writes (an over-broad
+    merchant id, a canonical-URL host) delete nothing. The denylist's notes go to `notes`, and so to the summary."""
+    deny = await read_denyset()
+    if notes is not None:
+        notes.update(deny.counts)
+    if deny.counts:
+        logger.warning("deal code retention: opt-out notes: %s", deny.counts)
+    if not deny.delete:
         return 0
-    ordered = sorted(hosts)
+    ordered = sorted(deny.delete)
     seller = func.lower(func.trim(o.c.seller_id))
     deleted = 0
     for k in range(0, len(ordered), BATCH):
         if deleted >= MAX_ROWS_PER_RULE:
             break
         chunk = ordered[k:k + BATCH]
-        # The host itself (bare or www.), or a subdomain of it — never through a shared platform host (writer `covers`).
-        parents = [h for h in chunk if "." in h and not h.startswith("www.") and h not in SHARED_PLATFORM_HOSTS]
+        # The host itself (bare or www.), or a subdomain of it — only under a host that anchors subdomains (the
+        # writer's `covers`): never through a public suffix or a shared platform host.
+        parents = [h for h in chunk if not h.startswith("www.") and subdomain_anchor(h)]
         condition = or_(seller.in_(chunk), *[seller.like("%." + _like_escape(h), escape="\\") for h in parents])
         deleted += await _delete_where(condition, MAX_ROWS_PER_RULE - deleted)
     return deleted
@@ -145,7 +156,9 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
             counts["errors"] = counts.get("errors", 0) + 1
             logger.warning("deal code retention %s failed: %s", name, type(exc).__name__)
 
-    await step("deleted_optout", _delete_opted_out())
+    notes: Dict[str, int] = {}
+    await step("deleted_optout", _delete_opted_out(notes))
+    counts.update(notes)
     # 2. never applied and never refused, not seen for 14 days.
     await step("deleted_unverified", _delete_where(and_(
         o.c.observed_at < now - timedelta(days=UNVERIFIED_DAYS),
@@ -159,14 +172,17 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
         _has_state("failed"), not_(_was_applied()),
         last_refusal < now - timedelta(days=REFUSED_DAYS),
     )))
-    # 4. applied: 30 days after the last valid-until across its verification history, whatever the state is now.
-    valid_until = (
-        select(func.max(func.coalesce(v.c.expires_at, v.c.verified_at, v.c.updated_at)))
-        .where(and_(v.c.deal_id == o.c.deal_id, applied_history())).scalar_subquery()
-    )
-    await step("deleted_applied_expired", _delete_where(and_(
-        _was_applied(), valid_until < now - timedelta(days=APPLIED_GRACE_DAYS),
+    # 4. applied: 30 days after the last valid-until across its verification history, whatever the state is now. A
+    # verification's valid-until is clamped to verified_at + DEAL_VERIFY_TTL_HOURS, as serving clamps it
+    # (services/deal_lane_decision._ttl_ceiling), so an expires_at decades out cannot keep a row forever (P3-N4).
+    grace_from = now - timedelta(days=APPLIED_GRACE_DAYS)
+    ttl = timedelta(hours=settings.deal_verify_ttl_hours)
+    within_grace = exists().where(and_(v.c.deal_id == o.c.deal_id, applied_history(), or_(
+        and_(v.c.verified_at.isnot(None), v.c.verified_at >= grace_from - ttl,
+             or_(v.c.expires_at.is_(None), v.c.expires_at >= grace_from)),
+        and_(v.c.verified_at.is_(None), func.coalesce(v.c.expires_at, v.c.updated_at) >= grace_from),
     )))
+    await step("deleted_applied_expired", _delete_where(and_(_was_applied(), not_(within_grace))))
 
     # 5. bar text: cleared once a check recorded an outcome, or 14 days after creation.
     async def clear_terms():

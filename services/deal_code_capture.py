@@ -129,20 +129,21 @@ _BODY_BUDGET = 500_000
 _MAX_DEPTH = 512
 _MAX_REGION_CHARS = 4000
 _MAX_CODES_PER_PAGE = 20
+_BLOCK_MARK = "\ue000"  # a block tag's boundary inside region text (not whitespace), written out as a line break
 _SNIPPET_CHARS = 160
 
 # The code is case-sensitive (an all-caps or digit token, as stores print them); the words before it are not.
 _CODE_RES = (
     ("use_code", re.compile(
-        r"\b(?i:use|enter|apply)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*:?\s*"
+        r"\b(?i:use|enter|apply)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)[ \t]*:?[ \t]*"
         r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     ("labelled", re.compile(
-        r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)\s*[:：]\s*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
+        r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)[ \t]*[:：][ \t]*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     # Widened 2026-11-07 from the shadow diagnostics (by_miss "wording": all-caps codes after "code" that the two
     # forms above miss — "with code SAVE10", "Code: WELCOME15", "Extra 20% off code SPRING20"). Listed AFTER them,
     # so a code they read keeps their form; each new form is counted apart in `by_form`.
     ("with_code", re.compile(
-        r"\b(?i:with|using)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*[:：]?\s*"
+        r"\b(?i:with|using)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)[ \t]*[:：]?[ \t]*"
         r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     ("after_code", re.compile(
         r"\b(?i:code)\b[ \t]{0,3}[:：]?[ \t]{0,3}[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
@@ -278,9 +279,9 @@ class _RegionParser(HTMLParser):
     def _separate(self, tag: str) -> None:
         if self._skip_depth is None and tag not in _INLINE_TAGS:
             if self._region_depth is not None:
-                self._buffer.append(" ")
+                self._buffer.append(_BLOCK_MARK)
             if self._fallback_depth is not None:
-                self._fallback_buffer.append(" ")
+                self._fallback_buffer.append(_BLOCK_MARK)
 
     def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
         self._separate(tag)
@@ -322,7 +323,10 @@ class _RegionParser(HTMLParser):
 
 
 def _flush(buffer: List[str], into: List[str]) -> None:
-    text = re.sub(r"\s+", " ", "".join(buffer)).strip()
+    # A block boundary stays a line break (review of be#2735, P3-N5): a marquee item ending in "USE CODE" must not
+    # join the next item's first word. Whitespace inside a text node collapses to one space as before.
+    text = re.sub(r"\s+", " ", "".join(buffer))
+    text = re.sub(r" ?\ue000[\ue000 ]*", "\n", text).strip(" \n\ue000")
     if text:
         into.append(text[:_MAX_REGION_CHARS])
 
@@ -637,8 +641,17 @@ _HOST_CODES: set = set()
 _HOSTS_WITH_CODES: set = set()
 
 
+_RUN_GENERATION = [0]
+
+
+def run_generation() -> int:
+    """Bumped by every reset_stats() (once per refresh run): the writer caches its opt-out read per generation."""
+    return _RUN_GENERATION[0]
+
+
 def reset_stats() -> None:
     with _LOCK:
+        _RUN_GENERATION[0] += 1
         _STATS.clear()
         _STATS.update({
             "pages_scanned": 0, "pages_with_region": 0, "pages_with_code": 0, "codes_seen": 0,

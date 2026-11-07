@@ -56,6 +56,9 @@ async def db(monkeypatch):
         await database.execute("DELETE FROM catalog_products WHERE product_key LIKE :p", {"p": _PREFIX + "%"})
 
     await _clean()
+    from services import deal_code_capture
+
+    deal_code_capture.reset_stats()  # a new run: the writer rereads the denylist
     monkeypatch.delenv("DEAL_CODE_RETENTION_PAUSED", raising=False)
     try:
         yield database
@@ -153,6 +156,12 @@ async def test_the_writers_opt_out_check_binds_its_host_on_postgres(db, optout_i
 from tests.test_deal_code_retention import (  # noqa: E402,F401
     test_a_code_refused_twice_is_kept_7_days_after_the_LAST_refusal,
     test_a_delete_re_checks_its_condition,
+    test_a_failed_check_stamped_with_verified_at_but_no_discount_follows_the_refusal_clock,
+    test_a_wildcard_opt_out_names_the_host_and_its_subdomains,
+    test_an_explicit_platform_tenant_covers_its_own_subdomains,
+    test_an_expires_at_decades_out_is_clamped_to_the_verification_ttl,
+    test_an_underscore_in_a_host_is_matched_literally,
+    test_the_latest_of_several_applied_variants_sets_the_clock,
     test_a_lapsed_verification_keeps_the_30_day_grace_whatever_its_state_now,
     test_a_recent_refusal_keeps_a_row_not_seen_for_more_than_14_days,
     test_a_refused_row_once_applied_follows_the_applied_clock_not_the_refusal_clock,
@@ -194,5 +203,37 @@ async def test_the_opt_out_rule_stays_cheap_at_scale(db):
     out = await r.run(now=NOW)
     elapsed = time.monotonic() - started
     assert "errors" not in out, out
-    assert not any(out.values()), out
+    assert not any(n for k, n in out.items() if k.startswith(("deleted_", "cleared_"))), out
+    assert out.get("optout_ids_unmapped") == 1  # merch_nomatch: no catalog rows, reported
     assert elapsed < 5, f"retention took {elapsed:.1f}s"
+
+
+async def test_the_canonical_url_fallback_reads_each_id_on_postgres(db, monkeypatch):
+    """Review of be#2735, P3-N2: each NULL-domain id reads its own distinct canonical URLs (DISTINCT + ORDER BY +
+    LIMIT on Postgres); a big id never starves a small one; the hosts block writes and delete nothing."""
+    from services import deal_code_capture_writer as w
+    from services import deal_code_retention as r
+    from tests.test_deal_code_retention import NOW, ids, offer
+
+    monkeypatch.setattr(w, "CANONICAL_URLS_PER_ID", 2)
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " SELECT :p || 'big' || g, 'merch_big', 'shopify', 'big' || g, 't', 'https://big.example/p/' || g"
+        " FROM generate_series(1, 50) AS g",
+        {"p": _PREFIX},
+    )
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " VALUES (:k, 'merch_small', 'shopify', 'small1', 't', 'https://small.example/p/1')",
+        {"k": _PREFIX + "small"},
+    )
+    for mid in ("merch_big", "merch_small"):
+        await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
+                         {"s": mid, "t": NOW})
+    deny = await w.read_denyset()
+    assert deny.blocks("big.example") and deny.blocks("small.example") and not deny.blocks("other.example")
+    assert not deny.delete
+    await offer(db, "small", seller="small.example")
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["small"]
+    assert out["optout_ids_canonical_only"] == 2

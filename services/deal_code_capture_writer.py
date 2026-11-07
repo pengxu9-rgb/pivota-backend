@@ -26,9 +26,12 @@ WHAT IS NOT WRITTEN (review of be#2732):
     measured in prod (`skipped_loose_form`);
   - any code from a page whose request was redirected to ANOTHER host: the codes are that host's, not the requested
     seller's (`skipped_host_changed`);
-  - a seller on the opt-out denylist (`denied_hosts`: an id as a host or its www. form, or the catalog hosts of an id
-    as a merchant id; ADR-027 Q20) (`skipped_optout`). If that check cannot be read, nothing is written
-    (`skipped_optout_unreadable`): fail closed;
+  - a seller the opt-out denylist covers (`read_denyset`, read once per run: an id as a host, its www. form and its
+    subdomains; or the catalog hosts of an id as a merchant id; ADR-027 Q20) (`skipped_optout`). Where the denylist
+    is uncertain (a merchant id spanning many registrable domains, hosts known only from canonical URLs) it blocks
+    writes anyway. If that check cannot be read, nothing is written (`skipped_optout_unreadable`): fail closed;
+  - a digit token that names something else (`not_a_code`: units, durations, times, model numbers, masked numbers,
+    "example" codes) (`skipped_not_a_code`);
   - past the per-run budget: at most MAX_WRITES_PER_HOST_PER_RUN rows per host and MAX_WRITES_PER_RUN in all
     (`skipped_host_cap`, `skipped_run_cap`);
   - over a row another source owns for the same identity (`skipped_other_source`).
@@ -43,10 +46,12 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from sqlalchemy import and_, select
@@ -55,6 +60,7 @@ from db.catalog import catalog_products
 from db.database import database
 from db.deal_lane import deal_lane_optout, observed_store_offer_key, observed_store_offer_verifications, observed_store_offers
 from services import deal_code_capture
+from services.brand_claim_service import _PUBLIC_SUFFIXES, _is_registrable_base
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +75,9 @@ _KINDS = {"percent", "amount", "free_shipping"}
 # Kept on purpose, because stores do use them as codes and the verifier is the check: "50OFF", "20OFF", "4EVER",
 # "COVID19", "W10".
 _NOT_A_CODE_RE = re.compile(
-    r"^(?:\d+(?:ST|ND|RD|TH|H|HR|HRS|AM|PM|X|PER)|\d+-?DAYS?|SPF\d+|[A-Z]\d[A-Z])$|X{3,}", re.IGNORECASE)
+    r"^(?:\d+(?:ST|ND|RD|TH|H|HR|HRS|AM|PM|X|PER)|\d+-?DAYS?|SPF\d+|[A-Z]\d[A-Z]"
+    r"|\d+-?(?:ML|L|OZ|G|KG|LBS?|PCS?|PK|PACK|MINS?|HOURS?|WEEKS?|MONTHS?|YRS?|YEARS?|FT|IN|CM|MM|P|K|GB|TB|W|V|MAH)"
+    r"|\d+-IN-\d+|\d+(?:AM|PM)-\d+(?:AM|PM)|KN\d+|N\d{2})$|X{3,}", re.IGNORECASE)
 # The phrased forms only; the bare-"code" form is shadow-only until measured.
 _WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
 # PROVENANCE: every row this writer creates has a deal_id with this prefix, and no other writer uses it. Retention
@@ -80,7 +88,7 @@ CRAWL_DEAL_ID_PREFIX = "dlc_"
 
 def normalize_host(value: Optional[str]) -> str:
     """A host as an opt-out, a catalog source_domain or a page names it, in one form (review of be#2732, P3-I): trimmed,
-    lower-case, a URL reduced to its host, no port, no trailing dot, no leading "www.". "" when there is none."""
+    lower-case, a URL reduced to its host, no port, no trailing dot, no leading "*." or "www.". "" when there is none."""
     text = str(value or "").strip().lower()
     if not text:
         return ""
@@ -89,6 +97,8 @@ def normalize_host(value: Optional[str]) -> str:
     elif ":" in text:
         text = text.split(":", 1)[0]
     text = text.strip().rstrip(".")
+    while text.startswith("*."):  # a wildcard spelling names the host and its subdomains (review of be#2735)
+        text = text[2:]
     if text.startswith("www."):
         text = text[4:]
     return text
@@ -167,6 +177,8 @@ def not_a_code(captured: "deal_code_capture.CapturedCode") -> bool:
         return True
     snippet = str(captured.snippet or "")
     at = snippet.upper().find(code.upper()) if code else -1
+    if at >= 0 and re.search(r"(?:\bexample\b|\be\.g\.|\bsuch\s+as\b|\bsample\b)", snippet[max(0, at - 40):at], re.IGNORECASE):
+        return True  # "Example: use code SAVE20" (P3-N5)
     if at >= 0:
         after = snippet[at + len(code): at + len(code) + 24].lower()
         if re.match(r"^\W{0,3}\(?\s*(?:e\.g\.|(?:for\s+)?example\b|sample\b)", after):
@@ -179,13 +191,26 @@ def _same_seller(a: Optional[str], b: Optional[str]) -> bool:
 
 
 # Merchant ids that are not one seller (ADR-009: the legacy bucket of seed rows across many hosts, served by the agent
-# API as those products' merchant id). An opt-out naming one never reaches the catalog leg (review of be#2735, P2-3).
+# API as those products' merchant id). An opt-out naming one never reaches the catalog leg (review of be#2735, P2-3); it
+# is counted in the retention summary, since that opt-out row then denies nothing.
 PLACEHOLDER_MERCHANT_IDS = frozenset({"external_seed"})
-# An opt-out naming a merchant id the catalog ties to more hosts than this is not one seller's: its catalog leg is
-# ignored (counted), and only a host-level opt-out stays exact. An ADR-009 observed id is one brand on one domain.
+# A merchant id whose catalog hosts span more registrable domains than this is not one seller's (review of be#2735,
+# P2-N1): FAIL CLOSED for writes (every host it names is blocked) and delete nothing through it (counted).
 MAX_HOSTS_PER_OPTOUT_ID = 3
 _IN_CHUNK = 500
-_CANONICAL_URL_READ_LIMIT = 2000
+# The canonical-URL fallback reads at most this many distinct URLs PER merchant id (P3-N2).
+CANONICAL_URLS_PER_ID = 200
+# Marketplace and platform labels (as services/canonical_source_discovery._GENERIC_DOMAINS): a canonical URL on one of
+# these names where the product is listed, not the seller's own host, so it never becomes a denied host.
+MARKETPLACE_LABELS = frozenset({
+    "shopify", "myshopify", "amazon", "ebay", "walmart", "target", "sephora", "ulta", "iherb", "yesstyle",
+    "stylevana", "oliveyoung", "etsy", "lazada", "shopee", "coupang", "rakuten", "qoo10", "wixsite", "bigcartel",
+    "squarespace",
+})
+# Shared hosts beyond services/brand_claim_service._PUBLIC_SUFFIXES: a subdomain under one is another store.
+EXTRA_SHARED_HOSTS = frozenset({"shop.app", "square.site", "mybigcommerce.com", "shopifypreview.com", "company.site"})
+# The denylist read is reused for this long within one run (P3-N6); a new run (deal_code_capture.reset_stats) rereads.
+DENYLIST_CACHE_SECONDS = 600
 
 
 def crawl_rows():
@@ -195,18 +220,38 @@ def crawl_rows():
                 observed_store_offers.c.deal_id.like(escaped + "%", escape="\\"))
 
 
-# Hosts shared by many sellers: an opt-out of one covers that host only, never its subdomains (each a different store).
-SHARED_PLATFORM_HOSTS = frozenset({"myshopify.com", "shopify.com", "shop.app"})
+def registrable(host: Optional[str]) -> str:
+    """The registrable domain of a host, as services/seller_identity.etld1 computes it (a tenant of a shared platform
+    is its own registrable name). "" when there is none."""
+    h = normalize_host(host)
+    if not h or "." not in h:
+        return ""
+    labels = h.split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in _PUBLIC_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def subdomain_anchor(host: str) -> bool:
+    """True when the subdomains of `host` belong to the same seller: a registrable host, never a public suffix (co.uk,
+    com.sg) or a shared platform (myshopify.com, wixsite.com, ...) (review of be#2735, P3-N3)."""
+    return _is_registrable_base(host) and host not in EXTRA_SHARED_HOSTS
+
+
+def is_marketplace(host: str) -> bool:
+    reg = registrable(host)
+    return not reg or not subdomain_anchor(reg) or reg.split(".")[0] in MARKETPLACE_LABELS
 
 
 def _host_forms(value: str) -> Set[str]:
     host = normalize_host(value)
-    return {host, "www." + host} if host else set()
+    return {host, "www." + host} if host and "." in host else set()
 
 
-def covers(denied: Set[str], seller: Optional[str]) -> bool:
-    """True when `seller` is a denied host, its www. form, or a subdomain of a denied host (an opted-out store's own
-    subdomains, review of be#2732, P3-I) — never through a shared platform host."""
+def covers(denied: Iterable[str], seller: Optional[str]) -> bool:
+    """True when `seller` is a denied host, its www. form, or a subdomain of a denied host that anchors subdomains (an
+    opted-out store's own subdomains; never through a public suffix or a shared platform host)."""
+    denied = denied if isinstance(denied, (set, frozenset)) else set(denied)
     host = normalize_host(seller)
     if not host or not denied:
         return False
@@ -215,81 +260,120 @@ def covers(denied: Set[str], seller: Optional[str]) -> bool:
     parts = host.split(".")
     for k in range(1, len(parts) - 1):
         parent = ".".join(parts[k:])
-        if parent in denied and parent not in SHARED_PLATFORM_HOSTS:
+        if parent in denied and subdomain_anchor(parent):
             return True
     return False
 
 
-async def denied_hosts() -> Tuple[Set[str], Dict[str, int]]:
-    """Every host the opt-out denylist covers (ADR-027 Q20), normalised (`normalize_host`), each in its bare and www.
-    form: an id read as a host, and the catalog hosts of an id read as a merchant id (source_domain, or the canonical
-    URL's host for rows with none). Read ONCE, uncorrelated (review of be#2735, P2-1; be#2732, P3-J): one read of the
-    small opt-out table, then indexed reads of catalog_products by `merchant_id IN (id as entered, trimmed, lower-case)`.
-    Placeholder ids and ids spanning more than MAX_HOSTS_PER_OPTOUT_ID hosts never reach the catalog leg (P2-3).
-    Returns (hosts, counts); counts never name an id. Raises when it cannot be read: callers fail closed."""
+@dataclass(frozen=True)
+class DenySet:
+    """`delete`: confirmed hosts (bare and www.), through which retention deletes and the writer blocks. `block`: those
+    plus hosts that only block writes (an over-broad merchant id's hosts; hosts known only from canonical URLs).
+    `counts`: notes for the retention summary, never naming an id."""
+    delete: frozenset
+    block: frozenset
+    counts: Dict[str, int]
+
+    def blocks(self, seller: Optional[str]) -> bool:
+        return covers(self.block, seller)
+
+
+async def read_denyset() -> DenySet:
+    """The opt-out denylist as hosts (ADR-027 Q20), read ONCE, uncorrelated (review of be#2735, P2-1; be#2732, P3-J).
+      - An id with a dot is a host: trimmed, normalised (`normalize_host`), with its www. form.
+      - An id without one is a merchant id (merchant ids carry no dot): its catalog hosts, by an indexed read of
+        `merchant_id IN (id as entered, trimmed, lower-case)` (source_domain). For an id whose rows carry no
+        source_domain, up to CANONICAL_URLS_PER_ID distinct canonical URLs OF THAT ID are read; their hosts block
+        writes only (a canonical URL may name a marketplace), and marketplace hosts are dropped (P3-N2).
+      - The placeholder id never reaches the catalog (P2-3). An id whose hosts span more than MAX_HOSTS_PER_OPTOUT_ID
+        registrable domains blocks writes on all of them and deletes nothing (P2-N1).
+    Raises when it cannot be read: callers fail closed."""
     rows = await database.fetch_all(select(deal_lane_optout.c.seller_id))
     raw = {str(r["seller_id"] or "") for r in rows}
     ids = sorted({i.strip() for i in raw} - {""})
     counts: Dict[str, int] = {}
-    hosts: Set[str] = set()
+    delete: Set[str] = set()
+    block: Set[str] = set()
     if not ids:
-        return hosts, counts
+        return DenySet(frozenset(), frozenset(), counts)
 
     def bump(name: str) -> None:
         counts[name] = counts.get(name, 0) + 1
 
+    merchants: Dict[str, Set[str]] = {}  # lower-case id -> the spellings to look up
     for i in ids:
-        hosts |= _host_forms(i)
-    lookup = set()
-    for i in ids:
-        if i.lower() in PLACEHOLDER_MERCHANT_IDS:
+        if "." in normalize_host(i):
+            delete |= _host_forms(i)
+        elif i.lower() in PLACEHOLDER_MERCHANT_IDS:
             bump("optout_ids_placeholder")
-            continue
-        lookup |= {i, i.lower()}
-    lookup |= {r for r in raw if r.strip() and r.strip().lower() not in PLACEHOLDER_MERCHANT_IDS}  # padded as stored
-    domains: Dict[str, Set[str]] = {}
-    ordered = sorted(lookup)
-    for k in range(0, len(ordered), _IN_CHUNK):
+        else:
+            merchants.setdefault(i.lower(), set()).update({i, i.lower()})
+    merchants_raw = {r for r in raw if r.strip() and r.strip().lower() in merchants}  # padded as stored
+    lookup = sorted(set().union(*merchants.values(), merchants_raw)) if merchants else []
+    confirmed: Dict[str, Set[str]] = {}
+    for k in range(0, len(lookup), _IN_CHUNK):
         found = await database.fetch_all(
             select(catalog_products.c.merchant_id, catalog_products.c.source_domain)
-            .where(and_(catalog_products.c.merchant_id.in_(ordered[k:k + _IN_CHUNK]),
+            .where(and_(catalog_products.c.merchant_id.in_(lookup[k:k + _IN_CHUNK]),
                         catalog_products.c.source_domain.isnot(None)))
             .distinct()
         )
         for r in found:
             host = normalize_host(r["source_domain"])
-            if host:
-                domains.setdefault(str(r["merchant_id"]).strip().lower(), set()).add(host)
-    # An id whose catalog rows carry no source_domain: the host of their canonical URLs (bounded read).
-    unmapped = sorted({i for i in lookup if i.strip().lower() not in domains})
-    if unmapped:
-        found = await database.fetch_all(
-            select(catalog_products.c.merchant_id, catalog_products.c.canonical_url)
-            .where(and_(catalog_products.c.merchant_id.in_(unmapped[:_IN_CHUNK]),
-                        catalog_products.c.canonical_url.isnot(None)))
-            .limit(_CANONICAL_URL_READ_LIMIT)
-        )
-        for r in found:
-            host = normalize_host(r["canonical_url"])
-            if host:
-                domains.setdefault(str(r["merchant_id"]).strip().lower(), set()).add(host)
-    for merchant, merchant_hosts in domains.items():
-        if merchant in PLACEHOLDER_MERCHANT_IDS:
-            continue
-        if len(merchant_hosts) > MAX_HOSTS_PER_OPTOUT_ID:
+            if host and "." in host:
+                confirmed.setdefault(str(r["merchant_id"]).strip().lower(), set()).add(host)
+    for merchant, hosts in confirmed.items():
+        regs = {registrable(h) or h for h in hosts}
+        forms = set().union(*(_host_forms(h) for h in hosts))
+        if len(regs) > MAX_HOSTS_PER_OPTOUT_ID:
             bump("optout_ids_too_broad")
+            block |= forms
             continue
-        if len(merchant_hosts) > 1:
+        if len(regs) > 1:
             bump("optout_ids_multi_host")
-        for h in merchant_hosts:
-            hosts |= _host_forms(h)
-    return hosts, counts
+        delete |= forms
+    for merchant in sorted(set(merchants) - set(confirmed)):
+        spellings = sorted(merchants[merchant] | {r for r in merchants_raw if r.strip().lower() == merchant})
+        found = await database.fetch_all(
+            select(catalog_products.c.canonical_url)
+            .where(and_(catalog_products.c.merchant_id.in_(spellings), catalog_products.c.canonical_url.isnot(None)))
+            .distinct().order_by(catalog_products.c.canonical_url).limit(CANONICAL_URLS_PER_ID)
+        )
+        hosts = {normalize_host(r["canonical_url"]) for r in found}
+        hosts = {h for h in hosts if h and "." in h and not is_marketplace(h)}
+        if not hosts:
+            bump("optout_ids_unmapped")
+            continue
+        bump("optout_ids_canonical_only")
+        if len({registrable(h) for h in hosts}) > MAX_HOSTS_PER_OPTOUT_ID:
+            bump("optout_ids_too_broad")
+        block |= set().union(*(_host_forms(h) for h in hosts))
+    return DenySet(frozenset(delete), frozenset(delete | block), counts)
+
+
+async def denied_hosts() -> Tuple[Set[str], Dict[str, int]]:
+    """The hosts retention may delete through, and the notes. (The writer blocks on `read_denyset().block`.)"""
+    deny = await read_denyset()
+    return set(deny.delete), dict(deny.counts)
+
+
+_DENY_CACHE: Dict[str, Any] = {}
+
+
+async def _denyset_for_run() -> DenySet:
+    """The denylist, read once per refresh run (P3-N6). A failed read is not cached: the caller fails closed."""
+    generation = deal_code_capture.run_generation()
+    cached = _DENY_CACHE.get("entry")
+    if cached and cached[0] == generation and time.monotonic() - cached[1] < DENYLIST_CACHE_SECONDS:
+        return cached[2]
+    deny = await read_denyset()
+    _DENY_CACHE["entry"] = (generation, time.monotonic(), deny)
+    return deny
 
 
 async def _opted_out(seller: str) -> bool:
     """Raises when it cannot be read (the caller fails closed)."""
-    hosts, _ = await denied_hosts()
-    return covers(hosts, seller)
+    return (await _denyset_for_run()).blocks(seller)
 
 
 def _existing_row():

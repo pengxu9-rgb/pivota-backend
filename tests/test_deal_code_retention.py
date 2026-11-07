@@ -78,8 +78,9 @@ async def verification(db, name, state, *, updated_days=0, expires_days=None, va
     deal_id = "dlc_" + name
 
     values = dict(deal_id=deal_id, variant_id=variant, state=state, updated_at=NOW - _ago(updated_days))
-    if lapsed_days is not None:
-        values.update(verified_at=NOW - _ago(lapsed_days) - timedelta(days=1), expires_at=NOW - _ago(lapsed_days))
+    if lapsed_days is not None:  # a re-queue keeps verified_at, expires_at and the reference amounts (the contract)
+        values.update(verified_at=NOW - _ago(lapsed_days) - timedelta(days=1), expires_at=NOW - _ago(lapsed_days),
+                      ref_discount_amount=5)
     if state == "checkout_verified":
         expires_at = NOW + _ago(expires_days if expires_days is not None else 1)
         values.update(verified_at=expires_at - timedelta(days=1), verified_via="ucp_checkout", authorized_by="q2_approval",
@@ -200,7 +201,7 @@ async def test_one_rules_failure_never_stops_the_others_and_logs_counts_only(db,
     await offer(db, "stale", seller="secret-shop.example", code="SECRETCODE", observed_days=20)
     real = r._delete_opted_out
 
-    async def boom():
+    async def boom(*a, **k):
         raise RuntimeError("optout table gone SECRETCODE")
 
     monkeypatch.setattr(r, "_delete_opted_out", boom)
@@ -410,10 +411,13 @@ async def test_the_placeholder_merchant_id_never_reaches_the_catalog(db, caplog)
     out = await r.run(now=NOW)
     assert await ids(db) == ["a", "b"]
     assert out["deleted_optout"] == 0
+    assert out["optout_ids_placeholder"] == 1  # in the summary: that opt-out row denies nothing
     assert "optout_ids_placeholder" in caplog.text and "External_Seed" not in caplog.text
 
 
-async def test_a_merchant_id_spanning_more_than_the_limit_of_hosts_is_not_applied_to_the_catalog(db, caplog):
+async def test_a_merchant_id_over_the_host_limit_deletes_nothing_and_is_reported_in_the_summary(db, caplog):
+    # Four different registrable domains: not one seller's. Retention deletes nothing through it (the writer blocks
+    # writes on all four: tests/test_deal_code_capture_writer.py) and the summary says so on every run.
     for i, host in enumerate(["a.example", "b.example", "c.example", "d.example"]):
         await _catalog(db, i, "merch_wide", host)
         await offer(db, host[0], seller=host)
@@ -421,8 +425,25 @@ async def test_a_merchant_id_spanning_more_than_the_limit_of_hosts_is_not_applie
     caplog.set_level(logging.WARNING)
     out = await r.run(now=NOW)
     assert await ids(db) == ["a", "b", "c", "d"]
-    assert out["deleted_optout"] == 0
+    assert out["deleted_optout"] == 0 and out["optout_ids_too_broad"] == 1
     assert "optout_ids_too_broad" in caplog.text and "merch_wide" not in caplog.text
+
+
+@pytest.mark.parametrize("hosts", [
+    # apex, a shop. subdomain, a regional domain and the platform tenant: 3 registrable domains (review P2-N1, D8).
+    ["store.example", "shop.store.example", "store.example.sg", "store-1.myshopify.com"],
+    # an apex and three of its own subdomains: one registrable domain (D8c).
+    ["store.example", "shop.store.example", "us.store.example", "eu.store.example"],
+])
+async def test_one_stores_hosts_collapse_to_registrable_domains_before_the_limit(db, hosts):
+    for i, host in enumerate(hosts):
+        await _catalog(db, i, "merch_store", host)
+        await offer(db, f"h{i}", seller=host)
+    await offer(db, "unrelated", seller="other.example")
+    await _optout(db, "merch_store")
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["unrelated"]
+    assert out["deleted_optout"] == len(hosts) and "optout_ids_too_broad" not in out
 
 
 async def test_a_merchant_id_on_a_few_hosts_and_its_www_forms_counts_each_host_once(db):
@@ -465,9 +486,9 @@ async def test_the_opt_out_reads_a_fixed_number_of_times_whatever_the_row_count(
 
     monkeypatch.setattr(database, "fetch_all", counting)
     assert await r._delete_opted_out() == 0
-    # One read of the opt-out table, one of the catalog by merchant id, one canonical-URL read for the ids the catalog
-    # holds no source_domain for, one membership select: never one per row or per opt-out.
-    assert len(calls) == 4
+    # One read of the opt-out table, one of the catalog by merchant id (host ids skip the catalog), one membership
+    # select: never one per row or per opt-out.
+    assert len(calls) == 3
 
 
 async def test_no_opt_out_rows_means_one_read_and_nothing_else(db, monkeypatch):
@@ -523,3 +544,92 @@ async def test_an_opted_out_host_covers_its_subdomains_and_padded_sellers_but_no
     out = await r.run(now=NOW)
     assert await ids(db) == ["lookalike", "platform"]
     assert out["deleted_optout"] == 2
+
+
+
+# ── public suffixes and shared platforms never anchor subdomains (review of be#2735, P3-N3) ─────────────────────────
+@pytest.mark.parametrize("optout,catalog", [("co.uk", None), ("merch_sg", "com.sg"), ("wixsite.com", None),
+                                             ("merch_wix", "wixsite.com"), ("myshopify.com", None)])
+async def test_a_public_suffix_or_platform_opt_out_never_deletes_the_stores_under_it(db, optout, catalog):
+    if catalog:
+        await _catalog(db, 1, optout, catalog)
+    for i, host in enumerate(["brand9.co.uk", "shop.com.sg", "s4.wixsite.com", "s1.myshopify.com"]):
+        await offer(db, f"h{i}", seller=host)
+    await _optout(db, optout)
+    out = await r.run(now=NOW)
+    assert len(await ids(db)) == 4
+    assert out.get("deleted_optout", 0) == 0
+
+
+async def test_an_explicit_platform_tenant_covers_its_own_subdomains(db):
+    await offer(db, "tenant", seller="s2.myshopify.com")
+    await offer(db, "tenantsub", seller="x.s2.myshopify.com")
+    await offer(db, "othertenant", seller="s3.myshopify.com")
+    await _optout(db, "s2.myshopify.com")
+    await r.run(now=NOW)
+    assert await ids(db) == ["othertenant"]
+
+
+async def test_a_wildcard_opt_out_names_the_host_and_its_subdomains(db):
+    await offer(db, "apex")
+    await offer(db, "sub", seller="shop.glow.example")
+    await offer(db, "other", seller="other.example")
+    await _optout(db, "*.glow.example")
+    await r.run(now=NOW)
+    assert await ids(db) == ["other"]
+
+
+async def test_an_underscore_in_a_host_is_matched_literally(db):
+    await offer(db, "sub", seller="s.a_b.example")
+    await offer(db, "lookalike", seller="s.aXb.example")
+    await _optout(db, "a_b.example")
+    await r.run(now=NOW)
+    assert await ids(db) == ["lookalike"]
+
+
+# ── canonical-URL hosts block writes but delete nothing; each id has its own read (review of be#2735, P3-N2) ───────
+async def test_canonical_url_hosts_delete_nothing_and_are_reported(db):
+    from db.catalog import catalog_products
+
+    await db.execute(catalog_products.insert().values(product_key="c1", merchant_id="merch_nulldomain", platform="shopify",
+                                                      source_product_id="c1", canonical_url="https://brand-x.example/p/1", title="t"))
+    await offer(db, "brandx", seller="brand-x.example")
+    await _optout(db, "merch_nulldomain")
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["brandx"]
+    assert out["optout_ids_canonical_only"] == 1
+
+
+# ── applied evidence and the TTL clamp (review of be#2735, P3-N4) ────────────────────────────────────────────────────
+async def test_a_failed_check_stamped_with_verified_at_but_no_discount_follows_the_refusal_clock(db):
+    from db.deal_lane import observed_store_offer_verifications as v
+
+    await offer(db, "stamped", observed_days=20)
+    await db.execute(v.insert().values(deal_id="dlc_stamped", variant_id="1", state="failed", failure_reason="x",
+                                       verified_at=NOW - timedelta(days=8), updated_at=NOW - timedelta(days=8)))
+    out = await r.run(now=NOW)
+    assert await ids(db) == []
+    assert out["deleted_refused"] == 1
+
+
+async def test_an_expires_at_decades_out_is_clamped_to_the_verification_ttl(db):
+    from db.deal_lane import observed_store_offer_verifications as v
+
+    await offer(db, "forever", observed_days=400)
+    await db.execute(v.insert().values(
+        deal_id="dlc_forever", variant_id="1", state="checkout_verified", verified_at=NOW - timedelta(days=32),
+        expires_at=NOW + timedelta(days=36500), verified_via="ucp_checkout", authorized_by="q2_approval",
+        ref_currency="USD", ref_unit_price=25, ref_subtotal=25, ref_discount_amount=5, ref_automatic_discounts=[],
+        updated_at=NOW - timedelta(days=32)))
+    out = await r.run(now=NOW)
+    assert await ids(db) == []
+    assert out["deleted_applied_expired"] == 1
+
+
+async def test_the_latest_of_several_applied_variants_sets_the_clock(db):
+    await offer(db, "variants", observed_days=60)
+    await verification(db, "variants", "expired", lapsed_days=40, variant="1")
+    await verification(db, "variants", "expired", lapsed_days=1, variant="2")
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["variants"]
+    assert out["deleted_applied_expired"] == 0
