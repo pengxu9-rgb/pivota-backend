@@ -180,7 +180,9 @@ worker service** (the job runs there; the ledger flag on `web` alone does not ar
 - Events are written to `agent_purchase_events` (migration 265) before anything is sent.
 - Both rails are detected, Reap and the A2A token rail, by the same rules. An A2A purchase whose
   parent row the create route did not write (it is written best effort after the purchase commits)
-  is given its parent by the job before it reads, up to 50 per run, so it is not missed.
+  is given its parent by the job before it reads, up to 50 per run, so it is not missed. The heal
+  uses the same window as the read below (state entered within the lookback), whenever the purchase
+  was created.
 - Only purchases that entered their current state within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS`
   (default 72, max 168) are considered, so switching the dial on does not replay old purchases;
   it DOES send events for purchases that changed state within that window. For a quiet first
