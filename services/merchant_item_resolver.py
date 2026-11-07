@@ -22,9 +22,16 @@ mirror, 70% to an enrichment-ingested product; 92.7% resolved to one record and 
     complete a purchase, and answering with its key would only move the refusal later;
   * an attachment to a SUPPRESSED product names nothing: the catalog withdrew it, and search does not
     serve such a seed (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`).
-The seed is found by its storefront (`domain`, indexed) and market, then by its product URL: a SQL `LIKE`
-anchored on the path (it must end the stored URL or be followed by `/`, `?` or `#`) narrows the rows, and
-the exact comparison is done here, on one normalisation applied to both sides (`normalize_product_url`).
+The seed is found by its storefront (`domain`, indexed) and market, then by its product page: the
+lane's own idea of it, `canonical_url` else `destination_url` (`_seed_storefront_host`), never a
+`destination_url` that sits beside a different canonical page. A SQL `LIKE` anchored on the path (it
+must end the stored URL or be followed by `/`, `?` or `#`) narrows the rows, and the exact comparison is
+done here, on one normalisation applied to both sides (`normalize_product_url`).
+
+THE PAGE NAMES A PRODUCT, NEVER A VARIANT. A URL purchase names its variant by `variant_id`, required
+beside `product_url` (the route's selector rule). A `variant=` in the URL's query is not ignored: it must
+BE that `variant_id`, or the request is refused (`check_url_variant`). Otherwise a variant-grain seed
+(`?variant=A`) would answer a caller's `?variant=B` with the record that proves only A.
 
 FAILS CLOSED. A seed whose `domain` is NULL or not lowercase is not read (`row_not_found`): the writers
 lowercase it, and a seed placed by its URL alone is reachable by `product_key` as before. Paths are
@@ -40,7 +47,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 from typing import Any, List, Optional, Set
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from db.database import database
 from services.reap_agentic_purchase import PurchaseRefused
@@ -50,7 +57,13 @@ logger = logging.getLogger(__name__)
 #: What the request fingerprint carries for a product named by URL, like `variant_id:<n>` for a variant
 #: named by the storefront's id: what the caller SENT, normalised, never the key resolved from today's
 #: catalog, so a retry hashes the same and a URL request can never replay a `product_key` one.
-PRODUCT_URL_HASH_PREFIX = "product_url:"
+#: VERSIONED: the fingerprint depends on `normalize_product_url`, so a later change to the normalisation
+#: takes a new tag and leaves in-flight attempts reachable under the old one only by their old spelling
+#: (a retry then answers `idempotency_conflict`, never a second purchase).
+PRODUCT_URL_HASH_PREFIX = "product_url:v1:"
+
+#: No `product_key` (a catalog key) starts with this: a key that did would share a URL request's fingerprint.
+PRODUCT_URL_HASH_ROOT = "product_url:"
 
 #: Longer than any product URL a card carries; a value past it is a caller bug, refused before any read.
 MAX_PRODUCT_URL_CHARS = 2048
@@ -65,14 +78,10 @@ _SEED_SQL = """
      WHERE e.status = 'active'
        AND e.domain IN (:domain_apex, :domain_www)
        AND upper(e.market) = :market_country
-       AND (lower(e.canonical_url) LIKE :path_end ESCAPE '!'
-            OR lower(e.canonical_url) LIKE :path_slash ESCAPE '!'
-            OR lower(e.canonical_url) LIKE :path_query ESCAPE '!'
-            OR lower(e.canonical_url) LIKE :path_fragment ESCAPE '!'
-            OR lower(e.destination_url) LIKE :path_end ESCAPE '!'
-            OR lower(e.destination_url) LIKE :path_slash ESCAPE '!'
-            OR lower(e.destination_url) LIKE :path_query ESCAPE '!'
-            OR lower(e.destination_url) LIKE :path_fragment ESCAPE '!')
+       AND (lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_end ESCAPE '!'
+            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_slash ESCAPE '!'
+            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_query ESCAPE '!'
+            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_fragment ESCAPE '!')
      ORDER BY e.id
      LIMIT :limit
 """
@@ -119,9 +128,13 @@ def normalize_product_url(product_url: str, merchant_host: str) -> str:
 
     It must be an http(s) URL on THIS storefront (one `www.` is noise; a subdomain or a lookalike is
     another store) with a product path. The value is never echoed: it is caller-controlled.
+
+    PRINTABLE ASCII ONLY, never trimmed: a card's URL is ASCII (a non-ASCII page is percent-encoded), so
+    anything else -- whitespace, a zero-width or format character, NBSP, a raw unicode letter (whose case
+    Python and SQL fold differently) -- is a caller bug, refused before it reaches a bind or a fingerprint.
     """
-    text = str(product_url or "").strip()
-    if not text or len(text) > MAX_PRODUCT_URL_CHARS or any(ord(ch) < 0x21 or ord(ch) == 0x7F for ch in text):
+    text = str(product_url or "")
+    if not text or len(text) > MAX_PRODUCT_URL_CHARS or any(not 0x21 <= ord(ch) <= 0x7E for ch in text):
         raise PurchaseRefused("invalid_request", "product_url is not a usable URL")
     normalized = _normalized(text)
     if normalized is None:
@@ -134,6 +147,21 @@ def normalize_product_url(product_url: str, merchant_host: str) -> str:
     if normalized == _bare_host(host):
         raise PurchaseRefused("invalid_request", "product_url names no product page")
     return normalized
+
+
+def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
+    """Refuse a URL whose query names a variant other than the request's `variant_id` (`invalid_request`).
+
+    `variant=` (any case, every occurrence) must equal `variant_id` exactly; the request must name one.
+    Call it after `normalize_product_url` has accepted the URL."""
+    if variant_id is None:
+        raise PurchaseRefused("invalid_request", "a product_url purchase names its variant by variant_id")
+    try:
+        pairs = parse_qsl(urlsplit(product_url).query, keep_blank_values=True)
+    except ValueError:
+        raise PurchaseRefused("invalid_request", "product_url is not a usable URL") from None
+    if any(name.lower() == "variant" and value != variant_id for name, value in pairs):
+        raise PurchaseRefused("invalid_request", "product_url names another variant than variant_id")
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -172,8 +200,8 @@ async def resolve_product_key(*, normalized_url: str, market_country: str) -> st
     if len(rows) > MAX_SEED_CANDIDATES:
         raise PurchaseRefused("product_ambiguous", "too many catalog seeds for this product URL")
     seeds: List[dict] = [
-        dict(r) for r in rows
-        if normalized_url in (_normalized(dict(r).get("canonical_url")), _normalized(dict(r).get("destination_url")))
+        row for row in (dict(r) for r in rows)
+        if _normalized(row.get("canonical_url") or row.get("destination_url")) == normalized_url
     ]
     keys: Set[str] = set()
     for seed in seeds:

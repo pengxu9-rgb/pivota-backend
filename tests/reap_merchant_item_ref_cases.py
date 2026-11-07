@@ -103,6 +103,10 @@ async def test_prepare_resolves_every_spelling_of_the_same_page(client, monkeypa
     "https://judydoll.com:8443/products/lip-ink",          # a non-default port
     "https://judydoll.com/products/lip ink",               # whitespace inside
     "https://judydoll.com/products/lip-ink\u0000",         # NUL
+    "https://judydoll.com/products/lip\u200b-ink",         # zero-width space (a format character)
+    "\u00a0https://judydoll.com/products/lip-ink",         # NBSP, never silently trimmed
+    " https://judydoll.com/products/lip-ink",              # leading space, never silently trimmed
+    "https://judydoll.com/products/lip-ink\u00e9",         # raw non-ASCII (Python and SQL fold it apart)
     "https://judydoll.com/" + "a" * 2100,                  # longer than the cap
 ])
 async def test_prepare_refuses_an_unusable_product_url_before_any_sql(client, monkeypatch, bad):
@@ -380,15 +384,37 @@ async def test_an_unescaped_wildcard_never_widens_the_candidate_read(monkeypatch
 
 
 def test_a_url_fingerprint_differs_from_the_same_string_sent_as_a_product_key():
-    """The prefix keeps a URL request apart from a `product_key` equal to its normalised URL. (A key spelled
-    `product_url:<url>` would hash alike, exactly as one spelled `variant_id:<n>` does for variants; replay is
-    scoped to one owner and one idempotency key, so that is the caller replaying itself.)"""
+    """The versioned prefix keeps a URL request apart from a `product_key` equal to its normalised URL, and a
+    key (or a sku key) spelled with a fingerprint prefix is refused, so no key request hashes like a URL or
+    `variant_id` one."""
     from types import SimpleNamespace
     normalized = merchant_item.normalize_product_url(URL, DOMAIN)
-    by_url = reap._product_selector(SimpleNamespace(product_url=URL, product_key=None), DOMAIN)
+    by_url = reap._product_selector(SimpleNamespace(product_url=URL, product_key=None, variant_id=VARIANT), DOMAIN)
     by_key = reap._product_selector(SimpleNamespace(product_url=None, product_key=normalized), DOMAIN)
-    assert by_url[1] != by_key[1]
+    assert by_url[1] == "product_url:v1:" + normalized and by_url[1] != by_key[1]
     assert (by_url[0], by_url[2]) == (None, normalized) and by_key[0] == normalized
+    for spelled in (by_url[1], "product_url:" + normalized):
+        with pytest.raises(svc.PurchaseRefused) as refused:
+            reap._product_selector(SimpleNamespace(product_url=None, product_key=spelled), DOMAIN)
+        assert refused.value.reason == "invalid_request"
+    with pytest.raises(svc.PurchaseRefused) as refused:
+        reap._variant_selector(SimpleNamespace(variant_id=None, variant_key="variant_id:" + VARIANT))
+    assert refused.value.reason == "invalid_request"
+
+
+async def test_a_product_key_spelled_as_a_url_fingerprint_never_replays_the_url_purchase(client, monkeypatch):
+    """The reviewer's repro: under one idempotency key, a URL create then a key create spelled
+    `product_url:<normalised>` replayed the URL purchase. It is refused before any lookup."""
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    created = await client.post(CREATE, json=url_create_body(witness, "spelled-as-url"))
+    assert created.status_code == 202, created.text
+    spelled = create_body(witness, "spelled-as-url", by="variant_id")
+    spelled["product_key"] = merchant_item.PRODUCT_URL_HASH_PREFIX + merchant_item.normalize_product_url(URL, DOMAIN)
+    with monkeypatch.context() as patches:
+        forbid_sql(patches)
+        response = await client.post(CREATE, json=spelled)
+    assert response.status_code == 400 and error(response) == "invalid_request", response.text
 
 
 
@@ -495,9 +521,128 @@ async def test_a_url_resume_whose_page_now_names_another_record_is_a_changed_sel
     aged = ("clock_timestamp()-INTERVAL '1000 seconds'" if IS_POSTGRES else "datetime('now','-1000 seconds')")
     await database.execute(f"UPDATE reap_agentic_purchases SET created_at={aged} WHERE id=:id", {"id": pid})
     assert await ledger.scrub_reconciling_purchase_pii() == [pid]
-    await add_product(PRODUCT + "-moved")
-    await database.execute(
-        "UPDATE external_product_seeds SET attached_product_key=:pk WHERE id=:id", {"pk": PRODUCT + "-moved", "id": SEED})
+    before = dict(await ledger.get_purchase_internal(pid))
+    moved = PRODUCT + "-moved"
+    # The page now names another record (the resolver's answer), and that record WOULD load as the same
+    # variant at the same price (its reads are answered from the original's, whose seed proof still holds),
+    # so the only thing that stands between it and a resumed purchase is the row compare.
+    resolved = []
+
+    async def resolves_to_the_moved_record(**kwargs):
+        resolved.append(kwargs["normalized_url"])
+        return moved
+    monkeypatch.setattr(merchant_item, "resolve_product_key", resolves_to_the_moved_record)
+    real_load, real_variant = reap._load_cart_link_item, reap._resolve_selected_variant_key
+    seen = []
+
+    async def load_as_original(**kwargs):
+        seen.append(kwargs["product_key"])
+        return await real_load(**{**kwargs, "product_key": PRODUCT})
+
+    async def variant_as_original(**kwargs):
+        return await real_variant(**{**kwargs, "product_key": PRODUCT})
+    monkeypatch.setattr(reap, "_load_cart_link_item", load_as_original)
+    monkeypatch.setattr(reap, "_resolve_selected_variant_key", variant_as_original)
     resumed = await client.post(CREATE + f"/{pid}/resume", json=original)
-    assert resumed.status_code == 409, resumed.text
-    assert (await ledger.get_purchase_internal(pid))["contact_revision"] in (0, None)
+    assert resumed.status_code == 409 and error(resumed) == "resume_selection_changed", resumed.text
+    assert seen == [moved] and resolved == [merchant_item.normalize_product_url(URL, DOMAIN)]
+    after = dict(await ledger.get_purchase_internal(pid))
+    assert after["contact_revision"] == before["contact_revision"]
+    assert after["product_key"] == PRODUCT and after["state"] == before["state"]
+
+
+# ── review 2: the URL's variant, the seed's page, the left side of the match, retries ───────────
+
+
+async def test_a_url_create_must_name_its_variant_and_the_urls_variant_must_be_it(client, monkeypatch):
+    """The reviewer's P2 repro: a variant-grain seed (`?variant=A`) and a caller's `?variant=999` with no
+    `variant_id` bought A. Every such body is now refused before any SQL; the agreeing one buys exactly it."""
+    await seed(monkeypatch)
+    await database.execute("UPDATE external_product_seeds SET destination_url=:u WHERE id=:id",
+                           {"u": URL + "?variant=" + VARIANT, "id": SEED})
+    await add_seed("variant-999-seed", url=URL + "?variant=999")
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+
+    no_variant = url_create_body(witness, "url-no-variant", url=URL + "?variant=999")
+    no_variant.pop("variant_id")
+    disagreeing = url_create_body(witness, "url-disagrees", url=URL + "?variant=111")
+    repeated = url_create_body(witness, "url-repeated", url=URL + "?variant=" + VARIANT + "&variant=111")
+    cased = url_create_body(witness, "url-cased", url=URL + "?Variant=111")
+    bare = url_create_body(witness, "url-bare", url=URL)
+    bare.pop("variant_id")
+    for request in (no_variant, disagreeing, repeated, cased, bare):
+        with monkeypatch.context() as patches:
+            forbid_sql(patches)
+            response = await client.post(CREATE, json=request)
+        assert response.status_code == 400 and error(response) == "invalid_request", (request["product_url"], response.text)
+    with monkeypatch.context() as patches:
+        forbid_sql(patches)
+        prepared = await client.post(BASE, json=url_body(URL + "?variant=111"))
+    assert prepared.status_code == 400 and error(prepared) == "invalid_request", prepared.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 0
+
+    agreeing = await client.post(CREATE, json=url_create_body(witness, "url-agrees", url=URL + "?variant=" + VARIANT))
+    assert agreeing.status_code == 202, agreeing.text
+    row = dict(await database.fetch_one("SELECT * FROM reap_agentic_purchases"))
+    assert row["product_key"] == PRODUCT and row["variant_key"] == "shopify:" + VARIANT
+
+
+async def test_a_destination_beside_a_different_canonical_page_is_not_the_seeds_page(client, monkeypatch):
+    """The lane's page of a seed is `canonical_url` else `destination_url`; a destination that sits beside
+    another canonical page names nothing."""
+    await seed(monkeypatch)
+    await database.execute(
+        "UPDATE external_product_seeds SET canonical_url=:c, destination_url=:d WHERE id=:id",
+        {"c": URL, "d": "https://judydoll.com/products/a-different-page", "id": SEED})
+    response = await client.post(BASE, json=url_body("https://judydoll.com/products/a-different-page"))
+    assert response.status_code == 409 and error(response) == "row_not_found", response.text
+    assert (await client.post(BASE, json=url_body())).json()["selection"]["product_key"] == PRODUCT
+
+
+async def test_an_empty_canonical_url_falls_back_to_the_destination(monkeypatch):
+    await seed(monkeypatch)
+    await database.execute("UPDATE external_product_seeds SET canonical_url='' WHERE id=:id", {"id": SEED})
+    normalized = merchant_item.normalize_product_url(URL, DOMAIN)
+    assert await merchant_item.resolve_product_key(normalized_url=normalized, market_country="US") == PRODUCT
+
+
+async def test_the_left_side_of_the_match_is_the_whole_host_and_path(client, monkeypatch):
+    """SQL anchors the path on its right only; the exact compare carries the left. A seed one folder deeper
+    (`/en-gb/products/lip-ink`) under the same store, attached to another product, is not this page."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-gb")
+    await add_seed("gb-seed", url="https://judydoll.com/en-gb/products/lip-ink", attached=PRODUCT + "-gb")
+    response = await client.post(BASE, json=url_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"]["product_key"] == PRODUCT
+
+
+async def test_a_seed_with_no_or_an_unlowered_domain_is_not_read(client, monkeypatch):
+    """Documented fail-closed rule: the storefront filter is the indexed `domain`, so a seed placed by its URL
+    alone (NULL domain) or with an upper-case one is not a candidate, even at this exact page."""
+    await seed(monkeypatch)
+    await add_product(PRODUCT + "-nodomain")
+    await add_seed("nodomain-seed", attached=PRODUCT + "-nodomain", domain=None)
+    await add_product(PRODUCT + "-upper")
+    await add_seed("upper-seed", attached=PRODUCT + "-upper", domain=DOMAIN.upper())
+    response = await client.post(BASE, json=url_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["selection"]["product_key"] == PRODUCT
+
+
+async def test_a_retry_with_another_spelling_of_the_same_page_replays(client, monkeypatch):
+    """The fingerprint holds the NORMALISED URL: a retry that spells the page another way (case, `www.`, a
+    trailing slash, the agreeing `variant=`, a fragment) is the same purchase, replayed without resolving."""
+    await seed(monkeypatch)
+    witness = (await client.post(BASE, json=url_body())).json()["selection"]
+    created = await client.post(CREATE, json=url_create_body(witness, "two-spellings"))
+    assert created.status_code == 202, created.text
+
+    async def unresolvable(**kwargs):
+        raise AssertionError("a replay resolved the product URL")
+    monkeypatch.setattr(merchant_item, "resolve_product_key", unresolvable)
+    respelled = url_create_body(
+        witness, "two-spellings", url="HTTPS://WWW.JudyDoll.com/products/Lip-Ink/?variant=" + VARIANT + "#reviews")
+    again = await client.post(CREATE, json=respelled)
+    assert again.status_code == 202 and again.json()["purchase_id"] == created.json()["purchase_id"], again.text
+    assert await database.fetch_val("SELECT COUNT(*) FROM reap_agentic_purchases") == 1

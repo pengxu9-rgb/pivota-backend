@@ -2190,7 +2190,8 @@ def _default_return_url() -> str:
 
 
 #: The fingerprint's spelling of a `variant_id` selector. A sku key always starts with its product key
-#: (`prod::…`), so no `variant_key` can collide with it.
+#: (`prod::…`), and a `variant_key` spelled with this prefix is refused (`_variant_selector`), so none
+#: collides with it.
 _VARIANT_ID_HASH_PREFIX = "variant_id:"
 
 
@@ -2211,12 +2212,20 @@ def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str,
     THE `_variant_selector` RULE FOR THE PRODUCT: the fingerprint holds what the caller SENT. A
     `product_key` is itself; a `product_url` is `product_url:<normalised URL>` with no key yet, resolved
     to OUR record only after the replay lookup (`_resolved_product_key`), so a retry hashes the same
-    whatever the catalog says by then, and a URL request can never replay a key request.
+    whatever the catalog says by then, and a URL request can never replay a key request (a `product_key`
+    spelled with the URL prefix is refused, so none hashes like one).
+
+    A URL names a product page, never a variant: the request must name its variant by `variant_id`, and
+    a `variant=` in the URL's query must BE it (`merchant_item.check_url_variant`), so the query the
+    normalisation drops can never pick a different variant than the one bought.
     """
     if req.product_url is not None:
         normalized = merchant_item.normalize_product_url(req.product_url, merchant_host)
+        merchant_item.check_url_variant(req.product_url, getattr(req, "variant_id", None))
         return None, merchant_item.PRODUCT_URL_HASH_PREFIX + normalized, normalized
     product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+    if product_key.startswith(merchant_item.PRODUCT_URL_HASH_ROOT):
+        raise svc.PurchaseRefused("invalid_request", "product_key is a catalog key, not a product URL")
     return product_key, product_key, None
 
 
@@ -2239,6 +2248,10 @@ def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optio
     if req.variant_id is not None:
         return None, _VARIANT_ID_HASH_PREFIX + req.variant_id
     key = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+    if key is not None and key.startswith(_VARIANT_ID_HASH_PREFIX):
+        # No sku key starts with it (they start with their product key): one that did would share a
+        # `variant_id` request's fingerprint.
+        raise svc.PurchaseRefused("invalid_request", "variant_key is a sku key, not a variant_id")
     return key, key
 
 
