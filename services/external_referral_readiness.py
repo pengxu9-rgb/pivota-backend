@@ -44,6 +44,7 @@ from services.external_seed_search import (
     seed_serving_currency,
 )
 from services.region_pricing import pricing_currency_for_region_or_none
+from utils.logger import logger as pivota_logger
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -454,11 +455,66 @@ def count_handleless_read(
             _bump(counter, key)
 
 
-def handleless_read_summary(mode: str, totals: Dict[str, int], by_host: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+# At most this many HANDLELESS_DECISION lines per run; the rest are counted (`decision_lines.suppressed`).
+HANDLELESS_DECISION_LOG_MAX = 500
+
+
+def handleless_decision_line(seed_id: Any, host: Any, info: Any) -> Optional[Dict[str, Any]]:
+    """One SHADOW decision as a reviewer reads it, or None (not a decision, or not shadow: `on` and `off` log
+    nothing). Ids, the host and the decision only: no URL, so no query string or token can reach the log."""
+    if not isinstance(info, dict) or info.get("mode") != "shadow":
+        return None
+    detail = info.get("detail") if isinstance(info.get("detail"), dict) else {}
+    return {
+        "seed_id": str(seed_id) if seed_id is not None else None,
+        "host": str(host or "unknown"),
+        "would_read": bool(info.get("would_read")),
+        "would_flip_healthy": bool(info.get("would_flip_healthy")),
+        "refusal": info.get("refusal"),
+        "segment": info.get("segment"),
+        "identity_by": info.get("identity_by"),
+        "title_dice": detail.get("title_dice"),
+        "price_ratio": detail.get("price_ratio"),
+    }
+
+
+def log_handleless_decision(lines: Dict[str, int], seed_id: Any, host: Any, info: Any) -> None:
+    """Log one SHADOW decision as a `HANDLELESS_DECISION {json}` line through the `pivota` logger (the one prod
+    keeps at INFO), at most `HANDLELESS_DECISION_LOG_MAX` per run (`lines` counts `logged` / `suppressed`).
+    NEVER RAISES: it runs inside the row's try, where a raise would count a refreshed row as failed."""
+    try:
+        line = handleless_decision_line(seed_id, host, info)
+        if line is None:
+            return
+        if int(lines.get("logged") or 0) >= HANDLELESS_DECISION_LOG_MAX:
+            lines["suppressed"] = int(lines.get("suppressed") or 0) + 1
+            return
+        lines["logged"] = int(lines.get("logged") or 0) + 1
+        pivota_logger.info("HANDLELESS_DECISION " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its count
+        return
+
+
+def handleless_read_summary(
+    mode: str,
+    totals: Dict[str, int],
+    by_host: Dict[str, Dict[str, int]],
+    decision_lines: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     """The run's handle-less read decisions: the mode, the totals, and the `HANDLELESS_TOP_HOSTS` hosts with
-    the most rows decided."""
+    the most rows decided; in shadow also `decision_lines` ({logged, suppressed}, `log_handleless_decision`)."""
     top = sorted(by_host.items(), key=lambda kv: (-int(kv[1].get("decided") or 0), kv[0]))[:HANDLELESS_TOP_HOSTS]
-    return {"mode": mode, "totals": dict(sorted(totals.items())), "top_hosts": {h: dict(sorted(c.items())) for h, c in top}}
+    out: Dict[str, Any] = {
+        "mode": mode,
+        "totals": dict(sorted(totals.items())),
+        "top_hosts": {h: dict(sorted(c.items())) for h, c in top},
+    }
+    if mode == "shadow" and decision_lines is not None:
+        out["decision_lines"] = {
+            "logged": int(decision_lines.get("logged") or 0),
+            "suppressed": int(decision_lines.get("suppressed") or 0),
+        }
+    return out
 
 
 def _degraded_reason_bucket(error: Any) -> str:
@@ -2507,6 +2563,8 @@ async def run_external_referral_refresh_batch(
     # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
     handleless_totals: Dict[str, int] = {}
     handleless_hosts: Dict[str, Dict[str, int]] = {}
+    # In shadow, one HANDLELESS_DECISION log line per decided row, bounded per run (`log_handleless_decision`).
+    handleless_lines: Dict[str, int] = {}
     # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): each host's observations this run and its
     # candidates, applied (or, in shadow, reported) after the run by `apply_unconfirmed_hides`.
     unconfirmed_mode = unconfirmed_hide_mode()
@@ -2634,6 +2692,7 @@ async def run_external_referral_refresh_batch(
                 elif isinstance(availability, dict) and availability.get("status") == "not_read":
                     availability_not_read += 1
                 count_handleless_read(handleless_totals, handleless_hosts, host, result.get("handleless_read"))
+                log_handleless_decision(handleless_lines, seed_id, host, result.get("handleless_read"))
             elif status == "degraded":
                 degraded += 1
                 # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
@@ -3136,7 +3195,9 @@ async def run_external_referral_refresh_batch(
         "availability_changed": availability_changed,
         # Rows whose served URL names no product handle, and what EXTERNAL_SEED_HANDLELESS_READ decided for them
         # (`count_handleless_read`): nothing is counted with the flag off.
-        "handleless_read": handleless_read_summary(handleless_read_mode(), handleless_totals, handleless_hosts),
+        "handleless_read": handleless_read_summary(
+            handleless_read_mode(), handleless_totals, handleless_hosts, handleless_lines
+        ),
         # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): per host and in total, what the run
         # observed, its candidates, what it hid (`on`) or would have (`shadow`), and what the host brake held.
         "unconfirmed_hide": unconfirmed_hide,

@@ -6000,6 +6000,18 @@ def _handleless_read_outcome(
         info["segment"] = decision.segment
     if decision.identity_by:
         info["identity_by"] = decision.identity_by
+    if mode == "shadow":
+        # SHADOW ONLY: the evidence a reviewer needs before `on` (title dice, price ratio), which the batch logs
+        # as one HANDLELESS_DECISION line per row. Never read by a guard; `on` and `off` carry nothing new.
+        info["detail"] = destination_liveness.handleless_decision_detail(
+            evidence=evidence,
+            seed_title=row.get("title"),
+            seed_brand=seed_data.get("brand"),
+            fresh_amount=price_amount,
+            fresh_currency=price_currency,
+            stored_amount=row.get("price_amount"),
+            stored_currency=row.get("price_currency"),
+        )
     return decision.observation, decision.read, info
 
 
