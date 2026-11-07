@@ -393,9 +393,11 @@ def _is_sqlite() -> bool:
 
 
 # The host of an absolute URL, in SQL (Postgres: a two-argument substring is a POSIX regex with one capture group).
-# Tolerant as the Python parse is (review of be#2742, P2-B): leading space, no scheme, "//host", and userinfo up to the
-# LAST "@" before the path.
-_URL_HOST_PATTERN = r"^\s*(?:[A-Za-z][A-Za-z0-9+.-]*:)?(?://)?(?:[^/?#]*@)?([^/:?#\s]+)"
+# Tolerant as the Python parse is (reviews of be#2742, P2-B and P2-B'): leading space, no scheme, "//host", userinfo up
+# to the LAST "@" before the path, and space around the host. A scheme counts only before "//" (so "host:8080/p" reads
+# "host", not the port), and the column loses tab, CR and LF first, as urlsplit does.
+_URL_HOST_PATTERN = r"^\s*(?:[A-Za-z][A-Za-z0-9+.-]*://|//)?\s*(?:[^/?#]*@)?\s*([^/:?#\s]+)"
+_URL_CONTROL_CHARS = "\t\n\r"
 
 
 async def _canonical_hosts(spellings) -> Set[str]:
@@ -408,7 +410,8 @@ async def _canonical_hosts(spellings) -> Set[str]:
             .limit(CANONICAL_URLS_PER_ID_FALLBACK))
         hosts = sorted({normalize_host(r["canonical_url"]) for r in found} - {""})
         return set(hosts[:CANONICAL_HOSTS_PER_ID])
-    host = func.lower(func.substring(p.c.canonical_url, _URL_HOST_PATTERN)).label("host")
+    url = func.translate(p.c.canonical_url, _URL_CONTROL_CHARS, "")
+    host = func.lower(func.substring(url, _URL_HOST_PATTERN)).label("host")
     found = await database.fetch_all(
         select(host).where(where).distinct().order_by(host).limit(CANONICAL_HOSTS_PER_ID))
     return {normalize_host(r["host"]) for r in found if r["host"]} - {""}

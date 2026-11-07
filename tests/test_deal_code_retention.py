@@ -723,3 +723,30 @@ async def test_a_timestamp_in_the_future_never_keeps_a_row_forever(db):
     assert await ids(db) == ["aheadexpiry", "landing", "landingedge"]
     assert out["deleted_applied_expired"] == 3
 
+
+async def test_an_expiry_exactly_one_ttl_ahead_is_trusted_and_a_microsecond_later_is_not(db):
+    """Review of be#2742 delta, Q07: with no verified_at and a stale updated_at, an expires_at at exactly now + TTL keeps
+    the row; one microsecond later it runs on updated_at and goes."""
+    await offer(db, "expatttl", observed_days=60)
+    await _raw_verification(db, "expatttl", "expired", expires_at=NOW + timedelta(hours=24),
+                            updated_at=NOW - timedelta(days=40))
+    await offer(db, "exppastttl", observed_days=60)
+    await _raw_verification(db, "exppastttl", "expired", expires_at=NOW + timedelta(hours=24, microseconds=1),
+                            updated_at=NOW - timedelta(days=40))
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["expatttl"]
+    assert out["deleted_applied_expired"] == 1
+
+
+async def test_an_updated_at_past_the_horizon_is_no_evidence(db):
+    """Review of be#2742 delta, P3: a row whose only timestamp is updated_at is kept by it only up to now + TTL, so a
+    malformed updated_at decades out cannot keep the row until then."""
+    await offer(db, "farupdated", observed_days=60)
+    await _raw_verification(db, "farupdated", "expired", updated_at=NOW + timedelta(days=36500))
+    await offer(db, "updatedttl", observed_days=60)  # exactly one TTL ahead: still trusted
+    await _raw_verification(db, "updatedttl", "expired", updated_at=NOW + timedelta(hours=24))
+    await offer(db, "updatedpast", observed_days=60)
+    await _raw_verification(db, "updatedpast", "expired", updated_at=NOW + timedelta(hours=24, microseconds=1))
+    out = await r.run(now=NOW)
+    assert await ids(db) == ["updatedttl"]
+    assert out["deleted_applied_expired"] == 2

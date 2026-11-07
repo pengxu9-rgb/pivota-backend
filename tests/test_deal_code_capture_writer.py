@@ -696,7 +696,7 @@ async def test_an_internationalised_host_matches_in_either_spelling(db, optout, 
     assert dcc.stats()["writes"] == {"skipped_optout": 1}
 
 
-def test_registrable_domains_under_shared_hosts_and_suffixes():
+async def test_registrable_domains_under_shared_hosts_and_suffixes():
     assert w.registrable("brand1.square.site") == "brand1.square.site"
     assert w.registrable("x.brand1.square.site") == "brand1.square.site"
     assert w.registrable("shop.brand.com.vn") == "brand.com.vn"
@@ -731,6 +731,18 @@ async def test_the_denylist_cache_expires_after_its_cap_within_a_run(db, monkeyp
     ("\udcff.example", "\udcff.example"),  # a lone surrogate: UTS-46 refuses it, so does the stdlib codec
     ("a..é.example", "a..xn--9ca.example"),  # an empty label does not stop the others
 ])
-def test_a_host_that_cannot_be_encoded_never_raises_and_keeps_its_spelling(value, expected):
+async def test_a_host_that_cannot_be_encoded_never_raises_and_keeps_its_spelling(value, expected):
+    assert w.normalize_host(value) == expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("ｗｗｗ。bücher。example", "xn--bcher-kva.example"),
+    ("é" * 70 + "。example", "é" * 70 + ".example"),  # the ideographic stop is a dot even where a label cannot encode
+    ("www.brand．example｡", "brand.example"),
+    ("straße.example", "strasse.example"),  # IDNA 2003 without the package (it maps ß; the package keeps it)
+])
+async def test_without_the_idna_package_the_stdlib_codec_still_gives_one_spelling(monkeypatch, value, expected):
+    """Review of be#2742 delta, Q22: the fallback branch maps the full-width and ideographic stops itself."""
+    monkeypatch.setitem(sys.modules, "idna", None)  # "import idna" now raises ImportError
     assert w.normalize_host(value) == expected
 

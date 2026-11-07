@@ -1272,7 +1272,8 @@ def test_a_copy_code_button_inside_a_marquee_item_still_reads_and_items_stay_apa
 
 
 @pytest.mark.parametrize("separator", ['<img src="dot.svg">', '<svg><circle r="1"/></svg>',
-                                       '<picture><source srcset="a.webp"><img src="a.png"></picture>'])
+                                       '<picture><source srcset="a.webp"><img src="a.png"></picture>',
+                                       '<picture><source srcset="a.webp"></picture>'])
 def test_an_icon_between_inline_marquee_items_keeps_them_apart(separator):
     """Review of be#2742, P3-2: images are the separators between inline marquee items, so they stay a boundary."""
     html = (f'<div class="announcement-bar"><span>FREE SHIPPING OVER $50 USE CODE</span>{separator}'

@@ -180,6 +180,9 @@ from tests.test_deal_code_retention import (  # noqa: E402,F401
     test_an_expired_row_without_verified_at_runs_on_its_past_expiry,
     test_a_timestamp_in_the_future_never_keeps_a_row_forever,
     test_the_expiry_only_leg_boundary_is_exactly_30_days,
+    # review of be#2742 delta (Q07, the updated_at horizon)
+    test_an_expiry_exactly_one_ttl_ahead_is_trusted_and_a_microsecond_later_is_not,
+    test_an_updated_at_past_the_horizon_is_no_evidence,
 )
 
 
@@ -273,7 +276,15 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
             ("o5", "merch_order", "https://e.example/p"),
             # review of be#2742, P2-B: shapes the Python parse reads, so the SQL host must read them too
             ("ws", "merch_ws", " https://ws-own.example/p"), ("ns", "merch_ns", "nos-own.example/p"),
-            ("at", "merch_at", "https://a@b@at-own.example/p")]
+            ("at", "merch_at", "https://a@b@at-own.example/p"),
+            # review of be#2742, P2-B': a scheme-less host:port is the host, not a scheme; tab, CR, LF and space in the
+            # authority are dropped as urlsplit drops them
+            ("p1", "merch_p1", "sp.example:8080/p"), ("p2", "merch_p2", "sp2.example:8080"),
+            ("p3", "merch_p3", "www.nos2.example:443"), ("t1", "merch_t1", "https://ta\tb.example/p"),
+            ("t2", "merch_t2", "https://nl\n.example/p"), ("t3", "merch_t3", "https://cr\r.example/p"),
+            ("t4", "merch_t4", "https:// sp3.example/p"), ("t5", "merch_t5", "https://user@ sp5.example/p"),
+            ("t6", "merch_t6", "//proto-rel.example/p"),  # Python reads no host here; SQL reading one fails closed
+            ("m1", "merch_pmix", "sp4.example:8080/p"), ("m2", "merch_pmix", "https://own4.example/p")]
     for key, mid, url in rows:
         await db.execute(
             "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
@@ -293,7 +304,9 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
     await db.execute(
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
         " VALUES (:k, 'merch_deep', 'shopify', 'deepown', 't', 'https://zz-own.example/p')", {"k": _PREFIX + "deepown"})
-    for mid in ("merch_mix", "merch_sq", "merch_order", "merch_ws", "merch_ns", "merch_at", "merch_deep"):
+    shape_ids = ("merch_p1", "merch_p2", "merch_p3", "merch_t1", "merch_t2", "merch_t3", "merch_t4", "merch_t5",
+                 "merch_t6", "merch_pmix")
+    for mid in ("merch_mix", "merch_sq", "merch_order", "merch_ws", "merch_ns", "merch_at", "merch_deep") + shape_ids:
         await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
                          {"s": mid, "t": NOW})
     # With sort plans off, Postgres answers an unordered DISTINCT by hashing; only the ORDER BY keeps the first hosts.
@@ -307,5 +320,8 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
     assert all(deny.blocks(f"{c}.example") for c in "abcd") and not deny.blocks("e.example")
     assert deny.blocks("ws-own.example") and deny.blocks("nos-own.example") and deny.blocks("at-own.example")
     assert deny.blocks("zz-own.example")
+    for host in ("sp.example", "sp2.example", "nos2.example", "tab.example", "nl.example", "cr.example", "sp3.example",
+                 "sp5.example", "proto-rel.example", "sp4.example", "own4.example"):
+        assert deny.blocks(host), host
     assert not deny.delete
-    assert deny.counts == {"optout_ids_canonical_only": 7, "optout_ids_too_broad": 1}
+    assert deny.counts == {"optout_ids_canonical_only": 7 + len(shape_ids), "optout_ids_too_broad": 1}
