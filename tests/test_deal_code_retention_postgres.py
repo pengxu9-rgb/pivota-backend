@@ -179,6 +179,7 @@ from tests.test_deal_code_retention import (  # noqa: E402,F401
     test_an_expired_row_without_timestamps_runs_on_updated_at_to_the_second,
     test_an_expired_row_without_verified_at_runs_on_its_past_expiry,
     test_a_timestamp_in_the_future_never_keeps_a_row_forever,
+    test_the_expiry_only_leg_boundary_is_exactly_30_days,
 )
 
 
@@ -269,7 +270,10 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
     rows = [("z", "merch_mix", "HTTPS://user@Shop.Z-Own.Example:8443/p?x=1"), ("sq", "merch_sq", "https://brand1.square.site/p"),
             ("o1", "merch_order", "https://d.example/p"), ("o2", "merch_order", "https://c.example/p"),
             ("o3", "merch_order", "https://b.example/p"), ("o4", "merch_order", "https://a.example/p"),
-            ("o5", "merch_order", "https://e.example/p")]
+            ("o5", "merch_order", "https://e.example/p"),
+            # review of be#2742, P2-B: shapes the Python parse reads, so the SQL host must read them too
+            ("ws", "merch_ws", " https://ws-own.example/p"), ("ns", "merch_ns", "nos-own.example/p"),
+            ("at", "merch_at", "https://a@b@at-own.example/p")]
     for key, mid, url in rows:
         await db.execute(
             "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
@@ -280,7 +284,16 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
         " FROM generate_series(1, 3000) AS g",
         {"p": _PREFIX},
     )
-    for mid in ("merch_mix", "merch_sq", "merch_order"):
+    await db.execute(  # one id past the URL cap: only the SQL host read finds its own host behind 5,100 listings
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " SELECT :p || 'deep' || g, 'merch_deep', 'shopify', 'deep' || g, 't', 'https://www.amazon.com/dp/d' || g"
+        " FROM generate_series(1, 5100) AS g",
+        {"p": _PREFIX},
+    )
+    await db.execute(
+        "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
+        " VALUES (:k, 'merch_deep', 'shopify', 'deepown', 't', 'https://zz-own.example/p')", {"k": _PREFIX + "deepown"})
+    for mid in ("merch_mix", "merch_sq", "merch_order", "merch_ws", "merch_ns", "merch_at", "merch_deep"):
         await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
                          {"s": mid, "t": NOW})
     # With sort plans off, Postgres answers an unordered DISTINCT by hashing; only the ORDER BY keeps the first hosts.
@@ -292,5 +305,7 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
     assert deny.blocks("a-own.example") and deny.blocks("shop.z-own.example") and not deny.blocks("amazon.com")
     assert deny.blocks("brand1.square.site") and not deny.blocks("other.square.site")
     assert all(deny.blocks(f"{c}.example") for c in "abcd") and not deny.blocks("e.example")
+    assert deny.blocks("ws-own.example") and deny.blocks("nos-own.example") and deny.blocks("at-own.example")
+    assert deny.blocks("zz-own.example")
     assert not deny.delete
-    assert deny.counts == {"optout_ids_canonical_only": 3, "optout_ids_too_broad": 1}
+    assert deny.counts == {"optout_ids_canonical_only": 7, "optout_ids_too_broad": 1}

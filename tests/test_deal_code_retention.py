@@ -675,6 +675,16 @@ async def test_an_expired_row_without_timestamps_runs_on_updated_at_to_the_secon
     assert await ids(db) == ["edge"]
 
 
+async def test_the_expiry_only_leg_boundary_is_exactly_30_days(db):
+    await offer(db, "expedge", observed_days=60)
+    await _raw_verification(db, "expedge", "expired", expires_at=NOW - timedelta(days=30), updated_at=NOW - timedelta(days=60))
+    await offer(db, "exppast", observed_days=60)
+    await _raw_verification(db, "exppast", "expired", expires_at=NOW - timedelta(days=30, seconds=1),
+                            updated_at=NOW - timedelta(days=60))
+    await r.run(now=NOW)
+    assert await ids(db) == ["expedge"]
+
+
 async def test_an_expired_row_without_verified_at_runs_on_its_past_expiry(db):
     await offer(db, "byexpiry", observed_days=60)
     await _raw_verification(db, "byexpiry", "expired", expires_at=NOW - timedelta(days=20),
@@ -693,13 +703,23 @@ async def test_a_timestamp_in_the_future_never_keeps_a_row_forever(db):
     await offer(db, "farverified", observed_days=60)
     await _raw_verification(db, "farverified", "expired", verified_at=NOW + timedelta(days=36500), ref_discount_amount=5,
                             updated_at=NOW - timedelta(days=31))
-    await offer(db, "landing", observed_days=60)  # a verification written while the run is going
+    full = dict(verified_via="ucp_checkout", authorized_by="q2_approval", ref_currency="USD", ref_unit_price=25,
+                ref_subtotal=25, ref_automatic_discounts=[], ref_discount_amount=5)
+    # A verification written while the run is going (or by a clock running ahead), on a queued row whose updated_at
+    # was never refreshed: kept (review of be#2742, P2-A).
+    await offer(db, "landing", observed_days=60)
     await _raw_verification(db, "landing", "checkout_verified", verified_at=NOW + timedelta(seconds=5),
-                            expires_at=NOW + timedelta(hours=24), ref_discount_amount=5,
-                            updated_at=NOW + timedelta(seconds=5), verified_via="ucp_checkout",
-                            authorized_by="q2_approval", ref_currency="USD", ref_unit_price=25, ref_subtotal=25,
-                            ref_automatic_discounts=[])
+                            expires_at=NOW + timedelta(hours=24), updated_at=NOW - timedelta(days=40), **full)
+    await offer(db, "landingedge", observed_days=60)  # exactly one TTL ahead: still trusted
+    await _raw_verification(db, "landingedge", "checkout_verified", verified_at=NOW + timedelta(hours=24),
+                            expires_at=NOW + timedelta(hours=48), updated_at=NOW - timedelta(days=40), **full)
+    await offer(db, "aheadexpiry", observed_days=60)  # no verified_at, expiry a moment ahead
+    await _raw_verification(db, "aheadexpiry", "expired", expires_at=NOW + timedelta(seconds=5),
+                            updated_at=NOW - timedelta(days=40))
+    await offer(db, "pastttl", observed_days=60)  # one TTL and a second ahead: not trusted, runs on updated_at
+    await _raw_verification(db, "pastttl", "checkout_verified", verified_at=NOW + timedelta(hours=24, seconds=1),
+                            expires_at=NOW + timedelta(hours=48), updated_at=NOW - timedelta(days=31), **full)
     out = await r.run(now=NOW)
-    assert await ids(db) == ["landing"]
-    assert out["deleted_applied_expired"] == 2
+    assert await ids(db) == ["aheadexpiry", "landing", "landingedge"]
+    assert out["deleted_applied_expired"] == 3
 

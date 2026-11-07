@@ -24,9 +24,12 @@ The writer reads the same denylist. Each note counts opt-out rows, never names o
 | `optout_ids_unmapped` | a merchant id with no catalog host the store owns (no rows, only marketplace URLs, or a host typed without its TLD) | **writes** | deletes nothing | **add a host row for the store** |
 | `optout_ids_canonical_only` | the merchant id's hosts are known only from canonical URLs | blocks those hosts | deletes nothing | add host rows if existing rows must go now (otherwise they age out in 14 days) |
 | `optout_ids_too_broad` | the merchant id spans more than 3 registrable domains | blocks every host it names | deletes nothing | add host rows for the store's own domains |
+| `optout_ids_shared_host` | a host opt-out names a shared platform or registry suffix (`github.io`, `square.site`, `co.uk`, ...) | blocks only that exact host, **writes for every store under it** | deletes only that exact host | **add a host row for the store's own address** (`brand.github.io`) |
 
-**Do not give the write go while `optout_ids_placeholder` or `optout_ids_unmapped` is non-zero** unless every such
-opt-out also has a host row. Those two classes cannot fail closed: there is no host to block, so the store's codes are
+**Do not give the write go while `optout_ids_placeholder`, `optout_ids_unmapped` or `optout_ids_shared_host` is
+non-zero** unless every such opt-out also has a host row. The count stays non-zero after you add the host row (it
+counts the original opt-out, which still maps to nothing), so this check is manual: list `deal_lane_optout` and confirm
+each such id has its store's host row next to it. These three classes cannot fail closed: there is no store host to block, so the store's codes are
 still written. A host row is the store's domain as `seller_id` (`brand.example`); it covers its `www.` form and its
 subdomains. An opt-out of a public suffix or a shared platform domain (`co.uk`, `myshopify.com`, `square.site`,
 `github.io`, ...) covers only that exact host, never the stores under it.

@@ -403,7 +403,8 @@ async def test_a_digit_token_that_names_something_else_is_not_written(db, token)
                                      "Get 15% off with code ABC123 — for example only",
                                      "Example: use code ABC123 at checkout for 15% off",
                                      "Enter a code such as ABC123 for 15% off",
-                                     "For instance, use code ABC123 for 15% off"])
+                                     "For instance, use code ABC123 for 15% off",
+                                     "Get 15% off with code ABC123, for instance on boots"])
 async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
     await w.record([captured(code="ABC123", snippet=snippet)], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -411,7 +412,7 @@ async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
     assert dcc.stats()["writes"] == {"skipped_not_a_code": 1}
 
 
-@pytest.mark.parametrize("token", ["50OFF", "20OFF", "4EVER", "COVID19", "W10", "SAVE15", "B2B10X1"])
+@pytest.mark.parametrize("token", ["50OFF", "20OFF", "4EVER", "COVID19", "W10", "SAVE15", "B2B10X1", "10PCT", "20PCT"])
 async def test_ambiguous_digit_codes_stores_really_use_are_written(db, token):
     await w.record([captured(code=token, snippet=f"Get 15% off with code {token} today")], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -670,17 +671,24 @@ async def test_a_normal_multi_domain_store_adds_no_note(db):
     assert deny.blocks("glow.co.uk") and deny.blocks("glow-store.myshopify.com")
 
 
-@pytest.mark.parametrize("optout", ["github.io", "vercel.app", "herokuapp.com", "netlify.app", "com.vn", "com.ar"])
+@pytest.mark.parametrize("optout", ["github.io", "vercel.app", "herokuapp.com", "netlify.app", "com.vn", "com.ar",
+                                    "company.site", "square.site", "co.uk"])
 async def test_a_hosting_platform_or_registry_suffix_opt_out_never_blocks_the_stores_under_it(db, optout):
     await _optout(db, optout)
     host = f"brand.{optout}"
     await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
     assert [r["seller_id"] for r in await rows(db)] == [host]
+    deny = await w.read_denyset()
+    assert deny.counts == {"optout_ids_shared_host": 1}  # reported: the opt-out probably meant one store (be#2742 P3-4)
+    assert deny.blocks(optout)  # the exact host itself is still covered
 
 
 @pytest.mark.parametrize("optout,page", [("bücher.example", "xn--bcher-kva.example"),
                                          ("xn--bcher-kva.example", "bücher.example"),
-                                         ("https://www.BÜCHER.example/x", "shop.xn--bcher-kva.example")])
+                                         ("https://www.BÜCHER.example/x", "shop.xn--bcher-kva.example"),
+                                         ("ｗｗｗ.bücher.example", "xn--bcher-kva.example"),  # full-width www. (P3-5)
+                                         ("bücher.example。", "xn--bcher-kva.example"),  # ideographic full stop
+                                         ("straße.example", "xn--strae-oqa.example")])  # UTS-46 nontransitional
 async def test_an_internationalised_host_matches_in_either_spelling(db, optout, page):
     await _optout(db, optout)
     await w.record([captured()], url=f"https://{page}/p", final_url=f"https://{page}/p", market="US", page_currency="USD")
@@ -716,4 +724,13 @@ async def test_the_denylist_cache_expires_after_its_cap_within_a_run(db, monkeyp
     await w.record([captured(code="NEW22")], url="https://b.example/q", final_url="https://b.example/q", market="US", page_currency="USD")
     assert len(reads) == 2
     assert dcc.stats()["writes"] == {"inserted": 2, "skipped_optout": 1}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("é" * 70 + ".example", "é" * 70 + ".example"),  # a label over 63 characters: kept as it is
+    ("\udcff.example", "\udcff.example"),  # a lone surrogate: UTS-46 refuses it, so does the stdlib codec
+    ("a..é.example", "a..xn--9ca.example"),  # an empty label does not stop the others
+])
+def test_a_host_that_cannot_be_encoded_never_raises_and_keeps_its_spelling(value, expected):
+    assert w.normalize_host(value) == expected
 

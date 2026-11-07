@@ -78,9 +78,10 @@ _NOT_A_CODE_RE = re.compile(
     r"^(?:\d+(?:ST|ND|RD|TH|H|HR|HRS|AM|PM|X|PER)|\d+-?DAYS?|SPF\d+|[A-Z]\d[A-Z]"
     r"|\d+-?(?:ML|L|OZ|G|KG|LBS?|PCS?|PK|PACK|MINS?|HOURS?|WEEKS?|MONTHS?|YRS?|YEARS?|FT|IN|CM|MM|P|K|GB|TB|W|V|MAH)"
     r"|\d+-IN-\d+|\d+(?:AM|PM)-\d+(?:AM|PM)|KN\d+|N\d{2}"
-    # review of be#2735 delta 3, P3-R3: dimensions and drive types ("4X4"), sizes ("3XL", "2XS"), "100PCT",
+    # review of be#2735 delta 3, P3-R3: dimensions and drive types ("4X4"), sizes ("3XL", "2XS"), "100PCT" (only that:
+    # "10PCT" and "20PCT" can be codes, review of be#2742),
     # "360-DEGREE", ratings ("5STAR") and season labels ("2026SS", "2025FW")
-    r"|\d+X\d+|\d+X{1,3}[SL]|\d+PCT|\d+-?DEG(?:REE)?S?|\d+-?STARS?|\d{4}(?:SS|FW|AW))$|X{3,}", re.IGNORECASE)
+    r"|\d+X\d+|\d+X{1,3}[SL]|100PCT|\d+-?DEG(?:REE)?S?|\d+-?STARS?|\d{4}(?:SS|FW|AW))$|X{3,}", re.IGNORECASE)
 # The phrased forms only; the bare-"code" form is shadow-only until measured.
 _WRITTEN_FORMS = {"use_code", "labelled", "with_code"}
 # PROVENANCE: every row this writer creates has a deal_id with this prefix, and no other writer uses it. Retention
@@ -99,17 +100,36 @@ def normalize_host(value: Optional[str]) -> str:
         text = (urlparse(text if "://" in text else "//" + text).hostname or "")
     elif ":" in text:
         text = text.split(":", 1)[0]
+    if text and not text.isascii():
+        # One spelling for an internationalised host (review of be#2735 delta 3, P3-R3), BEFORE the strips below so a
+        # full-width "ｗｗｗ." or a trailing "。" is stripped too (review of be#2742, P3-5).
+        text = _ascii_host(text)
     text = text.strip().rstrip(".")
     while text.startswith(("*.", "www.")):  # "*.host", "www.host" and "www.*.host" all name the host (be#2735)
         text = text[2:] if text.startswith("*.") else text[4:]
-    if text and not text.isascii():
-        # One spelling for an internationalised host (review of be#2735 delta 3, P3-R3): the unicode form becomes the
-        # punycode form a URL carries, so an opt-out entered either way covers the other.
-        try:
-            text = text.encode("idna").decode("ascii").lower()
-        except (UnicodeError, ValueError):
-            pass
     return text
+
+
+def _ascii_host(text: str) -> str:
+    """The punycode form a URL carries (UTS-46 nontransitional, as browsers map it: "straße" stays "xn--strae-oqa").
+    A label that cannot be encoded is kept as it is (it still matches the same spelling elsewhere). Never raises."""
+    try:
+        import idna  # a dependency of requests and httpx
+
+        mapped = idna.uts46_remap(text, std3_rules=False, transitional=False)
+        encode = lambda label: idna.alabel(label).decode("ascii")  # noqa: E731
+    except Exception:  # noqa: BLE001 - no idna package, or a string UTS-46 cannot map: the stdlib codec per label
+        mapped = text.replace("\u3002", ".").replace("\uff0e", ".").replace("\uff61", ".")
+        encode = lambda label: label.encode("idna").decode("ascii")  # noqa: E731
+    labels = []
+    for label in mapped.split("."):
+        if label and not label.isascii():
+            try:
+                label = encode(label)
+            except Exception:  # noqa: BLE001 - an invalid label stays unicode
+                pass
+        labels.append(label)
+    return ".".join(labels).lower()
 
 
 def seller_id_for(url: str) -> Optional[str]:
@@ -322,6 +342,11 @@ async def read_denyset() -> DenySet:
     merchants: Dict[str, Set[str]] = {}  # lower-case id -> the spellings to look up
     for i in ids:
         if "." in normalize_host(i):
+            host = normalize_host(i)
+            if host in EXTRA_SHARED_HOSTS or host in _PUBLIC_SUFFIXES:
+                # A shared platform or registry suffix covers only that exact host, never the stores under it
+                # (review of be#2742, P3-4): reported, as the opt-out probably meant one store.
+                bump("optout_ids_shared_host")
             delete |= _host_forms(i)
         elif i.lower() in PLACEHOLDER_MERCHANT_IDS:
             bump("optout_ids_placeholder")
@@ -368,7 +393,9 @@ def _is_sqlite() -> bool:
 
 
 # The host of an absolute URL, in SQL (Postgres: a two-argument substring is a POSIX regex with one capture group).
-_URL_HOST_PATTERN = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@]*@)?([^/:?#]+)"
+# Tolerant as the Python parse is (review of be#2742, P2-B): leading space, no scheme, "//host", and userinfo up to the
+# LAST "@" before the path.
+_URL_HOST_PATTERN = r"^\s*(?:[A-Za-z][A-Za-z0-9+.-]*:)?(?://)?(?:[^/?#]*@)?([^/:?#\s]+)"
 
 
 async def _canonical_hosts(spellings) -> Set[str]:
