@@ -451,6 +451,8 @@ async def _catalog(db, i, merchant, domain=None, url=None):
     ("merch_obs_glow", ("merch_obs_glow", None, "https://www.glow.example/products/toner")),
     ("www.*.glow.example", None),
     ("*.www.glow.example", None),
+    ("www.\u2003glow.example", None),  # an em space UTS-46 maps to a space after "www." (be#2742 delta 3, P3-1)
+    ("merch_obs_glow", ("merch_obs_glow", None, "https://www.\u2003glow.example/p")),
 ])
 async def test_the_opt_out_matches_whatever_form_each_side_was_entered_in(db, optout, catalog):
     if catalog:
@@ -738,6 +740,8 @@ async def test_a_host_that_cannot_be_encoded_never_raises_and_keeps_its_spelling
 @pytest.mark.parametrize("value,expected", [
     ("ｗｗｗ。bücher。example", "xn--bcher-kva.example"),
     ("é" * 70 + "。example", "é" * 70 + ".example"),  # the ideographic stop is a dot even where a label cannot encode
+    ("é" * 70 + "．example", "é" * 70 + ".example"),  # so are the full-width and half-width stops (delta 3, P3-3)
+    ("é" * 70 + "｡example", "é" * 70 + ".example"),
     ("www.brand．example｡", "brand.example"),
     ("straße.example", "strasse.example"),  # IDNA 2003 without the package (it maps ß; the package keeps it)
 ])

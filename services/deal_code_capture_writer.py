@@ -106,7 +106,8 @@ def normalize_host(value: Optional[str]) -> str:
         text = _ascii_host(text)
     text = text.strip().rstrip(".")
     while text.startswith(("*.", "www.")):  # "*.host", "www.host" and "www.*.host" all name the host (be#2735)
-        text = text[2:] if text.startswith("*.") else text[4:]
+        # strip again: a Unicode space after "www." only becomes a space once UTS-46 maps it (delta 3, P3-1)
+        text = (text[2:] if text.startswith("*.") else text[4:]).strip()
     return text
 
 
@@ -393,11 +394,17 @@ def _is_sqlite() -> bool:
 
 
 # The host of an absolute URL, in SQL (Postgres: a two-argument substring is a POSIX regex with one capture group).
-# Tolerant as the Python parse is (reviews of be#2742, P2-B and P2-B'): leading space, no scheme, "//host", userinfo up
-# to the LAST "@" before the path, and space around the host. A scheme counts only before "//" (so "host:8080/p" reads
-# "host", not the port), and the column loses tab, CR and LF first, as urlsplit does.
-_URL_HOST_PATTERN = r"^\s*(?:[A-Za-z][A-Za-z0-9+.-]*://|//)?\s*(?:[^/?#]*@)?\s*([^/:?#\s]+)"
-_URL_CONTROL_CHARS = "\t\n\r"
+# Tolerant as the Python parse is (reviews of be#2742, P2-B, P2-B' and delta 3 P3-1): no scheme, "//host", and userinfo
+# up to the LAST "@" before the path. A scheme counts only before "//" (so "host:8080/p" reads "host", not the port).
+# The column first loses every character the Python side strips or ignores around a host: C0 controls and space (which
+# urlsplit strips before the scheme), DEL to NBSP (NEL among them), and the Unicode spaces and zero-width characters
+# that str.strip() and UTS-46 drop. Listed as characters, not "\s", whose meaning in Postgres depends on the server
+# locale. Dropping one in the middle of a host only makes a host that matches nothing (fails closed). No SQL lower():
+# normalize_host lowers as Python does (Postgres folds a dotted capital I to a plain "i"; Python does not).
+_URL_STRIPPED_CHARS = "[" + "".join((
+    "\x01-\x20", "\x7f-\xa0", "\u1680", "\u180e", "\u2000-\u200b", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000",
+    "\ufeff")) + "]"
+_URL_HOST_PATTERN = r"^(?:[A-Za-z][A-Za-z0-9+.-]*://|//)?(?:[^/?#]*@)?([^/:?#]+)"
 
 
 async def _canonical_hosts(spellings) -> Set[str]:
@@ -410,8 +417,8 @@ async def _canonical_hosts(spellings) -> Set[str]:
             .limit(CANONICAL_URLS_PER_ID_FALLBACK))
         hosts = sorted({normalize_host(r["canonical_url"]) for r in found} - {""})
         return set(hosts[:CANONICAL_HOSTS_PER_ID])
-    url = func.translate(p.c.canonical_url, _URL_CONTROL_CHARS, "")
-    host = func.lower(func.substring(url, _URL_HOST_PATTERN)).label("host")
+    url = func.regexp_replace(p.c.canonical_url, _URL_STRIPPED_CHARS, "", "g")
+    host = func.substring(url, _URL_HOST_PATTERN).label("host")
     found = await database.fetch_all(
         select(host).where(where).distinct().order_by(host).limit(CANONICAL_HOSTS_PER_ID))
     return {normalize_host(r["host"]) for r in found if r["host"]} - {""}
