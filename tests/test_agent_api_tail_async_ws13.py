@@ -173,7 +173,7 @@ def _install_agent_create_order_harness(
     async def fake_get_primary_store(_merchant_id: str):
         return {"platform": "shopify", "store_id": "store_ws13"}
 
-    async def fake_load_replayable_agent_order_create_response(_order_request: Any):
+    async def fake_load_replayable_agent_order_create_response(_order_request: Any, **_replay_owner: Any):
         return None
 
     async def fake_quote_load(self: Any, *, quote_id: str):
@@ -210,6 +210,7 @@ def _install_agent_create_order_harness(
     async def fake_cache_agent_order_create_response_best_effort(
         _idempotency_key: Optional[str],
         _response: dict[str, Any],
+        **_replay_owner: Any,
     ) -> None:
         await maybe_fail("_cache_agent_order_create_response_best_effort")
 
