@@ -2577,6 +2577,7 @@ def _resolve_exec_spec_offer(
     row_overrides: dict = None,
     allowed_domains: list = None,
     product: dict = None,
+    payload_extra: dict = None,
 ) -> dict:
     """One external offer for the exec-spec fixture, through the real route.
 
@@ -2602,7 +2603,7 @@ def _resolve_exec_spec_offer(
         json={
             "operation": "offers.resolve",
             "payload": {"product": product or {"sku_id": "SKU-1"}, "limit": 10, "market": "US",
-                        "tool": "*"},
+                        "tool": "*", **(payload_extra or {})},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -2944,7 +2945,7 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
     assert offer["cart_prefilled"] is None
 
 
-def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
+def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool, payload_extra=None, currency=None, expect_status=200):
     """Drive the REAL route and return (offer, decoded_token_dest).
 
     The real `_make_external_redirect_url` runs — only the DB read is faked. The token is
@@ -2959,7 +2960,12 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
-            return [_seed_row_for_exec_spec(evidence=evidence)]
+            row = _seed_row_for_exec_spec(evidence=evidence)
+            if currency:
+                row["price_currency"] = currency
+                for v in row["seed_data"]["snapshot"]["variants"]:
+                    v["price_currency"] = currency
+            return [row]
         return []
 
     # These tests are about the execution spec, not about rate limiting, and the anon limiter is
@@ -2977,11 +2983,13 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*", **(payload_extra or {})},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == expect_status, res.text
+    if expect_status != 200:
+        return res, None
     offers = [o for o in (res.json().get("offers") or [])
               if o.get("purchase_route") == "affiliate_outbound"]
     assert offers, "the external offer must be returned for this to prove anything"
@@ -6270,6 +6278,87 @@ def test_an_affiliate_destination_is_never_stamped_or_asked(
     offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert calls == []
     assert "warm_fact" not in _ctx_of(offer)
+
+
+# ---- decision D-10: a market the gateway ASSUMED is not a market the buyer named -------------------------------
+
+
+@pytest.mark.parametrize("flag", ["marketAssumed", "market_assumed"])
+def test_an_assumed_market_is_served_but_never_stamped_observed(monkeypatch, client: TestClient, flag: str) -> None:
+    """The gateway's get_offers sends `market: "US"` for a call that named no market, with `marketAssumed`. The
+    offer is the US one (the served market is US), but its `/r` token must not say the buyer named US: the
+    warm-handoff sink keys its gate only on an observed market."""
+    declared, declared_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    assumed, assumed_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={flag: True})
+    assert declared_payload["market_observed"] is True, "the premise: a named US is observed"
+    assert "market_observed" not in assumed_payload
+    assert assumed_payload["market"] == declared_payload["market"] == "US"
+    assert assumed["purchase_route"] == declared["purchase_route"]
+
+
+def _cart_country(url):
+    from urllib.parse import parse_qs, urlparse
+
+    return (parse_qs(urlparse(url).query).get("country") or [None])[0]
+
+
+def test_p2_n1_the_flag_never_downgrades_a_declared_market(monkeypatch, client: TestClient) -> None:
+    """P2-N1: `marketAssumed` beside a declared SG is IGNORED: the token stays observed and the SG cart pin stays.
+    The answer is the declared-SG answer, whatever the flag says."""
+    sg, sg_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, currency="SGD", payload_extra={"market": "SG"})
+    forged, forged_payload = _resolve_offer_with_spec(
+        monkeypatch, client, evidence=True, currency="SGD", payload_extra={"market": "SG", "marketAssumed": True})
+    assert sg_payload["market_observed"] is True
+    assert forged_payload["market_observed"] is True, "beside SG the flag is ignored"
+    assert _cart_country(sg["execution_spec"]["cart_url"]) == "SG"
+    assert _cart_country(forged["execution_spec"]["cart_url"]) == "SG", "the SG pin is kept"
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+def test_p2_n1_only_a_literal_true_assumes(monkeypatch, client: TestClient, value) -> None:
+    _, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": value})
+    assert payload["market_observed"] is True, f"{value!r} is not a literal True: the declared US is kept"
+
+
+@pytest.mark.parametrize("value", [None, "maybe", {"x": 1}, [], "false", 0, False])
+def test_p3_n5_a_junk_flag_is_ignored_never_an_error(monkeypatch, client: TestClient, value) -> None:
+    """P3-N5: any value but a literal True is "not assumed" -- a 200 with the declared answer, never a 500."""
+    _, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": value})
+    assert payload["market_observed"] is True
+
+
+def test_p3_n3_an_assumed_us_cart_url_is_still_byte_identical_to_what_the_redirect_signs(monkeypatch, client: TestClient) -> None:
+    """The anti-drift assertion, for the assumed case: the published cart_url and the signed destination agree
+    (neither carries the pin a declared US would)."""
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": True})
+    spec = offer["execution_spec"]
+    assert spec["cart_url"], "evidence-stamped seed must produce a cart"
+    assert spec["cart_url"] == payload["dest"]
+    assert "market_observed" not in payload
+
+
+def test_p3_n2_an_assumed_us_is_never_asked_a_warm_fact(monkeypatch, client: TestClient, fact_lane) -> None:
+    """P3-N2: the assumed-US token is unobserved, so its click could never redeem a warm fact (`fact_no_market`):
+    none is asked or stamped, and the answer claims `cart_prefilled: false`, what a no-market answer claimed. The
+    cart GATE still runs on US (the fact read for it is the purchasability one)."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    declared = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert _ctx_of(declared)["warm_fact"] == "human_handoff", "the premise: a declared US is stamped"
+    assert declared["cart_prefilled"] is None
+    calls.clear()
+    assumed = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN, payload_extra={"marketAssumed": True})
+    assert "warm_fact" not in _ctx_of(assumed)
+    assert assumed["cart_prefilled"] is False
+    assert "market_observed" not in _payload_of(assumed)
+    assert _payload_of(declared)["market_observed"] is True
+
+
+def test_the_assumed_flag_is_kept_by_the_normaliser_and_defaults_off() -> None:
+    import routes.agent_shop_gateway as gw
+
+    norm = gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US", "marketAssumed": True})
+    assert gw.OffersResolvePayload(**norm).market_assumed is True
+    assert gw.OffersResolvePayload(**gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US"})).market_assumed is False
 
 
 @pytest.mark.parametrize("row_overrides", [
