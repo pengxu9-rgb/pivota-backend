@@ -287,6 +287,20 @@ class AgentContext:
         return merchant_id in self.allowed_merchants
 
 
+def has_no_merchant_scope(context: Any) -> bool:
+    """True when the agent's merchant allowlist is an EMPTY list: it may act for NO merchant.
+
+    `allowed_merchants` None means every merchant; a list means only those, and an empty list
+    means none (a new self-serve key starts there, routes/agent_account.py). Search lanes that
+    fall back to "all merchants" when no scope is named must ask this first, or `[]` reads as
+    "unrestricted" there while `can_access_merchant` reads it as "nothing".
+    """
+    allowed = getattr(context, "allowed_merchants", None)
+    if not isinstance(allowed, list):
+        return False
+    return not any(str(m or "").strip() for m in allowed)
+
+
 async def get_agent_context(
     request: Request,
     api_key: Optional[str] = Security(api_key_header),

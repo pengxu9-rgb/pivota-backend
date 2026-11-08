@@ -46,6 +46,7 @@ from routes.agent_auth import (
     AgentContext,
     ensure_checkout_token_order_access,
     get_agent_context,
+    has_no_merchant_scope,
     log_agent_request,
 )
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
@@ -5292,6 +5293,53 @@ async def agent_search_products(
         # Contract: allow callers to request above 200, but clamp internally.
         limit = max(1, min(int(limit or 20), AGENT_SEARCH_LIMIT_MAX))
         offset = max(0, int(offset or 0))
+
+        # An agent whose allowlist is an EMPTY list may search NO merchant. Every lane below
+        # falls back to cross-merchant search when it finds no scope, which read `[]` as
+        # "unrestricted" (a new self-serve key starts at `[]` until staff grant merchants).
+        if has_no_merchant_scope(context):
+            if merchant_id or any(str(m or "").strip() for m in (merchant_ids or [])):
+                # A named merchant this agent may not access: the 403 the scoped lanes below give.
+                raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id="no_merchant_scope",
+            )
+            return {
+                "status": "success",
+                "products": [],
+                "pagination": {
+                    "total_count": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "page": (offset // limit) + 1,
+                    "total_pages": 0,
+                    "has_more": False,
+                },
+                "search_context": {
+                    "merchant_id": None,
+                    "merchant_ids": [],
+                    "merchants_searched": [],
+                    "cross_merchant_search": False,
+                    "catalog_surface": catalog_surface,
+                },
+                "filters_applied": {
+                    "query": query,
+                    "category": category,
+                    "catalog_surface": catalog_surface,
+                    "min_price": min_price,
+                    "max_price": max_price,
+                    "in_stock_only": in_stock_only,
+                },
+                "metadata": _finalize_search_metadata({
+                    "source": "agent_search_products",
+                    "reason_code": "no_merchant_scope",
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "external_seed_returned_count": 0,
+                }),
+            }
 
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
             try:
@@ -10807,6 +10855,11 @@ async def agent_refund_order(
             allowed_refs = await resolve_buyer_ref_sources(context.agent_id, str(buyer_ref))
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
+        from services.agent_refund_policy import refuse_agent_refund_execution
+
+        refuse_agent_refund_execution()
 
         # Build refund request (full refund)
         class _Req(BaseModel):
