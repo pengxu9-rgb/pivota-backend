@@ -612,68 +612,13 @@ async def process_case_refund(
     except Exception:
         amount = None
 
+    # D-03 (2026-11-08): a refund is a REQUEST to the merchant; Pivota never executes it. The case records
+    # the request and its amount; nothing here runs a PSP refund, restocks or cancels a store order.
+    from services.agent_refund_policy import CASE_STATUS_REQUESTED_FROM_MERCHANT, REFUSAL_DETAIL
+
     audit = loaded.get("audit_log") or []
     audit = audit if isinstance(audit, list) else []
-    audit = _append_audit(audit, "refund_requested", {"amount": amount})
-
-    try:
-        await database.execute(
-            """
-            UPDATE after_sales_cases
-            SET status = 'refund_pending',
-                audit_log = CAST(:audit_log AS JSONB),
-                updated_at = NOW()
-            WHERE case_id = :case_id
-            """,
-            {"case_id": case_id, "audit_log": json.dumps(audit, ensure_ascii=False)},
-        )
-    except Exception:
-        pass
-
-    # Execute refund via existing refund API (supports full + partial).
-    refund_req = RefundRequest(
-        order_id=str(order.get("order_id")),
-        amount=amount,
-        reason=str(loaded.get("reason_text") or loaded.get("reason_code") or "After-sales refund"),
-        restore_inventory=True,
-        idempotency_key=f"after_sales_case:{case_id}",
-    )
-
-    refund_result = await process_refund(
-        order_id=str(order.get("order_id")),
-        refund_request=refund_req,
-        background_tasks=background_tasks,
-        current_user={"role": "admin"},
-    )
-
-    # Reload order after refund attempt (PII-safe summary only)
-    try:
-        order = await get_order(str(order.get("order_id")))
-    except Exception:
-        pass
-
-    # Update case status best-effort
-    audit = _append_audit(
-        audit,
-        "refund_processed",
-        {"result_status": refund_result.get("status") if isinstance(refund_result, dict) else None},
-    )
-    next_status = "refund_processed"
-    try:
-        if isinstance(refund_result, dict) and str(refund_result.get("new_order_status") or "") in (
-            "partially_refunded",
-            "refunded",
-        ):
-            next_status = str(refund_result.get("new_order_status"))
-        if isinstance(refund_result, dict) and refund_result.get("refund_type") == "partial":
-            next_status = "partially_refunded"
-        if isinstance(refund_result, dict) and refund_result.get("status") == "already_refunded":
-            # Make the case converge to the order's current terminal status.
-            next_status = str((order or {}).get("status") or "refunded")
-        if isinstance(refund_result, dict) and refund_result.get("status") in ("partially_refunded", "refunded"):
-            next_status = str(refund_result.get("status"))
-    except Exception:
-        pass
+    audit = _append_audit(audit, "refund_requested_from_merchant", {"amount": amount})
 
     try:
         await database.execute(
@@ -684,30 +629,26 @@ async def process_case_refund(
                 updated_at = NOW()
             WHERE case_id = :case_id
             """,
-            {"case_id": case_id, "status": next_status, "audit_log": json.dumps(audit, ensure_ascii=False)},
+            {
+                "case_id": case_id,
+                "status": CASE_STATUS_REQUESTED_FROM_MERCHANT,
+                "audit_log": json.dumps(audit, ensure_ascii=False),
+            },
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"after_sales refund request error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record the refund request")
 
     reloaded = await _get_case_by_id(case_id)
-    order_summary = None
-    try:
-        if isinstance(order, dict) and order.get("order_id"):
-	            order_summary = {
-	                "order_id": str(order.get("order_id")),
-	                "status": str(order.get("status") or ""),
-	                "payment_status": str(order.get("payment_status") or ""),
-	                "fulfillment_status": str(order.get("fulfillment_status") or ""),
-	                "total": str(order.get("total") or ""),
-	                "total_refunded": str(order.get("total_refunded") or ""),
-	                "currency": str(order.get("currency") or ""),
-	                "updated_at": str(order.get("updated_at") or ""),
-	            }
-    except Exception:
-        order_summary = None
     return {
         "status": "success",
         "case": _serialize_case(reloaded),
-        "refund": refund_result,
-        "order": order_summary,
+        "refund": {
+            "state": "requested_from_merchant",
+            "executed": False,
+            "amount": amount,
+            "code": REFUSAL_DETAIL["code"],
+            "message": REFUSAL_DETAIL["message"],
+        },
+        "order": {"order_id": str(order.get("order_id") or "")},
     }

@@ -37,7 +37,7 @@ async def _override_get_agent_user_context():
 
 
 @pytest.mark.asyncio
-async def test_agent_refund_proxy_passes_idempotency_key(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_agent_refund_proxy_never_executes_a_refund(monkeypatch: pytest.MonkeyPatch) -> None:
     import routes.agent_api as agent_api
 
     captured: Dict[str, Any] = {}
@@ -82,9 +82,8 @@ async def test_agent_refund_proxy_passes_idempotency_key(monkeypatch: pytest.Mon
         app.dependency_overrides.pop(agent_api.get_agent_context, None)
         app.dependency_overrides.pop(agent_api.get_agent_user_context, None)
 
-    assert response.status_code == 200
-    assert captured["current_user"]["role"] == "admin"
-    refund_request = captured["refund_request"]
-    assert refund_request.idempotency_key == "agent_refund:agent_refund_proxy:ORD_REFUND_PROXY"
-    assert refund_request.amount is None
-    assert refund_request.restore_inventory is True
+    # D-03 (2026-11-08): refunds are the merchant's; the agent route refuses and runs nothing.
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "REFUND_HANDLED_BY_MERCHANT"
+    assert response.json()["detail"]["retryable"] is False
+    assert captured == {}, "process_refund must never be called from an agent route"
