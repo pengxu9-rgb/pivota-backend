@@ -13,7 +13,8 @@ store), are never touched. The rules:
   3. refused by the store and never applied for any variant: deleted 7 days after its last refusal;
   4. applied: kept while a verification is valid; deleted 30 days after the last valid-until across its verification
      history, whatever state a lapsed verification is in now (`expired`, or back to `unverified`), each valid-until
-     clamped to verified_at + DEAL_VERIFY_TTL_HOURS;
+     clamped to verified_at + DEAL_VERIFY_TTL_HOURS; a timestamp more than that TTL past the run (malformed) is not
+     trusted and the row runs on updated_at instead;
   5. the bar text (`terms_text`): cleared once a check recorded an outcome, or 14 days after the row was created.
 Every DELETE re-checks its rule's condition, so a verification that lands between the read and the delete keeps the row.
 
@@ -67,7 +68,8 @@ def applied_history():
     """A verification row recording that the code applied at checkout, whatever its state is now (review of be#2735,
     P2-2, P3-N4): `checkout_verified` or `expired`, or any row that kept its verified_at AND a discount amount (a
     re-queued `unverified`, a later `failed`). A check stamped on a failure that never applied has no amount and does
-    not count. The verifier's contract: a re-queue keeps verified_at, expires_at and the reference amounts."""
+    not count. The verifier's contract: a re-queue keeps verified_at, expires_at and the reference amounts, and EVERY
+    verification write sets updated_at (the column has only a server default; rule 4 falls back to it)."""
     return or_(v.c.state.in_(("checkout_verified", "expired")),
                and_(v.c.verified_at.isnot(None), v.c.ref_discount_amount > 0))
 
@@ -177,10 +179,22 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
     # (services/deal_lane_decision._ttl_ceiling), so an expires_at decades out cannot keep a row forever (P3-N4).
     grace_from = now - timedelta(days=APPLIED_GRACE_DAYS)
     ttl = timedelta(hours=settings.deal_verify_ttl_hours)
+    # A timestamp far in the future is not evidence of validity (review of be#2735 delta 3, P3-R4): a verified_at
+    # later than now + TTL, or (on a row with no usable verified_at) an expires_at later than now + TTL, falls back to
+    # updated_at, so a malformed row is kept 30 days after its last update, never forever. Up to TTL ahead is trusted
+    # (review of be#2742, P2-A): a verification that lands while this run is going, or from a clock running ahead,
+    # keeps its full grace whatever its updated_at. updated_at is bounded the same way (review of be#2742 delta, P3): a
+    # row whose only timestamp is an updated_at past the horizon has no evidence left and goes.
+    horizon = now + ttl
+    verified_usable = and_(v.c.verified_at.isnot(None), v.c.verified_at <= horizon)
     within_grace = exists().where(and_(v.c.deal_id == o.c.deal_id, applied_history(), or_(
-        and_(v.c.verified_at.isnot(None), v.c.verified_at >= grace_from - ttl,
+        and_(verified_usable, v.c.verified_at >= grace_from - ttl,
              or_(v.c.expires_at.is_(None), v.c.expires_at >= grace_from)),
-        and_(v.c.verified_at.is_(None), func.coalesce(v.c.expires_at, v.c.updated_at) >= grace_from),
+        and_(or_(v.c.verified_at.is_(None), v.c.verified_at > horizon), or_(
+            and_(v.c.expires_at.isnot(None), v.c.expires_at <= horizon, v.c.expires_at >= grace_from),
+            and_(or_(v.c.expires_at.is_(None), v.c.expires_at > horizon),
+                 v.c.updated_at >= grace_from, v.c.updated_at <= horizon),
+        )),
     )))
     await step("deleted_applied_expired", _delete_where(and_(_was_applied(), not_(within_grace))))
 
