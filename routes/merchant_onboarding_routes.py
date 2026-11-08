@@ -30,6 +30,7 @@ from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
 from utils.auth import ADMIN_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin
+from utils.tenant_scope import assert_merchant_scope, is_scope_staff
 from routes.manage_integrations import sync_legacy_primary_store_fields
 from urllib.parse import urlparse
 from utils.logger import logger as pivota_logger
@@ -871,10 +872,17 @@ async def register_merchant(
         )
 
 @router.post("/kyc/upload", response_model=Dict[str, Any])
-async def upload_kyc(kyc_data: KYCUploadRequest):
+async def upload_kyc(
+    kyc_data: KYCUploadRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Step 2: Upload KYC documents (simulated as JSON blob)
+
+    The merchant itself or staff. Was anonymous: anyone could overwrite any
+    merchant's KYB document record.
     """
+    assert_merchant_scope(current_user, kyc_data.merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(kyc_data.merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1029,10 +1037,14 @@ async def setup_psp(
     }
 
 @router.get("/status/{merchant_id}", response_model=Dict[str, Any])
-async def get_onboarding_status(merchant_id: str):
+async def get_onboarding_status(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
-    Get merchant onboarding status (KYC + PSP setup)
+    Get merchant onboarding status (KYC + PSP setup). The merchant itself or staff.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     
     if not merchant:
@@ -1054,11 +1066,13 @@ async def get_onboarding_status(merchant_id: str):
 @router.get("/details/{merchant_id}", response_model=Dict[str, Any])
 async def get_onboarding_details(
     merchant_id: str,
-    current_user: dict = Depends(get_current_user)  # Allow all authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Get full onboarding merchant details including KYB documents, stores, and PSPs
+    Get full onboarding merchant details including KYB documents, stores, and PSPs.
+    The merchant itself or staff (contact email, phone, KYB documents, PSPs).
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1260,11 +1274,15 @@ async def admin_repair_primary_store(
 async def list_all_onboardings(
     status: Optional[str] = None,
     include_deleted: bool = False,
-    current_user: dict = Depends(get_current_user)  # Allow authenticated users (employee/admin/agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Admin: List all merchant onboardings (filtered by status if provided)
+    Staff: List all merchant onboardings (filtered by status if provided).
+    Was open to any token, including self-registered merchants and agents --
+    the whole merchant roster with contact emails.
     """
+    if not is_scope_staff(current_user, EMPLOYEE_STAFF_ROLES):
+        raise HTTPException(status_code=403, detail="Staff access required")
     try:
         merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
 
@@ -1522,12 +1540,15 @@ async def delete_onboarding_merchant_alias(
 async def upload_kyc_file(
     merchant_id: str,
     document_type: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Upload a KYB document for onboarding merchant (Phase 2) via multipart form.
     We only store metadata for now (no real file storage).
+    The merchant itself or staff; was anonymous.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1560,9 +1581,15 @@ async def upload_kyc_file(
 async def upload_kyc_files(
     merchant_id: str,
     files: list[UploadFile] = File(...),
-    document_type: str = Form("other")
+    document_type: str = Form("other"),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Multipart 多文件上传（商户门户使用，无需鉴权）。上传到 R2 并存元数据。"""
+    """Multipart multi-file KYB upload (metadata only for now).
+
+    The merchant itself or staff. Was unauthenticated: anyone could attach
+    documents to any merchant's KYB file.
+    """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")

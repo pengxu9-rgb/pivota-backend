@@ -11,6 +11,7 @@ import json
 from db.database import database
 from services.protocol_adapter_service import ProtocolAdapterService
 from utils.auth import ADMIN_ROLES, AGENT_OR_ADMIN_ROLES, get_current_user, get_current_employee
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 # Enabling/disabling a protocol for an agent changes what that agent can
 # transact with, so this stays admin-only; ADMIN_ROLES only adds the
@@ -128,13 +129,11 @@ async def get_protocol_events(
     """
     # Verify agent access
     current_role = current_user.get("role")
-    current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
 
     if current_role not in AGENT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    if current_role == "agent" and current_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    await assert_agent_scope_or_owner(database, current_user, agent_id)
     
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     
@@ -242,13 +241,11 @@ async def get_agent_protocols(
     """
     # Verify agent access
     current_role = current_user.get("role")
-    current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
 
     if current_role not in AGENT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    if current_role == "agent" and current_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    await assert_agent_scope_or_owner(database, current_user, agent_id)
     
     protocols = await database.fetch_all(
         """

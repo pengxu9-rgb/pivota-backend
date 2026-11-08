@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from typing import Optional
 from db.database import database
 from utils.auth import get_current_user
+from utils.tenant_scope import assert_merchant_agent_relationship
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,12 @@ async def get_agent_bank_details(
     """
     Get agent's bank details for payout purposes
     Only returns data if agent has enabled sharing (allow_share_with_merchants = true)
+
+    The caller must be staff, or the merchant itself AND the agent must have
+    placed an order with that merchant. Before this check any authenticated
+    account could read any agent's full IBAN / account number.
     """
+    await assert_merchant_agent_relationship(database, current_user, merchant_id, agent_id)
     try:
         # Get agent info (only id; avoid missing column issues on name/email)
         agent = await database.fetch_one(
