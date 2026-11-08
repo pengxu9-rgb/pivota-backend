@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from db.database import database
 from db.orders import get_order
@@ -35,7 +35,7 @@ from services.platform_capabilities import get_store_platform_capabilities
 from services.psp_capabilities import get_psp_capabilities
 from services.quote_service import QuoteError, QuoteService
 from services.refund_observability import build_order_refund_tracking_payload
-from services.request_market import ASSUMED_MARKET, market_assumed_label, market_is_unnamed
+from services.request_market import ASSUMED_MARKET, assumed_flag_honoured, market_assumed_label, market_is_unnamed, strict_true
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -88,6 +88,12 @@ class SearchProductsRequest(BaseModel):
     # Honoured only beside that US: the search is then answered as an ASSUMED US (served as US, never stamped
     # observed, labelled), exactly as a search that named nothing. Absent/False: unchanged.
     market_assumed: bool = False
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_literal_true(cls, value: Any) -> bool:
+        """Only a literal True; anything else (None, "true", 1, {...}) is not assumed, and never an error."""
+        return strict_true(value)
 
 
 class QuoteOfferRef(BaseModel):
@@ -784,9 +790,7 @@ async def search_products_v2(
     # BLANK `market` names nothing, so it no longer hides a named `request_context.country`.
     country = body.request_context.country if body.request_context and body.request_context.country else None
     requested_market = body.market if not market_is_unnamed(body.market) else country
-    market_assumed = market_is_unnamed(requested_market) or (
-        body.market_assumed is True and str(requested_market).strip().upper() == ASSUMED_MARKET
-    )
+    market_assumed = market_is_unnamed(requested_market) or assumed_flag_honoured(body.market_assumed, requested_market)
     result = await agent_v1_search_products(
         req=req,
         background_tasks=background_tasks,

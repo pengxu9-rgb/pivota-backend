@@ -654,8 +654,9 @@ _PROVENANCE_FN = "request_market_observed"
 _SITES: Dict[Tuple[str, str], Tuple[Set[str], Set[str]]] = {
     # `payload.market_assumed` (decision D-10): a market the gateway ASSUMED turns the flag OFF, never on.
     ("routes/agent_shop_gateway.py", "_handle_offers_resolve/_append_external_offers_from_seed_rows"): (
-        {"payload.market", "payload.market_assumed"}, set()),
-    ("routes/agent_shop_gateway.py", "_handle_offers_resolve"): ({"payload.market", "payload.market_assumed"}, set()),
+        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured"}, set()),
+    ("routes/agent_shop_gateway.py", "_handle_offers_resolve"): (
+        {"payload.market", "payload.market_assumed", "call:assumed_flag_honoured"}, set()),
     ("routes/agent_shop_gateway.py", "_attach_connected_product_redirects"): ({"param:market"}, set()),
     ("routes/agent_shop_gateway.py", "mint_external_seed_links"): ({"body.market"}, set()),
     ("routes/agent_shop_gateway.py", "_build_prefetched_external_seed_wrappers"): (
@@ -975,6 +976,9 @@ def test_the_multi_request_market_is_none_for_an_assumed_market() -> None:
     assert gw._request_market_for_multi(payload("US", True), {}) is None
     assert gw._request_market_for_multi(payload("US", False), {}) == "US"
     assert gw._request_market_for_multi(payload("US", "yes"), {}) == "US", "only a literal True assumes"
+    # P2-N1: beside any market but US the flag is ignored -- a declared SG stays SG (served AND observed).
+    assert gw._request_market_for_multi(payload("SG", True), {}) == "SG"
+    assert gw._request_market_for_multi(payload("us", True), {}) is None
     assert "market_assumed" not in payload("US", True).search.model_dump(), "provenance only: in no dump or cache key"
 
 
@@ -984,3 +988,10 @@ async def test_find_products_multi_an_assumed_us_is_served_as_us_but_never_obser
     assert named["market_observed"] is True, "the premise: a named US is observed"
     assert "market_observed" not in assumed
     assert assumed["market"] == "US"
+
+
+async def test_p2_n1_find_products_multi_a_flag_beside_sg_is_ignored(monkeypatch):
+    named = await _multi_card_token(monkeypatch, search_market="SG", row_market="SG")
+    forged = await _multi_card_token(monkeypatch, search_market="SG", row_market="SG", assumed=True)
+    assert named["market_observed"] is True
+    assert forged == {**forged, "market_observed": True}, "beside SG the flag is ignored"

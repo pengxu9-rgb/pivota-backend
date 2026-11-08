@@ -800,3 +800,12 @@ async def test_agent_v2_search_the_gateways_assumed_us_is_assumed_not_observed(m
     body2, observed2 = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "market": "SG", "market_assumed": True})
     assert observed2["market"] == "SG" and "serving_market" not in observed2
     assert "market_assumed" not in body2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, "maybe", {"x": 1}, [], "true", 1, "yes"])
+async def test_agent_v2_search_a_junk_assumed_flag_is_ignored_never_an_error(monkeypatch: pytest.MonkeyPatch, value: Any) -> None:
+    """P3-N5 / P2-N1: anything but a literal True is not assumed -- the declared US answer, and never a 400."""
+    body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "market": "US", "market_assumed": value})
+    assert observed["market"] == "US" and "serving_market" not in observed
+    assert "market_assumed" not in body

@@ -30,6 +30,28 @@ def market_is_unnamed(raw: Any) -> bool:
     return raw is None or (isinstance(raw, str) and raw.strip() == "")
 
 
+def assumed_flag_honoured(flag: Any, market: Any) -> bool:
+    """THE ONE RULE for a caller's "this market was assumed" flag (the gateway's D-10 carriers).
+
+    Honoured only when the flag is a literal ``True`` AND the market beside it normalizes to the assumed US.
+    The flag DOWNGRADES provenance (a minted `/r` token then claims no market was named), so beside a declared
+    SG -- or as ``"true"``, ``1``, ``"yes"`` -- it is ignored and the declared market is answered exactly as
+    before. Never raises.
+    """
+    from utils.market_code import iso2_market
+
+    try:
+        return flag is True and iso2_market(market) == ASSUMED_MARKET
+    except Exception:
+        return False
+
+
+def strict_true(value: Any) -> bool:
+    """A model validator for the flag: a literal True is True, ANY other value (None, "true", 1, {...}) is False.
+    Never a validation error -- an unknown value used to be ignored, and still is."""
+    return value is True
+
+
 def market_assumed_label() -> Dict[str, str]:
     """The member an answer carries when its market was assumed. A fresh dict per call."""
     return {"code": ASSUMED_MARKET, "message": MARKET_ASSUMED_MESSAGE}
