@@ -124,7 +124,7 @@ def client():
     from utils.auth import get_current_employee
 
     async def _employee():
-        return {"employee_id": "emp_test", "email": "reviewer@example.com"}
+        return dict(_ACTOR)
 
     app = FastAPI()
     app.include_router(ep.router)
@@ -133,6 +133,8 @@ def client():
 
 
 PREFIX = "/employee/products/external-seeds"
+#: The authenticated reviewer every route call runs as, unless a test changes it.
+_ACTOR: Dict[str, Any] = {"employee_id": "emp_test", "email": "reviewer@example.com", "role": "employee"}
 PUBLISH_ORDER = ["begin", "lock", "conflict_check", "supersede", "update", "commit"]
 
 
@@ -261,7 +263,7 @@ def test_the_patch_publish_locks_every_url_it_supersedes_on_in_a_fixed_order(mon
 
     db = _DB(monkeypatch, _row("draft", canonical_url=CANON), locks=True)
     asyncio.run(ep.update_external_seed("seed_1", ep.UpdateExternalSeedRequest(status="active"),
-                                        current_user={"employee_id": "emp_test"}))
+                                        current_user=dict(_ACTOR)))
     assert db.ops() == ["begin", "lock", "lock", *PUBLISH_ORDER[2:]], "both locks first, inside the transaction"
     assert db.locks() == sorted([f"external_seed_publish|US|*|{DEST}", f"external_seed_publish|US|*|{CANON}"])
     assert ep._seed_publish_lock_keys(market="US", tool="*", urls=(DEST, DEST, None)) == [f"external_seed_publish|US|*|{DEST}"]
@@ -272,11 +274,11 @@ def test_no_lock_statement_off_postgres_and_no_lock_for_a_non_publishing_edit(mo
 
     db = _DB(monkeypatch, _row("draft"), locks=False)
     asyncio.run(ep.update_external_seed("seed_1", ep.UpdateExternalSeedRequest(status="active"),
-                                        current_user={"employee_id": "emp_test"}))
+                                        current_user=dict(_ACTOR)))
     assert db.ops() == ["begin", "conflict_check", "supersede", "update", "commit"]
     db = _DB(monkeypatch, _row("active"), locks=True)
     asyncio.run(ep.update_external_seed("seed_1", ep.UpdateExternalSeedRequest(title="x"),
-                                        current_user={"employee_id": "emp_test"}))
+                                        current_user=dict(_ACTOR)))
     assert db.locks() == [] and "begin" not in db.ops()
 
 
@@ -335,7 +337,7 @@ def _csv(monkeypatch, existing: Dict[str, Any], csv_status: str, *, holder=None,
     db = _DB(monkeypatch, None, holder=holder, locks=locks, csv_existing=existing)
     out = asyncio.run(ep._import_external_seeds_csv_text(
         text=f"destination_url,market,status\n{DEST},US,{csv_status}\n",
-        current_user={"employee_id": "emp_test"}, market="US", tool="*", mode="upsert",
+        current_user=dict(_ACTOR), market="US", tool="*", mode="upsert",
     ))
     return out, db
 
@@ -410,7 +412,7 @@ def test_the_storefront_backfill_counts_its_drafts(monkeypatch, client):
         return {"merchant_id": merchant_id, "market": "US", "primary_domain": "shop-a.example",
                 "matched_domains": ["shop-a.example"], "candidates": candidates}
 
-    async def fake_upsert(candidate, *, employee_id=None):
+    async def fake_upsert(candidate, *, employee_id=None, created_by=None):
         return results.pop(0)
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))

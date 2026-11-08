@@ -15,7 +15,10 @@ transaction. This file drives the real router (httpx over ASGI) against real tab
     each supersede misses the other's uncommitted row and both go live (the review's probe). It holds for
     PATCH + PATCH, APPROVE + APPROVE and PATCH + APPROVE;
   * BD-3: a CSV upsert with `status=active` on an existing draft publishes it through the same step: it
-    supersedes the destination's live seed, and a conflicting id is that row's error with nothing changed.
+    supersedes the destination's live seed, and a conflicting id is that row's error with nothing changed;
+  * the owner's publish rule: a seed CREATED through the real CSV door carries its creator, so its creator's
+    APPROVE, PATCH and CSV publish are a 403 that changes nothing, an `outsourced` reviewer's is a 403, and
+    another staff reviewer's APPROVE publishes it.
 
 Two connections stand for two web requests: each publish runs in a task with a FRESH context, so `databases`
 gives it its own connection (a task that inherits the test's context would share the test's one connection and
@@ -164,14 +167,18 @@ async def env(monkeypatch):
         monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
         assert ep._seed_publish_locks_enabled(), "premise: the route module runs on the Postgres dialect here"
 
+        # The authenticated reviewer; a test swaps it to act as someone else.
+        actor = {"employee_id": "emp_test", "email": "reviewer@example.com", "role": "employee"}
+
         async def _employee():
-            return {"employee_id": "emp_test", "email": "reviewer@example.com"}
+            return dict(actor)
 
         app = FastAPI()
         app.include_router(ep.router)
         app.dependency_overrides[get_current_employee] = _employee
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            yield {"db": scoped, "route_db": route_db, "client": client, "ep": ep, "dual_write": dual_write}
+            yield {"db": scoped, "route_db": route_db, "client": client, "ep": ep, "dual_write": dual_write,
+                   "actor": actor}
     finally:
         await scoped.disconnect()
         await admin.execute(f"DROP SCHEMA IF EXISTS {_SCHEMA} CASCADE")
@@ -407,3 +414,55 @@ async def test_a_csv_active_row_whose_id_a_live_seed_holds_elsewhere_is_that_row
     assert await _seeds(db) == before
     title = await db.fetch_val("SELECT title FROM external_product_seeds WHERE id = 'seed_draft'")
     assert title == "Placeholder cream", "the whole row is rolled back, not only its status"
+
+
+# ---------------------------------------------------------------- who may publish (owner rule, 2026-11-08)
+
+
+async def test_a_seed_is_published_by_another_staff_reviewer_never_by_its_creator(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    actor.update({"employee_id": "emp_creator", "email": "Creator@Example.com", "role": "admin"})
+    res = await _csv(client, f"destination_url,market\n{DEST},US\n")
+    assert res.status_code == 200 and res.json()["createdAsDraft"] == 1, res.text
+    (seed_id,) = res.json()["seedIds"]
+    stamp = await db.fetch_val("SELECT created_by_employee_id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    assert stamp == "emp_creator|creator@example.com"
+    before = await _seeds(db)
+
+    # The creator, though an admin, on every door.
+    res = await _verdict(client, seed_id, "approve")
+    assert res.status_code == 403 and res.json()["detail"]["error"] == "SEED_SELF_APPROVAL_FORBIDDEN"
+    res = await client.patch(f"{PREFIX}/{seed_id}", json={"status": "active"})
+    assert res.status_code == 403 and res.json()["detail"]["error"] == "SEED_SELF_APPROVAL_FORBIDDEN"
+    res = await _csv(client, f"destination_url,market,status,title\n{DEST},US,active,Renamed\n")
+    assert "SEED_SELF_APPROVAL_FORBIDDEN" in res.json()["errors"][0]
+    # An outsourced reviewer.
+    actor.update({"employee_id": "emp_contractor", "email": "contractor@example.com", "role": "outsourced"})
+    res = await _verdict(client, seed_id, "approve")
+    assert res.status_code == 403 and res.json()["detail"]["error"] == "SEED_PUBLISH_ROLE_FORBIDDEN"
+    assert await _seeds(db) == before, "no refusal changed a status, a note or a title"
+    title = await db.fetch_val("SELECT title FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    assert title != "Renamed"
+
+    # Another staff reviewer: published. The creator stays the creator.
+    actor.update({"employee_id": "emp_reviewer", "email": "reviewer@example.com", "role": "employee"})
+    res = await _verdict(client, seed_id, "approve")
+    assert res.status_code == 200 and res.json()["published"] is True, res.text
+    row = await db.fetch_one("SELECT status, created_by_employee_id FROM external_product_seeds WHERE id = :id",
+                             {"id": seed_id})
+    assert (row["status"], row["created_by_employee_id"]) == ("active", "emp_creator|creator@example.com")
+
+
+async def test_a_csv_update_by_someone_else_does_not_make_them_the_creator(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    actor.update({"employee_id": "emp_creator", "email": "creator@example.com", "role": "employee"})
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+    actor.update({"employee_id": "emp_editor", "email": "editor@example.com"})
+    assert (await _csv(client, f"destination_url,market,title\n{DEST},US,Edited\n")).json()["updated"] == 1
+    stamp = await db.fetch_val("SELECT created_by_employee_id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    assert stamp == "emp_creator|creator@example.com"
+    # So the editor may approve it, and the creator still may not.
+    actor.update({"employee_id": "emp_creator", "email": "creator@example.com"})
+    assert (await _verdict(client, seed_id, "approve")).status_code == 403
+    actor.update({"employee_id": "emp_editor", "email": "editor@example.com"})
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200

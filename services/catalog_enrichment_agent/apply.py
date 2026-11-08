@@ -686,12 +686,13 @@ _SEED_UPSERT_SQL = """
                   (id, external_product_id, market, tool, title, image_url,
                    price_amount, price_currency, destination_url,
                    canonical_url, domain, attached_product_key, status,
-                   availability, seed_data, seller_ref, seed_kind)
+                   availability, seed_data, seller_ref, seed_kind, created_by_employee_id)
                 VALUES
                   (:id, :external_product_id, :market, :tool, :title, :image_url,
                    :price_amount, :price_currency, :destination_url,
                    :canonical_url, :domain, :attached_product_key, :status,
-                   :availability, CAST(:seed_data AS jsonb), :seller_ref, :seed_kind)
+                   :availability, CAST(:seed_data AS jsonb), :seller_ref, :seed_kind,
+                   'system/catalog_enrichment_agent')
                 ON CONFLICT (id) DO UPDATE SET
                   external_product_id = EXCLUDED.external_product_id,
                   attached_product_key = EXCLUDED.attached_product_key,

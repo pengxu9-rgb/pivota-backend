@@ -32,7 +32,7 @@ from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
-from utils.auth import get_current_employee, require_employee_permissions
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, require_employee_permissions
 
 from services import crawl_global_pacer
 from services import external_seed_destination_liveness as destination_liveness
@@ -1911,6 +1911,83 @@ def _is_active_seed_unique_violation(exc: BaseException) -> bool:
     )
 
 
+#: Who may PUBLISH a seed or APPROVE a draft (owner rule, 2026-11-08): the staff roles. `outsourced` staff may create
+#: and edit drafts, and reject one, but never put a seed in front of buyers.
+SEED_PUBLISH_ROLES = frozenset(EMPLOYEE_STAFF_ROLES)
+
+#: The identity keys of an authenticated employee, most stable first. A creator stamp and a self-approval check both
+#: read these, never a display name.
+_ACTOR_ID_KEYS = ("employee_id", "employeeId", "sub", "user_id", "id")
+
+
+def _normalize_actor_part(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _seed_creator_stamp(current_user: Optional[Dict[str, Any]]) -> Optional[str]:
+    """What a staff create door writes to `created_by_employee_id`: `<id>|<email>`, normalized.
+
+    Both parts, so a later token that carries only one of them (no employee_id, or a changed id claim) still
+    matches. `|` never occurs in an id or an email. None only for an actor with no identity at all, which
+    get_current_user never returns (it requires `sub` and `email`).
+    """
+    user = current_user or {}
+    primary = next((_normalize_actor_part(user.get(k)) for k in _ACTOR_ID_KEYS if _normalize_actor_part(user.get(k))), "")
+    email = _normalize_actor_part(user.get("email"))
+    parts = [part for part in dict.fromkeys((primary, email)) if part]
+    return "|".join(parts) or None
+
+
+def _actor_identities(current_user: Optional[Dict[str, Any]]) -> set:
+    user = current_user or {}
+    return {_normalize_actor_part(user.get(k)) for k in (*_ACTOR_ID_KEYS, "email")} - {""}
+
+
+def _creator_identities(created_by: Any) -> set:
+    """The identities a stored creator names. Reads a stamp (`<id>|<email>`) and the single id or email older rows
+    hold alike."""
+    return {_normalize_actor_part(part) for part in str(created_by or "").split("|")} - {""}
+
+
+def _seed_publish_refusal(*, created_by: Any, actor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Why this actor may not publish this seed, or None. The role first, then the creator: NOBODY publishes or
+    approves a seed they created, admins included. A seed with no recorded creator is not refused (see
+    `_authorize_seed_publish`)."""
+    role = _normalize_actor_part((actor or {}).get("role"))
+    if role not in SEED_PUBLISH_ROLES:
+        return {"error": "SEED_PUBLISH_ROLE_FORBIDDEN", "role": role or None}
+    if _creator_identities(created_by) & _actor_identities(actor):
+        return {"error": "SEED_SELF_APPROVAL_FORBIDDEN"}
+    return None
+
+
+def _authorize_seed_publish(*, seed_id: str, created_by: Any, actor: Optional[Dict[str, Any]]) -> None:
+    """403 unless this actor may publish this seed. Called by `_publish_seed` itself, so no door can skip it."""
+    refusal = _seed_publish_refusal(created_by=created_by, actor=actor)
+    if refusal is not None:
+        raise HTTPException(status_code=403, detail={**refusal, "seed_id": seed_id})
+    if not _creator_identities(created_by):
+        # A legacy seed, from before every create door stamped its creator: allowed, and said so.
+        logger.warning({
+            "event": "external_seed_publish_unstamped_creator",
+            "seed_id": seed_id,
+            "actor": next((_normalize_actor_part((actor or {}).get(k)) for k in _ACTOR_ID_KEYS
+                           if _normalize_actor_part((actor or {}).get(k))), None),
+            "actor_role": _normalize_actor_part((actor or {}).get("role")) or None,
+        })
+
+
+def _seed_publish_permission(row: Optional[Dict[str, Any]], current_user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """What the portal shows on a seed: may this viewer publish or approve it, and if not, why."""
+    created_by = (row or {}).get("created_by_employee_id")
+    refusal = _seed_publish_refusal(created_by=created_by, actor=current_user)
+    return {
+        "may_publish": refusal is None,
+        "reason": refusal["error"] if refusal else None,
+        "created_by_viewer": bool(_creator_identities(created_by) & _actor_identities(current_user)),
+    }
+
+
 def _seed_publish_locks_enabled() -> bool:
     """The publish lock is a Postgres advisory lock; SQLite (tests, local dev) serializes its writers anyway."""
     return bool(_db_core.IS_POSTGRES)
@@ -1944,6 +2021,8 @@ async def _publish_seed(
     canonical_url: Optional[str],
     update_sql: str,
     update_values: Dict[str, Any],
+    actor: Optional[Dict[str, Any]],
+    created_by: Any,
 ) -> None:
     """THE PUBLISH STEP: a seed that was not served becomes served. Every door that turns a seed `active` runs
     this one function: `PATCH /external-seeds/{id}` with `status=active`, an audit-queue APPROVE of a draft, and a
@@ -1958,9 +2037,11 @@ async def _publish_seed(
       3. the supersede: the other live seeds of THIS destination are disabled;
       4. the row's own UPDATE (`update_sql`, which must write `status = 'active'`).
     A 409 or any failure rolls all of it back. An active-unique collision is a 409, never an unhandled 500.
+    Before any of it, `_authorize_seed_publish`: only a staff role publishes, and never the seed's own creator (403).
     The caller projects the published seed afterwards (`_project_published_seed`); a projection is a mirror,
     best-effort and post-commit.
     """
+    _authorize_seed_publish(seed_id=seed_id, created_by=created_by, actor=actor)
     match_url = canonical_url or destination_url
     try:
         async with database.transaction():
@@ -2472,6 +2553,7 @@ async def _upsert_storefront_referral_seed_candidate(
     candidate: Dict[str, Any],
     *,
     employee_id: Optional[str],
+    created_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     attached_product_key = str(candidate.get("attached_product_key") or "").strip()
     storefront_url = str(candidate.get("storefront_url") or "").strip()
@@ -2553,7 +2635,6 @@ async def _upsert_storefront_referral_seed_candidate(
         "availability": candidate.get("availability"),
         "seed_data": _seed_data_payload(seed_data),
         "notes": "storefront_seed_backfill",
-        "created_by_employee_id": str(employee_id) if employee_id else None,
         "attached_product_key": attached_product_key,
         "attached_variant_id": None,
     }
@@ -2594,7 +2675,6 @@ async def _upsert_storefront_referral_seed_candidate(
                 availability = :availability,
                 seed_data = :seed_data,
                 notes = :notes,
-                created_by_employee_id = :created_by_employee_id,
                 attached_product_key = :attached_product_key,
                 attached_variant_id = :attached_variant_id,
                 updated_at = NOW()
@@ -2646,6 +2726,8 @@ async def _upsert_storefront_referral_seed_candidate(
                 **values,
                 "id": seed_id,
                 "status": seed_status,
+                # Who created it: the run's actor when the route passed one, else the employee id it always had.
+                "created_by_employee_id": created_by or (str(employee_id) if employee_id else None),
                 "seller_ref": seller_ref,
                 "seed_kind": seed_kind,
             },
@@ -2935,7 +3017,9 @@ async def _import_external_seeds_csv_text(
     seed_ids: List[str] = []
 
     employee_id = current_user.get("employee_id") or current_user.get("employeeId")
-    created_by = str(current_user.get("email") or employee_id or "")
+    # The creator of every seed this import CREATES (a stable identity, never a display name). An update keeps the
+    # row's creator: `created_by_employee_id` is who created the seed, the self-approval check reads it.
+    created_by = _seed_creator_stamp(current_user)
 
     if is_catalog_export:
         # Catalog-style import (one row per variant, grouped into a single seed per Product URL).
@@ -3202,7 +3286,6 @@ async def _import_external_seeds_csv_text(
                         "canonical_url": canonical_url_update,
                         "domain": domain_update,
                         "seed_data": _seed_data_payload(seed_data),
-                        "created_by_employee_id": str(employee_id) if employee_id else None,
                     }
                     set_clauses = [
                         "external_product_id = :external_product_id",
@@ -3211,7 +3294,6 @@ async def _import_external_seeds_csv_text(
                         "domain = :domain",
                         "seed_data = :seed_data",
                         "updated_at = NOW()",
-                        "created_by_employee_id = :created_by_employee_id",
                     ]
 
                     if title is not None:
@@ -3456,7 +3538,6 @@ async def _import_external_seeds_csv_text(
                         "canonical_url": canonical_url_update,
                         "domain": domain_update,
                         "seed_data": _seed_data_payload(seed_data),
-                        "created_by_employee_id": str(employee_id) if employee_id else None,
                     }
                     set_clauses = [
                         "external_product_id = :external_product_id",
@@ -3465,7 +3546,6 @@ async def _import_external_seeds_csv_text(
                         "domain = :domain",
                         "seed_data = :seed_data",
                         "updated_at = NOW()",
-                        "created_by_employee_id = :created_by_employee_id",
                     ]
 
                     if title is not None:
@@ -3521,6 +3601,8 @@ async def _import_external_seeds_csv_text(
                             canonical_url=canonical_url_update,
                             update_sql=update_sql,
                             update_values=update_values,
+                            actor=current_user,
+                            created_by=existing.get("created_by_employee_id"),
                         )
                         await _project_published_seed(seed_id, price_source=None)
                     else:
@@ -3818,7 +3900,9 @@ async def _fetch_external_seed_rows_for_audit(
     return [dict(row) for row in rows]
 
 
-def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, Any]:
+def _build_external_seed_audit_response_item(
+    row: Dict[str, Any], current_user: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     audit_result = audit_external_seed_row(row)
     item = build_external_seed_audit_item(row, audit_result)
     seed = item.get("seed") or {}
@@ -3826,6 +3910,8 @@ def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, A
         seed["created_at"] = _to_iso(row.get("created_at"))
     if row.get("updated_at"):
         seed["updated_at"] = _to_iso(row.get("updated_at"))
+    # May THIS viewer approve it (their role, and not their own seed)? The portal hides the approve control if not.
+    item["publish_permission"] = _seed_publish_permission(row, current_user)
     return item
 
 
@@ -4017,7 +4103,7 @@ async def list_external_seed_audit_queue(
         )
     ]
 
-    items = [_build_external_seed_audit_response_item(row) for row, _ in filtered_pairs]
+    items = [_build_external_seed_audit_response_item(row, current_user) for row, _ in filtered_pairs]
     items.sort(key=audit_item_sort_key)
 
     return {
@@ -4067,7 +4153,7 @@ async def get_external_seed_audit(
             raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
         rows = [dict(row)]
 
-    item = _build_external_seed_audit_response_item(rows[0])
+    item = _build_external_seed_audit_response_item(rows[0], current_user)
     return {
         "status": "success",
         "item": item,
@@ -4111,6 +4197,14 @@ async def record_external_seed_audit_verdict(
     current_status = _seed_status_of(row)
     verdict = body.verdict
 
+    if verdict == "approve":
+        # The role is the approver's whatever the seed's state; the creator check runs in `_publish_seed`.
+        role = _normalize_actor_part(current_user.get("role"))
+        if role not in SEED_PUBLISH_ROLES:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "SEED_PUBLISH_ROLE_FORBIDDEN", "role": role or None, "seed_id": seed_id},
+            )
     if verdict == "approve" and current_status == "active":
         return {"status": "success", "verdict": verdict, "seed_status": "active", "published": False, "projected": {}}
     if current_status != NEW_EMPLOYEE_SEED_STATUS:
@@ -4149,6 +4243,8 @@ async def record_external_seed_audit_verdict(
             "notes = COALESCE(notes, '') || :note, updated_at = NOW() WHERE id = :id"
         ),
         update_values={"id": seed_id, "external_product_id": external_product_id, "note": note},
+        actor=current_user,
+        created_by=row.get("created_by_employee_id"),
     )
     # As a PATCH publish with no price edit: projected, and no one vouches for the seed's price.
     projected = await _project_published_seed(seed_id, price_source=None)
@@ -4214,7 +4310,9 @@ async def backfill_storefront_external_seeds(
     updated_as_draft = 0
     items: List[Dict[str, Any]] = []
     for candidate in candidates:
-        result = await _upsert_storefront_referral_seed_candidate(candidate, employee_id=employee_id)
+        result = await _upsert_storefront_referral_seed_candidate(
+            candidate, employee_id=employee_id, created_by=_seed_creator_stamp(current_user)
+        )
         items.append(result)
         action = str(result.get("action") or "")
         is_draft = _seed_status_of(result) == NEW_EMPLOYEE_SEED_STATUS
@@ -4791,7 +4889,6 @@ async def create_external_seed(
                 availability = :availability,
                 seed_data = :seed_data,
                 notes = :notes,
-                created_by_employee_id = :created_by_employee_id,
                 attached_product_key = :attached_product_key,
                 attached_variant_id = :attached_variant_id,
                 updated_at = NOW()
@@ -4815,7 +4912,6 @@ async def create_external_seed(
                 "availability": availability,
                 "seed_data": _seed_data_payload(seed_data),
                 "notes": notes,
-                "created_by_employee_id": str(employee_id) if employee_id else None,
                 "attached_product_key": attached_product_key,
                 "attached_variant_id": attached_variant_id,
             },
@@ -4943,7 +5039,8 @@ async def create_external_seed(
                 "availability": availability,
                 "seed_data": _seed_data_payload(seed_data),
                 "notes": body.notes,
-                "created_by_employee_id": str(employee_id) if employee_id else None,
+                # Who created it (a stable identity): the self-approval check reads it, and no update rewrites it.
+                "created_by_employee_id": _seed_creator_stamp(current_user),
                 "attached_product_key": attached_product_key,
                 "attached_variant_id": attached_variant_id,
                 "seller_ref": seller_ref,
@@ -5128,6 +5225,8 @@ async def get_external_seed(
                 "brand": seed_data.get("brand") or seed_data.get("product", {}).get("brand"),
                 "category": seed_data.get("category") or seed_data.get("product", {}).get("category"),
             },
+            # May this viewer publish it? The editor disables `active` when not (their role, or their own seed).
+            "publish_permission": _seed_publish_permission(row, current_user),
         },
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
     }
@@ -5328,6 +5427,8 @@ async def update_external_seed(
             canonical_url=next_canonical_url,
             update_sql=update_sql,
             update_values=updates,
+            actor=current_user,
+            created_by=row.get("created_by_employee_id"),
         )
     else:
         await _execute_seed_data_stmt(update_sql, updates)

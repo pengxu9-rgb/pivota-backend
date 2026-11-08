@@ -325,8 +325,9 @@ def test_backfill_storefront_external_seeds_write_mode(
         {"action": "skipped", "seed_id": "eps_3", "canonical_url": candidates[2]["storefront_url"]},
     ]
 
-    async def fake_upsert(candidate, *, employee_id=None):
+    async def fake_upsert(candidate, *, employee_id=None, created_by=None):
         assert employee_id == "emp_test"
+        assert created_by == "emp_test|test@example.com", "the run's creator stamp: the actor's id and email"
         return actions.pop(0)
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))

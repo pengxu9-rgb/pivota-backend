@@ -82,7 +82,8 @@ class _Harness:
 
     def patch(self, **fields):
         return asyncio.run(self.ep.update_external_seed(
-            "seed_1", self.ep.UpdateExternalSeedRequest(**fields), current_user={"employee_id": "emp_test"}
+            "seed_1", self.ep.UpdateExternalSeedRequest(**fields),
+            current_user={"employee_id": "emp_test", "email": "staff@example.com", "role": "employee"}
         ))
 
     def updates(self):

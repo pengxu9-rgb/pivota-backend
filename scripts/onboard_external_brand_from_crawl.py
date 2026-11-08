@@ -566,10 +566,12 @@ async def _upsert_seed(
         """
         INSERT INTO external_product_seeds
           (id, external_product_id, market, tool, domain, destination_url, title, image_url,
-           price_amount, price_currency, availability, seed_data, status, seller_ref, seed_kind)
+           price_amount, price_currency, availability, seed_data, status, seller_ref, seed_kind,
+           created_by_employee_id)
         VALUES
           (:id, :epid, :market, :tool, :domain, :url, :title, :img,
-           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active', :seller_ref, :seed_kind)
+           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active', :seller_ref, :seed_kind,
+           'system/onboard_external_brand_from_crawl')
         ON CONFLICT (id) DO UPDATE SET
           title=EXCLUDED.title, image_url=EXCLUDED.image_url, price_amount=EXCLUDED.price_amount,
           price_currency=EXCLUDED.price_currency, market=EXCLUDED.market,
