@@ -8,8 +8,8 @@ copies only ids, owner columns and created_at: no PII, and it never touches a Re
     python scripts/backfill_agent_purchases.py            # write
     python scripts/backfill_agent_purchases.py --dry-run  # count only
 
-Exits 1 when any purchase could not be given a parent (each is logged; the last line counts what is
-still missing), 0 otherwise.
+Exits 1 when any purchase could not be given a parent (each failure is a WARNING naming the purchase
+and the error type; the last line counts what is still missing), 0 otherwise.
 """
 
 from __future__ import annotations
@@ -43,6 +43,10 @@ async def run(args: argparse.Namespace) -> int:
                 print(f"missing_parents=unknown ({type(exc).__name__}: is agent_purchases built yet?)")
             return 0
         await ledger.ensure_agent_purchase_schema()
+        # Remember every row that fails for this whole run. The usual cap (sized for a long-lived web
+        # process) would forget the oldest failures once more than that many rows fail, and the next
+        # batches would retry them instead of reaching the rows after them.
+        ledger._HEAL_DEFERRED_MAX = max(ledger._HEAL_DEFERRED_MAX, args.batch * args.max_batches)
         total = failed = 0
         for batch in range(args.max_batches):
             tally: Counter = Counter()
@@ -55,7 +59,8 @@ async def run(args: argparse.Namespace) -> int:
             # stopped) is followed by one that skips them, so failing rows cannot hide the rest.
             if parented == 0 and not tally["failed"]:
                 break
-        print(f"done parented={total} failed={failed} missing_parents={await ledger.count_missing_reap_parents()}")
+        print(f"done parented={total} failed_attempts={failed} "
+              f"missing_parents={await ledger.count_missing_reap_parents()}")
         return 1 if failed else 0
     finally:
         await database.disconnect()

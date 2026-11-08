@@ -395,15 +395,38 @@ async def test_the_backfill_never_writes_a_reap_row():
     assert before == after
 
 
+def test_the_prepare_gate_collects_the_postgres_statements_of_this_module():
+    """Driver property 5 (db/reap_agentic_ledger.py): a statement the PREPARE gate cannot see ships
+    unplanned. The write and the DDL were once chosen by a conditional expression, which hid both."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_prepare_gate", _REPO / "tests/test_repo_sql_prepare_postgres.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    collected = [" ".join(str(sql).split()) for _where, sql in gate.collect_statements()]
+    for statement in (
+        purchases._INSERT_REAP_PARENT_SQL,
+        purchases._CREATE_TABLE_PG,
+        purchases._SELECT_FOR_OWNER_SQL,
+        purchases._LIST_FOR_OWNER_SQL,
+        purchases._COUNT_REAP_MISSING_PARENTS_SQL,
+    ):
+        assert " ".join(statement.split()) in collected, statement.split("\n")[1][:60]
+
+
 # ── healing, row by row ──────────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture(autouse=True)
 def heal_clock(monkeypatch):
-    """A clock the test moves, and an empty retry memory (it is per process)."""
+    """A clock the test moves, and an empty retry memory (it is per process). The cap is restored after
+    each test: the backfill script raises it for its own run."""
     now = [1000.0]
     monkeypatch.setattr(purchases, "_clock", lambda: now[0])
     monkeypatch.setattr(purchases, "_heal_deferred_until", {})
+    monkeypatch.setattr(purchases, "_HEAL_DEFERRED_MAX", purchases._HEAL_DEFERRED_MAX)
     return now
 
 
@@ -597,7 +620,7 @@ async def test_the_backfill_script_carries_on_past_failures_and_stops_when_a_bat
         "batch=0 parented=2 total=2 failed=0 skipped_after_failure=0 stopped=0",
         "batch=1 parented=0 total=2 failed=1 skipped_after_failure=2 stopped=0",
         "batch=2 parented=0 total=2 failed=0 skipped_after_failure=3 stopped=0",
-        "done parented=2 failed=1 missing_parents=1",
+        "done parented=2 failed_attempts=1 missing_parents=1",
     ]
 
 
@@ -609,10 +632,23 @@ async def test_rows_that_always_fail_do_not_keep_the_backfill_script_from_the_re
     _failing_for(monkeypatch, set(ids[:stop]))
     assert await _run_script(monkeypatch) == 1
     assert sorted(r["rail_purchase_id"] for r in await _parent_rows()) == sorted(ids[stop:])
-    assert capsys.readouterr().out.splitlines()[-1] == f"done parented=3 failed={stop} missing_parents={stop}"
+    assert capsys.readouterr().out.splitlines()[-1] == f"done parented=3 failed_attempts={stop} missing_parents={stop}"
 
 
 async def test_the_backfill_script_exits_0_when_every_row_is_parented(monkeypatch, capsys):
     await _reaps_in_order(2)
     assert await _run_script(monkeypatch) == 0
-    assert capsys.readouterr().out.splitlines()[-1] == "done parented=2 failed=0 missing_parents=0"
+    assert capsys.readouterr().out.splitlines()[-1] == "done parented=2 failed_attempts=0 missing_parents=0"
+
+
+async def test_more_failing_rows_than_the_retry_memory_holds_do_not_keep_the_script_from_the_rest(
+        monkeypatch, capsys):
+    """With the web-process cap, the oldest failures would be forgotten and retried batch after batch
+    (to --max-batches) instead of reaching the healthy row. The script lifts the cap for its own run."""
+    monkeypatch.setattr(purchases, "_HEAL_DEFERRED_MAX", 2)
+    monkeypatch.setattr(purchases, "HEAL_STOP_AFTER_FAILURES_IN_A_ROW", 2)
+    ids = await _reaps_in_order(5)
+    _failing_for(monkeypatch, set(ids[:4]))
+    assert await _run_script(monkeypatch, max_batches=10) == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [ids[4]]
+    assert capsys.readouterr().out.splitlines()[-1] == "done parented=1 failed_attempts=4 missing_parents=4"

@@ -376,6 +376,29 @@ async def test_the_heal_gives_up_after_failures_in_a_row_and_says_so(monkeypatch
     assert (await purchase_events.detect()) == {"a2a_parent_heal_failed": 1, "a2a_parent_heal_deferred": stop}
 
 
+async def test_the_a2a_owner_heal_has_its_own_short_retry_memory(monkeypatch, heal_clock):
+    """A list read retries a row the backfill is waiting on, and its own failures wait only
+    HEAL_OWNER_RETRY_AFTER_SECONDS."""
+    ap = await _purchase("quoting", parent=False)
+    real = purchases.ensure_a2a_parent
+
+    async def broken(rail_purchase_id, **kw):
+        raise RuntimeError("constraint violation")
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", broken)
+    assert (await purchase_events.detect()) == {"a2a_parent_heal_failed": 1}
+    assert purchases._deferred_ids("backfill", "a2a") == {ap}
+    assert purchases._deferred_ids("owner", "a2a") == frozenset()
+    assert await purchases.heal_a2a_parents_for_owner(AGENT, OWNER) == 0  # tried (and failed) anyway
+    assert purchases._deferred_ids("owner", "a2a") == {ap}
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", real)
+    heal_clock[0] += purchases.HEAL_OWNER_RETRY_AFTER_SECONDS - 1
+    assert await purchases.heal_a2a_parents_for_owner(AGENT, OWNER) == 0
+    heal_clock[0] += 1
+    assert await purchases.heal_a2a_parents_for_owner(AGENT, OWNER) == 1
+    assert purchases._deferred_ids("backfill", "a2a") == {ap}  # the backfill's wait is its own
+
+
 async def test_the_owner_heal_skips_a_row_it_cannot_parent_and_heals_the_rest(monkeypatch):
     older = await _purchase("quoting", parent=False)
     newer = await _purchase("quoting", parent=False)

@@ -131,7 +131,11 @@ unavailable rail). Neither names a reason, and neither opens anything.
   rest are still healed, and that purchase is left alone (per process) for 10 minutes by the backfill
   and the event job, and for 30 seconds by list reads, before it is tried again. Five failures in a
   row end that heal run. The backfill script prints `failed=` per batch, carries on past failed rows,
-  and exits 1 if any row failed (its last line counts the parents still missing).
+  and exits 1 if any row failed. **Exit 1** means some Reap purchases still have no parent: the purchases
+  themselves are untouched, but those rows are missing from the unified list until healed. Its last
+  line is `done parented=… failed_attempts=… missing_parents=…`; the WARNING lines
+  `reap parent heal failed purchase=rp_… error_type=…` name each one. Fix the cause, then run the
+  backfill again until it exits 0 (`missing_parents=0`).
 - Turn off: unset the dial. The table stays; nothing reads or writes it.
 
 ## Webhook events (`purchase.*`)
