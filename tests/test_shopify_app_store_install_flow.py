@@ -531,7 +531,7 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return None  # brand-new account
             raise AssertionError(f"unexpected query: {query}")
 
@@ -596,7 +596,7 @@ async def test_claim_with_existing_merchant_moves_store_not_account(
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "owner@example.com",
@@ -665,7 +665,7 @@ async def test_claim_rejects_wrong_password_for_existing_account(
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "victim@example.com",
