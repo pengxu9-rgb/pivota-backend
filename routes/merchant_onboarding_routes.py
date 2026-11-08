@@ -318,16 +318,38 @@ async def sync_merchant_auth_user(
         credential_source="merchant_sync",
     )
 
-async def keep_converted_agent_memberships(email: str) -> List[str]:
-    """Keep agent-portal access for an agent account converted into a merchant.
+# A membership written this long before its users row still counts as that row's
+# (users.created_at is the database clock, membership timestamps the app's).
+_CONVERSION_MEMBERSHIP_CLOCK_SKEW = timedelta(seconds=60)
 
-    The conversion (resolve_public_merchant_identity_merge) verifies the agent's own
-    password, then sync_merchant_auth_user rewrites users.role to 'merchant' -- and
-    users holds one role per email, so the owner could no longer sign in to the
-    developer portal ("This login is for agents only"). The owner proved the agent is
-    theirs, so record that as an active agent membership per owned agent; agent login
-    admits a non-agent role only through a membership bound to that exact agent.
+
+async def keep_converted_agent_memberships(email: str) -> List[str]:
+    """Keep the agent-portal access an agent account converted into a merchant HAD.
+
+    The conversion (resolve_public_merchant_identity_merge) verifies the agent account's
+    own password, then sync_merchant_auth_user rewrites users.role to 'merchant' --
+    users holds one role per email, and agent login admits a non-agent role only
+    through an agent membership bound to that exact agent.
+
+    It used to WRITE an agent membership for every agent whose owner_email is this
+    address. That password proves only that the caller owns the users row, and
+    /api/auth/register creates that row with no mailbox proof: register an address
+    before staff create an agent for it, convert, and the agent was yours. Now only
+    the links this account already held are kept (re-affirmed): an active agent
+    membership for that agent, written after this users row existed -- which only the
+    agent's own registration, a password reset (mailbox proof) or an earlier linked
+    login writes. An owner_email match alone links nothing.
     """
+    from db.auth_identity import has_active_membership_for_entity
+
+    user = await database.fetch_one(
+        "SELECT created_at FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+        {"email": email},
+    )
+    created_at = dict(user).get("created_at") if user else None
+    if not isinstance(created_at, datetime):
+        # Without the row's age no membership can be shown to be this account's.
+        return []
     rows = await database.fetch_all(
         "SELECT agent_id, agent_name FROM agents WHERE LOWER(owner_email) = LOWER(:email)",
         {"email": email},
@@ -335,16 +357,26 @@ async def keep_converted_agent_memberships(email: str) -> List[str]:
     kept: List[str] = []
     for row in rows:
         agent = dict(row)
+        agent_id = str(agent.get("agent_id") or "")
+        if not agent_id:
+            continue
+        if not await has_active_membership_for_entity(
+            email=email,
+            membership_type="agent",
+            entity_id=agent_id,
+            not_before=created_at - _CONVERSION_MEMBERSHIP_CLOCK_SKEW,
+        ):
+            continue
         await upsert_membership(
             email=email,
             membership_type="agent",
             role="agent",
-            entity_id=str(agent["agent_id"]),
+            entity_id=agent_id,
             status="active",
             full_name=agent.get("agent_name"),
             source="merchant_conversion_keeps_agent",
         )
-        kept.append(str(agent["agent_id"]))
+        kept.append(agent_id)
     return kept
 
 
