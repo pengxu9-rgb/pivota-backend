@@ -338,9 +338,57 @@ TOKEN_ORDERS: Dict[str, Dict[str, Any]] = {
 def _mint(**extra: Any) -> str:
     from routes.agent_checkout_intents import mint_checkout_token
 
-    payload = {"agent_id": AGENT_A, "intent_id": INTENT, "merchant_ids": [MERCHANT], "scopes": ["checkout"]}
+    payload = {
+        "agent_id": AGENT_A,
+        "intent_id": INTENT,
+        "merchant_ids": [MERCHANT],
+        "scopes": ["checkout"],
+        "items": [{"merchant_id": MERCHANT, "product_id": "p_item", "variant_id": "v_item", "quantity": 1}],
+    }
     payload.update(extra)
     return mint_checkout_token(payload, ttl_seconds=600)
+
+
+# product_group_members, on a real SQLite table: the token's item p_item is in grp_item with another
+# listing of the same product by its merchant (p_item_alt) and one by another merchant.
+CATALOG_MEMBERS = [
+    ("grp_item", MERCHANT, "p_item"),
+    ("grp_item", MERCHANT, "p_item_alt"),
+    ("grp_item", "merch_other", "p_other_seller"),
+    ("grp_unrelated", MERCHANT, "p_unrelated"),
+    ("grp_foreign", "merch_other", "p_foreign"),
+]
+
+
+def _install_catalog(monkeypatch: pytest.MonkeyPatch, *, broken: bool = False):
+    import db.database as db_database
+    from sqlalchemy.pool import StaticPool
+
+    # One shared in-memory database: the routed app reads it from TestClient's worker thread.
+    engine = sa.create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
+    with engine.begin() as conn:
+        conn.execute(sa.text(
+            "CREATE TABLE product_group_members (product_group_id TEXT, merchant_id TEXT, platform TEXT,"
+            " platform_product_id TEXT, is_primary BOOLEAN)"
+        ))
+        for group_id, merchant_id, product_id in CATALOG_MEMBERS:
+            conn.execute(
+                sa.text("INSERT INTO product_group_members VALUES (:g, :m, 'shopify', :p, 0)"),
+                {"g": group_id, "m": merchant_id, "p": product_id},
+            )
+
+    async def fetch_all(query, values=None):
+        if broken:
+            raise RuntimeError("db down")
+        with engine.connect() as conn:
+            return [dict(r) for r in conn.execute(sa.text(query), values or {}).mappings().all()]
+
+    async def fetch_one(query, values=None):
+        rows = await fetch_all(query, values)
+        return rows[0] if rows else None
+
+    monkeypatch.setattr(db_database.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(db_database.database, "fetch_one", fetch_one)
 
 
 def _ok(context: agent_auth.AgentContext = Depends(agent_auth.get_agent_context)):
@@ -361,6 +409,9 @@ ALLOWED = [
     ("POST", "/agent/v2/orders"),
     ("POST", "/agent/v2/payments/checkout-sessions"),
     ("GET", "/agent/v2/orders/{order_id}/tracking"),
+    # Read-only catalog lookups of the gateway's offer rewrite, bound to the token's own items.
+    ("GET", "/agent/v1/product-groups/{product_group_id}"),
+    ("GET", "/agent/v1/products/{merchant_id}/{product_id}"),
 ]
 # Routes that carry the order id in the path and are checked in the auth dependency.
 PATH_BOUND = [
@@ -385,6 +436,9 @@ DENIED = [
     ("POST", "/agent/v2/products/search"),
     ("GET", "/agent/v2/merchants/capabilities"),
     ("GET", "/agent/v1/products/search"),
+    # Other catalog reads stay closed: only the two the offer rewrite needs are open.
+    ("GET", "/agent/v1/product-groups/resolve"),
+    ("GET", "/agent/v1/product-groups/resolve-by-product-id"),
 ]
 
 
@@ -413,6 +467,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(agent_auth, "check_daily_quota", check_daily_quota)
     monkeypatch.setattr(agent_auth, "update_agent_stats", update_agent_stats)
     monkeypatch.setattr(orders_module, "get_order", get_order)
+    _install_catalog(monkeypatch)
 
     app = FastAPI()
     router = APIRouter()
@@ -424,7 +479,14 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 def _call(client: TestClient, method: str, path: str, token: str, **ids: str):
-    url = path.format(order_id=ids.get("order_id", "ord_mine"), payment_id="pay_1", quote_id="q_1")
+    url = path.format(
+        order_id=ids.get("order_id", "ord_mine"),
+        payment_id="pay_1",
+        quote_id="q_1",
+        product_group_id=ids.get("product_group_id", "grp_item"),
+        merchant_id=ids.get("merchant_id", MERCHANT),
+        product_id=ids.get("product_id", "p_item"),
+    )
     return client.request(method, url, headers={"X-Checkout-Token": token}, json={})
 
 
@@ -777,3 +839,185 @@ async def test_v2_order_create_by_an_api_key_keeps_its_metadata(monkeypatch) -> 
     await agent_v2.create_order_v2(body, BackgroundTasks(), context=ctx, agent_user=None)
 
     assert captured["metadata"]["intent_id"] == OTHER_INTENT
+
+
+
+# Read-only catalog lookups (the gateway's offer rewrite): only what the token's own checkout concerns.
+
+GROUP_ROUTE = "/agent/v1/product-groups/{product_group_id}"
+PRODUCT_ROUTE = "/agent/v1/products/{merchant_id}/{product_id}"
+
+
+@pytest.mark.parametrize("group_id", ["grp_item"])
+def test_token_reads_the_product_group_of_its_own_item(client, group_id) -> None:
+    resp = _call(client, "GET", GROUP_ROUTE, _mint(), product_group_id=group_id)
+
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize("group_id", ["grp_unrelated", "grp_foreign", "grp_missing"])
+def test_token_is_refused_a_product_group_its_items_are_not_in(client, group_id) -> None:
+    resp = _call(client, "GET", GROUP_ROUTE, _mint(), product_group_id=group_id)
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Checkout token not authorized for this product"
+
+
+@pytest.mark.parametrize("product_id", ["p_item", "p_item_alt"])
+def test_token_reads_its_item_and_its_merchant_s_other_listings_in_that_group(client, product_id) -> None:
+    resp = _call(client, "GET", PRODUCT_ROUTE, _mint(), merchant_id=MERCHANT, product_id=product_id)
+
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(
+    "merchant_id,product_id",
+    [
+        (MERCHANT, "p_unrelated"),        # its merchant, another group
+        (MERCHANT, "p_nowhere"),          # its merchant, in no group
+        ("merch_other", "p_other_seller"),  # same group, another merchant
+        ("merch_other", "p_item"),        # its item id under another merchant
+        ("external_seed", "p_item"),
+    ],
+)
+def test_token_is_refused_other_products(client, merchant_id, product_id) -> None:
+    resp = _call(client, "GET", PRODUCT_ROUTE, _mint(), merchant_id=merchant_id, product_id=product_id)
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Checkout token not authorized for this product"
+
+
+@pytest.mark.parametrize("route,ids", [
+    (GROUP_ROUTE, {"product_group_id": "grp_item"}),
+    (PRODUCT_ROUTE, {"merchant_id": MERCHANT, "product_id": "p_item_alt"}),
+])
+@pytest.mark.parametrize("claims", [
+    {"items": []},
+    {"items": None},
+    {"merchant_ids": []},
+    {"merchant_ids": ["merch_other"]},
+    {"items": [{"merchant_id": "merch_other", "product_id": "p_item"}]},
+])
+def test_a_token_whose_items_bind_nothing_reads_nothing(client, route, ids, claims) -> None:
+    resp = _call(client, "GET", route, _mint(**claims), **ids)
+
+    assert resp.status_code == 403
+
+
+@pytest.mark.parametrize("route,ids", [
+    (GROUP_ROUTE, {"product_group_id": "grp_item"}),
+    (PRODUCT_ROUTE, {"merchant_id": MERCHANT, "product_id": "p_item_alt"}),
+])
+def test_a_catalog_lookup_failure_refuses(client, monkeypatch, route, ids) -> None:
+    _install_catalog(monkeypatch, broken=True)
+
+    resp = _call(client, "GET", route, _mint(), **ids)
+
+    assert resp.status_code == 403
+
+
+def test_the_token_s_own_item_needs_no_catalog_lookup(client, monkeypatch) -> None:
+    _install_catalog(monkeypatch, broken=True)
+
+    resp = _call(client, "GET", PRODUCT_ROUTE, _mint(), merchant_id=MERCHANT, product_id="p_item")
+
+    assert resp.status_code == 200, resp.text
+
+
+def test_catalog_binding_reads_at_most_a_bounded_number_of_items() -> None:
+    items = [{"merchant_id": MERCHANT, "product_id": f"p{i}"} for i in range(100)]
+    pairs = agent_auth._checkout_token_item_products({"merchant_ids": [MERCHANT], "items": items})
+
+    assert len(pairs) == agent_auth._CHECKOUT_TOKEN_MAX_CATALOG_ITEMS
+
+
+# A token that mints a new intent (v2 checkout-sessions) never outlives itself.
+
+
+def _intent_req(intents):
+    return intents.CreateCheckoutIntentRequest(
+        items=[{"product_id": "p1", "merchant_id": MERCHANT, "quantity": 1}],
+        order_id="ord_resumed",
+    )
+
+
+@pytest.fixture()
+def intents_module(monkeypatch: pytest.MonkeyPatch):
+    import routes.agent_checkout_intents as intents
+
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("CHECKOUT_TOKEN_TTL_SECONDS", "3600")
+    monkeypatch.setenv("CHECKOUT_INTENT_TTL_SECONDS", "3600")
+    inserted: List[Any] = []
+
+    async def execute(query, *_a, **_k):
+        inserted.append(query)
+        return None
+
+    monkeypatch.setattr(intents.database, "execute", execute)
+    return intents
+
+
+@pytest.mark.asyncio
+async def test_a_token_re_minted_under_a_token_expires_no_later_than_its_parent(intents_module) -> None:
+    import time as _time
+
+    parent_exp = int(_time.time()) + 120
+    ctx = SimpleNamespace(
+        agent_id=AGENT_A,
+        can_access_merchant=lambda _m: True,
+        checkout_token_payload={"agent_id": AGENT_A, "intent_id": INTENT, "exp": parent_exp},
+    )
+
+    out = await intents_module.create_checkout_intent(_intent_req(intents_module), context=ctx, agent_user=None)
+
+    claims = agent_auth.verify_checkout_token_claims(out["checkout_token"])
+    assert claims["exp"] <= parent_exp
+    assert claims["parent_exp"] == parent_exp
+    assert out["expires_at"] <= parent_exp
+
+
+@pytest.mark.asyncio
+async def test_a_chain_of_re_mints_only_shrinks(intents_module) -> None:
+    import time as _time
+
+    exp = int(_time.time()) + 300
+    for _ in range(3):
+        ctx = SimpleNamespace(
+            agent_id=AGENT_A,
+            can_access_merchant=lambda _m: True,
+            checkout_token_payload={"agent_id": AGENT_A, "intent_id": INTENT, "exp": exp},
+        )
+        out = await intents_module.create_checkout_intent(_intent_req(intents_module), context=ctx, agent_user=None)
+        next_exp = agent_auth.verify_checkout_token_claims(out["checkout_token"])["exp"]
+        assert next_exp <= exp
+        exp = next_exp
+
+
+@pytest.mark.asyncio
+async def test_an_api_key_caller_mints_a_full_lifetime_token(intents_module) -> None:
+    import time as _time
+
+    before = int(_time.time())
+    ctx = SimpleNamespace(agent_id=AGENT_A, can_access_merchant=lambda _m: True)
+
+    out = await intents_module.create_checkout_intent(_intent_req(intents_module), context=ctx, agent_user=None)
+
+    claims = agent_auth.verify_checkout_token_claims(out["checkout_token"])
+    assert claims["exp"] >= before + 3600
+    assert "parent_exp" not in claims
+    assert out["expires_at"] >= before + 3600
+
+
+def test_mint_exp_cap_is_a_ceiling(monkeypatch) -> None:
+    import time as _time
+    from routes.agent_checkout_intents import mint_checkout_token
+
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", SECRET)
+    cap = int(_time.time()) + 10
+
+    capped = agent_auth.verify_checkout_token_claims(mint_checkout_token({"agent_id": AGENT_A}, 3600, exp_cap=cap))
+    uncapped = agent_auth.verify_checkout_token_claims(mint_checkout_token({"agent_id": AGENT_A}, 60, exp_cap=cap + 3600))
+
+    assert capped["exp"] == cap
+    assert uncapped["exp"] <= int(_time.time()) + 60

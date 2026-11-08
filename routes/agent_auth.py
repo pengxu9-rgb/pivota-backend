@@ -669,6 +669,8 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
 # list or events, refund, cancel, another order's detail) is refused. Each value says where the
 # route carries an order id: "path" is checked here against the token's own order; "body" is checked
 # by the handler once it has loaded the order (ensure_checkout_token_order_access); None carries none.
+# "catalog_group" / "catalog_product" are read-only catalog lookups, checked here against the products
+# the token's own checkout concerns (checkout_token_may_read_catalog).
 CHECKOUT_TOKEN_ROUTES: Dict[tuple, Optional[str]] = {
     ("POST", "/agent/v1/quotes/preview"): None,
     ("POST", "/agent/v1/orders/create"): None,
@@ -684,10 +686,19 @@ CHECKOUT_TOKEN_ROUTES: Dict[tuple, Optional[str]] = {
     ("POST", "/agent/v2/orders"): None,
     ("POST", "/agent/v2/payments/checkout-sessions"): "body",
     ("GET", "/agent/v2/orders/{order_id}/tracking"): "path",
+    # The catalog reads the gateway's offer rewrite makes inside a token-lane preview_quote or
+    # create_order that carries an offer_id (PIVOTA-Agent rewriteCheckoutItemsForOfferSelection): the
+    # product group behind the offer and its members' product detail. Read-only, and only for a group
+    # that holds one of the token's own items, or a product of the token's merchant in such a group.
+    ("GET", "/agent/v1/product-groups/{product_group_id}"): "catalog_group",
+    ("GET", "/agent/v1/products/{merchant_id}/{product_id}"): "catalog_product",
 }
 
 _CHECKOUT_TOKEN_ROUTE_DENIED = "Checkout token not authorized for this endpoint"
 _CHECKOUT_TOKEN_ORDER_DENIED = "Checkout token not authorized for this order"
+_CHECKOUT_TOKEN_CATALOG_DENIED = "Checkout token not authorized for this product"
+# A token's items come from one checkout; bound the lookups a forged-looking claim could fan out to.
+_CHECKOUT_TOKEN_MAX_CATALOG_ITEMS = 25
 
 
 def _matched_route_template(request: Request) -> Optional[str]:
@@ -743,6 +754,99 @@ def ensure_checkout_token_order_access(context: Any, order: Optional[Dict[str, A
         raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_ORDER_DENIED)
 
 
+def _checkout_token_item_products(payload: Any) -> set:
+    """(merchant_id, product_id) of the token's own checkout items, limited to its merchant_ids."""
+    if not isinstance(payload, dict):
+        return set()
+    merchants = {
+        str(m or "").strip() for m in (payload.get("merchant_ids") or []) if str(m or "").strip()
+    } if isinstance(payload.get("merchant_ids"), list) else set()
+    pairs = set()
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    for item in items[:_CHECKOUT_TOKEN_MAX_CATALOG_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        merchant_id = str(item.get("merchant_id") or "").strip()
+        product_id = str(item.get("product_id") or "").strip()
+        if merchant_id and product_id and merchant_id in merchants:
+            pairs.add((merchant_id, product_id))
+    return pairs
+
+
+async def _checkout_token_item_group_ids(item_products: set) -> set:
+    """The product groups that hold one of the token's items. Any read failure binds nothing."""
+    from db.database import database
+
+    group_ids = set()
+    try:
+        for merchant_id, product_id in sorted(item_products):
+            rows = await database.fetch_all(
+                """
+                SELECT DISTINCT product_group_id
+                FROM product_group_members
+                WHERE merchant_id = :merchant_id AND platform_product_id = :product_id
+                """,
+                {"merchant_id": merchant_id, "product_id": product_id},
+            )
+            for row in rows or []:
+                group_id = str(dict(row).get("product_group_id") or "").strip()
+                if group_id:
+                    group_ids.add(group_id)
+    except Exception:
+        logger.warning("checkout token catalog binding: product group lookup failed", exc_info=True)
+        return set()
+    return group_ids
+
+
+async def checkout_token_may_read_catalog(payload: Any, kind: str, path_params: Dict[str, Any]) -> bool:
+    """Whether a checkout token may make this read-only catalog lookup.
+
+    catalog_group: the group holds one of the token's own items.
+    catalog_product: the product is one of the token's items, or a product of the token's merchant in
+    a group that holds one of them (the offer's other listings of the same product).
+    """
+    item_products = _checkout_token_item_products(payload)
+    if not item_products:
+        return False
+    if kind == "catalog_group":
+        group_id = str(path_params.get("product_group_id") or "").strip()
+        return bool(group_id) and group_id in await _checkout_token_item_group_ids(item_products)
+    if kind != "catalog_product":
+        return False
+    merchant_id = str(path_params.get("merchant_id") or "").strip()
+    product_id = str(path_params.get("product_id") or "").strip()
+    if not merchant_id or not product_id:
+        return False
+    if (merchant_id, product_id) in item_products:
+        return True
+    token_merchants = {m for m, _ in item_products}
+    if merchant_id not in token_merchants:
+        return False
+    group_ids = await _checkout_token_item_group_ids(item_products)
+    if not group_ids:
+        return False
+    from db.database import database
+
+    try:
+        for group_id in sorted(group_ids):
+            row = await database.fetch_one(
+                """
+                SELECT 1 AS hit
+                FROM product_group_members
+                WHERE product_group_id = :group_id
+                  AND merchant_id = :merchant_id
+                  AND platform_product_id = :product_id
+                LIMIT 1
+                """,
+                {"group_id": group_id, "merchant_id": merchant_id, "product_id": product_id},
+            )
+            if row:
+                return True
+    except Exception:
+        logger.warning("checkout token catalog binding: member lookup failed", exc_info=True)
+    return False
+
+
 async def _enforce_checkout_token_route(request: Request, payload: Dict[str, Any]) -> None:
     """A checkout token reaches only CHECKOUT_TOKEN_ROUTES, and an order-id route only for its order.
 
@@ -753,7 +857,13 @@ async def _enforce_checkout_token_route(request: Request, payload: Dict[str, Any
     template = _matched_route_template(request)
     if not template or (method, template) not in CHECKOUT_TOKEN_ROUTES:
         raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_ROUTE_DENIED)
-    if CHECKOUT_TOKEN_ROUTES[(method, template)] != "path":
+    kind = CHECKOUT_TOKEN_ROUTES[(method, template)]
+    if kind in ("catalog_group", "catalog_product"):
+        path_params = getattr(request, "path_params", None) or {}
+        if not await checkout_token_may_read_catalog(payload, kind, path_params):
+            raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_CATALOG_DENIED)
+        return
+    if kind != "path":
         return
     order_id = str((getattr(request, "path_params", None) or {}).get("order_id") or "").strip()
     order = None
