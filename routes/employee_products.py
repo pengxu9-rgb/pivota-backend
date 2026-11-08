@@ -1100,6 +1100,34 @@ SEED_DESCRIPTION_SOURCE_KEY = "description_source"
 _FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
 # Copy an employee supplied (creation body, CSV import): never upgraded by a page read.
 SEED_DESCRIPTION_SOURCE_EMPLOYEE = "employee"
+# Who wrote the seed's title. An untitled creation takes the page's name, which on a page with several priced
+# products is the name of the node that priced it (a component on a bundle page, be#2746 review P2-A). Only a
+# title a person typed may name a pricing node for the ambiguous-price guard.
+SEED_TITLE_SOURCE_KEY = "title_source"
+SEED_TITLE_SOURCE_EMPLOYEE = "employee"
+SEED_TITLE_SOURCE_PAGE = "page"
+
+
+def _title_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+
+
+def _seed_title_a_person_typed(title: Any, seed_data: Any) -> Optional[str]:
+    """The seed's title when a person typed it, else None (the guard then decides by url alone).
+
+    Stamped rows say who wrote it. An unstamped row (written before the stamp, or by another writer) counts as
+    page-derived when its title is the page's stored name: an untitled creation stored both from the same node.
+    A typed title that happens to equal the page's name is then decided by url alone, which can only refuse.
+    """
+    text = str(title or "").strip()
+    if not text:
+        return None
+    data = seed_data if isinstance(seed_data, dict) else {}
+    source = data.get(SEED_TITLE_SOURCE_KEY)
+    if source is not None:
+        return text if source == SEED_TITLE_SOURCE_EMPLOYEE else None
+    snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+    return None if _title_key(text) == _title_key(snapshot.get("title")) else text
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -4415,6 +4443,9 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
+        seed_data[SEED_TITLE_SOURCE_KEY] = (
+            SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE
+        )
         if description and (
             description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
             or not str(seed_data.get("description") or "").strip()
@@ -4570,6 +4601,7 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
+            SEED_TITLE_SOURCE_KEY: SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE,
             "description": description or fill_only_description,
             **(
                 {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
@@ -4898,6 +4930,10 @@ async def update_external_seed(
     if body.title is not None:
         seed_data["title"] = body.title
         seed_data["snapshot"]["title"] = body.title
+        if str(body.title).strip():
+            seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
+        else:
+            seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
     if body.description is not None:
         seed_data["description"] = body.description
         seed_data["snapshot"]["description"] = body.description
@@ -6297,7 +6333,9 @@ async def _refresh_external_seed_by_id(
                 evidence=getattr(snapshot, "evidence", None),
                 requested_url=requested_for_guard,
                 final_url=observed.get("final_url") if isinstance(observed, dict) else None,
-                seed_title=row.get("title"),
+                # ONLY A TITLE A PERSON TYPED (review P2-A): an untitled creation stored the pricing node's own name,
+                # so on a bundle page the component would name itself by title on the first refresh.
+                seed_title=_seed_title_a_person_typed(row.get("title"), _ensure_json_obj(row.get("seed_data"))),
                 seed_brand=_ensure_json_obj(row.get("seed_data")).get("brand"),
             ) if requested_for_guard else None
         except Exception:  # noqa: BLE001 - THE GUARD MUST NEVER COST A ROW ITS REFRESH

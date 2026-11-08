@@ -49,6 +49,7 @@ _INTERNAL_KEYS = {
     "fetched_at",
     "description_source",
     "description_refused_source",
+    "title_source",
     "image_urls_source",
     "storefront_platform_source",
     "review_summary",

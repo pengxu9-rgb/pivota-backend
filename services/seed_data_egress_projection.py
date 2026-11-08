@@ -216,7 +216,7 @@ def project_product_seed_data(product: Any) -> Any:
 #:                            variant_census, canonical_reset, read_provenance, read_source,
 #:                            refresh_status, refreshed_at, extracted_at, fetched_at
 #:                            (routes/employee_products refresh + services/external_seed_catalogue_refresh)
-#:   provenance stamps        description_source, description_refused_source, image_urls_source,
+#:   provenance stamps        description_source, description_refused_source, title_source, image_urls_source,
 #:                            storefront_platform_source
 #:   review / audit state     review_summary, review_status, audit, audit_quarantine
 #:                            (employee_products._SEED_DATA_REVIEW_PRESERVE_KEYS)
@@ -249,6 +249,7 @@ INTERNAL_STATE_KEYS = frozenset(
         "fetched_at",
         "description_source",
         "description_refused_source",
+        "title_source",
         "image_urls_source",
         "storefront_platform_source",
         "review_summary",
