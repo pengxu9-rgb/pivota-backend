@@ -400,3 +400,117 @@ async def test_a_live_employee_membership_without_an_employees_row_holds_the_add
     for portal in ("employee", None):
         claims = await _login(client, staff, ATTACKER_PW, portal)
         assert not claims.get("employee_id"), (portal, claims)
+
+
+# ---------------------------------------------------------------------------
+# Review R1: a buyer-only identity is not a tenant, so it may still sign up
+# ---------------------------------------------------------------------------
+
+
+async def test_d_buyer_identity_can_still_sign_up_as_merchant(db, client):
+    """An address that only has a buyer (customer) identity, as every accounts OTP or
+    password login writes, signs up as a merchant through the public onboarding route.
+    Refusing it was a dead end: no users row to sign in with, and a merchant-portal
+    reset sends nothing for an address with no merchant contact or membership."""
+    from db.accounts import sync_customer_auth_membership
+
+    buyer = _addr("buyer")
+    await sync_customer_auth_membership({"id": "su_" + secrets.token_hex(4), "email": buyer, "primary_role": "customer"})
+
+    resp = await client.post("/merchant/onboarding/register", json=_store_less(buyer, "Founder123x"))
+
+    assert resp.status_code == 200, resp.text
+    merchant_id = resp.json()["merchant_id"]
+    claims = await _login(client, buyer, "Founder123x", "merchant")
+    assert claims.get("merchant_id") == merchant_id and claims.get("role") == "merchant", claims
+
+
+@pytest.mark.parametrize("lane", ["api_register", "merchant_register", "shopify_claim"])
+async def test_a_buyer_with_a_buyer_password_can_sign_up_on_every_lane(db, client, monkeypatch, lane):
+    """/agent/account/register gates on the same _email_claims_existing_tenant call as
+    /api/auth/register (asserted below); its own agents INSERT needs columns the
+    model-built agents table here does not default, so it is not driven end to end."""
+    from db.accounts import sync_customer_auth_membership
+    from routes import auth
+    from utils.auth import hash_password, verify_password
+
+    buyer = _addr("buyer-pw")
+    seeded = await sync_customer_auth_membership(
+        {"id": "su_" + secrets.token_hex(4), "email": buyer, "primary_role": "customer"},
+        password_hash=hash_password("BuyerShop1pw"),
+    )
+    assert await auth._email_claims_existing_tenant(buyer) is False
+    if lane == "shopify_claim":
+        token = await _claim_token(f"shop-d-{secrets.token_hex(3)}.myshopify.com")
+        resp = await client.post(
+            "/integrations/shopify/claim", json={"claim_token": token, "email": buyer, "password": ATTACKER_PW}
+        )
+    else:
+        resp = await _register(client, lane, buyer, monkeypatch)
+
+    assert resp.status_code == 200, (lane, resp.status_code, resp.text)
+    assert await _users_rows(db, buyer) == 1
+    if lane == "api_register":
+        # Insert-if-absent: the buyer's own password is kept on this lane.
+        cred = await db.fetch_one("SELECT password_hash FROM auth_credentials WHERE identity_id = :i",
+                                  {"i": seeded["identity"]["identity_id"]})
+        assert verify_password("BuyerShop1pw", cred["password_hash"])
+
+
+# ---------------------------------------------------------------------------
+# Review R3: the claimed-address check runs before the claim token is spent
+# ---------------------------------------------------------------------------
+
+
+async def _token_used_at(token):
+    import hashlib as _hashlib
+
+    import routes.merchant_store_connections as msc
+    from db.database import database
+
+    jti = msc._verify_claim_token(token)["jti"]
+    return await database.fetch_val(
+        "SELECT used_at FROM shopify_store_claim_tokens WHERE jti_sha256 = :h",
+        {"h": _hashlib.sha256(jti.encode("utf-8")).hexdigest()},
+    )
+
+
+async def test_a_refused_claim_leaves_the_token_usable_once_the_address_is_free(db, client):
+    import db.agents as agents_db
+
+    addr = _addr("installer-agent")
+    created = await agents_db.create_agent(agent_name="Agent B", agent_type="custom", owner_email=addr)
+    token = await _claim_token(f"shop-e-{secrets.token_hex(3)}.myshopify.com")
+    body = {"claim_token": token, "email": addr, "password": "Installer1x"}
+
+    refused = await client.post("/integrations/shopify/claim", json=body)
+    _signin_required(refused)
+    assert await _token_used_at(token) is None
+    assert await _users_rows(db, addr) == 0
+
+    # The address issue is fixed (the agent no longer names it): the same link works.
+    await db.execute("DELETE FROM agents WHERE agent_id = :a", {"a": created["agent_id"]})
+    ok = await client.post("/integrations/shopify/claim", json=body)
+    assert ok.status_code == 200, ok.text
+    assert await _token_used_at(token) is not None
+    assert await _users_rows(db, addr) == 1
+
+    replay = await client.post("/integrations/shopify/claim", json={**body, "email": _addr("other")})
+    assert replay.status_code == 400 and "already been used" in replay.text
+
+
+async def test_a_claim_token_is_consumed_exactly_once_under_concurrent_claims(db, client):
+    import asyncio
+
+    token = await _claim_token(f"shop-f-{secrets.token_hex(3)}.myshopify.com")
+    first, second = _addr("racer-1"), _addr("racer-2")
+
+    results = await asyncio.gather(
+        client.post("/integrations/shopify/claim", json={"claim_token": token, "email": first, "password": "Racer1pass"}),
+        client.post("/integrations/shopify/claim", json={"claim_token": token, "email": second, "password": "Racer2pass"}),
+    )
+
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 400], [(r.status_code, r.text[:200]) for r in results]
+    assert await _users_rows(db, first) + await _users_rows(db, second) == 1
+    assert await _token_used_at(token) is not None
