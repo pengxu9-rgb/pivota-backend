@@ -1021,3 +1021,44 @@ def test_mint_exp_cap_is_a_ceiling(monkeypatch) -> None:
 
     assert capped["exp"] == cap
     assert uncapped["exp"] <= int(_time.time()) + 60
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claims", [{}, {"exp": 0}, {"exp": None}, {"exp": ""}], ids=["absent", "zero", "null", "empty"])
+async def test_a_presented_token_without_an_exp_still_caps_the_re_mint(intents_module, monkeypatch, claims) -> None:
+    """No exp must not mean "uncapped": the child gets at most the default token life from now."""
+    import time as _time
+
+    # A token life shorter than the intent life makes the cap visible on the intent's expires_at.
+    monkeypatch.setenv("CHECKOUT_TOKEN_TTL_SECONDS", "600")
+    before = int(_time.time())
+    ctx = SimpleNamespace(
+        agent_id=AGENT_A,
+        can_access_merchant=lambda _m: True,
+        checkout_token_payload={"agent_id": AGENT_A, "intent_id": INTENT, **claims},
+    )
+
+    out = await intents_module.create_checkout_intent(_intent_req(intents_module), context=ctx, agent_user=None)
+
+    after = int(_time.time())
+    child = agent_auth.verify_checkout_token_claims(out["checkout_token"])
+    assert before + 600 <= child["parent_exp"] <= after + 600
+    assert child["exp"] <= child["parent_exp"]
+    assert out["expires_at"] <= child["parent_exp"]
+
+
+@pytest.mark.parametrize("field,value", [("exp", 4_102_444_800), ("iat", 1), ("v", 9)])
+def test_no_payload_field_overrides_what_the_mint_sets(monkeypatch, field, value) -> None:
+    import time as _time
+    from routes.agent_checkout_intents import mint_checkout_token
+
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", SECRET)
+    cap = int(_time.time()) + 10
+
+    claims = agent_auth.verify_checkout_token_claims(
+        mint_checkout_token({"agent_id": AGENT_A, field: value}, 3600, exp_cap=cap)
+    )
+
+    assert claims["exp"] == cap
+    assert claims["v"] == 1
+    assert claims["iat"] >= cap - 10
