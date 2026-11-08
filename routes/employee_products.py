@@ -1882,6 +1882,35 @@ async def _make_redirect_url(
 #: row and leaves its status alone, so a live seed stays live.
 NEW_EMPLOYEE_SEED_STATUS = "draft"
 
+#: The statuses `PATCH /external-seeds/{id}` may set. `active` is served; the rest are not. A save that sends
+#: back the row's own stored status is always accepted, so a row in a status outside this set stays editable.
+SEED_STATUSES_SETTABLE = frozenset({"active", NEW_EMPLOYEE_SEED_STATUS, "disabled", "inactive", "paused"})
+
+#: The statuses the product page's External links panel lists: the served links and the drafts awaiting publish.
+_LISTED_LINK_STATUSES_SQL = f"('active', '{NEW_EMPLOYEE_SEED_STATUS}')"
+
+
+def _seed_status_of(row: Optional[Dict[str, Any]]) -> str:
+    """A row's status as every serving read compares it: trimmed, lower-cased; a blank one reads `active`."""
+    return str((row or {}).get("status") or "").strip().lower() or "active"
+
+
+def _settable_seed_status(requested: Any, *, current: str) -> str:
+    """The status a PATCH may write, or a 400. An empty string is refused, never read as `active`."""
+    value = str(requested if requested is not None else "").strip().lower()
+    if not value:
+        raise HTTPException(status_code=400, detail="SEED_STATUS_REQUIRED")
+    if value == current or value in SEED_STATUSES_SETTABLE:
+        return value
+    raise HTTPException(status_code=400, detail=f"INVALID_SEED_STATUS:{value}")
+
+
+def _is_active_seed_unique_violation(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}"
+    return "idx_external_product_seeds_active_unique" in text or (
+        "UniqueViolation" in text and "external_product_seeds" in text
+    )
+
 
 class CreateExternalSeedRequest(BaseModel):
     destination_url: str = Field(..., min_length=1)
@@ -1957,6 +1986,8 @@ class BackfillStorefrontExternalSeedsRequest(BaseModel):
 
 class ExternalSeedsCsvImportResponse(BaseModel):
     created: int
+    # Of `created`, how many are drafts (not served until published; FIX_PLAN D-11).
+    createdAsDraft: int = 0
     updated: int = 0
     errors: List[str] = Field(default_factory=list)
     # Rows that imported but with a value changed on the way in (a canonical_url that was not the
@@ -2285,23 +2316,25 @@ async def _derive_seed_seller_columns(
 
 
 async def _existing_storefront_referral_seed(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The active seed a storefront backfill candidate would update, matched by product key or URL in
-    ANY market partition; None when the backfill would create one."""
+    """The seed a storefront backfill candidate would update, matched by product key or URL in ANY market
+    partition: a live one first, else a draft an earlier backfill created (so a re-run edits that draft
+    instead of adding another); None when the backfill would create one."""
     row = await database.fetch_one(
         """
         SELECT *
         FROM external_product_seeds
-        WHERE status = 'active'
+        WHERE status IN ('active', :draft_status)
           AND (
             attached_product_key = :attached_product_key
             OR external_product_id = :external_product_id
             OR canonical_url = :canonical_url
             OR destination_url = :canonical_url
           )
-        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        ORDER BY (status = 'active') DESC, updated_at DESC NULLS LAST, created_at DESC NULLS LAST
         LIMIT 1
         """,
         {
+            "draft_status": NEW_EMPLOYEE_SEED_STATUS,
             "attached_product_key": str(candidate.get("attached_product_key") or "").strip(),
             "external_product_id": str(candidate.get("external_product_id") or "").strip(),
             "canonical_url": str(candidate.get("storefront_url") or "").strip(),
@@ -2450,8 +2483,12 @@ async def _upsert_storefront_referral_seed_candidate(
         seed_id = str(row.get("id") or "").strip()
         market = str(row.get("market") or "")
         action = "updated"
+        seed_status = _seed_status_of(row)
     else:
         seed_id = _seed_id()
+        # FIX_PLAN D-11: an employee-run backfill creates DRAFTS, served once published, like every other
+        # employee create door.
+        seed_status = NEW_EMPLOYEE_SEED_STATUS
         # ADR-009 D3: a storefront seed's destination IS the merchant's own store
         # → derive resolves SELF (seller_ref = the anchor merchant). NULL only if
         # unmintable (logged loudly). New-row derivation only; the UPDATE branch
@@ -2476,43 +2513,47 @@ async def _upsert_storefront_referral_seed_candidate(
               :destination_url, :canonical_url, :domain, :title, :image_url,
               :price_amount, :price_currency, :availability,
               :seed_data,
-              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+              :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
               :seller_ref, :seed_kind
             )
             """,
             {
                 **values,
                 "id": seed_id,
+                "status": seed_status,
                 "seller_ref": seller_ref,
                 "seed_kind": seed_kind,
             },
         )
         action = "created"
 
-    await database.execute(
-        """
-        UPDATE external_product_seeds
-        SET status = 'disabled',
-            notes = COALESCE(notes, '') || :note,
-            updated_at = NOW()
-        WHERE id <> :id
-          AND status = 'active'
-          AND (
-            attached_product_key = :attached_product_key
-            OR canonical_url = :canonical_url
-            OR destination_url = :canonical_url
-          )
-        """,
-        {
-            "id": seed_id,
-            "attached_product_key": attached_product_key,
-            "canonical_url": storefront_url,
-            "note": f" superseded_by:{seed_id}",
-        },
-    )
+    # Only a LIVE seed supersedes: a draft is not served, so it must not take a served seed down.
+    if seed_status == "active":
+        await database.execute(
+            """
+            UPDATE external_product_seeds
+            SET status = 'disabled',
+                notes = COALESCE(notes, '') || :note,
+                updated_at = NOW()
+            WHERE id <> :id
+              AND status = 'active'
+              AND (
+                attached_product_key = :attached_product_key
+                OR canonical_url = :canonical_url
+                OR destination_url = :canonical_url
+              )
+            """,
+            {
+                "id": seed_id,
+                "attached_product_key": attached_product_key,
+                "canonical_url": storefront_url,
+                "note": f" superseded_by:{seed_id}",
+            },
+        )
 
     return {
         "action": action,
+        "status": seed_status,
         "seed_id": seed_id,
         "market": market,
         "external_product_id": external_product_id,
@@ -2734,7 +2775,8 @@ async def _import_external_seeds_csv_text(
       - market, tool, title, image_url, price_amount, price_currency, availability
       - utm_template, partner_type, disclosure_text, notes
       - attached_product_key, attached_variant_id
-      - status (active|disabled)
+      - status (active|disabled): applied to an EXISTING seed. A NEW seed is created as a draft (or
+        disabled when the column says so) and is served only once published (FIX_PLAN D-11).
     """
     await _ensure_external_seeds_table()
 
@@ -2757,6 +2799,7 @@ async def _import_external_seeds_csv_text(
     )
 
     created = 0
+    created_as_draft = 0
     updated = 0
     errors: List[str] = []
     warnings: List[str] = []
@@ -3128,7 +3171,8 @@ async def _import_external_seeds_csv_text(
                         "price_currency": price_currency,
                         "availability": availability,
                         "seed_data": _seed_data_payload(seed_data),
-                        "status": "active",
+                        # FIX_PLAN D-11: a NEW imported seed is a draft until someone publishes it.
+                        "status": NEW_EMPLOYEE_SEED_STATUS,
                         "notes": None,
                         "created_by_employee_id": created_by,
                         "attached_product_key": None,
@@ -3138,6 +3182,7 @@ async def _import_external_seeds_csv_text(
                     },
                 )
                 created += 1
+                created_as_draft += 1
                 seed_ids.append(seed_id)
             except HTTPException as exc:
                 errors.append(f"Group {group_key}: {exc.detail}")
@@ -3403,7 +3448,9 @@ async def _import_external_seeds_csv_text(
                         "price_currency": price_currency,
                         "availability": availability,
                         "seed_data": _seed_data_payload(seed_data),
-                        "status": status if status in ("active", "disabled") else "active",
+                        # FIX_PLAN D-11: a NEW imported seed is a draft until someone publishes it. A
+                        # `status` column may still file it `disabled`; `active` does not skip review.
+                        "status": "disabled" if status == "disabled" else NEW_EMPLOYEE_SEED_STATUS,
                         "notes": notes,
                         "created_by_employee_id": created_by,
                         "attached_product_key": attached_product_key,
@@ -3413,6 +3460,8 @@ async def _import_external_seeds_csv_text(
                     },
                 )
                 created += 1
+                if status != "disabled":
+                    created_as_draft += 1
                 seed_ids.append(seed_id)
             except HTTPException as exc:
                 errors.append(f"Row {idx}: {exc.detail}")
@@ -3420,7 +3469,12 @@ async def _import_external_seeds_csv_text(
                 errors.append(f"Row {idx}: {str(exc)}")
 
     return ExternalSeedsCsvImportResponse(
-        created=created, updated=updated, errors=errors, warnings=warnings, seedIds=seed_ids
+        created=created,
+        createdAsDraft=created_as_draft,
+        updated=updated,
+        errors=errors,
+        warnings=warnings,
+        seedIds=seed_ids,
     )
 
 
@@ -4950,8 +5004,9 @@ async def update_external_seed(
     if body.notes is not None:
         updates["notes"] = body.notes
         set_clauses.append("notes = :notes")
+    current_status = _seed_status_of(row)
     if body.status is not None:
-        updates["status"] = str(body.status).strip() or "active"
+        updates["status"] = _settable_seed_status(body.status, current=current_status)
         set_clauses.append("status = :status")
     if body.merchant_display_name is not None:
         seed_data["merchant_display_name"] = (body.merchant_display_name or "").strip() or None
@@ -4991,10 +5046,77 @@ async def update_external_seed(
     set_clauses.append("seed_data = :seed_data")
     set_clauses.append("updated_at = NOW()")
 
-    await _execute_seed_data_stmt(
-        f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
-        updates,
-    )
+    final_status = updates.get("status", current_status)
+    # PUBLISH: a seed that was not served becomes served. It does what a create of a live seed does: the
+    # other live seeds of its destination are superseded, and a live seed that already holds its
+    # (market, tool, external_product_id) is a clear 409, never an unhandled unique-index 500.
+    publishing = final_status == "active" and current_status != "active"
+    update_sql = f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id"
+    if publishing:
+        final_market = updates.get("market", row.get("market"))
+        final_tool = updates.get("tool", row.get("tool"))
+        final_epid = updates.get("external_product_id") or row.get("external_product_id")
+        publish_dest = next_destination_url
+        publish_match_url = next_canonical_url or next_destination_url
+        holder = await database.fetch_one(
+            """
+            SELECT id
+            FROM external_product_seeds
+            WHERE status = 'active'
+              AND id <> :id
+              AND market = :market
+              AND tool = :tool
+              AND external_product_id = :external_product_id
+              AND destination_url NOT IN (:match_url, :dest)
+            LIMIT 1
+            """,
+            {
+                "id": seed_id,
+                "market": final_market,
+                "tool": final_tool,
+                "external_product_id": final_epid,
+                "match_url": publish_match_url,
+                "dest": publish_dest,
+            },
+        )
+        if holder:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": dict(holder).get("id")},
+            )
+        try:
+            async with database.transaction():
+                await database.execute(
+                    """
+                    UPDATE external_product_seeds
+                    SET status = 'disabled',
+                        notes = COALESCE(notes, '') || :note,
+                        updated_at = NOW()
+                    WHERE id <> :id
+                      AND status = 'active'
+                      AND market = :market
+                      AND tool = :tool
+                      -- As create: only seeds for THIS destination, never one matched through a canonical.
+                      AND destination_url IN (:match_url, :dest)
+                    """,
+                    {
+                        "id": seed_id,
+                        "market": final_market,
+                        "tool": final_tool,
+                        "match_url": publish_match_url,
+                        "dest": publish_dest,
+                        "note": f" superseded_by:{seed_id}",
+                    },
+                )
+                await _execute_seed_data_stmt(update_sql, updates)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if _is_active_seed_unique_violation(exc):
+                raise HTTPException(status_code=409, detail={"error": "SEED_ACTIVE_CONFLICT"}) from exc
+            raise
+    else:
+        await _execute_seed_data_stmt(update_sql, updates)
 
     # An employee price edit has to reach the BUYER's surfaces, not just the seed.
     # `_refresh_external_seed_by_id` already projects after a re-read; this manual
@@ -5018,7 +5140,12 @@ async def update_external_seed(
         and str(updates["price_currency"] or "").strip().upper()
         != str(row_dict.get("price_currency") or "").strip().upper()
     )
-    if any(k in updates for k in ("price_amount", "price_currency", "availability")):
+    # ONLY A SERVED SEED PROJECTS. A draft (or any non-active seed) is not served, so its price must not
+    # reach the canonical's live offers; publishing projects it, with no price vouching unless this same
+    # save edited the price.
+    if final_status == "active" and (
+        publishing or any(k in updates for k in ("price_amount", "price_currency", "availability"))
+    ):
         try:
             projected = await _project_refreshed_seed_to_serving_surfaces(
                 seed_id, price_source="employee_edit" if price_edited else None
@@ -6868,7 +6995,13 @@ async def _refresh_external_seed_by_id(
     # of rows on 09-05) also yields `unchanged`, and projecting it would stamp
     # catalog_offers.updated_at = NOW() on a row nobody re-read — claiming a freshness we did not
     # earn, which is exactly what the projection exists to stop.
-    if read_the_served_product and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE:
+    # ONLY A SERVED SEED PROJECTS (FIX_PLAN D-11): a refreshed draft, or any non-active seed, is re-read but
+    # its price is not put on the canonical's live offers; publishing projects it.
+    if (
+        read_the_served_product
+        and price_status in _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE
+        and _seed_status_of(row) == "active"
+    ):
         projection = await _project_refreshed_seed_to_serving_surfaces(
             seed_id,
             price_source="refresh",
@@ -7091,7 +7224,7 @@ async def list_attached_external_links(
     if _is_external_seed_product_key(merchant_id=merchant_id, platform=platform):
         values = {"external_product_id": platform_product_id, "pk": product_key, "limit": limit}
         where = (
-            "status = 'active' AND (external_product_id = :external_product_id OR (seed_data->>'external_product_id') = :external_product_id)"
+            f"status IN {_LISTED_LINK_STATUSES_SQL} AND (external_product_id = :external_product_id OR (seed_data->>'external_product_id') = :external_product_id)"
         )
         where += " AND (attached_product_key IS NULL OR attached_product_key = :pk)"
         if variant_id:
@@ -7104,7 +7237,7 @@ async def list_attached_external_links(
                        price_amount, price_currency, availability,
                        utm_template, partner_type, disclosure_text,
                        seed_data,
-                       notes, attached_variant_id, created_at
+                       notes, attached_variant_id, created_at, status
                 FROM external_product_seeds
                 WHERE {where}
                 ORDER BY created_at DESC
@@ -7113,7 +7246,7 @@ async def list_attached_external_links(
                 values,
             )
         except Exception:
-            where = "status = 'active' AND external_product_id = :external_product_id"
+            where = f"status IN {_LISTED_LINK_STATUSES_SQL} AND external_product_id = :external_product_id"
             where += " AND (attached_product_key IS NULL OR attached_product_key = :pk)"
             if variant_id:
                 where += " AND COALESCE(attached_variant_id, '∅') = :vid"
@@ -7123,7 +7256,7 @@ async def list_attached_external_links(
                        price_amount, price_currency, availability,
                        utm_template, partner_type, disclosure_text,
                        seed_data,
-                       notes, attached_variant_id, created_at
+                       notes, attached_variant_id, created_at, status
                 FROM external_product_seeds
                 WHERE {where}
                 ORDER BY created_at DESC
@@ -7133,7 +7266,7 @@ async def list_attached_external_links(
             )
     else:
         values = {"pk": product_key, "limit": limit}
-        where = "attached_product_key = :pk AND status = 'active'"
+        where = f"attached_product_key = :pk AND status IN {_LISTED_LINK_STATUSES_SQL}"
         if variant_id:
             values["vid"] = str(variant_id).strip()
             where += " AND attached_variant_id = :vid"
@@ -7144,7 +7277,7 @@ async def list_attached_external_links(
                    price_amount, price_currency, availability,
                    utm_template, partner_type, disclosure_text,
                    seed_data,
-                   notes, attached_variant_id, created_at
+                   notes, attached_variant_id, created_at, status
             FROM external_product_seeds
             WHERE {where}
             ORDER BY created_at DESC
@@ -7190,6 +7323,10 @@ async def list_attached_external_links(
                 "notes": r.get("notes"),
                 "attached_variant_id": r.get("attached_variant_id") or "∅",
                 "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                # A draft is listed so the link an employee just added does not vanish, and marked so the
+                # panel can say it is not served until it is published (NEW_EMPLOYEE_SEED_STATUS).
+                "status": _seed_status_of(r),
+                "is_draft": _seed_status_of(r) == NEW_EMPLOYEE_SEED_STATUS,
                 "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
             }
         )

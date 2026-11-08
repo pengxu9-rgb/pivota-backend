@@ -102,28 +102,7 @@ def test_saving_the_same_new_seed_again_edits_the_one_draft(monkeypatch):
     assert supersedes == [], "a draft must not take a served seed down before it is published"
 
 
-class _Written(Exception):
-    pass
-
-
-def test_publishing_is_a_patch_to_active(monkeypatch):
-    import routes.employee_products as ep
-
-    seen: List[Dict[str, Any]] = []
-
-    async def write(query, values=None):
-        seen.append({"sql": query, **(values or {})})
-        raise _Written
-
-    monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
-    monkeypatch.setattr(ep.database, "fetch_one", AsyncMock(return_value=_row("draft")))
-    monkeypatch.setattr(ep.database, "execute", write)
-    monkeypatch.setattr(ep, "_execute_seed_data_stmt", write)
-    with pytest.raises(_Written):
-        asyncio.run(ep.update_external_seed("seed_draft", ep.UpdateExternalSeedRequest(status="active"),
-                                            current_user={"employee_id": "emp_test"}))
-    (stmt,) = seen
-    assert "status = :status" in stmt["sql"] and stmt["status"] == "active"
+# Publishing (PATCH status 'active') is pinned in tests/test_employee_seed_publish_and_draft_gates.py.
 
 
 def test_the_agent_detail_read_serves_only_active_seeds():
