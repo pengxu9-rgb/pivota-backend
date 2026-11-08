@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 from utils.auth import get_current_user, require_admin
+from utils.tenant_scope import assert_merchant_scope
 from db.merchants import (
     create_merchant, get_merchant, get_all_merchants,
     update_merchant_status, add_kyb_document, get_merchant_documents,
@@ -81,8 +82,9 @@ async def upload_kyb_document(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Upload a KYB document for a merchant
+    Upload a KYB document for a merchant (the merchant itself or admin)
     """
+    assert_merchant_scope(current_user, merchant_id)
     try:
         # Verify merchant exists
         merchant = await get_merchant(merchant_id)
@@ -126,8 +128,9 @@ async def get_merchant_details(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get merchant details with documents
+    Get merchant details with documents (the merchant itself or admin)
     """
+    assert_merchant_scope(current_user, merchant_id)
     merchant = await get_merchant(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 from config.settings import resolve_public_api_base_url
 from utils.auth import MERCHANT_OR_ADMIN_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from db.database import database
 from db.merchant_onboarding import merchant_onboarding
 from db.merchant_portal_preferences import (
@@ -732,6 +733,7 @@ async def get_merchant_stores(
     """Get merchant's connected stores from database"""
     if current_user["role"] not in ["merchant", "admin", "super_admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
+    assert_merchant_scope(current_user, merchant_id)
     
     stores = []
     cache_counts_by_platform: Dict[str, int] = {}
@@ -844,6 +846,7 @@ async def get_merchant_psps(
     """Get merchant's connected PSPs."""
     if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
+    assert_merchant_scope(current_user, merchant_id)
     
     psps = []
     
@@ -920,6 +923,7 @@ async def get_merchant_orders(
     """Get merchant's orders from real database"""
     if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
+    assert_merchant_scope(current_user, merchant_id)
     
     try:
         # Build query with optional status filter
@@ -1011,6 +1015,7 @@ async def get_merchant_analytics(
     try:
         if current_user["role"] not in MERCHANT_OR_ADMIN_ROLES:
             raise HTTPException(status_code=403, detail="Not authorized")
+        assert_merchant_scope(current_user, merchant_id)
 
         # Get analytics from real orders
         analytics_query = """
