@@ -644,10 +644,7 @@ def test_gsc_start_has_a_json_variant_for_portals(monkeypatch):
     assert other.status_code == 403
 
 
-@pytest.mark.parametrize("role", ["employee", "outsourced", "admin"])
-def test_gsc_start_admits_every_employee_role_for_any_merchant(monkeypatch, role):
-    """Staff connect Search Console on a merchant's behalf: the guard is EMPLOYEE_ROLES,
-    not ADMIN_ROLES, so an employee or outsourced employee-portal token may start it."""
+def _gsc_start_client(monkeypatch):
     import routes.gsc_oauth_routes as module
     from config import settings as settings_module
 
@@ -658,16 +655,61 @@ def test_gsc_start_admits_every_employee_role_for_any_merchant(monkeypatch, role
     monkeypatch.setattr(module, "_state_secret", lambda: b"x" * 32)
     app = FastAPI()
     app.include_router(module.router)
-    client = TestClient(app)
+    return TestClient(app)
 
+
+def _start_for(client, merchant_id, headers):
+    return client.get(
+        "/api/gsc/oauth/start", params={"merchant_id": merchant_id, "format": "json"}, headers=headers
+    )
+
+
+@pytest.mark.parametrize("role", ["admin", "super_admin"])
+def test_gsc_start_admits_admin_staff_for_any_merchant(monkeypatch, role):
+    """Starting a grant picks the Google account a merchant's audits will read, and the
+    callback trusts the signed state alone: among staff, only ADMIN_ROLES may start it."""
+    client = _gsc_start_client(monkeypatch)
     staff = _bearer(role=role, membership_type="employee", employee_id="emp_s", email="s@example.com")
-    resp = client.get("/api/gsc/oauth/start", params={"merchant_id": "merch_b", "format": "json"}, headers=staff)
-    assert resp.status_code == 200, resp.text
 
-    # A staff role string on a merchant membership is not staff.
-    posing = _bearer(role=role, membership_type="merchant", merchant_id="merch_a", email="a@example.com")
-    resp = client.get("/api/gsc/oauth/start", params={"merchant_id": "merch_b", "format": "json"}, headers=posing)
+    resp = _start_for(client, "merch_b", staff)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["authorization_url"].startswith("https://accounts.google.com/")
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"role": "employee", "membership_type": "employee", "employee_id": "emp_e"},
+        {"role": "outsourced", "membership_type": "employee", "employee_id": "emp_o"},
+        {"role": "admin", "membership_type": "merchant", "merchant_id": "merch_a"},
+        {"role": "super_admin", "membership_type": "merchant", "merchant_id": "merch_a"},
+    ],
+    ids=["employee", "outsourced", "admin-string-on-merchant", "super_admin-string-on-merchant"],
+)
+def test_gsc_start_refuses_non_admin_staff_and_role_strings_on_a_merchant(monkeypatch, claims):
+    client = _gsc_start_client(monkeypatch)
+
+    resp = _start_for(client, "merch_b", _bearer(email="s@example.com", **claims))
+
     assert resp.status_code == 403, resp.text
+
+
+def test_gsc_status_stays_readable_by_every_employee_role(monkeypatch):
+    """/status is a read (grant presence and metadata, never tokens): staff support
+    still reads it for any merchant, while starting a grant is admin only."""
+    import db.database as dbmod
+
+    async def no_row(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(dbmod.database, "fetch_one", no_row)
+    client = _gsc_start_client(monkeypatch)
+    for role in ("employee", "outsourced"):
+        hdrs = _bearer(role=role, membership_type="employee", employee_id="emp_s", email="s@example.com")
+        resp = client.get("/api/gsc/oauth/status", params={"merchant_id": "merch_b"}, headers=hdrs)
+        assert resp.status_code == 200, (role, resp.text)
+        assert _start_for(client, "merch_b", hdrs).status_code == 403
 
 
 def test_merchant_guard_on_body_routes_needs_an_employee_membership_for_staff():
