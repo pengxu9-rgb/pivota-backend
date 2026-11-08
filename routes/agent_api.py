@@ -10699,6 +10699,11 @@ async def agent_refund_order(
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
+        # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
+        from services.agent_refund_policy import refuse_agent_refund_execution
+
+        refuse_agent_refund_execution()
+
         # Build refund request (full refund)
         class _Req(BaseModel):
             order_id: str
