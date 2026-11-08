@@ -63,6 +63,8 @@ async def run_settlement(billing_run_id: int) -> int:
             FROM commerce_attribution_edges cae
             WHERE cae.merchant_id = pa.merchant_id
               AND DATE(cae.created_at) BETWEEN :period_start AND :period_end
+              -- O-07: a merchant whose only edges are test traffic puts no partner in scope.
+              AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')
           )
 
           UNION

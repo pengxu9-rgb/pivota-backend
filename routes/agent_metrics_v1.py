@@ -69,10 +69,12 @@ async def get_metrics_summary_v1(
             {"since": last_24h}
         ) or 0
 
-        # Revenue from orders table (last 24h)
+        # Revenue from orders table (last 24h). Test orders (O-07, stamped at write by
+        # services/test_traffic.py) are not revenue.
         revenue = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)""",
+               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND COALESCE(CAST(metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')""",
             {"since": last_24h}
         ) or 0
 

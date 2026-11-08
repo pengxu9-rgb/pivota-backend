@@ -279,6 +279,17 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         return
 
 
+def _is_stamped_test_order_create(merchant_id: Optional[str]) -> bool:
+    """O-07: whether a just-created order is test traffic that create_order stamped (the rig
+    merchant / probe legs of services.test_traffic; the canary does not create through this
+    route). False whenever TEST_TRAFFIC_STAMP_ENABLED is off, so counting is then unchanged."""
+    from services import test_traffic
+
+    if not test_traffic.stamp_enabled():
+        return False
+    return test_traffic.is_test_traffic(merchant_ids=[merchant_id])
+
+
 def _enqueue_agent_create_order_background_task(
     step_name: str,
     order_id: Any,
@@ -9495,6 +9506,9 @@ async def agent_create_order(
                     merchant_id=order_request.merchant_id,
                     order_id=order_response.order_id,
                     order_amount=order_amount,
+                    # The one call that counts an order (agents.total_orders/total_gmv). A test
+                    # order (services/test_traffic.py) is not counted while stamping is on.
+                    order_created=not _is_stamped_test_order_create(order_request.merchant_id),
                 ),
             )
         except Exception as log_error:

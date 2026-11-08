@@ -954,6 +954,60 @@ async def resolve_outbound_link(input: Dict[str, Any], request_base_url: str) ->
     )
 
 
+# O-08: a click or impression row that fails to write used to vanish (`except: pass`), so "0 clicks"
+# could not be told from "every write failed". Each failure is now logged through the "pivota"
+# logger (the one prod keeps) as `outbound_click_write_failed`, counted per process here, and on
+# the Prometheus counter outbound_click_write_failed_total. The redirect still answers. The log
+# carries the exception TYPE only: a database error message can echo the row, and the row holds
+# the buyer's IP and user agent.
+_CLICK_WRITE_FAILURES: Dict[str, int] = {}
+
+
+def click_write_failure_counts() -> Dict[str, int]:
+    """Failures since process start, keyed '<table>:<event_type>'."""
+    return dict(_CLICK_WRITE_FAILURES)
+
+
+def note_click_write_failure(table: str, event_type: str, exc: BaseException) -> None:
+    key = f"{table}:{event_type or 'unknown'}"
+    _CLICK_WRITE_FAILURES[key] = _CLICK_WRITE_FAILURES.get(key, 0) + 1
+    try:
+        from observability.reliability_metrics import record_outbound_click_write_failed
+
+        record_outbound_click_write_failed(table=table, event_type=event_type or "unknown")
+    except Exception:  # noqa: BLE001 — accounting must never break the redirect
+        pass
+    try:
+        from utils.logger import logger as operator_logger
+
+        operator_logger.warning(
+            "outbound_click_write_failed table=%s event_type=%s error_type=%s process_total=%d",
+            table, event_type or "unknown", type(exc).__name__, _CLICK_WRITE_FAILURES[key],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stamped_click_context(ctx: Dict[str, Any], token_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """O-07: the click row's context, stamped when the click is test traffic (services.test_traffic).
+    A real click, or TEST_TRAFFIC_STAMP_ENABLED off: unchanged except that stamp keys a token's ctx
+    carried are dropped."""
+    from services import test_traffic
+
+    test_traffic.strip_caller_markers(ctx)
+    merchant_id = (
+        token_payload.get("merchantId")
+        or token_payload.get("merchant_id")
+        or ctx.get("merchantId")
+        or ctx.get("merchant_id")
+    )
+    reasons = test_traffic.test_traffic_reasons(
+        merchant_ids=[merchant_id],
+        synthetic_link=token_is_synthetic(token_payload),
+    )
+    return test_traffic.stamp(ctx, reasons)
+
+
 async def log_outbound_event(*, token_payload: Dict[str, Any], request_meta: Dict[str, Any], event_type: str) -> None:
     """
     Best-effort outbound telemetry.
@@ -980,15 +1034,15 @@ async def log_outbound_event(*, token_payload: Dict[str, Any], request_meta: Dic
         "kind": str(ctx2.get("kind") or "") or None,
         "dest_domain": url_domain(dest) or None,
         "destination_url": dest or None,
-        "context": ctx2 or None,
+        "context": _stamped_click_context(ctx2, token_payload) or None,
         "user_agent": request_meta.get("user_agent"),
         "ip": request_meta.get("ip"),
     }
     try:
         await database.execute(outbound_click_events.insert(), row)
-    except Exception:
-        # Best-effort: never break redirect or callers.
-        pass
+    except Exception as exc:
+        # Best-effort: never break redirect or callers — but never silently (O-08).
+        note_click_write_failure("outbound_click_events", event_type, exc)
     try:
         await record_surface_event(
             token_payload={
@@ -998,7 +1052,8 @@ async def log_outbound_event(*, token_payload: Dict[str, Any], request_meta: Dic
             request_meta=request_meta,
             event_type=event_type,
         )
-    except Exception:
+    except Exception as exc:
+        note_click_write_failure("surface_click_events", event_type, exc)
         return
 
 
