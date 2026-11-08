@@ -367,6 +367,26 @@ async def resolve_public_merchant_identity_merge(
 
     normalized_role = normalize_account_role(existing_user.get("role"))
     if normalized_role in {None, "merchant"}:
+        # Signup rewrites this row's password (sync_merchant_auth_user), so reusing
+        # it is a sign-in: without the current password anyone who knows the
+        # contact email (and the public store URL) would set a new password on
+        # someone else's merchant account.
+        if existing_user.get("password_hash"):
+            from utils.auth import verify_password
+
+            if not entered_password or not verify_password(
+                entered_password,
+                str(existing_user.get("password_hash") or ""),
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=build_identity_conflict_detail(
+                        code="MERCHANT_SIGNIN_REQUIRED",
+                        message="Email already registered. Sign in or reset password to continue.",
+                        current_role=normalized_role,
+                        resolution="sign_in_or_reset_password",
+                    ),
+                )
         return existing_user, None
 
     merchant_id = (
@@ -584,6 +604,21 @@ async def register_merchant(
             existing_onboarding=existing_onboarding,
             entered_password=merchant_data.password,
         )
+
+        if reuse_existing_onboarding and not existing_user:
+            # An onboarding row with this contact email but no login (staff
+            # onboarded it, or an earlier signup failed after the insert). Signup
+            # does not prove the mailbox, so it must not mint the login for it: the
+            # merchant-portal password reset does, and emails that mailbox.
+            raise HTTPException(
+                status_code=409,
+                detail=build_identity_conflict_detail(
+                    code="MERCHANT_SIGNIN_REQUIRED",
+                    message="Email already registered. Sign in or reset password to continue.",
+                    current_role=None,
+                    resolution="sign_in_or_reset_password",
+                ),
+            )
 
         if existing_user and existing_user.get("merchant_id") and not reuse_existing_onboarding:
             linked_onboarding = await get_merchant_onboarding(existing_user["merchant_id"])

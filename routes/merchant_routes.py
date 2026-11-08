@@ -146,10 +146,11 @@ async def get_merchant_details(
 @router.get("/")
 async def list_merchants(
     status: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_admin)
 ):
     """
-    List all merchants (optionally filtered by status)
+    List all merchants (optionally filtered by status). Admin only: every row carries
+    the merchant's contact_email and contact_phone.
     """
     merchants = await get_all_merchants(status)
     return {

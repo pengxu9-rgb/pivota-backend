@@ -12,6 +12,7 @@ from db.database import database
 from db.payout_repo import PayoutRepo
 from utils.auth import get_current_user
 from utils.tenant_scope import (
+    NO_RELATIONSHIP_WITH_AGENT,
     assert_merchant_scope,
     is_scope_staff,
     merchant_has_agent_relationship,
@@ -185,7 +186,7 @@ async def create_bulk_payouts(
             ):
                 raise HTTPException(
                     status_code=403,
-                    detail="No orders between this merchant and this agent",
+                    detail=NO_RELATIONSHIP_WITH_AGENT,
                 )
     try:
         items = body.get("items", [])

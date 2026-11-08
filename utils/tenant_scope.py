@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 NOT_AUTHORIZED_FOR_MERCHANT = "Not authorized for this merchant"
 NOT_AUTHORIZED_FOR_AGENT = "Not authorized for this agent"
-NO_RELATIONSHIP_WITH_AGENT = "No orders between this merchant and this agent"
+NO_RELATIONSHIP_WITH_AGENT = "No paid orders between this merchant and this agent"
 
 
 def _target(value: Any) -> str:
@@ -87,23 +87,15 @@ def assert_merchant_scope(
     )
 
 
-def _owns_agent(
-    current_user: Optional[Dict[str, Any]],
-    target: str,
-    owner_email: Optional[str],
-) -> bool:
+def _owns_agent(current_user: Optional[Dict[str, Any]], target: str) -> bool:
     if not target or not isinstance(current_user, dict):
         return False
     if current_user.get("role") != "agent":
         return False
+    # A token that names its agent is that agent and no other. A token with no
+    # agent_id claim names no agent: its email is not proof of ownership.
     claimed = _claim(current_user, "agent_id")
-    if claimed:
-        # A token that names its agent is that agent and no other; the email
-        # route below is only for an agent user whose token carries no claim.
-        return claimed == target
-    wanted = str(owner_email or "").strip().lower()
-    have = _claim(current_user, "email").strip().lower()
-    return bool(wanted) and have == wanted
+    return bool(claimed) and claimed == target
 
 
 def assert_agent_scope(
@@ -111,27 +103,27 @@ def assert_agent_scope(
     agent_id: Any,
     *,
     staff_roles: Collection[str] = ADMIN_ROLES,
-    owner_email: Optional[str] = None,
 ) -> None:
     """403 unless the caller is staff or the agent that owns `agent_id`.
 
     Same rule routes/agent_api.py applies to API-key callers
     (`str(order.get("agent_id")) != str(context.agent_id)`), for JWT callers:
-    an `agent` token whose `agent_id` claim equals the path id, or -- for the
-    agent's own user, whose token carries NO agent_id claim -- whose `email`
-    equals the agent record's `owner_email` (pass it in, or use
-    `assert_agent_scope_or_owner`, which loads it). A token that carries an
-    agent_id claim is judged on that claim alone.
+    an `agent` token whose `agent_id` claim equals the path id.
 
-    Deliberately NOT accepted: `email == agent_id` and `user_id == agent_id`.
-    Neither is an ownership relation (see routes/agent_management.py
-    `_is_own_agent_record`), and the second compares a users-table id with an
-    agent id.
+    Deliberately NOT accepted: `email == agent_id`, `user_id == agent_id`, and
+    `email == agents.owner_email`. None is an ownership relation. The first
+    two compare unrelated identifiers (see routes/agent_management.py
+    `_is_own_agent_record`). The third trusts an address nobody proved:
+    staff create agents whose owner_email has no users row, and a self-service
+    signup at that address (routes/auth.py) used to inherit the agent. Agent
+    portal tokens carry the agent_id claim (routes/agent_account.login_agent),
+    so only a claim-less legacy token (/auth/signin) is refused by this; such
+    tokens never passed these routes before the shared guard either.
     """
     target = _target(agent_id)
     if target and is_scope_staff(current_user, staff_roles):
         return
-    if _owns_agent(current_user, target, owner_email):
+    if _owns_agent(current_user, target):
         return
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
@@ -146,53 +138,47 @@ async def assert_agent_scope_or_owner(
     *,
     staff_roles: Collection[str] = ADMIN_ROLES,
 ) -> None:
-    """`assert_agent_scope`, loading `agents.owner_email` only when the claim check fails.
+    """`assert_agent_scope`, awaitable, for the routes that used to accept the owner email.
 
-    Must be awaited; the route sweep test checks that it is.
+    It used to load `agents.owner_email` and admit a claim-less agent token whose
+    email matched. That fallback is gone on every route, reads and mutations
+    alike (keys, webhooks, bank details, payouts, identity issuers, protocols):
+    see assert_agent_scope for why the email is not proof. `database` is
+    accepted and unused so the call sites keep one shape. Must be awaited; the
+    route sweep test checks that it is.
     """
-    target = _target(agent_id)
-    if target and (
-        is_scope_staff(current_user, staff_roles) or _owns_agent(current_user, target, None)
-    ):
-        return
-    owner_email: Optional[str] = None
-    if (
-        target
-        and isinstance(current_user, dict)
-        and current_user.get("role") == "agent"
-        and not _claim(current_user, "agent_id")
-        and _claim(current_user, "email").strip()
-    ):
-        try:
-            row = await database.fetch_one(
-                "SELECT owner_email FROM agents WHERE agent_id = :agent_id",
-                {"agent_id": target},
-            )
-        except Exception:  # noqa: BLE001 - a failed lookup proves nothing: refuse below
-            logger.warning("agent owner lookup failed; refusing", exc_info=True)
-            row = None
-        if row is not None:
-            owner_email = dict(row).get("owner_email")
-    assert_agent_scope(
-        current_user, target, staff_roles=staff_roles, owner_email=owner_email
-    )
+    assert_agent_scope(current_user, agent_id, staff_roles=staff_roles)
+
+
+# payment_status values that mean the buyer paid (the dashboard's paid set:
+# routes/merchant_dashboard_routes.PAID_PAYMENT_STATUSES_SQL). Fully refunded is out.
+RELATIONSHIP_PAID_PAYMENT_STATUSES = (
+    "paid", "completed", "succeeded", "success", "settled", "partially_refunded",
+)
 
 
 async def merchant_has_agent_relationship(database: Any, merchant_id: str, agent_id: str) -> bool:
-    """True when the agent has placed at least one (non-deleted) order with the merchant.
+    """True when the agent has placed at least one non-deleted, PAID order with the merchant.
 
     Orders, not payouts: `POST /merchants/{merchant_id}/payouts/bulk` lets the
     merchant write `agent_payouts` rows for any agent_id it likes, so a payout
     row is something the merchant can forge. An order's agent_id is stamped by
     the agent's own authenticated call.
+
+    Paid, not any order: a merchant can get an unpaid order cheaply by acting as a
+    buyer on the agent's own surface and asking it to buy the merchant's product,
+    and that alone used to unlock the agent's bank details. A paid order costs the
+    buyer the order total.
     """
+    statuses = ", ".join(f"'{s}'" for s in RELATIONSHIP_PAID_PAYMENT_STATUSES)
     row = await database.fetch_one(
-        """
+        f"""
         SELECT 1 AS present
         FROM orders
         WHERE merchant_id = :merchant_id
           AND agent_id = :agent_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
+          AND LOWER(COALESCE(payment_status, '')) IN ({statuses})
         LIMIT 1
         """,
         {"merchant_id": str(merchant_id), "agent_id": str(agent_id)},
