@@ -710,3 +710,71 @@ async def test_agent_v2_order_and_tracking_include_pricing_breakdown(
         "currency": "USD",
     }
     assert tracking_body["tracking"]["total"] == "9.53"
+
+
+# ---- decision D-10: a search that names no market is answered as US, and says so -----------------------------
+
+
+async def _v2_search(monkeypatch: pytest.MonkeyPatch, body: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    import routes.agent_v2 as agent_v2
+    from routes.agent_auth import get_agent_context
+
+    observed: Dict[str, Any] = {}
+
+    async def fake_v1_search(**kwargs: Any) -> Dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "status": "success",
+            "products": [],
+            "pagination": {"total": 0, "limit": 10, "offset": 0, "has_more": False},
+            "metadata": {"reason_code": "no_candidates"},
+        }
+
+    app.dependency_overrides[get_agent_context] = _override_get_agent_context
+    monkeypatch.setattr(agent_v2, "agent_v1_search_products", fake_v1_search)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/agent/v2/products/search", json=body)
+    finally:
+        app.dependency_overrides.pop(get_agent_context, None)
+    assert resp.status_code == 200
+    return resp.json(), observed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"market": None}, {"market": "  "}, {"request_context": {"channel": "agent"}}, {"market": "", "request_context": {"country": ""}}],
+    ids=["absent", "null", "blank", "context_without_country", "both_blank"],
+)
+async def test_agent_v2_search_without_a_market_is_answered_as_us_and_says_so(
+    monkeypatch: pytest.MonkeyPatch, extra: Dict[str, Any]
+) -> None:
+    from services.request_market import MARKET_ASSUMED_MESSAGE
+
+    body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "limit": 10, **extra})
+    assert observed["market"] == "US", "US is what the search is run for"
+    assert body["market_assumed"] == {"code": "US", "message": MARKET_ASSUMED_MESSAGE}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra, sent",
+    [
+        ({"market": "SG"}, "SG"),
+        ({"market": "US"}, "US"),
+        ({"market": "sg"}, "sg"),
+        ({"market": "USA"}, "USA"),
+        ({"request_context": {"country": "JP"}}, "JP"),
+        ({"market": "GB", "request_context": {"country": "JP"}}, "GB"),
+    ],
+    ids=["SG", "US", "lower_sg", "invalid_USA", "context_country", "market_wins"],
+)
+async def test_agent_v2_search_with_a_market_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, extra: Dict[str, Any], sent: str
+) -> None:
+    body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "limit": 10, **extra})
+    assert observed["market"] == sent, "a named market is passed exactly as before"
+    assert "market_assumed" not in body
+    assert set(body) == {"status", "products", "pagination", "metadata", "request_context"}

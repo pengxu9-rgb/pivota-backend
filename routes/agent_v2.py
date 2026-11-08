@@ -35,6 +35,7 @@ from services.platform_capabilities import get_store_platform_capabilities
 from services.psp_capabilities import get_psp_capabilities
 from services.quote_service import QuoteError, QuoteService
 from services.refund_observability import build_order_refund_tracking_payload
+from services.request_market import ASSUMED_MARKET, market_assumed_label, market_is_unnamed
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -773,6 +774,16 @@ async def search_products_v2(
     search_all_merchants = body.search_all_merchants or (
         not body.merchant_id and not body.merchant_ids
     )
+    # THE MARKET THIS SEARCH IS ANSWERED FOR (decision D-10, services/request_market.py): the caller's
+    # `market`, else its `request_context.country`, exactly as before; a search that names neither is
+    # answered as US -- US is what the search is run for (so every served row is priced in USD) -- and
+    # the answer says so in `market_assumed`. A named market, valid or not, is passed through unchanged.
+    requested_market = body.market or (
+        body.request_context.country
+        if body.request_context and body.request_context.country
+        else None
+    )
+    market_assumed = market_is_unnamed(requested_market)
     result = await agent_v1_search_products(
         req=req,
         background_tasks=background_tasks,
@@ -793,11 +804,7 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=body.market or (
-            body.request_context.country
-            if body.request_context and body.request_context.country
-            else None
-        ),
+        market=ASSUMED_MARKET if market_assumed else requested_market,
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,
@@ -884,7 +891,7 @@ async def search_products_v2(
         asyncio.create_task(_record_search_decision())
     except Exception:
         logger.debug("agent_v2 decision event scheduling failed", exc_info=True)
-    return {
+    response = {
         "status": str(result.get("status") or "success"),
         "products": products,
         "pagination": result.get("pagination") or {},
@@ -893,6 +900,9 @@ async def search_products_v2(
         if body.request_context
         else None,
     }
+    if market_assumed:
+        response["market_assumed"] = market_assumed_label()
+    return response
 
 
 @router.post("/quotes/preview")
