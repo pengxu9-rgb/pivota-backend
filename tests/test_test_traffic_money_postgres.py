@@ -166,7 +166,7 @@ async def _place(db, merchant_id, metadata, gross_cents, *, synthetic=False):
     return order_id
 
 
-async def _shopify_close(merchant_id, external_order_id, gross_cents, *, test_flag):
+async def _shopify_close(merchant_id, external_order_id, gross_cents, *, test_flag, self_report=False):
     from services.commerce_attribution_service import close_external_order_conversion
 
     return await close_external_order_conversion(
@@ -178,6 +178,7 @@ async def _shopify_close(merchant_id, external_order_id, gross_cents, *, test_fl
         converted_at=datetime.now(timezone.utc),
         note_attrs_or_payload={"id": external_order_id, "financial_status": "paid", "test": test_flag},
         converting_shop_domain=None,
+        is_self_report=self_report,
     )
 
 
@@ -215,6 +216,8 @@ async def _scenario(db):
     rig = await _place(db, RIG, {"pvt_click_id": "clk_rig_1"}, 4_000)
     await _shopify_close(REAL, "5001", 500, test_flag=True)
     await _shopify_close(REAL, "5002", 700, test_flag=False)
+    # A merchant self-report carrying `test: true` is not Shopify's flag: it stays counted.
+    await _shopify_close(REAL, "5003", 300, test_flag=True, self_report=True)
     return {"real": real, "synthetic": synthetic, "canary": canary, "rig": rig}
 
 
@@ -227,7 +230,7 @@ async def test_flag_off_every_order_counts_as_before(db):
     ids = await _scenario(db)
     gmv = await _gmv_by_merchant(db)
     # before == after: nothing stamped, every order in GMV
-    assert gmv == {REAL: 10_000 + 2_000 + 3_000 + 500 + 700, RIG: 4_000}
+    assert gmv == {REAL: 10_000 + 2_000 + 3_000 + 500 + 700 + 300, RIG: 4_000}
     assert await db.fetch_val(
         "SELECT COUNT(*) FROM commerce_attribution_edges WHERE metadata ? 'test_traffic'"
     ) == 0
@@ -239,7 +242,7 @@ async def test_flag_on_test_orders_leave_gmv_and_a_real_order_stays(db, monkeypa
     monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
     ids = await _scenario(db)
     gmv = await _gmv_by_merchant(db)
-    assert gmv == {REAL: 10_000 + 700}  # the real order and the non-test Shopify order only
+    assert gmv == {REAL: 10_000 + 700 + 300}  # the real order, the non-test Shopify order, the self-report
 
     assert "test_traffic" not in (await _order_md(db, ids["real"]) or {})
     assert (await _order_md(db, ids["synthetic"]))["test_traffic_reasons"] == ["synthetic_call"]
@@ -257,18 +260,18 @@ async def test_flag_on_test_orders_leave_gmv_and_a_real_order_stays(db, monkeypa
     assert reasons[ids["canary"]] == ["ops_canary"]
     assert reasons[ids["rig"]] == ["test_merchant"]
     shopify = {k: v for k, v in reasons.items() if k not in ids.values()}
-    assert sorted(map(str, shopify.values())) == ["None", "['shopify_test']"]
+    assert sorted(map(str, shopify.values())) == ["None", "None", "['shopify_test']"]
 
 
 async def test_flag_on_statement_gmv_excludes_test_orders(db, monkeypatch):
     monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
     await _scenario(db)
-    assert await _statement_gmv(db, REAL) == 10_000 + 700
+    assert await _statement_gmv(db, REAL) == 10_000 + 700 + 300
 
 
 async def test_flag_off_statement_gmv_is_unchanged(db):
     await _scenario(db)
-    assert await _statement_gmv(db, REAL) == 10_000 + 2_000 + 3_000 + 500 + 700
+    assert await _statement_gmv(db, REAL) == 10_000 + 2_000 + 3_000 + 500 + 700 + 300
 
 
 async def test_a_caller_supplied_stamp_never_takes_a_real_order_out_of_gmv(db, monkeypatch):

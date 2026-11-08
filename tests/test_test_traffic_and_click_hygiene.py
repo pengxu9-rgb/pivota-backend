@@ -381,12 +381,19 @@ async def test_issued_vs_clicked_counts_issue_and_follow_separately(click_db, mo
         "UPDATE surface_click_events SET click_count = click_count + 1, first_click_at = :t "
         "WHERE click_id = 'clk_0'", {"t": datetime.now(timezone.utc)},
     )
+    # a legacy row /r wrote first (no issue record), followed once
+    await click_db.execute(
+        "INSERT INTO surface_click_events (click_id, surface, impression_count, click_count, created_at, "
+        "updated_at) VALUES ('clk_legacy', 'agent', 0, 1, :t, :t)", {"t": datetime.now(timezone.utc)},
+    )
     now = datetime.now(timezone.utc)
     report = await issued_vs_clicked(start_at=now - timedelta(days=1), end_at=now + timedelta(minutes=1))
     assert report["issued"] == 4
     assert report["clicked"] == 1
     assert report["issued_not_clicked"] == 3
     assert report["follow_rate"] == 0.25
+    assert report["clicked_unissued"] == 1
+    assert report["click_events"] == 2
     assert report["test_traffic_rows_excluded"] == 1
     assert "click_write_failures_this_process" in report
 
