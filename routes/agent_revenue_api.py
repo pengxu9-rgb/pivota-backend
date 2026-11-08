@@ -12,6 +12,7 @@ import json
 
 from db.database import database
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_agent_scope
 
 # Initialize router
 router = APIRouter(
@@ -70,8 +71,7 @@ async def get_revenue_policies(
     [Phase 5] Get all revenue split policies for this agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         policies = await database.fetch_all(
@@ -221,8 +221,7 @@ async def get_agent_earnings(
     [Phase 5] Get earnings summary for agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         # Query from commissions table (Phase 6 commission automation)
@@ -269,8 +268,7 @@ async def get_revenue_logs(
     [Phase 5] Get revenue transaction logs
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         query = """
@@ -326,8 +324,7 @@ async def get_settlement_history(
     [Phase 5] Get settlement batch history
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         # Group by settlement batch
@@ -390,8 +387,7 @@ async def set_revenue_expectations(
     """[Phase 5.5] Set agent revenue expectations"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         await database.execute(
@@ -418,8 +414,7 @@ async def get_revenue_expectations(
     """[Phase 5.5] Get agent revenue expectations"""
     
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         exp = await database.fetch_one(

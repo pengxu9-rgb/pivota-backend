@@ -11,6 +11,11 @@ from datetime import date, datetime
 from db.database import database
 from db.payout_repo import PayoutRepo
 from utils.auth import get_current_user
+from utils.tenant_scope import (
+    assert_merchant_scope,
+    is_scope_staff,
+    merchant_has_agent_relationship,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -129,6 +134,7 @@ async def list_payouts(
     current_user: dict = Depends(get_current_user)
 ):
     """List all payouts for a merchant"""
+    assert_merchant_scope(current_user, merchant_id)
     try:
         repo = PayoutRepo()
         offset = (page - 1) * size
@@ -166,6 +172,21 @@ async def create_bulk_payouts(
     current_user: dict = Depends(get_current_user)
 ):
     """Create multiple payouts at once"""
+    assert_merchant_scope(current_user, merchant_id)
+    # A merchant may only raise payouts to agents that actually sold for it:
+    # a payout row is what the bank-details route would otherwise have to
+    # trust as a relationship, and it must not be something the merchant can
+    # mint for an arbitrary agent.
+    if not is_scope_staff(current_user):
+        for item in body.get("items", []) or []:
+            agent_id = item.get("agent_id") if isinstance(item, dict) else None
+            if not agent_id or not await merchant_has_agent_relationship(
+                database, merchant_id, str(agent_id)
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="No orders between this merchant and this agent",
+                )
     try:
         items = body.get("items", [])
         if not items:
@@ -192,6 +213,7 @@ async def get_payout_details(
     current_user: dict = Depends(get_current_user)
 ):
     """Get detailed information about a specific payout"""
+    assert_merchant_scope(current_user, merchant_id)
     try:
         query = """
             SELECT * FROM agent_payouts
@@ -226,6 +248,7 @@ async def upload_payment_proof(
     current_user: dict = Depends(get_current_user)
 ):
     """Upload payment proof and mark payout as uploaded"""
+    assert_merchant_scope(current_user, merchant_id)
     try:
         repo = PayoutRepo()
         await repo.upload(
@@ -234,7 +257,8 @@ async def upload_payment_proof(
             file_url=body.get("file_url"),
             method=body.get("method"),
             provider=body.get("provider"),
-            external_id=body.get("external_id")
+            external_id=body.get("external_id"),
+            merchant_id=merchant_id,
         )
         
         return {
@@ -254,6 +278,7 @@ async def export_payouts_csv(
     current_user: dict = Depends(get_current_user)
 ):
     """Export payouts as CSV data"""
+    assert_merchant_scope(current_user, merchant_id)
     try:
         repo = PayoutRepo()
         items = await repo.list(merchant_id=merchant_id, status=status, limit=10000, offset=0)
