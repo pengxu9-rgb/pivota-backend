@@ -485,6 +485,30 @@ async def test_simple_fix_links_a_login_only_by_configured_id(monkeypatch):
     assert "WHERE id = :user_id" in q and v["user_id"] == 5
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["abc", "5x", "0", "-3", "1.5"])
+async def test_simple_fix_refuses_a_bad_user_id_before_any_write(monkeypatch, bad_id):
+    """No transaction: the id is parsed before the contact-email UPDATE, so a bad value
+    is a 400 that changed nothing, not a 500 after the merchant was already edited."""
+    import routes.admin_simple_fix as module
+
+    db = _AdminDB()
+    monkeypatch.setattr(module, "database", db)
+    monkeypatch.setattr(module, "require_runtime_gate", lambda _name: None)
+    env = {
+        "ADMIN_SIMPLE_FIX_MERCHANT_ID": "merch_x",
+        "ADMIN_SIMPLE_FIX_CONTACT_EMAIL": EMAIL,
+        "ADMIN_SIMPLE_FIX_USER_ID": bad_id,
+    }
+    monkeypatch.setattr(module, "configured_env_value", lambda name: env.get(name))
+
+    with pytest.raises(HTTPException) as exc:
+        await module.update_contact_email(current_user={"role": "admin"})
+
+    assert exc.value.status_code == 400
+    assert db.queries == []
+
+
 # ---------------------------------------------------------------------------
 # P2-3: agent_management ownership is the agent_id claim only
 # ---------------------------------------------------------------------------
@@ -618,6 +642,32 @@ def test_gsc_start_has_a_json_variant_for_portals(monkeypatch):
 
     other = client.get("/api/gsc/oauth/start", params={"merchant_id": "merch_b", "format": "json"}, headers=hdrs)
     assert other.status_code == 403
+
+
+@pytest.mark.parametrize("role", ["employee", "outsourced", "admin"])
+def test_gsc_start_admits_every_employee_role_for_any_merchant(monkeypatch, role):
+    """Staff connect Search Console on a merchant's behalf: the guard is EMPLOYEE_ROLES,
+    not ADMIN_ROLES, so an employee or outsourced employee-portal token may start it."""
+    import routes.gsc_oauth_routes as module
+    from config import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "gsc_integration_enabled", True)
+    monkeypatch.setattr(settings_module.settings, "google_oauth_client_id", "cid")
+    monkeypatch.setattr(settings_module.settings, "google_oauth_client_secret", "secret")
+    monkeypatch.setattr(settings_module.settings, "google_oauth_redirect_uri", "https://t.example/cb")
+    monkeypatch.setattr(module, "_state_secret", lambda: b"x" * 32)
+    app = FastAPI()
+    app.include_router(module.router)
+    client = TestClient(app)
+
+    staff = _bearer(role=role, membership_type="employee", employee_id="emp_s", email="s@example.com")
+    resp = client.get("/api/gsc/oauth/start", params={"merchant_id": "merch_b", "format": "json"}, headers=staff)
+    assert resp.status_code == 200, resp.text
+
+    # A staff role string on a merchant membership is not staff.
+    posing = _bearer(role=role, membership_type="merchant", merchant_id="merch_a", email="a@example.com")
+    resp = client.get("/api/gsc/oauth/start", params={"merchant_id": "merch_b", "format": "json"}, headers=posing)
+    assert resp.status_code == 403, resp.text
 
 
 def test_merchant_guard_on_body_routes_needs_an_employee_membership_for_staff():

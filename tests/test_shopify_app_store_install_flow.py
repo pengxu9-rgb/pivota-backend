@@ -593,7 +593,7 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
     # The new-account branch asked whether the address already names someone
     # (an employee of any status, an agent owner, a merchant contact, an identity).
     assert tenant_checks == [
-        ("reviewer@example.com", {"check_users_and_merchant_contacts": True, "any_employee_status": True})
+        ("reviewer@example.com", {"check_users_and_merchant_contacts": True})
     ]
 
 

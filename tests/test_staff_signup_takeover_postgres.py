@@ -342,3 +342,61 @@ async def test_login_promotes_on_the_employees_own_legacy_password(db, client):
     )
     assert refused == 0
     assert claims.get("membership_id") and not str(claims["membership_id"]).startswith("legacy:"), claims
+
+
+# ---------------------------------------------------------------------------
+# The identity-in-use check counts only live tenant memberships; that must not
+# reopen the hole on any register lane.
+# ---------------------------------------------------------------------------
+
+
+async def _register(client, lane, email, monkeypatch):
+    if lane == "api_register":
+        return await client.post("/api/auth/register", json={"email": email, "password": ATTACKER_PW, "role": "merchant"})
+    if lane == "agent_register":
+        from routes import agent_account
+
+        monkeypatch.setattr(agent_account, "_check_registration_rate_limit", lambda ip: True)
+        monkeypatch.setattr(agent_account, "_self_serve_registration_enabled", lambda: True)
+        return await client.post(
+            "/agent/account/register", json={"email": email, "password": ATTACKER_PW, "agent_name": "A"}
+        )
+    return await client.post("/merchant/onboarding/register", json=_store_less(email))
+
+
+LANES = ["api_register", "agent_register", "merchant_register"]
+
+
+@pytest.mark.parametrize("lane", LANES)
+async def test_an_inactive_employee_with_a_dead_membership_still_holds_the_address(db, client, monkeypatch, lane):
+    """No live membership, so only the employees arm (any status) refuses: the employee
+    can be reactivated, which re-activates the membership."""
+    from db.auth_identity import upsert_membership
+
+    staff = _addr("former")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id, status="inactive", membership=False)
+    await upsert_membership(email=staff, membership_type="employee", role="admin", entity_id=emp_id,
+                            status="inactive", source="employees_backfill")
+
+    resp = await _register(client, lane, staff, monkeypatch)
+
+    assert resp.status_code in (400, 409), (resp.status_code, resp.text)
+    assert await _users_rows(db, staff) == 0
+
+
+@pytest.mark.parametrize("lane", LANES)
+async def test_a_live_employee_membership_without_an_employees_row_holds_the_address(db, client, monkeypatch, lane):
+    from db.auth_identity import upsert_membership
+
+    staff = _addr("orphan-staff")
+    await upsert_membership(email=staff, membership_type="employee", role="admin",
+                            entity_id="emp_" + secrets.token_hex(4), status="active", source="employees_backfill")
+
+    resp = await _register(client, lane, staff, monkeypatch)
+
+    assert resp.status_code in (400, 409), (resp.status_code, resp.text)
+    assert await _users_rows(db, staff) == 0
+    for portal in ("employee", None):
+        claims = await _login(client, staff, ATTACKER_PW, portal)
+        assert not claims.get("employee_id"), (portal, claims)

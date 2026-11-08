@@ -579,7 +579,6 @@ async def _email_claims_existing_tenant(
     email: str,
     *,
     check_users_and_merchant_contacts: bool = True,
-    any_employee_status: bool = False,
 ) -> bool:
     """Whether `email` already belongs to someone: a login, an identity, a tenant, staff.
 
@@ -587,18 +586,21 @@ async def _email_claims_existing_tenant(
     users row (or set the identity's password) for an address that is already in use:
     - a users row at that address in ANY letter case (login matches case-insensitively,
       so a second row at `victim@x` next to `Victim@x` shares the victim's identity);
-    - a canonical identity that already has a password or any membership: register
-      would otherwise overwrite that password and inherit the memberships;
-    - an agent owner, a non-deleted merchant contact or an active employee.
+    - a canonical identity with a live tenant membership (an active merchant, agent
+      or employee membership): register would otherwise set that identity's password
+      and inherit the membership. A buyer-only identity (a `customer` membership, a
+      backfilled shop password) or one whose memberships are all inactive (its users
+      row was deleted) is not a tenant: it may register, and login ignores a merchant
+      or agent membership older than the new users row;
+    - an agent owner, a non-deleted merchant contact, or an employees row of ANY
+      status (an inactive employee can be reactivated after the address was taken,
+      which is what PUT /merchant/profile, `_login_email_claimed_by`, checks too).
     The owner of such an address signs in, or resets the password from the portal,
     which emails the link to that mailbox. Fails closed: an unanswerable lookup
     refuses the registration.
 
     `check_users_and_merchant_contacts=False` skips the users and merchant-contact
-    arms, for a caller that has already resolved both itself (merchant onboarding,
-    the Shopify claim). `any_employee_status=True` counts an employees row of any
-    status: an inactive employee can be reactivated after the address was taken,
-    which is what PUT /merchant/profile (`_login_email_claimed_by`) checks too.
+    arms, for a caller that has already resolved both itself (merchant onboarding).
     """
     users_arm = ("SELECT 1 FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1", None)
     merchant_contact_arm = (
@@ -610,27 +612,16 @@ async def _email_claims_existing_tenant(
         """,
         None,
     )
-    employee_arm = (
-        (
-            "SELECT 1 FROM employees WHERE LOWER(TRIM(email)) = LOWER(:email) LIMIT 1",
-            None,
-        )
-        if any_employee_status
-        else (
-            "SELECT 1 FROM employees WHERE LOWER(email) = LOWER(:email) AND status = 'active' LIMIT 1",
-            None,
-        )
-    )
+    employee_arm = ("SELECT 1 FROM employees WHERE LOWER(TRIM(email)) = LOWER(:email) LIMIT 1", None)
     checks = (
         *((users_arm,) if check_users_and_merchant_contacts else ()),
         (
             """
             SELECT 1 FROM auth_identities i
+            JOIN auth_memberships m ON m.identity_id = i.identity_id
             WHERE i.email_normalized = LOWER(:email)
-              AND (
-                EXISTS (SELECT 1 FROM auth_credentials c WHERE c.identity_id = i.identity_id)
-                OR EXISTS (SELECT 1 FROM auth_memberships m WHERE m.identity_id = i.identity_id)
-              )
+              AND m.status = 'active'
+              AND m.membership_type IN ('merchant', 'agent', 'employee')
             LIMIT 1
             """,
             None,
@@ -1154,6 +1145,7 @@ async def login(data: LoginRequest):
             SELECT id, email, password_hash, full_name, role, active, merchant_id, created_at
             FROM users
             WHERE LOWER(email) = LOWER(:email)
+            ORDER BY id
             LIMIT 1
         """
         user = _record_to_dict(await _auth_fetch_one(query, {"email": normalized_email}))

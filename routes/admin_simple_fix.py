@@ -19,6 +19,22 @@ async def update_contact_email(current_user: dict = Depends(require_admin)):
             status_code=400,
             detail="ADMIN_SIMPLE_FIX_MERCHANT_ID and ADMIN_SIMPLE_FIX_CONTACT_EMAIL are required",
         )
+    # The login is linked only when staff name it by id: whatever users row sits
+    # at an address is not proof it belongs to that merchant (self-service
+    # registration does not verify the mailbox). Parsed before any write: there
+    # is no transaction, so a bad id must not leave the contact email changed.
+    raw_user_id = configured_env_value("ADMIN_SIMPLE_FIX_USER_ID")
+    user_id = None
+    if raw_user_id:
+        try:
+            user_id = int(str(raw_user_id).strip())
+        except (TypeError, ValueError):
+            user_id = None
+        if user_id is None or user_id <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="ADMIN_SIMPLE_FIX_USER_ID must be a positive integer users.id",
+            )
     try:
         result = await database.fetch_one(
             """
@@ -29,13 +45,9 @@ async def update_contact_email(current_user: dict = Depends(require_admin)):
             """,
             {"merchant_id": merchant_id, "contact_email": contact_email},
         )
-        
-        # The login is linked only when staff name it by id: whatever users row sits
-        # at an address is not proof it belongs to that merchant (self-service
-        # registration does not verify the mailbox).
-        user_id = configured_env_value("ADMIN_SIMPLE_FIX_USER_ID")
+
         user_result = None
-        if user_id:
+        if user_id is not None:
             user_result = await database.fetch_one(
                 """
                 UPDATE users
@@ -46,7 +58,7 @@ async def update_contact_email(current_user: dict = Depends(require_admin)):
                 {
                     "merchant_id": merchant_id,
                     "contact_email": contact_email,
-                    "user_id": int(user_id),
+                    "user_id": user_id,
                 },
             )
         
