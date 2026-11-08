@@ -274,3 +274,15 @@ async def test_order_create_refuses_a_session_without_buyer_identity(monkeypatch
     assert ei.value.code == "acp_email_required"
     assert ei.value.status_code == 400
     assert created_orders == []  # nothing was ever created
+
+
+@pytest.fixture(autouse=True)
+def _quote_rows_owned_by_the_test_agent(monkeypatch):
+    """S-28: order create first checks who owns the quote row. These tests fake the quote LOAD, so
+    the quote they stand for belongs to this file's agent."""
+    import services.quote_service as quote_service_module
+
+    async def owned_row(quote_id: str):
+        return {"quote_id": quote_id, "agent_id": 'agent_test', "snapshot_json": {}}
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)

@@ -117,6 +117,119 @@ class QuoteSnapshot:
     created_at: Optional[datetime] = None
 
 
+#: snapshot_json["metadata"][QUOTE_OWNER_METADATA_KEY] = {"checkout_intent_id": str | None}
+QUOTE_OWNER_METADATA_KEY = "owner"
+
+#: The ONE answer for a quote the caller may not use, identical to a quote that does not exist, so a
+#: foreign quote_id is never confirmed.
+QUOTE_NOT_FOUND_DETAIL = {"error": "QUOTE_NOT_FOUND", "message": "Quote not found"}
+
+
+#: routes.agent_auth._build_internal_trusted_agent names each internal trusted key's caller
+#: `agent_internal_trusted_<key hash>`. Those keys are all the gateway's own service credential (the
+#: commerce kernel previews and creates with it), so they own quotes as ONE caller: otherwise a key
+#: rotation, with gateway revisions on both keys, would 404 a kernel checkout between its preview
+#: and its create.
+INTERNAL_TRUSTED_AGENT_PREFIX = "agent_internal_trusted_"
+
+
+def _quote_owner_identity(agent_id: Any) -> str:
+    value = str(agent_id or "").strip()
+    if value.startswith(INTERNAL_TRUSTED_AGENT_PREFIX):
+        return INTERNAL_TRUSTED_AGENT_PREFIX
+    return value
+
+
+def quote_owner_stamp(checkout_intent_id: Optional[str]) -> Dict[str, Optional[str]]:
+    return {"checkout_intent_id": (str(checkout_intent_id or "").strip() or None)}
+
+
+def checkout_intent_id_of(context: Any) -> Optional[str]:
+    """The intent of the checkout token behind `context`, or None for an API key."""
+    payload = getattr(context, "checkout_token_payload", None)
+    if not isinstance(payload, dict):
+        return None
+    return str(payload.get("intent_id") or "").strip() or None
+
+
+def _quote_owner_meta(snapshot_json: Any) -> Optional[Dict[str, Any]]:
+    """The owner stamp, or None for a quote written before stamps existed."""
+    if isinstance(snapshot_json, str):
+        try:
+            snapshot_json = json.loads(snapshot_json)
+        except Exception:
+            return None
+    if not isinstance(snapshot_json, dict):
+        return None
+    meta = snapshot_json.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    stamp = meta.get(QUOTE_OWNER_METADATA_KEY)
+    return stamp if isinstance(stamp, dict) else None
+
+
+def quote_owner_intent_id(snapshot_json: Any) -> Optional[str]:
+    stamp = _quote_owner_meta(snapshot_json)
+    return (str(stamp.get("checkout_intent_id") or "").strip() or None) if stamp else None
+
+
+def caller_may_use_quote(
+    *, quote_id: str, quote_agent_id: Any, snapshot_json: Any, context: Any
+) -> bool:
+    """May the caller behind `context` use this quote? (S-28)
+
+    A quote carries the buyer's email and address from its preview, so a quote is usable only by:
+      * the agent that made it (`quotes.agent_id`), with its API key, whatever credential made it;
+      * a checkout token of that agent, when the quote was made under the token's own intent, or is
+        the quote the token was minted for (`quote_id` claim).
+    A quote with no agent (made outside the agent API) is nobody's here.
+
+    LEGACY: a quote written before the owner stamp has only its agent_id, so for it a token of the
+    same agent is enough. Quotes live QUOTE_TTL_SECONDS (600 s by default), so this rule only covers
+    quotes that were in flight at the deploy.
+    """
+    caller_agent = _quote_owner_identity(getattr(context, "agent_id", ""))
+    owner_agent = _quote_owner_identity(quote_agent_id)
+    if not caller_agent or not owner_agent or caller_agent != owner_agent:
+        return False
+    token = getattr(context, "checkout_token_payload", None)
+    if not isinstance(token, dict):
+        return True
+    if str(token.get("quote_id") or "").strip() == str(quote_id or "").strip():
+        return True
+    stamp = _quote_owner_meta(snapshot_json)
+    if stamp is None:
+        return True
+    quote_intent = str(stamp.get("checkout_intent_id") or "").strip()
+    return bool(quote_intent) and quote_intent == checkout_intent_id_of(context)
+
+
+async def get_quote_owner_row(quote_id: str) -> Optional[Dict[str, Any]]:
+    """The raw quote row the owner check reads (its own seam, so a test faking the quote LOAD can
+    say who owns the quote it stands for)."""
+    return await get_quote(quote_id)
+
+
+async def require_quote_for_caller(quote_id: Optional[str], context: Any) -> Dict[str, Any]:
+    """The quote row, or a 404 QUOTE_NOT_FOUND when it is missing OR the caller may not use it.
+
+    Reads the raw row (no expiry side effect), so the owner still reaches a consumed or expired quote
+    and gets that quote's own answer, and an idempotent replay of its own create still works.
+    """
+    from fastapi import HTTPException
+
+    qid = str(quote_id or "").strip()
+    row = await get_quote_owner_row(qid) if qid else None
+    if not row or not caller_may_use_quote(
+        quote_id=qid,
+        quote_agent_id=row.get("agent_id"),
+        snapshot_json=row.get("snapshot_json"),
+        context=context,
+    ):
+        raise HTTPException(status_code=404, detail=dict(QUOTE_NOT_FOUND_DETAIL))
+    return row
+
+
 class QuoteError(Exception):
     def __init__(
         self,
@@ -151,6 +264,7 @@ class QuoteService:
         payment_context: Optional[Any] = None,
         brief_id: Optional[str] = None,
         brief_schema_version: Optional[str] = None,
+        checkout_intent_id: Optional[str] = None,
         persist: bool = True,
         emit_analytics: bool = True,
         require_persistence: bool = False,
@@ -360,6 +474,16 @@ class QuoteService:
                 snapshot_json["metadata"] = meta
             except Exception:
                 pass
+        # WHO MAY USE THIS QUOTE (S-28), stored like the brief: in snapshot metadata, after the hash.
+        # The agent is the row's agent_id; this adds the checkout-token intent it was made under (None
+        # for an API key). Its presence also marks the quote as stamped (see caller_may_use_quote).
+        try:
+            meta = snapshot_json.get("metadata") if isinstance(snapshot_json.get("metadata"), dict) else {}
+            meta = dict(meta or {})
+            meta[QUOTE_OWNER_METADATA_KEY] = quote_owner_stamp(checkout_intent_id)
+            snapshot_json["metadata"] = meta
+        except Exception:
+            pass
         if persist:
             try:
                 await insert_quote(
@@ -445,6 +569,8 @@ class QuoteService:
         quote_kwargs = {
             "merchant_id": quote.merchant_id,
             "agent_id": quote.agent_id,
+            # A replacement quote belongs to whoever owned the quote it replaces.
+            "checkout_intent_id": quote_owner_intent_id(snapshot_json),
             "items": request_json.get("items") or [],
             "discount_codes": request_json.get("discount_codes") or [],
             "customer_email": customer_email,

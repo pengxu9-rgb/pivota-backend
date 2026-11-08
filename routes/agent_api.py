@@ -47,7 +47,7 @@ from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
-from services.quote_service import QuoteError
+from services.quote_service import QuoteError, require_quote_for_caller
 from services.commerce_execution_policy import (
     COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
     SURFACE_PUBLIC_AGENT_PURCHASE,
@@ -8734,6 +8734,11 @@ async def agent_create_order(
                     "context": agent_quote_required_ctx,
                 },
             )
+
+        # S-28: a quote the caller does not own is refused BEFORE anything reads it: it carries its
+        # preview's buyer email and address, and the default replay key below is built from the
+        # quote id alone, so another agent's quote id would otherwise replay that agent's order.
+        await require_quote_for_caller(order_request.quote_id, context)
 
         order_create_idempotency_key = getattr(order_request, "idempotency_key", None)
         if order_request.quote_id and not order_create_idempotency_key:

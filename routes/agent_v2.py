@@ -33,7 +33,7 @@ from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.platform_capabilities import get_store_platform_capabilities
 from services.psp_capabilities import get_psp_capabilities
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, caller_may_use_quote, require_quote_for_caller
 from services.refund_observability import build_order_refund_tracking_payload
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
@@ -978,7 +978,13 @@ async def get_quote_v2(
 ):
     await expire_quote_if_needed(quote_id)
     row = await get_quote(quote_id)
-    if not row:
+    # Another agent's quote (or another checkout's, under a token) reads exactly like a missing one.
+    if not row or not caller_may_use_quote(
+        quote_id=quote_id,
+        quote_agent_id=row.get("agent_id"),
+        snapshot_json=row.get("snapshot_json"),
+        context=context,
+    ):
         raise HTTPException(status_code=404, detail="Quote not found")
     if not context.can_access_merchant(str(row.get("merchant_id") or "")):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -1004,6 +1010,9 @@ async def create_order_v2(
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
+    # S-28: the quote carries its preview's buyer email and address into the order below, so a
+    # quote the caller does not own is refused first, as if it did not exist.
+    await require_quote_for_caller(body.quote_id, context)
     service = QuoteService()
     try:
         quote = await service.load_active_quote_or_raise(quote_id=body.quote_id)

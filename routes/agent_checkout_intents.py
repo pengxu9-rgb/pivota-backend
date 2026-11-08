@@ -28,7 +28,7 @@ from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
     resolve_commerce_execution_policy,
 )
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, require_quote_for_caller
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from services.tier2_acp_lane import resolve_acp_lane_decision
 from services.acp_checkout_session_service import (
@@ -876,6 +876,8 @@ async def create_checkout_intent(
             },
         )
     if quote_id:
+        # S-28: a token minted for a quote may use it, so only the quote's owner may name it here.
+        await require_quote_for_caller(quote_id, context)
         try:
             quote = await QuoteService().load_active_quote_or_raise(quote_id=quote_id)
         except QuoteError as exc:
