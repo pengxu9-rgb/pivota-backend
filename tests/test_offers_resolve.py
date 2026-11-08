@@ -6270,3 +6270,44 @@ def test_an_affiliate_destination_is_never_stamped_or_asked(
     offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert calls == []
     assert "warm_fact" not in _ctx_of(offer)
+
+
+@pytest.mark.parametrize("row_overrides", [
+    {},
+    # The seed's `domain` names another store: the stamp asks the destination host.
+    {"domain": "another-store.com"},
+    # The production `www.` + mixed-case spelling on both URLs.
+    {"destination_url": "https://www.Brand.com/products/serum",
+     "canonical_url": "https://www.Brand.com/products/serum"},
+    # The canonical URL wins in the mint (`canonical_url or destination_url`).
+    {"canonical_url": "https://canonical-store.com/products/serum"},
+    # No canonical URL: the mint falls back to the destination.
+    {"canonical_url": None},
+    # Listed in another market: never asked, and the sweep keys that market, not the request's.
+    {"market": "CA"},
+], ids=["plain", "seed-domain-elsewhere", "www-mixed-case", "canonical-differs", "no-canonical",
+        "listed-ca"])
+def test_the_sweep_population_holds_every_fact_the_warm_stamp_asks(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane, row_overrides: dict
+) -> None:
+    """THE SAME PRODUCER: the real offers.resolve mint asks `human_handoff_allowed` for its warm
+    stamp, and every (host, market) it asks must be a key the purchasability sweep's warm-click
+    lane derives from the SAME row (jobs/merchant_purchasability_sweep._seed_warm_hosts). A fact
+    the stamp asks for and the sweep never gathers is a link that can never warm."""
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row_for_exec_spec(evidence=False)
+    row.update(row_overrides)
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    allowed = sorted({"brand.com", "canonical-store.com", "another-store.com"})
+    _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+                             row_overrides=row_overrides, allowed_domains=allowed)
+    swept = {(host, mp.normalize_market(row["market"])) for host in sweep._seed_warm_hosts(gateway, row)}
+    if row_overrides.get("market") == "CA":
+        assert calls == [], "a CA-listed row is never asked on a US request"
+        assert swept == {("brand.com", "CA")}
+        return
+    assert calls, "the stamp must be asked for this to prove anything"
+    assert set(calls) <= swept, sorted(set(calls) - swept)
