@@ -28,10 +28,11 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
 from config.settings import settings
+from utils.auth import assert_merchant_owner_or_staff, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -115,13 +116,15 @@ def _require_enabled() -> None:
 @router.get("/status")
 async def oauth_status(
     merchant_id: str = Query(..., min_length=1),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Diagnostic: returns the merchant's GSC integration state.
+    """Diagnostic: returns the merchant's GSC integration state (that merchant or staff).
     Doesn't expose tokens — only metadata (presence + grant time +
     site URL + scopes + last refresh status). Useful for the audit
     pipeline to decide whether to surface "Grant GSC access" CTA,
     and for operators to verify the OAuth round-trip persisted.
     """
+    assert_merchant_owner_or_staff(current_user, merchant_id)
     try:
         from db.database import database
         row = await database.fetch_one(
@@ -178,10 +181,16 @@ async def oauth_status(
 async def start_oauth(
     merchant_id: str = Query(..., min_length=1),
     return_to: Optional[str] = Query(None, description="Portal URL to land back on"),
+    current_user: dict = Depends(get_current_user),
 ):
     """Builds the Google authorization URL + redirects. The merchant
-    completes consent on Google's side, then returns to /callback."""
+    completes consent on Google's side, then returns to /callback.
+
+    The signed state binds the grant to merchant_id, and the callback stores the
+    Google account's tokens on that merchant (replacing any earlier grant), so only
+    that merchant or staff may start it."""
     _require_enabled()
+    assert_merchant_owner_or_staff(current_user, merchant_id)
     nonce = secrets.token_urlsafe(16)
     expires_at = int(
         (datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()

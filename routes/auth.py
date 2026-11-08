@@ -8,7 +8,7 @@ import asyncio
 import json
 import os
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from textwrap import dedent
 from typing import Any, Dict, Optional
 
@@ -415,6 +415,11 @@ async def _safe_record_identity_event(**kwargs) -> None:
 
 
 async def _resolve_agent_id_for_email(email: str) -> Optional[str]:
+    """An agent whose address is `email`, by email match alone.
+
+    Only for deciding whether to email a reset link to that mailbox (the reset
+    flow then proves the mailbox). Never a login link: see _resolve_linked_agent_id.
+    """
     try:
         row = await _auth_fetch_one(
             """
@@ -447,25 +452,168 @@ async def _resolve_agent_id_for_email(email: str) -> Optional[str]:
 
 
 async def _resolve_merchant_id_for_user(user: Optional[dict], email: str) -> Optional[str]:
+    """The merchant this users row is linked to: users.merchant_id, nothing else.
+
+    It used to fall back to `merchant_onboarding.contact_email`. Nothing proves a
+    mailbox at /api/auth/register, so anyone could register a staff-onboarded
+    merchant's contact address and log in with that merchant's id in a verified
+    token. users.merchant_id is written only by the merchant's own signup, the
+    Shopify claim, staff, or a merchant-portal password reset (which proves the
+    mailbox, see _link_tenants_after_mailbox_proof). The demo map stays: it is
+    off in production.
+    """
     merchant_id = user.get("merchant_id") if user else None
     if merchant_id:
         return str(merchant_id)
+    return _demo_merchant_ids().get(email)
+
+
+# A membership written at most this long before its users row still counts as that
+# row's: the users row's created_at is the database clock, the membership's the app's.
+_MEMBERSHIP_CLOCK_SKEW = timedelta(seconds=60)
+
+
+def _user_created_at(user: Optional[dict]) -> Optional[datetime]:
     try:
-        merchant_record = await _auth_fetch_one(
+        value = (user or {}).get("created_at")
+    except Exception:
+        return None
+    return value if isinstance(value, datetime) else None
+
+
+def _membership_not_before(user: Optional[dict]) -> Optional[datetime]:
+    created_at = _user_created_at(user)
+    return created_at - _MEMBERSHIP_CLOCK_SKEW if created_at else None
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _membership_predates_user(membership: Optional[dict], user: Optional[dict]) -> bool:
+    """Whether `membership` was last written before this users row existed.
+
+    Identities and memberships outlive a deleted users row, and /api/auth/register
+    reuses the identity for the same email, so a stranger who registers that email
+    again must not inherit the old account's merchant or agent membership.
+    """
+    floor = _membership_not_before(user)
+    if not membership or floor is None:
+        return False
+    written = [
+        _as_aware_utc(membership[key])
+        for key in ("created_at", "updated_at")
+        if isinstance(membership.get(key), datetime)
+    ]
+    return bool(written) and max(written) < _as_aware_utc(floor)
+
+
+async def _resolve_linked_agent_id(user: Optional[dict], email: str) -> Optional[str]:
+    """The agent this users row is linked to, or None.
+
+    An agents row whose owner_email equals the login email is not, alone, proof the
+    agent is this account's: staff create agents with an owner_email that has no
+    users row (POST /agents/create), and /api/auth/register lets anyone create that
+    users row without proving the mailbox. The link is an active agent membership,
+    bound to that agent and written after this users row existed. Only flows that
+    prove ownership write one: the agent's own registration (/agent/account/register
+    creates the users row, the agent and the membership together), the
+    password-verified merchant conversion, a password reset (mailbox proof), and the
+    login that follows one of those.
+    """
+    if not user:
+        return None
+    from db.auth_identity import has_active_membership_for_entity
+
+    try:
+        rows = await database.fetch_all(
             """
-            SELECT merchant_id
-            FROM merchant_onboarding
-            WHERE LOWER(contact_email) = LOWER(:email)
-            ORDER BY created_at DESC
-            LIMIT 1
+            SELECT agent_id
+            FROM agents
+            WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)
+            ORDER BY created_at
             """,
             {"email": email},
         )
     except Exception:
-        merchant_record = None
-    if merchant_record:
-        return str(merchant_record["merchant_id"])
-    return _demo_merchant_ids().get(email)
+        return None
+    for row in rows or []:
+        try:
+            agent_id = str(dict(row)["agent_id"] or "")
+        except Exception:
+            continue
+        if not agent_id:
+            continue
+        try:
+            linked = await has_active_membership_for_entity(
+                email=email,
+                membership_type="agent",
+                entity_id=agent_id,
+                not_before=_membership_not_before(user),
+            )
+        except Exception:
+            linked = False
+        if linked:
+            return agent_id
+    return None
+
+
+async def _email_claims_existing_tenant(email: str) -> bool:
+    """Whether `email` already names an agent owner, a merchant contact or an employee.
+
+    Self-service registration does not prove the mailbox, so it must not create the
+    users row for an address that already stands for a tenant or a staff member: that
+    row is what the login flows key on. The owner of such an address signs in, or
+    resets the password from the portal, which emails the link to that mailbox.
+    Fails closed: an unanswerable lookup refuses the registration.
+    """
+    checks = (
+        (
+            # Legacy agents rows carry the address in `email`, newer ones in owner_email.
+            """
+            SELECT 1 FROM agents
+            WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)
+               OR LOWER(COALESCE(email, '')) = LOWER(:email)
+            LIMIT 1
+            """,
+            "SELECT 1 FROM agents WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email) LIMIT 1",
+        ),
+        (
+            """
+            SELECT 1 FROM merchant_onboarding
+            WHERE LOWER(COALESCE(contact_email, '')) = LOWER(:email)
+              AND COALESCE(status, '') != 'deleted'
+            LIMIT 1
+            """,
+            None,
+        ),
+        (
+            "SELECT 1 FROM employees WHERE LOWER(email) = LOWER(:email) AND status = 'active' LIMIT 1",
+            None,
+        ),
+    )
+    for query, fallback in checks:
+        for attempt in (query, fallback):
+            if attempt is None:
+                continue
+            try:
+                row = await database.fetch_one(attempt, {"email": email})
+                break
+            except Exception:
+                continue
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Registration is temporarily unavailable; try again shortly.",
+            )
+        if row:
+            return True
+    return False
+
+
+EMAIL_ALREADY_REGISTERED_DETAIL = (
+    "Email already registered. Sign in, or reset your password from the portal to continue."
+)
 
 
 def _fallback_membership(
@@ -860,6 +1008,13 @@ async def register(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
             )
+        # An address that already names an agent owner, a merchant contact or an
+        # employee belongs to someone; nothing here proves this caller reads it.
+        if await _email_claims_existing_tenant(normalized_email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=EMAIL_ALREADY_REGISTERED_DETAIL,
+            )
         
         # Hash password
         password_hash = hash_password(data.password)
@@ -932,7 +1087,7 @@ async def login(data: LoginRequest):
 
         # Find user by email
         query = """
-            SELECT id, email, password_hash, full_name, role, active, merchant_id
+            SELECT id, email, password_hash, full_name, role, active, merchant_id, created_at
             FROM users
             WHERE LOWER(email) = LOWER(:email)
             LIMIT 1
@@ -1029,8 +1184,14 @@ async def login(data: LoginRequest):
                     source="employees_login_sync",
                 )
 
+        # Tenant links come from stored, proven links only, never from an email
+        # match: see _resolve_merchant_id_for_user and _resolve_linked_agent_id.
         merchant_id = await _resolve_merchant_id_for_user(user, normalized_email)
-        agent_id = await _resolve_agent_id_for_email(normalized_email)
+        agent_id = (
+            await _resolve_linked_agent_id(user, normalized_email)
+            if user_role == "agent"
+            else None
+        )
 
         if canonical_identity and user and user.get("password_hash") and not verified_with_user_password:
             await _safe_upsert_credential_hash(
@@ -1109,6 +1270,21 @@ async def login(data: LoginRequest):
                 normalized_email,
                 inferred_membership_type,
             )
+            if (
+                inferred_membership_type in {"merchant", "agent"}
+                and _membership_predates_user(membership, user)
+            ):
+                # Left by an earlier account at this email; this users row is newer.
+                await _safe_record_identity_event(
+                    event_type="stale_membership_ignored",
+                    email=normalized_email,
+                    details={
+                        "membership_type": inferred_membership_type,
+                        "entity_id": str(membership.get("entity_id") or ""),
+                        "source": "login",
+                    },
+                )
+                membership = None
 
         if not membership and inferred_membership_type == "employee" and employee_identity:
             membership = _fallback_membership(
@@ -1487,6 +1663,36 @@ async def forgot_password(data: ForgotPasswordRequest):
                         "role": "merchant",
                     }
 
+            # Agent bootstrap: an agent owner_email with no users row yet (staff
+            # create agents that way). Same shape as the merchant bootstrap: a
+            # random password only the mailbox can replace, and an explicit
+            # agent-portal reset only. Redeeming the link links the agent
+            # (_link_tenants_after_mailbox_proof); self-registration of the
+            # address is refused, so this is how such an owner gets in.
+            if not user and data.portal == "agent":
+                agent_id = await _resolve_agent_id_for_email(normalized_email)
+                if agent_id:
+                    from utils.auth import hash_password
+
+                    await database.execute(
+                        """
+                        INSERT INTO users (email, password_hash, full_name, role, active)
+                        VALUES (:email, :password_hash, :full_name, :role, :active)
+                        """,
+                        {
+                            "email": normalized_email,
+                            "password_hash": hash_password(secrets.token_urlsafe(12)),
+                            "full_name": normalized_email.split("@")[0],
+                            "role": "agent",
+                            "active": True,
+                        },
+                    )
+                    logger.info(
+                        "[Auth] Auto-created agent user for %s to support password reset",
+                        normalized_email,
+                    )
+                    user = {"email": normalized_email, "role": "agent"}
+
             if not user:
                 # Don't reveal if email exists or not (security best practice)
                 return generic_response
@@ -1544,6 +1750,67 @@ async def forgot_password(data: ForgotPasswordRequest):
             status_code=500,
             detail=f"Failed to process password reset: {str(e)}"
         )
+
+
+async def _link_tenants_after_mailbox_proof(email: str, portal: Optional[str]) -> None:
+    """Record the tenant links an email match suggests, now that the mailbox is proven.
+
+    A redeemed reset token was emailed to this address, so whoever redeemed it reads
+    the mailbox. That is the proof login no longer infers from an email match:
+    - merchant (or portal-less) reset of a role=merchant users row with no
+      merchant_id: link the latest non-deleted onboarding whose contact_email is
+      this address;
+    - agent (or portal-less) reset of a role=agent users row: record an active
+      agent membership for every agent whose owner_email is this address.
+    Best effort: a failure here leaves the password reset in place.
+    """
+    try:
+        user = _record_to_dict(await database.fetch_one(
+            "SELECT email, role, merchant_id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+            {"email": email},
+        ))
+        role = ((user or {}).get("role") or "").strip().lower()
+        if not user:
+            return
+        if role == "merchant" and portal in (None, "merchant") and not user.get("merchant_id"):
+            merchant = await database.fetch_one(
+                """
+                SELECT merchant_id FROM merchant_onboarding
+                WHERE LOWER(contact_email) = LOWER(:email)
+                  AND COALESCE(status, '') != 'deleted'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"email": email},
+            )
+            if merchant and merchant["merchant_id"]:
+                await database.execute(
+                    """
+                    UPDATE users SET merchant_id = :merchant_id
+                    WHERE LOWER(email) = LOWER(:email) AND merchant_id IS NULL
+                    """,
+                    {"merchant_id": str(merchant["merchant_id"]), "email": email},
+                )
+        elif role == "agent" and portal in (None, "agent"):
+            rows = await database.fetch_all(
+                "SELECT agent_id, agent_name FROM agents WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)",
+                {"email": email},
+            )
+            for row in rows or []:
+                agent = dict(row)
+                if not agent.get("agent_id"):
+                    continue
+                await _safe_upsert_membership(
+                    email=_normalize_email(email),
+                    membership_type="agent",
+                    role="agent",
+                    entity_id=str(agent["agent_id"]),
+                    status="active",
+                    full_name=agent.get("agent_name"),
+                    source="password_reset_mailbox_proof",
+                )
+    except Exception as exc:
+        logger.warning("[Auth] Post-reset tenant link skipped: %s", type(exc).__name__)
 
 
 @router.post("/reset-password", response_model=MessageResponse)
@@ -1625,6 +1892,8 @@ async def reset_password(data: ResetPasswordRequest):
             "UPDATE password_reset_tokens SET used = TRUE WHERE token = :token",
             {"token": data.token}
         )
+
+        await _link_tenants_after_mailbox_proof(token_record["user_email"], token_portal)
         
         return MessageResponse(
             success=True,

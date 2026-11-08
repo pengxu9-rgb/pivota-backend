@@ -85,9 +85,12 @@ ALLOWLIST: Dict[Tuple[str, str], str] = {
     ("POST", "/v1/catalog/incentives/reconcile/{merchant_id}"): "_require_catalog_scope: normalizes the id and keeps merch_obs_* admin-only",
     ("GET", "/agents/{agent_id}"): "_is_own_agent_record ownership (id claims + record owner_email), reviewed in agent_management",
     ("PUT", "/agents/{agent_id}"): "owner-or-staff check plus field-level self-escalation refusal, reviewed in agent_management",
-    ("GET", "/agents/{agent_id}/funnel"): "staff, or _is_own_agent_record owner, reviewed in agent_management",
-    ("GET", "/agents/{agent_id}/query-analytics"): "staff, or _is_own_agent_record owner, reviewed in agent_management",
-    ("GET", "/agents/{agent_id}/merchants"): "staff, or _is_own_agent_record owner, reviewed in agent_management",
+    # Read-only, inline: employee staff, or a token whose agent_id claim (else its email)
+    # equals the path id. The email arm can only match an email-shaped id (the non-prod
+    # demo lane), never an agent_<hex> id; moving these onto the guard is a follow-up.
+    ("GET", "/agents/{agent_id}/funnel"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
+    ("GET", "/agents/{agent_id}/query-analytics"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
+    ("GET", "/agents/{agent_id}/merchants"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
     # Pre-existing fail-closed lockout: compares user_id (a users-table id) with the
     # agent id, so only admins pass. Admitting agent owners is a separate, reviewed
     # decision pinned by tests/test_admin_route_token_and_role_gate.py.
@@ -98,8 +101,8 @@ ALLOWLIST: Dict[Tuple[str, str], str] = {
     ("DELETE", "/agents/{agent_id}/routes/{route_id}"): "admin-only in effect (user_id lockout), widening needs its own review",
     ("POST", "/agents/{agent_id}/protocols/{protocol_name}/test"): "admin-only in effect (user_id lockout), widening needs its own review",
     # Staff-only by an inline role check (no tenant token passes it).
-    ("GET", "/agents/{agent_id}/analytics"): "inline staff-only role check",
-    ("GET", "/agents/{agent_id}/usage"): "inline staff-only role check",
+    ("GET", "/agents/{agent_id}/analytics"): "read-only: admin/employee/super_admin, or agent_id claim (else email) == path id, inline in agent_management",
+    ("GET", "/agents/{agent_id}/usage"): "read-only: admin/employee/super_admin, or agent_id claim (else email) == path id, inline in agent_management",
     ("PATCH", "/agents/{agent_id}/tier"): "inline staff-only role check",
     ("POST", "/agents/{agent_id}/revenue/policies"): "inline staff-only role check",
     ("POST", "/agents/{agent_id}/protocols/"): "inline admin-only role check",
@@ -129,7 +132,10 @@ ALLOWLIST: Dict[Tuple[str, str], str] = {
     ("GET", "/employee/agents/{agent_id}/health-score"): "inline employee-staff role check",
 }
 
-TENANT_PARAMS = ("merchant_id", "agent_id")
+TENANT_PARAMS = ("merchant_id", "agent_id", "onboarding_id")
+# Path params that name a merchant. /platform-onboarding/{onboarding_id}/* uses the
+# onboarding id AS the merchant id (routes/platform_onboarding_routes.py).
+MERCHANT_KEYED_PARAMS = {"merchant_id", "onboarding_id"}
 
 
 @pytest.fixture(scope="module")
@@ -198,7 +204,7 @@ def _classify(route: APIRoute) -> Tuple[str, str]:
         if name in ASYNC_GUARDS and not is_awaited:
             problems.append(f"{name} is not awaited (a bare coroutine checks nothing)")
     for param in _tenant_params(route.path):
-        wanted = MERCHANT_GUARDS if param == "merchant_id" else AGENT_GUARDS
+        wanted = MERCHANT_GUARDS if param in MERCHANT_KEYED_PARAMS else AGENT_GUARDS
         if not any(name in wanted and param in names for name, _, names in calls):
             problems.append(f"no {sorted(wanted)} call on path param {param!r}")
     if problems:
@@ -275,9 +281,9 @@ VICTIM_AGENT = "agent_victim"
 class _DbTripwire:
     """Stands in for the endpoint module's `database`.
 
-    The only queries a refusal may run are the guard's own lookups: the
-    agent-owner email (answered with someone else's address) and the
-    merchant-agent relationship (answered "none").
+    The only query a refusal may run is the guard's own merchant-agent
+    relationship lookup (answered "none"). The agent guard no longer looks the
+    owner email up, so that lookup now fails the test like any other read.
     """
 
     def __init__(self) -> None:
@@ -290,8 +296,6 @@ class _DbTripwire:
 
     async def fetch_one(self, query: Any, values: Any = None, *a: Any, **kw: Any):
         q = self._record(query)
-        if "SELECT owner_email FROM agents" in q:
-            return {"owner_email": "someone-else@example.com"}
         if "SELECT 1 AS present FROM orders" in q:
             return None
         raise AssertionError(f"endpoint queried before refusing a foreign tenant: {q}")
@@ -305,10 +309,7 @@ class _DbTripwire:
 
 
 def _guard_query_only(queries: List[str]) -> bool:
-    return all(
-        "SELECT owner_email FROM agents" in q or "SELECT 1 AS present FROM orders" in q
-        for q in queries
-    )
+    return all("SELECT 1 AS present FROM orders" in q for q in queries)
 
 
 def _guarded_routes(app) -> List[APIRoute]:
@@ -337,6 +338,10 @@ def _foreign_callers(path: str) -> List[Tuple[str, Dict[str, Any]]]:
         # A merchant membership is never staff, whatever role string it carries.
         ("merchant_membership_with_admin_role", {"sub": "u-d", "email": "d@example.com", "role": "admin",
                                                  "membership_type": "merchant", "merchant_id": "merch_attacker"}),
+        # A claim-less agent token is no agent, even with the victim agent's
+        # owner email (the guard does not look it up any more).
+        ("claimless_agent_with_owner_email", {"sub": "u-e", "email": "someone-else@example.com",
+                                              "role": "agent"}),
     ]
     return callers
 
@@ -344,7 +349,7 @@ def _foreign_callers(path: str) -> List[Tuple[str, Dict[str, Any]]]:
 def _call_kwargs(fn, user: Dict[str, Any]) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {}
     for name, param in inspect.signature(fn).parameters.items():
-        if name == "merchant_id":
+        if name in MERCHANT_KEYED_PARAMS:
             kwargs[name] = VICTIM_MERCHANT
         elif name == "agent_id":
             kwargs[name] = VICTIM_AGENT
@@ -381,4 +386,127 @@ async def test_every_guarded_route_refuses_foreign_tenants_before_any_query(guar
                 failures.append(f"{route.path} [{caller_name}]: {exc}")
             if not _guard_query_only(tripwire.queries):
                 failures.append(f"{route.path} [{caller_name}]: queried {tripwire.queries}")
+    assert not failures, "\n".join(failures)
+
+
+async def _first_refusal(fn, user) -> Optional[HTTPException]:
+    """Call the endpoint; return the HTTPException it raised, or None when it got past."""
+    try:
+        result = fn(**_call_kwargs(fn, user))
+        if inspect.isawaitable(result):
+            await result
+    except HTTPException as exc:
+        return exc
+    except Exception:  # noqa: BLE001 - past the guard, into the (tripwired) body
+        return None
+    return None
+
+
+def _agent_guard_staff_roles(fn) -> Optional[str]:
+    """The staff_roles name passed to the agent guard in fn, '' for the default, None if absent."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name in ("assert_agent_scope", "assert_agent_scope_or_owner"):
+                for kw in node.keywords:
+                    if kw.arg == "staff_roles":
+                        return ast.unparse(kw.value)
+                return ""
+    return None
+
+
+class _PastTheGuard(Exception):
+    """Raised by the wrapped guard once it lets the caller through: stops the body."""
+
+
+def _stop_after_agent_guard(monkeypatch, fn) -> None:
+    import utils.tenant_scope as ts
+
+    async def or_owner(*a, **kw):
+        await ts.assert_agent_scope_or_owner(*a, **kw)
+        raise _PastTheGuard()
+
+    def scope(*a, **kw):
+        ts.assert_agent_scope(*a, **kw)
+        raise _PastTheGuard()
+
+    if "assert_agent_scope_or_owner" in fn.__globals__:
+        monkeypatch.setitem(fn.__globals__, "assert_agent_scope_or_owner", or_owner)
+    if "assert_agent_scope" in fn.__globals__:
+        monkeypatch.setitem(fn.__globals__, "assert_agent_scope", scope)
+
+
+async def test_agent_routes_admit_the_staff_set_they_declare(guarded, monkeypatch):
+    """M13: a route that passes EMPLOYEE_STAFF_ROLES to the agent guard (keys,
+    webhooks, identity issuers, revenue, routing) lets an employee token past it; a
+    route that passes () (bank details, payouts) refuses every staff token. The
+    guard is wrapped so nothing past it runs."""
+    employee = {"sub": "u-emp", "email": "emp@example.com", "role": "employee",
+                "membership_type": "employee", "employee_id": "emp_1"}
+    admin = {"sub": "u-adm", "email": "adm@example.com", "role": "admin",
+             "membership_type": "employee", "employee_id": "emp_2"}
+    checked = {"EMPLOYEE_STAFF_ROLES": 0, "()": 0}
+    failures = []
+    for route in guarded:
+        fn = route.endpoint
+        roles = _agent_guard_staff_roles(fn)
+        if roles not in checked:
+            continue
+        checked[roles] += 1
+        monkeypatch.setitem(fn.__globals__, "database", _DbTripwire())
+        with monkeypatch.context() as m:
+            _stop_after_agent_guard(m, fn)
+            for who, user in (("employee", employee), ("admin", admin)):
+                try:
+                    result = fn(**_call_kwargs(fn, user))
+                    if inspect.isawaitable(result):
+                        await result
+                    outcome = "no guard ran"
+                except _PastTheGuard:
+                    outcome = "past"
+                except HTTPException as exc:
+                    outcome = f"refused {exc.status_code}"
+                if roles == "EMPLOYEE_STAFF_ROLES" and outcome != "past":
+                    failures.append(f"{route.path}: {who} {outcome}")
+                if roles == "()" and not outcome.startswith("refused 403"):
+                    failures.append(f"{route.path}: {who} {outcome}")
+    assert checked["EMPLOYEE_STAFF_ROLES"] >= 10 and checked["()"] >= 5, checked
+    assert not failures, "\n".join(failures)
+
+
+@pytest.fixture(scope="module")
+def onboarding_v2_app():
+    """/platform-onboarding/* is mounted only with FEATURE_PLATFORM_ONBOARDING_V2=true
+    (off by default), so the main.app sweep never sees it. Sweep its router alone."""
+    from fastapi import FastAPI
+
+    from routes.platform_onboarding_routes import router
+
+    app = FastAPI()
+    app.include_router(router)
+    return app
+
+
+def test_flag_gated_onboarding_id_routes_run_the_merchant_guard(onboarding_v2_app):
+    routes = _tenant_routes(onboarding_v2_app)
+    assert len(routes) >= 8, [r.path for r in routes]
+    bad = [
+        f"{','.join(sorted(r.methods))} {r.path}: {kind} {detail}"
+        for r in routes
+        for kind, detail in [_classify(r)]
+        if kind != "guarded"
+    ]
+    assert not bad, "\n".join(bad)
+
+
+async def test_flag_gated_onboarding_id_routes_refuse_foreign_tenants(onboarding_v2_app, monkeypatch):
+    failures = []
+    for route in _tenant_routes(onboarding_v2_app):
+        fn = route.endpoint
+        for caller_name, user in _foreign_callers(route.path):
+            monkeypatch.setitem(fn.__globals__, "database", _DbTripwire())
+            exc = await _first_refusal(fn, user)
+            if exc is None or exc.status_code != 403:
+                failures.append(f"{route.path} [{caller_name}]: {exc!r}")
     assert not failures, "\n".join(failures)

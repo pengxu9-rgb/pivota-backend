@@ -328,6 +328,13 @@ def _login_setup(monkeypatch, module, *, stored_api_key: str):
         return None
 
     monkeypatch.setattr(module, "_sync_agent_auth_membership", _no_membership)
+
+    # The account is linked to agent_abc (its own registration wrote the membership);
+    # login refuses a role=agent row whose agent is matched only by owner_email.
+    async def _linked(user, agent, **_kwargs):
+        return agent["agent_id"] == "agent_abc"
+
+    monkeypatch.setattr(module, "_holds_agent_membership", _linked)
     return executed
 
 

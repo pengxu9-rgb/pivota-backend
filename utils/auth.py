@@ -554,6 +554,28 @@ def can_access_merchant(user_info: Dict[str, Any], merchant_id: str) -> bool:
     return False
 
 
+def assert_merchant_owner_or_staff(user_info: Dict[str, Any], merchant_id: Any) -> None:
+    """403 unless the caller is staff or the merchant `merchant_id` itself.
+
+    For routes that take the merchant from the request body or query. Unlike
+    can_access_merchant, an agent token never passes, and a merchant token passes
+    only on an exact match of its own merchant_id claim.
+    """
+    target = str(merchant_id or "").strip()
+    role = str((user_info or {}).get("role") or "")
+    if target and role in EMPLOYEE_ROLES:
+        return
+    claimed = (user_info or {}).get("merchant_id")
+    if (
+        target
+        and role == "merchant"
+        and isinstance(claimed, (str, int))
+        and str(claimed).strip() == target
+    ):
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this merchant")
+
+
 def can_access_agent(user_info: Dict[str, Any], agent_id: str) -> bool:
     """
     Check if user can access specific agent data
