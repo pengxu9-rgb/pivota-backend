@@ -64,6 +64,7 @@ from db.database import database  # noqa: E402
 from services.catalog_enrichment_agent.apply import live_retailer_listing_owner  # noqa: E402
 from services.catalog_row_trust_upserter import upsert_catalog_row_trust_many  # noqa: E402
 from services.index_pipeline_state_service import recompute_serving_eligibility  # noqa: E402
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval  # noqa: E402
 
 SCRIPT_NAME = "withdraw_catalog_rows"
 DEFAULT_REASON = "manual_withdrawal"
@@ -218,6 +219,8 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
             " WHERE id = ANY(:ids) AND status = 'inactive'",
             {"ids": seed_ids},
         )
+        # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+        log_seed_reactivated_outside_approval(seed_ids, tool=SCRIPT_NAME, row_confirmed=False)
     keys = sorted({r["content_key"] for r in rows if r.get("content_key")})
     states = await _recompute_and_verify(keys, f"{SCRIPT_NAME}:revert")
     await upsert_catalog_row_trust_many(db=database, product_keys=[r["product_key"] for r in rows])
