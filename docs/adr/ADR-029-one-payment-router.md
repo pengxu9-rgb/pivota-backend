@@ -123,7 +123,7 @@ A path is admitted only with a written funds flow showing that the buyer's payme
   - the merchant has not opted out (D5);
   - for `pivota_browser`, D5's run condition;
   - for `rail_managed`, the partner's contractual equivalents of D5 to D7 are recorded (D2). A merchant being proven on a rail is necessary, not sufficient: it must also be **permitted**.
-- **Currency equals market (ADR-026):** the purchase currency is the buyer market's currency, and the market is never defaulted. A path whose credential step carries another currency, or none, is not a candidate (see D5's one-currency rule).
+- **Currency equals market (ADR-026):** the purchase currency is the buyer market's currency, and the market is never defaulted. A path whose credential step carries another currency is not a candidate. A path whose credential step carries none is a candidate only for its one declared currency (D5), and only when that currency is the market's.
 - **The caller and the buyer:** the caller class is allowed (ADR-012); the amount is within the consent's ceiling (ADR-028 D7) and the path's cap; the buyer holds the credential or can enrol it in the flow.
 - **The path's own requirements** (D2 `requires`, `works_on`) and its dial (D8).
 
