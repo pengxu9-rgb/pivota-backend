@@ -618,7 +618,7 @@ async def test_the_census_reports_each_key_in_the_state_the_gate_would_read(_db,
     import db.merchant_purchasability as mp
     import jobs.merchant_purchasability_sweep as sweep
     from scripts import merchant_purchasability_census as census
-    from tests.test_merchant_purchasability import _ALLOWLISTS, _CART_MINT_EXPECTED, _Fetcher
+    from tests.test_merchant_purchasability import _POPULATION, _WARM_CLICK_EXPECTED, _Fetcher
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
@@ -632,13 +632,19 @@ async def test_the_census_reports_each_key_in_the_state_the_gate_would_read(_db,
     report = await census.census()
     assert report["incomplete"] is False
     states = {(r["host"], r["market"]): r["state"] for r in report["rows"]}
-    assert set(states) == _ALLOWLISTS | _CART_MINT_EXPECTED
+    # Every lane's keys, the warm-click lane included.
+    assert set(states) == _POPULATION
     for key, state in states.items():
         assert (state == "positive") is await mp.is_purchasable(*key), key
     assert states[("catalog-brand-0.example", "US")] == "unverifiable"
     assert states[("flowerbeauty.com", "US")] == "confirmed_negative"
     assert list(states.values()).count("never_checked") == len(states) - 6
     assert report["summary"]["cart_mint_lane"]["complete"] is True
+    # The warm-click lane is counted by state, and the summary carries no per-key map (it is
+    # fenced as JSON by `run`).
+    assert sum(report["summary"]["warm_click_keys"].values()) == len(_WARM_CLICK_EXPECTED)
+    assert "warm_seeds_by_key" not in report["summary"]["cart_mint_lane"]
+    census._fence(report["summary"])
 
 
 async def test_the_census_transaction_refuses_a_write(_db, _cart_seeds, monkeypatch):
