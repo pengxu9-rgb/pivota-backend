@@ -1122,6 +1122,32 @@ def _same_title(a: Any, b: Any) -> bool:
     return bool(key) and key == _title_key(b)
 
 
+def _title_keys_without_brand(value: Any, brands: Iterable[Any]) -> set:
+    """`_title_key(value)`, plus the same key with a brand cut from its start, its end, or both. Empty keys never."""
+    key = _title_key(value)
+    if not key:
+        return set()
+    out = {key}
+    for brand in brands:
+        if isinstance(brand, dict):
+            brand = brand.get("name")
+        cut = _title_key(brand) if isinstance(brand, str) else ""
+        if not cut:
+            continue
+        head = key[len(cut):] if key.startswith(cut) else key        # the prefix cut, if there is one
+        both = head[: -len(cut)] if head.endswith(cut) else head      # then the suffix
+        out |= {k for k in (head, both) if k}
+    return out
+
+
+def _same_title_but_brand(a: Any, b: Any, brands: Iterable[Any] = ()) -> bool:
+    """`_same_title`, where a brand prefix or suffix on either side does not count as a difference (review be#2764
+    P3-B): the guard's matcher drops brand words, so cutting the brand from a prefilled page name is not typing a
+    title. A missing title is unknown, never equal."""
+    brands = tuple(brands)
+    return bool(_title_keys_without_brand(a, brands) & _title_keys_without_brand(b, brands))
+
+
 def _guard_title_and_origin(title: Any, seed_data: Any) -> Tuple[Optional[str], str]:
     """(the title the ambiguous-price guard may name a pricing node by, where it came from).
 
@@ -1163,26 +1189,76 @@ def _title_source_at_creation(
     existing_seed_data: Any = None,
     existing_title: Any = None,
     title_from_row: bool = False,
+    brands: Iterable[Any] = (),
 ) -> str:
-    """Who wrote the title a creation stores: `employee` or `page`.
+    """Who wrote the title a creation stores: `employee` or `page`. Titles compare by `_same_title_but_brand`.
 
-    * A body title equal (`_title_key`) to the page's own name (this read's snapshot title, or its pricing node's
-      name) is the page's: the portal pre-fills the create form from `/external-seeds/preview`, which returns that
-      name (review P2-C). It is then decided by url alone, which can only refuse.
-    * A re-create re-sending the row's own `employee` title keeps the stamp (the person typed it before).
+    * A re-create re-sending the row's own title keeps who wrote it: `employee` only when the row is already stamped
+      so, else the page's (be#2764 review P3-A: this read may have no name, or a challenge page's, to compare with,
+      and an unstamped or `page` row's title was not typed).
+    * A body title equal to the page's own name (this read's snapshot title, or its pricing node's name) is the
+      page's: the portal pre-fills the create form from `/external-seeds/preview`, which returns that name (review
+      P2-C). It is then decided by url alone, which can only refuse.
     * An untitled re-create that keeps the row's title (this read gave no name) keeps the row's `employee` stamp
       (review P3-4); else the title is the page's.
     """
     existing = existing_seed_data if isinstance(existing_seed_data, dict) else {}
     typed_before = existing.get(SEED_TITLE_SOURCE_KEY) == SEED_TITLE_SOURCE_EMPLOYEE
+    brands = tuple(brands)
     text = str(body_title or "").strip()
     if not text:
         return SEED_TITLE_SOURCE_EMPLOYEE if (title_from_row and typed_before) else SEED_TITLE_SOURCE_PAGE
-    if typed_before and _same_title(text, existing_title):
-        return SEED_TITLE_SOURCE_EMPLOYEE
-    if any(_same_title(text, name) for name in page_names):
+    if _same_title_but_brand(text, existing_title, brands):
+        return SEED_TITLE_SOURCE_EMPLOYEE if typed_before else SEED_TITLE_SOURCE_PAGE
+    if any(_same_title_but_brand(text, name, brands) for name in page_names):
         return SEED_TITLE_SOURCE_PAGE
     return SEED_TITLE_SOURCE_EMPLOYEE
+
+
+def _page_variant_key(variant: Any) -> Optional[Tuple[str, Optional[float], str]]:
+    """(variant id, price, currency) as the preview shows it and the portal copies it; None without an id."""
+    if not isinstance(variant, dict):
+        return None
+    vid = str(variant.get("variant_id") or "").strip()
+    if not vid:
+        return None
+    amount = _as_price(variant.get("price_amount"))
+    return vid, (round(amount, 2) if amount is not None else None), str(variant.get("price_currency") or "").strip().upper()
+
+
+def _body_values_from_the_page(
+    *,
+    body_price_amount: Any,
+    body_price_currency: Any,
+    body_variants: Any,
+    page_price_amount: Any,
+    page_price_currency: Any,
+    evidence: Any,
+) -> List[str]:
+    """Which body values a refused creation got from the page (be#2764 review P2-E): `price` and / or `variants`.
+
+    The portal pre-fills the price, its currency and the variants from `/external-seeds/preview`, which shows the
+    page's pricing node and `evidence.variants` unguarded (on a bundle page: a component, and the components).
+    * `price`: the body amount is the refused node's price, with no currency or the node's own.
+    * `variants`: every body variant (id, price, currency) is one of the page's `evidence.variants` (the portal
+      copies them, and may drop some). A variant a person added or repriced makes the whole list theirs.
+    A value a person typed differently stands. Never raises (anything odd: not the page's)."""
+    out: List[str] = []
+    try:
+        amount, page_amount = _as_price(body_price_amount), _as_price(page_price_amount)
+        currency = str(body_price_currency or "").strip().upper()
+        if (amount is not None and page_amount is not None and abs(amount - page_amount) < 0.005
+                and currency in ("", str(page_price_currency or "").strip().upper())):
+            out.append("price")
+        raw = evidence.get("variants") if isinstance(evidence, dict) else None
+        page_keys = {k for k in (_page_variant_key(v) for v in (raw if isinstance(raw, list) else [])) if k}
+        if isinstance(body_variants, list) and body_variants and page_keys:
+            keys = [_page_variant_key(v) for v in body_variants]
+            if all(k is not None and k in page_keys for k in keys):
+                out.append("variants")
+    except Exception:  # noqa: BLE001 - never cost a creation
+        return out
+    return out
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -3561,8 +3637,33 @@ async def preview_external_seed(
         image_urls = content["image_urls"]
         description = content["description"]
 
+    # THE PREVIEW FEEDS WRITERS: the portal's create form pre-fills its price and variants from it, and the ops
+    # `sync-variants` mode PATCHes its variants (be#2764 review P2-E). With EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD
+    # `on`, a page whose pricing node does not name the served URL shows no price and no variants, as creation
+    # would store none. The preview has no typed title, so it decides by url alone (a creation whose typed title
+    # names the node still takes the page's price and variants itself). `shadow` only reports. Never raises.
+    price_amount = getattr(snapshot, "price_amount", None)
+    price_currency = getattr(snapshot, "price_currency", None)
+    ambiguous_price: Optional[Dict[str, Any]] = None
+    ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
+    if ambiguous_mode != "off":
+        try:
+            decision = destination_liveness.ambiguous_price_decision(
+                evidence=evidence, requested_url=_normalize_offer_url(str(dest)), seed_title=None
+            )
+        except Exception:  # noqa: BLE001 - the preview is best-effort
+            decision = None
+        if decision is not None:
+            refused = bool(decision.get("refusal")) and ambiguous_mode == "on"
+            ambiguous_price = {"mode": ambiguous_mode, "refused": refused,
+                               **{k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation")}}
+            if refused:
+                price_amount = price_currency = None
+                variants = []
+
     return {
         "status": "success",
+        **({"ambiguous_price": ambiguous_price} if ambiguous_price is not None else {}),
         "preview": {
             "url": dest,
             "canonical_url": canonical_url,
@@ -3573,8 +3674,8 @@ async def preview_external_seed(
             "description": description,
             "image_url": getattr(snapshot, "image_url", None),
             "image_urls": image_urls,
-            "price_amount": getattr(snapshot, "price_amount", None),
-            "price_currency": getattr(snapshot, "price_currency", None),
+            "price_amount": price_amount,
+            "price_currency": price_currency,
             "availability": getattr(snapshot, "availability", None),
             "variants": variants,
             "domain_allowed": domain_allowed,
@@ -4406,6 +4507,8 @@ async def create_external_seed(
         existing_seed_data=existing_title_seed_data,
         existing_title=existing_title,
         title_from_row=title_from_row,
+        brands=(body.brand, existing_title_seed_data.get("brand"),
+                page_identity.get("brand") if isinstance(page_identity, dict) else None),
     )
     typed_title: Optional[str] = None
     if title_source == SEED_TITLE_SOURCE_EMPLOYEE:
@@ -4415,6 +4518,8 @@ async def create_external_seed(
     # EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD `on`, a pricing node that does not name this seed's product
     # (`destination_liveness.ambiguous_price_decision`) gives the seed neither its price nor its variants (the snapshot
     # keeps no price either); a field the employee stated stands. `shadow` only logs the decision.
+    # The body's variants, unless a refusal finds they are the page's (`_body_values_from_the_page`).
+    body_variants = body.variants
     ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
     ambiguous_refused_at_create = False
     if ambiguous_mode != "off" and snapshot is not None and snapshot_price_refused is None:
@@ -4438,23 +4543,39 @@ async def create_external_seed(
             logger.warning("ambiguous-price guard raised at creation; priced as without it", exc_info=True)
             decision = None
         if decision is not None and decision.get("refusal"):
+            # A PREFILLED PRICE OR VARIANT LIST IS THE PAGE'S, not the employee's (be#2764 review P2-E): the portal
+            # copies the preview's, which on a bundle page are a component's price and the components.
+            page_values = _body_values_from_the_page(
+                body_price_amount=body.price_amount,
+                body_price_currency=body.price_currency,
+                body_variants=body.variants,
+                page_price_amount=snap_price_amount,
+                page_price_currency=snap_price_currency,
+                evidence=evidence,
+            )
             _log_ambiguous_price_at_create(ambiguous_mode, {
                 **decision,
                 "title_from": title_source if (body_title or snap_title or title_from_row) else "none",
+                "page_values": page_values,
             })
             if ambiguous_mode == "on":
                 ambiguous_refused_at_create = True
                 # The AMOUNT is what is ambiguous, never the currency (the currency check above passed): an amount
                 # the employee stated keeps the page's currency beside it, so no amount is stored without one.
-                if body.price_amount is None:
+                price_is_the_pages = "price" in page_values
+                if body.price_amount is None or price_is_the_pages:
                     price_amount = None
-                    if not (body.price_currency or "").strip():
+                    if not (body.price_currency or "").strip() or price_is_the_pages:
                         price_currency = None
+                if "variants" in page_values:
+                    body_variants = None
                 snapshot_price_refused = {
                     "reason": "ambiguous_product",
                     "refusal": decision.get("refusal"),
                     "priced_identities": decision.get("priced_identities"),
                     "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
+                    # Body values found to be the page's, and so not stored.
+                    "body_values_from_the_page": page_values,
                 }
                 snap_price_amount = None
                 snap_price_currency = None
@@ -4466,7 +4587,7 @@ async def create_external_seed(
 
     held_row = dict(existing_row) if existing_row else {}
     _refuse_unstorable_employee_variants(
-        body.variants,
+        body_variants,
         stored_variants=_seed_variants(_ensure_json_obj(held_row.get("seed_data"))),
         row_currency=held_row.get("price_currency"),
     )
@@ -4571,8 +4692,8 @@ async def create_external_seed(
             # stay `snapshot.description`, which the gateway serves first (review of #2621).
             seed_data["snapshot"]["description"] = None
             seed_data["snapshot"]["description_refused_source"] = content["description_refused_source"]
-        if body.variants is not None and body.variants:
-            seed_data["variants"] = body.variants
+        if body_variants is not None and body_variants:
+            seed_data["variants"] = body_variants
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
             variant_adoption_refused = _variant_adoption_refusal(
@@ -4665,7 +4786,7 @@ async def create_external_seed(
     else:
         seed_id = _seed_id()
         external_product_id = _stable_external_product_id(match_url)
-        if snap_variants and not body.variants:
+        if snap_variants and not body_variants:
             variant_adoption_refused = _variant_adoption_refusal(
                 _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
             )
@@ -4693,7 +4814,7 @@ async def create_external_seed(
                 else ({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_PAGE_READ} if snap_image_urls else {})
             ),
             "availability": availability,
-            "variants": body.variants or ([] if variant_adoption_refused else (snap_variants or [])),
+            "variants": body_variants or ([] if variant_adoption_refused else (snap_variants or [])),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -5009,7 +5130,11 @@ async def update_external_seed(
         # fills only the latter). An empty title clears the stamp.
         if not str(body.title).strip():
             seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
-        elif not any(_same_title(body.title, stored) for stored in (row.get("title"), seed_data.get("title"))):
+        elif not any(
+            # A brand cut from, or added to, the stored title is not a change either (be#2764 review P3-B).
+            _same_title_but_brand(body.title, stored, (body.brand, seed_data.get("brand")))
+            for stored in (row.get("title"), seed_data.get("title"))
+        ):
             seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
         seed_data["title"] = body.title
         seed_data["snapshot"]["title"] = body.title
@@ -6183,7 +6308,8 @@ def _log_ambiguous_price_at_create(mode: str, decision: Dict[str, Any]) -> None:
     try:
         from utils.logger import logger as pivota_log
 
-        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice", "title_from")}
+        line = {k: decision.get(k) for k in (
+            "refusal", "priced_identities", "url_relation", "title_dice", "title_from", "page_values")}
         line["mode"] = mode
         pivota_log.info("AMBIGUOUS_PRICE_CREATE " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a creation
