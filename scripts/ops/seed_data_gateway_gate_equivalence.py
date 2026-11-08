@@ -79,6 +79,8 @@ def _internal_state() -> Dict[str, Any]:
         "utm_template": "utm_source=pivota&utm_medium={tool}",
         "seller_ref": "seller_1",
         "description_source": "jsonld",
+        # Who wrote the title (be#2746): never a gateway gate's input, so planting it must change no gate.
+        "title_source": "employee",
         "image_urls_source": "page_read",
     }
 

@@ -17,6 +17,7 @@ import logging
 import time
 import math
 import re
+import unicodedata
 from urllib.parse import urlparse
 from urllib.parse import parse_qsl, urlencode, urlunparse
 from datetime import datetime, timezone, timedelta
@@ -1109,25 +1110,79 @@ SEED_TITLE_SOURCE_PAGE = "page"
 
 
 def _title_key(value: Any) -> str:
-    return re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+    """A title's comparison key: NFKC, casefolded, letters, marks and digits only, in every script (a CJK, Hangul or
+    Thai title keeps its characters; the ASCII-only key made every non-Latin title "", review P3-3). "" for none."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in ("L", "M", "N"))
 
 
-def _seed_title_a_person_typed(title: Any, seed_data: Any) -> Optional[str]:
-    """The seed's title when a person typed it, else None (the guard then decides by url alone).
+def _same_title(a: Any, b: Any) -> bool:
+    """Both titles present and equal by `_title_key`. A missing title is unknown, never equal."""
+    key = _title_key(a)
+    return bool(key) and key == _title_key(b)
 
-    Stamped rows say who wrote it. An unstamped row (written before the stamp, or by another writer) counts as
-    page-derived when its title is the page's stored name: an untitled creation stored both from the same node.
-    A typed title that happens to equal the page's name is then decided by url alone, which can only refuse.
+
+def _guard_title_and_origin(title: Any, seed_data: Any) -> Tuple[Optional[str], str]:
+    """(the title the ambiguous-price guard may name a pricing node by, where it came from).
+
+    Only a row stamped `employee` vouches for its title. Every other row is decided by url alone, which can only
+    refuse more:
+      * `page`: an untitled creation stored the page's name, which on a bundle page is the pricing component's own;
+      * an UNSTAMPED row (written before the stamp, or by another writer) cannot tell a typed title from one copied
+        from the page (review P2-D): its stored `snapshot.title` is rewritten by every page fetch, a bot-challenge
+        page or a page without JSON-LD included, so comparing against it fails open after one such night.
+    The origin is for the decision log only (no title text): employee | page | legacy_equal | legacy_differs |
+    unknown_stamp | none. `legacy_differs` is the unstamped row whose title is not its stored page name: the one a
+    person may have typed, which this rule now decides by url (what shadow sizes).
     """
     text = str(title or "").strip()
     if not text:
-        return None
+        return None, "none"
     data = seed_data if isinstance(seed_data, dict) else {}
     source = data.get(SEED_TITLE_SOURCE_KEY)
+    if source == SEED_TITLE_SOURCE_EMPLOYEE:
+        return text, "employee"
+    if source == SEED_TITLE_SOURCE_PAGE:
+        return None, "page"
     if source is not None:
-        return text if source == SEED_TITLE_SOURCE_EMPLOYEE else None
+        return None, "unknown_stamp"
     snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
-    return None if _title_key(text) == _title_key(snapshot.get("title")) else text
+    return None, ("legacy_equal" if _same_title(text, snapshot.get("title")) else "legacy_differs")
+
+
+def _seed_title_a_person_typed(title: Any, seed_data: Any) -> Optional[str]:
+    """The seed's title when a person typed it (the row is stamped `employee`), else None: the guard then decides by
+    url alone. See `_guard_title_and_origin`."""
+    return _guard_title_and_origin(title, seed_data)[0]
+
+
+def _title_source_at_creation(
+    body_title: Any,
+    *,
+    page_names: Iterable[Any],
+    existing_seed_data: Any = None,
+    existing_title: Any = None,
+    title_from_row: bool = False,
+) -> str:
+    """Who wrote the title a creation stores: `employee` or `page`.
+
+    * A body title equal (`_title_key`) to the page's own name (this read's snapshot title, or its pricing node's
+      name) is the page's: the portal pre-fills the create form from `/external-seeds/preview`, which returns that
+      name (review P2-C). It is then decided by url alone, which can only refuse.
+    * A re-create re-sending the row's own `employee` title keeps the stamp (the person typed it before).
+    * An untitled re-create that keeps the row's title (this read gave no name) keeps the row's `employee` stamp
+      (review P3-4); else the title is the page's.
+    """
+    existing = existing_seed_data if isinstance(existing_seed_data, dict) else {}
+    typed_before = existing.get(SEED_TITLE_SOURCE_KEY) == SEED_TITLE_SOURCE_EMPLOYEE
+    text = str(body_title or "").strip()
+    if not text:
+        return SEED_TITLE_SOURCE_EMPLOYEE if (title_from_row and typed_before) else SEED_TITLE_SOURCE_PAGE
+    if typed_before and _same_title(text, existing_title):
+        return SEED_TITLE_SOURCE_EMPLOYEE
+    if any(_same_title(text, name) for name in page_names):
+        return SEED_TITLE_SOURCE_PAGE
+    return SEED_TITLE_SOURCE_EMPLOYEE
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -4336,6 +4391,25 @@ async def create_external_seed(
             "currencies": refused_currencies,
             "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
         }
+    # WHO WROTE THE TITLE (`_title_source_at_creation`), decided before the guard: only a title a person typed may
+    # name the pricing node, and a body title that is the page's own name (the portal pre-fills it from the preview,
+    # review P2-C) is the page's.
+    existing_title_seed_data = _ensure_json_obj(existing_dict.get("seed_data"))
+    existing_title = existing_title_seed_data.get("title") or existing_dict.get("title")
+    body_title = (body.title or "").strip()
+    title_from_row = bool(existing_row) and not body_title and not snap_title and bool(existing_title)
+    page_identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+    title_source = _title_source_at_creation(
+        body_title,
+        # The page's own name: the snapshot's title (what the preview showed) and its pricing node's name.
+        page_names=(snap_title, page_identity.get("name") if isinstance(page_identity, dict) else None),
+        existing_seed_data=existing_title_seed_data,
+        existing_title=existing_title,
+        title_from_row=title_from_row,
+    )
+    typed_title: Optional[str] = None
+    if title_source == SEED_TITLE_SOURCE_EMPLOYEE:
+        typed_title = body_title or (str(existing_title).strip() if title_from_row else "") or None
     # A PAGE WITH SEVERAL PRICED PRODUCTS PRICES ITSELF AS WHICHEVER SCORED BEST, which on a bundle page was a
     # COMPONENT: served bundle cards were created at one component's price (2026-11-07). With
     # EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD `on`, a pricing node that does not name this seed's product
@@ -4352,9 +4426,9 @@ async def create_external_seed(
             decision = destination_liveness.ambiguous_price_decision(
                 evidence=evidence,
                 requested_url=requested_for_guard,
-                # ONLY THE EMPLOYEE'S OWN TITLE: `title` falls back to the page's, which is the pricing node's name, so
-                # the node would name itself. With no stated title the page is decided by its urls alone.
-                seed_title=(body.title or "").strip() or None,
+                # ONLY A TITLE A PERSON TYPED: `title` falls back to the page's, which is the pricing node's name, so
+                # the node would name itself. With no typed title the page is decided by its urls alone.
+                seed_title=typed_title,
                 # As G4 does: the stated brand, else the one this seed already stores.
                 seed_brand=(body.brand or "").strip()
                 or _ensure_json_obj(existing_dict.get("seed_data")).get("brand")
@@ -4364,7 +4438,10 @@ async def create_external_seed(
             logger.warning("ambiguous-price guard raised at creation; priced as without it", exc_info=True)
             decision = None
         if decision is not None and decision.get("refusal"):
-            _log_ambiguous_price_at_create(ambiguous_mode, decision)
+            _log_ambiguous_price_at_create(ambiguous_mode, {
+                **decision,
+                "title_from": title_source if (body_title or snap_title or title_from_row) else "none",
+            })
             if ambiguous_mode == "on":
                 ambiguous_refused_at_create = True
                 # The AMOUNT is what is ambiguous, never the currency (the currency check above passed): an amount
@@ -4443,9 +4520,7 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
-        seed_data[SEED_TITLE_SOURCE_KEY] = (
-            SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE
-        )
+        seed_data[SEED_TITLE_SOURCE_KEY] = title_source
         if description and (
             description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
             or not str(seed_data.get("description") or "").strip()
@@ -4601,7 +4676,7 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
-            SEED_TITLE_SOURCE_KEY: SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE,
+            SEED_TITLE_SOURCE_KEY: title_source,
             "description": description or fill_only_description,
             **(
                 {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
@@ -4928,12 +5003,16 @@ async def update_external_seed(
     seed_data.setdefault("snapshot", {})
 
     if body.title is not None:
+        # A TITLE IS TYPED ONLY WHEN THE PATCH CHANGES IT (review P2-B): both portal editors re-send the stored title
+        # on every save, whatever field was edited, so a re-sent title (`_same_title`) keeps the row's stamp, or its
+        # lack of one. "Stored" is either copy the editor may have loaded: the column or `seed_data.title` (a refresh
+        # fills only the latter). An empty title clears the stamp.
+        if not str(body.title).strip():
+            seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
+        elif not any(_same_title(body.title, stored) for stored in (row.get("title"), seed_data.get("title"))):
+            seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
         seed_data["title"] = body.title
         seed_data["snapshot"]["title"] = body.title
-        if str(body.title).strip():
-            seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
-        else:
-            seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
     if body.description is not None:
         seed_data["description"] = body.description
         seed_data["snapshot"]["description"] = body.description
@@ -6104,7 +6183,7 @@ def _log_ambiguous_price_at_create(mode: str, decision: Dict[str, Any]) -> None:
     try:
         from utils.logger import logger as pivota_log
 
-        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice")}
+        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice", "title_from")}
         line["mode"] = mode
         pivota_log.info("AMBIGUOUS_PRICE_CREATE " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a creation
@@ -6329,20 +6408,22 @@ async def _refresh_external_seed_by_id(
         except ValueError:
             requested_for_guard = None
         try:
+            # ONLY A TITLE A PERSON TYPED (review P2-A, P2-D): an untitled creation stored the pricing node's own name,
+            # so on a bundle page the component would name itself by title on the first refresh; an unstamped row
+            # cannot say who wrote its title (`_guard_title_and_origin`).
+            guard_title, title_from = _guard_title_and_origin(row.get("title"), _ensure_json_obj(row.get("seed_data")))
             decision = destination_liveness.ambiguous_price_decision(
                 evidence=getattr(snapshot, "evidence", None),
                 requested_url=requested_for_guard,
                 final_url=observed.get("final_url") if isinstance(observed, dict) else None,
-                # ONLY A TITLE A PERSON TYPED (review P2-A): an untitled creation stored the pricing node's own name,
-                # so on a bundle page the component would name itself by title on the first refresh.
-                seed_title=_seed_title_a_person_typed(row.get("title"), _ensure_json_obj(row.get("seed_data"))),
+                seed_title=guard_title,
                 seed_brand=_ensure_json_obj(row.get("seed_data")).get("brand"),
             ) if requested_for_guard else None
         except Exception:  # noqa: BLE001 - THE GUARD MUST NEVER COST A ROW ITS REFRESH
             logger.warning("ambiguous-price guard raised for seed_id=%r; read as without it", seed_id, exc_info=True)
             decision = None
         if decision is not None:
-            ambiguous_price = {"mode": ambiguous_mode, **decision}
+            ambiguous_price = {"mode": ambiguous_mode, **decision, "title_from": title_from}
             if decision.get("refusal") and ambiguous_mode == "on":
                 ambiguous_refused = True
                 read_the_served_product = False

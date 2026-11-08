@@ -43,6 +43,13 @@ def test_every_case_carries_internal_state_that_the_strip_removes() -> None:
         assert "utm_source=pivota&utm_medium" not in json.dumps(stripped), name
 
 
+def test_every_case_plants_the_title_stamp_so_the_gateway_run_proves_it_changes_no_gate() -> None:
+    """be#2746 delta-2 review P3-2: an equivalence run that never sent `title_source` proved nothing about it."""
+    for name, product in geq.build_cases().items():
+        assert product["seed_data"].get("title_source") == "employee", name
+        assert "title_source" not in strip_product_internal_seed_data(product)["seed_data"], name
+
+
 def test_the_review_cases_are_all_present() -> None:
     """The be#2727 review's repro cases (A, A2, B, C, D, E, F) stay in the battery."""
     names = set(geq.build_cases())

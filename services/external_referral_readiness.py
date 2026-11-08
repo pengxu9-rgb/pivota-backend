@@ -741,6 +741,9 @@ def count_ambiguous_price(
             # one, and how close the titles are. Still no URL and no title.
             "url_relation": info.get("url_relation"),
             "title_dice": info.get("title_dice"),
+            # Who wrote the title the guard was given (`_guard_title_and_origin`): employee | page | legacy_equal |
+            # legacy_differs | unknown_stamp | none. The label only, never the title (review P3-5).
+            "title_from": info.get("title_from"),
         }
         pivota_log.info("AMBIGUOUS_PRICE_DECISION " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a row its count
