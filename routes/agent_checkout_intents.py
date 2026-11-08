@@ -91,13 +91,21 @@ def _checkout_token_secret() -> str:
     return (os.getenv("CHECKOUT_TOKEN_SECRET") or os.getenv("AGENT_CHECKOUT_TOKEN_SECRET") or "").strip()
 
 
-def mint_checkout_token(payload: Dict[str, Any], ttl_seconds: int = 60 * 60) -> str:
+def mint_checkout_token(
+    payload: Dict[str, Any],
+    ttl_seconds: int = 60 * 60,
+    *,
+    exp_cap: Optional[int] = None,
+) -> str:
+    """Sign a checkout token. `exp_cap` (epoch seconds) is a hard ceiling on its expiry."""
     secret = _checkout_token_secret()
     if not secret:
         raise HTTPException(status_code=500, detail="Checkout token secret is not configured")
 
     now = int(time.time())
     exp = now + int(ttl_seconds)
+    if exp_cap is not None:
+        exp = min(exp, int(exp_cap))
     body = {
         "v": 1,
         "iat": now,
@@ -166,6 +174,24 @@ def _checkout_intent_ttl_seconds() -> int:
         val = 1800
     # Clamp to a sane range: 5min .. 6h
     return max(300, min(val, 6 * 60 * 60))
+
+
+def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
+    """The expiry of the checkout token the caller presented, or None for any other credential.
+
+    A checkout token can mint a new intent and token for its own order (POST
+    /agent/v2/payments/checkout-sessions). The new token and intent must not outlive the token that
+    asked for them, or a token holder could extend its one-hour life indefinitely by re-minting.
+    Its own `exp` already carries any earlier cap, so the chain can only shrink.
+    """
+    payload = getattr(context, "checkout_token_payload", None)
+    if not isinstance(payload, dict):
+        return None
+    try:
+        exp = int(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    return exp if exp > 0 else None
 
 
 def _checkout_token_ttl_seconds() -> int:
@@ -921,7 +947,10 @@ async def create_checkout_intent(
             )
 
     intent_id = f"ci_{uuid.uuid4().hex}"
+    parent_token_exp = _presenting_checkout_token_exp(context)
     expires_at_sec = int(time.time()) + _checkout_intent_ttl_seconds()
+    if parent_token_exp is not None:
+        expires_at_sec = min(expires_at_sec, parent_token_exp)
     expires_at_dt = datetime.fromtimestamp(expires_at_sec, tz=timezone.utc)
 
     prefill: Optional[Dict[str, Any]] = None
@@ -947,6 +976,11 @@ async def create_checkout_intent(
         # item-level enforcement can be added later if needed).
         "items": [it.model_dump() for it in req.items],
     }
+    bound_order_id = str(req.order_id or "").strip() or None
+    if bound_order_id:
+        # Binds the token to the order this intent resumes (routes.agent_auth
+        # checkout_token_may_use_order); orders the page creates bind through intent_id.
+        token_payload["order_id"] = bound_order_id
     if agent_user_ref:
         token_payload["agent_user_ref"] = agent_user_ref
     if brief_id:
@@ -966,7 +1000,15 @@ async def create_checkout_intent(
         ),
     )
 
-    token = mint_checkout_token(token_payload, ttl_seconds=_checkout_token_ttl_seconds())
+    if parent_token_exp is not None:
+        # Minted under another checkout token: record the ceiling it inherited (audit only; `exp` is
+        # what verification enforces).
+        token_payload["parent_exp"] = parent_token_exp
+    token = mint_checkout_token(
+        token_payload,
+        ttl_seconds=_checkout_token_ttl_seconds(),
+        exp_cap=parent_token_exp,
+    )
 
     # Best-effort: store intent server-side (prefill never goes into URLs/tokens).
     # If the table isn't migrated yet, we still return a usable checkout_url without prefill.

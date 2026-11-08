@@ -64,10 +64,13 @@ async def test_load_replayable_order_create_response_forwards_preferred_psp(monk
         preferred_psp="adyen",
     )
 
-    replay = await module._load_replayable_agent_order_create_response(order_request)
+    replay = await module._load_replayable_agent_order_create_response(
+        order_request, agent_id="agent_1", intent_id=None
+    )
 
     assert replay is None
     assert captured["preferred_psp"] == "adyen"
+    assert captured["agent_id"] == "agent_1"
 
 
 @pytest.mark.asyncio
@@ -91,6 +94,7 @@ async def test_find_replayable_order_for_create_skips_quote_replay_when_preferre
 
     replay = await module.find_replayable_order_for_create(
         merchant_id="merch_1",
+        agent_id="agent_1",
         quote_id="q_1",
         preferred_psp="adyen",
     )
@@ -119,6 +123,7 @@ async def test_find_replayable_order_for_create_replays_quote_when_preferred_psp
 
     replay = await module.find_replayable_order_for_create(
         merchant_id="merch_1",
+        agent_id="agent_1",
         quote_id="q_1",
         preferred_psp="adyen",
     )
