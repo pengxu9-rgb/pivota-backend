@@ -36,6 +36,7 @@ from db.products import log_order_event
 from db.database import database, IS_POSTGRES
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from utils.auth import require_admin, require_admin_or_key, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
@@ -5592,9 +5593,12 @@ async def get_merchant_orders(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """获取商户的订单列表"""
+    # Admin, or the merchant itself. Was any authenticated account -- buyer
+    # emails and shipping addresses for every merchant.
+    assert_merchant_scope(current_user, merchant_id)
     orders_list = await get_orders_by_merchant(merchant_id, status, limit, offset)
     
     return OrderListResponse(

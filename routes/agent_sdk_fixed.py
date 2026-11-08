@@ -725,8 +725,9 @@ async def list_merchants(
     and is the only scope that takes another `status`. Both scopes honour the
     agent's `allowed_merchants` the way `can_access_merchant` does: None means
     every merchant, a list (even an empty one) means only those. (The legacy
-    search lane is looser: it treats `[]` as unrestricted, and with
-    `search_all_merchants=true` it bypasses an allowlist of exactly
+    search lane now also reads `[]` as no merchant, via
+    `routes.agent_auth.has_no_merchant_scope`; it is still looser in one way:
+    with `search_all_merchants=true` it bypasses an allowlist of exactly
     `["external_seed"]`.)
 
     Both scopes drop test/demo rigs (`services/test_merchant_policy`, the same

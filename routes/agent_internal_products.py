@@ -8,7 +8,7 @@ from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 import routes.agent_api as agent_api
-from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_auth import AgentContext, get_agent_context, has_no_merchant_scope
 from utils.agent_search_intent import infer_query_overrides
 
 router = APIRouter(prefix="/agent/internal", tags=["agent-internal-products"])
@@ -248,6 +248,24 @@ async def agent_internal_products_search(
     for mid in merchant_ids:
         if not context.can_access_merchant(mid):
             raise HTTPException(status_code=403, detail=f"Not authorized for merchant {mid}")
+
+    if has_no_merchant_scope(context):
+        # An EMPTY allowlist is no merchant at all. Without this, no named scope fell through to
+        # `merchant_scope=None`, which the fast-mode search reads as every merchant.
+        return {
+            "status": "success",
+            "success": True,
+            "products": [],
+            "total": 0,
+            "page": 1,
+            "page_size": 0,
+            "reply": None,
+            "metadata": {
+                "query_source": "internal_products_search_primitive_cache",
+                "endpoint_kind": "internal_primitive",
+                "reason_code": "no_merchant_scope",
+            },
+        }
 
     merchant_scope = list(dict.fromkeys([*([merchant_id] if merchant_id else []), *merchant_ids])) or None
     search_all_merchants = bool(search.get("search_all_merchants", True))

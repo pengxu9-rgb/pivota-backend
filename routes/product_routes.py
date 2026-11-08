@@ -26,7 +26,8 @@ from db.products import (
     get_cached_products, upsert_product_cache, mark_cache_accessed,
     log_api_call, cleanup_expired_cache
 )
-from utils.auth import require_admin, get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, require_admin, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from config.settings import settings
 import logging
 
@@ -86,7 +87,7 @@ async def get_merchant_products_realtime(
     background_tasks: BackgroundTasks,
     limit: int = Query(50, ge=1, le=250, description="返回产品数量"),
     force_refresh: bool = Query(False, description="强制刷新缓存"),
-    current_user: dict = Depends(get_current_user)  # Allow all authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """
     **实时获取商户产品（标准格式）+ 智能缓存**
@@ -98,7 +99,11 @@ async def get_merchant_products_realtime(
     - ✅ 自动过期：缓存 TTL 1小时，自动清理
     
     **Pivota 核心价值：数据标准化 + 性能优化 + 业务洞察**
+
+    The merchant itself or staff. force_refresh calls the store platform with
+    the merchant's stored credentials.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     start_time = time.time()
     cache_hit = False
     products = []
