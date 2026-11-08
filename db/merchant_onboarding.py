@@ -148,27 +148,43 @@ async def get_merchant_onboarding(merchant_id: str) -> Optional[Dict[str, Any]]:
     result = await database.fetch_one(query)
     return dict(result) if result else None
 
-async def update_kyc_status(merchant_id: str, status: str, reason: Optional[str] = None, rejection_reason: Optional[str] = None) -> bool:
-    """Update KYC verification status. 
-    When approving after rejection, pass rejection_reason=None to clear it."""
+async def update_kyc_status(
+    merchant_id: str,
+    status: str,
+    reason: Optional[str] = None,
+    rejection_reason: Optional[str] = None,
+    *,
+    approved_by_staff: bool = False,
+) -> bool:
+    """Update KYC verification status.
+    When approving after rejection, pass rejection_reason=None to clear it.
+
+    Approval is a staff decision (managed onboarding, D-09): `status="approved"`
+    is refused unless the caller is a staff approval route and says so with
+    `approved_by_staff=True`. Nothing automatic may approve a merchant.
+    """
+    if status == "approved" and not approved_by_staff:
+        raise ValueError(
+            "merchant approval is a staff decision; pass approved_by_staff=True from a staff route"
+        )
     update_data = {
         "status": status,
-        "updated_at": datetime.now()
+        "updated_at": datetime.now(),
+        # `auto_approved` records that the AUTOMATIC signup path approved this
+        # merchant. Every write here clears it:
+        #  * leaving approved: a rejected merchant whose flag stayed True could
+        #    still connect a PSP, because the PSP setup gate in
+        #    routes/merchant_onboarding_routes.py passes on status approved OR
+        #    auto_approved;
+        #  * approving: only staff routes reach this, so the approval it records
+        #    is a staff one. `status='approved' AND auto_approved IS NOT TRUE AND
+        #    verified_at IS NOT NULL` is how the partner merchant list
+        #    (routes/agent_sdk_fixed.py) tells a staff approval from the old
+        #    signup auto-approval, which set auto_approved=True. Without the
+        #    clear, staff re-approving a floor-approved merchant would still
+        #    look automatic.
+        "auto_approved": False,
     }
-    if status != "approved":
-        # `auto_approved` records that the AUTOMATIC path approved this merchant.
-        # It was set True at signup and never cleared, while the one gate that
-        # reads status — the PSP setup check in
-        # routes/merchant_onboarding_routes.py — passes when EITHER the status is
-        # approved OR auto_approved is set. Since registration auto-approves
-        # everyone, every merchant carried auto_approved=True, so rejecting one
-        # left it able to connect a payment provider exactly as before. Rejection
-        # was a no-op at the only place it was checked.
-        #
-        # Not restored on a later approval: an admin approving a rejected
-        # merchant is a manual decision, not an automatic one, and the gate
-        # passes on status alone.
-        update_data["auto_approved"] = False
     if status == "approved":
         update_data["verified_at"] = datetime.now()
         # Clear rejection reason on approval unless explicitly provided

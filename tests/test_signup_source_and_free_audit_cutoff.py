@@ -134,7 +134,7 @@ def test_signup_source_sanitization():
     assert source_of("a" * 80) == "a" * 64
 
 
-# ---- (a2) audit-funnel approval floor ---------------------------------------
+# ---- (a2) no approval floor: managed onboarding (D-09) ----------------------
 
 def _patch_failed_auto_kyb(monkeypatch):
     import utils.auto_kyb_validator as kyb
@@ -150,11 +150,10 @@ def _patch_failed_auto_kyb(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_any_signup_gets_low_confidence_floor_on_failed_kyb(monkeypatch):
-    """EVERY storefront signup whose URL fails auto-KYB auto-approves at the
-    store_less-style low-confidence floor (registration-first policy,
-    2026-07-22) — no signup dead-ends in manual review / mandatory
-    documents. Funnel source not required."""
+async def test_a_failed_kyb_signup_is_held_for_staff_review(monkeypatch):
+    """A storefront signup whose URL fails auto-KYB is NOT approved: the
+    registration-first approval floor (2026-07-22) is gone under managed
+    onboarding (D-09). It waits for staff with its KYB findings on record."""
     captured = {}
     _patch_common(monkeypatch, captured)
     _patch_failed_auto_kyb(monkeypatch)
@@ -169,17 +168,18 @@ async def test_any_signup_gets_low_confidence_floor_on_failed_kyb(monkeypatch):
 
     resp = await module.register_merchant(req, _DummyBackgroundTasks())
 
-    assert resp["auto_approved"] is True
-    assert resp["confidence_score"] == module.APPROVAL_FLOOR_CONFIDENCE
-    assert "approval_floor" in resp["validation_details"]
-    # Original KYB findings stay on record alongside the floor note.
+    assert resp["auto_approved"] is False
+    assert resp["confidence_score"] == 0.1
+    assert "approval_floor" not in resp["validation_details"]
+    assert "staff_review" in resp["validation_details"]
+    # Original KYB findings stay on record for the reviewer.
     assert "url_validation" in resp["validation_details"]
 
 
 @pytest.mark.asyncio
 async def test_kyb_pass_keeps_its_own_confidence(monkeypatch):
-    """A signup that PASSES auto-KYB keeps the validator's confidence — the
-    floor only catches failures, it never overwrites a real approval."""
+    """A signup that PASSES auto-KYB keeps the validator's confidence as a
+    triage signal, but a pass is not an approval either (D-09)."""
     import utils.auto_kyb_validator as kyb
 
     captured = {}
@@ -206,7 +206,7 @@ async def test_kyb_pass_keeps_its_own_confidence(monkeypatch):
 
     resp = await module.register_merchant(req, _DummyBackgroundTasks())
 
-    assert resp["auto_approved"] is True
+    assert resp["auto_approved"] is False
     assert resp["confidence_score"] == 0.91
     assert "approval_floor" not in resp["validation_details"]
 

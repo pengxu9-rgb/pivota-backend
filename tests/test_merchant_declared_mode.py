@@ -2,8 +2,9 @@
 Declared merchant mode (store_less) onboarding tests.
 
 Covers:
-  (a) store_less register with NO store_url -> approved, operating_mode='store_less',
-      store_url NULL, auto-approved at low confidence, auto-KYB NOT called.
+  (a) store_less register with NO store_url -> operating_mode='store_less',
+      store_url NULL, held for staff review (never auto-approved, D-09) with
+      the low triage confidence, auto-KYB NOT called.
   (b) storefront register still REQUIRES store_url (422 without it).
   (c) operating_mode normalization (bad value -> 'storefront').
 
@@ -94,7 +95,7 @@ async def test_store_less_register_without_store_url(monkeypatch):
 
     assert resp["status"] == "success"
     assert resp["merchant_id"] == "merch_test_storeless"
-    assert resp["auto_approved"] is True
+    assert resp["auto_approved"] is False
     assert resp["confidence_score"] == STORE_LESS_APPROVAL_CONFIDENCE
 
     # Row persisted with store_less + NULL store_url.
@@ -102,8 +103,9 @@ async def test_store_less_register_without_store_url(monkeypatch):
     assert create_dict["operating_mode"] == "store_less"
     assert create_dict["store_url"] is None
 
-    # Auto-approved at low confidence (status flipped to approved via update_kyc_status).
-    assert ("merch_test_storeless", "approved") in captured.get("kyc_status_calls", [])
+    # Managed onboarding (D-09): a skipped check is not an approval; the row
+    # stays pending_verification until staff approve it.
+    assert captured.get("kyc_status_calls", []) == []
 
 
 @pytest.mark.asyncio

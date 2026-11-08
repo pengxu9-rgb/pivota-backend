@@ -57,7 +57,7 @@ async def test_order_create_stamps_an_allowlisted_test_mode_merchant(monkeypatch
     captured: dict = {}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
-        return {"merchant_id": _merchant_id}
+        return {"merchant_id": _merchant_id, "status": "approved"}
 
     async def fake_check_inventory(_merchant_id: str, _items):
         return True, {}
@@ -187,7 +187,7 @@ async def test_order_create_does_not_stamp_a_merchant_with_a_live_processor(monk
     captured: dict = {}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
-        return {"merchant_id": _merchant_id}
+        return {"merchant_id": _merchant_id, "status": "approved"}
 
     async def fake_check_inventory(_merchant_id: str, _items):
         return True, {}

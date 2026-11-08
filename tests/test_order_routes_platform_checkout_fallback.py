@@ -113,7 +113,7 @@ def _install_create_new_order_harness(
         return False, {}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
-        return {"merchant_id": _merchant_id, "psp_connected": True}
+        return {"merchant_id": _merchant_id, "psp_connected": True, "status": "approved"}
 
     async def fake_check_inventory_availability(merchant_id: str, items):
         return True, {"items": []}
@@ -381,7 +381,7 @@ async def test_create_new_order_checkout_ui_requires_quote_id_even_when_global_q
     req.metadata = {"ui_source": "checkout_ui"}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
-        return {"merchant_id": _merchant_id, "psp_connected": True}
+        return {"merchant_id": _merchant_id, "psp_connected": True, "status": "approved"}
 
     async def fake_check_inventory_availability(_merchant_id: str, _items):
         return True, {"items": []}

@@ -3437,7 +3437,9 @@ async def _search_products_fast_mode(
     if not AGENT_SEARCH_FAST_MODE_SKIP_MERCHANT_JOIN:
         where_clauses.extend(
             [
-                "mo.status NOT IN ('deleted', 'rejected')",
+                # Approved, not merely "not rejected": a merchant pending staff
+                # review that connected a PSP is not transactable (D-09).
+                "mo.status = 'approved'",
                 "mo.psp_connected = true",
             ]
         )
@@ -5393,7 +5395,7 @@ async def agent_search_products(
 	                    ) pc
 	                    JOIN merchant_onboarding mo
 	                      ON mo.merchant_id = pc.merchant_id
-	                    WHERE mo.status NOT IN ('deleted', 'rejected')
+	                    WHERE mo.status = 'approved'
 	                      AND mo.psp_connected = true
 	                    ORDER BY pc.expires_at DESC, pc.id DESC
 	                    """.format(subquery_where_allowed=subquery_where_allowed),
@@ -5582,7 +5584,7 @@ async def agent_search_products(
                 # is kept for client-side explicitness but is not required.
                 query_merchants = """
                     SELECT merchant_id, business_name FROM merchant_onboarding
-                    WHERE status NOT IN ('deleted', 'rejected')
+                    WHERE status = 'approved'
                     AND psp_connected = true
                     LIMIT 100
                 """
@@ -6020,7 +6022,7 @@ async def agent_search_products(
 	                    SELECT merchant_id, business_name
 	                    FROM merchant_onboarding
 	                    WHERE merchant_id = ANY(:merchant_ids)
-	                      AND status NOT IN ('deleted', 'rejected')
+	                      AND status = 'approved'
 	                      AND psp_connected = true
 	                    """,
                     {"merchant_ids": merchants_to_search},

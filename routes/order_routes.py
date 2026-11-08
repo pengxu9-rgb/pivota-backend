@@ -4122,7 +4122,24 @@ async def create_new_order(
                 status_code=500,
                 detail="Failed to determine complete PSP configuration"
             )
-        
+
+        # Managed onboarding (D-09): a PSP connection alone never makes a
+        # merchant transactable. The PSP connect doors accept a merchant still
+        # pending staff review (and do not validate the key), and the
+        # suppressed-status check above admits every status but rejected and
+        # deleted. An order charged through the merchant's own PSP therefore
+        # needs a staff-approved merchant. The capability-deferred lane books no
+        # charge against a merchant PSP and keeps its own gate.
+        if psp_type != CAPABILITY_DEFERRED_PSP_PROVIDER and merchant_status != "approved":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "MERCHANT_NOT_ACCEPTING_ORDERS",
+                    "message": "This merchant is not currently able to accept orders.",
+                    "merchant_id": order_request.merchant_id,
+                },
+            )
+
         logger.info(f"✅ PSP determined: {psp_type} (ID: {psp_id_value})")
 
         requested_psp_mode = "stripe_checkout" if (order_request.preferred_psp or "").lower() == "stripe_checkout" else None

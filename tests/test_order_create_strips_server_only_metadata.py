@@ -48,7 +48,7 @@ def captured(monkeypatch: pytest.MonkeyPatch) -> dict:
     captured: dict = {}
 
     async def fake_get_merchant_onboarding(_merchant_id: str):
-        return {"merchant_id": _merchant_id}
+        return {"merchant_id": _merchant_id, "status": "approved"}
 
     async def fake_check_inventory(_merchant_id: str, _items):
         return True, {}

@@ -56,6 +56,7 @@ from db.agent_product_events import log_product_events
 from routes.agent_auth import log_agent_request
 from services import agent_search_gateway_proxy
 from services.test_merchant_policy import get_excluded_merchant_ids, static_test_merchant_ids
+from services.connection_layer import LIVE_STORE_STATUSES
 from config.settings import settings as _app_settings
 
 router = APIRouter(prefix="/agent/v1", tags=["agent-sdk"])
@@ -658,6 +659,36 @@ async def generate_api_key():
 # MERCHANTS
 # ============================================================================
 
+# Managed onboarding (founder decision D-09, 2026-11-08): `scope=available` lists
+# a merchant to partners only when ALL of these hold, on top of
+# `status='approved'`, the PSP rule and the test/rig exclusion:
+#
+#  * staff approved it. Signup used to auto-approve (the approval floor, the
+#    *.myshopify.com fast lane, store-less) and wrote `auto_approved=True`;
+#    the staff routes (`/merchant/onboarding/kyb/{id}` from the employee
+#    portal, `/merchant/onboarding/approve/{id}`) go through
+#    db.merchant_onboarding.update_kyc_status, which stamps `verified_at` and
+#    now clears `auto_approved`. NULL counts as not-automatic because the
+#    `databases` insert path never applied the column's False default. A row
+#    approved by a direct insert (no `verified_at`) is not a staff approval.
+#  * it has at least one live connected store: a `merchant_stores` row whose
+#    status is in services.connection_layer.LIVE_STORE_STATUSES (the repo's
+#    canonical "connected"). Store-less merchants have no transact path.
+#
+# A PSP connection alone therefore never lists a merchant: the PSP routes set
+# `psp_connected` but write neither the staff approval nor a store.
+# Every literal below comes from a module constant, never from the request.
+_STAFF_LISTED_MERCHANT_WHERE = (
+    "COALESCE(mo.auto_approved, FALSE) = FALSE",
+    "mo.verified_at IS NOT NULL",
+    "EXISTS (SELECT 1 FROM merchant_stores ms_listed "
+    "WHERE ms_listed.merchant_id = mo.merchant_id "
+    "AND lower(trim(COALESCE(ms_listed.status, ''))) IN ("
+    + ", ".join(f"'{s}'" for s in LIVE_STORE_STATUSES)
+    + "))",
+)
+
+
 @router.get("/merchants")
 async def list_merchants(
     status: str = Query(
@@ -687,7 +718,9 @@ async def list_merchants(
     """List merchants for this agent.
 
     `scope=available` is what a new agent needs to find a `merchant_id`:
-    approved, PSP-connected merchants (the PSP rule product search uses).
+    approved, PSP-connected merchants (the PSP rule product search uses) that
+    staff approved and that have a connected store (managed onboarding, see
+    `_STAFF_LISTED_MERCHANT_WHERE`).
     `scope=mine` keeps the order-history view this endpoint served before,
     and is the only scope that takes another `status`. Both scopes honour the
     agent's `allowed_merchants` the way `can_access_merchant` does: None means
@@ -735,8 +768,10 @@ async def list_merchants(
         if scope == "mine":
             where.append("o.merchant_id IS NOT NULL")
         else:
-            # The PSP rule cross-merchant product search applies.
+            # The PSP rule cross-merchant product search applies, and only a
+            # staff-approved merchant with a connected store is listed (D-09).
             where.append("mo.psp_connected = TRUE")
+            where.extend(_STAFF_LISTED_MERCHANT_WHERE)
         allowed = context.allowed_merchants
         if allowed is not None:
             if not allowed:

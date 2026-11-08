@@ -7,7 +7,7 @@ from services.merchant_store_service import get_merchant_active_stores, get_prim
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr, validator
 from typing import Optional, Dict, Any, List, Literal, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
 import logging
 import re
@@ -53,18 +53,44 @@ PUBLIC_MERGEABLE_ACCOUNT_ROLES = {"agent"}
 # URL-based auto-KYB); 'store_less' onboards a brand with no storefront URL.
 VALID_OPERATING_MODES = {"storefront", "store_less"}
 DEFAULT_OPERATING_MODE = "storefront"
-# Store-less signups are lenient auto-approved at LOW confidence, WITHOUT the
-# URL-based auto-KYB. Safe because downstream serving keeps their products
-# un-served until graduated/claimed.
+# Store-less signups skip the URL-based auto-KYB (there is no URL); this is the
+# triage confidence recorded for staff, not an approval.
 STORE_LESS_APPROVAL_CONFIDENCE = 0.2
-# Registration-first policy (founder decision 2026-07-22): EVERY signup whose
-# auto-KYB fails is approved at the same low-confidence floor store_less has
-# always used — no signup dead-ends in manual review / mandatory document
-# upload. Adds no exposure beyond store_less (anyone could already register
-# auto-approved with NO URL at all); document verification moves to the
-# dashboard lifecycle, and PSP connection still live-validates real
-# credentials before any transacting.
-APPROVAL_FLOOR_CONFIDENCE = STORE_LESS_APPROVAL_CONFIDENCE
+
+# Managed onboarding (founder decision D-09, 2026-11-08): NO signup is approved
+# automatically. The registration-first "approval floor" (2026-07-22) approved
+# every signup whose auto-KYB failed, the *.myshopify.com fast lane approved at
+# 0.96, and store-less signups approved at 0.2; each of those put an unreviewed
+# business_name into the partner merchant list. Every new signup now stays
+# `pending_verification` until staff approve it through the employee approval
+# routes below (`POST /merchant/onboarding/kyb/{id}` from the employee portal,
+# or `POST /merchant/onboarding/approve/{id}`). The automatic checks still run
+# and their findings and confidence are kept for the reviewer.
+
+
+def _held_for_staff_review(validation_result: Dict[str, Any]) -> Dict[str, Any]:
+    """The automatic check's findings, never its approval.
+
+    Whatever the check concluded (passed, failed, skipped or raised), the
+    signup is held for staff review. The 7-day KYB deadline is dropped: it was
+    written at signup and read nowhere.
+    """
+    return {
+        "approved": False,
+        "confidence_score": validation_result.get("confidence_score") or 0,
+        "validation_results": {
+            **(validation_result.get("validation_results") or {}),
+            "staff_review": {
+                "match": False,
+                "message": (
+                    "Pending review: Pivota staff review every new merchant "
+                    "before it is approved or listed to partners."
+                ),
+            },
+        },
+        "requires_full_kyb": True,
+        "full_kyb_deadline": None,
+    }
 
 
 class MerchantRegisterRequest(BaseModel):
@@ -513,16 +539,6 @@ async def validate_psp_credentials(psp_type: str, api_key: str) -> tuple[bool, s
         return (False, f"Unsupported PSP type: {psp_type}")
 
 # ============================================================================
-# BACKGROUND TASKS
-# ============================================================================
-
-async def auto_approve_kyc(merchant_id: str):
-    """Simulate KYC verification - auto-approve after 5 seconds"""
-    await asyncio.sleep(5)  # Simulate review time
-    await update_kyc_status(merchant_id, "approved")
-    print(f"✅ Auto-approved KYC for merchant: {merchant_id}")
-
-# ============================================================================
 # ENDPOINTS
 # ============================================================================
 
@@ -532,8 +548,9 @@ async def register_merchant(
     background_tasks: BackgroundTasks
 ):
     """
-    Step 1: Register a new merchant with intelligent auto-approval
-    快速自动审批：验证 Store URL 和名称匹配后自动批准，允许立即连接PSP
+    Step 1: Register a new merchant. The merchant is created
+    `pending_verification` and waits for staff approval (managed onboarding,
+    D-09); the automatic checks run for triage only and never approve.
     """
     try:
         # Pre-flight connection check to avoid aborted transaction state
@@ -632,26 +649,18 @@ async def register_merchant(
                 ),
             }
         elif is_store_less:
-            # Declared store-less brand: no storefront URL to dedupe or KYB against.
-            # Lenient auto-approve at LOW confidence WITHOUT URL-based auto-KYB.
-            # Safe because downstream serving keeps store_less products un-served
-            # until graduated/claimed.
+            # Declared store-less brand: no storefront URL to dedupe or KYB against,
+            # so the automatic check is skipped. Skipped is not approved.
             print("🏷️ Store-less onboarding: skipping store_url dup check + auto-KYB")
-            validation_result = {
-                "approved": True,
+            validation_result = _held_for_staff_review({
                 "confidence_score": STORE_LESS_APPROVAL_CONFIDENCE,
                 "validation_results": {
                     "store_less": {
                         "match": True,
-                        "message": (
-                            "Store-less brand auto-approved at low confidence; "
-                            "gated downstream until graduated/claimed."
-                        ),
+                        "message": "Store-less brand: no storefront URL to check automatically.",
                     }
                 },
-                "requires_full_kyb": True,
-                "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
-            }
+            })
 
             # 3. 创建商户记录（store_url=None, operating_mode='store_less'）
             merchant_dict = merchant_data.dict()
@@ -687,16 +696,14 @@ async def register_merchant(
                 # Shopify 域名快速通道：*.myshopify.com 直接视为可用平台域
                 parsed = urlparse(merchant_data.store_url if merchant_data.store_url.startswith(('http://','https://')) else ('https://' + merchant_data.store_url))
                 if parsed.netloc.endswith('.myshopify.com'):
-                    confidence = 0.96
+                    # A platform host proves nothing about who owns the shop:
+                    # recorded as a triage signal, never as an approval.
                     validation_result = {
-                        "approved": True,
-                        "confidence_score": confidence,
+                        "approved": False,
+                        "confidence_score": 0.96,
                         "validation_results": {
                             "url_validation": {"valid": True, "message": f"Known e-commerce platform detected: {parsed.netloc}"},
-                            "name_match": {"match": True, "message": "Trusted platform auto-approval", "score": 0.9},
                         },
-                        "requires_full_kyb": True,
-                        "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
                     }
                 else:
                     validation_result = await auto_kyb_pre_approval(
@@ -712,30 +719,9 @@ async def register_merchant(
                 # Continue without auto-approval
                 validation_result = {"approved": False, "confidence_score": 0, "validation_results": {}}
 
-            # Approval floor: no signup dead-ends in manual review just
-            # because auto-KYB could not verify the URL. Approve at the
-            # store_less low-confidence floor, keeping the original KYB
-            # findings on record and the 7-day full-KYB deadline.
-            if not validation_result.get("approved"):
-                print("🪜 Applying low-confidence approval floor (auto-KYB did not approve)")
-                validation_result = {
-                    "approved": True,
-                    "confidence_score": APPROVAL_FLOOR_CONFIDENCE,
-                    "validation_results": {
-                        **(validation_result.get("validation_results") or {}),
-                        "approval_floor": {
-                            "match": True,
-                            "message": (
-                                "Auto-approved at low confidence despite "
-                                "failed auto-KYB (registration-first policy); "
-                                "PSP connection still requires live "
-                                "credential validation."
-                            ),
-                        },
-                    },
-                    "requires_full_kyb": True,
-                    "full_kyb_deadline": (datetime.utcnow() + timedelta(days=7)).isoformat(),
-                }
+            # Managed onboarding: passed, failed or raised, the automatic
+            # check never approves. Its findings go to the staff reviewer.
+            validation_result = _held_for_staff_review(validation_result)
 
             # 3. 创建商户记录
             merchant_dict = merchant_data.dict()
@@ -777,30 +763,29 @@ async def register_merchant(
                 detail=f"Failed to create user account: {str(user_err)}"
             )
         
-        # 3. 如果自动批准，立即更新状态为 approved
-        if not reuse_existing_onboarding and validation_result["approved"]:
-            print(f"🎉 Auto-approving merchant {merchant_id}...")
-            await update_kyc_status(merchant_id, "approved")
-            # Update additional fields
-            query = merchant_onboarding.update().where(
-                merchant_onboarding.c.merchant_id == merchant_id
-            ).values(
-                auto_approved=True,
-                approval_confidence=validation_result["confidence_score"],
-                full_kyb_deadline=datetime.fromisoformat(validation_result["full_kyb_deadline"]) if validation_result.get("full_kyb_deadline") else None
+        # 3. A new signup is never approved here (managed onboarding, D-09). It
+        # stays `pending_verification` (create_merchant_onboarding's status)
+        # until staff approve it; the automatic check's confidence is kept so
+        # the reviewer can triage. `auto_approved` is written False rather than
+        # left to the column default, which the `databases` insert path does not
+        # apply.
+        if not reuse_existing_onboarding:
+            await database.execute(
+                merchant_onboarding.update()
+                .where(merchant_onboarding.c.merchant_id == merchant_id)
+                .values(
+                    auto_approved=False,
+                    approval_confidence=validation_result["confidence_score"],
+                )
             )
-            await database.execute(query)
-            print(f"✅ Merchant {merchant_id} auto-approved successfully")
-        
+
         # Build response
         response_message = (
             "Merchant account recovered. Continue onboarding in the portal."
             if reuse_existing_onboarding
             else (
-                "✅ Registration approved! You can now connect your PSP and start processing payments.\n"
-                "⚠️ Please complete full KYB documentation within 7 days."
-                if validation_result["approved"]
-                else "Registration received. Manual review required before PSP connection."
+                "Registration received and pending review. Pivota reviews every "
+                "new merchant before it is approved or listed to partners."
             )
         )
 
@@ -812,7 +797,7 @@ async def register_merchant(
             "confidence_score": validation_result["confidence_score"],
             "validation_details": validation_result["validation_results"],
             "full_kyb_deadline": validation_result.get("full_kyb_deadline"),
-            "next_step": "Connect PSP" if validation_result["approved"] else "Wait for admin approval",
+            "next_step": "Connect PSP" if validation_result["approved"] else "Wait for Pivota review",
             "login_email": normalized_email
         }
 
@@ -848,12 +833,14 @@ async def register_merchant(
                     # Remove password field as it's not in the merchant_onboarding table
                     merchant_dict.pop('password', None)
                     merchant_id = await create_merchant_onboarding(merchant_dict)
-                    background_tasks.add_task(auto_approve_kyc, merchant_id)
+                    # No background auto-approval: this retry used to approve
+                    # the merchant five seconds later, unreviewed.
                     return {
                         "status": "success",
-                        "message": "Merchant registered successfully. KYC verification in progress.",
+                        "message": "Registration received and pending review.",
                         "merchant_id": merchant_id,
-                        "next_step": "Upload KYC documents or wait for auto-verification"
+                        "auto_approved": False,
+                        "next_step": "Wait for Pivota review"
                     }
                 except Exception as retry_err:
                     print(f"⚠️ Retry after reconnect failed: {retry_err}")
@@ -900,7 +887,11 @@ async def update_kyb_status_alias(
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
-    await update_kyc_status(merchant_id, kyb_update.status, kyb_update.reason)
+    # require_admin above: this is the employee portal's approval path, so an
+    # approval here is a staff approval.
+    await update_kyc_status(
+        merchant_id, kyb_update.status, kyb_update.reason, approved_by_staff=True
+    )
 
     # This alias writes the same column /approve and /reject do, so it owes the
     # same re-derivation. Without it an admin rejecting through /kyb blocked the
@@ -1376,7 +1367,7 @@ async def manual_approve_kyc(
         raise HTTPException(status_code=404, detail="Merchant not found")
     
     # Clear rejection reason when approving
-    await update_kyc_status(merchant_id, "approved", rejection_reason=None)
+    await update_kyc_status(merchant_id, "approved", rejection_reason=None, approved_by_staff=True)
 
     # Symmetry with rejection: approving must let them serve again. Re-derived
     # from the stores, so a merchant with no active store stays inactive —
