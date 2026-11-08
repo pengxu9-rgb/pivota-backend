@@ -89,14 +89,15 @@ def money_calls(monkeypatch):
     monkeypatch.setattr(invoice_generation_service, "run_billing_cycle", _billing)
     monkeypatch.setattr(partner_settlement_service, "run_settlement", _settle)
 
-    class _DB:
-        async def fetch_one(self, query, params=None):
-            calls.append(("fetch_one", str(query)))
-            return {"id": 7, "period_start": None, "period_end": None}
+    async def _fetch_one(query, params=None):
+        calls.append(("fetch_one", str(query)))
+        return {"id": 7, "period_start": None, "period_end": None}
 
     import db.database as dbmod
 
-    monkeypatch.setattr(dbmod, "database", _DB())
+    # Patch the METHOD, not the module attribute: modules start_scheduler imports for the first
+    # time bind `database` by name, and must keep the real object after this test.
+    monkeypatch.setattr(dbmod.database, "fetch_one", _fetch_one)
     return calls
 
 
