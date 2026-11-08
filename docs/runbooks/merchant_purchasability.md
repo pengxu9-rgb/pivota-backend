@@ -600,6 +600,55 @@ SELECT scanned_at, complete, reason, seeds_scanned, cart_seeds, elapsed_ms,
 The next hourly run scans. **To roll the cache back**, drop the table
 (`db/migrations/down/245_…`). The next run recreates it and scans once.
 
+### The warm-click lane (2026-11-08)
+
+The `/r` warm handoff (#2729, `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE`) gave the fact a third
+consumer: `offers.resolve` signs `warm_fact: human_handoff` into a COLD seed link when
+`human_handoff_allowed(<destination host>, <listing market>)` answers yes, and the click is then
+upgraded to a prefilled checkout. That read asks for the destination host of a link that mints
+**no cart**, so none of the four lanes above named it. Measured on prod 2026-11-08 (read-only):
+the four lanes held 196 keys; active seeds pointed at 489 (destination host × market) keys, and
+**310 of them (23,221 seeds) were in no lane; 303 had no fact row at all**. Mostly cross-retailer
+seeds: they carry no shop domain, so the minter builds no cart on them.
+
+`load_population` now adds a fifth lane, `warm-click`:
+
+* **The host** is `normalize_domain(url)` for both spellings the mint may ask (`canonical_url or
+  destination_url`, and the destination), exactly the key `warm_fact` reads.
+* **Never an affiliate destination** (`is_affiliate_destination`, the gateway's own reference): a
+  stamp skip and a click knockout, so a fact about it gates nothing.
+* **Every other stamp skip is ignored on purpose** (a cart, a named variant, stock, a preflight
+  refusal): they vary per request, and a population narrower than the consumer is a link that can
+  never warm. The superset only re-checks hosts the cart-mint lane names anyway.
+* **The market** is the seed row's `market`, as for the cart-mint lane (the stamp is signed only
+  when the listing market equals the request market). Never defaulted: a market-less seed is
+  counted in `population_skipped_market_unknown` once per lane that names it.
+* **No catalog variant hint**, as for the cart-mint lane: the preflight picks the storefront's
+  first available variant itself.
+* **Not filtered to Shopify.** The preflight is Shopify-only, so a non-Shopify host (about a third
+  of the new keys by the variant-id shape) comes back unverifiable, never positive, and creates
+  no checkout (the catalog read fails first). It costs one rotation slot.
+* **Same daily scan, same cache row.** The lane is computed in the cart-mint scan's pass over the
+  seeds (no second read of the seed table) and cached in the same `hosts` array as tagged entries
+  `[host, market, seeds, "warm-click"]`, so it needed no DDL. An image that predates the lane
+  reads only 3-element entries and ignores them; a scan written by such an image carries none,
+  so **after re-imaging the job the lane fills at the next 05:00Z scan** (or force a rescan as
+  above).
+* The run log line gains `warm_seeds=… warm_keys=…`, and the census reports
+  `warm-click keys by state` and `warm-click seeds by state`.
+
+```sql
+-- Warm-click keys in the newest scan.
+SELECT scanned_at, complete,
+       (SELECT count(*) FROM json_array_elements(hosts::json) e WHERE json_array_length(e) = 4) AS warm_keys
+  FROM merchant_purchasability_cart_mint_scans
+ ORDER BY scanned_at DESC LIMIT 3;
+```
+
+**The job never redeploys on merge.** Re-image it with the setup script **and `--enable`**
+(without it the script DISARMS the lane):
+`infra/gcp/setup_merchant_purchasability_sweep_job.sh prod <backend-tag> --enable`.
+
 ### Capacity: a population larger than the batch (2026-09-28)
 
 With the cart-mint lane the population is larger than `BATCH` = 20, so a run no longer checks
@@ -644,6 +693,14 @@ other way round.
 | margin to the 72 h TTL | ~10× | ~5× |
 | checks (= abandoned checkouts) per merchant per day, 21 × 20 / *T* | ~5.6 | ~1.8 |
 | first full pass after arming (every key has a fact) | ~4 h | ~12–15 h |
+
+**With the warm-click lane (2026-11-08)** *T* ≈ 196 + 310 ≈ **506**: ⌈506/20⌉ = 26 runs per rotation,
+so each key is re-checked about every **29 h** (21 runs a day), a ~2.5× margin to the 72 h TTL, at
+~0.8 checks per merchant per day. The first pass over the 303 never-checked keys takes ~15 runs
+(about 18 h, never-checked first). The request RATE does not change (the batch and the schedule are
+the same); only the rotation is longer. If `population_never_checked` does not reach ~0 within a
+day of the first warm-click scan, or *T* grows past ~800, raise `BATCH` to 40 in the setup script
+(~420 s of checks at 10.4 s, inside the 600 s budget).
 
 The rotation stops keeping every positive fact fresh only past *T* ≈ 1,240 (62 runs of 20 inside
 72 h). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the

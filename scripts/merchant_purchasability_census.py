@@ -92,6 +92,8 @@ def build_rows(
     facts_by_key: Dict[Tuple[str, str], Dict[str, Any]],
     seeds_by_key: Dict[Tuple[str, str], int],
     negative_verdicts,
+    *,
+    warm_seeds_by_key: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> List[Dict[str, Any]]:
     """One row per population key, host-ordered. Pure, so it is tested without a database."""
     keys = sorted({key for lane in lanes.values() for key in lane})
@@ -104,6 +106,7 @@ def build_rows(
             "state": classify(fact, negative_verdicts),
             "lanes": [name for name, lane in lanes.items() if key in lane],
             "cart_mint_seeds": int(seeds_by_key.get(key, 0)),
+            "warm_click_seeds": int((warm_seeds_by_key or {}).get(key, 0)),
             "verdict": (fact or {}).get("verdict"),
             "card_available": (fact or {}).get("card_available"),
             "consecutive_failures": (fact or {}).get("consecutive_failures"),
@@ -128,13 +131,29 @@ def summarise(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if seen is None or STATES.index(row["state"]) < STATES.index(seen):
             best[row["host"]] = row["state"]
     cart = [r for r in rows if "cart-mint" in r["lanes"]]
+    # The warm-click lane's keys (what the #2729 stamp asks), counted the same way.
+    warm = [r for r in rows if "warm-click" in r["lanes"]]
     return {
         "keys": _by_state(rows),
         "cart_mint_keys": _by_state(cart),
         "cart_mint_seeds": {state: sum(r["cart_mint_seeds"] for r in cart if r["state"] == state)
                             for state in STATES},
+        "warm_click_keys": _by_state(warm),
+        "warm_click_seeds": {state: sum(r.get("warm_click_seeds", 0) for r in warm if r["state"] == state)
+                             for state in STATES},
         "hosts_best_state": _by_state([{"state": s} for s in best.values()]),
     }
+
+
+#: The per-key seed maps in `collect_population`'s detail. They are keyed by (host, market) tuples,
+#: which JSON cannot carry, and they are on the rows already.
+_PER_KEY_DETAIL = ("seeds_by_key", "warm_seeds_by_key")
+
+
+def lane_summary(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """`collect_population`'s cart-mint detail as the summary prints it: the counts, never the
+    per-key maps."""
+    return {k: v for k, v in detail.items() if k not in _PER_KEY_DETAIL}
 
 
 def _fence(payload: Dict[str, Any]) -> str:
@@ -171,13 +190,14 @@ async def census() -> Dict[str, Any]:
                 (str(r["merchant_domain"]), str(r["market_country"])): dict(r)
                 for r in await database.fetch_all(_FACTS_SQL, {"vantage": vantage})
             }
-    rows = build_rows(lanes, facts_by_key, detail.get("seeds_by_key") or {}, facts.NEGATIVE_VERDICTS)
+    rows = build_rows(lanes, facts_by_key, detail.get("seeds_by_key") or {}, facts.NEGATIVE_VERDICTS,
+                      warm_seeds_by_key=detail.get("warm_seeds_by_key") or {})
     summary = {
         "kind": "summary",
         "n": len(rows),
         "vantage": vantage,
         "population_counts": tally,
-        "cart_mint_lane": {k: v for k, v in detail.items() if k != "seeds_by_key"},
+        "cart_mint_lane": lane_summary(detail),
         **summarise(rows),
     }
     # Incomplete when a lane could not be read (or came back incomplete): the census then
@@ -234,6 +254,8 @@ def render(report: Dict[str, Any]) -> str:
         f"keys by state:            {summary['keys']}",
         f"cart-mint keys by state:  {summary['cart_mint_keys']}   (what #2411 gates)",
         f"cart-mint seeds by state: {summary['cart_mint_seeds']}",
+        f"warm-click keys by state: {summary.get('warm_click_keys')}   (what the #2729 stamp asks)",
+        f"warm-click seeds by state: {summary.get('warm_click_seeds')}",
         f"hosts by best state:      {summary['hosts_best_state']}",
         "",
         f"{'host':<40} {'mkt':<3} {'state':<18} {'seeds':>5} {'verdict':<22} {'checked_at':<26} lanes",

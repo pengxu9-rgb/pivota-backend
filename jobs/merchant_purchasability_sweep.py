@@ -112,6 +112,35 @@ that every cart host it mints is in the population.
     where the Tier B lane confirmed one IT STILL WINS, and elsewhere the catalog hint or the
     preflight's own pick is used, exactly as for the connected lane.
 
+THE FIFTH LANE IS THE WARM-CLICK STAMP (#2729). `offers.resolve` signs `warm_fact: human_handoff`
+into a COLD seed link when `human_handoff_allowed(<destination host>, <market>)` answers yes, and
+`/r` then upgrades that click to a prefilled checkout on the store's own UCP door
+(routes/agent_shop_gateway `_CartPurchasabilityGate.warm_fact`, OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE).
+That read asks for the DESTINATION host of a link that mints NO cart, so no other lane names it: a
+standalone or cross-retailer seed carries no shop domain, and the cart minter builds nothing for
+it. Measured on prod 2026-11-08: the four lanes held 196 keys, while active seeds pointed at 489
+(destination host x market) keys; 310 of them (23,221 seeds) were in no lane and 303 had no fact
+row at all, so the warm lane could never fire for them.
+
+  * THE HOST is `facts.normalize_domain(url)` for BOTH spellings the mint may pass (`canonical_url
+    or destination_url`, and the destination itself), which is what `warm_fact` asks.
+  * NOT AN AFFILIATE DESTINATION: `is_affiliate_destination` is a stamp skip
+    (`_warm_fact_skip_reason`) and a click knockout, so a fact about an affiliate host gates
+    nothing.
+  * EVERY OTHER SKIP IS IGNORED ON PURPOSE (a cart, a named variant, stock, preflight): those vary
+    per request, and a population narrower than the consumer is a link that can never warm. The
+    cost of the superset is a check on a host that also mints carts, which the cart-mint lane
+    names anyway.
+  * THE MARKET is the seed row's `market`, exactly as for the cart-mint lane: the stamp is signed
+    only when that listing market equals the request market. Never defaulted.
+  * COMPUTED BY THE SAME DAILY SCAN as the cart-mint lane (no second read of the seed table) and
+    cached in the same row (db/merchant_purchasability_cart_mint_scans.py, tagged entries). A scan
+    written before this lane existed carries none, so the lane fills at the next 05:00Z scan.
+  * NOT SHOPIFY-FILTERED. The preflight is Shopify-only, so a non-Shopify host comes back
+    unverifiable and never positive; it creates no checkout (the catalog read fails first) and
+    costs one rotation slot. Filtering on a seed-side platform guess would drop real Shopify
+    stores the seeds do not label.
+
 Wix and WooCommerce connected stores stay out on purpose: no card lane mints a cart for them
 (`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
 Shopify-only, so a check could only ever come back unverifiable.
@@ -272,7 +301,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -535,6 +564,11 @@ class CartMintLane:
     incomplete_reason: str = ""
     #: The scan's wall clock. It is spent from the run's budget, so it is logged every run.
     elapsed_ms: int = 0
+    #: The WARM-CLICK lane from the same scan: (normalised destination host, the seed row's raw
+    #: `market`) -> seeds whose link the warm stamp would ask that host's fact for. See "THE FIFTH
+    #: LANE" in the module docstring.
+    warm_hosts: Dict[Tuple[str, str], int] = field(default_factory=dict)
+    warm_seeds: int = 0
 
 
 def _seed_cart_hosts(gw: Any, resolver: Any, row: Dict[str, Any]) -> set:
@@ -595,6 +629,27 @@ def _seed_cart_hosts(gw: Any, resolver: Any, row: Dict[str, Any]) -> set:
     return hosts
 
 
+def _seed_warm_hosts(gw: Any, row: Dict[str, Any]) -> set:
+    """Every host the warm-click stamp would ask the human-handoff fact for, for ONE seed row.
+
+    `offers.resolve` asks `warm_fact(str(canonical_url or destination_url))`, keyed by
+    `facts.normalize_domain`; both spellings are taken, as `_seed_cart_hosts` does, so this is
+    never narrower than the mint. An affiliate destination is never stamped, so it is left out,
+    by the gateway's own `is_affiliate_destination` (the reference `_warm_fact_skip_reason`
+    calls). A seed with no http(s) URL mints no link at all.
+    """
+    seed_data = gw._ensure_seed_data_obj(row.get("seed_data"))
+    destination_url = str(row.get("destination_url") or seed_data.get("destination_url") or "")
+    canonical_url = str(row.get("canonical_url") or seed_data.get("canonical_url") or destination_url)
+    hosts: set = set()
+    for url in dict.fromkeys((canonical_url, destination_url)):
+        if not url.startswith(("http://", "https://")) or gw.is_affiliate_destination(url):
+            continue
+        hosts.add(facts.normalize_domain(url))
+    hosts.discard("")
+    return hosts
+
+
 async def _cart_mint_lane() -> CartMintLane:
     """Every (cart host, seed market) the cart minter would build a prefilled cart on.
 
@@ -637,6 +692,11 @@ async def _cart_mint_lane() -> CartMintLane:
             market = str(row.get("market") or "")
             for host in hosts:
                 lane.hosts[(host, market)] = lane.hosts.get((host, market), 0) + 1
+            warm = _seed_warm_hosts(gw, row)
+            if warm:
+                lane.warm_seeds += 1
+            for host in warm:
+                lane.warm_hosts[(host, market)] = lane.warm_hosts.get((host, market), 0) + 1
         if any(resolver.stats.get(name) for name in _HANDOVER_NOT_CONSULTED):
             lane.complete, lane.incomplete_reason = False, "catalog_lookup"
         if len(records) < _SEED_PAGE_ROWS:
@@ -713,6 +773,8 @@ def _from_scan_row(row: Dict[str, Any]) -> CartMintLane:
         hosts=dict(row["hosts"]), seeds_scanned=int(row.get("seeds_scanned") or 0),
         cart_seeds=int(row.get("cart_seeds") or 0), complete=True,
         elapsed_ms=int(row.get("elapsed_ms") or 0),
+        warm_hosts=dict(row.get("warm_hosts") or {}),
+        warm_seeds=int(row.get("warm_seeds") or 0),
     )
 
 
@@ -762,6 +824,8 @@ async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulati
                 cart_seeds=lane.cart_seeds if lane else 0,
                 elapsed_ms=lane.elapsed_ms if lane else 0,
                 hosts=lane.hosts if lane else {},
+                warm_hosts=lane.warm_hosts if lane else {},
+                warm_seeds=lane.warm_seeds if lane else 0,
             )
         except Exception as exc:  # noqa: BLE001
             write_failed = True
@@ -777,11 +841,15 @@ async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulati
     hosts: Dict[Tuple[str, str], int] = dict(cached["hosts"]) if cached is not None else {}
     for key, seeds in (lane.hosts.items() if lane is not None else ()):
         hosts[key] = max(hosts.get(key, 0), seeds)
+    warm_hosts: Dict[Tuple[str, str], int] = dict(cached.get("warm_hosts") or {}) if cached is not None else {}
+    for key, seeds in (lane.warm_hosts.items() if lane is not None else ()):
+        warm_hosts[key] = max(warm_hosts.get(key, 0), seeds)
     base = _from_scan_row(cached) if cached is not None else CartMintLane(hosts={}, complete=False)
     base.hosts = hosts
+    base.warm_hosts = warm_hosts
     age_s = int((now - cached["scanned_at"]).total_seconds()) if cached is not None else -1
     usable = cached is not None and age_s <= _SCAN_MAX_AGE_S
-    source = "cache+partial-scan" if lane is not None and lane.hosts else "cache"
+    source = "cache+partial-scan" if lane is not None and (lane.hosts or lane.warm_hosts) else "cache"
     return CartMintPopulation(base, source, age_s, usable, reason, write_failed)
 
 #: `source_domain` IS FOLDED, BY THE ROUTE'S EXPRESSION, CHARACTER FOR CHARACTER. `:domain` is a
@@ -904,7 +972,7 @@ CART_MINT_AGE_TALLY = "cart_mint_population_age_min"
 #: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
 #: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
 #: on a key whichever other lanes also name it.
-LANES = ("variant", "cart-link", "connected-store", "cart-mint")
+LANES = ("variant", "cart-link", "connected-store", "cart-mint", "warm-click")
 
 
 async def collect_population(
@@ -923,7 +991,8 @@ async def collect_population(
     are still swept).
 
     `cart_mint`, when given, receives the cart-mint lane's counts (`seeds_scanned`, `cart_seeds`,
-    `complete`, `source`, `age_s`, and `seeds_by_key` — seeds per admitted key). The cart-mint lane
+    `complete`, `source`, `age_s`, `seeds_by_key` — seeds per admitted key — and the warm-click
+    lane's `warm_seeds` and `warm_seeds_by_key`, from the same scan). The cart-mint lane
     follows the once-a-day scan policy (`_cart_mint_population`); `fresh_cart_mint_scan=True`
     scans now and touches no cache, which is what the read-only census does. This function is the
     ONE place the population is decided: the sweep and scripts/merchant_purchasability_census.py
@@ -1021,11 +1090,21 @@ async def collect_population(
             if key is not None:
                 lanes["cart-mint"].setdefault(key, None)
                 seeds_by_key[key] = seeds_by_key.get(key, 0) + seeds
+        # THE WARM-CLICK LANE comes from the same scan and goes through the same `_key` rule, so a
+        # market-less seed is counted (MARKET_UNKNOWN_TALLY) per lane that names it, never swept as US.
+        warm_seeds_by_key: Dict[Tuple[str, str], int] = {}
+        for (host, market), seeds in sorted(minted.warm_hosts.items()):
+            key = _key(host, market)
+            if key is not None:
+                lanes["warm-click"].setdefault(key, None)
+                warm_seeds_by_key[key] = warm_seeds_by_key.get(key, 0) + seeds
         operator_logger.info(
             "merchant_purchasability_sweep: cart-mint lane: source=%s age_min=%d seeds_scanned=%d "
-            "cart_seeds=%d keys=%d complete=%s elapsed_ms=%d", population.source,
+            "cart_seeds=%d keys=%d complete=%s elapsed_ms=%d warm_seeds=%d warm_keys=%d",
+            population.source,
             population.age_s // 60 if population.age_s >= 0 else -1, minted.seeds_scanned,
             minted.cart_seeds, len(lanes["cart-mint"]), minted.complete, minted.elapsed_ms,
+            minted.warm_seeds, len(lanes["warm-click"]),
         )
         if cart_mint is not None:
             cart_mint.update(
@@ -1033,6 +1112,7 @@ async def collect_population(
                 complete=population.usable and minted.complete, incomplete_reason=population.reason,
                 source=population.source, age_s=population.age_s,
                 elapsed_ms=minted.elapsed_ms, seeds_by_key=seeds_by_key,
+                warm_seeds=minted.warm_seeds, warm_seeds_by_key=warm_seeds_by_key,
             )
     return lanes
 

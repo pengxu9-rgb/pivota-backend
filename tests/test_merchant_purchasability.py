@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import db.merchant_purchasability as mp  # noqa: E402
 import db.reap_agentic_ledger as ledger  # noqa: E402
 import jobs.merchant_purchasability_sweep as sweep  # noqa: E402
+import db.merchant_purchasability_cart_mint_scans as mint_scans  # noqa: E402
 from pivota_log_capture import (  # noqa: E402
     capture_pivota_stdout,
     pivota_lines,
@@ -2509,6 +2510,14 @@ _CART_MINT_EXPECTED = {
     ("jp-brand.example", "JP"),
 }
 _ALLOWLISTS = {("judydoll.com", "US"), ("flowerbeauty.com", "US")}
+#: Exactly what the WARM-CLICK lane must admit: the destination host of every ACTIVE seed with an
+#: http(s) URL and an ISO-2 market, whether or not it mints a cart. The two seeds the cart-mint
+#: lane refuses (referral-only, multi-brand) are exactly the cold links the warm stamp asks about.
+_WARM_CLICK_EXPECTED = _CART_MINT_EXPECTED | {
+    ("referral-only.example", "US"),
+    ("multi-brand.example", "US"),
+}
+_POPULATION = _ALLOWLISTS | _CART_MINT_EXPECTED | _WARM_CLICK_EXPECTED
 
 
 def _seed_product_id(seed_id):
@@ -2579,11 +2588,12 @@ async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _ca
     sizes: dict = {}
     targets = await sweep.load_population(50, tally=tally, sizes=sizes)
     keys = {(t.domain, t.market) for t in targets}
-    assert keys == _ALLOWLISTS | _CART_MINT_EXPECTED
+    assert keys == _POPULATION
     assert len(targets) == len(keys)
-    # The seed with no ISO-2 market is COUNTED and never swept as "US". Nothing else was refused
-    # by the key rule, and no read failed or came back incomplete.
-    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 1}
+    # The seed with no ISO-2 market is COUNTED and never swept as "US" -- once per lane that names
+    # it (the cart-mint and the warm-click lane). Nothing else was refused by the key rule, and no
+    # read failed or came back incomplete.
+    assert tally == {sweep.MARKET_UNKNOWN_TALLY: 2}
     assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys),
                      sweep.CART_MINT_AGE_TALLY: 0}
     by_key = {(t.domain, t.market): t for t in targets}
@@ -2593,7 +2603,7 @@ async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _ca
     # NO CATALOG HINT for a key only the cart-mint lane names. catalog-brand-*.example DO have a
     # catalog product on their host, so the hint would name one; a stale or SKU-shaped hint makes
     # the preflight answer VARIANT_GONE (a confirmed negative) or INVALID_INPUT (never positive).
-    for key in _CART_MINT_EXPECTED - _ALLOWLISTS:
+    for key in _POPULATION - _ALLOWLISTS:
         assert (by_key[key].variant_id, by_key[key].expected_price_minor) == (None, None), key
 
 
@@ -2607,6 +2617,12 @@ async def test_the_lanes_are_reported_separately_for_the_census(_db, _cart_seeds
     # One cart seed per expected key, plus the market-less one that mints a cart but is not keyed.
     assert detail["cart_seeds"] == len(_CART_MINT_EXPECTED) + 1
     assert detail["seeds_by_key"] == {key: 1 for key in _CART_MINT_EXPECTED}
+    # The warm-click lane, from the SAME scan: every active seed with a URL and a market, one seed
+    # per key, plus the market-less one (counted, not keyed).
+    assert set(lanes["warm-click"]) == _WARM_CLICK_EXPECTED
+    assert ("referral-only.example", "US") not in lanes["cart-mint"]
+    assert detail["warm_seeds"] == len(_WARM_CLICK_EXPECTED) + 1
+    assert detail["warm_seeds_by_key"] == {key: 1 for key in _WARM_CLICK_EXPECTED}
 
 
 async def test_the_population_covers_every_cart_the_real_mint_builds(_db, _cart_seeds, monkeypatch):
@@ -2666,7 +2682,11 @@ async def test_a_swept_cart_mint_host_answers_the_cart_gate(_db, monkeypatch, _c
     monkeypatch.setattr(sweep, "_preflight", fetcher)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_unreadable == 0 and report.errors == 0
-    assert report.population_total == len(_ALLOWLISTS | _CART_MINT_EXPECTED)
+    assert report.population_total == len(_POPULATION)
+    # The warm-click lane's cold host now answers the stamp's read -- the one a referral-only
+    # link could never get a yes from before -- in its listed market only.
+    assert await mp.human_handoff_allowed("referral-only.example", "US") is True
+    assert await mp.human_handoff_allowed("referral-only.example", "JP") is False
     cart = shopify_cart_base_url(shop_domain="www.Attached-Brand.example", variant_id="46100000000002")
     assert await mp.is_purchasable(mp.normalize_domain(cart), "US") is True
     assert await mp.is_purchasable("jp-brand.example", "JP") is True
@@ -2687,10 +2707,13 @@ async def test_a_catalog_lookup_failure_leaves_the_lane_incomplete_and_counted(
 
     monkeypatch.setattr(HandoverVariantResolver, "_fetch", _down)
     tally: dict = {}
-    keys = {(t.domain, t.market) for t in await sweep.load_population(50, tally=tally)}
+    lanes = await sweep.collect_population(tally=tally)
+    keys = set(lanes["cart-mint"])
     assert tally.get(sweep.UNREADABLE_TALLY) == 1
     assert {("stamp-brand.example", "US"), ("attached-brand.example", "US")} <= keys
     assert ("catalog-brand-0.example", "US") not in keys
+    # The warm-click lane needs no catalog lookup, so it still names the host.
+    assert ("catalog-brand-0.example", "US") in lanes["warm-click"]
 
 
 async def test_the_cart_mint_lane_failure_is_counted_and_the_other_lanes_still_swept(
@@ -2751,7 +2774,7 @@ async def test_a_population_larger_than_the_batch_is_covered_by_the_rotation(
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BATCH", "4")
     fetcher = _Fetcher({})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
-    total = len(_ALLOWLISTS | _CART_MINT_EXPECTED)
+    total = len(_POPULATION)
     runs = -(-total // 4)
     reports = []
     for _ in range(runs):
@@ -2759,7 +2782,7 @@ async def test_a_population_larger_than_the_batch_is_covered_by_the_rotation(
     swept = [(host, kwargs["market"]) for host, kwargs in fetcher.calls]
     assert len(swept) == 4 * runs and all(r.population == 4 for r in reports)
     first_pass = swept[:total]
-    assert set(first_pass) == _ALLOWLISTS | _CART_MINT_EXPECTED
+    assert set(first_pass) == _POPULATION
     assert len(set(first_pass)) == total, "no key is checked twice before every key is checked once"
     assert [r.population_total for r in reports] == [total] * runs
     assert [r.population_never_checked for r in reports] == [total - 4 * i for i in range(runs)]
@@ -2810,6 +2833,35 @@ def test_the_census_rows_carry_every_lane_and_count_hosts_once_in_their_best_sta
     assert summary["cart_mint_seeds"]["positive"] == 3
     assert summary["hosts_best_state"] == {"positive": 1, "confirmed_negative": 0, "unverifiable": 0,
                                            "never_checked": 1}
+
+
+def test_the_census_counts_the_warm_click_lane_and_its_report_is_json():
+    """The warm-click keys get their own by-state count, and the summary the census prints stays
+    JSON: the per-key seed maps (tuple keys) never reach it."""
+    lanes = {"variant": {}, "cart-link": {}, "connected-store": {},
+             "cart-mint": {("a.example", "US"): None},
+             "warm-click": {("a.example", "US"): None, ("w.example", "US"): None}}
+    rows = census.build_rows(lanes, {("a.example", "US"): {"fresh": 1, "verdict": "ELIGIBLE"}},
+                             {("a.example", "US"): 2}, mp.NEGATIVE_VERDICTS,
+                             warm_seeds_by_key={("a.example", "US"): 2, ("w.example", "US"): 5})
+    summary = census.summarise(rows)
+    assert summary["warm_click_keys"] == {"positive": 1, "confirmed_negative": 0, "unverifiable": 0,
+                                          "never_checked": 1}
+    assert summary["warm_click_seeds"]["never_checked"] == 5
+    assert "warm-click keys by state" in census.render({"summary": {
+        **summary, "vantage": "worker", "n": len(rows), "population_counts": {},
+        "cart_mint_lane": {}}, "rows": rows})
+
+
+async def test_the_census_lane_summary_of_a_real_population_is_json(_db, _cart_seeds):
+    """The census prints `collect_population`'s detail through `lane_summary`; the warm-click
+    lane adds a second tuple-keyed map, and a summary carrying it could not be fenced."""
+    detail: dict = {}
+    await sweep.collect_population(cart_mint=detail)
+    assert detail["warm_seeds_by_key"], "the fixture must exercise the warm-click map"
+    summary = census.lane_summary(detail)
+    assert census.decode(census._fence({"kind": "summary", "n": 0, **summary}))["summary"]["warm_seeds"] == (
+        detail["warm_seeds"])
 
 
 def test_the_census_decoder_refuses_a_log_with_a_missing_row():
@@ -2886,7 +2938,8 @@ async def test_the_seed_table_is_scanned_once_a_day_and_the_other_runs_read_the_
     clock, calls = _scans
     keys, tally, sizes = await _population_now()
     assert calls["scans"] == 1 and ("stamp-brand.example", "US") in keys
-    assert sizes[sweep.CART_MINT_AGE_TALLY] == 0 and tally == {sweep.MARKET_UNKNOWN_TALLY: 1}
+    assert sizes[sweep.CART_MINT_AGE_TALLY] == 0 and tally == {sweep.MARKET_UNKNOWN_TALLY: 2}
+    assert ("referral-only.example", "US") in keys, "the warm-click lane comes from the same scan"
 
     # A cart host that appears after today's scan waits for tomorrow's: the other runs of the
     # day, and tomorrow's 00:07 and 01:07 (still yesterday's 05:00 slot), read the cache.
@@ -2896,6 +2949,11 @@ async def test_the_seed_table_is_scanned_once_a_day_and_the_other_runs_read_the_
         keys, tally, sizes = await _population_now()
         assert calls["scans"] == 1, later
         assert ("late-brand.example", "US") not in keys and ("stamp-brand.example", "US") in keys
+        assert ("referral-only.example", "US") in keys, "the cached scan carries the warm-click lane"
+        detail: dict = {}
+        await sweep.collect_population(cart_mint=detail)
+        assert detail["source"] == "cache" and detail["warm_seeds"] == len(_WARM_CLICK_EXPECTED) + 1, (
+            "a cached run reports the scan's warm-click seed count, not 0")
         assert sizes[sweep.CART_MINT_AGE_TALLY] == int(later.total_seconds() // 60)
         assert sweep.UNREADABLE_TALLY not in tally
 
@@ -3421,3 +3479,66 @@ async def test_the_ops_route_publishes_the_human_tier_beside_the_rails(_db, ops_
     body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com")).json()
     assert (body["tier"], body["human_handoff_tier"], body["reason"]) == (
         "browse_only", "browse_only", "market_unknown")
+
+
+# ══ the warm-click lane (the #2729 stamp's fact) ═════════════════════════════════════════════
+
+
+def test_the_warm_click_lane_keys_both_spellings_and_never_an_affiliate():
+    """`offers.resolve` asks `warm_fact(canonical_url or destination_url)`: both spellings are
+    keyed, `www.` and case folded the way the fact table keys, and an affiliate destination -- a
+    stamp skip and a click knockout -- is never keyed."""
+    import routes.agent_shop_gateway as gw
+
+    row = {"destination_url": "https://www.Shop-A.example/products/x",
+           "canonical_url": "https://shop-b.example/products/x", "seed_data": {}}
+    assert sweep._seed_warm_hosts(gw, row) == {"shop-a.example", "shop-b.example"}
+    # Spellings carried only in seed_data are read too (the mint's own fallback).
+    assert sweep._seed_warm_hosts(gw, {"seed_data": json.dumps(
+        {"destination_url": "https://shop-c.example/products/x"})}) == {"shop-c.example"}
+    affiliate = {"destination_url": "https://click.linksynergy.com/deeplink?id=1",
+                 "canonical_url": "https://shop-d.example/products/x", "seed_data": {}}
+    assert sweep._seed_warm_hosts(gw, affiliate) == {"shop-d.example"}
+    assert sweep._seed_warm_hosts(gw, {"destination_url": "", "seed_data": {}}) == set()
+
+
+def test_the_warm_click_entries_ride_the_cart_mint_cache_row_without_ddl():
+    """Tagged 4-element entries next to the cart hosts. The row reader that predates the lane
+    keeps only 3-element entries, so an older job image reads a new row unchanged; a row the
+    older image wrote reads as no warm-click keys. An untagged 4-element entry is never read as
+    a warm key."""
+    payload = json.dumps([
+        ["cart.example", "US", 3],
+        ["warm.example", "US", 7, mint_scans.WARM_CLICK_TAG],
+        ["odd.example", "US", 1, "something-else"],
+        ["", "", 9, mint_scans.WARM_CLICK_SEEDS_TAG],
+    ])
+    row = mint_scans._row({"scanned_at": None, "complete": True, "hosts": payload})
+    assert row["hosts"] == {("cart.example", "US"): 3}
+    assert row["warm_hosts"] == {("warm.example", "US"): 7}
+    assert row["warm_seeds"] == 9
+    old = mint_scans._row({"scanned_at": None, "complete": True, "hosts": json.dumps([["cart.example", "US", 3]])})
+    assert old["warm_hosts"] == {}
+    # The pre-lane reader, verbatim: only 3-element entries.
+    pre_lane = {(str(h[0]), str(h[1])): int(h[2]) for h in json.loads(payload) if isinstance(h, list) and len(h) == 3}
+    assert pre_lane == {("cart.example", "US"): 3}
+
+
+async def test_a_recorded_scan_round_trips_the_warm_click_lane(_db):
+    await mint_scans.ensure_table()
+    now = datetime.now(timezone.utc)
+    await mint_scans.record(
+        scan_id="cms_warm_roundtrip", scanned_at=now, complete=True, reason="",
+        seeds_scanned=2, cart_seeds=1, elapsed_ms=1,
+        hosts={("cart.example", "US"): 1}, warm_hosts={("warm.example", "US"): 2}, warm_seeds=2,
+    )
+    try:
+        row = await mint_scans.latest(complete_only=True)
+        assert row["hosts"] == {("cart.example", "US"): 1}
+        assert row["warm_hosts"] == {("warm.example", "US"): 2}
+        lane = sweep._from_scan_row(row)
+        assert (lane.warm_hosts, lane.warm_seeds) == ({("warm.example", "US"): 2}, 2)
+    finally:
+        await database.execute(
+            "DELETE FROM merchant_purchasability_cart_mint_scans WHERE scan_id = 'cms_warm_roundtrip'")
+
