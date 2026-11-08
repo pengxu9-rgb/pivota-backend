@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import os
 import secrets
 import hashlib
+import json
 import time
 
 from db.agents import evict_agent_auth_cache, is_redacted_agent_api_key, redacted_agent_api_key
@@ -33,6 +34,15 @@ router = APIRouter(prefix="/agent/account", tags=["agent-account"])
 # In-memory per-instance store, same precedent as the review-media IP limiter.
 _REGISTRATION_IP_LIMIT_STORE: Dict[str, Tuple[int, int]] = {}
 _REGISTRATION_IP_LIMIT_MAX_KEYS = 10_000
+
+
+#: The merchant scope a self-serve key starts with: NONE. `agents.allowed_merchants` NULL means
+#: EVERY merchant (db/agents.py, AgentContext.can_access_merchant), so a key minted here with the
+#: column left NULL could act for, and read data of, any merchant with no review at all. A new
+#: self-serve agent gets an empty list instead, and staff grant merchants
+#: (staff-only PUT /agents/{agent_id}, allowed_merchants). Existing rows, and what NULL means
+#: for them, are not touched here.
+SELF_SERVE_INITIAL_ALLOWED_MERCHANTS: Tuple[str, ...] = ()
 
 
 def _self_serve_registration_enabled() -> bool:
@@ -787,6 +797,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 description,
                 api_key,
                 api_key_hash,
+                allowed_merchants,
                 is_active,
                 created_at,
                 updated_at
@@ -798,6 +809,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 :description,
                 :api_key,
                 :api_key_hash,
+                :allowed_merchants,
                 TRUE,
                 NOW(),
                 NOW()
@@ -810,6 +822,8 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 "description": data.description or "",
                 "api_key": stored_api_key,
                 "api_key_hash": api_key_hash,
+                # JSON text: '[]' = no merchants (NULL would be ALL merchants).
+                "allowed_merchants": json.dumps(list(SELF_SERVE_INITIAL_ALLOWED_MERCHANTS)),
             }
         )
 

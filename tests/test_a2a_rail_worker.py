@@ -1422,3 +1422,97 @@ async def test_the_tick_hands_its_voider_to_the_orphan_pass():
     counts = await worker.run_tick(_client(Rail()), W, voider=voider)
     assert seen == ["ptk_tick"] and counts.get("token_voided") == 1 and "orphan_tokens" not in counts
     assert (await _row(pid))["payment_token_id"] is None
+
+
+# ── the token step is REFUSED in production, whatever its dial says (S-10) ──────────────────────
+
+#: Every shape config.platform resolves to production: explicit, and a Cloud Run service or job that
+#: names no environment (fail-closed). The token dial is ON in all of them (the autouse fixture).
+_PRODUCTION_SHAPES = {
+    "pivota_env": {"PIVOTA_ENV": "production"},
+    "cloud_run_service_unresolved": {"K_SERVICE": "pivota-backend", "K_REVISION": "pivota-backend-00001-abc"},
+    "cloud_run_job_unresolved": {"CLOUD_RUN_JOB": "a2a-rail-purchase-poll"},
+}
+_PLATFORM_ENV_KEYS = (
+    "PIVOTA_ENV", "PIVOTA_PLATFORM", "RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME",
+    "K_SERVICE", "K_REVISION", "K_CONFIGURATION", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION",
+)
+
+
+@pytest.fixture(params=sorted(_PRODUCTION_SHAPES))
+def in_production(request, monkeypatch):
+    for key in _PLATFORM_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in _PRODUCTION_SHAPES[request.param].items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(worker, "_token_step_refusal_logged_at", None)
+    return request.param
+
+
+async def test_in_production_a_locked_purchase_parks_and_sends_nothing_with_the_dial_on(in_production, caplog):
+    pid = await _locked()
+    # The production shape applies to the STEP only: the purchase was set up the same way as anywhere.
+    assert os.environ[worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV] == "1"
+    assert worker.token_step_enabled() is False
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    with caplog.at_level(logging.ERROR, logger=worker.__name__):
+        assert await _step(rail, pid) == "parked"
+    row = await _row(pid)
+    assert rail.sent == [] and row["last_error_code"] == worker.TOKEN_STEP_REFUSED_PRODUCTION
+    assert (row["state"], row["payment_token_id"], row["pending_write"]) == ("quoting", None, None)
+    assert any("REFUSED in production" in r.getMessage() for r in caplog.records)
+
+
+async def test_in_production_a_purchase_already_awaiting_approval_sends_no_paid_or_poll(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    rail = Rail().on("payment.visa-action-required#paid", _token_result()).on("payment.await#poll", _token_result())
+    assert await _step(rail, pid) == "parked"
+    assert rail.sent == []
+
+
+async def test_in_production_an_unseen_paid_is_neither_resent_nor_cleared(monkeypatch):
+    pid = await _approving()
+    await _ago("state_entered_at", worker.APPROVAL_SCHEDULE[0] + 1, purchase_id=pid)
+    await _step(Rail().on("payment.visa-action-required#paid", httpx.Response(502)), pid)
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    rail = Rail()
+    assert await _step(rail, pid) == "parked"
+    row = await _row(pid)
+    assert rail.sent == [] and row["pending_write"] == "payment.visa-action-required#paid"
+    assert row["last_error_code"].endswith(worker.TOKEN_STEP_REFUSED_PRODUCTION)
+
+
+async def test_in_production_no_orphan_void_is_attempted(monkeypatch):
+    called = []
+
+    async def voider(row):
+        called.append(row)
+        return True
+
+    monkeypatch.setenv("PIVOTA_ENV", "production")
+    await worker.void_orphan_tokens(voider)
+    assert called == []
+
+
+@pytest.mark.parametrize("env", ["staging", "development"])
+async def test_outside_production_the_token_step_still_runs_on_its_dial(monkeypatch, env):
+    """Non-production is unchanged: with the dial on, a locked purchase sends token-setup."""
+    for key in _PLATFORM_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("PIVOTA_ENV", env)
+    assert worker.token_step_enabled() is True
+    pid = await _locked()
+    rail = Rail().on("payment.method-view#submit", _methods(VISA)).on("payment.token-setup#submit", _visa_page())
+    assert await _step(rail, pid) == "approval_page_issued"
+    assert "payment.token-setup#submit" in rail.actions()
+
+
+async def test_outside_production_the_dial_off_reason_is_unchanged(monkeypatch):
+    monkeypatch.setenv("PIVOTA_ENV", "staging")
+    monkeypatch.delenv(worker.A2A_RAIL_TOKEN_STEP_ENABLED_ENV)
+    pid = await _locked()
+    rail = Rail()
+    assert await _step(rail, pid) == "parked"
+    assert rail.sent == [] and (await _row(pid))["last_error_code"] == "token_step_disabled"
