@@ -663,29 +663,48 @@ async def generate_api_key():
 # a merchant to partners only when ALL of these hold, on top of
 # `status='approved'`, the PSP rule and the test/rig exclusion:
 #
-#  * staff approved it. Signup used to auto-approve (the approval floor, the
-#    *.myshopify.com fast lane, store-less) and wrote `auto_approved=True`;
-#    the staff routes (`/merchant/onboarding/kyb/{id}` from the employee
-#    portal, `/merchant/onboarding/approve/{id}`) go through
-#    db.merchant_onboarding.update_kyc_status, which stamps `verified_at` and
-#    now clears `auto_approved`. NULL counts as not-automatic because the
-#    `databases` insert path never applied the column's False default. A row
-#    approved by a direct insert (no `verified_at`) is not a staff approval.
+#  * staff approved it ON OR AFTER the D-09 cutover. Since D-09 the only
+#    writer of status='approved' is db.merchant_onboarding.update_kyc_status
+#    with approved_by_staff=True, called only by the two require_admin routes
+#    (`/merchant/onboarding/kyb/{id}` from the employee portal,
+#    `/merchant/onboarding/approve/{id}`); it stamps `verified_at` and clears
+#    `auto_approved`. Before D-09 the same function also stamped `verified_at`
+#    for AUTOMATIC approvals, and not all of those left `auto_approved=True`:
+#    the transaction-abort retry approved five seconds later and wrote nothing
+#    else, and the main signup lane set the flag in a second, separate UPDATE
+#    that could fail. Old columns cannot tell those rows from a staff approval,
+#    so only a `verified_at` at or after the cutover counts. Every merchant
+#    approved before it needs a staff re-approval to list. There is no
+#    approver column, and no existing JSON column can hold one safely: the
+#    merchant itself writes kyc_documents, apm_scope_jsonb and platform_profile.
+#    `auto_approved` NULL still counts as not-automatic (the `databases`
+#    insert path never applied the column's False default).
 #  * it has at least one live connected store: a `merchant_stores` row whose
 #    status is in services.connection_layer.LIVE_STORE_STATUSES (the repo's
-#    canonical "connected"). Store-less merchants have no transact path.
+#    canonical "connected"), or the legacy single-store record on
+#    merchant_onboarding (`mcp_connected` with a shop domain), which the
+#    purchasability sweep and get_merchant_active_stores also treat as a
+#    store. Store-less merchants have no transact path.
 #
 # A PSP connection alone therefore never lists a merchant: the PSP routes set
 # `psp_connected` but write neither the staff approval nor a store.
 # Every literal below comes from a module constant, never from the request.
+#
+# The D-09 cutover, naive UTC like `verified_at` (update_kyc_status stamps it
+# with utcnow). Fixed in code on purpose: an env value could move it back and
+# re-admit the old automatic approvals. Approvals between this instant and the
+# deploy were made by the old code; the residual is the automatic approvals in
+# that window that left auto_approved unset (retry lane, failed second UPDATE).
+D09_STAFF_APPROVAL_CUTOVER_UTC = datetime(2026, 11, 8, 0, 0, 0)
 _STAFF_LISTED_MERCHANT_WHERE = (
     "COALESCE(mo.auto_approved, FALSE) = FALSE",
-    "mo.verified_at IS NOT NULL",
-    "EXISTS (SELECT 1 FROM merchant_stores ms_listed "
+    "mo.verified_at >= :staff_approval_cutover",  # NULL (never approved by update_kyc_status) fails too
+    "(EXISTS (SELECT 1 FROM merchant_stores ms_listed "
     "WHERE ms_listed.merchant_id = mo.merchant_id "
     "AND lower(trim(COALESCE(ms_listed.status, ''))) IN ("
     + ", ".join(f"'{s}'" for s in LIVE_STORE_STATUSES)
-    + "))",
+    + ")) OR (COALESCE(mo.mcp_connected, FALSE) = TRUE "
+    "AND trim(COALESCE(mo.mcp_shop_domain, '')) <> ''))",
 )
 
 
@@ -773,6 +792,7 @@ async def list_merchants(
             # staff-approved merchant with a connected store is listed (D-09).
             where.append("mo.psp_connected = TRUE")
             where.extend(_STAFF_LISTED_MERCHANT_WHERE)
+            params["staff_approval_cutover"] = D09_STAFF_APPROVAL_CUTOVER_UTC
         allowed = context.allowed_merchants
         if allowed is not None:
             if not allowed:

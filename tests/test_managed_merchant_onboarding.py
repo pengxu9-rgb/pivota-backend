@@ -190,6 +190,35 @@ async def test_the_transaction_abort_retry_does_not_schedule_an_approval(signup,
     assert not hasattr(onboarding, "auto_approve_kyc")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,approved", [("pending_verification", False), ("approved", True)])
+async def test_a_recovered_signup_reports_its_own_status_not_the_old_flag(signup, monkeypatch, status, approved):
+    """Re-registering with the same email and store recovers the row. A row still pending
+    review that carries the old auto_approved=True is not told it is approved."""
+    async def existing(_email):
+        return {
+            "merchant_id": "merch_recovered",
+            "store_url": "https://recover.example.com",
+            "status": status,
+            "auto_approved": True,
+            "approval_confidence": 0.2,
+        }
+
+    monkeypatch.setattr(onboarding, "get_active_onboarding_by_email", existing)
+    req = MerchantRegisterRequest(
+        business_name="Recovered Co",
+        region="US",
+        contact_email="owner@example.com",
+        password="hunter2hunter2",
+        store_url="https://recover.example.com",
+    )
+    resp = await onboarding.register_merchant(req, _DummyBackgroundTasks())
+    assert resp["merchant_id"] == "merch_recovered"
+    assert resp["auto_approved"] is approved
+    assert resp["next_step"] == ("Connect PSP" if approved else "Wait for Pivota review")
+    assert signup["kyc_calls"] == []
+
+
 # ---- 2. approval is a staff decision -----------------------------------------------------
 
 
@@ -225,6 +254,26 @@ async def test_a_staff_approval_clears_auto_approved_and_stamps_verified_at(db):
     assert written["status"] == "approved"
     assert written["auto_approved"] is False
     assert written["verified_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_the_staff_approval_stamp_is_utc(db, monkeypatch):
+    """The partner list compares verified_at with the D-09 cutover, which is naive UTC. A
+    local-clock stamp on a non-UTC host would shift every approval by the UTC offset."""
+    from datetime import datetime as real_datetime
+
+    class _Clock(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime(2026, 11, 8, 3, 0, 0)  # a host eight hours behind UTC
+
+        @classmethod
+        def utcnow(cls):
+            return real_datetime(2026, 11, 8, 11, 0, 0)
+
+    monkeypatch.setattr(mo, "datetime", _Clock)
+    await mo.update_kyc_status("merch_1", "approved", approved_by_staff=True)
+    assert db.values[-1]["verified_at"] == real_datetime(2026, 11, 8, 11, 0, 0)
 
 
 @pytest.mark.asyncio

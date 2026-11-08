@@ -632,10 +632,10 @@ async def register_merchant(
 
             full_kyb_deadline = existing_onboarding.get("full_kyb_deadline")
             validation_result = {
-                "approved": bool(
-                    existing_onboarding.get("auto_approved")
-                    or existing_onboarding.get("status") == "approved"
-                ),
+                # The row's own status, not the old auto-approval flag: a
+                # recovered signup that is still pending review is not told
+                # it is approved (D-09).
+                "approved": existing_onboarding.get("status") == "approved",
                 "confidence_score": existing_onboarding.get("approval_confidence") or 0,
                 "validation_results": {
                     "recovery": {

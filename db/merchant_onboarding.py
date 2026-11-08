@@ -178,15 +178,16 @@ async def update_kyc_status(
         #    auto_approved;
         #  * approving: only staff routes reach this, so the approval it records
         #    is a staff one. `status='approved' AND auto_approved IS NOT TRUE AND
-        #    verified_at IS NOT NULL` is how the partner merchant list
+        #    verified_at >= the D-09 cutover` is how the partner merchant list
         #    (routes/agent_sdk_fixed.py) tells a staff approval from the old
-        #    signup auto-approval, which set auto_approved=True. Without the
-        #    clear, staff re-approving a floor-approved merchant would still
-        #    look automatic.
+        #    signup auto-approval. Without the clear, staff re-approving a
+        #    floor-approved merchant would still look automatic.
         "auto_approved": False,
     }
     if status == "approved":
-        update_data["verified_at"] = datetime.now()
+        # UTC, explicitly: the partner list compares it with the D-09 cutover
+        # (routes/agent_sdk_fixed.D09_STAFF_APPROVAL_CUTOVER_UTC, naive UTC).
+        update_data["verified_at"] = datetime.utcnow()
         # Clear rejection reason on approval unless explicitly provided
         if rejection_reason is None and reason is None:
             update_data["rejection_reason"] = None

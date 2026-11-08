@@ -52,6 +52,13 @@ M_UNVERIFIED = f"merch_ml_unverif_{RUN}"   # status written directly: no staff v
 M_STORELESS = f"merch_ml_storeless_{RUN}"  # staff-approved, no store at all
 M_STORE_GONE = f"merch_ml_storegone_{RUN}"  # staff-approved, its only store disconnected
 M_PENDING_PSP = f"merch_ml_pendpsp_{RUN}"  # pending review, PSP + store connected
+# Approved before the D-09 cutover with auto_approved left NULL: what the old transaction-abort
+# retry (and a main-lane signup whose second UPDATE failed) left behind.
+M_PRE_CUTOVER = f"merch_ml_precut_{RUN}"
+
+# A staff approval after the D-09 cutover, and one from before it.
+STAFF_APPROVED_AT = datetime(2026, 11, 8, 12, 0, 0)
+PRE_CUTOVER_AT = datetime(2026, 11, 7, 23, 59, 59)
 
 MERCHANTS = {
     M_ORDERED: ("approved", True),
@@ -67,6 +74,7 @@ MERCHANTS = {
     M_STORELESS: ("approved", True),
     M_STORE_GONE: ("approved", True),
     M_PENDING_PSP: ("pending_verification", True),
+    M_PRE_CUTOVER: ("approved", True),
 }
 ALL_IDS = list(MERCHANTS)
 
@@ -79,6 +87,7 @@ APPROVAL = {
     M_OTHERS: (None, True),
     M_PENDING: (False, False),
     M_PENDING_PSP: (False, False),
+    M_PRE_CUTOVER: (None, "pre_cutover"),
 }
 
 # merchant_id -> its one store's status (no entry: no store). Mixed case/padding on purpose:
@@ -113,7 +122,8 @@ async def _table_exists(name: str) -> bool:
 
 
 def _merchant_row(mid, status="approved", psp=True, auto_approved=False, verified=True):
-    """`auto_approved=False, verified=True` is what a staff approval leaves behind."""
+    """`auto_approved=False, verified=True` is what a staff approval since D-09 leaves behind.
+    `verified="pre_cutover"` stamps a verified_at from before the cutover."""
     from db.merchant_onboarding import merchant_onboarding
 
     return merchant_onboarding.insert().values(
@@ -126,7 +136,7 @@ def _merchant_row(mid, status="approved", psp=True, auto_approved=False, verifie
         psp_connected=psp,
         psp_type="stripe" if psp else None,
         auto_approved=auto_approved,
-        verified_at=datetime(2026, 11, 1) if verified else None,
+        verified_at=(PRE_CUTOVER_AT if verified == "pre_cutover" else STAFF_APPROVED_AT) if verified else None,
         operating_mode="storefront",
         apm_enabled=False,
     )
@@ -323,7 +333,7 @@ async def _rig_rows(fail_after: Optional[str] = None):
             await database.execute(
                 "UPDATE merchant_onboarding SET status = 'approved', psp_connected = TRUE, "
                 "auto_approved = FALSE, verified_at = :v WHERE merchant_id = :m",
-                {"m": r_known, "v": datetime(2026, 11, 1)},
+                {"m": r_known, "v": STAFF_APPROVED_AT},
             )
             done.append(("restore_merchant", r_known, known_original))
         _step("known")
@@ -766,6 +776,10 @@ ONE_RULE_MISSING = {
     "signup_auto_approval": (M_FLOOR, "UPDATE merchant_onboarding SET auto_approved = FALSE WHERE merchant_id = :m"),
     "no_staff_verified_at": (M_UNVERIFIED, "UPDATE merchant_onboarding SET verified_at = :v WHERE merchant_id = :m"),
     "store_disconnected": (M_STORE_GONE, "UPDATE merchant_stores SET status = 'connected' WHERE merchant_id = :m"),
+    "approved_before_the_d09_cutover": (
+        M_PRE_CUTOVER,
+        "UPDATE merchant_onboarding SET verified_at = :v WHERE merchant_id = :m",
+    ),
     "pending_review_with_psp": (
         M_PENDING_PSP,
         "UPDATE merchant_onboarding SET status = 'approved', verified_at = :v WHERE merchant_id = :m",
@@ -781,7 +795,7 @@ async def _available_ids(agent_id=AGENT):
 
 async def test_only_staff_approved_merchants_with_a_connected_store_list(_rows):
     ids = await _available_ids()
-    assert not ids & {M_FLOOR, M_UNVERIFIED, M_STORELESS, M_STORE_GONE, M_PENDING_PSP}
+    assert not ids & {M_FLOOR, M_UNVERIFIED, M_STORELESS, M_STORE_GONE, M_PENDING_PSP, M_PRE_CUTOVER}
     # NULL auto_approved (M_OTHERS) and a padded ' Active ' store still list.
     assert {M_ORDERED, M_FRESH, M_OTHERS} <= ids
 
@@ -792,7 +806,7 @@ async def test_each_listing_rule_alone_keeps_a_merchant_out(_rows, rule):
     assert mid not in await _available_ids()
     params = {"m": mid}
     if ":v" in repair:
-        params["v"] = datetime(2026, 11, 2)
+        params["v"] = STAFF_APPROVED_AT
     await database.execute(repair, params)
     assert mid in await _available_ids(), f"{rule}: repairing that one rule did not list it"
 
@@ -830,3 +844,34 @@ async def test_mine_is_not_narrowed_by_the_listing_rules(_rows):
     await database.execute(_order(M_STORELESS, AGENT, 9))
     ids = {m["merchant_id"] for m in (await _get(_app(), {"scope": "mine"})).json()["merchants"]}
     assert {M_FLOOR, M_STORELESS} <= ids
+
+
+def test_the_cutover_is_fixed_in_code_and_matches_the_staff_stamp():
+    """The cutover is naive UTC, like the verified_at update_kyc_status writes (utcnow)."""
+    import routes.agent_sdk_fixed as mod
+
+    assert mod.D09_STAFF_APPROVAL_CUTOVER_UTC == datetime(2026, 11, 8, 0, 0, 0)
+    assert mod.D09_STAFF_APPROVAL_CUTOVER_UTC.tzinfo is None
+    assert PRE_CUTOVER_AT < mod.D09_STAFF_APPROVAL_CUTOVER_UTC <= STAFF_APPROVED_AT
+
+
+async def test_a_staff_re_approval_lists_a_pre_cutover_approval(_rows):
+    from db.merchant_onboarding import update_kyc_status
+
+    assert M_PRE_CUTOVER not in await _available_ids()
+    await update_kyc_status(M_PRE_CUTOVER, "approved", approved_by_staff=True)
+    assert M_PRE_CUTOVER in await _available_ids()
+
+
+@pytest.mark.parametrize(
+    "mcp_connected,domain,listed",
+    [(True, "legacy-shop.example", True), (True, "  ", False), (False, "legacy-shop.example", False)],
+)
+async def test_a_legacy_single_store_record_counts_as_a_connected_store(_rows, mcp_connected, domain, listed):
+    """A merchant whose only store is the legacy mcp_* record on merchant_onboarding (no
+    merchant_stores row) relists after a staff re-approval, as the sweep treats it as a store."""
+    await database.execute(
+        "UPDATE merchant_onboarding SET mcp_connected = :c, mcp_shop_domain = :d WHERE merchant_id = :m",
+        {"c": mcp_connected, "d": domain, "m": M_STORELESS},
+    )
+    assert (M_STORELESS in await _available_ids()) is listed
