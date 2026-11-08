@@ -1,6 +1,6 @@
 # ADR-029: One purchase router for agent-paid orders on merchants not connected to Pivota
 
-**Status:** Proposed, draft for review, 2026-11-08 (rev 3, after an adversarial review and a delta review). Nothing here is built or switched on by this ADR.
+**Status:** Proposed (rev 3), 2026-11-08, after three adversarial review passes. Acceptance waits on the owner's questions at the end. Nothing here is built or switched on by this ADR.
 
 **Decision owner:** peng. **Runtime owner of the router:** the payment orchestration code owner (to be named at acceptance).
 
@@ -60,7 +60,7 @@ Every door that starts an agent-paid purchase on an unconnected seller asks `ser
   - it needs `PAYMENT_ORCHESTRATOR_ENABLED`;
   - an unset pilot scope admits nobody (D8).
 
-  A request that opens today without these is refused. Its parent keeps `basis="agent_selected_rail"`, which is correct for a direct call.
+  A request that opens today without these is refused. The route sits behind `REAP_AGENTIC_ENABLED`, which defaults off, so the change refuses nothing until that rail is switched on. Its parent keeps `basis="agent_selected_rail"`, which is correct for a direct call.
 - **The router's own choices** pass their basis and dropped candidates through to the parent (D9). They are no longer written with the direct route's default.
 - **ADR-014 amendment.** For unconnected sellers, this router is the settlement selector; the adapter's `select_settlement` does not choose for them (see "One spine, two settlement selectors" above).
 
@@ -123,6 +123,7 @@ A path is admitted only with a written funds flow showing that the buyer's payme
   - the merchant has not opted out (D5);
   - for `pivota_browser`, D5's run condition;
   - for `rail_managed`, the partner's contractual equivalents of D5 to D7 are recorded (D2). A merchant being proven on a rail is necessary, not sufficient: it must also be **permitted**.
+- **Currency equals market (ADR-026):** the purchase currency is the buyer market's currency, and the market is never defaulted. A path whose credential step carries another currency, or none, is not a candidate (see D5's one-currency rule).
 - **The caller and the buyer:** the caller class is allowed (ADR-012); the amount is within the consent's ceiling (ADR-028 D7) and the path's cap; the buyer holds the credential or can enrol it in the flow.
 - **The path's own requirements** (D2 `requires`, `works_on`) and its dial (D8).
 
@@ -135,7 +136,7 @@ Attribution never outranks a known lower total.
 
 **Fallback.** This amends the router's rule 4 ("no fallback after routing") to match ADR-028 D1:
 - A purchase never changes path after its first write (rule 5 stands).
-- When a path **definitely refuses before payment**, the next candidate may be tried as a **new purchase**, with its own idempotency key and a new buyer confirmation (ADR-028 D7).
+- When a path **definitely refuses before payment**, the next candidate may be tried as a **new purchase**. It needs its own idempotency key, a new buyer confirmation (ADR-028 D7) and a **new CAA under the buyer's consent**: the first purchase's CAA was consumed at its submit (D5) and never carries over.
 - An `outcome_unknown` answer is never a refusal. It is read back until it is definite, and no new purchase starts meanwhile.
 - On `rail_managed`, "before payment" means before the buyer's authorization step on the partner's page. After that step, a failure stops and returns to the buyer.
 - A payment decline stops (ADR-028 D1).
