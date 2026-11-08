@@ -1875,6 +1875,14 @@ async def _make_redirect_url(
     return f"{_request_base_url(request)}/r?token={token}"
 
 
+#: The status a NEW seed made through `POST /external-seeds` starts in (FIX_PLAN D-11). Every serving read
+#: keys on `status = 'active'`, so a draft is stored, listable (`GET /external-seeds?status=draft`) and
+#: editable, and is served only once someone publishes it: `PATCH /external-seeds/{id}` with
+#: `{"status": "active"}`. A create that lands on an existing seed for the same destination updates that
+#: row and leaves its status alone, so a live seed stays live.
+NEW_EMPLOYEE_SEED_STATUS = "draft"
+
+
 class CreateExternalSeedRequest(BaseModel):
     destination_url: str = Field(..., min_length=1)
     market: Optional[str] = None
@@ -4246,18 +4254,26 @@ async def create_external_seed(
     # `reset_unreadable_canonical_urls.py` runs; matching on that canonical alone would rewrite
     # the other shade's seed. Candidates are found broadly, then kept only if their
     # `destination_url` is this destination (`_same_destination`).
+    # A DRAFT for this destination is a candidate too, after every live one, so saving the same new seed
+    # twice edits one draft instead of leaving two to publish.
     candidate_rows = await database.fetch_all(
         """
         SELECT *
         FROM external_product_seeds
-        WHERE status = 'active'
+        WHERE status IN ('active', :draft_status)
           AND market = :market
           AND tool = :tool
           AND (canonical_url IN (:match_url, :dest) OR destination_url IN (:match_url, :dest))
-        ORDER BY updated_at DESC, created_at DESC
+        ORDER BY (status = 'active') DESC, updated_at DESC, created_at DESC
         LIMIT 20
         """,
-        {"market": market, "tool": tool, "match_url": match_url, "dest": dest},
+        {
+            "market": market,
+            "tool": tool,
+            "match_url": match_url,
+            "dest": dest,
+            "draft_status": NEW_EMPLOYEE_SEED_STATUS,
+        },
     )
     existing_row = next(
         (r for r in candidate_rows if _same_destination(dest, dict(r).get("destination_url"))),
@@ -4483,31 +4499,36 @@ async def create_external_seed(
                 "attached_variant_id": attached_variant_id,
             },
         )
-        await database.execute(
-            """
-            UPDATE external_product_seeds
-            SET status = 'disabled',
-                notes = COALESCE(notes, '') || :note,
-                updated_at = NOW()
-            WHERE id <> :id
-              AND status = 'active'
-              AND market = :market
-              AND tool = :tool
-              -- Only seeds for THIS destination; never one matched through a canonical
-              -- (a poisoned canonical would disable another shade's seed).
-              AND destination_url IN (:match_url, :dest)
-            """,
-            {
-                "id": seed_id,
-                "market": market,
-                "tool": tool,
-                "match_url": match_url,
-                "dest": dest,
-                "note": f" superseded_by:{seed_id}",
-            },
-        )
+        seed_status = str(row.get("status") or "").strip() or "active"
+        # Only a LIVE seed supersedes the other live seeds of its destination: a draft is not served,
+        # so it must not take a served seed down before anyone publishes it.
+        if seed_status == "active":
+            await database.execute(
+                """
+                UPDATE external_product_seeds
+                SET status = 'disabled',
+                    notes = COALESCE(notes, '') || :note,
+                    updated_at = NOW()
+                WHERE id <> :id
+                  AND status = 'active'
+                  AND market = :market
+                  AND tool = :tool
+                  -- Only seeds for THIS destination; never one matched through a canonical
+                  -- (a poisoned canonical would disable another shade's seed).
+                  AND destination_url IN (:match_url, :dest)
+                """,
+                {
+                    "id": seed_id,
+                    "market": market,
+                    "tool": tool,
+                    "match_url": match_url,
+                    "dest": dest,
+                    "note": f" superseded_by:{seed_id}",
+                },
+            )
     else:
         seed_id = _seed_id()
+        seed_status = NEW_EMPLOYEE_SEED_STATUS
         external_product_id = _stable_external_product_id(match_url)
         if snap_variants and not body.variants:
             variant_adoption_refused = _variant_adoption_refusal(
@@ -4578,12 +4599,13 @@ async def create_external_seed(
               :destination_url, :canonical_url, :domain, :title, :image_url,
               :price_amount, :price_currency, :availability,
               :seed_data,
-              'active', :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
+              :status, :notes, :created_by_employee_id, :attached_product_key, :attached_variant_id,
               :seller_ref, :seed_kind
             )
             """,
             {
                 "id": seed_id,
+                "status": seed_status,
                 "external_product_id": external_product_id,
                 "market": market,
                 "tool": tool,
@@ -4625,6 +4647,8 @@ async def create_external_seed(
         "status": "success",
         "seed": {
             "id": seed_id,
+            # A new seed is a draft and is not served until it is published (NEW_EMPLOYEE_SEED_STATUS).
+            "status": seed_status,
             "external_product_id": seed_data.get("external_product_id"),
             "market": market,
             "tool": tool,
