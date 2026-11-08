@@ -21,6 +21,14 @@ from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
 from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
+from routes.agent_forwarded_owner import (
+    PARTNER_AGENT_ID_METADATA_KEY,
+    PARTNER_IDENTITY_METADATA_KEY,
+    forwarded_owner_context,
+    order_access_allowed,
+    partner_identity_forwarding_enabled,
+    partner_identity_metadata,
+)
 from routes.agent_checkout_intents import (
     CheckoutIntentItem,
     CreateCheckoutIntentRequest,
@@ -898,7 +906,7 @@ async def search_products_v2(
 @router.post("/quotes/preview")
 async def preview_quote_v2(
     body: QuotePreviewBody,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("preview_quote")),
 ):
     request_context = body.request_context.model_dump(exclude_none=True) if body.request_context else {}
     buyer_context = body.buyer_context or BuyerContext()
@@ -1001,7 +1009,7 @@ async def get_quote_v2(
 async def create_order_v2(
     body: CreateOrderBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("create_order")),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     service = QuoteService()
@@ -1035,6 +1043,14 @@ async def create_order_v2(
     shipping_address = _coerce_shipping_address(raw_shipping)
 
     metadata = dict(body.metadata or {})
+    if partner_identity_forwarding_enabled():
+        # The partner stamp is this service's record of a VERIFIED owner: never a caller's claim.
+        metadata.pop(PARTNER_IDENTITY_METADATA_KEY, None)
+        metadata.pop(PARTNER_AGENT_ID_METADATA_KEY, None)
+        partner_stamp = partner_identity_metadata(context)
+        if partner_stamp:
+            metadata[PARTNER_IDENTITY_METADATA_KEY] = partner_stamp
+            metadata[PARTNER_AGENT_ID_METADATA_KEY] = partner_stamp["partner_agent_id"]
     agent_v2_meta = dict(metadata.get("agent_v2") or {}) if isinstance(metadata.get("agent_v2"), dict) else {}
     agent_v2_meta.update({
         "contract_version": "merchant-network-middleware-v1",
@@ -1132,12 +1148,12 @@ async def create_order_v2(
 @router.get("/orders/{order_id}")
 async def get_order_v2(
     order_id: str,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
 ):
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     return {
         "status": "success",
@@ -1148,7 +1164,8 @@ async def get_order_v2(
 @router.post("/payments/checkout-sessions")
 async def create_checkout_session_v2(
     body: CreateCheckoutSessionBody,
-    context: AgentContext = Depends(get_agent_context),
+    # The gateway reaches this route for two operations: a hosted link and a strict submit_payment.
+    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment")),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     from services.agent_governance import agent_governance
@@ -1159,7 +1176,7 @@ async def create_checkout_session_v2(
     ensure_checkout_token_order_access(context, order)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
 
     await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
@@ -1341,7 +1358,8 @@ async def list_merchant_capabilities_v2(
 @router.get("/orders/{order_id}/tracking")
 async def track_order_v2(
     order_id: str,
-    context: AgentContext = Depends(get_agent_context),
+    # Adoption only, no `via` access: agent_v1_track_order re-checks the owner on its own.
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1373,14 +1391,14 @@ async def create_refund_v2(
     order_id: str,
     body: RefundCreateBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("request_after_sales")),
 ):
     from services.agent_governance import agent_governance
 
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
     # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
