@@ -389,7 +389,9 @@ async def test_a_later_sighting_never_changes_the_restriction_flags(db):
 @pytest.mark.parametrize("token", ["48HRS", "24HR", "48H", "1ST", "2ND", "3RD", "4TH", "3PM", "10AM", "2-DAY", "2DAY",
                                    "3DAYS", "3X", "1PER", "XXXX-1234", "SPF50", "B2B", "D2C",
                                    "48HOURS", "2-IN-1", "3PCS", "50ML", "8OZ", "2PK", "KN95", "N95", "30MIN", "2WEEKS",
-                                   "12MONTHS", "1080P", "10AM-2PM", "6FT"])
+                                   "12MONTHS", "1080P", "10AM-2PM", "6FT",
+                                   "4X4", "3XL", "2XS", "100PCT", "360-DEGREE", "360DEG", "5STAR", "5-STARS", "2026SS",
+                                   "2025FW"])
 async def test_a_digit_token_that_names_something_else_is_not_written(db, token):
     await w.record([captured(code=token, snippet=f"Get 15% off with code {token}")], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -400,7 +402,9 @@ async def test_a_digit_token_that_names_something_else_is_not_written(db, token)
 @pytest.mark.parametrize("snippet", ["Get 15% off with code ABC123 (example)", "Get 15% off with code ABC123, e.g. at checkout",
                                      "Get 15% off with code ABC123 — for example only",
                                      "Example: use code ABC123 at checkout for 15% off",
-                                     "Enter a code such as ABC123 for 15% off"])
+                                     "Enter a code such as ABC123 for 15% off",
+                                     "For instance, use code ABC123 for 15% off",
+                                     "Get 15% off with code ABC123, for instance on boots"])
 async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
     await w.record([captured(code="ABC123", snippet=snippet)], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -408,7 +412,7 @@ async def test_a_code_the_page_calls_an_example_is_not_written(db, snippet):
     assert dcc.stats()["writes"] == {"skipped_not_a_code": 1}
 
 
-@pytest.mark.parametrize("token", ["50OFF", "20OFF", "4EVER", "COVID19", "W10", "SAVE15", "B2B10X1"])
+@pytest.mark.parametrize("token", ["50OFF", "20OFF", "4EVER", "COVID19", "W10", "SAVE15", "B2B10X1", "10PCT", "20PCT"])
 async def test_ambiguous_digit_codes_stores_really_use_are_written(db, token):
     await w.record([captured(code=token, snippet=f"Get 15% off with code {token} today")], url="https://glow.example/p",
                    final_url="https://glow.example/p", market="US", page_currency="USD")
@@ -445,6 +449,8 @@ async def _catalog(db, i, merchant, domain=None, url=None):
     ("merch_obs_glow", ("merch_obs_glow", "glow.example:8443", None)),
     (" merch_obs_glow ", ("merch_obs_glow", "glow.example", None)),
     ("merch_obs_glow", ("merch_obs_glow", None, "https://www.glow.example/products/toner")),
+    ("www.*.glow.example", None),
+    ("*.www.glow.example", None),
 ])
 async def test_the_opt_out_matches_whatever_form_each_side_was_entered_in(db, optout, catalog):
     if catalog:
@@ -547,7 +553,7 @@ async def test_a_re_sighting_does_not_restore_bar_text_after_14_days(db):
 
 # ── a canonical-URL host blocks writes; a marketplace host never does; each id reads its own URLs (P3-N2) ──────────
 async def test_canonical_url_hosts_block_writes_per_id_and_skip_marketplaces(db, monkeypatch):
-    monkeypatch.setattr(w, "CANONICAL_URLS_PER_ID", 2)
+    monkeypatch.setattr(w, "CANONICAL_HOSTS_PER_ID", 2)
     for i in range(5):  # the first id has more URLs than the per-id read
         await _catalog(db, i, "merch_big", url=f"https://big.example/p/{i}")
     await _catalog(db, 20, "merch_small", url="https://small.example/p/1")
@@ -608,3 +614,135 @@ async def test_the_canonical_url_read_sees_past_the_first_url_of_an_id(db):
     await w.record([captured()], url="https://mix.example/p", final_url="https://mix.example/p", market="US", page_currency="USD")
     assert await rows(db) == []
     assert dcc.stats()["writes"] == {"skipped_optout": 1}
+
+
+# ── review of be#2735 delta 3 ───────────────────────────────────────────────────────────────────────────────────────
+async def test_a_store_on_a_shared_host_known_only_from_canonical_urls_is_blocked(db):
+    """P3-R1(b): a tenant of square.site, mybigcommerce.com or company.site is the store's own host, not a marketplace."""
+    for i, (mid, host) in enumerate([("merch_sq", "brand1.square.site"), ("merch_bc", "brand2.mybigcommerce.com"),
+                                     ("merch_co", "brand3.company.site")]):
+        await _catalog(db, i, mid, url=f"https://{host}/p/1")
+        await _optout(db, mid)
+    for host in ("brand1.square.site", "brand2.mybigcommerce.com", "brand3.company.site", "other.square.site"):
+        await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert [r["seller_id"] for r in await rows(db)] == ["other.square.site"]
+    deny = await w.read_denyset()
+    assert deny.counts == {"optout_ids_canonical_only": 3}
+
+
+async def test_marketplace_listings_never_crowd_out_the_stores_own_host(db, monkeypatch):
+    """P3-R1(c): the per-id read takes distinct HOSTS, so many marketplace URLs that sort first never hide the store's
+    own host, nor its second host behind many URLs on its first."""
+    monkeypatch.setattr(w, "CANONICAL_HOSTS_PER_ID", 5)
+    for i in range(30):
+        await _catalog(db, i, "merch_mix", url=f"https://www.amazon.com/dp/{i:03d}")
+        await _catalog(db, 100 + i, "merch_mix", url=f"https://a-own.example/p/{i:03d}")
+    await _catalog(db, 200, "merch_mix", url="https://shop.z-own.example/p/1")
+    await _optout(db, "merch_mix")
+    deny = await w.read_denyset()
+    assert deny.blocks("a-own.example") and deny.blocks("shop.z-own.example") and not deny.blocks("amazon.com")
+
+
+async def test_the_per_id_host_read_keeps_the_first_hosts_in_host_order(db, monkeypatch):
+    monkeypatch.setattr(w, "CANONICAL_HOSTS_PER_ID", 2)
+    for i, host in enumerate(["d.example", "c.example", "b.example", "a.example"]):  # inserted out of order
+        await _catalog(db, i, "merch_many", url=f"https://{host}/p")
+    await _optout(db, "merch_many")
+    deny = await w.read_denyset()
+    assert sorted(h for h in deny.block if not h.startswith("www.")) == ["a.example", "b.example"]
+    assert deny.counts == {"optout_ids_canonical_only": 1}
+
+
+async def test_an_over_broad_canonical_only_id_is_counted_too_broad(db):
+    for i in range(4):
+        await _catalog(db, i, "merch_wide", url=f"https://brand{i}.example/p")
+    await _optout(db, "merch_wide")
+    deny = await w.read_denyset()
+    assert deny.counts == {"optout_ids_canonical_only": 1, "optout_ids_too_broad": 1}
+    assert all(deny.blocks(f"brand{i}.example") for i in range(4)) and not deny.delete
+
+
+async def test_a_normal_multi_domain_store_adds_no_note(db):
+    for i, host in enumerate(["glow.example", "shop.glow.example", "glow.co.uk", "glow-store.myshopify.com"]):
+        await _catalog(db, i, "merch_glow", host)
+    await _optout(db, "merch_glow")
+    deny = await w.read_denyset()
+    assert deny.counts == {}
+    assert deny.blocks("glow.co.uk") and deny.blocks("glow-store.myshopify.com")
+
+
+@pytest.mark.parametrize("optout", ["github.io", "vercel.app", "herokuapp.com", "netlify.app", "com.vn", "com.ar",
+                                    "company.site", "square.site", "co.uk"])
+async def test_a_hosting_platform_or_registry_suffix_opt_out_never_blocks_the_stores_under_it(db, optout):
+    await _optout(db, optout)
+    host = f"brand.{optout}"
+    await w.record([captured()], url=f"https://{host}/p", final_url=f"https://{host}/p", market="US", page_currency="USD")
+    assert [r["seller_id"] for r in await rows(db)] == [host]
+    deny = await w.read_denyset()
+    assert deny.counts == {"optout_ids_shared_host": 1}  # reported: the opt-out probably meant one store (be#2742 P3-4)
+    assert deny.blocks(optout)  # the exact host itself is still covered
+
+
+@pytest.mark.parametrize("optout,page", [("bücher.example", "xn--bcher-kva.example"),
+                                         ("xn--bcher-kva.example", "bücher.example"),
+                                         ("https://www.BÜCHER.example/x", "shop.xn--bcher-kva.example"),
+                                         ("ｗｗｗ.bücher.example", "xn--bcher-kva.example"),  # full-width www. (P3-5)
+                                         ("bücher.example。", "xn--bcher-kva.example"),  # ideographic full stop
+                                         ("straße.example", "xn--strae-oqa.example")])  # UTS-46 nontransitional
+async def test_an_internationalised_host_matches_in_either_spelling(db, optout, page):
+    await _optout(db, optout)
+    await w.record([captured()], url=f"https://{page}/p", final_url=f"https://{page}/p", market="US", page_currency="USD")
+    assert await rows(db) == []
+    assert dcc.stats()["writes"] == {"skipped_optout": 1}
+
+
+async def test_registrable_domains_under_shared_hosts_and_suffixes():
+    assert w.registrable("brand1.square.site") == "brand1.square.site"
+    assert w.registrable("x.brand1.square.site") == "brand1.square.site"
+    assert w.registrable("shop.brand.com.vn") == "brand.com.vn"
+    assert w.registrable("square.site") == "square.site"
+    assert not w.is_marketplace("brand1.square.site") and w.is_marketplace("square.site")
+
+
+async def test_the_denylist_cache_expires_after_its_cap_within_a_run(db, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(w.time, "monotonic", lambda: clock[0])
+    reads = []
+    real = w.read_denyset
+
+    async def counting():
+        reads.append(1)
+        return await real()
+
+    monkeypatch.setattr(w, "read_denyset", counting)
+    await w.record([captured()], url="https://a.example/p", final_url="https://a.example/p", market="US", page_currency="USD")
+    clock[0] += w.DENYLIST_CACHE_SECONDS - 1
+    await _optout(db, "b.example")
+    await w.record([captured()], url="https://b.example/p", final_url="https://b.example/p", market="US", page_currency="USD")
+    assert len(reads) == 1  # still cached: the new opt-out is not seen yet
+    clock[0] += 2
+    await w.record([captured(code="NEW22")], url="https://b.example/q", final_url="https://b.example/q", market="US", page_currency="USD")
+    assert len(reads) == 2
+    assert dcc.stats()["writes"] == {"inserted": 2, "skipped_optout": 1}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("é" * 70 + ".example", "é" * 70 + ".example"),  # a label over 63 characters: kept as it is
+    ("\udcff.example", "\udcff.example"),  # a lone surrogate: UTS-46 refuses it, so does the stdlib codec
+    ("a..é.example", "a..xn--9ca.example"),  # an empty label does not stop the others
+])
+async def test_a_host_that_cannot_be_encoded_never_raises_and_keeps_its_spelling(value, expected):
+    assert w.normalize_host(value) == expected
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("ｗｗｗ。bücher。example", "xn--bcher-kva.example"),
+    ("é" * 70 + "。example", "é" * 70 + ".example"),  # the ideographic stop is a dot even where a label cannot encode
+    ("www.brand．example｡", "brand.example"),
+    ("straße.example", "strasse.example"),  # IDNA 2003 without the package (it maps ß; the package keeps it)
+])
+async def test_without_the_idna_package_the_stdlib_codec_still_gives_one_spelling(monkeypatch, value, expected):
+    """Review of be#2742 delta, Q22: the fallback branch maps the full-width and ideographic stops itself."""
+    monkeypatch.setitem(sys.modules, "idna", None)  # "import idna" now raises ImportError
+    assert w.normalize_host(value) == expected
+
