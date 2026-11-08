@@ -202,15 +202,18 @@ def test_external_seed_audit_queue_supports_merchant_id_filter(
         },
     )
 
+    asked_statuses = []
+
     async def fake_inventory(*, merchant_id: str, status: str):
         assert merchant_id == "merch_1"
-        assert status == "active"
+        asked_statuses.append(status)
+        rows = [attached, unattached] if status == "active" else []
         return {
             "merchant_id": merchant_id,
             "matched_domains": ["example.com"],
-            "attached_rows": [attached],
-            "domain_unattached_rows": [unattached],
-            "rows": [attached, unattached],
+            "attached_rows": [attached] if rows else [],
+            "domain_unattached_rows": [unattached] if rows else [],
+            "rows": rows,
             "matched_via_by_seed": {"eps_attached": "attached_product_key", "eps_unattached": "merchant_domain"},
         }
 
@@ -229,6 +232,7 @@ def test_external_seed_audit_queue_supports_merchant_id_filter(
     returned_ids = [item["seed"]["id"] for item in payload["items"]]
     assert "eps_attached" in returned_ids
     assert "eps_unattached" in returned_ids
+    assert asked_statuses == ["active", "draft"], "the queue reads the live seeds and the drafts by default"
 
 
 def test_backfill_storefront_external_seeds_dry_run(

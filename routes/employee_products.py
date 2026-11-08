@@ -27,6 +27,7 @@ import uuid
 
 from db._ddl_guard import apply_ddl_statements
 from db.schema_guard import guarded_statements, is_lock_timeout
+import db.database as _db_core
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
@@ -683,11 +684,9 @@ async def _execute_seed_data_stmt(query: str, values: Dict[str, Any]) -> None:
     except Exception as exc:
         msg = str(exc)
         seed_data = values.get("seed_data")
-        if (
-            not _SEED_DATA_FORCE_TEXT
-            and isinstance(seed_data, dict)
-            and ("expected str" in msg or "got dict" in msg or "query argument" in msg)
-        ):
+        # NOT gated on the flag: a concurrent call that built its dict payload before another call flipped the
+        # flag fails the same way and must be retried too (two concurrent publishes hit exactly that).
+        if isinstance(seed_data, dict) and ("expected str" in msg or "got dict" in msg or "query argument" in msg):
             _SEED_DATA_FORCE_TEXT = True
             retry_values = dict(values)
             retry_values["seed_data"] = json.dumps(seed_data or {})
@@ -1912,6 +1911,132 @@ def _is_active_seed_unique_violation(exc: BaseException) -> bool:
     )
 
 
+def _seed_publish_locks_enabled() -> bool:
+    """The publish lock is a Postgres advisory lock; SQLite (tests, local dev) serializes its writers anyway."""
+    return bool(_db_core.IS_POSTGRES)
+
+
+def _seed_publish_lock_keys(*, market: Any, tool: Any, urls: Iterable[Optional[str]]) -> List[str]:
+    """One key per URL the publish supersedes on, in a fixed order so two publishes never deadlock.
+
+    The supersede matches `destination_url IN (:match_url, :dest)` within a (market, tool), so two publishes
+    whose URL sets share one URL can each take the other's row down: they share that URL's key and run one
+    after the other. A hash collision between unrelated keys only makes two publishes wait for each other.
+    """
+    return sorted({f"external_seed_publish|{market or ''}|{tool or ''}|{url}" for url in urls if url})
+
+
+async def _lock_seed_publish_destination(*, market: Any, tool: Any, urls: Iterable[Optional[str]]) -> None:
+    """Take the destination's publish lock for the rest of the CURRENT transaction (review BD-1)."""
+    if not _seed_publish_locks_enabled():
+        return
+    for key in _seed_publish_lock_keys(market=market, tool=tool, urls=urls):
+        await database.execute("SELECT pg_advisory_xact_lock(hashtext(:lock_key))", {"lock_key": key})
+
+
+async def _publish_seed(
+    *,
+    seed_id: str,
+    market: Any,
+    tool: Any,
+    external_product_id: Any,
+    destination_url: Optional[str],
+    canonical_url: Optional[str],
+    update_sql: str,
+    update_values: Dict[str, Any],
+) -> None:
+    """THE PUBLISH STEP: a seed that was not served becomes served. Every door that turns a seed `active` runs
+    this one function: `PATCH /external-seeds/{id}` with `status=active`, an audit-queue APPROVE of a draft, and a
+    CSV upsert whose `status` column says `active` for an existing seed that is not live.
+
+    It does what a create of a live seed does, in ONE transaction, under the destination's lock:
+      1. the per-destination advisory lock, so two publishes for one destination run one after the other (two
+         drafts with DIFFERENT ids for one URL would otherwise both go live: under READ COMMITTED each supersede
+         misses the other's uncommitted row, and the active-unique index keys on the id, not the destination);
+      2. the conflict check: a live seed that holds this (market, tool, external_product_id) for ANOTHER
+         destination is a clear 409 naming it;
+      3. the supersede: the other live seeds of THIS destination are disabled;
+      4. the row's own UPDATE (`update_sql`, which must write `status = 'active'`).
+    A 409 or any failure rolls all of it back. An active-unique collision is a 409, never an unhandled 500.
+    The caller projects the published seed afterwards (`_project_published_seed`); a projection is a mirror,
+    best-effort and post-commit.
+    """
+    match_url = canonical_url or destination_url
+    try:
+        async with database.transaction():
+            await _lock_seed_publish_destination(market=market, tool=tool, urls=(match_url, destination_url))
+            holder = await database.fetch_one(
+                """
+                SELECT id
+                FROM external_product_seeds
+                WHERE status = 'active'
+                  AND id <> :id
+                  AND market = :market
+                  AND tool = :tool
+                  AND external_product_id = :external_product_id
+                  AND destination_url NOT IN (:match_url, :dest)
+                LIMIT 1
+                """,
+                {
+                    "id": seed_id,
+                    "market": market,
+                    "tool": tool,
+                    "external_product_id": external_product_id,
+                    "match_url": match_url,
+                    "dest": destination_url,
+                },
+            )
+            if holder:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": dict(holder).get("id")},
+                )
+            await database.execute(
+                """
+                UPDATE external_product_seeds
+                SET status = 'disabled',
+                    notes = COALESCE(notes, '') || :note,
+                    updated_at = NOW()
+                WHERE id <> :id
+                  AND status = 'active'
+                  AND market = :market
+                  AND tool = :tool
+                  -- As create: only seeds for THIS destination, never one matched through a canonical.
+                  AND destination_url IN (:match_url, :dest)
+                """,
+                {
+                    "id": seed_id,
+                    "market": market,
+                    "tool": tool,
+                    "match_url": match_url,
+                    "dest": destination_url,
+                    "note": f" superseded_by:{seed_id}",
+                },
+            )
+            await _execute_seed_data_stmt(update_sql, update_values)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _is_active_seed_unique_violation(exc):
+            raise HTTPException(status_code=409, detail={"error": "SEED_ACTIVE_CONFLICT"}) from exc
+        raise
+
+
+async def _project_published_seed(seed_id: str, *, price_source: Optional[str]) -> Dict[str, Any]:
+    """Project a seed that is (now) served onto the surfaces a buyer reads; best-effort and post-write.
+
+    The projection is a mirror: failing to mirror must never fail the authorized write that came before it.
+    """
+    try:
+        return await _project_refreshed_seed_to_serving_surfaces(seed_id, price_source=price_source)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "employee seed publish/edit: serving-surface projection failed for seed_id=%r",
+            seed_id, exc_info=True,
+        )
+        return {}
+
+
 class CreateExternalSeedRequest(BaseModel):
     destination_url: str = Field(..., min_length=1)
     market: Optional[str] = None
@@ -2597,6 +2722,7 @@ async def _run_external_seed_import_task(
         stats = {
             "duration_ms": duration_ms,
             "created": result.created,
+            "created_as_draft": result.createdAsDraft,
             "updated": result.updated,
             "errors_count": len(result.errors or []),
             "seed_ids_count": len(result.seedIds or []),
@@ -2672,6 +2798,8 @@ async def get_external_seed_import_task(
             "tool": data.get("tool"),
             "mode": data.get("mode"),
             "created": int(data.get("created_count") or 0),
+            # Of `created`, the drafts (the task table has no column for it; it rides in `stats`).
+            "createdAsDraft": int(_ensure_json_obj(data.get("stats")).get("created_as_draft") or 0),
             "updated": int(data.get("updated_count") or 0),
             "errors": [str(x) for x in _ensure_json_list(data.get("errors")) if str(x)],
             "warnings": [str(x) for x in _ensure_json_list(_ensure_json_obj(data.get("stats")).get("warnings")) if str(x)],
@@ -2776,7 +2904,8 @@ async def _import_external_seeds_csv_text(
       - utm_template, partner_type, disclosure_text, notes
       - attached_product_key, attached_variant_id
       - status (active|disabled): applied to an EXISTING seed. A NEW seed is created as a draft (or
-        disabled when the column says so) and is served only once published (FIX_PLAN D-11).
+        disabled when the column says so) and is served only once published (FIX_PLAN D-11). `active` on an
+        existing seed that is not live publishes it through `_publish_seed`, the same checked step as a PATCH.
     """
     await _ensure_external_seeds_table()
 
@@ -3377,10 +3506,25 @@ async def _import_external_seeds_csv_text(
                         update_values["attached_variant_id"] = attached_variant_id or "∅"
                         set_clauses.append("attached_variant_id = :attached_variant_id")
 
-                    await _execute_seed_data_stmt(
-                        f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
-                        update_values,
-                    )
+                    update_sql = f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id"
+                    if status == "active" and _seed_status_of(existing) != "active":
+                        # A PUBLISH (review BD-3): an `active` column on a seed that is not served (a draft, or one
+                        # taken down) runs the one publish step, as `PATCH status=active` does: the destination
+                        # lock, the 409 conflict check and the supersede, in one transaction with this UPDATE.
+                        # A 409 is this row's error and changes nothing; a published seed is then projected.
+                        await _publish_seed(
+                            seed_id=seed_id,
+                            market=existing.get("market"),
+                            tool=existing.get("tool"),
+                            external_product_id=update_values["external_product_id"],
+                            destination_url=dest,
+                            canonical_url=canonical_url_update,
+                            update_sql=update_sql,
+                            update_values=update_values,
+                        )
+                        await _project_published_seed(seed_id, price_source=None)
+                    else:
+                        await _execute_seed_data_stmt(update_sql, update_values)
                     updated += 1
                     seed_ids.append(seed_id)
                     continue
@@ -3561,6 +3705,21 @@ async def preview_external_seed(
     }
 
 
+#: What the audit queue lists by default: the served seeds AND the drafts awaiting review (owner decision ED-2: an
+#: APPROVE verdict on a draft publishes it). `?status=` takes one status or a comma-separated list.
+AUDIT_QUEUE_DEFAULT_STATUSES = ("active", NEW_EMPLOYEE_SEED_STATUS)
+
+
+def _audit_queue_statuses(status: Optional[str]) -> List[str]:
+    """`?status=` as a de-duplicated list, trimmed and lower-cased; blank means the default (live + drafts)."""
+    out: List[str] = []
+    for part in str(status or "").split(","):
+        value = part.strip().lower()
+        if value and value not in out:
+            out.append(value)
+    return out or list(AUDIT_QUEUE_DEFAULT_STATUSES)
+
+
 def _build_external_seed_audit_where_clauses(
     *,
     q: Optional[str],
@@ -3570,8 +3729,15 @@ def _build_external_seed_audit_where_clauses(
     market: Optional[str],
     seed_id: Optional[str],
 ) -> tuple[list[str], Dict[str, Any]]:
-    where = ["status = :status"]
-    values: Dict[str, Any] = {"status": status}
+    statuses = _audit_queue_statuses(status)
+    values: Dict[str, Any] = {}
+    if len(statuses) == 1:
+        where = ["status = :status"]
+        values["status"] = statuses[0]
+    else:
+        names = [f"status_{i}" for i in range(len(statuses))]
+        where = [f"status IN ({', '.join(':' + n for n in names)})"]
+        values.update(dict(zip(names, statuses)))
 
     if attached is True:
         where.append("attached_product_key IS NOT NULL")
@@ -3794,7 +3960,7 @@ async def _delete_employee_pci_kb_scope_review_row(sku_key: str) -> None:
 async def list_external_seed_audit_queue(
     q: Optional[str] = Query(default=None),
     attached: Optional[bool] = Query(default=None),
-    status: str = Query(default="active"),
+    status: str = Query(default=",".join(AUDIT_QUEUE_DEFAULT_STATUSES)),
     merchant_id: Optional[str] = Query(default=None),
     domain: Optional[str] = Query(default=None),
     market: Optional[str] = Query(default=None),
@@ -3807,9 +3973,18 @@ async def list_external_seed_audit_queue(
 ):
     await _ensure_external_seeds_table()
     if merchant_id:
-        inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=status)
+        # The merchant inventory reads one status at a time; the queue's statuses are read in turn, in order.
+        inventory_rows: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for one_status in _audit_queue_statuses(status):
+            inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=one_status)
+            for inv_row in inventory["rows"]:
+                inv_id = str(inv_row.get("id") or "")
+                if inv_id and inv_id not in seen_ids:
+                    seen_ids.add(inv_id)
+                    inventory_rows.append(inv_row)
         rows = filter_referral_inventory_rows(
-            inventory["rows"],
+            inventory_rows,
             q=q,
             attached=attached,
             domain=domain,
@@ -3836,7 +4011,9 @@ async def list_external_seed_audit_queue(
             result,
             severity=severity or "",
             anomaly_type=anomaly_type or "",
-            flagged_only=bool(flagged_only),
+            # A draft awaits a verdict whether or not the machine audit flagged it, so `flagged_only` never
+            # hides one (an explicit severity / anomaly filter still applies).
+            flagged_only=bool(flagged_only) and _seed_status_of(row) != NEW_EMPLOYEE_SEED_STATUS,
         )
     ]
 
@@ -3897,6 +4074,87 @@ async def get_external_seed_audit(
     }
 
 
+class ExternalSeedAuditVerdictRequest(BaseModel):
+    verdict: Literal["approve", "reject"]
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+def _audit_verdict_note(verdict: str, *, reviewer: str, reason: Optional[str]) -> str:
+    """The trace a verdict leaves on the seed's notes: who decided what, and why when they said."""
+    note = f" audit_{verdict}:{reviewer or 'unknown'}"
+    cleaned = " ".join(str(reason or "").split())[:200]
+    return f"{note} ({cleaned})" if cleaned else note
+
+
+@router.post("/external-seeds/{seed_id}/audit-verdict")
+async def record_external_seed_audit_verdict(
+    seed_id: str,
+    body: ExternalSeedAuditVerdictRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    """The audit queue's verdict on a DRAFT (owner decision ED-2).
+
+    * `approve` publishes the draft through `_publish_seed`, the same step as `PATCH status=active`: the
+      destination lock, the 409 `SEED_ACTIVE_CONFLICT` check, the supersede of the destination's other live seeds
+      in one transaction; then the seed is projected. A 409 changes nothing. Approving a seed that is already
+      live is a no-op success.
+    * `reject` keeps the draft a draft (not served, not projected) and records the verdict on its notes.
+
+    Any other seed (disabled, paused, ...) is a 409 `SEED_NOT_A_DRAFT`: a verdict never brings a seed someone took
+    down back to life, and a live seed is taken down with `PATCH status=disabled`.
+    """
+    await _ensure_external_seeds_table()
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    row = dict(row)
+    current_status = _seed_status_of(row)
+    verdict = body.verdict
+
+    if verdict == "approve" and current_status == "active":
+        return {"status": "success", "verdict": verdict, "seed_status": "active", "published": False, "projected": {}}
+    if current_status != NEW_EMPLOYEE_SEED_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "SEED_NOT_A_DRAFT", "seed_status": current_status, "verdict": verdict},
+        )
+
+    note = _audit_verdict_note(verdict, reviewer=_employee_id_from_user(current_user), reason=body.reason)
+    if verdict == "reject":
+        await database.execute(
+            "UPDATE external_product_seeds SET notes = COALESCE(notes, '') || :note, updated_at = NOW() "
+            "WHERE id = :id",
+            {"id": seed_id, "note": note},
+        )
+        return {
+            "status": "success", "verdict": verdict, "seed_status": current_status, "published": False,
+            "projected": {},
+        }
+
+    # The identity a PATCH publish would give it: the stored id, else the seed_data's, else the URL's.
+    external_product_id = (
+        row.get("external_product_id")
+        or _ensure_json_obj(row.get("seed_data")).get("external_product_id")
+        or _stable_external_product_id(row.get("canonical_url") or row.get("destination_url") or "")
+    )
+    await _publish_seed(
+        seed_id=seed_id,
+        market=row.get("market"),
+        tool=row.get("tool"),
+        external_product_id=external_product_id,
+        destination_url=row.get("destination_url"),
+        canonical_url=row.get("canonical_url"),
+        update_sql=(
+            "UPDATE external_product_seeds SET status = 'active', external_product_id = :external_product_id, "
+            "notes = COALESCE(notes, '') || :note, updated_at = NOW() WHERE id = :id"
+        ),
+        update_values={"id": seed_id, "external_product_id": external_product_id, "note": note},
+    )
+    # As a PATCH publish with no price edit: projected, and no one vouches for the seed's price.
+    projected = await _project_published_seed(seed_id, price_source=None)
+    return {"status": "success", "verdict": verdict, "seed_status": "active", "published": True, "projected": projected}
+
+
 @router.post("/external-seeds/backfill-storefront")
 async def backfill_storefront_external_seeds(
     body: BackfillStorefrontExternalSeedsRequest,
@@ -3950,15 +4208,22 @@ async def backfill_storefront_external_seeds(
     created = 0
     updated = 0
     skipped = 0
+    # Of `created` / `updated`, the seeds that are drafts: stored, not served until approved (FIX_PLAN D-11), so the
+    # portal can say "N drafts created" instead of letting a draft-only run look like a run that made nothing usable.
+    created_as_draft = 0
+    updated_as_draft = 0
     items: List[Dict[str, Any]] = []
     for candidate in candidates:
         result = await _upsert_storefront_referral_seed_candidate(candidate, employee_id=employee_id)
         items.append(result)
         action = str(result.get("action") or "")
+        is_draft = _seed_status_of(result) == NEW_EMPLOYEE_SEED_STATUS
         if action == "created":
             created += 1
+            created_as_draft += int(is_draft)
         elif action == "updated":
             updated += 1
+            updated_as_draft += int(is_draft)
         else:
             skipped += 1
 
@@ -3971,7 +4236,9 @@ async def backfill_storefront_external_seeds(
         "dry_run": False,
         "candidate_count": len(candidates),
         "created": created,
+        "created_as_draft": created_as_draft,
         "updated": updated,
+        "updated_as_draft": updated_as_draft,
         "skipped": skipped,
         "items": items[:20],
     }
@@ -5047,74 +5314,21 @@ async def update_external_seed(
     set_clauses.append("updated_at = NOW()")
 
     final_status = updates.get("status", current_status)
-    # PUBLISH: a seed that was not served becomes served. It does what a create of a live seed does: the
-    # other live seeds of its destination are superseded, and a live seed that already holds its
-    # (market, tool, external_product_id) is a clear 409, never an unhandled unique-index 500.
+    # PUBLISH: a seed that was not served becomes served, through `_publish_seed`, the one publish step (the
+    # destination lock, the 409 conflict check and the supersede, in one transaction with this UPDATE).
     publishing = final_status == "active" and current_status != "active"
     update_sql = f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id"
     if publishing:
-        final_market = updates.get("market", row.get("market"))
-        final_tool = updates.get("tool", row.get("tool"))
-        final_epid = updates.get("external_product_id") or row.get("external_product_id")
-        publish_dest = next_destination_url
-        publish_match_url = next_canonical_url or next_destination_url
-        holder = await database.fetch_one(
-            """
-            SELECT id
-            FROM external_product_seeds
-            WHERE status = 'active'
-              AND id <> :id
-              AND market = :market
-              AND tool = :tool
-              AND external_product_id = :external_product_id
-              AND destination_url NOT IN (:match_url, :dest)
-            LIMIT 1
-            """,
-            {
-                "id": seed_id,
-                "market": final_market,
-                "tool": final_tool,
-                "external_product_id": final_epid,
-                "match_url": publish_match_url,
-                "dest": publish_dest,
-            },
+        await _publish_seed(
+            seed_id=seed_id,
+            market=updates.get("market", row.get("market")),
+            tool=updates.get("tool", row.get("tool")),
+            external_product_id=updates.get("external_product_id") or row.get("external_product_id"),
+            destination_url=next_destination_url,
+            canonical_url=next_canonical_url,
+            update_sql=update_sql,
+            update_values=updates,
         )
-        if holder:
-            raise HTTPException(
-                status_code=409,
-                detail={"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": dict(holder).get("id")},
-            )
-        try:
-            async with database.transaction():
-                await database.execute(
-                    """
-                    UPDATE external_product_seeds
-                    SET status = 'disabled',
-                        notes = COALESCE(notes, '') || :note,
-                        updated_at = NOW()
-                    WHERE id <> :id
-                      AND status = 'active'
-                      AND market = :market
-                      AND tool = :tool
-                      -- As create: only seeds for THIS destination, never one matched through a canonical.
-                      AND destination_url IN (:match_url, :dest)
-                    """,
-                    {
-                        "id": seed_id,
-                        "market": final_market,
-                        "tool": final_tool,
-                        "match_url": publish_match_url,
-                        "dest": publish_dest,
-                        "note": f" superseded_by:{seed_id}",
-                    },
-                )
-                await _execute_seed_data_stmt(update_sql, updates)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            if _is_active_seed_unique_violation(exc):
-                raise HTTPException(status_code=409, detail={"error": "SEED_ACTIVE_CONFLICT"}) from exc
-            raise
     else:
         await _execute_seed_data_stmt(update_sql, updates)
 
@@ -5146,15 +5360,7 @@ async def update_external_seed(
     if final_status == "active" and (
         publishing or any(k in updates for k in ("price_amount", "price_currency", "availability"))
     ):
-        try:
-            projected = await _project_refreshed_seed_to_serving_surfaces(
-                seed_id, price_source="employee_edit" if price_edited else None
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "employee seed edit: serving-surface projection failed for seed_id=%r",
-                seed_id, exc_info=True,
-            )
+        projected = await _project_published_seed(seed_id, price_source="employee_edit" if price_edited else None)
 
     return {"status": "success", "projected": projected}
 
