@@ -15,13 +15,16 @@ from db.database import IS_POSTGRES, database
 import routes.agent_commerce_reap as reap
 from routes.agent_auth import get_agent_context
 from routes.agent_user_auth import get_agent_user_context
+from services.seller_identity import resolve_seed_seller_identity
 
-DOMAIN = "judydoll.com"
+DOMAIN = "store.example"
 EXT = "ext_0f95730ee5ba05a6b7957ada"
 PRODUCT = "prod::external_seed::external_seed::" + EXT
 SKU = PRODUCT + "::sku_58ae6f8de2c8797993f2"
-VARIANT = "49819267301653"
-SELLER = "merch_obs_a25cbba37ef98c52"
+VARIANT = "40000000000001"
+BRAND = "Brand A"
+# The observed seller id the repo mints for this brand on this storefront (what the mirror writes).
+SELLER = resolve_seed_seller_identity(brand=BRAND, domain=DOMAIN)["merchant_id"]
 SEED = "reap_prepare_owned_seed"
 BASE = "/agent/v2/commerce/reap/purchases/prepare"
 
@@ -101,8 +104,8 @@ async def seed(monkeypatch, *, proof_age_days=0, source="external_product_seeds_
     monkeypatch.setenv("REAP_AGENTIC_CART_LINK_ENABLED", "1")
     monkeypatch.delenv("REAP_AGENTIC_CART_LINK_ENRICHMENT_ENABLED", raising=False)
     await database.execute(
-        "INSERT INTO catalog_products (product_key,merchant_id,platform,source_product_id,title,brand,source_domain,source_system,source_ref,seed_kind) VALUES (:pk,:seller,'external_seed',:ext,'Lip Ink','Judydoll',:domain,:source,:seed,'self')",
-        {"pk": PRODUCT, "seller": SELLER, "ext": EXT, "domain": DOMAIN, "source": source, "seed": SEED},
+        "INSERT INTO catalog_products (product_key,merchant_id,platform,source_product_id,title,brand,source_domain,source_system,source_ref,seed_kind) VALUES (:pk,:seller,'external_seed',:ext,'Lip Ink',:brand,:domain,:source,:seed,'self')",
+        {"pk": PRODUCT, "seller": SELLER, "ext": EXT, "brand": BRAND, "domain": DOMAIN, "source": source, "seed": SEED},
     )
     await database.execute(
         "INSERT INTO catalog_skus (sku_key,product_key,merchant_id,platform,source_product_id,source_variant_id,title,currency) VALUES (:sku,:pk,:seller,'external_seed',:ext,:variant,'Selected shade','USD')",
@@ -112,12 +115,12 @@ async def seed(monkeypatch, *, proof_age_days=0, source="external_product_seeds_
         "INSERT INTO catalog_offers (offer_id,sku_key,product_key,merchant_id,currency,merchant_effective_price,availability) VALUES ('prepare-offer',:sku,:pk,:seller,'USD',:price,'in_stock')",
         {"sku": SKU, "pk": PRODUCT, "seller": SELLER, "price": price},
     )
-    sd = {"snapshot": {"brand": "Judydoll", "storefront_platform": "shopify", "storefront_platform_source": "products_js_v1", "variants": [{"title": "Selected shade", "price": price, "shopify_variant_id": VARIANT}]}}
+    sd = {"snapshot": {"brand": BRAND, "storefront_platform": "shopify", "storefront_platform_source": "products_js_v1", "variants": [{"title": "Selected shade", "price": price, "shopify_variant_id": VARIANT}]}}
     if proof:
-        sd["snapshot"]["shopify_cart_proof"] = {"source": "products_js_v1", "product_js_url": "https://judydoll.com/products/lip-ink.js", "live_variant_count": 1, "variant_id": VARIANT, "checked_at": (datetime.now(timezone.utc) - timedelta(days=proof_age_days)).isoformat()}
+        sd["snapshot"]["shopify_cart_proof"] = {"source": "products_js_v1", "product_js_url": f"https://{DOMAIN}/products/lip-ink.js", "live_variant_count": 1, "variant_id": VARIANT, "checked_at": (datetime.now(timezone.utc) - timedelta(days=proof_age_days)).isoformat()}
     await database.execute(
-        "INSERT INTO external_product_seeds (id,status,domain,market,destination_url,attached_product_key,seed_data) VALUES (:id,'active',:domain,'US','https://judydoll.com/products/lip-ink',:pk,:data)",
-        {"id": SEED, "domain": DOMAIN, "pk": PRODUCT, "data": json.dumps(sd)},
+        "INSERT INTO external_product_seeds (id,status,domain,market,destination_url,attached_product_key,seed_data) VALUES (:id,'active',:domain,'US',:url,:pk,:data)",
+        {"id": SEED, "domain": DOMAIN, "url": f"https://{DOMAIN}/products/lip-ink", "pk": PRODUCT, "data": json.dumps(sd)},
     )
     await database.execute("INSERT INTO tierb_cart_link_eligibility (shop_domain,market,verdict,checked_at) VALUES (:domain,'US','ELIGIBLE',CURRENT_TIMESTAMP)", {"domain": DOMAIN})
 

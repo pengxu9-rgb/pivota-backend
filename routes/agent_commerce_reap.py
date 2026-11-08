@@ -2224,8 +2224,8 @@ def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str,
     spelled with the URL prefix is refused, so none hashes like one).
 
     A URL names a product page, never a variant: the request must name its variant by `variant_id`, and
-    a `variant=` in the URL's query must BE it (`merchant_item.check_url_variant`), so the query the
-    normalisation drops can never pick a different variant than the one bought.
+    a `variant=` in the URL's query or fragment must BE it (`merchant_item.check_url_variant`), so the
+    query and fragment the normalisation drops can never pick a different variant than the one bought.
     """
     if req.product_url is not None:
         normalized = merchant_item.normalize_product_url(req.product_url, merchant_host)

@@ -921,7 +921,7 @@ async def test_a_payload_that_moved_between_read_and_write_rolls_everything_back
 
 
 async def test_a_seed_about_this_variant_moves_its_placeholder_beside_a_real_sku(client, monkeypatch):
-    """Staging, 2026-10-07 (Judydoll): the seed lists ONE of the storefront's live shades (a named
+    """Staging, 2026-10-07: the seed lists ONE of the storefront's live shades (a named
     proof, 8 live) and the placeholder -- the projection of the seed's price, which moves -- stayed
     at the old price, so the product view kept showing it."""
     await refused_at(client, monkeypatch, live=1499)
