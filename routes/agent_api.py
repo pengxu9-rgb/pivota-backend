@@ -8156,39 +8156,10 @@ async def agent_get_product(
         if not _context_can_access_merchant(context, merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # Special handling for Platform Orders products (SKU-xxx format)
-        # These are from Amazon/Temu and don't exist in Shopify/Wix cache
-        if product_id.startswith('SKU-'):
-            logger.info(f"Returning mock product for Platform Order SKU: {product_id}")
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id
-            )
-            return {
-                "status": "success",
-                "product": {
-                    "id": product_id,
-                    "title": f"Platform Order Product {product_id}",
-                    "price": 10.00,  # Default price, actual price is in order data
-                    "currency": "USD",
-                    "platform": "shopify",  # Mock as shopify for ACP compatibility
-                    "stock": 999,
-                    "available": True,
-                    "variants": [{
-                        "id": product_id,
-                        "title": "Default",
-                        "price": 10.00,
-                        "sku": product_id,
-                        "available": True
-                    }]
-                },
-                "metadata": {
-                    "detail_source": "upstream",
-                },
-            }
-        
+        # A `SKU-*` id gets no special case. This route used to answer any such id with a made-up product
+        # (10.00 USD, stock 999) for "Platform Orders" lines; nothing calls it that way, and a partner was
+        # served a fake price (FIX_PLAN D-10). It now takes the same lookup, and the same 404, as any id.
+        #
         # Detail source order:
         # 1) fresh_cache
         # 2) upstream (realtime path)
