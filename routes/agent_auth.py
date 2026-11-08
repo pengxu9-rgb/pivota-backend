@@ -677,6 +677,13 @@ CHECKOUT_TOKEN_ROUTES: Dict[tuple, Optional[str]] = {
     ("POST", "/agent/v1/orders/{order_id}/confirm-payment"): "path",
     ("GET", "/agent/v1/orders/{order_id}/track"): "path",
     ("GET", "/agent/v1/checkout/prefill"): None,
+    # The /agent/v2 equivalents the gateway's token-only invoke operations call (PIVOTA-Agent
+    # CHECKOUT_TOKEN_INVOKE_OPERATIONS: preview_quote, create_order, submit_payment, get_order_status).
+    # Same binding as their v1 twins. No search route: a token is not a catalog credential.
+    ("POST", "/agent/v2/quotes/preview"): None,
+    ("POST", "/agent/v2/orders"): None,
+    ("POST", "/agent/v2/payments/checkout-sessions"): "body",
+    ("GET", "/agent/v2/orders/{order_id}/tracking"): "path",
 }
 
 _CHECKOUT_TOKEN_ROUTE_DENIED = "Checkout token not authorized for this endpoint"

@@ -20,7 +20,7 @@ from models.quote import QuotePreviewRequest
 from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
-from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
 from routes.agent_checkout_intents import (
     CheckoutIntentItem,
     CreateCheckoutIntentRequest,
@@ -1047,6 +1047,12 @@ async def create_order_v2(
         metadata["selected_payment_offer_id"] = body.selected_payment_offer_id
     if isinstance(body.payment_method_evidence, dict):
         metadata["payment_method_evidence"] = body.payment_method_evidence
+    token_payload = getattr(context, "checkout_token_payload", None)
+    if isinstance(token_payload, dict):
+        # An order created under a checkout token carries that token's intent, whatever the body
+        # says: that is what binds the order to the token (routes.agent_auth.checkout_token_may_use_order).
+        # agent_create_order stamps it again; this keeps the v2 metadata honest on its own.
+        metadata["intent_id"] = str(token_payload.get("intent_id") or "").strip() or None
     metadata = attach_traffic_taxonomy(
         metadata,
         build_traffic_taxonomy(
@@ -1148,6 +1154,9 @@ async def create_checkout_session_v2(
     from services.agent_governance import agent_governance
 
     order = await get_order(body.order_id)
+    # A checkout token may open a session only for its own order; checked before the not-found
+    # answer so a token cannot probe order ids (routes.agent_auth CHECKOUT_TOKEN_ROUTES "body").
+    ensure_checkout_token_order_access(context, order)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if str(order.get("agent_id") or "") != str(context.agent_id):

@@ -356,6 +356,17 @@ ALLOWED = [
     ("POST", "/agent/v1/orders/{order_id}/confirm-payment"),
     ("GET", "/agent/v1/orders/{order_id}/track"),
     ("GET", "/agent/v1/checkout/prefill"),
+    # The /agent/v2 twins the gateway's token-only invoke operations call.
+    ("POST", "/agent/v2/quotes/preview"),
+    ("POST", "/agent/v2/orders"),
+    ("POST", "/agent/v2/payments/checkout-sessions"),
+    ("GET", "/agent/v2/orders/{order_id}/tracking"),
+]
+# Routes that carry the order id in the path and are checked in the auth dependency.
+PATH_BOUND = [
+    "/agent/v1/orders/{order_id}/confirm-payment",
+    "/agent/v1/orders/{order_id}/track",
+    "/agent/v2/orders/{order_id}/tracking",
 ]
 DENIED = [
     ("GET", "/agent/v1/orders/events"),
@@ -367,6 +378,13 @@ DENIED = [
     ("POST", "/agent/v1/buyers/merge"),
     ("POST", "/agent/v1/payments/authorize"),
     ("GET", "/agent/v1/payments/{payment_id}"),
+    # v2 siblings of the allowlisted routes, and search: a token is not a catalog credential.
+    ("GET", "/agent/v2/orders/{order_id}"),
+    ("POST", "/agent/v2/orders/{order_id}/refunds"),
+    ("GET", "/agent/v2/quotes/{quote_id}"),
+    ("POST", "/agent/v2/products/search"),
+    ("GET", "/agent/v2/merchants/capabilities"),
+    ("GET", "/agent/v1/products/search"),
 ]
 
 
@@ -406,7 +424,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
 
 
 def _call(client: TestClient, method: str, path: str, token: str, **ids: str):
-    url = path.format(order_id=ids.get("order_id", "ord_mine"), payment_id="pay_1")
+    url = path.format(order_id=ids.get("order_id", "ord_mine"), payment_id="pay_1", quote_id="q_1")
     return client.request(method, url, headers={"X-Checkout-Token": token}, json={})
 
 
@@ -419,19 +437,20 @@ def test_token_reaches_each_allowlisted_route_for_its_own_order(client, method, 
 
 
 @pytest.mark.parametrize("order_id", ["ord_mine", "ord_mine_2"])
-@pytest.mark.parametrize("path", ["/agent/v1/orders/{order_id}/confirm-payment", "/agent/v1/orders/{order_id}/track"])
+@pytest.mark.parametrize("path", PATH_BOUND)
 def test_token_reaches_every_order_created_under_its_intent(client, path, order_id) -> None:
-    method = "GET" if path.endswith("/track") else "POST"
+    method = "POST" if path.endswith("/confirm-payment") else "GET"
 
     resp = _call(client, method, path, _mint(), order_id=order_id)
 
     assert resp.status_code == 200, resp.text
 
 
-def test_token_minted_for_an_order_reaches_that_order(client) -> None:
+@pytest.mark.parametrize("path", ["/agent/v1/orders/{order_id}/track", "/agent/v2/orders/{order_id}/tracking"])
+def test_token_minted_for_an_order_reaches_that_order(client, path) -> None:
     token = _mint(order_id="ord_resumed")
 
-    resp = _call(client, "GET", "/agent/v1/orders/{order_id}/track", token, order_id="ord_resumed")
+    resp = _call(client, "GET", path, token, order_id="ord_resumed")
 
     assert resp.status_code == 200, resp.text
 
@@ -445,9 +464,9 @@ def test_token_is_refused_on_lists_events_refund_cancel_and_other_routes(client,
 
 
 @pytest.mark.parametrize("order_id", ["ord_other_intent", "ord_api_key", "ord_b_same_intent", "ord_missing"])
-@pytest.mark.parametrize("path", ["/agent/v1/orders/{order_id}/confirm-payment", "/agent/v1/orders/{order_id}/track"])
+@pytest.mark.parametrize("path", PATH_BOUND)
 def test_token_is_refused_on_another_order(client, path, order_id) -> None:
-    method = "GET" if path.endswith("/track") else "POST"
+    method = "POST" if path.endswith("/confirm-payment") else "GET"
 
     resp = _call(client, method, path, _mint(), order_id=order_id)
 
@@ -471,10 +490,12 @@ def test_allowlist_matches_the_real_route_templates() -> None:
     import routes.agent_api as agent_api
     import routes.agent_checkout_intents as intents
     import routes.agent_payment_sdk as payments
+    import routes.agent_sdk_fixed as sdk_fixed
+    import routes.agent_v2 as agent_v2
     import routes.quote_routes as quotes
 
     real = set()
-    for router in (agent_api.router, intents.router, payments.router, quotes.router):
+    for router in (agent_api.router, intents.router, payments.router, quotes.router, agent_v2.router, sdk_fixed.router):
         for route in router.routes:
             for method in getattr(route, "methods", None) or ():
                 real.add((method, route.path))
@@ -482,6 +503,12 @@ def test_allowlist_matches_the_real_route_templates() -> None:
     assert set(agent_auth.CHECKOUT_TOKEN_ROUTES) == set(ALLOWED)
     assert set(ALLOWED) <= real
     assert set(DENIED) <= real
+    path_bound = {("POST" if p.endswith("/confirm-payment") else "GET", p) for p in PATH_BOUND}
+    assert {k for k, v in agent_auth.CHECKOUT_TOKEN_ROUTES.items() if v == "path"} == path_bound
+
+
+def test_the_allowlist_holds_no_search_route() -> None:
+    assert not [k for k in agent_auth.CHECKOUT_TOKEN_ROUTES if "search" in k[1]]
 
 
 @pytest.mark.parametrize(
@@ -624,3 +651,129 @@ async def test_intent_minted_for_an_order_binds_its_token_to_that_order(monkeypa
     claims = agent_auth.verify_checkout_token_claims(out["checkout_token"])
     assert claims["order_id"] == "ord_resumed"
     assert claims["intent_id"] == out["intent_id"]
+
+
+# /agent/v2: checkout-session creation takes the order id in the body; order create stamps the intent.
+
+
+@pytest.fixture()
+def v2_handler(monkeypatch: pytest.MonkeyPatch):
+    import routes.agent_v2 as agent_v2
+
+    async def get_order(order_id):
+        return TOKEN_ORDERS.get(order_id)
+
+    async def past_the_binding(*_a, **_k):
+        raise HTTPException(status_code=418, detail="past the binding check")
+
+    monkeypatch.setattr(agent_v2, "get_order", get_order)
+    monkeypatch.setattr(agent_v2, "validate_request_compat", past_the_binding)
+    return agent_v2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order_id", ["ord_other_intent", "ord_api_key", "ord_b_same_intent", "ord_missing"])
+async def test_v2_checkout_session_refuses_a_token_on_another_order(v2_handler, order_id) -> None:
+    body = v2_handler.CreateCheckoutSessionBody(order_id=order_id)
+
+    with pytest.raises(HTTPException) as exc:
+        await v2_handler.create_checkout_session_v2(body, context=_token_ctx(), agent_user=None)
+
+    # 403 for a missing order too: a token cannot tell which order ids exist.
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Checkout token not authorized for this order"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order_id", ["ord_mine", "ord_mine_2"])
+async def test_v2_checkout_session_lets_a_token_through_on_its_own_order(v2_handler, order_id) -> None:
+    body = v2_handler.CreateCheckoutSessionBody(order_id=order_id)
+
+    with pytest.raises(HTTPException) as exc:
+        await v2_handler.create_checkout_session_v2(body, context=_token_ctx(), agent_user=None)
+
+    assert exc.value.status_code == 418
+
+
+@pytest.mark.asyncio
+async def test_v2_checkout_session_is_unchanged_for_api_key_callers(v2_handler) -> None:
+    body = v2_handler.CreateCheckoutSessionBody(order_id="ord_missing")
+    ctx = SimpleNamespace(agent_id=AGENT_A)
+
+    with pytest.raises(HTTPException) as exc:
+        await v2_handler.create_checkout_session_v2(body, context=ctx, agent_user=None)
+
+    assert exc.value.status_code == 404
+
+
+def _v2_order_harness(monkeypatch: pytest.MonkeyPatch):
+    import routes.agent_v2 as agent_v2
+    from services.quote_service import QuoteSnapshot
+
+    async def load_quote(self: Any, *, quote_id: str) -> QuoteSnapshot:
+        now = datetime.now(timezone.utc)
+        return QuoteSnapshot(
+            quote_id=quote_id,
+            merchant_id=MERCHANT,
+            agent_id=AGENT_A,
+            expires_at=now + timedelta(minutes=10),
+            status="active",
+            engine="shopify_storefront_cart",
+            engine_ref="cart_1",
+            request_fingerprint="fp",
+            request_json={"items": [{"product_id": "p1", "variant_id": "v1", "quantity": 1}]},
+            snapshot_json={"currency": "USD"},
+            quote_hash_sha256="h",
+            debug_id="d",
+        )
+
+    captured: Dict[str, Any] = {}
+
+    async def create_order(**kwargs: Any) -> Dict[str, Any]:
+        captured["metadata"] = kwargs["order_request"].metadata
+        captured["context"] = kwargs["context"]
+        return {"status": "success", "order_id": "ord_mine"}
+
+    async def get_order(order_id):
+        return dict(TOKEN_ORDERS.get(order_id) or {}, items=[], currency="USD", status="pending")
+
+    monkeypatch.setattr(agent_v2.QuoteService, "load_active_quote_or_raise", load_quote)
+    monkeypatch.setattr(agent_v2, "agent_v1_create_order", create_order)
+    monkeypatch.setattr(agent_v2, "get_order", get_order)
+    body = agent_v2.CreateOrderBody(
+        quote_id="q_1",
+        buyer_context={
+            "customer_email": "buyer@example.com",
+            "shipping_address": {
+                "name": "Buyer",
+                "address_line1": "1 Main St",
+                "city": "San Francisco",
+                "state": "CA",
+                "postal_code": "94105",
+                "country": "US",
+            },
+        },
+        metadata={"intent_id": OTHER_INTENT},
+    )
+    return agent_v2, body, captured
+
+
+@pytest.mark.asyncio
+async def test_v2_order_create_under_a_token_carries_the_token_intent_not_the_body_one(monkeypatch) -> None:
+    agent_v2, body, captured = _v2_order_harness(monkeypatch)
+    ctx = _token_ctx()
+
+    await agent_v2.create_order_v2(body, BackgroundTasks(), context=ctx, agent_user=None)
+
+    assert captured["metadata"]["intent_id"] == INTENT
+    assert captured["context"] is ctx
+
+
+@pytest.mark.asyncio
+async def test_v2_order_create_by_an_api_key_keeps_its_metadata(monkeypatch) -> None:
+    agent_v2, body, captured = _v2_order_harness(monkeypatch)
+    ctx = SimpleNamespace(agent_id=AGENT_A)
+
+    await agent_v2.create_order_v2(body, BackgroundTasks(), context=ctx, agent_user=None)
+
+    assert captured["metadata"]["intent_id"] == OTHER_INTENT
