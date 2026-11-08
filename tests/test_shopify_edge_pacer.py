@@ -209,7 +209,13 @@ async def test_the_refresh_summary_is_unchanged_while_dark(monkeypatch) -> None:
     async def fake_batch(**kwargs):
         return {"status": "success", "rows": 3}
 
+    async def no_retention(**kwargs):
+        return {}
+
     monkeypatch.setattr(job, "run_external_referral_refresh_batch", fake_batch)
+    # Retention runs on every refresh run and reads the deal-lane tables through the shared database, which the
+    # Postgres copy of this file never connects (its rules fail and are counted). Pinned in test_deal_code_retention*.
+    monkeypatch.setattr(job.deal_code_retention, "run", no_retention)
     assert await job.run_daily_external_referral_refresh(limit=3) == {"status": "success", "rows": 3}
     monkeypatch.setenv(sep.ENABLED_ENV, "1")
     lit = await job.run_daily_external_referral_refresh(limit=3)

@@ -111,6 +111,7 @@ import db.tierb_cart_link_eligibility as tierb_eligibility
 import db.merchant_purchasability as purchasability
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
+import services.merchant_item_resolver as merchant_item
 from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
 from db.commerce_attribution import surface_click_events
 from db.database import IS_POSTGRES, database
@@ -237,6 +238,9 @@ _REFUSAL_STATUS: Dict[str, int] = {
     "merchant_not_purchasable": 409,
     "buyer_unlinked": 409,
     "row_not_found": 409,
+    # A product URL that names more than one live catalog product (services/merchant_item_resolver.py):
+    # never a pick. 409 like `row_not_found`: the body is fine, the catalog is not.
+    "product_ambiguous": 409,
     "row_unpriced": 409,
     "price_changed": 409,
     # Tier B: two catalog spellings of the ONE chosen Shopify variant carry different usable
@@ -510,7 +514,12 @@ class ReapBuyer(BaseModel):
 class StartPurchaseRequest(BaseModel):
     item_source: Literal["reap_variant", "cart_link"] = "reap_variant"
     merchant_domain: str = Field(..., min_length=1, max_length=255)
-    product_key: str = Field(..., min_length=1)
+    #: Exactly one of `product_key` (OUR catalog key) and `product_url` (CART-LINK ONLY: the merchant's
+    #: own product page, as a search card's `canonical_url` shows it). A URL is a lookup key only: the
+    #: route finds OUR record for it (services/merchant_item_resolver.py) after the replay lookup, and
+    #: everything the purchase uses is read from that record, exactly as for a `product_key`.
+    product_key: Optional[str] = Field(None, min_length=1)
+    product_url: Optional[StrictStr] = Field(None, min_length=1, max_length=merchant_item.MAX_PRODUCT_URL_CHARS)
     variant_key: Optional[str] = None
     #: CART-LINK ONLY, and never with `variant_key`: the buyer's chosen variant as the storefront
     #: numbers it (get_product's `variants[].variant_id`). The route resolves it to the catalog's own
@@ -561,6 +570,11 @@ class StartPurchaseRequest(BaseModel):
             raise ValueError("variant_id is a cart-link selector, never beside variant_key")
         return self
 
+    @model_validator(mode="after")
+    def one_product_selector(self):
+        _check_one_product_selector(self.product_key, self.product_url, self.item_source)
+        return self
+
 
 class RecoverPurchaseRequest(StartPurchaseRequest):
     # Recovery must recognize bodies accepted before strict create admission; it cannot spend.
@@ -572,12 +586,19 @@ class PreparePurchaseSelectionRequest(BaseModel):
 
     item_source: Literal["cart_link"]
     merchant_domain: StrictStr
-    product_key: StrictStr
+    #: Exactly one, as on create (`StartPurchaseRequest.product_url`).
+    product_key: Optional[StrictStr] = None
+    product_url: Optional[StrictStr] = Field(None, min_length=1, max_length=merchant_item.MAX_PRODUCT_URL_CHARS)
     variant_id: StrictStr
     quantity: StrictInt = Field(..., ge=1, le=svc.MAX_QUANTITY)
     market_country: StrictStr
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def one_product_selector(self):
+        _check_one_product_selector(self.product_key, self.product_url, self.item_source)
+        return self
 
 
 def _offer_code(value: Any) -> Optional[str]:
@@ -1907,7 +1928,8 @@ async def _load_cart_link_item(
     """Return server-priced cart item, seller identity, and Shopify variant, or refuse.
 
     The buyer/agent supplies only catalog keys. No caller URL, price, Shopify variant, or seller
-    identity is accepted. Mirrored seeds need an attached product and a sole variant proven by
+    identity is accepted HERE: a caller's `product_url` is only a lookup key, resolved to a catalog key
+    before this load (services/merchant_item_resolver.py), and never reaches it. Mirrored seeds need an attached product and a sole variant proven by
     storefront evidence. Numeric operator input alone cannot authorize a purchase.
 
     ENRICHMENT rows (option 2) take `_load_enrichment_cart_link_item` instead, and only while
@@ -2168,8 +2190,62 @@ def _default_return_url() -> str:
 
 
 #: The fingerprint's spelling of a `variant_id` selector. A sku key always starts with its product key
-#: (`prod::…`), so no `variant_key` can collide with it.
+#: (`prod::…`), and a `variant_key` spelled with this prefix is refused (`_variant_selector`), so none
+#: collides with it.
 _VARIANT_ID_HASH_PREFIX = "variant_id:"
+
+
+def _check_one_product_selector(product_key: Optional[str], product_url: Optional[str], item_source: str) -> None:
+    """Exactly one product selector; a URL only on the cart-link lane (the variant lane's products are the
+    payment partner's own keys, which no storefront URL names)."""
+    has_key = product_key is not None
+    has_url = product_url is not None
+    if has_key == has_url:
+        raise ValueError("name the product by exactly one of product_key and product_url")
+    if has_url and item_source != "cart_link":
+        raise ValueError("product_url is a cart-link selector")
+
+
+def _fingerprint_prefixes_live(req: Any) -> bool:
+    """Whether a key spelled with a selector's fingerprint prefix (`product_url:`, `variant_id:`) must be
+    refused: only where a `product_url` or `variant_id` request can exist, the cart-link lane with its dial
+    on. The hash holds `item_source`, so no other lane's request can share such a fingerprint, and with the
+    dial off every key request answers exactly as before these selectors (dark)."""
+    return getattr(req, "item_source", None) == "cart_link" and svc.is_cart_link_enabled()
+
+
+def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str, Optional[str]]:
+    """`(product_key, fingerprint_product, normalized_url)` from a create-shaped body.
+
+    THE `_variant_selector` RULE FOR THE PRODUCT: the fingerprint holds what the caller SENT. A
+    `product_key` is itself; a `product_url` is `product_url:<normalised URL>` with no key yet, resolved
+    to OUR record only after the replay lookup (`_resolved_product_key`), so a retry hashes the same
+    whatever the catalog says by then, and a URL request can never replay a key request (a `product_key`
+    spelled with the URL prefix is refused, so none hashes like one).
+
+    A URL names a product page, never a variant: the request must name its variant by `variant_id`, and
+    a `variant=` in the URL's query must BE it (`merchant_item.check_url_variant`), so the query the
+    normalisation drops can never pick a different variant than the one bought.
+    """
+    if req.product_url is not None:
+        normalized = merchant_item.normalize_product_url(req.product_url, merchant_host)
+        merchant_item.check_url_variant(req.product_url, getattr(req, "variant_id", None))
+        return None, merchant_item.PRODUCT_URL_HASH_PREFIX + normalized, normalized
+    product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+    if _fingerprint_prefixes_live(req) and product_key.startswith(merchant_item.PRODUCT_URL_HASH_ROOT):
+        raise svc.PurchaseRefused("invalid_request", "product_key is a catalog key, not a product URL")
+    return product_key, product_key, None
+
+
+async def _resolved_product_key(
+    product_key: Optional[str], normalized_url: Optional[str], market_country: str
+) -> str:
+    """The catalog key this request buys: the caller's own, or the ONE live record its URL names."""
+    if product_key is not None:
+        return product_key
+    return await merchant_item.resolve_product_key(
+        normalized_url=str(normalized_url), market_country=market_country
+    )
 
 
 def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optional[str]]:
@@ -2180,6 +2256,10 @@ def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optio
     if req.variant_id is not None:
         return None, _VARIANT_ID_HASH_PREFIX + req.variant_id
     key = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
+    if key is not None and _fingerprint_prefixes_live(req) and key.startswith(_VARIANT_ID_HASH_PREFIX):
+        # No sku key starts with it (they start with their product key): one that did would share a
+        # `variant_id` request's fingerprint.
+        raise svc.PurchaseRefused("invalid_request", "variant_key is a sku key, not a variant_id")
     return key, key
 
 
@@ -2882,7 +2962,7 @@ async def prepare_reap_purchase_selection(
             raise svc.PurchaseRefused("invalid_request") from None
         merchant_host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant_domain = _merchant_domain_key(merchant_host)
-        product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+        product_key, _hashed_product, product_url = _product_selector(req, merchant_host)
         variant_id = _identifier(req.variant_id, "variant_id", max_chars=20)
         if not re.fullmatch(r"[1-9][0-9]{0,19}", variant_id):
             raise svc.PurchaseRefused("invalid_request")
@@ -2893,6 +2973,7 @@ async def prepare_reap_purchase_selection(
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
             product_key=product_key, quantity=req.quantity, resolved=False,
+            product_pending=product_key is None,
         )
         if svc.is_cart_link_enrichment_enabled():
             # PostgreSQL refuses CREATE TABLE IF NOT EXISTS in a read-only transaction even when
@@ -2911,6 +2992,13 @@ async def prepare_reap_purchase_selection(
             await _refuse_if_merchant_disabled(merchant_domain=merchant_domain, market_country=market)
             if not await tierb_eligibility.is_cart_link_eligible(merchant_host, market):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if product_key is None:
+                # Inside the snapshot, after the merchant gates (see create).
+                product_key = await _resolved_product_key(None, product_url, market)
+                svc.enforce_pilot_scope(
+                    agent_id=agent_id, merchant_domain=merchant_domain, market_country=market,
+                    product_key=product_key, quantity=req.quantity, resolved=False,
+                )
             product = await database.fetch_one(
                 _CART_PRODUCT_SQL, {"product_key": product_key, "merchant_domain": merchant_host}
             )
@@ -3060,7 +3148,9 @@ async def start_reap_purchase(
         # Validated here, for BOTH lanes, so a host that is not a bare host name is refused
         # before any read.
         merchant_domain = _merchant_domain_key(merchant_host)
-        product_key = _identifier(req.product_key, "product_key", max_chars=1024)
+        # A `product_url` (like a `variant_id`) is resolved to the catalog below, after the replay
+        # lookup; the fingerprint keeps what was sent.
+        product_key, hashed_product, product_url = _product_selector(req, merchant_host)
         # A `variant_id` selector is resolved to the catalog's sku below, after the replay lookup;
         # the fingerprint keeps what was sent.
         variant_key, hashed_variant = _variant_selector(req)
@@ -3089,7 +3179,7 @@ async def start_reap_purchase(
 
         request_hash = _request_hash(
             merchant_domain=merchant_domain,
-            product_key=product_key,
+            product_key=hashed_product,
             variant_key=hashed_variant,
             quantity=int(req.quantity),
             email=buyer_email,
@@ -3172,10 +3262,14 @@ async def start_reap_purchase(
                 "invalid_request", "expected_unit_price_minor and expected_currency are required"
             )
 
+        # A `product_url` request is pre-checked here (everything but the product), and resolved to OUR
+        # record inside the cart-link branch, AFTER the merchant-level gates, so its refusal for a merchant
+        # we never enabled is the same `merchant_not_*` a `product_key` request gets, with no catalog read.
         svc.enforce_pilot_scope(
             agent_id=agent_id, merchant_domain=merchant_domain,
             market_country=str(shipping_address.get("country") or ""),
             product_key=product_key, quantity=req.quantity, resolved=False,
+            product_pending=product_key is None,
         )
 
         # PURCHASABILITY BEFORE EITHER LANE'S ELIGIBILITY, because it is the broader refusal:
@@ -3224,6 +3318,14 @@ async def start_reap_purchase(
                 merchant_host, market_country
             ):
                 raise svc.PurchaseRefused("merchant_not_eligible")
+            if product_key is None:
+                # A NEW attempt: the `product_url` becomes OUR record's key; nothing downstream sees the URL.
+                product_key = await _resolved_product_key(None, product_url, market_country)
+                svc.enforce_pilot_scope(
+                    agent_id=agent_id, merchant_domain=merchant_domain,
+                    market_country=str(shipping_address.get("country") or ""),
+                    product_key=product_key, quantity=req.quantity, resolved=False,
+                )
             if req.variant_id is not None:
                 variant_key = await _resolve_selected_variant_key(
                     merchant_domain=merchant_host, product_key=product_key,
@@ -3397,8 +3499,11 @@ async def start_reap_purchase(
         return _refused(exc)
 
 
-async def _validate_resume_selection(req, row, merchant, host, product, variant, market):
-    """Fresh admission for the SAME immutable item and price; creates no buyer/click/attempt."""
+async def _validate_resume_selection(req, row, merchant, host, product, variant, market, *, product_url=None):
+    """Fresh admission for the SAME immutable item and price; creates no buyer/click/attempt.
+
+    A `product_url` request (`product` None) is resolved after the merchant gates, as on create; the
+    record it names must be the row's, or `resume_selection_changed`."""
     if purchasability.is_enforcement_enabled() and not await purchasability.is_purchasable(merchant, market):
         raise svc.PurchaseRefused("merchant_not_purchasable")
     if req.item_source == "cart_link":
@@ -3407,6 +3512,8 @@ async def _validate_resume_selection(req, row, merchant, host, product, variant,
         await _refuse_if_merchant_disabled(merchant_domain=merchant, market_country=market)
         if not await tierb_eligibility.is_cart_link_eligible(host, market):
             raise svc.PurchaseRefused("merchant_not_eligible")
+        if product is None:
+            product = await _resolved_product_key(None, product_url, market)
         if req.variant_id is not None:
             variant = await _resolve_selected_variant_key(
                 merchant_domain=host, product_key=product, variant_id=req.variant_id, market_country=market)
@@ -3461,13 +3568,13 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
         host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
         merchant = _merchant_domain_key(host)
-        product = _identifier(req.product_key, "product_key", max_chars=1024)
+        product, hashed_product, product_url = _product_selector(req, host)
         variant, hashed_variant = _variant_selector(req)
         consent = _consent_version(req.buyer.consent_version)
         offer = _offer_code(req.offer_code)
         address = _buyer_address_for_client(req.buyer)
         email = str(req.buyer.email or "").strip()
-        request_hash = _request_hash(merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
+        request_hash = _request_hash(merchant_domain=merchant, product_key=hashed_product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=email, shipping_address=address,
             return_url=str(req.return_url or "").strip() or _default_return_url(), item_source=req.item_source,
             offer_code=offer, expected_unit_price_minor=req.expected_unit_price_minor, expected_currency=req.expected_currency)
@@ -3495,7 +3602,8 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         if linked is None or linked["reap_buyer_ref"] != row.get("buyer_ref"):
             raise svc.PurchaseRefused("buyer_unlinked")
         market = purchasability.normalize_market(req.buyer.shipping_address.country)
-        await _validate_resume_selection(req, row, merchant, host, product, variant, market)
+        await _validate_resume_selection(req, row, merchant, host, product, variant, market,
+                                         product_url=product_url)
         email, address = svc._validated_buyer(svc.BuyerContact(email=email, shipping_address=address))
         restored = await continuation.restore_contact(row, agent_id=agent, owner_hash=owner,
             request_key=key, request_hash=request_hash, email=email, address=address, offer_code=offer)
@@ -3536,12 +3644,14 @@ async def recover_reap_purchase(
         except (ValueError, ValidationError):
             raise svc.PurchaseRefused("invalid_request", "the recovery body did not validate")
         key = _identifier(req.idempotency_key, "idempotency_key", max_chars=128)
-        merchant = _merchant_domain_key(_identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower())
-        product = _identifier(req.product_key, "product_key", max_chars=1024)
+        recover_host = _identifier(req.merchant_domain, "merchant_domain", max_chars=255).lower()
+        merchant = _merchant_domain_key(recover_host)
+        # The fingerprint only: recovery never reads the catalog, so a `product_url` is not resolved.
+        _product, hashed_product, _url = _product_selector(req, recover_host)
         _variant, hashed_variant = _variant_selector(req)
         _consent_version(req.buyer.consent_version)  # Validation only; preserve stored consent.
         request_hash = _request_hash(
-            merchant_domain=merchant, product_key=product, variant_key=hashed_variant,
+            merchant_domain=merchant, product_key=hashed_product, variant_key=hashed_variant,
             quantity=int(req.quantity), email=str(req.buyer.email or "").strip(),
             shipping_address=_buyer_address_for_client(req.buyer),
             return_url=str(req.return_url or "").strip() or _default_return_url(),
