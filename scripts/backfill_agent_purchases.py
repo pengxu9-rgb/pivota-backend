@@ -7,6 +7,9 @@ copies only ids, owner columns and created_at: no PII, and it never touches a Re
 
     python scripts/backfill_agent_purchases.py            # write
     python scripts/backfill_agent_purchases.py --dry-run  # count only
+
+Exits 1 when any purchase could not be given a parent (each is logged; the last line counts what is
+still missing), 0 otherwise.
 """
 
 from __future__ import annotations
@@ -40,16 +43,20 @@ async def run(args: argparse.Namespace) -> int:
                 print(f"missing_parents=unknown ({type(exc).__name__}: is agent_purchases built yet?)")
             return 0
         await ledger.ensure_agent_purchase_schema()
-        total = 0
+        total = failed = 0
         for batch in range(args.max_batches):
             tally: Counter = Counter()
             parented = await ledger.backfill_reap_parents(limit=args.batch, tally=tally)
             total += parented
+            failed += tally["failed"]
             print(f"batch={batch} parented={parented} total={total} failed={tally['failed']} "
                   f"skipped_after_failure={tally['deferred']} stopped={tally['stopped']}")
-            if parented == 0:
+            # Done only when a batch neither parented nor failed: a batch whose rows all failed (and
+            # stopped) is followed by one that skips them, so failing rows cannot hide the rest.
+            if parented == 0 and not tally["failed"]:
                 break
-        return 0
+        print(f"done parented={total} failed={failed} missing_parents={await ledger.count_missing_reap_parents()}")
+        return 1 if failed else 0
     finally:
         await database.disconnect()
 

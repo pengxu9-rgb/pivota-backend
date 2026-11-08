@@ -276,11 +276,17 @@ async def test_the_heal_takes_the_purchase_that_entered_its_state_first():
             "UPDATE a2a_rail_purchases SET created_at = now() - (:c * interval '1 hour'), "
             "state_entered_at = now() - (:e * interval '1 hour') WHERE id = :i",
             {"c": created, "e": entered, "i": ap})
-    assert await purchases.backfill_a2a_parents(limit=1, lookback_hours=24 * 30) == 1
-    rows = await database.fetch_all(
-        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
-        {"a": born_first, "b": entered_first})
-    assert [r["rail_purchase_id"] for r in rows] == [entered_first]
+    try:
+        assert await purchases.backfill_a2a_parents(limit=1, lookback_hours=24 * 30) == 1
+        rows = await database.fetch_all(
+            "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
+            {"a": born_first, "b": entered_first})
+        assert [r["rail_purchase_id"] for r in rows] == [entered_first]
+    finally:
+        # Leave no parentless row behind: on a reused database it would age past the next run's rows
+        # and take the single slot.
+        for ap in (born_first, entered_first):
+            await purchases.ensure_a2a_parent(ap)
 
 
 async def test_inside_a_callers_transaction_a_database_error_on_one_row_rolls_back_only_that_row(monkeypatch):
