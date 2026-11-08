@@ -645,21 +645,103 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
     # Attach raw token payload for downstream callers (best-effort; do not rely on it for PII).
     setattr(context, "checkout_token_payload", payload)
 
-    # Optional scope enforcement: when scopes include "checkout", allow only checkout-safe agent endpoints.
-    scopes = payload.get("scopes")
-    if isinstance(scopes, list) and "checkout" in scopes and "agent_api" not in scopes and "full" not in scopes:
-        path = str(getattr(request, "url", None).path if getattr(request, "url", None) else request.url.path)
-        allowed_prefixes = (
-            "/agent/v1/quotes/",
-            "/agent/v1/orders/",
-            "/agent/v1/payments",
-            "/agent/v1/buyers/merge",
-            "/agent/v1/checkout/prefill",
-        )
-        if not any(path.startswith(p) for p in allowed_prefixes):
-            raise HTTPException(status_code=403, detail="Checkout token not authorized for this endpoint")
+    await _enforce_checkout_token_route(request, payload)
 
     return context
+
+
+# The exact routes a checkout token may call: what the hosted checkout page uses, and nothing else.
+# Matched on (method, route template), so a sibling route under the same prefix (the agent's order
+# list or events, refund, cancel, another order's detail) is refused. Each value says where the
+# route carries an order id: "path" is checked here against the token's own order; "body" is checked
+# by the handler once it has loaded the order (ensure_checkout_token_order_access); None carries none.
+CHECKOUT_TOKEN_ROUTES: Dict[tuple, Optional[str]] = {
+    ("POST", "/agent/v1/quotes/preview"): None,
+    ("POST", "/agent/v1/orders/create"): None,
+    ("POST", "/agent/v1/orders/payment-offer-evidence"): "body",
+    ("POST", "/agent/v1/payments"): "body",
+    ("POST", "/agent/v1/orders/{order_id}/confirm-payment"): "path",
+    ("GET", "/agent/v1/orders/{order_id}/track"): "path",
+    ("GET", "/agent/v1/checkout/prefill"): None,
+}
+
+_CHECKOUT_TOKEN_ROUTE_DENIED = "Checkout token not authorized for this endpoint"
+_CHECKOUT_TOKEN_ORDER_DENIED = "Checkout token not authorized for this order"
+
+
+def _matched_route_template(request: Request) -> Optional[str]:
+    route = None
+    try:
+        route = request.scope.get("route")
+    except Exception:
+        route = None
+    template = getattr(route, "path_format", None) or getattr(route, "path", None)
+    return str(template) if template else None
+
+
+def checkout_token_may_use_order(payload: Any, order: Optional[Dict[str, Any]]) -> bool:
+    """Whether a checkout token is bound to this order.
+
+    The token belongs to one agent and one checkout session (its intent). The order must be that
+    agent's, and be either the order the intent was minted for (`order_id` claim) or one created
+    under this token (orders/create stamps the token's `intent_id` on it). No order, no binding.
+    """
+    if not isinstance(payload, dict) or not isinstance(order, dict):
+        return False
+    token_agent = str(payload.get("agent_id") or "").strip()
+    if not token_agent or str(order.get("agent_id") or "").strip() != token_agent:
+        return False
+    order_id = str(order.get("order_id") or "").strip()
+    bound_order_id = str(payload.get("order_id") or "").strip()
+    if bound_order_id and order_id == bound_order_id:
+        return True
+    token_intent = str(payload.get("intent_id") or "").strip()
+    if not token_intent:
+        return False
+    metadata = order.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = None
+    if not isinstance(metadata, dict):
+        return False
+    return str(metadata.get("intent_id") or "").strip() == token_intent
+
+
+def ensure_checkout_token_order_access(context: Any, order: Optional[Dict[str, Any]]) -> None:
+    """403 when the caller is a checkout token and `order` is not the token's own (or missing).
+
+    API-key callers pass through unchanged. Handlers that take the order id in the body call this
+    right after loading the order, before any not-found answer, so a token cannot probe order ids.
+    """
+    payload = getattr(context, "checkout_token_payload", None)
+    if payload is None:
+        return
+    if not checkout_token_may_use_order(payload, order):
+        raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_ORDER_DENIED)
+
+
+async def _enforce_checkout_token_route(request: Request, payload: Dict[str, Any]) -> None:
+    """A checkout token reaches only CHECKOUT_TOKEN_ROUTES, and an order-id route only for its order.
+
+    Applies to every checkout token, whatever its `scopes` claim: the one minter
+    (routes.agent_checkout_intents) issues them for the hosted checkout page only.
+    """
+    method = str(getattr(request, "method", "") or "").upper()
+    template = _matched_route_template(request)
+    if not template or (method, template) not in CHECKOUT_TOKEN_ROUTES:
+        raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_ROUTE_DENIED)
+    if CHECKOUT_TOKEN_ROUTES[(method, template)] != "path":
+        return
+    order_id = str((getattr(request, "path_params", None) or {}).get("order_id") or "").strip()
+    order = None
+    if order_id:
+        from db.orders import get_order
+
+        order = await get_order(order_id)
+    if not checkout_token_may_use_order(payload, order):
+        raise HTTPException(status_code=403, detail=_CHECKOUT_TOKEN_ORDER_DENIED)
 
 
 async def require_merchant_access(

@@ -404,7 +404,7 @@ async def test_agent_create_order_replays_existing_order_before_recreating(monke
             },
         }
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             return expected
 
         async def fail_create_new_order(order_request: Any, background_tasks: Any):
@@ -520,7 +520,7 @@ async def test_agent_create_order_busy_replays_existing_order_without_second_cre
             },
         }
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             replay_checks["count"] += 1
             if replay_checks["count"] == 1:
                 return None
@@ -625,7 +625,7 @@ async def test_agent_create_order_busy_retries_once_when_no_existing_order(monke
 
         monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             return None
 
         calls = {"count": 0}

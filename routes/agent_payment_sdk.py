@@ -15,7 +15,12 @@ from typing import Optional, Dict, Any, List
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
-from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
+from routes.agent_auth import (
+    AgentContext,
+    ensure_checkout_token_order_access,
+    get_agent_context,
+    log_agent_request,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import get_order, update_payment_info
 from adapters.psp_adapter import get_psp_adapter
@@ -386,6 +391,8 @@ async def create_payment(
             "order lookup",
             lambda: get_order(request.order_id),
         )
+        # A checkout token pays only for its own order (before not-found: no order-id probe).
+        ensure_checkout_token_order_access(context, order)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         

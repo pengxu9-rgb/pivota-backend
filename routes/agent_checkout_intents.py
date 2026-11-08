@@ -945,6 +945,11 @@ async def create_checkout_intent(
         # item-level enforcement can be added later if needed).
         "items": [it.model_dump() for it in req.items],
     }
+    bound_order_id = str(req.order_id or "").strip() or None
+    if bound_order_id:
+        # Binds the token to the order this intent resumes (routes.agent_auth
+        # checkout_token_may_use_order); orders the page creates bind through intent_id.
+        token_payload["order_id"] = bound_order_id
     if agent_user_ref:
         token_payload["agent_user_ref"] = agent_user_ref
     if brief_id:
