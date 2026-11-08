@@ -30,15 +30,25 @@ async def update_contact_email(current_user: dict = Depends(require_admin)):
             {"merchant_id": merchant_id, "contact_email": contact_email},
         )
         
-        user_result = await database.fetch_one(
-            """
-            UPDATE users
-            SET merchant_id = :merchant_id
-            WHERE email = :contact_email
-            RETURNING id, email, merchant_id
-            """,
-            {"merchant_id": merchant_id, "contact_email": contact_email},
-        )
+        # The login is linked only when staff name it by id: whatever users row sits
+        # at an address is not proof it belongs to that merchant (self-service
+        # registration does not verify the mailbox).
+        user_id = configured_env_value("ADMIN_SIMPLE_FIX_USER_ID")
+        user_result = None
+        if user_id:
+            user_result = await database.fetch_one(
+                """
+                UPDATE users
+                SET merchant_id = :merchant_id
+                WHERE id = :user_id AND LOWER(email) = LOWER(:contact_email)
+                RETURNING id, email, merchant_id
+                """,
+                {
+                    "merchant_id": merchant_id,
+                    "contact_email": contact_email,
+                    "user_id": int(user_id),
+                },
+            )
         
         return {
             "status": "success",

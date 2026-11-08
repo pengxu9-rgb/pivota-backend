@@ -93,48 +93,38 @@ async def create_new_agent(
 
 
 def _own_agent_identity(current_user: dict) -> Tuple[Set[str], str]:
-    """The identity claims that can name the agent a token belongs to.
+    """The identity claims that name the agent a token belongs to.
 
     Single-sourced because the detail route and the list route have to agree:
     whatever identifies agent_A on GET /agents/{agent_id} must also be what
-    scopes GET /agents/ to agent_A's row, or one of the two is wrong. Returns
-    (ids, lowercased email) -- the ids are matched against `agent_id`, the
-    email against the RECORD's `owner_email`; see _is_own_agent_record for why
-    those are the three spellings and why the email one is not matched against
-    the id.
+    scopes GET /agents/ to agent_A's row. Returns (ids, email).
+
+    Only an `agent` token's own `agent_id` claim names an agent. The email used to
+    count too, matched against the record's owner_email: that address was never
+    proven (staff create agents whose owner_email has no users row, and
+    self-service signup at that address inherited the agent), and the legacy
+    /auth/signin minted agent tokens without the claim. `user_id` is a users-table
+    id and never named an agent. The email slot is kept, always empty, so callers
+    keep one shape.
     """
-    ids = {
-        str(current_user.get(claim) or "").strip()
-        for claim in ("agent_id", "user_id")
-    }
+    if str(current_user.get("role") or "") != "agent":
+        return set(), ""
+    claimed = current_user.get("agent_id")
+    if claimed is None or isinstance(claimed, (dict, list, tuple, set)):
+        return set(), ""
+    ids = {str(claimed).strip()}
     ids.discard("")
-    email = str(current_user.get("email") or "").strip().lower()
-    return ids, email
+    return ids, ""
 
 
 def _is_own_agent_record(current_user: dict, agent_id: str, agent: dict) -> bool:
-    """Does this token identify the agent whose record was just loaded?
+    """Does this token name the agent whose record was just loaded?
 
-    utils.auth.can_access_agent reads only the `agent_id` claim, but not every
-    agent token carries it -- which is why the guards in this module have
-    always accepted more. They do not agree on what: update_agent takes
-    `user_id`, while the analytics, usage, funnel, query-analytics and
-    merchants reads take `email`. A token carrying only one spelling is
-    therefore itself on some of its own sub-routes and a stranger on others.
-
-    The `email` spelling in those five is `email == agent_id`, which can only
-    ever match because agent ids happen to be shaped `agent_<hex>` and an
-    address is not -- a coincidence of format, not an ownership relation, and
-    one that stops holding the day an id is minted differently. Here the email
-    claim is matched against the RECORD's own `owner_email` instead: that is
-    the actual relation, `users.email` is UNIQUE NOT NULL so it names exactly
-    one account, and it does not care how ids are shaped.
+    An `agent` token whose agent_id claim is this agent's id. Nothing else: not the
+    email (see _own_agent_identity), not user_id.
     """
-    ids, email = _own_agent_identity(current_user)
-    if str(agent_id).strip() in ids:
-        return True
-    owner_email = str((agent or {}).get("owner_email") or "").strip().lower()
-    return bool(email) and email == owner_email
+    ids, _ = _own_agent_identity(current_user)
+    return str(agent_id).strip() in ids
 
 
 @router.get("/{agent_id}")
@@ -173,10 +163,9 @@ async def get_agent_details(
     # STAFF_ROLES decides who may attempt the route; it never decided WHOSE
     # record. Staff keep cross-agent reads; an `agent` gets their own.
     #
-    # Ownership must be at least as wide as this route's own sub-routes, or an
-    # agent is refused the record whose /analytics, /usage and /funnel it can
-    # read -- see _is_own_agent_record for why the three claim spellings exist
-    # and why the email one is matched against owner_email rather than the id.
+    # Ownership is the agent token's own agent_id claim, the same rule its
+    # /analytics, /usage and /funnel sub-routes apply (see _own_agent_identity
+    # for why the email and user_id spellings no longer count).
     if not can_access_agent(current_user, agent_id) and not _is_own_agent_record(
         current_user, agent_id, agent
     ):
@@ -208,7 +197,7 @@ async def update_agent(
             raise HTTPException(status_code=404, detail="Agent not found")
 
         current_role = current_user.get("role")
-        current_agent_id = current_user.get("agent_id") or current_user.get("user_id")
+        current_agent_id = current_user.get("agent_id")
         is_staff = current_role in EMPLOYEE_STAFF_ROLES
         if not is_staff and str(current_agent_id or "") != str(agent_id):
             raise HTTPException(status_code=403, detail="Not authorized")
@@ -672,8 +661,8 @@ async def get_agent_analytics_endpoint(
             raise HTTPException(status_code=404, detail="Agent not found")
 
         if current_user.get("role") not in ["admin", "employee", "super_admin"]:
-            user_agent_id = current_user.get("agent_id") or current_user.get("email")
-            if str(user_agent_id or "") != str(agent_id):
+            user_agent_id = current_user.get("agent_id")
+            if not user_agent_id or str(user_agent_id) != str(agent_id):
                 raise HTTPException(status_code=403, detail="Not authorized")
         
         # 获取分析数据
@@ -712,8 +701,8 @@ async def get_agent_usage(
     """
     try:
         if current_user.get("role") not in ["admin", "employee", "super_admin"]:
-            user_agent_id = current_user.get("agent_id") or current_user.get("email")
-            if str(user_agent_id or "") != str(agent_id):
+            user_agent_id = current_user.get("agent_id")
+            if not user_agent_id or str(user_agent_id) != str(agent_id):
                 raise HTTPException(status_code=403, detail="Not authorized")
 
         # 默认时间范围
@@ -752,6 +741,8 @@ async def get_agent_usage(
             "logs": [dict(log) for log in logs]
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get agent usage: {e}")
         raise HTTPException(status_code=500, detail="Failed to get usage logs")
@@ -770,8 +761,8 @@ async def get_agent_conversion_funnel(
     try:
         # Verify access (allow agent via agent_id/email fallback)
         if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            user_agent_id = current_user.get("agent_id") or current_user.get("email")
-            if user_agent_id != agent_id:
+            user_agent_id = current_user.get("agent_id")
+            if not user_agent_id or str(user_agent_id) != str(agent_id):
                 raise HTTPException(status_code=403, detail="Not authorized")
         
         since = datetime.now() - timedelta(days=days)
@@ -852,8 +843,8 @@ async def get_agent_query_analytics(
     try:
         # Verify access
         if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            user_agent_id = current_user.get("agent_id") or current_user.get("email")
-            if user_agent_id != agent_id:
+            user_agent_id = current_user.get("agent_id")
+            if not user_agent_id or str(user_agent_id) != str(agent_id):
                 raise HTTPException(status_code=403, detail="Not authorized")
         
         # Get query counts from agent_usage_logs
@@ -988,8 +979,8 @@ async def get_agent_merchant_authorizations(
     try:
         # Verify access
         if current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            user_agent_id = current_user.get("agent_id") or current_user.get("email")
-            if user_agent_id != agent_id:
+            user_agent_id = current_user.get("agent_id")
+            if not user_agent_id or str(user_agent_id) != str(agent_id):
                 raise HTTPException(status_code=403, detail="Not authorized")
         
         # Get agent's allowed merchants

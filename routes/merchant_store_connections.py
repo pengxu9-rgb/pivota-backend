@@ -1214,7 +1214,7 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
         )
 
     existing = await database.fetch_one(
-        "SELECT id, email, password_hash, full_name, role, active, merchant_id FROM users WHERE email = :email",
+        "SELECT id, email, password_hash, full_name, role, active, merchant_id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
         {"email": email},
     )
     user = dict(existing) if existing else None

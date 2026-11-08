@@ -302,6 +302,15 @@ async def signin(login_data: UserLogin):
                     detail="Account has been deactivated",
                 )
 
+            if str(user_row.get("role") or "").strip().lower() == "agent":
+                # This lane mints no agent_id claim, and a claim-less agent token is
+                # no agent anywhere: the developer portal signs in through
+                # /agent/account/login, which links the agent and carries the claim.
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Agent accounts sign in at POST /agent/account/login",
+                )
+
             merchant_id = user_row.get("merchant_id")
             if user_row.get("role") == "merchant" and not merchant_id:
                 merchant_id = _demo_merchant_ids().get(normalized_email)
@@ -391,14 +400,22 @@ async def signin(login_data: UserLogin):
                         }
                     )
                     agent_api_key = api_key
+                    token_payload["agent_id"] = normalized_email
                     print(f"✅ Auto-created agent record for {normalized_email}")
                 else:
                     # Return existing API key
                     agent_api_key = existing_agent["api_key"]
+                    token_payload["agent_id"] = str(existing_agent["agent_id"])
             except Exception as e:
                 # Don't fail login if agent creation fails
                 print(f"⚠️ Could not create agent record: {e}")
         
+        if acct["role"] == "agent" and not token_payload.get("agent_id"):
+            # Never a claim-less agent token (it names no agent).
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Demo agent record unavailable",
+            )
         token = jwt.encode(token_payload, require_jwt_secret(), algorithm=JWT_ALGORITHM)
         
         user_data = {
