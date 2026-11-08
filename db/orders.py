@@ -302,10 +302,12 @@ async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
 async def find_replayable_order_for_create(
     *,
     merchant_id: str,
+    agent_id: Optional[str],
     idempotency_key: Optional[str] = None,
     quote_id: Optional[str] = None,
     agent_session_id: Optional[str] = None,
     preferred_psp: Optional[str] = None,
+    intent_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Find the most recent order that is safe to replay for order-create recovery.
@@ -314,10 +316,21 @@ async def find_replayable_order_for_create(
     1. metadata.idempotency_key
     2. metadata.pricing_quote.quote_id
     3. agent_session_id
+
+    Every lookup is scoped to the calling agent (`orders.agent_id`). Keys are chosen by the caller,
+    and every agent reaches the same merchants, so a key another agent used must never hand this
+    caller that agent's order: it simply does not match, and the caller gets a fresh create. With no
+    agent there is nothing to scope by, so nothing replays. `intent_id` (a checkout token's session)
+    narrows it further to the orders created under that token.
     """
     merchant_id = str(merchant_id or "").strip()
     if not merchant_id:
         return None
+    agent_id = str(agent_id or "").strip()
+    if not agent_id:
+        return None
+    intent_id = str(intent_id or "").strip() or None
+    intent_clause = "\n                  AND metadata ->> 'intent_id' = :intent_id" if intent_id else ""
 
     def _normalize_preferred_psp(value: Optional[str]) -> Optional[str]:
         normalized = str(value or "").strip().lower()
@@ -342,12 +355,13 @@ async def find_replayable_order_for_create(
     if idempotency_key:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND metadata ->> 'idempotency_key' = :match_value
+                  AND metadata ->> 'idempotency_key' = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -358,12 +372,13 @@ async def find_replayable_order_for_create(
     if quote_id:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value
+                  AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -374,12 +389,13 @@ async def find_replayable_order_for_create(
     if agent_session_id:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND agent_session_id = :match_value
+                  AND agent_session_id = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -391,10 +407,10 @@ async def find_replayable_order_for_create(
     for query, match_value, replay_scope in candidate_queries:
         if not match_value:
             continue
-        row = await database.fetch_one(
-            query,
-            {"merchant_id": merchant_id, "match_value": match_value},
-        )
+        values = {"merchant_id": merchant_id, "agent_id": agent_id, "match_value": match_value}
+        if intent_id:
+            values["intent_id"] = intent_id
+        row = await database.fetch_one(query, values)
         if row:
             row_dict = dict(row)
             if replay_scope != "idempotency_key" and not _replay_matches_preferred_psp(
