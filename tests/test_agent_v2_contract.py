@@ -753,8 +753,13 @@ async def test_agent_v2_search_without_a_market_is_answered_as_us_and_says_so(
 ) -> None:
     from services.request_market import MARKET_ASSUMED_MESSAGE
 
+    from services.outbound_links_service import request_market_observed
+
     body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "limit": 10, **extra})
-    assert observed["market"] == "US", "US is what the search is run for"
+    assert observed["serving_market"] == "US", "US is what the search is served for (every row priced in USD)"
+    # ...but it is ASSUMED, not observed: `market` (what the `/r` minters stamp `market_observed` from) names nothing.
+    assert observed["market"] is None
+    assert request_market_observed(observed["market"]) is False
     assert body["market_assumed"] == {"code": "US", "message": MARKET_ASSUMED_MESSAGE}
 
 
@@ -768,13 +773,30 @@ async def test_agent_v2_search_without_a_market_is_answered_as_us_and_says_so(
         ({"market": "USA"}, "USA"),
         ({"request_context": {"country": "JP"}}, "JP"),
         ({"market": "GB", "request_context": {"country": "JP"}}, "GB"),
+        # P3-B2: a BLANK market names nothing, so the named country is the market (it used to be hidden).
+        ({"market": "  ", "request_context": {"country": "JP"}}, "JP"),
+        ({"market": "", "request_context": {"country": "JP"}}, "JP"),
     ],
-    ids=["SG", "US", "lower_sg", "invalid_USA", "context_country", "market_wins"],
+    ids=["SG", "US", "lower_sg", "invalid_USA", "context_country", "market_wins", "blank_market_country", "empty_market_country"],
 )
 async def test_agent_v2_search_with_a_market_is_unchanged(
     monkeypatch: pytest.MonkeyPatch, extra: Dict[str, Any], sent: str
 ) -> None:
     body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "limit": 10, **extra})
     assert observed["market"] == sent, "a named market is passed exactly as before"
+    assert "serving_market" not in observed, "and nothing is added to the call"
     assert "market_assumed" not in body
     assert set(body) == {"status", "products", "pagination", "metadata", "request_context"}
+
+
+@pytest.mark.asyncio
+async def test_agent_v2_search_the_gateways_assumed_us_is_assumed_not_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway's own search lanes call this route with `market: "US"` + `market_assumed: true` for a call that
+    named no market: answered as the assumed US (served as US, never observed), labelled. The flag is honoured only
+    beside US: `market_assumed` with SG is SG, as declared."""
+    body, observed = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "market": "US", "market_assumed": True})
+    assert observed["market"] is None and observed["serving_market"] == "US"
+    assert body["market_assumed"]["code"] == "US"
+    body2, observed2 = await _v2_search(monkeypatch, {"query": "serum", "merchant_id": "m_contract", "market": "SG", "market_assumed": True})
+    assert observed2["market"] == "SG" and "serving_market" not in observed2
+    assert "market_assumed" not in body2

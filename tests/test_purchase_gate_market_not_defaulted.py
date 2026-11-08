@@ -418,18 +418,18 @@ _MULTI_ROW: Dict[str, Any] = {
 }
 
 
-async def _multi_card_token(monkeypatch, *, search_market=None, meta_market=None, row_market="US"):
+async def _multi_card_token(monkeypatch, *, search_market=None, meta_market=None, row_market="US", assumed=None):
     row = dict(_MULTI_ROW)
     if row_market is None:
         row.pop("market")
     else:
         row["market"] = row_market
-    tokens = await _multi_card_tokens(monkeypatch, [row], search_market=search_market, meta_market=meta_market)
+    tokens = await _multi_card_tokens(monkeypatch, [row], search_market=search_market, meta_market=meta_market, assumed=assumed)
     assert len(tokens) == 1
     return tokens[0]
 
 
-async def _multi_card_tokens(monkeypatch, rows, *, search_market=None, meta_market=None):
+async def _multi_card_tokens(monkeypatch, rows, *, search_market=None, meta_market=None, assumed=None):
     import routes.agent_shop_gateway as gw
 
     async def fake_fetch_all(query: str, values=None):
@@ -447,6 +447,8 @@ async def _multi_card_tokens(monkeypatch, rows, *, search_market=None, meta_mark
     }
     if search_market is not None:
         raw_payload["search"]["market"] = search_market
+    if assumed is not None:
+        raw_payload["search"]["market_assumed"] = assumed
     meta: Dict[str, Any] = {"source": "creator-agent-ui"}
     if meta_market is not None:
         meta["market"] = meta_market
@@ -650,9 +652,10 @@ _PROVENANCE_FN = "request_market_observed"
 
 #: (file, enclosing function path) -> (leaves of the request argument, keyword args of the call)
 _SITES: Dict[Tuple[str, str], Tuple[Set[str], Set[str]]] = {
+    # `payload.market_assumed` (decision D-10): a market the gateway ASSUMED turns the flag OFF, never on.
     ("routes/agent_shop_gateway.py", "_handle_offers_resolve/_append_external_offers_from_seed_rows"): (
-        {"payload.market"}, set()),
-    ("routes/agent_shop_gateway.py", "_handle_offers_resolve"): ({"payload.market"}, set()),
+        {"payload.market", "payload.market_assumed"}, set()),
+    ("routes/agent_shop_gateway.py", "_handle_offers_resolve"): ({"payload.market", "payload.market_assumed"}, set()),
     ("routes/agent_shop_gateway.py", "_attach_connected_product_redirects"): ({"param:market"}, set()),
     ("routes/agent_shop_gateway.py", "mint_external_seed_links"): ({"body.market"}, set()),
     ("routes/agent_shop_gateway.py", "_build_prefetched_external_seed_wrappers"): (
@@ -958,3 +961,26 @@ def test_no_other_mint_file_builds_a_purchasability_gate() -> None:
         if rel == "routes/agent_shop_gateway.py":
             continue
         assert "_CartPurchasabilityGate" not in (ROOT / rel).read_text(), rel
+
+
+# ---- decision D-10: the gateway's ASSUMED US (search.market_assumed) is never observed ---------------------------
+
+
+def test_the_multi_request_market_is_none_for_an_assumed_market() -> None:
+    import routes.agent_shop_gateway as gw
+
+    def payload(market, assumed):
+        return gw.FindProductsMultiPayload(search=gw.MultiSearchFilters(query="x", market=market, market_assumed=assumed))
+
+    assert gw._request_market_for_multi(payload("US", True), {}) is None
+    assert gw._request_market_for_multi(payload("US", False), {}) == "US"
+    assert gw._request_market_for_multi(payload("US", "yes"), {}) == "US", "only a literal True assumes"
+    assert "market_assumed" not in payload("US", True).search.model_dump(), "provenance only: in no dump or cache key"
+
+
+async def test_find_products_multi_an_assumed_us_is_served_as_us_but_never_observed(monkeypatch):
+    named = await _multi_card_token(monkeypatch, search_market="US")
+    assumed = await _multi_card_token(monkeypatch, search_market="US", assumed=True)
+    assert named["market_observed"] is True, "the premise: a named US is observed"
+    assert "market_observed" not in assumed
+    assert assumed["market"] == "US"

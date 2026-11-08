@@ -84,6 +84,10 @@ class SearchProductsRequest(BaseModel):
     fast_mode: bool = False
     payment_context: Optional[PivotPaymentContext] = None
     request_context: Optional[RequestContext] = None
+    # DECISION D-10, internal: the gateway sends `market: "US"` for a call that named no market, and says so here.
+    # Honoured only beside that US: the search is then answered as an ASSUMED US (served as US, never stamped
+    # observed, labelled), exactly as a search that named nothing. Absent/False: unchanged.
+    market_assumed: bool = False
 
 
 class QuoteOfferRef(BaseModel):
@@ -775,15 +779,14 @@ async def search_products_v2(
         not body.merchant_id and not body.merchant_ids
     )
     # THE MARKET THIS SEARCH IS ANSWERED FOR (decision D-10, services/request_market.py): the caller's
-    # `market`, else its `request_context.country`, exactly as before; a search that names neither is
-    # answered as US -- US is what the search is run for (so every served row is priced in USD) -- and
-    # the answer says so in `market_assumed`. A named market, valid or not, is passed through unchanged.
-    requested_market = body.market or (
-        body.request_context.country
-        if body.request_context and body.request_context.country
-        else None
+    # `market`, else its `request_context.country`; a search that names neither is answered as US and the
+    # answer says so in `market_assumed`. A named market, valid or not, is passed through unchanged. A
+    # BLANK `market` names nothing, so it no longer hides a named `request_context.country`.
+    country = body.request_context.country if body.request_context and body.request_context.country else None
+    requested_market = body.market if not market_is_unnamed(body.market) else country
+    market_assumed = market_is_unnamed(requested_market) or (
+        body.market_assumed is True and str(requested_market).strip().upper() == ASSUMED_MARKET
     )
-    market_assumed = market_is_unnamed(requested_market)
     result = await agent_v1_search_products(
         req=req,
         background_tasks=background_tasks,
@@ -804,7 +807,13 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=ASSUMED_MARKET if market_assumed else requested_market,
+        # ASSUMED, NOT OBSERVED. The assumed US is the SERVING market (every row priced in USD), never the
+        # request's `market`: the `/r` minters stamp `market_observed` from that argument, and a token must
+        # not claim the buyer named a market nobody named (the warm-handoff sink keys its gate only on an
+        # observed market, and click telemetry counts these as `none_unobserved`, as before D-10). The
+        # storage partition is the one a market-less search always read.
+        market=None if market_assumed else requested_market,
+        **({"serving_market": ASSUMED_MARKET} if market_assumed else {}),
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,

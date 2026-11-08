@@ -2944,7 +2944,7 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
     assert offer["cart_prefilled"] is None
 
 
-def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
+def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool, payload_extra=None):
     """Drive the REAL route and return (offer, decoded_token_dest).
 
     The real `_make_external_redirect_url` runs — only the DB read is faked. The token is
@@ -2977,7 +2977,7 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*", **(payload_extra or {})},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -6270,3 +6270,27 @@ def test_an_affiliate_destination_is_never_stamped_or_asked(
     offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
     assert calls == []
     assert "warm_fact" not in _ctx_of(offer)
+
+
+# ---- decision D-10: a market the gateway ASSUMED is not a market the buyer named -------------------------------
+
+
+@pytest.mark.parametrize("flag", ["marketAssumed", "market_assumed"])
+def test_an_assumed_market_is_served_but_never_stamped_observed(monkeypatch, client: TestClient, flag: str) -> None:
+    """The gateway's get_offers sends `market: "US"` for a call that named no market, with `marketAssumed`. The
+    offer is the US one (the served market is US), but its `/r` token must not say the buyer named US: the
+    warm-handoff sink keys its gate only on an observed market."""
+    declared, declared_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    assumed, assumed_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={flag: True})
+    assert declared_payload["market_observed"] is True, "the premise: a named US is observed"
+    assert "market_observed" not in assumed_payload
+    assert assumed_payload["market"] == declared_payload["market"] == "US"
+    assert assumed["purchase_route"] == declared["purchase_route"]
+
+
+def test_the_assumed_flag_is_kept_by_the_normaliser_and_defaults_off() -> None:
+    import routes.agent_shop_gateway as gw
+
+    norm = gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US", "marketAssumed": True})
+    assert gw.OffersResolvePayload(**norm).market_assumed is True
+    assert gw.OffersResolvePayload(**gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US"})).market_assumed is False
