@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 import httpx
 import json
 import logging
@@ -88,7 +89,11 @@ async def run_mcp_e2e_test(
     3. Inventory data availability
     4. Order processing capability
     5. ALL Payment processors readiness
+
+    The merchant itself or staff: the tests exercise the merchant's stored
+    store and PSP credentials and report on them.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     start_time = datetime.now()
     tests: List[MCPTestResult] = []
     

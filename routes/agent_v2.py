@@ -1384,6 +1384,10 @@ async def create_refund_v2(
     if str(order.get("agent_id") or "") != str(context.agent_id):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
+    # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
+    from services.agent_refund_policy import refuse_agent_refund_execution
+
+    refuse_agent_refund_execution()
     response = await process_refund_route(
         order_id=order_id,
         refund_request=RefundRequest(

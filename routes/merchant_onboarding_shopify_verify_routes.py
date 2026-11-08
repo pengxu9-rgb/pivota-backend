@@ -7,7 +7,8 @@ from pydantic import BaseModel, Field
 
 from db.database import database
 from services.shopify_integration_verify import verify_shopify_integration
-from utils.auth import MERCHANT_OR_EMPLOYEE_STAFF_ROLES, can_access_merchant, get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, MERCHANT_OR_EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +80,7 @@ async def merchant_onboarding_verify_shopify(
     """
     if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if not can_access_merchant(current_user, merchant_id):
-        raise HTTPException(status_code=403, detail="Can only verify your own merchant")
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
 
     try:
         report = await verify_shopify_integration(
@@ -119,8 +119,7 @@ async def merchant_get_latest_shopify_capability_report(
     """
     if current_user.get("role") not in MERCHANT_OR_EMPLOYEE_STAFF_ROLES:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if not can_access_merchant(current_user, merchant_id):
-        raise HTTPException(status_code=403, detail="Not authorized for merchant")
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
 
     row = await database.fetch_one(
         """

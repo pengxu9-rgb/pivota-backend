@@ -1,9 +1,10 @@
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from services.product_enrichment_pipeline import run_enrichment_for_product
+from utils.auth import assert_merchant_owner_or_staff, get_current_user
 
 
 router = APIRouter(
@@ -20,7 +21,10 @@ class EnrichmentRunRequest(BaseModel):
 
 
 @router.post("/run")
-async def run_enrichment(body: EnrichmentRunRequest):
+async def run_enrichment(
+    body: EnrichmentRunRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Run the enrichment pipeline for a single product.
 
@@ -30,7 +34,11 @@ async def run_enrichment(body: EnrichmentRunRequest):
     - Upserting into product_enrichment
     - Running full quality eval and writing product_quality_snapshot
     - Emitting a PRODUCT_ENRICHED event (best-effort)
+
+    It writes enrichment for body.merchant_id, so the caller must be that merchant
+    or staff.
     """
+    assert_merchant_owner_or_staff(current_user, body.merchant_id)
     try:
         result = await run_enrichment_for_product(
             merchant_id=body.merchant_id,

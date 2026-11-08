@@ -13,6 +13,7 @@ import logging
 from db.database import database
 from db.payout_repo import PayoutRepo
 from utils.auth import get_current_user
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +60,7 @@ async def list_agent_payouts(
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
     # Check if agent is accessing their own data
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view these payouts")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         repo = PayoutRepo()
@@ -130,9 +129,7 @@ async def get_payout_summary(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         # Get summary by status
@@ -206,9 +203,7 @@ async def export_agent_payouts_csv(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         # Build query with filters
@@ -290,9 +285,7 @@ async def get_payout_details(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         repo = PayoutRepo()

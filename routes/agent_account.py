@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import os
 import secrets
 import hashlib
+import json
 import time
 
 from db.agents import evict_agent_auth_cache, is_redacted_agent_api_key, redacted_agent_api_key
@@ -19,6 +20,10 @@ from services.agent_registration_notify import notify_agent_registered
 from utils.auth import hash_password, verify_password, create_access_token, get_current_user
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
+
+# users.created_at is the database clock and a membership's timestamps the app's; a
+# membership the registration wrote right after the users row must not read as older.
+AGENT_LINK_CLOCK_SKEW = timedelta(seconds=60)
 
 
 # ── Self-serve registration guardrails ────────────────────────────────────────
@@ -33,6 +38,15 @@ router = APIRouter(prefix="/agent/account", tags=["agent-account"])
 # In-memory per-instance store, same precedent as the review-media IP limiter.
 _REGISTRATION_IP_LIMIT_STORE: Dict[str, Tuple[int, int]] = {}
 _REGISTRATION_IP_LIMIT_MAX_KEYS = 10_000
+
+
+#: The merchant scope a self-serve key starts with: NONE. `agents.allowed_merchants` NULL means
+#: EVERY merchant (db/agents.py, AgentContext.can_access_merchant), so a key minted here with the
+#: column left NULL could act for, and read data of, any merchant with no review at all. A new
+#: self-serve agent gets an empty list instead, and staff grant merchants
+#: (staff-only PUT /agents/{agent_id}, allowed_merchants). Existing rows, and what NULL means
+#: for them, are not touched here.
+SELF_SERVE_INITIAL_ALLOWED_MERCHANTS: Tuple[str, ...] = ()
 
 
 def _self_serve_registration_enabled() -> bool:
@@ -742,6 +756,14 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
+        # Nothing here proves the mailbox, so an address that already names an agent
+        # owner (a staff-created agent has no users row), a merchant contact or an
+        # employee is refused: the users row created here would be what agent login
+        # keys on. The owner resets the password from the portal instead.
+        from routes.auth import EMAIL_ALREADY_REGISTERED_DETAIL, _email_claims_existing_tenant
+
+        if await _email_claims_existing_tenant(email):
+            raise HTTPException(status_code=400, detail=EMAIL_ALREADY_REGISTERED_DETAIL)
 
         # Decide WHERE the key will live BEFORE any row is written, so a failed probe leaves nothing
         # behind (a 503 with an orphaned users row would block the email from ever registering).
@@ -787,6 +809,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 description,
                 api_key,
                 api_key_hash,
+                allowed_merchants,
                 is_active,
                 created_at,
                 updated_at
@@ -798,6 +821,7 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 :description,
                 :api_key,
                 :api_key_hash,
+                :allowed_merchants,
                 TRUE,
                 NOW(),
                 NOW()
@@ -810,6 +834,8 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
                 "description": data.description or "",
                 "api_key": stored_api_key,
                 "api_key_hash": api_key_hash,
+                # JSON text: '[]' = no merchants (NULL would be ALL merchants).
+                "allowed_merchants": json.dumps(list(SELF_SERVE_INITIAL_ALLOWED_MERCHANTS)),
             }
         )
 
@@ -911,7 +937,7 @@ async def _is_active_staff_account(user) -> bool:
     return bool(await _fetch_active_employee_identity(user["email"]))
 
 
-async def _holds_agent_membership(user, agent) -> bool:
+async def _holds_agent_membership(user, agent, *, clock_skew: timedelta = timedelta(0)) -> bool:
     """Whether this email holds an active agent membership for exactly this agent.
 
     auth_memberships is the model built for one email holding several portals, and only
@@ -939,7 +965,7 @@ async def _holds_agent_membership(user, agent) -> bool:
         email=user["email"],
         membership_type="agent",
         entity_id=agent["agent_id"],
-        not_before=user_created_at,
+        not_before=user_created_at - clock_skew,
     )
 
 
@@ -971,6 +997,8 @@ async def login_agent(data: AgentLoginRequest):
             SELECT agent_id, agent_name, owner_email, api_key, agent_type
             FROM agents
             WHERE LOWER(owner_email) = LOWER(:email)
+            ORDER BY created_at
+            LIMIT 1
             """,
             {"email": email}
         )
@@ -981,6 +1009,22 @@ async def login_agent(data: AgentLoginRequest):
             raise HTTPException(status_code=403, detail="This login is for agents only")
         if not agent:
             raise HTTPException(status_code=404, detail="Agent record not found")
+        # role='agent' plus a matching owner_email is not proof the agent is this
+        # account's: staff create agents whose owner_email has no users row, and
+        # /api/auth/register used to let anyone create that row. The link is an
+        # agent membership for this agent written after this users row existed,
+        # which only the agent's own registration, a password-verified conversion,
+        # a password reset (mailbox proof) or an earlier linked login writes.
+        if user["role"] == "agent" and not await _holds_agent_membership(
+            user, agent, clock_skew=AGENT_LINK_CLOCK_SKEW
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This agent is not linked to this login yet. Reset your password "
+                    "from the developer portal to confirm the email and link it."
+                ),
+            )
         
         # databases.Record → plain dict for safe .get() usage
         agent_dict = dict(agent)
