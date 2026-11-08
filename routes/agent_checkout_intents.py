@@ -19,7 +19,7 @@ from db.database import IS_POSTGRES, database, engine, metadata
 from db.schema_guard import guarded_add_columns, guarded_index
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
-from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
+from db.buyer_vault import buyer_addresses, buyer_identity_links, resolve_agent_user_ref_hash
 from routes.accounts_orders_api import get_accounts_principal
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_execution_policy import (
@@ -369,7 +369,7 @@ async def _buyer_prefill_from_identity_link(*, agent_id: str, agent_user_ref: st
     ref = str(agent_user_ref or "").strip()
     if not ref:
         return None
-    ref_hash = hash_agent_user_ref(ref)
+    ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
     if not ref_hash:
         return None
 

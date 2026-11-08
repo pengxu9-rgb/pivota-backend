@@ -21,7 +21,7 @@ from db.buyer_vault import (
     buyer_agent_links,
     buyer_identity_links,
     buyer_save_challenges,
-    hash_agent_user_ref,
+    resolve_agent_user_ref_hash,
     mandates,
     mint_pairwise_buyer_ref,
 )
@@ -650,7 +650,7 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
     ref = str(agent_user_ref or "").strip()
     if not ref:
         return None
-    ref_hash = hash_agent_user_ref(ref)
+    ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
     if not ref_hash:
         return None
 

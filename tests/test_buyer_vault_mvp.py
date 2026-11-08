@@ -528,6 +528,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
     from routes.agent_checkout_intents import mint_checkout_token
     from routes.agent_auth import get_agent_context
     from routes import agent_checkout_intents
+    from db import buyer_vault
 
     intent_id = "ci_test_intent"
     agent_user_ref = "https://agent.tools.example:user_123"
@@ -572,7 +573,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
             }
         if isinstance(query, str) and "from buyer_identity_links" in query.lower():
             assert (values or {}).get("agent_id") == "agent_test"
-            assert (values or {}).get("agent_user_ref_hash") == agent_checkout_intents.hash_agent_user_ref(agent_user_ref)
+            assert (values or {}).get("agent_user_ref_hash") == buyer_vault.hash_agent_user_ref(agent_user_ref)
             return {"buyer_id": "buyer_1"}
         if isinstance(query, str) and "from shop_users" in query.lower():
             return {"email": "vault@example.com"}
