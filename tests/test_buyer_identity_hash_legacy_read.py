@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from buyer_identity_hash_cases import *  # noqa: E402,F401,F403
-from buyer_identity_hash_cases import AGENT, DEDICATED, TOKEN_KEY, USER_REF, _hmac_hex  # noqa: E402
+from buyer_identity_hash_cases import AGENT, DEDICATED, LEGACY_KEY, TOKEN_KEY, USER_REF, _hmac_hex  # noqa: E402
 
 import db.buyer_vault as buyer_vault  # noqa: E402
 
@@ -44,6 +44,7 @@ def test_with_the_dedicated_key_a_stored_hash_is_no_token_signature(monkeypatch)
     signature_hex = hmac.new(TOKEN_KEY.encode(), payload_b64.encode(), hashlib.sha256).hexdigest()
 
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     assert buyer_vault.hash_agent_user_ref(payload_b64) == signature_hex  # the bug, when unset
 
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
@@ -62,6 +63,7 @@ def test_with_the_dedicated_key_a_stored_hash_is_no_token_signature(monkeypatch)
 )
 def test_without_the_dedicated_key_the_hash_is_unchanged(monkeypatch, env, key):
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     monkeypatch.delenv("CHECKOUT_TOKEN_SECRET")
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -72,6 +74,7 @@ def test_without_the_dedicated_key_the_hash_is_unchanged(monkeypatch, env, key):
 
 def test_with_no_key_at_all_the_hash_is_the_local_dev_sha256(monkeypatch):
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     monkeypatch.delenv("CHECKOUT_TOKEN_SECRET")
 
     assert buyer_vault.hash_agent_user_ref(USER_REF) == hashlib.sha256(USER_REF.encode()).hexdigest()
@@ -79,6 +82,7 @@ def test_with_no_key_at_all_the_hash_is_the_local_dev_sha256(monkeypatch):
 
 async def test_without_the_dedicated_key_resolve_makes_no_query(monkeypatch):
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
 
     async def no_query(*_a, **_k):
         raise AssertionError("no legacy lookup without the dedicated key")
@@ -98,7 +102,82 @@ def test_the_window_closes_on_an_off_value(monkeypatch, value):
 def test_the_window_is_open_by_default(monkeypatch, value):
     if value is not None:
         monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", value)
-    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
+
+
+# --- the legacy key and the token keys (S-29 P2-2) ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token_env",
+    [
+        {"CHECKOUT_TOKEN_SECRET": TOKEN_KEY},
+        {"BUYER_ACTION_TOKEN_SECRET": "action-token-test-key", "CHECKOUT_TOKEN_SECRET": TOKEN_KEY},
+        {"AGENT_CHECKOUT_TOKEN_SECRET": "agent-checkout-token-test-key"},
+        {},
+    ],
+    ids=["checkout-key", "action-key-first", "agent-checkout-key", "no-token-key"],
+)
+def test_the_legacy_hash_uses_the_legacy_copy_and_never_a_token_key(monkeypatch, token_env):
+    for name in ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in token_env.items():
+        monkeypatch.setenv(name, value)
+
+    legacy = buyer_vault.legacy_agent_user_ref_hash(USER_REF)
+
+    assert legacy == _hmac_hex(LEGACY_KEY, USER_REF)
+    for token in token_env.values():
+        assert legacy != _hmac_hex(token, USER_REF)
+
+
+def test_without_the_dedicated_key_a_mounted_legacy_copy_is_the_write_key(monkeypatch):
+    """So the token keys can rotate before the dedicated key is mounted, too: the copy holds the
+    old value, and the hash stops following the live token key."""
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+
+
+@pytest.mark.parametrize(
+    "equal_to",
+    ["CHECKOUT_TOKEN_SECRET", "BUYER_ACTION_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET"],
+)
+def test_a_dedicated_key_equal_to_a_token_key_or_the_legacy_copy_is_refused(monkeypatch, equal_to):
+    """Refused = treated as unset: the hash stays on the pre-dedicated key and the legacy read is off.
+    With the key equal to a token key, keeping it would keep every hash a token signature."""
+    monkeypatch.setenv(equal_to, DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", "  " + DEDICATED + " ")
+
+    assert buyer_vault._dedicated_hash_secret() == ""
+    pre_dedicated = LEGACY_KEY if equal_to != "BUYER_IDENTITY_LINK_LEGACY_SECRET" else DEDICATED
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(pre_dedicated, USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+
+
+@pytest.mark.parametrize("value", ["", "  ", "\t\n"], ids=["empty", "spaces", "tab-newline"])
+def test_a_whitespace_only_value_counts_as_unset(monkeypatch, value):
+    # The dedicated key.
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", value)
+    assert buyer_vault._dedicated_hash_secret() == ""
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
+    # The legacy copy: the write key falls through to the first token key that is set.
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", value)
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
+    # A token key: skipped, the next one is used.
+    monkeypatch.setenv("BUYER_ACTION_TOKEN_SECRET", value)
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
+
+
+def test_a_padded_value_is_the_same_key(monkeypatch):
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", f"  {DEDICATED}\n")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", f"\t{LEGACY_KEY} ")
+
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(DEDICATED, USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
 
 
 def test_a_blank_ref_hashes_to_nothing():
@@ -128,9 +207,13 @@ def platform(monkeypatch):
     monkeypatch.setattr(cp, "is_production", lambda *a, **k: state["production"])
     monkeypatch.setattr(cp, "is_deployed", lambda *a, **k: state["deployed"])
     monkeypatch.setattr(buyer_vault, "_missing_secret_reported_at", None)
+    monkeypatch.setattr(buyer_vault, "_reported_problem", None)
+    monkeypatch.setattr(buyer_vault, "_errored_problems", set())
     clock = {"t": 1000.0}
     monkeypatch.setattr(buyer_vault.time, "monotonic", lambda: clock["t"])
+    # Today's prod: neither the dedicated key nor the legacy copy is mounted.
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     return state, clock
 
 
@@ -157,18 +240,94 @@ def _missing(records):
     return [r for r in records if "buyer_identity_hash_secret_missing" in r.getMessage()]
 
 
-def test_production_without_the_key_logs_one_error_an_hour_and_keeps_hashing(platform, records):
+def _config(records):
+    return [r for r in records if "event=buyer_identity_hash_" in r.getMessage() and "lookup_failed" not in r.getMessage()]
+
+
+def test_production_without_the_key_logs_one_warning_an_hour_and_keeps_hashing(platform, records):
+    """WARNING, not ERROR: the key being unset is the planned state between the deploy and the
+    mount. The alerts here match log text and Sentry makes every ERROR an event, so an hourly ERROR
+    per instance would page for a known state."""
     _state, clock = platform
 
     for _ in range(3):
         assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
     clock["t"] += 3599
     buyer_vault.hash_agent_user_ref(USER_REF)
-    assert [r.levelno for r in _missing(records)] == [logging.ERROR]
+    assert [r.levelno for r in _missing(records)] == [logging.WARNING]
 
     clock["t"] += 2
     buyer_vault.hash_agent_user_ref(USER_REF)
-    assert [r.levelno for r in _missing(records)] == [logging.ERROR, logging.ERROR]
+    assert [r.levelno for r in _missing(records)] == [logging.WARNING, logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    "equal_to,event",
+    [
+        ("CHECKOUT_TOKEN_SECRET", "reason=dedicated_equals_token_key"),
+        ("BUYER_IDENTITY_LINK_LEGACY_SECRET", "reason=dedicated_equals_legacy_key"),
+    ],
+    ids=["token-key", "legacy-copy"],
+)
+def test_a_refused_dedicated_key_is_one_error_then_hourly_warnings(platform, records, monkeypatch, equal_to, event):
+    _state, clock = platform
+    monkeypatch.setenv(equal_to, DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+
+    assert buyer_vault.report_missing_buyer_identity_hash_secret(force=True) is True  # the boot line
+    buyer_vault.hash_agent_user_ref(USER_REF)  # inside the hour: nothing more
+    clock["t"] += 3601
+    buyer_vault.hash_agent_user_ref(USER_REF)
+
+    lines = _config(records)
+    assert [r.levelno for r in lines] == [logging.ERROR, logging.WARNING]
+    assert all(event in r.getMessage() for r in lines)
+    for line in lines:
+        for secret in (DEDICATED, LEGACY_KEY, TOKEN_KEY, USER_REF, _hmac_hex(DEDICATED, USER_REF)):
+            assert secret not in line.getMessage()
+
+
+def test_a_missing_legacy_copy_with_the_window_open_is_an_error_at_first_use(platform, records, monkeypatch):
+    _state, clock = platform
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+    clock["t"] += 3601
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+
+    lines = _config(records)
+    assert [r.levelno for r in lines] == [logging.ERROR, logging.WARNING]
+    assert all("buyer_identity_hash_legacy_secret_missing" in r.getMessage() for r in lines)
+    assert TOKEN_KEY not in lines[0].getMessage() and DEDICATED not in lines[0].getMessage()
+
+
+def test_a_missing_legacy_copy_with_the_window_closed_is_the_intended_end_state(platform, records, monkeypatch):
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
+
+    assert buyer_vault.report_missing_buyer_identity_hash_secret(force=True) is False
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(DEDICATED, USER_REF)
+    assert _config(records) == []
+
+
+def test_a_new_problem_is_reported_at_once_not_an_hour_later(platform, records, monkeypatch):
+    buyer_vault.hash_agent_user_ref(USER_REF)  # dedicated missing: a WARNING
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", DEDICATED)  # same hour, a different problem
+    buyer_vault.hash_agent_user_ref(USER_REF)
+
+    assert [r.levelno for r in _config(records)] == [logging.WARNING, logging.ERROR]
+
+
+def test_a_non_production_host_never_logs_an_error(platform, records, monkeypatch):
+    state, _clock = platform
+    state["production"] = False
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", DEDICATED)
+
+    assert buyer_vault.report_missing_buyer_identity_hash_secret(force=True) is True
+    assert [r.levelno for r in _config(records)] == [logging.WARNING]
 
 
 def test_the_report_never_carries_a_key_or_a_ref(platform, records):
@@ -202,10 +361,12 @@ def test_a_laptop_says_nothing(platform, records):
 
 def test_with_the_key_set_nothing_is_reported(platform, records, monkeypatch):
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", LEGACY_KEY)
 
     buyer_vault.hash_agent_user_ref(USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
     assert buyer_vault.report_missing_buyer_identity_hash_secret(force=True) is False
-    assert _missing(records) == []
+    assert _config(records) == []
 
 
 def test_the_lookup_covers_every_table_keyed_on_the_hash():

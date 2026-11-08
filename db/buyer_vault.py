@@ -18,6 +18,7 @@ import secrets
 import time
 from typing import Any, Dict, Optional
 
+from fastapi import HTTPException
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -33,6 +34,7 @@ from sqlalchemy.sql import func
 
 from db.database import IS_SQLITE, JSONB_TYPE, database, metadata
 from utils.logger import logger
+from utils.transient_errors import db_busy_http_exception
 
 
 _autoincrement_pk_type = Integer if IS_SQLITE else BigInteger
@@ -158,20 +160,41 @@ def _base64url_no_pad(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
 
 
-#: THE DEDICATED KEY for the agent_user_ref hash (S-29). Every hash written while it is set is made
-#: with it and nothing else.
+#: THE DEDICATED KEY for the agent_user_ref hash (S-29). Every hash written while it is set (and
+#: not refused, see `_dedicated_key_problem`) is made with it and nothing else.
+#:
+#: ROLL FORWARD ONLY. Once this key is mounted and has served a request, never unmount it, and never
+#: let a revision without it serve these routes next to one with it. An identity first seen after
+#: the mount has rows ONLY under this key's hash; a revision without the key hashes it with the
+#: pre-dedicated key instead, so it misses that identity's saved link, purchases and idempotency
+#: keys (a retry can open a second purchase) and writes new rows under the other hash. No code can
+#: tell a dedicated-key hash from any other hash without the key, so an unmount cannot be detected
+#: here: the rollout note carries this rule. Mount it on every service that serves these routes,
+#: in one revision.
 BUYER_IDENTITY_HASH_SECRET_ENV = "BUYER_IDENTITY_LINK_SECRET"
 
-#: The keys the hash fell back to before it had its own. Each one ALSO SIGNS A TOKEN: the buyer
+#: THE LEGACY KEY (S-29 P2-2). A COPY of the value the hash used before the dedicated key existed
+#: (the first set token key below, as it was when the copy was made). The legacy read matches old
+#: rows with THIS variable and never with a live token key, so the token keys can rotate right
+#: after the dedicated key is mounted: the stored legacy hashes then stop being token signatures,
+#: and the rows stay readable.
+#:
+#: Unset while the dedicated key is set and the window is open: legacy matching is REFUSED and an
+#: ERROR says so. It never falls back to the live token key, which would tie the legacy read to a
+#: key that must rotate (and break silently when it does).
+BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV = "BUYER_IDENTITY_LINK_LEGACY_SECRET"
+
+#: The token keys the hash fell back to before it had its own. Each one ALSO SIGNS A TOKEN: the buyer
 #: save token (routes.buyer_api._buyer_action_secret) or the checkout token
 #: (routes.agent_checkout_intents.mint_checkout_token). Those tokens are
 #: HMAC-SHA256(key, payload_b64), and agent_user_ref is a caller-chosen string, so a stored hash made
-#: with one of these keys IS a valid token signature for a payload the caller picked. Kept only to
-#: match rows written before the dedicated key existed (the legacy read below).
-_LEGACY_HASH_SECRET_ENVS = ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET")
+#: with one of these keys IS a valid token signature for a payload the caller picked. Read for
+#: hashing only while neither the dedicated key nor the legacy copy is mounted (today's behaviour),
+#: and compared against the dedicated key so an equal value is refused.
+_TOKEN_SECRET_ENVS = ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET")
 
 #: The legacy-read window. Open unless set to an off value; it only matters while the dedicated key
-#: is set (without it the legacy key IS the write key).
+#: is set (without it the pre-dedicated key IS the write key).
 BUYER_IDENTITY_HASH_LEGACY_READ_ENV = "BUYER_IDENTITY_LINK_LEGACY_READ"
 
 #: Every table keyed on (agent_id, agent_user_ref_hash). Each has an index that leads with both.
@@ -187,18 +210,88 @@ _OWNER_KEYED_TABLES = (
 
 _MISSING_SECRET_REPORT_INTERVAL_SECONDS = 3600.0
 _missing_secret_reported_at: Optional[float] = None
+#: The problem the last report was about: a DIFFERENT problem is reported at once, not an hour later.
+_reported_problem: Optional[str] = None
+#: Misconfigurations already reported at ERROR in this process. Each gets ONE ERROR (at boot or on
+#: first use); the hourly repeats are WARNINGs, so a standing misconfiguration is one event, not a
+#: page an hour per instance.
+_errored_problems: set = set()
+
+
+class BuyerIdentityHashUnavailable(HTTPException):
+    """503 + Retry-After: the lookup that picks the dedicated or the legacy hash could not answer.
+
+    S-29 P2-1. Guessing is never safe. Answering the legacy hash splits an identity first seen after
+    the mount (its rows are all under the dedicated hash): it misses its own link, purchases and
+    idempotency keys, a retry can open a second purchase, and anything written lands under the
+    legacy hash, after which every successful lookup FINDS that row and keeps the identity on the
+    legacy hash for good. Answering the dedicated hash does the same to an identity seen before the
+    mount. The database is already failing when this fires, and a 503 is retryable and splits
+    nothing. An HTTPException, so every route that lets it propagate answers the same 503 the
+    codebase uses for a busy database (`utils.transient_errors.db_busy_http_exception`).
+    """
+
+    def __init__(self) -> None:
+        busy = db_busy_http_exception()
+        super().__init__(status_code=busy.status_code, detail=busy.detail, headers=busy.headers)
+
+
+def _env_secret(name: str) -> str:
+    """A secret variable's value. Whitespace-only counts as unset."""
+    return (os.getenv(name) or "").strip()
+
+
+def _token_secrets() -> tuple:
+    """Every token key that is set, in fallback order."""
+    return tuple(value for value in (_env_secret(name) for name in _TOKEN_SECRET_ENVS) if value)
+
+
+def _legacy_env_secret() -> str:
+    return _env_secret(BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV)
+
+
+def _same_secret(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _dedicated_key_problem() -> Optional[str]:
+    """Why a SET dedicated key is refused, else None. Compares values; never logs one.
+
+    Equal to a token key: every hash made with it is still a token signature (the oracle S-29
+    closes). Equal to the legacy copy: it is the old key under a new name, so the legacy read
+    cannot tell old rows from new and the token-key value lives on as the write key.
+    """
+    dedicated = _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV)
+    if not dedicated:
+        return None
+    if any(_same_secret(dedicated, token) for token in _token_secrets()):
+        return "dedicated_equals_token_key"
+    legacy = _legacy_env_secret()
+    if legacy and _same_secret(dedicated, legacy):
+        return "dedicated_equals_legacy_key"
+    return None
 
 
 def _dedicated_hash_secret() -> str:
-    return (os.getenv(BUYER_IDENTITY_HASH_SECRET_ENV) or "").strip()
+    """The dedicated key, or "" when it is unset or refused (`_dedicated_key_problem`)."""
+    dedicated = _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV)
+    if not dedicated or _dedicated_key_problem() is not None:
+        return ""
+    return dedicated
 
 
-def _legacy_hash_secret() -> str:
-    for name in _LEGACY_HASH_SECRET_ENVS:
-        value = (os.getenv(name) or "").strip()
-        if value:
-            return value
-    return ""
+def _pre_dedicated_hash_secret() -> str:
+    """The key a hash is WRITTEN with while there is no usable dedicated key.
+
+    The legacy copy when it is mounted (so the token keys can rotate even before the dedicated key
+    is), else the first token key that is set (today's behaviour, unchanged), else "" (a laptop:
+    unkeyed SHA-256).
+    """
+    legacy = _legacy_env_secret()
+    if legacy:
+        return legacy
+    tokens = _token_secrets()
+    return tokens[0] if tokens else ""
 
 
 def _keyed_hash(secret: str, raw: str) -> str:
@@ -212,20 +305,67 @@ def legacy_read_window_open() -> bool:
     return value not in {"0", "false", "no", "off", "closed"}
 
 
-def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
-    """One log line, at most hourly, when a deployed host hashes without the dedicated key.
+def _hash_key_config_problem() -> Optional[str]:
+    """The one thing wrong with the hash keys right now, or None when nothing is."""
+    if not _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV):
+        return "dedicated_missing"
+    problem = _dedicated_key_problem()
+    if problem is not None:
+        return problem
+    if legacy_read_window_open() and not _legacy_env_secret():
+        return "legacy_key_missing"
+    return None
 
-    ERROR in production, WARNING on any other deployed host, silent on a laptop or in tests. The
-    hash itself keeps today's key: failing closed here would change every stored hash at once and
-    cut every buyer off from their saved link and purchases on the deploy that did it. Returns
-    True when it logged.
+
+_PROBLEM_MESSAGES = {
+    # The expected state between deploying this code and mounting the key: a WARNING, never paged.
+    "dedicated_missing": (
+        "event=buyer_identity_hash_secret_missing "
+        + BUYER_IDENTITY_HASH_SECRET_ENV
+        + " is unset: agent_user_ref hashes use the pre-dedicated key (%s). Mount the dedicated secret."
+    ),
+    "dedicated_equals_token_key": (
+        "event=buyer_identity_hash_secret_refused reason=dedicated_equals_token_key "
+        + BUYER_IDENTITY_HASH_SECRET_ENV
+        + " equals a token-signing key and is IGNORED: hashes stay on the pre-dedicated key (%s). "
+        "Mount a fresh random value."
+    ),
+    "dedicated_equals_legacy_key": (
+        "event=buyer_identity_hash_secret_refused reason=dedicated_equals_legacy_key "
+        + BUYER_IDENTITY_HASH_SECRET_ENV
+        + " equals "
+        + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
+        + " and is IGNORED: hashes stay on the pre-dedicated key (%s). Mount a fresh random value."
+    ),
+    "legacy_key_missing": (
+        "event=buyer_identity_hash_legacy_secret_missing "
+        + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
+        + " is unset while the legacy-read window is open: rows hashed before the dedicated key are "
+        "NOT matched (%s). Mount the legacy copy, or close the window."
+    ),
+}
+
+
+def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
+    """One log line, at most hourly, when a deployed host's hash keys are missing or misconfigured.
+
+    Silent on a laptop or in tests. The dedicated key merely being unset (the state between
+    deploying this code and mounting the key) is a WARNING. A misconfiguration (a refused dedicated
+    key, or a missing legacy copy while the window is open) is ONE ERROR per process in production
+    (at boot or on first use) and a WARNING on each hourly repeat, and a WARNING on any other
+    deployed host: the codebase's alerts match log text, and Sentry turns every ERROR into an event,
+    so an hourly ERROR per instance would be noise that pages. No line carries a key, a ref or a
+    hash. Never fail-closed: switching every stored hash at once would cut every buyer off from
+    their saved link and purchases on the deploy that did it. Returns True when it logged.
     """
-    global _missing_secret_reported_at
-    if _dedicated_hash_secret():
+    global _missing_secret_reported_at, _reported_problem
+    problem = _hash_key_config_problem()
+    if problem is None:
         return False
     now = time.monotonic()
     if (
         not force
+        and problem == _reported_problem
         and _missing_secret_reported_at is not None
         and now - _missing_secret_reported_at < _MISSING_SECRET_REPORT_INTERVAL_SECONDS
     ):
@@ -240,15 +380,19 @@ def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
     if not deployed:
         return False
     _missing_secret_reported_at = now
-    message = (
-        "event=buyer_identity_hash_secret_missing %s is unset: agent_user_ref hashes fall back to a "
-        "token-signing key (%s). Mount the dedicated secret."
-    )
-    keyed = "yes" if _legacy_hash_secret() else "no key, unkeyed sha256"
-    if production:
-        logger.error(message, BUYER_IDENTITY_HASH_SECRET_ENV, keyed)
+    _reported_problem = problem
+    if problem == "legacy_key_missing":
+        detail = "legacy matching refused"
+    elif _pre_dedicated_hash_secret():
+        detail = "the legacy copy" if _legacy_env_secret() else "a token-signing key"
     else:
-        logger.warning(message, BUYER_IDENTITY_HASH_SECRET_ENV, keyed)
+        detail = "no key, unkeyed sha256"
+    first_error = production and problem != "dedicated_missing" and problem not in _errored_problems
+    if first_error:
+        _errored_problems.add(problem)
+        logger.error(_PROBLEM_MESSAGES[problem], detail)
+    else:
+        logger.warning(_PROBLEM_MESSAGES[problem], detail)
     return True
 
 
@@ -256,9 +400,9 @@ def hash_agent_user_ref(agent_user_ref: str) -> str:
     """
     The hash a NEW identity is written under: HMAC-SHA256 with BUYER_IDENTITY_LINK_SECRET.
 
-    Without that key it falls back, as before, to the first legacy key that is set (see
-    `_LEGACY_HASH_SECRET_ENVS`), else a bare SHA-256 for local dev, and reports the missing key
-    (`report_missing_buyer_identity_hash_secret`). Routes that look an identity up must use
+    Without a usable dedicated key it falls back to `_pre_dedicated_hash_secret` (the legacy copy,
+    else the first token key that is set, as before, else a bare SHA-256 for local dev) and reports
+    it (`report_missing_buyer_identity_hash_secret`). Routes that look an identity up must use
     `resolve_agent_user_ref_hash`, which also matches rows written under the legacy key.
     """
     raw = str(agent_user_ref or "").strip()
@@ -268,14 +412,16 @@ def hash_agent_user_ref(agent_user_ref: str) -> str:
     if dedicated:
         return _keyed_hash(dedicated, raw)
     report_missing_buyer_identity_hash_secret()
-    return _keyed_hash(_legacy_hash_secret(), raw)
+    return _keyed_hash(_pre_dedicated_hash_secret(), raw)
 
 
 def legacy_agent_user_ref_hash(agent_user_ref: str) -> Optional[str]:
     """The hash this ref had before the dedicated key, while the legacy-read window is open.
 
-    None when there is nothing to match: no dedicated key (the legacy key is then the write key),
-    the window is closed, or the two hashes are the same.
+    Keyed with BUYER_IDENTITY_LINK_LEGACY_SECRET only, never with a live token key. None when there
+    is nothing to match: no usable dedicated key (the pre-dedicated key is then the write key), the
+    window is closed, the legacy copy is not mounted (refused, with an ERROR), or the two hashes
+    are the same.
     """
     raw = str(agent_user_ref or "").strip()
     if not raw or not legacy_read_window_open():
@@ -283,12 +429,20 @@ def legacy_agent_user_ref_hash(agent_user_ref: str) -> Optional[str]:
     dedicated = _dedicated_hash_secret()
     if not dedicated:
         return None
-    legacy = _keyed_hash(_legacy_hash_secret(), raw)
+    legacy_key = _legacy_env_secret()
+    if not legacy_key:
+        report_missing_buyer_identity_hash_secret()
+        return None
+    legacy = _keyed_hash(legacy_key, raw)
     return None if legacy == _keyed_hash(dedicated, raw) else legacy
 
 
-async def _owner_rows_exist(agent_id: str, agent_user_ref_hash: str) -> bool:
-    """True if any owner-keyed table holds a row for (agent_id, hash). One index-backed statement."""
+async def _owner_rows_exist(agent_id: str, agent_user_ref_hash: str) -> Optional[bool]:
+    """True if any owner-keyed table holds a row for (agent_id, hash). One index-backed statement.
+
+    None when the statement returned no answer (no row, or a NULL): the caller must not read that
+    as "no rows", which would pick the dedicated hash for an identity that may have legacy rows.
+    """
     clauses = " OR ".join(
         f"EXISTS (SELECT 1 FROM {table} WHERE agent_id = :agent_id AND agent_user_ref_hash = :h)"
         for table in _OWNER_KEYED_TABLES
@@ -297,27 +451,29 @@ async def _owner_rows_exist(agent_id: str, agent_user_ref_hash: str) -> bool:
         f"SELECT ({clauses}) AS found", {"agent_id": agent_id, "h": agent_user_ref_hash}
     )
     if row is None:
-        return False
-    return bool(dict(row).get("found"))
+        return None
+    found = dict(row).get("found")
+    if found is None:
+        return None
+    return bool(found)
 
 
 async def resolve_agent_user_ref_hash(agent_id: str, agent_user_ref: str) -> str:
-    """The hash to read AND write this identity under. Never raises.
+    """The hash to read AND write this identity under.
 
     THE LEGACY READ (S-29). When the dedicated key is set and the window is open, an identity that
     already has rows under its legacy hash keeps that hash, in every owner-keyed table at once, so
     its saved link, its purchases and its idempotency keys all still match after the deploy. An
     identity with no legacy rows gets the dedicated-key hash. So no NEW legacy-key value is ever
     produced for a ref that was not already stored under it, which is what closes the forgery
-    oracle; already-stored values were exposed before this change either way.
+    oracle; already-stored values stop being token signatures once the token keys rotate (the
+    legacy hash is keyed with its own copy, see BUYER_IDENTITY_LINK_LEGACY_SECRET).
 
     Sticky per identity, never mixed: one identity never has rows under both hashes because of
     this function, and every owner-scoped query below it keeps comparing one value.
 
-    A failed lookup answers the legacy hash, today's behaviour: a transient DB error must not cut a
-    buyer off from their rows, and on the purchase routes a missed idempotency key could open a
-    second purchase. The cost is that a ref first seen during such a failure may be stored under its
-    legacy hash; nobody outside can choose when the lookup fails.
+    RAISES `BuyerIdentityHashUnavailable` (a 503) when that lookup fails or gives no answer. It
+    never guesses either hash: see the exception for why each guess splits an identity.
     """
     primary = hash_agent_user_ref(agent_user_ref)
     if not primary:
@@ -330,7 +486,10 @@ async def resolve_agent_user_ref_hash(agent_id: str, agent_user_ref: str) -> str
     except Exception as exc:  # noqa: BLE001
         # The type only: a driver error stringifies its bound parameters, and one is the hash.
         logger.warning("event=buyer_identity_hash_legacy_lookup_failed error=%s", type(exc).__name__)
-        return legacy
+        raise BuyerIdentityHashUnavailable() from None
+    if found is None:
+        logger.warning("event=buyer_identity_hash_legacy_lookup_failed error=no_answer")
+        raise BuyerIdentityHashUnavailable()
     return legacy if found else primary
 
 
