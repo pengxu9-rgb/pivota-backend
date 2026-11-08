@@ -25,7 +25,8 @@ from services.connector_service import (
     InvalidConnectorError,
     CredentialsError,
 )
-from utils.auth import get_current_user, can_access_merchant
+from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from db.merchant_onboarding import get_merchant_onboarding
 from db.platform_import_reports import save_raw_report, attach_import_task
 from db.platform_orders import list_orders_for_merchant
@@ -205,11 +206,15 @@ async def register_platform_merchant(
 
 
 @router.get("/{onboarding_id}", dependencies=[Depends(ensure_feature_enabled)])
-async def get_platform_onboarding(onboarding_id: str) -> dict:
-    """Read-only view of a Platform onboarding record.
+async def get_platform_onboarding(
+    onboarding_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Read-only view of a Platform onboarding record (that merchant or staff).
 
     This endpoint is side-car only and does not expose any v1-specific fields.
     """
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     try:
         return await get_platform_onboarding_v2(onboarding_id)
@@ -226,11 +231,15 @@ async def get_platform_onboarding(onboarding_id: str) -> dict:
 
 
 @router.get("/{onboarding_id}/import-tasks", dependencies=[Depends(ensure_feature_enabled)])
-async def get_platform_import_tasks(onboarding_id: str) -> dict:
-    """List ImportTasks for a Platform merchant (read-only, v2-only).
+async def get_platform_import_tasks(
+    onboarding_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """List ImportTasks for a Platform merchant (read-only, v2-only; that merchant or staff).
 
     Uses onboarding_id as merchant_id since v2 onboarding IDs are merchant IDs.
     """
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     try:
         tasks = await list_import_tasks(onboarding_id)
@@ -255,11 +264,7 @@ async def list_platform_orders(
     Version: 2.0 - Using SQLAlchemy Table API
     """
 
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to access orders for this merchant",
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     try:
         safe_platform = platform.strip().lower() if platform else None
@@ -299,14 +304,7 @@ async def validate_platform_connector_credentials(
     """
 
     # Access control: ensure the caller is allowed to see this onboarding/merchant.
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error_code": "ACCESS_DENIED",
-                "message": "Not authorized to validate connectors for this merchant",
-            },
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     # Ensure onboarding exists (and is part of v2).
     try:
@@ -412,11 +410,7 @@ async def validate_platform_report(
     Returns validation status, missing columns, row preview, etc.
     """
     # Access control
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to validate reports for this merchant",
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
     
     report_type = (report_type or "").strip().lower()
     if report_type not in ALLOWED_REPORT_TYPES:
@@ -509,11 +503,7 @@ async def upload_platform_report(
     Stores raw content and schedules import task.
     """
     # Access control
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to upload reports for this merchant",
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
     
     report_type = (report_type or "").strip().lower()
     if report_type not in ALLOWED_REPORT_TYPES:
@@ -622,11 +612,7 @@ async def validate_platform_orders_csv(
 
     This is a non-persistent validator to shape the future orders import pipeline.
     """
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to validate orders for this merchant",
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     platform = (platform or "").strip().lower()
     required_cols = ORDER_REPORT_REQUIRED_COLUMNS.get(platform)
@@ -721,11 +707,7 @@ async def upload_platform_orders_csv(
     - Persist raw report to platform_import_reports
     - Schedule ImportTask with source_type="orders_report" (connector: "<platform>_orders")
     """
-    if not can_access_merchant(current_user, onboarding_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to upload orders for this merchant",
-        )
+    assert_merchant_scope(current_user, onboarding_id, staff_roles=EMPLOYEE_ROLES)
 
     platform = (platform or "").strip().lower()
     required_cols = ORDER_REPORT_REQUIRED_COLUMNS.get(platform)

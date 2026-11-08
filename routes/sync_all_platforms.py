@@ -3,7 +3,7 @@ from services.merchant_store_service import get_merchant_active_stores
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from typing import List, Dict, Any
 from pydantic import BaseModel
-from utils.auth import get_current_user
+from utils.auth import assert_merchant_owner_or_staff, get_current_user
 from db.database import database
 from db.merchant_onboarding import get_merchant_onboarding
 from datetime import datetime
@@ -45,6 +45,9 @@ async def sync_all_platforms(
     Sync products from ALL connected platforms for a merchant.
     Unlike sync-universal which only syncs the first platform found.
     """
+    # The sync calls the store platform with the merchant's stored credentials and
+    # rewrites its products_cache, so only that merchant or staff may trigger it.
+    assert_merchant_owner_or_staff(current_user, request.merchant_id)
     start_time = datetime.now()
     results = []
     total_synced = 0
