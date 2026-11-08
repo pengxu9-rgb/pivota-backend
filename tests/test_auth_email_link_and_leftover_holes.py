@@ -351,7 +351,11 @@ def test_membership_predates_user_allows_clock_skew():
 # ---------------------------------------------------------------------------
 
 
-def _agent_login_client(monkeypatch, *, linked: bool):
+def _agent_login_client(monkeypatch, *, linked, agents=("agent_staff_made",)):
+    """linked: True/False for agent_staff_made, or the set of agent ids the login holds."""
+    linked_ids = set(linked) if isinstance(linked, (set, frozenset, list, tuple)) else (
+        {"agent_staff_made"} if linked else set()
+    )
     import db.auth_identity as auth_identity
     import db.agents as agents_db
     import routes.agent_account as module
@@ -371,27 +375,35 @@ def _agent_login_client(monkeypatch, *, linked: bool):
                 "active": True,
                 "created_at": CREATED,
             }
-        if "FROM agents" in q and "owner_email" in q:
-            return {
-                "agent_id": "agent_staff_made",
-                "agent_name": "Partner",
-                "owner_email": EMAIL,
-                "api_key": "redacted:agent_staff_made",
-                "agent_type": "basic",
-            }
         return None
+
+    async def fetch_all(query, values=None):
+        q = " ".join(str(query).split())
+        if "FROM agents" in q and "owner_email" in q:
+            return [
+                {
+                    "agent_id": a,
+                    "agent_name": "Partner",
+                    "owner_email": EMAIL,
+                    "api_key": f"redacted:{a}",
+                    "agent_type": "basic",
+                }
+                for a in agents
+            ]
+        return []
 
     async def execute(query, values=None):
         return None
 
     async def has_membership(*, email, membership_type, entity_id, not_before=None):
         checks.append((entity_id, not_before))
-        return linked and entity_id == "agent_staff_made"
+        return entity_id in linked_ids
 
     async def no_sync(**_kwargs):
         return None
 
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
     monkeypatch.setattr(module.database, "execute", execute)
     monkeypatch.setattr(module, "_sync_agent_auth_membership", no_sync)
     monkeypatch.setattr(auth_identity, "has_active_membership_for_entity", has_membership)

@@ -192,8 +192,9 @@ def _install_agent_create_order_harness(
             raise store_exception
         return store_result
 
-    async def fake_load_replayable_agent_order_create_response(_order_request: Any):
+    async def fake_load_replayable_agent_order_create_response(_order_request: Any, **replay_owner: Any):
         calls["steps"].append("load_replayable")
+        calls["replay_owner"] = replay_owner
         calls["replay_idempotency_key"] = getattr(_order_request, "idempotency_key", None)
         if replay_exception is not None:
             raise replay_exception
@@ -202,8 +203,9 @@ def _install_agent_create_order_harness(
     async def fake_cache_agent_order_create_response_best_effort(
         idempotency_key: Optional[str],
         response: dict[str, Any],
+        **replay_owner: Any,
     ) -> None:
-        calls["cached_replay"] = {"idempotency_key": idempotency_key, "response": response}
+        calls["cached_replay"] = {"idempotency_key": idempotency_key, "response": response, **replay_owner}
 
     async def fake_quote_load(self: Any, *, quote_id: str):
         calls["steps"].append(f"quote_load:{quote_id}")
@@ -243,7 +245,9 @@ def _install_agent_create_order_harness(
     class FakePostgresIdempotencyStore:
         async def get(self, *, scope: str, key: str):
             calls["steps"].append("idempotency_get")
-            calls["idempotency_get"] = {"scope": scope, "key": key}
+            # The first read is the owner-namespaced key; a miss also reads the legacy bare key.
+            calls.setdefault("idempotency_get", {"scope": scope, "key": key})
+            calls.setdefault("idempotency_gets", []).append(key)
             if idempotency_value is None:
                 return None
             return SimpleNamespace(value=idempotency_value)
@@ -322,7 +326,7 @@ async def test_agent_create_order_parallel_pre_create_reads_success(monkeypatch:
     response = await _call_agent_create_order(module, order_request)
 
     assert response["order_id"] == "ord_ws14"
-    assert calls["idempotency_get"] == {"scope": "order_create", "key": "idem_ws14"}
+    assert calls["idempotency_get"] == {"scope": "order_create", "key": "agent:agent_ws14:idem_ws14"}
     assert calls["replay_idempotency_key"] == "idem_ws14"
     assert "create_new_order" in calls["steps"]
     assert calls["create_new_order_kwargs"]["precomputed_store_info"] == {
@@ -393,4 +397,51 @@ async def test_agent_create_order_parallel_pre_create_reads_raises_replay_except
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == "replay-boom"
-    assert calls["idempotency_get"] == {"scope": "order_create", "key": "idem_ws14"}
+    assert calls["idempotency_get"] == {"scope": "order_create", "key": "agent:agent_ws14:idem_ws14"}
+
+
+class _TestCheckoutTokenContext(_TestAgentContext):
+    checkout_token_payload = {
+        "agent_id": "agent_ws14",
+        "intent_id": "ci_ws14_token",
+        "scopes": ["checkout"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_scopes_replay_and_cache_to_the_calling_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, calls = _install_agent_create_order_harness(monkeypatch)
+    order_request = _build_order_request()
+    calls["order_request"] = order_request
+
+    await _call_agent_create_order(module, order_request)
+
+    assert calls["replay_owner"] == {"agent_id": "agent_ws14", "intent_id": None}
+    assert calls["idempotency_get"]["key"] == "agent:agent_ws14:idem_ws14"
+
+
+@pytest.mark.asyncio
+async def test_agent_create_order_under_a_checkout_token_binds_the_order_to_the_token_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, calls = _install_agent_create_order_harness(monkeypatch)
+    order_request = _build_order_request()
+    # A caller-supplied intent id must not let the order bind to another token's session.
+    order_request.metadata["intent_id"] = "ci_forged"
+    calls["order_request"] = order_request
+
+    await module.agent_create_order(
+        order_request,
+        BackgroundTasks(),
+        request=None,
+        context=_TestCheckoutTokenContext(),
+        agent_user=None,
+        x_buyer_ref=None,
+    )
+
+    assert "create_new_order" in calls["steps"]
+    assert order_request.metadata["intent_id"] == "ci_ws14_token"
+    assert calls["replay_owner"] == {"agent_id": "agent_ws14", "intent_id": "ci_ws14_token"}
+    assert calls["idempotency_get"]["key"] == "agent:agent_ws14:intent:ci_ws14_token:idem_ws14"
