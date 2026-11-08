@@ -1242,6 +1242,15 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
             )
         role = user.get("role") or "merchant"
     else:
+        # This branch creates the users row at the address, and a claim token only
+        # proves an install (on any store, including the caller's own dev store),
+        # never that the caller reads this mailbox. Refuse an address that already
+        # names an employee (login would promote this row to staff), an agent
+        # owner, a merchant contact or an identity in use.
+        from routes.merchant_onboarding_routes import refuse_signup_at_claimed_address
+
+        await refuse_signup_at_claimed_address(email, also_check_users_and_merchant_contacts=True)
+
         # New account: it owns the shell merchant outright.
         target_merchant_id = shell_merchant_id
         role = "merchant"
