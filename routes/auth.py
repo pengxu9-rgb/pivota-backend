@@ -1585,7 +1585,7 @@ async def change_password(
     try:
         # Get user from database
         rows = await database.fetch_all(
-            "SELECT id, email, password_hash FROM users WHERE LOWER(email) = LOWER(:email)",
+            "SELECT id, email, password_hash, role FROM users WHERE LOWER(email) = LOWER(:email)",
             {"email": current_user["email"]}
         )
         
@@ -1628,7 +1628,7 @@ async def change_password(
             )
 
         employee_identity = await _fetch_active_employee_identity(current_user["email"])
-        if employee_identity:
+        if employee_identity and _caller_is_the_employee(current_user, dict(user), employee_identity):
             legacy_password_hash = hashlib.sha256(
                 f"{data.new_password}pivota_employee_salt_v1".encode()
             ).hexdigest()
@@ -1639,6 +1639,17 @@ async def change_password(
                 )
             except Exception as exc:
                 logger.warning("[Auth] Failed to sync employee legacy password: %s", exc)
+        elif employee_identity:
+            await _safe_record_identity_event(
+                event_type="employee_password_sync_refused",
+                email=_normalize_email(current_user["email"]),
+                details={
+                    "membership_type": str(current_user.get("membership_type") or ""),
+                    "users_role": str(dict(user).get("role") or ""),
+                    "employee_id": str(employee_identity.get("employee_id") or ""),
+                    "source": "change_password",
+                },
+            )
         
         return MessageResponse(
             success=True,
@@ -1652,6 +1663,25 @@ async def change_password(
             status_code=500,
             detail=f"Failed to change password: {str(e)}"
         )
+
+
+def _caller_is_the_employee(current_user: dict, user: dict, employee: dict) -> bool:
+    """Whether a change-password caller may also rewrite the employee's legacy password.
+
+    The legacy employees.password is the only proof login accepts for promoting a
+    non-staff users row to staff, so only the employee may set it here: a token
+    issued for an employee membership (for this employee, when it names one), or a
+    legacy token with no membership_type whose users row is itself staff. A merchant
+    or agent token at the same address changes that account's own password only.
+    Reset-password keeps syncing: it proves the mailbox.
+    """
+    membership_type = str(current_user.get("membership_type") or "").strip().lower()
+    if membership_type == "employee":
+        claimed = str(current_user.get("employee_id") or "").strip()
+        return not claimed or claimed == str(employee.get("employee_id") or "")
+    if membership_type:
+        return False
+    return not _is_non_staff_account_role(user.get("role")) and bool(str(user.get("role") or "").strip())
 
 
 @router.post("/forgot-password", response_model=MessageResponse)

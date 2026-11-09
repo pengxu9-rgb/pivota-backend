@@ -514,3 +514,132 @@ async def test_a_claim_token_is_consumed_exactly_once_under_concurrent_claims(db
     assert codes == [200, 400], [(r.status_code, r.text[:200]) for r in results]
     assert await _users_rows(db, first) + await _users_rows(db, second) == 1
     assert await _token_used_at(token) is not None
+
+
+# ---------------------------------------------------------------------------
+# Review X1: change-password rewrites employees.password only for the employee
+# ---------------------------------------------------------------------------
+
+
+async def _employee_legacy_hash_in_db(db, email):
+    return await db.fetch_val("SELECT password FROM employees WHERE LOWER(email) = LOWER(:e)", {"e": email})
+
+
+async def _login_token(client, email, password, portal):
+    body = {"email": email, "password": password}
+    if portal:
+        body["portal"] = portal
+    resp = await client.post("/api/auth/login", json=body)
+    assert resp.status_code == 200, (portal, resp.status_code, resp.text)
+    return resp.json()["token"]
+
+
+async def _change_password(client, token, current, new):
+    return await client.post(
+        "/api/auth/change-password",
+        json={"current_password": current, "new_password": new},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+async def test_x1_a_merchant_token_at_an_employee_address_cannot_set_the_staff_password(db, client):
+    """A merchant users row left at an active admin's address (a pre-fix sign-up). Its
+    holder signs in on the merchant portal and changes the password: that changes the
+    merchant login only. employees.password, the one proof login accepts for promoting
+    this row, is untouched, so the new password opens no employee claim."""
+    from utils.auth import hash_password
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await db.execute(
+        "INSERT INTO users (email, password_hash, full_name, role, merchant_id) "
+        "VALUES (:e, :h, 'M', 'merchant', :m)",
+        {"e": staff, "h": hash_password(ATTACKER_PW), "m": "merch_x1_" + secrets.token_hex(4)},
+    )
+    before = await _employee_legacy_hash_in_db(db, staff)
+    token = await _login_token(client, staff, ATTACKER_PW, "merchant")
+
+    resp = await _change_password(client, token, ATTACKER_PW, "Attacker456pw")
+
+    assert resp.status_code == 200, resp.text
+    assert await _employee_legacy_hash_in_db(db, staff) == before == _legacy_employee_hash(EMPLOYEE_PW)
+    for portal in ("employee", None):
+        claims = await _login(client, staff, "Attacker456pw", portal)
+        assert not claims.get("employee_id"), (portal, claims)
+        assert claims.get("role") not in ("admin", "employee", "super_admin"), (portal, claims)
+    refused = await db.fetch_val(
+        "SELECT count(*) FROM auth_identity_events "
+        "WHERE email_normalized = :e AND event_type = 'employee_password_sync_refused'",
+        {"e": staff},
+    )
+    assert refused == 1
+    # The merchant login itself did change.
+    assert (await _login(client, staff, "Attacker456pw", "merchant")).get("role") == "merchant"
+
+
+async def test_x1_an_employee_token_still_syncs_the_legacy_password(db, client):
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    token = await _login_token(client, staff, EMPLOYEE_PW, "employee")
+
+    resp = await _change_password(client, token, EMPLOYEE_PW, "EmployeeNew2pw")
+
+    assert resp.status_code == 200, resp.text
+    assert await _employee_legacy_hash_in_db(db, staff) == _legacy_employee_hash("EmployeeNew2pw")
+    claims = await _login(client, staff, "EmployeeNew2pw", "employee")
+    assert claims.get("employee_id") == emp_id and claims.get("role") == "admin", claims
+
+
+@pytest.mark.parametrize(
+    "claims, users_role, syncs",
+    [
+        ({}, "admin", True),                                                   # legacy staff token, staff row
+        ({}, "merchant", False),                                               # legacy token, merchant row
+        ({"membership_type": "agent", "agent_id": "agent_x"}, "agent", False),
+        ({"membership_type": "employee", "employee_id": "emp_other"}, "admin", False),  # another employee's id
+        ({"membership_type": "merchant", "merchant_id": "merch_x"}, "admin", False),   # non-employee token, staff row
+    ],
+    ids=["legacy-staff-row", "legacy-merchant-row", "agent-token", "employee-token-other-id", "merchant-token-staff-row"],
+)
+async def test_x1_who_may_sync_the_legacy_password(db, client, claims, users_role, syncs):
+    from utils.auth import create_access_token, hash_password
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await db.execute(
+        "INSERT INTO users (email, password_hash, full_name, role) VALUES (:e, :h, 'U', :r)",
+        {"e": staff, "h": hash_password(ATTACKER_PW), "r": users_role},
+    )
+    token = create_access_token({"sub": staff, "email": staff, "role": users_role, **claims})
+
+    resp = await _change_password(client, token, ATTACKER_PW, "Changed789pw")
+
+    assert resp.status_code == 200, resp.text
+    expected = _legacy_employee_hash("Changed789pw" if syncs else EMPLOYEE_PW)
+    assert await _employee_legacy_hash_in_db(db, staff) == expected
+
+
+async def test_x1_reset_still_syncs_the_legacy_password(db, client, monkeypatch):
+    """Reset proves the mailbox, so it may set the employee's legacy password, even
+    when the users row at the address is a merchant's."""
+    from routes import auth
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await _seed_merchant_row_at(db, staff, ATTACKER_PW)
+    sent = {}
+    monkeypatch.setattr(auth, "_send_reset_password_email", lambda e, link: sent.__setitem__(e, link.split("token=")[1]))
+
+    resp = await client.post("/api/auth/forgot-password", json={"email": staff, "portal": "employee"})
+    assert resp.status_code == 200, resp.text
+    assert sent.get(staff), sent
+    resp = await client.post("/api/auth/reset-password", json={"token": sent[staff], "new_password": "ResetOwn1pw"})
+    assert resp.status_code == 200, resp.text
+
+    assert await _employee_legacy_hash_in_db(db, staff) == _legacy_employee_hash("ResetOwn1pw")
+    claims = await _login(client, staff, "ResetOwn1pw", "employee")
+    assert claims.get("employee_id") == emp_id, claims
