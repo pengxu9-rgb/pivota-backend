@@ -99,6 +99,16 @@ auth_identity_events = Table(
 )
 
 
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now for the timestamptz columns below.
+
+    A naive utcnow() is read by Postgres in the SESSION time zone, so on a host
+    whose zone is not UTC every membership looked hours older or newer than the
+    users row (created_at = NOW()) it is compared against.
+    """
+    return datetime.now(timezone.utc)
+
+
 def normalize_email(email: str) -> str:
     return (email or "").strip().lower()
 
@@ -151,7 +161,7 @@ async def ensure_identity(
     normalized = normalize_email(email)
     existing = await get_identity_by_email(normalized)
     if existing:
-        updates: Dict[str, Any] = {"status": status, "updated_at": datetime.utcnow()}
+        updates: Dict[str, Any] = {"status": status, "updated_at": _utcnow()}
         if full_name:
             updates["full_name"] = full_name
         await database.execute(
@@ -163,7 +173,7 @@ async def ensure_identity(
         return refreshed or existing
 
     identity_id = f"identity_{secrets.token_hex(12)}"
-    now = datetime.utcnow()
+    now = _utcnow()
     try:
         await database.execute(
             auth_identities.insert().values(
@@ -201,7 +211,7 @@ async def upsert_credential_hash(
     existing = await database.fetch_one(
         auth_credentials.select().where(auth_credentials.c.identity_id == identity_id)
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     if existing:
         await database.execute(
             auth_credentials.update()
@@ -219,6 +229,39 @@ async def upsert_credential_hash(
             updated_at=now,
         )
     )
+
+
+async def insert_credential_hash_if_absent(
+    *,
+    identity_id: str,
+    password_hash: str,
+    source: str,
+) -> bool:
+    """Set the identity's password only if it has none. True when this call set it.
+
+    For flows that prove nothing about who holds the identity (self-service
+    registration): they may give a new identity its first password, never replace one.
+    """
+    existing = await database.fetch_one(
+        auth_credentials.select().where(auth_credentials.c.identity_id == identity_id)
+    )
+    if existing:
+        return False
+    now = _utcnow()
+    try:
+        await database.execute(
+            auth_credentials.insert().values(
+                identity_id=identity_id,
+                password_hash=password_hash,
+                source=source,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    except Exception:
+        # A concurrent writer got there first (primary key): keep theirs.
+        return False
+    return True
 
 
 async def verify_identity_password(email: str, plain_password: str) -> Optional[Dict[str, Any]]:
@@ -272,7 +315,7 @@ async def upsert_membership(
             & (auth_memberships.c.entity_id == str(entity_id))
         )
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     values = {
         "role": role,
         "status": status,
@@ -415,6 +458,6 @@ async def record_identity_event(
             email_normalized=normalize_email(email or ""),
             event_type=event_type,
             details=details or {},
-            created_at=datetime.utcnow(),
+            created_at=_utcnow(),
         )
     )

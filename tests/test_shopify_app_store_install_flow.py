@@ -531,12 +531,22 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return None  # brand-new account
             raise AssertionError(f"unexpected query: {query}")
 
         async def execute(self, query: str, values: dict = None):
             executed.append((query, values or {}))
+
+    import routes.auth as auth_module
+
+    tenant_checks: list = []
+
+    async def address_names_no_one(email, **kwargs):
+        tenant_checks.append((email, kwargs))
+        return False
+
+    monkeypatch.setattr(auth_module, "_email_claims_existing_tenant", address_names_no_one)
 
     async def fake_ensure_tables():
         return None
@@ -580,6 +590,12 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
     assert user_values["password_hash"] != "a-good-password"
     assert module.verify_bcrypt_password("a-good-password", user_values["password_hash"])
 
+    # The new-account branch asked whether the address already names someone
+    # (an employee of any status, an agent owner, a merchant contact, an identity).
+    assert tenant_checks == [
+        ("reviewer@example.com", {"check_users_and_merchant_contacts": True, "any_employee_status": True})
+    ]
+
 
 @pytest.mark.asyncio
 async def test_claim_with_existing_merchant_moves_store_not_account(
@@ -596,7 +612,7 @@ async def test_claim_with_existing_merchant_moves_store_not_account(
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "owner@example.com",
@@ -665,7 +681,7 @@ async def test_claim_rejects_wrong_password_for_existing_account(
         async def fetch_one(self, query: str, values: dict):
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "victim@example.com",

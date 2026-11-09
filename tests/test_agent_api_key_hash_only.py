@@ -317,7 +317,13 @@ def _login_setup(monkeypatch, module, *, stored_api_key: str):
     async def execute(query, values=None):
         executed.append((" ".join(str(query).split()), dict(values or {})))
 
+    async def fetch_all(query, values=None):
+        q = " ".join(str(query).split())
+        row = await fetch_one(query, values) if "FROM agents" in q else None
+        return [row] if row else []
+
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
     monkeypatch.setattr(module.database, "execute", execute)
     import db.agents as agents_db
 

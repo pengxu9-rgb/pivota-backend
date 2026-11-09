@@ -83,14 +83,14 @@ ALLOWLIST: Dict[Tuple[str, str], str] = {
     ("POST", "/v1/catalog/reconcile/merchants/{merchant_id}"): "_require_catalog_scope: normalizes the id and keeps merch_obs_* admin-only",
     ("POST", "/v1/catalog/verticals/beauty/rebuild/{merchant_id}"): "_require_catalog_scope: normalizes the id and keeps merch_obs_* admin-only",
     ("POST", "/v1/catalog/incentives/reconcile/{merchant_id}"): "_require_catalog_scope: normalizes the id and keeps merch_obs_* admin-only",
-    ("GET", "/agents/{agent_id}"): "_is_own_agent_record ownership (id claims + record owner_email), reviewed in agent_management",
-    ("PUT", "/agents/{agent_id}"): "owner-or-staff check plus field-level self-escalation refusal, reviewed in agent_management",
-    # Read-only, inline: employee staff, or a token whose agent_id claim (else its email)
-    # equals the path id. The email arm can only match an email-shaped id (the non-prod
-    # demo lane), never an agent_<hex> id; moving these onto the guard is a follow-up.
-    ("GET", "/agents/{agent_id}/funnel"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
-    ("GET", "/agents/{agent_id}/query-analytics"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
-    ("GET", "/agents/{agent_id}/merchants"): "read-only: staff, or agent_id claim (else email) == path id, inline in agent_management",
+    # agent_management's inline checks: employee staff, or an `agent` token whose own
+    # agent_id claim is the path id. No email arm (owner_email or email == id) and no
+    # user_id arm; pinned by tests/test_auth_takeover_followups.py.
+    ("GET", "/agents/{agent_id}"): "staff, or _is_own_agent_record (agent token's agent_id claim only), agent_management",
+    ("PUT", "/agents/{agent_id}"): "staff, or agent_id claim == path id, plus field-level self-escalation refusal, agent_management",
+    ("GET", "/agents/{agent_id}/funnel"): "read-only: staff, or agent_id claim == path id (no email arm), agent_management",
+    ("GET", "/agents/{agent_id}/query-analytics"): "read-only: staff, or agent_id claim == path id (no email arm), agent_management",
+    ("GET", "/agents/{agent_id}/merchants"): "read-only: staff, or agent_id claim == path id (no email arm), agent_management",
     # Pre-existing fail-closed lockout: compares user_id (a users-table id) with the
     # agent id, so only admins pass. Admitting agent owners is a separate, reviewed
     # decision pinned by tests/test_admin_route_token_and_role_gate.py.
@@ -101,8 +101,8 @@ ALLOWLIST: Dict[Tuple[str, str], str] = {
     ("DELETE", "/agents/{agent_id}/routes/{route_id}"): "admin-only in effect (user_id lockout), widening needs its own review",
     ("POST", "/agents/{agent_id}/protocols/{protocol_name}/test"): "admin-only in effect (user_id lockout), widening needs its own review",
     # Staff-only by an inline role check (no tenant token passes it).
-    ("GET", "/agents/{agent_id}/analytics"): "read-only: admin/employee/super_admin, or agent_id claim (else email) == path id, inline in agent_management",
-    ("GET", "/agents/{agent_id}/usage"): "read-only: admin/employee/super_admin, or agent_id claim (else email) == path id, inline in agent_management",
+    ("GET", "/agents/{agent_id}/analytics"): "read-only: admin/employee/super_admin, or agent_id claim == path id (no email arm), agent_management",
+    ("GET", "/agents/{agent_id}/usage"): "read-only: admin/employee/super_admin, or agent_id claim == path id (no email arm), agent_management",
     ("PATCH", "/agents/{agent_id}/tier"): "inline staff-only role check",
     ("POST", "/agents/{agent_id}/revenue/policies"): "inline staff-only role check",
     ("POST", "/agents/{agent_id}/protocols/"): "inline admin-only role check",
@@ -510,3 +510,50 @@ async def test_flag_gated_onboarding_id_routes_refuse_foreign_tenants(onboarding
             if exc is None or exc.status_code != 403:
                 failures.append(f"{route.path} [{caller_name}]: {exc!r}")
     assert not failures, "\n".join(failures)
+
+
+# ---------------------------------------------------------------------------
+# Routes that take the merchant from the BODY or QUERY (not swept above)
+# ---------------------------------------------------------------------------
+
+# (method, path, parameter expression the guard must be called on). These were
+# anonymous or any-token; each must call the shared merchant guard on that value.
+BODY_OR_QUERY_MERCHANT_ROUTES = [
+    ("POST", "/products/sync-all-platforms/", "request.merchant_id"),
+    ("POST", "/internal/product/quality/eval", "body.merchant_id"),
+    ("POST", "/internal/product/enrichment/run", "body.merchant_id"),
+    ("GET", "/api/gsc/oauth/start", "merchant_id"),
+    ("GET", "/api/gsc/oauth/status", "merchant_id"),
+]
+
+
+def _merchant_guard_targets(fn) -> Set[str]:
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    out: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name in MERCHANT_GUARDS and len(node.args) >= 2:
+                out.add(ast.unparse(node.args[1]))
+    return out
+
+
+@pytest.mark.parametrize("method,path,target", BODY_OR_QUERY_MERCHANT_ROUTES)
+def test_body_and_query_merchant_routes_run_the_shared_guard(app, method, path, target):
+    matches = [
+        r for r in app.routes
+        if isinstance(r, APIRoute) and r.path == path and method in (r.methods or set())
+    ]
+    if path.startswith("/api/gsc/") and not matches:
+        from fastapi import FastAPI
+
+        from routes.gsc_oauth_routes import router as gsc_router
+
+        gsc_app = FastAPI()
+        gsc_app.include_router(gsc_router)
+        matches = [r for r in gsc_app.routes if isinstance(r, APIRoute) and r.path == path]
+    assert matches, f"{method} {path} is not mounted"
+    for route in matches:
+        assert target in _merchant_guard_targets(route.endpoint), (
+            f"{method} {path} must call assert_merchant_scope on {target}"
+        )

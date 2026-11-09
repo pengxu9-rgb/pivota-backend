@@ -4,7 +4,8 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel
 
 from services.product_quality_service import preview_quality, full_quality_eval
-from utils.auth import assert_merchant_owner_or_staff, get_current_user
+from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 
 
 router = APIRouter(
@@ -69,7 +70,7 @@ async def product_quality_eval(
     It writes a snapshot for body.merchant_id, so the caller must be that merchant
     (the merchant portal sends its own token and id) or staff.
     """
-    assert_merchant_owner_or_staff(current_user, body.merchant_id)
+    assert_merchant_scope(current_user, body.merchant_id, staff_roles=EMPLOYEE_ROLES)
     try:
         result = await full_quality_eval(
             merchant_id=body.merchant_id,
