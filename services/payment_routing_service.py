@@ -121,6 +121,44 @@ class RetryDecision:
     retryable: bool
     fallbackable: bool
     reason: str
+    # True when the PSP may have accepted the payment: a timeout, a transport error after the
+    # request could have been sent, a 5xx, or an error we cannot classify. Such an attempt is never
+    # resent and never failed over; it is reconciled at that PSP by our reference (order_id).
+    outcome_unknown: bool = False
+
+
+class PaymentNotSentError(Exception):
+    """Raised by a PSP adapter ONLY from its connect layer, when the request provably never left
+    (no connection was made). It is the one failure that may move a payment to another PSP.
+    Error text is never taken as proof: "connection refused" can be the last of several
+    transport retries, or a later step after the PSP already accepted."""
+
+
+class PSPExecutionNotImplemented(PaymentNotSentError, NotImplementedError):
+    """The fail-closed stub in _execute_with_psp: no adapter is wired, nothing was sent."""
+
+
+# A failure that can happen after the PSP received the request. Checked before anything else.
+_MAYBE_SENT_TRANSPORT_MARKERS = (
+    "reset",
+    "broken pipe",
+    "aborted",
+    "eof",
+    "connection",
+    "network",
+    "refused",
+    "dns",
+    "getaddrinfo",
+)
+_PSP_5XX_MARKERS = ("500", "502", "503", "504", "server error", "5xx")
+_BUSINESS_DECLINE_MARKERS = (
+    "insufficient funds",
+    "declined",
+    "do_not_honor",
+    "not allowed",
+    "fraud",
+    "card_declined",
+)
 
 class RoutingStrategy(Enum):
     PRIORITY = "priority"  # Use PSP order
@@ -290,60 +328,16 @@ class PaymentRoutingService:
                 currency=currency
             )
             
+            start_time = datetime.utcnow()
+            start_mono = time.monotonic()
             try:
-                # Execute payment with PSP
-                start_time = datetime.utcnow()
-                start_mono = time.monotonic()
                 result = await self._execute_with_psp(psp_name, payment_request)
-                response_time_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
-                record_payment_attempt(
-                    psp=psp_name,
-                    result="success",
-                    error_category="none",
-                    duration_seconds=max(0.0, time.monotonic() - start_mono),
-                )
-                
-                # Log successful attempt
-                await self._update_payment_attempt(
-                    attempt_id=attempt_id,
-                    status="success",
-                    response_time_ms=response_time_ms
-                )
-                
-                # Update route metrics
-                await self.update_route_metrics(route_id, {
-                    "success": True,
-                    "psp": psp_name,
-                    "response_time_ms": response_time_ms,
-                    "attempt_number": attempt_number
-                })
-                logger.info(
-                    "payment.routing.success",
-                    extra={
-                        "event": "payment.routing.success",
-                        "mode": "legacy",
-                        "order_id": str(order_id or ""),
-                        "route_id": str(route_id or ""),
-                        "attempt_number": attempt_number,
-                        "psp": psp_name,
-                        "response_time_ms": response_time_ms,
-                    },
-                )
-                
-                return {
-                    "success": True,
-                    "psp_used": psp_name,
-                    "attempt_number": attempt_number,
-                    "response_time_ms": response_time_ms,
-                    **result
-                }
-                
             except Exception as e:
-                # Log failed attempt
                 error_message = str(e)
                 last_error = error_message
-                error_category = self._classify_error_message(error_message).value
-                if error_category == PaymentErrorCategory.TIMEOUT.value:
+                decision = self._retry_decision(e)
+                error_category = decision.category.value
+                if decision.category == PaymentErrorCategory.TIMEOUT:
                     record_payment_timeout(psp=psp_name, stage="execute_with_failover")
                 record_payment_attempt(
                     psp=psp_name,
@@ -360,19 +354,54 @@ class PaymentRoutingService:
                         "attempt_number": attempt_number,
                         "psp": psp_name,
                         "error_category": error_category,
+                        "outcome_unknown": decision.outcome_unknown,
                         "error_message": error_message[:400],
                     },
                 )
-                
-                await self._update_payment_attempt(
-                    attempt_id=attempt_id,
-                    status="failed",
-                    error_code="PSP_ERROR",
-                    error_message=error_message
+
+                if decision.outcome_unknown:
+                    # The PSP may have charged: stop here, never try the next PSP.
+                    await self._best_effort(
+                        "attempt_update",
+                        self._update_payment_attempt(
+                            attempt_id=attempt_id,
+                            status="outcome_unknown",
+                            error_code=error_category.upper(),
+                            error_message=error_message,
+                        ),
+                    )
+                    await self._best_effort(
+                        "route_metrics",
+                        self.update_route_metrics(route_id, {
+                            "success": False,
+                            "psp": psp_name,
+                            "attempt_number": attempt_number,
+                            "error": error_message,
+                        }),
+                    )
+                    return self._outcome_unknown_result(
+                        order_id=order_id,
+                        psp_name=psp_name,
+                        attempt_number=attempt_number,
+                        error=error_message,
+                    )
+
+                await self._best_effort(
+                    "attempt_update",
+                    self._update_payment_attempt(
+                        attempt_id=attempt_id,
+                        status="failed",
+                        error_code="PSP_ERROR",
+                        error_message=error_message
+                    ),
                 )
-                
-                # Continue to next PSP if available
-                if attempt_number < len(sorted_psps) and attempt_number <= max_retries:
+
+                # Only a request that never left may go to the next PSP. A decline ends here.
+                if (
+                    decision.fallbackable
+                    and attempt_number < len(sorted_psps)
+                    and attempt_number <= max_retries
+                ):
                     record_retry_attempt(domain="payment", category=error_category)
                     pending_fallback_from = psp_name
                     logger.info(
@@ -390,14 +419,62 @@ class PaymentRoutingService:
                     continue
                 else:
                     break
+
+            # The PSP accepted. Nothing below may turn this into a failover.
+            response_time_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            record_payment_attempt(
+                psp=psp_name,
+                result="success",
+                error_category="none",
+                duration_seconds=max(0.0, time.monotonic() - start_mono),
+            )
+            await self._best_effort(
+                "attempt_update",
+                self._update_payment_attempt(
+                    attempt_id=attempt_id,
+                    status="success",
+                    response_time_ms=response_time_ms
+                ),
+            )
+            await self._best_effort(
+                "route_metrics",
+                self.update_route_metrics(route_id, {
+                    "success": True,
+                    "psp": psp_name,
+                    "response_time_ms": response_time_ms,
+                    "attempt_number": attempt_number
+                }),
+            )
+            logger.info(
+                "payment.routing.success",
+                extra={
+                    "event": "payment.routing.success",
+                    "mode": "legacy",
+                    "order_id": str(order_id or ""),
+                    "route_id": str(route_id or ""),
+                    "attempt_number": attempt_number,
+                    "psp": psp_name,
+                    "response_time_ms": response_time_ms,
+                },
+            )
+            return {
+                **self._psp_result_fields(result, psp_name),
+                "success": True,
+                "psp_used": psp_name,
+                "attempt_number": attempt_number,
+                "response_time_ms": response_time_ms,
+            }
         
         # All attempts failed
-        await self.update_route_metrics(route_id, {
-            "success": False,
-            "psp": last_attempted_psp,
-            "attempt_number": attempt_number,
-            "error": last_error
-        })
+        await self._best_effort(
+            "route_metrics",
+            self.update_route_metrics(route_id, {
+                "success": False,
+                "psp": last_attempted_psp,
+                "attempt_number": attempt_number,
+                "error": last_error
+            }),
+        )
         logger.warning(
             "payment.routing.exhausted",
             extra={
@@ -426,58 +503,111 @@ class PaymentRoutingService:
         mid = str(merchant_id or "").strip()
         return bool(mid and mid in PAYMENT_ROUTING_V2_ALLOWLIST)
 
-    @staticmethod
-    def _classify_error_message(message: str) -> PaymentErrorCategory:
-        msg = str(message or "").lower()
-        if "timeout" in msg:
-            return PaymentErrorCategory.TIMEOUT
-        if any(k in msg for k in ("connection", "refused", "reset", "dns", "network")):
-            return PaymentErrorCategory.CONNECTION
-        if any(
-            k in msg
-            for k in (
-                "insufficient funds",
-                "declined",
-                "do_not_honor",
-                "not allowed",
-                "fraud",
-                "card_declined",
-            )
-        ):
-            return PaymentErrorCategory.BUSINESS
-        if any(k in msg for k in ("500", "502", "503", "504", "server error", "5xx")):
-            return PaymentErrorCategory.PSP
-        return PaymentErrorCategory.UNKNOWN
-
     def _retry_decision(self, exc: Exception) -> RetryDecision:
-        if isinstance(exc, asyncio.TimeoutError):
+        """Decide what may follow a failed PSP call.
+
+        Only a typed PaymentNotSentError (the request never left) may move the payment to another
+        PSP. A decline ends the attempt. Everything else may have been accepted by the PSP, so it
+        is an unknown outcome: never resent and never failed over, because the first PSP may
+        already have charged the buyer.
+        """
+        if isinstance(exc, PSPExecutionNotImplemented):
+            # Every PSP goes through the same stub, so trying the next one is pointless.
             return RetryDecision(
-                category=PaymentErrorCategory.TIMEOUT,
+                category=PaymentErrorCategory.UNKNOWN,
+                retryable=False,
+                fallbackable=False,
+                reason="not_attempted",
+            )
+        if isinstance(exc, PaymentNotSentError):
+            return RetryDecision(
+                category=PaymentErrorCategory.CONNECTION,
                 retryable=True,
                 fallbackable=True,
-                reason="timeout",
+                reason="not_sent",
             )
-        category = self._classify_error_message(str(exc))
-        if category in {PaymentErrorCategory.TIMEOUT, PaymentErrorCategory.CONNECTION, PaymentErrorCategory.PSP}:
+
+        msg = str(exc or "").lower()
+        maybe_sent: Optional[Tuple[PaymentErrorCategory, str]] = None
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in msg or "timed out" in msg:
+            maybe_sent = (PaymentErrorCategory.TIMEOUT, "timeout")
+        elif isinstance(exc, ConnectionError) or any(k in msg for k in _MAYBE_SENT_TRANSPORT_MARKERS):
+            maybe_sent = (PaymentErrorCategory.CONNECTION, "connection")
+        elif any(k in msg for k in _PSP_5XX_MARKERS):
+            maybe_sent = (PaymentErrorCategory.PSP, "psp_5xx")
+
+        if maybe_sent is None and any(k in msg for k in _BUSINESS_DECLINE_MARKERS):
             return RetryDecision(
-                category=category,
-                retryable=True,
-                fallbackable=True,
-                reason=category.value,
-            )
-        if category == PaymentErrorCategory.BUSINESS:
-            return RetryDecision(
-                category=category,
+                category=PaymentErrorCategory.BUSINESS,
                 retryable=False,
                 fallbackable=False,
                 reason="business_decline",
             )
+        category, reason = maybe_sent or (PaymentErrorCategory.UNKNOWN, "unknown")
         return RetryDecision(
-            category=PaymentErrorCategory.UNKNOWN,
+            category=category,
             retryable=False,
             fallbackable=False,
-            reason="unknown",
+            reason=reason,
+            outcome_unknown=True,
         )
+
+    async def _best_effort(self, label: str, coro) -> None:
+        """Run bookkeeping that follows a PSP call. Its failure must never be read as the
+        payment's failure: that would turn a charge into a failover and a second charge."""
+        try:
+            await coro
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "payment.routing.bookkeeping_failed",
+                extra={"event": "payment.routing.bookkeeping_failed", "step": label, "error": str(exc)[:200]},
+            )
+
+    @staticmethod
+    def _psp_result_fields(result: Any, psp_name: str) -> Dict[str, Any]:
+        """The PSP's own fields for a success answer. They never override ours (success,
+        psp_used, ...), and an odd shape is logged rather than raised: raising after the PSP
+        accepted would make the caller resend a payment that has landed."""
+        if isinstance(result, dict):
+            return dict(result)
+        if result is not None:
+            logger.error(
+                "payment.routing.unexpected_psp_result",
+                extra={"event": "payment.routing.unexpected_psp_result", "psp": psp_name, "type": type(result).__name__},
+            )
+        return {}
+
+    def _outcome_unknown_result(
+        self,
+        *,
+        order_id: Any,
+        psp_name: str,
+        attempt_number: int,
+        error: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        logger.warning(
+            "payment.routing.outcome_unknown",
+            extra={
+                "event": "payment.routing.outcome_unknown",
+                "order_id": str(order_id or ""),
+                "psp": psp_name,
+                "attempt_number": attempt_number,
+                "error": (error or "")[:400],
+            },
+        )
+        return {
+            "success": False,
+            "status": "outcome_unknown",
+            "outcome_unknown": True,
+            # Reconcile at this PSP by our reference; do not resend and do not try another PSP.
+            "psp_used": psp_name,
+            "reference": str(order_id or ""),
+            "error": error or "outcome_unknown",
+            "attempts": attempt_number,
+            "last_psp": psp_name,
+            **(extra or {}),
+        }
 
     def _v2_prune_failures(self, psp_name: str, now_mono: float) -> None:
         events = self._v2_failure_events.get(psp_name, [])
@@ -631,61 +761,18 @@ class PaymentRoutingService:
                     self._execute_with_psp(psp_name, payment_request),
                     timeout=timeout_seconds,
                 )
-                response_time_ms = int((time.monotonic() - started_mono) * 1000)
-                await self._update_payment_attempt(
-                    attempt_id=attempt_id,
-                    status="success",
-                    response_time_ms=response_time_ms,
-                )
-                self._v2_record_success(psp_name)
-                record_payment_attempt(
-                    psp=psp_name,
-                    result="success",
-                    error_category="none",
-                    duration_seconds=max(0.0, time.monotonic() - started_mono),
-                )
-
-                await self.update_route_metrics(
-                    route_id,
-                    {
-                        "success": True,
-                        "psp": psp_name,
-                        "response_time_ms": response_time_ms,
-                        "attempt_number": attempt_number,
-                    },
-                )
-                logger.info(
-                    "payment.routing.success",
-                    extra={
-                        "event": "payment.routing.success",
-                        "mode": "v2",
-                        "order_id": str(order_id or ""),
-                        "route_id": str(route_id or ""),
-                        "attempt_number": attempt_number,
-                        "attempt_limit": max_attempts_total,
-                        "psp": psp_name,
-                        "response_time_ms": response_time_ms,
-                        "visited_psps": sorted(visited_psps),
-                    },
-                )
-                return {
-                    "success": True,
-                    "psp_used": psp_name,
-                    "attempt_number": attempt_number,
-                    "response_time_ms": response_time_ms,
-                    "attempts_limit": max_attempts_total,
-                    "visited_psps": sorted(visited_psps),
-                    **result,
-                }
             except Exception as exc:
                 decision = self._retry_decision(exc)
                 last_error = str(exc)
                 last_failed_psp = psp_name
-                await self._update_payment_attempt(
-                    attempt_id=attempt_id,
-                    status="failed",
-                    error_code=decision.category.value.upper(),
-                    error_message=last_error,
+                await self._best_effort(
+                    "attempt_update",
+                    self._update_payment_attempt(
+                        attempt_id=attempt_id,
+                        status="outcome_unknown" if decision.outcome_unknown else "failed",
+                        error_code=decision.category.value.upper(),
+                        error_message=last_error,
+                    ),
                 )
                 if decision.category == PaymentErrorCategory.TIMEOUT:
                     record_payment_timeout(psp=psp_name, stage="v2_execute")
@@ -712,10 +799,36 @@ class PaymentRoutingService:
                         "error_category": decision.category.value,
                         "retryable": decision.retryable,
                         "fallbackable": decision.fallbackable,
+                        "outcome_unknown": decision.outcome_unknown,
                         "reason": decision.reason,
                         "error_message": (last_error or "")[:400],
                     },
                 )
+                if decision.outcome_unknown:
+                    # The PSP may have charged: stop here, never try the next PSP.
+                    await self._best_effort(
+                        "route_metrics",
+                        self.update_route_metrics(
+                            route_id,
+                            {
+                                "success": False,
+                                "psp": psp_name,
+                                "attempt_number": attempt_number,
+                                "error": last_error,
+                            },
+                        ),
+                    )
+                    return self._outcome_unknown_result(
+                        order_id=order_id,
+                        psp_name=psp_name,
+                        attempt_number=attempt_number,
+                        error=last_error,
+                        extra={
+                            "attempts_limit": max_attempts_total,
+                            "visited_psps": sorted(visited_psps),
+                            "no_backjump": True,
+                        },
+                    )
                 if decision.retryable:
                     record_retry_attempt(domain="payment", category=decision.category.value)
                 if decision.retryable and decision.fallbackable and attempt_number < max_attempts_total:
@@ -723,14 +836,70 @@ class PaymentRoutingService:
                     continue
                 break
 
-        await self.update_route_metrics(
-            route_id,
-            {
-                "success": False,
-                "psp": last_failed_psp or last_attempted_psp,
+            # The PSP accepted. Nothing below may turn this into a failover.
+            response_time_ms = int((time.monotonic() - started_mono) * 1000)
+            await self._best_effort(
+                "attempt_update",
+                self._update_payment_attempt(
+                    attempt_id=attempt_id,
+                    status="success",
+                    response_time_ms=response_time_ms,
+                ),
+            )
+            self._v2_record_success(psp_name)
+            record_payment_attempt(
+                psp=psp_name,
+                result="success",
+                error_category="none",
+                duration_seconds=max(0.0, time.monotonic() - started_mono),
+            )
+            await self._best_effort(
+                "route_metrics",
+                self.update_route_metrics(
+                    route_id,
+                    {
+                        "success": True,
+                        "psp": psp_name,
+                        "response_time_ms": response_time_ms,
+                        "attempt_number": attempt_number,
+                    },
+                ),
+            )
+            logger.info(
+                "payment.routing.success",
+                extra={
+                    "event": "payment.routing.success",
+                    "mode": "v2",
+                    "order_id": str(order_id or ""),
+                    "route_id": str(route_id or ""),
+                    "attempt_number": attempt_number,
+                    "attempt_limit": max_attempts_total,
+                    "psp": psp_name,
+                    "response_time_ms": response_time_ms,
+                    "visited_psps": sorted(visited_psps),
+                },
+            )
+            return {
+                **self._psp_result_fields(result, psp_name),
+                "success": True,
+                "psp_used": psp_name,
                 "attempt_number": attempt_number,
-                "error": last_error or "all_failed",
-            },
+                "response_time_ms": response_time_ms,
+                "attempts_limit": max_attempts_total,
+                "visited_psps": sorted(visited_psps),
+            }
+
+        await self._best_effort(
+            "route_metrics",
+            self.update_route_metrics(
+                route_id,
+                {
+                    "success": False,
+                    "psp": last_failed_psp or last_attempted_psp,
+                    "attempt_number": attempt_number,
+                    "error": last_error or "all_failed",
+                },
+            ),
         )
         logger.warning(
             "payment.routing.exhausted",
@@ -1049,7 +1218,7 @@ class PaymentRoutingService:
         so no fabricated success can be returned; the failover caller converts this
         into an honest failure response.
         """
-        raise NotImplementedError(
+        raise PSPExecutionNotImplemented(
             f"PSP execution via payment routing is not implemented for '{psp_name}'; "
             "the simulated success path is disabled (fail-closed). Use the "
             "hosted-checkout / initiate_merchant_payment path for real payments."
@@ -1287,33 +1456,32 @@ class PaymentRoutingService:
         Returns:
             Payment result with routing trace
         """
+        # Only policy resolution may fall back to single routing. The payment itself runs
+        # exactly once: re-running it after an error would resend a payment that may have landed.
+        selected_psp: Optional[str] = None
+        routing_decision: Optional[Dict[str, Any]] = None
         try:
-            # Check if dual routing policies exist
             merchant_policy = await self.get_merchant_routing_policy(merchant_id)
             agent_policy = await self.get_agent_routing_policy(agent_id)
-            
-            if not merchant_policy and not agent_policy:
-                # No dual routing policies, use existing single routing
-                logger.info(f"[Phase 4++] No dual routing policies found, using single routing")
-                return await self.execute_with_failover(
+
+            if merchant_policy or agent_policy:
+                amount = payment_request.get('amount', 0)
+                currency = payment_request.get('currency', 'USD')
+                selected_psp, routing_decision = await self.resolve_dual_routing(
+                    merchant_id=merchant_id,
                     agent_id=agent_id,
-                    payment_request=payment_request,
-                    preferred_psp=None
+                    amount=amount,
+                    currency=currency
                 )
-            
-            # Use dual routing
-            amount = payment_request.get('amount', 0)
-            currency = payment_request.get('currency', 'USD')
-            
-            selected_psp, routing_decision = await self.resolve_dual_routing(
-                merchant_id=merchant_id,
-                agent_id=agent_id,
-                amount=amount,
-                currency=currency
-            )
-            
+            else:
+                logger.info(f"[Phase 4++] No dual routing policies found, using single routing")
+        except Exception as e:
+            logger.error(f"[Phase 4++] Dual routing resolution failed, using single routing: {e}")
+            selected_psp, routing_decision = None, None
+
+        if routing_decision is not None:
             # Add routing context to payment request
-            payment_request['metadata'] = payment_request.get('metadata', {})
+            payment_request['metadata'] = payment_request.get('metadata') or {}
             payment_request['metadata']['routing_context'] = {
                 'log_id': routing_decision.get('log_id'),
                 'dual_routing': True,
@@ -1322,27 +1490,15 @@ class PaymentRoutingService:
             }
             payment_request['metadata']['merchant_id'] = merchant_id
             payment_request['metadata']['agent_id'] = agent_id
-            
-            # Execute payment with selected PSP
-            result = await self.execute_with_failover(
-                agent_id=agent_id,
-                payment_request=payment_request,
-                preferred_psp=selected_psp
-            )
-            
-            # Add routing decision to result
+
+        result = await self.execute_with_failover(
+            agent_id=agent_id,
+            payment_request=payment_request,
+            preferred_psp=selected_psp
+        )
+        if routing_decision is not None:
             result['routing_decision'] = routing_decision
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"[Phase 4++] Dual routing transaction failed: {e}")
-            # Fall back to single routing on error
-            return await self.execute_with_failover(
-                agent_id=agent_id,
-                payment_request=payment_request,
-                preferred_psp=None
-            )
+        return result
     
     async def log_routing_decision(
         self,

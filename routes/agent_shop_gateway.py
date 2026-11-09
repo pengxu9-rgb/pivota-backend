@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
@@ -3044,8 +3045,18 @@ class MultiSearchFilters(BaseModel):
     # `market_observed` on minted `/r` tokens; it filters and serves nothing. `exclude=True` keeps
     # it out of every `model_dump`, so no cache key or forwarded body changes because of it.
     market: Optional[str] = Field(None, exclude=True, description="Buyer market, provenance only")
+    # DECISION D-10: the gateway sends `market: "US"` for a search that named no market, and says so here. The
+    # market is then ASSUMED, not observed (`_request_market_for_multi` answers None), so a minted `/r` token never
+    # claims the buyer named it. Provenance only, and excluded from every dump like `market`.
+    market_assumed: bool = Field(False, exclude=True, description="The market was assumed, provenance only")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_true_or_false(cls, value: Any) -> bool:
+        """Only a literal True assumes; anything else (a string, a number) is the default: not assumed."""
+        return strict_true(value)
 
     @field_validator("market", mode="before")
     @classmethod
@@ -3157,8 +3168,22 @@ class OffersResolvePayload(BaseModel):
         alias="liveVerificationsDryRun",
         description="Answer identically, record no issued clicks (internal)",
     )
+    # DECISION D-10: the gateway's get_offers sends `market: "US"` for a call that named no market (so the
+    # cart gate and currency filter run as US) and says so here. The market is then ASSUMED, not observed:
+    # a minted `/r` token must not claim the buyer named it. Absent/False: unchanged.
+    market_assumed: bool = Field(
+        False,
+        alias="marketAssumed",
+        description="The market was assumed (US) for a request that named none (internal)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_literal_true(cls, value: Any) -> bool:
+        """Only a literal True; anything else (None, "true", 1, {...}) is not assumed, and never an error."""
+        return strict_true(value)
 
 
 #: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
@@ -3269,7 +3294,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
     for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
                 "include_live_verification_offers", "includeLiveVerificationOffers",
                 "live_verifications", "liveVerifications",
-                "live_verifications_dry_run", "liveVerificationsDryRun"):
+                "live_verifications_dry_run", "liveVerificationsDryRun",
+                "market_assumed", "marketAssumed"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -4409,6 +4435,13 @@ async def _handle_offers_resolve(
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
     market_hint = str(payload.market or "").strip() or None
+    # DECISION D-10: a market the gateway ASSUMED (US, `marketAssumed`) is the market this answer is decided for --
+    # the cart gate, the currency filter and the served market all use `market_hint` -- but it was never NAMED, so
+    # every `market_observed` / cart-pin decision below reads this instead: None, exactly as for no market.
+    # Honoured ONLY as a literal True beside a market that normalizes to US (services/request_market): beside a
+    # declared SG it is ignored, so the flag can never downgrade a market a caller named.
+    _market_assumed = assumed_flag_honoured(payload.market_assumed, market_hint)
+    observed_market_hint = None if _market_assumed else market_hint
     tool_hint = str(payload.tool or "").strip() or None
     limit = int(payload.limit or 10)
     attached_seed_limit = min(max(limit * 6, 40), 240)
@@ -5457,6 +5490,11 @@ async def _handle_offers_resolve(
                         in_stock=in_stock,
                         dest=str(canonical_url or destination_url),
                     )
+                    # An ASSUMED market is not asked a warm fact: the token is unobserved, so its click
+                    # re-check could never redeem one (`fact_no_market`), and the answer would claim a
+                    # cart the click lane cannot build. Exactly the no-market answer, as before D-10.
+                    else None
+                    if _market_assumed
                     else await _cart_purchasability.warm_fact(
                         str(canonical_url or destination_url), signed_market=used_market
                     )
@@ -5476,7 +5514,7 @@ async def _handle_offers_resolve(
                     # CA-listed USD row can serve a US request. That is pre-existing; the
                     # `warm_fact` stamp above is therefore asked only when the signed market IS
                     # the request market, so the click re-check asks the market the mint asked.
-                    market_observed=request_market_observed(market_hint),
+                    market_observed=request_market_observed(observed_market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -5543,7 +5581,7 @@ async def _handle_offers_resolve(
                     recovery_key=_recovery_key,
                     # The SAME pin `_make_external_redirect_url` applied to the link it signed,
                     # from the same two inputs, so the published cart is the signed destination.
-                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(observed_market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -6769,7 +6807,7 @@ async def _handle_offers_resolve(
             # "nothing matched".
             redirect_url = await _make_external_redirect_url(
                 market=market_hint or "US",
-                market_observed=request_market_observed(market_hint),
+                market_observed=request_market_observed(observed_market_hint),
                 tool=tool_hint or "offers.resolve",
                 destination_url=destination,
                 utm_template=None,
@@ -12880,6 +12918,11 @@ def _request_market_for_multi(
     """
     search = getattr(payload, "search", None)
     raw = getattr(search, "market", None)
+    if assumed_flag_honoured(getattr(search, "market_assumed", False), raw):
+        # The gateway ASSUMED this US (decision D-10): nobody named it. As unobserved as no market at all (and
+        # the seed lane's serving currency for None is US's, the market that was assumed). Beside any other
+        # market the flag is ignored: a declared SG stays SG, served and observed.
+        return None
     if isinstance(raw, str) and raw.strip():
         return raw
     if not isinstance(request_metadata, dict):
