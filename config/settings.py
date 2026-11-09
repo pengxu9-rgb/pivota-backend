@@ -652,6 +652,22 @@ class Settings(BaseSettings):
     def deal_code_capture_write(self) -> bool:
         return _deal_flag("DEAL_CODE_CAPTURE_WRITE")
 
+    # ---- Affiliate sub-ID on the `/r` click-out (ADR-025 D2; services/affiliate_subid.py) ----
+    # `/r` writes our click id into the affiliate network's sub-ID parameter (Rakuten `u1`, ...) on a
+    # destination whose host is a mapped network, so a network commission report can be joined back
+    # to the click. DEFAULT OFF: off, `/r` is byte-identical to before. Read from the env on every
+    # access (a property, like the deal-lane flags): tests use monkeypatch.setenv, not setattr.
+    @property
+    def affiliate_subid_click_id_enabled(self) -> bool:
+        return _deal_flag("AFFILIATE_SUBID_CLICK_ID_ENABLED")
+
+    # Optional JSON object {"<host suffix>": "<param name>" | null} merged over the code's map, so
+    # ops can add (or, with null, remove) a network without a deploy. Parsed and validated in
+    # services/affiliate_subid.subid_param_map; anything malformed is ignored, never raised.
+    @property
+    def affiliate_subid_params_json(self) -> str:
+        return os.getenv("AFFILIATE_SUBID_PARAMS_JSON") or ""
+
     # ---- Capability-based checkout gate (Fix Plan A, option (ii)) ----
     # Lets a protocol-capable merchant (a row in pcs_merchant_capabilities) create an
     # order WITHOUT a merchant_psps row — for the protocol/deferred-payment lane only.
