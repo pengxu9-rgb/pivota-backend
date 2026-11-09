@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from db.database import database
 from db.orders import get_order
@@ -41,8 +41,9 @@ from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.platform_capabilities import get_store_platform_capabilities
 from services.psp_capabilities import get_psp_capabilities
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, caller_may_use_quote, require_quote_for_caller
 from services.refund_observability import build_order_refund_tracking_payload
+from services.request_market import ASSUMED_MARKET, assumed_flag_honoured, market_assumed_label, market_is_unnamed, strict_true
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from utils.availability_vocabulary import IN_STOCK, OUT_OF_STOCK, normalize_availability
 
@@ -91,6 +92,16 @@ class SearchProductsRequest(BaseModel):
     fast_mode: bool = False
     payment_context: Optional[PivotPaymentContext] = None
     request_context: Optional[RequestContext] = None
+    # DECISION D-10, internal: the gateway sends `market: "US"` for a call that named no market, and says so here.
+    # Honoured only beside that US: the search is then answered as an ASSUMED US (served as US, never stamped
+    # observed, labelled), exactly as a search that named nothing. Absent/False: unchanged.
+    market_assumed: bool = False
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_literal_true(cls, value: Any) -> bool:
+        """Only a literal True; anything else (None, "true", 1, {...}) is not assumed, and never an error."""
+        return strict_true(value)
 
 
 class QuoteOfferRef(BaseModel):
@@ -781,6 +792,13 @@ async def search_products_v2(
     search_all_merchants = body.search_all_merchants or (
         not body.merchant_id and not body.merchant_ids
     )
+    # THE MARKET THIS SEARCH IS ANSWERED FOR (decision D-10, services/request_market.py): the caller's
+    # `market`, else its `request_context.country`; a search that names neither is answered as US and the
+    # answer says so in `market_assumed`. A named market, valid or not, is passed through unchanged. A
+    # BLANK `market` names nothing, so it no longer hides a named `request_context.country`.
+    country = body.request_context.country if body.request_context and body.request_context.country else None
+    requested_market = body.market if not market_is_unnamed(body.market) else country
+    market_assumed = market_is_unnamed(requested_market) or assumed_flag_honoured(body.market_assumed, requested_market)
     result = await agent_v1_search_products(
         req=req,
         background_tasks=background_tasks,
@@ -801,11 +819,13 @@ async def search_products_v2(
         allow_stale_cache=body.allow_stale_cache,
         external_seed_strategy=body.external_seed_strategy,
         fast_mode=body.fast_mode,
-        market=body.market or (
-            body.request_context.country
-            if body.request_context and body.request_context.country
-            else None
-        ),
+        # ASSUMED, NOT OBSERVED. The assumed US is the SERVING market (every row priced in USD), never the
+        # request's `market`: the `/r` minters stamp `market_observed` from that argument, and a token must
+        # not claim the buyer named a market nobody named (the warm-handoff sink keys its gate only on an
+        # observed market, and click telemetry counts these as `none_unobserved`, as before D-10). The
+        # storage partition is the one a market-less search always read.
+        market=None if market_assumed else requested_market,
+        **({"serving_market": ASSUMED_MARKET} if market_assumed else {}),
         psp=body.payment_context.psp if body.payment_context else None,
         payment_method_type=body.payment_context.payment_method_type if body.payment_context else None,
         card_network=body.payment_context.card_network if body.payment_context else None,
@@ -892,7 +912,7 @@ async def search_products_v2(
         asyncio.create_task(_record_search_decision())
     except Exception:
         logger.debug("agent_v2 decision event scheduling failed", exc_info=True)
-    return {
+    response = {
         "status": str(result.get("status") or "success"),
         "products": products,
         "pagination": result.get("pagination") or {},
@@ -901,6 +921,9 @@ async def search_products_v2(
         if body.request_context
         else None,
     }
+    if market_assumed:
+        response["market_assumed"] = market_assumed_label()
+    return response
 
 
 @router.post("/quotes/preview")
@@ -986,7 +1009,13 @@ async def get_quote_v2(
 ):
     await expire_quote_if_needed(quote_id)
     row = await get_quote(quote_id)
-    if not row:
+    # Another agent's quote (or another checkout's, under a token) reads exactly like a missing one.
+    if not row or not caller_may_use_quote(
+        quote_id=quote_id,
+        quote_agent_id=row.get("agent_id"),
+        snapshot_json=row.get("snapshot_json"),
+        context=context,
+    ):
         raise HTTPException(status_code=404, detail="Quote not found")
     if not context.can_access_merchant(str(row.get("merchant_id") or "")):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -1009,9 +1038,12 @@ async def get_quote_v2(
 async def create_order_v2(
     body: CreateOrderBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(forwarded_owner_context("create_order")),
+    context: AgentContext = Depends(forwarded_owner_context("create_order", resource=("body", "quote_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
+    # S-28: the quote carries its preview's buyer email and address into the order below, so a
+    # quote the caller does not own is refused first, as if it did not exist.
+    await require_quote_for_caller(body.quote_id, context)
     service = QuoteService()
     try:
         quote = await service.load_active_quote_or_raise(quote_id=body.quote_id)
@@ -1148,7 +1180,7 @@ async def create_order_v2(
 @router.get("/orders/{order_id}")
 async def get_order_v2(
     order_id: str,
-    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1165,7 +1197,7 @@ async def get_order_v2(
 async def create_checkout_session_v2(
     body: CreateCheckoutSessionBody,
     # The gateway reaches this route for two operations: a hosted link and a strict submit_payment.
-    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment")),
+    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment", resource=("body", "order_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     from services.agent_governance import agent_governance
@@ -1359,7 +1391,7 @@ async def list_merchant_capabilities_v2(
 async def track_order_v2(
     order_id: str,
     # Adoption only, no `via` access: agent_v1_track_order re-checks the owner on its own.
-    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1391,7 +1423,7 @@ async def create_refund_v2(
     order_id: str,
     body: RefundCreateBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(forwarded_owner_context("request_after_sales")),
+    context: AgentContext = Depends(forwarded_owner_context("request_after_sales", resource=("path", "order_id"))),
 ):
     from services.agent_governance import agent_governance
 

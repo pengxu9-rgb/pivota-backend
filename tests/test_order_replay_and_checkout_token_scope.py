@@ -799,6 +799,13 @@ def _v2_order_harness(monkeypatch: pytest.MonkeyPatch):
     async def get_order(order_id):
         return dict(TOKEN_ORDERS.get(order_id) or {}, items=[], currency="USD", status="pending")
 
+    async def owned_row(quote_id: str) -> Dict[str, Any]:
+        # S-28: order create first checks who owns the quote row; the faked quote belongs to AGENT_A.
+        return {"quote_id": quote_id, "agent_id": AGENT_A, "snapshot_json": {}}
+
+    import services.quote_service as quote_service_module
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)
     monkeypatch.setattr(agent_v2.QuoteService, "load_active_quote_or_raise", load_quote)
     monkeypatch.setattr(agent_v2, "agent_v1_create_order", create_order)
     monkeypatch.setattr(agent_v2, "get_order", get_order)
