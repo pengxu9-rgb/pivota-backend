@@ -111,7 +111,12 @@ async def execute_payment_with_routing(
             attempt_number=result.get("attempt_number", 1),
             response_time_ms=result.get("response_time_ms"),
             order_id=request.order_id,
-            status="success" if result.get("success") else "failed",
+            # "outcome_unknown": the PSP may have charged; reconcile by order_id, do not resend.
+            status=(
+                "success"
+                if result.get("success")
+                else ("outcome_unknown" if result.get("outcome_unknown") else "failed")
+            ),
             error=result.get("error")
         )
         

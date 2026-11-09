@@ -29,8 +29,12 @@ async def test_agent_order_idempotency_store_singleton_reused_across_cache_calls
     store = _ObservedAgentOrderIdempotencyStore()
     monkeypatch.setattr(module, "_AGENT_ORDER_IDEMPOTENCY_STORE", store)
 
-    await module._cache_agent_order_create_response_best_effort("idem_1", {"order_id": "ord_1"})
-    await module._cache_agent_order_create_response_best_effort("idem_2", {"order_id": "ord_2"})
+    await module._cache_agent_order_create_response_best_effort(
+        "idem_1", {"order_id": "ord_1"}, agent_id="agent_1", intent_id=None
+    )
+    await module._cache_agent_order_create_response_best_effort(
+        "idem_2", {"order_id": "ord_2"}, agent_id="agent_1", intent_id=None
+    )
 
     assert [call["store_id"] for call in store.put_calls] == [id(store), id(store)]
-    assert [call["key"] for call in store.put_calls] == ["idem_1", "idem_2"]
+    assert [call["key"] for call in store.put_calls] == ["agent:agent_1:idem_1", "agent:agent_1:idem_2"]
