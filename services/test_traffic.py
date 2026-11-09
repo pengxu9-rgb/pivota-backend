@@ -11,8 +11,13 @@ An order, attribution edge or click is TEST traffic when any server-controlled s
                    routes.order_routes strips it from caller metadata).
   test_merchant    the merchant is a rig: services.test_merchant_policy.static_test_merchant_ids
                    (the baked-in rig list plus PIVOTA_TEST_MERCHANT_IDS).
-  test_psp_probe   the merchant is on the test-processor probe allowlist (TEST_PSP_PROBE_MERCHANTS)
-                   while ALLOW_TEST_PSP_PROBE is on: its orders can only be paid on a test processor.
+  test_psp_probe   the order the server GRANTED the test-processor bypass at create
+                   (routes.order_routes._apply_server_granted_test_psp_stamp: ALLOW_TEST_PSP_PROBE on,
+                   merchant in TEST_PSP_PROBE_MERCHANTS, AND every active processor of the merchant
+                   normalises to TEST). Such an order can only be paid on a test processor. The grant
+                   writes `metadata.test_psp_probe_granted`, a server-only order key the create route
+                   strips from caller metadata. Merchant membership in the probe list is NOT a signal
+                   on its own: a probe merchant's real (live-processor) orders stay real (W3 F2).
   shopify_test     a Shopify order payload with `test: true` (Shopify's own test-order flag; read only
                    from a Shopify-signed webhook or our own poll, never from a self-report).
 
@@ -54,6 +59,10 @@ REASON_TEST_MERCHANT = "test_merchant"
 REASON_TEST_PSP_PROBE = "test_psp_probe"
 REASON_SHOPIFY_TEST = "shopify_test"
 
+#: Written by routes.order_routes._apply_server_granted_test_psp_stamp on a granted order (only
+#: while stamping is on), and stripped from caller order metadata as a server-only key.
+TEST_PSP_GRANT_KEY = "test_psp_probe_granted"
+
 
 def stamp_enabled() -> bool:
     """True only when TEST_TRAFFIC_STAMP_ENABLED is literally 'true'. Read at call time."""
@@ -72,15 +81,6 @@ def _test_merchant_ids() -> set:
     from services.test_merchant_policy import static_test_merchant_ids
 
     return {m.strip().lower() for m in static_test_merchant_ids() if str(m or "").strip()}
-
-
-def _test_psp_probe_merchant_ids() -> set:
-    # Same env and parse as routes.order_routes._test_psp_probe_enabled/_test_psp_probe_merchants,
-    # read here so this leaf module does not import the order routes.
-    if str(os.getenv("ALLOW_TEST_PSP_PROBE", "")).strip().lower() not in {"1", "true", "yes", "on"}:
-        return set()
-    raw = os.getenv("TEST_PSP_PROBE_MERCHANTS", "") or ""
-    return {m.strip().lower() for m in raw.split(",") if m.strip()}
 
 
 def _current_call_is_synthetic() -> bool:
@@ -103,8 +103,9 @@ def test_traffic_reasons(
     """Every reason this row is test traffic, sorted; [] for real traffic.
 
     merchant_ids     the row's merchant(s) (an edge's subject and converting merchant, say).
-    server_metadata  metadata whose `ops_canary` only the server can set (order metadata after
-                     routes.order_routes stripped the caller's server-only keys).
+    server_metadata  metadata whose `ops_canary` / `test_psp_probe_granted` only the server can
+                     set (order metadata after the caller's server-only keys were stripped:
+                     routes.order_routes on create, routes.ap2_routes on the AP2 edge).
     shopify_order    a Shopify-SIGNED order payload (webhook or our own poll) — never a self-report.
     synthetic_link   the click's outbound token was minted inside synthetic traffic.
     synthetic_call   override for the request verdict; None reads the current request's.
@@ -118,12 +119,12 @@ def test_traffic_reasons(
         reasons.add(REASON_SYNTHETIC_LINK)
     if isinstance(server_metadata, Mapping) and _truthy(server_metadata.get("ops_canary")):
         reasons.add(REASON_OPS_CANARY)
+    if isinstance(server_metadata, Mapping) and server_metadata.get(TEST_PSP_GRANT_KEY) is True:
+        reasons.add(REASON_TEST_PSP_PROBE)
     ids = {str(m or "").strip().lower() for m in merchant_ids if str(m or "").strip()}
     if ids:
         if ids & _test_merchant_ids():
             reasons.add(REASON_TEST_MERCHANT)
-        if ids & _test_psp_probe_merchant_ids():
-            reasons.add(REASON_TEST_PSP_PROBE)
     if isinstance(shopify_order, Mapping) and shopify_order.get("test") is True:
         reasons.add(REASON_SHOPIFY_TEST)
     return sorted(reasons)

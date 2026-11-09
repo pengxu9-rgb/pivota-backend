@@ -56,11 +56,18 @@ def test_predicate_legs_and_refusals(monkeypatch):
     assert tt.test_traffic_reasons(
         merchant_ids=[REAL], server_metadata={"synthetic": True, "surface": "ops_canary", "test_traffic": True}
     ) == []
-    # the probe allowlist counts only while the probe is armed
+    # W3 F2: probe-list membership alone is NOT a signal (a probe merchant's live orders are real);
+    # only the server's grant marker on the order is, and only as the boolean True
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", REAL)
-    assert tt.test_traffic_reasons(merchant_ids=[REAL]) == []
     monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
-    assert tt.test_traffic_reasons(merchant_ids=[REAL]) == ["test_psp_probe"]
+    assert tt.test_traffic_reasons(merchant_ids=[REAL]) == []
+    assert tt.test_traffic_reasons(
+        merchant_ids=[REAL], server_metadata={"test_psp_surfaces_granted_by": "server_allowlist"}
+    ) == []
+    assert tt.test_traffic_reasons(merchant_ids=[REAL], server_metadata={"test_psp_probe_granted": "yes"}) == []
+    assert tt.test_traffic_reasons(
+        merchant_ids=[REAL], server_metadata={"test_psp_probe_granted": True}
+    ) == ["test_psp_probe"]
 
 
 @pytest.mark.parametrize("value,armed", [("", False), ("1", False), ("yes", False), ("TRUE", True), (" true ", True)])
