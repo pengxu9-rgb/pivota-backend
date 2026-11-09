@@ -575,7 +575,12 @@ async def _resolve_linked_agent_id(user: Optional[dict], email: str) -> Optional
     return None
 
 
-async def _email_claims_existing_tenant(email: str) -> bool:
+async def _email_claims_existing_tenant(
+    email: str,
+    *,
+    check_users_and_merchant_contacts: bool = True,
+    any_employee_status: bool = False,
+) -> bool:
     """Whether `email` already belongs to someone: a login, an identity, a tenant, staff.
 
     Self-service registration does not prove the mailbox, so it must not create the
@@ -588,9 +593,36 @@ async def _email_claims_existing_tenant(email: str) -> bool:
     The owner of such an address signs in, or resets the password from the portal,
     which emails the link to that mailbox. Fails closed: an unanswerable lookup
     refuses the registration.
+
+    `check_users_and_merchant_contacts=False` skips the users and merchant-contact
+    arms, for a caller that has already resolved both itself (merchant onboarding,
+    the Shopify claim). `any_employee_status=True` counts an employees row of any
+    status: an inactive employee can be reactivated after the address was taken,
+    which is what PUT /merchant/profile (`_login_email_claimed_by`) checks too.
     """
+    users_arm = ("SELECT 1 FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1", None)
+    merchant_contact_arm = (
+        """
+        SELECT 1 FROM merchant_onboarding
+        WHERE LOWER(COALESCE(contact_email, '')) = LOWER(:email)
+          AND COALESCE(status, '') != 'deleted'
+        LIMIT 1
+        """,
+        None,
+    )
+    employee_arm = (
+        (
+            "SELECT 1 FROM employees WHERE LOWER(TRIM(email)) = LOWER(:email) LIMIT 1",
+            None,
+        )
+        if any_employee_status
+        else (
+            "SELECT 1 FROM employees WHERE LOWER(email) = LOWER(:email) AND status = 'active' LIMIT 1",
+            None,
+        )
+    )
     checks = (
-        ("SELECT 1 FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1", None),
+        *((users_arm,) if check_users_and_merchant_contacts else ()),
         (
             """
             SELECT 1 FROM auth_identities i
@@ -613,19 +645,8 @@ async def _email_claims_existing_tenant(email: str) -> bool:
             """,
             "SELECT 1 FROM agents WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email) LIMIT 1",
         ),
-        (
-            """
-            SELECT 1 FROM merchant_onboarding
-            WHERE LOWER(COALESCE(contact_email, '')) = LOWER(:email)
-              AND COALESCE(status, '') != 'deleted'
-            LIMIT 1
-            """,
-            None,
-        ),
-        (
-            "SELECT 1 FROM employees WHERE LOWER(email) = LOWER(:email) AND status = 'active' LIMIT 1",
-            None,
-        ),
+        *((merchant_contact_arm,) if check_users_and_merchant_contacts else ()),
+        employee_arm,
     )
     for query, fallback in checks:
         for attempt in (query, fallback):
@@ -1170,15 +1191,16 @@ async def login(data: LoginRequest):
         # address belongs to another portal (a merchant can move its login email
         # onto any free address without proving the mailbox), the password that
         # just verified is that account's password, not the employee's. Unless
-        # the password is the employee's own, or this identity already holds an
-        # active employee membership, the employees row is not this caller's:
-        # log in as the account the password belongs to, and do not promote it.
+        # the password is the employee's own legacy password, the employees row
+        # is not this caller's: log in as the account the password belongs to,
+        # and do not promote it. An active employee membership is no proof:
+        # backfills and employees_create write one with no users row at the
+        # address, so whoever later creates that users row would inherit it.
         if (
             employee_identity
             and user
             and _is_non_staff_account_role(user_role)
             and not _verify_legacy_employee_password(data.password, employee_identity)
-            and not await _safe_get_active_membership(normalized_email, "employee")
         ):
             logger.warning(
                 "[Auth] Ignoring employees row at %s for a %s login: password not proven for the employee",
@@ -1325,6 +1347,27 @@ async def login(data: LoginRequest):
                         "membership_type": inferred_membership_type,
                         "entity_id": str(membership.get("entity_id") or ""),
                         "source": "login",
+                    },
+                )
+                membership = None
+            elif (
+                membership
+                and inferred_membership_type == "employee"
+                and user
+                and _is_non_staff_account_role(user_role)
+                and not employee_identity
+            ):
+                # A merchant/agent users row whose password was not proven for an
+                # active employee: an employee membership at this address is not
+                # this caller's to use (see the guard above).
+                await _safe_record_identity_event(
+                    event_type="employee_promotion_refused",
+                    email=normalized_email,
+                    details={
+                        "users_role": user_role,
+                        "employee_id": str(membership.get("entity_id") or ""),
+                        "reason": "password_not_proven_for_employee",
+                        "source": "login_membership",
                     },
                 )
                 membership = None

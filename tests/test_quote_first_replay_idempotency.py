@@ -1006,3 +1006,15 @@ async def test_agent_payment_without_live_validated_quote_blocks_psp(
         assert resp.json()["detail"]["error"] == "QUOTE_REQUIRED_BEFORE_PAYMENT"
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.fixture(autouse=True)
+def _quote_rows_owned_by_the_test_agent(monkeypatch):
+    """S-28: order create first checks who owns the quote row. These tests fake the quote LOAD, so
+    the quote they stand for belongs to this file's agent."""
+    import services.quote_service as quote_service_module
+
+    async def owned_row(quote_id: str):
+        return {"quote_id": quote_id, "agent_id": 'agent_test', "snapshot_json": {}}
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)
