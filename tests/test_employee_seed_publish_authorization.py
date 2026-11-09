@@ -325,11 +325,12 @@ def _updates(writes):
     return [w for w in writes if w["sql"].lstrip().startswith("UPDATE external_product_seeds")]
 
 
-@pytest.mark.parametrize("csv_text", [
-    f"destination_url,market\n{DEST},US\n",
-    f"product_url,title,brand\n{DEST},Placeholder serum,Brand X\n",
+@pytest.mark.parametrize("csv_text,changes_content", [
+    (f"destination_url,market\n{DEST},US\n", False),
+    (f"product_url,title,brand\n{DEST},Placeholder serum,Brand X\n", True),
 ])
-def test_a_csv_import_stamps_what_it_creates_and_keeps_the_creator_of_what_it_updates(monkeypatch, csv_text):
+def test_a_csv_import_stamps_what_it_creates_and_keeps_the_creator_of_what_it_updates(monkeypatch, csv_text,
+                                                                                    changes_content):
     import routes.employee_products as ep
 
     writes = _capture_writes(monkeypatch)
@@ -342,7 +343,13 @@ def test_a_csv_import_stamps_what_it_creates_and_keeps_the_creator_of_what_it_up
     asyncio.run(ep._import_external_seeds_csv_text(text=csv_text, current_user=dict(CREATOR), market="US", tool="*",
                                                    mode="upsert"))
     (update,) = _updates(writes)
-    assert "created_by_employee_id" not in update["sql"] and "created_by_employee_id" not in update
+    if changes_content:
+        # The update changed the draft's content: the importer is appended to its authors, the creator stays first.
+        assert update["created_by_employee_id"] == "emp_first|first@example.com|" + CREATOR_STAMP
+        assert "created_by_employee_id = :created_by_employee_id" in update["sql"]
+    else:
+        # Nothing it shows changed: the importer is not an author, and the column is not written.
+        assert "created_by_employee_id" not in update["sql"] and "created_by_employee_id" not in update
 
 
 def _storefront(monkeypatch, existing):
@@ -426,8 +433,9 @@ def _sql_files():
             yield path
 
 
-def test_every_insert_of_a_seed_names_its_creator_and_no_update_rewrites_it():
-    """THE RATCHET: no code path creates a seed without a creator, and none moves the creator afterwards."""
+def test_every_insert_of_a_seed_names_its_authors_and_an_update_only_appends_an_editor():
+    """THE RATCHET: no code path creates a seed without a creator, and no update moves or drops one. An update
+    writes the authors column only through `_AUTHORS_SET_CLAUSE`, with a value from `_merge_seed_authors`."""
     inserts, rewrites = [], []
     for path in _sql_files():
         text = path.read_text(errors="replace")
@@ -439,9 +447,13 @@ def test_every_insert_of_a_seed_names_its_creator_and_no_update_rewrites_it():
         for match in re.finditer(r"ON CONFLICT \(id\) DO UPDATE SET(.*?)\"\"\"", text, re.S):
             if "external_product_seeds" in text and "created_by_employee_id" in match.group(1):
                 rewrites.append(path.relative_to(REPO).as_posix())
-    assert len(inserts) == 7, inserts
+    assert len(inserts) == 8, inserts  # 4 staff create doors, the revision draft, 3 machine writers
     assert [p for p, stamped in inserts if not stamped] == [], "a create path writes no creator"
     assert rewrites == [], "an update must never rewrite who created a seed"
+    routes_text = (REPO / "routes/employee_products.py").read_text()
+    assert routes_text.count("created_by_employee_id = :created_by_employee_id") == 1, "only _AUTHORS_SET_CLAUSE"
+    assignments = re.findall(r'\["created_by_employee_id"\] = (.+)', routes_text)
+    assert assignments and all(a.startswith(("authors", "_merge_seed_authors(")) for a in assignments), assignments
 
 
 @pytest.mark.parametrize("path,stamp", [

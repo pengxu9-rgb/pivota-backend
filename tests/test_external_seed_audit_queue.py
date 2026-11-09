@@ -751,6 +751,8 @@ def test_refresh_external_seed_preserves_manual_description_override_when_seed_r
         ({"price_currency": "CAD"}, "employee_edit"),
     ],
 )
+# An edit that CHANGES a live seed is a revision draft now (approval-rule review P2-2): nothing projects until
+# another reviewer approves it, and the revision carries whether its approval vouches for the price.
 def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, edit, expected_source
 ) -> None:
@@ -772,8 +774,13 @@ def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
         return {}
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    writes = []
+
+    async def record_write(query, values):
+        writes.append({"sql": query, **values})
+
     monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", record_write)
     monkeypatch.setattr(employee_products_module, "_project_refreshed_seed_to_serving_surfaces", fake_project)
 
     res = client.patch(
@@ -782,4 +789,13 @@ def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
         json=edit,
     )
     assert res.status_code == 200, res.text
-    assert calls == [{"price_source": expected_source}]
+    revision = res.json().get("revision")
+    if revision:
+        (insert,) = writes
+        assert "INSERT INTO external_product_seeds" in insert["sql"] and calls == [], "the live seed is untouched"
+        vouched = "employee_edit" if insert["seed_data"].get("revision_price_edited") else None
+        assert vouched == expected_source
+    else:
+        # Nothing changed what the seed shows: edited in place, projected, and the price is not vouched for.
+        assert expected_source is None
+        assert calls == [{"price_source": expected_source}]

@@ -407,7 +407,8 @@ async def test_a_csv_active_row_whose_id_a_live_seed_holds_elsewhere_is_that_row
     await _seed(db, "seed_holder", status="active", dest=OTHER_DEST, external_product_id=epid, age_hours=24)
     before = await _seeds(db)
 
-    res = await _csv(client, f"destination_url,market,status,title\n{DEST},US,active,Renamed\n")
+    # No content change in the row (a change would make the importer an author, refused before the conflict check).
+    res = await _csv(client, f"destination_url,market,status\n{DEST},US,active\n")
     assert res.status_code == 200, res.text
     (error,) = res.json()["errors"]
     assert "SEED_ACTIVE_CONFLICT" in error and "seed_holder" in error
@@ -453,16 +454,91 @@ async def test_a_seed_is_published_by_another_staff_reviewer_never_by_its_creato
     assert (row["status"], row["created_by_employee_id"]) == ("active", "emp_creator|creator@example.com")
 
 
-async def test_a_csv_update_by_someone_else_does_not_make_them_the_creator(env):
+async def test_a_csv_update_by_someone_else_keeps_the_creator_first_and_makes_them_an_author(env):
     db, client, actor = env["db"], env["client"], env["actor"]
     actor.update({"employee_id": "emp_creator", "email": "creator@example.com", "role": "employee"})
     (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
     actor.update({"employee_id": "emp_editor", "email": "editor@example.com"})
     assert (await _csv(client, f"destination_url,market,title\n{DEST},US,Edited\n")).json()["updated"] == 1
     stamp = await db.fetch_val("SELECT created_by_employee_id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
-    assert stamp == "emp_creator|creator@example.com"
-    # So the editor may approve it, and the creator still may not.
-    actor.update({"employee_id": "emp_creator", "email": "creator@example.com"})
-    assert (await _verdict(client, seed_id, "approve")).status_code == 403
-    actor.update({"employee_id": "emp_editor", "email": "editor@example.com"})
+    assert stamp == "emp_creator|creator@example.com|emp_editor|editor@example.com", "the creator first, then the editor"
+    # Neither the creator nor the editor may approve it (approval-rule review P2-1); a third reviewer may.
+    for who in ("creator", "editor"):
+        actor.update({"employee_id": f"emp_{who}", "email": f"{who}@example.com"})
+        assert (await _verdict(client, seed_id, "approve")).status_code == 403, who
+    actor.update({"employee_id": "emp_third", "email": "third@example.com"})
     assert (await _verdict(client, seed_id, "approve")).status_code == 200
+
+
+# ---------------------------------------------------------------- content edits need another reviewer (P2-1, P2-2)
+
+
+async def _as(actor, employee_id, role="employee"):
+    actor.update({"employee_id": employee_id, "email": f"{employee_id}@example.com", "role": role})
+
+
+async def _row(db, seed_id):
+    return dict(await db.fetch_one(
+        "SELECT status, destination_url, price_amount, created_by_employee_id, seed_data, notes"
+        " FROM external_product_seeds WHERE id = :id", {"id": seed_id}))
+
+
+async def test_b_cannot_rewrite_a_s_draft_and_publish_it(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _as(actor, "emp_a")
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+    before = await _row(db, seed_id)
+
+    await _as(actor, "emp_b")
+    res = await client.patch(f"{PREFIX}/{seed_id}", json={"destination_url": OTHER_DEST, "price_amount": 1.0,
+                                                          "status": "active"})
+    assert res.status_code == 403 and res.json()["detail"]["error"] == "SEED_SELF_APPROVAL_FORBIDDEN"
+    assert await _row(db, seed_id) == before, "nothing changed"
+
+    # In two steps it is the same: the edit lands, B is an author, and B's publish is refused.
+    assert (await client.patch(f"{PREFIX}/{seed_id}", json={"price_amount": 1.0})).status_code == 200
+    assert (await _row(db, seed_id))["created_by_employee_id"] == "emp_a|emp_a@example.com|emp_b|emp_b@example.com"
+    assert (await _verdict(client, seed_id, "approve")).status_code == 403
+    await _as(actor, "emp_c")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200
+
+
+@pytest.mark.parametrize("editor,role", [("emp_o", "outsourced"), ("emp_a", "employee")])
+async def test_a_live_seeds_content_changes_only_through_a_reviewed_revision(env, editor, role):
+    """An outsourced contractor, or the creator right after approval, re-points a live seed: the live seed stays
+    as approved, the change is a revision draft, and only another staff reviewer's approval puts it live."""
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _as(actor, "emp_a")
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+    await _as(actor, "emp_b")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200
+    approved = await _row(db, seed_id)
+
+    await _as(actor, editor, role)
+    res = await client.patch(f"{PREFIX}/{seed_id}", json={"destination_url": OTHER_DEST, "price_amount": 1.0})
+    assert res.status_code == 200, res.text
+    revision_id = res.json()["revision"]["seed_id"]
+    assert await _row(db, seed_id) == approved, "the live seed is exactly as approved"
+    revision = await _row(db, revision_id)
+    assert (revision["status"], revision["destination_url"], revision["price_amount"]) == ("draft", OTHER_DEST, 1.0)
+    assert revision["created_by_employee_id"] == f"{editor}|{editor}@example.com"
+    revision_data = revision["seed_data"]
+    revision_data = json.loads(revision_data) if isinstance(revision_data, str) else revision_data
+    assert revision_data["revision_of"] == seed_id and revision_data["revision_price_edited"] is True
+
+    # Its editor cannot approve it (outsourced: no publish role; the creator: its author).
+    assert (await _verdict(client, revision_id, "approve")).status_code == 403
+    await _as(actor, "emp_c")
+    res = await _verdict(client, revision_id, "approve")
+    assert res.status_code == 200 and res.json()["published"] is True, res.text
+    seeds = await _seeds(db)
+    assert seeds[revision_id]["status"] == "active" and seeds[seed_id]["status"] == "disabled"
+    assert f"superseded_by:{revision_id}" in seeds[seed_id]["notes"], "the revision replaced it, wherever it pointed"
+
+
+async def test_a_takedown_of_a_live_seed_still_applies_at_once(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _seed(db, "seed_live", status="active")
+    await _as(actor, "emp_o", "outsourced")
+    assert (await client.patch(f"{PREFIX}/seed_live", json={"status": "disabled"})).status_code == 200
+    assert (await _seeds(db))["seed_live"]["status"] == "disabled"

@@ -149,13 +149,13 @@ def test_updating_an_existing_seed_drops_a_canonical_that_is_not_its_destination
     }
     _, _, writes, supersedes = _run_create(monkeypatch, page_canonical=SIBLING, existing=existing)
 
-    (update,) = writes
-    assert update["sql"].strip().upper().startswith("UPDATE")
-    assert (update["destination_url"], update["canonical_url"]) == (DEST, DEST)
-    (supersede,) = supersedes
-    assert SIBLING not in (supersede["match_url"], supersede["dest"]), "never disables the sibling's seeds"
-    assert "AND destination_url IN (:match_url, :dest)" in supersede["sql"]
-    assert "canonical_url IN" not in supersede["sql"], "never by a canonical"
+    # The seed is live and its canonical changes, so the re-create is its revision draft (approval-rule P2-2): the
+    # canonical rule applies to the revision, and nothing is superseded until another reviewer approves it.
+    (revision,) = writes
+    assert revision["sql"].strip().upper().startswith("INSERT")
+    assert revision["seed_data"]["revision_of"] == "eps_existing"
+    assert (revision["destination_url"], revision["canonical_url"]) == (DEST, DEST)
+    assert supersedes == [], "never disables the sibling's seeds (nor anything else, before approval)"
 
 
 def test_updating_an_existing_seed_keeps_its_own_canonical_when_that_is_the_destination(monkeypatch):
@@ -235,8 +235,9 @@ def test_an_import_update_drops_the_rows_old_canonical_when_it_is_not_the_destin
     }
     _, writes = _run_csv(monkeypatch, f"destination_url,title\n{DEST},Foundation 470\n", existing=existing)
 
+    # A live seed: the import's change is its revision draft (approval-rule P2-2), with the canonical dropped.
     (update,) = writes
-    assert update["sql"].strip().upper().startswith("UPDATE")
+    assert update["sql"].strip().upper().startswith("INSERT") and update["seed_data"]["revision_of"] == "eps_existing"
     assert (update["destination_url"], update["canonical_url"]) == (DEST, DEST)
 
 
@@ -355,11 +356,13 @@ def test_reimporting_a_row_whose_canonical_is_not_its_destination_keeps_its_id(m
         monkeypatch, f"destination_url,canonical_url,title\n{DEST},{SIBLING},Foundation 470\n", existing=existing
     )
 
+    # A live seed: the re-import is its revision draft (approval-rule P2-2), keeping the seed's id.
     (update,) = writes
-    assert update["sql"].strip().upper().startswith("UPDATE")
+    assert update["sql"].strip().upper().startswith("INSERT") and update["seed_data"]["revision_of"] == "eps_existing"
     assert update["external_product_id"] == original_id
     assert update["canonical_url"] == DEST
-    assert len(result.warnings) == 1
+    assert len(result.warnings) == 2, result.warnings  # the canonical note, and the revision note
+    assert "revision draft" in result.warnings[1]
 
 
 def test_an_update_keeps_the_existing_id_even_when_the_derived_one_differs(monkeypatch):
