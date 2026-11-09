@@ -13,6 +13,8 @@ The same writes and reads on real Postgres: tests/test_storefront_handoff_record
 from __future__ import annotations
 
 import hashlib
+import json
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -28,6 +30,8 @@ from db.commerce_attribution import commerce_attribution_edges, surface_click_ev
 from db.database import database
 from main import app
 from services import storefront_handoff_record as handoffs
+from services import assertion_replay_guard
+from services.bound_issuing_assertion import sign_bound_issuing_agent_assertion
 from services.issuing_agent_assertion import sign_issuing_agent_assertion
 
 SECRET = "test_handoff_record_secret"
@@ -59,10 +63,29 @@ def binding(esc_id: str) -> str:
     return hashlib.sha256(esc_id.encode("utf-8")).hexdigest()
 
 
-def signed(sub: str, op: str, *, ts: Optional[int] = None) -> str:
-    return sign_issuing_agent_assertion(
-        {"v": 1, "kind": "agent", "sub": sub, "op": op, "ts": int(time.time()) if ts is None else ts}, SECRET
-    )
+RECORD_PATH = "/agent/v2/storefront-handoffs"
+READ_PATH = "/agent/v2/storefront-handoffs/read"
+
+
+def raw_json(body: Dict[str, Any]) -> bytes:
+    """The exact bytes sent: the gateway hashes the string it sends, so the tests do the same."""
+    return json.dumps(body, separators=(",", ":")).encode("utf-8")
+
+
+def bound(sub: str, op: str, *, path: str, raw: bytes, rid: Optional[str], method: str = "POST",
+          ts: Optional[int] = None, jti: Optional[str] = None, **override: Any) -> str:
+    """The gateway's v2 token (PIVOTA-Agent boundIssuingAgentAssertionHeaders): rid = the record id."""
+    payload: Dict[str, Any] = {
+        "v": 2, "kind": "agent", "sub": sub, "op": op, "ts": int(time.time()) if ts is None else ts,
+        "jti": jti or secrets.token_urlsafe(18), "m": method, "p": path, "rid": rid,
+        "bh": hashlib.sha256(raw).hexdigest(),
+    }
+    payload.update(override)
+    return sign_bound_issuing_agent_assertion(payload, SECRET)
+
+
+def v1(sub: str, op: str) -> str:
+    return sign_issuing_agent_assertion({"v": 1, "kind": "agent", "sub": sub, "op": op, "ts": int(time.time())}, SECRET)
 
 
 def hdrs(key: str, assertion: Optional[str] = None) -> Dict[str, str]:
@@ -139,6 +162,7 @@ async def world(monkeypatch: pytest.MonkeyPatch):
         await database.execute(str(CreateTable(table, if_not_exists=True).compile(dialect=dialect)))
     await _clean()
     forwarded.FORWARDED_OWNER_OUTCOMES.clear()
+    assertion_replay_guard.reset_local_store()
     transport = httpx.ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -149,18 +173,22 @@ async def world(monkeypatch: pytest.MonkeyPatch):
             await database.disconnect()
 
 
-async def record(client, partner: Optional[str], body: Dict[str, Any], *, key: str = GATEWAY_KEY, op: str = handoffs.RECORD_OP):
-    return await client.post(
-        "/agent/v2/storefront-handoffs", json=body,
-        headers=hdrs(key, signed(partner, op) if partner else None),
-    )
+async def send(client, path: str, body: Dict[str, Any], *, key: str, assertion: Optional[str]):
+    out = hdrs(key, assertion)
+    out["Content-Type"] = "application/json"
+    return await client.post(path, content=raw_json(body), headers=out)
 
 
-async def read(client, partner: Optional[str], record_id: str, esc_id: str, *, key: str = GATEWAY_KEY, op: str = handoffs.READ_OP):
-    return await client.post(
-        "/agent/v2/storefront-handoffs/read", json={"record_id": record_id, "binding": binding(esc_id)},
-        headers=hdrs(key, signed(partner, op) if partner else None),
-    )
+async def record(client, partner: Optional[str], body: Dict[str, Any], *, key: str = GATEWAY_KEY, op: str = handoffs.RECORD_OP, **sign: Any):
+    raw = raw_json(body)
+    token = bound(partner, op, path=RECORD_PATH, raw=raw, rid=body.get("record_id"), **sign) if partner else None
+    return await send(client, RECORD_PATH, body, key=key, assertion=token)
+
+
+async def read(client, partner: Optional[str], record_id: str, esc_id: str, *, key: str = GATEWAY_KEY, op: str = handoffs.READ_OP, **sign: Any):
+    body = {"record_id": record_id, "binding": binding(esc_id)}
+    token = bound(partner, op, path=READ_PATH, raw=raw_json(body), rid=record_id, **sign) if partner else None
+    return await send(client, READ_PATH, body, key=key, assertion=token)
 
 
 async def _row(click_id: str) -> Optional[Dict[str, Any]]:
@@ -248,26 +276,28 @@ async def test_a_forged_esc_id_or_an_unknown_record_is_not_found(world):
 
 
 async def test_no_partner_no_row(world):
-    cases = [
+    # Not adopted: the route acts as its caller, and a hand-off is never the caller's own.
+    for case in (
         dict(partner=None),  # the gateway alone: no assertion
-        dict(partner=PARTNER_A, op=handoffs.READ_OP),  # signed for the other op
-        dict(partner=PARTNER_A, op="create_order"),
         dict(partner=PARTNER_A, key=PARTNER_A_KEY),  # a partner's own key cannot vouch, even for itself
         dict(partner=PARTNER_B, key=PARTNER_A_KEY),
-    ]
-    for case in cases:
-        res = await record(world, case["partner"], record_body(RECORD_A, ESC_A),
-                           key=case.get("key", GATEWAY_KEY), op=case.get("op", handoffs.RECORD_OP))
+    ):
+        res = await record(world, case["partner"], record_body(RECORD_A, ESC_A), key=case.get("key", GATEWAY_KEY))
         assert refusal(res) == (403, "partner_identity_required"), case
+    # From the gateway, a v2 token for another op is REFUSED (O-04: never a quiet fallback to the gateway).
+    for op in (handoffs.READ_OP, "create_order"):
+        res = await record(world, PARTNER_A, record_body(RECORD_A, ESC_A), op=op)
+        assert res.status_code == 409 and (res.json().get("detail") or {}).get("reason") == "op", op
     assert await _row(RECORD_A) is None
 
 
 async def test_a_read_needs_the_partner_too(world):
     await record(world, PARTNER_A, record_body(RECORD_A, ESC_A))
-    for kwargs in (dict(partner=None), dict(partner=PARTNER_A, op=handoffs.RECORD_OP), dict(partner=PARTNER_A, key=PARTNER_A_KEY)):
-        res = await read(world, kwargs["partner"], RECORD_A, ESC_A,
-                         key=kwargs.get("key", GATEWAY_KEY), op=kwargs.get("op", handoffs.READ_OP))
+    for kwargs in (dict(partner=None), dict(partner=PARTNER_A, key=PARTNER_A_KEY)):
+        res = await read(world, kwargs["partner"], RECORD_A, ESC_A, key=kwargs.get("key", GATEWAY_KEY))
         assert refusal(res) == (403, "partner_identity_required"), kwargs
+    res = await read(world, PARTNER_A, RECORD_A, ESC_A, op=handoffs.RECORD_OP)
+    assert res.status_code == 409 and (res.json().get("detail") or {}).get("reason") == "op"
 
 
 async def test_the_forwarding_flag_off_adopts_no_partner(world, monkeypatch):
@@ -389,3 +419,49 @@ async def test_a_referred_edge_that_never_converted_is_not_an_order(world):
     ))
     body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
     assert body["status"] == "handed_off" and "seller_order_observed_at" not in body
+
+
+# --- the request-bound (v2) assertion ---------------------------------------------------------------
+
+
+async def test_a_v1_token_is_never_adopted(world):
+    body = record_body(RECORD_A, ESC_A)
+    res = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=v1(PARTNER_A, handoffs.RECORD_OP))
+    assert refusal(res) == (403, "partner_identity_required")
+    assert await _row(RECORD_A) is None
+    await record(world, PARTNER_A, body)
+    rb = {"record_id": RECORD_A, "binding": binding(ESC_A)}
+    res = await send(world, READ_PATH, rb, key=GATEWAY_KEY, assertion=v1(PARTNER_A, handoffs.READ_OP))
+    assert refusal(res) == (403, "partner_identity_required")
+    assert forwarded.FORWARDED_OWNER_OUTCOMES["unbound_v1"] == 2
+
+
+@pytest.mark.parametrize("sign, reason", [
+    (dict(rid=RECORD_B), "resource"),  # rid names another record
+    (dict(rid=None), "resource"),
+    (dict(path=READ_PATH), "path"),  # a token for the read route
+    (dict(method="PUT"), "method"),
+    (dict(raw=b'{"other":"body"}'), "body"),  # hashed over other bytes
+    (dict(ts=int(time.time()) - 120), "stale"),
+    (dict(op=handoffs.READ_OP), "op"),
+])
+async def test_a_v2_token_bound_to_another_request_is_rejected(world, sign, reason):
+    body = record_body(RECORD_A, ESC_A)
+    raw = raw_json(body)
+    args = dict(path=RECORD_PATH, raw=raw, rid=RECORD_A)
+    op = sign.pop("op", handoffs.RECORD_OP)
+    args.update(sign)
+    res = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=bound(PARTNER_A, op, **args))
+    detail = res.json().get("detail") or {}
+    assert res.status_code == 409, res.text
+    assert (detail.get("error"), detail.get("reason")) == ("PARTNER_ASSERTION_REJECTED", reason)
+    assert await _row(RECORD_A) is None
+
+
+async def test_a_v2_nonce_is_single_use(world):
+    body = record_body(RECORD_A, ESC_A)
+    token = bound(PARTNER_A, handoffs.RECORD_OP, path=RECORD_PATH, raw=raw_json(body), rid=RECORD_A)
+    first = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=token)
+    assert first.status_code == 200, first.text
+    again = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=token)
+    assert again.status_code == 409 and (again.json().get("detail") or {}).get("reason") == "replay"

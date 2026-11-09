@@ -3,16 +3,19 @@
 DARK BY DEFAULT. While UCP_STOREFRONT_HANDOFF_RECORD_ENABLED is off every call answers the same
 404 `not_available`, whatever its shape, and nothing is read or written.
 
-Two calls, both made by the GATEWAY with its own service key and a verified
+Two calls, both made by the GATEWAY with its own service key and a REQUEST-BOUND (v2)
 X-Pivota-Issuing-Agent naming the partner (the O-04 assertion, adopted by
-routes.agent_forwarded_owner, so PARTNER_IDENTITY_FORWARDING_ENABLED must be on too):
+routes.agent_forwarded_owner, so PARTNER_IDENTITY_FORWARDING_ENABLED must be on too). The token
+must verify for the route's op, `POST`, the raw path, the exact body bytes, a fresh single-use
+nonce within 60 s, and `rid` = the body's `record_id` (services/bound_issuing_assertion.py). A v2
+token that fails any check is 409 PARTNER_ASSERTION_REJECTED; a v1 token is never adopted:
 
   POST /agent/v2/storefront-handoffs        record a hand-off the gateway just issued
                                             (op `ucp_storefront_handoff.record`)
   POST /agent/v2/storefront-handoffs/read   read one back for get_order (op `ucp_storefront_handoff.read`)
 
-A call whose partner was NOT adopted (no assertion, one that does not verify for the op, a caller
-that may not vouch, the forwarding flag off) is refused with 403 `partner_identity_required`: a
+A call whose partner was NOT adopted (no assertion, a v1 token, a caller that may not vouch, the
+forwarding flag off) is refused with 403 `partner_identity_required`: a
 hand-off row is only worth having with its partner, and a read is only answered to its owner.
 The partner is never taken from the body. See services/storefront_handoff_record.py for the row.
 """
@@ -76,7 +79,8 @@ def _adopted_partner(context: AgentContext) -> Optional[str]:
 @router.post("")
 async def record_storefront_handoff(
     body: HandoffRecordBody,
-    context: AgentContext = Depends(forwarded_owner_context(handoffs.RECORD_OP)),
+    # rid = the hand-off record id: the one resource both calls act on (the gateway signs the same).
+    context: AgentContext = Depends(forwarded_owner_context(handoffs.RECORD_OP, resource=("body", "record_id"))),
 ):
     if not handoffs.storefront_handoff_record_enabled():
         return _refuse(404, "not_available")
@@ -109,7 +113,7 @@ async def record_storefront_handoff(
 @router.post("/read")
 async def read_storefront_handoff(
     body: HandoffReadBody,
-    context: AgentContext = Depends(forwarded_owner_context(handoffs.READ_OP)),
+    context: AgentContext = Depends(forwarded_owner_context(handoffs.READ_OP, resource=("body", "record_id"))),
 ):
     if not handoffs.storefront_handoff_record_enabled():
         return _refuse(404, "not_available")
