@@ -1009,7 +1009,7 @@ async def get_quote_v2(
 async def create_order_v2(
     body: CreateOrderBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(forwarded_owner_context("create_order")),
+    context: AgentContext = Depends(forwarded_owner_context("create_order", resource=("body", "quote_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     service = QuoteService()
@@ -1148,7 +1148,7 @@ async def create_order_v2(
 @router.get("/orders/{order_id}")
 async def get_order_v2(
     order_id: str,
-    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1165,7 +1165,7 @@ async def get_order_v2(
 async def create_checkout_session_v2(
     body: CreateCheckoutSessionBody,
     # The gateway reaches this route for two operations: a hosted link and a strict submit_payment.
-    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment")),
+    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment", resource=("body", "order_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     from services.agent_governance import agent_governance
@@ -1359,7 +1359,7 @@ async def list_merchant_capabilities_v2(
 async def track_order_v2(
     order_id: str,
     # Adoption only, no `via` access: agent_v1_track_order re-checks the owner on its own.
-    context: AgentContext = Depends(forwarded_owner_context("get_order_status")),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1391,7 +1391,7 @@ async def create_refund_v2(
     order_id: str,
     body: RefundCreateBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(forwarded_owner_context("request_after_sales")),
+    context: AgentContext = Depends(forwarded_owner_context("request_after_sales", resource=("path", "order_id"))),
 ):
     from services.agent_governance import agent_governance
 
