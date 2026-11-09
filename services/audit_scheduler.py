@@ -302,14 +302,14 @@ def run_deadline_for(job_id: str) -> float:
 #   settlement_file_transfer    — Stripe Connect transfers to channel partners (money OUT).
 #   partner_settlement_monthly  — T8: settlement snapshots + legacy pending payout rows.
 #   invoice_generation_monthly  — T7: Stripe invoices to merchants for GMV take.
-SETTLEMENT_FILE_TRANSFER_FLAG = "SETTLEMENT_FILE_TRANSFER_ENABLED"
-PARTNER_SETTLEMENT_MONTHLY_FLAG = "PARTNER_SETTLEMENT_MONTHLY_ENABLED"
-INVOICE_GENERATION_MONTHLY_FLAG = "INVOICE_GENERATION_MONTHLY_ENABLED"
-
-
-def money_job_enabled(flag: str) -> bool:
-    """True only when `flag` is literally 'true'. Unset, empty or anything else is OFF."""
-    return (os.getenv(flag) or "").strip().lower() == "true"
+# The flags and the literal-true parse live in services/money_flags.py (one parser for the
+# scheduler and the services that move money); re-exported here under the same names.
+from services.money_flags import (  # noqa: E402
+    INVOICE_GENERATION_MONTHLY_FLAG,
+    PARTNER_SETTLEMENT_MONTHLY_FLAG,
+    SETTLEMENT_FILE_TRANSFER_FLAG,
+    money_job_enabled,
+)
 
 
 def _skip_money_job(job_id: str, flag: str) -> None:

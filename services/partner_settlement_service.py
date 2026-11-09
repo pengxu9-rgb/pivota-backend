@@ -36,6 +36,20 @@ class PayoutNotPendingError(Exception):
     """Raised when an admin tries to approve a payout that is not pending."""
 
 
+class PayoutsDisabledError(Exception):
+    """Raised before any read or write when PARTNER_PAYOUT_EXECUTION_ENABLED is not literally
+    'true' (FIX_PLAN O-05, W3 review F5): no row changes and nothing is sent to Stripe."""
+
+
+def _require_payouts_enabled() -> None:
+    from services.money_flags import PARTNER_PAYOUT_EXECUTION_FLAG, money_job_enabled
+
+    if not money_job_enabled(PARTNER_PAYOUT_EXECUTION_FLAG):
+        raise PayoutsDisabledError(
+            f"Partner payouts are disabled ({PARTNER_PAYOUT_EXECUTION_FLAG} is off)"
+        )
+
+
 class PayoutMissingConnectAccountError(Exception):
     """Raised when a channel partner payout has no Stripe Connect destination."""
 
@@ -562,7 +576,12 @@ async def create_payout(
 
 
 async def approve_payout(payout_id: int, approved_by: str) -> None:
-    """Approve a pending payout and execute the Stripe Connect transfer."""
+    """Approve a pending payout and execute the Stripe Connect transfer.
+
+    Refuses (PayoutsDisabledError) before flipping the row unless PARTNER_PAYOUT_EXECUTION_ENABLED
+    is literally 'true', so a disabled approve leaves the payout pending.
+    """
+    _require_payouts_enabled()
 
     agent_payout_columns = await _table_columns("agent_payouts")
     assignments = ["status = 'approved'"]
@@ -591,7 +610,11 @@ async def approve_payout(payout_id: int, approved_by: str) -> None:
 
 
 async def execute_payout(payout_id: int) -> None:
-    """Execute an approved channel partner payout using a platform Stripe transfer."""
+    """Execute an approved channel partner payout using a platform Stripe transfer.
+
+    Gated like approve_payout: PayoutsDisabledError before any read, write or Stripe call.
+    """
+    _require_payouts_enabled()
 
     connect_column = await _partner_connect_account_column()
     connect_select = (

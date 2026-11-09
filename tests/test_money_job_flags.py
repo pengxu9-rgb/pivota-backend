@@ -177,3 +177,84 @@ async def test_registration_shape_is_unchanged(monkeypatch, sched, money_calls):
     assert rec.kwargs["partner_settlement_monthly"]["next_run_time"] is None
     assert "next_run_time" not in rec.kwargs["settlement_file_transfer"]
     assert rec.kwargs["settlement_file_transfer"]["day"] == 10
+
+
+# --- W3 F5: the legacy agent_payouts transfer (approve_payout -> execute_payout) -------------
+
+
+class _NoTouchDB:
+    """Any read or write is a failure: a disabled payout must not touch the database."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def fetch_one(self, *a, **k):
+        self.calls.append("fetch_one")
+        return {"id": 1}
+
+    async def fetch_all(self, *a, **k):
+        self.calls.append("fetch_all")
+        return []
+
+    async def execute(self, *a, **k):
+        self.calls.append("execute")
+
+
+@pytest.mark.parametrize("value", [None, "", "1", "yes", "on", "false"])
+async def test_payouts_refuse_unless_literally_true(monkeypatch, value):
+    import services.partner_settlement_service as svc
+
+    if value is None:
+        monkeypatch.delenv("PARTNER_PAYOUT_EXECUTION_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("PARTNER_PAYOUT_EXECUTION_ENABLED", value)
+    db = _NoTouchDB()
+    stripe_calls = []
+    monkeypatch.setattr(svc, "database", db)
+    monkeypatch.setattr(svc.stripe_client.v1.transfers, "create", lambda *a, **k: stripe_calls.append(k))
+
+    with pytest.raises(svc.PayoutsDisabledError):
+        await svc.approve_payout(42, "admin@example.com")
+    with pytest.raises(svc.PayoutsDisabledError):
+        await svc.execute_payout(42)
+    assert db.calls == []  # the payout stays pending; nothing read, nothing written
+    assert stripe_calls == []
+
+
+async def test_payouts_armed_reach_the_payout_body(monkeypatch):
+    import services.partner_settlement_service as svc
+
+    monkeypatch.setenv("PARTNER_PAYOUT_EXECUTION_ENABLED", "true")
+    executed = []
+
+    async def _columns(_t):
+        return {"status"}
+
+    async def _execute(payout_id):
+        executed.append(payout_id)
+
+    monkeypatch.setattr(svc, "database", _NoTouchDB())
+    monkeypatch.setattr(svc, "_table_columns", _columns)
+    monkeypatch.setattr(svc, "execute_payout", _execute)
+    await svc.approve_payout(42, "admin@example.com")
+    assert executed == [42]
+
+
+def test_nothing_in_the_app_calls_the_legacy_payout():
+    """The proof the path is unreachable today: no module outside its own calls approve_payout or
+    execute_payout. If a route or job ever does, this fails and the caller must be reviewed."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    hits = []
+    for path in root.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if rel.startswith(("tests/", ".venv/", "venv/")) or "/site-packages/" in rel:
+            continue
+        if rel == "services/partner_settlement_service.py":
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if re.search(r"\b(approve_payout|execute_payout)\b", text):
+            hits.append(rel)
+    assert hits == []
