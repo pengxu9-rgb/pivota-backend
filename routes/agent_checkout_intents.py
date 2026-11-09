@@ -106,11 +106,13 @@ def mint_checkout_token(
     exp = now + int(ttl_seconds)
     if exp_cap is not None:
         exp = min(exp, int(exp_cap))
+    # The payload goes FIRST so that no field in it can override the version, issue time or the
+    # (capped) expiry set here.
     body = {
+        **payload,
         "v": 1,
         "iat": now,
         "exp": exp,
-        **payload,
     }
 
     payload_b64 = _base64url_encode(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
@@ -183,6 +185,9 @@ def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
     /agent/v2/payments/checkout-sessions). The new token and intent must not outlive the token that
     asked for them, or a token holder could extend its one-hour life indefinitely by re-minting.
     Its own `exp` already carries any earlier cap, so the chain can only shrink.
+
+    A presented token with no usable `exp` (only possible with the signing secret; every minted token
+    has one) still gets a cap: the default token lifetime from now. It never means "uncapped".
     """
     payload = getattr(context, "checkout_token_payload", None)
     if not isinstance(payload, dict):
@@ -191,7 +196,9 @@ def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
         exp = int(payload.get("exp") or 0)
     except (TypeError, ValueError):
         exp = 0
-    return exp if exp > 0 else None
+    if exp > 0:
+        return exp
+    return int(time.time()) + _checkout_token_ttl_seconds()
 
 
 def _checkout_token_ttl_seconds() -> int:
