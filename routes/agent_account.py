@@ -991,33 +991,48 @@ async def login_agent(data: AgentLoginRequest):
         if not user["active"]:
             raise HTTPException(status_code=403, detail="Account is deactivated")
 
-        # 3. Get agent record
-        agent = await database.fetch_one(
-            """
-            SELECT agent_id, agent_name, owner_email, api_key, agent_type
-            FROM agents
-            WHERE LOWER(owner_email) = LOWER(:email)
-            ORDER BY created_at
-            LIMIT 1
-            """,
-            {"email": email}
-        )
+        # 3. Get the agent this login is linked to. An owner may have several agents
+        # rows (staff can add one at the same owner_email); take the oldest one the
+        # link holds for, not merely the oldest.
+        agent_rows = [
+            dict(r)
+            for r in (
+                await database.fetch_all(
+                    """
+                    SELECT agent_id, agent_name, owner_email, api_key, agent_type
+                    FROM agents
+                    WHERE LOWER(owner_email) = LOWER(:email)
+                    ORDER BY created_at
+                    """,
+                    {"email": email},
+                )
+                or []
+            )
+        ]
+        is_agent_role = user["role"] == "agent"
+        staff_owner = (not is_agent_role) and bool(agent_rows) and await _is_active_staff_account(user)
 
-        if user["role"] != "agent" and not (
-            agent and (await _is_active_staff_account(user) or await _holds_agent_membership(user, agent))
-        ):
-            raise HTTPException(status_code=403, detail="This login is for agents only")
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent record not found")
         # role='agent' plus a matching owner_email is not proof the agent is this
         # account's: staff create agents whose owner_email has no users row, and
         # /api/auth/register used to let anyone create that row. The link is an
         # agent membership for this agent written after this users row existed,
-        # which only the agent's own registration, a password-verified conversion,
-        # a password reset (mailbox proof) or an earlier linked login writes.
-        if user["role"] == "agent" and not await _holds_agent_membership(
-            user, agent, clock_skew=AGENT_LINK_CLOCK_SKEW
-        ):
+        # which only the agent's own registration, a password reset (mailbox proof)
+        # or an earlier linked login writes (a conversion keeps one, never makes one).
+        agent = None
+        for candidate in agent_rows:
+            if staff_owner or await _holds_agent_membership(
+                user,
+                candidate,
+                clock_skew=AGENT_LINK_CLOCK_SKEW if is_agent_role else timedelta(0),
+            ):
+                agent = candidate
+                break
+
+        if not is_agent_role and agent is None:
+            raise HTTPException(status_code=403, detail="This login is for agents only")
+        if not agent_rows:
+            raise HTTPException(status_code=404, detail="Agent record not found")
+        if agent is None:
             raise HTTPException(
                 status_code=403,
                 detail=(

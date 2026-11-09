@@ -10,9 +10,14 @@ import logging
 router = APIRouter(prefix="/admin/fix", tags=["Admin Fixes"])
 logger = logging.getLogger(__name__)
 
+# Links between a login and a tenant are made by the login's users.id, never by
+# the address alone: self-service registration does not verify the mailbox, so the
+# users row at an address may be a squatter's. Look the id up first with
+# GET /admin/fix/identity/{email}.
 class FixMerchantIDRequest(BaseModel):
     email: str
     correct_merchant_id: str
+    user_id: Optional[int] = None
 
 class MergeMerchantsRequest(BaseModel):
     keep_merchant_id: str
@@ -23,6 +28,7 @@ class FixUserRoleRequest(BaseModel):
     email: str
     role: str
     merchant_id: Optional[str] = None
+    user_id: Optional[int] = None
 
 
 class InspectIdentityRequest(BaseModel):
@@ -34,6 +40,7 @@ class MergeIdentityToMerchantRequest(BaseModel):
     merchant_id: Optional[str] = None
     new_password: Optional[str] = None
     force: bool = False
+    user_id: Optional[int] = None
 
 
 def _normalize_email(raw_email: str) -> str:
@@ -116,22 +123,25 @@ async def fix_merchant_id(
         if not merchant_result:
             raise HTTPException(status_code=404, detail=f"Merchant {request.correct_merchant_id} not found")
         
-        # Also update users table if merchant_id column exists
-        try:
-            users_query = """
-            UPDATE users
-            SET merchant_id = :new_merchant_id
-            WHERE email = :email
-            RETURNING id, email, merchant_id, role
-            """
-            
-            user_result = await database.fetch_one(users_query, {
-                "email": request.email,
-                "new_merchant_id": request.correct_merchant_id
-            })
-        except Exception as e:
-            logger.warning(f"Failed to update users.merchant_id (column may not exist yet): {e}")
-            user_result = None
+        # Link the login only when staff name it by id (see FixMerchantIDRequest).
+        user_result = None
+        if request.user_id is not None:
+            try:
+                users_query = """
+                UPDATE users
+                SET merchant_id = :new_merchant_id
+                WHERE id = :user_id AND LOWER(email) = LOWER(:email)
+                RETURNING id, email, merchant_id, role
+                """
+
+                user_result = await database.fetch_one(users_query, {
+                    "email": request.email,
+                    "user_id": request.user_id,
+                    "new_merchant_id": request.correct_merchant_id
+                })
+            except Exception as e:
+                logger.warning(f"Failed to update users.merchant_id (column may not exist yet): {e}")
+                user_result = None
         
         logger.info(f"✅ Updated merchant {request.correct_merchant_id} contact_email to {request.email}")
         
@@ -177,9 +187,17 @@ async def merge_merchants(
             )
             
             # Update user
+            # Only a login already linked to the removed merchant moves with it.
             await database.execute(
-                "UPDATE users SET merchant_id = :keep WHERE email = :email",
-                {"keep": request.keep_merchant_id, "email": request.user_email}
+                """
+                UPDATE users SET merchant_id = :keep
+                WHERE LOWER(email) = LOWER(:email) AND merchant_id = :remove
+                """,
+                {
+                    "keep": request.keep_merchant_id,
+                    "remove": request.remove_merchant_id,
+                    "email": request.user_email,
+                },
             )
             
             # Delete old merchant record
@@ -221,21 +239,15 @@ async def fix_user_role(
     if request.role not in valid_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role: {request.role}")
 
+    merchant_id = request.merchant_id
+    # A merchant link names both sides explicitly: the merchant by id (no
+    # contact_email inference) and the login by users.id.
+    if merchant_id and request.role == "merchant" and request.user_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id is required to link a login to a merchant (GET /admin/fix/identity/{email})",
+        )
     try:
-        merchant_id = request.merchant_id
-        if request.role == "merchant" and not merchant_id:
-            merchant = await database.fetch_one(
-                """
-                SELECT merchant_id
-                FROM merchant_onboarding
-                WHERE contact_email = :email
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                {"email": request.email},
-            )
-            if merchant:
-                merchant_id = merchant["merchant_id"]
 
         # Update users row
         try:
@@ -244,10 +256,15 @@ async def fix_user_role(
                     """
                     UPDATE users
                     SET role = :role, merchant_id = :merchant_id
-                    WHERE email = :email
+                    WHERE id = :user_id AND LOWER(email) = LOWER(:email)
                     RETURNING id, email, role, merchant_id
                     """,
-                    {"email": request.email, "role": request.role, "merchant_id": merchant_id},
+                    {
+                        "email": request.email,
+                        "role": request.role,
+                        "merchant_id": merchant_id,
+                        "user_id": request.user_id,
+                    },
                 )
             else:
                 user = await database.fetch_one(
@@ -336,6 +353,16 @@ async def merge_identity_to_merchant(
             detail=(
                 "This email is attached to an internal role. "
                 "Re-submit with force=true if you explicitly want to convert it into the merchant identity."
+            ),
+        )
+
+    if existing_user and str(request.user_id or "") != str(existing_user.get("id") or ""):
+        # The login at this address is linked only when staff name it by id.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A login already exists at this email. Pass its user_id "
+                "(GET /admin/fix/identity/{email}) to link it to this merchant."
             ),
         )
 

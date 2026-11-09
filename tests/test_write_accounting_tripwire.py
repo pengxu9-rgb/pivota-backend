@@ -313,7 +313,7 @@ def test_the_real_returning_call_sites_stay_unflagged():
     violations = {(str(v[0]), v[1]) for v in _violations()}
     for path, line in (
         ("services/agent_integration_bridge.py", 86),
-        ("services/payment_routing_service.py", 1377),
+        ("services/payment_routing_service.py", 1533),
     ):
         assert not any(p == path and abs(l - line) <= 4 for p, l in violations), (
             "%s:%d returns an id and uses it as an id; it must not be flagged" % (path, line)

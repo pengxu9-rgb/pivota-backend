@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from services.product_enrichment_pipeline import run_enrichment_for_product
-from utils.auth import assert_merchant_owner_or_staff, get_current_user
+from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 
 
 router = APIRouter(
@@ -38,7 +39,7 @@ async def run_enrichment(
     It writes enrichment for body.merchant_id, so the caller must be that merchant
     or staff.
     """
-    assert_merchant_owner_or_staff(current_user, body.merchant_id)
+    assert_merchant_scope(current_user, body.merchant_id, staff_roles=EMPLOYEE_ROLES)
     try:
         result = await run_enrichment_for_product(
             merchant_id=body.merchant_id,

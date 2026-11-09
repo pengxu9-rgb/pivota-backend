@@ -228,6 +228,40 @@ async def get_user_auth_binding(contact_email: str) -> Optional[Dict[str, Any]]:
     return dict(record) if record else None
 
 
+async def refuse_signup_at_claimed_address(
+    contact_email: str,
+    *,
+    also_check_users_and_merchant_contacts: bool = False,
+) -> None:
+    """409 MERCHANT_SIGNIN_REQUIRED when a sign-up with no users row would take an address in use.
+
+    A public sign-up does not prove the mailbox, yet it creates the users row (and
+    sets the identity's password) at this address. If the address already names an
+    employee (any status), an agent owner, or an identity with a password or a
+    membership, that row would let the caller sign in as that principal: login
+    promotes a users row to staff at an employee's address. Merchant onboarding
+    has already checked the users table and the merchant contacts; a caller that
+    has not passes `also_check_users_and_merchant_contacts=True`. The owner signs
+    in, or resets the password from the portal, which emails that mailbox.
+    """
+    from routes.auth import _email_claims_existing_tenant
+
+    if await _email_claims_existing_tenant(
+        normalize_contact_email(contact_email),
+        check_users_and_merchant_contacts=also_check_users_and_merchant_contacts,
+        any_employee_status=True,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=build_identity_conflict_detail(
+                code="MERCHANT_SIGNIN_REQUIRED",
+                message="Email already registered. Sign in or reset password to continue.",
+                current_role=None,
+                resolution="sign_in_or_reset_password",
+            ),
+        )
+
+
 async def sync_merchant_auth_membership(
     *,
     contact_email: str,
@@ -318,16 +352,38 @@ async def sync_merchant_auth_user(
         credential_source="merchant_sync",
     )
 
-async def keep_converted_agent_memberships(email: str) -> List[str]:
-    """Keep agent-portal access for an agent account converted into a merchant.
+# A membership written this long before its users row still counts as that row's
+# (users.created_at is the database clock, membership timestamps the app's).
+_CONVERSION_MEMBERSHIP_CLOCK_SKEW = timedelta(seconds=60)
 
-    The conversion (resolve_public_merchant_identity_merge) verifies the agent's own
-    password, then sync_merchant_auth_user rewrites users.role to 'merchant' -- and
-    users holds one role per email, so the owner could no longer sign in to the
-    developer portal ("This login is for agents only"). The owner proved the agent is
-    theirs, so record that as an active agent membership per owned agent; agent login
-    admits a non-agent role only through a membership bound to that exact agent.
+
+async def keep_converted_agent_memberships(email: str) -> List[str]:
+    """Keep the agent-portal access an agent account converted into a merchant HAD.
+
+    The conversion (resolve_public_merchant_identity_merge) verifies the agent account's
+    own password, then sync_merchant_auth_user rewrites users.role to 'merchant' --
+    users holds one role per email, and agent login admits a non-agent role only
+    through an agent membership bound to that exact agent.
+
+    It used to WRITE an agent membership for every agent whose owner_email is this
+    address. That password proves only that the caller owns the users row, and
+    /api/auth/register creates that row with no mailbox proof: register an address
+    before staff create an agent for it, convert, and the agent was yours. Now only
+    the links this account already held are kept (re-affirmed): an active agent
+    membership for that agent, written after this users row existed -- which only the
+    agent's own registration, a password reset (mailbox proof) or an earlier linked
+    login writes. An owner_email match alone links nothing.
     """
+    from db.auth_identity import has_active_membership_for_entity
+
+    user = await database.fetch_one(
+        "SELECT created_at FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+        {"email": email},
+    )
+    created_at = dict(user).get("created_at") if user else None
+    if not isinstance(created_at, datetime):
+        # Without the row's age no membership can be shown to be this account's.
+        return []
     rows = await database.fetch_all(
         "SELECT agent_id, agent_name FROM agents WHERE LOWER(owner_email) = LOWER(:email)",
         {"email": email},
@@ -335,16 +391,26 @@ async def keep_converted_agent_memberships(email: str) -> List[str]:
     kept: List[str] = []
     for row in rows:
         agent = dict(row)
+        agent_id = str(agent.get("agent_id") or "")
+        if not agent_id:
+            continue
+        if not await has_active_membership_for_entity(
+            email=email,
+            membership_type="agent",
+            entity_id=agent_id,
+            not_before=created_at - _CONVERSION_MEMBERSHIP_CLOCK_SKEW,
+        ):
+            continue
         await upsert_membership(
             email=email,
             membership_type="agent",
             role="agent",
-            entity_id=str(agent["agent_id"]),
+            entity_id=agent_id,
             status="active",
             full_name=agent.get("agent_name"),
             source="merchant_conversion_keeps_agent",
         )
-        kept.append(str(agent["agent_id"]))
+        kept.append(agent_id)
     return kept
 
 
@@ -619,6 +685,9 @@ async def register_merchant(
                     resolution="sign_in_or_reset_password",
                 ),
             )
+
+        if not existing_user:
+            await refuse_signup_at_claimed_address(normalized_email)
 
         if existing_user and existing_user.get("merchant_id") and not reuse_existing_onboarding:
             linked_onboarding = await get_merchant_onboarding(existing_user["merchant_id"])
