@@ -144,15 +144,18 @@ row at all, so the warm lane could never fire for them.
     existing key's re-check out by about a day, past the cart gate's TTL if trips repeat. So
     (`load_population`, `_sweep_targets`):
       - one staleness order (never-checked first) over every key, but WARM-ONLY keys (named by
-        no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (6) slots of
-        a run. So the other lanes' due keys always have the rest, and a warm-only key is never
+        no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (8, of a
+        batch of 24 in the setup script) slots of a run. So the other lanes' due keys always have the rest, and a warm-only key is never
         re-checked ahead of a staler one of theirs;
-      - a warm-only key is PROVEN SHOPIFY once its last check came back with a verdict only a
-        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`). Until then its requests feed
+      - a warm-only key is PROVEN SHOPIFY when its last check came back with a verdict only a
+        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`), or when it has EVER held a
+        positive window (`positive_until` set), so one throttle on a real store does not unprove
+        it. Otherwise its requests feed
         neither the IP breaker nor the shared Shopify-edge budget (the job's own 1.5 s pacer
         still spaces them): its throttles say nothing about the crawl IP's standing with Shopify;
       - a warm-only key whose last check found NO Shopify catalog (page 1 of `/products.json`
-        not a product list, for any reason but a throttle) is re-checked only every
+        answered 404, 410, or 200 with something that is not a product list; never a 5xx or a
+        throttle, which are transient) is re-checked only every
         `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` (7), and counted in
         `SweepReport.population_deferred_not_shopify` meanwhile.
 
@@ -419,7 +422,7 @@ DIALS: Dict[str, _Dial] = {
     # THE WARM-CLICK GUARD (see "THE FIFTH LANE"): at most this many WARM-ONLY keys (named by no
     # other lane) per run, after the other lanes' keys. 0 takes the warm-click lane out of the
     # population entirely: the rollback that needs no re-image.
-    "warm_click_max_per_run": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", 6, 0, 200),
+    "warm_click_max_per_run": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", 8, 0, 200),
     # A warm-only key whose last check found NO Shopify catalog is re-checked only this often.
     "warm_click_not_shopify_recheck_days": _Dial(
         "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", 7, 1, 60
@@ -1011,10 +1014,11 @@ SHOPIFY_STOREFRONT_VERDICTS = frozenset({
 })
 
 #: The preflight's detail when page 1 of the catalog was not a product list
-#: (`products_json_page_1_status_<status>`). A throttle never lands here (it is TRANSPORT_ERROR),
-#: but 429 and 503 are excluded anyway so a future change cannot turn a throttle into "not Shopify".
+#: (`products_json_page_1_status_<status>`). Only the statuses that SAY there is no catalog defer a
+#: key: 404 and 410 (no such route), and 200 with a body that is not a product list (an HTML page
+#: where a Shopify store serves JSON). A 5xx, a 403 or a throttle is transient and never defers.
 _NO_CATALOG_DETAIL = re.compile(r"^products_json_page_1_status_(\d{3})$")
-_THROTTLE_STATUSES = frozenset({"429", "503"})
+_NO_CATALOG_STATUSES = frozenset({"200", "404", "410"})
 
 
 def _found_no_shopify_catalog(verdict: Any, detail: Any) -> bool:
@@ -1022,7 +1026,7 @@ def _found_no_shopify_catalog(verdict: Any, detail: Any) -> bool:
     if str(verdict or "") != "VARIANT_UNVERIFIED":
         return False
     match = _NO_CATALOG_DETAIL.match(str(detail or ""))
-    return bool(match) and match.group(1) not in _THROTTLE_STATUSES
+    return bool(match) and match.group(1) in _NO_CATALOG_STATUSES
 
 
 def _aware_utc(value: Any) -> Optional[datetime]:
@@ -1299,8 +1303,10 @@ async def load_population(
         if variant is None and (domain, market) in reap_keys:
             variant = await _catalog_variant(domain)
         price_minor, currency = await _catalog_price(domain, variant) if variant else (None, None)
+        row = last.get((domain, market)) or {}
         proven = (domain, market) not in warm_keys or (
-            str((last.get((domain, market)) or {}).get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
+            str(row.get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
+            or row.get("positive_until") is not None
         )
         targets.append(Target(domain, market, variant, price_minor, currency, proven_shopify=proven))
     return targets

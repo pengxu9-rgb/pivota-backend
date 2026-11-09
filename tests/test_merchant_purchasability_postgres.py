@@ -337,6 +337,8 @@ async def test_list_due_reads_the_verdict_and_the_evidence_detail(_migration_db)
     assert (rows["nocatalog.example"]["verdict"], rows["nocatalog.example"]["detail"]) == (
         "VARIANT_UNVERIFIED", "products_json_page_1_status_404")
     assert rows["judydoll.com"]["verdict"] == "ELIGIBLE"
+    assert rows["judydoll.com"]["positive_until"] is not None, "the sticky-proven read"
+    assert rows["nocatalog.example"]["positive_until"] is None
     assert sweep._found_no_shopify_catalog(rows["nocatalog.example"]["verdict"],
                                            rows["nocatalog.example"]["detail"]) is True
 
