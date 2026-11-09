@@ -18,8 +18,10 @@ read, the checkout-intent mint, the refund executor).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -88,8 +90,23 @@ def v1(sub: str, op: str) -> str:
     return sign_issuing_agent_assertion({"v": 1, "kind": "agent", "sub": sub, "op": op, "ts": int(time.time())}, SECRET)
 
 
+def _would_own(key: str, assertion: Optional[str]) -> str:
+    """Who an order create made with this key and header is FOR, as the adoption rules decide it."""
+    if key == GATEWAY_KEY and assertion and assertion.startswith("v2.") and os.getenv(FLAG):
+        try:
+            return json.loads(base64.urlsafe_b64decode(assertion.split(".")[1] + "==")).get("sub") or GATEWAY_AGENT
+        except ValueError:
+            return GATEWAY_AGENT
+    return KEYS.get(key, "")
+
+
 def send(world, method: str, path: str, key: str, body: Optional[Dict[str, Any]] = None,
          assertion: Optional[str] = None):
+    if world.get("auto_own_quote", True) and method == "POST" and path == ORDERS and body and body.get("quote_id"):
+        # be#2770 (S-28): a quote is usable only by the agent that previewed it. By default each order
+        # create stands for a quote its own owner previewed; the S-28 composition tests below turn this
+        # off and preview through the real route instead.
+        world["quote_owners"][body["quote_id"]] = _would_own(key, assertion)
     headers = {"X-API-Key": key}
     if assertion is not None:
         headers["X-Pivota-Issuing-Agent"] = assertion
@@ -115,6 +132,7 @@ def world(monkeypatch: pytest.MonkeyPatch):
     refunds: List[Dict[str, Any]] = []
     intents: List[Dict[str, Any]] = []
     quotes: List[str] = []
+    quote_owners: Dict[str, str] = {}
 
     async def get_agent_by_key(api_key, metrics_out=None):
         agent_id = KEYS.get(api_key)
@@ -187,8 +205,14 @@ def world(monkeypatch: pytest.MonkeyPatch):
         return {"refund_id": "rf_1", "order_id": kwargs["order_id"], "refund_amount": "10.00"}
 
     async def preview(req, context):
+        # What the real preview writes: quotes.agent_id = the context that previewed (be#2770 reads it).
         quotes.append(context.agent_id)
+        quote_owners["q_1"] = context.agent_id
         return {"quote_id": "q_1", "pricing": {"total": "10.00"}, "currency": "USD"}
+
+    async def quote_owner_row(quote_id):
+        owner = quote_owners.get(quote_id)
+        return {"quote_id": quote_id, "agent_id": owner, "snapshot_json": {}} if owner else None
 
     async def no_quote_row(quote_id):
         return None
@@ -206,13 +230,14 @@ def world(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(agent_v2, "process_refund_route", refund)
     monkeypatch.setattr(agent_v2, "agent_v1_preview_quote", preview)
     monkeypatch.setattr(agent_v2, "get_quote", no_quote_row)
+    monkeypatch.setattr("services.quote_service.get_quote_owner_row", quote_owner_row)
     monkeypatch.setattr(agent_v2, "validate_request_compat", allow)
     monkeypatch.setattr(governance_module.agent_governance, "validate_request", allow)
     monkeypatch.setattr(refund_policy, "refuse_agent_refund_execution", lambda: None)
     forwarded.FORWARDED_OWNER_OUTCOMES.clear()
     return {
         "client": TestClient(app), "charged": charged, "orders": orders, "created": created,
-        "refunds": refunds, "intents": intents, "quotes": quotes,
+        "refunds": refunds, "intents": intents, "quotes": quotes, "quote_owners": quote_owners,
     }
 
 
@@ -695,3 +720,42 @@ def test_a_failed_click_write_still_serves_the_link(mint, monkeypatch):
     monkeypatch.setattr(gw, "issue_clicks", boom)
     click, link = call(GATEWAY_KEY, for_mint(PARTNER_A))
     assert click and link["external_redirect_url"]
+
+
+# --- be#2770 (S-28): the quote must belong to the PARTNER when forwarding is on ----------------------
+
+
+def _preview_as(world, sub: Optional[str]):
+    if sub is None:
+        return send(world, "POST", PREVIEW, GATEWAY_KEY, PREVIEW_BODY)
+    return as_partner(world, sub, "preview_quote", "POST", PREVIEW, PREVIEW_BODY)
+
+
+def test_a_quote_the_partner_previewed_is_used_by_that_partner(world):
+    world["auto_own_quote"] = False
+    assert _preview_as(world, PARTNER_A).status_code == 200
+    assert world["quote_owners"]["q_1"] == PARTNER_A, "the forwarded preview stamps the PARTNER as the quote owner"
+    res = create_as(world, PARTNER_A)
+    assert res.status_code == 200, res.text
+    assert world["created"][0]["agent_id"] == PARTNER_A
+
+
+def test_a_partners_quote_is_not_found_by_another_partner_nor_the_unsigned_gateway(world):
+    world["auto_own_quote"] = False
+    assert _preview_as(world, PARTNER_A).status_code == 200
+    other = create_as(world, PARTNER_B)
+    unsigned = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY)
+    assert (other.status_code, unsigned.status_code) == (404, 404), (other.text, unsigned.text)
+    assert "QUOTE_NOT_FOUND" in other.text and "QUOTE_NOT_FOUND" in unsigned.text
+    assert world["created"] == []
+
+
+def test_a_gateway_quote_is_not_found_by_an_adopted_partner(world):
+    world["auto_own_quote"] = False
+    assert _preview_as(world, None).status_code == 200
+    assert world["quote_owners"]["q_1"] == GATEWAY_AGENT
+    res = create_as(world, PARTNER_A)
+    assert res.status_code == 404 and "QUOTE_NOT_FOUND" in res.text, res.text
+    # ...and the unsigned gateway, which owns it, still may (today's MCP path, flag on or off).
+    assert send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY).status_code == 200
+    assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT]
