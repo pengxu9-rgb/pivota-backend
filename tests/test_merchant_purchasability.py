@@ -3045,9 +3045,9 @@ async def test_a_scan_publishes_the_dials_the_run_used_and_a_cache_only_reader_g
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "3")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", "9")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_TTL_HOURS", "48")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", "5")
     scanned = await sweep.collect_population()
     assert calls["scans"] == 1
-    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", "5")
     used = {"warm_click_max_per_run": 3, "warm_click_not_shopify_recheck_days": 9,
             "warm_click_sticky_days": 5, "ttl_hours": 48}
     assert sweep.published_dials() == used and set(used) == set(sweep.PUBLISHED_DIALS)
