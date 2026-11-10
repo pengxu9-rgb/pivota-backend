@@ -1,6 +1,6 @@
 # ADR-030: Pivota is the UCP/ACP platform; the checkout is the merchant's; card networks are only the credential layer
 
-**Status:** Proposed (draft 3), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Draft 3 answers the docs review of this ADR together with ADR-028 amendment 1.
+**Status:** Proposed (draft 4), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1.
 
 **Decision owner:** peng. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
@@ -35,7 +35,7 @@
   - **Amended (D5, the run condition, for a payment partner's checkout agent in the pilot only):** see D11.
   - **Amended (D7, on the payment-partner route only):** see D3, "Approval" and "Payment".
   - Pivota's own browser runner stays out, as amendment 1 says.
-  - Pointer lines under ADR-028 D2, D5 and D7 are added in a follow-up once #2758 has merged, so that two changes do not edit that file at once.
+  - Pointer lines under ADR-028 D5 and D7 are added in a follow-up once #2758 has merged, so that two changes do not edit that file at once. D2's pointer is already in #2758. The follow-up cites "ADR-030 D11" in full, because ADR-028 has a D11 of its own.
 - **ADR-029:** one purchase router for unconnected sellers. Its door, router, parent ledger and events are where a partner-completed purchase starts and is recorded (D3, D10). **Unchanged, except:**
   - the paths Pivota itself would execute are never admitted: completion through a platform protocol (its context table and its Phase 2), completion through a merchant's protocol, Pivota's own browser route, and so the `merchant_protocol` and `pivota_browser` executors;
   - a `card_number` path stays not admitted;
@@ -280,7 +280,8 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 - **What it replaces, for that agent in the pilot:**
   - D5's entry list (verified recognition, the merchant's written permission, or a protocol grant whose terms cover browser completion);
   - D5's interim clause, which allows the browser route only under written permission or such a grant until the robots-and-terms decision is made.
-- **What it does not decide.** ADR-028 D5's open owner decision on robots and terms. That stays open for anything beyond the pilot (question 5).
+- **Robots and terms, for the pilot** (owner, 2026-11-10). ADR-028 D5 requires the owner's decision on robots and terms before the browser route takes its first order. For a payment partner's checkout agent in the pilot, the condition above **is** that decision: a buyer-initiated order, placed by an agent that identifies itself, on a merchant that publishes an agentic checkout protocol, may proceed. No further check of robots rules or store terms is required before the pilot's first order.
+- **What it does not decide.** Robots and terms for anything beyond the pilot, and for any agent other than a payment partner's. That stays ADR-028 D5's open owner decision (question 5).
 - **D5 rules that stand unchanged:**
   - a merchant that opts out is never completed;
   - no CAPTCHA solving, address rotation, or disguised user agent or fingerprint;
@@ -350,7 +351,7 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 2. **Order capability.** OK to request the order capability and declare a `webhook_url` in our public platform profile? This creates a new inbound data flow of merchant order events.
 3. **Lane A.** Frozen as-is for connected merchants, or scheduled for retirement?
 4. **Own completion later.** Confirm it stays intent only for now, with the 2026-11-10 rule and ADR-028 amendment 1 in force until a separate decision.
-5. **Robots and terms, and the reach of D11.** D11 is pilot-only and replaces D5's interim permission clause for a payment partner's agent. Does the 2026-11-10 answer also decide ADR-028 D5's robots-and-terms question for that agent, and does D11 hold beyond the pilot?
+5. **Robots and terms beyond the pilot.** D11 decides robots and terms for a payment partner's agent in the pilot only. Does it hold beyond the pilot, and how are store terms checked then?
 6. **ADR-029 questions 1 and 3.** Confirm both are closed as "no": no card vault, and no platform protocol as a completion route for Pivota.
 7. **Lane A refunds.** Staff and operations refund routes still execute a refund. Remove them, or treat reversing Pivota's own failed orchestration as a separate case (amendment 1 leaves that open)?
 8. **The approved total on the payment-partner route.** Confirm D3's rule: exact in one session; on a re-opened session a lower total is paid without re-asking only with the same seller, items and currency.
@@ -360,7 +361,10 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 - the freeze does not cover the agreed payment-partner flow (answered below);
 - the later intent of Pivota's own completion (D3, "Later");
 - the payment partner's report as a source of order status on path 2 (D4);
-- the pilot's run condition, with no separate merchant permission sought (D11).
+- the pilot's run condition, with no separate merchant permission sought (D11);
+- that the run condition is the robots-and-terms decision ADR-028 D5 requires, for a payment partner's checkout agent in the pilot (D11);
+- the six points of the agreed partner flow of 2026-11-10 (listed at the top);
+- the single orchestration layer of 2026-11-08, with Pivota-issued cards removed (listed at the top; D10).
 
 **Answered (owner, 2026-11-10): the freeze and the agreed partner flow.** The freeze stops only custom rail work outside the agreed contract. The agreed flow's remaining work on our side of the partner rail continues: the single-session quote step, the entry link on the order, the transport to the partner's sandbox, a held state and a cancel path.
 
