@@ -1,6 +1,6 @@
 # ADR-028: Pivota completes the order on the merchant's own checkout; the buyer stays in the agent front
 
-**Status:** Proposed, 2026-11-02. peng decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms). **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place.
+**Status:** Proposed, 2026-11-02. peng decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms). **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place. **Also since 2026-11-10, D6 is the rule for now:** Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a compliance assessment and a separate owner decision (ADR-030, "D3. Who completes the payment").
 
 **Decision owner:** peng
 
@@ -16,7 +16,7 @@
 
 The decision owner decided three questions on 2026-11-08. They are binding on every lane, not only on the completed checkout.
 
-1. **The card credential (D6, replaced).** The payment partner fills the merchant's checkout. Pivota never sees, receives or holds the card credential: no card number (PAN), no device or network token number (DPAN), no cryptogram, no dynamic security code (dCVV), in any Pivota process, log or store.
+1. **The card credential (D6, replaced).** The payment partner fills the merchant's checkout. Pivota never sees, receives or holds the card credential: no card number (PAN), no device or network token number (DPAN), no cryptogram, no dynamic security code (dCVV), in any Pivota process, log or store. *Narrowed 2026-11-10:* this is the rule for now. Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota.
 2. **The merchant of record (D10, new).** The merchant is the merchant of record on every lane, and Pivota is never the payee of a buyer's payment.
 3. **Refunds (D11, new).** A refund is a request to the merchant. Pivota never executes one.
 
@@ -25,10 +25,11 @@ The decision owner decided three questions on 2026-11-08. They are binding on ev
 **Consequences of the amendment**
 - **The payment partner's token step stays refused in production.** That step returns a network token and cryptogram to the caller. It MUST NOT be enabled in any environment that can take a real payment, and it is refused in production in code (be#2759, `services/payment_orchestration/a2a_rail.py:38-42`), whatever its switch says. The partner is asked to stop sending credential fields to Pivota's account at all.
 - **Pivota's own credential retrieval from a card network is out of scope.** No Pivota code calls a card network's credential endpoint (for Visa Intelligent Commerce, `credentials-for-instruction` or its predecessor), whether the answer is readable or encrypted. Card-network connectivity work stops before any such call. Reopening it needs a new decision that amends D6.
+  - *2026-11-10:* ADR-030, "D3. Who completes the payment", names the conditions under which such a decision could later be taken. It enables nothing.
 - **Agent programs that expect the agent to enter the token** in the checkout's payment fields are usable only through a payment partner that does it on its own side.
 - **Refunds are request-only** on every lane (D11). An after-sales tool or API that executes a refund on a merchant's payment provider is a contradiction to remove (see below).
 - **Stripping is a detector, not compliance.** Pivota's clients strip credential-shaped fields from partner answers and count each one as a breach. A credential that reaches the stripper has already entered a Pivota process, so the rule is met only when the partner never sends one. The partner's written confirmation, and a sandbox log scan showing no credential fields, are conditions for a pilot.
-- **Card-data scope.** The design keeps card credentials out of Pivota's systems, which is the precondition for the SAQ-A scope. **A scoping opinion from a Qualified Security Assessor (QSA) is still to be obtained**, and no SAQ-A claim relies on this ADR until it is on file. The opinion covers each live route, including the protocol route's payment handler and the redirects to the partner's hosted pages.
+- **Card-data scope.** The design keeps card credentials out of Pivota's systems, which is the precondition for the SAQ-A scope. **A scoping opinion from a Qualified Security Assessor (QSA) is still to be obtained**, and no SAQ-A claim relies on this ADR until it is on file. The opinion covers each live route, including the protocol route's payment handler and the redirects to the partner's hosted pages. *2026-11-10:* the later token pass-through (ADR-030 D3) is outside this scope claim and needs its own PCI assessment before it is enabled.
 
 **Cross-references**
 - **ADR-016 (non-custodial).** Unchanged. D10 restates its money boundary per lane: the merchant's payment provider, or the payment partner acting for the merchant, charges; funds never settle to Pivota.
@@ -52,7 +53,7 @@ The decision owner decided three questions on 2026-11-08. They are binding on ev
 | ADR-029, path table rows "Shop MCP checkout completion" and "Merchant protocol completion (UCP `complete_checkout`)" | Pivota calls `complete_checkout`, on a platform protocol with the shopper's token, or on the merchant's protocol through its payment handler (ADR-028 protocol route) | ADR-030, "D3. Who completes the payment": Pivota does not call `complete_checkout` for now; D6, where the shopper's token passes through Pivota |
 | ADR-029, path table row "Pivota's own browser route (ADR-028 D2)" | "a network token in memory for one attempt (ADR-028 D6)", with Pivota placing the order | D6: Pivota never holds the credential; D2 as amended: Pivota's own runner does not complete a checkout |
 | ADR-029 D2, the `executor` field | the values `merchant_protocol` (Pivota calls the merchant's protocol) and `pivota_browser` | D2 and D6 as amended; ADR-030, "D3. Who completes the payment" |
-| ADR-029 D3 (card data) | "ADR-028 D6 holds as written ... a token or cryptogram may exist only in memory for one attempt, on a route Pivota executes"; "No card data reaches Pivota" means "stripped on arrival" | D6, replaced: no credential in any Pivota process; stripping is a detector, not compliance |
+| ADR-029 D3 (card data) | "ADR-028 D6 holds as written ... a token or cryptogram may exist only in memory for one attempt, on a route Pivota executes"; "No card data reaches Pivota" means "stripped on arrival" | D6, replaced: no credential in any Pivota process; stripping is a detector, not compliance (D6 is narrowed 2026-11-10: this is the rule for now) |
 | ADR-029 D6, the ADR-028 admission rules | "for `pivota_browser`, D5's run condition" | D2 as amended: Pivota's own runner does not complete a checkout, so `pivota_browser` is never a candidate |
 | ADR-029 Phases, step 2 | Shop MCP completion, behind its dial, once its permission and wallet fact exist | ADR-030, "D3. Who completes the payment": Pivota does not call `complete_checkout` for now |
 | ADR-029, question 1 for the owner | a card vault, as a separate decision that "would change ADR-028 D6" | D6: Pivota never sees, receives or holds the credential; reopening needs a new decision that amends D6 |
@@ -69,7 +70,7 @@ Today a recommendation ends in a click-out: the `/r` redirect sends the buyer to
 
 peng decided on 2026-11-02 that the buyer checks out in the agent front, and that Pivota completes the order on the merchant's own storefront checkout, with the buyer's agent payment token. The buyer is sent to the merchant only when no offer for that product can be completed by Pivota.
 
-> **Amended 2026-11-08 (D6):** the buyer still checks out in the agent front, but Pivota never handles the agent payment token. The payment partner fills the merchant's checkout with it.
+> **Amended 2026-11-08 (D6):** the buyer still checks out in the agent front, but Pivota never handles the agent payment token. The payment partner fills the merchant's checkout with it. *(Narrowed 2026-11-10: for now; see D6.)*
 
 ### What exists and can be reused
 - **A protocol client.** The gateway's UCP buyer-agent client discovers a merchant's `/.well-known/ucp` profile, creates carts and checkouts and reads their totals. It signs requests at UCP's signed trust tier with a key published in our agent profile. Today it never calls `complete_checkout`, by design.
@@ -104,7 +105,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 > **Not used for now (2026-11-10, protocol route):** Pivota does not call `complete_checkout` for now; see ADR-030, "D3. Who completes the payment".
 
 - **Protocol route:** the merchant's agentic checkout protocol, at the trust tier the merchant requires: UCP `complete_checkout`, ACP, and others as ADR-014 adapters. Payment goes through the protocol's payment handler.
-  - *Amended 2026-11-08 (D6):* only where no card credential passes through Pivota on the way to the handler. A handler that needs Pivota to carry a card number, a network token, a cryptogram or a dynamic security code is not used.
+  - *Amended 2026-11-08 (D6):* only where no card credential passes through Pivota on the way to the handler. For now, no handler that needs Pivota to carry any card credential is used. Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. (*Narrowed 2026-11-10;* see D6 and ADR-030, "D3. Who completes the payment".)
 - **Browser route:** a headless browser, ours or a payment partner's, completes the merchant's storefront checkout, paying with the buyer's agent payment token from a card network's agent program (Visa Intelligent Commerce, Mastercard Agent Pay).
   - *Amended 2026-11-08 (D6):* the browser route is the **payment partner's** runner. It fills the merchant's checkout and pays with the credential on the partner's side. Pivota's own runner does not complete a checkout and never enters a credential.
   - A payment partner's runner cannot be held to Pivota's code. Pivota MUST NOT dispatch an order to a partner's browser runner unless the partner's contractual equivalents of D5 to D7 (identity, challenges, guest checkout, card data, the mandate), D10 (the payee) and D11 (refund requests) are recorded for that partner.
@@ -165,9 +166,11 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 - Attempts per real order MUST be capped.
 - **Open owner decision: robots and terms.** Storefront `robots.txt` defaults usually disallow cart and checkout paths, and store terms may restrict automated access. The decision owner decides, before the browser route takes its first order, whether a buyer-initiated, signed agent completing that buyer's own order is treated as outside `robots.txt` (which governs crawlers), and how store terms are checked. **Until then, the browser route MUST run only under the merchant's written permission or a protocol grant whose terms explicitly cover browser completion (see the run condition above); verified recognition alone is not enough.**
 
-### D6. Money and card data: Pivota never handles the card credential (amended 2026-11-08)
+### D6. Money and card data: Pivota handles no card credential for now (amended 2026-11-08, narrowed 2026-11-10)
 
 > **Replaced 2026-11-08 (amendment 1).** The 2026-11-02 text let Pivota hold the token number, cryptogram and dynamic security code in memory for one payment attempt, and left open how the credential reaches the checkout (protocol handler, payment provider pass-through, or entry by Pivota's browser). The decision owner decided instead that the payment partner fills the merchant's checkout and Pivota never handles the credential. The earlier text is in this file's history.
+
+> **Narrowed 2026-11-10 (decision owner).** For now, no handler that needs Pivota to carry any card credential is used. Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a PCI and compliance assessment and a separate owner decision; the conditions are in ADR-030, "D3. Who completes the payment". Until then, every rule below holds as written.
 
 - **ADR-016 holds as written.** The merchant's payment provider charges. Pivota never receives, holds, pools or settles funds, and takes no cut of them. The merchant is the merchant of record (D10).
 - **The credential is the buyer's.** The agent payment token is the buyer's own credential, issued under the buyer's enrolment with the card network, through the payment partner. The buyer is the cardholder and the merchant's customer. Pivota never pays from funds of its own.
@@ -177,6 +180,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
   - a partner is admitted only when it confirms in writing that it sends no credential to Pivota, and its sandbox answers show none;
   - Pivota's clients still strip any credential-shaped field from a partner answer and record each one as a breach of the partner's contract. Stripping is a detector, not compliance: the rule is met only when nothing arrives;
   - only non-sensitive references are kept: the partner's card or enrolment id, the card brand and the last four digits when the partner supplies them.
+  - *Narrowed 2026-11-10:* the one later exception is the conditional pass-through in the note above: a single-use, merchant- and amount-scoped network token and its cryptogram, passed to the merchant's payment handler and never stored or logged. A card number or security code never passes through Pivota, on any route, now or later.
 - **Protocol route.** Only through a payment handler where no credential passes through Pivota (D2).
   - *Not used for now (2026-11-10):* Pivota does not call `complete_checkout` for now; see ADR-030, "D3. Who completes the payment".
 - **Browser artifacts** (screenshots, traces, recordings, page dumps) MUST be off on the payment and contact steps, on any runner Pivota operates.
@@ -261,7 +265,7 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 - `/r` click-outs become the fallback for products with no completable offer.
 - Attribution moves from the buyer's browser into the session Pivota completes. That makes it observable per order, and makes per-program permission for agent-placed orders a hard requirement.
 - A new operations loop: unattributed orders become tasks to fix the merchant's commission loop.
-- ~~Card-data scope stays SAQ-A by construction (D6).~~ *Replaced 2026-11-08:* card credentials stay out of Pivota's systems (D6), which is the precondition for the SAQ-A scope. A QSA scoping opinion is still to be obtained before any SAQ-A claim relies on it. The enrolment options are limited accordingly.
+- ~~Card-data scope stays SAQ-A by construction (D6).~~ *Replaced 2026-11-08:* card credentials stay out of Pivota's systems (D6), which is the precondition for the SAQ-A scope. A QSA scoping opinion is still to be obtained before any SAQ-A claim relies on it. The enrolment options are limited accordingly. *2026-11-10:* the later token pass-through (ADR-030 D3) needs its own PCI assessment before it is enabled.
 - *Added 2026-11-08:* the payment partner's token step stays refused in production in code (be#2759, `services/payment_orchestration/a2a_rail.py:38-42`); Pivota's own credential retrieval from a card network is out of scope; refunds are request-only (amendment 1).
 - Coverage depends on merchants recognizing agents. Where they do not, the product falls back to click-outs; Pivota never forces its way through.
 
@@ -286,6 +290,6 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 
 ## Resolved questions (decision owner, 2026-11-08)
 
-6. **Who touches the card credential:** the payment partner fills the merchant's checkout. Pivota never sees, receives or holds the credential (D6, replaced).
+6. **Who touches the card credential:** the payment partner fills the merchant's checkout. Pivota never sees, receives or holds the credential (D6, replaced). (*Narrowed 2026-11-10:* this is the rule for now; the one later, conditional exception is in ADR-030, "D3. Who completes the payment".)
 7. **Merchant of record:** the merchant, on every lane. Pivota is never the payee (D10).
 8. **Refunds:** a request to the merchant, never executed by Pivota (D11).
