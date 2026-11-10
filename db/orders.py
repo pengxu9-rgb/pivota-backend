@@ -668,6 +668,49 @@ async def update_payment_info(
     return result is not None and result > 0
 
 
+async def update_payment_info_unless_cancelled(
+    order_id: str,
+    payment_intent_id: str,
+    client_secret: str,
+    payment_status: str = "processing",
+    psp_used: Optional[str] = None,
+) -> bool:
+    """`update_payment_info`, as ONE conditional UPDATE that refuses a cancelled order (FIX_PLAN C-11,
+    CHECKOUT_CANCEL_UPSTREAM_ENABLED; routes/agent_payment_sdk.py create_payment).
+
+    True when THIS call wrote the payment surface. False when the order is cancelled (or gone): nothing is written,
+    so a cancel that committed while the PSP object was being created is never overwritten with a live reference
+    and "processing". RETURNING, not the rowcount (unreliable under the `databases` driver), reports the outcome;
+    the cancel side (services/checkout_cancel_upstream.py) is the same kind of conditional UPDATE, so the two
+    serialise on the row.
+    """
+    safe_secret = client_secret
+    try:
+        if client_secret and len(str(client_secret)) > 480:
+            await _ensure_client_secret_storage_allows_long_values()
+            safe_secret = str(client_secret)
+    except Exception:
+        safe_secret = client_secret
+
+    update_values = {
+        "payment_intent_id": payment_intent_id,
+        "client_secret": safe_secret,
+        "payment_status": payment_status,
+        "updated_at": datetime.now(),
+    }
+    if psp_used:
+        update_values["psp_used"] = psp_used
+
+    query = (
+        orders.update()
+        .where(orders.c.order_id == order_id)
+        .where(func.lower(func.coalesce(orders.c.status, "")) != "cancelled")
+        .values(**update_values)
+        .returning(orders.c.order_id)
+    )
+    return await database.fetch_one(query) is not None
+
+
 async def mark_order_paid(order_id: str) -> bool:
     """标记订单已支付.
 
