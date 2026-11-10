@@ -159,3 +159,49 @@ async def test_blank_ids_from_the_column_are_ignored():
     db = _RoutingDB(is_test=[{"merchant_id": " "}, {"merchant_id": None}, {"merchant_id": "m_x "}])
     ids = await pol.get_excluded_merchant_ids(db, env=ON)
     assert "m_x" in ids and "" not in ids and " " not in ids
+
+
+# ── phase B: the sync read the test-traffic classifier uses ───────────────────────────────────
+
+
+async def test_cached_set_is_empty_until_an_async_read():
+    assert pol.cached_is_test_merchant_ids(ON) == set()
+    db = _RoutingDB(is_test=[{"merchant_id": "m_staff_test"}])
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    assert pol.cached_is_test_merchant_ids(ON) == {"m_staff_test"}
+
+
+async def test_cached_set_is_empty_with_the_flag_off_even_when_filled():
+    db = _RoutingDB(is_test=[{"merchant_id": "m_staff_test"}])
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    assert pol.cached_is_test_merchant_ids({}) == set()
+    assert pol.cached_is_test_merchant_ids({pol.IS_TEST_FILTER_ENV: "false"}) == set()
+
+
+async def test_refresh_with_the_flag_off_touches_no_database():
+    db = _RoutingDB(is_test=[{"merchant_id": "m_staff_test"}])
+    await pol.refresh_is_test_merchant_ids(db, env={})
+    assert db.queries == []
+    await pol.refresh_is_test_merchant_ids(None, env=ON)  # no database: nothing to do, no raise
+
+
+async def test_refresh_is_cached_and_never_raises():
+    db = _RoutingDB(is_test=[{"merchant_id": "m_a"}])
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    assert db.is_test_reads() == 1
+    down = _RoutingDB(demo_raises=True, is_test_raises=True)
+    pol.invalidate_cache()
+    await pol.refresh_is_test_merchant_ids(down, env=ON)
+    assert pol.cached_is_test_merchant_ids(ON) == {"m_a"}  # last good kept
+
+
+async def test_classifier_reads_the_cached_set_only_with_the_flag_on(monkeypatch):
+    from services import test_traffic as tt
+
+    db = _RoutingDB(is_test=[{"merchant_id": "m_staff_test"}])
+    monkeypatch.setenv(pol.IS_TEST_FILTER_ENV, "true")
+    await pol.refresh_is_test_merchant_ids(db)
+    assert tt.classify_test_traffic(merchant_ids=["M_STAFF_TEST"], synthetic_call=False) == ["test_merchant"]
+    monkeypatch.delenv(pol.IS_TEST_FILTER_ENV)
+    assert tt.classify_test_traffic(merchant_ids=["m_staff_test"], synthetic_call=False) == []

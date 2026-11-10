@@ -186,6 +186,11 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["status"] = "pending"
     order_data["payment_status"] = "unpaid"
     order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
+    # M-05: the classifier's is_test merchant leg is a cached read; warm it (no-op unless both the
+    # stamp and the is_test filter flags are on; never raises).
+    from services.test_traffic import warm_test_merchant_ids
+
+    await warm_test_merchant_ids()
     _stamp_test_traffic(order_data)
 
     query = orders.insert().values(**order_data)

@@ -700,6 +700,8 @@ async def upsert_order_attribution_edge(
         },
         "updated_at": now,
     }
+    # M-05: warm the classifier's cached is_test merchant set (no-op unless both flags are on).
+    await test_traffic.warm_test_merchant_ids()
     # O-07: stamp a test order's edge (services.test_traffic) so GMV, statements and outcomes skip
     # it. Off (TEST_TRAFFIC_STAMP_ENABLED unset) or a real order: the metadata is unchanged.
     test_traffic.stamp(
@@ -1718,6 +1720,8 @@ async def close_external_order_conversion(
             # else: click_matched is False → T2-3 already excludes this edge; we do NOT
             #       double-guard with seller_mismatch, only stamp the converting domain.
 
+    # M-05: warm the classifier's cached is_test merchant set (no-op unless both flags are on).
+    await test_traffic.warm_test_merchant_ids()
     values = {
         "edge_id": edge_id,
         # ADR-009 D3: the edge SUBJECT is the seller (seller_ref) when seller-keyed,

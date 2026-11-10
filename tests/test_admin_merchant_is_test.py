@@ -389,3 +389,138 @@ async def test_directory_rig_domains_follow_the_flag(rows, monkeypatch):
     assert TEST_HOST in on and REAL_HOST not in on
     assert not directory.is_listable_domain(TEST_HOST, excluded=on)
     assert directory.is_listable_domain(REAL_HOST, excluded=on)
+
+
+# ── phase B: the test-traffic classifier (services/test_traffic) ─────────────────────────────
+
+STAMP = "TEST_TRAFFIC_STAMP_ENABLED"
+
+
+def _order_data(mid: str) -> dict:
+    return {
+        "merchant_id": mid,
+        "customer_email": "buyer@example.com",
+        "shipping_address": {"country": "US"},
+        "items": [{"product_id": "p1", "quantity": 1, "unit_price": 5.0, "subtotal": 5.0}],
+        "subtotal": 5.0,
+        "total": 5.0,
+        "currency": "USD",
+        "agent_id": AGENT,
+        "metadata": {"pvt_click_id": f"clk_{mid}"},
+    }
+
+
+async def _create_and_read(mid: str) -> dict:
+    """The real producer: db.orders.create_order (it warms the is_test cache, then classifies and
+    stamps). Returns the stored metadata."""
+    from db.orders import create_order
+
+    order_id = await create_order(_order_data(mid))
+    raw = await database.fetch_val("SELECT metadata FROM orders WHERE order_id = :o", {"o": order_id})
+    return _as_dict(raw) or {}
+
+
+async def _counted_orders() -> set:
+    """Which of our merchants' orders a money read keeps (services.test_traffic.not_test_traffic_sql,
+    the predicate the GMV roll-up, statements and outcomes use)."""
+    from services.test_traffic import not_test_traffic_sql
+
+    rows = await database.fetch_all(
+        "SELECT DISTINCT merchant_id FROM orders WHERE agent_id = :a AND "
+        + not_test_traffic_sql("metadata"),
+        {"a": AGENT},
+    )
+    return {r["merchant_id"] for r in rows} & set(OURS)
+
+
+@pytest.fixture
+async def orders_cleanup(rows):
+    yield
+    await database.execute("DELETE FROM orders WHERE agent_id = :a", {"a": AGENT})
+
+
+async def test_an_order_on_an_is_test_merchant_classifies_as_test(rows, orders_cleanup, monkeypatch):
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    test_md = await _create_and_read(M_TEST)
+    real_md = await _create_and_read(M_REAL)
+    assert test_md == {
+        "pvt_click_id": f"clk_{M_TEST}", "test_traffic": True, "test_traffic_reasons": ["test_merchant"],
+    }
+    assert real_md == {"pvt_click_id": f"clk_{M_REAL}"}
+    # and the money read drops it, keeping the real one
+    assert await _counted_orders() == {M_REAL}
+    # the sync predicate agrees, from the cache create_order warmed
+    from services import test_traffic as tt
+
+    assert tt.classify_test_traffic(merchant_ids=[M_TEST.upper()], synthetic_call=False) == ["test_merchant"]
+    assert tt.classify_test_traffic(merchant_ids=[M_REAL], synthetic_call=False) == []
+
+
+@pytest.mark.parametrize("filter_flag", ["", "false"])
+async def test_flag_off_an_is_test_merchants_order_is_real(rows, orders_cleanup, monkeypatch, filter_flag):
+    monkeypatch.setenv(FLAG, filter_flag)
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    assert await _create_and_read(M_TEST) == {"pvt_click_id": f"clk_{M_TEST}"}
+    assert await _counted_orders() == {M_TEST}
+
+
+async def test_stamp_off_warms_nothing_and_stamps_nothing(rows, orders_cleanup, monkeypatch):
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.delenv(STAMP, raising=False)
+    await _set(M_TEST, True)
+    from services import test_merchant_policy
+
+    test_merchant_policy.reset_cache()
+    real_fetch_all = database.fetch_all
+    reads = []
+
+    async def _spy(query, *a, **k):
+        reads.append(str(query))
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _spy)
+    assert await _create_and_read(M_TEST) == {"pvt_click_id": f"clk_{M_TEST}"}
+    assert not [q for q in reads if "is_test" in q]
+
+
+async def test_unknown_is_not_test_when_the_column_cannot_be_read(rows, orders_cleanup, monkeypatch):
+    """The billing fail direction: if the is_test read fails, the order is classified real and stays
+    in the money numbers (a counted test order can be excluded later; a dropped real one is lost)."""
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    from services import test_merchant_policy
+
+    test_merchant_policy.reset_cache()
+    real_fetch_all = database.fetch_all
+
+    async def _is_test_down(query, *a, **k):
+        if "is_test" in str(query):
+            raise RuntimeError("column merchant_onboarding.is_test does not exist")
+        return await real_fetch_all(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_all", _is_test_down)
+    assert await _create_and_read(M_TEST) == {"pvt_click_id": f"clk_{M_TEST}"}
+    monkeypatch.undo()
+    assert await _counted_orders() == {M_TEST}
+
+
+async def test_a_cleared_merchant_is_real_again_on_this_instance(rows, orders_cleanup, monkeypatch):
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    assert (await _create_and_read(M_TEST)).get("test_traffic") is True
+    await _set(M_TEST, False, reason="real merchant after all")
+    assert "test_traffic" not in await _create_and_read(M_TEST)
+
+
+async def test_turning_the_filter_off_makes_the_next_order_real_at_once(rows, orders_cleanup, monkeypatch):
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    assert (await _create_and_read(M_TEST)).get("test_traffic") is True  # the cache is now filled
+    monkeypatch.setenv(FLAG, "false")
+    assert "test_traffic" not in await _create_and_read(M_TEST)

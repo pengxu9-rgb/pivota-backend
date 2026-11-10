@@ -346,6 +346,28 @@ def invalidate_cache() -> None:
     _is_test_attempted = False
 
 
+def cached_is_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
+    """The last good is_test set, with NO database read, for sync callers (the test-traffic
+    classifier). Empty while MERCHANT_IS_TEST_FILTER_ENABLED is off, and empty until some async
+    caller has read the column (`refresh_is_test_merchant_ids`, or any `get_excluded_merchant_ids`
+    call with a database). Unknown is NOT test: see IS_TEST_FILTER_ENV."""
+    if not merchant_is_test_filter_enabled(env):
+        return set()
+    return set(_is_test_value or ())
+
+
+async def refresh_is_test_merchant_ids(database, *, env: Optional[Dict[str, str]] = None) -> None:
+    """Make `cached_is_test_merchant_ids` current, through the same cached, single-flight attempt
+    as the exclusion set (at most one read per _CACHE_TTL_SECONDS). No-op, and no database read,
+    while the flag is off. Never raises."""
+    if database is None or not merchant_is_test_filter_enabled(env):
+        return
+    try:
+        await get_excluded_merchant_ids(database, env=env)
+    except Exception:  # noqa: BLE001 - get_excluded_merchant_ids is fail-soft; belt and braces
+        logger.warning("test_merchant_policy: is_test refresh failed", exc_info=True)
+
+
 def _merchant_id_of(product: Any) -> str:
     if isinstance(product, dict):
         return str(product.get("merchant_id") or "").strip()

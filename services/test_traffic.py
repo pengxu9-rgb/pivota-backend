@@ -10,7 +10,15 @@ An order, attribution edge or click is TEST traffic when any server-controlled s
   ops_canary       the payment canary's own order (metadata.ops_canary, a server-only order key:
                    routes.order_routes strips it from caller metadata).
   test_merchant    the merchant is a rig: services.test_merchant_policy.static_test_merchant_ids
-                   (the baked-in rig list plus PIVOTA_TEST_MERCHANT_IDS).
+                   (the baked-in rig list plus PIVOTA_TEST_MERCHANT_IDS), and, while
+                   MERCHANT_IS_TEST_FILTER_ENABLED is on, a merchant staff marked
+                   `merchant_onboarding.is_test` (migration 282). That last set is a CACHED read
+                   (services.test_merchant_policy.cached_is_test_merchant_ids): this predicate is
+                   sync and never touches the database. The async writers warm it first
+                   (`warm_test_merchant_ids`). FAIL DIRECTION: unknown is NOT test. If the column
+                   could not be read, or no caller has read it yet in this process, an is_test
+                   merchant's row is classified real and stays IN billing: a test row counted is
+                   recoverable by a later exclusion, a real row dropped from billing is lost revenue.
   test_psp_probe   the order the server GRANTED the test-processor bypass at create
                    (routes.order_routes._apply_server_granted_test_psp_stamp: ALLOW_TEST_PSP_PROBE on,
                    merchant in TEST_PSP_PROBE_MERCHANTS, AND every active processor of the merchant
@@ -78,9 +86,26 @@ def _truthy(value: Any) -> bool:
 
 
 def _test_merchant_ids() -> set:
-    from services.test_merchant_policy import static_test_merchant_ids
+    from services.test_merchant_policy import cached_is_test_merchant_ids, static_test_merchant_ids
 
-    return {m.strip().lower() for m in static_test_merchant_ids() if str(m or "").strip()}
+    ids = static_test_merchant_ids() | cached_is_test_merchant_ids()
+    return {m.strip().lower() for m in ids if str(m or "").strip()}
+
+
+async def warm_test_merchant_ids() -> None:
+    """Refresh the cached is_test merchant set before an async writer classifies (migration 282).
+    A no-op, with no database read, unless both TEST_TRAFFIC_STAMP_ENABLED and
+    MERCHANT_IS_TEST_FILTER_ENABLED are on. Cached (one read per 300 s per process) and never raises:
+    a failed read leaves the last good set, and unknown is not test."""
+    if not stamp_enabled():
+        return
+    try:
+        from db.database import database
+        from services.test_merchant_policy import refresh_is_test_merchant_ids
+
+        await refresh_is_test_merchant_ids(database)
+    except Exception:  # noqa: BLE001 — a predicate must never break a writer
+        return
 
 
 def _current_call_is_synthetic() -> bool:
