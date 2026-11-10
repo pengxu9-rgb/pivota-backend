@@ -209,6 +209,60 @@ def _full_refund_fulfillment_status(order: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+async def _late_payment_after_cancel(
+    order: Dict[str, Any],
+    *,
+    psp: str,
+    payment_reference: Optional[str],
+    amount_minor: Any,
+    currency: Optional[str],
+    source_event: str,
+) -> Optional[Dict[str, Any]]:
+    """A PSP success on a CANCELLED order, with CHECKOUT_CANCEL_UPSTREAM_ENABLED: record it and raise it as a refund
+    request (services/checkout_cancel_upstream.py). None (flag off, or not a cancelled order): today's answer."""
+    from services.checkout_cancel_upstream import (
+        checkout_cancel_upstream_enabled,
+        is_cancelled_order,
+        record_late_payment_after_cancel,
+    )
+
+    if not checkout_cancel_upstream_enabled() or not is_cancelled_order(order):
+        return None
+    reference = str(payment_reference or "").strip() or str(order.get("payment_intent_id") or "").strip()
+    amount_major = (
+        _money_from_minor_units(amount_minor, currency or str(order.get("currency") or ""))
+        if amount_minor is not None
+        else None
+    )
+    return await record_late_payment_after_cancel(
+        order,
+        psp=psp,
+        payment_reference=reference,
+        amount_major=amount_major,
+        amount_minor=amount_minor,
+        currency=currency,
+        source_event=source_event,
+    )
+
+
+async def _late_payment_after_concurrent_cancel(order_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+    """The paid transition lost its race: re-read the row (flag on only) and treat a cancel that won as a late
+    payment. Any read failure keeps today's answer."""
+    from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+    if not checkout_cancel_upstream_enabled():
+        return None
+    try:
+        from db.orders import get_order
+
+        current = await get_order(order_id)
+    except Exception:
+        return None
+    if not current:
+        return None
+    return await _late_payment_after_cancel(current, **kwargs)
+
+
 async def finalize_payment_success(
     order: Dict[str, Any],
     *,
@@ -226,6 +280,16 @@ async def finalize_payment_success(
     if not order:
         return {"applied": False, "reason": "order_missing"}
     if _is_terminal_paid_state(order) or _blocks_payment_success_recovery(order):
+        late = await _late_payment_after_cancel(
+            order,
+            psp=psp,
+            payment_reference=transaction_id or payment_reference,
+            amount_minor=amount_minor,
+            currency=currency,
+            source_event=source_event,
+        )
+        if late is not None:
+            return late
         return {"applied": False, "reason": "already_settled", "order_id": order.get("order_id")}
 
     order_id = str(order.get("order_id") or "")
@@ -266,6 +330,17 @@ async def finalize_payment_success(
     # unfulfilled order is handled by the reconcile sweep, not by re-finalizing.
     transitioned = bool(await mark_order_paid_fn(order_id))
     if not transitioned:
+        # A cancel can win this race too (services/checkout_cancel_upstream.py): then this payment is a late one.
+        late = await _late_payment_after_concurrent_cancel(
+            order_id,
+            psp=psp,
+            payment_reference=resolved_payment_reference,
+            amount_minor=amount_minor,
+            currency=currency,
+            source_event=source_event,
+        )
+        if late is not None:
+            return late
         # Someone else won the paid transition between our in-memory guard above
         # and this atomic update. Treat as already-settled, suppress duplicate
         # side effects.

@@ -398,7 +398,21 @@ async def create_payment(
         
         if order.get("payment_status") == "paid":
             raise HTTPException(status_code=400, detail="Order already paid")
-        
+
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): a cancelled order gets no PSP payment surface, neither a
+        # new one nor the reuse of one it had. Before the reuse path below, which would hand back the old one.
+        from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled, is_cancelled_order
+
+        if checkout_cancel_upstream_enabled() and is_cancelled_order(order):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "ORDER_CANCELED",
+                    "message": "This order was canceled and can no longer be paid.",
+                    "order_id": request.order_id,
+                },
+            )
+
         merchant_id = _resolve_order_merchant_id(order)
         if not merchant_id:
             raise HTTPException(status_code=400, detail="Order merchant could not be resolved")
