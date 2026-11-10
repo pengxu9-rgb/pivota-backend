@@ -171,6 +171,8 @@ def _run(
     here.mkdir()
     script = here / "deploy_gateway.sh"
     shutil.copy2(SCRIPT, script)
+    # The script sources its gateway-image resolver from its own directory.
+    shutil.copy2(SCRIPT.parent / "_gateway_image.sh", here / "_gateway_image.sh")
     # True writes both; "env" / "secrets" write just one, for the half-ported state a run
     # interrupted partway through port_railway_env.py leaves behind.
     if ported_files in (True, "env"):

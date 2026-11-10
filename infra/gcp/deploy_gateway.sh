@@ -177,7 +177,10 @@ if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ];
   fi
 fi
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
-IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
+# Gateway images built on merge live in pivota-gateway (immutable tags); hand builds in pivota.
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$HERE/_gateway_image.sh"
+IMAGE="$(resolve_gateway_image "$TAG")" || IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
 # an existing service. A brand-new service has no previous revision to protect anyway.

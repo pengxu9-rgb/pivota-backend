@@ -21,6 +21,17 @@
 #   no flags          trigger PAUSED, job args are a DRY RUN. A hand execution writes nothing.
 #   --enable          trigger RESUMED, job args are a DRY RUN: a daily would-be census in the log.
 #   --enable --apply  trigger RESUMED, job args carry --apply: it writes. --apply alone is refused.
+# A run without --enable pauses an existing trigger FIRST, before any preflight, so worker drift or a
+# missing image can never keep an armed writer running. Fastest disarm, no script needed:
+#   gcloud scheduler jobs pause brand-official-canonical-promote-cron --location us-west1 --project pivota-prod
+#
+# THIS SCRIPT OWNS THE JOB'S WHOLE ENV AND SECRETS: --set-env-vars / --set-secrets REPLACE the set on
+# every run, so a value added by hand is wiped by the next run. Pin it here instead.
+#
+# NO --limit, ON PURPOSE. The population is "not yet serving-eligible", and a row the classifier
+# blocks STAYS in it, so a daily --limit would re-score the same first N blocked rows forever and
+# never reach newer ones. Size is checked instead: arm with --enable first and read the dry-run
+# census (rows scored, would-be pass/fail per blocker) before adding --apply.
 #
 # PINNED ENV, VERIFIED AGAINST THE WORKER. A Cloud Run Job inherits nothing. Run through the one-off
 # runner, this script computed eligibility WITHOUT ENABLE_KBEAUTY_AGENT_DECISION_GATES and promoted
@@ -28,6 +39,9 @@
 # that this path reads is pinned below, and the preflight REFUSES to provision if the live worker's
 # value differs: a job whose gates disagree with the service that re-gates its rows every night is
 # the defect, so drift stops this script instead of being copied silently. Update the pin here.
+# `<unset>` means the worker does not set the flag and neither may the job: these are flags the
+# write path reads (serving eligibility, the trust upsert, the PDP view heal) that are off today, so
+# turning one on in `worker` stops this script until the pin follows.
 #
 # SCHEDULE: 08:25 UTC daily, default subnet (Cloud SQL only; no merchant fetches, so not the crawl
 # address). Clear of nightly_index_health (04:00), catalog_invariant_sweep (04:50), the 07:15 and
@@ -79,7 +93,20 @@ INDEXNOW_ENABLED=true
 PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS=1
 PIVOTA_SERVING_PRICING_REGIONS=US,SG
 SERVE_PDP_ENRICHMENT_ON_WRITE=1
-STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true"
+SERVING_PRICE_REQUIRES_SEED_CURRENCY=1
+STRICT_BEAUTY_CATEGORY_TEXT_RECALL=true
+CATEGORY_LEAF_REQUIRED_FOR_SERVING=<unset>
+CATALOG_TRUST_CRAWL_FRESH_ENABLED=<unset>
+CATALOG_TRUST_CRAWL_FRESH_DAYS=<unset>
+CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT=<unset>
+AGENT_PDP_VIEW_UNBUILDABLE_REAP=<unset>"
+
+# DISARM FIRST: a run without --enable pauses an existing trigger before anything below can refuse.
+if [ "$ENABLED" != true ] && have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGION"; then
+  "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
+    || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }
+  echo "== paused $TRIGGER (disarm runs before the preflight)"
+fi
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
 have "$GCLOUD" artifacts docker images describe "$BACKEND_IMAGE" \
@@ -111,7 +138,11 @@ PY
 ENV_VARS="^|^PIVOTA_ENV=$PIVOTA_ENV|PIVOTA_SERVICE_NAME=$JOB|PIVOTA_COMMIT_SHA=$BACKEND_TAG"
 ENV_VARS="$ENV_VARS|DB_POOL_MIN_SIZE=1|DB_POOL_MAX_SIZE=2"
 ENV_VARS="$ENV_VARS|DB_STATEMENT_TIMEOUT_SECONDS=30|DB_COMMAND_TIMEOUT_SECONDS=600"
-ENV_VARS="$ENV_VARS|$(printf '%s' "$PINNED_FLAGS" | tr '\n' '|')"
+while IFS= read -r line; do
+  case "$line" in *"=<unset>") ;; *) ENV_VARS="$ENV_VARS|$line" ;; esac
+done <<EOF
+$PINNED_FLAGS
+EOF
 
 ARGS="scripts/promote_brand_official_canonicals.py"
 [ "$APPLY" = true ] && ARGS="$ARGS,--apply"

@@ -26,12 +26,21 @@
 # provisioned; the definition moved here and setup_scheduler.sh no longer carries it.
 #
 # DARK BY DEFAULT, ARMED ONLY BY --enable. Without --enable the trigger is PAUSED; with it, RESUMED.
-# Re-running WITHOUT --enable therefore disarms an armed lane, deliberately. The job is read-only,
-# so an execution started by hand against a dark job is harmless.
+# Re-running WITHOUT --enable therefore disarms an armed lane, deliberately, and it pauses an existing
+# trigger FIRST, before any preflight, so a missing image cannot stop a disarm. The job is read-only,
+# so an execution started by hand against a dark job is harmless. Fastest disarm, no script needed:
+#   gcloud scheduler jobs pause relgraph-health-cron --location us-west1 --project pivota-prod
 #
-# SCHEDULE: 12:05 UTC daily, after relgraph-sync (10:37) and outside the 10:15-11:45 window reserved
-# for it on pivota-pg. Default subnet: it reaches only Cloud SQL, never a merchant host, so the crawl
-# address is not involved. Neighbours at 12:xx: external-referral-refresh (12:15, crawl subnet).
+# THIS SCRIPT OWNS THE JOB'S WHOLE ENV AND SECRETS. The update path uses --set-env-vars and
+# --set-secrets, which REPLACE the set: a value added by hand (RELGRAPH_FAIL_ON_NOOP=true, a
+# RELGRAPH_CRITICAL_REASONS override) is wiped by the next run of this script. Put it here instead.
+#
+# SCHEDULE: 17:05 UTC daily. relgraph-sync starts at 10:37 with a 21600s task timeout, so a slow night
+# can still be writing until 16:37; a health check read in the middle of that could report a
+# half-applied graph. 17:05 is after the latest possible end, and outside the 10:15-11:45 window
+# reserved for relgraph-sync on pivota-pg. Default subnet: it reaches only Cloud SQL, never a merchant
+# host, so the crawl address is not involved. Neighbours: external-referral-refresh (16:15 and 18:15,
+# crawl subnet, ~55 min each).
 set -euo pipefail
 
 ENV="${1:-}"; GATEWAY_TAG="${2:-}"; FLAG="${3:-}"
@@ -51,20 +60,28 @@ case "$FLAG" in
 esac
 [ "$#" -le 3 ] || { echo "too many arguments" >&2; exit 2; }
 
-GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; SHARED=pivota-shared
+GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1
 JOB=relgraph-health
 TRIGGER=relgraph-health-cron
-SCHEDULE="5 12 * * *"
+SCHEDULE="5 17 * * *"
 # The worker identity, as setup_scheduler.sh's gateway jobs use it: it already holds Secret Manager
 # access to DATABASE_URL_NOVERIFY and project-level run.invoker for Scheduler.
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
-GATEWAY_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/gateway:$GATEWAY_TAG"
 have(){ "$@" >/dev/null 2>&1; }
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
+
+# DISARM FIRST: a run without --enable pauses an existing trigger before anything below can refuse.
+if [ "$ENABLED" != true ] && have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGION"; then
+  "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
+    || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }
+  echo "== paused $TRIGGER (disarm runs before the preflight)"
+fi
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
-have "$GCLOUD" artifacts docker images describe "$GATEWAY_IMAGE" \
-  || { echo "missing image $GATEWAY_IMAGE; build it first (gateway images are built on merge to main by PIVOTA-Agent's build-gateway-image workflow, or by hand with infra/gcp/cloudbuild.gateway.yaml)" >&2; exit 1; }
+GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
+  || { echo "missing image gateway:$GATEWAY_TAG in pivota-gateway and pivota; build it first (on merge to main by PIVOTA-Agent's build-gateway-image workflow, or by hand with infra/gcp/cloudbuild.gateway.yaml)" >&2; exit 1; }
 
 # The thresholds are the retired GitHub workflow's, exactly as setup_scheduler.sh passed them.
 # RELGRAPH_CRITICAL_REASONS is deliberately NOT passed: gcloud splits --set-env-vars on commas, and
@@ -99,7 +116,7 @@ verb=create; have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGI
 if [ "$ENABLED" = true ]; then
   "$GCLOUD" scheduler jobs resume "$TRIGGER" --location "$REGION" --quiet \
     || { echo "FAILED to resume $TRIGGER" >&2; exit 1; }
-  echo "ARMED: $JOB runs daily at 12:05 UTC."
+  echo "ARMED: $JOB runs daily at 17:05 UTC."
 else
   "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
     || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }

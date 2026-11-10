@@ -195,7 +195,10 @@ GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd
 . "$HERE/_serving_revision.sh"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
-GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
+# Gateway images built on merge live in pivota-gateway (immutable tags); hand builds in pivota.
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$HERE/_gateway_image.sh"
+GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
 BROWSER_AUDIT_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/store-audit-browser:$GATEWAY_TAG"
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
 UCP_CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
@@ -835,8 +838,10 @@ have "$GCLOUD" projects add-iam-policy-binding "$PROJECT" --member="serviceAccou
 in_list(){ # name list -- exact match against a comma-separated list
   case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac
 }
+SCHED_SEEN=""
 sched(){ # name schedule job-name [invoker] [paused-on-CREATE: 0|1]
   local name="$1" cron="$2" job="$3" invoker="${4:-$RUN_INVOKER}" paused="${5:-$PAUSED}"
+  SCHED_SEEN="$SCHED_SEEN,$name"
   local uri="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT/jobs/$job:run"
   local verb=create; have "$GCLOUD" scheduler jobs describe "$name" --location "$REGION" && verb=update
   "$GCLOUD" scheduler jobs "$verb" http "$name" --location "$REGION" \
@@ -1205,3 +1210,16 @@ if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQ
   echo "       --update-env-vars AUDIT_WORKER_ENABLED=$WORKERS_REQUESTED" >&2
 fi
 "$GCLOUD" scheduler jobs list --location "$REGION" --format="table(name.basename(),schedule,state)"
+
+# AN ARM/DISARM NAME THIS SCRIPT DOES NOT DEFINE CHANGED NOTHING. Say so, and fail, so a stale
+# instruction (e.g. the old `ARM=relgraph-health-cron`, now owned by setup_relgraph_health_job.sh)
+# is not mistaken for a done step.
+UNKNOWN=""
+for name in $(printf '%s' "$ARM,$DISARM" | tr ',' ' '); do
+  in_list "$name" "${SCHED_SEEN#,}" || UNKNOWN="$UNKNOWN $name"
+done
+if [ -n "$UNKNOWN" ]; then
+  echo "ERROR: ARM/DISARM named triggers this script does not define, so nothing was done for them:$UNKNOWN" >&2
+  echo "       (relgraph-health-cron: use infra/gcp/setup_relgraph_health_job.sh)" >&2
+  exit 3
+fi

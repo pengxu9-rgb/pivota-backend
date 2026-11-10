@@ -19,8 +19,13 @@
 # RE-READS the job and fails if anything other than those two fields differs from before.
 #
 # DRY RUN BY DEFAULT. Without --apply it prints, per job, current -> target and changes nothing.
-# Each --apply is a separate decision: the jobs that write prices or the graph (relgraph-sync,
-# external-referral-refresh, the sweeps) are re-imaged on the owner's go, one run at a time.
+# --apply NEEDS JOB NAMES: a dry run may plan every registered job, but a roll names each job it
+# changes, because the jobs that write prices or the graph (relgraph-sync, external-referral-refresh,
+# the sweeps) are each re-imaged on the owner's go. `--apply` with no names is refused.
+#
+# GATEWAY IMAGES resolve through _gateway_image.sh: pivota-gateway (built on merge, immutable tags)
+# first, then pivota (hand builds). Rolling a job onto the same sha in the other repository is a
+# roll like any other.
 #
 # REFUSALS, each a hard stop:
 #   - the sha is not on the repo's main (checked against GitHub's compare API, public repos);
@@ -29,7 +34,9 @@
 #   - any job with an execution still running (it keeps its old image; re-image after it ends);
 #   - retailer-ingest-drain unless named explicitly AND RETAILER_INGEST_DRAIN_WRITER=1: that job has
 #     a single writer for its image, and a default "all backend jobs" run must not roll it.
-# Without job names it re-images every registered job of that repo that EXISTS in the project.
+#   - a job whose executions cannot be listed (a failed read is not "nothing running").
+# One refusal stops the run before anything changes. A FAILED VERIFY mid-roll stops at that job; the
+# jobs listed as "rolled" before it stay rolled (each was verified), and the message names them.
 set -euo pipefail
 
 ENV="${1:-}"; MODE="${2:-}"
@@ -41,6 +48,8 @@ esac
 GCLOUD="${GCLOUD:-gcloud}"; PYTHON="${PYTHON:-python3}"; CURL="${CURL:-curl}"
 REGION=us-west1; SHARED=pivota-shared; OWNER=pengxu9-rgb
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
 
 # THE REGISTRY: every pinned job this script may roll, by the repo its image is built from.
 # store-audit-commerce-probe is absent on purpose (store-audit-browser image, its own build).
@@ -93,11 +102,13 @@ compare(){
   # Unauthenticated, GitHub allows 60 calls an hour PER IP, shared with everything else on that
   # network; set GITHUB_TOKEN (e.g. `GITHUB_TOKEN=$(gh auth token)`) to lift it. A failed call is a
   # failure, never a pass: status prints "?", a re-image refuses.
-  local body auth=()
-  [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  # The token travels to curl as a config file on STDIN (`--config -`), never on argv, where any
+  # other user of the machine could read it in `ps` while curl runs.
+  local body config=""
+  [ -n "${GITHUB_TOKEN:-}" ] && config="header = \"Authorization: Bearer $GITHUB_TOKEN\""
   # The body lists every file changed since the sha (megabytes for an old image), so it goes to
   # python on STDIN: as an environment variable it exceeds ARG_MAX and the parse never runs.
-  body="$("$CURL" -fsS --max-time 60 -H 'Accept: application/vnd.github+json' ${auth[@]+"${auth[@]}"} \
+  body="$(printf '%s\n' "$config" | "$CURL" --config - -fsS --max-time 60 -H 'Accept: application/vnd.github+json' \
     "https://api.github.com/repos/$OWNER/$1/compare/$2...main?per_page=1")" || return 1
   printf '%s' "$body" | "$PYTHON" -c '
 import json, sys
@@ -105,10 +116,11 @@ d = json.load(sys.stdin)
 print(d["status"] + "\t" + str(d["ahead_by"]) + "\t" + str(d["behind_by"]))'
 }
 
-running_executions(){ # job -> count of executions with no completion time
-  "$GCLOUD" run jobs executions list --job "$1" --region "$REGION" --limit 20 \
-    --format='value(metadata.name,status.completionTime)' 2>/dev/null \
-    | awk -F'\t' 'NF && $2 == "" {n++} END {print n+0}'
+running_executions(){ # job -> count of executions with no completion time; exit 1 if unreadable
+  local listing
+  listing="$("$GCLOUD" run jobs executions list --job "$1" --region "$REGION" --limit 20 \
+    --format='value(metadata.name,status.completionTime)')" || return 1
+  printf '%s\n' "$listing" | awk -F'\t' 'NF && $2 == "" {n++} END {print n+0}'
 }
 
 sha_of_image(){ # image ref -> the tag when it is a 40-hex sha, else ""
@@ -165,7 +177,8 @@ for arg in "$@"; do
   esac
 done
 
-TARGET_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/$IMAGE_NAME:$SHA"
+[ "$APPLY" = true ] && [ -z "$NAMED" ] && {
+  echo "--apply needs job names: a roll names every job it changes (dry-run without --apply to see the plan)" >&2; exit 2; }
 
 cmp="$(compare "$REPO_NAME" "$SHA")" \
   || { echo "cannot reach GitHub to verify $SHA is on $REPO_NAME main; refusing" >&2; exit 1; }
@@ -173,8 +186,14 @@ case "$(echo "$cmp" | cut -f1)" in
   identical|ahead) ;;  # sha...main: main is identical to or ahead of sha -> sha is on main
   *) echo "$SHA is not on $REPO_NAME main (compare: $(echo "$cmp" | cut -f1)); refusing" >&2; exit 1 ;;
 esac
-"$GCLOUD" artifacts docker images describe "$TARGET_IMAGE" >/dev/null 2>&1 \
-  || { echo "missing image $TARGET_IMAGE; build it first" >&2; exit 1; }
+if [ "$MODE" = gateway ]; then
+  TARGET_IMAGE="$(resolve_gateway_image "$SHA")" \
+    || { echo "missing image gateway:$SHA in pivota-gateway and pivota; build it first" >&2; exit 1; }
+else
+  TARGET_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/$IMAGE_NAME:$SHA"
+  "$GCLOUD" artifacts docker images describe "$TARGET_IMAGE" >/dev/null 2>&1 \
+    || { echo "missing image $TARGET_IMAGE; build it first" >&2; exit 1; }
+fi
 
 if [ -n "$NAMED" ]; then JOBS="$NAMED"; else JOBS="$REGISTERED"; fi
 NOW_HHMM="${NOW_HHMM:-$(date -u +%H%M)}"
@@ -197,7 +216,10 @@ for job in $JOBS; do
   if in_words "$job" "$RELGRAPH_WINDOW_JOBS" && in_relgraph_window; then
     echo "REFUSE $job: 10:15-11:45 UTC is the relgraph-sync window" >&2; refused=1; continue
   fi
-  if [ "$(running_executions "$job")" != 0 ]; then
+  if ! running="$(running_executions "$job")"; then
+    echo "REFUSE $job: cannot list its executions, so cannot tell whether one is running" >&2; refused=1; continue
+  fi
+  if [ "$running" != 0 ]; then
     echo "REFUSE $job: an execution is still running" >&2; refused=1; continue
   fi
   image="${facts%%$'\t'*}"; stamp="${facts#*$'\t'}"
@@ -212,6 +234,7 @@ done
 [ -n "$plan" ] || { echo "nothing to do"; exit 0; }
 if [ "$APPLY" != true ]; then echo "DRY RUN: re-run with --apply to roll:$plan"; exit 0; fi
 
+rolled=""
 for job in $plan; do
   before="$(job_shape "$job")"
   "$GCLOUD" run jobs update "$job" --region "$REGION" --image "$TARGET_IMAGE" \
@@ -220,7 +243,9 @@ for job in $plan; do
   facts="$(job_facts "$job")"
   if [ "$before" != "$after" ] || [ "${facts%%$'\t'*}" != "$TARGET_IMAGE" ] || [ "${facts#*$'\t'}" != "$SHA" ]; then
     echo "FAILED VERIFY $job: the job changed beyond image + PIVOTA_COMMIT_SHA, or did not take the new image" >&2
+    echo "already rolled and verified before it:${rolled:- none}; not attempted after it: the rest of$plan" >&2
     exit 1
   fi
-  echo "rolled $job -> $IMAGE_NAME:${SHA:0:12} (verified: only image + PIVOTA_COMMIT_SHA changed)"
+  rolled="$rolled $job"
+  echo "rolled $job -> ${TARGET_IMAGE##*/} (verified: only image + PIVOTA_COMMIT_SHA changed)"
 done

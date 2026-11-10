@@ -10,7 +10,7 @@ Each prod change below (create or arm a job, re-image, IAM) needs the owner's go
 
 | Job | Script | Trigger (UTC) | Default | Arm |
 |---|---|---|---|---|
-| `relgraph-health` | `infra/gcp/setup_relgraph_health_job.sh` | `relgraph-health-cron`, 12:05 daily | trigger paused | `--enable` |
+| `relgraph-health` | `infra/gcp/setup_relgraph_health_job.sh` | `relgraph-health-cron`, 17:05 daily (after relgraph-sync's latest possible end) | trigger paused | `--enable` |
 | `brand-official-canonical-promote` | `infra/gcp/setup_brand_official_canonical_promote_job.sh` | `brand-official-canonical-promote-cron`, 08:25 daily | trigger paused, args dry run | `--enable` (dry run), `--enable --apply` (writes) |
 | `pdp-live-read-promote` | `infra/gcp/setup_pdp_live_read_promote_job.sh` | none, by design | args dry run | run by hand with `--write` |
 
@@ -28,13 +28,39 @@ Each prod change below (create or arm a job, re-image, IAM) needs the owner's go
   - Leave out `--write` for a dry run. `--args` replaces the job's args entirely.
   - The preflight refuses on drift from the live `gateway`'s flags.
 
+**Each setup script owns its job's whole env and secrets.** A re-run replaces both
+(`--set-env-vars` / `--set-secrets`), so a value set by hand on the job is wiped. Put it in the
+script.
+
+**Disarm, fastest first.** A re-run without `--enable` pauses the trigger before any preflight, so it
+works even when the image is missing or the worker's flags have drifted. Without the script:
+
+```bash
+gcloud scheduler jobs pause relgraph-health-cron --location us-west1 --project pivota-prod
+```
+
+```bash
+gcloud scheduler jobs pause brand-official-canonical-promote-cron --location us-west1 --project pivota-prod
+```
+
+**Before `--enable` on relgraph-health:** its first hand run (2026-11-10) failed the serving guard: 142
+suppressed rows (0.28%), all non-critical reasons, against a 0/0 threshold. Arming it as-is pages
+daily. Decide the threshold, or clean up those rows, first.
+
+**The brand-official promote has no `--limit`.** A row the classifier blocks stays in its
+population, so a daily limit would re-score the same blocked rows forever. Size it instead: run
+with `--enable` (a dry run) and read the census before adding `--apply`.
+
 ## Re-imaging pinned jobs after a merge
 
 Deploys roll services, never jobs. Every job keeps running its last image until it is re-imaged.
 
 ```bash
-infra/gcp/reimage_jobs.sh prod status
+GITHUB_TOKEN=$(gh auth token) infra/gcp/reimage_jobs.sh prod status
 ```
+
+(`GITHUB_TOKEN` is optional. Without it, GitHub allows 60 calls an hour per IP, shared with
+everything on that network. The token is passed to curl on stdin, never on argv.)
 
 The output lists every registered job, the sha it runs, and how many commits it is behind main.
 
@@ -48,25 +74,33 @@ This is a dry run: it prints current -> target for each job and changes nothing.
 infra/gcp/reimage_jobs.sh prod backend <sha> --apply [job ...]
 ```
 
-This rolls the jobs. It changes only the image and `PIVOTA_COMMIT_SHA`, then re-reads each job and
-fails if anything else changed. Use `gateway` instead of `backend` for gateway-image jobs.
+This rolls the named jobs. `--apply` needs job names; the dry run without names shows the plan
+for every registered job. It changes only the image and `PIVOTA_COMMIT_SHA`, then re-reads each job
+and fails if anything else changed. Use `gateway` instead of `backend` for gateway-image jobs.
 
 - The script refuses in these cases:
   - the sha is not on that repo's main;
   - the image `<repo>:<sha>` is missing;
   - it is 10:15-11:45 UTC and the job is a relgraph job;
-  - an execution is still running;
+  - an execution is still running, or the executions cannot be listed;
   - the job is `retailer-ingest-drain` and it was not named with `RETAILER_INGEST_DRAIN_WRITER=1` (that job has a single writer).
-- One refusal stops the whole run, so nothing is half-rolled.
+- One refusal stops the run before anything changes. A failed verify mid-roll stops at that job, and
+  the message lists the jobs already rolled (each one verified) and the ones not attempted.
 - Each `--apply` on a job that writes prices or the graph (`relgraph-sync`, `external-referral-refresh`, the sweeps) is its own go.
 - Backend images exist for every merged commit, because `deploy-prod.yml` builds `backend:<sha>`.
-- Gateway images are built on merge by PIVOTA-Agent's `build-gateway-image.yml` once it is armed (below). Until then, build by hand: `gcloud builds submit --config infra/gcp/cloudbuild.gateway.yaml --project pivota-shared --substitutions=COMMIT_SHA=<sha> .` from a PIVOTA-Agent checkout.
+- Gateway images come from two repositories, and every script resolves a sha the same way
+  (`infra/gcp/_gateway_image.sh`): `pivota-gateway` first, then `pivota`.
+  - `pivota-gateway`: built on merge by PIVOTA-Agent's `build-gateway-image.yml` once it is armed (below). Its tags are immutable.
+  - `pivota`: hand builds, `gcloud builds submit --config infra/gcp/cloudbuild.gateway.yaml --project pivota-shared --substitutions=COMMIT_SHA=<sha> .` from a PIVOTA-Agent checkout.
 
 ## Arming the gateway image build (owner, once)
 
-1. `infra/gcp/setup_gateway_image_build_identity.sh` creates three things:
-   - WIF provider `github-gateway`, pinned to PIVOTA-Agent's repo id and `refs/heads/main`;
-   - service account `sa-gateway-image-build`, with `artifactregistry.writer` on the `pivota` repository only;
+1. `infra/gcp/setup_gateway_image_build_identity.sh` creates four things:
+   - Artifact Registry repository `pivota-gateway`, with immutable tags and the same readers as `pivota`;
+   - WIF provider `github-gateway`, pinned to PIVOTA-Agent's repo id, `refs/heads/main`, the
+     `build-gateway-image.yml` workflow, and push/dispatch events;
+   - service account `sa-gateway-image-build`, with `artifactregistry.writer` on `pivota-gateway` only
+     (never on `pivota`, where `backend:latest` runs in prod as sa-worker);
    - the `workloadIdentityUser` binding that lets that repo's main use the account.
 
    It is an IAM change, so the owner runs it.

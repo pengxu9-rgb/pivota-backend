@@ -43,6 +43,7 @@ WORKER_ENV = {
     "PDP_QUALITY_SCORE_SOURCE_BACKED_OPTIONAL_COMPONENTS": "1",
     "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
     "SERVE_PDP_ENRICHMENT_ON_WRITE": "1",
+    "SERVING_PRICE_REQUIRES_SEED_CURRENCY": "1",
     "STRICT_BEAUTY_CATEGORY_TEXT_RECALL": "true",
     "UNRELATED": "x",
 }
@@ -89,11 +90,15 @@ FAKE_GCLOUD = textwrap.dedent(
             c["env"].append({"name": "SURPRISE", "value": "1"})
         json.dump(d, open(p, "w")); sys.exit(0)
     if head == "run jobs executions":
+        if os.environ.get("EXECUTIONS_READ_FAILS") == "1": sys.exit(1)
         sys.stdout.write(os.environ.get("FAKE_EXECUTIONS", "")); sys.exit(0)
     if head == "scheduler jobs describe":
         sys.exit(0 if os.environ.get("TRIGGER_EXISTS") == "1" else 1)
     if head == "artifacts docker images":
-        sys.exit(0 if os.environ.get("IMAGE_EXISTS", "1") == "1" else 1)
+        if os.environ.get("IMAGE_EXISTS", "1") != "1": sys.exit(1)
+        missing = os.environ.get("MISSING_REPOS", "").split(",")
+        repo = a[4].split("/")[2] if len(a) > 4 and a[4].count("/") >= 3 else ""
+        sys.exit(1 if repo and repo in missing else 0)
     if head == "run services describe":
         if os.environ.get("SERVICE_READ_FAILS") == "1": sys.exit(1)
         env = json.loads(os.environ.get("SERVICE_ENV", "{}"))
@@ -106,7 +111,8 @@ FAKE_GCLOUD = textwrap.dedent(
 FAKE_CURL = textwrap.dedent(
     r'''
     #!/usr/bin/env bash
-    printf '%s\n' "$*" >> "$CURL_LOG"
+    printf 'ARGV %s\n' "$*" >> "$CURL_LOG"
+    case " $* " in *" --config - "*) printf 'STDIN %s\n' "$(cat)" >> "$CURL_LOG" ;; esac
     [ "${CURL_FAILS:-0}" = 1 ] && exit 22
     # A real compare body carries every changed file: megabytes for an old image. PAD_KB makes the
     # fake that big, so a parse that cannot take a large body fails here and not in prod.
@@ -186,7 +192,7 @@ def test_health_is_dark_by_default_and_read_only_on_the_default_subnet(tmp_path)
     assert proc.returncode == 0, proc.stderr
     job = one(calls, "run", "jobs", "create")
     assert job[3] == "relgraph-health"
-    assert flag(job, "--image") == f"{AR}/gateway:{TAG}"
+    assert flag(job, "--image") == f"{AR}-gateway/gateway:{TAG}"
     assert flag(job, "--subnet") == "default"
     assert flag(job, "--set-secrets") == "DATABASE_URL=DATABASE_URL_NOVERIFY:latest"
     assert flag(job, "--command") == "npm" and flag(job, "--args") == "run,relgraph:health-job"
@@ -198,7 +204,7 @@ def test_health_is_dark_by_default_and_read_only_on_the_default_subnet(tmp_path)
     # through comma-split gcloud env would risk a single bogus reason. It must stay unset.
     assert "RELGRAPH_CRITICAL_REASONS" not in e and "RELGRAPH_FAIL_ON_NOOP" not in e
     trig = one(calls, "scheduler", "jobs", "create", "http")
-    assert flag(trig, "--schedule") == "5 12 * * *"
+    assert flag(trig, "--schedule") == "5 17 * * *"
     assert flag(trig, "--uri").endswith("/namespaces/pivota-prod/jobs/relgraph-health:run")
     assert calls_with(calls, "scheduler", "jobs", "pause") and not calls_with(calls, "scheduler", "jobs", "resume")
 
@@ -214,7 +220,8 @@ def test_health_runs_after_relgraph_sync_and_outside_its_window():
     m = re.search(r'^SCHEDULE="(\d+) (\d+) \* \* \*"', HEALTH.read_text(), re.M)
     minute, hour = int(m.group(1)), int(m.group(2))
     hhmm = hour * 100 + minute
-    assert hhmm > 1037 and not (1015 <= hhmm < 1145)
+    # relgraph-sync starts 10:37 with a 21600s task timeout: it may still be writing until 16:37.
+    assert hhmm >= 1637 and not (1015 <= hhmm < 1145)
 
 
 @pytest.mark.parametrize("args", [("prod", "latest"), ("prod", TAG, "--arm"), ("prod", TAG, "--enable", "x"),
@@ -320,7 +327,7 @@ def test_live_read_is_a_named_dry_run_job_with_no_trigger(tmp_path):
     assert proc.returncode == 0, proc.stderr
     job = one(calls, "run", "jobs", "create")
     assert job[3] == "pdp-live-read-promote"
-    assert flag(job, "--image") == f"{AR}/gateway:{TAG}"
+    assert flag(job, "--image") == f"{AR}-gateway/gateway:{TAG}"
     assert flag(job, "--command") == "node"
     args = flag(job, "--args").split(",")
     assert args[0] == "scripts/promote-pdp-identity-live-read.js" and "--write" not in args
@@ -377,7 +384,7 @@ def test_reimage_is_a_dry_run_by_default(tmp_path):
 
 
 def test_reimage_apply_changes_only_image_and_commit_stamp(tmp_path):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job(EXTRA="kept")})
     assert proc.returncode == 0, proc.stderr
     up = one(calls, "run", "jobs", "update")
@@ -391,20 +398,20 @@ def test_reimage_apply_changes_only_image_and_commit_stamp(tmp_path):
 
 
 def test_reimage_fails_verification_when_anything_else_changed(tmp_path):
-    proc, _, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, _, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                      jobs={"external-referral-refresh": backend_job()}, env={"FAKE_UPDATE_SIDE_EFFECT": "1"})
     assert proc.returncode == 1 and "FAILED VERIFY" in proc.stderr
 
 
 @pytest.mark.parametrize("status", ["behind", "diverged"])
 def test_reimage_refuses_a_sha_that_is_not_on_main(tmp_path, status):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job()}, env={"COMPARE_STATUS": status})
     assert proc.returncode == 1 and not updates(calls)
 
 
 def test_reimage_refuses_when_github_cannot_be_reached(tmp_path):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job()}, env={"CURL_FAILS": "1"})
     assert proc.returncode == 1 and not updates(calls)
 
@@ -416,7 +423,7 @@ def test_reimage_checks_main_of_the_right_repository(tmp_path):
 
 
 def test_reimage_refuses_a_missing_image(tmp_path):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job()}, env={"IMAGE_EXISTS": "0"})
     assert proc.returncode == 1 and not updates(calls)
 
@@ -429,11 +436,19 @@ def test_reimage_refuses_relgraph_in_its_window(tmp_path, hhmm, refused):
     assert bool(updates(calls)) is (not refused)
 
 
-def test_reimage_never_rolls_the_drain_by_default(tmp_path):
+def test_reimage_never_plans_the_drain_by_default(tmp_path):
     jobs = {"external-referral-refresh": backend_job(), "retailer-ingest-drain": backend_job()}
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", jobs=jobs)
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, jobs=jobs)
     assert proc.returncode == 0, proc.stderr
-    assert [c[3] for c in updates(calls)] == ["external-referral-refresh"]
+    assert "plan  external-referral-refresh" in proc.stdout
+    assert "plan  retailer-ingest-drain" not in proc.stdout and "skip  retailer-ingest-drain" in proc.stdout
+    assert not updates(calls)
+
+
+def test_reimage_apply_needs_job_names(tmp_path):
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+                         jobs={"external-referral-refresh": backend_job()})
+    assert proc.returncode == 2 and "needs job names" in proc.stderr and not updates(calls)
 
 
 def test_reimage_refuses_the_drain_without_its_writer(tmp_path):
@@ -450,7 +465,7 @@ def test_reimage_rolls_the_drain_for_its_writer(tmp_path):
 
 
 def test_reimage_refuses_a_job_with_a_running_execution(tmp_path):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job()},
                          env={"FAKE_EXECUTIONS": "external-referral-refresh-abc\t\n"})
     assert proc.returncode == 1 and "still running" in proc.stderr and not updates(calls)
@@ -472,7 +487,7 @@ def test_reimage_refuses_bad_invocations(tmp_path, args):
 
 
 def test_reimage_skips_a_job_already_on_the_sha(tmp_path):
-    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply",
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
                          jobs={"external-referral-refresh": backend_job(NEW)})
     assert proc.returncode == 0 and "nothing to do" in proc.stdout and not updates(calls)
 
@@ -499,7 +514,8 @@ def test_status_calls_github_once_per_distinct_sha(tmp_path):
             "audit-domainless-offer-currency": backend_job(), "relgraph-sync": gateway_job()}
     proc, _, curl = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs)
     assert proc.returncode == 0, proc.stderr
-    assert len(curl) == 2, curl  # one backend sha, one gateway sha
+    calls = [c for c in curl if c.startswith("ARGV")]
+    assert len(calls) == 2, curl  # one backend sha, one gateway sha
     behind = [line.split()[-1] for line in proc.stdout.splitlines()[1:]]
     assert behind == ["5"] * 4
 
@@ -509,7 +525,9 @@ def test_github_token_is_sent_only_when_set(tmp_path):
     _, _, without = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs, env={"GITHUB_TOKEN": ""})
     assert not any("Authorization" in c for c in without)
     _, _, with_token = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs, env={"GITHUB_TOKEN": "t0k"})
-    assert any("Authorization: Bearer t0k" in c for c in with_token)
+    assert any(c.startswith("STDIN") and "Authorization: Bearer t0k" in c for c in with_token), with_token
+    # never on argv, where `ps` shows it to every user of the machine
+    assert not any(c.startswith("ARGV") and "t0k" in c for c in with_token), with_token
 
 
 def test_status_reports_unknown_when_github_fails(tmp_path):
@@ -526,3 +544,150 @@ def test_a_megabyte_compare_body_still_parses(tmp_path):
     proc, _, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, jobs={"content-canonical-election": backend_job()},
                      env={"PAD_KB": "3000"})
     assert proc.returncode == 0 and "DRY RUN" in proc.stdout, proc.stderr
+
+
+# ------------------------------------------------------------------ review of be#2779
+
+def test_reimage_refuses_when_executions_cannot_be_read(tmp_path):
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
+                         jobs={"external-referral-refresh": backend_job()}, env={"EXECUTIONS_READ_FAILS": "1"})
+    assert proc.returncode == 1 and "cannot list its executions" in proc.stderr and not updates(calls)
+
+
+def test_reimage_names_what_was_rolled_when_a_later_verify_fails(tmp_path):
+    # Both jobs are rolled in order; the side effect makes EVERY update fail verify, so the first
+    # fails and nothing is reported as rolled.
+    jobs = {"external-referral-refresh": backend_job(), "content-canonical-election": backend_job()}
+    proc, _, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, "--apply", "external-referral-refresh",
+                     "content-canonical-election", jobs=jobs, env={"FAKE_UPDATE_SIDE_EFFECT": "1"})
+    assert proc.returncode == 1 and "already rolled and verified before it: none" in proc.stderr
+
+
+@pytest.mark.parametrize("missing,expected", [("", "pivota-gateway"), ("pivota-gateway", "pivota")])
+def test_gateway_images_prefer_the_dedicated_repository(tmp_path, missing, expected):
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "gateway", NEW, "--apply", "relgraph-sync",
+                         jobs={"relgraph-sync": gateway_job()}, env={"NOW_HHMM": "1300", "MISSING_REPOS": missing})
+    assert proc.returncode == 0, proc.stderr
+    assert flag(one(calls, "run", "jobs", "update"), "--image") == f"us-west1-docker.pkg.dev/pivota-shared/{expected}/gateway:{NEW}"
+
+
+def test_gateway_image_missing_from_both_repositories_is_refused(tmp_path):
+    proc, calls, _ = run(tmp_path, REIMAGE, "prod", "gateway", NEW, "--apply", "relgraph-sync",
+                         jobs={"relgraph-sync": gateway_job()},
+                         env={"NOW_HHMM": "1300", "MISSING_REPOS": "pivota-gateway,pivota"})
+    assert proc.returncode == 1 and not updates(calls)
+
+
+@pytest.mark.parametrize("script,args", [(HEALTH, ()), (PROMOTE, ())])
+def test_a_plain_rerun_pauses_an_existing_trigger_even_when_the_preflight_refuses(tmp_path, script, args):
+    proc, calls, _ = run(tmp_path, script, "prod", TAG, *args,
+                         env={"TRIGGER_EXISTS": "1", "IMAGE_EXISTS": "0", "SERVICE_ENV": json.dumps(WORKER_ENV)})
+    assert proc.returncode == 1  # the preflight refused (no image) ...
+    assert calls_with(calls, "scheduler", "jobs", "pause"), calls  # ... but the disarm already happened
+    assert not calls_with(calls, "scheduler", "jobs", "resume")
+
+
+def test_an_enable_rerun_does_not_pause_first(tmp_path):
+    proc, calls, _ = run(tmp_path, HEALTH, "prod", TAG, "--enable", env={"TRIGGER_EXISTS": "1"})
+    assert proc.returncode == 0 and not calls_with(calls, "scheduler", "jobs", "pause")
+
+
+def test_promote_pins_the_flags_its_write_path_reads_including_unset_ones(tmp_path):
+    pins = _pins(PROMOTE)
+    assert pins["SERVING_PRICE_REQUIRES_SEED_CURRENCY"] == "1"
+    for name in ("CATEGORY_LEAF_REQUIRED_FOR_SERVING", "CATALOG_TRUST_CRAWL_FRESH_ENABLED",
+                 "CATALOG_TRUST_CRAWL_FRESH_DAYS", "CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT",
+                 "AGENT_PDP_VIEW_UNBUILDABLE_REAP"):
+        assert pins[name] == "<unset>", name
+    proc, calls, _ = promote(tmp_path)
+    e = env_vars(one(calls, "run", "jobs", "create"))
+    assert e["SERVING_PRICE_REQUIRES_SEED_CURRENCY"] == "1"
+    assert "CATEGORY_LEAF_REQUIRED_FOR_SERVING" not in e and not any(v == "<unset>" for v in e.values())
+
+
+@pytest.mark.parametrize("drift", [{"CATEGORY_LEAF_REQUIRED_FOR_SERVING": "1"},
+                                   {"CATALOG_TRUST_CRAWL_FRESH_ENABLED": "true"},
+                                   {"SERVING_PRICE_REQUIRES_SEED_CURRENCY": None}])
+def test_promote_refuses_drift_in_a_write_path_flag(tmp_path, drift):
+    worker = dict(WORKER_ENV)
+    for k, v in drift.items():
+        if v is None:
+            worker.pop(k, None)
+        else:
+            worker[k] = v
+    proc, calls, _ = promote(tmp_path, worker=worker)
+    assert proc.returncode == 1 and "REFUSING" in proc.stderr
+    assert not calls_with(calls, "run", "jobs", "create")
+
+
+# ------------------------------------------------------------------ gateway image build identity (P2-1)
+
+IDENTITY = GCP / "setup_gateway_image_build_identity.sh"
+
+FAKE_IDENTITY_GCLOUD = textwrap.dedent(
+    r'''
+    #!/usr/bin/env python3
+    import json, os, sys
+    a = sys.argv[1:]
+    with open(os.environ["GCLOUD_LOG"], "a") as f:
+        f.write("\x1f".join(a) + "\x1f\n")
+    head = " ".join(a[:3])
+    if head == "projects describe pivota-shared": print("371394967380"); sys.exit(0)
+    if a[:3] == ["artifacts", "repositories", "describe"]:
+        if any(t.startswith("--format") for t in a):
+            print(os.environ.get("REPO_IMMUTABLE", "True")); sys.exit(0)
+        sys.exit(0 if os.environ.get("REPO_EXISTS") == "1" else 1)
+    if a[:3] == ["artifacts", "repositories", "get-iam-policy"]:
+        print(json.dumps({"bindings": [
+            {"role": "roles/artifactregistry.reader", "members": ["serviceAccount:runtime@p.iam", "serviceAccount:robot@p.iam"]},
+            {"role": "roles/artifactregistry.writer", "members": ["serviceAccount:hand-build@p.iam"]}]}))
+        sys.exit(0)
+    if a[:3] == ["iam", "workload-identity-pools", "providers"] and a[3] == "describe":
+        sys.exit(1)
+    sys.exit(0)
+    ''').lstrip()
+
+
+def run_identity(tmp_path, env=None):
+    gcloud = tmp_path / "fake-gcloud"; gcloud.write_text(FAKE_IDENTITY_GCLOUD); gcloud.chmod(0o755)
+    log = tmp_path / "calls.log"; log.write_text("")
+    proc = subprocess.run(["bash", str(IDENTITY)], capture_output=True, text=True, cwd=str(REPO),
+                          env={**os.environ, "GCLOUD": str(gcloud), "GCLOUD_LOG": str(log), **(env or {})})
+    return proc, [line.split("\x1f")[:-1] for line in log.read_text().splitlines() if line]
+
+
+def test_identity_writes_only_to_the_dedicated_immutable_repository(tmp_path):
+    proc, calls = run_identity(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    create = one(calls, "artifacts", "repositories", "create")
+    assert create[3] == "pivota-gateway" and "--immutable-tags" in create
+    writer = [c for c in calls if "--role=roles/artifactregistry.writer" in c]
+    assert len(writer) == 1 and writer[0][:4] == ["artifacts", "repositories", "add-iam-policy-binding", "pivota-gateway"]
+    # never on `pivota`, where backend:latest runs in prod as sa-worker
+    assert not [c for c in calls if "add-iam-policy-binding" in c and "pivota" in c[3:4]]
+    # no project-level grant at all
+    assert not [c for c in calls if c[:2] == ["projects", "add-iam-policy-binding"]]
+
+
+def test_identity_copies_only_the_readers_of_pivota(tmp_path):
+    proc, calls = run_identity(tmp_path)
+    readers = [flag(c, "--member") for c in calls if "--role=roles/artifactregistry.reader" in c]
+    assert sorted(readers) == ["serviceAccount:robot@p.iam", "serviceAccount:runtime@p.iam"]
+    assert all(c[3] == "pivota-gateway" for c in calls if "--role=roles/artifactregistry.reader" in c)
+
+
+def test_identity_refuses_an_existing_repository_with_mutable_tags(tmp_path):
+    proc, calls = run_identity(tmp_path, env={"REPO_EXISTS": "1", "REPO_IMMUTABLE": "False"})
+    assert proc.returncode == 1 and "immutable" in proc.stderr
+    assert not [c for c in calls if "--role=roles/artifactregistry.writer" in c]
+
+
+def test_identity_provider_is_pinned_to_the_repo_branch_workflow_and_events(tmp_path):
+    proc, calls = run_identity(tmp_path)
+    prov = one(calls, "iam", "workload-identity-pools", "providers", "create-oidc")
+    cond = flag(prov, "--attribute-condition")
+    assert "assertion.repository_id == '1100586824'" in cond
+    assert "assertion.ref == 'refs/heads/main'" in cond
+    assert ("assertion.workflow_ref == 'pengxu9-rgb/PIVOTA-Agent/.github/workflows/build-gateway-image.yml"
+            "@refs/heads/main'") in cond
+    assert "assertion.event_name in ['push', 'workflow_dispatch']" in cond

@@ -27,6 +27,9 @@
 # is pinned below to the live gateway's value, with `<unset>` meaning the gateway does not set it and
 # neither does this job; the preflight REFUSES to provision on any difference.
 #
+# THIS SCRIPT OWNS THE JOB'S WHOLE ENV AND SECRETS: --set-env-vars / --set-secrets REPLACE the set on
+# every run, so a value added by hand is wiped by the next run. Pin it here instead.
+#
 # Default subnet: Cloud SQL only, no merchant fetches.
 set -euo pipefail
 
@@ -42,12 +45,13 @@ case "$GATEWAY_TAG" in
 esac
 [ "$#" -le 2 ] || { echo "too many arguments (this job has no trigger, so there is no --enable)" >&2; exit 2; }
 
-GCLOUD="${GCLOUD:-gcloud}"; PYTHON="${PYTHON:-python3}"; REGION=us-west1; SHARED=pivota-shared
+GCLOUD="${GCLOUD:-gcloud}"; PYTHON="${PYTHON:-python3}"; REGION=us-west1
 JOB=pdp-live-read-promote
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
-GATEWAY_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/gateway:$GATEWAY_TAG"
 have(){ "$@" >/dev/null 2>&1; }
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
 
 PINNED_FLAGS="PDP_IDENTITY_GRAPH_ENABLED=true
 PDP_IDENTITY_GRAPH_BRAND_ALLOWLIST=kravebeauty
@@ -57,8 +61,8 @@ CATALOG_TRUST_CRAWL_FRESH_DAYS=<unset>
 SHADE_LINE_CARD_COLLAPSE_ENABLED=<unset>"
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
-have "$GCLOUD" artifacts docker images describe "$GATEWAY_IMAGE" \
-  || { echo "missing image $GATEWAY_IMAGE; build it first" >&2; exit 1; }
+GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
+  || { echo "missing image gateway:$GATEWAY_TAG in pivota-gateway and pivota; build it first" >&2; exit 1; }
 
 echo "== preflight: pinned flags vs the live gateway service"
 GATEWAY_JSON="$("$GCLOUD" run services describe gateway --region "$REGION" --format=json)" \

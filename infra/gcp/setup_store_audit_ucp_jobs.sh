@@ -22,7 +22,10 @@ CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
 SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
 SCHEDULER_SA="sa-store-audit-ucp-scheduler@$PROJECT.iam.gserviceaccount.com"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/backend:$BACKEND_TAG"
-GATEWAY_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/gateway:$GATEWAY_TAG"
+# Gateway images built on merge live in pivota-gateway (immutable tags); hand builds in pivota.
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
+GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
 have(){ "$@" >/dev/null 2>&1; }
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 

@@ -194,6 +194,20 @@ def test_relgraph_health_is_no_longer_provisioned_here(tmp_path):
     assert not touching, touching
 
 
+@pytest.mark.parametrize("var", ["ARM", "DISARM"])
+def test_an_arm_name_this_script_does_not_define_fails_loudly(tmp_path, var):
+    """`ARM=relgraph-health-cron` was the documented hand step until that trigger moved to its own
+    script. A name sched() never saw changed nothing, so the run must say so and exit non-zero."""
+    calls, proc = _run_full(tmp_path, {var: "relgraph-health-cron"}, expect_rc=3)
+    assert "does not define" in proc.stderr and "relgraph-health-cron" in proc.stderr
+    assert not [c for c in calls if re.search(r"\bscheduler jobs (pause|resume) relgraph-health-cron\b", c)]
+
+
+def test_a_defined_arm_name_still_passes(tmp_path):
+    calls, proc = _run_full(tmp_path, {"ARM": "content-canonical-election-cron"})
+    assert proc.returncode == 0, proc.stderr
+
+
 def test_it_does_not_require_the_retired_railway_files(tmp_path):
     """It must not exit 1 looking for files `port_railway_env.py` can no longer produce."""
     assert not (REPO / "infra" / "gcp" / "env.prod.yaml").exists(), (
