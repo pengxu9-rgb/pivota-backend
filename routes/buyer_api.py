@@ -20,6 +20,7 @@ from db.buyer_vault import (
     buyer_addresses,
     buyer_agent_links,
     buyer_identity_links,
+    BuyerIdentityHashUnavailable,
     buyer_save_challenges,
     resolve_agent_user_ref_hash,
     mandates,
@@ -650,7 +651,16 @@ async def _upsert_buyer_identity_link(*, buyer_id: str, agent_id: str, agent_use
     ref = str(agent_user_ref or "").strip()
     if not ref:
         return None
-    ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
+    try:
+        ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
+    except BuyerIdentityHashUnavailable:
+        # S-29 P2-1: the lookup that picks the dedicated or the legacy hash could not answer, and
+        # neither guess is safe (see the exception). Everywhere else that is a 503, but this save
+        # has already redeemed its single-use save token, so a 503 here could never be retried.
+        # The link is best-effort like its own writes below: no link, rather than one written
+        # under a guessed hash. The buyer's next save links it.
+        logger.warning("event=buyer_identity_link_skipped reason=hash_lookup_unavailable")
+        return None
     if not ref_hash:
         return None
 

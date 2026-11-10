@@ -24,6 +24,24 @@ class SettlementFileError(Exception):
     """Base error for settlement file operations."""
 
 
+class SettlementTransfersDisabledError(SettlementFileError):
+    """SETTLEMENT_FILE_TRANSFER_ENABLED is not literally 'true' (FIX_PLAN O-05; Peng's decision on
+    W3 F1). Raised before any read, write or Stripe call, so the file row is unchanged."""
+
+
+def transfers_enabled() -> bool:
+    from services.money_flags import SETTLEMENT_FILE_TRANSFER_FLAG, money_job_enabled
+
+    return money_job_enabled(SETTLEMENT_FILE_TRANSFER_FLAG)
+
+
+def _require_transfers_enabled() -> None:
+    if not transfers_enabled():
+        raise SettlementTransfersDisabledError(
+            "Settlement transfers are disabled (SETTLEMENT_FILE_TRANSFER_ENABLED is off)"
+        )
+
+
 async def generate(
     *,
     channel_partner_id: int,
@@ -209,7 +227,13 @@ async def generate(
 
 
 async def transfer(*, settlement_file_id: int) -> None:
-    """Execute the Stripe Connect transfer for a pending settlement_file."""
+    """Execute the Stripe Connect transfer for a pending settlement_file.
+
+    The ONE gate for every caller (the day-10 cron, a resume, the staff retry route, anything
+    later): SettlementTransfersDisabledError unless SETTLEMENT_FILE_TRANSFER_ENABLED is literally
+    'true', before the row is read or locked.
+    """
+    _require_transfers_enabled()
 
     stripe_destination_account = ""
     settlement_transfer_cents = 0
@@ -341,7 +365,8 @@ async def generate_for_all_active_partners(calendar_month: date) -> list[int]:
 
 
 async def transfer_all_pending_for_month(calendar_month: date) -> dict[int, str]:
-    """Transfer every pending settlement file for the month."""
+    """Transfer every pending settlement file for the month (gated like `transfer`)."""
+    _require_transfers_enabled()
 
     _validate_calendar_month(calendar_month)
     rows = await database.fetch_all(
