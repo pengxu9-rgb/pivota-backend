@@ -96,6 +96,16 @@ case "$1 $2" in
     esac ;;
   "logging read")  printf '%s' "$STUB_LOG_OUTPUT"; exit 0 ;;
   "auth print-identity-token") echo stub-token; exit 0 ;;
+  "artifacts docker")
+    # Image lookups (_gateway_image.sh): repositories named in STUB_MISSING_REPOS answer "not found",
+    # those in STUB_DENIED_REPOS answer PERMISSION_DENIED; every other image exists.
+    for r in $STUB_DENIED_REPOS; do
+      case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: PERMISSION_DENIED: denied" >&2; exit 1 ;; esac
+    done
+    for r in $STUB_MISSING_REPOS; do
+      case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: (gcloud.artifacts.docker.images.describe) Image not found." >&2; exit 1 ;; esac
+    done
+    exit 0 ;;
 esac
 exit 0
 """
@@ -171,6 +181,8 @@ def _run(
     here.mkdir()
     script = here / "deploy_gateway.sh"
     shutil.copy2(SCRIPT, script)
+    # The script sources its gateway-image resolver from its own directory.
+    shutil.copy2(SCRIPT.parent / "_gateway_image.sh", here / "_gateway_image.sh")
     # True writes both; "env" / "secrets" write just one, for the half-ported state a run
     # interrupted partway through port_railway_env.py leaves behind.
     if ported_files in (True, "env"):
@@ -225,6 +237,30 @@ def _run(
 
 
 # --------------------------------------------------------------------- the regression
+
+# --------------------------------------------------------------------- which image a sha deploys
+
+AR = "us-west1-docker.pkg.dev/pivota-shared"
+
+
+@pytest.mark.parametrize("missing,expected", [
+    ("", f"{AR}/pivota/gateway:{SHA}"),                    # a hand build exists: exactly today's image
+    ("pivota", f"{AR}/pivota-gateway/gateway:{SHA}"),       # built on merge only
+    ("pivota pivota-gateway", f"{AR}/pivota/gateway:{SHA}"),  # in neither: today's path, fails at deploy as before
+])
+def test_the_deploy_resolves_the_sha_pivota_first(tmp_path, missing, expected):
+    r = _run(tmp_path, overrides={"STUB_MISSING_REPOS": missing})
+    assert r.rc == 0, r.err
+    assert r.flag(r.deploy(), "--image") == expected
+
+
+@pytest.mark.parametrize("denied", ["pivota", "pivota-gateway"])
+def test_a_lookup_error_refuses_the_deploy_instead_of_falling_through(tmp_path, denied):
+    missing = "pivota" if denied == "pivota-gateway" else ""
+    r = _run(tmp_path, overrides={"STUB_DENIED_REPOS": denied, "STUB_MISSING_REPOS": missing})
+    assert r.rc != 0 and "lookup error" in r.err
+    assert not r._match("run", "deploy")
+
 
 def test_a_prod_deploy_needs_no_railway_ported_files(tmp_path):
     """THE REGRESSION, and the reason the gateway was being deployed by hand.
