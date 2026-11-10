@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Prove the search seed_data strip changes no gateway gate decision.
+"""Prove what the search routes serve changes no gateway gate decision.
 
-The backend's search routes strip internal state from external-seed products' seed_data
-(services/seed_data_egress_projection.strip_product_internal_seed_data). The gateway reads that response
+The backend's search routes serve their products through
+services/seed_data_egress_projection.serve_search_products: internal state stripped from seed_data, then
+every lone surrogate replaced by U+FFFD so the response can encode. The gateway reads that response
 and gates on it BEFORE its own egress projection: the retinoid/pregnancy safety net, the fragrance-free,
 category, brand and strict-intent hard constraints, the hold contracts, the "X-free" ingredient exclusion,
 the canonical price. This script builds products the way the backend builder does (top-level fields plus
-seed_data, with internal state at every depth), strips each one with the real backend function, runs the
-GATEWAY'S OWN gate functions (scripts/ops/seed_data_gateway_gate_eval.cjs over a PIVOTA-Agent tree) on
-the full and the stripped product, and exits 1 unless every decision is identical. Readers whose output
+seed_data, with internal state at every depth), serves each one with that real backend function, runs
+the GATEWAY'S OWN gate functions (scripts/ops/seed_data_gateway_gate_eval.cjs over a PIVOTA-Agent tree)
+on the full and the served product, and exits 1 unless every decision is identical. Readers whose output
 is the product's TEXT (the raw / wide / safety texts, the ingredient source text, the rich variants) are
-compared against the full product with exactly the denied keys deleted, so nothing but those keys may
-change them. A reader missing from the gateway tree fails the run, as does a case whose full product no
-longer exercises the gate it exists for (EXPECTED_FULL).
+compared against the full product with exactly the denied keys deleted and lone surrogates replaced
+(String.prototype.toWellFormed, the gateway's own rule), so nothing else may change them.
+Lone surrogates: S1 (between words) and S2 (inside an ingredient name, "Reti" + a split emoji + "nol")
+decide identically. In S2 the gateway's retinoid net misses the word on the RAW text already, so serving
+U+FFFD in its place loses nothing the gateway would have caught.
+A reader missing from the gateway tree fails the run, as does a case whose full product no longer
+exercises the gate it exists for (EXPECTED_FULL).
 
     python scripts/ops/seed_data_gateway_gate_equivalence.py --gateway-dir <PIVOTA-Agent tree>
         [--node node] [--node-require <guard.cjs>] [--json-out out.json]
@@ -32,7 +37,8 @@ review's (r2730/make_cases_2730.py): category paths only on the snapshot, holds 
 URLs whose slug / query / scheme / backslash names a retinoid (the URLs must reach the net as stored), a
 variant destination_url with ?variant=, a variant image url, a URL field holding a list, seed-only fit
 attributes / local authority / rich PDP / schema paths / variant prices, a weak pregnancy anti-aging
-product, and cart proofs + variant provenance.
+product, and cart proofs + variant provenance; plus the be#2740 review's S1 (lone surrogates between
+words in the title, seed title, snapshot INCI and a variant title) and S2 (one inside an INCI word).
 """
 
 from __future__ import annotations
@@ -54,7 +60,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from services.seed_data_egress_projection import (  # noqa: E402
     INTERNAL_STATE_KEYS,
-    strip_product_internal_seed_data,
+    serve_search_products,
 )
 
 EVALUATOR = Path(__file__).resolve().with_name("seed_data_gateway_gate_eval.cjs")
@@ -301,6 +307,18 @@ def build_cases() -> Dict[str, Dict[str, Any]]:
                               "url_source": "shade_fold", "url": "https://shop.example/products/gel?variant=1"}]},
              "pdp_matcher": {"decision": "matched"}},
         ),
+        # --- the be#2740 review's: lone surrogates BETWEEN words (a split emoji in a JSON-text field) ---
+        "S1_lone_surrogates_between_words": _product(
+            "ls-1", "Night \ud83d Renewal Serum",
+            {"title": "Night Renewal \udc00 Serum",
+             "snapshot": {"inci_list": "Aqua, \ud83d Glycerin, Retinol \udc00"},
+             "variants": [{"variant_id": "1", "title": "30ml \ud83d"}]},
+            description="Rich \udc00 night serum",
+        ),
+        "S2_lone_surrogate_inside_a_word": _product(
+            "ls-2", "Night Renewal Serum",
+            {"title": "Night Renewal Serum", "snapshot": {"inci_list": "Aqua, Glycerin, Reti\ud83dnol"}},
+        ),
     }
     cases: Dict[str, Dict[str, Any]] = {}
     for name, product in base.items():
@@ -342,6 +360,7 @@ EXPECTED_FULL = {
     "R5_non_http_seed_url_names_retinoid": ("retinoid_for_safety", True),
     "R6_backslash_seed_url_names_retinoid": ("retinoid_for_safety", True),
     "R14_price_in_seed_variants_only": ("canonical_price", {"amount": 21, "currency": "USD"}),
+    "S1_lone_surrogates_between_words": ("retinoid_for_safety", True),
 }
 
 
@@ -352,9 +371,9 @@ def run(gateway_dir: Path, *, node: str = "node", node_require: Optional[List[st
     payload: Dict[str, Any] = {"denied_keys": sorted(INTERNAL_STATE_KEYS), "cases": {}}
     for name, full in cases.items():
         before = copy.deepcopy(full)
-        stripped = strip_product_internal_seed_data(full)
+        stripped = serve_search_products([full])[0]
         if full != before:
-            raise AssertionError(f"{name}: the strip mutated its input")
+            raise AssertionError(f"{name}: serving mutated its input")
         payload["cases"][name] = {"full": full, "stripped": stripped}
     with tempfile.TemporaryDirectory() as tmp:
         cases_path = Path(tmp) / "cases.json"

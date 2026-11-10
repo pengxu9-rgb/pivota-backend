@@ -450,6 +450,7 @@ async def test_failure_modes(stripe_test_clock: Any, monkeypatch: pytest.MonkeyP
     assert await _invoice_status(finalized_invoice_id) == "finalizing"
 
     payout_id = await _seed_pending_partner_payout(partner_id, first_run, amount_dollars="12.34")
+    monkeypatch.setenv("PARTNER_PAYOUT_EXECUTION_ENABLED", "true")  # the O-05 gate (W3 F5)
     with pytest.raises(PayoutMissingConnectAccountError):
         await partner_settlement_service.execute_payout(payout_id)
 

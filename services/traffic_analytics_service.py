@@ -101,6 +101,8 @@ async def _fetch_click_rows(
           -- Exposure = a row /r touched. Since ADR-025 D1 a row also exists for a link that was
           -- only ISSUED (click_count = impression_count = 0), which nobody saw.
           AND (COALESCE(click_count, 0) > 0 OR COALESCE(impression_count, 0) > 0)
+          -- O-07: test traffic, stamped at write (services/test_traffic.py).
+          AND COALESCE(CAST(context->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')
     """
     params: Dict[str, Any] = {"start_at": start_at, "end_at": end_at}
     if merchant_id:
@@ -128,6 +130,8 @@ async def _fetch_edge_rows(
         WHERE COALESCE(o.created_at, cae.created_at) >= :start_at
           AND COALESCE(o.created_at, cae.created_at) < :end_at
           AND (o.is_deleted IS NULL OR o.is_deleted = FALSE)
+          -- O-07: test traffic, stamped at write (services/test_traffic.py).
+          AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')
     """
     params: Dict[str, Any] = {"start_at": start_at, "end_at": end_at}
     if merchant_id:

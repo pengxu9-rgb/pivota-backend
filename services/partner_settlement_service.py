@@ -12,6 +12,10 @@ import stripe
 from config.settings import settings
 from db.database import IS_POSTGRES, database
 from services import partner_rev_share_engine_v2
+# M-05 P2-2: settlement re-reads each merchant's CURRENT is_test where it locks its scope and its
+# take rows (the snapshot it writes is immutable), behind MERCHANT_IS_TEST_FILTER_ENABLED.
+from services import test_traffic
+from services.test_traffic import is_test_merchant_lock_sql
 
 
 logger = logging.getLogger(__name__)
@@ -34,6 +38,20 @@ class SettlementAlreadyExistsError(Exception):
 
 class PayoutNotPendingError(Exception):
     """Raised when an admin tries to approve a payout that is not pending."""
+
+
+class PayoutsDisabledError(Exception):
+    """Raised before any read or write when PARTNER_PAYOUT_EXECUTION_ENABLED is not literally
+    'true' (FIX_PLAN O-05, W3 review F5): no row changes and nothing is sent to Stripe."""
+
+
+def _require_payouts_enabled() -> None:
+    from services.money_flags import PARTNER_PAYOUT_EXECUTION_FLAG, money_job_enabled
+
+    if not money_job_enabled(PARTNER_PAYOUT_EXECUTION_FLAG):
+        raise PayoutsDisabledError(
+            f"Partner payouts are disabled ({PARTNER_PAYOUT_EXECUTION_FLAG} is off)"
+        )
 
 
 class PayoutMissingConnectAccountError(Exception):
@@ -63,6 +81,10 @@ async def run_settlement(billing_run_id: int) -> int:
             FROM commerce_attribution_edges cae
             WHERE cae.merchant_id = pa.merchant_id
               AND DATE(cae.created_at) BETWEEN :period_start AND :period_end
+              -- O-07: a merchant whose only edges are test traffic puts no partner in scope.
+              AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')"""
+        + is_test_merchant_lock_sql("cae.merchant_id")
+        + """
           )
 
           UNION
@@ -70,13 +92,16 @@ async def run_settlement(billing_run_id: int) -> int:
           SELECT DISTINCT gad.channel_partner_id
           FROM gmv_attribution_daily gad
           WHERE gad.channel_partner_id IS NOT NULL
-            AND gad.date BETWEEN :period_start AND :period_end
+            AND gad.date BETWEEN :period_start AND :period_end"""
+        + is_test_merchant_lock_sql("gad.merchant_id")
+        + """
         ) partner_scope
         WHERE channel_partner_id IS NOT NULL
         ORDER BY channel_partner_id
         """,
         {"period_start": period_start, "period_end": period_end},
     )
+    await _record_is_test_lock_drops(billing_run_id, period_start, period_end)
 
     payout_count = 0
     settled_partner_ids: list[int] = []
@@ -134,6 +159,74 @@ async def run_settlement(billing_run_id: int) -> int:
     # waits for this row before deducting what partners were paid (ADR-025 D5, review of #2275).
     await record_settlement_completion(billing_run_id, settled_partner_ids)
     return payout_count
+
+
+async def _record_is_test_lock_drops(billing_run_id: int, period_start: date, period_end: date) -> None:
+    """M-05 P3-B: one audit line per (billing run, merchant) the lock-time is_test check left out of
+    this settlement, for both legs: `edge_rows` is what the partner_attribution scope leg dropped,
+    `rollup_rows` / `take_cents` what the rollup scope leg and the take rows (`_gmv_take_rows`)
+    dropped (an upper bound for the take rows, which also need a paid invoice). One read-only
+    query, only while MERCHANT_IS_TEST_FILTER_ENABLED is on; a failure is logged and never fails
+    the settlement. The snapshot written next is immutable, so this line is the record.
+
+    NOT covered by any is_test check (M-05 delta review P3-D, no code change here):
+      * the v2 engine (PARTNER_REV_SHARE_USE_V2, off): it reads FROZEN monthly_brand_statements. A
+        statement frozen before the merchant was marked, or before the filter was on, keeps its
+        GMV take; only statements assembled with the filter on leave an is_test merchant out;
+      * the subscription and credit-overage legs (`_subscription_revenue_by_merchant`,
+        `_credit_overage_for_partner`, and their v2 twins): an is_test merchant with a paid
+        subscription still accrues partner comp on it.
+    """
+    if not test_traffic.lock_drop_audit_enabled():
+        return
+    is_test_edge = test_traffic.is_test_merchant_exists_sql("cae.merchant_id")
+    is_test_rollup = test_traffic.is_test_merchant_exists_sql("gad.merchant_id")
+    try:
+        async with database.transaction():
+            rows = await database.fetch_all(
+                """
+                SELECT merchant_id,
+                       SUM(edge_rows) AS edge_rows,
+                       SUM(rollup_rows) AS rollup_rows,
+                       SUM(take_cents) AS take_cents
+                FROM (
+                  SELECT cae.merchant_id, COUNT(*) AS edge_rows, 0 AS rollup_rows, 0 AS take_cents
+                  FROM commerce_attribution_edges cae
+                  WHERE DATE(cae.created_at) BETWEEN :period_start AND :period_end
+                    AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')
+                    AND EXISTS (SELECT 1 FROM partner_attribution pa WHERE pa.merchant_id = cae.merchant_id)
+                    AND """ + is_test_edge + """
+                  GROUP BY cae.merchant_id
+
+                  UNION ALL
+
+                  SELECT gad.merchant_id, 0, COUNT(*), COALESCE(SUM(gad.take_amount_cents), 0)
+                  FROM gmv_attribution_daily gad
+                  WHERE gad.channel_partner_id IS NOT NULL
+                    AND gad.date BETWEEN :period_start AND :period_end
+                    AND """ + is_test_rollup + """
+                  GROUP BY gad.merchant_id
+                ) dropped
+                GROUP BY merchant_id
+                ORDER BY merchant_id
+                """,
+                {"period_start": period_start, "period_end": period_end},
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit read never fails the settlement
+        # The failed read is the one that names the dropped merchants, hence "unknown".
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "partner_settlement", ref=f"billing_run:{billing_run_id}", merchant_id="unknown", exc=exc
+        )
+        return
+    for row in rows:
+        test_traffic.log_is_test_lock_drop(
+            "partner_settlement",
+            ref=f"billing_run:{billing_run_id}",
+            merchant_id=_row_get(row, "merchant_id"),
+            edge_rows=_as_int(_row_get(row, "edge_rows")),
+            rollup_rows=_as_int(_row_get(row, "rollup_rows")),
+            take_cents=_as_int(_row_get(row, "take_cents")),
+        )
 
 
 async def compute_partner_comp(
@@ -560,7 +653,12 @@ async def create_payout(
 
 
 async def approve_payout(payout_id: int, approved_by: str) -> None:
-    """Approve a pending payout and execute the Stripe Connect transfer."""
+    """Approve a pending payout and execute the Stripe Connect transfer.
+
+    Refuses (PayoutsDisabledError) before flipping the row unless PARTNER_PAYOUT_EXECUTION_ENABLED
+    is literally 'true', so a disabled approve leaves the payout pending.
+    """
+    _require_payouts_enabled()
 
     agent_payout_columns = await _table_columns("agent_payouts")
     assignments = ["status = 'approved'"]
@@ -589,7 +687,11 @@ async def approve_payout(payout_id: int, approved_by: str) -> None:
 
 
 async def execute_payout(payout_id: int) -> None:
-    """Execute an approved channel partner payout using a platform Stripe transfer."""
+    """Execute an approved channel partner payout using a platform Stripe transfer.
+
+    Gated like approve_payout: PayoutsDisabledError before any read, write or Stripe call.
+    """
+    _require_payouts_enabled()
 
     connect_column = await _partner_connect_account_column()
     connect_select = (
@@ -734,7 +836,9 @@ async def _gmv_take_rows(
               AND i.billing_period_start <= gad.date
               AND gad.date <= i.billing_period_end
               AND i.status = 'paid'
-          )
+          )"""
+        + is_test_merchant_lock_sql("gad.merchant_id")
+        + """
         ORDER BY gad.id
         """,
         {

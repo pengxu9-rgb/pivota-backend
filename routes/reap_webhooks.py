@@ -40,7 +40,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from db.agent_issued_cards import (
     apply_auth_approved,
@@ -70,8 +70,16 @@ from services.reap_webhooks import (
     webhook_secret,
 )
 from utils.logger import logger
+from utils.runtime_safety import refuse_in_production
 
-router = APIRouter(prefix="/webhooks", tags=["reap-webhooks"])
+# REFUSED IN PRODUCTION, whatever REAP_WEBHOOK_SECRET / REAP_EXTERNAL_AUTH_ENABLED say: both receivers
+# exist only for Pivota-issued cards (routes/agent_cards.py), which are out of policy. In production
+# they answer 404 before the body is read or a signature is checked. Staging and local are unchanged.
+router = APIRouter(
+    prefix="/webhooks",
+    tags=["reap-webhooks"],
+    dependencies=[Depends(refuse_in_production("reap_card_issuer_webhooks"))],
+)
 
 # A CARD_AUTHORIZATION_REQUEST is a few hundred bytes. 64 KiB is ~100x headroom and still small
 # enough that hashing it cannot eat a meaningful share of Reap's 1.6-second budget. Scoped to
