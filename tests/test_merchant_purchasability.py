@@ -3579,9 +3579,10 @@ def _guard(monkeypatch):
     return state
 
 
-def _due_row(key, *, hours_ago, verdict="ELIGIBLE", detail=None):
+def _due_row(key, *, hours_ago, verdict="ELIGIBLE", detail=None, positive_until=None):
     return {"merchant_domain": key[0], "market_country": key[1],
-            "checked_at": _GUARD_NOW - timedelta(hours=hours_ago), "verdict": verdict, "detail": detail}
+            "checked_at": _GUARD_NOW - timedelta(hours=hours_ago), "verdict": verdict, "detail": detail,
+            "positive_until": positive_until}
 
 
 async def test_warm_only_keys_take_at_most_the_cap_and_core_keys_the_rest(_guard, monkeypatch):
@@ -3635,7 +3636,11 @@ async def test_a_zero_cap_takes_the_warm_click_lane_out_of_the_population(_guard
 
 @pytest.mark.parametrize("detail, hours_ago, deferred", [
     ("products_json_page_1_status_404", 48, True),       # no catalog, checked 2 days ago
+    ("products_json_page_1_status_410", 48, True),
     ("products_json_page_1_status_200", 48, True),       # an HTML page where the catalog would be
+    ("products_json_page_1_status_500", 48, False),      # a 5xx is transient, never "not Shopify"
+    ("products_json_page_1_status_502", 48, False),
+    ("products_json_page_1_status_403", 48, False),
     ("products_json_page_1_status_404", 8 * 24, False),  # a week has passed: re-check it
     ("products_json_page_1_status_429", 48, False),      # a throttle never reads as "not Shopify"
     ("products_json_page_1_status_503", 48, False),
@@ -3666,6 +3671,101 @@ async def test_a_warm_only_key_is_proven_shopify_only_by_a_storefront_verdict(_g
     _guard["due"] = [] if verdict is None else [_due_row(key, hours_ago=30, verdict=verdict, detail="x")]
     [target] = await sweep.load_population(20)
     assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("verdict, detail, window_end, proven", [
+    # One throttle on a card-positive store must not unprove it, open window or recently closed.
+    ("TRANSPORT_ERROR", "throttled", timedelta(hours=40), True),
+    ("TRANSPORT_ERROR", "throttled", -timedelta(days=5), True),         # "recently", not "now"
+    ("BLOCKED_UNKNOWN", "x", -timedelta(days=5), True),
+    ("TRANSPORT_ERROR", "throttled", -(timedelta(days=14) - timedelta(hours=1)), True),
+    # P3-A: a host that held a window long ago (it replatformed, say) is not proven forever.
+    ("TRANSPORT_ERROR", "throttled", -(timedelta(days=14) + timedelta(hours=1)), False),
+    ("TRANSPORT_ERROR", "throttled", -timedelta(days=90), False),
+    # ...nor once its last check says there is no Shopify catalog at all.
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_404", -timedelta(days=5), False),
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_200", timedelta(hours=40), False),
+    # A 5xx page 1 is transient, not "no catalog": the recent positive still proves it.
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_500", -timedelta(days=5), True),
+    ("TRANSPORT_ERROR", "throttled", None, False),                      # never armed (NO_CARD...)
+])
+async def test_proven_is_sticky_for_a_recent_card_positive_only(_guard, verdict, detail, window_end, proven):
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=30, verdict=verdict, detail=detail,
+                              positive_until=None if window_end is None else _GUARD_NOW + window_end)]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("days, window_end, proven", [
+    ("0", timedelta(hours=1), True),     # 0 = only while the window is still open
+    ("0", -timedelta(hours=1), False),
+    ("30", -timedelta(days=20), True),
+])
+async def test_the_sticky_window_is_a_dial(_guard, monkeypatch, days, window_end, proven):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", days)
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=30, verdict="TRANSPORT_ERROR", detail="throttled",
+                              positive_until=_GUARD_NOW + window_end)]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("window_end, deferred", [
+    (-timedelta(days=5), False),    # P3-C: a store we checked out on is not "no catalog" on one answer
+    (timedelta(hours=40), False),
+    (-timedelta(days=20), True),    # outside the sticky window: deferred as any other
+    (None, True),
+])
+async def test_a_recent_card_positive_is_never_deferred_as_no_catalog(_guard, window_end, deferred):
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=48, verdict="VARIANT_UNVERIFIED",
+                              detail="products_json_page_1_status_404",
+                              positive_until=None if window_end is None else _GUARD_NOW + window_end)]
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert (targets == []) is deferred
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == int(deferred)
+    if not deferred:
+        assert targets[0].proven_shopify is False, "re-checked, but its no-catalog answer is not proof"
+
+
+async def test_sticky_proven_through_the_real_producer(_db, monkeypatch):
+    """The rows `record_check` actually writes, read back by the strict `list_due`: a card positive
+    then a throttle keeps the key proven for 14 days after its window ends, and no longer."""
+    key = ("producer-store.example", "US")
+    await mp.record_check(key[0], key[1], res("ELIGIBLE", card=True, host=key[0]))
+    await mp.record_check(key[0], key[1], res("TRANSPORT_ERROR", host=key[0], retryable=True,
+                                              throttled=True, detail="throttled"))
+
+    async def _collect(**_kwargs):
+        return _guard_lanes([], [key])
+
+    real_list_due = mp.list_due  # `sweep.facts` IS this module: keep the real one before patching
+
+    async def _due(*args, **kwargs):
+        return [r for r in await real_list_due(*args, **kwargs) if r["merchant_domain"] == key[0]]
+
+    monkeypatch.setattr(sweep, "collect_population", _collect)
+    monkeypatch.setattr(sweep.facts, "list_due", _due)
+    [row] = await _due(50, strict=True)
+    assert row["verdict"] == "TRANSPORT_ERROR" and row["positive_until"] is not None
+    window_end = row["positive_until"] if row["positive_until"].tzinfo else \
+        row["positive_until"].replace(tzinfo=timezone.utc)
+    for after, proven in ((timedelta(days=13), True), (timedelta(days=15), False)):
+        monkeypatch.setattr(sweep, "_utcnow", lambda: window_end + after)
+        [target] = await sweep.load_population(20)
+        assert target.proven_shopify is proven, after
+
+
+async def test_the_default_cap_is_eight(_guard, monkeypatch):
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", raising=False)
+    warm = [(f"warm-{i}.example", "US") for i in range(30)]
+    _guard["lanes"] = _guard_lanes([], warm)
+    assert len(await sweep.load_population(24)) == 8
 
 
 def test_the_storefront_verdicts_are_real_preflight_verdicts():
@@ -3725,4 +3825,8 @@ async def test_list_due_carries_the_last_verdict_and_detail(_db):
     row = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "nocatalog.example")
     assert (row["verdict"], row["detail"]) == ("VARIANT_UNVERIFIED", "products_json_page_1_status_404")
     assert sweep._found_no_shopify_catalog(row["verdict"], row["detail"]) is True
+    assert row["positive_until"] is None
+    await mp.record_check("positive.example", "US", res("ELIGIBLE", card=True, host="positive.example"))
+    positive = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "positive.example")
+    assert positive["positive_until"] is not None
 

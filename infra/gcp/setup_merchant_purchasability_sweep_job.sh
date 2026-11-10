@@ -83,10 +83,10 @@ SUBNET=pivota-crawl
 # The sweep's own dials, PINNED here because the task timeout below is derived from them. A re-run
 # of this script resets them; tune them here, not with `gcloud run jobs update`.
 BUDGET_SECONDS=600
-BATCH=20
+BATCH=24
 # The warm-click lane's per-run cap (jobs/merchant_purchasability_sweep.py, "THE FIFTH LANE"). 0 takes
 # the lane out of the population: THE ROLLBACK, by editing this line and re-running with --enable.
-WARM_CLICK_MAX_PER_RUN=6
+WARM_CLICK_MAX_PER_RUN=8
 # The worker identity, exactly as setup_scheduler.sh's crawl jobs and the Tier B job use it: it
 # already holds Secret Manager access to DATABASE_URL and project-level run.invoker for Scheduler.
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
