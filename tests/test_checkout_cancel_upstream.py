@@ -572,3 +572,160 @@ async def test_flag_on_the_v1_cancel_keeps_its_ownership_answers(v1_door, monkey
     assert (foreign.status_code, foreign.json()["detail"]) == (403, "Not authorized for this order")
     assert (unknown.status_code, unknown.json()["detail"]) == (404, "Order not found")
     assert v1_door["upstream"] == []
+
+
+# ---- a PSP object made for an order cancelled meanwhile (create_payment's lost write) --------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "psp_status, alerted",
+    [("canceled", False), ("requires_action", True), ("succeeded", True)],
+    ids=["closed", "not-closed", "already-paid"],
+)
+async def test_closing_a_surface_made_for_a_cancelled_order_alerts_unless_it_closed(
+    adapter, money_alert_lines, psp_status, alerted
+) -> None:
+    import json
+
+    from services.checkout_cancel_upstream import close_surface_created_for_cancelled_order
+
+    adapter["adapter"] = _NoVoidAdapter(status=psp_status)
+    surface = await close_surface_created_for_cancelled_order(_order(None), reference="pay_other_new", psp="other_psp")
+
+    assert adapter["adapter"].calls == ["cancel_payment_authorization", "get_payment_status"], "the NEW reference is closed"
+    assert [json.loads(line[len("money_alert: "):])["action"] for line in money_alert_lines] == (
+        [surface["action"]] if alerted else []
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_close_that_raises_is_alerted_and_never_propagates(monkeypatch, money_alert_lines) -> None:
+    import json
+
+    import services.checkout_cancel_upstream as cancel_module
+
+    async def boom(order: Dict[str, Any]) -> Dict[str, Any]:
+        raise TimeoutError("psp timeout")
+
+    monkeypatch.setattr(cancel_module, "close_payment_surface", boom)
+    surface = await cancel_module.close_surface_created_for_cancelled_order(_order(None), reference="cs_new", psp="stripe")
+
+    assert surface["action"] == "failed"
+    assert len(money_alert_lines) == 1
+    body = json.loads(money_alert_lines[0][len("money_alert: "):])
+    assert (body["event"], body["order_id"], body["payment_reference"], body["error_type"]) == (
+        "cancelled_order_surface_not_closed",
+        "ORD_X",
+        "cs_new",
+        "TimeoutError",
+    )
+
+
+@pytest.mark.asyncio
+async def test_flag_on_the_off_session_capture_lane_keeps_its_unconditional_order_write(monkeypatch) -> None:
+    """The synchronous off-session capture lane is left exactly as it is: its charge may already be captured, which
+    closing a hosted surface would not undo. Even with the order cancelled meanwhile it writes as today (the late
+    payment path owns that money)."""
+    from types import SimpleNamespace
+
+    import db.orders as db_orders
+    import mvp.events as mvp_events
+    import mvp.governance as mvp_governance
+    import routes.agent_payment_sdk as pay
+    import services.acp_offsession_payment as acp
+    import services.commerce_attribution_service as attribution
+    import services.psp_payment_finalizer as finalizer
+    from fastapi import BackgroundTasks
+
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+    row = {
+        "order_id": "ORD_OFF", "merchant_id": "m_off", "agent_id": "agent_off", "status": "pending",
+        "payment_status": "awaiting_payment", "total": 42.0, "currency": "USD", "items": [],
+        "metadata": {"pricing_quote": {"quote_id": "q_off", "live_validation": {"status": "validated"}, "expires_at": "2099-01-01T00:00:00Z"}},
+    }
+    writes: List[str] = []
+
+    async def get_order(order_id: str):
+        return dict(row)
+
+    async def offsession(**kwargs: Any):
+        row["status"] = "cancelled"  # the cancel commits while the capture runs
+        return SimpleNamespace(success=True, error=None, psp_used="stripe", payment_intent=SimpleNamespace(id="pi_off_new", status="succeeded", client_secret=None))
+
+    async def unconditional(**kwargs: Any) -> bool:
+        writes.append("update_payment_info")
+        return True
+
+    async def conditional(**kwargs: Any) -> bool:
+        writes.append("update_payment_info_unless_cancelled")
+        return False
+
+    class _Routing:
+        def __init__(self, _db: Any) -> None:
+            pass
+
+        async def select_psp(self, **_kwargs: Any):
+            return "stripe", {}
+
+    class _Decision:
+        decision = "allow"
+        reason_codes: list = []
+        required_scopes: list = []
+        risk_tier = "low"
+
+    async def none(*_a: Any, **_k: Any):
+        return None
+
+    async def stop_after_the_write(*_a: Any, **_k: Any):
+        raise RuntimeError("stopped by the test after the order write")
+
+    monkeypatch.setattr(pay, "get_order", get_order)
+    monkeypatch.setattr(pay, "update_payment_info", unconditional)
+    monkeypatch.setattr(db_orders, "update_payment_info_unless_cancelled", conditional)
+    async def store(merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "shopify", "store_id": "store_off"}
+
+    async def onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    monkeypatch.setattr(pay, "get_primary_store", store)
+    monkeypatch.setattr(pay, "PaymentRoutingService", _Routing)
+    monkeypatch.setattr(pay, "get_merchant_onboarding", onboarding)
+    monkeypatch.setattr(pay.database, "fetch_one", none)
+    monkeypatch.setattr(pay.database, "execute", none)
+    monkeypatch.setattr(attribution, "upsert_order_attribution_edge", none)
+    monkeypatch.setattr(finalizer, "finalize_payment_success", stop_after_the_write)
+    monkeypatch.setattr(
+        acp,
+        "evaluate_acp_offsession_gates",
+        lambda **_k: SimpleNamespace(
+            kill_switch=SimpleNamespace(),
+            test_capture=SimpleNamespace(bypass_live_readiness=True),
+            live_capture=SimpleNamespace(allow_live=False, max_cents=None),
+        ),
+    )
+    monkeypatch.setattr(acp, "execute_acp_offsession_payment", offsession)
+    monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+    monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
+    monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_: None)
+
+    class _Ctx:
+        agent_id = "agent_off"
+        session_id = "s"
+
+        def can_access_merchant(self, merchant_id: str) -> bool:
+            return True
+
+    outcome: Any = None
+    try:
+        outcome = await pay.create_payment(
+            pay.PaymentRequest(order_id="ORD_OFF", payment_method=pay.PaymentMethod(type="card")),
+            BackgroundTasks(),
+            context=_Ctx(),
+        )
+    except Exception as exc:  # noqa: BLE001 - what follows the write is not under test
+        outcome = exc
+
+    assert writes == ["update_payment_info"], repr(outcome)
+    assert "ORDER_CANCELED" not in repr(outcome)

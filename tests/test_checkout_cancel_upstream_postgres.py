@@ -57,6 +57,7 @@ async def _delete_own_rows() -> None:
 
     await database.execute("DELETE FROM orders WHERE order_id = :o", {"o": ORDER_ID})
     await database.execute("DELETE FROM after_sales_cases WHERE order_id = :o", {"o": ORDER_ID})
+    await database.execute("DELETE FROM payments WHERE order_id = :o", {"o": ORDER_ID})
 
 
 async def _insert_order(
@@ -65,6 +66,7 @@ async def _insert_order(
     payment_status: str = "awaiting_payment",
     payment_intent_id: Optional[str] = None,
     agent_id: str = OWNER,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     from db.database import database
     from db.orders import orders
@@ -85,7 +87,7 @@ async def _insert_order(
             payment_intent_id=payment_intent_id,
             psp_used="stripe" if payment_intent_id else None,
             agent_id=agent_id,
-            metadata={"agent_v2": {"hosted_checkout": True}},
+            metadata=metadata if metadata is not None else {"agent_v2": {"hosted_checkout": True}},
             is_deleted=False,
             created_at=datetime.now(timezone.utc),
         )
@@ -141,6 +143,25 @@ async def _db():
     from routes.after_sales_cases import _ensure_after_sales_cases_table
 
     await _ensure_after_sales_cases_table()
+    # The payments ledger create_payment writes before the order (the DDL main.py's startup applies).
+    await database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            payment_id VARCHAR(100) PRIMARY KEY,
+            order_id VARCHAR(100) NOT NULL,
+            payment_intent_id VARCHAR(255) UNIQUE NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            currency VARCHAR(3) NOT NULL,
+            psp_type VARCHAR(50) NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            idempotency_key VARCHAR(255) UNIQUE,
+            agent_id VARCHAR(50),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE,
+            metadata JSONB
+        )
+        """
+    )
     await _delete_own_rows()
     yield
     await _delete_own_rows()
@@ -864,3 +885,198 @@ async def test_an_unchanged_row_with_a_blank_reference_is_still_cancelled(flag_o
     assert resp.status_code == 200, resp.text
     assert resp.json()["cancel"]["payment_surface"]["action"] == "none"
     assert (await _stored())["status"] == "cancelled"
+
+
+# ---- a cancel that commits while create_payment is making the PSP object (the reverse interleaving) ------------
+
+
+_QUOTED = {"pricing_quote": {"quote_id": "q_cancel_reverse", "live_validation": {"status": "validated"}, "expires_at": "2099-01-01T00:00:00Z"}}
+
+
+@pytest.fixture()
+def money_alerts():
+    lines: List[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            message = record.getMessage()
+            if message.startswith("money_alert: "):
+                lines.append(message)
+
+    handler = _Capture(level=logging.ERROR)
+    logger = logging.getLogger("pivota")
+    logger.addHandler(handler)
+    try:
+        yield lines
+    finally:
+        logger.removeHandler(handler)
+
+
+@pytest.fixture()
+def create_payment_lane(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
+    """The real POST /agent/v1/payments over the real orders and payments rows. Its routing, merchant and store
+    lookups, governance and measurement are doubled (the pattern of tests/test_agent_payments_test_psp_stamp_bypass.py),
+    and the PSP call `create_payment_with_failover` returns `lane["reference"]` after running `lane["during"]`: what
+    happens while the PSP object is being made."""
+    import mvp.events as mvp_events
+    import mvp.governance as mvp_governance
+    import routes.agent_payment_sdk as payment_module
+    import services.commerce_attribution_service as attribution
+
+    lane: Dict[str, Any] = {"during": None, "reference": "cs_cancel_reverse_new", "psp_calls": 0}
+
+    async def get_primary_store(merchant_id: str) -> Dict[str, Any]:
+        return {"platform": "shopify", "store_id": "store_cancel_reverse"}
+
+    class _Routing:
+        def __init__(self, _database: Any) -> None:
+            pass
+
+        async def select_psp(self, **_kwargs: Any):
+            return "stripe", {}
+
+    async def get_merchant_onboarding(merchant_id: str) -> Dict[str, Any]:
+        return {"merchant_id": merchant_id}
+
+    class _Decision:
+        decision = "allow"
+        reason_codes: list = []
+        required_scopes: list = []
+        risk_tier = "low"
+
+    async def failover(*_args: Any, **_kwargs: Any):
+        lane["psp_calls"] += 1
+        if lane["during"] is not None:
+            await lane["during"]()
+        intent = SimpleNamespace(id=lane["reference"], status="requires_payment_method", client_secret="cs_secret_fake_not_real")
+        return True, intent, None, "stripe"
+
+    async def no_edge(**_kwargs: Any) -> None:
+        return None
+
+    async def no_usage_log(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(payment_module, "log_agent_request", no_usage_log)
+    monkeypatch.setattr(payment_module, "get_primary_store", get_primary_store)
+    monkeypatch.setattr(payment_module, "PaymentRoutingService", _Routing)
+    monkeypatch.setattr(payment_module, "get_merchant_onboarding", get_merchant_onboarding)
+    monkeypatch.setattr(payment_module, "create_payment_with_failover", failover)
+    monkeypatch.setattr(attribution, "upsert_order_attribution_edge", no_edge)
+    monkeypatch.setattr(mvp_events, "emit_best_effort", lambda **_: None)
+    monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
+    monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_: None)
+    return lane
+
+
+async def _pay():
+    return await _post(_app(OWNER), "/agent/v1/payments", json={"order_id": ORDER_ID, "payment_method": {"type": "card"}})
+
+
+async def test_a_cancel_committed_during_the_psp_call_makes_create_payments_write_lose_and_expires_the_session(
+    flag_on, stripe_fake, create_payment_lane, money_alerts
+) -> None:
+    """create_payment reads the order (not cancelled), the cancel commits while the PSP object is being made, then
+    create_payment writes. The write refuses the cancelled row, the new session is expired, the answer is 409."""
+    await _insert_order(metadata=_QUOTED)
+
+    async def cancel_commits() -> None:
+        resp = await _cancel()
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["cancel"]["payment_surface"]["action"] == "none"
+
+    create_payment_lane["during"] = cancel_commits
+
+    resp = await _pay()
+
+    assert create_payment_lane["psp_calls"] == 1
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "ORDER_CANCELED"
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"], stored["payment_intent_id"]) == ("cancelled", "cancelled", None)
+    assert stripe_fake.methods() == ["checkout.sessions.expire"]
+    assert stripe_fake.session["cs_cancel_reverse_new"]["status"] == "expired", "no live surface for a cancelled order"
+    assert money_alerts == []
+
+
+async def test_a_session_that_cannot_be_expired_after_a_lost_write_raises_the_money_alert(
+    flag_on, stripe_fake, create_payment_lane, money_alerts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _insert_order(metadata=_QUOTED)
+
+    async def cancel_commits() -> None:
+        assert (await _cancel()).status_code == 200
+
+    def down(*args: Any, **kwargs: Any):
+        stripe_fake.calls.append({"method": "checkout.sessions.expire"})
+        raise RuntimeError("connection reset")
+
+    def unreadable(*args: Any, **kwargs: Any):
+        raise RuntimeError("connection reset")
+
+    create_payment_lane["during"] = cancel_commits
+    monkeypatch.setattr(stripe_fake, "cs_expire", down)
+    monkeypatch.setattr(stripe_fake, "cs_retrieve", unreadable)
+
+    resp = await _pay()
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "ORDER_CANCELED"
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"], stored["payment_intent_id"]) == ("cancelled", "cancelled", None)
+    assert len(money_alerts) == 1
+    alert = json.loads(money_alerts[0][len("money_alert: "):])
+    assert alert == {
+        "event": "cancelled_order_surface_not_closed",
+        "order_id": ORDER_ID,
+        "psp": "stripe",
+        "payment_reference": "cs_cancel_reverse_new",
+        "action": "failed",
+        "reference_type": "checkout_session",
+        "error_type": None,
+    }
+
+
+async def test_flag_on_create_payment_on_an_open_order_still_writes_its_surface(
+    flag_on, stripe_fake, create_payment_lane, money_alerts
+) -> None:
+    await _insert_order(metadata=_QUOTED)
+
+    resp = await _pay()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payment_intent_id"] == "cs_cancel_reverse_new"
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"], stored["payment_intent_id"]) == (
+        "pending",
+        "processing",
+        "cs_cancel_reverse_new",
+    )
+    assert stripe_fake.calls == []
+    assert money_alerts == []
+
+
+async def test_flag_off_create_payment_still_writes_over_a_cancel_that_committed_during_the_psp_call(
+    stripe_fake, create_payment_lane, money_alerts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Today's behaviour, unchanged with the flag off: why the flag exists."""
+    from db.database import database
+
+    monkeypatch.delenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", raising=False)
+    await _insert_order(metadata=_QUOTED)
+
+    async def cancel_commits() -> None:
+        await database.execute("UPDATE orders SET status = 'cancelled' WHERE order_id = :o", {"o": ORDER_ID})
+
+    create_payment_lane["during"] = cancel_commits
+
+    resp = await _pay()
+
+    assert resp.status_code == 200, resp.text
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"], stored["payment_intent_id"]) == (
+        "cancelled",
+        "processing",
+        "cs_cancel_reverse_new",
+    )
+    assert stripe_fake.calls == []

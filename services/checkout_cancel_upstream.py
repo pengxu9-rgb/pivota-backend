@@ -208,6 +208,48 @@ def _payment_surface_unchanged(order: Dict[str, Any], surface: Dict[str, Any]) -
     return func.trim(func.coalesce(orders.c.payment_intent_id, "")) == str(order.get("payment_intent_id") or "").strip()
 
 
+SURFACE_NOT_CLOSED_EVENT = "cancelled_order_surface_not_closed"
+_CLOSED_ACTIONS = frozenset({"expired", "canceled", "already_closed"})
+
+
+def _emit_money_alert(event: str, **fields: Any) -> None:
+    """One `money_alert: {...}` line (compact sorted JSON, ids and codes only) through the "pivota" logger, the shape
+    of utils/money_alerts.py (FIX_PLAN R-02). Never raises."""
+    try:
+        body = {"event": event, **{k: (None if v is None else str(v)[:128]) for k, v in fields.items()}}
+        logger.error("money_alert: %s", json.dumps(body, sort_keys=True, separators=(",", ":")))
+    except Exception:  # noqa: BLE001 - an alert must never break the money path it reports on
+        pass
+
+
+async def close_surface_created_for_cancelled_order(order: Dict[str, Any], *, reference: str, psp: Optional[str]) -> Dict[str, Any]:
+    """create_payment made a PSP object (a `cs_` Checkout Session or a PaymentIntent) for an order that a cancel
+    cancelled while the object was being created, and its order write refused the cancelled row. Close that object
+    at the PSP so the buyer cannot pay it. Best effort and never raises: anything short of a confirmed close raises
+    the money_alert line, since a live surface for a cancelled order is money that may arrive and must be refunded.
+    """
+    order_id = str((order or {}).get("order_id") or "")
+    surface: Dict[str, Any] = {"action": "failed", "reference_type": None}
+    error_type: Optional[str] = None
+    try:
+        surface = await close_payment_surface({**(order or {}), "payment_intent_id": reference})
+    except Exception as exc:  # noqa: BLE001
+        error_type = type(exc).__name__
+    if surface.get("action") not in _CLOSED_ACTIONS:
+        _emit_money_alert(
+            SURFACE_NOT_CLOSED_EVENT,
+            order_id=order_id,
+            psp=psp,
+            payment_reference=reference or None,
+            action=surface.get("action"),
+            reference_type=surface.get("reference_type"),
+            error_type=error_type,
+        )
+    else:
+        logger.info("checkout cancel: order %s was cancelled during create_payment; its new surface was closed", order_id)
+    return surface
+
+
 async def _cancel_row_if_unpaid(order: Dict[str, Any], *, agent_id: str, surface: Dict[str, Any]) -> bool:
     """ONE conditional UPDATE: cancel the row only while it is not paid, not already cancelled, and still carries
     the payment surface this cancel closed. True when THIS call cancelled it. The same shape as
