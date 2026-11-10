@@ -22,7 +22,7 @@ _IS_PG = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("po
 pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_URL")
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
-CLICK_ID = "clk_afsubpg000000000000000001"
+CLICK_ID = "clk_af5ab9000000000000000001"  # the minted shape: clk_ + 24 lowercase hex
 LINK_HOST = "click.linksynergy.com"
 FEED_LINK = f"https://{LINK_HOST}/deeplink?id=AbC123&mid=99999&murl=https%3A%2F%2Fshop-a.example.com%2Fp&u1=stale"
 
@@ -50,7 +50,7 @@ async def db(monkeypatch):
     metadata.create_all(engine, tables=[surface_click_events, outbound_click_events], checkfirst=True)
 
     async def _clean():
-        await database.execute("DELETE FROM surface_click_events WHERE click_id LIKE 'clk_afsubpg%'")
+        await database.execute("DELETE FROM surface_click_events WHERE click_id LIKE 'clk_af5ab9%'")
         await database.execute("DELETE FROM outbound_click_events WHERE dest_domain = :h", {"h": LINK_HOST})
 
     await _clean()
@@ -71,6 +71,7 @@ async def test_a_minted_network_link_carries_the_recorded_click_id_in_u1_on_post
 
     import routes.agent_shop_gateway as gw
     import routes.outbound_links as outbound_routes
+    from services.affiliate_subid import click_id_from_subid
     from services.commerce_attribution_service import issue_clicks
     from services.outbound_links_service import parse_and_verify_redirect_token
 
@@ -92,19 +93,22 @@ async def test_a_minted_network_link_carries_the_recorded_click_id_in_u1_on_post
     location = resp.headers["location"]
 
     assert resp.status_code == 302
-    assert parse_qs(urlparse(location).query)["u1"] == [CLICK_ID]  # the stale u1 replaced, one copy
-    assert location == signed_dest.replace("u1=stale", f"u1={CLICK_ID}")
+    hex_form = CLICK_ID[len("clk_"):]  # u1 is alphanumeric: the bare hex
+    assert parse_qs(urlparse(location).query)["u1"] == [hex_form]  # the stale u1 replaced, one copy
+    assert location == signed_dest.replace("u1=stale", f"u1={hex_form}")
 
     surface = await db.fetch_one(
         "SELECT click_id, click_count, context FROM surface_click_events WHERE click_id = :c", {"c": CLICK_ID}
     )
     assert surface["click_count"] == 1
     sctx = _obj(surface["context"])
-    assert (sctx["affiliate_subid_param"], sctx["affiliate_subid_value"]) == ("u1", surface["click_id"])
+    assert (sctx["affiliate_subid_param"], sctx["affiliate_subid_value"]) == ("u1", hex_form)
+    # The import's re-prefix lands on the surface row's click_id column.
+    assert click_id_from_subid(sctx["affiliate_subid_value"]) == surface["click_id"]
 
     click = await db.fetch_one(
         "SELECT destination_url, context FROM outbound_click_events WHERE dest_domain = :h", {"h": LINK_HOST}
     )
     assert click["destination_url"] == signed_dest  # the row keeps the SIGNED destination
     cctx = _obj(click["context"])
-    assert (cctx["affiliate_subid_param"], cctx["affiliate_subid_value"]) == ("u1", CLICK_ID)
+    assert (cctx["affiliate_subid_param"], cctx["affiliate_subid_value"]) == ("u1", hex_form)

@@ -661,9 +661,10 @@ class Settings(BaseSettings):
     def affiliate_subid_click_id_enabled(self) -> bool:
         return _deal_flag("AFFILIATE_SUBID_CLICK_ID_ENABLED")
 
-    # Optional JSON object {"<host suffix>": "<param name>" | null} merged over the code's map, so
-    # ops can add (or, with null, remove) a network without a deploy. Parsed and validated in
-    # services/affiliate_subid.subid_param_map; anything malformed is ignored, never raised.
+    # Optional JSON object {"<host suffix>": "<param name>" | {"param": ..., "form": "hex"|"clk"} | null}
+    # merged over the code's map, so ops can add (or, with null, remove) a network without a deploy.
+    # Parsed and validated in services/affiliate_subid.subid_param_map; anything malformed, or a
+    # parameter that carries the destination or an id (SUBID_PARAM_DENYLIST), is ignored, never raised.
     @property
     def affiliate_subid_params_json(self) -> str:
         return os.getenv("AFFILIATE_SUBID_PARAMS_JSON") or ""
