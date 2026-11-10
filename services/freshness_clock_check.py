@@ -161,7 +161,9 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
     import db.merchant_purchasability as mp
     from services import agent_merchant_directory as directory
 
-    now = now or datetime.now(timezone.utc)
+    # A caller's `now` may be naive (a job harness, a backfill): read it as UTC, the way every stored
+    # timestamp is read, so an aware fact minus a naive clock can never raise mid-tick.
+    now = (_aware(now) if now is not None else None) or datetime.now(timezone.utc)
     summary: Dict[str, Any] = {"pairs": None, "fresh": 0, "stale": 0, "missing": 0, "negative": 0,
                                "unavailable": 0}
     try:
