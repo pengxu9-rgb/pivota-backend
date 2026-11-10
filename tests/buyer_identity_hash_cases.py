@@ -1,0 +1,360 @@
+"""S-29 cases: the agent_user_ref hash has its own key, and rows made with the old key still match.
+
+Shared by two collectors, so the one statement the legacy read adds runs on both engines:
+  * tests/test_buyer_identity_hash_legacy_read.py — SQLite, a file in tmp_path;
+  * tests/test_buyer_identity_hash_legacy_read_postgres.py — Postgres (the dialect gate), inside a
+    fresh schema of the gate's DATABASE_URL, so it never touches the gate's real tables.
+
+The owner-keyed tables are built with just the two key columns (plus the link's own columns): the
+statement under test reads nothing else. `buyer_identity_links` is built with every column the
+link upsert writes, because one case runs the real upsert.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import uuid
+
+import pytest
+
+import db.buyer_vault as buyer_vault
+
+AGENT = "agent_s29"
+OTHER_AGENT = "agent_s29_other"
+USER_REF = "end-user-placeholder-1"
+BUYER = "buy_s29_placeholder"
+DEDICATED = "dedicated-test-key"
+TOKEN_KEY = "checkout-token-test-key"
+#: The legacy copy (BUYER_IDENTITY_LINK_LEGACY_SECRET). DIFFERENT from TOKEN_KEY on purpose: the copy
+#: is what the token key was before it rotated, so a legacy read that reached for the live token
+#: key would miss every seeded row here.
+LEGACY_KEY = "legacy-copy-test-key"
+
+#: Written out, not read from the module: a table dropped from the lookup must fail a case.
+OWNER_TABLES = (
+    "buyer_identity_links",
+    "agent_purchases",
+    "reap_agentic_purchases",
+    "reap_agentic_purchase_keys",
+    "reap_unopened_attempt_retirements",
+    "a2a_rail_buyer_refs",
+    "a2a_rail_purchases",
+)
+
+
+def _hmac_hex(key: str, raw: str) -> str:
+    return hmac.new(key.encode(), raw.encode(), hashlib.sha256).hexdigest()
+
+
+def _is_pg() -> bool:
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    return url.startswith("postgresql://") or url.startswith("postgres://")
+
+
+@pytest.fixture(autouse=True)
+def hash_env(monkeypatch):
+    """Dedicated key and legacy copy set, window at its default (open), a rotated checkout-token key."""
+    for name in (
+        "BUYER_IDENTITY_LINK_SECRET",
+        "BUYER_IDENTITY_LINK_LEGACY_SECRET",
+        "BUYER_ACTION_TOKEN_SECRET",
+        "CHECKOUT_TOKEN_SECRET",
+        "AGENT_CHECKOUT_TOKEN_SECRET",
+        "BUYER_IDENTITY_LINK_LEGACY_READ",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", LEGACY_KEY)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", TOKEN_KEY)
+
+
+@pytest.fixture
+async def owner_db(monkeypatch, tmp_path):
+    import databases
+
+    schema = None
+    if _is_pg():
+        url = os.environ["DATABASE_URL"].strip()
+        schema = f"s29_{uuid.uuid4().hex[:12]}"
+        admin = databases.Database(url)
+        await admin.connect()
+        await admin.execute(f"CREATE SCHEMA {schema}")
+        await admin.disconnect()
+        db = databases.Database(url, server_settings={"search_path": schema})
+        link_id = "id BIGSERIAL PRIMARY KEY"
+        ts = "TIMESTAMPTZ"
+    else:
+        admin = None
+        url = f"sqlite+aiosqlite:///{tmp_path / 'owner.db'}"
+        db = databases.Database(url)
+        link_id = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+        ts = "TIMESTAMP"
+    await db.connect()
+    try:
+        for table in OWNER_TABLES:
+            if table == "buyer_identity_links":
+                continue
+            await db.execute(
+                f"CREATE TABLE {table} (agent_id VARCHAR(100) NOT NULL, agent_user_ref_hash VARCHAR(64))"
+            )
+        await db.execute(
+            f"""CREATE TABLE buyer_identity_links (
+                {link_id},
+                agent_id VARCHAR(100) NOT NULL,
+                agent_user_ref_hash VARCHAR(64) NOT NULL,
+                buyer_id VARCHAR(50) NOT NULL,
+                created_at {ts} DEFAULT CURRENT_TIMESTAMP,
+                updated_at {ts} DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at {ts},
+                UNIQUE (agent_id, agent_user_ref_hash)
+            )"""
+        )
+        await db.execute("CREATE TABLE shop_users (id VARCHAR(50) PRIMARY KEY, email VARCHAR(255))")
+
+        import routes.agent_checkout_intents as intents
+        import routes.buyer_api as buyer_api
+
+        for module in (buyer_vault, intents, buyer_api):
+            monkeypatch.setattr(module, "database", db)
+        yield db
+    finally:
+        await db.disconnect()
+        if schema is not None:
+            admin = databases.Database(os.environ["DATABASE_URL"].strip())
+            await admin.connect()
+            await admin.execute(f"DROP SCHEMA {schema} CASCADE")
+            await admin.disconnect()
+
+
+async def _seed(db, table: str, agent_id: str, ref_hash: str) -> None:
+    if table == "buyer_identity_links":
+        await db.execute(
+            "INSERT INTO buyer_identity_links (agent_id, agent_user_ref_hash, buyer_id) VALUES (:a, :h, :b)",
+            {"a": agent_id, "h": ref_hash, "b": BUYER},
+        )
+    else:
+        await db.execute(
+            f"INSERT INTO {table} (agent_id, agent_user_ref_hash) VALUES (:a, :h)",
+            {"a": agent_id, "h": ref_hash},
+        )
+
+
+def legacy_hash() -> str:
+    return _hmac_hex(LEGACY_KEY, USER_REF)
+
+
+def token_key_hash() -> str:
+    return _hmac_hex(TOKEN_KEY, USER_REF)
+
+
+def dedicated_hash() -> str:
+    return _hmac_hex(DEDICATED, USER_REF)
+
+
+# --- the legacy read --------------------------------------------------------------------------
+
+
+async def test_a_new_identity_resolves_to_the_dedicated_key_hash(owner_db):
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+
+
+@pytest.mark.parametrize("table", OWNER_TABLES)
+async def test_an_identity_with_legacy_rows_in_any_owner_table_keeps_its_legacy_hash(owner_db, table):
+    await _seed(owner_db, table, AGENT, legacy_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == legacy_hash()
+
+
+async def test_another_agents_legacy_row_does_not_pull_this_identity_back(owner_db):
+    await _seed(owner_db, "buyer_identity_links", OTHER_AGENT, legacy_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+
+
+async def test_a_closed_window_ignores_legacy_rows(owner_db, monkeypatch):
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+
+
+async def test_a_failed_lookup_is_a_503_never_a_guessed_hash(owner_db):
+    """S-29 P2-1. The legacy hash would split an identity first seen after the mount; the dedicated
+    hash would split one seen before it. Both are guesses, so the lookup's failure is the answer."""
+    await _seed(owner_db, "a2a_rail_purchases", AGENT, dedicated_hash())
+    await owner_db.execute("DROP TABLE a2a_rail_buyer_refs")
+
+    with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable) as raised:
+        await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF)
+
+    assert raised.value.status_code == 503
+    assert raised.value.headers == {"Retry-After": "1"}
+    assert raised.value.detail["error"] == "TEMPORARY_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("answer", [None, {"found": None}], ids=["no-row", "null"])
+async def test_a_lookup_with_no_answer_is_a_503_not_a_new_identity(owner_db, monkeypatch, answer):
+    """No row / NULL is "could not tell", not "no legacy rows": reading it as the latter would move
+    an identity that has legacy rows onto the dedicated hash."""
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+
+    async def _no_answer(*_a, **_k):
+        return answer
+
+    monkeypatch.setattr(owner_db, "fetch_one", _no_answer)
+
+    with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable):
+        await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF)
+
+
+async def test_after_the_lookup_recovers_each_identity_resolves_to_its_own_hash(owner_db, monkeypatch):
+    await _seed(owner_db, "agent_purchases", AGENT, legacy_hash())
+    real = owner_db.fetch_one
+
+    async def _down(*_a, **_k):
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(owner_db, "fetch_one", _down)
+    for ref in (USER_REF, "end-user-placeholder-2"):
+        with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable):
+            await buyer_vault.resolve_agent_user_ref_hash(AGENT, ref)
+
+    monkeypatch.setattr(owner_db, "fetch_one", real)
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == legacy_hash()
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, "end-user-placeholder-2") == _hmac_hex(
+        DEDICATED, "end-user-placeholder-2"
+    )
+
+
+# --- the legacy key is its own copy, never the live token key (S-29 P2-2) -----------------------
+
+
+async def test_rows_under_the_live_token_key_are_not_legacy_rows(owner_db):
+    """Only the legacy copy matches. The live token key is free to rotate, and a stored hash under
+    it is not pulled back in."""
+    await _seed(owner_db, "buyer_identity_links", AGENT, token_key_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+
+
+async def test_rotating_the_token_key_keeps_every_legacy_identity(owner_db, monkeypatch):
+    await _seed(owner_db, "reap_agentic_purchase_keys", AGENT, legacy_hash())
+    for rotated in ("rotated-token-test-key-1", "rotated-token-test-key-2"):
+        monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", rotated)
+        monkeypatch.setenv("BUYER_ACTION_TOKEN_SECRET", rotated + "-action")
+
+        assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == legacy_hash()
+
+
+@pytest.mark.parametrize("value", [None, "", "   "], ids=["unset", "empty", "whitespace"])
+async def test_without_the_legacy_copy_the_dedicated_key_is_refused_and_every_buyer_keeps_todays_hash(
+        owner_db, monkeypatch, value):
+    """S-29b N-1, the copy missing (wrong name, or forgotten on one service). Before: legacy matching
+    was refused and every existing buyer silently moved onto the dedicated hash. Now the dedicated
+    key is refused: old and new buyers stay on today's token-key hash, and no lookup runs."""
+    if value is None:
+        monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
+    else:
+        monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", value)
+    await _seed(owner_db, "buyer_identity_links", AGENT, token_key_hash())
+
+    async def no_query(*_a, **_k):
+        raise AssertionError("no legacy lookup without the legacy copy")
+
+    monkeypatch.setattr(owner_db, "fetch_one", no_query)
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, "end-user-placeholder-2") == _hmac_hex(
+        TOKEN_KEY, "end-user-placeholder-2"
+    )
+
+
+async def test_a_dedicated_key_equal_to_the_copy_keeps_every_buyer_on_todays_hash(owner_db, monkeypatch):
+    """The copy mounted twice under both names: the dedicated key is refused, nothing moves."""
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", TOKEN_KEY)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", TOKEN_KEY)
+    await _seed(owner_db, "a2a_rail_purchases", AGENT, token_key_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
+
+
+async def test_a_wrong_copy_before_the_dedicated_key_changes_no_hash(owner_db, monkeypatch):
+    """S-29b N-1, the copy mounted alone with a wrong value: writes keep today's token-key hash.
+    (With the dedicated key also mounted a wrong copy matches nothing; only the boot check
+    `legacy_copy_matches_token_key=no` can catch that, which is why the copy is checked first.)"""
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", "a-wrong-copy-test-key")
+    await _seed(owner_db, "buyer_identity_links", AGENT, token_key_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
+
+
+# --- the routes that read a link, end to end against the same tables ---------------------------
+
+
+async def test_checkout_prefill_still_finds_a_link_written_under_the_legacy_key(owner_db):
+    import routes.agent_checkout_intents as intents
+
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+    await owner_db.execute(
+        "INSERT INTO shop_users (id, email) VALUES (:id, :e)", {"id": BUYER, "e": "buyer@example.com"}
+    )
+
+    prefill = await intents._buyer_prefill_from_identity_link(agent_id=AGENT, agent_user_ref=USER_REF)
+
+    assert prefill is not None and prefill["customer_email"] == "buyer@example.com"
+
+
+async def test_saving_a_legacy_identity_again_updates_its_link_and_adds_none(owner_db):
+    import routes.buyer_api as buyer_api
+
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+
+    written = await buyer_api._upsert_buyer_identity_link(buyer_id=BUYER, agent_id=AGENT, agent_user_ref=USER_REF)
+
+    rows = await owner_db.fetch_all("SELECT agent_user_ref_hash FROM buyer_identity_links WHERE agent_id = :a", {"a": AGENT})
+    assert written == legacy_hash()
+    assert [dict(r)["agent_user_ref_hash"] for r in rows] == [legacy_hash()]
+
+
+async def test_checkout_prefill_answers_503_when_the_lookup_fails(owner_db):
+    import routes.agent_checkout_intents as intents
+
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+    await owner_db.execute("DROP TABLE reap_unopened_attempt_retirements")
+
+    with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable):
+        await intents._buyer_prefill_from_identity_link(agent_id=AGENT, agent_user_ref=USER_REF)
+
+
+async def test_a_save_whose_lookup_fails_writes_no_link_and_the_next_save_links_the_right_hash(owner_db):
+    """The save redeems a single-use token before it links, so it cannot answer 503 and be retried:
+    it writes NO link rather than one under a guessed hash."""
+    import routes.buyer_api as buyer_api
+
+    await owner_db.execute("DROP TABLE reap_unopened_attempt_retirements")
+    written = await buyer_api._upsert_buyer_identity_link(buyer_id=BUYER, agent_id=AGENT, agent_user_ref=USER_REF)
+
+    assert written is None
+    assert await owner_db.fetch_all("SELECT agent_user_ref_hash FROM buyer_identity_links") == []
+
+    await owner_db.execute(
+        "CREATE TABLE reap_unopened_attempt_retirements (agent_id VARCHAR(100) NOT NULL, agent_user_ref_hash VARCHAR(64))"
+    )
+    written = await buyer_api._upsert_buyer_identity_link(buyer_id=BUYER, agent_id=AGENT, agent_user_ref=USER_REF)
+
+    rows = await owner_db.fetch_all("SELECT agent_user_ref_hash FROM buyer_identity_links WHERE agent_id = :a", {"a": AGENT})
+    assert written == dedicated_hash()
+    assert [dict(r)["agent_user_ref_hash"] for r in rows] == [dedicated_hash()]
+
+
+async def test_saving_a_new_identity_writes_the_dedicated_key_hash(owner_db):
+    import routes.buyer_api as buyer_api
+
+    written = await buyer_api._upsert_buyer_identity_link(buyer_id=BUYER, agent_id=AGENT, agent_user_ref=USER_REF)
+
+    rows = await owner_db.fetch_all("SELECT agent_user_ref_hash FROM buyer_identity_links WHERE agent_id = :a", {"a": AGENT})
+    assert written == dedicated_hash()
+    assert [dict(r)["agent_user_ref_hash"] for r in rows] == [dedicated_hash()]

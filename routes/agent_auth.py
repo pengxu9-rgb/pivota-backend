@@ -940,9 +940,15 @@ async def log_agent_request(
     merchant_id: Optional[str] = None,
     order_id: Optional[str] = None,
     order_amount: Optional[float] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    order_created: bool = False,
 ):
-    """记录 Agent 请求（通常在响应后调用）"""
+    """记录 Agent 请求（通常在响应后调用）
+
+    `order_id` is logged on the usage row for any order-scoped call (get_order, tracking,
+    confirm-payment). Only `order_created=True` — passed by the order CREATE route alone — adds to
+    agents.total_orders / total_gmv (O-07: reads were counting as orders).
+    """
     
     # 获取请求信息
     request = context.request
@@ -964,8 +970,8 @@ async def log_agent_request(
     
     context.request_id = request_id
     
-    # 如果创建了订单，更新统计
-    if order_id and status_code < 400:
+    # 如果创建了订单，更新统计 — a create only; a read of an existing order is not an order.
+    if order_created and order_id and status_code < 400:
         await update_agent_stats(
             context.agent_id,
             increment_orders=1,

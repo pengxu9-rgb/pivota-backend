@@ -161,6 +161,24 @@ async def _heal_orders(sql: str) -> None:
     for statement in guarded_add_columns(sql):
         await database.execute(statement)
 
+def _stamp_test_traffic(order_data: Dict[str, Any]) -> None:
+    """O-07: stamp a test order's metadata at write (services.test_traffic). Every order create
+    reaches the table through create_order, so this is the one place. A caller-supplied stamp is
+    removed whatever the flag (the money reads exclude stamped rows); with
+    TEST_TRAFFIC_STAMP_ENABLED off nothing is added, and a real order is never touched."""
+    from services import test_traffic
+
+    md = order_data.get("metadata")
+    if isinstance(md, dict):
+        test_traffic.strip_caller_markers(md)
+    reasons = test_traffic.classify_test_traffic(
+        merchant_ids=[order_data.get("merchant_id")],
+        server_metadata=md if isinstance(md, dict) else None,
+    )
+    if reasons and test_traffic.stamp_enabled():
+        order_data["metadata"] = test_traffic.stamp(md if isinstance(md, dict) else None, reasons)
+
+
 async def create_order(order_data: Dict[str, Any]) -> str:
     """创建新订单"""
     order_id = f"ORD_{secrets.token_hex(8).upper()}"
@@ -168,7 +186,8 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["status"] = "pending"
     order_data["payment_status"] = "unpaid"
     order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
-    
+    _stamp_test_traffic(order_data)
+
     query = orders.insert().values(**order_data)
     try:
         await database.execute(query)

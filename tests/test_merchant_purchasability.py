@@ -2595,7 +2595,7 @@ async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _ca
     # read failed or came back incomplete.
     assert tally == {sweep.MARKET_UNKNOWN_TALLY: 2}
     assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys),
-                     sweep.CART_MINT_AGE_TALLY: 0}
+                     sweep.CART_MINT_AGE_TALLY: 0, sweep.WARM_DEFERRED_TALLY: 0}
     by_key = {(t.domain, t.market): t for t in targets}
     assert by_key[("judydoll.com", "US")].variant_id == "50041364447509", (
         "the Tier B lane's CONFIRMED variant still wins where the cart-mint lane names the key too"
@@ -2974,6 +2974,7 @@ async def test_a_failed_scan_falls_back_to_the_last_complete_one_and_backs_off(_
     assert calls["scans"] == 2
     assert sweep.UNREADABLE_TALLY not in tally, "a day-old scan stands in; nothing is counted"
     assert ("stamp-brand.example", "US") in keys
+    assert ("referral-only.example", "US") in keys, "the stand-in scan carries its warm-click keys too"
     assert sizes[sweep.CART_MINT_AGE_TALLY] == 24 * 60
 
     clock.now = _DAY1 + timedelta(days=1, hours=5)
@@ -3541,4 +3542,214 @@ async def test_a_recorded_scan_round_trips_the_warm_click_lane(_db):
     finally:
         await database.execute(
             "DELETE FROM merchant_purchasability_cart_mint_scans WHERE scan_id = 'cms_warm_roundtrip'")
+
+
+# ══ the warm-click guard (be#2772 review P2-1) ═══════════════════════════════════════════════
+#
+# A third of the warm-click lane's hosts are not Shopify, and a big retailer's bot wall reads as
+# a throttle. These hold that the lane can neither starve the other lanes' keys nor trip the IP
+# breaker, and that a host with no Shopify catalog is re-checked weekly, not every rotation.
+
+_GUARD_NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def _guard_lanes(core, warm_only, also_warm=()):
+    lanes = {name: {} for name in sweep.LANES}
+    for key in core:
+        lanes["cart-mint"][key] = None
+    for key in [*warm_only, *also_warm]:
+        lanes["warm-click"][key] = None
+    return lanes
+
+
+@pytest.fixture
+def _guard(monkeypatch):
+    """`load_population` over synthetic lanes and a synthetic staleness read: no database."""
+    state = {"lanes": {}, "due": []}
+
+    async def _collect(**_kwargs):
+        return state["lanes"]
+
+    async def _due(*_args, **_kwargs):
+        return state["due"]
+
+    monkeypatch.setattr(sweep, "collect_population", _collect)
+    monkeypatch.setattr(sweep.facts, "list_due", _due)
+    monkeypatch.setattr(sweep, "_utcnow", lambda: _GUARD_NOW)
+    return state
+
+
+def _due_row(key, *, hours_ago, verdict="ELIGIBLE", detail=None, positive_until=None):
+    return {"merchant_domain": key[0], "market_country": key[1],
+            "checked_at": _GUARD_NOW - timedelta(hours=hours_ago), "verdict": verdict, "detail": detail,
+            "positive_until": positive_until}
+
+
+async def test_warm_only_keys_take_at_most_the_cap_and_core_keys_the_rest(_guard, monkeypatch):
+    core = [(f"core-{i}.example", "US") for i in range(10)]
+    warm = [(f"warm-{i}.example", "US") for i in range(30)]  # never checked: first in staleness
+    _guard["lanes"] = _guard_lanes(core, warm)
+    _guard["due"] = [_due_row(k, hours_ago=20) for k in core]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "6")
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    picked = {(t.domain, t.market) for t in targets}
+    assert len(picked & set(warm)) == 6, "never-checked warm-only keys cannot fill the run"
+    assert set(core) <= picked, "every due core key still gets a slot"
+    assert len(targets) == 16, "the batch is not padded with more warm-only keys"
+    assert sizes[sweep.TOTAL_TALLY] == 40 and sizes[sweep.NEVER_CHECKED_TALLY] == 30
+
+
+async def test_a_warm_only_key_is_never_rechecked_ahead_of_a_staler_core_key(_guard, monkeypatch):
+    core = [(f"core-{i}.example", "US") for i in range(5)]
+    warm = [("warm-fresh.example", "US")]
+    _guard["lanes"] = _guard_lanes(core, warm)
+    _guard["due"] = [_due_row(k, hours_ago=30) for k in core] + [_due_row(warm[0], hours_ago=1)]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "6")
+    targets = await sweep.load_population(5)
+    assert {(t.domain, t.market) for t in targets} == set(core)
+
+
+async def test_a_key_another_lane_names_is_never_guarded(_guard, monkeypatch):
+    """A warm-click key that the cart-mint lane also names is a core key: no cap, proven."""
+    shared = ("shared.example", "US")
+    _guard["lanes"] = _guard_lanes([shared], [], also_warm=[shared])
+    _guard["due"] = [_due_row(shared, hours_ago=5, verdict="VARIANT_UNVERIFIED",
+                              detail="products_json_page_1_status_404")]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "0")
+    sizes: dict = {}
+    [target] = await sweep.load_population(5, sizes=sizes)
+    assert (target.domain, target.proven_shopify) == ("shared.example", True)
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == 0
+
+
+async def test_a_zero_cap_takes_the_warm_click_lane_out_of_the_population(_guard, monkeypatch):
+    core = [("core.example", "US")]
+    warm = [("warm.example", "US")]
+    _guard["lanes"] = _guard_lanes(core, warm)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "0")
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert [(t.domain, t.market) for t in targets] == core
+    assert sizes[sweep.TOTAL_TALLY] == 1 and sizes[sweep.NEVER_CHECKED_TALLY] == 1
+
+
+@pytest.mark.parametrize("detail, hours_ago, deferred", [
+    ("products_json_page_1_status_404", 48, True),       # no catalog, checked 2 days ago
+    ("products_json_page_1_status_410", 48, True),
+    ("products_json_page_1_status_200", 48, True),       # an HTML page where the catalog would be
+    ("products_json_page_1_status_500", 48, False),      # a 5xx is transient, never "not Shopify"
+    ("products_json_page_1_status_502", 48, False),
+    ("products_json_page_1_status_403", 48, False),
+    ("products_json_page_1_status_404", 8 * 24, False),  # a week has passed: re-check it
+    ("products_json_page_1_status_429", 48, False),      # a throttle never reads as "not Shopify"
+    ("products_json_page_1_status_503", 48, False),
+    ("products_json_page_2_status_404", 48, False),      # page 1 WAS a product list
+    ("pagination_stalled", 48, False),
+])
+async def test_a_warm_only_key_with_no_shopify_catalog_is_rechecked_weekly(
+    _guard, monkeypatch, detail, hours_ago, deferred
+):
+    key = ("retailer.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=hours_ago, verdict="VARIANT_UNVERIFIED", detail=detail)]
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert (targets == []) is deferred
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == int(deferred)
+    assert sizes[sweep.TOTAL_TALLY] == 1, "a deferred key is still counted in the population"
+
+
+@pytest.mark.parametrize("verdict, proven", [
+    *[(v, True) for v in sorted(sweep.SHOPIFY_STOREFRONT_VERDICTS)],
+    ("TRANSPORT_ERROR", False), ("BLOCKED_UNKNOWN", False), ("VARIANT_UNVERIFIED", False),
+    ("UNCLASSIFIED", False), ("INVALID_INPUT", False), (None, False),
+])
+async def test_a_warm_only_key_is_proven_shopify_only_by_a_storefront_verdict(_guard, verdict, proven):
+    key = ("warm.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [] if verdict is None else [_due_row(key, hours_ago=30, verdict=verdict, detail="x")]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+async def test_proven_is_sticky_once_a_host_has_held_a_positive_window(_guard):
+    """One throttle on a real Shopify store must not make it unproven: a host that has ever held a
+    positive window stays proven whatever its last verdict was."""
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=30, verdict="TRANSPORT_ERROR", detail="throttled",
+                              positive_until=_GUARD_NOW + timedelta(hours=40))]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is True
+
+
+async def test_the_default_cap_is_eight(_guard, monkeypatch):
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", raising=False)
+    warm = [(f"warm-{i}.example", "US") for i in range(30)]
+    _guard["lanes"] = _guard_lanes([], warm)
+    assert len(await sweep.load_population(24)) == 8
+
+
+def test_the_storefront_verdicts_are_real_preflight_verdicts():
+    assert sweep.SHOPIFY_STOREFRONT_VERDICTS <= {v.value for v in Verdict}
+
+
+async def test_an_unproven_host_feeds_neither_the_ip_breaker_nor_the_shopify_edge(monkeypatch):
+    """The two transports `_sweep_targets` builds per check, recorded: an unproven warm-only host
+    is paced by the run's pacer only; a proven one (and every core key) is unchanged."""
+    built = []
+
+    class _Paced:
+        def __init__(self, inner, pacer, *, shopify_edge):
+            built.append(("edge", shopify_edge))
+
+    class _Watch:
+        def __init__(self, inner, breaker, *, observe=True):
+            built.append(("observe", observe))
+            self.refused = 0
+
+        async def aclose(self):
+            return None
+
+    async def _check(target, *, vantage, client):
+        return res("ELIGIBLE", card=True, host=target.domain)
+
+    async def _record(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(sweep, "PacedTransport", _Paced)
+    monkeypatch.setattr(sweep, "_ThrottleWatchingTransport", _Watch)
+    monkeypatch.setattr(sweep, "_inner_transport", lambda via: None)
+    monkeypatch.setattr(sweep, "_check_one", _check)
+    monkeypatch.setattr(sweep.facts, "record_check", _record)
+    monkeypatch.setattr(sweep.httpx, "AsyncClient", lambda **_k: _NullClient())
+    counts = {name: 0 for name in sweep._COUNTS}
+    breaker = sweep._new_breaker()
+    targets = [sweep.Target("unproven.example", "US", proven_shopify=False),
+               sweep.Target("proven.example", "US")]
+    await sweep._sweep_targets(targets, [(mp.WORKER_VANTAGE, None)], {}, None, breaker, counts, 0,
+                               lambda: False)
+    assert built == [("edge", False), ("observe", False), ("edge", True), ("observe", True)]
+    assert counts["checked"] == 2
+
+
+class _NullClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+async def test_list_due_carries_the_last_verdict_and_detail(_db):
+    await mp.record_check("nocatalog.example", "US", res(
+        "VARIANT_UNVERIFIED", host="nocatalog.example", detail="products_json_page_1_status_404"))
+    row = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "nocatalog.example")
+    assert (row["verdict"], row["detail"]) == ("VARIANT_UNVERIFIED", "products_json_page_1_status_404")
+    assert sweep._found_no_shopify_catalog(row["verdict"], row["detail"]) is True
+    assert row["positive_until"] is None
+    await mp.record_check("positive.example", "US", res("ELIGIBLE", card=True, host="positive.example"))
+    positive = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "positive.example")
+    assert positive["positive_until"] is not None
 
