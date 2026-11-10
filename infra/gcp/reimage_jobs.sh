@@ -23,9 +23,9 @@
 # changes, because the jobs that write prices or the graph (relgraph-sync, external-referral-refresh,
 # the sweeps) are each re-imaged on the owner's go. `--apply` with no names is refused.
 #
-# GATEWAY IMAGES resolve through _gateway_image.sh: pivota-gateway (built on merge, immutable tags)
-# first, then pivota (hand builds). Rolling a job onto the same sha in the other repository is a
-# roll like any other.
+# GATEWAY IMAGES resolve through _gateway_image.sh: `pivota` (hand builds, and every image built
+# before build-on-merge) first, then `pivota-gateway` (built on merge, immutable tags). A lookup error
+# other than "not found" refuses. The plan line prints which repository the sha resolved to.
 #
 # REFUSALS, each a hard stop:
 #   - the sha is not on the repo's main (checked against GitHub's compare API, public repos);
@@ -35,8 +35,9 @@
 #   - retailer-ingest-drain unless named explicitly AND RETAILER_INGEST_DRAIN_WRITER=1: that job has
 #     a single writer for its image, and a default "all backend jobs" run must not roll it.
 #   - a job whose executions cannot be listed (a failed read is not "nothing running").
-# One refusal stops the run before anything changes. A FAILED VERIFY mid-roll stops at that job; the
-# jobs listed as "rolled" before it stay rolled (each was verified), and the message names them.
+# One refusal stops the run before anything changes. Any failure mid-roll (update, re-read or verify)
+# stops at that job; the jobs rolled before it stay rolled (each was verified), and the message names
+# them.
 set -euo pipefail
 
 ENV="${1:-}"; MODE="${2:-}"
@@ -187,8 +188,12 @@ case "$(echo "$cmp" | cut -f1)" in
   *) echo "$SHA is not on $REPO_NAME main (compare: $(echo "$cmp" | cut -f1)); refusing" >&2; exit 1 ;;
 esac
 if [ "$MODE" = gateway ]; then
-  TARGET_IMAGE="$(resolve_gateway_image "$SHA")" \
-    || { echo "missing image gateway:$SHA in pivota-gateway and pivota; build it first" >&2; exit 1; }
+  _rc=0; TARGET_IMAGE="$(resolve_gateway_image "$SHA")" || _rc=$?
+  case "$_rc" in
+    0) ;;
+    1) echo "missing image gateway:$SHA in pivota and pivota-gateway; build it first" >&2; exit 1 ;;
+    *) echo "cannot resolve gateway:$SHA (lookup error above); refusing" >&2; exit 1 ;;
+  esac
 else
   TARGET_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/$IMAGE_NAME:$SHA"
   "$GCLOUD" artifacts docker images describe "$TARGET_IMAGE" >/dev/null 2>&1 \
@@ -226,7 +231,8 @@ for job in $JOBS; do
   if [ "$image" = "$TARGET_IMAGE" ] && [ "$stamp" = "$SHA" ]; then
     echo "same  $job (already on ${SHA:0:12})"; continue
   fi
-  echo "plan  $job: ${image##*/} (stamp ${stamp:0:12}) -> $IMAGE_NAME:${SHA:0:12}"
+  # The plan names the REPOSITORY too: the operator names a sha, and must see which image it resolved to.
+  echo "plan  $job: ${image#*/pivota-shared/} (stamp ${stamp:0:12}) -> ${TARGET_IMAGE#*/pivota-shared/}"
   plan="$plan $job"
 done
 
@@ -235,6 +241,8 @@ done
 if [ "$APPLY" != true ]; then echo "DRY RUN: re-run with --apply to roll:$plan"; exit 0; fi
 
 rolled=""
+# Any failure mid-roll (a failed update, a failed re-read, a failed verify) names what is already done.
+trap 'echo "STOPPED mid-roll; already rolled and verified:${rolled:- none}" >&2' ERR
 for job in $plan; do
   before="$(job_shape "$job")"
   "$GCLOUD" run jobs update "$job" --region "$REGION" --image "$TARGET_IMAGE" \

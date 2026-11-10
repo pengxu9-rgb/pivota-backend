@@ -21,8 +21,9 @@
 #   no flags          trigger PAUSED, job args are a DRY RUN. A hand execution writes nothing.
 #   --enable          trigger RESUMED, job args are a DRY RUN: a daily would-be census in the log.
 #   --enable --apply  trigger RESUMED, job args carry --apply: it writes. --apply alone is refused.
-# A run without --enable pauses an existing trigger FIRST, before any preflight, so worker drift or a
-# missing image can never keep an armed writer running. Fastest disarm, no script needed:
+# A run that does not WRITE (no flags, or --enable alone) pauses the trigger FIRST, before any
+# preflight, so worker drift or a missing image can never keep an --apply lane running; an --enable
+# run resumes it at the end, after the job's args have been stepped back to a dry run. Fastest disarm, no script needed:
 #   gcloud scheduler jobs pause brand-official-canonical-promote-cron --location us-west1 --project pivota-prod
 #
 # THIS SCRIPT OWNS THE JOB'S WHOLE ENV AND SECRETS: --set-env-vars / --set-secrets REPLACE the set on
@@ -99,13 +100,30 @@ CATEGORY_LEAF_REQUIRED_FOR_SERVING=<unset>
 CATALOG_TRUST_CRAWL_FRESH_ENABLED=<unset>
 CATALOG_TRUST_CRAWL_FRESH_DAYS=<unset>
 CATALOG_TRUST_CRAWL_FRESH_RECHECK_LIMIT=<unset>
-AGENT_PDP_VIEW_UNBUILDABLE_REAP=<unset>"
+AGENT_PDP_VIEW_UNBUILDABLE_REAP=<unset>
+ENABLE_KBEAUTY_EVIDENCE_GATES=<unset>
+CATALOG_TRUST_RENDERABLE_GATE=<unset>"
 
-# DISARM FIRST: a run without --enable pauses an existing trigger before anything below can refuse.
-if [ "$ENABLED" != true ] && have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGION"; then
-  "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
-    || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }
-  echo "== paused $TRIGGER (disarm runs before the preflight)"
+# THE FAMILY GUARD (delta review, D-P2-2): a grep of today's code always lags tomorrow's. So beyond
+# the pins, the preflight REFUSES when the worker sets ANY plain-value flag in these catalog families
+# that is neither pinned above nor listed below as read only elsewhere. A new eligibility or trust
+# flag turned on in `worker` stops this script until someone decides how the job should carry it.
+CATALOG_FLAG_FAMILIES="AGENT_PDP_VIEW_ CATALOG_TRUST_ CATEGORY_ ENABLE_KBEAUTY_ ENABLE_STORELESS_ INDEX_ INDEXNOW_ PDP_QUALITY_ PIVOTA_SERVING_ SERVE_PDP_ SERVING_ STRICT_BEAUTY_"
+# Set on the worker, in a family above, and NOT read by this path. Each needs its reason.
+#   AGENT_PDP_VIEW_RECONCILE_LIMIT   batch size of jobs/agent_pdp_view_reconciler_cron.py only
+NOT_READ_BY_THIS_PATH="AGENT_PDP_VIEW_RECONCILE_LIMIT"
+
+# DISARM FIRST: any run that does not WRITE (no flags, or --enable alone) pauses the trigger before
+# anything below can refuse, so a preflight refusal can never leave an --apply lane running. The pause
+# is always attempted; only "not found" (no trigger yet) is fine. An --enable run resumes it at the end.
+if [ "$APPLY" != true ]; then
+  _err="$("$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet 2>&1 >/dev/null)" && \
+    echo "== paused $TRIGGER (disarm runs before the preflight)" || {
+    case "$_err" in
+      *NOT_FOUND*|*"not found"*|*"Not found"*) ;;
+      *) printf 'FAILED to pause %s - it may be LIVE:\n%s\n' "$TRIGGER" "$_err" >&2; exit 1 ;;
+    esac
+  }
 fi
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
@@ -115,18 +133,26 @@ have "$GCLOUD" artifacts docker images describe "$BACKEND_IMAGE" \
 echo "== preflight: pinned flags vs the live worker service"
 WORKER_JSON="$("$GCLOUD" run services describe worker --region "$REGION" --format=json)" \
   || { echo "cannot read the worker service; refusing to provision without verifying the pinned flags" >&2; exit 1; }
-WORKER_JSON="$WORKER_JSON" PINNED_FLAGS="$PINNED_FLAGS" "$PYTHON" - <<'PY' || exit 1
+WORKER_JSON="$WORKER_JSON" PINNED_FLAGS="$PINNED_FLAGS" FAMILIES="$CATALOG_FLAG_FAMILIES" \
+  NOT_READ="$NOT_READ_BY_THIS_PATH" "$PYTHON" - <<'PY' || exit 1
 import json, os, sys
 doc = json.loads(os.environ["WORKER_JSON"])
 env = {}
 for e in doc["spec"]["template"]["spec"]["containers"][0].get("env", []):
     env[e["name"]] = e.get("value") if "value" in e else None
 bad = []
+pinned = set()
 for line in os.environ["PINNED_FLAGS"].splitlines():
     name, want = line.split("=", 1)
+    pinned.add(name)
     have = env.get(name, "<unset>")
     if have != want:
         bad.append(f"  {name}: pinned {want!r}, worker has {have!r}")
+families = tuple(os.environ["FAMILIES"].split())
+not_read = set(os.environ["NOT_READ"].split())
+for name in sorted(env):
+    if name.startswith(families) and name not in pinned and name not in not_read:
+        bad.append(f"  {name}: set on the worker, in a catalog flag family, and neither pinned nor listed as not read")
 if bad:
     print("REFUSING: pinned flags disagree with the live worker:\n" + "\n".join(bad), file=sys.stderr)
     print("Update PINNED_FLAGS in this script after deciding which value is right.", file=sys.stderr)

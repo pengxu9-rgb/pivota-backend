@@ -86,6 +86,10 @@ case "$CONFIG" in apply|preserve) ;; *) echo "CONFIG must be apply or preserve (
 #   ARM=content-canonical-election-cron infra/gcp/setup_scheduler.sh prod <a> <b>
 : "${ARM:=}"
 : "${DISARM:=}"
+# Whitespace is stripped ONCE, here: sched() matches names exactly, so `ARM="a, b"` used to arm `a`
+# and silently skip ` b` (delta review of be#2779, D-P3-2). Trigger names never contain spaces.
+ARM="$(printf '%s' "$ARM" | tr -d '[:space:]')"
+DISARM="$(printf '%s' "$DISARM" | tr -d '[:space:]')"
 : "${RELGRAPH_PUBLICATION_WORKER:=false}"
 : "${SEARCH_INDEX_PUBLICATION_WORKER:=false}"
 : "${CHECKOUT_VALIDATION_WORKER:=false}"
@@ -195,10 +199,16 @@ GCLOUD="${GCLOUD:-gcloud}"; REGION=us-west1; HERE="$(cd "$(dirname "$0")" && pwd
 . "$HERE/_serving_revision.sh"
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/backend:$BACKEND_TAG"
-# Gateway images built on merge live in pivota-gateway (immutable tags); hand builds in pivota.
+# A gateway sha resolves in pivota (hand builds) first, then pivota-gateway (built on merge); see
+# _gateway_image.sh for why that order, and why only "not found" falls through.
 # shellcheck source=infra/gcp/_gateway_image.sh
 . "$HERE/_gateway_image.sh"
-GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG"
+_rc=0; GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || _rc=$?
+case "$_rc" in
+  0) ;;
+  1) GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG" ;;  # in neither: today's path, which fails later exactly as before
+  *) echo "cannot resolve gateway:$GATEWAY_TAG (lookup error above); refusing" >&2; exit 1 ;;
+esac
 BROWSER_AUDIT_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/store-audit-browser:$GATEWAY_TAG"
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
 UCP_CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
@@ -1211,15 +1221,16 @@ if [ "$CONFIG" != apply ] && [ -n "${WORKERS_REQUESTED:-}" ] && [ "${WORKERS_REQ
 fi
 "$GCLOUD" scheduler jobs list --location "$REGION" --format="table(name.basename(),schedule,state)"
 
-# AN ARM/DISARM NAME THIS SCRIPT DOES NOT DEFINE CHANGED NOTHING. Say so, and fail, so a stale
-# instruction (e.g. the old `ARM=relgraph-health-cron`, now owned by setup_relgraph_health_job.sh)
-# is not mistaken for a done step.
+# AN ARM/DISARM NAME THAT NO sched() CALL REACHED ON THIS RUN CHANGED NOTHING: either this script does
+# not define it (e.g. the old `ARM=relgraph-health-cron`, now owned by setup_relgraph_health_job.sh),
+# or it is defined inside a lane this run did not enable. Say so, and fail, so it is not mistaken for
+# a done step.
 UNKNOWN=""
 for name in $(printf '%s' "$ARM,$DISARM" | tr ',' ' '); do
   in_list "$name" "${SCHED_SEEN#,}" || UNKNOWN="$UNKNOWN $name"
 done
 if [ -n "$UNKNOWN" ]; then
-  echo "ERROR: ARM/DISARM named triggers this script does not define, so nothing was done for them:$UNKNOWN" >&2
+  echo "ERROR: ARM/DISARM named triggers this run did not reach (not defined here, or in a lane not enabled on this run), so nothing was done for them:$UNKNOWN" >&2
   echo "       (relgraph-health-cron: use infra/gcp/setup_relgraph_health_job.sh)" >&2
   exit 3
 fi

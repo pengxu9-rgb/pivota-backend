@@ -32,8 +32,10 @@ Each prod change below (create or arm a job, re-image, IAM) needs the owner's go
 (`--set-env-vars` / `--set-secrets`), so a value set by hand on the job is wiped. Put it in the
 script.
 
-**Disarm, fastest first.** A re-run without `--enable` pauses the trigger before any preflight, so it
-works even when the image is missing or the worker's flags have drifted. Without the script:
+**Disarm, fastest first.** A re-run that does not arm (relgraph-health without `--enable`; the promote
+without `--apply`) pauses the trigger before any preflight, so it works even when the image is missing
+or the worker's flags have drifted. Only "not found" is tolerated; any other pause error stops the
+run. Without the script:
 
 ```bash
 gcloud scheduler jobs pause relgraph-health-cron --location us-west1 --project pivota-prod
@@ -85,12 +87,17 @@ and fails if anything else changed. Use `gateway` instead of `backend` for gatew
   - it is 10:15-11:45 UTC and the job is a relgraph job;
   - an execution is still running, or the executions cannot be listed;
   - the job is `retailer-ingest-drain` and it was not named with `RETAILER_INGEST_DRAIN_WRITER=1` (that job has a single writer).
-- One refusal stops the run before anything changes. A failed verify mid-roll stops at that job, and
-  the message lists the jobs already rolled (each one verified) and the ones not attempted.
+- One refusal stops the run before anything changes. Any failure mid-roll (a failed update, re-read
+  or verify) stops at that job, and the message lists the jobs already rolled (each one verified).
+  The per-job `rolled` lines on stdout say the same.
 - Each `--apply` on a job that writes prices or the graph (`relgraph-sync`, `external-referral-refresh`, the sweeps) is its own go.
 - Backend images exist for every merged commit, because `deploy-prod.yml` builds `backend:<sha>`.
 - Gateway images come from two repositories, and every script resolves a sha the same way
-  (`infra/gcp/_gateway_image.sh`): `pivota-gateway` first, then `pivota`.
+  (`infra/gcp/_gateway_image.sh`): `pivota` first, then `pivota-gateway` (full 40-hex shas only).
+  `pivota` comes first because immutable tags protect only a tag's first push: every older sha lives
+  only in `pivota`, so its tag is still free in `pivota-gateway`, and must not be shadowed there. Only
+  "not found" counts as absent; any other lookup error refuses. `reimage_jobs.sh`'s plan line prints
+  the repository a sha resolved to.
   - `pivota-gateway`: built on merge by PIVOTA-Agent's `build-gateway-image.yml` once it is armed (below). Its tags are immutable.
   - `pivota`: hand builds, `gcloud builds submit --config infra/gcp/cloudbuild.gateway.yaml --project pivota-shared --substitutions=COMMIT_SHA=<sha> .` from a PIVOTA-Agent checkout.
 

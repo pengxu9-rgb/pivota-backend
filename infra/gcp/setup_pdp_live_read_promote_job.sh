@@ -61,8 +61,12 @@ CATALOG_TRUST_CRAWL_FRESH_DAYS=<unset>
 SHADE_LINE_CARD_COLLAPSE_ENABLED=<unset>"
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
-GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
-  || { echo "missing image gateway:$GATEWAY_TAG in pivota-gateway and pivota; build it first" >&2; exit 1; }
+_rc=0; GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || _rc=$?
+case "$_rc" in
+  0) echo "== image: $GATEWAY_IMAGE" ;;
+  1) echo "missing image gateway:$GATEWAY_TAG in pivota and pivota-gateway; build it first" >&2; exit 1 ;;
+  *) echo "cannot resolve gateway:$GATEWAY_TAG (lookup error above); refusing" >&2; exit 1 ;;
+esac
 
 echo "== preflight: pinned flags vs the live gateway service"
 GATEWAY_JSON="$("$GCLOUD" run services describe gateway --region "$REGION" --format=json)" \

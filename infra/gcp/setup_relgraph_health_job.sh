@@ -72,16 +72,25 @@ export CLOUDSDK_CORE_PROJECT="$PROJECT"
 # shellcheck source=infra/gcp/_gateway_image.sh
 . "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
 
-# DISARM FIRST: a run without --enable pauses an existing trigger before anything below can refuse.
-if [ "$ENABLED" != true ] && have "$GCLOUD" scheduler jobs describe "$TRIGGER" --location "$REGION"; then
-  "$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet \
-    || { echo "FAILED to pause $TRIGGER - it may be LIVE" >&2; exit 1; }
-  echo "== paused $TRIGGER (disarm runs before the preflight)"
+# DISARM FIRST: a run without --enable pauses the trigger before anything below can refuse. The pause
+# is always attempted; only "not found" (no trigger yet) is fine, any other error stops the run.
+if [ "$ENABLED" != true ]; then
+  _err="$("$GCLOUD" scheduler jobs pause "$TRIGGER" --location "$REGION" --quiet 2>&1 >/dev/null)" && \
+    echo "== paused $TRIGGER (disarm runs before the preflight)" || {
+    case "$_err" in
+      *NOT_FOUND*|*"not found"*|*"Not found"*) ;;
+      *) printf 'FAILED to pause %s - it may be LIVE:\n%s\n' "$TRIGGER" "$_err" >&2; exit 1 ;;
+    esac
+  }
 fi
 
 have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; exit 1; }
-GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
-  || { echo "missing image gateway:$GATEWAY_TAG in pivota-gateway and pivota; build it first (on merge to main by PIVOTA-Agent's build-gateway-image workflow, or by hand with infra/gcp/cloudbuild.gateway.yaml)" >&2; exit 1; }
+_rc=0; GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || _rc=$?
+case "$_rc" in
+  0) echo "== image: $GATEWAY_IMAGE" ;;
+  1) echo "missing image gateway:$GATEWAY_TAG in pivota and pivota-gateway; build it first (on merge to main by PIVOTA-Agent's build-gateway-image workflow, or by hand with infra/gcp/cloudbuild.gateway.yaml)" >&2; exit 1 ;;
+  *) echo "cannot resolve gateway:$GATEWAY_TAG (lookup error above); refusing" >&2; exit 1 ;;
+esac
 
 # SUPPRESSED-ROW THRESHOLD: at most 1% AND at most 500 rows (owner's decision, 2026-11-10). The retired
 # workflow's 0/0 was set for a smaller, cleaner graph. The first hand run here (2026-11-10) found 142

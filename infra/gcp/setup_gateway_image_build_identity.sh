@@ -9,8 +9,8 @@
 # WHY. The gateway never deploys on merge, and until now it was not even BUILT on merge: every
 # `gateway:<sha>` was built by hand with `gcloud builds submit --config infra/gcp/cloudbuild.gateway.yaml`
 # from a laptop checkout, before a job (relgraph-sync, the sentinel, ...) could be re-imaged onto it.
-# PIVOTA-Agent's `.github/workflows/build-gateway-image.yml` builds and pushes `gateway:<sha>` (and
-# `gateway:latest`, as the hand build does) on every push to main. It deploys nothing.
+# PIVOTA-Agent's `.github/workflows/build-gateway-image.yml` builds and pushes `gateway:<sha>` (and only
+# that tag; no `:latest`) on every push to main. It deploys nothing.
 #
 # WHAT THIS CREATES, all in pivota-shared:
 #   repository  us-west1/pivota-gateway   Docker, IMMUTABLE TAGS; readers copied from `pivota`
@@ -24,15 +24,28 @@
 # are mutable (the hand builds re-push `:latest`), and `backend:latest` RUNS in prod as sa-worker
 # (deploy_backend.sh's in-VPC probe, on every backend merge). Writer on `pivota` would let any
 # workflow on PIVOTA-Agent main get code running as sa-worker with no human step. So the CI identity
-# writes only to `pivota-gateway`, and that repository's tags are immutable: a pushed `gateway:<sha>`
-# can never be re-pointed, so a later deploy or re-image of that sha pulls exactly what was built.
-# Readers (the runtime and Cloud Run service-agent identities) are copied from `pivota`'s policy so
-# every job and service that can pull a gateway image today can pull from here.
+# writes only to `pivota-gateway`, whose tags are immutable: once `gateway:<sha>` is pushed there it
+# cannot be re-pointed.
+#
+# WHAT IMMUTABILITY DOES NOT DO (delta review, D-P2-1). It protects a tag's FIRST push only, and every
+# sha built before this repository existed lives in `pivota`, so its tag is still free here. That is
+# why infra/gcp/_gateway_image.sh resolves a sha in `pivota` FIRST: a sha with a hand build keeps
+# resolving to it, and only a sha that exists nowhere but here resolves here. It is also why only a
+# 40-hex tag is ever read from here.
+#
+# WHO ELSE CAN WRITE HERE. Not only this identity: the backend's deploy identity holds project-level
+# roles/artifactregistry.writer on pivota-shared (setup_github_wif.sh), and so do humans with
+# project-level roles. This script grants nothing beyond the one repository-level writer below.
+#
+# Readers (the runtime and Cloud Run service-agent identities) are copied from `pivota`'s policy, ONCE,
+# when this script runs: a reader added to `pivota` later must be added here too (re-running this
+# script does it). Conditional bindings and `deleted:` members are skipped and printed, never copied.
 #
 # RESIDUAL RISK, stated so it is a decision: the workflow builds whatever is on PIVOTA-Agent main, and
-# that code runs in prod anyway once a sha is deployed or a job is re-imaged onto it (both by hand).
-# The identity adds no path around those hand steps: it can create a NEW tag, never change one, and
-# nothing deploys a tag nobody named.
+# that code runs in prod once a sha is deployed or a job is re-imaged onto it, both by hand, naming a
+# sha. A commit on main that rewrote the workflow could push an image whose content differs from its
+# sha's source, but only under a sha that has no `pivota` build, and only for a deploy or re-image
+# that names that sha.
 set -euo pipefail
 
 GCLOUD="${GCLOUD:-gcloud}"; PYTHON="${PYTHON:-python3}"
@@ -75,7 +88,21 @@ esac
 
 echo "== copying readers from $READERS_FROM"
 READERS="$("$GCLOUD" artifacts repositories get-iam-policy "$READERS_FROM" --location="$REGION" --project="$SHARED" --format=json \
-  | "$PYTHON" -c 'import json,sys; print("\n".join(m for b in json.load(sys.stdin).get("bindings", []) if b["role"] == "roles/artifactregistry.reader" for m in b["members"]))')"
+  | "$PYTHON" -c '
+import json, sys
+out = []
+for b in json.load(sys.stdin).get("bindings", []):
+    if b.get("role") != "roles/artifactregistry.reader":
+        continue
+    if b.get("condition"):
+        print("   SKIPPED conditional reader binding (copy it by hand if it is wanted): " + " ".join(b.get("members", [])), file=sys.stderr)
+        continue
+    for m in b.get("members", []):
+        if m.startswith("deleted:"):
+            print("   SKIPPED deleted member: " + m, file=sys.stderr)
+            continue
+        out.append(m)
+print("\n".join(out))')"
 [ -n "$READERS" ] || { echo "no readers found on $READERS_FROM; refusing to create a repository nothing can pull from" >&2; exit 1; }
 while IFS= read -r member; do
   "$GCLOUD" artifacts repositories add-iam-policy-binding "$AR_REPO" --location="$REGION" --project="$SHARED" \

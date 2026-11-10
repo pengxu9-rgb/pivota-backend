@@ -99,6 +99,14 @@ FAKE_GCLOUD = textwrap.dedent(
         fi
         exit 1 ;;
       "iam service-accounts") exit 0 ;;
+      "artifacts docker images")               # _gateway_image.sh lookups, per repository
+        for r in ${DENIED_REPOS:-}; do
+          case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;; esac
+        done
+        for r in ${MISSING_REPOS:-}; do
+          case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: Image not found." >&2; exit 1 ;; esac
+        done
+        exit 0 ;;
       "run revisions describe") printf '%s' "$REVISION_JSON"; exit 0 ;;
       "run services describe")
         case "$*" in *--format=json*) printf '%s' "$WEB_JSON" ;; *) echo "https://worker.example" ;; esac
@@ -199,13 +207,35 @@ def test_an_arm_name_this_script_does_not_define_fails_loudly(tmp_path, var):
     """`ARM=relgraph-health-cron` was the documented hand step until that trigger moved to its own
     script. A name sched() never saw changed nothing, so the run must say so and exit non-zero."""
     calls, proc = _run_full(tmp_path, {var: "relgraph-health-cron"}, expect_rc=3)
-    assert "does not define" in proc.stderr and "relgraph-health-cron" in proc.stderr
+    assert "did not reach" in proc.stderr and "relgraph-health-cron" in proc.stderr
     assert not [c for c in calls if re.search(r"\bscheduler jobs (pause|resume) relgraph-health-cron\b", c)]
 
 
 def test_a_defined_arm_name_still_passes(tmp_path):
     calls, proc = _run_full(tmp_path, {"ARM": "content-canonical-election-cron"})
     assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("missing,repo", [("", "pivota"), ("pivota", "pivota-gateway")])
+def test_gateway_jobs_take_the_resolved_image_pivota_first(tmp_path, missing, repo):
+    calls = _run(tmp_path, {"MISSING_REPOS": missing})
+    sync = [c for c in calls if re.match(r"run jobs (create|update) relgraph-sync ", c)]
+    assert sync, calls[:5]
+    assert f"/pivota-shared/{repo}/gateway:" in sync[0], sync[0]
+
+
+def test_a_gateway_lookup_error_stops_the_run(tmp_path):
+    calls, proc = _run_full(tmp_path, {"DENIED_REPOS": "pivota"}, expect_rc=1)
+    assert "lookup error" in proc.stderr
+    assert not [c for c in calls if re.match(r"run jobs (create|update) ", c)]
+
+
+def test_a_space_after_a_comma_still_disarms_both(tmp_path):
+    """`DISARM="a, b"` used to pause only `a` and leave `b` - the per-minute mailer here - armed."""
+    calls = _run(tmp_path, {"DISARM": "content-canonical-election-cron, reviews-invitation-send-cron"})
+    paused = {verb_target for verb_target in _state_changes(calls) if verb_target[0] == "pause"}
+    assert ("pause", "content-canonical-election-cron") in paused
+    assert ("pause", "reviews-invitation-send-cron") in paused
 
 
 def test_it_does_not_require_the_retired_railway_files(tmp_path):
