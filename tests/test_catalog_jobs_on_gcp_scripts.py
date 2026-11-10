@@ -198,7 +198,9 @@ def test_health_is_dark_by_default_and_read_only_on_the_default_subnet(tmp_path)
     assert flag(job, "--command") == "npm" and flag(job, "--args") == "run,relgraph:health-job"
     e = env_vars(job)
     assert e["PIVOTA_COMMIT_SHA"] == TAG and e["PIVOTA_ENV"] == "production"
-    assert (e["RELGRAPH_MAX_SUPPRESSED_ROWS"], e["RELGRAPH_MAX_SUPPRESSED_PCT"]) == ("0", "0")
+    # Owner's threshold (2026-11-10): <= 500 rows AND <= 1%; critical reasons stay at zero tolerance
+    # through the job's built-in list, which is why RELGRAPH_CRITICAL_REASONS is asserted unset below.
+    assert (e["RELGRAPH_MAX_SUPPRESSED_ROWS"], e["RELGRAPH_MAX_SUPPRESSED_PCT"]) == ("500", "1")
     assert (e["RELGRAPH_MAX_EXPIRING_14D_PCT"], e["RELGRAPH_MIN_TOTAL_ROWS"]) == ("30", "500")
     # The parser falls back to its built-in critical reasons only when the list is EMPTY; passing one
     # through comma-split gcloud env would risk a single bogus reason. It must stay unset.

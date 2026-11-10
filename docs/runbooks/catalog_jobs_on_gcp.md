@@ -43,9 +43,10 @@ gcloud scheduler jobs pause relgraph-health-cron --location us-west1 --project p
 gcloud scheduler jobs pause brand-official-canonical-promote-cron --location us-west1 --project pivota-prod
 ```
 
-**Before `--enable` on relgraph-health:** its first hand run (2026-11-10) failed the serving guard: 142
-suppressed rows (0.28%), all non-critical reasons, against a 0/0 threshold. Arming it as-is pages
-daily. Decide the threshold, or clean up those rows, first.
+**relgraph-health's suppressed-row threshold is at most 1% and at most 500 rows** (decided
+2026-11-10). Its first hand run found 142 suppressed rows (0.28%), all with non-critical reasons,
+which the old 0/0 threshold would have paged on every night. Critical reasons stay at zero tolerance,
+and the expiry alarm is unchanged. Arming is still its own go.
 
 **The brand-official promote has no `--limit`.** A row the classifier blocks stays in its
 population, so a daily limit would re-score the same blocked rows forever. Size it instead: run

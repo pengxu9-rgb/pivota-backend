@@ -83,7 +83,14 @@ have "$GCLOUD" iam service-accounts describe "$SA" || { echo "missing $SA" >&2; 
 GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
   || { echo "missing image gateway:$GATEWAY_TAG in pivota-gateway and pivota; build it first (on merge to main by PIVOTA-Agent's build-gateway-image workflow, or by hand with infra/gcp/cloudbuild.gateway.yaml)" >&2; exit 1; }
 
-# The thresholds are the retired GitHub workflow's, exactly as setup_scheduler.sh passed them.
+# SUPPRESSED-ROW THRESHOLD: at most 1% AND at most 500 rows (owner's decision, 2026-11-10). The retired
+# workflow's 0/0 was set for a smaller, cleaner graph. The first hand run here (2026-11-10) found 142
+# suppressed rows (0.28% of 50,483), every one with a NON-critical reason (same-family variant,
+# fragrance scent family, same product across sizes, fragrance category). The serving guard already
+# hides those rows at read time, so 0/0 would page every night over a known, handled state. 1% / 500
+# still pages on a ~3x jump. The three CRITICAL reasons stay at zero tolerance (below), and the
+# expiry thresholds are unchanged.
+# The expiry thresholds are the retired GitHub workflow's, exactly as setup_scheduler.sh passed them.
 # RELGRAPH_CRITICAL_REASONS is deliberately NOT passed: gcloud splits --set-env-vars on commas, and
 # the job's parser falls back to its built-in three only when the list is EMPTY, so leaving it unset
 # is the one path that cannot be mis-parsed into a single bogus reason. The three are:
@@ -92,7 +99,7 @@ GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" \
 #   anchor_ref_unresolvable_nested_product_prefix
 # RELGRAPH_FAIL_ON_NOOP is deliberately NOT set: the no-op detector reports and does not page.
 ENV_VARS="PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=$JOB,PIVOTA_COMMIT_SHA=$GATEWAY_TAG,DB_POOL_MAX=3"
-ENV_VARS="$ENV_VARS,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=0,RELGRAPH_MAX_SUPPRESSED_PCT=0"
+ENV_VARS="$ENV_VARS,RELGRAPH_MARKET=US,RELGRAPH_MAX_SUPPRESSED_ROWS=500,RELGRAPH_MAX_SUPPRESSED_PCT=1"
 ENV_VARS="$ENV_VARS,RELGRAPH_MAX_EXPIRING_14D_PCT=30,RELGRAPH_MIN_TOTAL_ROWS=500,RELGRAPH_READOUT_RUN_DAYS=7"
 
 echo "== job: $JOB (default subnet, read-only)"
