@@ -22,9 +22,11 @@ the asserted agent the request's AgentContext on the routes those ops reach:
 
 Anything else leaves the context EXACTLY as get_agent_context built it (the gateway), with one
 log line and a counter naming why: `absent` (the gateway sent no header), `unbound_v1` (a v1
-token), `ignored_not_service` (a header from a caller that may not vouch). A refused v2 header is
-counted as `rejected_<reason>`. Ownership is never taken from a request body field or from an
-unverified header.
+token), `ignored_not_service` (a header from a caller that may not vouch), `absent_oauth_unregistered`
+(a v2 token that verifies in full, nonce included, for an OAuth client that maps to no active
+agent: the public connectors, which are nobody's partner, so the call stays the gateway's, as it was
+before this change; O-04 status review P1-7). A refused v2 header is counted as `rejected_<reason>`.
+Ownership is never taken from a request body field or from an unverified header.
 
 A checkout-token request is never touched: the token names its own agent and order.
 """
@@ -63,7 +65,8 @@ PARTNER_AGENT_ID_METADATA_KEY = "partner_agent_id"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
-#: Outcome counts for this process: adopted / absent / invalid / ignored_not_service.
+#: Outcome counts for this process: adopted / absent / absent_oauth_unregistered / unbound_v1 /
+#: ignored_not_service / rejected_<reason>.
 FORWARDED_OWNER_OUTCOMES: Counter = Counter()
 
 
@@ -158,18 +161,30 @@ async def _resource_id(request: Request, raw_body: bytes, resource: Optional[Tup
     return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else None
 
 
-async def _subject_agent_id(subject: BoundSubject) -> Optional[str]:
-    """The ACTIVE, non-service agent a verified subject names: the v1 rules, unchanged."""
+#: The reason for a VERIFIED v2 OAuth subject whose client maps to no active agent (a public or
+#: unprovisioned client, a foreign issuer, a disabled registration). It is not a refusal: such a caller
+#: is nobody's partner, so the request is treated like one with no header and stays the gateway's.
+OAUTH_UNREGISTERED = "oauth_unregistered"
+
+
+async def _subject_agent_id(subject: BoundSubject) -> Tuple[Optional[str], str]:
+    """(agent_id, "ok") for the ACTIVE, non-service agent a verified subject names (the v1 rules,
+    unchanged), else (None, why). An agent subject that names no active agent is "subject" (the
+    gateway signs `kind: agent` only for an agent key it verified, so that is a fault, refused). An
+    OAuth client that maps to no active agent is OAUTH_UNREGISTERED. A lookup that FAILS is
+    "subject" either way: unreadable is never taken as "nobody's"."""
     excluded = agent_auth.issuing_excluded_agent_ids()
     try:
         if subject.kind == "agent":
-            return await ia._active_agent_id(subject.agent_id, excluded)
+            agent_id = await ia._active_agent_id(subject.agent_id, excluded)
+            return (agent_id, "ok") if agent_id else (None, "subject")
         if subject.kind == "oauth":
             registered = await ia.agent_for_oauth_client(subject.issuer or "", subject.client_id or "")
-            return await ia._active_agent_id(registered, excluded)
+            agent_id = await ia._active_agent_id(registered, excluded) if registered else None
+            return (agent_id, "ok") if agent_id else (None, OAUTH_UNREGISTERED)
     except Exception as exc:  # noqa: BLE001 -- unreadable = not adoptable
         logger.warning("partner_identity_forwarding subject lookup failed: %s", type(exc).__name__)
-    return None
+    return None, "subject"
 
 
 def _reject(reason: str, *, op: str, request: Request, caller: Optional[str]) -> HTTPException:
@@ -189,7 +204,9 @@ async def verify_bound_forwarded_subject(
 ) -> Tuple[Optional[str], Optional[str], str]:
     """(agent_id, op, reason) for this request's v2 assertion. Checks the binding (method, path,
     resource id, body hash), the window, the subject, and LAST claims the nonce (single use), so a
-    token that fails any other check never burns one. Never raises."""
+    token that fails any other check never burns one. A fully verified token for an unregistered
+    OAuth client burns its nonce too (it is single use like any other) and answers
+    (None, op, OAUTH_UNREGISTERED). Never raises."""
     token = _header(request)
     try:
         raw_body = await request.body()
@@ -205,13 +222,15 @@ async def verify_bound_forwarded_subject(
     )
     if verdict.subject is None:
         return None, None, verdict.reason
-    agent_id = await _subject_agent_id(verdict.subject)
-    if not agent_id:
-        return None, None, "subject"
+    agent_id, miss = await _subject_agent_id(verdict.subject)
+    if not agent_id and miss != OAUTH_UNREGISTERED:
+        return None, None, miss
     first_use, store = await assertion_replay_guard.claim(verdict.subject.jti, REPLAY_TTL_SECONDS)
     if not first_use:
         logger.info("partner_identity_forwarding nonce reuse refused store=%s", store)
         return None, None, "replay"
+    if not agent_id:
+        return None, verdict.subject.op, OAUTH_UNREGISTERED
     return agent_id, verdict.subject.op, "ok"
 
 
@@ -226,8 +245,10 @@ async def adopt_forwarded_owner(
     a REQUEST-BOUND (v2) assertion and the flag is on, else `context` itself, unchanged.
 
     From the vouching service: no header, or a v1 token (unbound, e.g. an older gateway revision),
-    leaves the gateway the owner (`absent` / `unbound_v1`); a v2 token that fails ANY check (MAC,
-    op, window, method, path, resource, body, subject, nonce already used) refuses the request with
+    leaves the gateway the owner (`absent` / `unbound_v1`), and so does a v2 token that verifies in
+    full for an OAuth client that maps to no active agent (`absent_oauth_unregistered`: a public
+    connector is nobody's partner). A v2 token that fails ANY check (MAC, op, window, method, path,
+    resource, body, an agent subject that is not active, nonce already used) refuses the request with
     409 PARTNER_ASSERTION_REJECTED, so a captured or edited header can never act, nor quietly fall
     back. From anyone else the header is ignored. Raises the adopted agent's 429 too."""
     if not partner_identity_forwarding_enabled():
@@ -250,6 +271,9 @@ async def adopt_forwarded_owner(
         return context
 
     agent_id, matched_op, reason = await verify_bound_forwarded_subject(request, ops=ops, resource=resource)
+    if reason == OAUTH_UNREGISTERED:
+        _note("absent_oauth_unregistered", op=matched_op or op_label, request=request, caller=caller)
+        return context
     if not agent_id:
         raise _reject(reason, op=op_label, request=request, caller=caller)
     agent: Optional[Dict[str, Any]] = None
