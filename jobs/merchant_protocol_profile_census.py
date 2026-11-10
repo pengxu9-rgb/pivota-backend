@@ -807,10 +807,16 @@ def main(argv: Optional[List[str]] = None, *, out: Callable[[str], None] = _prin
                         help="the merchant directory's domains, read from the database (not with --domains*)")
     args = parser.parse_args(argv)
 
-    # httpx logs every request URL at INFO; this job's own lines are the whole output.
-    for name in ("httpx", "httpcore"):
+    # httpx logs every request URL at INFO; this job's own lines are the whole output. The levels are
+    # put back afterwards: a caller in the same process (a test run, another job) keeps its own.
+    quieted = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    for name in quieted:
         logging.getLogger(name).setLevel(logging.WARNING)
-    return asyncio.run(amain(args, out=out, **seams))
+    try:
+        return asyncio.run(amain(args, out=out, **seams))
+    finally:
+        for name, level in quieted.items():
+            logging.getLogger(name).setLevel(level)
 
 
 if __name__ == "__main__":

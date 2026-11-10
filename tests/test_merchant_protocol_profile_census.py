@@ -154,6 +154,9 @@ class _FakeDirectoryDb:
         self.rows = {"tierb_cart_link_eligibility": [{"shop_domain": v} for v in tierb],
                      "merchant_purchasability": [{"merchant_domain": v} for v in purchasability]}
         self.fail = fail
+        # Another test file in the same process may have left the shared object connected; the
+        # directory read connects only when nothing has, so pin the state it starts from.
+        monkeypatch.setattr(database, "is_connected", False)
         monkeypatch.setattr(database, "connect", self.connect)
         monkeypatch.setattr(database, "disconnect", self.disconnect)
         monkeypatch.setattr(database, "fetch_all", self.fetch_all)
@@ -996,6 +999,25 @@ def test_a_robots_reader_that_breaks_allows_nothing(monkeypatch):
     monkeypatch.setattr(census.RobotFileParser, "parse", _boom)
     net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots("User-agent: *\nAllow: /\n")})
     assert got.row("shop-a.example")["err"] == "robots_unparseable" and net.paths("shop-a.example") == [R]
+
+
+def test_a_run_leaves_the_http_library_log_levels_as_it_found_them(monkeypatch):
+    """The job quiets httpx/httpcore for its own run. Left quiet, every later test in the same
+    process that asserts on those loggers' records sees none."""
+    import logging
+
+    before = {}
+    for name, level in (("httpx", logging.DEBUG), ("httpcore", logging.NOTSET)):
+        before[name] = logging.getLogger(name).level
+        logging.getLogger(name).setLevel(level)
+    try:
+        _, got = _census(monkeypatch, {})
+        assert got.code == 0
+        assert logging.getLogger("httpx").level == logging.DEBUG
+        assert logging.getLogger("httpcore").level == logging.NOTSET
+    finally:
+        for name, level in before.items():
+            logging.getLogger(name).setLevel(level)
 
 
 # ── the directory population ─────────────────────────────────────────────────────────────────
