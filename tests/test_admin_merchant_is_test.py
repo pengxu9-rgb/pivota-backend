@@ -1,0 +1,391 @@
+"""POST/GET /admin/merchants/{merchant_id}/is-test, and what the fact does downstream.
+
+The route (routes/admin_merchant_is_test.py) is admin-only, needs a reason, and writes the column
+and an employee_audit_logs row in one transaction. The fact reaches the agent merchant list and
+the protocol directory's rig domains only while MERCHANT_IS_TEST_FILTER_ENABLED is on; with it off
+both answer exactly as before.
+
+Drives the real routers on a minimal app (never `main`'s startup) against the test DB, with real
+JWTs. tests/test_admin_merchant_is_test_postgres.py runs these cases on Postgres.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import uuid
+from pathlib import Path
+
+import httpx
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from db.database import database  # noqa: E402
+
+RUN = uuid.uuid4().hex[:8]
+AGENT = f"agent_it_{RUN}"
+M_TEST = f"merch_it_flagged_{RUN}"
+M_REAL = f"merch_it_real_{RUN}"
+OURS = (M_TEST, M_REAL)
+TEST_HOST = f"shop-a-{RUN}.example.com"
+REAL_HOST = f"shop-b-{RUN}.example.com"
+FLAG = "MERCHANT_IS_TEST_FILTER_ENABLED"
+_MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/282_merchant_onboarding_is_test.sql"
+
+
+def _sync_url() -> str:
+    return (os.getenv("DATABASE_URL") or "").replace("sqlite+aiosqlite://", "sqlite://").replace(
+        "postgresql+asyncpg://", "postgresql://"
+    )
+
+
+async def _table_exists(name: str) -> bool:
+    from db.database import IS_SQLITE
+
+    if IS_SQLITE:
+        row = await database.fetch_one(
+            "SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = :n", {"n": name}
+        )
+    else:
+        row = await database.fetch_one(
+            "SELECT 1 AS x FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = :n",
+            {"n": name},
+        )
+    return row is not None
+
+
+async def _has_column(table: str, column: str) -> bool:
+    try:
+        await database.fetch_all(f"SELECT {column} FROM {table} WHERE 1 = 0")
+        return True
+    except Exception:  # noqa: BLE001 - the probe only says "missing"
+        return False
+
+
+async def add_is_test_column() -> None:
+    """The column as migration 282 makes it. On Postgres the migration file itself; SQLite has no
+    IF [NOT] EXISTS on ALTER, so the same column there."""
+    from db.database import IS_SQLITE
+    from db.sql_migrations import split_statements
+
+    if IS_SQLITE:
+        await database.execute(
+            "ALTER TABLE merchant_onboarding ADD COLUMN is_test BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        return
+    for statement in split_statements(_MIGRATION.read_text()):
+        await database.execute(statement)
+
+
+def _merchant_row(mid: str, host: str):
+    from db.merchant_onboarding import merchant_onboarding
+
+    return merchant_onboarding.insert().values(
+        merchant_id=mid,
+        business_name=f"Biz {mid}",
+        store_url=f"https://{host}",
+        contact_email=f"owner@{host}",
+        region="US",
+        status="approved",
+        psp_connected=True,
+        psp_type="stripe",
+        operating_mode="storefront",
+        apm_enabled=False,
+    )
+
+
+@pytest.fixture
+async def rows(monkeypatch):
+    """Two approved, PSP-connected merchants. Everything this creates (tables, the column, rows)
+    is removed again: the Postgres dialect gate shares one database across files."""
+    import sqlalchemy
+
+    from db.database import metadata
+    from db.merchant_onboarding import merchant_onboarding
+    from db.orders import orders
+    from db.reviews_center import employee_audit_logs
+    from services import test_merchant_policy
+
+    monkeypatch.delenv(FLAG, raising=False)
+    test_merchant_policy.reset_cache()
+    was_connected = database.is_connected
+    if not was_connected:
+        await database.connect()
+    created = [
+        t
+        for t in ("merchant_onboarding", "orders", "employee_audit_logs", "merchant_psps", "merchant_stores")
+        if not await _table_exists(t)
+    ]
+    engine = sqlalchemy.create_engine(_sync_url())
+    metadata.create_all(engine, tables=[merchant_onboarding, orders, employee_audit_logs], checkfirst=True)
+    engine.dispose()
+    await database.execute(
+        "CREATE TABLE IF NOT EXISTS merchant_psps ("
+        "psp_id VARCHAR(100) PRIMARY KEY, merchant_id VARCHAR(50), provider VARCHAR(50), "
+        "status VARCHAR(50), connected_at TIMESTAMP)"
+    )
+    await database.execute(
+        "CREATE TABLE IF NOT EXISTS merchant_stores ("
+        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50), domain VARCHAR(255))"
+    )
+    added_column = False
+    try:
+        if not await _has_column("merchant_onboarding", "is_test"):
+            await add_is_test_column()
+            added_column = True
+        await database.execute(_merchant_row(M_TEST, TEST_HOST))
+        await database.execute(_merchant_row(M_REAL, REAL_HOST))
+        yield
+    finally:
+        params = {"a": M_TEST, "b": M_REAL}
+        await database.execute(
+            "DELETE FROM employee_audit_logs WHERE target_type = 'merchant' AND target_id IN (:a, :b)",
+            params,
+        )
+        await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id IN (:a, :b)", params)
+        if added_column and "merchant_onboarding" not in created:
+            await database.execute("ALTER TABLE merchant_onboarding DROP COLUMN is_test")
+        for table in reversed(created):
+            await database.execute(f"DROP TABLE IF EXISTS {table}")
+        test_merchant_policy.reset_cache()
+        if not was_connected and database.is_connected:
+            await database.disconnect()
+
+
+def _token(role: str, **extra) -> str:
+    from utils.auth import create_access_token
+
+    return create_access_token({"sub": f"u_{role}", "email": f"{role}@example.com", "role": role, **extra})
+
+
+def _admin_app():
+    from fastapi import FastAPI
+
+    from routes.admin_merchant_is_test import router
+
+    app = FastAPI()
+    app.include_router(router)
+    return app
+
+
+def _agent_app():
+    from fastapi import FastAPI
+
+    from routes.agent_auth import AgentContext, get_agent_context
+    from routes.agent_sdk_fixed import router
+
+    app = FastAPI()
+    app.include_router(router)
+    ctx = AgentContext({"agent_id": AGENT, "agent_name": "t", "allowed_merchants": None}, request=None)
+    app.dependency_overrides[get_agent_context] = lambda: ctx
+    return app
+
+
+async def _call(app, method: str, path: str, *, token=None, json=None, params=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        return await client.request(method, path, headers=headers, json=json, params=params)
+
+
+async def _set(mid: str, value: bool, reason: str = "internal rig for partner-a", role: str = "admin"):
+    return await _call(
+        _admin_app(), "POST", f"/admin/merchants/{mid}/is-test",
+        token=_token(role, employee_id="emp_1"), json={"is_test": value, "reason": reason},
+    )
+
+
+async def _stored(mid: str) -> bool:
+    row = await database.fetch_one("SELECT is_test FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid})
+    return bool(row["is_test"])
+
+
+async def _audit_rows(mid: str) -> list:
+    rows = await database.fetch_all(
+        "SELECT action, reason, actor_employee_id, actor_email, before_json, after_json "
+        "FROM employee_audit_logs WHERE target_type = 'merchant' AND target_id = :m ORDER BY id",
+        {"m": mid},
+    )
+    return [dict(r) for r in rows]
+
+
+def _as_dict(value):
+    if isinstance(value, str):
+        import json
+
+        return json.loads(value)
+    return value
+
+
+async def _listed() -> set:
+    resp = await _call(_agent_app(), "GET", "/agent/v1/merchants", params={"limit": 100})
+    assert resp.status_code == 200, resp.text
+    return {m["merchant_id"] for m in resp.json()["merchants"]} & set(OURS)
+
+
+# ── the guard ────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_anonymous_is_refused_and_nothing_changes(rows, method):
+    resp = await _call(
+        _admin_app(), method, f"/admin/merchants/{M_TEST}/is-test",
+        json={"is_test": True, "reason": "no token"} if method == "POST" else None,
+    )
+    assert resp.status_code in (401, 403)
+    assert await _stored(M_TEST) is False
+    assert await _audit_rows(M_TEST) == []
+
+
+@pytest.mark.parametrize("role", ["merchant", "agent", "employee", "outsourced"])
+async def test_non_admin_roles_are_refused(rows, role):
+    resp = await _set(M_TEST, True, role=role)
+    assert resp.status_code == 403, resp.text
+    get = await _call(_admin_app(), "GET", f"/admin/merchants/{M_TEST}/is-test", token=_token(role))
+    assert get.status_code == 403
+    assert await _stored(M_TEST) is False
+    assert await _audit_rows(M_TEST) == []
+
+
+@pytest.mark.parametrize("body", [{"is_test": True}, {"is_test": True, "reason": "   "}, {"is_test": True, "reason": "x"}, {"reason": "no value given"}])
+async def test_a_reason_and_a_value_are_required(rows, body):
+    resp = await _call(
+        _admin_app(), "POST", f"/admin/merchants/{M_TEST}/is-test", token=_token("admin"), json=body
+    )
+    assert resp.status_code == 422, resp.text
+    assert await _stored(M_TEST) is False
+    assert await _audit_rows(M_TEST) == []
+
+
+# ── the write ────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("role", ["admin", "super_admin"])
+async def test_admin_sets_it_with_an_audit_row(rows, role):
+    resp = await _set(M_TEST, True, reason="  internal rig for partner-a  ", role=role)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"merchant_id": M_TEST, "is_test": True, "changed": True}
+    assert await _stored(M_TEST) is True
+    assert await _stored(M_REAL) is False
+    [row] = await _audit_rows(M_TEST)
+    assert row["action"] == "merchant.is_test.set"
+    assert row["reason"] == "internal rig for partner-a"
+    assert row["actor_employee_id"] == "emp_1"
+    assert row["actor_email"] == f"{role}@example.com"
+    assert _as_dict(row["before_json"]) == {"is_test": False}
+    assert _as_dict(row["after_json"]) == {"is_test": True}
+
+
+async def test_setting_the_same_value_changes_nothing_and_writes_no_row(rows):
+    assert (await _set(M_TEST, True)).status_code == 200
+    again = await _set(M_TEST, True, reason="second click")
+    assert again.status_code == 200
+    assert again.json() == {"merchant_id": M_TEST, "is_test": True, "changed": False}
+    assert len(await _audit_rows(M_TEST)) == 1
+    noop_clear = await _set(M_REAL, False, reason="already real")
+    assert noop_clear.json()["changed"] is False
+    assert await _audit_rows(M_REAL) == []
+
+
+async def test_clearing_it_is_audited_too(rows):
+    await _set(M_TEST, True)
+    resp = await _set(M_TEST, False, reason="real merchant after all")
+    assert resp.json() == {"merchant_id": M_TEST, "is_test": False, "changed": True}
+    assert await _stored(M_TEST) is False
+    actions = [r["action"] for r in await _audit_rows(M_TEST)]
+    assert actions == ["merchant.is_test.set", "merchant.is_test.clear"]
+
+
+async def test_unknown_merchant_is_404_and_writes_nothing(rows):
+    ghost = f"merch_it_ghost_{RUN}"
+    resp = await _set(ghost, True)
+    assert resp.status_code == 404
+    assert await _audit_rows(ghost) == []
+    get = await _call(_admin_app(), "GET", f"/admin/merchants/{ghost}/is-test", token=_token("admin"))
+    assert get.status_code == 404
+
+
+async def test_get_returns_the_value_and_its_audit_trail(rows):
+    await _set(M_TEST, True, reason="rig one")
+    await _set(M_TEST, False, reason="rig two")
+    resp = await _call(_admin_app(), "GET", f"/admin/merchants/{M_TEST}/is-test", token=_token("admin"))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["merchant_id"] == M_TEST and body["is_test"] is False
+    assert [a["reason"] for a in body["audit"]] == ["rig two", "rig one"]
+
+
+async def test_a_failed_audit_insert_rolls_the_change_back(rows, monkeypatch):
+    real_execute = database.execute
+
+    async def _audit_down(query, *a, **k):
+        if "employee_audit_logs" in str(query):
+            raise RuntimeError("relation employee_audit_logs is unavailable")
+        return await real_execute(query, *a, **k)
+
+    monkeypatch.setattr(database, "execute", _audit_down)
+    resp = await _set(M_TEST, True)
+    monkeypatch.undo()
+    assert resp.status_code == 503
+    assert "employee_audit_logs" not in resp.text
+    assert await _stored(M_TEST) is False
+
+
+# ── what the fact does: the agent merchant list ──────────────────────────────────────────────
+
+
+async def test_flag_off_an_is_test_merchant_still_lists(rows):
+    assert await _listed() == {M_TEST, M_REAL}
+    await _set(M_TEST, True)
+    assert await _listed() == {M_TEST, M_REAL}
+
+
+async def test_flag_on_an_is_test_merchant_is_dropped_at_once(rows, monkeypatch):
+    monkeypatch.setenv(FLAG, "true")
+    assert await _listed() == {M_TEST, M_REAL}  # fills the cache before the write
+    await _set(M_TEST, True)
+    assert await _listed() == {M_REAL}  # the write invalidated this instance's cache
+    await _set(M_TEST, False, reason="real merchant after all")
+    assert await _listed() == {M_TEST, M_REAL}
+
+
+async def test_flag_on_scope_mine_drops_it_too(rows, monkeypatch):
+    from db.orders import orders
+    import json
+
+    for mid in OURS:
+        await database.execute(
+            orders.insert().values(
+                order_id=f"ord_it_{uuid.uuid4().hex[:12]}", merchant_id=mid, agent_id=AGENT,
+                customer_email="buyer@example.com", shipping_address=json.dumps({"country": "US"}),
+                items=json.dumps([]), subtotal=10, total=10, currency="USD", payment_status="paid",
+                is_deleted=False,
+            )
+        )
+    try:
+        await _set(M_TEST, True)
+        monkeypatch.setenv(FLAG, "true")
+        resp = await _call(_agent_app(), "GET", "/agent/v1/merchants", params={"scope": "mine", "limit": 100})
+        assert {m["merchant_id"] for m in resp.json()["merchants"]} & set(OURS) == {M_REAL}
+    finally:
+        await database.execute("DELETE FROM orders WHERE agent_id = :a", {"a": AGENT})
+
+
+# ── what the fact does: the protocol directory's rig domains ─────────────────────────────────
+
+
+async def test_directory_rig_domains_follow_the_flag(rows, monkeypatch):
+    from services import agent_merchant_directory as directory
+    from services import test_merchant_policy
+
+    await _set(M_TEST, True)
+    off = await directory._rig_and_rejected_domains()
+    assert TEST_HOST not in off and REAL_HOST not in off
+    monkeypatch.setenv(FLAG, "true")
+    test_merchant_policy.reset_cache()
+    on = await directory._rig_and_rejected_domains()
+    assert TEST_HOST in on and REAL_HOST not in on
+    assert not directory.is_listable_domain(TEST_HOST, excluded=on)
+    assert directory.is_listable_domain(REAL_HOST, excluded=on)

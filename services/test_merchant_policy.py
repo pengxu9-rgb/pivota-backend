@@ -21,6 +21,11 @@ Two identification signals, because rigs appear under multiple merchant_ids:
     merchant_stores — catches the SAME demo store re-connected under a new
     merchant_id (observed live: pivota-review-demo.myshopify.com carried two
     distinct merchant_ids), with zero code change.
+
+A third, behind ``MERCHANT_IS_TEST_FILTER_ENABLED`` (default off): the staff-set
+``merchant_onboarding.is_test`` fact (migration 282, written only by
+POST /admin/merchants/{merchant_id}/is-test). With the flag off it is never read,
+and every answer here is what it was before the column existed.
 """
 
 from __future__ import annotations
@@ -115,6 +120,18 @@ _inflight: Optional["asyncio.Future[Optional[Set[str]]]"] = None
 # search in the instance; the leader alone still waits on its own query.
 _FOLLOWER_WAIT_SECONDS = 3.0
 
+# The staff-set `merchant_onboarding.is_test` leg (migration 282). Off by default: with it off
+# the column is never read. Resolved inside the same shared attempt as the demo-domain set and
+# cached with it, but in its OWN try: a failed is_test read (the column not yet there, say) keeps
+# its last good set and never costs the demo-domain leg. FAIL DIRECTION: a merchant this read
+# could not see is treated as NOT test (it lists, as it did before the column existed); the
+# baked-in and env ids still apply.
+IS_TEST_FILTER_ENV = "MERCHANT_IS_TEST_FILTER_ENABLED"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_is_test_value: Optional[Set[str]] = None  # last good is_test set; None = never read
+_is_test_attempted = False  # the cached attempt also tried the is_test leg
+_is_test_last_warn_at: Optional[float] = None
+
 # A persistent failure must not log a traceback per search.
 _WARN_INTERVAL_SECONDS = 60.0
 _last_warn_at: Optional[float] = None
@@ -124,6 +141,13 @@ _suppressed_warnings = 0
 def _env_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
     raw = (env or os.environ).get(_ENV_VAR, "") or ""
     return {tok.strip() for tok in raw.split(",") if tok.strip()}
+
+
+def merchant_is_test_filter_enabled(env: Optional[Dict[str, str]] = None) -> bool:
+    """MERCHANT_IS_TEST_FILTER_ENABLED, default off. `env` replaces the process env when given
+    (an empty dict means "nothing set")."""
+    raw = (env if env is not None else os.environ).get(IS_TEST_FILTER_ENV, "") or ""
+    return raw.strip().lower() in _TRUTHY
 
 
 def static_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
@@ -158,16 +182,62 @@ async def _resolve_demo_domain_merchant_ids(database) -> Set[str]:
     return out
 
 
+async def _resolve_is_test_merchant_ids(database) -> Set[str]:
+    """merchant_ids staff marked `is_test` (migration 282). Raises on a DB error, a missing
+    column included; `_is_test_leg` owns the fail-soft handling."""
+    rows = await database.fetch_all(
+        "SELECT merchant_id FROM merchant_onboarding WHERE is_test = TRUE"
+    )
+    out: Set[str] = set()
+    for r in rows or []:
+        try:
+            mid = r["merchant_id"]
+        except Exception:
+            mid = (dict(r).get("merchant_id") if hasattr(r, "keys") else None)
+        if mid and str(mid).strip():
+            out.add(str(mid).strip())
+    return out
+
+
+async def _is_test_leg(database, ts: float) -> None:
+    """Refresh `_is_test_value`. Never raises: on a failure the last good set stays (None if
+    there never was one), and the warning is logged at most once per _WARN_INTERVAL_SECONDS."""
+    global _is_test_value, _is_test_attempted, _is_test_last_warn_at
+    try:
+        _is_test_value = await _resolve_is_test_merchant_ids(database)
+    except Exception:
+        if _is_test_last_warn_at is None or (ts - _is_test_last_warn_at) >= _WARN_INTERVAL_SECONDS:
+            logger.warning(
+                "test_merchant_policy: is_test resolve FAILED; serving %s last-good is_test ids",
+                len(_is_test_value or ()),
+                exc_info=True,
+            )
+            _is_test_last_warn_at = ts
+    _is_test_attempted = True
+
+
+def _with_is_test(ids: Set[str], is_test_on: bool) -> Set[str]:
+    """`ids` plus the last good is_test set while the flag is on; `ids` untouched while it is off."""
+    if not is_test_on:
+        return ids
+    return ids | (_is_test_value or set())
+
+
 async def get_excluded_merchant_ids(
     database=None,
     *,
     env: Optional[Dict[str, str]] = None,
     now: Optional[float] = None,
 ) -> Set[str]:
-    """The effective exclusion set: static ids ∪ resolved demo-domain ids.
+    """The effective exclusion set: static ids ∪ resolved demo-domain ids, plus the
+    staff-set is_test ids while MERCHANT_IS_TEST_FILTER_ENABLED is on.
 
     Cached for _CACHE_TTL_SECONDS. When ``database`` is None only the static set
     is returned (used by pure/sync callers).
+
+    The is_test leg runs in the same shared attempt, after a successful demo-domain
+    read, and is cached with it. Its own failure keeps its last good set and is not
+    a failure of the attempt (see IS_TEST_FILTER_ENV for the fail direction).
 
     Fail-soft, never crashes: on a failed lookup it returns the static set plus
     the last good demo-domain set (if any). A FAILED lookup is never cached as
@@ -176,7 +246,7 @@ async def get_excluded_merchant_ids(
     _FAILURE_BACKOFF_SECONDS, and the warning is rate-limited to one per
     _WARN_INTERVAL_SECONDS with a count of the ones it suppressed.
     """
-    global _cache_value, _cache_at, _failed_at, _inflight
+    global _cache_value, _cache_at, _failed_at, _inflight, _is_test_attempted
     static = static_test_merchant_ids(env)
     if database is None:
         return static
@@ -184,11 +254,17 @@ async def get_excluded_merchant_ids(
     def _clock() -> float:
         return time.monotonic() if now is None else now
 
+    is_test_on = merchant_is_test_filter_enabled(env)
     ts = _clock()
-    if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
-        return static | _cache_value
+    # A cache filled while the flag was off never tried the is_test leg: not a hit for a flag-on call.
+    if (
+        _cache_value is not None
+        and (ts - _cache_at) < _CACHE_TTL_SECONDS
+        and (not is_test_on or _is_test_attempted)
+    ):
+        return _with_is_test(static | _cache_value, is_test_on)
     if _failed_at is not None and (ts - _failed_at) < _FAILURE_BACKOFF_SECONDS:
-        return static | (_cache_value or set())
+        return _with_is_test(static | (_cache_value or set()), is_test_on)
 
     loop = asyncio.get_running_loop()
     if _inflight is not None and not _inflight.done() and _inflight.get_loop() is loop:
@@ -198,19 +274,26 @@ async def get_excluded_merchant_ids(
             joined = await asyncio.wait_for(asyncio.shield(_inflight), _FOLLOWER_WAIT_SECONDS)
         except asyncio.TimeoutError:
             joined = None
-        return static | (joined if joined is not None else (_cache_value or set()))
+        return _with_is_test(
+            static | (joined if joined is not None else (_cache_value or set())), is_test_on
+        )
 
     fut: "asyncio.Future[Optional[Set[str]]]" = loop.create_future()
     _inflight = fut
     resolved: Optional[Set[str]] = None
     try:
         resolved = await _resolve_demo_domain_merchant_ids(database)
+        if is_test_on:
+            # Before the future resolves, so a follower of this attempt sees its result.
+            await _is_test_leg(database, _clock())
+        else:
+            _is_test_attempted = False
     except Exception:
         # Stamp when the attempt FINISHED: a lookup that fails after a long pool
         # wait must still back off for the full window from that point.
         _failed_at = _clock()
         _warn_resolve_failed(_failed_at)
-        return static | (_cache_value or set())
+        return _with_is_test(static | (_cache_value or set()), is_test_on)
     finally:
         if not fut.done():
             fut.set_result(resolved)
@@ -219,7 +302,7 @@ async def get_excluded_merchant_ids(
     _failed_at = None
     _cache_value = resolved
     _cache_at = _clock()
-    return static | resolved
+    return _with_is_test(static | resolved, is_test_on)
 
 
 def _warn_resolve_failed(ts: float) -> None:
@@ -239,14 +322,28 @@ def _warn_resolve_failed(ts: float) -> None:
 
 
 def reset_cache() -> None:
-    """Test hook — drop the memoized demo-domain set and the failure state."""
+    """Test hook — drop the memoized demo-domain and is_test sets and the failure state."""
     global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings, _inflight
+    global _is_test_value, _is_test_attempted, _is_test_last_warn_at
+    _is_test_value = None
+    _is_test_attempted = False
+    _is_test_last_warn_at = None
     _cache_value = None
     _cache_at = 0.0
     _failed_at = None
     _inflight = None
     _last_warn_at = None
     _suppressed_warnings = 0
+
+
+def invalidate_cache() -> None:
+    """Expire the cached sets without forgetting them: the next call re-reads, and a failed
+    re-read still serves the last good sets. Called after a staff is_test write, so THIS
+    instance serves it on its next read; other instances follow within _CACHE_TTL_SECONDS."""
+    global _cache_at, _is_test_attempted
+    # -inf, not 0.0: a monotonic clock on a host up for less than the TTL would read 0.0 as fresh.
+    _cache_at = float("-inf")
+    _is_test_attempted = False
 
 
 def _merchant_id_of(product: Any) -> str:

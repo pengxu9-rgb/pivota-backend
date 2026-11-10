@@ -273,6 +273,7 @@ from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_r
 from routes.admin_data_consistency import router as admin_data_consistency_router
 from routes.admin_merchant_canonicalize import router as admin_merchant_canonicalize_router
 from routes.admin_merchant_reset import router as admin_merchant_reset_router
+from routes.admin_merchant_is_test import router as admin_merchant_is_test_router
 from routes.admin_shopify_health import router as admin_shopify_health_router
 from routes.admin_amazon_oauth import router as admin_amazon_oauth_router
 from routes.admin_amazon_orders import router as admin_amazon_orders_router
@@ -1199,6 +1200,7 @@ app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplica
 app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix
 app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonicalization
 app.include_router(admin_merchant_reset_router)  # Admin merchant reset
+app.include_router(admin_merchant_is_test_router)  # Admin merchant is_test fact (staff set/clear + audit)
 app.include_router(admin_shopify_health_router)  # Admin Shopify health check
 if settings.enable_amazon_sp_api:
     app.include_router(admin_amazon_oauth_router)  # Amazon SP-API OAuth (admin-only)
