@@ -10,11 +10,12 @@
 #
 # The build config is always THIS checkout's copy, so a branch that predates it can still be tested.
 # Prints the build id, waits for the result, prints the summary block, and exits 0 only on GREEN.
-# Env: PROJECT (default pivota-shared).
+# Env: CLOUD_BUILD_TESTS_PROJECT (default pivota-shared). Deliberately not PROJECT, which this repo's
+# deploy scripts export for the production project.
 set -euo pipefail
 
 SRC="${1:-.}"
-PROJECT="${PROJECT:-pivota-shared}"
+PROJECT="${CLOUD_BUILD_TESTS_PROJECT:-pivota-shared}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="$HERE/infra/gcp/cloudbuild.tests.yaml"
 HELPER="$HERE/scripts/ops/cloud_build_tests.py"
@@ -30,19 +31,28 @@ trap 'rm -rf -- "$STAGE"' EXIT
 # The runner's own helper must be in the build even when <worktree> predates it.
 mkdir -p "$STAGE/overlay/scripts/ops"
 cp "$HELPER" "$STAGE/overlay/scripts/ops/cloud_build_tests.py"
-tar -C "$SRC" --null -T "$STAGE/files.lst" -cf "$STAGE/src.tar"
+# --no-recursion: a tracked path that is now a directory must not pull in its untracked contents.
+tar -C "$SRC" --no-recursion --null -T "$STAGE/files.lst" -cf "$STAGE/src.tar"
 tar -C "$STAGE/overlay" -rf "$STAGE/src.tar" scripts/ops/cloud_build_tests.py
 gzip -9 "$STAGE/src.tar"
 echo "uploading $(tr -cd '\0' < "$STAGE/files.lst" | wc -c | tr -d ' ') tracked files from $SRC" \
-     "at $(git -C "$SRC" rev-parse --short HEAD)$(git -C "$SRC" diff --quiet || echo ' (+ uncommitted changes)')"
+     "at $(git -C "$SRC" rev-parse --short HEAD)$(git -C "$SRC" diff HEAD --quiet || echo ' (+ uncommitted changes)')"
 
 BUILD_ID="$(gcloud builds submit "$STAGE/src.tar.gz" --project "$PROJECT" --config "$CONFIG" \
   --async --format='value(id)')"
 echo "build $BUILD_ID: https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT"
 
+# One failed describe (a network blip) must not abandon a running build without its summary; ten in
+# a row (about five minutes) is a real problem and is reported as one.
 STATUS=""
+FAILS=0
 while :; do
-  STATUS="$(gcloud builds describe "$BUILD_ID" --project "$PROJECT" --format='value(status)')"
+  if NEXT="$(gcloud builds describe "$BUILD_ID" --project "$PROJECT" --format='value(status)')"; then
+    STATUS="$NEXT"; FAILS=0
+  else
+    FAILS=$((FAILS + 1))
+    [ "$FAILS" -ge 10 ] && { echo "gcloud builds describe failed $FAILS times in a row; build $BUILD_ID may still be running" >&2; exit 3; }
+  fi
   case "$STATUS" in
     SUCCESS|FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED) break ;;
   esac

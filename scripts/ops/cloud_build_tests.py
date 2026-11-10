@@ -1,53 +1,112 @@
-"""Helpers for infra/gcp/cloudbuild.tests.yaml: the backend test suites on Cloud Build.
+"""Helpers for infra/gcp/cloudbuild.tests.yaml: the backend's SQLite sweep and Postgres dialect gate
+on Cloud Build.
 
-    python scripts/ops/cloud_build_tests.py pg-files --shard K --manifest PATH
-        Prints the Postgres dialect gate's file list for shard K. The shard count, the ride-along
-        shard and the ride-along files are READ from .github/workflows/postgres-dialect-gate.yml,
-        so this runner and CI can never disagree about them; the split itself is
-        scripts/postgres_dialect_gate_shards.py, the planner CI runs.
+THE RUNNER EXECUTES CI'S OWN STEPS. Every test command, preflight, verdict and floor below is the
+`run:` body of a step in .github/workflows/backend-test-sweep.yml or postgres-dialect-gate.yml,
+read from the uploaded checkout at run time, with that workflow's (and job's, and step's) literal
+env. Nothing is a hand copy, so when CI's ignores, floors, shard count or ride-alongs change, this
+runner changes with them. When CI changes SHAPE (a step is renamed, a step's env starts needing a
+value this runner does not supply, a body starts interpolating `${{ }}`), `step` fails loudly
+instead of guessing.
+
+    python scripts/ops/cloud_build_tests.py step OUT --workflow W --job J --step S [--provide K ...]
+        Writes job J's step S (its `id`, or a unique prefix of its `name`) of .github/workflows/W.yml
+        to OUT as a bash script: the shell options GitHub would use, `export`s of the workflow's,
+        job's and step's literal env, then the body. Every key named by --provide is left to the
+        caller's environment and overrides a literal; an env value that is a `${{ }}` expression
+        MUST be provided.
+
+    python scripts/ops/cloud_build_tests.py wf-env W KEY
+        Prints workflow W's top-level env value KEY.
 
     python scripts/ops/cloud_build_tests.py summary --ci-dir DIR --sqlite-shards N --pg-shards M
-        Reads every shard's recorded exit code and JUnit XML, proves the SQLite shards add up to one
-        complete run (scripts/merge_sweep_shards.py, the same check CI's `sweep` job makes), and
-        requires zero skips in every Postgres shard (the dialect gate's own rule). Prints one table
-        and the failing test ids, and exits non-zero when anything is red, missing or skipped.
+        Reads every shard's exit code and JUnit, then runs CI's own verdict steps over the results:
+        the sweep's merge + executed-test floor, and the dialect gate's `verify` (which re-plans
+        the shards from the workflow's own DIALECT_GATE_SHARDS and requires the recovery report).
+        Prints one block and exits non-zero unless every one of them passed.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
-GATE_WORKFLOW = ROOT / ".github" / "workflows" / "postgres-dialect-gate.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 SUMMARY_BEGIN = "=== CLOUD BUILD TEST SUMMARY ==="
 SUMMARY_END = "=== END SUMMARY ==="
+SWEEP_WF, GATE_WF = "backend-test-sweep", "postgres-dialect-gate"
 
 
-def gate_env() -> Dict[str, str]:
+class ShapeError(SystemExit):
+    """CI's workflow no longer has the shape this runner was written against."""
+
+
+def _workflow(name: str) -> dict:
     import yaml
 
-    env = yaml.safe_load(GATE_WORKFLOW.read_text())["env"]
-    return {k: str(env[k]) for k in ("DIALECT_GATE_SHARDS", "RIDE_ALONG_SHARD", "RIDE_ALONGS")}
+    return yaml.safe_load((WORKFLOWS / f"{name}.yml").read_text())
 
 
-def pg_files(shard: int, manifest: str) -> List[str]:
-    env = gate_env()
-    out = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "postgres_dialect_gate_shards.py"), "plan",
-         "--num-shards", env["DIALECT_GATE_SHARDS"], "--shard", str(shard),
-         "--ride-along-shard", env["RIDE_ALONG_SHARD"], "--ride-alongs", " ".join(env["RIDE_ALONGS"].split()),
-         "--manifest", manifest],
-        cwd=ROOT, check=True, capture_output=True, text=True,
-    ).stdout
-    for line in out.splitlines():
-        if line.startswith("files="):
-            return line[len("files="):].split()
-    raise SystemExit("the planner printed no files= line")
+def _literal_env(env: Optional[dict], where: str, provided: set) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for key, value in (env or {}).items():
+        if key in provided:
+            continue
+        text = "" if value is None else str(value)
+        if "${{" in text:
+            raise ShapeError(f"{where} env {key} is a GitHub expression ({text!r}); this runner "
+                             f"must supply it (--provide {key}) or it cannot run the step as CI does")
+        out[key] = text
+    return out
+
+
+def step_script(workflow: str, job: str, step: str, provide: Sequence[str]) -> str:
+    wf = _workflow(workflow)
+    try:
+        job_def = wf["jobs"][job]
+    except KeyError:
+        raise ShapeError(f"{workflow}.yml has no job {job!r}")
+    hits = [s for s in job_def.get("steps") or []
+            if "run" in s and (s.get("id") == step or str(s.get("name") or "").startswith(step))]
+    if len(hits) != 1:
+        raise ShapeError(f"{workflow}.yml job {job}: {len(hits)} run step(s) match {step!r}, need exactly 1")
+    s = hits[0]
+    body = str(s["run"])
+    if "${{" in body:
+        raise ShapeError(f"{workflow}.yml {job}/{step}: the run body interpolates ${{{{ }}}}; "
+                         "it cannot be executed outside GitHub")
+    provided = set(provide)
+    env: Dict[str, str] = {}
+    for scope, where in ((wf.get("env"), f"{workflow}.yml"), (job_def.get("env"), f"job {job}"),
+                         (s.get("env"), f"step {step!r}")):
+        env.update(_literal_env(scope, where, provided))
+    # GitHub's own defaults: `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`; no
+    # `shell:` on Linux is `bash -e {0}`.
+    opts = "set -eo pipefail" if s.get("shell") == "bash" else "set -e"
+    lines = ["#!/usr/bin/env bash", f"# {workflow}.yml / {job} / {s.get('name') or s.get('id')}", opts]
+    # A provided value that is unset at run time would silently become "" in the body.
+    lines += [f': "${{{k}:?cloud_build_tests: {k} must be set to run this step}}"' for k in sorted(provided)]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
+    return "\n".join(lines) + "\n" + body + ("" if body.endswith("\n") else "\n")
+
+
+def wf_env(workflow: str, key: str) -> str:
+    env = _workflow(workflow).get("env") or {}
+    if key not in env:
+        raise ShapeError(f"{workflow}.yml has no top-level env {key}")
+    return str(env[key])
+
+
+# ── summary ───────────────────────────────────────────────────────────────────
 
 
 def _junit(path: Path) -> Optional[Dict[str, object]]:
@@ -75,13 +134,39 @@ def _rc(path: Path) -> Optional[int]:
         return None
 
 
+def _clip(text: str, lines: int = 60, width: int = 400) -> str:
+    """The last `lines` lines, each cut to `width`: one huge line (verify's file lists) must not
+    push the reasons out of the block."""
+    kept = text.strip().splitlines()[-lines:]
+    return "\n".join(line if len(line) <= width else line[:width] + " ..." for line in kept)
+
+
+def _scratch_checkout() -> Path:
+    """A private copy of the uploaded source: CI's verdict steps write into their cwd and read
+    fixed relative paths (`shards`, `sweep.xml`), so each gets its own tree."""
+    dest = Path(tempfile.mkdtemp(prefix="verdict-"))
+    top_level_skip = {".ci-venv", "ci", ".git"}
+    shutil.copytree(ROOT, dest, dirs_exist_ok=True, symlinks=True,
+                    ignore=lambda d, names: [n for n in names if Path(d) == ROOT and n in top_level_skip])
+    return dest
+
+
+def _run_ci_step(cwd: Path, workflow: str, job: str, step: str, env: Dict[str, str]) -> subprocess.CompletedProcess:
+    script = cwd / f".ci-step-{job}-{len(list(cwd.glob('.ci-step-*')))}.sh"
+    script.write_text(step_script(workflow, job, step, list(env)))
+    return subprocess.run(["bash", str(script)], cwd=cwd, env={**os.environ, **env},
+                          capture_output=True, text=True)
+
+
 def summary(ci_dir: Path, sqlite_shards: int, pg_shards: int) -> int:
+    ci_dir = ci_dir.resolve()
     red: List[str] = []
     rows: List[str] = []
     failed_ids: List[str] = []
+    pg_dir = ci_dir / "pg"
     for kind, n, xml_of in (
         ("sqlite", sqlite_shards, lambda k: ci_dir / "shards" / f"sweep-shard-{k}.xml"),
-        ("postgres", pg_shards, lambda k: ci_dir / f"postgres-{k}.xml"),
+        ("postgres", pg_shards, lambda k: pg_dir / f"pytest-postgres-shard-{k}.xml"),
     ):
         for k in range(1, n + 1):
             rc = _rc(ci_dir / f"{kind}-{k}.rc")
@@ -90,29 +175,63 @@ def summary(ci_dir: Path, sqlite_shards: int, pg_shards: int) -> int:
                 red.append(f"{kind} shard {k}: no readable JUnit XML (rc={rc})")
                 rows.append(f"{kind:<8} {k:>2}  rc={rc}  NO RESULT")
                 continue
-            rows.append(f"{kind:<8} {k:>2}  rc={rc}  tests={j['tests']} failures={j['failures']} "
-                        f"errors={j['errors']} skipped={j['skipped']}")
+            executed = int(j["tests"]) - int(j["skipped"])
+            rows.append(f"{kind:<8} {k:>2}  rc={rc}  tests={j['tests']} executed={executed} "
+                        f"failures={j['failures']} errors={j['errors']} skipped={j['skipped']}")
             failed_ids += list(j["failed_ids"])
             if rc != 0:
                 red.append(f"{kind} shard {k} exited {rc}")
-            if kind == "postgres" and int(j["skipped"]):
-                red.append(f"postgres shard {k} skipped {j['skipped']} test(s); the gate allows none")
+    recovery = _junit(pg_dir / f"pytest-recovery-postgres-shard-{wf_env(GATE_WF, 'RIDE_ALONG_SHARD')}.xml")
+    if recovery is not None:
+        rows.append(f"recovery     tests={recovery['tests']} failures={recovery['failures']} "
+                    f"errors={recovery['errors']} skipped={recovery['skipped']}")
+        failed_ids += list(recovery["failed_ids"])
+
+    gate_shards = int(wf_env(GATE_WF, "DIALECT_GATE_SHARDS"))
+    if pg_shards != gate_shards:
+        red.append(f"this build ran {pg_shards} Postgres shard(s) but {GATE_WF}.yml plans "
+                   f"DIALECT_GATE_SHARDS={gate_shards}: add or remove postgres-K steps in "
+                   "infra/gcp/cloudbuild.tests.yaml")
+
+    verdicts: List[str] = []
     sqlite_ok = all(_rc(ci_dir / f"sqlite-{k}.rc") == 0 for k in range(1, sqlite_shards + 1))
-    merge = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "merge_sweep_shards.py"), "--shards-dir", str(ci_dir / "shards"),
-         "--num-shards", str(sqlite_shards), "--needs-result", "success" if sqlite_ok else "failure",
-         "--out", str(ci_dir / "sweep.xml")],
-        cwd=ROOT, capture_output=True, text=True,
-    )
+    pg_ok = all(_rc(ci_dir / f"postgres-{k}.rc") == 0 for k in range(1, pg_shards + 1))
+
+    # The sweep: CI's merge step, then CI's executed-test floor over the merged sweep.xml.
+    sweep_tree = _scratch_checkout()
+    shutil.copytree(ci_dir / "shards", sweep_tree / "shards")
+    for label, job, step, env in (
+        ("sweep: merge (backend-test-sweep.yml)", "sweep", "Merge the shards",
+         {"SHARD_RESULT": "success" if sqlite_ok else "failure", "SWEEP_SHARDS": str(sqlite_shards)}),
+        ("sweep: executed-test floor (backend-test-sweep.yml)", "sweep", "Assert the sweep actually ran",
+         {"SWEEP_EVENT": "pull_request"}),
+    ):
+        done = _run_ci_step(sweep_tree, SWEEP_WF, job, step, env)
+        verdicts.append(f"--- {label}: rc={done.returncode}\n{_clip(done.stdout + done.stderr)}")
+        if done.returncode != 0:
+            red.append(f"{label} failed")
+
+    # The dialect gate: CI's final job, `verify`, over this build's manifests and JUnit.
+    gate_tree = _scratch_checkout()
+    shutil.copytree(pg_dir, gate_tree / "shards") if pg_dir.is_dir() else (gate_tree / "shards").mkdir()
+    label = "postgres: verify (postgres-dialect-gate.yml)"
+    done = _run_ci_step(gate_tree, GATE_WF, "postgres-dialect-gate", "Prove the shards are one complete run",
+                        {"SHARD_RESULT": "success" if pg_ok else "failure"})
+    verdicts.append(f"--- {label}: rc={done.returncode}\n{_clip(done.stdout + done.stderr)}")
+    if done.returncode != 0:
+        red.append(f"{label} failed")
+
+    notices = sorted(p.read_text().strip() for p in ci_dir.glob("notice-*.txt"))
+
     print(SUMMARY_BEGIN)
     print("\n".join(rows))
-    print("--- sqlite completeness (scripts/merge_sweep_shards.py)")
-    print((merge.stdout + merge.stderr).strip()[-3000:])
-    if merge.returncode != 0:
-        red.append("the SQLite shards do not add up to one complete green run")
+    print("\n".join(verdicts))
     if failed_ids:
         print("--- failing tests")
         print("\n".join(sorted(set(failed_ids))[:200]))
+    if notices:
+        print("--- differences from CI in this run")
+        print("\n".join(sorted(set(notices))))
     print("--- verdict:", "GREEN" if not red else "RED")
     for line in red:
         print("  *", line)
@@ -123,16 +242,25 @@ def summary(ci_dir: Path, sqlite_shards: int, pg_shards: int) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p_files = sub.add_parser("pg-files")
-    p_files.add_argument("--shard", type=int, required=True)
-    p_files.add_argument("--manifest", required=True)
+    p_step = sub.add_parser("step")
+    p_step.add_argument("out", type=Path)
+    p_step.add_argument("--workflow", required=True)
+    p_step.add_argument("--job", required=True)
+    p_step.add_argument("--step", required=True)
+    p_step.add_argument("--provide", nargs="*", default=[])
+    p_env = sub.add_parser("wf-env")
+    p_env.add_argument("workflow")
+    p_env.add_argument("key")
     p_sum = sub.add_parser("summary")
     p_sum.add_argument("--ci-dir", type=Path, required=True)
     p_sum.add_argument("--sqlite-shards", type=int, required=True)
     p_sum.add_argument("--pg-shards", type=int, required=True)
     args = ap.parse_args(argv)
-    if args.cmd == "pg-files":
-        print(" ".join(pg_files(args.shard, args.manifest)))
+    if args.cmd == "step":
+        args.out.write_text(step_script(args.workflow, args.job, args.step, args.provide))
+        return 0
+    if args.cmd == "wf-env":
+        print(wf_env(args.workflow, args.key))
         return 0
     return summary(args.ci_dir, args.sqlite_shards, args.pg_shards)
 

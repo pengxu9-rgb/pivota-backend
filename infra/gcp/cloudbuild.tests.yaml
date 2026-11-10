@@ -1,12 +1,29 @@
-# The backend test suites on Cloud Build, off the developer's machine. It mirrors CI:
-#   * the SQLite sweep, sharded by tests/sweep_shard.py exactly as backend-test-sweep.yml runs it
-#     (same ignores and deselect, every tests/test_*_postgres.py excluded), proven complete by
-#     scripts/merge_sweep_shards.py;
-#   * the Postgres dialect gate, sharded by scripts/postgres_dialect_gate_shards.py with the shard
-#     count and ride-alongs READ from postgres-dialect-gate.yml at run time. Each shard installs and
-#     starts its OWN Postgres 15 inside its step and connects on localhost, as CI does: the suite's
-#     network guard (tests' net_guard) refuses any non-loopback Postgres URL. Database
-#     pivota_dialect_check, which the gate requires; zero skips allowed.
+# The backend's SQLite sweep and Postgres dialect gate on Cloud Build, off the developer's machine.
+#
+# EVERY TEST COMMAND, PREFLIGHT, VERDICT AND FLOOR HERE IS CI'S OWN STEP. scripts/ops/cloud_build_tests.py
+# reads each step's `run:` body and literal env from .github/workflows/backend-test-sweep.yml and
+# postgres-dialect-gate.yml in the uploaded checkout and runs it, so the ignores, deselects, floors,
+# shard plan, ride-alongs, preflight, recovery report and `verify` are always the ones CI applies to
+# that same commit. If a workflow changes shape (a step renamed, a new `${{ }}` the runner does not
+# supply), the step fails loudly.
+#
+#   * sqlite-K: backend-test-sweep.yml's `sweep` step, sharded 8 ways (CI uses 4: a test that
+#     depends on what ran before it in its shard can pass here and fail there, or the reverse).
+#   * postgres-K: postgres-dialect-gate.yml's `shard` job in order: Preflight, Discover, Execute,
+#     Assert, and the Recovery report in RIDE_ALONG_SHARD. Each step starts its OWN Postgres 15
+#     (CI's service is postgres:15; installed from the PostgreSQL project's apt repository, since
+#     Debian ships only one major per release) on localhost, as CI does: the suite's net guard
+#     refuses any non-loopback Postgres URL. The step fails unless the server reports 15.
+#
+# THE IMAGE IS PINNED TO DEBIAN TRIXIE FOR ITS SQLITE. The sweep needs SQLite >= 3.44 (`concat()`;
+# tests/test_pdp_content_depth.py), which CI's Ubuntu 24.04 has (3.45) and trixie has (3.46).
+# Bookworm's 3.40 fails 35 tests with "no such function: concat". The deps step prints the version.
+#   * summary: the sweep job's merge and executed-test floor, then the gate's final `verify`
+#     (which plans the shards from the workflow's DIALECT_GATE_SHARDS: a missing shard is red).
+#
+# WHAT IS NOT RUN HERE (GitHub CI still gates the merge): lint.yml, the node web-pixel contract,
+# new-tests-are-covered, the commerce-agents adapter, v3-audit-gate and the agent reliability suite.
+# Where this run has to differ from CI (no IPv6 loopback in Cloud Build), the summary says so.
 #
 # EVERY SHARD RUNS IN ITS OWN COPY OF THE SOURCE (/tmp/src, local to its step container). The steps
 # share /workspace, and tests/conftest.py keeps the SQLite test database at <repo>/pivota_test.db and
@@ -19,14 +36,12 @@
 # which can only write logs and read the uploaded source.
 #
 # Every test step exits 0 and records its own exit code in /workspace/ci/<step>.rc, so one red
-# shard does not cancel the others; the `summary` step decides the build's result.
-#
-# The SQLite shard count (8) is spelled in three places: the sqlite-* steps, their SWEEP_SHARDS env,
-# and the summary step. The Postgres shard count must equal postgres-dialect-gate.yml's
-# DIALECT_GATE_SHARDS (3); the summary step fails if a shard is missing.
+# shard does not cancel the others; the `summary` step decides the build's result. The SQLite shard
+# count (8) is spelled in the sqlite-* steps, their SWEEP_SHARDS env and the summary step; the
+# Postgres steps must number DIALECT_GATE_SHARDS, which the summary checks.
 steps:
   - id: deps
-    name: mirror.gcr.io/library/python:3.11
+    name: mirror.gcr.io/library/python:3.11-trixie
     waitFor: ['-']
     entrypoint: bash
     args:
@@ -41,12 +56,13 @@ steps:
         . /workspace/.ci-venv/bin/activate
         python -m pip install -q --upgrade pip
         pip install -q -r requirements.txt -r requirements-dev.txt
-        mkdir -p /workspace/ci/shards
+        mkdir -p /workspace/ci/shards /workspace/ci/pg
         python --version
+        python -c "import sqlite3; print('sqlite', sqlite3.sqlite_version)"
 
   - &sqlite
     id: sqlite-1
-    name: mirror.gcr.io/library/python:3.11
+    name: mirror.gcr.io/library/python:3.11-trixie
     waitFor: ['deps']
     entrypoint: bash
     env: ['CI=true', 'SWEEP_SHARD=1', 'SWEEP_SHARDS=8']
@@ -57,25 +73,22 @@ steps:
         unset DATABASE_URL
         mkdir -p /tmp/src && (cd /workspace && tar --exclude=./.ci-venv --exclude=./ci -cf - .) | tar -C /tmp/src -xf -
         cd /tmp/src
-        # Cloud Build's step containers have no IPv6 loopback (GitHub's runners do). Only then, and
-        # saying so, the one net-guard case that binds ::1 is deselected.
-        IPV6_DESELECT=""
+        H=scripts/ops/cloud_build_tests.py
+        rc=0
+        python $$H step /tmp/sweep.sh --workflow backend-test-sweep --job sweep-shard --step sweep \
+          --provide SWEEP_SHARD SWEEP_SHARDS || rc=96
+        # Cloud Build's step containers have no IPv6 loopback (GitHub's runners do). Only then the
+        # one net-guard case that binds ::1 is deselected, and the summary says so.
         if ! python -c "import socket; s = socket.socket(socket.AF_INET6); s.bind(('::1', 0))" 2>/dev/null; then
-          echo "NOTICE: no IPv6 loopback in this container; deselecting test_loopback_and_localhost_are_allowed"
-          IPV6_DESELECT="tests/test_net_guard.py::test_what_stays_on_loopback_passes[test_loopback_and_localhost_are_allowed]"
+          T="tests/test_net_guard.py::test_what_stays_on_loopback_passes[test_loopback_and_localhost_are_allowed]"
+          export PYTEST_ADDOPTS="--deselect $$T"
+          echo "sqlite: no IPv6 loopback in Cloud Build, so $$T was deselected (it runs on CI)" \
+            > "/workspace/ci/notice-ipv6.txt"
         fi
-        python -m pytest tests readiness/tests $${IPV6_DESELECT:+--deselect "$$IPV6_DESELECT"} \
-          --ignore=readiness/tests/test_real_merchant_goldens.py \
-          --ignore=readiness/tests/test_shopify_live_source.py \
-          --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
-          --ignore-glob='tests/test_*_postgres.py' \
-          -q --no-header -p no:randomly -p no:cacheprovider \
-          -p tests.sweep_shard --sweep-shard "$$SWEEP_SHARD/$$SWEEP_SHARDS" \
-          --sweep-shard-manifest "/workspace/ci/shards/sweep-shard-$$SWEEP_SHARD.manifest.json" \
-          --junitxml="/workspace/ci/shards/sweep-shard-$$SWEEP_SHARD.xml" \
-          > "/workspace/ci/sqlite-$$SWEEP_SHARD.log" 2>&1
-        echo $$? > "/workspace/ci/sqlite-$$SWEEP_SHARD.rc"
-        tail -3 "/workspace/ci/sqlite-$$SWEEP_SHARD.log"
+        [ "$$rc" = 0 ] && { bash /tmp/sweep.sh > "/workspace/ci/sqlite-$$SWEEP_SHARD.log" 2>&1 || rc=$$?; }
+        cp "sweep-shard-$$SWEEP_SHARD.xml" "sweep-shard-$$SWEEP_SHARD.manifest.json" /workspace/ci/shards/ 2>/dev/null || true
+        echo "$$rc" > "/workspace/ci/sqlite-$$SWEEP_SHARD.rc"
+        tail -3 "/workspace/ci/sqlite-$$SWEEP_SHARD.log" 2>/dev/null || true
         exit 0
   - {<<: *sqlite, id: sqlite-2, env: ['CI=true', 'SWEEP_SHARD=2', 'SWEEP_SHARDS=8']}
   - {<<: *sqlite, id: sqlite-3, env: ['CI=true', 'SWEEP_SHARD=3', 'SWEEP_SHARDS=8']}
@@ -85,39 +98,68 @@ steps:
   - {<<: *sqlite, id: sqlite-7, env: ['CI=true', 'SWEEP_SHARD=7', 'SWEEP_SHARDS=8']}
   - {<<: *sqlite, id: sqlite-8, env: ['CI=true', 'SWEEP_SHARD=8', 'SWEEP_SHARDS=8']}
 
+  # postgres-dialect-gate.yml's `shard` job, step by step, with GitHub's own sequencing: a failed
+  # Preflight or Discover stops the shard; Assert runs even when Execute failed; the Recovery report
+  # runs (in RIDE_ALONG_SHARD only) when everything before it passed.
   - &postgres
     id: postgres-1
-    name: mirror.gcr.io/library/python:3.11
+    name: mirror.gcr.io/library/python:3.11-trixie
     waitFor: ['deps']
     entrypoint: bash
-    env: ['CI=true', 'SHARD=1', 'PYTHONDONTWRITEBYTECODE=1',
-          'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']
+    env: ['CI=true', 'SHARD=1']
     args:
       - -c
       - |
         set -e
-        apt-get -qq update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y postgresql >/dev/null
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get -qq update >/dev/null && apt-get -qq install -y postgresql-common >/dev/null
+        # postgresql-common's own script adds the PostgreSQL project's apt repository (its signing
+        # key ships in the package), so the major can match CI's postgres:15.
+        /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
+        apt-get -qq install -y postgresql-15 >/dev/null
         service postgresql start >/dev/null
         su postgres -c "psql -q -c \"ALTER USER postgres PASSWORD 'postgres'\"" >/dev/null
         su postgres -c "createdb pivota_dialect_check"
+        PGV="$$(su postgres -c 'psql -tAc "SHOW server_version_num"')"
+        echo "postgres server_version_num=$$PGV"
         set +e
         . /workspace/.ci-venv/bin/activate
         mkdir -p /tmp/src && (cd /workspace && tar --exclude=./.ci-venv --exclude=./ci -cf - .) | tar -C /tmp/src -xf -
         cd /tmp/src
-        FILES=$$(python scripts/ops/cloud_build_tests.py pg-files --shard "$$SHARD" \
-          --manifest "/workspace/ci/postgres-$$SHARD.manifest.json")
-        python -m pytest -q -p no:cacheprovider -rfE --junitxml="/workspace/ci/postgres-$$SHARD.xml" $$FILES \
-          > "/workspace/ci/postgres-$$SHARD.log" 2>&1
-        echo $$? > "/workspace/ci/postgres-$$SHARD.rc"
-        tail -3 "/workspace/ci/postgres-$$SHARD.log"
+        H=scripts/ops/cloud_build_tests.py
+        LOG="/workspace/ci/postgres-$$SHARD.log"
+        W=postgres-dialect-gate
+        run() { python $$H step "/tmp/$$1.sh" --workflow $$W --job shard --step "$$2" --provide $${@:3} \
+                  && bash "/tmp/$$1.sh" >> "$$LOG" 2>&1; }
+        rc=0
+        case "$$PGV" in 15*) ;; *) echo "CI runs Postgres 15; this container has $$PGV" >> "$$LOG"; rc=95 ;; esac
+        [ "$$rc" = 0 ] && { run preflight Preflight || rc=91; }
+        if [ "$$rc" = 0 ]; then
+          export GITHUB_OUTPUT=/tmp/discover.out; : > "$$GITHUB_OUTPUT"
+          run discover discover SHARD || rc=92
+          GATE_FILES="$$(sed -n 's/^files=//p' "$$GITHUB_OUTPUT")"
+          GATE_MODULES="$$(sed -n 's/^gate_modules=//p' "$$GITHUB_OUTPUT")"
+          unset GITHUB_OUTPUT
+          [ -n "$$GATE_FILES" ] && [ -n "$$GATE_MODULES" ] || { [ "$$rc" = 0 ] && rc=93; }
+          export GATE_FILES GATE_MODULES JUNIT="pytest-postgres-shard-$$SHARD.xml"
+        fi
+        if [ "$$rc" = 0 ]; then
+          run execute run_gate SHARD GATE_FILES || rc=1
+          run assert "Assert the gate" GATE_MODULES JUNIT || rc=94
+        fi
+        if [ "$$rc" = 0 ] && [ "$$SHARD" = "$$(python $$H wf-env $$W RIDE_ALONG_SHARD)" ]; then
+          run recovery "Recovery report" SHARD || rc=90
+        fi
+        cp shard-$$SHARD.manifest.json pytest-postgres-shard-$$SHARD.xml pytest-recovery-postgres-shard-$$SHARD.xml \
+          /workspace/ci/pg/ 2>/dev/null
+        echo "$$rc" > "/workspace/ci/postgres-$$SHARD.rc"
+        tail -3 "$$LOG"
         exit 0
-  - {<<: *postgres, id: postgres-2, env: ['CI=true', 'SHARD=2', 'PYTHONDONTWRITEBYTECODE=1',
-                                         'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']}
-  - {<<: *postgres, id: postgres-3, env: ['CI=true', 'SHARD=3', 'PYTHONDONTWRITEBYTECODE=1',
-                                         'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']}
+  - {<<: *postgres, id: postgres-2, env: ['CI=true', 'SHARD=2']}
+  - {<<: *postgres, id: postgres-3, env: ['CI=true', 'SHARD=3']}
 
   - id: summary
-    name: mirror.gcr.io/library/python:3.11
+    name: mirror.gcr.io/library/python:3.11-trixie
     waitFor: ['sqlite-1', 'sqlite-2', 'sqlite-3', 'sqlite-4', 'sqlite-5', 'sqlite-6', 'sqlite-7',
               'sqlite-8', 'postgres-1', 'postgres-2', 'postgres-3']
     entrypoint: bash
