@@ -135,7 +135,7 @@ U, A, R = census.UCP_PATH, census.ACP_PATH, census.ROBOTS_PATH
 SUMMARY_ZERO = {
     "domains": 0, "ucp_ok": 0, "with_checkout": 0, "with_order": 0, "with_discount": 0,
     "handlers_accepting_network_token": 0, "acp_ok": 0, "errors": 0,
-    "robots_ok": 0, "robots_absent": 0, "robots_disallowed": 0, "robots_unavailable": 0,
+    "robots_ok": 0, "robots_absent": 0, "robots_disallowed": 0, "robots_unavailable": 0, "deadline": 0,
 }  # fmt: skip
 
 
@@ -263,7 +263,7 @@ def test_row_keys_and_their_order_are_the_documented_ones(monkeypatch):
         "d", "robots", "ucp", "ver", "supported", "svc", "cap", "ph", "keys", "acp", "acp_ver", "acp_cap", "err"]
     assert list(got.summary) == ["domains", "ucp_ok", "with_checkout", "with_order", "with_discount",
                                  "handlers_accepting_network_token", "acp_ok", "errors",
-                                 "robots_ok", "robots_absent", "robots_disallowed", "robots_unavailable"]
+                                 "robots_ok", "robots_absent", "robots_disallowed", "robots_unavailable", "deadline"]
     assert " " not in line[len(census.ROW_PREFIX):]  # compact JSON
 
 
@@ -324,8 +324,9 @@ def test_the_2026_04_08_shape_is_read_too():
 
 def test_a_capability_mapped_to_null_or_false_is_not_advertised():
     facts = census.parse_ucp_profile({"ucp": {"version": "2026-08-25", "capabilities": {
-        "dev.ucp.shopping.checkout": None, "dev.ucp.shopping.order": False, "dev.ucp.shopping.discount": []}}})
-    assert facts["cap"] == ["dev.ucp.shopping.discount"]
+        "dev.ucp.shopping.checkout": None, "dev.ucp.shopping.order": False, "dev.ucp.shopping.discount": [],
+        "dev.ucp.shopping.fulfillment": [{}], "dev.ucp.common.identity_linking": {}}}})
+    assert facts["cap"] == ["dev.ucp.shopping.fulfillment", "dev.ucp.common.identity_linking"]
 
 
 @pytest.mark.parametrize("doc, reason", [
@@ -515,7 +516,7 @@ def test_without_an_injected_resolver_the_real_guard_decides(monkeypatch, addres
     got = Run(0, lines)
     row = got.row("shop-a.example")
     assert (row["ucp"], row["err"]) == ("robots_unavailable", "robots_not_public") and net.requests == []
-    assert asked == ["shop-a.example"]
+    assert asked == ["shop-a.example"] * 2  # the guard's lookup, then one more to name the refusal
 
 
 def test_a_resolver_that_raises_or_hangs_costs_one_row(monkeypatch):
@@ -538,7 +539,7 @@ def test_the_fetcher_itself_refuses_a_host_that_is_not_a_bare_public_name(host):
             pacer = census.Pacer(clock=net.clock, sleep=net.sleep)
             return await census.fetch_well_known(client, host, census.UCP_PATH, resolver=net.resolver, pacer=pacer)
 
-    assert asyncio.run(go()) == ("invalid_domain", None)
+    assert asyncio.run(go()) == census.Fetched("invalid_domain", None, None)
     assert net.requests == [] and net.resolved == []
 
 
@@ -856,9 +857,9 @@ def test_output_lines_are_prefixed_and_carry_no_body_text(monkeypatch):
     row = got.row("shop-a.example")
     assert row["err"] is None and row["keys"] == 2 and row["ph"] == {"processor_tokenizer": ["card"]}
     assert [s["name"] for s in row["svc"]] == ["dev.ucp.shopping"] * 4 + [None]
-    assert len(got.lines) == 3
-    assert got.lines[0].startswith("UCPPROF_ROW {") and got.lines[1].startswith("UCPPROF_SUM {")
-    assert got.lines[2] == "UCPPROF_DONE"
+    assert len(got.lines) == 4 and got.lines[0].startswith("UCPPROF_PLAN {")
+    assert got.lines[1].startswith("UCPPROF_ROW {") and got.lines[2].startswith("UCPPROF_SUM {")
+    assert got.lines[3] == "UCPPROF_DONE"
     text = "\n".join(got.lines)
     for forbidden in (MARKER, "http", "?", "token=", "token_retrieval", "/ucp/v1", "poqkLGiymh", "psp.example", "accounts.example"):
         assert forbidden not in text, forbidden
@@ -889,9 +890,10 @@ def test_the_robots_token_is_the_product_name_inside_the_declared_user_agent():
     ("User-agent: *\nDisallow: /.well-known/ucp\n", "robots_disallowed", 200, [R, A]),
     ("\ufeffUser-agent: *\r\nDisallow: /.well-known\r\n", "robots_disallowed", "robots_disallowed", [R]),
     ("User-agent: *\nDisallow: /*.json$\n", 200, "robots_disallowed", [R, U]),
-    ("User-agent: otherbot\nDisallow: /.well-known/*\n", "robots_disallowed", "robots_disallowed", [R]),
+    ("User-agent: *\nDisallow: /.well-known/*\n", "robots_disallowed", "robots_disallowed", [R]),
+    ("User-agent: otherbot\nUser-agent: PivotaBot/1.0\nDisallow: /.well-known/ucp$\n", "robots_disallowed", 200, [R, A]),
 ], ids=["our-token-ucp", "our-token-lowercase-acp", "our-token-directory", "our-token-beats-star-allow", "star-everything",
-        "star-ucp", "bom-and-crlf", "wildcard-suffix", "wildcard-any-group"])
+        "star-ucp", "bom-and-crlf", "wildcard-suffix", "wildcard-directory", "shared-group-anchored"])
 def test_a_path_robots_disallows_is_never_requested(monkeypatch, text, ucp, acp, asked):
     net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots(text)})
     row = got.row("shop-a.example")
@@ -909,7 +911,11 @@ def test_a_path_robots_disallows_is_never_requested(monkeypatch, text, ucp, acp,
     "User-agent: *\nDisallow:\n",
     "User-agent: *\nDisallow: /*?preview=\nSitemap: https://shop-a.example/sitemap.xml\n",
     "<html><body>not a robots file</body></html>",
-], ids=["other-paths", "other-bot-only", "our-token-allowed-by-name", "empty-disallow", "unrelated-wildcard", "html"])
+    "User-agent: otherbot\nDisallow: /.well-known/*\n",
+    "Disallow: /\n",
+    "User-agent: *\nDisallow: /.well-known/ucp/\nDisallow: /.well-known/acp.jsonl$\nDisallow: /.WELL-KNOWN/\n",
+], ids=["other-paths", "other-bot-only", "our-token-allowed-by-name", "empty-disallow", "unrelated-wildcard", "html",
+        "other-bot-wildcard", "rule-before-any-group", "near-misses"])
 def test_a_robots_file_that_allows_both_paths(monkeypatch, text):
     net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots(text)})
     row = got.row("shop-a.example")
@@ -961,11 +967,13 @@ def test_a_robots_redirect_to_the_www_sibling_is_followed_once_and_obeyed(monkey
         **BOTH,
         ("shop-a.example", R): _redirect("https://www.shop-a.example/robots.txt"),
         ("www.shop-a.example", R): _robots("User-agent: *\nDisallow: /.well-known/acp.json\n"),
+        ("www.shop-a.example", U): _json(UCP_EMPTY),
     })
     row = got.row("shop-a.example")
-    assert (row["robots"], row["ucp"], row["acp"]) == ("disallowed", 200, "robots_disallowed")
+    assert (row["robots"], row["ucp"], row["ver"], row["acp"]) == ("disallowed", 200, "2026-01-23", "robots_disallowed")
+    # the host that answered robots.txt is asked directly: no second redirect is paid for
     assert net.urls() == ["https://shop-a.example/robots.txt", "https://www.shop-a.example/robots.txt",
-                          "https://shop-a.example/.well-known/ucp"]
+                          "https://www.shop-a.example/.well-known/ucp"]
     net, got = _census(monkeypatch, {
         **BOTH,
         ("shop-a.example", R): _redirect("https://www.shop-a.example/robots.txt"),
@@ -993,10 +1001,10 @@ def test_read_robots_never_raises_and_allows_nothing_it_could_not_read(fetched):
 
 
 def test_a_robots_reader_that_breaks_allows_nothing(monkeypatch):
-    def _boom(self, lines):
+    def _boom(text):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(census.RobotFileParser, "parse", _boom)
+    monkeypatch.setattr(census, "_robots_rules", _boom)
     net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots("User-agent: *\nAllow: /\n")})
     assert got.row("shop-a.example")["err"] == "robots_unparseable" and net.paths("shop-a.example") == [R]
 
@@ -1088,3 +1096,433 @@ def test_the_typed_population_never_touches_the_database(monkeypatch):
     net = Net({})
     got = _run(monkeypatch, net, ["--domains", "shop-a.example"])
     assert got.code == 0 and db.calls == [] and [r["d"] for r in got.rows] == ["shop-a.example"]
+
+
+# ── robots patterns: linear, bounded, longest match ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("pattern, path, expected", [
+    ("/", "/.well-known/ucp", True),
+    ("/.well-known", "/.well-known/ucp", True),
+    ("/.well-known/ucp", "/.well-known/ucp", True),
+    ("/.well-known/ucp", "/.well-known/ucpx", True),
+    ("/.well-known/ucp/", "/.well-known/ucp", False),
+    ("/.well-known/acp", "/.well-known/ucp", False),
+    ("/*/ucp", "/.well-known/ucp", True),
+    ("/.well*ucp", "/.well-known/ucp", True),
+    ("/*.json", "/.well-known/acp.json", True),
+    ("/*.json", "/.well-known/acp.json5", True),
+    ("/*.json$", "/.well-known/acp.json", True),
+    ("/*.json$", "/.well-known/acp.json5", False),
+    ("/*.json$", "/.well-known/ucp", False),
+    ("/.well-known/ucp$", "/.well-known/ucp", True),
+    ("/.well-known/ucp$", "/.well-known/ucp/x", False),
+    ("/.well-known$", "/.well-known/ucp", False),
+    ("*", "/.well-known/ucp", True),
+    ("*$", "/.well-known/ucp", True),
+    ("$", "/.well-known/ucp", False),
+    ("", "/.well-known/ucp", True),
+    ("/a*b*c*d", "/.well-known/ucp", False),
+    ("/*k*n*w*n/*", "/.well-known/ucp", True),
+    ("/.well-known/u$cp", "/.well-known/u$cp", True),
+    ("/.well-known/u$cp", "/.well-known/ucp", False),
+    ("/.well%2Dknown/ucp", "/.well-known/ucp", False),
+    ("/.well%2Dknown/ucp", "/.well%2Dknown/ucp", True),
+    ("/.Well-Known/ucp", "/.well-known/ucp", False),
+    (".well-known", "/.well-known/ucp", False),
+], ids=["root", "prefix", "exact", "prefix-longer-path", "longer-than-path", "other-prefix", "star-middle",
+        "star-inside-segment", "star-suffix", "star-suffix-is-prefix", "anchored-suffix", "anchored-suffix-miss",
+        "anchored-other", "anchored-exact", "anchored-exact-miss", "anchored-prefix-miss", "lone-star",
+        "lone-star-anchored", "lone-anchor", "empty", "many-stars-miss", "many-stars-hit", "inner-dollar-literal",
+        "inner-dollar-miss", "percent-encoding-as-written", "percent-encoding-literal", "case-sensitive",
+        "no-leading-slash"])
+def test_robots_pattern_semantics(pattern, path, expected):
+    assert census.glob_matches(pattern, path) is expected
+
+
+def _timed(text: str):
+    import time as _time
+
+    started = _time.perf_counter()
+    result = census.read_robots("shop-a.example", (200, text.encode()))
+    return result, _time.perf_counter() - started
+
+
+@pytest.mark.parametrize("stars", [12, 20, 5000], ids=["stars-12", "stars-20", "stars-5000"])
+def test_a_run_of_stars_costs_no_more_than_one(stars):
+    (state, allowed, _), elapsed = _timed("User-agent: *\nDisallow: /" + "*" * stars + "Z$\n")
+    assert (state, allowed) == ("ok", {U: True, A: True})  # the run collapses to one `*`; `/*Z$` matches neither
+    assert elapsed < 0.5, elapsed
+    (state, allowed, _), second = _timed("User-agent: *\nDisallow: /" + "*" * stars + "n$\n")
+    assert (state, allowed) == ("disallowed", {U: True, A: False}) and second < 0.5
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("Disallow: /" + "a" * 200_000, {U: False, A: False}),
+    ("Disallow: /" + "*a" * 100_000, {U: False, A: False}),
+    ("Allow: /" + "*a" * 100_000, {U: True, A: True}),
+    ("Disallow: " + "*" * 200_000, {U: False, A: False}),
+], ids=["literal", "alternating-stars", "allow-alternating-stars", "only-stars"])
+def test_a_200_kb_single_line_pattern_returns_at_once(line, expected):
+    (state, allowed, why), elapsed = _timed("User-agent: *\n" + line + "\n")
+    assert allowed == expected and why is None
+    assert elapsed < 0.5, elapsed
+
+
+@pytest.mark.parametrize("pattern, disallowed", [
+    ("/x" + "*y" * 16, False),
+    ("/x" + "*y" * 17, True),
+    ("/x" + "**y" * 16, False),
+    ("/" + "x" * 511, False),
+    ("/" + "x" * 512, True),
+], ids=["16-stars", "17-stars", "16-runs-of-stars", "512-chars", "513-chars"])
+def test_a_pattern_too_large_to_evaluate_disallows(pattern, disallowed):
+    assert (census.MAX_ROBOTS_PATTERN_STARS, census.MAX_ROBOTS_PATTERN_CHARS) == (16, 512)
+    state, allowed, _ = census.read_robots("shop-a.example", (200, f"User-agent: *\nDisallow: {pattern}\n".encode()))
+    assert allowed == {U: not disallowed, A: not disallowed}
+    # the same pattern as an Allow is ignored, so it cannot lift a Disallow
+    text = f"User-agent: *\nDisallow: /.well-known/\nAllow: {pattern}\n"
+    assert census.read_robots("shop-a.example", (200, text.encode()))[1] == {U: False, A: False}
+
+
+def test_more_rules_than_the_reader_takes_fails_closed(monkeypatch):
+    assert census.MAX_ROBOTS_RULES == 5000
+    lines = "User-agent: *\n" + "Disallow: /p\n" * 5000
+    assert census.read_robots("shop-a.example", (200, lines.encode()))[0] == "ok"
+    state, allowed, why = census.read_robots("shop-a.example", (200, (lines + "Disallow: /q\n").encode()))
+    assert (state, allowed, why) == ("unavailable", {U: False, A: False}, "too_many_rules")
+    # rules of groups that are not ours are not counted (and not read)
+    other = "User-agent: otherbot\n" + "Disallow: /\n" * 6000 + "User-agent: *\nDisallow: /cart\n"
+    assert census.read_robots("shop-a.example", (200, other.encode()))[0] == "ok"
+    net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots(lines + "Disallow: /q\n")})
+    assert got.row("shop-a.example")["err"] == "robots_too_many_rules" and net.paths("shop-a.example") == [R]
+
+
+@pytest.mark.parametrize("group", ["*", "PivotaBot"], ids=["star-group", "our-group"])
+@pytest.mark.parametrize("rules, ucp, acp", [
+    ("Allow: /\nDisallow: /.well-known/ucp", False, True),
+    ("Disallow: /.well-known/ucp\nAllow: /", False, True),
+    ("Disallow: /\nAllow: /.well-known/", True, True),
+    ("Allow: /.well-known/\nDisallow: /", True, True),
+    ("Disallow: /.well-known/\nAllow: /.well-known/acp.json", False, True),
+    ("Disallow: /.well-known/ucp\nAllow: /.well-known/ucp", True, True),
+    ("Allow: /.well-known/ucp\nDisallow: /.well-known/ucp", True, True),
+    ("Allow: /.well-known/*\nDisallow: /.well-known/acp.json$", True, False),
+    ("Disallow: /*.json\nAllow: /.well-known/acp", True, True),
+], ids=["allow-root-then-disallow-path", "disallow-path-then-allow-root", "disallow-root-allow-directory",
+        "allow-directory-disallow-root", "longer-allow", "tie-disallow-first", "tie-allow-first",
+        "longer-anchored-disallow", "longer-allow-over-wildcard"])
+def test_the_longest_matching_rule_decides(monkeypatch, group, rules, ucp, acp):
+    text = f"User-agent: {group}\n{rules}\n"
+    net, got = _census(monkeypatch, {**BOTH, ("shop-a.example", R): _robots(text)})
+    row = got.row("shop-a.example")
+    assert (row["ucp"] == 200, row["acp"] == 200) == (ucp, acp)
+    assert net.paths("shop-a.example") == [R] + ([U] if ucp else []) + ([A] if acp else [])
+
+
+def test_our_group_is_used_alone_when_it_exists_and_groups_of_one_name_add_up():
+    def read(text):
+        return census.read_robots("shop-a.example", (200, text.encode()))[1]
+
+    assert read("User-agent: *\nDisallow: /\n\nUser-agent: PivotaBot\nDisallow: /cart\n") == {U: True, A: True}
+    assert read("User-agent: PivotaBot\nDisallow: /cart\n\nUser-agent: *\nDisallow: /\n") == {U: True, A: True}
+    assert read("User-agent: PivotaBot\nAllow: /\n\nUser-agent: pivotabot\nDisallow: /.well-known/ucp\n") == {U: False, A: True}
+    assert read("User-agent: *\nAllow: /\n\nUser-agent: *\nDisallow: /.well-known/acp.json\n") == {U: True, A: False}
+    assert read("User-agent: PivotaBot\n\nUser-agent: *\nDisallow: /\n") == {U: False, A: False}  # one group, two names
+    assert read("User-agent: PivotaBotX\nDisallow: /\n") == {U: True, A: True}  # another crawler's name
+    # a group that names us and disallows nothing is still OUR group: the `*` group is not consulted
+    assert read("User-agent: PivotaBot\nDisallow:\n\nUser-agent: *\nDisallow: /\n") == {U: True, A: True}
+    assert read("User-agent: *\nCrawl-delay: 5\nSitemap: https://shop-a.example/s.xml\nDisallow: /.well-known/ucp # no\n") == {
+        U: False, A: True}
+
+
+# ── strict tokens, capped rows ───────────────────────────────────────────────────────────────
+
+
+def test_a_token_with_a_trailing_newline_is_not_a_token():
+    facts = census.parse_ucp_profile({"ucp": {
+        "version": "2026-08-25",
+        "supported_versions": ["2026-01-11\n", "2026-01-23"],
+        "services": {"dev.ucp.shopping\n": [{"transport": "mcp"}], "dev.ucp.shopping": [{"transport": "rest"}]},
+        "capabilities": {"dev.ucp.shopping.checkout\n": [{}], "dev.ucp.shopping.order": [{}]},
+        "payment_handlers": {"com.example.pay": [{"id": "h1\n", "available_instruments": [{"type": "card\n"}, {"type": "card"}]}]},
+    }})
+    assert facts["supported"] == ["2026-01-23"] and facts["cap"] == ["dev.ucp.shopping.order"]
+    assert facts["svc"] == [{"name": None, "transport": "mcp"}, {"name": "dev.ucp.shopping", "transport": "rest"}]
+    assert facts["ph"] == {"com.example.pay": ["card"]}
+    assert census.parse_ucp_profile({"ucp": {"version": "2026-08-25\nx"}}) == {"ok": False, "reason": "version_invalid"}
+    assert census.parse_acp_discovery({"protocol": {"version": "2026-04-17"}, "capabilities": {
+        "services": ["checkout\n", "orders"], "extensions": [{"name": "discount\n"}]}})["cap"] == ["orders"]
+    for pattern in (census._VERSION_RE, census._NAME_RE, census._TRANSPORT_RE, census._TLD_RE):
+        assert pattern.fullmatch("a1\n") is None and pattern.fullmatch("2026-01-11\n") is None
+    assert census._name("card\n") is None and census._version("2026-01-11\n") is None
+
+
+def test_the_client_ignores_the_environment_and_never_follows_redirects_itself(monkeypatch):
+    seen: List[Dict[str, Any]] = []
+    real = httpx.AsyncClient
+
+    class _Recording(real):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            seen.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(census.httpx, "AsyncClient", _Recording)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.example:3128")
+    net, got = _census(monkeypatch, BOTH)
+    assert got.row("shop-a.example")["ucp"] == 200
+    (kwargs,) = seen
+    assert kwargs["trust_env"] is False and kwargs["follow_redirects"] is False
+    assert "proxy" not in kwargs and "proxies" not in kwargs and "auth" not in kwargs and "cookies" not in kwargs
+    assert kwargs.get("verify", True) is True
+
+
+def test_every_list_in_a_printed_row_is_capped_and_says_so(monkeypatch):
+    assert census.MAX_ROW_LIST == 32
+    old = {f"2025-01-{d:02d}": "x" for d in range(1, 29)}
+    old.update({f"2025-03-{d:02d}": "x" for d in range(1, 29)})
+    handlers = {f"com.example.h{i}": [{"id": f"h{i}"}] for i in range(40)}
+    handlers["com.example.nt"] = [{"id": "zz", "available_instruments": [{"type": "network_token"}]}]
+    handlers["com.example.wide"] = [{"id": "h0", "available_instruments": [{"type": f"type{i}"} for i in range(40)]}]
+    capabilities = {f"com.example.cap{i}": [{}] for i in range(40)}
+    capabilities["dev.ucp.shopping.checkout"] = [{}]
+    profile = {"ucp": {
+        "version": "2026-08-25", "supported_versions": old, "capabilities": capabilities, "payment_handlers": handlers,
+        "services": {"dev.ucp.shopping": [{"transport": f"t{i}"} for i in range(40)]},
+    }}
+    acp = {"protocol": {"version": "2026-04-17"}, "capabilities": {"services": [f"svc{i}" for i in range(40)]}}
+    _, got = _census(monkeypatch, {("shop-a.example", U): _json(profile), ("shop-a.example", A): _json(acp),
+                                   ("shop-b.example", U): _json(UCP_0825)}, domains="shop-a.example,shop-b.example")
+    row = got.row("shop-a.example")
+    assert row["truncated"] is True and list(row)[-1] == "truncated"
+    assert [len(row[k]) for k in ("supported", "svc", "cap", "ph", "acp_cap")] == [32] * 5
+    assert len(row["ph"]["h0"]) == 32 and row["cap"][0] == "com.example.cap0"
+    assert "truncated" not in got.row("shop-b.example")
+    # the totals are counted before the cut: the 41st capability and the 41st handler still count
+    assert (got.summary["with_checkout"], got.summary["handlers_accepting_network_token"]) == (2, 1)
+    assert max(len(line) for line in got.lines) < 8000
+
+
+@pytest.mark.parametrize("key", ["supported", "svc", "cap", "acp_cap", "ph", "ph-types"],
+                         ids=["supported", "svc", "cap", "acp-cap", "handlers", "handler-types"])
+def test_each_list_is_capped_on_its_own(key):
+    row = census.empty_row("shop-a.example")
+    if key == "ph":
+        row["ph"] = {f"h{i}": [] for i in range(33)}
+    elif key == "ph-types":
+        row["ph"] = {"h": [f"t{i}" for i in range(33)]}
+    else:
+        row[key] = [f"x{i}" for i in range(33)]
+    printed = census.printable_row(row)
+    assert printed["truncated"] is True
+    assert max([len(printed[k]) for k in ("supported", "svc", "cap", "acp_cap", "ph")]
+               + [len(v) for v in printed["ph"].values()]) == 32
+    at_cap = census.empty_row("shop-a.example")
+    at_cap.update(supported=["x"] * 32, svc=["x"] * 32, cap=["x"] * 32, acp_cap=["x"] * 32,
+                  ph={f"h{i}": ["t"] * 32 for i in range(32)})
+    assert census.printable_row(at_cap) == at_cap
+
+
+# ── unresolvable is not "not public" ─────────────────────────────────────────────────────────
+
+
+def test_a_name_that_does_not_resolve_has_its_own_code_and_is_not_retried_elsewhere(monkeypatch):
+    net = Net(BOTH)
+
+    def _resolver(host):
+        net.resolved.append(host)
+        return "unresolvable"
+
+    got = _run(monkeypatch, net, ["--domains", "shop-a.example"], resolver=_resolver)
+    row = got.row("shop-a.example")
+    assert (row["robots"], row["ucp"], row["err"]) == ("unavailable", "robots_unavailable", "robots_unresolvable")
+    assert net.requests == [] and net.resolved == ["shop-a.example"]  # no www retry
+
+
+@pytest.mark.parametrize("answer, code", [
+    (socket.gaierror(8, "nodename nor servname provided"), "robots_unresolvable"),
+    ([], "robots_unresolvable"),
+    ([(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))], "robots_not_public"),
+    ([(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.9", 443)),
+      (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.9", 443))], "robots_not_public"),
+], ids=["lookup-fails", "no-answer", "private-answer", "mixed-answer"])
+def test_the_default_resolver_names_why_the_guard_refused(monkeypatch, answer, code):
+    def _fake_getaddrinfo(host, port, *a, **k):
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)
+    monkeypatch.setenv(census.FLAG, "on")
+    net = Net(BOTH)
+    seams = net.seams()
+    del seams["resolver"]
+    lines: List[str] = []
+    assert census.main(["--domains", "shop-a.example"], out=lines.append, **seams) == 0
+    assert Run(0, lines).row("shop-a.example")["err"] == code and net.requests == []
+
+
+@pytest.mark.parametrize("answer", [None, 1, "yes", "public", [True], 0, ""],
+                         ids=["none", "one", "yes", "word", "list", "zero", "empty"])
+def test_only_a_plain_true_from_the_resolver_lets_a_request_out(monkeypatch, answer):
+    net = Net(BOTH)
+    got = _run(monkeypatch, net, ["--domains", "shop-a.example"], resolver=lambda host: answer)
+    assert got.row("shop-a.example")["err"] == "robots_not_public" and net.requests == []
+
+
+# ── the host robots.txt answered on is reused ────────────────────────────────────────────────
+
+WWW = "www.shop-a.example"
+
+
+def test_a_www_canonical_shop_costs_four_requests_not_six(monkeypatch):
+    net, got = _census(monkeypatch, {
+        ("shop-a.example", R): _redirect(f"https://{WWW}/robots.txt"),
+        ("shop-a.example", U): _redirect(f"https://{WWW}/.well-known/ucp"),
+        ("shop-a.example", A): _redirect(f"https://{WWW}/.well-known/acp.json"),
+        (WWW, R): _robots("User-agent: *\nDisallow: /cart\n"),
+        (WWW, U): _json(UCP_0825), (WWW, A): _json(ACP_MIN),
+    })
+    row = got.row("shop-a.example")
+    assert (row["d"], row["robots"], row["ucp"], row["ver"], row["acp"], row["err"]) == (
+        "shop-a.example", "ok", 200, "2026-08-25", 200, None)
+    assert net.urls() == ["https://shop-a.example/robots.txt", f"https://{WWW}/robots.txt",
+                          f"https://{WWW}/.well-known/ucp", f"https://{WWW}/.well-known/acp.json"]
+    assert net.resolved == ["shop-a.example", WWW, WWW, WWW]  # the reused host is guarded before each request
+    assert net.sleeps == [1.0] * 3
+
+
+def test_the_reused_host_is_checked_again_and_refused_if_it_now_resolves_inside(monkeypatch):
+    net = Net({("shop-a.example", R): _redirect(f"https://{WWW}/robots.txt"), (WWW, R): _raw(404),
+               (WWW, U): _json(UCP_0825), (WWW, A): _json(ACP_MIN)})
+    answers = iter([True, True, False, "unresolvable"])  # apex, www for robots, then www turns private, then gone
+
+    def _resolver(host):
+        net.resolved.append(host)
+        return next(answers)
+
+    got = _run(monkeypatch, net, ["--domains", "shop-a.example"], resolver=_resolver)
+    row = got.row("shop-a.example")
+    assert (row["robots"], row["ucp"], row["acp"], row["err"]) == ("absent", "not_public", "unresolvable", "ucp_not_public")
+    assert net.urls() == ["https://shop-a.example/robots.txt", f"https://{WWW}/robots.txt"]
+    assert net.resolved == ["shop-a.example", WWW, WWW, WWW]
+
+
+def test_from_the_reused_host_the_one_hop_rule_still_holds(monkeypatch):
+    net, got = _census(monkeypatch, {
+        ("shop-a.example", R): _redirect(f"https://{WWW}/robots.txt"), (WWW, R): _raw(404),
+        (WWW, U): _redirect("https://shop-a.example/.well-known/ucp"),  # back to the apex: the sibling, one hop
+        ("shop-a.example", U): _json(UCP_EMPTY),
+        (WWW, A): _redirect("https://cdn.shop-a.example/.well-known/acp.json"),
+    })
+    row = got.row("shop-a.example")
+    assert (row["ucp"], row["ver"], row["acp"], row["err"]) == (200, "2026-01-23", "redirect_refused", "acp_redirect_refused")
+    assert len(net.requests) == 5 <= census.MAX_REQUESTS_PER_DOMAIN
+    assert {r.url.host for r in net.requests} == {"shop-a.example", WWW}
+
+
+def test_an_unavailable_robots_after_a_redirect_reuses_nothing(monkeypatch):
+    net, got = _census(monkeypatch, {("shop-a.example", R): _redirect(f"https://{WWW}/robots.txt"), (WWW, R): _raw(503),
+                                     (WWW, U): _json(UCP_0825)})
+    assert got.row("shop-a.example")["err"] == "robots_503" and len(net.requests) == 2
+
+
+# ── the plan line and the run deadline ───────────────────────────────────────────────────────
+
+
+def test_the_plan_is_printed_before_the_first_request(monkeypatch):
+    net = Net({})
+    lines: List[str] = []
+    resolved_after: List[int] = []
+
+    def _resolver(host):
+        resolved_after.append(len(lines))
+        return True
+
+    monkeypatch.setenv(census.FLAG, "on")
+    code = census.main(["--domains", "shop-a.example,https://x,shop-b.example"], out=lines.append,
+                       **net.seams(resolver=_resolver))
+    assert code == 0 and resolved_after[0] == 1  # one line was out before the first name was even resolved
+    assert lines[0] == 'UCPPROF_PLAN {"domains":3,"max_requests":12,"pace_seconds":1,"deadline_seconds":1500}'
+    assert census.DEFAULT_DEADLINE_SECONDS == 1500 and census.MAX_REQUESTS_PER_DOMAIN == 6
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "inf", "86401"],
+                         ids=["zero", "negative", "nan", "infinite", "over-a-day"])
+def test_a_deadline_that_is_not_a_usable_number_refuses_the_run(monkeypatch, value):
+    net = Net({})
+    got = _run(monkeypatch, net, ["--domains", "shop-a.example", f"--deadline-seconds={value}"])
+    assert got.code == census.EXIT_REFUSED and len(got.lines) == 1
+    assert got.lines[0].startswith("UCPPROF_REFUSED bad_deadline") and net.requests == [] and net.resolved == []
+
+
+FOUR = "shop-a.example,shop-b.example,shop-c.example,shop-d.example"
+
+
+def _deadline_run(monkeypatch, seconds: str, **kw: Any):
+    routes = {(f"shop-{x}.example", path): (_json(UCP_EMPTY) if path == U else _json(ACP_MIN))
+              for x in "abcd" for path in (U, A)}
+    net = Net(routes)
+    got = _run(monkeypatch, net, ["--domains", FOUR, "--deadline-seconds", seconds], **kw)
+    return net, got
+
+
+def test_past_the_deadline_every_remaining_domain_gets_a_deadline_row(monkeypatch):
+    # The fake clock moves only when the pacer sleeps: request k (from 0) goes out at second k.
+    net, got = _deadline_run(monkeypatch, "5.5")  # a: 0,1,2  b: 3,4,5  c: its robots.txt would be second 6
+    assert got.code == 0 and len(net.requests) == 6
+    assert [r["err"] for r in got.rows] == [None, None, "deadline", "deadline"]
+    for late in got.rows[2:]:
+        assert late == {**census.empty_row(late["d"]), "err": "deadline"}
+    assert got.summary == {**SUMMARY_ZERO, "domains": 4, "ucp_ok": 2, "acp_ok": 2, "robots_absent": 2,
+                           "errors": 2, "deadline": 2}
+    assert got.lines[0].endswith('"deadline_seconds":5.5}') and got.lines[-1] == census.DONE_LINE
+    assert len(got.lines) == 1 + 4 + 2
+    assert {r.url.host for r in net.requests} == {"shop-a.example", "shop-b.example"}
+
+
+@pytest.mark.parametrize("seconds, sent, row_b", [
+    ("3.5", 4, {"robots": "absent"}),
+    ("4.5", 5, {"robots": "absent", "ucp": 200, "ver": "2026-01-23", "supported": ["2026-01-11"]}),
+], ids=["after-robots-before-ucp", "between-ucp-and-acp"])
+def test_a_deadline_in_the_middle_of_a_domain_keeps_what_was_read(monkeypatch, seconds, sent, row_b):
+    net, got = _deadline_run(monkeypatch, seconds)  # b: robots.txt at second 3, ucp at 4, acp at 5
+    assert got.code == 0
+    assert len(net.requests) == sent  # nothing is sent once the deadline has passed
+    assert net.paths("shop-b.example") == [R, U, A][:sent - 3]
+    b = got.row("shop-b.example")
+    assert b == {**census.empty_row("shop-b.example"), **row_b, "err": "deadline"}
+    assert b["acp"] is None and b["acp_ver"] is None
+    assert got.row("shop-a.example")["err"] is None
+    for later in ("shop-c.example", "shop-d.example"):
+        assert got.row(later) == {**census.empty_row(later), "err": "deadline"}
+    assert not net.paths("shop-c.example") and not net.paths("shop-d.example")
+    assert (got.summary["deadline"], got.summary["errors"], got.summary["domains"]) == (3, 3, 4)
+    assert got.summary["ucp_ok"] == (2 if "ucp" in row_b else 1) and got.summary["robots_absent"] == 2
+    assert got.lines[-2].startswith(census.SUM_PREFIX) and got.lines[-1] == census.DONE_LINE
+
+
+def test_a_deadline_passed_while_a_request_was_in_flight_stops_before_the_next_lookup(monkeypatch):
+    net = Net({})
+
+    def handler(request):
+        if request.url.host == "shop-b.example" and request.url.path == R:
+            net.now += 100.0  # this answer took a very long time
+        return net.handler(request)
+
+    got = _run(monkeypatch, net, ["--domains", FOUR, "--deadline-seconds", "50"], transport=httpx.MockTransport(handler))
+    assert len(net.requests) == 4 and got.code == 0
+    # not one more name is resolved and not one more pace is waited for
+    assert net.resolved == ["shop-a.example"] * 3 + ["shop-b.example"] and net.sleeps == [1.0] * 3
+    assert got.row("shop-b.example") == {**census.empty_row("shop-b.example"), "robots": "absent", "err": "deadline"}
+    assert [r["err"] for r in got.rows] == [None, "deadline", "deadline", "deadline"]
+    assert got.summary["deadline"] == 3 and got.lines[-1] == census.DONE_LINE
+
+
+def test_a_deadline_overrides_an_earlier_error_in_the_same_row_and_spares_refused_entries(monkeypatch):
+    net = Net({("shop-a.example", U): _raw(200, b"{broken", content_type="application/json")})
+    got = _run(monkeypatch, net, ["--domains", "shop-a.example,https://x,shop-b.example", "--deadline-seconds", "1.5"])
+    assert got.rows[0]["ucp"] == 200 and got.rows[0]["err"] == "deadline"
+    assert [r["err"] for r in got.rows] == ["deadline", "invalid_domain", "deadline"]
+    assert (got.summary["deadline"], got.summary["errors"]) == (2, 3)
