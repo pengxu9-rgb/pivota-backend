@@ -2,18 +2,24 @@
 Agent Metrics aliases under /agent/v1/metrics for external agents and portals
 These mirror /agent/metrics endpoints and support x-api-key-based filtering.
 /recent reads only what routes.agent_metrics.resolve_recent_activity_scope lets the caller read.
+/summary and /timeline are platform-wide (every agent's traffic, 24 h order revenue, the active-agent
+count), so they are staff-only: the same require_admin_or_key gate as the other internal usage
+routes (X-ADMIN-KEY or an admin JWT; anonymous -> 401). FIX_PLAN S-09.
 """
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from db.database import database
 from routes.agent_metrics import resolve_recent_activity_scope
+from utils.auth import require_admin_or_key
 
 router = APIRouter(prefix="/agent/v1/metrics", tags=["Agent Metrics V1"])
 
 
 @router.get("/summary")
-async def get_metrics_summary_v1(request: Request) -> Dict[str, Any]:
+async def get_metrics_summary_v1(
+    request: Request, _staff: Dict[str, Any] = Depends(require_admin_or_key),
+) -> Dict[str, Any]:
     try:
         now = datetime.now()
         last_hour = now - timedelta(hours=1)
@@ -63,10 +69,12 @@ async def get_metrics_summary_v1(request: Request) -> Dict[str, Any]:
             {"since": last_24h}
         ) or 0
 
-        # Revenue from orders table (last 24h)
+        # Revenue from orders table (last 24h). Test orders (O-07, stamped at write by
+        # services/test_traffic.py) are not revenue.
         revenue = await database.fetch_val(
             """SELECT COALESCE(SUM(total), 0) FROM orders 
-               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)""",
+               WHERE created_at >= :since AND (is_deleted IS NULL OR is_deleted = FALSE)
+                 AND COALESCE(CAST(metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')""",
             {"since": last_24h}
         ) or 0
 
@@ -156,7 +164,9 @@ async def get_recent_activity_v1(
         return {"status": "success", "activities": [], "count": 0, "note": str(e)}
 
 @router.get("/timeline")
-async def get_metrics_timeline_v1(hours: int = 24) -> Dict[str, Any]:
+async def get_metrics_timeline_v1(
+    hours: int = 24, _staff: Dict[str, Any] = Depends(require_admin_or_key),
+) -> Dict[str, Any]:
     try:
         since = datetime.now() - timedelta(hours=hours)
         timeline = await database.fetch_all(

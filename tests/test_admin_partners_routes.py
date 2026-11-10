@@ -479,6 +479,7 @@ def test_settlement_retry_resets_status_and_calls_transfer(
     fake_db.add_file(file_id=7, channel_partner_id=19, transfer_status="failed")
     transfer_calls: list[dict[str, Any]] = []
     monkeypatch.setenv("SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING", "true")
+    monkeypatch.setenv("SETTLEMENT_FILE_TRANSFER_ENABLED", "true")  # O-05 gate armed (W3 F1)
     monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
 
     def fake_stripe_transfer_create(**kwargs: Any) -> SimpleNamespace:
@@ -505,6 +506,63 @@ def test_settlement_retry_resets_status_and_calls_transfer(
     assert body["stripe_transfer_error"] is None
     assert transfer_calls[0]["amount"] == 1104500
     assert fake_db._file_by_id(7)["transfer_status"] == "transferred"
+
+
+@pytest.mark.parametrize("flag", [None, "", "1", "yes", "false"])
+def test_settlement_retry_409_transfers_disabled_sends_nothing_and_keeps_the_row(
+    fake_db: _FakeAdminPartnersDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str | None,
+) -> None:
+    # O-05, Peng's decision on W3 F1: with SETTLEMENT_FILE_TRANSFER_ENABLED not literally 'true'
+    # the staff retry answers 409 TRANSFERS_DISABLED, calls Stripe zero times, and leaves the
+    # file exactly as it was (still `failed`, its error intact).
+    fake_db.add_partner()
+    fake_db.add_file(file_id=7, channel_partner_id=19, transfer_status="failed")
+    fake_db._file_by_id(7)["stripe_transfer_error"] = "no_stripe_connect_account"
+    before = dict(fake_db._file_by_id(7))
+    if flag is None:
+        monkeypatch.delenv("SETTLEMENT_FILE_TRANSFER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SETTLEMENT_FILE_TRANSFER_ENABLED", flag)
+    monkeypatch.setenv("SETTLEMENT_TRANSFER_ALLOWED_ON_STAGING", "true")
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    transfer_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        module.settlement_file_service.stripe.Transfer,
+        "create",
+        lambda **kw: transfer_calls.append(kw) or SimpleNamespace(id="tr_should_not_happen"),
+        raising=False,
+    )
+    client, app = _build_client()
+    try:
+        response = client.post("/admin/partners/19/settlements/7/retry")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"] == "TRANSFERS_DISABLED"
+    assert "SETTLEMENT_FILE_TRANSFER_ENABLED is off" in body["message"]
+    assert transfer_calls == []
+    assert fake_db._file_by_id(7) == before
+
+
+async def test_settlement_transfer_service_refuses_every_caller_when_disabled(
+    fake_db: _FakeAdminPartnersDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is INSIDE the service, so the cron's transfer_all and any direct caller obey it.
+    fake_db.add_partner()
+    fake_db.add_file(file_id=7, channel_partner_id=19, transfer_status="pending")
+    before = dict(fake_db._file_by_id(7))
+    monkeypatch.delenv("SETTLEMENT_FILE_TRANSFER_ENABLED", raising=False)
+    svc = module.settlement_file_service
+    with pytest.raises(svc.SettlementTransfersDisabledError):
+        await svc.transfer(settlement_file_id=7)
+    with pytest.raises(svc.SettlementTransfersDisabledError):
+        await svc.transfer_all_pending_for_month(date(2026, 10, 1))
+    assert fake_db._file_by_id(7) == before
 
 
 def _normalize_sql(query: str) -> str:
