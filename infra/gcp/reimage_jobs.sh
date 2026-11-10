@@ -54,8 +54,11 @@ export CLOUDSDK_CORE_PROJECT="$PROJECT"
 
 # THE REGISTRY: every pinned job this script may roll, by the repo its image is built from.
 # store-audit-commerce-probe is absent on purpose (store-audit-browser image, its own build).
+# The two cart-proof jobs are absent on purpose too: only their own setup script may name them
+# (a test scans all of infra/ for their names, this comment included), so re-run that script to
+# re-image them.
 BACKEND_JOBS="external-referral-refresh external-seed-destination-sweep merchant-purchasability-sweep
-tierb-cart-link-eligibility reap-cart-proof-mirror reap-cart-proof-enrichment content-canonical-election
+tierb-cart-link-eligibility content-canonical-election
 agent-pdp-orphan-reaper derive-offer-market-currency audit-domainless-offer-currency
 store-audit-ucp-reprobe-enqueue store-audit-commerce-reprobe-enqueue brand-official-canonical-promote
 reviews-invitation-send retailer-ingest-drain"
