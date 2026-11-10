@@ -35,6 +35,7 @@ import routes.agent_auth as agent_auth
 import routes.agent_forwarded_owner as forwarded
 import routes.agent_shop_gateway as gw
 import routes.agent_v2 as agent_v2
+import services.issuing_agent_assertion as ia
 from main import app
 from services import assertion_replay_guard
 from services.bound_issuing_assertion import sign_bound_issuing_agent_assertion
@@ -759,3 +760,235 @@ def test_a_gateway_quote_is_not_found_by_an_adopted_partner(world):
     # ...and the unsigned gateway, which owns it, still may (today's MCP path, flag on or off).
     assert send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY).status_code == 200
     assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT]
+
+
+# --- O-04 status review P1-7: an OAuth subject (the MCP OAuth door) --------------------------------
+#
+# The gateway signs a v2 `{kind: "oauth", iss, cid}` for every mcp_oauth caller (PIVOTA-Agent
+# src/attribution/issuingAgentAssertion.js issuingSubjectFromInvokeContext). Only a CONFIDENTIAL client
+# our authorization server provisioned to an active agent is a partner; every other client (the public
+# connectors) is nobody's partner, and its call must stay the gateway's, exactly as before O-04, not 409.
+# Driven through the real agent_for_oauth_client / is_confidential_client over a stubbed `database`.
+
+
+OWN_ISSUER = "https://as.example.com"
+PUBLIC_CLIENT = "mcpc_public_connector"
+PARTNER_A_CLIENT = "mcpc_partner_a"
+UNPROVISIONED_CLIENT = "mcpc_confidential_unprovisioned"
+INACTIVE_CLIENT = "mcpc_inactive_agent"
+OAUTH_CLIENTS = {
+    # client_id: (token_endpoint_auth_method, client_secret_hash)
+    PUBLIC_CLIENT: ("none", None),
+    PARTNER_A_CLIENT: ("client_secret_basic", "fake_hash_a"),
+    UNPROVISIONED_CLIENT: ("client_secret_post", "fake_hash_u"),
+    INACTIVE_CLIENT: ("client_secret_basic", "fake_hash_i"),
+}
+OAUTH_REGISTRATIONS = {(OWN_ISSUER, PARTNER_A_CLIENT): PARTNER_A, (OWN_ISSUER, INACTIVE_CLIENT): INACTIVE}
+
+
+class _OAuthTables:
+    """mcp_oauth_clients + agent_oauth_clients, answering exactly the two queries ia sends."""
+
+    def __init__(self):
+        self.fail = False
+        self.queries: List[str] = []
+
+    async def fetch_one(self, sql, values):
+        if self.fail:
+            raise RuntimeError("db down")
+        if sql == ia._CLIENT_AUTH_SQL:
+            self.queries.append("client")
+            row = OAUTH_CLIENTS.get(values["client_id"])
+            return {"token_endpoint_auth_method": row[0], "client_secret_hash": row[1]} if row else None
+        if sql == ia._ACTIVE_CLIENT_AGENT_SQL:
+            self.queries.append("registration")
+            agent_id = OAUTH_REGISTRATIONS.get((values["issuer"], values["client_id"]))
+            return {"agent_id": agent_id} if agent_id else None
+        raise AssertionError(f"unexpected query: {sql}")
+
+
+@pytest.fixture()
+def oauth(world, monkeypatch):
+    tables = _OAuthTables()
+    monkeypatch.setattr(ia, "database", tables)
+    monkeypatch.setattr(ia, "_own_issuer", lambda: OWN_ISSUER)
+    world["auto_own_quote"] = False  # each order below previews its quote through the real route first
+    return tables
+
+
+def bound_oauth(cid: str, op: str, *, method: str, path: str, rid: Optional[str], raw: bytes,
+                iss: str = OWN_ISSUER, secret: str = SECRET, ts: Optional[int] = None,
+                jti: Optional[str] = None) -> str:
+    """The gateway's v2 OAuth payload, member for member (signBoundIssuingAgentAssertion): no `sub`."""
+    payload: Dict[str, Any] = {
+        "v": 2, "kind": "oauth", "iss": iss, "cid": cid, "op": op,
+        "ts": int(time.time()) if ts is None else ts, "jti": jti or secrets.token_urlsafe(18),
+        "m": method, "p": path, "rid": rid, "bh": hashlib.sha256(raw).hexdigest(),
+    }
+    return sign_bound_issuing_agent_assertion(payload, secret)
+
+
+def as_oauth(world, cid: str, op: str, method: str, path: str, body: Optional[Dict[str, Any]] = None,
+             rid: Optional[str] = None, **token: Any):
+    return send(world, method, path, GATEWAY_KEY, body,
+                bound_oauth(cid, op, method=method, path=path, rid=rid, raw=raw_json(body), **token))
+
+
+def oauth_preview_then_create(world, cid: str, **token: Any):
+    preview = as_oauth(world, cid, "preview_quote", "POST", PREVIEW, PREVIEW_BODY)
+    assert preview.status_code == 200, preview.text
+    return as_oauth(world, cid, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1", **token)
+
+
+def _shape(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in row.items() if k != "order_id"}
+
+
+@pytest.mark.parametrize("cid,iss", [
+    (PUBLIC_CLIENT, OWN_ISSUER),
+    (UNPROVISIONED_CLIENT, OWN_ISSUER),
+    (INACTIVE_CLIENT, OWN_ISSUER),
+    (PARTNER_A_CLIENT, "https://foreign-as.example.com"),
+], ids=["public", "confidential_unprovisioned", "inactive_agent", "foreign_issuer"])
+def test_flag_on_an_unregistered_oauth_client_creates_its_order_as_today(world, oauth, cid, iss):
+    # Today's behaviour = the gateway's call with no header at all: measured on the same app first.
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    baseline = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY)
+    assert baseline.status_code == 200, baseline.text
+    [today] = world["created"]
+    world["created"].clear()
+    world["charged"].clear()
+    world["quote_owners"].clear()
+    forwarded.FORWARDED_OWNER_OUTCOMES.clear()
+
+    preview = send(world, "POST", PREVIEW, GATEWAY_KEY, PREVIEW_BODY,
+                   bound_oauth(cid, "preview_quote", method="POST", path=PREVIEW, rid=None,
+                               raw=raw_json(PREVIEW_BODY), iss=iss))
+    res = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY,
+               bound_oauth(cid, "create_order", method="POST", path=ORDERS, rid="q_1",
+                           raw=raw_json(ORDER_BODY), iss=iss))
+    assert (preview.status_code, res.status_code) == (200, 200), (preview.text, res.text)
+    assert world["quotes"] == [GATEWAY_AGENT], "the quote is the gateway's, as today"
+    [row] = world["created"]
+    assert _shape(row) == _shape(today)
+    assert row["agent_id"] == GATEWAY_AGENT
+    assert "partner_identity" not in row["metadata"] and "partner_agent_id" not in row["metadata"]
+    assert world["charged"] == [GATEWAY_AGENT, GATEWAY_AGENT], "no partner is charged"
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"absent_oauth_unregistered": 2}
+
+
+def test_a_registered_confidential_oauth_client_is_adopted(world, oauth):
+    res = oauth_preview_then_create(world, PARTNER_A_CLIENT)
+    assert res.status_code == 200, res.text
+    assert world["quotes"] == [PARTNER_A]
+    [row] = world["created"]
+    assert row["agent_id"] == PARTNER_A
+    assert row["allowed_merchants"] == ["m_shop_a"]
+    assert row["metadata"]["partner_agent_id"] == PARTNER_A
+    assert row["metadata"]["partner_identity"] == {
+        "partner_agent_id": PARTNER_A, "via_agent_id": GATEWAY_AGENT, "op": "create_order",
+    }
+    assert world["charged"] == [GATEWAY_AGENT, PARTNER_A, GATEWAY_AGENT, PARTNER_A]
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"adopted": 2}
+    assert "registration" in oauth.queries
+
+
+def test_an_api_key_partner_through_the_gateway_has_partner_agent_id_set(world, oauth):
+    preview = as_partner(world, PARTNER_B, "preview_quote", "POST", PREVIEW, PREVIEW_BODY)
+    res = create_as(world, PARTNER_B)
+    assert (preview.status_code, res.status_code) == (200, 200), (preview.text, res.text)
+    [row] = world["created"]
+    assert (row["agent_id"], row["metadata"]["partner_agent_id"]) == (PARTNER_B, PARTNER_B)
+    assert oauth.queries == [], "an agent subject never reads the OAuth tables"
+
+
+@pytest.mark.parametrize("label,token,reason", [
+    ("forged", {"secret": "not_the_secret"}, "bad_mac"),
+    ("expired", {"ts": int(time.time()) - 3600}, "stale"),
+    ("future", {"ts": int(time.time()) + 3600}, "stale"),
+], ids=["forged", "expired", "future"])
+def test_an_unregistered_oauth_token_that_does_not_verify_is_still_refused(world, oauth, label, token, reason):
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    res = as_oauth(world, PUBLIC_CLIENT, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1", **token)
+    assert rejected(res, reason), (label, res.text)
+    assert world["created"] == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {f"rejected_{reason}": 1}
+
+
+def test_an_unregistered_oauth_token_that_is_mismatched_is_still_refused(world, oauth):
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    raw = raw_json(ORDER_BODY)
+    swapped_body = {**ORDER_BODY, "metadata": {"agent_v2": {"hosted_checkout": False}}}
+    cases = [
+        ("body", bound_oauth(PUBLIC_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_1", raw=raw),
+         swapped_body),
+        ("op", bound_oauth(PUBLIC_CLIENT, "preview_quote", method="POST", path=ORDERS, rid="q_1", raw=raw),
+         ORDER_BODY),
+        ("path", bound_oauth(PUBLIC_CLIENT, "create_order", method="POST", path=PREVIEW, rid="q_1", raw=raw),
+         ORDER_BODY),
+        ("resource", bound_oauth(PUBLIC_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_2", raw=raw),
+         ORDER_BODY),
+        ("method", bound_oauth(PUBLIC_CLIENT, "create_order", method="PUT", path=ORDERS, rid="q_1", raw=raw),
+         ORDER_BODY),
+    ]
+    for reason, token, body in cases:
+        res = send(world, "POST", ORDERS, GATEWAY_KEY, body, token)
+        assert rejected(res, reason), (reason, res.text)
+    assert world["created"] == []
+
+
+def test_a_replayed_unregistered_oauth_token_is_refused(world, oauth):
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    token = bound_oauth(PUBLIC_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_1",
+                        raw=raw_json(ORDER_BODY))
+    first = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
+    second = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
+    assert first.status_code == 200, first.text
+    assert rejected(second, "replay"), second.text
+    assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT]
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"absent_oauth_unregistered": 1, "rejected_replay": 1}
+
+
+def test_an_unreadable_oauth_registration_is_refused_not_taken_as_nobodys(world, oauth):
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    oauth.fail = True
+    res = as_oauth(world, PUBLIC_CLIENT, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1")
+    assert rejected(res, "subject"), res.text
+    assert world["created"] == []
+
+
+def test_an_agent_subject_that_names_no_active_agent_is_still_refused(world, oauth):
+    # Only the OAuth miss is "nobody's partner": the gateway signs kind=agent only for a key it verified.
+    res = create_as(world, INACTIVE)
+    assert rejected(res, "subject"), res.text
+
+
+def test_a_v1_oauth_token_is_never_adopted_on_a_money_route(world, oauth):
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    token = sign_issuing_agent_assertion(
+        {"v": 1, "kind": "oauth", "iss": OWN_ISSUER, "cid": PARTNER_A_CLIENT, "op": "create_order",
+         "ts": int(time.time())}, SECRET)
+    res = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
+    assert res.status_code == 200, res.text
+    assert world["created"][0]["agent_id"] == GATEWAY_AGENT
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"unbound_v1": 1}
+
+
+def test_flag_off_an_oauth_token_changes_nothing(world, oauth, monkeypatch):
+    monkeypatch.delenv(FLAG)
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    for cid in (PUBLIC_CLIENT, PARTNER_A_CLIENT):
+        res = as_oauth(world, cid, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1")
+        assert res.status_code == 200, res.text
+    assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT, GATEWAY_AGENT]
+    assert oauth.queries == [] and forwarded.FORWARDED_OWNER_OUTCOMES == {}
+
+
+def test_an_unregistered_oauth_mint_serves_links_and_records_nothing(mint, oauth):
+    call, batches, _ = mint
+    _, link = call(GATEWAY_KEY, bound_oauth(PUBLIC_CLIENT, "external_seed_links.mint", method="POST",
+                                            path=MINT_PATH, rid=None, raw=raw_json(MINT_BODY)))
+    assert link["external_redirect_url"] and batches == []
+    click, _ = call(GATEWAY_KEY, bound_oauth(PARTNER_A_CLIENT, "external_seed_links.mint", method="POST",
+                                             path=MINT_PATH, rid=None, raw=raw_json(MINT_BODY)))
+    assert [[(c.click_id, c.agent_id) for c in b] for b in batches] == [[(click, PARTNER_A)]]
