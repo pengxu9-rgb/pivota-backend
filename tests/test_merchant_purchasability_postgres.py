@@ -72,6 +72,8 @@ if _IS_PG:
         _scans,
         # The IP-throttle cases: the sweep armed, a fake-clock pacer, the breaker state reset.
         _armed,
+        # The warm-click guard cases: synthetic lanes and staleness rows, no database.
+        _guard,
         page,
         res,
     )
@@ -237,8 +239,8 @@ async def test_the_self_heal_is_idempotent_and_leaves_the_rail_usable(_migration
     await ensure_required_schema_light()
     assert await _fingerprint() == once
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 async def test_the_migration_reapplies_over_a_self_healed_database(_migration_db):
@@ -295,11 +297,11 @@ async def test_the_primary_key_is_domain_market_vantage(_migration_db):
     import db.merchant_purchasability as mp
     from db.database import database
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="worker")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="worker")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="worker")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="worker")
     row = await database.fetch_one(
-        "SELECT COUNT(*) AS n FROM merchant_purchasability WHERE merchant_domain = 'judydoll.com'"
+        "SELECT COUNT(*) AS n FROM merchant_purchasability WHERE merchant_domain = 'juniper-card.example'"
     )
     assert int(row["n"]) == 2
 
@@ -310,16 +312,35 @@ async def test_the_jsonb_columns_are_really_jsonb(_migration_db):
     import db.merchant_purchasability as mp
     from db.database import database
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     row = await database.fetch_one(
         """
         SELECT payment_methods -> 0 AS first_method,
                evidence ->> 'verdict' AS verdict
-          FROM merchant_purchasability WHERE merchant_domain = 'judydoll.com'
+          FROM merchant_purchasability WHERE merchant_domain = 'juniper-card.example'
         """
     )
     assert row["verdict"] == "ELIGIBLE"
     assert row["first_method"] is not None
+
+
+async def test_list_due_reads_the_verdict_and_the_evidence_detail(_migration_db):
+    """The staleness read the sweep's warm-click guard decides on: `evidence->>'detail'` is the
+    Postgres half of the one statement that differs by dialect (SQLite uses json_extract)."""
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+
+    await mp.record_check("nocatalog.example", "US", res(
+        "VARIANT_UNVERIFIED", host="nocatalog.example", detail="products_json_page_1_status_404"))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    rows = {r["merchant_domain"]: r for r in await mp.list_due(50, strict=True)}
+    assert (rows["nocatalog.example"]["verdict"], rows["nocatalog.example"]["detail"]) == (
+        "VARIANT_UNVERIFIED", "products_json_page_1_status_404")
+    assert rows["juniper-card.example"]["verdict"] == "ELIGIBLE"
+    assert rows["juniper-card.example"]["positive_until"] is not None, "the sticky-proven read"
+    assert rows["nocatalog.example"]["positive_until"] is None
+    assert sweep._found_no_shopify_catalog(rows["nocatalog.example"]["verdict"],
+                                           rows["nocatalog.example"]["detail"]) is True
 
 
 async def test_the_ttl_window_is_computed_by_the_server(_migration_db, monkeypatch):
@@ -328,8 +349,8 @@ async def test_the_ttl_window_is_computed_by_the_server(_migration_db, monkeypat
     import db.merchant_purchasability as mp
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_TTL_HOURS", "5")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    fact = await mp.get_fact("judydoll.com", "US")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    fact = await mp.get_fact("juniper-card.example", "US")
     delta = fact["positive_until"] - fact["checked_at"]
     assert abs(delta.total_seconds() - 5 * 3600) < 60, delta
     assert fact["checked_at"].tzinfo is not None, "timestamps come back tz-aware"
@@ -370,8 +391,8 @@ async def _get(app, url):
 async def test_the_ops_route_reports_the_tier_the_door_would_serve(_migration_db, _app):
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    response = await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    response = await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")
     assert response.status_code == 200
     body = response.json()
     assert body["tier"] == "purchase"
@@ -395,8 +416,8 @@ async def test_the_ops_route_shows_a_wrong_vantage_fact_as_browse_only(_migratio
     True and concludes the merchant is purchasable. `tier` is the answer."""
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["facts"][0]["card_available"] is True
     assert body["facts"][0]["positive_now"] is False
     assert body["tier"] == "browse_only"
@@ -407,17 +428,17 @@ async def test_the_ops_route_normalises_the_key_the_way_the_writer_does(_migrati
     """An operator must not be shown a different row than the door reads."""
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=WWW.JudyDoll.com&market=us")).json()
-    assert body["domain"] == "judydoll.com" and body["market"] == "US"
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=WWW.Juniper-Card.example&market=us")).json()
+    assert body["domain"] == "juniper-card.example" and body["market"] == "US"
     assert body["tier"] == "purchase"
 
 
 async def test_the_ops_route_carries_no_buyer_data(_migration_db, _app):
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    text = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).text
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    text = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).text
     for forbidden in ("<html", "<script", "email", "address1", "postal", "phone"):
         assert forbidden not in text.lower(), forbidden
 
@@ -428,13 +449,13 @@ async def test_the_ops_route_reports_the_gate_state_but_is_not_gated_by_it(_migr
     "this merchant is browse_only" from "the backend is not enforcing yet"."""
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is False
     assert body["facts"], "the facts are still readable with the gate off"
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is True
 
 
@@ -587,16 +608,16 @@ async def test_the_ops_route_carries_the_gateway_contract_fields(_migration_db, 
     gateway acting on `tier` alone would take the whole catalogue browse-only on day one."""
     import db.merchant_purchasability as mp
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", raising=False)
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is False and body["sweep_enabled"] is False
     assert body["tier"] == "purchase", "the FACT is reported regardless of the dials"
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "1")
-    body = (await _get(_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await _get(_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is True and body["sweep_enabled"] is True
 
 
@@ -618,13 +639,13 @@ async def test_the_census_reports_each_key_in_the_state_the_gate_would_read(_db,
     import db.merchant_purchasability as mp
     import jobs.merchant_purchasability_sweep as sweep
     from scripts import merchant_purchasability_census as census
-    from tests.test_merchant_purchasability import _ALLOWLISTS, _CART_MINT_EXPECTED, _Fetcher
+    from tests.test_merchant_purchasability import _POPULATION, _WARM_CLICK_EXPECTED, _Fetcher
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BATCH", "6")
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({
-        "flowerbeauty.com": res("NO_CARD_PAYMENT", card=False, host="flowerbeauty.com"),
+        "fern-paypal.example": res("NO_CARD_PAYMENT", card=False, host="fern-paypal.example"),
         "catalog-brand-0.example": res("BLOCKED_UNKNOWN", host="catalog-brand-0.example"),
     }))
     await sweep.run_merchant_purchasability_sweep()
@@ -632,13 +653,19 @@ async def test_the_census_reports_each_key_in_the_state_the_gate_would_read(_db,
     report = await census.census()
     assert report["incomplete"] is False
     states = {(r["host"], r["market"]): r["state"] for r in report["rows"]}
-    assert set(states) == _ALLOWLISTS | _CART_MINT_EXPECTED
+    # Every lane's keys, the warm-click lane included.
+    assert set(states) == _POPULATION
     for key, state in states.items():
         assert (state == "positive") is await mp.is_purchasable(*key), key
     assert states[("catalog-brand-0.example", "US")] == "unverifiable"
-    assert states[("flowerbeauty.com", "US")] == "confirmed_negative"
+    assert states[("fern-paypal.example", "US")] == "confirmed_negative"
     assert list(states.values()).count("never_checked") == len(states) - 6
     assert report["summary"]["cart_mint_lane"]["complete"] is True
+    # The warm-click lane is counted by state, and the summary carries no per-key map (it is
+    # fenced as JSON by `run`).
+    assert sum(report["summary"]["warm_click_keys"].values()) == len(_WARM_CLICK_EXPECTED)
+    assert "warm_seeds_by_key" not in report["summary"]["cart_mint_lane"]
+    census._fence(report["summary"])
 
 
 async def test_the_census_transaction_refuses_a_write(_db, _cart_seeds, monkeypatch):

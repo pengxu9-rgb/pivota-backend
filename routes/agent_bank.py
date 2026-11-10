@@ -14,6 +14,7 @@ import re
 from db.database import database
 from db.beneficiary_repo import BeneficiaryRepo
 from utils.auth import get_current_user
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +79,7 @@ async def get_bank_details(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized to view these bank details")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         repo = BeneficiaryRepo()
@@ -133,9 +132,7 @@ async def update_bank_details(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         # Validate that either IBAN or account number is provided
@@ -198,9 +195,7 @@ async def toggle_share_permission(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         repo = BeneficiaryRepo()
@@ -242,9 +237,7 @@ async def delete_bank_details(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     try:
         repo = BeneficiaryRepo()
@@ -294,9 +287,7 @@ async def get_supported_methods(
     if current_user.get("role") != "agent":
         raise HTTPException(status_code=403, detail="Only agents can access this endpoint")
     
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=())
     
     # For now, return all supported methods
     # In production, this would check agent's country/region

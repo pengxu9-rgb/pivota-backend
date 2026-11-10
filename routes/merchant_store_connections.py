@@ -1189,7 +1189,50 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
     email = normalize_email(str(body.email))
     await _ensure_shopify_oauth_tables()
 
-    # Consume the token FIRST (atomic, one-time) so a replay cannot re-bind the store.
+    token_key = {
+        "jti_sha256": hashlib.sha256(jti.encode("utf-8")).hexdigest(),
+        "merchant_id": shell_merchant_id,
+        "shop_domain": shop_domain,
+    }
+    spent_detail = "This link has already been used or expired. Reinstall the app to get a new one."
+    # A spent, expired or unknown token gets no further than the token table: no
+    # account lookup (so a replayed link learns nothing about any address) and no write.
+    live = await database.fetch_one(
+        """
+        SELECT 1 FROM shopify_store_claim_tokens
+        WHERE jti_sha256 = :jti_sha256
+          AND used_at IS NULL
+          AND expires_at > NOW()
+          AND merchant_id = :merchant_id
+          AND shop_domain = :shop_domain
+        """,
+        token_key,
+    )
+    if not live:
+        raise HTTPException(status_code=400, detail=spent_detail)
+
+    existing = await database.fetch_one(
+        "SELECT id, email, password_hash, full_name, role, active, merchant_id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+        {"email": email},
+    )
+    user = dict(existing) if existing else None
+
+    if user is None:
+        # The new-account branch below creates the users row at the address, and a
+        # claim token only proves an install (on any store, including the caller's
+        # own dev store), never that the caller reads this mailbox. Refuse an address
+        # that already names an employee (login would promote this row to staff), an
+        # agent owner, a merchant contact or an identity in use. Read-only, and BEFORE
+        # the token is spent, so the installer can retry with another address. It
+        # reveals no more than the public sign-up's own 409 does.
+        from routes.merchant_onboarding_routes import refuse_signup_at_claimed_address
+
+        await refuse_signup_at_claimed_address(email, also_check_users_and_merchant_contacts=True)
+
+    # Consume the token (atomic, one-time) before anything is written, so a replay or
+    # a concurrent claim with the same link cannot bind the store twice. The password
+    # check on an existing account stays AFTER this: a wrong guess spends the link, so
+    # a link is never a free password oracle.
     consumed = await database.fetch_one(
         """
         UPDATE shopify_store_claim_tokens
@@ -1201,23 +1244,10 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
           AND shop_domain = :shop_domain
         RETURNING merchant_id
         """,
-        {
-            "jti_sha256": hashlib.sha256(jti.encode("utf-8")).hexdigest(),
-            "merchant_id": shell_merchant_id,
-            "shop_domain": shop_domain,
-        },
+        token_key,
     )
     if not consumed:
-        raise HTTPException(
-            status_code=400,
-            detail="This link has already been used or expired. Reinstall the app to get a new one.",
-        )
-
-    existing = await database.fetch_one(
-        "SELECT id, email, password_hash, full_name, role, active, merchant_id FROM users WHERE email = :email",
-        {"email": email},
-    )
-    user = dict(existing) if existing else None
+        raise HTTPException(status_code=400, detail=spent_detail)
 
     if user:
         # Existing account: authenticate before binding anything to it.
@@ -1242,7 +1272,7 @@ async def claim_shopify_store(body: ShopifyStoreClaimRequest):
             )
         role = user.get("role") or "merchant"
     else:
-        # New account: it owns the shell merchant outright.
+        # New account (the claimed-address refusal ran above): it owns the shell merchant outright.
         target_merchant_id = shell_merchant_id
         role = "merchant"
         await database.execute(

@@ -6194,8 +6194,9 @@ async def _refresh_external_seed_by_id(
     # BEFORE this was known and wrote the fetched page's price whatever it was -- a canonical naming
     # another product, a 200 redirect onto another handle, a 200 bot challenge, a cached fallback, a
     # URL with no product handle -- and the serving lanes read `price_amount` (and a stored variant's
-    # price ahead of it) first. NOT gated here, as before: the snapshot's title, copy, image and
-    # canonical from a page fetch, and the curated fills (title, description, image_url when empty).
+    # price ahead of it) first. The page's COPY (the snapshot's title, copy, image, gallery and canonical, the
+    # curated fills and the row's title / image_url fills) follows the content gate instead (`page_read_is_the_product`,
+    # below): a fetch that is not a read of the served product writes none of it.
     # Deriving "did we read it" twice is the twin-implementation drift this file keeps paying for.
     #
     # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
@@ -6311,6 +6312,24 @@ async def _refresh_external_seed_by_id(
                    if read_the_served_product else {}),
             }
         )
+    elif not page_read_is_the_product:
+        # A PAGE THAT IS NOT A READ OF THE SERVED PRODUCT WRITES NO COPY. A redirect onto another handle, a 200
+        # bot challenge, a cached fallback or a fetch that reached nothing answered this fetch: its title,
+        # copy, image and canonical are another page's, and the gateway serves `snapshot.description` AHEAD of the
+        # seed's own. Only what the catalogue lane writes is written: the price facts and the clock. A handle-less
+        # read (EXTERNAL_SEED_HANDLELESS_READ `on`) also lands here: it reads price, stock and variants, never the
+        # copy (its content gate is off by design), but it DID price the row, so `read_source` (which reader priced it
+        # last) is cleared as by any page read; a fetch that priced nothing leaves it.
+        if read_the_served_product:
+            seed_data["snapshot"].pop("read_source", None)
+        seed_data["snapshot"].update(
+            {
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
+                "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+                or _to_iso(datetime.now(timezone.utc)),
+            }
+        )
     else:
         seed_data["snapshot"].pop("read_source", None)
         seed_data["snapshot"].update(
@@ -6338,35 +6357,37 @@ async def _refresh_external_seed_by_id(
             seed_data["snapshot"]["description_refused_source"] = description_refused_source
         else:
             seed_data["snapshot"].pop("description_refused_source", None)
-    # Only overwrite curated fields if they are missing.
-    if _should_replace_localized_copy(
-        existing_text=seed_data.get("description"),
-        incoming_text=snap_description,
-        market=market,
-        previous_canonical_url=previous_canonical_url,
-        refreshed_canonical_url=canonical_url,
-    ):
-        seed_data["description"] = snap_description
-    if not seed_data.get("title"):
-        seed_data["title"] = snap_title
-    if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
-        seed_data, content["meta_description"]
-    ):
-        # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
-        seed_data["description"] = snap_description
-        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
-    if not seed_data.get("description"):
-        if snap_description:
+    # Only overwrite curated fields if they are missing. A page that is not a read of the served product (above)
+    # fills and replaces nothing either: an empty title, description or image would take another page's.
+    if not (content_read and not page_read_is_the_product):
+        if _should_replace_localized_copy(
+            existing_text=seed_data.get("description"),
+            incoming_text=snap_description,
+            market=market,
+            previous_canonical_url=previous_canonical_url,
+            refreshed_canonical_url=canonical_url,
+        ):
+            seed_data["description"] = snap_description
+        if not seed_data.get("title"):
+            seed_data["title"] = snap_title
+        if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
+            seed_data, content["meta_description"]
+        ):
+            # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
             seed_data["description"] = snap_description
             seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
-        elif page_read_is_the_product and content["fill_only_description"]:
-            # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
-            # copy from a later read replaces it (Peng 2026-10-15). It never reaches
-            # `snapshot.description`, which the gateway serves ahead of the seed's own.
-            seed_data["description"] = content["fill_only_description"]
-            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
-    if not seed_data.get("image_url"):
-        seed_data["image_url"] = snap_image_url
+        if not seed_data.get("description"):
+            if snap_description:
+                seed_data["description"] = snap_description
+                seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
+            elif page_read_is_the_product and content["fill_only_description"]:
+                # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
+                # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+                # `snapshot.description`, which the gateway serves ahead of the seed's own.
+                seed_data["description"] = content["fill_only_description"]
+                seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
+        if not seed_data.get("image_url"):
+            seed_data["image_url"] = snap_image_url
     # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
     # gallery another writer stamped: a storefront's own structured gallery (the drain's
     # products.json `images[]`) is the product's, and a page read's one or two declared images
@@ -6759,8 +6780,10 @@ async def _refresh_external_seed_by_id(
             "read_canonical_url": row.get("canonical_url"),
             "canonical_url": served_canonical,
             "domain": served_domain,
-            "title": snap_title,
-            "image_url": snap_image_url,
+            # The row's columns fill an EMPTY title / image (COALESCE above) and serving falls back to them: only from
+            # a page that is the served product, as the copy above.
+            "title": None if (content_read and not page_read_is_the_product) else snap_title,
+            "image_url": None if (content_read and not page_read_is_the_product) else snap_image_url,
             "price_amount": next_amount,
             "price_currency": next_currency,
             "availability": next_availability,
