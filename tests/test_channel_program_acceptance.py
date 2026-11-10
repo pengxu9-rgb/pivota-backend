@@ -1133,6 +1133,7 @@ async def test_brief_9_1_end_to_end_starter_brand_round_trip(
         "create",
         fake_transfer_create,
     )
+    monkeypatch.setenv("SETTLEMENT_FILE_TRANSFER_ENABLED", "true")  # O-05 gate (W3 F1)
 
     await settlement_file_service.transfer(settlement_file_id=file_id)
 
