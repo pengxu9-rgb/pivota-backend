@@ -161,11 +161,12 @@ async def _heal_orders(sql: str) -> None:
     for statement in guarded_add_columns(sql):
         await database.execute(statement)
 
-def _stamp_test_traffic(order_data: Dict[str, Any]) -> None:
+def _stamp_test_traffic(order_data: Dict[str, Any], is_test_merchant_ids: Optional[set] = None) -> None:
     """O-07: stamp a test order's metadata at write (services.test_traffic). Every order create
     reaches the table through create_order, so this is the one place. A caller-supplied stamp is
     removed whatever the flag (the money reads exclude stamped rows); with
-    TEST_TRAFFIC_STAMP_ENABLED off nothing is added, and a real order is never touched."""
+    TEST_TRAFFIC_STAMP_ENABLED off nothing is added, and a real order is never touched.
+    `is_test_merchant_ids` is create_order's write-time primary-key answer (M-05)."""
     from services import test_traffic
 
     md = order_data.get("metadata")
@@ -174,6 +175,7 @@ def _stamp_test_traffic(order_data: Dict[str, Any]) -> None:
     reasons = test_traffic.classify_test_traffic(
         merchant_ids=[order_data.get("merchant_id")],
         server_metadata=md if isinstance(md, dict) else None,
+        is_test_merchant_ids=is_test_merchant_ids,
     )
     if reasons and test_traffic.stamp_enabled():
         order_data["metadata"] = test_traffic.stamp(md if isinstance(md, dict) else None, reasons)
@@ -186,12 +188,13 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["status"] = "pending"
     order_data["payment_status"] = "unpaid"
     order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
-    # M-05: the classifier's is_test merchant leg is a cached read; warm it (no-op unless both the
-    # stamp and the is_test filter flags are on; never raises).
-    from services.test_traffic import warm_test_merchant_ids
+    # M-05: the merchant's is_test, read by primary key now, never from a cache that may be stale
+    # (None, with no read, unless both the stamp and the is_test filter flags are on; never raises;
+    # a failure or timeout is "not test").
+    from services.test_traffic import read_is_test_merchant_ids
 
-    await warm_test_merchant_ids()
-    _stamp_test_traffic(order_data)
+    is_test_ids = await read_is_test_merchant_ids([order_data.get("merchant_id")])
+    _stamp_test_traffic(order_data, is_test_ids)
 
     query = orders.insert().values(**order_data)
     try:

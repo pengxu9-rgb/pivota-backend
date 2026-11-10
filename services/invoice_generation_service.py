@@ -104,7 +104,7 @@ ORDER BY us.updated_at DESC NULLS LAST, us.created_at DESC NULLS LAST
 LIMIT 1
 """
 
-_GMV_ROWS_QUERY = """
+_GMV_ROWS_QUERY_HEAD = """
 SELECT
     id,
     date,
@@ -120,9 +120,21 @@ SELECT
 FROM gmv_attribution_daily
 WHERE merchant_id = :merchant_id
   AND date BETWEEN :period_start AND :period_end
-  AND take_amount_cents > 0
+  AND take_amount_cents > 0"""
+_GMV_ROWS_QUERY_TAIL = """
 ORDER BY date ASC, id ASC
 """
+_GMV_ROWS_QUERY = _GMV_ROWS_QUERY_HEAD + _GMV_ROWS_QUERY_TAIL
+
+
+def _gmv_rows_query() -> str:
+    """The rows an invoice bills. With MERCHANT_IS_TEST_FILTER_ENABLED on, also not a merchant that
+    is is_test at the time of the read (M-05 P2-2, services.test_traffic.is_test_merchant_lock_sql):
+    the read under the day locks is the lock, so history stamped before the flag never reaches an
+    invoice. Off, exactly _GMV_ROWS_QUERY."""
+    from services.test_traffic import is_test_merchant_lock_sql
+
+    return _GMV_ROWS_QUERY_HEAD + is_test_merchant_lock_sql("gmv_attribution_daily.merchant_id") + _GMV_ROWS_QUERY_TAIL
 
 _INSERT_BILLING_RUN_ITEM_QUERY = """
 INSERT INTO billing_run_items (
@@ -501,7 +513,7 @@ async def generate_merchant_invoice(
         return None
 
     rows = await database.fetch_all(
-        _GMV_ROWS_QUERY,
+        _gmv_rows_query(),
         {
             "merchant_id": merchant_id,
             "period_start": period_start,
@@ -527,8 +539,10 @@ async def generate_merchant_invoice(
             from services.gmv_aggregation_service import lock_billing_days
 
             await lock_billing_days(period_start, period_end, db=database)
+            # M-05 P2-2: the merchant's is_test is re-read HERE, under the lock, not trusted from
+            # the pre-read above or from the write-time stamp.
             rows = await database.fetch_all(
-                _GMV_ROWS_QUERY,
+                _gmv_rows_query(),
                 {
                     "merchant_id": merchant_id,
                     "period_start": period_start,

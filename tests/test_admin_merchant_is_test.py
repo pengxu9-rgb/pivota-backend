@@ -411,8 +411,8 @@ def _order_data(mid: str) -> dict:
 
 
 async def _create_and_read(mid: str) -> dict:
-    """The real producer: db.orders.create_order (it warms the is_test cache, then classifies and
-    stamps). Returns the stored metadata."""
+    """The real producer: db.orders.create_order (it reads the merchant's is_test by primary key,
+    then classifies and stamps). Returns the stored metadata."""
     from db.orders import create_order
 
     order_id = await create_order(_order_data(mid))
@@ -451,11 +451,15 @@ async def test_an_order_on_an_is_test_merchant_classifies_as_test(rows, orders_c
     assert real_md == {"pvt_click_id": f"clk_{M_REAL}"}
     # and the money read drops it, keeping the real one
     assert await _counted_orders() == {M_REAL}
-    # the sync predicate agrees, from the cache create_order warmed
+    # create_order decided from its own primary-key read: it neither needed nor filled the cache
+    from services import test_merchant_policy
     from services import test_traffic as tt
 
-    assert tt.classify_test_traffic(merchant_ids=[M_TEST.upper()], synthetic_call=False) == ["test_merchant"]
-    assert tt.classify_test_traffic(merchant_ids=[M_REAL], synthetic_call=False) == []
+    assert test_merchant_policy.cached_is_test_merchant_ids() == set()
+    assert tt.classify_test_traffic(
+        merchant_ids=[M_TEST.upper()], synthetic_call=False, is_test_merchant_ids={M_TEST}
+    ) == ["test_merchant"]
+    assert tt.classify_test_traffic(merchant_ids=[M_REAL], synthetic_call=False, is_test_merchant_ids={M_TEST}) == []
 
 
 @pytest.mark.parametrize("filter_flag", ["", "false"])
@@ -474,14 +478,19 @@ async def test_stamp_off_warms_nothing_and_stamps_nothing(rows, orders_cleanup, 
     from services import test_merchant_policy
 
     test_merchant_policy.reset_cache()
-    real_fetch_all = database.fetch_all
+    real_fetch_all, real_fetch_one = database.fetch_all, database.fetch_one
     reads = []
 
     async def _spy(query, *a, **k):
         reads.append(str(query))
         return await real_fetch_all(query, *a, **k)
 
+    async def _spy_one(query, *a, **k):
+        reads.append(str(query))
+        return await real_fetch_one(query, *a, **k)
+
     monkeypatch.setattr(database, "fetch_all", _spy)
+    monkeypatch.setattr(database, "fetch_one", _spy_one)
     assert await _create_and_read(M_TEST) == {"pvt_click_id": f"clk_{M_TEST}"}
     assert not [q for q in reads if "is_test" in q]
 
@@ -495,14 +504,20 @@ async def test_unknown_is_not_test_when_the_column_cannot_be_read(rows, orders_c
     from services import test_merchant_policy
 
     test_merchant_policy.reset_cache()
-    real_fetch_all = database.fetch_all
+    real_fetch_all, real_fetch_one = database.fetch_all, database.fetch_one
 
     async def _is_test_down(query, *a, **k):
         if "is_test" in str(query):
             raise RuntimeError("column merchant_onboarding.is_test does not exist")
         return await real_fetch_all(query, *a, **k)
 
+    async def _is_test_down_one(query, *a, **k):
+        if "is_test" in str(query):
+            raise RuntimeError("column merchant_onboarding.is_test does not exist")
+        return await real_fetch_one(query, *a, **k)
+
     monkeypatch.setattr(database, "fetch_all", _is_test_down)
+    monkeypatch.setattr(database, "fetch_one", _is_test_down_one)
     assert await _create_and_read(M_TEST) == {"pvt_click_id": f"clk_{M_TEST}"}
     monkeypatch.undo()
     assert await _counted_orders() == {M_TEST}
@@ -524,3 +539,97 @@ async def test_turning_the_filter_off_makes_the_next_order_real_at_once(rows, or
     assert (await _create_and_read(M_TEST)).get("test_traffic") is True  # the cache is now filled
     monkeypatch.setenv(FLAG, "false")
     assert "test_traffic" not in await _create_and_read(M_TEST)
+
+
+# ── M-05 P2-1: a stale cache never says "test" to a money writer ─────────────────────────────
+
+
+async def _clear_on_another_instance(monkeypatch, mid: str) -> None:
+    """The real POST, served by ANOTHER instance: the row changes, but this process's cache is
+    never told (its invalidate_cache is not what runs there)."""
+    from services import test_merchant_policy
+
+    with monkeypatch.context() as m:
+        m.setattr(test_merchant_policy, "invalidate_cache", lambda: None)
+        resp = await _set(mid, False, reason="real merchant after all")
+    assert resp.json()["changed"] is True
+
+
+async def test_a_clear_on_another_instance_makes_the_next_order_real_despite_a_warm_cache(
+    rows, orders_cleanup, monkeypatch
+):
+    from services import test_merchant_policy
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    assert M_TEST in await test_merchant_policy.get_excluded_merchant_ids(database)  # warm
+    await _clear_on_another_instance(monkeypatch, M_TEST)
+    # This process still holds the old set: listings may hide the merchant until the TTL ...
+    assert M_TEST in await test_merchant_policy.get_excluded_merchant_ids(database)
+    assert M_TEST in test_merchant_policy.cached_is_test_merchant_ids()
+    # ... but the order is classified from the row as it is now.
+    assert "test_traffic" not in await _create_and_read(M_TEST)
+    assert await _counted_orders() == {M_TEST}
+
+
+async def test_a_primary_key_read_that_times_out_makes_the_order_real(rows, orders_cleanup, monkeypatch):
+    import asyncio
+    import time
+
+    from services import test_merchant_policy
+
+    monkeypatch.setenv(FLAG, "true")
+    monkeypatch.setenv(STAMP, "true")
+    await _set(M_TEST, True)
+    monkeypatch.setattr(test_merchant_policy, "PK_READ_TIMEOUT_SECONDS", 0.05)
+    real_fetch_one = database.fetch_one
+
+    async def _hangs(query, *a, **k):
+        if "is_test" in str(query):
+            await asyncio.Event().wait()
+        return await real_fetch_one(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_one", _hangs)
+    started = time.monotonic()
+    md = await asyncio.wait_for(_create_and_read(M_TEST), 5.0)
+    assert time.monotonic() - started < 2.0
+    monkeypatch.setattr(database, "fetch_one", real_fetch_one)
+    assert md == {"pvt_click_id": f"clk_{M_TEST}"}
+
+
+# ── M-05 P2-2: the lock-time check, on this dialect ──────────────────────────────────────────
+
+
+@pytest.mark.parametrize("filter_flag", ["", "false"])
+def test_lock_time_check_is_empty_with_the_filter_off(monkeypatch, filter_flag):
+    from services import invoice_generation_service as inv
+    from services.test_traffic import is_test_merchant_lock_sql
+
+    monkeypatch.setenv(FLAG, filter_flag)
+    assert is_test_merchant_lock_sql("x.merchant_id") == ""
+    assert inv._gmv_rows_query() == inv._GMV_ROWS_QUERY
+
+
+async def test_lock_time_check_drops_a_merchant_that_is_is_test_now(rows, orders_cleanup, monkeypatch):
+    """History: orders written with both flags off carry no stamp. With the filter on, the
+    lock-time predicate leaves the merchant out by its CURRENT is_test; off, it counts."""
+    from services.test_traffic import is_test_merchant_lock_sql
+
+    for mid in OURS:
+        await _create_and_read(mid)  # flags off: unstamped history
+    await _set(M_TEST, True)
+
+    async def _locked() -> set:
+        rows_ = await database.fetch_all(
+            "SELECT DISTINCT merchant_id FROM orders WHERE agent_id = :a"
+            + is_test_merchant_lock_sql("orders.merchant_id"),
+            {"a": AGENT},
+        )
+        return {r["merchant_id"] for r in rows_} & set(OURS)
+
+    assert await _locked() == {M_TEST, M_REAL}
+    monkeypatch.setenv(FLAG, "true")
+    assert await _locked() == {M_REAL}
+    await _set(M_TEST, False, reason="real merchant after all")
+    assert await _locked() == {M_TEST, M_REAL}

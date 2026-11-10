@@ -2,12 +2,17 @@
 
 Flag off: the column is never read and every answer is what it was before it existed.
 Flag on: is_test merchants join the exclusion set; a failed is_test read keeps its last good set
-and never costs the demo-domain leg.
+for the listings and never costs the demo-domain leg. The classifier's view of the cache
+(`cached_is_test_merchant_ids`) is stricter: only a fresh set, never a stale, failed or
+invalidated one (M-05 P2-1).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List
+
+import asyncio
+import time
 
 import pytest
 
@@ -193,7 +198,9 @@ async def test_refresh_is_cached_and_never_raises():
     down = _RoutingDB(demo_raises=True, is_test_raises=True)
     pol.invalidate_cache()
     await pol.refresh_is_test_merchant_ids(down, env=ON)
-    assert pol.cached_is_test_merchant_ids(ON) == {"m_a"}  # last good kept
+    # The listings keep the last good set; the classifier is told nothing (unknown is not test).
+    assert "m_a" in await pol.get_excluded_merchant_ids(down, env=ON)
+    assert pol.cached_is_test_merchant_ids(ON) == set()
 
 
 async def test_classifier_reads_the_cached_set_only_with_the_flag_on(monkeypatch):
@@ -205,3 +212,158 @@ async def test_classifier_reads_the_cached_set_only_with_the_flag_on(monkeypatch
     assert tt.classify_test_traffic(merchant_ids=["M_STAFF_TEST"], synthetic_call=False) == ["test_merchant"]
     monkeypatch.delenv(pol.IS_TEST_FILTER_ENV)
     assert tt.classify_test_traffic(merchant_ids=["m_staff_test"], synthetic_call=False) == []
+
+
+# ── M-05 P2-1: what the classifier may take from the cache ───────────────────────────────────
+
+
+class _GatedDB(_RoutingDB):
+    """The is_test read waits on `gate` once it has started (`started`), so a test can act while it
+    is in flight. It returns the rows as they were when it STARTED, like a read from a snapshot."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+
+    async def fetch_all(self, query, values=None):
+        if "is_test" in query and not self.gate.is_set():
+            self.queries.append(query)
+            snapshot = list(self.is_test)
+            self.started.set()
+            await self.gate.wait()
+            return snapshot
+        return await super().fetch_all(query, values)
+
+
+async def test_an_in_flight_read_cannot_refresh_a_cache_invalidated_after_it_began():
+    db = _GatedDB(is_test=[{"merchant_id": "m_cleared"}])
+    leader = asyncio.ensure_future(pol.get_excluded_merchant_ids(db, env=ON))
+    await asyncio.wait_for(db.started.wait(), 1.0)
+    # the staff clear commits and this instance invalidates, while the read is still running
+    db.is_test = []
+    pol.invalidate_cache()
+    db.gate.set()
+    await asyncio.wait_for(leader, 1.0)
+    assert pol.cached_is_test_merchant_ids(ON) == set()  # the pre-write answer is not served
+    ids = await pol.get_excluded_merchant_ids(db, env=ON)  # not a cache hit: it reads again
+    assert db.is_test_reads() == 2
+    assert "m_cleared" not in ids
+    assert pol.cached_is_test_merchant_ids(ON) == set()
+
+
+async def test_a_read_not_raced_by_an_invalidate_is_served():
+    db = _GatedDB(is_test=[{"merchant_id": "m_a"}])
+    leader = asyncio.ensure_future(pol.get_excluded_merchant_ids(db, env=ON))
+    await asyncio.wait_for(db.started.wait(), 1.0)
+    db.gate.set()
+    await asyncio.wait_for(leader, 1.0)
+    assert pol.cached_is_test_merchant_ids(ON) == {"m_a"}
+
+
+async def test_a_stale_set_is_unknown_to_the_classifier():
+    db = _RoutingDB(is_test=[{"merchant_id": "m_a"}])
+    await pol.get_excluded_merchant_ids(db, env=ON, now=1000.0)
+    assert pol.cached_is_test_merchant_ids(ON, now=1000.0 + pol._CACHE_TTL_SECONDS - 1) == {"m_a"}
+    assert pol.cached_is_test_merchant_ids(ON, now=1000.0 + pol._CACHE_TTL_SECONDS) == set()
+
+
+async def test_an_invalidate_makes_the_set_unknown_until_a_new_read():
+    db = _RoutingDB(is_test=[{"merchant_id": "m_a"}])
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    pol.invalidate_cache()
+    assert pol.cached_is_test_merchant_ids(ON) == set()
+    await pol.refresh_is_test_merchant_ids(db, env=ON)
+    assert pol.cached_is_test_merchant_ids(ON) == {"m_a"}
+
+
+async def test_a_persistently_failing_read_is_not_test_to_the_classifier_but_keeps_listings():
+    from services import test_traffic as tt
+
+    good = _RoutingDB(is_test=[{"merchant_id": "m_a"}])
+    await pol.refresh_is_test_merchant_ids(good, env=ON)
+    bad = _RoutingDB(is_test_raises=True)
+    for _ in range(3):
+        pol.invalidate_cache()
+        assert "m_a" in await pol.get_excluded_merchant_ids(bad, env=ON)  # the listing: last good
+        assert pol.cached_is_test_merchant_ids(ON) == set()  # the classifier: unknown
+    assert bad.is_test_reads() == 3
+    assert tt.classify_test_traffic(merchant_ids=["m_a"], synthetic_call=False) == []
+
+
+async def test_a_writers_primary_key_answer_replaces_the_cache(monkeypatch):
+    """The cache says test (fresh, but another instance cleared the merchant): the writer's own
+    read says not, and the writer's read wins."""
+    from services import test_traffic as tt
+
+    monkeypatch.setenv(pol.IS_TEST_FILTER_ENV, "true")
+    await pol.refresh_is_test_merchant_ids(_RoutingDB(is_test=[{"merchant_id": "m_a"}]))
+    assert tt.classify_test_traffic(merchant_ids=["m_a"], synthetic_call=False) == ["test_merchant"]
+    assert tt.classify_test_traffic(merchant_ids=["m_a"], synthetic_call=False, is_test_merchant_ids=set()) == []
+    assert tt.classify_test_traffic(
+        merchant_ids=["M_B"], synthetic_call=False, is_test_merchant_ids={"m_b"}
+    ) == ["test_merchant"]
+
+
+class _PkDB:
+    def __init__(self, rows=None, raises=False, hangs=False):
+        self.rows = rows or {}
+        self.raises = raises
+        self.hangs = hangs
+        self.queries = []
+
+    async def fetch_one(self, query, values=None):
+        self.queries.append((query, dict(values or {})))
+        if self.hangs:
+            await asyncio.Event().wait()
+        if self.raises:
+            raise RuntimeError("column merchant_onboarding.is_test does not exist")
+        mid = (values or {}).get("m")
+        return {"is_test": self.rows[mid]} if mid in self.rows else None
+
+
+async def test_primary_key_read_answers_per_merchant():
+    db = _PkDB(rows={"m_t": True, "m_r": False})
+    assert await pol.read_is_test_merchant_ids(db, ["m_t", "m_r", "m_ghost", None, " ", "m_t"]) == {"m_t"}
+    assert [v["m"] for _, v in db.queries] == ["m_t", "m_r", "m_ghost"]  # one read per distinct id
+    assert all("WHERE merchant_id = :m" in q for q, _ in db.queries)
+
+
+@pytest.mark.parametrize("db", [_PkDB(raises=True), _PkDB(hangs=True)], ids=["raises", "hangs"])
+async def test_primary_key_read_failure_or_timeout_is_not_test(db):
+    started = time.monotonic()
+    out = await asyncio.wait_for(pol.read_is_test_merchant_ids(db, ["m_t"], timeout=0.05), 2.0)
+    assert out == set()
+    assert time.monotonic() - started < 1.0
+
+
+async def test_primary_key_read_uses_the_module_timeout_by_default(monkeypatch):
+    monkeypatch.setattr(pol, "PK_READ_TIMEOUT_SECONDS", 0.05)
+    out = await asyncio.wait_for(pol.read_is_test_merchant_ids(_PkDB(hangs=True), ["m_t"]), 2.0)
+    assert out == set()
+
+
+# ── M-05 P3-5: the leader's reads are bounded once the flag is on ─────────────────────────────
+
+
+class _HangingDB(_RoutingDB):
+    def __init__(self, hang_on: str, **kw):
+        super().__init__(**kw)
+        self.hang_on = hang_on
+
+    async def fetch_all(self, query, values=None):
+        if (self.hang_on == "is_test") == ("is_test" in query):
+            self.queries.append(query)
+            await asyncio.Event().wait()
+        return await super().fetch_all(query, values)
+
+
+@pytest.mark.parametrize("hang_on", ["is_test", "demo"])
+async def test_a_stuck_leader_read_is_bounded_with_the_flag_on(monkeypatch, hang_on):
+    monkeypatch.setattr(pol, "_LEADER_READ_TIMEOUT_SECONDS", 0.05)
+    db = _HangingDB(hang_on, demo=[{"merchant_id": "m_demo"}], is_test=[{"merchant_id": "m_a"}])
+    started = time.monotonic()
+    ids = await asyncio.wait_for(pol.get_excluded_merchant_ids(db, env=ON), 2.0)
+    assert time.monotonic() - started < 1.0
+    assert pol.static_test_merchant_ids({}) <= ids
+    assert pol.cached_is_test_merchant_ids(ON) == set()

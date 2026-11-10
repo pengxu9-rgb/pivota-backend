@@ -18,3 +18,9 @@ def test_main_mounts_the_router_behind_the_guard():
     assert {(r.path, tuple(sorted(r.methods))) for r in mounted} == ours
     for route in mounted:
         assert any(d.call is require_admin for d in route.dependant.dependencies), route.methods
+
+
+def test_the_router_itself_carries_the_admin_guard():
+    """P3-2: the guard a route added here later inherits is the ROUTER's, not a handler's own
+    parameter (which `route.dependant.dependencies` above would also show)."""
+    assert [d.dependency for d in module.router.dependencies] == [require_admin]

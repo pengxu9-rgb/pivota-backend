@@ -12,13 +12,21 @@ An order, attribution edge or click is TEST traffic when any server-controlled s
   test_merchant    the merchant is a rig: services.test_merchant_policy.static_test_merchant_ids
                    (the baked-in rig list plus PIVOTA_TEST_MERCHANT_IDS), and, while
                    MERCHANT_IS_TEST_FILTER_ENABLED is on, a merchant staff marked
-                   `merchant_onboarding.is_test` (migration 282). That last set is a CACHED read
-                   (services.test_merchant_policy.cached_is_test_merchant_ids): this predicate is
-                   sync and never touches the database. The async writers warm it first
-                   (`warm_test_merchant_ids`). FAIL DIRECTION: unknown is NOT test. If the column
-                   could not be read, or no caller has read it yet in this process, an is_test
-                   merchant's row is classified real and stays IN billing: a test row counted is
-                   recoverable by a later exclusion, a real row dropped from billing is lost revenue.
+                   `merchant_onboarding.is_test` (migration 282). This predicate is sync and never
+                   touches the database, so the is_test leg comes in two ways:
+                     * the money writers (db.orders.create_order, and the order edge and the
+                       external conversion in services.commerce_attribution_service) read the one
+                       merchant by primary key at write time (`read_is_test_merchant_ids`) and pass
+                       the answer in (`is_test_merchant_ids=`). Never stale.
+                     * every other caller (the click writers) gets the process cache
+                       (services.test_merchant_policy.cached_is_test_merchant_ids), served only
+                       while FRESH: a stale, failed or invalidated set is unknown.
+                   FAIL DIRECTION: unknown (and stale) is NOT test. If the read times out or fails,
+                   an is_test merchant's row is classified real and stays IN billing. What recovers
+                   it is the lock-time check (`is_test_merchant_lock_sql`): the invoice run, the
+                   monthly statement and partner settlement re-read the merchant's CURRENT is_test
+                   when they lock their rows and leave it out. A real row wrongly stamped test
+                   would be lost revenue with no such recovery, hence the direction.
   test_psp_probe   the order the server GRANTED the test-processor bypass at create
                    (routes.order_routes._apply_server_granted_test_psp_stamp: ALLOW_TEST_PSP_PROBE on,
                    merchant in TEST_PSP_PROBE_MERCHANTS, AND every active processor of the merchant
@@ -45,7 +53,10 @@ With the stamp flag off no row carries the key, so every read answers exactly as
 Agent share accrual and partner settlement read billing rows built from the GMV roll-up, so they
 inherit the exclusion and need no stamp of their own.
 
-Rows written before stamping was enabled are NOT stamped; a backfill needs its own go.
+Rows written before stamping was enabled are NOT stamped, and none is re-stamped. While
+MERCHANT_IS_TEST_FILTER_ENABLED is on, the lock-time check above leaves an is_test merchant's
+history out of the invoice, the monthly statement and the partner settlement it locks, without a
+backfill (M-05 P2-2). The GMV roll-up and the outcome signal still count it.
 """
 
 from __future__ import annotations
@@ -85,27 +96,39 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"true", "1", "yes"}
 
 
-def _test_merchant_ids() -> set:
+def _test_merchant_ids(is_test_merchant_ids: Optional[Iterable[Optional[str]]] = None) -> set:
     from services.test_merchant_policy import cached_is_test_merchant_ids, static_test_merchant_ids
 
-    ids = static_test_merchant_ids() | cached_is_test_merchant_ids()
+    if is_test_merchant_ids is None:
+        is_test = cached_is_test_merchant_ids()
+    else:
+        # A writer's primary-key answer replaces the cache: never union in a possibly stale set.
+        is_test = {str(m) for m in is_test_merchant_ids if str(m or "").strip()}
+    ids = static_test_merchant_ids() | is_test
     return {m.strip().lower() for m in ids if str(m or "").strip()}
 
 
-async def warm_test_merchant_ids() -> None:
-    """Refresh the cached is_test merchant set before an async writer classifies (migration 282).
-    A no-op, with no database read, unless both TEST_TRAFFIC_STAMP_ENABLED and
-    MERCHANT_IS_TEST_FILTER_ENABLED are on. Cached (one read per 300 s per process) and never raises:
-    a failed read leaves the last good set, and unknown is not test."""
-    if not stamp_enabled():
-        return
-    try:
-        from db.database import database
-        from services.test_merchant_policy import refresh_is_test_merchant_ids
+async def read_is_test_merchant_ids(merchant_ids: Iterable[Optional[str]]) -> Optional[set]:
+    """The money writers' is_test leg, read at write time: which of `merchant_ids` staff marked
+    is_test, by one primary-key read each (services.test_merchant_policy.read_is_test_merchant_ids),
+    bounded by its short timeout. Pass the result to `classify_test_traffic(is_test_merchant_ids=)`.
 
-        await refresh_is_test_merchant_ids(database)
+    None, with NO database read, unless both TEST_TRAFFIC_STAMP_ENABLED and
+    MERCHANT_IS_TEST_FILTER_ENABLED are on (the classifier then answers exactly as before). Never
+    raises: a failure or timeout is the empty set, i.e. unknown, i.e. not test."""
+    if not stamp_enabled():
+        return None
+    try:
+        from services.test_merchant_policy import merchant_is_test_filter_enabled
+
+        if not merchant_is_test_filter_enabled():
+            return None
+        from db.database import database
+        from services.test_merchant_policy import read_is_test_merchant_ids as _pk_read
+
+        return await _pk_read(database, merchant_ids)
     except Exception:  # noqa: BLE001 — a predicate must never break a writer
-        return
+        return set()
 
 
 def _current_call_is_synthetic() -> bool:
@@ -124,6 +147,7 @@ def classify_test_traffic(
     shopify_order: Optional[Mapping[str, Any]] = None,
     synthetic_link: bool = False,
     synthetic_call: Optional[bool] = None,
+    is_test_merchant_ids: Optional[Iterable[Optional[str]]] = None,
 ) -> List[str]:
     """Every reason this row is test traffic, sorted; [] for real traffic.
 
@@ -134,6 +158,9 @@ def classify_test_traffic(
     shopify_order    a Shopify-SIGNED order payload (webhook or our own poll) — never a self-report.
     synthetic_link   the click's outbound token was minted inside synthetic traffic.
     synthetic_call   override for the request verdict; None reads the current request's.
+    is_test_merchant_ids  a writer's write-time answer (`read_is_test_merchant_ids`); it REPLACES
+                     the process cache for the staff-set leg. None (the default, and what that
+                     read returns with a flag off) uses the cache, served only while fresh.
     """
     reasons = set()
     if synthetic_call is None:
@@ -148,7 +175,7 @@ def classify_test_traffic(
         reasons.add(REASON_TEST_PSP_PROBE)
     ids = {str(m or "").strip().lower() for m in merchant_ids if str(m or "").strip()}
     if ids:
-        if ids & _test_merchant_ids():
+        if ids & _test_merchant_ids(is_test_merchant_ids):
             reasons.add(REASON_TEST_MERCHANT)
     if isinstance(shopify_order, Mapping) and shopify_order.get("test") is True:
         reasons.add(REASON_SHOPIFY_TEST)
@@ -196,6 +223,30 @@ def stamp(metadata: Optional[Dict[str, Any]], reasons: List[str]) -> Optional[Di
     target[STAMP_KEY] = True
     target[REASONS_KEY] = list(reasons)
     return target
+
+
+def is_test_merchant_lock_sql(merchant_column: str) -> str:
+    """The lock-time is_test check (M-05 P2-2), for the reads that lock money rows: the invoice
+    run's rows under its day locks, the monthly statement's GMV, and partner settlement's scope and
+    take rows. Appended right after an existing condition.
+
+    '' while MERCHANT_IS_TEST_FILTER_ENABLED is off, so the query is byte-identical to before.
+    On, ' AND NOT EXISTS (...)': a row whose merchant is is_test NOW is left out, whatever was
+    stamped when it was written. So history written before the stamp, and rows a write-time read
+    classified real (unknown), leave the statement and settlement once staff mark the merchant.
+
+    It reads the column directly, not through a cache, so it is never stale. If the column is
+    missing the query raises and nothing is locked (it is in REQUIRED_SCHEMA, so /health already
+    fails); a lock never silently counts a merchant it could not check.
+    """
+    from services.test_merchant_policy import merchant_is_test_filter_enabled
+
+    if not merchant_is_test_filter_enabled():
+        return ""
+    return (
+        " AND NOT EXISTS (SELECT 1 FROM merchant_onboarding mo_is_test"
+        f" WHERE mo_is_test.merchant_id = {merchant_column} AND mo_is_test.is_test IS TRUE)"
+    )
 
 
 def not_test_traffic_sql(metadata_column: str) -> str:

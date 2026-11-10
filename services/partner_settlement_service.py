@@ -12,6 +12,9 @@ import stripe
 from config.settings import settings
 from db.database import IS_POSTGRES, database
 from services import partner_rev_share_engine_v2
+# M-05 P2-2: settlement re-reads each merchant's CURRENT is_test where it locks its scope and its
+# take rows (the snapshot it writes is immutable), behind MERCHANT_IS_TEST_FILTER_ENABLED.
+from services.test_traffic import is_test_merchant_lock_sql
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +81,9 @@ async def run_settlement(billing_run_id: int) -> int:
             WHERE cae.merchant_id = pa.merchant_id
               AND DATE(cae.created_at) BETWEEN :period_start AND :period_end
               -- O-07: a merchant whose only edges are test traffic puts no partner in scope.
-              AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')
+              AND COALESCE(CAST(cae.metadata->>'test_traffic' AS TEXT), '') NOT IN ('true', '1')"""
+        + is_test_merchant_lock_sql("cae.merchant_id")
+        + """
           )
 
           UNION
@@ -86,7 +91,9 @@ async def run_settlement(billing_run_id: int) -> int:
           SELECT DISTINCT gad.channel_partner_id
           FROM gmv_attribution_daily gad
           WHERE gad.channel_partner_id IS NOT NULL
-            AND gad.date BETWEEN :period_start AND :period_end
+            AND gad.date BETWEEN :period_start AND :period_end"""
+        + is_test_merchant_lock_sql("gad.merchant_id")
+        + """
         ) partner_scope
         WHERE channel_partner_id IS NOT NULL
         ORDER BY channel_partner_id
@@ -759,7 +766,9 @@ async def _gmv_take_rows(
               AND i.billing_period_start <= gad.date
               AND gad.date <= i.billing_period_end
               AND i.status = 'paid'
-          )
+          )"""
+        + is_test_merchant_lock_sql("gad.merchant_id")
+        + """
         ORDER BY gad.id
         """,
         {

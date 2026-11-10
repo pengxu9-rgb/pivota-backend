@@ -126,11 +126,38 @@ _FOLLOWER_WAIT_SECONDS = 3.0
 # its last good set and never costs the demo-domain leg. FAIL DIRECTION: a merchant this read
 # could not see is treated as NOT test (it lists, as it did before the column existed); the
 # baked-in and env ids still apply.
+#
+# Two consumers, two rules. The listing filters (search, the agent merchant list, the directory,
+# the sweep) may serve the last good set: a stale hide is reversible. The test-traffic classifier
+# may NOT (a stale "test" takes a real order out of billing for good), so for it
+# `cached_is_test_merchant_ids` answers "unknown" (empty) unless the set is FRESH: read by an
+# attempt that succeeded, within _CACHE_TTL_SECONDS, and not invalidated since it began. The money
+# writers do not use the cache at all: they read the one merchant by primary key at write time
+# (`read_is_test_merchant_ids`).
 IS_TEST_FILTER_ENV = "MERCHANT_IS_TEST_FILTER_ENABLED"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _is_test_value: Optional[Set[str]] = None  # last good is_test set; None = never read
 _is_test_attempted = False  # the cached attempt also tried the is_test leg
 _is_test_last_warn_at: Optional[float] = None
+# When the CURRENT `_is_test_value` was read, by an attempt whose generation was still current
+# when it finished. -inf = not fresh (never read, invalidated, or the last is_test read failed).
+_is_test_fresh_at: float = float("-inf")
+
+# Bumped by every invalidate/reset. An attempt records the generation it started under and writes
+# nothing to the cache if it changed meanwhile: a read that began before a staff write commits
+# must not re-freshen the cache that write just expired.
+_generation = 0
+
+# P3-5: once the flag is on, the shared attempt's reads are bounded. A leader stuck on a slow
+# pool would otherwise hold every follower for _FOLLOWER_WAIT_SECONDS and itself for as long as
+# the query takes. A timeout is a failed attempt (backoff, last good set for listings, unknown for
+# the classifier). With the flag off the demo-domain read is left exactly as it was.
+_LEADER_READ_TIMEOUT_SECONDS = 2.0
+
+# The money writers' primary-key read of the merchant(s) they write for (`read_is_test_merchant_ids`).
+# One indexed lookup per id; on a timeout or any error the answer is "unknown" = not test.
+PK_READ_TIMEOUT_SECONDS = 0.5
+_PK_READ_MAX_IDS = 4
 
 # A persistent failure must not log a traceback per search.
 _WARN_INTERVAL_SECONDS = 60.0
@@ -199,21 +226,25 @@ async def _resolve_is_test_merchant_ids(database) -> Set[str]:
     return out
 
 
-async def _is_test_leg(database, ts: float) -> None:
-    """Refresh `_is_test_value`. Never raises: on a failure the last good set stays (None if
-    there never was one), and the warning is logged at most once per _WARN_INTERVAL_SECONDS."""
-    global _is_test_value, _is_test_attempted, _is_test_last_warn_at
+async def _is_test_leg(database, ts: float) -> Optional[Set[str]]:
+    """Read the is_test set, bounded by _LEADER_READ_TIMEOUT_SECONDS. Returns it, or None on a
+    failure or timeout. Never raises; writes no cache state (the caller commits the result only if
+    its generation is still current). The warning is logged at most once per _WARN_INTERVAL_SECONDS."""
+    global _is_test_last_warn_at
     try:
-        _is_test_value = await _resolve_is_test_merchant_ids(database)
+        return await asyncio.wait_for(
+            _resolve_is_test_merchant_ids(database), _LEADER_READ_TIMEOUT_SECONDS
+        )
     except Exception:
         if _is_test_last_warn_at is None or (ts - _is_test_last_warn_at) >= _WARN_INTERVAL_SECONDS:
             logger.warning(
-                "test_merchant_policy: is_test resolve FAILED; serving %s last-good is_test ids",
+                "test_merchant_policy: is_test resolve FAILED; serving %s last-good is_test ids "
+                "to listings, none to the test-traffic classifier",
                 len(_is_test_value or ()),
                 exc_info=True,
             )
             _is_test_last_warn_at = ts
-    _is_test_attempted = True
+        return None
 
 
 def _with_is_test(ids: Set[str], is_test_on: bool) -> Set[str]:
@@ -236,8 +267,12 @@ async def get_excluded_merchant_ids(
     is returned (used by pure/sync callers).
 
     The is_test leg runs in the same shared attempt, after a successful demo-domain
-    read, and is cached with it. Its own failure keeps its last good set and is not
-    a failure of the attempt (see IS_TEST_FILTER_ENV for the fail direction).
+    read, and is cached with it. Its own failure keeps its last good set for this
+    function's callers and is not a failure of the attempt, but it makes the set
+    unknown to the classifier (see IS_TEST_FILTER_ENV for the fail direction). An
+    attempt invalidated while in flight (a staff write on this instance) writes no
+    is_test state (the generation), so the next flag-on call reads the column again.
+    With the flag on, both reads are bounded by _LEADER_READ_TIMEOUT_SECONDS.
 
     Fail-soft, never crashes: on a failed lookup it returns the static set plus
     the last good demo-domain set (if any). A FAILED lookup is never cached as
@@ -247,6 +282,7 @@ async def get_excluded_merchant_ids(
     _WARN_INTERVAL_SECONDS with a count of the ones it suppressed.
     """
     global _cache_value, _cache_at, _failed_at, _inflight, _is_test_attempted
+    global _is_test_value, _is_test_fresh_at
     static = static_test_merchant_ids(env)
     if database is None:
         return static
@@ -280,17 +316,34 @@ async def get_excluded_merchant_ids(
 
     fut: "asyncio.Future[Optional[Set[str]]]" = loop.create_future()
     _inflight = fut
+    started_gen = _generation
     resolved: Optional[Set[str]] = None
+    is_test_read: Optional[Set[str]] = None
     try:
-        resolved = await _resolve_demo_domain_merchant_ids(database)
+        if is_test_on:
+            resolved = await asyncio.wait_for(
+                _resolve_demo_domain_merchant_ids(database), _LEADER_READ_TIMEOUT_SECONDS
+            )
+        else:
+            resolved = await _resolve_demo_domain_merchant_ids(database)
         if is_test_on:
             # Before the future resolves, so a follower of this attempt sees its result.
-            await _is_test_leg(database, _clock())
+            is_test_read = await _is_test_leg(database, _clock())
+            if is_test_read is None:
+                # A failed is_test read: listings keep the last good set, the classifier gets none.
+                _is_test_fresh_at = float("-inf")
+            elif _generation == started_gen:
+                _is_test_value = is_test_read
+                _is_test_fresh_at = _clock()
+            if _generation == started_gen:
+                _is_test_attempted = True
         else:
             _is_test_attempted = False
     except Exception:
         # Stamp when the attempt FINISHED: a lookup that fails after a long pool
         # wait must still back off for the full window from that point.
+        if is_test_on:
+            _is_test_fresh_at = float("-inf")  # a failed refresh: unknown to the classifier
         _failed_at = _clock()
         _warn_resolve_failed(_failed_at)
         return _with_is_test(static | (_cache_value or set()), is_test_on)
@@ -300,6 +353,9 @@ async def get_excluded_merchant_ids(
         if _inflight is fut:
             _inflight = None
     _failed_at = None
+    # The demo-domain set is not what a staff write changes, so it is cached as before. An attempt
+    # invalidated in flight left `_is_test_attempted` False above, so the next flag-on call is not
+    # a cache hit and reads the is_test set again.
     _cache_value = resolved
     _cache_at = _clock()
     return _with_is_test(static | resolved, is_test_on)
@@ -324,7 +380,9 @@ def _warn_resolve_failed(ts: float) -> None:
 def reset_cache() -> None:
     """Test hook — drop the memoized demo-domain and is_test sets and the failure state."""
     global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings, _inflight
-    global _is_test_value, _is_test_attempted, _is_test_last_warn_at
+    global _is_test_value, _is_test_attempted, _is_test_last_warn_at, _is_test_fresh_at, _generation
+    _generation += 1
+    _is_test_fresh_at = float("-inf")
     _is_test_value = None
     _is_test_attempted = False
     _is_test_last_warn_at = None
@@ -339,21 +397,83 @@ def reset_cache() -> None:
 def invalidate_cache() -> None:
     """Expire the cached sets without forgetting them: the next call re-reads, and a failed
     re-read still serves the last good sets. Called after a staff is_test write, so THIS
-    instance serves it on its next read; other instances follow within _CACHE_TTL_SECONDS."""
-    global _cache_at, _is_test_attempted
+    instance serves it on its next read; other instances follow within _CACHE_TTL_SECONDS.
+    An attempt already in flight when this runs writes nothing to the cache (the generation), and
+    the classifier sees no is_test set until a read that began after this one succeeds."""
+    global _cache_at, _is_test_attempted, _is_test_fresh_at, _generation
+    _generation += 1
     # -inf, not 0.0: a monotonic clock on a host up for less than the TTL would read 0.0 as fresh.
     _cache_at = float("-inf")
     _is_test_attempted = False
+    _is_test_fresh_at = float("-inf")
 
 
-def cached_is_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
-    """The last good is_test set, with NO database read, for sync callers (the test-traffic
-    classifier). Empty while MERCHANT_IS_TEST_FILTER_ENABLED is off, and empty until some async
-    caller has read the column (`refresh_is_test_merchant_ids`, or any `get_excluded_merchant_ids`
-    call with a database). Unknown is NOT test: see IS_TEST_FILTER_ENV."""
+def cached_is_test_merchant_ids(
+    env: Optional[Dict[str, str]] = None, *, now: Optional[float] = None
+) -> Set[str]:
+    """The is_test set, with NO database read, for sync callers (the test-traffic classifier's
+    click writers). Only a FRESH set is served; anything else is unknown, which is NOT test (see
+    IS_TEST_FILTER_ENV). Empty while MERCHANT_IS_TEST_FILTER_ENABLED is off; until some async
+    caller has read the column; when the last is_test read failed; when the set is older than
+    _CACHE_TTL_SECONDS; and after an invalidate, until a read that began after it succeeds.
+    Never the last good set: a stale "test" would take a real row out of billing."""
     if not merchant_is_test_filter_enabled(env):
         return set()
-    return set(_is_test_value or ())
+    ts = time.monotonic() if now is None else now
+    if _is_test_value is None or (ts - _is_test_fresh_at) >= _CACHE_TTL_SECONDS:
+        return set()
+    return set(_is_test_value)
+
+
+async def read_is_test_merchant_ids(
+    database, merchant_ids: Iterable[Optional[str]], *, timeout: Optional[float] = None
+) -> Set[str]:
+    """Which of `merchant_ids` are is_test RIGHT NOW: one primary-key read of
+    `merchant_onboarding` per distinct id (at most _PK_READ_MAX_IDS), no cache, so never stale.
+    For the money writers, at write time.
+
+    Fail direction: unknown is NOT test. A timeout (`timeout` seconds for all the reads together,
+    default PK_READ_TIMEOUT_SECONDS),
+    a missing column, a missing row or any other error answers "not test" for every id it could
+    not confirm. Never raises. Does not look at the flag: the caller gates it.
+
+    Note for a caller inside `database.transaction()`: on Postgres a failed read (the column
+    missing, say) aborts the enclosing transaction even though the error is caught here. No
+    current caller is inside one."""
+    wanted: List[str] = []
+    for mid in merchant_ids or ():
+        m = str(mid or "").strip()
+        if m and m not in wanted:
+            wanted.append(m)
+    if database is None or not wanted:
+        return set()
+
+    async def _read() -> Set[str]:
+        out: Set[str] = set()
+        for m in wanted[:_PK_READ_MAX_IDS]:
+            row = await database.fetch_one(
+                "SELECT is_test FROM merchant_onboarding WHERE merchant_id = :m", {"m": m}
+            )
+            if row is None:
+                continue
+            try:
+                value = row["is_test"]
+            except Exception:  # noqa: BLE001
+                value = dict(row).get("is_test") if hasattr(row, "keys") else None
+            if value is True or value == 1:
+                out.add(m)
+        return out
+
+    try:
+        return await asyncio.wait_for(_read(), PK_READ_TIMEOUT_SECONDS if timeout is None else timeout)
+    except Exception:  # noqa: BLE001 - a timeout included: unknown is not test
+        logger.warning(
+            "test_merchant_policy: is_test primary-key read FAILED for %s merchant(s); "
+            "classifying them as not test",
+            len(wanted),
+            exc_info=True,
+        )
+        return set()
 
 
 async def refresh_is_test_merchant_ids(database, *, env: Optional[Dict[str, str]] = None) -> None:

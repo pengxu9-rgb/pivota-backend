@@ -13,7 +13,10 @@ from core.billing_constants import (
     overage_revenue_cents,
 )
 from db.database import IS_POSTGRES, database
-from services.test_traffic import not_test_traffic_sql
+# M-05 P2-2: the statement is assembled and frozen in one step (assemble_and_freeze_report_only),
+# so its GMV read is the lock: with MERCHANT_IS_TEST_FILTER_ENABLED on, a merchant that is is_test
+# then has no GMV on it, whatever its edges were stamped at write.
+from services.test_traffic import is_test_merchant_lock_sql, not_test_traffic_sql
 
 
 SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
@@ -661,7 +664,9 @@ async def _gmv_attribution_for_month(
           -- Exclude fallback-INFERRED edges (#1481): recorded for coverage, not billed.
           AND (metadata->>'inferred')::boolean IS NOT TRUE
           -- Exclude TEST traffic (O-07, services/test_traffic.py), stamped at write.
-          AND """ + not_test_traffic_sql("metadata") + """
+          AND """ + not_test_traffic_sql("metadata") + is_test_merchant_lock_sql(
+            "commerce_attribution_edges.merchant_id"
+        ) + """
         """,
         {
             "merchant_id": merchant_id,
