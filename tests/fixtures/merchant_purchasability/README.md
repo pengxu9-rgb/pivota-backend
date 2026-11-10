@@ -31,18 +31,32 @@ Each source page was ~310-370 KB. The trimming was mechanical, by
    `name`, `paymentBrands`, `merchandise.id`, `quantity`, `totalAmount` — are verbatim.
 
 **Placeholders, 2026-11-10.** This repository is public, and test fixtures carry no real store or
-brand names. So the file names, the merchant column above, and exactly three in-page values were
-replaced with placeholders: one `storefrontUrl` (now `https://iris-card.example/`), one product
-`vendor` (`Example Vendor`) and one image `altText` (`Example Blush`). The detector reads none of
-them; every structure listed in step 4 is still verbatim. That is the only hand edit these
-recordings have had, and it is not a precedent for the rule below.
+brand names. So the file names and the merchant column above were replaced with placeholders, and
+so was every in-page value that describes the store or the product, BY KEY, in all three files:
+
+| key | now |
+|---|---|
+| `storefrontUrl` (one file) | `https://iris-card.example/` |
+| `vendor`, `productType` | `Example Vendor`, `Example Type` |
+| `title`, `untranslatedTitle` | `Example Product` |
+| `subtitle`, `untranslatedSubtitle` | `Example Variant` |
+| option `value` (the string ones) | `Example Option` |
+| `altText`, `productUrl` | `Example product image`, `/products/example-product` |
+| every `https://cdn.shopify.com/...` image URL (they carry the shop's id and file names) | `https://cdn.example/product.jpg` |
+| `gatewayMerchantId`, `sellerId` (the shop's numeric ids) | `REDACTED` |
+
+The detector reads none of these: its outputs, and every id, quantity and amount in the files,
+were compared before and after and are identical, and every structure listed in step 4 is still
+verbatim. What still comes from the source stores is the product and variant ids (`gid://...`;
+the tests key on the variant ids) and the prices. This is the only hand edit these recordings
+have had, and it is not a precedent for the rule below.
 
 ## PII
 
 There is none, and not by redaction: the pages were fetched with `buyer=None`, so no email,
 name, address or phone number ever existed in the source. The click id was our own synthetic
-`clk_wp6survey`, tied to no buyer and no campaign, and it does not survive the trim. The only
-strings left that could look personal are product titles.
+`clk_wp6survey`, tied to no buyer and no campaign, and it does not survive the trim. No product
+title or vendor name is left either (see the placeholders above).
 
 ## Refreshing them
 

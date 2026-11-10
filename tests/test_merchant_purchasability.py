@@ -209,12 +209,12 @@ def test_the_card_merchants_carry_a_payment_provider_and_the_paypal_one_does_not
     """Names the MECHANISM, so a failure says which structure moved rather than arriving as a
     bare boolean. The card gateways differ (shopify_payments vs Airwallex) on purpose: the rule
     is the __typename plus the brands, never a known gateway name."""
-    idew = checkout_payment_methods((FIXTURES / "card_shopify_payments.html").read_text())[0]
-    judy = checkout_payment_methods((FIXTURES / "card_airwallex.html").read_text())[0]
-    flower = checkout_payment_methods((FIXTURES / "paypal_only.html").read_text())[0]
-    assert "shopify_payments" in idew and "Airwallex" in judy
-    assert "PAYPAL_EXPRESS" in flower
-    assert not {"shopify_payments", "Airwallex"} & set(flower)
+    shopify_card = checkout_payment_methods((FIXTURES / "card_shopify_payments.html").read_text())[0]
+    airwallex_card = checkout_payment_methods((FIXTURES / "card_airwallex.html").read_text())[0]
+    paypal_only = checkout_payment_methods((FIXTURES / "paypal_only.html").read_text())[0]
+    assert "shopify_payments" in shopify_card and "Airwallex" in airwallex_card
+    assert "PAYPAL_EXPRESS" in paypal_only
+    assert not {"shopify_payments", "Airwallex"} & set(paypal_only)
 
 
 def test_the_substring_creditcard_is_on_all_three_pages_and_must_not_be_the_detector():
@@ -1000,7 +1000,7 @@ async def test_the_report_carries_counts_only(_db, monkeypatch, _population):
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
     report = await sweep.run_merchant_purchasability_sweep()
     text = repr(report)
-    for leak in ("juniper-card", "fern-paypal", ".example", "5004"):
+    for leak in ("juniper-card", "fern-paypal", ".example", ".com", "5004"):
         assert leak not in text, f"{leak!r} leaked into the report"
     from dataclasses import fields
     for field in fields(report):
@@ -1980,7 +1980,7 @@ async def test_the_report_line_lands_on_pivota_stdout_at_info_with_root_at_warni
     # counts-only test already polices, and the line carries nothing else.
     assert proof[0].endswith(f"merchant_purchasability_sweep: {report!r}")
     assert report.checked == 2 and report.population == 2
-    for leak in ("juniper-card", "fern-paypal", ".example", "5004"):
+    for leak in ("juniper-card", "fern-paypal", ".example", ".com", "5004"):
         assert leak not in proof[0], f"{leak!r} leaked into the proof line"
 
 
