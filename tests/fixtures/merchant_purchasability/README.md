@@ -6,9 +6,9 @@ They are the evidence that the card detector separates a card checkout from a Pa
 
 | file | merchant | variant | what it proves |
 |---|---|---|---|
-| `idewcare_card.html` | idewcare.com | 46722440036604 | `PaymentProvider` / `shopify_payments`, brands VISA MASTERCARD AMEX DISCOVER DINERS_CLUB ELO -> `card_available=True`, line USD 13.99 |
-| `judydoll_card.html` | judydoll.com | 49922977038613 | `PaymentProvider` / `Airwallex`, brands VISA MASTERCARD AMEX MAESTRO JCB UNIONPAY -> `card_available=True`, line USD 13.99 |
-| `flowerbeauty_paypal_only.html` | flowerbeauty.com | 17281773207622 | NO `PaymentProvider` at all -> `card_available=False` / `NO_CARD_PAYMENT`, line **USD 8.00** against our indexed USD 14.95 |
+| `card_shopify_payments.html` | iris-card.example | 46722440036604 | `PaymentProvider` / `shopify_payments`, brands VISA MASTERCARD AMEX DISCOVER DINERS_CLUB ELO -> `card_available=True`, line USD 13.99 |
+| `card_airwallex.html` | juniper-card.example | 49922977038613 | `PaymentProvider` / `Airwallex`, brands VISA MASTERCARD AMEX MAESTRO JCB UNIONPAY -> `card_available=True`, line USD 13.99 |
+| `paypal_only.html` | fern-paypal.example | 17281773207622 | NO `PaymentProvider` at all -> `card_available=False` / `NO_CARD_PAYMENT`, line **USD 8.00** against our indexed USD 14.95 |
 
 The third file is the incident. It is the page that was served as purchasable.
 
@@ -30,16 +30,24 @@ Each source page was ~310-370 KB. The trimming was mechanical, by
 4. Nothing else was edited. The structures the detector reads — `placements`, `__typename`,
    `name`, `paymentBrands`, `merchandise.id`, `quantity`, `totalAmount` — are verbatim.
 
+**Placeholders, 2026-11-10.** This repository is public, and test fixtures carry no real store or
+brand names. So the file names, the merchant column above, and exactly three in-page values were
+replaced with placeholders: one `storefrontUrl` (now `https://iris-card.example/`), one product
+`vendor` (`Example Vendor`) and one image `altText` (`Example Blush`). The detector reads none of
+them; every structure listed in step 4 is still verbatim. That is the only hand edit these
+recordings have had, and it is not a precedent for the rule below.
+
 ## PII
 
 There is none, and not by redaction: the pages were fetched with `buyer=None`, so no email,
 name, address or phone number ever existed in the source. The click id was our own synthetic
 `clk_wp6survey`, tied to no buyer and no campaign, and it does not survive the trim. The only
-personal-looking strings left are product titles and a merchant's vendor name.
+strings left that could look personal are product titles.
 
 ## Refreshing them
 
-Re-run the fetch with the same three variants and re-run the trimmer. If a merchant has changed
+Re-run the fetch with the same three variants (the source stores are deliberately not named in
+this public repo) and re-run the trimmer, then re-apply the placeholders above. If a merchant has changed
 its payment configuration the fixture's expectation changes with it — update `LIVE_CASES` in
 `tests/test_merchant_purchasability.py` and say in the commit message what the store now offers.
 Do NOT hand-edit a fixture to keep a test green: these files are a recording, and a recording
