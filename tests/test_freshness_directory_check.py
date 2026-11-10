@@ -10,6 +10,8 @@ The alert lines are read off the pivota logger and evaluated against the definit
 Dialect-neutral: on SQLite it runs in the default suite; with a Postgres DATABASE_URL (a throwaway
 database, name containing "test" and ending "dialect_check") it is the production-dialect twin.
 It DROPS the tables it seeds, so the population is exactly the rows written here.
+Every case here runs on both engines (no skips). The scheduler registration cases need no database
+and live in tests/test_freshness_directory_registration.py.
 
     .venv/bin/python -m pytest tests/test_freshness_directory_check.py
 """
@@ -33,7 +35,6 @@ from services import freshness_clock_check as fresh  # noqa: E402
 from services.shopify_cart_link_preflight import PreflightResult, Verdict  # noqa: E402
 
 from test_reap_rail_alerts import matches, worker_log  # noqa: E402
-from test_scheduler_job_allowlist import clean_state  # noqa: E402,F401
 
 DEFS = os.path.join(os.path.dirname(__file__), "..", "infra", "gcp", "monitoring", "money_path_alerts.json")
 FRESH = "shop-a.example"
@@ -79,7 +80,7 @@ def _assert_throwaway() -> None:
         return
     name = (os.getenv("DATABASE_URL") or "").rsplit("/", 1)[-1].split("?")[0]
     if "test" not in name or not name.endswith("dialect_check"):
-        pytest.skip(f"refusing to drop tables in {name!r}: throwaway only (name contains test, ends dialect_check)")
+        pytest.fail(f"refusing to drop tables in {name!r}: throwaway only (name contains test, ends dialect_check)")
 
 
 @pytest.fixture(autouse=True)
@@ -329,29 +330,3 @@ async def test_an_unbuildable_directory_is_a_warning_and_a_summary_not_a_raise(m
     assert summary["unavailable"] == 1 and summary["pairs"] is None
     assert any("directory unavailable (error_type=DirectoryUnavailable)" in line for line in lines)
     assert _alerts(lines) == []
-
-
-# ── scheduler registration ─────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.skipif(IS_POSTGRES, reason="registration needs no database")
-@pytest.mark.parametrize("value,expected", [
-    (None, []),
-    ("", []),
-    ("0", []),
-    ("false", []),
-    ("off", []),
-    ("1", [fresh.DIRECTORY_JOB_ID]),
-    ("true", [fresh.DIRECTORY_JOB_ID]),
-], ids=["unset", "empty", "0", "false", "off", "1", "true"])
-async def test_registered_only_while_its_own_flag_is_on(monkeypatch, clean_state, value, expected):
-    """Flag off: EXACTLY main's job list (the allowlist suite's own constant)."""
-    from test_scheduler_job_allowlist import MAIN_WORKER_JOB_IDS, _start as start_scheduler
-
-    if value is not None:
-        monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, value)
-    rec = await start_scheduler(monkeypatch, clean_state, PIVOTA_ENV="production", AUDIT_WORKER_ENABLED="true")
-    assert [j for j in rec.ids if j not in MAIN_WORKER_JOB_IDS] == expected
-    assert [j for j in rec.ids if j in MAIN_WORKER_JOB_IDS] == MAIN_WORKER_JOB_IDS
-    for job_id in expected:
-        assert clean_state.run_deadline_for(job_id) == 300
