@@ -42,7 +42,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # a gate changes this number and fails the completeness test below, rather than
 # quietly joining the ungated set.
 RAW_SEED_QUERY_SITES = {
-    "routes/agent_shop_gateway.py": 5,
+    # 6th: the signature attached-key arm (OFFERS_RESOLVE_ATTACHED_SEED_ARM), gated like the rest.
+    "routes/agent_shop_gateway.py": 6,
     "routes/agent_api.py": 2,
     "routes/accounts_orders_api.py": 1,
 }

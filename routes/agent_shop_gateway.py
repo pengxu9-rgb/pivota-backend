@@ -5953,6 +5953,23 @@ async def _handle_offers_resolve(
                     if seed_rows:
                         query_label = "external_seed_by_pivota_signature"
 
+            # A MINTED catalog row (the enrichment drain's) never fills `source_ref`, and its
+            # `source_product_id` is a title slug, so neither key above reaches its seed: the seed
+            # is linked only by `attached_product_key` = the row's `product_key`. That is the third
+            # join the group lane already reads (`_fetch_resolved_group`). OFF by default
+            # (OFFERS_RESOLVE_ATTACHED_SEED_ARM); runs only when the two keys above found nothing,
+            # so a row they already serve is answered as before. It only FINDS rows: every row it
+            # returns goes through `_append_external_offers_from_seed_rows` like any other arm's.
+            if not seed_rows and sig_aliases and _attached_seed_arm_enabled():
+                seed_rows = await _fetch_signature_attached_seed_rows(
+                    database,
+                    sig_aliases=sig_aliases,
+                    market_hint=market_hint,
+                    limit=attached_seed_limit,
+                )
+                if seed_rows:
+                    query_label = OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY
+
         if not seed_rows:
             prefetched_internal = await _prefetch_canonical_internal_context()
             if prefetched_internal:
@@ -9413,6 +9430,80 @@ def _group_seed_siblings_mode() -> str:
     if raw in {"1", "true", "yes", "on"}:
         return "on"
     return "off"
+
+
+# ── offers.resolve: the seed ATTACHED to a signature's catalog row ────────────────────────────
+#
+# OFF by default. Read per request, so it flips without a restart; unset, falsy or any
+# unrecognised spelling is off, and off sends neither statement below.
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV = "OFFERS_RESOLVE_ATTACHED_SEED_ARM"
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY = "external_seed_by_signature_attached_key"
+
+
+def _attached_seed_arm_enabled() -> bool:
+    raw = (os.getenv(OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+async def _fetch_signature_attached_seed_rows(
+    db: Any,
+    *,
+    sig_aliases: List[str],
+    market_hint: Optional[str],
+    limit: int,
+) -> List[Any]:
+    """The active seeds attached to the catalog row(s) a signature names, or [].
+
+    The same rules the group lane's attached join applies (`_fetch_resolved_group`), no new one:
+      * the catalog row is not withdrawn (its suppression pair) -- a withdrawn listing lends its
+        seed to nobody;
+      * the seed is `active` and past the shared quarantine anti-join;
+      * the seed is priced in the buyer market's currency (`seed_serving_currency`: a caller that
+        names no market is a US buyer; a market with no known currency gets no seed).
+    Stock, freshness, the outbound allowlist and every other gate run downstream, on the rows.
+    Two single-table statements, as the signature arm: the quarantine anti-join reads unqualified
+    seed columns. The second is an equality probe on `attached_product_key`
+    (idx_external_product_seeds_attached, migration 044).
+    """
+    serving_currency = seed_serving_currency(market_hint)
+    if not sig_aliases or serving_currency is None:
+        return []
+    key_rows = await asyncio.wait_for(
+        db.fetch_all(
+            """
+            SELECT product_key
+            FROM catalog_products
+            WHERE pivota_signature_id = ANY(:sig_aliases)
+              AND suppressed_at IS NULL
+              AND suppression_reason IS NULL
+            LIMIT 8
+            """,
+            {"sig_aliases": sig_aliases},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    product_keys = sorted(
+        {str(_row_to_dict(row).get("product_key") or "").strip() for row in key_rows or []} - {""}
+    )
+    if not product_keys:
+        return []
+    rows = await asyncio.wait_for(
+        db.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE attached_product_key = ANY(:product_keys)
+              AND status = 'active'
+              AND {SEED_SERVING_CURRENCY_CLAUSE}
+            {_seed_quarantine_clause()}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT :limit
+            """,
+            {"product_keys": product_keys, "serving_currency": serving_currency, "limit": limit},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    return list(rows or [])
 
 
 def _remaining_timeout(deadline: float, cap: float) -> float:
