@@ -354,9 +354,23 @@ def test_the_boot_check_says_whether_the_copy_matches_todays_write_key(records, 
     assert buyer_vault.report_legacy_copy_matches_token_key() == answer
     [line] = _copy_check(records)
     assert f"legacy_copy_matches_token_key={answer}" in line.getMessage()
+    assert "dedicated_mounted=yes" in line.getMessage()
     assert line.levelno == logging.WARNING
     for secret in (copy.strip(), *token_env.values(), DEDICATED):
         assert secret not in line.getMessage()
+
+
+@pytest.mark.parametrize("dedicated,mounted", [(None, "no"), ("   ", "no"), (DEDICATED, "yes")], ids=["unset", "blank", "set"])
+def test_the_boot_check_says_whether_the_dedicated_key_is_mounted(records, monkeypatch, dedicated, mounted):
+    """Ops reads this field at step 3 (must be no) and step 5 (must be yes), on web and worker."""
+    if dedicated is None:
+        monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    else:
+        monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", dedicated)
+
+    buyer_vault.report_legacy_copy_matches_token_key()
+    [line] = _copy_check(records)
+    assert f"dedicated_mounted={mounted}" in line.getMessage()
 
 
 def test_the_boot_check_is_silent_without_a_copy(records, monkeypatch):

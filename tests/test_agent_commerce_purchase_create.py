@@ -971,11 +971,10 @@ async def test_every_purchase_route_answers_503_when_the_hash_lookup_fails(
 @pytest.mark.parametrize(
     "mount",
     [
-        {"BUYER_IDENTITY_LINK_SECRET": _S29_DEDICATED},
         {"BUYER_IDENTITY_LINK_SECRET": "same-value-test-key", "BUYER_IDENTITY_LINK_LEGACY_SECRET": "same-value-test-key"},
         {"BUYER_IDENTITY_LINK_LEGACY_SECRET": "a-wrong-copy-test-key"},
     ],
-    ids=["new-key-without-the-copy", "new-key-equal-to-the-copy", "wrong-copy-alone"],
+    ids=["new-key-equal-to-the-copy", "wrong-copy-alone"],
 )
 async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(client, stubs, monkeypatch, s29_tables, mount):
     """S-29b N-1. Each mistake at mount time used to (or could) move existing buyers onto a new hash,
@@ -994,3 +993,74 @@ async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(clie
     assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
     assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
     assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)
+
+
+async def _s29_owner_hashes() -> set:
+    rows = await database.fetch_all("SELECT agent_user_ref_hash FROM reap_agentic_purchase_keys")
+    return {r["agent_user_ref_hash"] for r in rows}
+
+
+def _assert_misconfigured_503(resp):
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("retry-after") == "30"
+
+
+async def test_the_new_key_without_the_copy_is_a_503_that_writes_nothing(client, stubs, monkeypatch, s29_tables):
+    """Step 4 before step 2 (the new key mounted, no copy): every buyer gets a retryable 503 and no
+    row is written under any hash, instead of silently guessing."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
+    before = await _s29_owner_hashes()
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    _assert_misconfigured_503(await client.post(BASE, body()))
+    CALLER.agent_user_ref = "post-mount-user-placeholder"
+    _assert_misconfigured_503(await client.post(BASE, body()))
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+    assert await _s29_owner_hashes() == before
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # the fix: mount the copy
+    CALLER.agent_user_ref = USER_REF
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid
+
+
+async def test_removing_the_copy_after_the_rotation_with_the_window_open_is_a_503_and_closing_the_window_proceeds(
+        client, stubs, monkeypatch, s29_tables):
+    """S-29c P2. After the rotation, a fallback for a missing copy would be the ROTATED token key:
+    every buyer, pre- and post-mount, would move onto a new hash. Instead: 503, nothing written,
+    no new hash. Closing the window (the planned end state) lets the post-mount buyer proceed."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    pre_pid = (await client.post(BASE, body())).json()["purchase_id"]  # a pre-mount buyer
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # steps 2-5
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    post_ref = "post-mount-user-placeholder"
+    CALLER.agent_user_ref = post_ref
+    post = await client.post(BASE, body())
+    assert post.status_code == 202, post.text
+    post_pid = post.json()["purchase_id"]
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")  # step 6
+    before = await _s29_owner_hashes()
+    assert before == {_s29_hash(_S29_LEGACY, USER_REF), _s29_hash(_S29_DEDICATED, post_ref)}
+
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")  # the copy removed, window still open
+    for ref in (USER_REF, post_ref, "new-user-placeholder"):
+        CALLER.agent_user_ref = ref
+        _assert_misconfigured_503(await client.post(BASE, body()))
+        _assert_misconfigured_503(await client.get(BASE))
+    assert await _count("a2a_rail_purchases") == 2 and await _count("agent_purchases") == 2
+    assert len(stubs.clicks) == 2 and await _s29_owner_hashes() == before
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")  # the window closed: proceeds
+    CALLER.agent_user_ref = post_ref
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == post_pid
+    assert await _count("a2a_rail_purchases") == 2
+    assert pre_pid != post_pid

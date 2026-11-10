@@ -107,3 +107,25 @@ Railway 的健康检查默认打到 `GET /health`。该接口会：
 - **先加迁移**（`db/migrations/*.sql`，可重复执行/幂等）
 - **再加 schema gate**（更新 `db/schema_guard.py:REQUIRED_SCHEMA`）
 - 最后再改业务代码引用新字段
+
+### 4.4 Buyer identity hash keys (S-29): rollout, roll forward only
+
+`agent_user_ref` is stored as an HMAC. Today the key is the first token secret that is set, in the order `BUYER_ACTION_TOKEN_SECRET`, `CHECKOUT_TOKEN_SECRET`, `AGENT_CHECKOUT_TOKEN_SECRET`. On web and worker that is only `CHECKOUT_TOKEN_SECRET`. Three variables move it to its own key:
+
+- `BUYER_IDENTITY_LINK_LEGACY_SECRET`: the **copy**. It holds the value today's hashes were made with, and it is used only to match old rows.
+- `BUYER_IDENTITY_LINK_SECRET`: the **new key**, a fresh random value.
+- `BUYER_IDENTITY_LINK_LEGACY_READ`: the **legacy-read window**, open unless set to `off`.
+
+Steps, in order. Each step is its own revision on **both web and worker**.
+1. Deploy the code with nothing mounted. No hash changes, and a WARNING says the new key is missing.
+2. Mount the copy. Create it as a **separate secret** holding the current value of `CHECKOUT_TOKEN_SECRET`. It must not be a reference to the live `CHECKOUT_TOKEN_SECRET` secret or version, or step 6 would change it too. No hash changes in this state.
+3. On the new revision of **both web and worker**, read the boot line `event=buyer_identity_hash_legacy_copy_check`. It must say `legacy_copy_matches_token_key=yes dedicated_mounted=no`. On `no`, fix the copy and repeat; nothing has changed yet.
+4. Mount the new key on both services, never on only one.
+5. On the new revision of both services, the boot line must say `dedicated_mounted=yes`. There must be no `buyer_identity_hash_secret_refused` line and no `buyer_identity_hash_secret_missing` line.
+6. Rotate `CHECKOUT_TOKEN_SECRET`. After this the boot line says `legacy_copy_matches_token_key=no`, as expected.
+
+Rules:
+- **Add no new token secret** (in particular `BUYER_ACTION_TOKEN_SECRET`, which is first in the chain) until the window is closed. Before step 4 it would become the write key and change every hash. After step 4 it makes the step-3 check meaningless.
+- **Do not rotate before step 4.** Until the new key is mounted, the token secret is still the write key.
+- **Never unmount the new key**, and never let a revision without it serve next to one with it. Buyers first seen after step 4 exist only under the new key.
+- **Closing the window:** set `BUYER_IDENTITY_LINK_LEGACY_READ=off` in the same revision as removing the copy, or earlier. If the copy is missing while the window is open and the new key is set, every buyer-hash request answers **503** (`buyer_identity_hash_secret_refused reason=legacy_copy_missing`), and nothing is written. That is by design: after step 6, any fallback would move every buyer onto a new hash. Fix it by mounting the copy again or by closing the window.

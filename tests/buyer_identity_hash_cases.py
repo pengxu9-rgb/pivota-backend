@@ -249,11 +249,12 @@ async def test_rotating_the_token_key_keeps_every_legacy_identity(owner_db, monk
 
 
 @pytest.mark.parametrize("value", [None, "", "   "], ids=["unset", "empty", "whitespace"])
-async def test_without_the_legacy_copy_the_dedicated_key_is_refused_and_every_buyer_keeps_todays_hash(
+async def test_without_the_legacy_copy_resolution_fails_closed_for_every_buyer_and_no_query_runs(
         owner_db, monkeypatch, value):
-    """S-29b N-1, the copy missing (wrong name, or forgotten on one service). Before: legacy matching
-    was refused and every existing buyer silently moved onto the dedicated hash. Now the dedicated
-    key is refused: old and new buyers stay on today's token-key hash, and no lookup runs."""
+    """S-29b N-1 / S-29c, the copy missing while the window is open (wrong name, forgotten on one
+    service, or removed before the window closed). Any fallback hash would move buyers once the
+    token key has rotated, so resolution answers a retryable 503 for old and new buyers alike, before
+    any query. Closing the window (the intended end state) lets resolution proceed."""
     if value is None:
         monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     else:
@@ -265,10 +266,13 @@ async def test_without_the_legacy_copy_the_dedicated_key_is_refused_and_every_bu
 
     monkeypatch.setattr(owner_db, "fetch_one", no_query)
 
-    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
-    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, "end-user-placeholder-2") == _hmac_hex(
-        TOKEN_KEY, "end-user-placeholder-2"
-    )
+    for ref in (USER_REF, "end-user-placeholder-2"):
+        with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable) as raised:
+            await buyer_vault.resolve_agent_user_ref_hash(AGENT, ref)
+        assert raised.value.status_code == 503 and raised.value.headers == {"Retry-After": "30"}
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
 
 
 async def test_a_dedicated_key_equal_to_the_copy_keeps_every_buyer_on_todays_hash(owner_db, monkeypatch):
