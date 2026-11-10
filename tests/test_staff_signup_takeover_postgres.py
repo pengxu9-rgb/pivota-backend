@@ -342,3 +342,304 @@ async def test_login_promotes_on_the_employees_own_legacy_password(db, client):
     )
     assert refused == 0
     assert claims.get("membership_id") and not str(claims["membership_id"]).startswith("legacy:"), claims
+
+
+# ---------------------------------------------------------------------------
+# The identity-in-use check counts only live tenant memberships; that must not
+# reopen the hole on any register lane.
+# ---------------------------------------------------------------------------
+
+
+async def _register(client, lane, email, monkeypatch):
+    if lane == "api_register":
+        return await client.post("/api/auth/register", json={"email": email, "password": ATTACKER_PW, "role": "merchant"})
+    if lane == "agent_register":
+        from routes import agent_account
+
+        monkeypatch.setattr(agent_account, "_check_registration_rate_limit", lambda ip: True)
+        monkeypatch.setattr(agent_account, "_self_serve_registration_enabled", lambda: True)
+        return await client.post(
+            "/agent/account/register", json={"email": email, "password": ATTACKER_PW, "agent_name": "A"}
+        )
+    return await client.post("/merchant/onboarding/register", json=_store_less(email))
+
+
+LANES = ["api_register", "agent_register", "merchant_register"]
+
+
+@pytest.mark.parametrize("lane", LANES)
+async def test_an_inactive_employee_with_a_dead_membership_still_holds_the_address(db, client, monkeypatch, lane):
+    """No live membership, so only the employees arm (any status) refuses: the employee
+    can be reactivated, which re-activates the membership."""
+    from db.auth_identity import upsert_membership
+
+    staff = _addr("former")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id, status="inactive", membership=False)
+    await upsert_membership(email=staff, membership_type="employee", role="admin", entity_id=emp_id,
+                            status="inactive", source="employees_backfill")
+
+    resp = await _register(client, lane, staff, monkeypatch)
+
+    assert resp.status_code in (400, 409), (resp.status_code, resp.text)
+    assert await _users_rows(db, staff) == 0
+
+
+@pytest.mark.parametrize("lane", LANES)
+async def test_a_live_employee_membership_without_an_employees_row_holds_the_address(db, client, monkeypatch, lane):
+    from db.auth_identity import upsert_membership
+
+    staff = _addr("orphan-staff")
+    await upsert_membership(email=staff, membership_type="employee", role="admin",
+                            entity_id="emp_" + secrets.token_hex(4), status="active", source="employees_backfill")
+
+    resp = await _register(client, lane, staff, monkeypatch)
+
+    assert resp.status_code in (400, 409), (resp.status_code, resp.text)
+    assert await _users_rows(db, staff) == 0
+    for portal in ("employee", None):
+        claims = await _login(client, staff, ATTACKER_PW, portal)
+        assert not claims.get("employee_id"), (portal, claims)
+
+
+# ---------------------------------------------------------------------------
+# Review R1: a buyer-only identity is not a tenant, so it may still sign up
+# ---------------------------------------------------------------------------
+
+
+async def test_d_buyer_identity_can_still_sign_up_as_merchant(db, client):
+    """An address that only has a buyer (customer) identity, as every accounts OTP or
+    password login writes, signs up as a merchant through the public onboarding route.
+    Refusing it was a dead end: no users row to sign in with, and a merchant-portal
+    reset sends nothing for an address with no merchant contact or membership."""
+    from db.accounts import sync_customer_auth_membership
+
+    buyer = _addr("buyer")
+    await sync_customer_auth_membership({"id": "su_" + secrets.token_hex(4), "email": buyer, "primary_role": "customer"})
+
+    resp = await client.post("/merchant/onboarding/register", json=_store_less(buyer, "Founder123x"))
+
+    assert resp.status_code == 200, resp.text
+    merchant_id = resp.json()["merchant_id"]
+    claims = await _login(client, buyer, "Founder123x", "merchant")
+    assert claims.get("merchant_id") == merchant_id and claims.get("role") == "merchant", claims
+
+
+@pytest.mark.parametrize("lane", ["api_register", "merchant_register", "shopify_claim"])
+async def test_a_buyer_with_a_buyer_password_can_sign_up_on_every_lane(db, client, monkeypatch, lane):
+    """/agent/account/register gates on the same _email_claims_existing_tenant call as
+    /api/auth/register (asserted below); its own agents INSERT needs columns the
+    model-built agents table here does not default, so it is not driven end to end."""
+    from db.accounts import sync_customer_auth_membership
+    from routes import auth
+    from utils.auth import hash_password, verify_password
+
+    buyer = _addr("buyer-pw")
+    seeded = await sync_customer_auth_membership(
+        {"id": "su_" + secrets.token_hex(4), "email": buyer, "primary_role": "customer"},
+        password_hash=hash_password("BuyerShop1pw"),
+    )
+    assert await auth._email_claims_existing_tenant(buyer) is False
+    if lane == "shopify_claim":
+        token = await _claim_token(f"shop-d-{secrets.token_hex(3)}.myshopify.com")
+        resp = await client.post(
+            "/integrations/shopify/claim", json={"claim_token": token, "email": buyer, "password": ATTACKER_PW}
+        )
+    else:
+        resp = await _register(client, lane, buyer, monkeypatch)
+
+    assert resp.status_code == 200, (lane, resp.status_code, resp.text)
+    assert await _users_rows(db, buyer) == 1
+    if lane == "api_register":
+        # Insert-if-absent: the buyer's own password is kept on this lane.
+        cred = await db.fetch_one("SELECT password_hash FROM auth_credentials WHERE identity_id = :i",
+                                  {"i": seeded["identity"]["identity_id"]})
+        assert verify_password("BuyerShop1pw", cred["password_hash"])
+
+
+# ---------------------------------------------------------------------------
+# Review R3: the claimed-address check runs before the claim token is spent
+# ---------------------------------------------------------------------------
+
+
+async def _token_used_at(token):
+    import hashlib as _hashlib
+
+    import routes.merchant_store_connections as msc
+    from db.database import database
+
+    jti = msc._verify_claim_token(token)["jti"]
+    return await database.fetch_val(
+        "SELECT used_at FROM shopify_store_claim_tokens WHERE jti_sha256 = :h",
+        {"h": _hashlib.sha256(jti.encode("utf-8")).hexdigest()},
+    )
+
+
+async def test_a_refused_claim_leaves_the_token_usable_once_the_address_is_free(db, client):
+    import db.agents as agents_db
+
+    addr = _addr("installer-agent")
+    created = await agents_db.create_agent(agent_name="Agent B", agent_type="custom", owner_email=addr)
+    token = await _claim_token(f"shop-e-{secrets.token_hex(3)}.myshopify.com")
+    body = {"claim_token": token, "email": addr, "password": "Installer1x"}
+
+    refused = await client.post("/integrations/shopify/claim", json=body)
+    _signin_required(refused)
+    assert await _token_used_at(token) is None
+    assert await _users_rows(db, addr) == 0
+
+    # The address issue is fixed (the agent no longer names it): the same link works.
+    await db.execute("DELETE FROM agents WHERE agent_id = :a", {"a": created["agent_id"]})
+    ok = await client.post("/integrations/shopify/claim", json=body)
+    assert ok.status_code == 200, ok.text
+    assert await _token_used_at(token) is not None
+    assert await _users_rows(db, addr) == 1
+
+    replay = await client.post("/integrations/shopify/claim", json={**body, "email": _addr("other")})
+    assert replay.status_code == 400 and "already been used" in replay.text
+
+
+async def test_a_claim_token_is_consumed_exactly_once_under_concurrent_claims(db, client):
+    import asyncio
+
+    token = await _claim_token(f"shop-f-{secrets.token_hex(3)}.myshopify.com")
+    first, second = _addr("racer-1"), _addr("racer-2")
+
+    results = await asyncio.gather(
+        client.post("/integrations/shopify/claim", json={"claim_token": token, "email": first, "password": "Racer1pass"}),
+        client.post("/integrations/shopify/claim", json={"claim_token": token, "email": second, "password": "Racer2pass"}),
+    )
+
+    codes = sorted(r.status_code for r in results)
+    assert codes == [200, 400], [(r.status_code, r.text[:200]) for r in results]
+    assert await _users_rows(db, first) + await _users_rows(db, second) == 1
+    assert await _token_used_at(token) is not None
+
+
+# ---------------------------------------------------------------------------
+# Review X1: change-password rewrites employees.password only for the employee
+# ---------------------------------------------------------------------------
+
+
+async def _employee_legacy_hash_in_db(db, email):
+    return await db.fetch_val("SELECT password FROM employees WHERE LOWER(email) = LOWER(:e)", {"e": email})
+
+
+async def _login_token(client, email, password, portal):
+    body = {"email": email, "password": password}
+    if portal:
+        body["portal"] = portal
+    resp = await client.post("/api/auth/login", json=body)
+    assert resp.status_code == 200, (portal, resp.status_code, resp.text)
+    return resp.json()["token"]
+
+
+async def _change_password(client, token, current, new):
+    return await client.post(
+        "/api/auth/change-password",
+        json={"current_password": current, "new_password": new},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+async def test_x1_a_merchant_token_at_an_employee_address_cannot_set_the_staff_password(db, client):
+    """A merchant users row left at an active admin's address (a pre-fix sign-up). Its
+    holder signs in on the merchant portal and changes the password: that changes the
+    merchant login only. employees.password, the one proof login accepts for promoting
+    this row, is untouched, so the new password opens no employee claim."""
+    from utils.auth import hash_password
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await db.execute(
+        "INSERT INTO users (email, password_hash, full_name, role, merchant_id) "
+        "VALUES (:e, :h, 'M', 'merchant', :m)",
+        {"e": staff, "h": hash_password(ATTACKER_PW), "m": "merch_x1_" + secrets.token_hex(4)},
+    )
+    before = await _employee_legacy_hash_in_db(db, staff)
+    token = await _login_token(client, staff, ATTACKER_PW, "merchant")
+
+    resp = await _change_password(client, token, ATTACKER_PW, "Attacker456pw")
+
+    assert resp.status_code == 200, resp.text
+    assert await _employee_legacy_hash_in_db(db, staff) == before == _legacy_employee_hash(EMPLOYEE_PW)
+    for portal in ("employee", None):
+        claims = await _login(client, staff, "Attacker456pw", portal)
+        assert not claims.get("employee_id"), (portal, claims)
+        assert claims.get("role") not in ("admin", "employee", "super_admin"), (portal, claims)
+    refused = await db.fetch_val(
+        "SELECT count(*) FROM auth_identity_events "
+        "WHERE email_normalized = :e AND event_type = 'employee_password_sync_refused'",
+        {"e": staff},
+    )
+    assert refused == 1
+    # The merchant login itself did change.
+    assert (await _login(client, staff, "Attacker456pw", "merchant")).get("role") == "merchant"
+
+
+async def test_x1_an_employee_token_still_syncs_the_legacy_password(db, client):
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    token = await _login_token(client, staff, EMPLOYEE_PW, "employee")
+
+    resp = await _change_password(client, token, EMPLOYEE_PW, "EmployeeNew2pw")
+
+    assert resp.status_code == 200, resp.text
+    assert await _employee_legacy_hash_in_db(db, staff) == _legacy_employee_hash("EmployeeNew2pw")
+    claims = await _login(client, staff, "EmployeeNew2pw", "employee")
+    assert claims.get("employee_id") == emp_id and claims.get("role") == "admin", claims
+
+
+@pytest.mark.parametrize(
+    "claims, users_role, syncs",
+    [
+        ({}, "admin", True),                                                   # legacy staff token, staff row
+        ({}, "merchant", False),                                               # legacy token, merchant row
+        ({"membership_type": "agent", "agent_id": "agent_x"}, "agent", False),
+        ({"membership_type": "employee", "employee_id": "emp_other"}, "admin", False),  # another employee's id
+        ({"membership_type": "merchant", "merchant_id": "merch_x"}, "admin", False),   # non-employee token, staff row
+    ],
+    ids=["legacy-staff-row", "legacy-merchant-row", "agent-token", "employee-token-other-id", "merchant-token-staff-row"],
+)
+async def test_x1_who_may_sync_the_legacy_password(db, client, claims, users_role, syncs):
+    from utils.auth import create_access_token, hash_password
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await db.execute(
+        "INSERT INTO users (email, password_hash, full_name, role) VALUES (:e, :h, 'U', :r)",
+        {"e": staff, "h": hash_password(ATTACKER_PW), "r": users_role},
+    )
+    token = create_access_token({"sub": staff, "email": staff, "role": users_role, **claims})
+
+    resp = await _change_password(client, token, ATTACKER_PW, "Changed789pw")
+
+    assert resp.status_code == 200, resp.text
+    expected = _legacy_employee_hash("Changed789pw" if syncs else EMPLOYEE_PW)
+    assert await _employee_legacy_hash_in_db(db, staff) == expected
+
+
+async def test_x1_reset_still_syncs_the_legacy_password(db, client, monkeypatch):
+    """Reset proves the mailbox, so it may set the employee's legacy password, even
+    when the users row at the address is a merchant's."""
+    from routes import auth
+
+    staff = _addr("staff")
+    emp_id = "emp_" + secrets.token_hex(4)
+    await _seed_exposed_employee(db, staff, employee_id=emp_id)
+    await _seed_merchant_row_at(db, staff, ATTACKER_PW)
+    sent = {}
+    monkeypatch.setattr(auth, "_send_reset_password_email", lambda e, link: sent.__setitem__(e, link.split("token=")[1]))
+
+    resp = await client.post("/api/auth/forgot-password", json={"email": staff, "portal": "employee"})
+    assert resp.status_code == 200, resp.text
+    assert sent.get(staff), sent
+    resp = await client.post("/api/auth/reset-password", json={"token": sent[staff], "new_password": "ResetOwn1pw"})
+    assert resp.status_code == 200, resp.text
+
+    assert await _employee_legacy_hash_in_db(db, staff) == _legacy_employee_hash("ResetOwn1pw")
+    claims = await _login(client, staff, "ResetOwn1pw", "employee")
+    assert claims.get("employee_id") == emp_id, claims

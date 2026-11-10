@@ -2163,12 +2163,18 @@ async def app_lifespan(_app: FastAPI):
     install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
-    # S-29: a deployed host hashing agent_user_refs without BUYER_IDENTITY_LINK_SECRET says so at
-    # boot (ERROR in production), not only on its first hash. Never fatal: see the function.
+    # S-29: a deployed host whose agent_user_ref hash keys are missing or misconfigured says so at
+    # boot, not only on its first hash: a WARNING while the dedicated key is unset, one ERROR in
+    # production for a refused dedicated key (including one set without the legacy copy), and the
+    # copy check `legacy_copy_matches_token_key=yes|no` while a copy is mounted. Never fatal.
     try:
-        from db.buyer_vault import report_missing_buyer_identity_hash_secret
+        from db.buyer_vault import (
+            report_legacy_copy_matches_token_key,
+            report_missing_buyer_identity_hash_secret,
+        )
 
         report_missing_buyer_identity_hash_secret(force=True)
+        report_legacy_copy_matches_token_key()
     except Exception:  # noqa: BLE001 - a log line must never stop the boot
         pass
 
