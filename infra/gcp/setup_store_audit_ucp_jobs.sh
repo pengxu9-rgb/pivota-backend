@@ -22,7 +22,16 @@ CRAWL_SA="sa-store-audit-ucp-crawl@$PROJECT.iam.gserviceaccount.com"
 SELECTOR_SA="sa-store-audit-ucp-selector@$PROJECT.iam.gserviceaccount.com"
 SCHEDULER_SA="sa-store-audit-ucp-scheduler@$PROJECT.iam.gserviceaccount.com"
 BACKEND_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/backend:$BACKEND_TAG"
-GATEWAY_IMAGE="$REGION-docker.pkg.dev/$SHARED/pivota/gateway:$GATEWAY_TAG"
+# A gateway sha resolves in pivota (hand builds) first, then pivota-gateway (built on merge); see
+# _gateway_image.sh for why that order, and why only "not found" falls through.
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$(cd "$(dirname "$0")" && pwd)/_gateway_image.sh"
+_rc=0; GATEWAY_IMAGE="$(resolve_gateway_image "$GATEWAY_TAG")" || _rc=$?
+case "$_rc" in
+  0) ;;
+  1) GATEWAY_IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$GATEWAY_TAG" ;;  # in neither: today's path, which fails later exactly as before
+  *) echo "cannot resolve gateway:$GATEWAY_TAG (lookup error above); refusing" >&2; exit 1 ;;
+esac
 have(){ "$@" >/dev/null 2>&1; }
 export CLOUDSDK_CORE_PROJECT="$PROJECT"
 

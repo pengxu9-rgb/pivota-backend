@@ -61,6 +61,10 @@ def _literal_env(env: Optional[dict], where: str, provided: set) -> Dict[str, st
     for key, value in (env or {}).items():
         if key in provided:
             continue
+        if isinstance(value, (bool, float)):
+            # PyYAML reads YAML 1.1 (`yes`/`on` are booleans, 1.10 is 1.1); GitHub reads the text.
+            raise ShapeError(f"{where} env {key} parses as {value!r} here but GitHub passes the "
+                             "literal text; quote it in the workflow")
         text = "" if value is None else str(value)
         if "${{" in text:
             raise ShapeError(f"{where} env {key} is a GitHub expression ({text!r}); this runner "
@@ -69,12 +73,88 @@ def _literal_env(env: Optional[dict], where: str, provided: set) -> Dict[str, st
     return out
 
 
-def step_script(workflow: str, job: str, step: str, provide: Sequence[str]) -> str:
-    wf = _workflow(workflow)
+_PIP_INSTALL = "python -m pip install --upgrade pip\npip install -r requirements.txt -r requirements-dev.txt\n"
+
+#: EVERY `run:` step of the four CI jobs this runner stands in for. RUNS: executed here, by the
+#: selector the build config passes to `step` (a step `id`, or a prefix of its `name`), with the
+#: `if:` this runner's sequencing was written against. NOT_RUN: deliberately not executed, with
+#: why, and the body it had when that was decided (None = any body). A run step in neither, a
+#: step that vanished, a changed `if:` or body, or a step key outside _STEP_KEYS (a
+#: `working-directory:`, say) is a ShapeError: CI changed, and a GREEN here would no longer mean
+#: what CI's means until this table (and the build config) is updated to match.
+RUNS: Dict[tuple, Dict[str, Optional[str]]] = {
+    (SWEEP_WF, "sweep-shard"): {"sweep": None},
+    (SWEEP_WF, "sweep"): {"Merge the shards": "!cancelled()", "Assert the sweep actually ran": "!cancelled()"},
+    (GATE_WF, "shard"): {
+        "Preflight": None, "discover": None, "run_gate": None,
+        "Assert the gate": "${{ !cancelled() && steps.run_gate.conclusion != 'skipped' }}",
+        "Recovery report": "${{ matrix.shard == fromJSON(env.RIDE_ALONG_SHARD) }}",
+    },
+    (GATE_WF, "postgres-dialect-gate"): {"Prove the shards are one complete run": None},
+}
+NOT_RUN: Dict[tuple, Dict[str, tuple]] = {
+    (SWEEP_WF, "sweep-shard"): {"Install dependencies": ("the build's deps step installs exactly this", _PIP_INSTALL)},
+    (SWEEP_WF, "sweep"): {"Run Shopify Web Pixel mapper contract": ("a node test; not covered here", None)},
+    (GATE_WF, "shard"): {"Install deps": ("the build's deps step installs exactly this", _PIP_INSTALL)},
+    (GATE_WF, "postgres-dialect-gate"): {},
+}
+_STEP_KEYS = {"name", "id", "run", "env", "shell", "if"}
+_JOB_KEYS = {"name", "runs-on", "needs", "if", "strategy", "services", "env", "timeout-minutes", "steps"}
+
+
+def _matches(step: dict, selector: str) -> bool:
+    return step.get("id") == selector or str(step.get("name") or "").startswith(selector)
+
+
+def check_job(wf: dict, workflow: str, job: str) -> None:
+    """Raise ShapeError unless job's run steps are exactly the ones this runner knows."""
+    where = f"{workflow}.yml job {job}"
+    if "defaults" in wf:
+        raise ShapeError(f"{workflow}.yml sets `defaults:`, which this runner does not apply")
     try:
         job_def = wf["jobs"][job]
+        runs, not_run = RUNS[(workflow, job)], NOT_RUN[(workflow, job)]
     except KeyError:
-        raise ShapeError(f"{workflow}.yml has no job {job!r}")
+        raise ShapeError(f"{where}: not a job this runner knows")
+    unknown = sorted(set(job_def) - _JOB_KEYS)
+    if unknown:
+        raise ShapeError(f"{where} has key(s) this runner does not apply: {', '.join(unknown)}")
+    seen: Dict[str, int] = {sel: 0 for sel in [*runs, *not_run]}
+    for s in job_def.get("steps") or []:
+        if "run" not in s:
+            continue
+        label = f"{where} step {s.get('name') or s.get('id')!r}"
+        hits = [sel for sel in seen if _matches(s, sel)]
+        if len(hits) != 1:
+            raise ShapeError(f"{label}: CI runs it and this runner does not know it (matches "
+                             f"{hits or 'nothing'}). Run it in infra/gcp/cloudbuild.tests.yaml, or "
+                             "list it in NOT_RUN with the reason")
+        sel = hits[0]
+        seen[sel] += 1
+        if sel in not_run:
+            body = not_run[sel][1]
+            if body is not None and str(s["run"]) != body:
+                raise ShapeError(f"{label}: its body changed since this runner decided not to run "
+                                 f"it ({not_run[sel][0]})")
+            continue
+        extra = sorted(set(s) - _STEP_KEYS)
+        if extra:
+            raise ShapeError(f"{label} has key(s) this runner does not apply: {', '.join(extra)}")
+        if s.get("shell") not in (None, "bash"):
+            raise ShapeError(f"{label}: shell {s.get('shell')!r} is not bash")
+        if s.get("if") != runs[sel]:
+            raise ShapeError(f"{label}: `if:` is {s.get('if')!r}, this runner sequences it as {runs[sel]!r}")
+    wrong = sorted(sel for sel, n in seen.items() if n != 1)
+    if wrong:
+        raise ShapeError(f"{where}: expected exactly one run step for each of {wrong}")
+
+
+def step_script(workflow: str, job: str, step: str, provide: Sequence[str]) -> str:
+    wf = _workflow(workflow)
+    check_job(wf, workflow, job)
+    if step not in RUNS[(workflow, job)]:
+        raise ShapeError(f"{workflow}.yml job {job}: {step!r} is not a step this runner runs")
+    job_def = wf["jobs"][job]
     hits = [s for s in job_def.get("steps") or []
             if "run" in s and (s.get("id") == step or str(s.get("name") or "").startswith(step))]
     if len(hits) != 1:
@@ -153,7 +233,10 @@ def _scratch_checkout() -> Path:
 
 def _run_ci_step(cwd: Path, workflow: str, job: str, step: str, env: Dict[str, str]) -> subprocess.CompletedProcess:
     script = cwd / f".ci-step-{job}-{len(list(cwd.glob('.ci-step-*')))}.sh"
-    script.write_text(step_script(workflow, job, step, list(env)))
+    try:
+        script.write_text(step_script(workflow, job, step, list(env)))
+    except ShapeError as exc:  # reported in the block, not as a traceback that hides it
+        return subprocess.CompletedProcess([], 98, "", f"CI changed shape: {exc}")
     return subprocess.run(["bash", str(script)], cwd=cwd, env={**os.environ, **env},
                           capture_output=True, text=True)
 
@@ -192,6 +275,12 @@ def summary(ci_dir: Path, sqlite_shards: int, pg_shards: int) -> int:
         red.append(f"this build ran {pg_shards} Postgres shard(s) but {GATE_WF}.yml plans "
                    f"DIALECT_GATE_SHARDS={gate_shards}: add or remove postgres-K steps in "
                    "infra/gcp/cloudbuild.tests.yaml")
+
+    for workflow, job in RUNS:
+        try:
+            check_job(_workflow(workflow), workflow, job)
+        except ShapeError as exc:
+            red.append(f"CI changed shape: {exc}")
 
     verdicts: List[str] = []
     sqlite_ok = all(_rc(ci_dir / f"sqlite-{k}.rc") == 0 for k in range(1, sqlite_shards + 1))

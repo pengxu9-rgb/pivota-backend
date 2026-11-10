@@ -23,7 +23,22 @@
 #
 # WHAT IS NOT RUN HERE (GitHub CI still gates the merge): lint.yml, the node web-pixel contract,
 # new-tests-are-covered, the commerce-agents adapter, v3-audit-gate and the agent reliability suite.
-# Where this run has to differ from CI (no IPv6 loopback in Cloud Build), the summary says so.
+# The helper holds the list of every `run:` step of the four CI jobs it stands in for (RUNS and
+# NOT_RUN in cloud_build_tests.py): a step CI adds, drops or re-conditions turns this build RED
+# until that list and this file are updated, so a new CI check cannot go silently unrun.
+#
+# STANDING DIFFERENCES FROM CI (a difference found at run time is printed in the summary instead):
+#   * Timeouts. CI's per-job `timeout-minutes` (30 sweep shard, 25 gate shard) are not applied; only
+#     this build's own 3000 s limit is. A hang that CI would cut at 25 min is cut later here.
+#   * The floor's CAP is advisory. The executed-test assert runs as a pull request does
+#     (SWEEP_EVENT=pull_request): an under-floor count is red, but "the floor has decayed" only
+#     warns. On a push to main CI makes that a failure, and it blocks the deploy.
+#   * Eight SQLite shards, not CI's four (see sqlite-K above).
+#   * YAML. The helper reads the workflows with PyYAML (YAML 1.1), GitHub with YAML 1.2. An env
+#     value the two would read differently (a bare yes/on/off, a float) fails the step.
+#   * Postgres is Debian's packaging of 15, not the postgres:15 image. The cluster is created in
+#     that image's locale, en_US.utf8, so text ORDER BY collates as on CI; if the database reports
+#     another collation the summary says so.
 #
 # EVERY SHARD RUNS IN ITS OWN COPY OF THE SOURCE (/tmp/src, local to its step container). The steps
 # share /workspace, and tests/conftest.py keeps the SQLite test database at <repo>/pivota_test.db and
@@ -112,16 +127,31 @@ steps:
       - |
         set -e
         export DEBIAN_FRONTEND=noninteractive
-        apt-get -qq update >/dev/null && apt-get -qq install -y postgresql-common >/dev/null
+        apt-get -qq update >/dev/null && apt-get -qq install -y postgresql-common locales >/dev/null
+        # CI's postgres:15 image initialises its cluster in en_US.utf8; the package would use this
+        # image's C.UTF-8, and text ORDER BY would collate differently.
+        sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && locale-gen >/dev/null
         # postgresql-common's own script adds the PostgreSQL project's apt repository (its signing
-        # key ships in the package), so the major can match CI's postgres:15.
-        /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
+        # key ships in the package), so the major can match CI's postgres:15. Its output and the
+        # resolved package stay in the build log: they are what was installed, and from where.
+        /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
         apt-get -qq install -y postgresql-15 >/dev/null
+        apt-cache policy postgresql-15
+        # The package created its cluster in the image's locale whatever LANG says (measured), so
+        # the empty cluster is replaced by one in CI's. Every database then inherits it, the
+        # recovery report's own included.
+        pg_dropcluster --stop 15 main
+        pg_createcluster --locale en_US.UTF-8 15 main >/dev/null
         service postgresql start >/dev/null
         su postgres -c "psql -q -c \"ALTER USER postgres PASSWORD 'postgres'\"" >/dev/null
         su postgres -c "createdb pivota_dialect_check"
         PGV="$$(su postgres -c 'psql -tAc "SHOW server_version_num"')"
         echo "postgres server_version_num=$$PGV"
+        COLL="$$(su postgres -c "psql -tAc \"SELECT datcollate FROM pg_database WHERE datname = 'pivota_dialect_check'\"")"
+        echo "postgres datcollate=$$COLL"
+        case "$$COLL" in en_US.[Uu][Tt][Ff]*8) ;; *)
+          echo "postgres: the database collates as $$COLL, not CI's en_US.utf8; text ORDER BY can differ" \
+            > "/workspace/ci/notice-collation.txt" ;; esac
         set +e
         . /workspace/.ci-venv/bin/activate
         mkdir -p /tmp/src && (cd /workspace && tar --exclude=./.ci-venv --exclude=./ci -cf - .) | tar -C /tmp/src -xf -

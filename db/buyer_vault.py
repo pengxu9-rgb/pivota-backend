@@ -180,8 +180,9 @@ BUYER_IDENTITY_HASH_SECRET_ENV = "BUYER_IDENTITY_LINK_SECRET"
 #: and the rows stay readable.
 #:
 #: Unset while the dedicated key is set and the window is open: the DEDICATED KEY is refused
-#: (`_dedicated_key_problem`), hashes stay on today's token key and an ERROR says so. Moving buyers
-#: onto the dedicated key without a legacy read would split every existing identity. It never falls
+#: (`_dedicated_key_problem`), an ERROR says so, and buyer-hash resolution FAILS CLOSED (503, see
+#: below). Moving buyers onto the dedicated key without a legacy read would split every existing
+#: identity, and so would falling back once the token key has rotated. It never falls
 #: back to the live token key for the legacy read, which would tie that read to a key that must
 #: rotate (and break silently when it does). The copy is READ ONLY by the legacy read, never for a
 #: write, so mounting it alone changes no hash; the boot line `legacy_copy_matches_token_key=yes|no`
@@ -189,8 +190,17 @@ BUYER_IDENTITY_HASH_SECRET_ENV = "BUYER_IDENTITY_LINK_SECRET"
 #: dedicated key. A WRONG copy cannot be refused by code (after the token key rotates, "differs" is
 #: the expected state), so that boot line is the check.
 #:
-#: Never remove the copy while the window is open: after the token key has rotated, a refused
-#: dedicated key falls back to the ROTATED token key and every hash changes. Close the window first.
+#: FAIL CLOSED without the copy (S-29c). The dedicated key set, the window open and the copy missing:
+#: `resolve_agent_user_ref_hash` answers 503 for every buyer and writes nothing. Falling back to
+#: the token key is only safe BEFORE the token key rotates; after it (the copy removed one revision
+#: before the window closes, or lost on one service), the fallback is the ROTATED key and every
+#: buyer, pre- and post-mount, would move onto a new hash. Code cannot tell the two moments apart,
+#: so it refuses both: a visible 503 and an ERROR, nothing split. THE ONLY REMEDY for that 503 is
+#: to mount the copy again (from its separate secret). Closing the window is NOT a remedy: with it
+#: closed `legacy_agent_user_ref_hash` returns None and nothing rehashes the old rows, so every
+#: identity first seen before the dedicated key loses its saved link, its purchases and its
+#: idempotency keys (a retry can open a second purchase). Closing it is a separate end-of-window
+#: decision (RUNBOOK_BUYER_VAULT.md 4.4).
 BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV = "BUYER_IDENTITY_LINK_LEGACY_SECRET"
 
 #: The token keys the hash fell back to before it had its own. Each one ALSO SIGNS A TOKEN: the buyer
@@ -238,11 +248,24 @@ class BuyerIdentityHashUnavailable(HTTPException):
     mount. The database is already failing when this fires, and a 503 is retryable and splits
     nothing. An HTTPException, so every route that lets it propagate answers the same 503 the
     codebase uses for a busy database (`utils.transient_errors.db_busy_http_exception`).
+
+    Also raised for a refused key configuration (`legacy_copy_missing`, S-29c): the same code and
+    shape, but `message` names the configuration fault, so on-call is not sent to the database.
     """
 
-    def __init__(self) -> None:
-        busy = db_busy_http_exception()
-        super().__init__(status_code=busy.status_code, detail=busy.detail, headers=busy.headers)
+    def __init__(self, *, retry_after_seconds: int = 1, message: Optional[str] = None) -> None:
+        busy = db_busy_http_exception(retry_after_seconds=retry_after_seconds)
+        detail = dict(busy.detail)
+        if message:
+            detail["message"] = message
+        super().__init__(status_code=busy.status_code, detail=detail, headers=busy.headers)
+
+
+#: The 503 message while the copy is missing with the window open (S-29c). It reaches the caller,
+#: so it names the fault, not a variable or a value.
+BUYER_IDENTITY_HASH_COPY_MISSING_MESSAGE = (
+    "Buyer identity hash key configuration refused: the legacy key copy is missing. Please retry shortly."
+)
 
 
 def _env_secret(name: str) -> str:
@@ -349,8 +372,9 @@ _PROBLEM_MESSAGES = {
         + BUYER_IDENTITY_HASH_SECRET_ENV
         + " is IGNORED because "
         + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
-        + " is unset while the legacy-read window is open: hashes stay on the pre-dedicated key (%s). "
-        "Mount the legacy copy in the same revision, or close the window."
+        + " is unset while the legacy-read window is open: buyer-hash resolution answers 503 and "
+        "writes nothing (%s). The only fix is to mount the legacy copy again. Do not close the window "
+        "to clear this: every buyer first seen before the dedicated key would lose their rows."
     ),
 }
 
@@ -499,10 +523,17 @@ async def resolve_agent_user_ref_hash(agent_id: str, agent_user_ref: str) -> str
 
     RAISES `BuyerIdentityHashUnavailable` (a 503) when that lookup fails or gives no answer. It
     never guesses either hash: see the exception for why each guess splits an identity.
+
+    Also RAISES it, for every buyer and before any query, while the dedicated key is set, the
+    window is open and the copy is missing (`legacy_copy_missing`): see
+    BUYER_IDENTITY_LINK_LEGACY_SECRET for why falling back would move every buyer once the token
+    key has rotated, and why re-mounting the copy is the only remedy.
     """
     primary = hash_agent_user_ref(agent_user_ref)
     if not primary:
         return ""
+    if _dedicated_key_problem() == "legacy_copy_missing":
+        raise BuyerIdentityHashUnavailable(retry_after_seconds=30, message=BUYER_IDENTITY_HASH_COPY_MISSING_MESSAGE)
     legacy = legacy_agent_user_ref_hash(agent_user_ref)
     if legacy is None:
         return primary
