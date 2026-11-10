@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -19,8 +18,6 @@ from db.database import IS_POSTGRES, database
 # then has no GMV on it, whatever its edges were stamped at write.
 from services import test_traffic
 from services.test_traffic import is_test_merchant_lock_sql, not_test_traffic_sql
-
-logger = logging.getLogger(__name__)
 
 
 SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
@@ -647,10 +644,7 @@ async def _gmv_attribution_for_month(
     period_start: date,
     period_end: date,
 ) -> Any:
-    await _record_is_test_lock_drop(
-        merchant_id=merchant_id, period_start=period_start, period_end=period_end
-    )
-    return await database.fetch_one(
+    row = await database.fetch_one(
         """
         SELECT
           COALESCE(SUM(net_attributed_gmv_cents), 0) AS gmv_raw_total_cents,
@@ -681,6 +675,12 @@ async def _gmv_attribution_for_month(
             "period_end": period_end,
         },
     )
+    # AFTER the read it explains (as the invoice run does), so the count describes the lock that
+    # was just taken rather than one about to be.
+    await _record_is_test_lock_drop(
+        merchant_id=merchant_id, period_start=period_start, period_end=period_end
+    )
+    return row
 
 
 async def _record_is_test_lock_drop(*, merchant_id: str, period_start: date, period_end: date) -> None:
@@ -709,7 +709,12 @@ async def _record_is_test_lock_drop(*, merchant_id: str, period_start: date, per
                 {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
             )
     except Exception as exc:  # noqa: BLE001 — the audit read never fails the statement
-        logger.warning("monthly statement: is_test lock-drop count failed (%s)", type(exc).__name__)
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "monthly_statement",
+            ref=f"statement:{merchant_id}:{period_start.isoformat()}",
+            merchant_id=merchant_id,
+            exc=exc,
+        )
         return
     dropped = int(_row_get(row, "n") or 0)
     if dropped > 0:

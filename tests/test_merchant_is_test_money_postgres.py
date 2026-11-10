@@ -95,7 +95,7 @@ def drop_lines():
 
     class _Collect(logging.Handler):
         def emit(self, record):
-            if record.getMessage().startswith("is_test_lock_drop "):
+            if record.getMessage().startswith("is_test_lock_drop"):
                 lines.append((record.levelno, record.getMessage()))
 
     handler = _Collect()
@@ -105,6 +105,18 @@ def drop_lines():
         yield lines
     finally:
         target.removeHandler(handler)
+
+
+async def _other_reasons_edges(db):
+    """Edges of FLAGGED that the statement and the settlement scope leave out for reasons OTHER
+    than is_test: one stamped test traffic, one with no net GMV. A drop line must not count them."""
+    for edge_id, gross, md in (("cae_m05_stamped", 700, '{"test_traffic": true}'), ("cae_m05_zero", 0, "{}")):
+        await db.execute(
+            "INSERT INTO commerce_attribution_edges (edge_id, merchant_id, order_id, gross_attributed_gmv_cents, "
+            "metadata, created_at, updated_at, refund_ids, refund_count, refunded_amount) "
+            f"VALUES (:e, :m, :e, :g, '{md}', now(), now(), '[]', 0, 0)",
+            {"e": edge_id, "m": FLAGGED, "g": gross},
+        )
 
 
 async def _mark_flagged():
@@ -309,6 +321,7 @@ async def test_history_leaves_the_statement_at_lock_only_with_the_filter_on(
     db, monkeypatch, drop_lines, filter_flag, flagged_gmv
 ):
     await _history(db)
+    await _other_reasons_edges(db)
     monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", filter_flag)
     assert await _statement_gmv(db, FLAGGED) == flagged_gmv
     assert await _statement_gmv(db, REAL) == 10_000
@@ -437,6 +450,32 @@ async def test_a_merchant_marked_after_the_pre_read_is_left_out_by_the_read_unde
     ]
 
 
+async def test_the_statement_drop_count_runs_after_the_read_it_explains(db, monkeypatch, drop_lines):
+    """P3-3: a mark that commits just before the GMV read drops the merchant, so the count must
+    come after that read to see it (before it, the drop had no line)."""
+    from db.database import database
+
+    await _scenario(db)
+    await _gmv_by_merchant(db)
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    real_fetch_one = database.fetch_one
+    order = []
+
+    async def _spy(query, *a, **k):
+        text = str(query)
+        if "gmv_raw_total_cents" in text:
+            order.append("read")
+        elif "COUNT(*) AS n" in text:
+            order.append("count")
+        return await real_fetch_one(query, *a, **k)
+
+    monkeypatch.setattr(database, "fetch_one", _spy)
+    await _mark_flagged()
+    assert await _statement_gmv(db, FLAGGED) == 0
+    assert order == ["read", "count"]
+    assert len(drop_lines) == 1
+
+
 async def test_a_merchant_with_nothing_to_bill_writes_no_drop_line(db, billing, stripe_fake, monkeypatch, drop_lines):
     """An empty read is only a DROP when the is_test check is why: a real merchant with no rollup
     rows, and an is_test merchant with none, record nothing."""
@@ -481,6 +520,7 @@ async def test_history_puts_no_partner_in_settlement_scope_with_the_filter_on(
 
     if branch == "partner_attribution":
         await _history(db)
+        await _other_reasons_edges(db)  # the stamped one is not an is_test drop (edge_rows stays 1 + the zero-net one)
         for mid, cp in ((FLAGGED, 7), (REAL, 8)):
             await db.execute(
                 "INSERT INTO partner_attribution (merchant_id, channel_partner_id) VALUES (:m, :c)", {"m": mid, "c": cp}
@@ -512,7 +552,7 @@ async def test_history_puts_no_partner_in_settlement_scope_with_the_filter_on(
     assert seen == ([8] if filter_flag == "true" else [7, 8])
     # P3-B: one line per (run, merchant) saying which leg dropped what; nothing with the filter off
     counts = (
-        "edge_rows=1 rollup_rows=0 take_cents=0" if branch == "partner_attribution"
+        "edge_rows=2 rollup_rows=0 take_cents=0" if branch == "partner_attribution"
         else "edge_rows=0 rollup_rows=1 take_cents=400"
     )
     expected = [(
@@ -558,7 +598,16 @@ async def test_a_failing_drop_count_never_fails_the_lock(db, billing, stripe_fak
     monkeypatch.setattr(ps, "record_settlement_completion", _none)
     await ps.run_settlement(run)
     assert seen == [8]
-    assert drop_lines == []
+    # P3-1: the lost audit line still says where to look: site, run or statement, merchant, error type
+    month = (TODAY - timedelta(days=1)).isoformat()
+    assert drop_lines == [
+        (logging.WARNING, f"is_test_lock_drop_count_failed site=invoice_run ref=billing_run:{run} "
+                          f"merchant_id={FLAGGED} error=UndefinedTableError"),
+        (logging.WARNING, f"is_test_lock_drop_count_failed site=monthly_statement ref=statement:{FLAGGED}:{month} "
+                          f"merchant_id={FLAGGED} error=UndefinedTableError"),
+        (logging.WARNING, f"is_test_lock_drop_count_failed site=partner_settlement ref=billing_run:{run} "
+                          "merchant_id=unknown error=UndefinedTableError"),
+    ]
 
 
 # ── P3-G: a seller-keyed conversion reads BOTH merchants (the seller it re-subjects to, and the

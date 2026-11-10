@@ -213,7 +213,10 @@ async def _record_is_test_lock_drops(billing_run_id: int, period_start: date, pe
                 {"period_start": period_start, "period_end": period_end},
             )
     except Exception as exc:  # noqa: BLE001 — the audit read never fails the settlement
-        logger.warning("partner settlement: is_test lock-drop count failed (%s)", type(exc).__name__)
+        # The failed read is the one that names the dropped merchants, hence "unknown".
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "partner_settlement", ref=f"billing_run:{billing_run_id}", merchant_id="unknown", exc=exc
+        )
         return
     for row in rows:
         test_traffic.log_is_test_lock_drop(

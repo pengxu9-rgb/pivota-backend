@@ -269,6 +269,27 @@ def lock_drop_audit_enabled() -> bool:
 
 
 LOCK_DROP_LOG_PREFIX = "is_test_lock_drop"
+LOCK_DROP_COUNT_FAILED_PREFIX = "is_test_lock_drop_count_failed"
+
+
+def log_is_test_lock_drop_count_failed(site: str, *, ref: Any, merchant_id: Any, exc: BaseException) -> None:
+    """The audit line for a drop count that FAILED: the lock went ahead (the count is best effort),
+    so whether this merchant was dropped is not recorded anywhere else. Says which run or statement
+    and which merchant to check by hand, and the error type only, e.g.
+
+        is_test_lock_drop_count_failed site=invoice_run ref=billing_run:41 merchant_id=m_1 error=TimeoutError
+
+    `merchant_id` is "unknown" where the failed count was the read that names the merchants
+    (partner settlement). Same logger and level as `log_is_test_lock_drop`. Never raises."""
+    try:
+        from utils.logger import logger as operator_logger
+
+        operator_logger.warning(
+            "%s site=%s ref=%s merchant_id=%s error=%s",
+            LOCK_DROP_COUNT_FAILED_PREFIX, site, ref, merchant_id, type(exc).__name__,
+        )
+    except Exception:  # noqa: BLE001 — an audit line never breaks a money run
+        return
 
 
 def log_is_test_lock_drop(site: str, *, ref: Any, merchant_id: Any, **counts: Any) -> None:

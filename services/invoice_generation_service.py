@@ -160,7 +160,9 @@ async def _record_is_test_lock_drop(
                 {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
             )
     except Exception as exc:  # noqa: BLE001 — the audit read never fails the run
-        logger.warning("invoice run: is_test lock-drop count failed (%s)", type(exc).__name__)
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "invoice_run", ref=f"billing_run:{billing_run_id}", merchant_id=merchant_id, exc=exc
+        )
         return
     dropped = _as_int(_get(row, "n"))
     if dropped > 0:
