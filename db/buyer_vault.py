@@ -195,8 +195,12 @@ BUYER_IDENTITY_HASH_SECRET_ENV = "BUYER_IDENTITY_LINK_SECRET"
 #: the token key is only safe BEFORE the token key rotates; after it (the copy removed one revision
 #: before the window closes, or lost on one service), the fallback is the ROTATED key and every
 #: buyer, pre- and post-mount, would move onto a new hash. Code cannot tell the two moments apart,
-#: so it refuses both: a visible 503 and an ERROR, nothing split. Close the window (set
-#: BUYER_IDENTITY_LINK_LEGACY_READ=off) in the same revision as removing the copy, or earlier.
+#: so it refuses both: a visible 503 and an ERROR, nothing split. THE ONLY REMEDY for that 503 is
+#: to mount the copy again (from its separate secret). Closing the window is NOT a remedy: with it
+#: closed `legacy_agent_user_ref_hash` returns None and nothing rehashes the old rows, so every
+#: identity first seen before the dedicated key loses its saved link, its purchases and its
+#: idempotency keys (a retry can open a second purchase). Closing it is a separate end-of-window
+#: decision (RUNBOOK_BUYER_VAULT.md 4.4).
 BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV = "BUYER_IDENTITY_LINK_LEGACY_SECRET"
 
 #: The token keys the hash fell back to before it had its own. Each one ALSO SIGNS A TOKEN: the buyer
@@ -244,11 +248,24 @@ class BuyerIdentityHashUnavailable(HTTPException):
     mount. The database is already failing when this fires, and a 503 is retryable and splits
     nothing. An HTTPException, so every route that lets it propagate answers the same 503 the
     codebase uses for a busy database (`utils.transient_errors.db_busy_http_exception`).
+
+    Also raised for a refused key configuration (`legacy_copy_missing`, S-29c): the same code and
+    shape, but `message` names the configuration fault, so on-call is not sent to the database.
     """
 
-    def __init__(self, *, retry_after_seconds: int = 1) -> None:
+    def __init__(self, *, retry_after_seconds: int = 1, message: Optional[str] = None) -> None:
         busy = db_busy_http_exception(retry_after_seconds=retry_after_seconds)
-        super().__init__(status_code=busy.status_code, detail=busy.detail, headers=busy.headers)
+        detail = dict(busy.detail)
+        if message:
+            detail["message"] = message
+        super().__init__(status_code=busy.status_code, detail=detail, headers=busy.headers)
+
+
+#: The 503 message while the copy is missing with the window open (S-29c). It reaches the caller,
+#: so it names the fault, not a variable or a value.
+BUYER_IDENTITY_HASH_COPY_MISSING_MESSAGE = (
+    "Buyer identity hash key configuration refused: the legacy key copy is missing. Please retry shortly."
+)
 
 
 def _env_secret(name: str) -> str:
@@ -356,7 +373,8 @@ _PROBLEM_MESSAGES = {
         + " is IGNORED because "
         + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
         + " is unset while the legacy-read window is open: buyer-hash resolution answers 503 and "
-        "writes nothing (%s). Mount the legacy copy, or close the window in the same revision."
+        "writes nothing (%s). The only fix is to mount the legacy copy again. Do not close the window "
+        "to clear this: every buyer first seen before the dedicated key would lose their rows."
     ),
 }
 
@@ -509,13 +527,13 @@ async def resolve_agent_user_ref_hash(agent_id: str, agent_user_ref: str) -> str
     Also RAISES it, for every buyer and before any query, while the dedicated key is set, the
     window is open and the copy is missing (`legacy_copy_missing`): see
     BUYER_IDENTITY_LINK_LEGACY_SECRET for why falling back would move every buyer once the token
-    key has rotated.
+    key has rotated, and why re-mounting the copy is the only remedy.
     """
     primary = hash_agent_user_ref(agent_user_ref)
     if not primary:
         return ""
     if _dedicated_key_problem() == "legacy_copy_missing":
-        raise BuyerIdentityHashUnavailable(retry_after_seconds=30)
+        raise BuyerIdentityHashUnavailable(retry_after_seconds=30, message=BUYER_IDENTITY_HASH_COPY_MISSING_MESSAGE)
     legacy = legacy_agent_user_ref_hash(agent_user_ref)
     if legacy is None:
         return primary

@@ -191,7 +191,7 @@ async def test_a_failed_lookup_is_a_503_never_a_guessed_hash(owner_db):
 
     assert raised.value.status_code == 503
     assert raised.value.headers == {"Retry-After": "1"}
-    assert raised.value.detail["error"] == "TEMPORARY_UNAVAILABLE"
+    assert raised.value.detail == {"error": "TEMPORARY_UNAVAILABLE", "message": "Temporary database busy. Please retry shortly."}
 
 
 @pytest.mark.parametrize("answer", [None, {"found": None}], ids=["no-row", "null"])
@@ -254,12 +254,14 @@ async def test_without_the_legacy_copy_resolution_fails_closed_for_every_buyer_a
     """S-29b N-1 / S-29c, the copy missing while the window is open (wrong name, forgotten on one
     service, or removed before the window closed). Any fallback hash would move buyers once the
     token key has rotated, so resolution answers a retryable 503 for old and new buyers alike, before
-    any query. Closing the window (the intended end state) lets resolution proceed."""
+    any query, and the 503 names the configuration fault. The only remedy is to mount the copy
+    again; closing the window instead moves the pre-mount buyer off its stored hash (no rehash)."""
     if value is None:
         monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     else:
         monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", value)
-    await _seed(owner_db, "buyer_identity_links", AGENT, token_key_hash())
+    await _seed(owner_db, "buyer_identity_links", AGENT, legacy_hash())
+    real = owner_db.fetch_one
 
     async def no_query(*_a, **_k):
         raise AssertionError("no legacy lookup without the legacy copy")
@@ -270,9 +272,19 @@ async def test_without_the_legacy_copy_resolution_fails_closed_for_every_buyer_a
         with pytest.raises(buyer_vault.BuyerIdentityHashUnavailable) as raised:
             await buyer_vault.resolve_agent_user_ref_hash(AGENT, ref)
         assert raised.value.status_code == 503 and raised.value.headers == {"Retry-After": "30"}
+        assert raised.value.detail == {
+            "error": "TEMPORARY_UNAVAILABLE",
+            "message": "Buyer identity hash key configuration refused: the legacy key copy is missing. "
+                       "Please retry shortly.",
+        }
 
+    monkeypatch.setattr(owner_db, "fetch_one", real)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", LEGACY_KEY)  # the remedy: mount the copy again
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == legacy_hash()
+
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")  # NOT a remedy: the copy gone, the window closed
     monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
-    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash() != legacy_hash()
 
 
 async def test_a_dedicated_key_equal_to_the_copy_keeps_every_buyer_on_todays_hash(owner_db, monkeypatch):

@@ -360,17 +360,32 @@ def test_the_boot_check_says_whether_the_copy_matches_todays_write_key(records, 
         assert secret not in line.getMessage()
 
 
-@pytest.mark.parametrize("dedicated,mounted", [(None, "no"), ("   ", "no"), (DEDICATED, "yes")], ids=["unset", "blank", "set"])
-def test_the_boot_check_says_whether_the_dedicated_key_is_mounted(records, monkeypatch, dedicated, mounted):
-    """Ops reads this field at step 3 (must be no) and step 5 (must be yes), on web and worker."""
+@pytest.mark.parametrize(
+    "dedicated,mounted,problem",
+    [
+        (None, "no", None),
+        ("   ", "no", None),
+        (DEDICATED, "yes", None),
+        (TOKEN_KEY, "yes", "dedicated_equals_token_key"),
+        (LEGACY_KEY, "yes", "dedicated_equals_legacy_key"),
+    ],
+    ids=["unset", "blank", "set", "set-but-refused-equals-token-key", "set-but-refused-equals-copy"],
+)
+def test_the_boot_check_says_whether_the_dedicated_key_is_mounted(records, monkeypatch, dedicated, mounted, problem):
+    """Ops reads this field at step 3 (must be no) and step 5 (must be yes), on web and worker. It says
+    whether the key is SET, not whether it is usable: a set but refused key still says yes, and its
+    own `buyer_identity_hash_secret_refused` line says why."""
     if dedicated is None:
         monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
     else:
         monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", dedicated)
+    assert buyer_vault._dedicated_key_problem() == problem
 
     buyer_vault.report_legacy_copy_matches_token_key()
     [line] = _copy_check(records)
     assert f"dedicated_mounted={mounted}" in line.getMessage()
+    for secret in (TOKEN_KEY, LEGACY_KEY, DEDICATED):
+        assert secret not in line.getMessage()
 
 
 def test_the_boot_check_is_silent_without_a_copy(records, monkeypatch):

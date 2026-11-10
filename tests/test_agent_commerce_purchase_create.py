@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres ru
 BASE = "/agent/v2/commerce/purchases"
 AGENT = "agent_create_route"
 USER_REF = "user-ada"
-SHOP = "judydoll.com"
+SHOP = "example.myshopify.com"
 VARIANT = "49922977038613"
 EMAIL = "ada@example.test"
 ADDRESS = {"firstName": "Ada", "lastName": "Lovelace", "phone": "+15550100", "addressLine1": "900 Brannan St",
@@ -128,7 +128,7 @@ def stubs(monkeypatch):
 
     async def _catalog(*, merchant_domain, product_key, variant_key, market_country):
         s.catalog.append((merchant_domain, product_key, variant_key, market_country))
-        return dict(s.facts), "merch_obs_judydoll", VARIANT, "brand_official"
+        return dict(s.facts), "merch_obs_shop_a", VARIANT, "brand_official"
 
     async def _click(click):
         s.clicks.append(click)
@@ -208,11 +208,17 @@ async def _count(table: str) -> int:
     return int(row["n"])
 
 
-async def _nothing_written():
-    assert await _count("a2a_rail_purchases") == 0
-    assert await _count("a2a_rail_buyer_refs") == 0
-    assert await _count("reap_agentic_purchase_keys") == 0
-    assert await _count("agent_purchases") == 0
+_WRITTEN_TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys", "agent_purchases")
+
+
+async def _written_counts() -> Dict[str, int]:
+    return {table: await _count(table) for table in _WRITTEN_TABLES}
+
+
+async def _nothing_written(since: Optional[Dict[str, int]] = None):
+    """No row in any written table, or (with `since`, from `_written_counts()`) none added since then."""
+    expected = since if since is not None else {table: 0 for table in _WRITTEN_TABLES}
+    assert await _written_counts() == expected
 
 
 # ── the door ─────────────────────────────────────────────────────────────────────────────────
@@ -497,8 +503,8 @@ async def test_an_explicit_a2a_choice_records_the_buyer_as_the_decider(client):
 
 def test_merchant_entries_are_parsed_strictly_and_folded(monkeypatch):
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV,
-                       " Judydoll.com:us ,bad, x.example:USA, :US, y.example: , www.brand.example:SG, bad host:US")
-    assert rail_router.proven_merchants() == frozenset({("judydoll.com", "US"), ("brand.example", "SG")})
+                       " Shop-A.Example:us ,bad, x.example:USA, :US, y.example: , www.brand.example:SG, bad host:US")
+    assert rail_router.proven_merchants() == frozenset({("shop-a.example", "US"), ("brand.example", "SG")})
 
 
 @pytest.mark.parametrize("raw,total,currency,ok", [
@@ -996,43 +1002,54 @@ async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(clie
 
 
 async def _s29_owner_hashes() -> set:
-    rows = await database.fetch_all("SELECT agent_user_ref_hash FROM reap_agentic_purchase_keys")
-    return {r["agent_user_ref_hash"] for r in rows}
+    """Every (table, owner hash) the create route writes: a 503 must leave every one of them alone."""
+    found = set()
+    for table in _WRITTEN_TABLES:
+        for r in await database.fetch_all(f"SELECT agent_user_ref_hash FROM {table}"):
+            found.add((table, r["agent_user_ref_hash"]))
+    return found
 
 
 def _assert_misconfigured_503(resp):
+    """The copy missing with the window open: the same 503 code and shape, a config-fault message."""
     assert resp.status_code == 503, resp.text
     assert resp.headers.get("retry-after") == "30"
+    assert "TEMPORARY_UNAVAILABLE" in resp.text
+    assert "Buyer identity hash key configuration refused: the legacy key copy is missing" in resp.text
+    assert "database busy" not in resp.text
 
 
 async def test_the_new_key_without_the_copy_is_a_503_that_writes_nothing(client, stubs, monkeypatch, s29_tables):
     """Step 4 before step 2 (the new key mounted, no copy): every buyer gets a retryable 503 and no
-    row is written under any hash, instead of silently guessing."""
+    row is written under any hash, instead of silently guessing. Mounting the copy is the fix."""
     for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
                  "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
     pid = (await client.post(BASE, body())).json()["purchase_id"]
-    before = await _s29_owner_hashes()
+    counts, before = await _written_counts(), await _s29_owner_hashes()
 
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
     _assert_misconfigured_503(await client.post(BASE, body()))
     CALLER.agent_user_ref = "post-mount-user-placeholder"
     _assert_misconfigured_503(await client.post(BASE, body()))
-    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
-    assert await _s29_owner_hashes() == before
+    await _nothing_written(since=counts)
+    assert len(stubs.clicks) == 1 and await _s29_owner_hashes() == before
 
     monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # the fix: mount the copy
     CALLER.agent_user_ref = USER_REF
     again = await client.post(BASE, body())
     assert again.status_code == 202 and again.json()["purchase_id"] == pid
+    await _nothing_written(since=counts)
 
 
-async def test_removing_the_copy_after_the_rotation_with_the_window_open_is_a_503_and_closing_the_window_proceeds(
+async def test_removing_the_copy_after_the_rotation_is_a_503_and_only_remounting_it_keeps_every_buyer(
         client, stubs, monkeypatch, s29_tables):
-    """S-29c P2. After the rotation, a fallback for a missing copy would be the ROTATED token key:
+    """S-29c. After the rotation, a fallback for a missing copy would be the ROTATED token key:
     every buyer, pre- and post-mount, would move onto a new hash. Instead: 503, nothing written,
-    no new hash. Closing the window (the planned end state) lets the post-mount buyer proceed."""
+    no new hash. Re-mounting the copy is the ONLY remedy: every buyer replays its own purchase.
+    Closing the window is not one: the pre-mount buyer then misses its idempotency key and its
+    history (nothing rehashes its rows), so its retry opens a SECOND purchase."""
     for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
                  "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
         monkeypatch.delenv(name, raising=False)
@@ -1047,20 +1064,35 @@ async def test_removing_the_copy_after_the_rotation_with_the_window_open_is_a_50
     assert post.status_code == 202, post.text
     post_pid = post.json()["purchase_id"]
     monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")  # step 6
-    before = await _s29_owner_hashes()
-    assert before == {_s29_hash(_S29_LEGACY, USER_REF), _s29_hash(_S29_DEDICATED, post_ref)}
+    counts, before = await _written_counts(), await _s29_owner_hashes()
+    assert {h for _t, h in before} == {_s29_hash(_S29_LEGACY, USER_REF), _s29_hash(_S29_DEDICATED, post_ref)}
 
     monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")  # the copy removed, window still open
     for ref in (USER_REF, post_ref, "new-user-placeholder"):
         CALLER.agent_user_ref = ref
         _assert_misconfigured_503(await client.post(BASE, body()))
         _assert_misconfigured_503(await client.get(BASE))
-    assert await _count("a2a_rail_purchases") == 2 and await _count("agent_purchases") == 2
+    await _nothing_written(since=counts)
     assert len(stubs.clicks) == 2 and await _s29_owner_hashes() == before
 
-    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")  # the window closed: proceeds
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # the remedy: mount the copy again
+    for ref, pid in ((USER_REF, pre_pid), (post_ref, post_pid)):
+        CALLER.agent_user_ref = ref
+        again = await client.post(BASE, body())
+        assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
+    await _nothing_written(since=counts)
+    assert len(stubs.clicks) == 2 and await _s29_owner_hashes() == before
+
+    # NOT a remedy: the copy removed again and the window closed. The post-mount buyer is fine, the
+    # pre-mount buyer is cut off from its rows: no history, and its retry is a second purchase.
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
     CALLER.agent_user_ref = post_ref
     again = await client.post(BASE, body())
     assert again.status_code == 202 and again.json()["purchase_id"] == post_pid
-    assert await _count("a2a_rail_purchases") == 2
-    assert pre_pid != post_pid
+    CALLER.agent_user_ref = USER_REF
+    listed = await client.get(BASE)
+    assert listed.status_code == 200 and listed.json()["purchases"] == []
+    split = await client.post(BASE, body())
+    assert split.status_code == 202 and split.json()["purchase_id"] not in (pre_pid, post_pid)
+    assert await _count("a2a_rail_purchases") == 3 and len(stubs.clicks) == 3
