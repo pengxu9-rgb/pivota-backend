@@ -15,6 +15,13 @@ The fix, pinned here through the real routes:
   `revision_of`; the live seed is untouched. Approving the revision supersedes the live seed in the publish
   transaction. A takedown (status to a non-live value) still applies in place, at once.
 
+
+The delta review (2026-11-09) found two more:
+- P2-A: attach / detach wrote the attached product in place for every role, with no author and no revision. They now
+  follow the PATCH's rule (`_set_seed_attachment`): a revision draft on a live seed, an author on any other.
+- P2-B: approving a revision after its live seed was taken down (or replaced by a newer revision) republished it.
+  The publish step refuses a revision whose base is not live (`_require_live_revision_base`, 409).
+
 The real-Postgres half is tests/test_seed_publish_lock_and_audit_verdict_postgres.py. All names are placeholders.
 """
 
@@ -68,8 +75,12 @@ class _DB:
         self.projected: List[Dict[str, Any]] = []
         db = self
         self._row = row
+        #: The status of the live seed a revision names (`_require_live_revision_base`); None: no such seed.
+        self.base_status: Optional[str] = "active"
 
         async def fetch_one(query, values=None):
+            if "WHERE id = :revision_of" in query:
+                return {"id": values["revision_of"], "status": db.base_status} if db.base_status is not None else None
             if "FROM external_product_seeds WHERE id = :id" in query or "ORDER BY updated_at DESC, created_at DESC" in query:
                 return copy.deepcopy(db._row) if db._row else None
             return None
@@ -347,3 +358,182 @@ def test_the_fingerprint_reads_what_the_editor_shows():
     assert ep._merge_seed_authors(A_STAMP, B_STAMP) == f"{A_STAMP}|{B_STAMP}"
     assert ep._merge_seed_authors(f"{A_STAMP}|{B_STAMP}", "EMP_B|B@example.com") == f"{A_STAMP}|{B_STAMP}"
     assert ep._merge_seed_authors(None, B_STAMP) == B_STAMP
+
+
+# ---------------------------------------------------------------- P2-A: attach / detach follow the same rule
+
+PK, OTHER_PK = "merch_a|shopify|1001", "merch_a|shopify|2002"
+ADMIN, SUPER = _actor("adm", role="admin"), _actor("sup", role="super_admin")
+ADMIN_STAMP, SUPER_STAMP = "emp_adm|adm@example.com", "emp_sup|sup@example.com"
+_EVERY_ROLE = [(O, O_STAMP), (B, B_STAMP), (ADMIN, ADMIN_STAMP), (SUPER, SUPER_STAMP), (A, A_STAMP)]
+_ROLE_IDS = ["outsourced", "employee", "admin", "super_admin", "creator"]
+
+
+def _attach(actor, product_key=PK, **body):
+    return _client(actor).post(f"{PREFIX}/seed_1/attach", json={"product_key": product_key, **body})
+
+
+def _detach(actor):
+    return _client(actor).post(f"{PREFIX}/seed_1/detach")
+
+
+@pytest.mark.parametrize("actor,stamp", _EVERY_ROLE, ids=_ROLE_IDS)
+def test_attaching_a_live_seed_is_a_revision_draft_for_every_role_and_for_its_creator(monkeypatch, actor, stamp):
+    db = _DB(monkeypatch, _row("active", created_by=A_STAMP))
+    res = _attach(actor, variant_id="v9")
+    assert res.status_code == 200, res.text
+    assert db.updates_of_seed() == [] and db.supersedes() == [] and db.projected == [], "the live seed is untouched"
+    (revision,) = db.inserts()
+    assert (revision["status"], revision["attached_product_key"], revision["attached_variant_id"]) == ("draft", PK, "v9")
+    assert revision["created_by_employee_id"] == stamp, "the revision is the attacher's: they cannot approve it"
+    assert revision["seed_data"]["revision_of"] == "seed_1" and "revision_price_edited" not in revision["seed_data"]
+    assert (revision["destination_url"], revision["price_amount"], revision["title"]) == (DEST, 24.0, "Placeholder cream")
+    assert res.json() == {"status": "success",
+                          "revision": {"seed_id": revision["id"], "seed_status": "draft", "revision_of": "seed_1"}}
+
+
+@pytest.mark.parametrize("actor,stamp", _EVERY_ROLE, ids=_ROLE_IDS)
+def test_detaching_a_live_seed_is_a_revision_draft_for_every_role_and_for_its_creator(monkeypatch, actor, stamp):
+    db = _DB(monkeypatch, _row("active", created_by=A_STAMP, attached_product_key=PK, attached_variant_id="v9"))
+    res = _detach(actor)
+    assert res.status_code == 200, res.text
+    assert db.updates_of_seed() == [] and db.supersedes() == [] and db.projected == [], "the live seed is untouched"
+    (revision,) = db.inserts()
+    assert (revision["status"], revision["attached_product_key"], revision["attached_variant_id"]) == ("draft", None, None)
+    assert revision["created_by_employee_id"] == stamp and revision["seed_data"]["revision_of"] == "seed_1"
+    assert res.json()["revision"]["seed_id"] == revision["id"]
+
+
+@pytest.mark.parametrize("actor,stamp", _EVERY_ROLE, ids=_ROLE_IDS)
+@pytest.mark.parametrize("door", ["attach", "detach"])
+def test_attaching_or_detaching_a_draft_makes_the_actor_an_author_who_may_not_publish_it(monkeypatch, door, actor, stamp):
+    before = {"attached_product_key": OTHER_PK, "attached_variant_id": "v1"}
+    db = _DB(monkeypatch, _row("draft", created_by=A_STAMP, **before))
+    res = _attach(actor) if door == "attach" else _detach(actor)
+    assert res.status_code == 200 and res.json() == {"status": "success"}, res.text
+    (update,) = db.updates_of_seed()
+    after = (PK, "∅") if door == "attach" else (None, None)
+    assert (update["attached_product_key"], update["attached_variant_id"]) == after
+    authors = A_STAMP if actor is A else f"{A_STAMP}|{stamp}"
+    assert update["created_by_employee_id"] == authors, "the creator first, then whoever re-attached it"
+    assert "created_by_employee_id = :created_by_employee_id" in update["sql"] and "status" not in update["sql"]
+    assert db.inserts() == [] and db.projected == []
+
+    # The attacher may not put it live on any door; a reviewer who changed nothing may.
+    db._row = _row("draft", created_by=authors, attached_product_key=after[0], attached_variant_id=after[1])
+    db.writes.clear()
+    assert _approve(actor).status_code == 403
+    assert _patch(actor, {"status": "active"}).status_code == 403
+    assert db.writes == [] and db.projected == []
+    assert _approve(C).status_code == 200
+
+
+@pytest.mark.parametrize("status", ["disabled", "paused"])
+def test_attaching_a_seed_that_is_not_live_changes_it_in_place_and_never_revives_it(monkeypatch, status):
+    db = _DB(monkeypatch, _row(status))
+    assert _attach(O).status_code == 200
+    (update,) = db.updates_of_seed()
+    assert update["created_by_employee_id"] == f"{A_STAMP}|{O_STAMP}" and "status" not in update["sql"]
+    assert db.inserts() == []
+
+
+@pytest.mark.parametrize("status", ["draft", "active"])
+def test_an_attach_or_detach_that_changes_nothing_writes_nothing(monkeypatch, status):
+    db = _DB(monkeypatch, _row(status, attached_product_key=PK, attached_variant_id="∅"))
+    assert _attach(B).json() == {"status": "success"}
+    assert db.writes == [], "the same attachment again is not an edit: B is not an author"
+    db = _DB(monkeypatch, _row(status))
+    assert _detach(B).json() == {"status": "success"}
+    assert db.writes == []
+    # Another variant of the same product IS a change.
+    db = _DB(monkeypatch, _row(status, attached_product_key=PK, attached_variant_id="∅"))
+    assert _attach(B, variant_id="v2").status_code == 200
+    assert len(db.writes) == 1
+
+
+def test_attach_and_detach_of_a_seed_that_does_not_exist_are_a_404_and_a_bad_key_a_400(monkeypatch):
+    db = _DB(monkeypatch, None)
+    assert _attach(B).status_code == 404 and _detach(B).status_code == 404
+    db = _DB(monkeypatch, _row("draft"))
+    assert _attach(B, product_key="not-a-product-key").status_code == 400
+    assert db.writes == []
+
+
+def test_both_attachment_doors_run_the_one_checked_step():
+    import inspect
+
+    import routes.employee_products as ep
+
+    for door in (ep.attach_external_seed, ep.detach_external_seed):
+        src = inspect.getsource(door)
+        assert "_set_seed_attachment(" in src and "UPDATE external_product_seeds" not in src, door.__name__
+        assert "current_user=current_user" in src
+
+
+# ---------------------------------------------------------------- P2-B: a stale revision never undoes a takedown
+
+
+def _revision_row(**over):
+    return _row("draft", **{
+        "created_by": B_STAMP, "destination_url": ELSEWHERE, "price_amount": 9.0,
+        "seed_data": {"title": "Placeholder cream", "revision_of": "seed_live", "revision_price_edited": True},
+        **over,
+    })
+
+
+@pytest.mark.parametrize("base_status", ["disabled", "paused", "draft", " Disabled ", None])
+@pytest.mark.parametrize("door", ["approve", "patch"])
+def test_a_revision_whose_live_seed_was_taken_down_or_replaced_is_not_published(monkeypatch, door, base_status):
+    db = _DB(monkeypatch, _revision_row())
+    db.base_status = base_status
+    res = _approve(C) if door == "approve" else _patch(C, {"status": "active"})
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"] == {
+        "error": "REVISION_BASE_NOT_LIVE", "seed_id": "seed_1", "revision_of": "seed_live",
+        "base_status": base_status.strip().lower() if base_status else None,
+    }
+    assert db.writes == [] and db.projected == [], "nothing was superseded, published or projected"
+
+
+def test_the_csv_door_does_not_publish_a_stale_revision_either(monkeypatch):
+    import routes.employee_products as ep
+
+    db = _DB(monkeypatch, _revision_row(destination_url=DEST))
+    db.base_status = "disabled"
+    out = asyncio.run(ep._import_external_seeds_csv_text(
+        text=f"destination_url,market,status\n{DEST},US,active\n", current_user=dict(C),
+        market="US", tool="*", mode="upsert"))
+    (error,) = out.errors
+    assert "REVISION_BASE_NOT_LIVE" in error and db.writes == [] and db.projected == []
+
+
+def test_a_revision_whose_live_seed_is_still_live_publishes_and_a_plain_draft_is_never_asked(monkeypatch):
+    db = _DB(monkeypatch, _revision_row())
+    assert _approve(C).status_code == 200 and len(db.supersedes()) == 1
+    # A draft that revises nothing has no base to check: the check must not refuse it.
+    db = _DB(monkeypatch, _row("draft"))
+    db.base_status = None
+    assert _approve(C).status_code == 200
+
+
+def test_the_base_check_runs_inside_the_publish_transaction_after_the_lock_and_locks_the_row_on_postgres(monkeypatch):
+    import inspect
+
+    import routes.employee_products as ep
+
+    src = inspect.getsource(ep._publish_seed)
+    lock, check, supersede = (src.index(s) for s in (
+        "await _lock_seed_publish_destination(", "await _require_live_revision_base(", "SET status = 'disabled'"))
+    assert src.index("async with database.transaction():") < lock < check < supersede
+
+    seen: List[str] = []
+
+    async def fetch_one(query, values=None):
+        seen.append(query)
+        return {"id": "seed_live", "status": "active"}
+
+    monkeypatch.setattr(ep.database, "fetch_one", fetch_one)
+    for on_postgres in (True, False):
+        monkeypatch.setattr(ep, "_seed_publish_locks_enabled", lambda v=on_postgres: v)
+        asyncio.run(ep._require_live_revision_base(seed_id="seed_1", revision_of="seed_live"))
+    assert seen[0].endswith(" FOR UPDATE") and "FOR UPDATE" not in seen[1], "SQLite has no row locks"

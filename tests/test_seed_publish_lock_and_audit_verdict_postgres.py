@@ -20,6 +20,11 @@ transaction. This file drives the real router (httpx over ASGI) against real tab
     APPROVE, PATCH and CSV publish are a 403 that changes nothing, an `outsourced` reviewer's is a 403, and
     another staff reviewer's APPROVE publishes it.
 
+  * the delta review (2026-11-09). P2-A: attach / detach follow the content-edit rule (an author on a draft, a
+    revision draft on a live seed), for every role. P2-B: a revision whose live seed was taken down, or replaced by
+    a newer revision, is a 409 `REVISION_BASE_NOT_LIVE`; and a takedown that races the approval, on its own
+    connection, cannot land between the approval's check and its supersede (the base row is locked).
+
 Two connections stand for two web requests: each publish runs in a task with a FRESH context, so `databases`
 gives it its own connection (a task that inherits the test's context would share the test's one connection and
 not be blocked at all). A rendezvous holds each publish at its supersede until the other publish gets there too,
@@ -108,6 +113,8 @@ class _RouteDB:
     def __init__(self, inner):
         self._inner = inner
         self.rendezvous: Optional[_Rendezvous] = None
+        #: Awaited when a publish reaches its supersede (inside its transaction, after its checks).
+        self.at_supersede: Optional[Any] = None
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
@@ -115,6 +122,8 @@ class _RouteDB:
     async def execute(self, query, values=None):
         if self.rendezvous is not None and " superseded_by:" in str((values or {}).get("note") or ""):
             await self.rendezvous.arrive()
+        if self.at_supersede is not None and " superseded_by:" in str((values or {}).get("note") or ""):
+            await self.at_supersede()
         return await self._inner.execute(query, values)
 
 
@@ -542,3 +551,193 @@ async def test_a_takedown_of_a_live_seed_still_applies_at_once(env):
     await _as(actor, "emp_o", "outsourced")
     assert (await client.patch(f"{PREFIX}/seed_live", json={"status": "disabled"})).status_code == 200
     assert (await _seeds(db))["seed_live"]["status"] == "disabled"
+
+
+# ---------------------------------------------------------------- attach / detach follow the same rule (delta P2-A)
+
+PK, OTHER_PK = "merch_a|shopify|1001", "merch_a|shopify|2002"
+
+
+async def _attachment(db, seed_id):
+    row = await db.fetch_one(
+        "SELECT attached_product_key, attached_variant_id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    return row["attached_product_key"], row["attached_variant_id"]
+
+
+async def test_whoever_attaches_or_detaches_a_draft_becomes_an_author_and_may_not_publish_it(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _as(actor, "emp_a")
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+
+    await _as(actor, "emp_b")
+    res = await client.post(f"{PREFIX}/{seed_id}/attach", json={"product_key": PK})
+    assert res.status_code == 200 and res.json() == {"status": "success"}, res.text
+    assert await _attachment(db, seed_id) == (PK, "∅")
+    assert (await _row(db, seed_id))["created_by_employee_id"] == "emp_a|emp_a@example.com|emp_b|emp_b@example.com"
+    res = await _verdict(client, seed_id, "approve")
+    assert res.status_code == 403 and res.json()["detail"]["error"] == "SEED_SELF_APPROVAL_FORBIDDEN"
+    assert (await client.patch(f"{PREFIX}/{seed_id}", json={"status": "active"})).status_code == 403
+
+    # The same attachment again is not an edit; a detach is, and its actor is an author too.
+    await _as(actor, "emp_c")
+    assert (await client.post(f"{PREFIX}/{seed_id}/attach", json={"product_key": PK})).status_code == 200
+    assert "emp_c" not in (await _row(db, seed_id))["created_by_employee_id"]
+    await _as(actor, "emp_d", "admin")
+    assert (await client.post(f"{PREFIX}/{seed_id}/detach")).status_code == 200
+    assert await _attachment(db, seed_id) == (None, None)
+    assert (await _row(db, seed_id))["created_by_employee_id"].endswith("|emp_d|emp_d@example.com")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 403, "an admin who detached it is its author"
+    assert (await _row(db, seed_id))["status"] == "draft"
+
+    await _as(actor, "emp_c")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200
+
+
+@pytest.mark.parametrize("editor,role", [("emp_o", "outsourced"), ("emp_a", "employee"), ("emp_e", "employee"),
+                                         ("emp_adm", "admin"), ("emp_sup", "super_admin")])
+@pytest.mark.parametrize("door", ["attach", "detach"])
+async def test_a_live_seed_is_attached_or_detached_only_through_a_reviewed_revision(env, door, editor, role):
+    """An outsourced contractor, the creator, another employee, an admin: none re-attaches a live seed alone."""
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _as(actor, "emp_a")
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+    await db.execute("UPDATE external_product_seeds SET attached_product_key = :pk, attached_variant_id = 'v1'"
+                     " WHERE id = :id", {"pk": OTHER_PK, "id": seed_id})
+    await _as(actor, "emp_b")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200
+    approved = await _row(db, seed_id)
+
+    await _as(actor, editor, role)
+    if door == "attach":
+        res = await client.post(f"{PREFIX}/{seed_id}/attach", json={"product_key": PK, "variant_id": "v2"})
+    else:
+        res = await client.post(f"{PREFIX}/{seed_id}/detach")
+    assert res.status_code == 200, res.text
+    revision_id = res.json()["revision"]["seed_id"]
+    assert res.json()["revision"] == {"seed_id": revision_id, "seed_status": "draft", "revision_of": seed_id}
+    assert await _row(db, seed_id) == approved, "the live seed is exactly as approved"
+    assert await _attachment(db, seed_id) == (OTHER_PK, "v1"), "and still attached where it was"
+    revision = await _row(db, revision_id)
+    assert revision["status"] == "draft" and revision["created_by_employee_id"] == f"{editor}|{editor}@example.com"
+    assert await _attachment(db, revision_id) == ((PK, "v2") if door == "attach" else (None, None))
+    revision_data = revision["seed_data"]
+    revision_data = json.loads(revision_data) if isinstance(revision_data, str) else revision_data
+    assert revision_data["revision_of"] == seed_id and "revision_price_edited" not in revision_data
+
+    # Whoever made it cannot approve it (outsourced: no publish role; anyone else: its author).
+    assert (await _verdict(client, revision_id, "approve")).status_code == 403
+    assert (await client.patch(f"{PREFIX}/{revision_id}", json={"status": "active"})).status_code == 403
+    assert (await _seeds(db))[revision_id]["status"] == "draft"
+    await _as(actor, "emp_c")
+    res = await _verdict(client, revision_id, "approve")
+    assert res.status_code == 200 and res.json()["published"] is True, res.text
+    seeds = await _seeds(db)
+    assert seeds[revision_id]["status"] == "active" and seeds[seed_id]["status"] == "disabled"
+
+
+async def test_attach_and_detach_of_a_missing_seed_are_a_404(env):
+    client = env["client"]
+    assert (await client.post(f"{PREFIX}/seed_nope/attach", json={"product_key": PK})).status_code == 404
+    assert (await client.post(f"{PREFIX}/seed_nope/detach")).status_code == 404
+
+
+# ---------------------------------------------------------------- a stale revision never undoes a takedown (delta P2-B)
+
+
+async def _live_seed_with_a_revision(env, *, editor: str = "emp_b", title: str = "Retitled cream"):
+    """A live seed (created by emp_a, approved by emp_r) and one pending revision of it by `editor`."""
+    db, client, actor = env["db"], env["client"], env["actor"]
+    await _as(actor, "emp_a")
+    (seed_id,) = (await _csv(client, f"destination_url,market\n{DEST},US\n")).json()["seedIds"]
+    await _as(actor, "emp_r")
+    assert (await _verdict(client, seed_id, "approve")).status_code == 200
+    await _as(actor, editor)
+    res = await client.patch(f"{PREFIX}/{seed_id}", json={"title": title})
+    assert res.status_code == 200, res.text
+    return seed_id, res.json()["revision"]["seed_id"]
+
+
+@pytest.mark.parametrize("door", ["approve", "patch"])
+async def test_a_revision_of_a_seed_that_was_taken_down_since_is_refused_and_the_takedown_stands(env, door):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    seed_id, revision_id = await _live_seed_with_a_revision(env)
+    await _as(actor, "emp_c")
+    assert (await client.patch(f"{PREFIX}/{seed_id}", json={"status": "disabled"})).status_code == 200
+    before = await _seeds(db)
+    assert (before[seed_id]["status"], before[revision_id]["status"]) == ("disabled", "draft")
+
+    await _as(actor, "emp_d")
+    res = await _publish_call(client, door, revision_id)
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"] == {"error": "REVISION_BASE_NOT_LIVE", "seed_id": revision_id,
+                                    "revision_of": seed_id, "base_status": "disabled"}
+    assert await _seeds(db) == before, "nothing is live: no status and no note changed"
+
+
+async def test_an_older_revision_does_not_replace_a_newer_one_that_was_approved_first(env):
+    db, client, actor = env["db"], env["client"], env["actor"]
+    seed_id, older = await _live_seed_with_a_revision(env, editor="emp_b", title="Older title")
+    await _as(actor, "emp_c")
+    newer = (await client.patch(f"{PREFIX}/{seed_id}", json={"title": "Newer title"})).json()["revision"]["seed_id"]
+    await _as(actor, "emp_d")
+    assert (await _verdict(client, newer, "approve")).status_code == 200
+    res = await _verdict(client, older, "approve")
+    assert res.status_code == 409 and res.json()["detail"]["error"] == "REVISION_BASE_NOT_LIVE", res.text
+    seeds = await _seeds(db)
+    assert {sid: s["status"] for sid, s in seeds.items()} == {seed_id: "disabled", newer: "active", older: "draft"}
+
+
+async def test_two_revisions_of_one_seed_approved_at_once_leave_one_live_and_refuse_the_other(env):
+    db, client, actor, route_db = env["db"], env["client"], env["actor"], env["route_db"]
+    seed_id, first = await _live_seed_with_a_revision(env, editor="emp_b", title="First title")
+    await _as(actor, "emp_c")
+    second = (await client.patch(f"{PREFIX}/{seed_id}", json={"title": "Second title"})).json()["revision"]["seed_id"]
+    await _as(actor, "emp_d")
+    route_db.rendezvous = _Rendezvous()
+
+    responses = await asyncio.gather(
+        _in_its_own_request(_verdict(client, first, "approve")),
+        _in_its_own_request(_verdict(client, second, "approve")),
+    )
+    assert sorted(r.status_code for r in responses) == [200, 409], [r.text for r in responses]
+    seeds = await _seeds(db)
+    statuses = sorted(seeds[sid]["status"] for sid in (first, second))
+    assert statuses == ["active", "draft"] and seeds[seed_id]["status"] == "disabled"
+    assert route_db.rendezvous.arrived == 1, "the loser was held at the lock and refused before its supersede"
+
+
+async def test_a_takedown_racing_the_approval_never_lands_between_its_check_and_its_supersede(env):
+    """The interleaving: the approval has checked its base and is about to supersede it when a takedown of the base
+    arrives on another connection. Unlocked, the takedown commits first, the supersede then misses the (already
+    disabled) base, and the revision goes live AFTER the takedown returned: the takedown is undone. With the base
+    row locked the takedown waits for the approval's commit, so the two happen one after the other."""
+    db, client, actor, route_db = env["db"], env["client"], env["actor"], env["route_db"]
+    seed_id, revision_id = await _live_seed_with_a_revision(env)
+    await _as(actor, "emp_d")
+    race: Dict[str, Any] = {}
+
+    async def _takedown_arrives():
+        race["task"] = asyncio.create_task(
+            client.patch(f"{PREFIX}/{seed_id}", json={"status": "disabled"}), context=contextvars.Context())
+        done, _pending = await asyncio.wait({race["task"]}, timeout=1.5)
+        race["landed_inside_the_publish"] = bool(done)
+
+    route_db.at_supersede = _takedown_arrives
+    approval = await _in_its_own_request(_verdict(client, revision_id, "approve"))
+    route_db.at_supersede = None
+    takedown = await race["task"]
+
+    assert race["landed_inside_the_publish"] is False, "the takedown waited for the approval's commit"
+    assert approval.status_code == 200 and takedown.status_code == 200, (approval.text, takedown.text)
+    seeds = await _seeds(db)
+    assert seeds[seed_id]["status"] == "disabled"
+    assert f"superseded_by:{revision_id}" in seeds[seed_id]["notes"], "the approval superseded a base that was live"
+
+    # And the other order, on the same doors: a takedown that landed first refuses the approval.
+    other_revision = (await client.patch(f"{PREFIX}/{revision_id}", json={"title": "Third title"})).json()
+    other_revision = other_revision["revision"]["seed_id"]
+    await _as(actor, "emp_c")
+    assert (await client.patch(f"{PREFIX}/{revision_id}", json={"status": "disabled"})).status_code == 200
+    res = await _verdict(client, other_revision, "approve")
+    assert res.status_code == 409 and res.json()["detail"]["error"] == "REVISION_BASE_NOT_LIVE", res.text
+    assert not [sid for sid, s in (await _seeds(db)).items() if s["status"] == "active"], "nothing is live"

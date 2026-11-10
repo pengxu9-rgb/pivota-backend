@@ -2152,6 +2152,31 @@ async def _lock_seed_publish_destination(*, market: Any, tool: Any, urls: Iterab
         await database.execute("SELECT pg_advisory_xact_lock(hashtext(:lock_key))", {"lock_key": key})
 
 
+async def _require_live_revision_base(*, seed_id: str, revision_of: str) -> None:
+    """409 `REVISION_BASE_NOT_LIVE` unless the seed this revision replaces is live NOW (review P2-B).
+
+    A revision is an edit of what was live when it was made. If that seed has since been taken down, or replaced by
+    a newer revision, publishing the old revision would undo the takedown (or silently drop the newer content), so
+    it is refused; the reviewer republishes the base, or edits again from what is live. Runs inside the publish
+    transaction, after the lock (two approvals of revisions of one seed run one after the other: the second finds
+    its base superseded). On Postgres the base row is also locked until the commit, so a takedown racing this
+    approval through ANY door either lands first (and this is the 409) or waits and lands after the publish; it never
+    slips between this check and the supersede.
+    """
+    base = await database.fetch_one(
+        "SELECT id, status FROM external_product_seeds WHERE id = :revision_of"
+        + (" FOR UPDATE" if _seed_publish_locks_enabled() else ""),
+        {"revision_of": revision_of},
+    )
+    base_status = str(dict(base).get("status") or "").strip().lower() if base else None
+    if base_status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "REVISION_BASE_NOT_LIVE", "seed_id": seed_id, "revision_of": revision_of,
+                    "base_status": base_status},
+        )
+
+
 async def _publish_seed(
     *,
     seed_id: str,
@@ -2182,6 +2207,7 @@ async def _publish_seed(
     Before any of it, `_authorize_seed_publish`: only a staff role publishes, and never one of the seed's authors
     (its creator or a content editor; 403). A REVISION draft (`revision_of`) also supersedes the live seed it revises,
     by id, wherever that seed points, and that seed is not a conflict for it.
+    A revision publishes only while the seed it revises is still live (`_require_live_revision_base`; 409).
     The caller projects the published seed afterwards (`_project_published_seed`); a projection is a mirror,
     best-effort and post-commit.
     """
@@ -2194,6 +2220,8 @@ async def _publish_seed(
                 market=market, tool=tool,
                 urls=(match_url, destination_url, *((f"revision_of:{revised}",) if revised else ())),
             )
+            if revised:
+                await _require_live_revision_base(seed_id=seed_id, revision_of=revised)
             holder = await database.fetch_one(
                 """
                 SELECT id
@@ -4390,6 +4418,7 @@ async def record_external_seed_audit_verdict(
       destination lock, the 409 `SEED_ACTIVE_CONFLICT` check, the supersede of the destination's other live seeds
       in one transaction; then the seed is projected. A 409 changes nothing. Approving a seed that is already
       live is a no-op success.
+      A REVISION draft whose live seed was taken down or replaced since is a 409 `REVISION_BASE_NOT_LIVE`.
     * `reject` keeps the draft a draft (not served, not projected) and records the verdict on its notes.
 
     Any other seed (disabled, paused, ...) is a 409 `SEED_NOT_A_DRAFT`: a verdict never brings a seed someone took
@@ -7666,6 +7695,55 @@ class AttachSeedRequest(BaseModel):
     variant_id: Optional[str] = None
 
 
+async def _set_seed_attachment(
+    *, seed_id: str, product_key: Optional[str], variant_id: Optional[str], current_user: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach a seed to a canonical product, or detach it (`product_key` None), under the approval rule (review P2-A).
+
+    Which product a seed's offer hangs on is CONTENT (`attached_product_key` is in `_seed_content_fingerprint`), so
+    this door follows the PATCH's rule and no role can put an attachment in front of buyers alone:
+      * a LIVE seed is never re-attached in place: the change is saved as a REVISION draft authored by the actor,
+        the live seed is untouched, and another staff reviewer's approval puts it live;
+      * any other seed (a draft, a disabled one) changes in place and the actor becomes one of its authors, who may
+        not publish or approve it;
+      * a call that changes nothing writes nothing, so it makes nobody an author.
+    """
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    row = dict(row)
+    unchanged = (
+        _norm_text(row.get("attached_product_key")) == _norm_text(product_key)
+        and _norm_text(row.get("attached_variant_id")) == _norm_text(variant_id)
+    )
+    if unchanged:
+        return {"status": "success"}
+    values = {"attached_product_key": product_key, "attached_variant_id": variant_id}
+    editor_stamp = _seed_creator_stamp(current_user)
+    if _seed_status_of(row) == "active":
+        revision_id = await _insert_seed_revision(
+            live_row=row, values=values, seed_data=_ensure_json_obj(row.get("seed_data")), created_by=editor_stamp,
+            price_edited=False,
+        )
+        return {
+            "status": "success",
+            "revision": {"seed_id": revision_id, "seed_status": NEW_EMPLOYEE_SEED_STATUS, "revision_of": seed_id},
+        }
+    authors = _merge_seed_authors(row.get("created_by_employee_id"), editor_stamp)
+    await database.execute(
+        f"""
+        UPDATE external_product_seeds
+        SET attached_product_key = :attached_product_key,
+            attached_variant_id = :attached_variant_id,
+            {_AUTHORS_SET_CLAUSE},
+            updated_at = NOW()
+        WHERE id = :id
+        """,
+        {**values, "created_by_employee_id": authors, "id": seed_id},
+    )
+    return {"status": "success"}
+
+
 @router.post("/external-seeds/{seed_id}/attach")
 async def attach_external_seed(
     seed_id: str,
@@ -7677,17 +7755,7 @@ async def attach_external_seed(
     if pk.count("|") != 2:
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
     vid = (body.variant_id or "").strip() or "∅"
-    await database.execute(
-        """
-        UPDATE external_product_seeds
-        SET attached_product_key = :pk,
-            attached_variant_id = :vid,
-            updated_at = NOW()
-        WHERE id = :id
-        """,
-        {"pk": pk, "vid": vid, "id": seed_id},
-    )
-    return {"status": "success"}
+    return await _set_seed_attachment(seed_id=seed_id, product_key=pk, variant_id=vid, current_user=current_user)
 
 
 @router.post("/external-seeds/{seed_id}/detach")
@@ -7696,20 +7764,7 @@ async def detach_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    row = await database.fetch_one("SELECT id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
-    if not row:
-        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
-    await database.execute(
-        """
-        UPDATE external_product_seeds
-        SET attached_product_key = NULL,
-            attached_variant_id = NULL,
-            updated_at = NOW()
-        WHERE id = :id
-        """,
-        {"id": seed_id},
-    )
-    return {"status": "success"}
+    return await _set_seed_attachment(seed_id=seed_id, product_key=None, variant_id=None, current_user=current_user)
 
 
 @router.get("/external-seeds/{seed_id}/resolve-subject")
