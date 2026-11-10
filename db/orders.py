@@ -171,7 +171,7 @@ def _stamp_test_traffic(order_data: Dict[str, Any]) -> None:
     md = order_data.get("metadata")
     if isinstance(md, dict):
         test_traffic.strip_caller_markers(md)
-    reasons = test_traffic.test_traffic_reasons(
+    reasons = test_traffic.classify_test_traffic(
         merchant_ids=[order_data.get("merchant_id")],
         server_metadata=md if isinstance(md, dict) else None,
     )

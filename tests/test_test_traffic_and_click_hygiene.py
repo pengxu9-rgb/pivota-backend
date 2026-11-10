@@ -35,37 +35,37 @@ def test_predicate_legs_and_refusals(monkeypatch):
     from services import synthetic_call as sc
     from services import test_traffic as tt
 
-    assert tt.test_traffic_reasons(merchant_ids=[REAL]) == []
-    assert tt.test_traffic_reasons(merchant_ids=[RIG]) == ["test_merchant"]
+    assert tt.classify_test_traffic(merchant_ids=[REAL]) == []
+    assert tt.classify_test_traffic(merchant_ids=[RIG]) == ["test_merchant"]
     # a baked-in rig id from services/test_merchant_policy.py, no env needed
     from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 
     baked = sorted(KNOWN_TEST_MERCHANT_IDS)[0]
-    assert tt.test_traffic_reasons(merchant_ids=[baked.upper()]) == ["test_merchant"]
-    assert tt.test_traffic_reasons(merchant_ids=[REAL], server_metadata={"ops_canary": True}) == ["ops_canary"]
-    assert tt.test_traffic_reasons(merchant_ids=[REAL], shopify_order={"test": True}) == ["shopify_test"]
+    assert tt.classify_test_traffic(merchant_ids=[baked.upper()]) == ["test_merchant"]
+    assert tt.classify_test_traffic(merchant_ids=[REAL], server_metadata={"ops_canary": True}) == ["ops_canary"]
+    assert tt.classify_test_traffic(merchant_ids=[REAL], shopify_order={"test": True}) == ["shopify_test"]
     # Shopify's flag must be the boolean; a string is not Shopify's
-    assert tt.test_traffic_reasons(merchant_ids=[REAL], shopify_order={"test": "true"}) == []
-    assert tt.test_traffic_reasons(merchant_ids=[REAL], synthetic_link=True) == ["synthetic_link"]
+    assert tt.classify_test_traffic(merchant_ids=[REAL], shopify_order={"test": "true"}) == []
+    assert tt.classify_test_traffic(merchant_ids=[REAL], synthetic_link=True) == ["synthetic_link"]
     token = sc.set_synthetic_call(sc.SyntheticCall(caller="gw|eval", gw_request_id="r"))
     try:
-        assert tt.test_traffic_reasons(merchant_ids=[REAL]) == ["synthetic_call"]
+        assert tt.classify_test_traffic(merchant_ids=[REAL]) == ["synthetic_call"]
     finally:
         sc.reset_synthetic_call(token)
     # caller-chosen values are NOT signals
-    assert tt.test_traffic_reasons(
+    assert tt.classify_test_traffic(
         merchant_ids=[REAL], server_metadata={"synthetic": True, "surface": "ops_canary", "test_traffic": True}
     ) == []
     # W3 F2: probe-list membership alone is NOT a signal (a probe merchant's live orders are real);
     # only the server's grant marker on the order is, and only as the boolean True
     monkeypatch.setenv("TEST_PSP_PROBE_MERCHANTS", REAL)
     monkeypatch.setenv("ALLOW_TEST_PSP_PROBE", "1")
-    assert tt.test_traffic_reasons(merchant_ids=[REAL]) == []
-    assert tt.test_traffic_reasons(
+    assert tt.classify_test_traffic(merchant_ids=[REAL]) == []
+    assert tt.classify_test_traffic(
         merchant_ids=[REAL], server_metadata={"test_psp_surfaces_granted_by": "server_allowlist"}
     ) == []
-    assert tt.test_traffic_reasons(merchant_ids=[REAL], server_metadata={"test_psp_probe_granted": "yes"}) == []
-    assert tt.test_traffic_reasons(
+    assert tt.classify_test_traffic(merchant_ids=[REAL], server_metadata={"test_psp_probe_granted": "yes"}) == []
+    assert tt.classify_test_traffic(
         merchant_ids=[REAL], server_metadata={"test_psp_probe_granted": True}
     ) == ["test_psp_probe"]
 

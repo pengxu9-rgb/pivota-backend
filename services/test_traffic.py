@@ -92,7 +92,7 @@ def _current_call_is_synthetic() -> bool:
         return False
 
 
-def test_traffic_reasons(
+def classify_test_traffic(
     *,
     merchant_ids: Iterable[Optional[str]] = (),
     server_metadata: Optional[Mapping[str, Any]] = None,
@@ -131,8 +131,8 @@ def test_traffic_reasons(
 
 
 def is_test_traffic(**kwargs: Any) -> bool:
-    """The predicate: True when `test_traffic_reasons(**kwargs)` names any reason."""
-    return bool(test_traffic_reasons(**kwargs))
+    """The predicate: True when `classify_test_traffic(**kwargs)` names any reason."""
+    return bool(classify_test_traffic(**kwargs))
 
 
 def is_stamped_test(metadata: Any) -> bool:

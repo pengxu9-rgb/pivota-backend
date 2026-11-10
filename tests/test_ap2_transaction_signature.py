@@ -457,4 +457,4 @@ def test_confirm_drops_server_only_keys_from_the_caller_metadata(client, fake_db
     assert meta["pvt_click_id"] == "clk_abc"
     for key in ("ops_canary", "skip_platform_order_creation", "test_psp_probe_granted"):
         assert key not in meta
-    assert test_traffic.test_traffic_reasons(merchant_ids=["m_1"], server_metadata=meta) == []
+    assert test_traffic.classify_test_traffic(merchant_ids=["m_1"], server_metadata=meta) == []

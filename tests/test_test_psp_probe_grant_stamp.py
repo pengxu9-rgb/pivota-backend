@@ -120,7 +120,7 @@ def _reasons(captured):
     order_data = copy.deepcopy(captured["order_data"])
     _stamp_test_traffic(order_data)
     order = (order_data.get("metadata") or {}).get("test_traffic_reasons")
-    edge = test_traffic.test_traffic_reasons(merchant_ids=[MERCHANT], server_metadata=captured["edge_metadata"])
+    edge = test_traffic.classify_test_traffic(merchant_ids=[MERCHANT], server_metadata=captured["edge_metadata"])
     return order, edge
 
 

@@ -1001,7 +1001,7 @@ def _stamped_click_context(ctx: Dict[str, Any], token_payload: Dict[str, Any]) -
         or ctx.get("merchantId")
         or ctx.get("merchant_id")
     )
-    reasons = test_traffic.test_traffic_reasons(
+    reasons = test_traffic.classify_test_traffic(
         merchant_ids=[merchant_id],
         synthetic_link=token_is_synthetic(token_payload),
     )

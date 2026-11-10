@@ -134,7 +134,7 @@ def _issued_context(click: IssuedClick) -> Optional[Dict[str, Any]]:
     caller-built context are dropped either way."""
     context = dict(click.context) if click.context else None
     test_traffic.strip_caller_markers(context)
-    reasons = test_traffic.test_traffic_reasons(merchant_ids=[click.merchant_id])
+    reasons = test_traffic.classify_test_traffic(merchant_ids=[click.merchant_id])
     return test_traffic.stamp(context, reasons)
 
 
@@ -704,7 +704,7 @@ async def upsert_order_attribution_edge(
     # it. Off (TEST_TRAFFIC_STAMP_ENABLED unset) or a real order: the metadata is unchanged.
     test_traffic.stamp(
         values["metadata"],
-        test_traffic.test_traffic_reasons(merchant_ids=[merchant_id], server_metadata=payload),
+        test_traffic.classify_test_traffic(merchant_ids=[merchant_id], server_metadata=payload),
     )
     interaction_event = await record_commerce_event_best_effort(
         event_type="order.created",
@@ -1752,7 +1752,7 @@ async def close_external_order_conversion(
             # Shopify-signed payload — never read from a self-report), is stamped test traffic.
             test_traffic.stamp(
                 metadata,
-                test_traffic.test_traffic_reasons(
+                test_traffic.classify_test_traffic(
                     merchant_ids=[subject_merchant_id, merchant_id],
                     shopify_order=None if is_self_report else note_attrs_or_payload,
                 ),
