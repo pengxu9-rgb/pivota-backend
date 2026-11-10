@@ -161,6 +161,24 @@ async def _heal_orders(sql: str) -> None:
     for statement in guarded_add_columns(sql):
         await database.execute(statement)
 
+def _stamp_test_traffic(order_data: Dict[str, Any]) -> None:
+    """O-07: stamp a test order's metadata at write (services.test_traffic). Every order create
+    reaches the table through create_order, so this is the one place. A caller-supplied stamp is
+    removed whatever the flag (the money reads exclude stamped rows); with
+    TEST_TRAFFIC_STAMP_ENABLED off nothing is added, and a real order is never touched."""
+    from services import test_traffic
+
+    md = order_data.get("metadata")
+    if isinstance(md, dict):
+        test_traffic.strip_caller_markers(md)
+    reasons = test_traffic.classify_test_traffic(
+        merchant_ids=[order_data.get("merchant_id")],
+        server_metadata=md if isinstance(md, dict) else None,
+    )
+    if reasons and test_traffic.stamp_enabled():
+        order_data["metadata"] = test_traffic.stamp(md if isinstance(md, dict) else None, reasons)
+
+
 async def create_order(order_data: Dict[str, Any]) -> str:
     """创建新订单"""
     order_id = f"ORD_{secrets.token_hex(8).upper()}"
@@ -168,7 +186,8 @@ async def create_order(order_data: Dict[str, Any]) -> str:
     order_data["status"] = "pending"
     order_data["payment_status"] = "unpaid"
     order_data["is_deleted"] = False  # Explicitly set for PostgreSQL
-    
+    _stamp_test_traffic(order_data)
+
     query = orders.insert().values(**order_data)
     try:
         await database.execute(query)
@@ -302,10 +321,12 @@ async def get_order(order_id: str) -> Optional[Dict[str, Any]]:
 async def find_replayable_order_for_create(
     *,
     merchant_id: str,
+    agent_id: Optional[str],
     idempotency_key: Optional[str] = None,
     quote_id: Optional[str] = None,
     agent_session_id: Optional[str] = None,
     preferred_psp: Optional[str] = None,
+    intent_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Find the most recent order that is safe to replay for order-create recovery.
@@ -314,10 +335,21 @@ async def find_replayable_order_for_create(
     1. metadata.idempotency_key
     2. metadata.pricing_quote.quote_id
     3. agent_session_id
+
+    Every lookup is scoped to the calling agent (`orders.agent_id`). Keys are chosen by the caller,
+    and every agent reaches the same merchants, so a key another agent used must never hand this
+    caller that agent's order: it simply does not match, and the caller gets a fresh create. With no
+    agent there is nothing to scope by, so nothing replays. `intent_id` (a checkout token's session)
+    narrows it further to the orders created under that token.
     """
     merchant_id = str(merchant_id or "").strip()
     if not merchant_id:
         return None
+    agent_id = str(agent_id or "").strip()
+    if not agent_id:
+        return None
+    intent_id = str(intent_id or "").strip() or None
+    intent_clause = "\n                  AND metadata ->> 'intent_id' = :intent_id" if intent_id else ""
 
     def _normalize_preferred_psp(value: Optional[str]) -> Optional[str]:
         normalized = str(value or "").strip().lower()
@@ -342,12 +374,13 @@ async def find_replayable_order_for_create(
     if idempotency_key:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND metadata ->> 'idempotency_key' = :match_value
+                  AND metadata ->> 'idempotency_key' = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -358,12 +391,13 @@ async def find_replayable_order_for_create(
     if quote_id:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value
+                  AND metadata -> 'pricing_quote' ->> 'quote_id' = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -374,12 +408,13 @@ async def find_replayable_order_for_create(
     if agent_session_id:
         candidate_queries.append(
             (
-                """
+                f"""
                 SELECT *
                 FROM orders
                 WHERE merchant_id = :merchant_id
+                  AND agent_id = :agent_id
                   AND COALESCE(is_deleted, FALSE) = FALSE
-                  AND agent_session_id = :match_value
+                  AND agent_session_id = :match_value{intent_clause}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
@@ -391,10 +426,10 @@ async def find_replayable_order_for_create(
     for query, match_value, replay_scope in candidate_queries:
         if not match_value:
             continue
-        row = await database.fetch_one(
-            query,
-            {"merchant_id": merchant_id, "match_value": match_value},
-        )
+        values = {"merchant_id": merchant_id, "agent_id": agent_id, "match_value": match_value}
+        if intent_id:
+            values["intent_id"] = intent_id
+        row = await database.fetch_one(query, values)
         if row:
             row_dict = dict(row)
             if replay_scope != "idempotency_key" and not _replay_matches_preferred_psp(
@@ -623,6 +658,49 @@ async def update_payment_info(
     result = await database.execute(query)
     # Handle None result from PostgreSQL
     return result is not None and result > 0
+
+
+async def update_payment_info_unless_cancelled(
+    order_id: str,
+    payment_intent_id: str,
+    client_secret: str,
+    payment_status: str = "processing",
+    psp_used: Optional[str] = None,
+) -> bool:
+    """`update_payment_info`, as ONE conditional UPDATE that refuses a cancelled order (FIX_PLAN C-11,
+    CHECKOUT_CANCEL_UPSTREAM_ENABLED; routes/agent_payment_sdk.py create_payment).
+
+    True when THIS call wrote the payment surface. False when the order is cancelled (or gone): nothing is written,
+    so a cancel that committed while the PSP object was being created is never overwritten with a live reference
+    and "processing". RETURNING, not the rowcount (unreliable under the `databases` driver), reports the outcome;
+    the cancel side (services/checkout_cancel_upstream.py) is the same kind of conditional UPDATE, so the two
+    serialise on the row.
+    """
+    safe_secret = client_secret
+    try:
+        if client_secret and len(str(client_secret)) > 480:
+            await _ensure_client_secret_storage_allows_long_values()
+            safe_secret = str(client_secret)
+    except Exception:
+        safe_secret = client_secret
+
+    update_values = {
+        "payment_intent_id": payment_intent_id,
+        "client_secret": safe_secret,
+        "payment_status": payment_status,
+        "updated_at": datetime.now(),
+    }
+    if psp_used:
+        update_values["psp_used"] = psp_used
+
+    query = (
+        orders.update()
+        .where(orders.c.order_id == order_id)
+        .where(func.lower(func.coalesce(orders.c.status, "")) != "cancelled")
+        .values(**update_values)
+        .returning(orders.c.order_id)
+    )
+    return await database.fetch_one(query) is not None
 
 
 async def mark_order_paid(order_id: str) -> bool:

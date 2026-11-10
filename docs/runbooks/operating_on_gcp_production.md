@@ -179,6 +179,11 @@ sha — a short sha matches no image tag in Artifact Registry:
 CONFIG=preserve CONCURRENCY_LIMIT=20 MIN_INSTANCES=4 MAX_INSTANCES=20 bash infra/gcp/deploy_gateway.sh prod <full sha>
 ```
 
+**Jobs are not deployed by either script.** A Cloud Run Job keeps its image until it is re-imaged:
+`infra/gcp/reimage_jobs.sh prod status` shows how far each one is behind, and
+`infra/gcp/reimage_jobs.sh prod backend|gateway <sha> --apply [job ...]` rolls them (image +
+`PIVOTA_COMMIT_SHA` only). See [catalog_jobs_on_gcp.md](catalog_jobs_on_gcp.md).
+
 ### Why the gateway command carries a shape prefix
 
 **`preserve` does not preserve the shape.** It keeps every environment variable and secret mount

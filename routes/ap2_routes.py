@@ -577,8 +577,16 @@ async def confirm_transaction(
         txn_metadata = txn["metadata"]
         if isinstance(txn_metadata, str):
             txn_metadata = json.loads(txn_metadata) if txn_metadata else {}
+        # The AP2 transaction metadata is the caller's payment.metadata. Its server-only order
+        # keys (ops_canary, skip_platform_order_creation, test_psp_probe_granted) are dropped the
+        # same way the order create route drops them: an honoured ops_canary would take this edge
+        # out of GMV billing once test-traffic stamping is on (W3 F3).
+        from routes.order_routes import _strip_server_only_order_metadata
+
+        txn_metadata = dict(txn_metadata or {}) if isinstance(txn_metadata, dict) else {}
+        _strip_server_only_order_metadata(txn_metadata, merchant_id=txn["merchant_id"])
         attribution_meta = {
-            **(txn_metadata or {}),
+            **txn_metadata,
             "merchant_id": txn["merchant_id"],
             "agent_id": agent_id,
             "product_id": txn["product_id"],
