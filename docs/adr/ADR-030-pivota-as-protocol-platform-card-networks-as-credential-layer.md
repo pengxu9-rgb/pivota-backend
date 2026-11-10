@@ -1,6 +1,6 @@
 # ADR-030: Pivota is the UCP/ACP platform; the checkout is the merchant's; card networks are only the credential layer
 
-**Status:** Proposed (draft 1), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end.
+**Status:** Proposed (draft 2), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligns D3, D7 and D10 with the payment-partner flow the owner had already agreed.
 
 **Decision owner:** the founder. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
@@ -8,20 +8,36 @@
 - Go protocol-native.
 - Freeze integration-only payment work.
 - Merchant eligibility for the pilot is "publishes UCP or ACP"; no separate merchant permission is sought.
-- Card-layer partners' own agents call the merchant's protocol door now. Pivota builds its own completion later, with a credential minted by a card-layer partner or fetched from a card network directly.
+- A payment partner's own checkout agent places the order on the merchant's checkout now. Pivota never handles the card credential.
+
+**Decisions this ADR follows and does not reopen:**
+- **2026-11-08 (ADR-028 amendment 1, in review as a separate change):**
+  - the payment partner fills the merchant's checkout, and Pivota never sees, receives or holds the card credential;
+  - the merchant is merchant of record on every lane;
+  - a refund is a request to the merchant;
+  - Pivota's own credential retrieval from a card network is out of scope until a new decision amends ADR-028 D6.
+- **2026-11-08:** the payment partners are interchangeable in one orchestration layer, which is the one system of record for partner-completed purchases. Pilot merchants are not told which payment partner is used. Pivota-issued cards are removed.
+- **2026-11-10 (the agreed partner flow):**
+  - quote and payment in one checkout session;
+  - the buyer approves every purchase;
+  - the pilot is one card network, one currency, guest checkout;
+  - the order enters the merchant through our entry link;
+  - the first supervised live purchase runs on the partner that already has quote, approve and place;
+  - the model where the agent polls for the credential and pays is never used.
 
 **Builds on and amends** (all Proposed unless marked; SIGNOFF.md is unsigned):
 - **ADR-014:** protocols are edge adapters around one spine. This ADR adds the *platform side*: Pivota calling a merchant's protocol, not only serving one.
 - **ADR-016:** Pivota is non-custodial. Holds as written.
 - **ADR-021 (Accepted):** the gateway is the protocol gateway. Merchant protocol calls are made by the gateway (D2).
 - **ADR-025:** the attribution loop. D7 says where our click id rides on this lane.
-- **ADR-028:** Pivota completes the order on the merchant's checkout.
-  - **Amended:** in phase 1 Pivota does not complete (D3).
-  - **Amended:** D5's run condition no longer needs merchant permission for the *protocol* route. A merchant that publishes the protocol is eligible.
-  - The browser route is out of scope here and unchanged.
-- **ADR-029:** one purchase router for unconnected sellers. **Amended:** a rail no longer places orders on a Pivota-chosen storefront path. It is a card-layer partner whose agent uses the merchant's protocol door (D3), and the router's new build is frozen (D10).
+- **ADR-028, read with its amendment 1:** the order is completed on the merchant's own checkout, and the step that carries the credential belongs to the payment partner.
+  - **Amended (D5, the run condition):** a payment partner's checkout agent may run on a merchant that publishes UCP or ACP. No separate merchant permission is sought (owner, 2026-11-10). D5's other rules stand: the agent identifies itself, stops on any CAPTCHA, bot challenge or issuer step-up, and uses guest checkout only.
+  - Pivota's own browser runner stays out, as amendment 1 says.
+- **ADR-029:** one purchase router for unconnected sellers. **Unchanged.** Its door, router, parent ledger and events are where a partner-completed purchase starts and is recorded (D3, D10).
 
 ## Scope
+
+**Terms.** A *partner agent* is an AI application that calls Pivota for its users. A *payment partner* is a card issuer or agent enabler whose checkout agent places an order with the buyer's card. The two are different parties.
 
 **In scope:** every agent purchase on a merchant that is *not* connected to Pivota (ADR-029's definition), from the moment the buyer picks an offer until the merchant's order is closed.
 
@@ -40,7 +56,7 @@ Checkout and payment run on four lanes:
 | C. Merchant protocol door (UCP checkout created at the merchant) | the merchant | the merchant | none | client built in both repos; `complete_checkout` refused in both; no partner-facing caller |
 | D. Hand-off (`/r`, a cart or checkout `continue_url`, `esc_` ids) | the merchant, or the buyer on the storefront | the merchant | none (click rows) | live |
 
-Most open money defects are in lanes A and B: cancels that do not reach the payment provider, a hosted page that leaves a second order, stuck-paid checks on our own rows, settlement jobs from an older business model. They are fixes to plumbing that a merchant's own protocol makes unnecessary.
+Most open money defects are in lane A: cancels that do not reach the payment provider, a hosted page that leaves a second order, stuck-paid checks on our own rows, settlement jobs from an older business model. They are fixes to plumbing that a merchant's own checkout makes unnecessary. Lane B is the built, dark home of the agreed partner flow; its open items are the partners' missing pieces (an order API on one, a first real purchase on the other).
 
 Lane C already does more than its "one caller" suggests:
 - **Gateway: `src/services/ucpBuyerAgentClient.js`.**
@@ -114,44 +130,44 @@ Lane C already does more than its "one caller" suggests:
 - `services/merchant_ucp_checkout.py` keeps `get_checkout` for its one reader. Its `create_checkout` and `update_checkout` get no new callers; a second transport would be a second thing to keep correct.
 - The buyer client stops pinning one spec version. It negotiates against the merchant's `version` / `supported_versions` and records the version that was used.
 
-### D3. Who completes the payment, in two phases
+### D3. Who completes the payment
 
-**Phase 1 (now): Pivota never calls `complete_checkout`.** A checkout completes in one of two ways.
+**Pivota never calls `complete_checkout` and never handles the card credential** (ADR-028 amendment 1). A checkout completes in one of two ways.
 
-1. **The buyer completes at the merchant.** Pivota creates the checkout at the merchant (`create_checkout`, not `create_cart`), with the buyer's selection, market and our attribution (D7). The partner gets back:
-   - the merchant's `continue_url`;
-   - the merchant's totals and messages;
-   - an `esc_` id.
+**Path 1. The buyer completes at the merchant.** Pivota creates the checkout at the merchant (`create_checkout`, not `create_cart`), with the buyer's selection, market and our attribution (D7). The partner agent gets back:
+- the merchant's `continue_url`;
+- the merchant's totals and messages;
+- an `esc_` id.
 
-   The buyer pays on the merchant's own checkout.
-2. **A card-layer partner's agent completes at the merchant.** The partner is a card issuer or agent enabler, such as Reap or the A2A provider. Its agent calls the merchant's UCP or ACP door **under its own platform identity**, using its own credential. Pivota hands it:
-   - the merchant's door, the item and variant;
-   - the buyer's market;
-   - our attribution map;
-   - the buyer-approved ceiling.
+The buyer pays on the merchant's own checkout.
 
-   It returns:
-   - the merchant's checkout id and status;
-   - on completion, the merchant's order id and total.
+**Path 2. A payment partner's checkout agent places the order on the merchant's own checkout.** This is the flow already agreed with the payment partners. This ADR adopts it as it stands.
+- **Start.** The purchase starts at the existing rail-neutral purchase door (ADR-029). Pivota checks the price and the cap, picks the payment partner, and records the purchase.
+- **Card.** First time only, the buyer binds a card on the partner's hosted page.
+- **Quote.** Pivota sends the partner: our reference, the entry link, the cart link, the items, the currency and the ship-to. The partner's agent opens the merchant's checkout through the entry link, then the cart link byte for byte, keeping cookies. It returns the merchant's items, discount, shipping, tax and total. Nothing is charged.
+- **Approval.** The buyer approves **every** purchase, on the partner's page that shows the merchant and the total. That total is a ceiling: if the merchant's checkout comes to more, the purchase fails with no charge.
+- **Payment.** It happens in the same checkout session as the quote. If the session cannot be held, the partner re-opens it and pays only at or under the approved total. The credential exists only on the partner's side. The merchant's own processor charges the card; the partner's charge and capture interfaces are not used.
+- **Completion.** It carries the merchant's order number, the total and the currency. An order without them is held for a person, never marked complete.
+- **After.** The partner cancels one order on request. A refund is a request to the merchant. The partner reports refunds and chargebacks, and gives a daily order list for reconciliation.
 
-   Pivota does not create a parallel checkout for that purchase. A UCP checkout is bound to the platform that created it, and the specs do not define handing one to another platform.
+**What stays on the partner's side.** How the partner's agent reaches the merchant's checkout is the partner's concern: form fill today, the merchant's protocol door or a credential delivered to the merchant's processor later. The contract with Pivota does not change with it. Pivota creates no merchant checkout of its own for a path-2 purchase.
 
-   **Pivota never receives the credential in phase 1.**
+**Pilot scope for path 2:**
+- one card network, one currency, guest checkout;
+- merchants in one market that publish UCP or ACP (D8);
+- the partner's agent identifies itself, and stops on any CAPTCHA, bot challenge or issuer step-up;
+- the first supervised live purchase runs on the partner that already has quote, approve and place, and is reconciled three ways: Pivota, the partner, the merchant's order.
 
-**Phase 2 (later, own capability): Pivota completes.**
-- **Credential source:** minted by a card-layer partner, or fetched by Pivota from a card network's agent programme.
-- **How it is submitted:**
-  - as the merchant's UCP payment instrument (`network_token` credential, or the handler the merchant lists);
-  - or as an ACP delegated-payment token from the merchant's payment provider.
-- **Where it may run:** only on a merchant that both
-  - lists a handler accepting that credential type, and
-  - grants completion at a trust tier Pivota holds.
-- **Rules that apply:**
-  - ADR-028 D6: token, cryptogram and dynamic code in memory for one attempt only, never stored or logged.
-  - ADR-028 D7: the buyer confirms exactly the merchant's total. Where the merchant offers AP2 mandates, the mandate is that confirmation.
-- **Gate before phase 2:** this ADR is amended with:
-  - the card-data scope of each credential path, assessed before that path takes a payment;
-  - the guardrail that Pivota never receives a credential, rewritten as "never stored, never logged, one attempt, merchant-bound".
+**Not used, on any path:** the model where an agent polls a partner or a card network for the credential and pays.
+
+**Later, recorded as intent only.** On 2026-11-10 the owner stated the intent that Pivota will, once it has the capability, complete a checkout itself with a credential minted by a payment partner or obtained from a card network directly. This ADR does **not** decide that.
+- It would reverse ADR-028 amendment 1, which puts Pivota's own credential retrieval out of scope and says reopening it needs a new decision amending D6.
+- Nothing here authorises a call to `complete_checkout`, a card-network credential call, or any code that holds, forwards or enters a credential.
+- **When it is reopened, it needs:**
+  - the owner's explicit decision amending D6;
+  - a card-data scoping opinion from an assessor;
+  - per merchant, a payment handler that accepts the credential type and a completion grant at a trust tier Pivota holds.
+- **The preferred shape** is the one already asked of the partners: the credential delivered straight to the merchant or its processor, encrypted to the merchant, so that Pivota carries nothing it can read.
 
 ### D4. Order status comes from the merchant, never from inference
 
@@ -161,29 +177,32 @@ Sources, in order:
    - Every event is verified: the signature, that the signer's profile is the order's business, a replay window, and an id seen once.
    - The full order snapshot is kept, minus buyer contact fields.
 2. **The merchant's `get_order`**, where the merchant grants it to Pivota.
-3. **The card-layer partner's report,** in the phase-1 rail case: the merchant order id and status the partner's agent got back. Merchant webhooks go to that partner's own platform, so it must forward them or answer status reads.
+3. **The payment partner's report,** on path 2: status read by our reference, with the merchant's order number, total and currency on completion, plus the partner's refund and chargeback notices and its daily order list.
 4. **The affiliate network's report** (commission import), as a late, partial confirmation.
 
 Partner-facing `get_order` on an `esc_` id answers only what a source says, labelled with the source and its time. With no source it answers `handed_off`, never "order observed" inferred from a click (the O-02 review finding).
 
 ### D5. Cancel and after-sales
 
-- **Before completion:** `cancel_checkout` at the merchant, with an idempotency key. A checkout the partner abandons expires at the merchant, so there is nothing of ours to clean up.
+- **Before completion, path 1:** `cancel_checkout` at the merchant, with an idempotency key. A checkout the partner agent abandons expires at the merchant, so there is nothing of ours to clean up.
+- **Before completion, path 2:** the payment partner cancels that one order, idempotently and with a definite answer. Never a card-wide removal.
 - **After completion:** the merchant handles refunds, returns and disputes (the existing "refund is the merchant's" rule stands). Pivota surfaces the order's adjustments and fulfilment events. It records after-sales requests and points the buyer to the merchant. It never executes a refund on this lane.
 
-### D6. Identity: one platform profile; partners are internal
+### D6. Identity: one platform profile; partner agents are internal
 
-- One Pivota platform profile and signing key serves all partners. Per-partner profiles are not adopted now: trust tiers and grants on merchant platforms attach to the profile or token holder, and per-partner profiles would split every grant.
+- One Pivota platform profile and signing key serves all partner agents. Per-partner profiles are not adopted now: trust tiers and grants on merchant platforms attach to the profile or token holder, and per-partner profiles would split every grant.
 - Partner identity is Pivota-internal: the forwarded-owner assertion (O-04). Every merchant checkout, hand-off record, click and order snapshot is keyed to the partner agent that asked for it. `get_order` and cancel are refused across partners.
-- **Merchants see our click id, not the partner.** The attribution map carries no partner name.
+- **Merchants see our click id, not the partner agent.** The attribution map carries no partner name.
+- **Pilot merchants are not told which payment partner is used** (owner, 2026-11-08). Whose identity the merchant sees when a payment partner's agent checks out is an open question to the partners.
 - Merchant rate limits are shared across partners, so partner rate isolation is enforced at Pivota's door, before a merchant call.
 
 ### D7. Attribution: our click id rides inside the checkout; commission rides the network
 
-- **Every merchant checkout Pivota creates** carries `attribution` with our click id, as `click_id_tag` / `click_id_value` (the pair already used on referral URLs), plus `referring_domain`. Because update is a full replacement, it is re-sent on every update.
+- **A partner-completed order (D3 path 2) enters the merchant through our entry link.** The entry link is our network tracking link, with our click id as the network sub-id. The partner's agent loads it first, follows its redirects and keeps its cookies, then opens the cart link byte for byte. The cart link carries our click id as a cart attribute. There is exactly one entry-link load per buyer order attempt, never one from a quote retry or a probe (ADR-028 D3). The entry link is a required field of the partner contract.
+- **Every merchant checkout Pivota creates (D3 path 1)** carries `attribution` with our click id, as `click_id_tag` / `click_id_value` (the pair already used on referral URLs), plus `referring_domain`. Because update is a full replacement, it is re-sent on every update.
 - **Where an ACP merchant offers `affiliate_attribution`:** the network provider, our publisher id, and our click id as the sub-id.
 - **Labels are not commission.** A checkout created server-side skips the network's tracking link. Per merchant and market, a stored fact records which path carries commission:
-  - **network-tracked:** the buyer enters through our tracking link, with our click id as the network sub-id (W8);
+  - **network-tracked:** the buyer, or the partner's checkout agent, enters through our tracking link, with our click id as the network sub-id. Each programme's terms must allow an order placed by a checkout agent, and the first orders are checked by hand in the network's report;
   - **protocol-attributed:** the network or merchant credits by the attribution member;
   - **none.**
 
@@ -214,9 +233,9 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | `MERCHANT_PROTOCOL_PROFILE_SWEEP_ENABLED` | backend job | the D8 capability sweep |
 | `UCP_BUYER_AGENT_ORDER_CAPABILITY_ENABLED` | gateway | our platform profile requests the order capability and declares `webhook_url` |
 | `UCP_ORDER_WEBHOOK_PERSIST_ENABLED` | gateway + backend | verified merchant order events are stored and served to `get_order` |
-| `CARD_LAYER_PARTNER_HANDOFF_ENABLED` | backend | phase-1 hand-off of a purchase to a card-layer partner's agent |
-| `UCP_COMPLETE_CHECKOUT_ENABLED` + a per-merchant allowlist | gateway | phase 2 only, after its amendment |
 
+- Path 2 adds no new switch. It runs behind the existing purchase-door and per-partner dials (ADR-029 D8), all off in production today.
+- No switch exists for Pivota's own completion; `complete_checkout` stays structurally refused in both clients.
 - The existing `MERCHANT_PURCHASABILITY_GATE_ENABLED` and the agent-checkout kill switch apply to every one of them.
 
 ### D10. Reuse, freeze, retire
@@ -229,86 +248,87 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | `execution_routes`, store-audit probe | **Reuse**: route identity; the D8 sweep extends it |
 | Merchant purchasability gate; partner identity; partner rate isolation; affiliate sub-id | **Keep** |
 | UCP order-webhook receiver | **Reuse and harden** (D4) |
-| Visa VDP client, trusted-agent verifier | **Keep** for phase 2 and for recognition |
+| Card-network client, trusted-agent verifier | **Keep** at connectivity and recognition only. No credential call (ADR-028 amendment 1) |
 | Lane A: `orders`, processor router, hosted page, payment finalizer | **Frozen** for connected merchants; hosted links stay off; no new builds |
 | In-process ACP lane, AP2 routes | **Frozen dark** |
-| Purchase router, parent ledger, Reap agentic rail, A2A token rail, VIC order step | **Frozen**. Phase 1's card-layer hand-off reuses the parent ledger's id and states only if they fit "the partner's agent completes at the merchant"; otherwise a new, smaller record. Retire the remainder once phase 1 runs |
-| Pivota-issued cards (`/agent/v1/cards`), refused in production | **Frozen**. Its rule "the card is capped by the merchant's own quote" carries into phase 2 |
+| Purchase door, router, parent ledger, purchase events (ADR-029) | **Keep**: the one system of record for partner-completed purchases (D3 path 2). Not retired |
+| The two partner rails (Reap agentic purchase; the A2A token rail and its order step) | **Keep as built, dark.** Work that the agreed partner flow needs waits on the partner's side: a first supervised live purchase on one, an order specification and sandbox on the other. Custom plumbing outside the agreed contract gets no new builds. Whether the freeze also stops the agreed flow's own remaining work is owner question 3 |
+| The A2A rail's token step (returns a credential to the caller) | **Refused in production**, to become a refusal in code (ADR-028 amendment 1) |
+| Pivota-issued cards (`/agent/v1/cards`), refused in production | **Remove** (owner decision, 2026-11-08) |
 | Settlement and transfer jobs | **Paused**; retire with the affiliate payout plan |
 
 ## Each flow: today vs protocol-native
 
-| Flow | Today | Phase 1 | Phase 2 |
-|---|---|---|---|
-| Discovery | Our catalogue; merchant `/.well-known/ucp` fetched at request time, in-memory cache; version pinned | Stored per-domain profile facts (D8); negotiated version | same |
-| Merchant decision | Purchasability gate; directory from cart-link and purchasability tables | + "publishes UCP checkout / ACP" fact; directory reads it | + "accepts our credential type; grants complete to us" |
-| Checkout URL | `/r` link or a merchant **cart** `continue_url` | Merchant **checkout** `continue_url`, merchant totals, our attribution inside | same, plus completion where allowed |
-| Payment completion | Hosted page (off), rails (dark), or buyer on storefront | Buyer at `continue_url`, or a card-layer partner's agent at the merchant's door | Pivota submits the network token / delegated token in the merchant's checkout |
-| Order status | None after hand-off; `esc_` not found | Merchant webhooks / `get_order` where granted; partner report; affiliate report | same |
-| Cancel / after-sales | Cancel flips our row; refunds refused | `cancel_checkout` at merchant; adjustments surfaced; merchant refunds | same |
+| Flow | Today | Protocol-native (this ADR) |
+|---|---|---|
+| Discovery | Our catalogue; merchant `/.well-known/ucp` fetched at request time, in-memory cache; version pinned | Stored per-domain profile facts (D8); negotiated version |
+| Merchant decision | Purchasability gate; directory from cart-link and purchasability tables | + "publishes UCP checkout / ACP" fact, which is the pilot eligibility rule; the directory reads it |
+| Checkout URL | `/r` link or a merchant **cart** `continue_url` | Path 1: merchant **checkout** `continue_url`, merchant totals, our attribution inside. Path 2: our entry link, then the cart link, opened by the payment partner's agent |
+| Payment completion | Hosted page (off), partner rails (dark), or buyer on storefront | Path 1: the buyer at `continue_url`. Path 2: the payment partner's checkout agent, after the buyer approves the quoted total. Never Pivota |
+| Order status | None after hand-off; `esc_` not found | Merchant webhooks / `get_order` where granted; the payment partner's report; the affiliate report |
+| Cancel / after-sales | Cancel flips our row; refunds refused | `cancel_checkout` at the merchant (path 1) or the partner's per-order cancel (path 2); adjustments surfaced; the merchant refunds |
 
 ## What Pivota signs and holds
 
 - **Signs:**
   - its platform profile (published keys);
-  - every request to a merchant door (RFC 9421, under that profile);
-  - in phase 2, the buyer's confirmation record (and an AP2 checkout mandate where the merchant uses one).
+  - every request to a merchant door (RFC 9421, under that profile).
 - **Holds:**
   - merchant capability facts;
-  - the hand-off record (partner, click id, merchant, merchant checkout id, `continue_url`, status, source, times);
+  - the hand-off record (partner agent, click id, merchant, merchant checkout id, `continue_url`, status, source, times);
+  - the purchase record of a partner-completed order (our reference, the quote, the approved total, status, the merchant's order number, total and currency);
   - verified order snapshots without buyer contact fields.
 
   The merchant checkout id and `continue_url` are bearer-like and are kept out of logs.
 - **Never holds:**
   - funds;
-  - a raw card number;
-  - in phase 1, any payment credential;
-  - in phase 2, a credential beyond one attempt in memory.
+  - a card number, a network token, a cryptogram or a dynamic security code, in any process, log or store.
 
 ## Phases
 
-1. **Census.** Read-only: what pilot merchants publish today (D8 facts, first from stored evidence, then the sweep).
-2. **Merchant checkout + hand-off.** Merchant checkout `continue_url` with merchant totals; `esc_` → hand-off record; `cancel_checkout`.
+1. **Census.** Read-only: what pilot merchants publish today (D8 facts, first from stored evidence, then the sweep). It also narrows the payment partners' pilot merchant list to those that publish UCP or ACP.
+2. **Merchant checkout + hand-off (path 1).** Merchant checkout `continue_url` with merchant totals; `esc_` → hand-off record; `cancel_checkout`.
 3. **Order leg.** Order capability requested, webhook persisted, `get_order` on `esc_` from sources.
-4. **Card-layer hand-off.** A card-layer partner's agent completes at the merchant, reporting checkout and order ids back.
+4. **Partner-completed purchase (path 2), as agreed.** The supervised live purchase on the partner that already has quote, approve and place. The other partner's order step once its specification and sandbox exist. This phase is paced by the partners, not by phases 1 to 3.
 5. **ACP adapter.** Only if the census finds ACP merchants and they issue us credentials.
-6. **Phase-2 completion.** After the amendment in D3, per merchant.
+
+Pivota's own completion is not a phase of this ADR (D3, "Later").
 
 ## Risks
 
-- **Commission leakage.** A protocol checkout bypasses network tracking. Revenue depends on the per-merchant attribution fact (D7) and on networks crediting protocol attribution, which is unproven.
-- **Completion grants.** A large merchant platform's complete grant is not publicly obtainable, so phase 2 may cover few merchants for a long time.
-- **Order visibility.** Merchant webhooks may need per-platform partner onboarding. Until then the hand-off lane shows `handed_off` only.
-- **Card-layer partner fit.** A partner whose agent cannot speak UCP or ACP falls back to a browser route, which is out of scope here (ADR-028 D5 still governs it).
+- **Commission leakage.** A protocol checkout bypasses network tracking. Revenue depends on the per-merchant attribution fact (D7), on the entry link being honoured by the payment partner's agent, and on networks crediting an order a checkout agent placed. None is proven yet.
+- **The payment partner's checkout agent is the weak link.** Its success rate, its behaviour on bot challenges, and whether it can hold a session through the buyer's approval are the partner's, and are unmeasured on real merchants.
+- **Order visibility.** Merchant webhooks may need per-platform partner onboarding. Until then path 1 shows `handed_off` only.
 - **Version drift.** Merchants move spec versions without notice; negotiation and stored versions replace the pin.
 - **Abandoned checkouts.** Creating a merchant checkout before the buyer is ready creates abandoned checkouts in merchant admin. Create on buyer intent only (never on search, preview or probe).
 
 ## Open spec questions
 
-1. Whether a checkout created by one platform may be completed by another (the phase-1 rail case). Assumed **no**.
-2. The sub-agent or partner identifier inside one platform profile: undefined.
-3. Webhook fan-out from a platform to its downstream partners: undefined. Pivota serves it through `get_order`.
-4. A handler that names a network agent token, and whether a merchant's payment provider accepts it as `network_token`: per merchant.
-5. ACP: how the order webhook URL and the shared secret are provisioned (bilateral), and whether `affiliate_attribution` leaves "Proposal".
-6. AP2 inside UCP: whether Pivota may sign as the trusted platform for its partners' users.
+1. The sub-agent or partner identifier inside one platform profile: undefined.
+2. Webhook fan-out from a platform to its downstream partners: undefined. Pivota serves it through `get_order`.
+3. A handler that names a network agent token, and whether a merchant's payment provider accepts it as `network_token`: per merchant. It matters to the payment partners' longer-term route, and to any later decision on Pivota's own completion.
+4. ACP: how the order webhook URL and the shared secret are provisioned (bilateral), and whether `affiliate_attribution` leaves "Proposal".
+5. Whose identity a merchant sees when a payment partner's agent checks out: the partner's or Pivota's.
 
 ## Questions for the owner
 
-1. **First milestone.** Phase 1 step 2: merchant checkout `continue_url` with merchant totals, buyer pays at the merchant. OK as the first build?
+1. **First milestone.** Path 1: merchant checkout `continue_url` with merchant totals, buyer pays at the merchant. OK as the first build?
 2. **Order capability.** OK to request the order capability and declare a `webhook_url` in our public platform profile? This creates a new inbound data flow of merchant order events.
-3. **Rail contract.** In the phase-1 rail case, does the card-layer partner's agent create the checkout itself (this ADR's assumption), and does it report the merchant order id back to us?
+3. **The freeze and the agreed partner flow.** The agreed flow still needs work on our side of the partner rail: the single-session quote step, the entry link on the order, the transport to the partner's sandbox, a held state and a cancel path. Does the freeze stop that work, or only custom rail work outside the agreed contract? This ADR assumes the second.
 4. **Lane A.** Frozen as-is for connected merchants, or scheduled for retirement?
+5. **Own completion later.** Confirm it stays intent only for now, with ADR-028 amendment 1 in force until a separate decision.
 
 ## Consequences
 
-- **Fewer money defects.** New money behaviour moves to the merchant's checkout, and most open money defects stop growing.
-- **Partners get the merchant's real total** in the agent before the buyer leaves.
-- **Order status depends on merchants and card-layer partners,** not on our own state machine.
+- **Fewer money defects.** New money behaviour moves to the merchant's checkout, and lane A's open defects stop growing.
+- **Partner agents get the merchant's real total** in the agent before the buyer leaves or approves.
+- **Order status depends on merchants and payment partners,** not on our own payment state.
+- **The agreed partner flow is unchanged.** This ADR adds the merchant-checkout hand-off, the stored capability facts and the order leg around it.
 - **Revenue needs a per-merchant attribution fact,** and that has to be proved order by order.
 
 ## Alternatives considered
 
-- **Keep building lanes A and B.** Rejected by the owner on 2026-11-10: the defects are in custom plumbing.
-- **Pivota completes from day one.** Blocked by completion grants, by credential custody, and by the card-network enrolment. Kept as phase 2.
+- **Keep building lane A.** Rejected by the owner on 2026-11-10: the defects are in custom plumbing.
+- **Require the payment partner's agent to use the merchant's protocol door now.** Rejected: the agreed contract is checkout fill through our entry link and cart link, and how the partner reaches the checkout is its own concern.
+- **Pivota completes the checkout itself.** Ruled out by ADR-028 amendment 1. Recorded as later intent only (D3).
 - **Per-partner platform profiles.** Rejected for now (D6).
-- **The browser route as the default completion.** Out of scope. It remains governed by ADR-028 D5.
