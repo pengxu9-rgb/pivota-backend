@@ -6,7 +6,7 @@
 
 **Direction already decided by the owner (2026-11-10):**
 - Go protocol-native.
-- Freeze integration-only payment work.
+- Freeze integration-only payment work. The freeze does not cover the work the agreed payment-partner flow still needs (see D10).
 - Merchant eligibility for the pilot is "publishes UCP or ACP"; no separate merchant permission is sought.
 - A payment partner's own checkout agent places the order on the merchant's checkout now. Pivota never handles the card credential.
 
@@ -252,7 +252,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | Lane A: `orders`, processor router, hosted page, payment finalizer | **Frozen** for connected merchants; hosted links stay off; no new builds |
 | In-process ACP lane, AP2 routes | **Frozen dark** |
 | Purchase door, router, parent ledger, purchase events (ADR-029) | **Keep**: the one system of record for partner-completed purchases (D3 path 2). Not retired |
-| The two partner rails (Reap agentic purchase; the A2A token rail and its order step) | **Keep as built, dark.** Work that the agreed partner flow needs waits on the partner's side: a first supervised live purchase on one, an order specification and sandbox on the other. Custom plumbing outside the agreed contract gets no new builds. Whether the freeze also stops the agreed flow's own remaining work is owner question 3 |
+| The two partner rails (Reap agentic purchase; the A2A token rail and its order step) | **Keep as built, dark.** Work that the agreed partner flow needs waits on the partner's side: a first supervised live purchase on one, an order specification and sandbox on the other. The freeze stops only custom plumbing outside the agreed contract; the agreed flow's own remaining work continues (owner, 2026-11-10) |
 | The A2A rail's token step (returns a credential to the caller) | **Refused in production**, to become a refusal in code (ADR-028 amendment 1) |
 | Pivota-issued cards (`/agent/v1/cards`), refused in production | **Remove** (owner decision, 2026-11-08) |
 | Settlement and transfer jobs | **Paused**; retire with the affiliate payout plan |
@@ -314,9 +314,10 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 
 1. **First milestone.** Path 1: merchant checkout `continue_url` with merchant totals, buyer pays at the merchant. OK as the first build?
 2. **Order capability.** OK to request the order capability and declare a `webhook_url` in our public platform profile? This creates a new inbound data flow of merchant order events.
-3. **The freeze and the agreed partner flow.** The agreed flow still needs work on our side of the partner rail: the single-session quote step, the entry link on the order, the transport to the partner's sandbox, a held state and a cancel path. Does the freeze stop that work, or only custom rail work outside the agreed contract? This ADR assumes the second.
-4. **Lane A.** Frozen as-is for connected merchants, or scheduled for retirement?
-5. **Own completion later.** Confirm it stays intent only for now, with ADR-028 amendment 1 in force until a separate decision.
+3. **Lane A.** Frozen as-is for connected merchants, or scheduled for retirement?
+4. **Own completion later.** Confirm it stays intent only for now, with ADR-028 amendment 1 in force until a separate decision.
+
+**Answered (owner, 2026-11-10): the freeze and the agreed partner flow.** The freeze stops only custom rail work outside the agreed contract. The agreed flow's remaining work on our side of the partner rail continues: the single-session quote step, the entry link on the order, the transport to the partner's sandbox, a held state and a cancel path.
 
 ## Consequences
 
