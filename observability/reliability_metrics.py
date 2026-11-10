@@ -248,6 +248,16 @@ try:
         commerce_attribution_inferred_recovered_total = _existing_collector("commerce_attribution_inferred_recovered_total")
 
     try:
+        outbound_click_write_failed_total = Counter(
+            "outbound_click_write_failed_total",
+            "Click/impression rows that FAILED to write (O-08): the redirect still answered, the "
+            "row is lost. By table and event type.",
+            ["table", "event_type"],
+        )
+    except ValueError:
+        outbound_click_write_failed_total = _existing_collector("outbound_click_write_failed_total")
+
+    try:
         catalog_import_task_total = Counter(
             "catalog_import_task_total",
             "Platform catalog import ATTEMPT outcomes by connector, status and error category. "
@@ -283,6 +293,7 @@ except Exception:  # pragma: no cover
     traffic_taxonomy_diagnostics_warning_total = None
     commerce_attribution_silent_reject_total = None
     commerce_attribution_inferred_recovered_total = None
+    outbound_click_write_failed_total = None
     catalog_import_task_total = None
 
 
@@ -484,6 +495,15 @@ def record_commerce_attribution_silent_reject(
     commerce_attribution_silent_reject_total.labels(
         merchant_id=str(merchant_id or "unknown"),
         reason=str(reason or "unknown"),
+    ).inc()
+
+
+def record_outbound_click_write_failed(*, table: str, event_type: str) -> None:
+    if outbound_click_write_failed_total is None:
+        return
+    outbound_click_write_failed_total.labels(
+        table=str(table or "unknown"),
+        event_type=str(event_type or "unknown"),
     ).inc()
 
 

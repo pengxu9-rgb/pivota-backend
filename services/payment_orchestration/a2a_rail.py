@@ -35,6 +35,12 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    followed; response bodies read with a hard size cap; no body, payload, token, key or member id
    is ever logged.
 
+6. THE TOKEN STEP IS REFUSED IN PRODUCTION, IN CODE. Every `TOKEN_STEP_ACTIONS` send raises
+   `TokenStepRefused` before any byte is sent when the platform resolves to production
+   (config.platform.is_production), whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says:
+   those steps make the provider hand Pivota a network token and cryptogram (rule 1), and no env
+   value may turn that on in production. Non-production behaviour is unchanged.
+
 Dark by default: `from_env()` returns None unless A2A_RAIL_ENABLED is on and both
 A2A_RAIL_BASE_URL and A2A_RAIL_API_KEY are set.
 """
@@ -53,6 +59,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
+
+from config.platform import is_production as _platform_is_production
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +114,17 @@ ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     # approval page (`visa-action-required`, measured 2026-10-12; `action-required` for the other scheme)
     # answers `paid` once the buyer is done, with the token result or the await card
     ("payment.token-setup", "submit"),
+    ("payment.action-required", "paid"),
+    ("payment.visa-action-required", "paid"),
+    ("payment.await", "poll"),
+})
+
+#: The token step: `token-setup` and the in-flow picker's `select-method` mint a network token; the
+#: approval page's `paid` and the `await` poll are answered with `payment.token-result`, which carries
+#: `networkToken.value` and `networkToken.cryptogram` in cleartext. Refused in production (rule 6).
+TOKEN_STEP_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
+    ("payment.token-setup", "submit"),
+    ("payment.method-list", "select-method"),
     ("payment.action-required", "paid"),
     ("payment.visa-action-required", "paid"),
     ("payment.await", "poll"),
@@ -174,8 +193,18 @@ class ActionNotAllowed(ValueError):
     """A (component, action) outside `ALLOWED_ACTIONS`. A programming error; nothing was sent."""
 
 
+class TokenStepRefused(ActionNotAllowed):
+    """A token-step action in production (rule 6). Refused whatever the env says; nothing was sent."""
+
+
 def is_enabled() -> bool:
     return (os.getenv(A2A_RAIL_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+def token_step_refused_in_production() -> bool:
+    """True when the token step must be refused: the platform resolves to production. Read live from
+    the environment on every call; no flag, dial or kwarg overrides it."""
+    return _platform_is_production()
 
 
 def _host_digest(host: str) -> str:
@@ -614,6 +643,13 @@ class A2ARailClient:
         """Send ONE structured action in conversation `context_id` on behalf of `member_id`."""
         if (component, action) not in ALLOWED_ACTIONS:
             raise ActionNotAllowed(f"{component}#{action} is not an allowed rail action")
+        if (component, action) in TOKEN_STEP_ACTIONS and token_step_refused_in_production():
+            logger.error(
+                "a2a_rail: REFUSED %s#%s in production: the token step would hand Pivota a network "
+                "token and cryptogram; refused in code whatever the env says; nothing was sent",
+                component, action,
+            )
+            raise TokenStepRefused(f"{component}#{action} is refused in production (A2A token step)")
         if not _MEMBER_ID_RE.match(str(member_id or "")):
             raise ValueError("member_id must be an opaque id of 1..128 safe characters")
         if not _CONTEXT_ID_RE.match(str(context_id or "")):

@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from db.database import database
-from utils.auth import get_current_user
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 import logging
 
 logger = logging.getLogger(__name__)
@@ -102,8 +103,9 @@ async def get_merchant_sync_history(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    Get sync history for a specific merchant
+    Get sync history for a specific merchant (the merchant itself or staff)
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         # Get sync events from merchant_stores
         since = datetime.now() - timedelta(days=days)

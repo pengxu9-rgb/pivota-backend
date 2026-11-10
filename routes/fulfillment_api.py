@@ -16,6 +16,13 @@ from utils.logger import logger
 router = APIRouter(prefix="/agent/v1/fulfillment", tags=["agent-fulfillment"])
 
 
+def _owned_by_caller(order: Dict[str, Any], context: AgentContext) -> bool:
+    """True only when the order was placed by the calling agent. An order with no agent is nobody's."""
+    owner = str((order or {}).get("agent_id") or "").strip()
+    caller = str(getattr(context, "agent_id", "") or "").strip()
+    return bool(owner) and bool(caller) and owner == caller
+
+
 @router.get("/track/{order_id}")
 async def track_order_fulfillment(
     order_id: str,
@@ -38,6 +45,12 @@ async def track_order_fulfillment(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         
+        # ONLY THE AGENT THAT PLACED THE ORDER may track it. Merchant access alone let any key with an
+        # unrestricted merchant scope (every self-serve key) read any order's tracking by id. Not found rather
+        # than forbidden, so an order id is not confirmed to a caller that does not own it.
+        if not _owned_by_caller(order, context):
+            raise HTTPException(status_code=404, detail="Order not found")
+
         # Verify agent has access to this merchant
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
@@ -143,7 +156,10 @@ async def get_in_transit_orders(
         from db.database import database
         from db.orders import orders
         
+        # ONLY THE CALLING AGENT'S OWN ORDERS. Without this the list held every partner's shipped orders,
+        # buyer emails included, for any key whose merchant scope is unrestricted (every self-serve key).
         query = orders.select().where(
+            (orders.c.agent_id == str(context.agent_id)) &
             (orders.c.fulfillment_status == "shipped") &
             orders.c.is_deleted.is_(False)
         )

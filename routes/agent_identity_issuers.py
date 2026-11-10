@@ -29,7 +29,9 @@ from pydantic import BaseModel
 
 from db import agent_identity_issuers as store
 from db.agent_identity_issuers import IssuerValidationError
+from db.database import database
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 router = APIRouter(tags=["agent-identity-issuers"])
 internal_router = APIRouter(prefix="/agent/internal", tags=["agent-internal-auth"])
@@ -42,12 +44,6 @@ class IssuerRegistrationBody(BaseModel):
     algs: Optional[List[str]] = None
     authorized_party: Optional[str] = None
     required_scopes: Optional[List[str]] = None
-
-
-def _require_owner_or_admin(current_user: Dict[str, Any], agent_id: str) -> None:
-    user_agent_id = current_user.get("agent_id") or current_user.get("email")
-    if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Not authorized to manage identity issuers for this agent")
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -65,7 +61,7 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.get("/agents/{agent_id}/identity-issuers")
 async def list_identity_issuers(agent_id: str, current_user: dict = Depends(get_current_user)):
-    _require_owner_or_admin(current_user, agent_id)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     rows = await store.list_issuers_for_agent(agent_id)
     return {
         "status": "success",
@@ -91,7 +87,7 @@ async def register_identity_issuer(
     body: IssuerRegistrationBody,
     current_user: dict = Depends(get_current_user),
 ):
-    _require_owner_or_admin(current_user, agent_id)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         reg = store.normalize_registration(body.model_dump())
     except IssuerValidationError as exc:
@@ -140,7 +136,7 @@ async def register_identity_issuer(
 
 @router.delete("/agents/{agent_id}/identity-issuers/{issuer_id}")
 async def disable_identity_issuer(agent_id: str, issuer_id: int, current_user: dict = Depends(get_current_user)):
-    _require_owner_or_admin(current_user, agent_id)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     ok = await store.disable_issuer(agent_id, issuer_id)
     if not ok:
         raise HTTPException(status_code=404, detail={"error": "ISSUER_NOT_FOUND"})

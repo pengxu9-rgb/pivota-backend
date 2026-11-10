@@ -117,6 +117,11 @@ _SKIP_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
 _INLINE_TAGS = frozenset({"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em", "font", "i",
                           "kbd", "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time",
                           "u", "var"})
+# Line breaks and form-level tags inside one line of a bar separate words with a SPACE, not a block boundary (review
+# of be#2735 delta 3, P3-R2): "Promo code:<br>SAVE15" and a copy-code "<button>SAVE15</button>" still read. Structural
+# blocks (div, p, li, ...) and images (img, svg, picture: the icon separators between marquee items) keep the line
+# break, so a marquee item ending in "USE CODE" does not join the next item (review of be#2742, P3-2).
+_SPACE_TAGS = frozenset({"br", "wbr", "button", "label", "input", "select", "option"})
 # A new one of these closes an open one of the same tag on top of the stack, as browsers do; without it
 # a page of unclosed <p>/<li> grows the stack without bound.
 _SIBLING_CLOSED_TAGS = frozenset({"p", "li", "option", "dt", "dd", "tr", "td", "th"})
@@ -129,20 +134,21 @@ _BODY_BUDGET = 500_000
 _MAX_DEPTH = 512
 _MAX_REGION_CHARS = 4000
 _MAX_CODES_PER_PAGE = 20
+_BLOCK_MARK = "\ue000"  # a block tag's boundary inside region text (not whitespace), written out as a line break
 _SNIPPET_CHARS = 160
 
 # The code is case-sensitive (an all-caps or digit token, as stores print them); the words before it are not.
 _CODE_RES = (
     ("use_code", re.compile(
-        r"\b(?i:use|enter|apply)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*:?\s*"
+        r"\b(?i:use|enter|apply)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)[ \t]*:?[ \t]*"
         r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     ("labelled", re.compile(
-        r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)\s*[:：]\s*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
+        r"\b(?i:promo|discount|coupon|voucher)\s*(?i:code)[ \t]*[:：][ \t]*[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     # Widened 2026-11-07 from the shadow diagnostics (by_miss "wording": all-caps codes after "code" that the two
     # forms above miss — "with code SAVE10", "Code: WELCOME15", "Extra 20% off code SPRING20"). Listed AFTER them,
     # so a code they read keeps their form; each new form is counted apart in `by_form`.
     ("with_code", re.compile(
-        r"\b(?i:with|using)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)\s*[:：]?\s*"
+        r"\b(?i:with|using)\s+(?i:the\s+)?(?i:(?:promo|discount|coupon|voucher)\s+)?(?i:code)[ \t]*[:：]?[ \t]*"
         r"[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
     ("after_code", re.compile(
         r"\b(?i:code)\b[ \t]{0,3}[:：]?[ \t]{0,3}[\"'“‘]?([A-Z0-9][A-Z0-9_-]{2,19})\b")),
@@ -277,10 +283,11 @@ class _RegionParser(HTMLParser):
 
     def _separate(self, tag: str) -> None:
         if self._skip_depth is None and tag not in _INLINE_TAGS:
+            mark = " " if tag in _SPACE_TAGS else _BLOCK_MARK
             if self._region_depth is not None:
-                self._buffer.append(" ")
+                self._buffer.append(mark)
             if self._fallback_depth is not None:
-                self._fallback_buffer.append(" ")
+                self._fallback_buffer.append(mark)
 
     def handle_starttag(self, tag: str, attrs: List[Any]) -> None:
         self._separate(tag)
@@ -322,7 +329,10 @@ class _RegionParser(HTMLParser):
 
 
 def _flush(buffer: List[str], into: List[str]) -> None:
-    text = re.sub(r"\s+", " ", "".join(buffer)).strip()
+    # A block boundary stays a line break (review of be#2735, P3-N5): a marquee item ending in "USE CODE" must not
+    # join the next item's first word. Whitespace inside a text node collapses to one space as before.
+    text = re.sub(r"\s+", " ", "".join(buffer))
+    text = re.sub(r" ?\ue000[\ue000 ]*", "\n", text).strip(" \n\ue000")
     if text:
         into.append(text[:_MAX_REGION_CHARS])
 
@@ -637,8 +647,17 @@ _HOST_CODES: set = set()
 _HOSTS_WITH_CODES: set = set()
 
 
+_RUN_GENERATION = [0]
+
+
+def run_generation() -> int:
+    """Bumped by every reset_stats() (once per refresh run): the writer caches its opt-out read per generation."""
+    return _RUN_GENERATION[0]
+
+
 def reset_stats() -> None:
     with _LOCK:
+        _RUN_GENERATION[0] += 1
         _STATS.clear()
         _STATS.update({
             "pages_scanned": 0, "pages_with_region": 0, "pages_with_code": 0, "codes_seen": 0,
@@ -673,6 +692,13 @@ def take_write_slot(host: str) -> Optional[str]:
             return "skipped_host_cap"
         _WRITE_HOSTS[host] = _WRITE_HOSTS.get(host, 0) + 1
         return None
+
+
+def release_write_slot(host: str) -> None:
+    """Give back a slot taken for an insert that wrote no new row (it lost a race and became an update)."""
+    with _LOCK:
+        if _WRITE_HOSTS.get(host, 0) > 0:
+            _WRITE_HOSTS[host] -= 1
 
 
 reset_stats()

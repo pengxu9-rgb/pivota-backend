@@ -146,7 +146,8 @@ Three things matter in that command:
 A better single number, straight from the aggregated table:
 
 ```bash
-curl -s "https://api.pivota.cc/agent/v1/metrics/timeline?hours=336"
+# Staff-only since S-09 (2026-11): pass X-ADMIN-KEY or an admin bearer token.
+curl -s -H "X-ADMIN-KEY: $ADMIN_API_KEY" "https://api.pivota.cc/agent/v1/metrics/timeline?hours=336"
 ```
 
 ## Kill switch

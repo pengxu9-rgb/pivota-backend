@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -605,6 +606,54 @@ def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence
         return False
     dice = 2.0 * len(seed & page) / (len(seed) + len(page))
     return dice >= HANDLELESS_TITLE_DICE_MIN
+
+
+def handleless_decision_detail(
+    *,
+    evidence: Any,
+    seed_title: Any,
+    seed_brand: Any = None,
+    fresh_amount: Any = None,
+    fresh_currency: Any = None,
+    stored_amount: Any = None,
+    stored_currency: Any = None,
+) -> Dict[str, Optional[float]]:
+    """What a reviewer of a SHADOW decision needs beside its refusal: {title_dice, price_ratio}, either None.
+
+    `title_dice` is the Dice coefficient `handleless_titles_match` computes (the seed's title against the page's
+    JSON-LD product name, brand words dropped), whether or not G4 went by the title; None without both titles.
+    `price_ratio` is the fresh price over the stored one, in one currency, both positive and finite; else None.
+    Reporting only: no guard reads it. NEVER RAISES (a raise in the refresh fails the row): anything odd is None."""
+    out: Dict[str, Optional[float]] = {"title_dice": None, "price_ratio": None}
+    try:
+        identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+        name = identity.get("name") if isinstance(identity, dict) else None
+        if isinstance(name, str) and name.strip():
+            drop = _brand_tokens(seed_brand, identity.get("brand"))
+            seed = _title_tokens(seed_title, drop)[0]
+            page = _title_tokens(name, drop)[0]
+            if seed and page:
+                out["title_dice"] = round(2.0 * len(seed & page) / (len(seed) + len(page)), 3)
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its refresh
+        out["title_dice"] = None
+    try:
+        currency = str(fresh_currency or "").strip().upper()
+        fresh = float(fresh_amount) if fresh_amount is not None else None
+        stored = float(stored_amount) if stored_amount is not None else None
+        if (
+            currency
+            and currency == str(stored_currency or "").strip().upper()
+            and fresh is not None
+            and stored is not None
+            and math.isfinite(fresh)
+            and math.isfinite(stored)
+            and fresh > 0
+            and stored > 0
+        ):
+            out["price_ratio"] = round(fresh / stored, 3)
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its refresh
+        out["price_ratio"] = None
+    return out
 
 
 def _handleless_refusal(
