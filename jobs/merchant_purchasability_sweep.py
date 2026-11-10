@@ -136,10 +136,25 @@ row at all, so the warm lane could never fire for them.
   * COMPUTED BY THE SAME DAILY SCAN as the cart-mint lane (no second read of the seed table) and
     cached in the same row (db/merchant_purchasability_cart_mint_scans.py, tagged entries). A scan
     written before this lane existed carries none, so the lane fills at the next 05:00Z scan.
-  * NOT SHOPIFY-FILTERED. The preflight is Shopify-only, so a non-Shopify host comes back
-    unverifiable and never positive; it creates no checkout (the catalog read fails first) and
-    costs one rotation slot. Filtering on a seed-side platform guess would drop real Shopify
-    stores the seeds do not label.
+  * NOT SHOPIFY-FILTERED, BUT GUARDED. The lane cannot know a seed host's platform, and a
+    seed-side guess would drop real Shopify stores the seeds do not label. About a third of its
+    keys are not Shopify, and a big retailer's bot wall answers the catalog read with a 429 or a
+    Cloudflare challenge -- a THROTTLE signal. Unguarded, three of those in one run trip the IP
+    breaker and stop the run, and the lane's ~300 never-checked keys (swept first) push every
+    existing key's re-check out by about a day, past the cart gate's TTL if trips repeat. So
+    (`load_population`, `_sweep_targets`):
+      - one staleness order (never-checked first) over every key, but WARM-ONLY keys (named by
+        no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (6) slots of
+        a run. So the other lanes' due keys always have the rest, and a warm-only key is never
+        re-checked ahead of a staler one of theirs;
+      - a warm-only key is PROVEN SHOPIFY once its last check came back with a verdict only a
+        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`). Until then its requests feed
+        neither the IP breaker nor the shared Shopify-edge budget (the job's own 1.5 s pacer
+        still spaces them): its throttles say nothing about the crawl IP's standing with Shopify;
+      - a warm-only key whose last check found NO Shopify catalog (page 1 of `/products.json`
+        not a product list, for any reason but a throttle) is re-checked only every
+        `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` (7), and counted in
+        `SweepReport.population_deferred_not_shopify` meanwhile.
 
 Wix and WooCommerce connected stores stay out on purpose: no card lane mints a cart for them
 (`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
@@ -214,7 +229,9 @@ between merchants, on top.
 With `CRAWL_SHOPIFY_EDGE_PACER_ENABLED` (set on the job by the setup script, as on the Reap proof
 jobs) every direct-vantage request also takes a slot of the aggregate Shopify-edge budget shared by
 every crawl job that sets the flag (services/shopify_edge_pacer.py, #2474): `PacedTransport(...,
-shopify_edge=True)`. Every merchant here is a Shopify store, so no host learning is needed. This
+shopify_edge=True)`. A key from the first four lanes is a Shopify store by construction; a
+warm-click key is treated as one only once it has answered as Shopify (`Target.proven_shopify`, see
+"THE FIFTH LANE"), so no other host learning is needed. This
 job's pacer has NO deadline, so a shared wait is bounded by the edge pacer's horizon (~60 s at
 lease 2), not by the run budget; and its own spacing is already under the shared rate, so the flag
 mostly keeps the other jobs' share honest.
@@ -299,6 +316,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -398,6 +416,14 @@ DIALS: Dict[str, _Dial] = {
     "ip_throttle_trip_hosts": _Dial("MERCHANT_PURCHASABILITY_IP_THROTTLE_TRIP_HOSTS", 3, 0, 50),
     # The default is the job's task timeout (setup script), i.e. "within one run".
     "ip_throttle_window_seconds": _Dial("MERCHANT_PURCHASABILITY_IP_THROTTLE_WINDOW_SECONDS", 1200, 60, 3600),
+    # THE WARM-CLICK GUARD (see "THE FIFTH LANE"): at most this many WARM-ONLY keys (named by no
+    # other lane) per run, after the other lanes' keys. 0 takes the warm-click lane out of the
+    # population entirely: the rollback that needs no re-image.
+    "warm_click_max_per_run": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", 6, 0, 200),
+    # A warm-only key whose last check found NO Shopify catalog is re-checked only this often.
+    "warm_click_not_shopify_recheck_days": _Dial(
+        "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", 7, 1, 60
+    ),
 }
 
 _WARNED: set = set()
@@ -908,6 +934,9 @@ class Target:
     variant_id: Optional[str] = None
     expected_price_minor: Optional[int] = None
     expected_currency: Optional[str] = None
+    #: False only for a warm-only key that has not yet answered as a Shopify storefront: its
+    #: requests then feed neither the IP breaker nor the Shopify-edge budget (see "THE FIFTH LANE").
+    proven_shopify: bool = True
 
 
 async def _rows(statement: str) -> List[Dict[str, Any]]:
@@ -968,6 +997,38 @@ TOTAL_TALLY = "population_total"
 NEVER_CHECKED_TALLY = "population_never_checked"
 #: And the age, in minutes, of the cart-mint scan the run used (0 = scanned this run; -1 = none).
 CART_MINT_AGE_TALLY = "cart_mint_population_age_min"
+#: And how many warm-only keys this run deferred because their last check found no Shopify catalog.
+WARM_DEFERRED_TALLY = "population_deferred_not_shopify"
+
+#: Verdicts only a SHOPIFY STOREFRONT gives: each needs a Shopify catalog or cart/checkout answer
+#: (a product list, a permalink 410, a checkout page, a Shopify password or sign-in wall). A
+#: warm-only key whose last check gave one of these is `proven_shopify`. TRANSPORT_ERROR,
+#: BLOCKED_UNKNOWN (any 403), VARIANT_UNVERIFIED, UNCLASSIFIED and INVALID_INPUT prove nothing.
+SHOPIFY_STOREFRONT_VERDICTS = frozenset({
+    "ELIGIBLE", "CHECKOUT_PREFILL_MISSING", "LOGIN_REQUIRED", "NOT_ACCEPTING_ORDERS",
+    "VARIANT_GONE", "VARIANT_UNAVAILABLE", "PASSWORD_PAGE", "NO_CARD_PAYMENT", "PRICE_DRIFT",
+    "CHECKOUT_MARKET_MISMATCH",
+})
+
+#: The preflight's detail when page 1 of the catalog was not a product list
+#: (`products_json_page_1_status_<status>`). A throttle never lands here (it is TRANSPORT_ERROR),
+#: but 429 and 503 are excluded anyway so a future change cannot turn a throttle into "not Shopify".
+_NO_CATALOG_DETAIL = re.compile(r"^products_json_page_1_status_(\d{3})$")
+_THROTTLE_STATUSES = frozenset({"429", "503"})
+
+
+def _found_no_shopify_catalog(verdict: Any, detail: Any) -> bool:
+    """The last check read page 1 of `/products.json` and it was not a product list."""
+    if str(verdict or "") != "VARIANT_UNVERIFIED":
+        return False
+    match = _NO_CATALOG_DETAIL.match(str(detail or ""))
+    return bool(match) and match.group(1) not in _THROTTLE_STATUSES
+
+
+def _aware_utc(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 #: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
 #: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
@@ -1175,9 +1236,11 @@ async def load_population(
             "merchant_purchasability_sweep: the staleness read failed; this run sweeps in key "
             "order (error_type=%s)", type(exc).__name__,
         )
+    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for row in due:
         key = (str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))
         seen[key] = row.get("checked_at")
+        last[key] = row
 
     def _staleness(key: Tuple[str, str]) -> Tuple[int, str]:
         checked = seen.get(key)
@@ -1185,17 +1248,61 @@ async def load_population(
         # orders the rest oldest-first without comparing an aware datetime to a naive one.
         return (1, checked.isoformat()) if checked is not None else (0, "")
 
-    ordered = sorted(merged.items(), key=lambda item: (_staleness(item[0]), item[0]))
+    # THE WARM-CLICK GUARD (see "THE FIFTH LANE"). Warm-ONLY keys are the ones no other lane names;
+    # a key another lane also names is swept as that lane's, unguarded, exactly as before.
+    other_keys = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
+    warm_cap = _env_int(DIALS["warm_click_max_per_run"])
+    recheck = timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+    now = _utcnow()
+    core: List[Tuple[Tuple[str, str], Optional[str]]] = []
+    warm: List[Tuple[Tuple[str, str], Optional[str]]] = []
+    deferred = 0
+    for key, variant in merged.items():
+        if key in other_keys:
+            core.append((key, variant))
+            continue
+        if warm_cap == 0:
+            continue  # the lane is switched off: not in the population at all
+        row = last.get(key) or {}
+        checked = _aware_utc(row.get("checked_at"))
+        if (
+            _found_no_shopify_catalog(row.get("verdict"), row.get("detail"))
+            and checked is not None and now - checked < recheck
+        ):
+            deferred += 1
+            continue
+        warm.append((key, variant))
+
+    # ONE staleness order over both, with at most `warm_cap` warm-only keys per run. So a run always
+    # has `limit - warm_cap` slots for the other lanes' due keys (the lane's ~300 never-checked keys
+    # cannot push them out), and a warm-only key is never re-checked ahead of a staler core key.
+    warm_keys = {key for key, _ in warm}
+    bound = max(1, int(limit))
+    picked: List[Tuple[Tuple[str, str], Optional[str]]] = []
+    taken_warm = 0
+    for item in sorted(core + warm, key=lambda item: (_staleness(item[0]), item[0])):
+        if len(picked) >= bound:
+            break
+        if item[0] in warm_keys:
+            if taken_warm >= warm_cap:
+                continue
+            taken_warm += 1
+        picked.append(item)
     if sizes is not None:
-        sizes[TOTAL_TALLY] = len(ordered)
-        sizes[NEVER_CHECKED_TALLY] = sum(1 for key, _ in ordered if key not in seen)
+        considered = core + warm
+        sizes[TOTAL_TALLY] = len(considered) + deferred
+        sizes[NEVER_CHECKED_TALLY] = sum(1 for key, _ in considered if key not in seen)
+        sizes[WARM_DEFERRED_TALLY] = deferred
 
     targets: List[Target] = []
-    for (domain, market), variant in ordered[: max(1, int(limit))]:
+    for (domain, market), variant in picked:
         if variant is None and (domain, market) in reap_keys:
             variant = await _catalog_variant(domain)
         price_minor, currency = await _catalog_price(domain, variant) if variant else (None, None)
-        targets.append(Target(domain, market, variant, price_minor, currency))
+        proven = (domain, market) not in warm_keys or (
+            str((last.get((domain, market)) or {}).get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
+        )
+        targets.append(Target(domain, market, variant, price_minor, currency, proven_shopify=proven))
     return targets
 
 
@@ -1266,6 +1373,9 @@ class SweepReport:
     #: older one stands in (see `_cart_mint_population`); above 4,320 the lane is counted
     #: unreadable.
     cart_mint_population_age_min: int = -1
+    #: Warm-only keys deferred this run because their last check found no Shopify catalog (they
+    #: are re-checked every `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS`). Counted in `population_total`.
+    population_deferred_not_shopify: int = 0
     checked: int = 0
     positive: int = 0
     negative: int = 0
@@ -1289,7 +1399,7 @@ class SweepReport:
 _COUNTS = (
     "population", "population_skipped_unusable", "population_skipped_market_unknown",
     "population_skipped_test_merchant", "population_unreadable", "population_total", "population_never_checked",
-    "cart_mint_population_age_min", "checked",
+    "cart_mint_population_age_min", "population_deferred_not_shopify", "checked",
     "positive", "negative", "unverifiable", "written", "abandoned_budget", "errors",
     "skipped_disabled", "throttled", "ip_throttled", "skipped_ip_throttle",
 )
@@ -1483,6 +1593,7 @@ async def run_merchant_purchasability_sweep() -> SweepReport:
     counts["population_total"] = sizes.get(TOTAL_TALLY, 0)
     counts["population_never_checked"] = sizes.get(NEVER_CHECKED_TALLY, 0)
     counts["cart_mint_population_age_min"] = sizes.get(CART_MINT_AGE_TALLY, -1)
+    counts["population_deferred_not_shopify"] = sizes.get(WARM_DEFERRED_TALLY, 0)
     # A scan that could not be cached means the next run scans the seed table again: an ERROR
     # (exit 4), because left alone it is exactly the hourly load the cache exists to prevent.
     counts["errors"] += tally.get(CACHE_WRITE_FAILED_TALLY, 0)
@@ -1574,10 +1685,13 @@ async def _sweep_targets(
             # something nobody has classified must not end the batch behind it.
             try:
                 # The shared Shopify-edge budget models the CRAWL egress IP only: the direct
-                # vantage (via=None) leaves from it; the proxy vantage does not.
+                # vantage (via=None) leaves from it; the proxy vantage does not. A warm-only host
+                # not yet proven Shopify is kept out of both the edge budget and the IP breaker
+                # (see "THE FIFTH LANE"); the run's own pacer still spaces its requests.
+                crawl_ip_shopify = via is None and target.proven_shopify
                 watch = _ThrottleWatchingTransport(
-                    PacedTransport(_inner_transport(via), pacer, shopify_edge=via is None), breaker,
-                    observe=via is None,
+                    PacedTransport(_inner_transport(via), pacer, shopify_edge=crawl_ip_shopify), breaker,
+                    observe=crawl_ip_shopify,
                 )
                 async with httpx.AsyncClient(
                     headers=headers, timeout=REQUEST_TIMEOUT_S, transport=watch
