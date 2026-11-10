@@ -36,6 +36,7 @@ from db.products import log_order_event
 from db.database import database, IS_POSTGRES
 from db.merchant_order_sync_jobs import enqueue_merchant_order_create
 from utils.auth import require_admin, require_admin_or_key, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from adapters.psp_adapter import get_psp_adapter
 from adapters.multi_psp_orchestrator import create_payment_with_failover
 from utils.logger import logger
@@ -563,7 +564,14 @@ async def _merchant_active_psp_is_test_mode(merchant_id: Optional[str]) -> bool:
 # canary writes them itself through db.orders.create_order. Order metadata on the create endpoint
 # is caller-supplied (the agent gateway forwards it verbatim), so an honoured caller value would
 # let any API caller get a PAID order that is never pushed to the merchant.
-_SERVER_ONLY_ORDER_METADATA_KEYS = ("ops_canary", "skip_platform_order_creation")
+_SERVER_ONLY_ORDER_METADATA_KEYS = (
+    "ops_canary",
+    "skip_platform_order_creation",
+    # O-07 (W3 F2): the test-processor grant marker services.test_traffic reads. Server-written
+    # only, by _apply_server_granted_test_psp_stamp; a caller value would take a live order out
+    # of billing.
+    "test_psp_probe_granted",
+)
 
 
 def _strip_server_only_order_metadata(metadata: Dict[str, Any], *, merchant_id: Optional[str]) -> None:
@@ -621,6 +629,13 @@ async def _apply_server_granted_test_psp_stamp(
     # caller could otherwise forge "server_allowlist" on an order the server refused to stamp and
     # make an incident review unable to tell the two apart.
     metadata["test_psp_surfaces_granted_by"] = "server_allowlist"
+    # O-07 (W3 F2): the unforgeable marker that this order can only be paid on a test processor
+    # (the caller's copy was stripped as a server-only key). Written only while stamping is on, so
+    # with TEST_TRAFFIC_STAMP_ENABLED off a granted order's metadata is unchanged.
+    from services import test_traffic
+
+    if test_traffic.stamp_enabled():
+        metadata[test_traffic.TEST_PSP_GRANT_KEY] = True
     logger.warning(
         "[OrderRoutes] test-PSP bypass GRANTED server-side merchant=%s "
         "(ALLOW_TEST_PSP_PROBE on, merchant allowlisted, all active processors normalise to test)",
@@ -5575,9 +5590,12 @@ async def get_merchant_orders(
     status: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
-    current_user: dict = Depends(get_current_user)  # Allow authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """获取商户的订单列表"""
+    # Admin, or the merchant itself. Was any authenticated account -- buyer
+    # emails and shipping addresses for every merchant.
+    assert_merchant_scope(current_user, merchant_id)
     orders_list = await get_orders_by_merchant(merchant_id, status, limit, offset)
     
     return OrderListResponse(

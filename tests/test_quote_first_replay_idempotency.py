@@ -404,7 +404,7 @@ async def test_agent_create_order_replays_existing_order_before_recreating(monke
             },
         }
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             return expected
 
         async def fail_create_new_order(order_request: Any, background_tasks: Any):
@@ -520,7 +520,7 @@ async def test_agent_create_order_busy_replays_existing_order_without_second_cre
             },
         }
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             replay_checks["count"] += 1
             if replay_checks["count"] == 1:
                 return None
@@ -625,7 +625,7 @@ async def test_agent_create_order_busy_retries_once_when_no_existing_order(monke
 
         monkeypatch.setattr(agent_api_module, "_AGENT_ORDER_IDEMPOTENCY_STORE", FakePostgresIdempotencyStore())
 
-        async def fake_load_replayable_agent_order_create_response(order_request: Any):
+        async def fake_load_replayable_agent_order_create_response(order_request: Any, **_replay_owner: Any):
             return None
 
         calls = {"count": 0}
@@ -1006,3 +1006,15 @@ async def test_agent_payment_without_live_validated_quote_blocks_psp(
         assert resp.json()["detail"]["error"] == "QUOTE_REQUIRED_BEFORE_PAYMENT"
     finally:
         app.dependency_overrides.pop(get_agent_context, None)
+
+
+@pytest.fixture(autouse=True)
+def _quote_rows_owned_by_the_test_agent(monkeypatch):
+    """S-28: order create first checks who owns the quote row. These tests fake the quote LOAD, so
+    the quote they stand for belongs to this file's agent."""
+    import services.quote_service as quote_service_module
+
+    async def owned_row(quote_id: str):
+        return {"quote_id": quote_id, "agent_id": 'agent_test', "snapshot_json": {}}
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)

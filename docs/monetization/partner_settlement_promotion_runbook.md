@@ -35,6 +35,16 @@ settlement_file_generate (day 5, ACTIVE) → aggregate snapshots → settlement_
 settlement_file_transfer (day 10, ACTIVE) → Stripe Connect transfers  ← REAL MONEY OUT
 ```
 
+> **Flags (O-05, 2026-11).** Each money job's body is a no-op unless its flag is
+> literally `true`: T7 `INVOICE_GENERATION_MONTHLY_ENABLED`, T8
+> `PARTNER_SETTLEMENT_MONTHLY_ENABLED`, day-10 transfer `SETTLEMENT_FILE_TRANSFER_ENABLED`.
+> Resuming a cron (or a run-now) without its flag logs `<job> SKIPPED` and does nothing.
+> The transfer flag also gates every direct caller of `settlement_file_service.transfer`,
+> including the staff retry route. The legacy `agent_payouts` transfer
+> (`partner_settlement_service` approve/execute payout, no caller today) needs
+> `PARTNER_PAYOUT_EXECUTION_ENABLED`.
+> Set the flag in the same step as the resume, and unset it as part of any rollback.
+
 Two hard invariants:
 
 1. **`PARTNER_REV_SHARE_USE_V2=true` must be set before T8 runs.** With the flag
@@ -197,7 +207,10 @@ dry-run's numbers against the actual snapshot rows to confirm parity.
 **real Stripe Connect transfers** — after this, money has moved.
 
 If a transfer fails, the staff-only retry endpoint is
-`POST /admin/partners/{id}/settlements/{file_id}/retry`.
+`POST /admin/partners/{id}/settlements/{file_id}/retry`. It obeys the same
+`SETTLEMENT_FILE_TRANSFER_ENABLED` gate as the cron (the gate is inside
+`settlement_file_service.transfer`): with the flag off it answers 409
+`TRANSFERS_DISABLED`, sends nothing to Stripe and leaves the file `failed`.
 
 ---
 
@@ -206,7 +219,7 @@ If a transfer fails, the staff-only retry endpoint is
 | Undo | How |
 |---|---|
 | Flag | `PARTNER_REV_SHARE_USE_V2=false` |
-| Crons | `POST /admin/scheduler/jobs/{id}/pause` (one call, no deploy) |
+| Crons | `POST /admin/scheduler/jobs/{id}/pause` (one call, no deploy), and unset the job's `*_ENABLED` flag |
 | Snapshots | immutable by design — do **not** hand-edit; a bad run is corrected by clawback/adjustment ledger entries, not deletion |
 | Transfers | cannot be un-sent; reconcile via Stripe refund/adjustment out of band |
 

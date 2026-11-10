@@ -23,6 +23,7 @@ from observability.reliability_metrics import (
 from services.commerce_interaction_service import record_commerce_event_best_effort
 from services.commerce_ledger_provenance import ledger_provenance
 from services.commerce_order_ref import pivota_order_ref
+from services import test_traffic
 from services.gmv_aggregation_service import recompute_days_for_edges
 from services.canonical_commerce_service import (
     make_canonical_product_id,
@@ -127,6 +128,16 @@ def _insert_ignoring_existing_click(rows: List[Dict[str, Any]]):
     return stmt.on_conflict_do_nothing(index_elements=["click_id"])
 
 
+def _issued_context(click: IssuedClick) -> Optional[Dict[str, Any]]:
+    """The click's context, stamped when it is test traffic (O-07; services.test_traffic).
+    Unchanged for a real click or with TEST_TRAFFIC_STAMP_ENABLED off; the stamp keys of a
+    caller-built context are dropped either way."""
+    context = dict(click.context) if click.context else None
+    test_traffic.strip_caller_markers(context)
+    reasons = test_traffic.classify_test_traffic(merchant_ids=[click.merchant_id])
+    return test_traffic.stamp(context, reasons)
+
+
 def _issued_row(click: IssuedClick, now: datetime) -> Optional[Dict[str, Any]]:
     click_id = _fits("click_id", click.click_id)
     if click_id is None:
@@ -143,7 +154,7 @@ def _issued_row(click: IssuedClick, now: datetime) -> Optional[Dict[str, Any]]:
         "agent_id": _issued_agent_id(click.agent_id),
         "destination_url": str(click.destination_url or "").strip() or None,
         "dest_domain": _fits("dest_domain", click.dest_domain),
-        "context": dict(click.context) if click.context else None,
+        "context": _issued_context(click),
         "discount_code": _fits("discount_code", click.discount_code),
         "impression_count": 0,
         "click_count": 0,
@@ -621,6 +632,8 @@ async def upsert_order_attribution_edge(
     # metadata so a caller can't tag its own edge out of GMV billing.
     payload.pop("inferred", None)
     payload.pop("inferred_via", None)
+    # Same reason for the O-07 test-traffic stamp: the money reads exclude a stamped edge.
+    test_traffic.strip_caller_markers(payload)
     inferred = False
     if not has_attribution_signal(payload):
         # Fallback (#1481): before dropping a token-less order, try to recover the
@@ -687,6 +700,12 @@ async def upsert_order_attribution_edge(
         },
         "updated_at": now,
     }
+    # O-07: stamp a test order's edge (services.test_traffic) so GMV, statements and outcomes skip
+    # it. Off (TEST_TRAFFIC_STAMP_ENABLED unset) or a real order: the metadata is unchanged.
+    test_traffic.stamp(
+        values["metadata"],
+        test_traffic.classify_test_traffic(merchant_ids=[merchant_id], server_metadata=payload),
+    )
     interaction_event = await record_commerce_event_best_effort(
         event_type="order.created",
         metadata={
@@ -1728,7 +1747,17 @@ async def close_external_order_conversion(
             int(gross_amount_cents) if gross_amount_cents is not None else None
         ),
         "currency": currency,
-        "metadata": json.dumps(metadata),
+        "metadata": json.dumps(
+            # O-07: a rig merchant's conversion, or a Shopify test order (`test: true` on the
+            # Shopify-signed payload — never read from a self-report), is stamped test traffic.
+            test_traffic.stamp(
+                metadata,
+                test_traffic.classify_test_traffic(
+                    merchant_ids=[subject_merchant_id, merchant_id],
+                    shopify_order=None if is_self_report else note_attrs_or_payload,
+                ),
+            )
+        ),
         "now": now,
     }
 

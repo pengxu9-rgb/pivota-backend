@@ -822,3 +822,175 @@ async def test_the_reap_door_names_its_own_purchase_on_a_conflict(client, stubs,
     assert resp.status_code == 409 and "idempotency_conflict" in resp.text, resp.text
     detail = resp.json().get("detail") or resp.json()
     assert (detail["purchase_id"], detail["rail"]) == (pid, "reap")
+
+
+# ── S-29 P2-1: the lookup that picks the buyer's hash cannot answer ──────────────────────────
+# With the dedicated key mounted, every purchase route resolves the buyer's hash with one lookup
+# (dedicated hash, or the legacy one for a buyer with older rows). When that lookup fails, the route
+# answers a retryable 503 and writes nothing: either guess would miss the buyer's idempotency key,
+# and the retry could open a second purchase under the other hash.
+
+_S29_DEDICATED = "dedicated-test-key"
+_S29_LEGACY = "legacy-copy-test-key"
+
+
+def _s29_hash(key: str, raw: str) -> str:
+    import hashlib
+    import hmac
+
+    return hmac.new(key.encode(), raw.encode(), hashlib.sha256).hexdigest()
+
+
+@pytest.fixture
+async def s29_tables():
+    """Every owner-keyed table the lookup reads. Prod creates `buyer_identity_links` from the model
+    metadata at boot; this file's schema step does not, so a real lookup here would fail on it."""
+    from sqlalchemy.schema import CreateTable
+
+    from db.buyer_vault import buyer_identity_links
+
+    await database.execute(CreateTable(buyer_identity_links, if_not_exists=True))
+
+
+@pytest.fixture
+def s29_mounted(monkeypatch, s29_tables):
+    """After the mount: the dedicated key, the legacy copy, and a token key that has rotated away."""
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_READ", raising=False)
+
+
+@pytest.fixture
+def s29_lookup(monkeypatch):
+    """`down()` makes the lookup fail the way a busy database does; `up()` restores the real one."""
+    import db.buyer_vault as buyer_vault
+
+    real = buyer_vault._owner_rows_exist
+    calls = []
+
+    async def _timeout(agent_id, ref_hash):
+        calls.append((agent_id, ref_hash))
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    class _Switch:
+        def down(self):
+            monkeypatch.setattr(buyer_vault, "_owner_rows_exist", _timeout)
+
+        def up(self):
+            monkeypatch.setattr(buyer_vault, "_owner_rows_exist", real)
+
+    _Switch.calls = calls
+    return _Switch()
+
+
+def _assert_retryable_503(resp):
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("retry-after") == "1"
+    assert "TEMPORARY_UNAVAILABLE" in resp.text
+
+
+async def test_a_failed_hash_lookup_is_a_503_that_writes_nothing_and_the_retry_opens_one_purchase(
+        client, stubs, s29_mounted, s29_lookup):
+    """A buyer first seen after the mount (P2-1's case): the old code answered the legacy hash here."""
+    s29_lookup.down()
+    for _ in range(2):
+        _assert_retryable_503(await client.post(BASE, body()))
+    await _nothing_written()
+    assert stubs.catalog == [] and stubs.clicks == [] and stubs.reap == []
+    assert len(s29_lookup.calls) == 2
+
+    s29_lookup.up()
+    first = await client.post(BASE, body())
+    assert first.status_code == 202, first.text
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert await _count("a2a_rail_purchases") == 1 and await _count("agent_purchases") == 1
+    row = await a2a_ledger.get_purchase_internal(first.json()["purchase_id"])
+    assert row["agent_user_ref_hash"] == _s29_hash(_S29_DEDICATED, USER_REF)
+    key = await database.fetch_one(
+        "SELECT agent_user_ref_hash FROM reap_agentic_purchase_keys WHERE idempotency_key = 'key-1'")
+    assert key["agent_user_ref_hash"] == _s29_hash(_S29_DEDICATED, USER_REF)
+
+
+async def test_a_buyer_with_a_pre_mount_purchase_gets_a_503_then_replays_it_under_the_legacy_hash(
+        client, stubs, monkeypatch, s29_tables, s29_lookup):
+    """Before the mount the token key holds the old value; ops copies it into the legacy variable,
+    mounts the dedicated key, then rotates the token key. The buyer's retry still finds its key."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    original = await client.post(BASE, body())
+    assert original.status_code == 202, original.text
+    pid = original.json()["purchase_id"]
+    assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
+
+    s29_lookup.down()
+    _assert_retryable_503(await client.post(BASE, body()))
+    _assert_retryable_503(await client.get(BASE))
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+
+    s29_lookup.up()
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid
+    listed = await client.get(BASE)
+    assert listed.status_code == 200 and [p["rail_purchase_id"] for p in listed.json()["purchases"]] == [pid]
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("post", BASE),
+        ("get", BASE),
+        ("get", f"{BASE}/ap_0123456789abcdef01234567"),
+        ("post", "/agent/v2/commerce/reap/purchases"),
+        ("post", "/agent/v2/commerce/reap/purchases/recover"),
+        ("post", "/agent/v2/commerce/reap/purchases/rp_0123456789abcdef01234567/resume"),
+        ("get", "/agent/v2/commerce/reap/purchases"),
+        ("get", "/agent/v2/commerce/reap/purchases/rp_0123456789abcdef01234567"),
+    ],
+    ids=["create", "list", "get", "reap-create", "reap-recover", "reap-resume", "reap-list", "reap-get"],
+)
+async def test_every_purchase_route_answers_503_when_the_hash_lookup_fails(
+        client, stubs, reap_door_open, s29_mounted, s29_lookup, method, path):
+    s29_lookup.down()
+    resp = await (client.post(path, body()) if method == "post" else client.get(path))
+    _assert_retryable_503(resp)
+    assert s29_lookup.calls, "the route never reached the lookup"
+    await _nothing_written()
+    assert await _count("reap_agentic_purchases") == 0
+    assert stubs.catalog == [] and stubs.clicks == []
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        {"BUYER_IDENTITY_LINK_SECRET": _S29_DEDICATED},
+        {"BUYER_IDENTITY_LINK_SECRET": "same-value-test-key", "BUYER_IDENTITY_LINK_LEGACY_SECRET": "same-value-test-key"},
+        {"BUYER_IDENTITY_LINK_LEGACY_SECRET": "a-wrong-copy-test-key"},
+    ],
+    ids=["new-key-without-the-copy", "new-key-equal-to-the-copy", "wrong-copy-alone"],
+)
+async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(client, stubs, monkeypatch, s29_tables, mount):
+    """S-29b N-1. Each mistake at mount time used to (or could) move existing buyers onto a new hash,
+    so a retry missed its idempotency key. Now the buyer's retry replays its original purchase."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    original = await client.post(BASE, body())
+    assert original.status_code == 202, original.text
+    pid = original.json()["purchase_id"]
+
+    for name, value in mount.items():
+        monkeypatch.setenv(name, value)
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+    assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)

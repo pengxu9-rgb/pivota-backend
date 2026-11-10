@@ -163,7 +163,9 @@ POLL_APPROVAL = 15
 #: voids a token, so a token minted for a purchase that then ends (expired, failed, refused) stays live
 #: on the rail until it lapses. Bound to its order and its amount it cannot be charged elsewhere, but it
 #: is an orphan, and "no orphans" is a design invariant. Arm this only once a void step exists. With it
-#: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`).
+#: off, an armed worker binds cards and parks every locked purchase (`token_step_disabled`). IN PRODUCTION
+#: THE DIAL IS IGNORED: the step is refused in code (`token_step_enabled`, a2a_rail rule 6) and purchases
+#: park as `token_step_refused_production`.
 A2A_RAIL_TOKEN_STEP_ENABLED_ENV = "A2A_RAIL_TOKEN_STEP_ENABLED"
 #: The currencies a token may be requested in (a2a_rail.TOKEN_CURRENCIES; the router refuses the others
 #: at create, and the token step refuses them again).
@@ -783,7 +785,7 @@ async def _reconcile_token(s: _Step, action: str) -> str:
     if not token_step_enabled():
         # The dial is off: nothing is resolved by resending, so the unseen `paid` stays pending (the sweep never
         # ends a row with a pending write) until the dial is on again or a human decides.
-        await s.release(POLL_PARKED, "token_step_disabled")
+        await s.release(POLL_PARKED, _token_step_off_reason())
         return "parked"
     # `paid` names no new token (the conversation's token is the one the row records): sent again on
     # the schedule. This rests on the payment-conversation invariant in the module docstring.
@@ -1131,8 +1133,41 @@ async def _vic_checkout(s: _Step, answer: Any) -> str:
     return "placing"
 
 
-def token_step_enabled() -> bool:
+#: The park reason when the token step is refused because this is production (not just dialled off).
+TOKEN_STEP_REFUSED_PRODUCTION = "token_step_refused_production"
+#: The refusal is logged at ERROR at most this often (per process) while the dial is on in production.
+TOKEN_STEP_REFUSAL_LOG_INTERVAL_SECONDS = 3600.0
+_token_step_refusal_logged_at: Optional[float] = None
+
+
+def _token_step_dial_on() -> bool:
     return (os.getenv(A2A_RAIL_TOKEN_STEP_ENABLED_ENV) or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def token_step_enabled() -> bool:
+    """The token step may run: its dial is on AND this is not production. In production the step is
+    REFUSED in code (a2a_rail rule 6), whatever A2A_RAIL_TOKEN_STEP_ENABLED says: it would make Pivota
+    receive a network token and cryptogram. Every caller of this gate then behaves as with the dial off."""
+    global _token_step_refusal_logged_at
+    if a2a_rail.token_step_refused_in_production():
+        if _token_step_dial_on():
+            now = time.monotonic()
+            if (
+                _token_step_refusal_logged_at is None
+                or now - _token_step_refusal_logged_at >= TOKEN_STEP_REFUSAL_LOG_INTERVAL_SECONDS
+            ):
+                _token_step_refusal_logged_at = now
+                logger.error(
+                    "a2a_rail_worker: %s is set but the A2A token step is REFUSED in production "
+                    "(it would hand Pivota a network token and cryptogram); purchases park as %s",
+                    A2A_RAIL_TOKEN_STEP_ENABLED_ENV, TOKEN_STEP_REFUSED_PRODUCTION,
+                )
+        return False
+    return _token_step_dial_on()
+
+
+def _token_step_off_reason() -> str:
+    return TOKEN_STEP_REFUSED_PRODUCTION if a2a_rail.token_step_refused_in_production() else "token_step_disabled"
 
 
 async def _quoting(s: _Step) -> str:
@@ -1141,7 +1176,7 @@ async def _quoting(s: _Step) -> str:
         return await _start_vic_order(s)
     if row.get("order_id") and row.get("quoted_total_minor") and not row.get("payment_token_id"):
         if not token_step_enabled():
-            return await _parked(s, "token_step_disabled")
+            return await _parked(s, _token_step_off_reason())
         return await _start_token(s)
     # Not locked yet (the quote and the lock are the order protocol's), or a token is already recorded
     # (a re-quote must void it first): nothing here may act.

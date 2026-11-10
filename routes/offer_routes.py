@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from mvp.governance import PolicyInput, governance
 from mvp.offer import build_offers_from_quote, preflight_offers
 from routes.agent_auth import AgentContext, get_agent_context
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, require_quote_for_caller
 from services.shopify_policy_service import get_latest_policy_hashes
 
 
@@ -36,6 +36,7 @@ async def preflight_quote_offer(
     - This endpoint is additive and does not replace existing quote/order endpoints.
     - Enforcement is gated by `MVP_PREFLIGHT_ENFORCE=true`.
     """
+    await require_quote_for_caller(req.quote_id, context)
     try:
         qs = await QuoteService().load_active_quote_or_raise(quote_id=req.quote_id)
     except QuoteError as e:
