@@ -2574,7 +2574,8 @@ async def test_deadline_all_owner_reads_share_original_clock_and_redaction(reap,
     expected=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
     monkeypatch.setattr(route,'_require_rail',lambda:None)
     monkeypatch.setattr(route,'_require_agent_user',lambda _: 'synthetic-user')
-    monkeypatch.setattr(route,'hash_agent_user_ref',lambda _: 'hash_alice')
+    async def _owner(_agent,_ref):return 'hash_alice'
+    monkeypatch.setattr(route,'resolve_agent_user_ref_hash',_owner)
     request=Request({'type':'http','method':'GET','path':'/purchases','query_string':b''})
     for _ in range(2):
         listed=await route.list_reap_purchases(request,SimpleNamespace(agent_id='agent_one'),None)
