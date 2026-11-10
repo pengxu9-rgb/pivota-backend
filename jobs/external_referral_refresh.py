@@ -72,6 +72,7 @@ from config.settings import settings
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
 from services import deal_code_capture
+from services import deal_code_retention
 from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
@@ -161,6 +162,12 @@ async def run_daily_external_referral_refresh(
     if settings.deal_code_capture_shadow:
         # ADR-027 code collection, shadow: what the promo regions of the pages this run read printed.
         summary["deal_code_capture"] = deal_code_capture.stats()
+    # ADR-027 Q18 retention of crawled codes, on EVERY run and whatever DEAL_CODE_CAPTURE_WRITE says: rows written
+    # while the flag was on must still expire after it is turned off. Never raises; counts only. Reported only when
+    # it did something (or was paused, or failed), so a run with nothing to expire keeps the summary as it was.
+    retention = await deal_code_retention.run()
+    if any(retention.values()):
+        summary["deal_code_retention"] = retention
     return summary
 
 
@@ -183,9 +190,33 @@ PRICE_REFRESH_KEYS = (
     "price_skipped_incomplete_pair",
     "price_skipped_currency_mismatch",
     "price_skipped_unreadable",
+    "price_not_read",
+    "availability_not_read",
     "price_unreadable_reasons",
     "price_unreadable_top_hosts",
+    # Rows whose price was NOT re-read because their host answered HTTP 423 three times in a row
+    # (`_HOST_LOCKED_TRIP_DEFAULT`): beside the price outcomes, since they are prices left as they were.
+    "skipped_for_host_423",
+    "host_423_stamped",
 )
+
+
+def handleless_read_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run's handle-less read decisions, as the one `HANDLELESS_READ` log line carries them, or None when the
+    run decided none (the flag is off, or no row's served URL lacked a handle)."""
+    block = summary.get("handleless_read")
+    if not isinstance(block, dict) or not (block.get("totals") or {}).get("decided"):
+        return None
+    return block
+
+
+def unconfirmed_hide_line(summary: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The run's unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE), as the one `UNCONFIRMED_HIDE` log
+    line carries it, or None when the flag is off or the run recorded no observation."""
+    block = summary.get("unconfirmed_hide")
+    if not isinstance(block, dict) or block.get("mode") == "off" or not (block.get("totals") or {}).get("observed"):
+        return None
+    return block
 
 
 def price_refresh_line(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -347,6 +378,14 @@ def main() -> int:
         print("DEAL_CODE_CAPTURE " + json.dumps(summary["deal_code_capture"], separators=(",", ":"), default=str))
     # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
     print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
+    # And for the handle-less read rule (EXTERNAL_SEED_HANDLELESS_READ): only on a run that decided a row.
+    line = handleless_read_line(summary)
+    if line is not None:
+        print("HANDLELESS_READ " + json.dumps(line, separators=(",", ":"), default=str))
+    # And for the unconfirmed-dead hide: only with the flag on or in shadow, on a run that observed a row.
+    line = unconfirmed_hide_line(summary)
+    if line is not None:
+        print("UNCONFIRMED_HIDE " + json.dumps(line, separators=(",", ":"), default=str))
     logger.info("external referral refresh completed", extra={"summary": summary})
     # EXIT CODE FOLLOWS THE SUMMARY. This used to `return 0` unconditionally, so Cloud Run
     # showed a green tick over every run — including nights that stopped on budget with 659

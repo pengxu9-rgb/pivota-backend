@@ -1426,8 +1426,8 @@ app.include_router(after_sales_cases_router)  # After-sales Case API (refund/ret
 app.include_router(agent_recommendations_router)  # Agent recommendations (proxy to internal service)
 app.include_router(agent_events_router)  # Agent events (click tracking etc.)
 app.include_router(card_rail_outcomes_router)  # POST /agent/v1/outcomes — handoff results
-app.include_router(agent_cards_router)  # POST /agent/v1/cards — Reap rail card minting (503 unless AGENT_CARD_ISSUANCE_ENABLED)
-app.include_router(reap_webhooks_router)  # POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET); POST /webhooks/reap/authorize — live external authorization (503 unless REAP_EXTERNAL_AUTH_ENABLED + REAP_AUTH_WEBHOOK_SECRET)
+app.include_router(agent_cards_router)  # POST /agent/v1/cards — Reap rail card minting (404 in production whatever the env; elsewhere 503 unless AGENT_CARD_ISSUANCE_ENABLED)
+app.include_router(reap_webhooks_router)  # 404 in production whatever the env. Elsewhere: POST /webhooks/reap — issuer reconciliation (503 unless REAP_WEBHOOK_SECRET); POST /webhooks/reap/authorize — live external authorization (503 unless REAP_EXTERNAL_AUTH_ENABLED + REAP_AUTH_WEBHOOK_SECRET)
 app.include_router(agent_shop_gateway_router)  # Agent shopping gateway (/agent/shop/v1/invoke)
 app.include_router(agent_internal_auth_router)  # Internal auth introspection (/agent/internal/auth/introspect)
 app.include_router(store_audit_probe_internal_router)  # Store Audit UCP worker receipt (flag + key gated)
@@ -2161,6 +2161,14 @@ async def app_lifespan(_app: FastAPI):
     install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
+    # S-29: a deployed host hashing agent_user_refs without BUYER_IDENTITY_LINK_SECRET says so at
+    # boot (ERROR in production), not only on its first hash. Never fatal: see the function.
+    try:
+        from db.buyer_vault import report_missing_buyer_identity_hash_secret
+
+        report_missing_buyer_identity_hash_secret(force=True)
+    except Exception:  # noqa: BLE001 - a log line must never stop the boot
+        pass
 
     await startup_event()
     await startup()

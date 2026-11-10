@@ -82,7 +82,14 @@ def _client(
     async def fetch_employee(email):
         return {"employee_id": "emp_1", "email": email, "role": role} if employee else None
 
+    async def fetch_all(query, values=None):
+        # login reads every agents row at the owner email (it may own several)
+        q = " ".join(str(query).split())
+        row = await fetch_one(query, values) if "FROM agents" in q else None
+        return [row] if row else []
+
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
     monkeypatch.setattr(module.database, "execute", execute)
     monkeypatch.setattr(module, "_sync_agent_auth_membership", _no_membership)
     async def has_membership(*, email, membership_type, entity_id, not_before=None):

@@ -25,9 +25,13 @@ Two identification signals, because rigs appear under multiple merchant_ids:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 # Storefront-domain prefix shared with scripts/step5_working_set.py. A store
 # whose domain starts with this is a rig regardless of its merchant_id.
@@ -93,6 +97,29 @@ _CACHE_TTL_SECONDS = 300.0
 _cache_value: Optional[Set[str]] = None
 _cache_at: float = 0.0
 
+# After a FAILED lookup, wait this long before the next DB attempt. Without it,
+# every uncached search re-queries merchant_stores during an outage, and under
+# pool saturation each attempt can sit out the pool's checkout timeout.
+_FAILURE_BACKOFF_SECONDS = 10.0
+_failed_at: Optional[float] = None  # when the last attempt FINISHED failing
+
+# Single flight: while one lookup is running, other callers await it instead of
+# starting their own. Its result is the resolved set, or None for a failure.
+# Without this, a lookup that is slow to fail (pool checkout timeout) lets every
+# caller in that window start another one.
+_inflight: Optional["asyncio.Future[Optional[Set[str]]]"] = None
+
+# A follower waits at most this long for the shared lookup, then serves static +
+# last good. Without a bound, one leader stuck on a dead connection (command
+# timeout up to 600 s in prod) would stall the rig filter on every uncached
+# search in the instance; the leader alone still waits on its own query.
+_FOLLOWER_WAIT_SECONDS = 3.0
+
+# A persistent failure must not log a traceback per search.
+_WARN_INTERVAL_SECONDS = 60.0
+_last_warn_at: Optional[float] = None
+_suppressed_warnings = 0
+
 
 def _env_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
     raw = (env or os.environ).get(_ENV_VAR, "") or ""
@@ -108,20 +135,17 @@ def static_test_merchant_ids(env: Optional[Dict[str, str]] = None) -> Set[str]:
 async def _resolve_demo_domain_merchant_ids(database) -> Set[str]:
     """merchant_ids whose connected store domain marks them a demo rig.
 
-    Fail-soft: on any DB error return the empty set (the static id denylist
-    still applies) — a resolver hiccup must never crash search.
+    Raises on a DB error; `get_excluded_merchant_ids` owns the fail-soft
+    handling (backoff, rate-limited warning, last-good set).
     """
-    try:
-        rows = await database.fetch_all(
-            """
-            SELECT DISTINCT merchant_id
-            FROM merchant_stores
-            WHERE lower(coalesce(domain, '')) LIKE :prefix
-            """,
-            {"prefix": f"{DEMO_DOMAIN_PREFIX}%"},
-        )
-    except Exception:
-        return set()
+    rows = await database.fetch_all(
+        """
+        SELECT DISTINCT merchant_id
+        FROM merchant_stores
+        WHERE lower(coalesce(domain, '')) LIKE :prefix
+        """,
+        {"prefix": f"{DEMO_DOMAIN_PREFIX}%"},
+    )
     out: Set[str] = set()
     for r in rows or []:
         mid = None
@@ -144,25 +168,85 @@ async def get_excluded_merchant_ids(
 
     Cached for _CACHE_TTL_SECONDS. When ``database`` is None only the static set
     is returned (used by pure/sync callers).
+
+    Fail-soft, never crashes: on a failed lookup it returns the static set plus
+    the last good demo-domain set (if any). A FAILED lookup is never cached as
+    the demo set: caching it as the empty set would let demo rigs list for a
+    whole TTL window after one DB blip. Instead the next DB attempt waits
+    _FAILURE_BACKOFF_SECONDS, and the warning is rate-limited to one per
+    _WARN_INTERVAL_SECONDS with a count of the ones it suppressed.
     """
-    global _cache_value, _cache_at
+    global _cache_value, _cache_at, _failed_at, _inflight
     static = static_test_merchant_ids(env)
     if database is None:
         return static
-    ts = time.monotonic() if now is None else now
+
+    def _clock() -> float:
+        return time.monotonic() if now is None else now
+
+    ts = _clock()
     if _cache_value is not None and (ts - _cache_at) < _CACHE_TTL_SECONDS:
         return static | _cache_value
-    resolved = await _resolve_demo_domain_merchant_ids(database)
+    if _failed_at is not None and (ts - _failed_at) < _FAILURE_BACKOFF_SECONDS:
+        return static | (_cache_value or set())
+
+    loop = asyncio.get_running_loop()
+    if _inflight is not None and not _inflight.done() and _inflight.get_loop() is loop:
+        # shield: neither a cancelled follower nor the timeout may cancel the shared
+        # attempt. On timeout, serve what we have rather than start a second one.
+        try:
+            joined = await asyncio.wait_for(asyncio.shield(_inflight), _FOLLOWER_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            joined = None
+        return static | (joined if joined is not None else (_cache_value or set()))
+
+    fut: "asyncio.Future[Optional[Set[str]]]" = loop.create_future()
+    _inflight = fut
+    resolved: Optional[Set[str]] = None
+    try:
+        resolved = await _resolve_demo_domain_merchant_ids(database)
+    except Exception:
+        # Stamp when the attempt FINISHED: a lookup that fails after a long pool
+        # wait must still back off for the full window from that point.
+        _failed_at = _clock()
+        _warn_resolve_failed(_failed_at)
+        return static | (_cache_value or set())
+    finally:
+        if not fut.done():
+            fut.set_result(resolved)
+        if _inflight is fut:
+            _inflight = None
+    _failed_at = None
     _cache_value = resolved
-    _cache_at = ts
+    _cache_at = _clock()
     return static | resolved
 
 
+def _warn_resolve_failed(ts: float) -> None:
+    global _last_warn_at, _suppressed_warnings
+    if _last_warn_at is not None and (ts - _last_warn_at) < _WARN_INTERVAL_SECONDS:
+        _suppressed_warnings += 1
+        return
+    logger.warning(
+        "test_merchant_policy: demo-domain resolve FAILED; serving static ids + %s last-good "
+        "demo ids (%s earlier failures suppressed)",
+        len(_cache_value or ()),
+        _suppressed_warnings,
+        exc_info=True,
+    )
+    _last_warn_at = ts
+    _suppressed_warnings = 0
+
+
 def reset_cache() -> None:
-    """Test hook — drop the memoized demo-domain set."""
-    global _cache_value, _cache_at
+    """Test hook — drop the memoized demo-domain set and the failure state."""
+    global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings, _inflight
     _cache_value = None
     _cache_at = 0.0
+    _failed_at = None
+    _inflight = None
+    _last_warn_at = None
+    _suppressed_warnings = 0
 
 
 def _merchant_id_of(product: Any) -> str:

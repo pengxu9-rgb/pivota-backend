@@ -36,12 +36,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urljoin, urlparse
+import unicodedata
 
 import httpx
 
@@ -99,6 +101,41 @@ PENDING_SUPPRESSION_FLAG = "EXTERNAL_SEED_DEAD_PENDING_SUPPRESSION_ENABLED"
 
 def pending_suppression_enabled() -> bool:
     return str(os.getenv(PENDING_SUPPRESSION_FLAG) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# THE UNCONFIRMED-DEAD HIDE (design rev 1, 11-06). The pending step above needs a CORROBORATED dead
+# observation, which only the sweep makes, and only on a host whose catalogue it can read. A served card
+# on a host with no readable catalogue therefore kept serving a link that answered 404 night after night.
+# This second, reversible reason hides it on REPETITION instead: the served URL answered 404 or 410 on
+# two observations at least `UNCONFIRMED_DEAD_MIN_GAP` apart (measured from the start of the run of 404s,
+# `destination_dead_404_since`, never from `destination_checked_at`, which each 404 re-stamps), with no
+# read of the page since the run began.
+#   * The writer only DECIDES (`unconfirmed_hide_candidate` in its result). The hide is applied by the
+#     refresh BATCH, per host, after the run (`apply_unconfirmed_hides`), so a host answering 404 to most of
+#     what we asked this run (a redesign, a domain move, a WAF) is braked rather than emptied.
+#   * Lifted exactly like the pending reason: by any answer from the origin that is not confirmed dead, on
+#     any lane, whatever the flag says.
+#   * Never converted to the final reason by itself; a retirement (two CORROBORATED observations) takes a
+#     row hidden under it over, as it takes the pending reason over.
+# Ends in `_pending`, as every self-lifting reason does: readers that tell a reversible hide from a final one key
+# on that suffix (services/retailer_ingest/pipeline._superseded_row_retired).
+UNCONFIRMED_DEAD_REASON = "external_seed_destination_dead_unconfirmed_pending"
+UNCONFIRMED_HIDE_ENV = "EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE"
+UNCONFIRMED_HIDE_MODES = ("off", "shadow", "on")
+UNCONFIRMED_DEAD_MIN_GAP = timedelta(hours=24)
+# A 404 or 410 from the origin. `redirected_off_product` is excluded: a wall can produce it.
+UNCONFIRMED_DEAD_STATUSES = frozenset({404, 410})
+# The host brake: a host with at least this many rows that reached the origin this run, more than this
+# share of them hard 404s, hides nothing this run.
+UNCONFIRMED_BRAKE_MIN_REACHED = 5
+UNCONFIRMED_BRAKE_MAX_DEAD_SHARE = 0.5
+UNCONFIRMED_TOP_HOSTS = 25
+
+
+def unconfirmed_hide_mode() -> str:
+    """`EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE`, read per call: off (default) | shadow | on."""
+    raw = str(os.getenv(UNCONFIRMED_HIDE_ENV) or "").strip().lower()
+    return raw if raw in UNCONFIRMED_HIDE_MODES else "off"
 
 PAGE_LIMIT = 250
 MAX_CATALOGUE_PAGES = 80
@@ -313,6 +350,453 @@ def _landed_off_site(requested_url: str, final_url: Optional[str]) -> str:
     if landed_host and _fold_www(landed_host) != _fold_www(wanted.hostname or ""):
         return _OFF_SITE_OTHER_HOST
     return ""
+
+
+# --------------------------------------------------------------------------- handle-less reads
+
+# A 200 on a served URL with no product handle (`/shop/<x>.html`, `/p/<sku>`) is `unverifiable` to
+# `classify_destination`: the URL cannot say which product it is, so the refresh never read such a seed
+# (no price, stock or variant refresh, ever). `classify_handleless_read` lets the PAGE say it, under
+# guards that each refuse on their own, and the refusal always wins:
+#   G0 `cache`            the evidence is a cached snapshot's, not this fetch's;
+#   G1 `status` / `challenge` / `redirect_unknown` / `redirect`
+#                         not 2xx, a challenge, an unknown or non-zero redirect count, or a final URL that is
+#                         not the one we sent;
+#   G2 `segment`          a root path, or a listing segment anywhere in the path (a cheap pre-filter);
+#   G3 `no_product` / `structure`
+#                         no priced JSON-LD product, or more than one, or a listing type on the page;
+#   G4 `identity_url_mismatch` / `identity`
+#                         the pricing product's own url / @id names another page, or (with none) its name
+#                         does not match the seed's title;
+#   G5 `price` / `price_source` / `price_inexact`
+#                         no exact JSON-LD price of that product;
+#   G6 `price_move`       outside [0.5x, 2x] of the stored price in the same currency.
+# A refusal, and every `shadow` decision, returns the observation the caller already had: nothing changes.
+HANDLELESS_READ_ENV = "EXTERNAL_SEED_HANDLELESS_READ"
+# Nothing about a decision is written to the seed row (its `seed_data` reaches partner agents whole): the refresh
+# batch counts decisions per host (`external_referral_readiness.count_handleless_read`).
+HANDLELESS_READ_MODES = ("off", "shadow", "on")
+HANDLELESS_REFUSALS = (
+    "cache", "status", "challenge", "redirect_unknown", "redirect", "segment", "no_product", "structure",
+    "identity_url_mismatch", "identity", "price", "price_source", "price_inexact", "price_move",
+    # The rule itself raised (`routes/employee_products._handleless_read_outcome` keeps today's observation).
+    "error",
+)
+HANDLELESS_LISTING_SEGMENTS = frozenset({
+    "collections", "collection", "category", "categories", "c", "search", "pages", "blogs", "blog",
+    "brands", "brand", "cart", "account", "sale",
+})
+HANDLELESS_PRICE_MOVE_BOUNDS = (0.5, 2.0)
+HANDLELESS_TITLE_DICE_MIN = 0.6
+HANDLELESS_LIVE_NOTE = "same destination, no product handle; jsonld identity by {by}"
+# A price text that states the bottom of a range ("From $19", "Starting at", "ab 19 €", "19円~", "19,000원부터").
+_FROM_PRICE_RE = re.compile(r"\bfrom\b|\bstarting\b|\bstarts\b|\bab\b|à partir|a partir|\bdesde\b|\bdès\b|[~〜]|から|起|부터|이상")
+# Words that name no product: dropped from both titles before they are compared.
+_TITLE_STOPWORDS = frozenset({
+    "the", "and", "a", "an", "of", "for", "with", "in", "by", "new",
+    "ml", "l", "g", "kg", "mg", "oz", "fl", "floz", "lb", "lbs", "ea", "x",
+})
+# Words that make a title name ANOTHER ITEM of the same product line: a pack, a set, a refill, a mini, a kit.
+# One title carrying one the other lacks refuses, however close the rest is ("Barrier Cream" / "Barrier Cream
+# 2 Pack"). So does a different pack count (`_PACK_COUNT_RE`).
+_ITEM_FORM_WORDS = frozenset({
+    "pack", "packs", "pk", "set", "sets", "kit", "kits", "bundle", "duo", "trio", "refill", "refills", "mini",
+    "minis", "travel", "sample", "samples", "jumbo", "deluxe", "value", "gift", "multipack", "pcs", "pieces",
+    "count", "ct",
+})
+_ITEM_FORM_WORDS_CJK = ("세트", "리필", "미니", "기획", "듀오", "샘플", "セット", "詰め替え", "つめかえ", "ミニ", "サンプル", "套装", "替换装")
+_PACK_COUNT_RE = re.compile(
+    r"(\d+)\s*-?\s*(?:pk|packs?|pcs|pc|pieces|count|ct|개입|개|枚入|枚|本入|本|個入|個|入)(?![a-z])"
+    r"|(?:x|×)\s*(\d+)(?![\d.])|(?<![\d.])(\d+)\s*(?:x|×)(?![a-z\d])"
+)
+# What KIND of product a title names. Two titles that each carry a kind word the other lacks are siblings
+# ("Barrier Cream" / "Barrier Toner"), whatever their overlap.
+_PRODUCT_KIND_WORDS = frozenset({
+    "cream", "toner", "serum", "essence", "ampoule", "cleanser", "cleansing", "foam", "gel", "lotion", "emulsion",
+    "mask", "masks", "pad", "pads", "patch", "patches", "mist", "oil", "balm", "sunscreen", "sunblock", "spf",
+    "stick", "cushion", "foundation", "primer", "powder", "concealer", "tint", "lipstick", "gloss", "liner",
+    "mascara", "shampoo", "conditioner", "scrub", "peel", "exfoliator", "moisturizer", "moisturiser", "eye",
+    "lip", "body", "hand", "hair", "soap", "wash", "spray", "palette", "blush", "bronzer", "highlighter",
+    "perfume", "fragrance", "deodorant", "brush", "sponge", "refill",
+})
+# The same, in Korean and Japanese (compared as character bigrams, so a kind word is the set of its bigrams).
+_PRODUCT_KIND_WORDS_CJK = (
+    "토너", "크림", "세럼", "에센스", "앰플", "클렌저", "클렌징", "폼", "젤", "로션", "마스크", "패드", "미스트",
+    "오일", "밤", "선크림", "쿠션", "파운데이션", "샴푸", "스크럽", "립",
+    "化粧水", "乳液", "美容液", "クリーム", "洗顔", "マスク", "パック", "日焼け止め", "オイル", "ジェル", "ローション",
+    "クレンジング", "セラム", "シャンプー", "リップ",
+)
+_CJK_RE = re.compile(r"[぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿ᄀ-ᇿ㄰-㆏가-힯]+")
+_WORD_RE = re.compile(r"[^\W_]+")
+
+
+def handleless_read_mode() -> str:
+    """`EXTERNAL_SEED_HANDLELESS_READ`, read per call: off (default) | shadow | on."""
+    raw = str(os.getenv(HANDLELESS_READ_ENV) or "").strip().lower()
+    return raw if raw in HANDLELESS_READ_MODES else "off"
+
+
+@dataclass(frozen=True)
+class HandlelessDecision:
+    observation: Optional[DestinationObservation]
+    # Did this fetch read the served product? True only in `on` mode with no refusal.
+    read: bool
+    # Would it, with the rule on (no refusal)? Same in every mode.
+    would_read: bool
+    refusal: Optional[str]
+    # The listing segment G2 refused on ("root" for an empty path).
+    segment: Optional[str] = None
+    # How G4 named the product: "url" (its own url / @id) or "title".
+    identity_by: Optional[str] = None
+
+
+def _url_parts(url: Any) -> Optional[Tuple[str, str, str, Tuple[Tuple[str, str], ...]]]:
+    """(scheme, host with one leading www. folded, unquoted path without a trailing /, query pairs), or None for
+    a URL that does not parse (a bad port `:abc` / `:99999` raises only when `.port` is read). The query is SPLIT
+    before each key and value is decoded, so an encoded separator stays data: `?pid=5%26x` is one pair
+    (`pid`, `5&x`), never the two pairs of `?pid=5&x`."""
+    try:
+        parsed = urlparse(str(url or "").strip())
+        host = _fold_www(parsed.hostname or "")
+        port = parsed.port
+        query = tuple(parse_qsl(parsed.query or "", keep_blank_values=True))
+    except Exception:  # noqa: BLE001 - an unparsable URL matches nothing
+        return None
+    if not host:
+        return None
+    if port:
+        host = f"{host}:{port}"
+    return (parsed.scheme.lower(), host, unquote(parsed.path or "").rstrip("/"), query)
+
+
+# Query keys that name no product: utm_* and mc_* (by prefix), the ad-click ids below, and `variant`. Only
+# these. A key like `ref`, `src`, `source` or `aff` can carry the product id on a handle-less URL
+# (`/item?ref=SKU1`), so it is identity. `variant` is dropped as it is for handle URLs: the URL variant pick owns
+# it, and the read adopts only the variants the pricing product lists.
+_IDENTITY_IGNORED_QUERY_PREFIXES = ("utm_", "mc_")
+_IDENTITY_IGNORED_QUERY_KEYS = frozenset({
+    "gclid", "fbclid", "yclid", "msclkid", "dclid", "gbraid", "wbraid", "ttclid", "igshid", "srsltid", "_ga",
+    "_gl", "variant",
+})
+
+
+def _identity_query(pairs: Sequence[Tuple[str, str]]) -> Tuple[Tuple[str, str], ...]:
+    """The query pairs (already split, then decoded: `_url_parts`) that can name a product (`/item.php?id=5`).
+    Keys compare case-folded; values exactly, outer spaces stripped."""
+    kept = set()
+    for key, value in pairs:
+        folded = key.strip().casefold()
+        if folded.startswith(_IDENTITY_IGNORED_QUERY_PREFIXES) or folded in _IDENTITY_IGNORED_QUERY_KEYS:
+            continue
+        kept.add((folded, value.strip()))
+    return tuple(sorted(kept))
+
+
+def _same_fetched_url(sent: Any, final: Any) -> bool:
+    """Did the response answer the URL we SENT? httpx re-encodes a non-ASCII path, so both paths are unquoted."""
+    left, right = _url_parts(sent), _url_parts(final)
+    return left is not None and left == right
+
+
+def _same_product_url(candidate: Any, served: Any) -> bool:
+    """Does the page's own product URL name the served page? Host, path AND the query pairs that can name a
+    product (`_identity_query`): a handle-less URL often carries its product id there (`/item.php?id=5`). Tracking
+    keys and `variant` are ignored; any other difference is another page."""
+    left, right = _url_parts(candidate), _url_parts(served)
+    return (
+        left is not None and right is not None and left[1:3] == right[1:3]
+        and _identity_query(left[3]) == _identity_query(right[3])
+    )
+
+
+def _listing_segment(url: Any) -> Optional[str]:
+    parts = _url_parts(url)
+    path = parts[2] if parts else ""
+    segments = [seg.lower() for seg in path.split("/") if seg]
+    if not segments:
+        return "root"
+    return next((seg for seg in segments if seg in HANDLELESS_LISTING_SEGMENTS), None)
+
+
+def _cjk_grams(run: str) -> Set[str]:
+    return {run[i:i + 2] for i in range(len(run) - 1)} if len(run) > 1 else {run}
+
+
+def _title_tokens(text: Any, drop: Set[str]) -> Tuple[Set[str], int, int, int]:
+    """(tokens, Latin words, CJK bigrams, CJK runs): NFKC + casefold, Latin text by word, CJK runs by character
+    bigram. Brand tokens (`drop`), stop words and anything holding a digit (sizes) are dropped. A CJK run is one
+    space-separated word, as Korean writes them."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    tokens: Set[str] = set()
+    words = bigrams = runs = 0
+    for run in _CJK_RE.findall(norm):
+        grams = _cjk_grams(run) - drop
+        if grams:
+            runs += 1
+        tokens |= grams
+        bigrams += len(grams)
+    for word in _WORD_RE.findall(_CJK_RE.sub(" ", norm)):
+        if word in drop or word in _TITLE_STOPWORDS or any(ch.isdigit() for ch in word):
+            continue
+        if word not in tokens:
+            tokens.add(word)
+            words += 1
+    return tokens, words, bigrams, runs
+
+
+def _brand_tokens(*brands: Any) -> Set[str]:
+    out: Set[str] = set()
+    for brand in brands:
+        if isinstance(brand, dict):
+            brand = brand.get("name")
+        if isinstance(brand, str) and brand.strip():
+            toks = _title_tokens(brand, set())[0]
+            out |= toks
+    return out
+
+
+_KIND_TOKENS = frozenset(_PRODUCT_KIND_WORDS) | frozenset(
+    gram for word in _PRODUCT_KIND_WORDS_CJK for gram in _cjk_grams(unicodedata.normalize("NFKC", word).casefold())
+)
+# Latin item-form words compare as words. The Korean / Japanese / Chinese ones compare as WHOLE substrings of
+# the title (`_cjk_item_forms`), never by character bigram: a bigram of サンプル (sample) is also in サンカット
+# (sun-cut) and パープル (purple), and one of セット (set) in ポケット (pocket).
+_ITEM_FORM_TOKENS = frozenset(_ITEM_FORM_WORDS)
+_ITEM_FORM_WORDS_CJK_NORM = tuple(unicodedata.normalize("NFKC", word).casefold() for word in _ITEM_FORM_WORDS_CJK)
+
+
+def _cjk_item_forms(text: Any) -> Set[str]:
+    """The CJK item-form words (`_ITEM_FORM_WORDS_CJK`) a title contains, each as a whole substring."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return {word for word in _ITEM_FORM_WORDS_CJK_NORM if word in norm}
+
+
+def _pack_counts(text: Any) -> Set[int]:
+    """The pack counts a title states ("2 Pack", "3pcs", "x2", "2개입"), a count of 1 dropped."""
+    norm = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    counts: Set[int] = set()
+    for match in _PACK_COUNT_RE.finditer(norm):
+        raw = next((g for g in match.groups() if g), None)
+        if raw and int(raw) > 1:
+            counts.add(int(raw))
+    return counts
+
+
+def handleless_titles_match(seed_title: Any, page_name: Any, *, brands: Sequence[Any] = ()) -> bool:
+    """The title path of G4: the seed's title, brand dropped, names at least 2 informative words (Latin words and
+    CJK words together) or 3 CJK bigrams; the two titles' Dice coefficient is at least `HANDLELESS_TITLE_DICE_MIN`;
+    and they are not siblings (each carries a product-kind word the other lacks: "Barrier Cream" / "Barrier Toner",
+    which share two words of three); nor does one name a pack, set, refill or mini the other does not, or another
+    pack count."""
+    drop = _brand_tokens(*brands)
+    seed, words, bigrams, runs = _title_tokens(seed_title, drop)
+    page = _title_tokens(page_name, drop)[0]
+    if words + runs < 2 and bigrams < 3:
+        return False
+    if not page:
+        return False
+    if (seed - page) & _KIND_TOKENS and (page - seed) & _KIND_TOKENS:
+        return False
+    if (
+        (seed ^ page) & _ITEM_FORM_TOKENS
+        or _cjk_item_forms(seed_title) != _cjk_item_forms(page_name)
+        or _pack_counts(seed_title) != _pack_counts(page_name)
+    ):
+        # A pack, set, refill or mini of the product is another item with another price.
+        return False
+    dice = 2.0 * len(seed & page) / (len(seed) + len(page))
+    return dice >= HANDLELESS_TITLE_DICE_MIN
+
+
+def handleless_decision_detail(
+    *,
+    evidence: Any,
+    seed_title: Any,
+    seed_brand: Any = None,
+    fresh_amount: Any = None,
+    fresh_currency: Any = None,
+    stored_amount: Any = None,
+    stored_currency: Any = None,
+) -> Dict[str, Optional[float]]:
+    """What a reviewer of a SHADOW decision needs beside its refusal: {title_dice, price_ratio}, either None.
+
+    `title_dice` is the Dice coefficient `handleless_titles_match` computes (the seed's title against the page's
+    JSON-LD product name, brand words dropped), whether or not G4 went by the title; None without both titles.
+    `price_ratio` is the fresh price over the stored one, in one currency, both positive and finite; else None.
+    Reporting only: no guard reads it. NEVER RAISES (a raise in the refresh fails the row): anything odd is None."""
+    out: Dict[str, Optional[float]] = {"title_dice": None, "price_ratio": None}
+    try:
+        identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+        name = identity.get("name") if isinstance(identity, dict) else None
+        if isinstance(name, str) and name.strip():
+            drop = _brand_tokens(seed_brand, identity.get("brand"))
+            seed = _title_tokens(seed_title, drop)[0]
+            page = _title_tokens(name, drop)[0]
+            if seed and page:
+                out["title_dice"] = round(2.0 * len(seed & page) / (len(seed) + len(page)), 3)
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its refresh
+        out["title_dice"] = None
+    try:
+        currency = str(fresh_currency or "").strip().upper()
+        fresh = float(fresh_amount) if fresh_amount is not None else None
+        stored = float(stored_amount) if stored_amount is not None else None
+        if (
+            currency
+            and currency == str(stored_currency or "").strip().upper()
+            and fresh is not None
+            and stored is not None
+            and math.isfinite(fresh)
+            and math.isfinite(stored)
+            and fresh > 0
+            and stored > 0
+        ):
+            out["price_ratio"] = round(fresh / stored, 3)
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its refresh
+        out["price_ratio"] = None
+    return out
+
+
+def _handleless_refusal(
+    *,
+    requested_url: str,
+    observed: Dict[str, Any],
+    evidence: Dict[str, Any],
+    seed_title: Any,
+    seed_brand: Any,
+    fresh_amount: Any,
+    fresh_currency: Any,
+    stored_amount: Any,
+    stored_currency: Any,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(refusal, listing segment, identity_by): the first guard that refuses, in order, or (None, None, how)."""
+    # G0
+    if observed.get("from_cache"):
+        return "cache", None, None
+    # G1
+    status = observed.get("status_code")
+    if not isinstance(status, int) or isinstance(status, bool) or not 200 <= status < 300:
+        return "status", None, None
+    if observed.get("bot_challenged"):
+        return "challenge", None, None
+    hops = observed.get("redirect_hops")
+    if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
+        return "redirect_unknown", None, None
+    if hops > 0 or not _same_fetched_url(requested_url, observed.get("final_url")):
+        return "redirect", None, None
+    # G2
+    segment = _listing_segment(requested_url)
+    if segment:
+        return "segment", segment, None
+    # G3
+    identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+    if not isinstance(identity, dict) or not identity.get("pricing_node"):
+        return "no_product", None, None
+    if identity.get("listing_types"):
+        return "structure", None, None
+    count = identity.get("priced_identities")
+    if not isinstance(count, int) or count < 1:
+        return "no_product", None, None
+    if count > 1:
+        return "structure", None, None
+    # G4
+    base = observed.get("final_url") or requested_url
+    candidate = None
+    for raw in (identity.get("url"), identity.get("id"), identity.get("group_url")):
+        if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("#"):
+            try:
+                candidate = urljoin(str(base), raw.strip()).split("#", 1)[0]
+            except ValueError:  # an unparsable URL names nothing we can match: refused, never raised
+                return "identity_url_mismatch", None, None
+            break
+    if candidate:
+        if not _same_product_url(candidate, requested_url):
+            return "identity_url_mismatch", None, None
+        identity_by = "url"
+    else:
+        name = identity.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return "identity", None, None
+        if not handleless_titles_match(seed_title, name, brands=(seed_brand, identity.get("brand"))):
+            return "identity", None, None
+        identity_by = "title"
+    # G5
+    price_read = evidence.get("price_read") if isinstance(evidence.get("price_read"), dict) else {}
+    try:
+        amount = float(fresh_amount) if fresh_amount is not None else None
+    except (TypeError, ValueError):
+        amount = None
+    if amount is None or not amount > 0 or price_read.get("status") != "parsed" or not fresh_currency:
+        return "price", None, identity_by
+    if price_read.get("source") != "jsonld":
+        return "price_source", None, identity_by
+    census = evidence.get("variant_census") if isinstance(evidence.get("variant_census"), dict) else {}
+    if identity.get("offer_kind") != "single" or census.get("product_price_exact") is not True:
+        return "price_inexact", None, identity_by
+    if _FROM_PRICE_RE.search(unicodedata.normalize("NFKC", str(price_read.get("raw") or "")).casefold()):
+        # "From $19.00" is the bottom of a range, not this product's price.
+        return "price_inexact", None, identity_by
+    # G6
+    try:
+        stored = float(stored_amount) if stored_amount is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    same_currency = str(stored_currency or "").strip().upper() == str(fresh_currency or "").strip().upper()
+    if stored is not None and stored > 0 and same_currency:
+        low, high = HANDLELESS_PRICE_MOVE_BOUNDS
+        if not low * stored <= amount <= high * stored:
+            return "price_move", None, identity_by
+    return None, None, identity_by
+
+
+def classify_handleless_read(
+    *,
+    requested_url: str,
+    observed: Dict[str, Any],
+    evidence: Any,
+    today: Optional[DestinationObservation],
+    mode: str,
+    seed_title: Any,
+    seed_brand: Any = None,
+    fresh_amount: Any = None,
+    fresh_currency: Any = None,
+    stored_amount: Any = None,
+    stored_currency: Any = None,
+) -> HandlelessDecision:
+    """May this fetch of a served URL with NO product handle count as a read of the served product?
+
+    `requested_url` is the URL the fetch SENT (`external_offers_service._normalize_url` of the destination);
+    `observed` is `_fetch_html`'s out-parameter; `evidence` the snapshot's (`snapshot_evidence`); `today` the
+    observation the caller already has (`classify_destination`'s). See the guard list above.
+
+    A refusal, and `shadow`, return `today` and no read: EXACTLY what the caller had. Only `on` with every guard
+    passing returns `live` (uncorroborated: it can reset a streak and lift a pending hide, never advance or retire)
+    and a read. Pure: no I/O, no env (the caller passes `mode`).
+    """
+    refusal, segment, identity_by = _handleless_refusal(
+        requested_url=requested_url,
+        observed=observed or {},
+        evidence=evidence if isinstance(evidence, dict) else {},
+        seed_title=seed_title,
+        seed_brand=seed_brand,
+        fresh_amount=fresh_amount,
+        fresh_currency=fresh_currency,
+        stored_amount=stored_amount,
+        stored_currency=stored_currency,
+    )
+    if refusal is None and today is not None and today.verdict != VERDICT_UNVERIFIABLE:
+        # Never over an observation that said something: a 2xx handle-less fetch is `unverifiable` today.
+        refusal = "status"
+    would_read = refusal is None
+    if would_read and mode == "on":
+        observation = DestinationObservation(
+            VERDICT_LIVE,
+            int(observed["status_code"]),
+            observed.get("final_url"),
+            HANDLELESS_LIVE_NOTE.format(by=identity_by),
+            corroborated=False,
+        )
+        return HandlelessDecision(observation, True, True, None, segment, identity_by)
+    return HandlelessDecision(today, False, would_read, refusal, segment, identity_by)
 
 
 def should_retire(verdict: str, failure_streak: int) -> bool:
@@ -628,7 +1112,8 @@ async def record_destination_observation(
     row = await database.fetch_one(
         """
         SELECT destination_checked_at, destination_verdict, destination_failure_streak,
-               destination_corroborated_dead_at, status
+               destination_corroborated_dead_at, status, destination_http_status,
+               destination_dead_404_since, last_crawled_at
         FROM external_product_seeds
         WHERE id = :id
         """,
@@ -638,6 +1123,7 @@ async def record_destination_observation(
         return {"seed_id": seed_id, "status": "missing"}
     current = dict(row)
     next_streak, next_corroborated_dead_at = next_streak_state(current, observation, stamp)
+    dead_404_since = next_dead_404_since(current, observation, stamp)
 
     await database.execute(
         """
@@ -652,6 +1138,7 @@ async def record_destination_observation(
             END,
             destination_failure_streak = :streak,
             destination_corroborated_dead_at = :corroborated_dead_at,
+            destination_dead_404_since = :dead_404_since,
             destination_checked_at = CASE
                 WHEN CAST(:reached_origin AS BOOLEAN) THEN :checked_at
                 ELSE destination_checked_at
@@ -664,6 +1151,7 @@ async def record_destination_observation(
             "http_status": observation.http_status,
             "streak": next_streak,
             "corroborated_dead_at": next_corroborated_dead_at,
+            "dead_404_since": dead_404_since,
             "reached_origin": bool(observation.reached_origin),
             "checked_at": stamp,
         },
@@ -677,6 +1165,12 @@ async def record_destination_observation(
         "checked_at": stamp.isoformat() if observation.reached_origin else None,
         "retire": retire,
     }
+    # THE UNCONFIRMED-DEAD HIDE IS ONLY DECIDED HERE, never applied: the refresh batch applies it per host
+    # after its run (`apply_unconfirmed_hides`), so this writer, which sees one row, cannot hide a host's
+    # whole catalogue on a host-wide 404. Decided only with the flag on or in shadow; nothing is written.
+    if unconfirmed_hide_mode() != "off" and unconfirmed_hide_candidate(current, observation, stamp, dead_404_since):
+        result["unconfirmed_hide_candidate"] = True
+        result["dead_404_since"] = _as_utc(dead_404_since).isoformat()
     # THE PENDING STEP. Hide on a corroborated confirmed-dead observation that leaves the streak
     # at 1 or more (retirement itself handles 2); lift on any answer from the origin that the
     # page is alive. NOT gated on the streak this observation reset: the reset above has already
@@ -696,11 +1190,171 @@ async def record_destination_observation(
         )
         result["pending_suppressed"] = len(moved["products"])
     elif observation.reached_origin and not observation.confirmed_dead:
+        mirror_keys = await _mirror_product_keys(seed_id)
         moved = await destination_dead_suppression.lift_pending(
-            await _mirror_product_keys(seed_id), reason=PENDING_SUPPRESSION_REASON, db=database,
+            mirror_keys, reason=PENDING_SUPPRESSION_REASON, db=database,
         )
         result["pending_lifted"] = len(moved["products"])
+        # The unconfirmed-dead reason lifts on the same answer, flag or no flag, on every lane: the
+        # single-seed refresh route and the sweep never hide under it, but they do lift it.
+        unconfirmed = await destination_dead_suppression.lift_pending(
+            mirror_keys, reason=UNCONFIRMED_DEAD_REASON, db=database,
+        )
+        result["unconfirmed_lifted"] = len(unconfirmed["products"])
     return result
+
+
+def count_unconfirmed_observation(
+    by_host: Dict[str, Dict[str, Any]], host: str, seed_id: str, destination_refresh: Any
+) -> None:
+    """Count one refresh row's observation for the unconfirmed-dead hide, under its host: `observed`,
+    `reached_origin`, `dead_404` (a hard 404), `lifted` (rows whose mirror this answer un-hid) and the
+    candidates (`record_destination_observation`'s `unconfirmed_hide_candidate`), kept with the run start
+    they were decided on so the apply step can check the row has not moved since."""
+    if not isinstance(destination_refresh, dict) or not destination_refresh.get("verdict"):
+        return
+    counts = by_host.setdefault(host or "unknown", {"observed": 0, "reached_origin": 0, "dead_404": 0,
+                                                    "lifted": 0, "candidates": []})
+    counts["observed"] += 1
+    if destination_refresh.get("checked_at") is None:
+        return
+    counts["reached_origin"] += 1
+    if (destination_refresh.get("verdict") == VERDICT_DEAD_404
+            and destination_refresh.get("http_status") in UNCONFIRMED_DEAD_STATUSES):
+        counts["dead_404"] += 1
+    if int(destination_refresh.get("unconfirmed_lifted") or 0) > 0:
+        counts["lifted"] += 1
+    if destination_refresh.get("unconfirmed_hide_candidate"):
+        counts["candidates"].append((seed_id, destination_refresh.get("dead_404_since")))
+
+
+def unconfirmed_host_braked(counts: Dict[str, Any]) -> bool:
+    """The host brake: at least `UNCONFIRMED_BRAKE_MIN_REACHED` rows reached the origin this run and more than
+    `UNCONFIRMED_BRAKE_MAX_DEAD_SHARE` of them were hard 404s. A redesign, a domain move or a WAF answering 404
+    to us looks like that; one product taken down does not."""
+    reached = int(counts.get("reached_origin") or 0)
+    dead = int(counts.get("dead_404") or 0)
+    return reached >= UNCONFIRMED_BRAKE_MIN_REACHED and dead > UNCONFIRMED_BRAKE_MAX_DEAD_SHARE * reached
+
+
+#: The candidate is re-read before it is hidden: still active, still in the SAME run of hard 404s it was
+#: decided on, and still unread since that run began. Anything else moved it after the decision. FOR UPDATE, in
+#: the same transaction as the hide: an observation that answers live meanwhile waits for the hide to commit,
+#: then lifts it; one that wrote first is seen here and nothing is hidden.
+UNCONFIRMED_RECHECK_SQL = """
+    SELECT status, destination_verdict, destination_http_status, destination_dead_404_since, last_crawled_at
+      FROM external_product_seeds
+     WHERE id = :id
+     FOR UPDATE
+"""
+
+UNCONFIRMED_LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '2s'"
+
+#: What `on` would hide for one candidate (shadow): its mirror products nobody has suppressed yet.
+UNCONFIRMED_WOULD_HIDE_SQL = """
+    SELECT COUNT(*) AS n
+      FROM catalog_products
+     WHERE source_ref = :id
+       AND source_system = :source_system
+       AND suppressed_at IS NULL
+"""
+
+
+def _still_a_candidate(row: Any, dead_404_since: Any) -> bool:
+    if not row:
+        return False
+    current = dict(row)
+    since = current.get("destination_dead_404_since")
+    if (
+        current.get("status") != "active"
+        or current.get("destination_verdict") != VERDICT_DEAD_404
+        or current.get("destination_http_status") not in UNCONFIRMED_DEAD_STATUSES
+        or since is None
+        or dead_404_since is None
+        or _as_utc(since) != _as_utc(dead_404_since)
+    ):
+        return False
+    last_read = current.get("last_crawled_at")
+    return last_read is None or _as_utc(last_read) < _as_utc(since)
+
+
+async def apply_unconfirmed_hides(
+    by_host: Dict[str, Dict[str, Any]], *, mode: str, now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """THE ONLY PLACE THE UNCONFIRMED-DEAD HIDE IS WRITTEN. Called by the refresh batch after its run with the
+    per-host counts `count_unconfirmed_observation` kept. For each host the brake decides (`unconfirmed_host_braked`);
+    an unbraked host's candidates are hidden with `mode == "on"`, each re-checked first (`UNCONFIRMED_RECHECK_SQL`),
+    under `UNCONFIRMED_DEAD_REASON` through the pending machinery (mirror products, then their offers). `shadow`
+    writes nothing and reports what `on` would have hidden. A row that fails is counted and never raises.
+
+    RUN IT ALONE, after every refresh of the run has returned (the batch calls it after `_run_workers`). The
+    `databases` library shares ONE connection between tasks gathered on the same Database, so a writer running
+    concurrently in this process would not be blocked by the FOR UPDATE below: it could answer live between the
+    re-check and the hide on the same connection, leaving the row hidden behind a live verdict. A writer in ANOTHER
+    process (the web route, the sweep) has its own connection and waits for the commit, then lifts.
+
+    Counts (per host and in total): `candidates`, `braked` (candidates the brake held), `would_hide` (unbraked
+    candidates) and, in shadow, `would_hide_products` (their mirror products still unsuppressed); in `on`,
+    `hidden_rows` (rows whose hide moved a product), `hidden_products`, `hidden_offers`, `nothing_moved` (the
+    mirror was already suppressed, or there is none), `changed` (the re-check refused) and `errors`.
+
+    Returns {"mode", "totals", "top_hosts"} (`UNCONFIRMED_TOP_HOSTS` hosts by candidates, then hard 404s).
+    """
+    stamp = now or _now()
+    totals: Dict[str, int] = {}
+    hosts: Dict[str, Dict[str, int]] = {}
+
+    def bump(counter: Dict[str, int], key: str, n: int = 1) -> None:
+        if n:
+            counter[key] = int(counter.get(key) or 0) + n
+
+    for host, counts in by_host.items():
+        candidates = list(counts.get("candidates") or [])
+        out = {k: int(counts.get(k) or 0) for k in ("observed", "reached_origin", "dead_404", "lifted")}
+        out["candidates"] = len(candidates)
+        braked = bool(candidates) and unconfirmed_host_braked(counts)
+        if braked:
+            out["braked"] = len(candidates)
+        elif candidates:
+            out["would_hide"] = len(candidates)
+            for seed_id, dead_404_since in candidates:
+                try:
+                    if mode != "on":
+                        row = await database.fetch_one(
+                            UNCONFIRMED_WOULD_HIDE_SQL, {"id": seed_id, "source_system": MIRROR_SOURCE_SYSTEM}
+                        )
+                        bump(out, "would_hide_products", int((dict(row) if row else {}).get("n") or 0))
+                        continue
+                    async with database.transaction():
+                        # A seed row held longer than this (a stuck writer, a lock cycle) is an `errors` row, not
+                        # a stalled run. LOCAL: it ends with this transaction.
+                        await database.execute(UNCONFIRMED_LOCK_TIMEOUT_SQL)
+                        row = await database.fetch_one(UNCONFIRMED_RECHECK_SQL, {"id": seed_id})
+                        if not _still_a_candidate(row, dead_404_since):
+                            bump(out, "changed")
+                            continue
+                        moved = await destination_dead_suppression.suppress_pending(
+                            await _mirror_product_keys(seed_id), reason=UNCONFIRMED_DEAD_REASON, stamp=stamp,
+                            db=database,
+                        )
+                except Exception:  # noqa: BLE001 - one row's failure never costs the run its summary
+                    logger.warning("unconfirmed-dead hide failed for one row", exc_info=True)
+                    bump(out, "errors")
+                    continue
+                if moved["products"]:
+                    bump(out, "hidden_rows")
+                    bump(out, "hidden_products", len(moved["products"]))
+                    bump(out, "hidden_offers", len(moved["offers"]))
+                else:
+                    bump(out, "nothing_moved")
+        for key, value in out.items():
+            bump(totals, key, value)
+        hosts[host] = {k: v for k, v in out.items() if v}
+    bump(totals, "braked_hosts", sum(1 for h in hosts.values() if h.get("braked")))
+    top = sorted(
+        hosts.items(), key=lambda kv: (-int(kv[1].get("candidates") or 0), -int(kv[1].get("dead_404") or 0), kv[0])
+    )[:UNCONFIRMED_TOP_HOSTS]
+    return {"mode": mode, "totals": dict(sorted(totals.items())), "top_hosts": dict(top)}
 
 
 #: The seed -> mirror link is the PAIR (source_ref, source_system); see retirement below.
@@ -756,6 +1410,63 @@ def next_streak_state(
         # streak was really earned earlier, so this can only delay a retirement.
         return streak, stamp
     return streak, corroborated_dead_at
+
+
+def is_hard_404(observation: DestinationObservation) -> bool:
+    """A 404 or 410 from the origin, recorded as `dead_404`."""
+    return bool(
+        observation.reached_origin
+        and observation.verdict == VERDICT_DEAD_404
+        and observation.http_status in UNCONFIRMED_DEAD_STATUSES
+    )
+
+
+def next_dead_404_since(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime
+) -> Optional[Any]:
+    """`destination_dead_404_since` after `observation`. Pure.
+
+    An `unverifiable` observation moves nothing. Any other answer that is not a hard 404 clears it. A hard 404
+    continues a run ONLY when the stored verdict is itself a hard 404: it keeps the stored start, or, when the
+    column predates the run, starts it at `destination_checked_at` (that check was a 404 of this run, so the run
+    began then or earlier: the gap can only come out short). Otherwise it starts a run now. A stored start
+    under a stored `live` (a writer on an older image answered live without clearing it) is not a run: keeping
+    it would make 404 -> live -> 404 a candidate, the ping-pong the rule excludes.
+    """
+    if not observation.reached_origin:
+        return current.get("destination_dead_404_since")
+    if not is_hard_404(observation):
+        return None
+    stored_hard_404 = (
+        current.get("destination_verdict") == VERDICT_DEAD_404
+        and current.get("destination_http_status") in UNCONFIRMED_DEAD_STATUSES
+    )
+    if not stored_hard_404:
+        return stamp
+    since = current.get("destination_dead_404_since")
+    if since is not None:
+        return since
+    return current.get("destination_checked_at") or stamp
+
+
+def unconfirmed_hide_candidate(
+    current: Dict[str, Any], observation: DestinationObservation, stamp: datetime, dead_404_since: Optional[Any]
+) -> bool:
+    """Would the unconfirmed-dead hide take this row? Pure. All of:
+
+    * this observation is a hard 404 (`is_hard_404`) that the sweep did not corroborate (a corroborated one
+      takes the pending path instead);
+    * the run of hard 404s it belongs to began at least `UNCONFIRMED_DEAD_MIN_GAP` ago, so the row answered
+      404 at least twice, a day or more apart;
+    * nothing read the page since the run began (`last_crawled_at` is NULL or earlier).
+    """
+    if not is_hard_404(observation) or observation.corroborated or dead_404_since is None:
+        return False
+    since = _as_utc(dead_404_since)
+    if _as_utc(stamp) - since < UNCONFIRMED_DEAD_MIN_GAP:
+        return False
+    last_read = current.get("last_crawled_at")
+    return last_read is None or _as_utc(last_read) < since
 
 
 def _gap_anchor(current: Dict[str, Any]) -> Optional[Any]:
@@ -852,7 +1563,7 @@ async def retire_seed_for_dead_destination(
             updated_at = NOW()
         WHERE source_ref = :id
           AND source_system = :source_system
-          AND (suppressed_at IS NULL OR suppression_reason = :pending_reason)
+          AND (suppressed_at IS NULL OR suppression_reason IN (:pending_reason, :unconfirmed_reason))
         RETURNING product_key
         """,
         {
@@ -862,6 +1573,8 @@ async def retire_seed_for_dead_destination(
             # A row hidden by the pending step is OURS: retirement takes it over (and its pending
             # offers become ordinary cascaded offers below) instead of leaving it pending forever.
             "pending_reason": PENDING_SUPPRESSION_REASON,
+            # So is a row hidden by the unconfirmed-dead step: two corroborated observations outrank it.
+            "unconfirmed_reason": UNCONFIRMED_DEAD_REASON,
             # `source_ref` ALONE IS NOT THE LINK. services/external_offer_dual_write states the
             # contract: "catalog_products.source_ref = external_product_seeds.id WITH THIS
             # source_system — that pair is the stable seed->product link", and
@@ -887,7 +1600,7 @@ async def retire_seed_for_dead_destination(
     # database than the statement above.
     gated_keys = [str(row["product_key"]) for row in (suppressed or [])]
     relabeled = await destination_dead_suppression.relabel_pending_offers(
-        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, db=database
+        gated_keys, pending_reason=PENDING_SUPPRESSION_REASON, also_reason=UNCONFIRMED_DEAD_REASON, db=database
     )
     cascaded = relabeled + await cascade_offer_suppression(gated_keys, db=database)
     logger.info(
@@ -1079,6 +1792,7 @@ async def run_destination_sweep(
         "seeds_retired": 0,
         "pending_suppressed": 0,
         "pending_lifted": 0,
+        "unconfirmed_lifted": 0,
         "verdicts": {v: 0 for v in ALL_VERDICTS},
         # Probes whose final URL was on ANOTHER host but still named a product handle (a domain
         # move, classified as usual; see `DestinationObservation.cross_host`).
@@ -1168,6 +1882,7 @@ async def run_destination_sweep(
                 )
                 summary["pending_suppressed"] += int(result.get("pending_suppressed") or 0)
                 summary["pending_lifted"] += int(result.get("pending_lifted") or 0)
+                summary["unconfirmed_lifted"] += int(result.get("unconfirmed_lifted") or 0)
                 if observation.confirmed_dead:
                     summary["dead_links_found"] += 1
                 if retire and result.get("retire"):
@@ -1250,6 +1965,12 @@ __all__: Iterable[str] = (
     "RETIREMENT_STREAK",
     "PENDING_SUPPRESSION_FLAG",
     "PENDING_SUPPRESSION_REASON",
+    "UNCONFIRMED_DEAD_REASON",
+    "UNCONFIRMED_HIDE_ENV",
+    "apply_unconfirmed_hides",
+    "count_unconfirmed_observation",
+    "unconfirmed_hide_candidate",
+    "unconfirmed_hide_mode",
     "SUPPRESSION_REASON",
     "VERDICT_DEAD_404",
     "VERDICT_LIVE",

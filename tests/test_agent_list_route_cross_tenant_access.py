@@ -344,11 +344,10 @@ def test_search_cannot_enumerate_other_owners_emails(client, agents_db):
 # ---------------------------------------------------------------------------
 
 
-def test_agent_identified_only_by_user_id_sees_its_own_record(client, agents_db):
-    """Some agent tokens carry the identity as `user_id`, not `agent_id`; the
-    detail route and update_agent both honour that. Kills a scoping fix built
-    on can_access_agent alone, which reads `agent_id` only and would hand those
-    agents an empty list."""
+def test_a_user_id_claim_names_no_agent(client, agents_db):
+    """`user_id` is a users-table id, never an agent id: a token carrying the agent
+    id only there (and the owner's email) lists nothing. Only an `agent` token's own
+    agent_id claim names an agent (routes/agent_management._own_agent_identity)."""
     token = _token(
         {"sub": AGENT_A, "email": AGENT_A_EMAIL, "role": "agent", "user_id": AGENT_A}
     )
@@ -356,7 +355,7 @@ def test_agent_identified_only_by_user_id_sees_its_own_record(client, agents_db)
     resp = client.get("/agents/", headers=_auth(token))
 
     assert resp.status_code == 200, resp.text
-    assert _agent_ids(resp.json()) == [AGENT_A]
+    assert _agent_ids(resp.json()) == []
 
 
 def test_agent_whose_email_is_not_the_records_owner_email_still_sees_it(client, agents_db):
@@ -387,15 +386,16 @@ def test_agent_whose_email_is_not_the_records_owner_email_still_sees_it(client, 
     )
 
 
-def test_agent_identified_only_by_email_sees_its_own_record(client, agents_db):
-    """The email fallback, matched against the record's own owner_email -- the
-    relation _is_own_agent_record settled on for the detail route."""
+def test_an_owner_email_match_alone_lists_nothing(client, agents_db):
+    """The email fallback is gone. owner_email was never proven (staff create agents
+    whose owner_email has no users row, and self-service signup at that address
+    inherited the agent), and /auth/signin minted agent tokens without the claim."""
     token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
 
     resp = client.get("/agents/", headers=_auth(token))
 
     assert resp.status_code == 200, resp.text
-    assert _agent_ids(resp.json()) == [AGENT_A]
+    assert _agent_ids(resp.json()) == []
 
 
 def test_email_identity_does_not_open_another_agents_record(client, agents_db):
@@ -497,7 +497,7 @@ def test_the_refusal_happens_before_the_query(client, agents_db):
 # ---------------------------------------------------------------------------
 
 
-def test_agent_whose_address_lives_in_email_sees_its_own_record(client, legacy_agents_db):
+def test_an_address_in_the_legacy_email_column_lists_nothing(client, legacy_agents_db):
     """The lockout this file could not previously see.
 
     The employee create route (retired in pivota-backend#2305) wrote
@@ -508,15 +508,13 @@ def test_agent_whose_address_lives_in_email_sees_its_own_record(client, legacy_a
     explicit 403. The earlier fixture was built from the SQLAlchemy model,
     which has no `email` column, so it could not represent such a row at all.
     """
+    # Since the email fallback went, an address (in either column) names no agent.
     token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
 
     resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
 
     assert resp.status_code == 200, resp.text
-    assert _agent_ids(resp.json()) == [AGENT_A], (
-        "an agent whose address is stored in `email` was locked out of its own "
-        f"record: {resp.text}"
-    )
+    assert _agent_ids(resp.json()) == []
 
 
 def test_the_email_column_does_not_widen_access(client, legacy_agents_db):
@@ -570,7 +568,7 @@ def test_the_column_probe_runs_once_not_per_request(client, agents_db):
     )
 
 
-def test_a_padded_owner_email_matches(client, monkeypatch):
+def test_a_padded_owner_email_matches_nothing(client, monkeypatch):
     """The trim half. _is_own_agent_record normalizes the stored value with
     .strip().lower(); a SQL comparison that only lowercased would disagree with
     it, so an agent could read its record through GET /agents/{id} and get an
@@ -584,9 +582,7 @@ def test_a_padded_owner_email_matches(client, monkeypatch):
     resp = client.get("/agents/", params={"limit": 100}, headers=_auth(token))
 
     assert resp.status_code == 200, resp.text
-    assert _agent_ids(resp.json()) == [AGENT_A], (
-        f"a padded owner_email did not match its own token: {resp.text}"
-    )
+    assert _agent_ids(resp.json()) == []
 
 
 def test_a_failed_probe_is_not_cached_forever(client, monkeypatch):
@@ -612,7 +608,7 @@ def test_a_failed_probe_is_not_cached_forever(client, monkeypatch):
 
     monkeypatch.setattr(spy, "fetch_one", flaky_fetch_one)
     monkeypatch.setattr(mod, "database", spy)
-    token = _token({"sub": "u-legacy", "email": AGENT_A_EMAIL, "role": "agent"})
+    token = _agent_token(AGENT_A, AGENT_A_EMAIL)
 
     first = client.get("/agents/", headers=_auth(token))
     assert first.status_code == 200, first.text

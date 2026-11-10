@@ -1,7 +1,7 @@
 # ADR-027: Best effective price comes from checkout-verified deals, never from scraped coupon sites
 
-**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link) and 2026-10-31 (Q13 program permission to test, Q14 the network lane). Amended 2026-11-02 with ADR-028 (Q15 the completed-checkout lane, Q16 completable offers rank first).
-- peng resolved four questions on 2026-10-29, eight more on 2026-10-30, two on 2026-10-31 and two on 2026-11-02 (see "Resolved questions").
+**Status:** Proposed, 2026-10-29. Revised 2026-10-30 after review. Amended 2026-10-30 (Q5 ranking, Q11 coverage before checkout, Q12 code and attribution on one link) and 2026-10-31 (Q13 program permission to test, Q14 the network lane). Amended 2026-11-02 with ADR-028 (Q15 the completed-checkout lane, Q16 completable offers rank first). Amended 2026-11-07 (amendment 4: Q17 Q2's approval given, Q18 where codes come from, Q19 the UCP cart verification route, Q20 seller identity, Q21 the code and our attribution on storefront checkouts).
+- peng resolved four questions on 2026-10-29, eight more on 2026-10-30, two on 2026-10-31, two on 2026-11-02 and five on 2026-11-07 (see "Resolved questions").
 - Phase 0a ran on 2026-10-29. Its base was unusable, so the gate has not been computed (see "Phases and gates").
 
 **Decision owner:** peng
@@ -552,3 +552,38 @@ That shows peng whether a failed gate means few deals or few connections.
    - Among the completable offers for that product, Q6 orders them: by the served price, and by the verified effective price only once Q6's measurement gate has opened for that lane.
    - Completability orders sellers within one product only. It never reorders products in a recommendation slate.
    - Whether an offer carries our attribution never affects its rank (ADR-025 Q4). An offer Pivota can complete without commission ranks like any other completable offer (ADR-028 D4).
+
+## Resolved questions (peng, 2026-11-07): amendment 4
+
+17. **Q2's separate approval is given.**
+   - peng approved, on 2026-11-07, testing codes against stores that have no relationship with Pivota. Its form stays recorded outside this ADR (Q10).
+   - D3's testing policy still applies in full to every such test: one unit of one variant in the deal's market, never completed, the per-host daily cart cap, joint pacing with the crawl jobs, the merchant opt-out denylist (D2) and the stop rule (D7).
+   - `DEAL_VERIFY_NONCONNECTED_ENABLED` may now be set, on its own go. Until it is set, the verifier still refuses such hosts.
+   - Accepted with this approval: every test leaves one anonymous cart on the store, never deleted; our code attempts appear in the merchant's own analytics; and the tests leave from shared egress addresses.
+   - A program host (Q13) is still tested only under its program's permission. This approval never authorizes it.
+18. **Where codes come from.**
+   - `merchant_published` codes come from our own reading of store pages the refresh job already downloads (the promo regions of each page).
+   - `authorized_feed` codes come from the coupon feeds of programs we have joined (Q13, Q14).
+   - A code from either source is stored as an **unverified observation**. Nothing serves or emits it until D3 has verified it (D5).
+   - **Not a source: Grounding with Google Search.**
+     - Google's Service Specific Terms (Grounding with Google Search) forbid caching, storing or analyzing grounded results, and using the feature to collect links or build an index.
+     - Grounded results may only be shown, with their search suggestions, to the person who asked.
+     - So grounded search may never feed `observed_store_offers`, a verification queue or a metric. D1 is unchanged: coupon aggregators stay out of scope, however they are reached.
+   - **Retention of unverified observations.** An unverified `merchant_published` row that is not seen again and never verified is deleted after a fixed period. peng sets the period; until a deletion job exists, the write flag stays off.
+19. **A UCP cart is a verification route (it extends amendment 3).**
+   - A store's UCP checkout door may be asked for a `create_cart` with the code in `discounts.codes`, as well as a `create_checkout`. The UCP discount extension allows codes on a cart.
+   - Allowed only when the store's own profile advertises the discount capability as extending carts. A store that advertises it for checkouts only is asked through a checkout, or not at all.
+   - One unit of one variant, in the deal's market currency. Never completed.
+   - `verified_via` is `ucp_checkout`. Applied, rejected or not confirmed is read exactly as the buyer's own checkout reads it.
+   - The request carries Pivota's agent profile and no bearer credential. It is refused for Pivota's own hosts, for platform hosts that are never a merchant, and for an endpoint the store's profile names on such a host.
+20. **Seller identity.**
+   - A row from a connected store keys its seller by the catalog merchant id, as before.
+   - A row from our own page reading, or verified through a store's UCP door, keys its seller by the store's host (lower-case, `www.` removed), the identity that lane holds.
+   - The opt-out denylist (D2) matches a seller by its host, the `www.` form of that host, and every merchant id the catalog holds for that host. A seller who opts out is never read, tested or served under either form.
+   - Each lane looks up deals by the identity it holds.
+21. **The code and our attribution on a storefront checkout.** Q12 and Q14 hold on the storefront (UCP) lane too:
+   - For a store in a program we have joined, the link handed to the buyer is the network's tracking link carrying our sub-id, whose destination is the store's cart holding the code. It is used only after that program's carrier check (Q14) passes; otherwise the buyer gets the tracking-only link and no code.
+   - The cart is also stamped with UCP's `attribution` member (our click id and source), as order evidence.
+   - A code that a network attributes to another partner is never applied.
+   - A store with no program has no commission to protect: the code may be applied with the cart's own attribution as the only evidence (ADR-028 D4).
+

@@ -528,6 +528,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
     from routes.agent_checkout_intents import mint_checkout_token
     from routes.agent_auth import get_agent_context
     from routes import agent_checkout_intents
+    from db import buyer_vault
 
     intent_id = "ci_test_intent"
     agent_user_ref = "https://agent.tools.example:user_123"
@@ -572,7 +573,7 @@ def test_checkout_prefill_anonymous_uses_identity_linked_buyer_vault(app, client
             }
         if isinstance(query, str) and "from buyer_identity_links" in query.lower():
             assert (values or {}).get("agent_id") == "agent_test"
-            assert (values or {}).get("agent_user_ref_hash") == agent_checkout_intents.hash_agent_user_ref(agent_user_ref)
+            assert (values or {}).get("agent_user_ref_hash") == buyer_vault.hash_agent_user_ref(agent_user_ref)
             return {"buyer_id": "buyer_1"}
         if isinstance(query, str) and "from shop_users" in query.lower():
             return {"email": "vault@example.com"}
@@ -807,3 +808,15 @@ def test_agent_list_orders_is_agent_scoped(client, monkeypatch):
     assert payload.get("status") == "success"
     assert payload.get("total") == 1
     assert payload.get("orders")[0]["order_id"] == "ord_1"
+
+
+@pytest.fixture(autouse=True)
+def _quote_rows_owned_by_the_test_agent(monkeypatch):
+    """S-28: order create first checks who owns the quote row. These tests fake the quote LOAD, so
+    the quote they stand for belongs to this file's agent."""
+    import services.quote_service as quote_service_module
+
+    async def owned_row(quote_id: str):
+        return {"quote_id": quote_id, "agent_id": 'agent_test', "snapshot_json": {}}
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)

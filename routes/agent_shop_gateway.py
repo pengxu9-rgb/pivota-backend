@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
@@ -47,7 +48,10 @@ from services.outbound_warm_handoff import (
     STOCK_OUT_OF_STOCK,
     VARIANT_DECLINE_KEY,
     VARIANT_NOT_NAMED,
+    WARM_FACT_HUMAN_HANDOFF,
+    WARM_FACT_KEY,
     could_upgrade_at_click_time,
+    is_affiliate_destination,
 )
 import db.merchant_purchasability as merchant_purchasability
 from services.offer_buyability import (
@@ -3041,8 +3045,18 @@ class MultiSearchFilters(BaseModel):
     # `market_observed` on minted `/r` tokens; it filters and serves nothing. `exclude=True` keeps
     # it out of every `model_dump`, so no cache key or forwarded body changes because of it.
     market: Optional[str] = Field(None, exclude=True, description="Buyer market, provenance only")
+    # DECISION D-10: the gateway sends `market: "US"` for a search that named no market, and says so here. The
+    # market is then ASSUMED, not observed (`_request_market_for_multi` answers None), so a minted `/r` token never
+    # claims the buyer named it. Provenance only, and excluded from every dump like `market`.
+    market_assumed: bool = Field(False, exclude=True, description="The market was assumed, provenance only")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_true_or_false(cls, value: Any) -> bool:
+        """Only a literal True assumes; anything else (a string, a number) is the default: not assumed."""
+        return strict_true(value)
 
     @field_validator("market", mode="before")
     @classmethod
@@ -3154,8 +3168,22 @@ class OffersResolvePayload(BaseModel):
         alias="liveVerificationsDryRun",
         description="Answer identically, record no issued clicks (internal)",
     )
+    # DECISION D-10: the gateway's get_offers sends `market: "US"` for a call that named no market (so the
+    # cart gate and currency filter run as US) and says so here. The market is then ASSUMED, not observed:
+    # a minted `/r` token must not claim the buyer named it. Absent/False: unchanged.
+    market_assumed: bool = Field(
+        False,
+        alias="marketAssumed",
+        description="The market was assumed (US) for a request that named none (internal)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_literal_true(cls, value: Any) -> bool:
+        """Only a literal True; anything else (None, "true", 1, {...}) is not assumed, and never an error."""
+        return strict_true(value)
 
 
 #: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
@@ -3266,7 +3294,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
     for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
                 "include_live_verification_offers", "includeLiveVerificationOffers",
                 "live_verifications", "liveVerifications",
-                "live_verifications_dry_run", "liveVerificationsDryRun"):
+                "live_verifications_dry_run", "liveVerificationsDryRun",
+                "market_assumed", "marketAssumed"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -4406,6 +4435,13 @@ async def _handle_offers_resolve(
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
     market_hint = str(payload.market or "").strip() or None
+    # DECISION D-10: a market the gateway ASSUMED (US, `marketAssumed`) is the market this answer is decided for --
+    # the cart gate, the currency filter and the served market all use `market_hint` -- but it was never NAMED, so
+    # every `market_observed` / cart-pin decision below reads this instead: None, exactly as for no market.
+    # Honoured ONLY as a literal True beside a market that normalizes to US (services/request_market): beside a
+    # declared SG it is ignored, so the flag can never downgrade a market a caller named.
+    _market_assumed = assumed_flag_honoured(payload.market_assumed, market_hint)
+    observed_market_hint = None if _market_assumed else market_hint
     tool_hint = str(payload.tool or "").strip() or None
     limit = int(payload.limit or 10)
     attached_seed_limit = min(max(limit * 6, 40), 240)
@@ -5295,6 +5331,9 @@ async def _handle_offers_resolve(
                 # kept as its own counter because it is a different question (how many
                 # hand-overs actually got a cart) and folding the two lost it.
                 _preflight_stats["candidates"] += 1
+                # Set when an ENFORCED preflight withdrew this offer's cart; the warm-fact stamp
+                # must not hand the click lane back the cart the preflight just refused.
+                _preflight_refused = False
                 # `is_enabled()` here, not only inside the helper. The helper short-circuits so
                 # no request is spent when off — but the COUNTERS still moved, so an off
                 # request attached coverage fields describing work nobody did.
@@ -5369,6 +5408,7 @@ async def _handle_offers_resolve(
                         )
                     if not _allowed:
                         _preflight_stats["degraded_to_referral"] += 1
+                        _preflight_refused = True
                         redirect_identity = dict(redirect_identity)
                         redirect_identity["cart_variant_id"] = None
 
@@ -5428,6 +5468,38 @@ async def _handle_offers_resolve(
                 # lane: the buyer has not chosen, which is what it was built for.
                 _named_without_cart = bool(sku_id) and not redirect_identity.get("cart_variant_id")
 
+                # FACT-DRIVEN WARM ELIGIBILITY: a cold link (no cart) whose host holds a fresh
+                # human-handoff fact is signed `warm_fact`, so the click lane may upgrade it even
+                # when the brand is not on the hand allowlist. Signed here and passed to
+                # `_cart_prefilled_claim` below, so the published claim reads the same stamp.
+                # Not asked where a knockout already decides the click (a cart, a named variant
+                # without one, a purchasability/stock decline, a live-verification flag): the
+                # stamp could change nothing there, so it must not cost a read.
+                # Also never for a cart the preflight refused, an item this answer calls out of
+                # stock (cold offers carry no `stock_declined` stamp, so the knockout cannot see
+                # it), or an affiliate destination (never warm-handed).
+                _warm_fact = (
+                    None
+                    if _warm_fact_skip_reason(
+                        has_cart=bool(redirect_identity.get("cart_variant_id")),
+                        named_without_cart=_named_without_cart,
+                        purchasability_tier=_purchasability_tier,
+                        stock_declined=_stock_declined,
+                        live_verification_required=bool(offer_requires_live_verification),
+                        preflight_refused=_preflight_refused,
+                        in_stock=in_stock,
+                        dest=str(canonical_url or destination_url),
+                    )
+                    # An ASSUMED market is not asked a warm fact: the token is unobserved, so its click
+                    # re-check could never redeem one (`fact_no_market`), and the answer would claim a
+                    # cart the click lane cannot build. Exactly the no-market answer, as before D-10.
+                    else None
+                    if _market_assumed
+                    else await _cart_purchasability.warm_fact(
+                        str(canonical_url or destination_url), signed_market=used_market
+                    )
+                )
+
                 stable_click_id = new_click_id()
                 redirect_url = await _make_external_redirect_url(
                     market=used_market,
@@ -5435,9 +5507,14 @@ async def _handle_offers_resolve(
                     # LISTED in (the column is NOT NULL, so it always "names" one); with no
                     # `market_hint` the SQL above returns rows of EVERY market, and stamping the
                     # row's would forward a listing market to the purchasability gate as the
-                    # buyer's. With a hint the SQL admits only `market = hint` or `'*'`, so this
-                    # is True exactly when it was before.
-                    market_observed=request_market_observed(market_hint),
+                    # buyer's. NOTE the signed `market` is still the row's (`used_market`), and
+                    # not every query that feeds this loop filters on the hint: the identity
+                    # query admits `market = hint` or `'*'`, but the attached-ref mainline, the
+                    # fuzzy fallback and resolved-group siblings filter on currency only, so a
+                    # CA-listed USD row can serve a US request. That is pre-existing; the
+                    # `warm_fact` stamp above is therefore asked only when the signed market IS
+                    # the request market, so the click re-check asks the market the mint asked.
+                    market_observed=request_market_observed(observed_market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -5458,6 +5535,7 @@ async def _handle_offers_resolve(
                             else {}
                         ),
                         **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if _named_without_cart else {}),
+                        **({WARM_FACT_KEY: _warm_fact} if _warm_fact else {}),
                     },
                     merchant_id=redirect_identity["merchant_id"],
                     product_id=redirect_identity["product_id"],
@@ -5503,7 +5581,7 @@ async def _handle_offers_resolve(
                     recovery_key=_recovery_key,
                     # The SAME pin `_make_external_redirect_url` applied to the link it signed,
                     # from the same two inputs, so the published cart is the signed destination.
-                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(observed_market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -5523,6 +5601,7 @@ async def _handle_offers_resolve(
                     stock_declined=_stock_declined,
                     live_verification_required=bool(offer_requires_live_verification),
                     variant_declined=_named_without_cart,
+                    warm_fact=_warm_fact,
                 )
 
                 offer_spec = {
@@ -6728,7 +6807,7 @@ async def _handle_offers_resolve(
             # "nothing matched".
             redirect_url = await _make_external_redirect_url(
                 market=market_hint or "US",
-                market_observed=request_market_observed(market_hint),
+                market_observed=request_market_observed(observed_market_hint),
                 tool=tool_hint or "offers.resolve",
                 destination_url=destination,
                 utm_template=None,
@@ -11824,6 +11903,47 @@ class _CartPurchasabilityGate:
             self.stats["declined"] += 1
         return allowed
 
+    async def warm_fact(self, destination_url: str, *, signed_market: Any) -> Optional[str]:
+        """`human_handoff` when a COLD link's DESTINATION host holds a fresh human-handoff fact.
+
+        Asked only with the warm lane and OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE on and the dial on,
+        and only for a token that will carry no cart (the caller's job).
+
+        KEYED ON THE DESTINATION HOST, the host the click lane builds its cart on
+        (`resolve_warm_handoff` sends `brand_domain = host(dest)`), and nothing else. The seed's
+        `domain` column can name a different store (writers diverge), and a fact about that one
+        must never authorize a cart on this one. Where the sweep recorded its fact under a
+        different host, this asks a host with no fact and stamps nothing: fail closed.
+        NO PLATFORM CHECK: a positive fact is itself the proof (the sweep only records one after
+        rendering that host's Shopify checkout).
+
+        ONLY WHEN THE TOKEN WILL CARRY THE MARKET THIS ASKS. The gate asks the REQUEST's market;
+        the token is signed with `signed_market` (the seed row's listing market), and the click
+        re-check asks the token's. Some seed queries serve a row listed in another market (a
+        CA-listed USD row on a US request) or in `'*'`; stamping those would let the click
+        re-check a different market's fact than the one the mint read. So a `signed_market`
+        that does not normalize to this request market stamps nothing and reads nothing.
+
+        Shares the per-request memo with `allows_cart` (same reader, same normalization) and
+        does not touch `stats`. Fails closed exactly as `human_handoff_allowed` does. The click
+        lane re-asks the same question at click time, so a fact that lapses inside the token's
+        life only narrows.
+        """
+        if not getattr(settings, "outbound_warm_handoff_enabled", False):
+            return None
+        if not getattr(settings, "outbound_warm_handoff_fact_eligible", False):
+            return None
+        if not self.enforced or self.market is None:
+            return None
+        if merchant_purchasability.normalize_market(signed_market) != self.market:
+            return None
+        host = merchant_purchasability.normalize_domain(destination_url)
+        if not host:
+            return None
+        if host not in self._memo:
+            self._memo[host] = await merchant_purchasability.human_handoff_allowed(host, self.market)
+        return WARM_FACT_HUMAN_HANDOFF if self._memo[host] else None
+
     async def decline_tier(
         self,
         *,
@@ -11874,6 +11994,50 @@ class _CartPurchasabilityGate:
         return {**redirect_identity, "cart_variant_id": None}, tier
 
 
+def _warm_fact_skip_reason(
+    *,
+    has_cart: bool,
+    named_without_cart: bool,
+    purchasability_tier: Optional[str],
+    stock_declined: bool,
+    live_verification_required: bool,
+    preflight_refused: bool,
+    in_stock: Optional[bool],
+    dest: str,
+) -> Optional[str]:
+    """Why a seed link must NOT be asked for a `warm_fact` stamp, or None when it may be.
+
+    Each arm is a case where the stamp could only hand the click lane a cart something else
+    refused, or where the lane would never act on it, so asking would waste a read:
+      * `cart` — the link already IS the cart;
+      * `named_variant` — a named variant without its cart (the rebuild carries no variant);
+      * `purchasability_declined`, `stock_declined`, `live_verification` — the mint withheld
+        the cart and signed why; the knockout fires anyway;
+      * `preflight_refused` — an enforced preflight withdrew the cart and signs nothing, so the
+        knockout could not see it;
+      * `out_of_stock` — this answer publishes `in_stock: false`; a cold offer carries no
+        `stock_declined` stamp (that needs a cart id), so the knockout could not see it either;
+      * `affiliate` — affiliate destinations are never warm-handed.
+    """
+    if has_cart:
+        return "cart"
+    if named_without_cart:
+        return "named_variant"
+    if purchasability_tier:
+        return "purchasability_declined"
+    if stock_declined:
+        return "stock_declined"
+    if live_verification_required:
+        return "live_verification"
+    if preflight_refused:
+        return "preflight_refused"
+    if in_stock is False:
+        return "out_of_stock"
+    if is_affiliate_destination(dest):
+        return "affiliate"
+    return None
+
+
 def _cart_prefilled_claim(
     *,
     cart_url: Optional[str],
@@ -11892,6 +12056,10 @@ def _cart_prefilled_claim(
     live_verification_required: bool = False,
     # Set when a named variant's cart was withheld as another variant's. Same road again.
     variant_declined: bool = False,
+    # The `warm_fact` the mint signed into this token, if any. It can only ADD warm eligibility,
+    # so omitting it errs toward a `False` the lane could contradict: callers that sign it MUST
+    # pass it. (The only signer, offers.resolve's seed mint, does.)
+    warm_fact: Optional[str] = None,
 ) -> Optional[bool]:
     """TRI-STATE: True = prefilled cart, False = bare PDP, None = we cannot promise either.
 
@@ -11966,6 +12134,7 @@ def _cart_prefilled_claim(
             **({STOCK_DECLINE_KEY: STOCK_OUT_OF_STOCK} if stock_declined else {}),
             **({LIVE_VERIFICATION_KEY: LIVE_VERIFICATION_REQUIRED} if live_verification_required else {}),
             **({VARIANT_DECLINE_KEY: VARIANT_NOT_NAMED} if variant_declined else {}),
+            **({WARM_FACT_KEY: warm_fact} if warm_fact else {}),
         },
         settings=settings,
     ):
@@ -12699,6 +12868,11 @@ def _request_market_for_multi(
     """
     search = getattr(payload, "search", None)
     raw = getattr(search, "market", None)
+    if assumed_flag_honoured(getattr(search, "market_assumed", False), raw):
+        # The gateway ASSUMED this US (decision D-10): nobody named it. As unobserved as no market at all (and
+        # the seed lane's serving currency for None is US's, the market that was assumed). Beside any other
+        # market the flag is ignored: a declared SG stays SG, served and observed.
+        return None
     if isinstance(raw, str) and raw.strip():
         return raw
     if not isinstance(request_metadata, dict):

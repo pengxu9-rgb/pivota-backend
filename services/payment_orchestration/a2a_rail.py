@@ -35,6 +35,12 @@ THE RULES THIS MODULE ENFORCES, each measured against the provider's sandbox on 
    followed; response bodies read with a hard size cap; no body, payload, token, key or member id
    is ever logged.
 
+6. THE TOKEN STEP IS REFUSED IN PRODUCTION, IN CODE. Every `TOKEN_STEP_ACTIONS` send raises
+   `TokenStepRefused` before any byte is sent when the platform resolves to production
+   (config.platform.is_production), whatever A2A_RAIL_TOKEN_STEP_ENABLED or any other env says:
+   those steps make the provider hand Pivota a network token and cryptogram (rule 1), and no env
+   value may turn that on in production. Non-production behaviour is unchanged.
+
 Dark by default: `from_env()` returns None unless A2A_RAIL_ENABLED is on and both
 A2A_RAIL_BASE_URL and A2A_RAIL_API_KEY are set.
 """
@@ -54,6 +60,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
+from config.platform import is_production as _platform_is_production
+
 logger = logging.getLogger(__name__)
 
 A2A_RAIL_ENABLED_ENV = "A2A_RAIL_ENABLED"
@@ -69,6 +77,11 @@ ALLOWED_HOST_SHA256: FrozenSet[str] = frozenset({
     "c91cff4b3b7cf1ed9344a5334df60dc9751db61743bd7a41d082c35345097d7b",
     "a88fafbb95893904e7dcc07c3937e4119093120255ea2ca530ac27b11e865b97",
 })
+#: The currencies a token may be requested in. The rail's `token-setup` takes `amount_cents` and no
+#: currency, so the amount is minor units of whatever currency the rail assumes; only USD has been
+#: measured. The router refuses other currencies at create (`currency_unsupported`), and the worker's
+#: token step refuses them again.
+TOKEN_CURRENCIES: FrozenSet[str] = frozenset({"USD"})
 AGENT_ID = "base-orchestrator"
 MESSAGE_PATH = f"/a2a/agents/{AGENT_ID}/v1/message:send"
 TOKEN_PATH = "/orch-public/auth/token"
@@ -106,6 +119,17 @@ ALLOWED_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
     ("payment.await", "poll"),
 })
 
+#: The token step: `token-setup` and the in-flow picker's `select-method` mint a network token; the
+#: approval page's `paid` and the `await` poll are answered with `payment.token-result`, which carries
+#: `networkToken.value` and `networkToken.cryptogram` in cleartext. Refused in production (rule 6).
+TOKEN_STEP_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
+    ("payment.token-setup", "submit"),
+    ("payment.method-list", "select-method"),
+    ("payment.action-required", "paid"),
+    ("payment.visa-action-required", "paid"),
+    ("payment.await", "poll"),
+})
+
 #: The actions that only read. Every other allowed action may change state on the provider's side,
 #: so a timeout on it is `outcome_unknown` (see rule 4).
 READ_ONLY_ACTIONS: FrozenSet[Tuple[str, str]] = frozenset({
@@ -123,6 +147,8 @@ _CREDENTIAL_LEAF_KEYS = frozenset({
     "cryptogram", "tokencryptogram", "cryptogramvalue", "pan", "dpan", "fpan", "cardnumber",
     "primaryaccountnumber", "accountnumber", "tokenvalue", "cvv", "cvc", "cvv2", "cvc2", "cvn",
     "securitycode", "tavv", "track1", "track2", "eci", "ucaf", "aav",
+    # dynamic CVVs (a VIC credential can carry one for key entry): a 3-digit value no digit rule sees
+    "dcvv", "dcvv2", "dcvc", "icvv", "dynamiccvv", "dynamiccvv2", "dynamiccvc", "dynamicsecuritycode",
 })
 #: Key fragments that only ever name an authentication credential (`paymentCryptogram`, `cavv`,
 #: `authenticationValue`, ...), matched as substrings of the canonical key.
@@ -167,8 +193,18 @@ class ActionNotAllowed(ValueError):
     """A (component, action) outside `ALLOWED_ACTIONS`. A programming error; nothing was sent."""
 
 
+class TokenStepRefused(ActionNotAllowed):
+    """A token-step action in production (rule 6). Refused whatever the env says; nothing was sent."""
+
+
 def is_enabled() -> bool:
     return (os.getenv(A2A_RAIL_ENABLED_ENV) or "").strip().lower() in _TRUTHY
+
+
+def token_step_refused_in_production() -> bool:
+    """True when the token step must be refused: the platform resolves to production. Read live from
+    the environment on every call; no flag, dial or kwarg overrides it."""
+    return _platform_is_production()
 
 
 def _host_digest(host: str) -> str:
@@ -607,6 +643,13 @@ class A2ARailClient:
         """Send ONE structured action in conversation `context_id` on behalf of `member_id`."""
         if (component, action) not in ALLOWED_ACTIONS:
             raise ActionNotAllowed(f"{component}#{action} is not an allowed rail action")
+        if (component, action) in TOKEN_STEP_ACTIONS and token_step_refused_in_production():
+            logger.error(
+                "a2a_rail: REFUSED %s#%s in production: the token step would hand Pivota a network "
+                "token and cryptogram; refused in code whatever the env says; nothing was sent",
+                component, action,
+            )
+            raise TokenStepRefused(f"{component}#{action} is refused in production (A2A token step)")
         if not _MEMBER_ID_RE.match(str(member_id or "")):
             raise ValueError("member_id must be an opaque id of 1..128 safe characters")
         if not _CONTEXT_ID_RE.match(str(context_id or "")):

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from models.quote import QuotePreviewRequest, QuotePreviewResponse
 from routes.agent_auth import AgentContext, get_agent_context
-from services.quote_service import QuoteError, QuoteService, parse_decimal_money
+from services.quote_service import QuoteError, QuoteService, checkout_intent_id_of, parse_decimal_money
 from mvp.constants import EVENT_OFFER_GENERATED, SURFACE_BACKEND
 from mvp.events import emit_best_effort
 from utils.database_readiness import (
@@ -41,6 +41,8 @@ async def preview_quote(
             payment_context=req.payment_context,
             brief_id=req.brief_id,
             brief_schema_version=req.brief_schema_version,
+            # Made under a checkout token: the quote also belongs to that token's intent (S-28).
+            checkout_intent_id=checkout_intent_id_of(context),
         )
     except QuoteError as e:
         raise HTTPException(

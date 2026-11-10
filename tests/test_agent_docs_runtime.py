@@ -47,3 +47,26 @@ def test_agent_docs_endpoints_summary_matches_openapi_surface():
 
     assert endpoint_paths <= docs_paths
     assert "/agent/v2/orders" in endpoint_paths
+
+
+def test_served_examples_are_quote_first_and_call_only_documented_routes():
+    import re
+
+    client = TestClient(app)
+    docs_paths = set((client.get("/agent/docs/openapi.json").json() or {}).get("paths", {}).keys())
+
+    for lang in ("python", "typescript"):
+        body = client.get(f"/agent/docs/examples/{lang}").text
+        # /orders/create without quote_id is a 400 QUOTE_REQUIRED_BEFORE_PURCHASE.
+        assert "/quotes/preview" in body, lang
+        assert "quote_id" in body, lang
+        assert body.index("/quotes/preview") < body.index("/orders/create"), lang
+        called = {"/agent/v1" + p for p in re.findall(r"\{API\}(/[a-z/_-]+)", body)}
+        assert {"/agent/v1/quotes/preview", "/agent/v1/orders/create"} <= called, (lang, called)
+        assert called <= docs_paths, (lang, called - docs_paths)
+
+    quickstart = client.get("/agent/docs/quickstart.md").text
+    assert "QUOTE_REQUIRED_BEFORE_PURCHASE" in quickstart
+    assert "scope=protocol" in quickstart
+    # The examples are plain REST; the quickstart must not send partners to the SDK packages instead.
+    assert "pip install" not in quickstart and "PivotaAgentClient" not in quickstart

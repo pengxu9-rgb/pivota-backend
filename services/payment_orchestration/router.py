@@ -2,8 +2,9 @@
 
 Two rails place merchant orders for a buyer (executor `rail_managed`): Reap, and the A2A token rail.
 This module decides between them for ONE create request, before anything is written and before any
-rail is called. It reads configuration only: no database, no rail, no clock. The route
-(routes/agent_commerce_purchases.py) acts on the answer.
+rail is called. It reads configuration and its arguments only: no database, no rail, no clock. The
+route (routes/agent_commerce_purchases.py) reads the worker's heartbeat, passes it in, and acts on
+the answer.
 
 ── THE RULES ────────────────────────────────────────────────────────────────────────────────
 
@@ -11,10 +12,18 @@ rail is called. It reads configuration only: no database, no rail, no clock. The
      a2a_rail_disabled        the rail's client is off (A2A_RAIL_ENABLED) or creating is off
                               (A2A_RAIL_CREATE_ENABLED)
      agent_not_in_pilot       the calling agent is not on A2A_RAIL_PILOT_AGENT_IDS
+     a2a_worker_unavailable   no worker tick has started within 15 minutes (the route reads the
+                              worker's heartbeat, db/a2a_rail_ledger.worker_is_alive, for a pilot
+                              agent only): a purchase opened now would never advance, expire or have
+                              its contact purged. After the pilot check, so an agent outside the pilot
+                              is told that, not that the worker is down (the route never reads the
+                              heartbeat for it and passes False)
      item_source_unsupported  the rail takes a merchant cart link only (`item_source=cart_link`)
      offer_code_unsupported   the rail has no field for the buyer's offer code
      merchant_not_proven      (merchant, market) is not on A2A_RAIL_MERCHANTS: a merchant is routable
                               to this rail only after a live order there has been proven
+     currency_unsupported     the shown currency is not one the rail's token step can carry
+                              (a2a_rail.TOKEN_CURRENCIES: the rail's amount has no currency field)
      amount_limit_unset       A2A_RAIL_MAX_TOTAL_MINOR names no cap at all: no cap, no rail
    The amount itself is checked by the route once OUR catalog has priced the item (`amount_ok`),
    because the price is never the caller's. Caps are PER CURRENCY (`USD:10000,SGD:13500`): a minor
@@ -123,33 +132,44 @@ class RailChoice:
     refusal: Optional[str] = None
 
 
+def a2a_create_dials_on() -> bool:
+    """Both of the rail's create dials. The route reads the worker's heartbeat only when they are on."""
+    return a2a_rail.is_enabled() and _on(A2A_RAIL_CREATE_ENABLED_ENV)
+
+
 def a2a_unavailable_reason(
-    *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, has_offer_code: bool = False
+    *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, currency: str,
+    worker_alive: bool, has_offer_code: bool = False,
 ) -> Optional[str]:
     """None when the A2A rail may take this request (before pricing); else the named reason."""
-    if not a2a_rail.is_enabled() or not _on(A2A_RAIL_CREATE_ENABLED_ENV):
+    if not a2a_create_dials_on():
         return "a2a_rail_disabled"
     if str(agent_id or "") not in pilot_agents():
         return "agent_not_in_pilot"
+    if worker_alive is not True:
+        return "a2a_worker_unavailable"
     if item_source != "cart_link":
         return "item_source_unsupported"
     if has_offer_code:
         return "offer_code_unsupported"
     if (str(merchant_domain or "").lower(), str(market_country or "").upper()) not in proven_merchants():
         return "merchant_not_proven"
+    if str(currency or "").upper() not in a2a_rail.TOKEN_CURRENCIES:
+        return "currency_unsupported"
     if not max_total_minor():
         return "amount_limit_unset"
     return None
 
 
 def choose_rail(
-    *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, has_offer_code: bool = False,
-    preferred: Optional[str] = None,
+    *, agent_id: str, merchant_domain: str, market_country: str, item_source: str, currency: str,
+    worker_alive: bool, has_offer_code: bool = False, preferred: Optional[str] = None,
 ) -> RailChoice:
-    """See the module docstring. `merchant_domain` is the canonical merchant (lower case, no `www.`)."""
+    """See the module docstring. `merchant_domain` is the canonical merchant (lower case, no `www.`),
+    `currency` the one the buyer was shown, `worker_alive` the A2A worker's heartbeat (the route's read)."""
     a2a_reason = a2a_unavailable_reason(
         agent_id=agent_id, merchant_domain=merchant_domain, market_country=market_country, item_source=item_source,
-        has_offer_code=has_offer_code)
+        currency=currency, worker_alive=worker_alive, has_offer_code=has_offer_code)
     if preferred == "a2a":
         if a2a_reason is not None:
             return RailChoice(rail=None, basis="buyer_selected_rail", refusal=a2a_reason)

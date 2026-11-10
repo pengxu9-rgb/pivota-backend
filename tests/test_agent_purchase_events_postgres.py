@@ -156,6 +156,91 @@ async def test_the_candidate_read_skips_dead_pages_and_keys_the_window_on_state_
     assert got & set(made) == {live, fresh}
 
 
+async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
+    from db.database import database
+    import db.a2a_rail_ledger as a2a_ledger
+    import db.agent_purchase_events as events_db
+    import db.agent_purchase_ledger as purchases
+
+    made = []
+
+    async def purchase(state, set_sql="", parent=True):
+        ap = (await a2a_ledger.create_purchase(
+            agent_id="agent_pg_a2a", agent_user_ref_hash="h" * 64, merchant_domain="brand.example",
+            checkout_url="https://brand.example/cart/1:1?attributes[pivota_click_id]=c1",
+            currency="USD", our_price_minor=4650, consent_version="v1",
+        ))["id"]
+        await database.execute(f"UPDATE a2a_rail_purchases SET state = :s{set_sql} WHERE id = :i",
+                               {"s": state, "i": ap})
+        made.append(await purchases.ensure_a2a_parent(ap) if parent else ap)
+        return made[-1]
+
+    page = ", buyer_action_url = 'https://pay.rail.test/a'"
+    live = await purchase("awaiting_authorization", page + ", buyer_action_kind = 'approval'"
+                          ", buyer_action_expires_at = now() + interval '1 hour'")
+    await purchase("awaiting_authorization", page + ", buyer_action_kind = 'approval'"
+                   ", buyer_action_expires_at = now() - interval '1 minute'")
+    await purchase("needs_payment_method", page + ", buyer_action_kind = 'approval'"
+                   ", buyer_action_expires_at = now() + interval '1 hour'")
+    await purchase("quoting")
+    await purchase("completed", ", state_entered_at = now() - interval '3 days', updated_at = now()")
+    fresh = await purchase("failed", ", updated_at = now() - interval '3 days'")
+    orphan = await purchase("completed", parent=False)
+    old_born = await purchase("completed", ", created_at = now() - interval '30 hours'", parent=False)
+    settled = await purchase("completed", ", state_entered_at = now() - interval '3 days'", parent=False)
+    inside = await purchase("completed", ", state_entered_at = now() - interval '23 hours'", parent=False)
+    outside = await purchase("completed", ", state_entered_at = now() - interval '25 hours'", parent=False)
+    # Only this test's rows are judged: the dialect gate shares one database across test files.
+    got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
+    assert got & set(made) == {live, fresh}
+    assert await purchases.backfill_a2a_parents(limit=5000, lookback_hours=24) >= 1
+    healed = await database.fetch_one(
+        "SELECT id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id = :i", {"i": orphan})
+    assert healed is not None
+    got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
+    assert healed["id"] in got
+    # The heal is bounded by the detector's clock (state_entered_at), not by created_at.
+    parents = {row["rail_purchase_id"] for row in await database.fetch_all(
+        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b, :c, :d)",
+        {"a": old_born, "b": settled, "c": inside, "d": outside})}
+    assert parents == {old_born, inside}  # the window is the lookback exactly
+
+
+async def test_a_database_error_on_one_heal_row_does_not_abort_the_rest(monkeypatch):
+    """A real Postgres error, not a Python raise: the heal runs outside any transaction (the job, the
+    scheduler and detect open none), so each statement commits on its own and a failed one does not
+    leave the connection in an aborted transaction for the rows after it."""
+    from db.database import database
+    import db.a2a_rail_ledger as a2a_ledger
+    import db.agent_purchase_ledger as purchases
+
+    async def child(n):
+        ap = (await a2a_ledger.create_purchase(
+            agent_id="agent_pg_heal_rows", agent_user_ref_hash="r" * 64, merchant_domain="brand.example",
+            checkout_url=f"https://brand.example/cart/{n}:1?attributes[pivota_click_id]=c{n}",
+            currency="USD", our_price_minor=4650, consent_version="v1",
+        ))["id"]
+        return ap
+
+    bad, good = await child(1), await child(2)
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = now() - interval '2 hours' WHERE id = :i",
+                           {"i": bad})  # oldest first: the bad row is healed first
+    real = purchases.ensure_a2a_parent
+
+    async def failing_in_the_database(rail_purchase_id, **kw):
+        if rail_purchase_id == bad:
+            await database.execute("SELECT 1 / 0")  # division_by_zero, raised by the server
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", failing_in_the_database)
+    assert await purchases.backfill_a2a_parents(limit=5000, lookback_hours=24) >= 1
+    rows = await database.fetch_all(
+        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
+        {"a": bad, "b": good})
+    assert {r["rail_purchase_id"] for r in rows} == {good}
+    assert await database.fetch_val("SELECT 1") == 1  # the connection is usable afterwards
+
+
 async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():
     from db.database import database
     import db.agent_purchase_events as events_db

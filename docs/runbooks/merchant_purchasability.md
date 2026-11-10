@@ -588,9 +588,10 @@ now unions a fourth lane, `_cart_mint_lane`:
   when there is none.
 
 ```sql
--- The scan cache: one row per attempt, newest first. `hosts` is [[host, market, seeds], ...].
+-- The scan cache: one row per attempt, newest first. `hosts` is [[host, market, seeds], ...]
+-- for the cart-mint lane, plus the warm-click lane's tagged 4-element entries (counted below).
 SELECT scanned_at, complete, reason, seeds_scanned, cart_seeds, elapsed_ms,
-       json_array_length(hosts::json) AS keys
+       (SELECT count(*) FROM json_array_elements(hosts::json) e WHERE json_array_length(e) = 3) AS keys
   FROM merchant_purchasability_cart_mint_scans
  ORDER BY scanned_at DESC LIMIT 10;
 ```
@@ -599,6 +600,83 @@ SELECT scanned_at, complete, reason, seeds_scanned, cart_seeds, elapsed_ms,
 `DELETE FROM merchant_purchasability_cart_mint_scans WHERE scanned_at >= date_trunc('day', now()) + interval '5 hours';`
 The next hourly run scans. **To roll the cache back**, drop the table
 (`db/migrations/down/245_…`). The next run recreates it and scans once.
+
+### The warm-click lane (2026-11-08)
+
+The `/r` warm handoff (#2729, `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE`) gave the fact a third
+consumer: `offers.resolve` signs `warm_fact: human_handoff` into a COLD seed link when
+`human_handoff_allowed(<destination host>, <listing market>)` answers yes, and the click is then
+upgraded to a prefilled checkout. That read asks for the destination host of a link that mints
+**no cart**, so none of the four lanes above named it. Measured on prod 2026-11-08 (read-only):
+the four lanes held 196 keys; active seeds pointed at 489 (destination host × market) keys, and
+**310 of them (23,221 seeds) were in no lane; 303 had no fact row at all**. Mostly cross-retailer
+seeds: they carry no shop domain, so the minter builds no cart on them.
+
+`load_population` now adds a fifth lane, `warm-click`:
+
+* **The host** is `normalize_domain(url)` for both spellings the mint may ask (`canonical_url or
+  destination_url`, and the destination), exactly the key `warm_fact` reads.
+* **Never an affiliate destination** (`is_affiliate_destination`, the gateway's own reference): a
+  stamp skip and a click knockout, so a fact about it gates nothing.
+* **Every other stamp skip is ignored on purpose** (a cart, a named variant, stock, a preflight
+  refusal): they vary per request, and a population narrower than the consumer is a link that can
+  never warm. The superset only re-checks hosts the cart-mint lane names anyway.
+* **The market** is the seed row's `market`, as for the cart-mint lane (the stamp is signed only
+  when the listing market equals the request market). Never defaulted: a market-less seed is
+  counted in `population_skipped_market_unknown` once per lane that names it.
+* **No catalog variant hint**, as for the cart-mint lane: the preflight picks the storefront's
+  first available variant itself.
+* **Not filtered to Shopify, but guarded** (be#2772 review). About a third of the new keys are not
+  Shopify by the variant-id shape. A big retailer's bot wall answers the catalog read with a 429
+  or a Cloudflare challenge, which is a THROTTLE signal, so unguarded, three of them in one run
+  trip the IP breaker and stop it. And the ~300 never-checked keys, swept first, would push every
+  existing key's re-check back by about a day. So:
+  - **A per-run cap.** One staleness order over every key, but warm-only keys (named by no other
+    lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` = 6 slots of a run. The
+    other lanes' due keys always keep the rest (14 of 20), and a warm-only key is never
+    re-checked ahead of a staler one of theirs. The cap is pinned in the setup script.
+  - **Proven Shopify before it counts.** A warm-only key is proven once its last check gave a
+    verdict only a Shopify storefront gives (`SHOPIFY_STOREFRONT_VERDICTS`: ELIGIBLE, a Shopify
+    sign-in or password wall, a 410 permalink, a checkout page...). Until then its requests feed
+    neither the IP breaker nor the shared Shopify-edge budget; the run's own 1.5 s pacer still
+    spaces them.
+  - **Weekly for no catalog.** A warm-only key whose last check found no Shopify catalog
+    (`VARIANT_UNVERIFIED` with `products_json_page_1_status_<n>`, never a 429 or 503) is
+    re-checked only every `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` = 7 days, and is counted in
+    `SweepReport.population_deferred_not_shopify` meanwhile. It stays in `population_total`.
+  - A key another lane also names is that lane's key: no cap, always proven, never deferred.
+* **Same daily scan, same cache row.** The lane is computed in the cart-mint scan's pass over the
+  seeds (no second read of the seed table) and cached in the same `hosts` array as tagged entries
+  `[host, market, seeds, "warm-click"]`, so it needed no DDL. An image that predates the lane
+  reads only 3-element entries and ignores them; a scan written by such an image carries none,
+  so **after re-imaging the job the lane fills at the next 05:00Z scan** (or force a rescan as
+  above).
+* The run log line gains `warm_seeds=… warm_keys=…`, and the census reports
+  `warm-click keys by state` and `warm-click seeds by state`.
+
+```sql
+-- Warm-click keys in the newest scan (the 4-element entries tagged 'warm-click'; the one tagged
+-- 'warm-click-seeds' carries the lane's seed count).
+SELECT scanned_at, complete,
+       (SELECT count(*) FROM json_array_elements(hosts::json) e
+         WHERE json_array_length(e) = 4 AND e->>3 = 'warm-click') AS warm_keys
+  FROM merchant_purchasability_cart_mint_scans
+ ORDER BY scanned_at DESC LIMIT 3;
+```
+
+**A seed with no market (`''`) is never swept** by this lane, as by the cart-mint lane: it is
+counted in `population_skipped_market_unknown` once per lane that names it (so one such seed can
+count twice), and the warm stamp, which needs the listing market, never fires for it. That fails
+closed.
+
+**Rollback without a re-image:** set `WARM_CLICK_MAX_PER_RUN=0` in the setup script and re-run it
+with `--enable`. That takes the lane out of the population (the other four lanes are unchanged).
+A hand `gcloud run jobs update --update-env-vars MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN=0`
+works at once but is reset by the next run of the setup script.
+
+**The job never redeploys on merge.** Re-image it with the setup script **and `--enable`**
+(without it the script DISARMS the lane):
+`infra/gcp/setup_merchant_purchasability_sweep_job.sh prod <backend-tag> --enable`.
 
 ### Capacity: a population larger than the batch (2026-09-28)
 
@@ -644,6 +722,18 @@ other way round.
 | margin to the 72 h TTL | ~10× | ~5× |
 | checks (= abandoned checkouts) per merchant per day, 21 × 20 / *T* | ~5.6 | ~1.8 |
 | first full pass after arming (every key has a fact) | ~4 h | ~12–15 h |
+
+**With the warm-click lane and its guard (2026-11-08)** *T* ≈ 196 + 310 ≈ 506, in two parts:
+- **The other lanes' 196 keys** keep at least 14 slots a run: ≥ 294 checks a day, so each is
+  re-checked about every **16 h** (was ~11 h), a ~4.5× margin to the 72 h TTL.
+- **The 310 warm-only keys** share at most 6 slots a run, 126 checks a day. The ~100 with no
+  Shopify catalog drop to weekly (~14 a day) once seen, leaving ~210 at ~112 a day: about every
+  **45 h**, a ~1.6× margin. The first pass over the 303 never-checked ones takes ~2.5 days.
+- The request RATE does not change (the batch and the schedule are the same).
+- **Watch:** `population_never_checked` should fall by ~6 a run, and `population_deferred_not_shopify`
+  should settle near ~100. If warm-only facts age out (a warm-only key's re-check gap above ~60 h),
+  raise the cap together with `BATCH` (e.g. 10 of 30, ~310 s of checks at 10.4 s, inside the 600 s
+  budget), both in the setup script.
 
 The rotation stops keeping every positive fact fresh only past *T* ≈ 1,240 (62 runs of 20 inside
 72 h). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the

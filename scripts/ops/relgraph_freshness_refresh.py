@@ -184,8 +184,8 @@ SUMMARY_NUMBERS = (
     "candidate_count", "attempted_count", "origin_reads", "refreshed_from_cache", "failed", "degraded",
     "skipped_for_budget", "skipped_for_host_backoff", "skipped_for_unreachable_host", "skipped_for_ip_throttle",
     "price_changed", "price_unchanged", "price_filled", "price_unavailable", "price_skipped_incomplete_pair",
-    "price_skipped_currency_mismatch", "price_skipped_non_positive", "price_skipped_unreadable",
-    "availability_changed", "projections_attempted", "projections_written", "projections_errored", "pdp_refreshed", "pdp_errored",
+    "price_skipped_currency_mismatch", "price_skipped_non_positive", "price_skipped_unreadable", "price_not_read",
+    "availability_not_read", "availability_changed", "projections_attempted", "projections_written", "projections_errored", "pdp_refreshed", "pdp_errored",
 )
 
 
@@ -267,7 +267,7 @@ async def run(db: Any, manifest: Dict[str, Any], *, apply: bool = False, authori
     residue = any(counts[key] for key in ("failed", "degraded", "refreshed_from_cache", "skipped_for_budget",
         "skipped_for_host_backoff", "skipped_for_unreachable_host", "skipped_for_ip_throttle", "projections_errored",
         "pdp_errored", "price_unavailable", "price_skipped_incomplete_pair", "price_skipped_currency_mismatch",
-        "price_skipped_non_positive", "price_skipped_unreadable"))
+        "price_skipped_non_positive", "price_skipped_unreadable", "price_not_read"))
     # A mirror upsert can succeed while price_read=False preserves an old/null price clock,
     # or the writer may select the seed's mirror instead of the requested attached canonical.
     # Worker counts cannot establish freshness of the manifest's products. Re-read the same

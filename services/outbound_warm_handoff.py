@@ -310,6 +310,79 @@ PURCHASABILITY_TIER_KEY = "purchasability_tier"
 PURCHASABILITY_BROWSE_ONLY = "browse_only"
 
 
+#: The signed-ctx key a mint stamps when the MERCHANT PURCHASABILITY fact said a HUMAN can check
+#: out at this cold link's host in the buyer's market (`db.merchant_purchasability.
+#: human_handoff_allowed`, a fresh fact from the buyer vantage). Written ONLY by offers.resolve's
+#: seed mint, ONLY while OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE is on, and only on a token with no
+#: cart. ABSENT on every other token, so every other minter keeps the allowlist rule alone.
+#:
+#: It is the mint-time answer, signed, for the same reason `join_mode` is: `offers.resolve` must
+#: answer `cart_prefilled` before the link is handed out, and an answer read from the table at
+#: CLICK time could not be known then. The gateway's own purchasability gate still re-asks at
+#: click time and can still refuse; this key can only ADD eligibility the mint proved.
+WARM_FACT_KEY = "warm_fact"
+WARM_FACT_HUMAN_HANDOFF = "human_handoff"
+
+
+def is_warm_fact_positive(ctx: Optional[Dict[str, Any]]) -> bool:
+    """True when the signed token says the mint found a fresh human-handoff fact for its host."""
+    if not isinstance(ctx, dict):
+        return False
+    return str(ctx.get(WARM_FACT_KEY) or "").strip().lower() == WARM_FACT_HUMAN_HANDOFF
+
+
+#: The click-time re-check is one indexed read, made BEFORE the 302 a real buyer is waiting on.
+#: Bounded on its own: the resolve budget (`OUTBOUND_WARM_HANDOFF_TIMEOUT_MS`) does not cover
+#: it, and a stalled pool must not hold the redirect. A timeout keeps the cold redirect.
+WARM_FACT_RECHECK_TIMEOUT_S = 0.5
+
+#: Why a `fact` click stayed cold, on the click event's `warm_reason`. Separate literals so the
+#: runbook's lapse count reads only real lapses:
+#:   * `fact_lapsed`    — the read answered no (no fresh human-handoff fact for host x market
+#:                        now, or the reader failed closed on a database error);
+#:   * `fact_no_market` — the token carries no observed ISO-2 market (`'*'`, a placeholder,
+#:                        or invalid), so there is nothing to key a fact on;
+#:   * `fact_no_host`   — the destination has no host to build a cart on;
+#:   * `fact_timeout`   — the read did not answer within WARM_FACT_RECHECK_TIMEOUT_S.
+FACT_LAPSED = "fact_lapsed"
+FACT_NO_MARKET = "fact_no_market"
+FACT_NO_HOST = "fact_no_host"
+FACT_TIMEOUT = "fact_timeout"
+
+
+async def warm_fact_recheck(*, dest: str, market: Optional[str]) -> Optional[str]:
+    """Re-ask, AT CLICK TIME, the question a `warm_fact` stamp answered at mint.
+
+    None when the fact still holds; otherwise the cold reason (see FACT_* above).
+
+    The stamp is the mint-time answer and the token lives 7 days; a fact's window is up to 72 h
+    by default. Without this the click could act on a fact that lapsed days ago, and the
+    gateway's own gate (MERCHANT_PURCHASABILITY_GATE_ENABLED) is not guaranteed to be armed.
+    Asked for the DESTINATION host, the host the cart is built on, and the token's own market
+    (the mint stamps only when that IS the market it asked). It can only NARROW: called only for
+    a click already eligible by `fact`. Fails closed: anything but a fresh yes is a reason.
+    """
+    if not market:
+        return FACT_NO_MARKET
+    host = _host_of(dest)
+    if not host:
+        return FACT_NO_HOST
+    try:
+        import db.merchant_purchasability as merchant_purchasability
+
+        allowed = await asyncio.wait_for(
+            merchant_purchasability.human_handoff_allowed(host, market),
+            timeout=WARM_FACT_RECHECK_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("outbound_warm_handoff: fact re-check timed out; keeping the cold redirect")
+        return FACT_TIMEOUT
+    except Exception:  # noqa: BLE001  the reader already fails closed; this guards the import
+        logger.warning("outbound_warm_handoff: fact re-check failed; keeping the cold redirect")
+        return FACT_LAPSED
+    return None if allowed else FACT_LAPSED
+
+
 def is_purchase_declined(ctx: Optional[Dict[str, Any]]) -> bool:
     """True when the signed token says the mint DECLINED a cart for this merchant x market.
 
@@ -402,11 +475,22 @@ def evaluate_warm_eligibility(
         return False, "affiliate"
     if not assume_human and is_bot_user_agent(user_agent):
         return False, "bot"
+    # FACT-DRIVEN ELIGIBILITY widens the allowlist; it never narrows it. Both inputs are fixed at
+    # mint time or by this process's env, so `could_upgrade_at_click_time` (assume_human) answers
+    # exactly what a human click would get here.
+    fact_eligible = bool(getattr(settings, "outbound_warm_handoff_fact_eligible", False)) and (
+        is_warm_fact_positive(ctx)
+    )
     brands = settings.outbound_warm_handoff_brands
     if brands:
-        if not any(_host_matches(host, b) for b in brands):
+        if any(_host_matches(host, b) for b in brands):
+            eligible_reason = "allowlisted"
+        elif fact_eligible:
+            eligible_reason = "fact"
+        else:
             return False, "not_allowlisted"
-        eligible_reason = "allowlisted"
+    elif fact_eligible:
+        eligible_reason = "fact"
     elif rollout_bucket(token, settings.outbound_warm_handoff_rollout_pct):
         eligible_reason = "rollout"
     else:

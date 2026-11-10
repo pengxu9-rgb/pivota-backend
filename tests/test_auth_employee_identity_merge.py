@@ -170,6 +170,9 @@ def test_api_auth_login_employee_password_still_reclaims_a_merchant_row(monkeypa
 
 
 def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypatch):
+    """The employee's own legacy password is proven, so the scoped employee membership
+    (not the merchant row) is what the token carries. Without that proof the same
+    login is refused: see the test below."""
     password = "Admin123!"
     user_record = {
         "id": 44,
@@ -184,7 +187,7 @@ def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypa
         "employee_id": "emp_peng",
         "name": "Peng Xu",
         "email": "peng@pivota.cc",
-        "password": None,
+        "password": hashlib.sha256(f"{password}pivota_employee_salt_v1".encode()).hexdigest(),
         "role": "admin",
         "status": "active",
         "permissions": ["reviews.read"],
@@ -245,6 +248,72 @@ def test_api_auth_login_employee_portal_uses_scoped_employee_membership(monkeypa
     assert token_payload["membership_id"] == "membership_emp_peng"
     assert token_payload["employee_id"] == "emp_peng"
     assert "merchant_id" not in token_payload
+
+
+def test_api_auth_login_employee_portal_refuses_a_merchant_row_on_the_membership_alone(monkeypatch):
+    """A merchant users row whose password verified, at an address with an active
+    employees row (no password of its own) and an active employee membership: the
+    membership alone is no proof. Backfills and employees_create write one with no
+    users row at the address, and a public sign-up could then create that row, so the
+    employee portal refuses and no employee claim is issued on any portal."""
+    password = "Merchant123!"
+    addr = "staff-a" + chr(64) + "example.com"
+    user_record = {
+        "id": 45,
+        "email": addr,
+        "password_hash": hash_password(password),
+        "full_name": "Shop A",
+        "role": "merchant",
+        "active": True,
+        "merchant_id": None,
+    }
+    employee_record = {
+        "employee_id": "emp_a",
+        "name": "Staff A",
+        "email": addr,
+        "password": None,
+        "role": "admin",
+        "status": "active",
+        "permissions": [],
+    }
+    employee_membership = {
+        "membership_id": "membership_emp_a",
+        "identity_id": "identity_a",
+        "membership_type": "employee",
+        "role": "admin",
+        "status": "active",
+        "entity_id": "emp_a",
+        "permissions": [],
+        "identity": {"identity_id": "identity_a", "email": addr, "email_normalized": addr,
+                     "full_name": "Staff A", "status": "active"},
+    }
+    writes = []
+
+    async def fake_fetch_one(*args, **kwargs):
+        query = str(kwargs.get("query") or (args[0] if args else ""))
+        if "FROM employees" in query:
+            return employee_record
+        if "FROM users" in query:
+            return user_record
+        return None
+
+    async def fake_execute(*args, **kwargs):
+        writes.append(str(kwargs.get("query") or (args[0] if args else "")))
+        return None
+
+    async def fake_get_active_membership(email, membership_type):
+        return employee_membership if membership_type == "employee" else None
+
+    monkeypatch.setattr(auth_module.database, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(auth_module.database, "execute", fake_execute)
+    monkeypatch.setattr(auth_module, "_safe_get_active_membership", fake_get_active_membership)
+
+    res = _client().post("/api/auth/login", json={"email": addr, "password": password, "portal": "employee"})
+    assert res.status_code == 403, res.text
+
+    res = _client().post("/api/auth/login", json={"email": addr, "password": password})
+    assert res.status_code != 200 or "employee_id" not in decode_token(res.json()["token"])
+    assert not any("UPDATE users" in q and "role = :role" in q for q in writes)
 
 
 def test_api_auth_login_employee_portal_rejects_customer_or_merchant_only_identity(monkeypatch):

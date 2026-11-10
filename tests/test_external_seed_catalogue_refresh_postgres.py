@@ -50,6 +50,8 @@ _TABLE_MIGRATIONS = (
     "200_external_seed_destination_liveness.sql",
     "202_external_seed_content_freshness.sql",
     "266_external_seed_destination_corroborated_dead_at.sql",
+    # The hard-404 run clock: the liveness writer reads and writes it on every observation.
+    "279_external_seed_destination_dead_404_since.sql",
     # Hand-applied before the lane is switched on: the page read the lane carries across its own reads.
     "274_external_seed_last_page_read_at.sql.disabled",
     # catalog_products: the candidate query's suppressed-product anti-join and the liveness writer's

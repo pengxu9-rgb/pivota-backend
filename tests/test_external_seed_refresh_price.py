@@ -97,7 +97,20 @@ def _run_refresh(
     monkeypatch.setattr(mod, "_ensure_external_seeds_table", AsyncMock(return_value=None))
     monkeypatch.setattr(mod.database, "fetch_one", fake_fetch_one)
     monkeypatch.setattr(mod, "_execute_seed_data_stmt", fake_execute_seed_data_stmt)
-    monkeypatch.setattr(mod, "resolve_external_offer", AsyncMock(return_value=snapshot))
+    async def fake_resolve(*, url=None, observed=None, **_kwargs):
+        # A READ OF THE SERVED PAGE, as `_fetch_html` stamps one: the refresh writes a price only
+        # from a fetch that reached this URL (`_read_the_served_product`), so a stub that leaves
+        # `observed` empty is a cached fallback and no price would be taken.
+        if observed is not None:
+            observed.update({"status_code": 200, "final_url": url, "bot_challenged": False})
+        return snapshot
+
+    monkeypatch.setattr(mod, "resolve_external_offer", fake_resolve)
+    # A read goes on to the liveness writer and the serving projection, which need a database and
+    # are not what this file pins.
+    monkeypatch.setattr(mod.destination_liveness, "record_destination_observation",
+                        AsyncMock(return_value={"status": "recorded"}))
+    monkeypatch.setattr(mod, "_project_refreshed_seed_to_serving_surfaces", AsyncMock(return_value={}))
 
     result = asyncio.run(mod._refresh_external_seed_by_id(stored_row["id"]))
     result["_sql"] = captured.get("query", "")

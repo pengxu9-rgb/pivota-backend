@@ -32,17 +32,21 @@ from services.external_seed_audit import (
 from services.external_seed_destination_liveness import (
     CONFIRMED_DEAD_VERDICTS,
     RETIREMENT_STREAK,
+    apply_unconfirmed_hides,
+    count_unconfirmed_observation,
+    handleless_read_mode,
+    unconfirmed_hide_mode,
 )
 from services import crawl_global_pacer, crawl_ip_throttle, crawl_politeness
 from services import external_seed_catalogue_refresh as catalogue_lane
 from services.external_seed_search import (
-    SEED_SUPPRESSED_PRODUCT_ANTI_JOIN,
     build_seed_quarantine_anti_join,
     seed_serving_currency,
 )
 # served_region_currencies moved to services.seed_serving (2026-11-06); re-exported under its old name so its
 # callers here and their tests are unchanged.
 from services.seed_serving import served_currencies as served_region_currencies
+from utils.logger import logger as pivota_logger
 from services.outbound_links_service import (
     DEFAULT_UTM_TEMPLATE,
     apply_utm,
@@ -162,6 +166,55 @@ def _host_challenge_trip() -> int:
     return crawl_global_pacer.resolve_count(
         None, "EXTERNAL_REFERRAL_REFRESH_HOST_CHALLENGE_TRIP", _HOST_CHALLENGE_TRIP_DEFAULT
     )
+
+
+# A host that has answered this many HTTP 423s ("Locked") IN A ROW is skipped for the rest of the run.
+# None of the other breakers sees it: 423 is neither a 429/503 nor a challenge, and it is an answer, so
+# it never counts as "no answer". Measured 2026-11-02..05: one host answered 423 to all 621 rows the
+# refresh asked of it over 39 runs (0 origin reads, ~8 s a row, ~1,200 s a day), every row of it.
+# The likeliest meaning is a firewall lock on our egress address, so this stops asking that ONE host
+# for the run and retires nothing. A 423 on many unrelated hosts at once would point at the address
+# itself; `crawl_ip_throttle` has NO 423 rule today, so that case would need one there, not here.
+#
+# ITS SKIPPED ROWS ARE STAMPED, UNLIKE THE OTHER HOST SKIPS. A 429 or a challenge is a throttle that
+# passes, so those skips keep their place and lead the next run. A host that locks every request does
+# not pass: unstamped, its rows would lead every run, take up to the per-host cap of the cut, cost 3
+# requests and give the rest of their slots back to nobody. Stamping `last_crawl_attempt_at` (and only
+# that: `last_crawled_at` stays, so the rows stay stale) keeps the rotation every degraded read gets:
+# the host's rows wait behind the rest of the queue and are tried again when their turn comes.
+# 3, like the challenge trip; through the shared helper, so 0 is never "off".
+_HOST_LOCKED_TRIP_DEFAULT = 3
+
+
+def _host_locked_trip() -> int:
+    """EXTERNAL_REFERRAL_REFRESH_HOST_LOCKED_TRIP, then 3. Rounded up, at least 1."""
+    return crawl_global_pacer.resolve_count(
+        None, "EXTERNAL_REFERRAL_REFRESH_HOST_LOCKED_TRIP", _HOST_LOCKED_TRIP_DEFAULT
+    )
+
+
+async def _stamp_crawl_attempts(seed_ids: Sequence[str]) -> int:
+    """Record an attempt (`last_crawl_attempt_at = NOW()`) on rows the 423 breaker passed over, and
+    nothing else. Returns how many ids were sent. FAILS SOFT, loudly: unstamped, the rows simply lead
+    the next run, which is the behaviour before this breaker existed."""
+    ids = [str(s) for s in seed_ids if s]
+    sent = 0
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            params = {f"id{i}": seed_id for i, seed_id in enumerate(chunk)}
+            placeholders = ", ".join(f":id{i}" for i in range(len(chunk)))
+            await database.execute(
+                f"UPDATE external_product_seeds SET last_crawl_attempt_at = NOW() WHERE id IN ({placeholders})",
+                params,
+            )
+            sent += len(chunk)
+    except Exception as exc:  # noqa: BLE001 - a failed stamp only costs the rotation, never the run
+        logger.warning(
+            "external referral refresh: could not stamp %d rows the 423 breaker passed over (%s); "
+            "they lead the next run", len(ids) - sent, type(exc).__name__,
+        )
+    return sent
 
 # Hosts read at once. 1 is the serial loop. Capped at 8: a host is never read by two workers at
 # once, but every worker holds an event-loop slice for HTML parsing on a 1-vCPU job, and the
@@ -373,6 +426,97 @@ def batch_run_status(
 
 def _bump(counter: Dict[str, int], key: str) -> None:
     counter[key] = int(counter.get(key) or 0) + 1
+
+
+# How many hosts the handle-less read summary lists (by rows decided), beside its totals.
+HANDLELESS_TOP_HOSTS = 25
+
+
+def count_handleless_read(
+    totals: Dict[str, int], by_host: Dict[str, Dict[str, int]], host: str, info: Any
+) -> None:
+    """Count one row's handle-less read decision (`result["handleless_read"]`, from
+    routes/employee_products._handleless_read_outcome), into the run's totals and its host's counts:
+    `decided`, `would_read`, `read`, `would_flip_healthy`, `refused:<reason>`, `segment:<segment>`."""
+    if not isinstance(info, dict):
+        return
+    counters = (totals, by_host.setdefault(host or "unknown", {}))
+    keys = ["decided"]
+    if info.get("would_read"):
+        keys.append("would_read")
+        if info.get("mode") == "on":
+            keys.append("read")
+        if info.get("would_flip_healthy"):
+            keys.append("would_flip_healthy")
+    if info.get("refusal"):
+        keys.append(f"refused:{info['refusal']}")
+    if info.get("segment"):
+        keys.append(f"segment:{info['segment']}")
+    for counter in counters:
+        for key in keys:
+            _bump(counter, key)
+
+
+# At most this many HANDLELESS_DECISION lines per run; the rest are counted (`decision_lines.suppressed`).
+HANDLELESS_DECISION_LOG_MAX = 500
+
+
+def handleless_decision_line(seed_id: Any, host: Any, info: Any) -> Optional[Dict[str, Any]]:
+    """One SHADOW decision as a reviewer reads it, or None (not a decision, or not shadow: `on` and `off` log
+    nothing). Ids, the host and the decision only: no URL, so no query string or token can reach the log."""
+    if not isinstance(info, dict) or info.get("mode") != "shadow":
+        return None
+    detail = info.get("detail") if isinstance(info.get("detail"), dict) else {}
+    return {
+        "seed_id": str(seed_id) if seed_id is not None else None,
+        "host": str(host or "unknown"),
+        "would_read": bool(info.get("would_read")),
+        "would_flip_healthy": bool(info.get("would_flip_healthy")),
+        "refusal": info.get("refusal"),
+        "segment": info.get("segment"),
+        "identity_by": info.get("identity_by"),
+        "title_dice": detail.get("title_dice"),
+        "price_ratio": detail.get("price_ratio"),
+    }
+
+
+def log_handleless_decision(lines: Dict[str, int], seed_id: Any, host: Any, info: Any) -> None:
+    """Log one SHADOW decision as a `HANDLELESS_DECISION {json}` line through the `pivota` logger (the one prod
+    keeps at INFO), at most `HANDLELESS_DECISION_LOG_MAX` per run (`lines` counts `logged` / `suppressed`).
+    NEVER RAISES: it runs inside the row's try, where a raise would count a refreshed row as failed."""
+    try:
+        line = handleless_decision_line(seed_id, host, info)
+        if line is None:
+            return
+        if int(lines.get("logged") or 0) >= HANDLELESS_DECISION_LOG_MAX:
+            lines["suppressed"] = int(lines.get("suppressed") or 0) + 1
+            return
+        lines["logged"] = int(lines.get("logged") or 0) + 1
+        pivota_logger.info("HANDLELESS_DECISION " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
+    except Exception:  # noqa: BLE001 - reporting must never cost a row its count
+        return
+
+
+def handleless_read_summary(
+    mode: str,
+    totals: Dict[str, int],
+    by_host: Dict[str, Dict[str, int]],
+    decision_lines: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """The run's handle-less read decisions: the mode, the totals, and the `HANDLELESS_TOP_HOSTS` hosts with
+    the most rows decided; in shadow also `decision_lines` ({logged, suppressed}, `log_handleless_decision`)."""
+    top = sorted(by_host.items(), key=lambda kv: (-int(kv[1].get("decided") or 0), kv[0]))[:HANDLELESS_TOP_HOSTS]
+    out: Dict[str, Any] = {
+        "mode": mode,
+        "totals": dict(sorted(totals.items())),
+        "top_hosts": {h: dict(sorted(c.items())) for h, c in top},
+    }
+    if mode == "shadow" and decision_lines is not None:
+        out["decision_lines"] = {
+            "logged": int(decision_lines.get("logged") or 0),
+            "suppressed": int(decision_lines.get("suppressed") or 0),
+        }
+    return out
 
 
 def _degraded_reason_bucket(error: Any) -> str:
@@ -1935,6 +2079,25 @@ def refresh_queue_tier(
     return (1 if is_fresh else 0, 0 if served_currency else 1)
 
 
+#: The refresh queue's suppressed-product filter: the seed lane's (`SEED_SUPPRESSED_PRODUCT_ANTI_JOIN`), except that a
+#: product suppressed ONLY under the unconfirmed-dead reason keeps its seed in the queue. The mirror back-links each
+#: seed's `attached_product_key` to its own mirror product, which is exactly what that hide suppresses; dropping the
+#: seed from the queue would leave nothing to observe it again (the sweep cannot read those hosts' catalogues), so
+#: the hide could never lift. The serving lanes keep the seed lane's filter. The reason is spelled out (a literal, for
+#: the repo's static PREPARE sweep); a test pins it to `external_seed_destination_liveness.UNCONFIRMED_DEAD_REASON`.
+REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN = """
+AND (
+  external_product_seeds.attached_product_key IS NULL
+  OR external_product_seeds.attached_product_key NOT IN (
+    SELECT seed_cp.product_key FROM catalog_products seed_cp
+    WHERE seed_cp.suppressed_at IS NOT NULL AND seed_cp.product_key IS NOT NULL
+      AND (seed_cp.suppression_reason IS NULL
+           OR seed_cp.suppression_reason <> 'external_seed_destination_dead_unconfirmed_pending')
+  )
+)
+"""
+
+
 async def get_external_referral_refresh_candidate_seed_ids(
     limit: int = 500, *, seed_ids: Optional[Sequence[str]] = None, market: Optional[str] = None
 ) -> List[str]:
@@ -1950,8 +2113,11 @@ async def get_external_referral_refresh_candidate_seed_ids(
     every active seed the seed lane can serve is a candidate.
 
     NOT candidates, filtered in SQL with the seed lane's own fragments:
-      * a seed attached to a SUPPRESSED catalog product (SEED_SUPPRESSED_PRODUCT_ANTI_JOIN).
-        Measured prod 2026-09-27: 682. Lifting the suppression puts it back, near the head;
+      * a seed attached to a SUPPRESSED catalog product (`REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN`, the seed lane's
+        SEED_SUPPRESSED_PRODUCT_ANTI_JOIN with one exception). Measured prod 2026-09-27: 682. Lifting the
+        suppression puts it back, near the head. THE EXCEPTION: a product hidden under the unconfirmed-dead reason
+        stays a candidate, because this refresh is the only lane that can lift it (the sweep cannot read those
+        hosts' catalogues) and a hide nothing re-observes is not reversible;
       * a seed whose domain is QUARANTINED (`build_seed_quarantine_anti_join`), for the same reason;
       * a RETIRED seed. The destination sweep sets `status = 'inactive'`.
 
@@ -2002,7 +2168,7 @@ async def get_external_referral_refresh_candidate_seed_ids(
                     THEN 1 ELSE 0 END AS is_fresh
         FROM external_product_seeds
         WHERE status = 'active'
-        {SEED_SUPPRESSED_PRODUCT_ANTI_JOIN}
+        {REFRESH_SUPPRESSED_PRODUCT_ANTI_JOIN}
         {build_seed_quarantine_anti_join()}
         {scope_sql}
         ORDER BY last_crawl_attempt_at ASC NULLS FIRST, last_crawled_at ASC NULLS FIRST, updated_at ASC NULLS FIRST
@@ -2268,6 +2434,7 @@ async def run_external_referral_refresh_batch(
     host_trip = _host_block_trip()
     unreachable_trip = _host_unreachable_trip()
     challenge_trip = _host_challenge_trip()
+    locked_trip = _host_locked_trip()
     concurrency = _refresh_host_concurrency(host_concurrency)
     # Looked up whatever the breakers say: the host is also the concurrency key (one row in
     # flight per host) and the per-host timing key. Without hosts every row is its own lane.
@@ -2371,6 +2538,20 @@ async def run_external_referral_refresh_batch(
     # ambiguous separator rather than guessing; an unread currency is no longer invented). By
     # reason, so a rising count points at the signal the extractor is missing.
     price_skipped_unreadable = 0
+    # A success that did not read the product we serve (routes/employee_products._read_the_served_product:
+    # a canonical or redirect naming another product, a 200 challenge, a cached fallback, a URL with no
+    # product handle). Its price and stock are not written; counted so a host that never reads is visible.
+    price_not_read = 0
+    availability_not_read = 0
+    # What the handle-less read rule decided, per row (EXTERNAL_SEED_HANDLELESS_READ shadow / on): totals and per host.
+    handleless_totals: Dict[str, int] = {}
+    handleless_hosts: Dict[str, Dict[str, int]] = {}
+    # In shadow, one HANDLELESS_DECISION log line per decided row, bounded per run (`log_handleless_decision`).
+    handleless_lines: Dict[str, int] = {}
+    # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): each host's observations this run and its
+    # candidates, applied (or, in shadow, reported) after the run by `apply_unconfirmed_hides`.
+    unconfirmed_mode = unconfirmed_hide_mode()
+    unconfirmed_hosts: Dict[str, Dict[str, Any]] = {}
     price_unreadable_reasons: Dict[str, int] = {}
     price_unreadable_hosts: Dict[str, int] = {}
     availability_changed = 0
@@ -2388,6 +2569,12 @@ async def run_external_referral_refresh_batch(
     # Hosts that answered `challenge_trip` Cloudflare challenges in a row, and the rows passed over.
     challenged_hosts: Dict[str, int] = {}
     skipped_for_host_challenge = 0
+    # Hosts that answered `locked_trip` HTTP 423s in a row, the rows passed over, and their ids: these
+    # skips ARE stamped after the run (see _HOST_LOCKED_TRIP_DEFAULT). Per run, like every breaker here.
+    locked_hosts: Dict[str, int] = {}
+    locked_streak: Dict[str, int] = {}
+    locked_skipped_ids: List[str] = []
+    skipped_for_host_423 = 0
     # Per-host cost, measured around the refresh call: the fetch, the pacing wait it includes,
     # the writes and the projection. This is how to see which hosts the budget goes to.
     host_stats: Dict[str, Dict[str, float]] = {}
@@ -2403,6 +2590,7 @@ async def run_external_referral_refresh_batch(
         nonlocal price_changed, price_filled, price_unchanged, price_unavailable
         nonlocal price_skipped_incomplete_pair, price_skipped_currency_mismatch
         nonlocal price_skipped_non_positive, price_skipped_unreadable, availability_changed
+        nonlocal price_not_read, availability_not_read
         nonlocal proj_attempted, proj_written, proj_errored, proj_seconds
         nonlocal pdp_refreshed, pdp_errored, catalogue_rows_read
         outcome = "failed"
@@ -2425,6 +2613,9 @@ async def run_external_referral_refresh_batch(
                 result = await refresh_seed_by_id(seed_id, **refresh_kwargs)
             status = str(result.get("status") or "success")
             outcome = status
+            if unconfirmed_mode != "off":
+                # Every outcome: a 404 comes back `degraded`, a read `success`.
+                count_unconfirmed_observation(unconfirmed_hosts, host, seed_id, result.get("destination_refresh"))
             # Counted whatever the row's outcome: a seed sent back to its page read can still end degraded.
             if catalogue_read is not None and result.get("catalogue_fallback"):
                 _bump(catalogue_fallbacks, str(result["catalogue_fallback"]))
@@ -2458,6 +2649,8 @@ async def run_external_referral_refresh_batch(
                     price_unreadable_hosts[host or "unknown"] = price_unreadable_hosts.get(host or "unknown", 0) + 1
                 elif price_status == "unavailable":
                     price_unavailable += 1
+                elif price_status == "not_read":
+                    price_not_read += 1
                 proj = result.get("projection")
                 if isinstance(proj, dict):
                     proj_attempted += int(proj.get("attempted") or 0)
@@ -2479,6 +2672,10 @@ async def run_external_referral_refresh_batch(
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
+                elif isinstance(availability, dict) and availability.get("status") == "not_read":
+                    availability_not_read += 1
+                count_handleless_read(handleless_totals, handleless_hosts, host, result.get("handleless_read"))
+                log_handleless_decision(handleless_lines, seed_id, host, result.get("handleless_read"))
             elif status == "degraded":
                 degraded += 1
                 # THE REASON USED TO BE DROPPED HERE. `errors[]` is populated only on the
@@ -2583,6 +2780,32 @@ async def run_external_referral_refresh_batch(
                 "external referral refresh: %s gave no answer %d rows in a row (%s); skipping "
                 "its remaining rows this run", host, unreachable_streak[host], outcome_bucket,
             )
+        # 423 ("Locked"), row after row: stop asking for the rest of the run. Only a REAL ANSWER breaks
+        # the streak: a read that reached the origin, or another HTTP status (a challenge included).
+        # A timeout, a connection/DNS/TLS failure, a pacer or robots refusal, a cached snapshot, an
+        # exception or an unprocessable seed says nothing about the lock and leaves the streak alone;
+        # otherwise a host alternating 423 and timeouts would trip neither this breaker nor the
+        # no-answer one (each resets the other's streak).
+        if outcome == "degraded" and outcome_bucket == "http_423":
+            locked_streak[host] = locked_streak.get(host, 0) + 1
+        elif (
+            outcome == "success" and not (isinstance(result, dict) and result.get("snapshot_from_cache"))
+        ) or (
+            outcome == "degraded" and (outcome_bucket.startswith("http_") or outcome_bucket == "bot_challenge")
+        ):
+            locked_streak[host] = 0
+        if (
+            host not in locked_hosts
+            and host not in tripped_hosts
+            and host not in unreachable_hosts
+            and host not in challenged_hosts
+            and locked_streak.get(host, 0) >= locked_trip
+        ):
+            locked_hosts[host] = 0
+            logger.warning(
+                "external referral refresh: %s answered %d HTTP 423s in a row; skipping its "
+                "remaining rows this run", host, locked_streak[host],
+            )
 
     # THE SCHEDULER. One lane per host, holding that host's rows in queue order. A worker takes
     # the lane whose next row is EARLIEST in the queue among lanes with nothing in flight, so:
@@ -2646,11 +2869,17 @@ async def run_external_referral_refresh_batch(
 
     def _drain_tripped_lane(key: str) -> None:
         nonlocal skipped_for_host_backoff, skipped_for_unreachable_host, skipped_for_host_challenge
+        nonlocal skipped_for_host_423
         # Passed-over rows are NOT stamped (`refresh_seed_by_id` is never called), so they keep
         # their place at the head of tomorrow's queue instead of being recorded as an attempt
-        # that never happened.
-        remaining = len(lanes.pop(key, ()))
-        if key in tripped_hosts:
+        # that never happened. The 423 breaker's are the exception: stamped after the run.
+        lane = lanes.pop(key, ())
+        remaining = len(lane)
+        if key in locked_hosts:
+            locked_hosts[key] += remaining
+            skipped_for_host_423 += remaining
+            locked_skipped_ids.extend(lane)
+        elif key in tripped_hosts:
             tripped_hosts[key] += remaining
             skipped_for_host_backoff += remaining
         elif key in challenged_hosts:
@@ -2711,7 +2940,10 @@ async def run_external_referral_refresh_batch(
                     # Give it back. A no-op once the host has really been contacted. (A drained lane
                     # needs no release of its own: a breaker only ever drains a host that answered.)
                     pacer.release(key)
-                    if key in tripped_hosts or key in unreachable_hosts or key in challenged_hosts:
+                    if (
+                        key in tripped_hosts or key in unreachable_hosts or key in challenged_hosts
+                        or key in locked_hosts
+                    ):
                         _drain_tripped_lane(key)
                     elif ip_breaker.tripped and lanes.get(key):
                         _drain_ip_throttled_lane(key)
@@ -2723,6 +2955,14 @@ async def run_external_referral_refresh_batch(
 
     with crawl_ip_throttle.installed(ip_breaker), crawl_global_pacer.installed(pacer):
         await _run_workers(_worker, concurrency)
+    host_423_stamped = await _stamp_crawl_attempts(locked_skipped_ids) if locked_skipped_ids else 0
+    # AFTER the run, when every host's share of hard 404s is known (the brake), never per row. And ALONE: every worker
+    # has returned, so no refresh of this run shares the apply step's connection (`databases` hands tasks gathered on
+    # one Database the same connection, which a FOR UPDATE does not block). See `apply_unconfirmed_hides`.
+    unconfirmed_hide = (
+        await apply_unconfirmed_hides(unconfirmed_hosts, mode=unconfirmed_mode)
+        if unconfirmed_mode != "off" else {"mode": "off", "totals": {}, "top_hosts": {}}
+    )
     if ip_breaker.tripped:
         logger.warning(
             "external referral refresh: IP throttled at %s (trip %d of %d, %d distinct hosts); the "
@@ -2761,6 +3001,7 @@ async def run_external_referral_refresh_batch(
         - skipped_for_host_backoff
         - skipped_for_unreachable_host
         - skipped_for_host_challenge
+        - skipped_for_host_423
         - skipped_for_ip_throttle,
     )
     origin_yield = (origin_reads / attempted_count) if attempted_count else 1.0
@@ -2883,6 +3124,12 @@ async def run_external_referral_refresh_batch(
         "skipped_for_host_challenge": skipped_for_host_challenge,
         "host_challenge_skips": dict(sorted(challenged_hosts.items(), key=lambda kv: -kv[1])[:10]),
         "host_challenge_trip": challenge_trip,
+        # Rows NOT attempted because their host answered `host_423_trip` HTTP 423s in a row, per host.
+        # STAMPED (`host_423_stamped` of them), unlike the other host skips: see _HOST_LOCKED_TRIP_DEFAULT.
+        "skipped_for_host_423": skipped_for_host_423,
+        "host_423_skips": dict(sorted(locked_hosts.items(), key=lambda kv: -kv[1])[:10]),
+        "host_423_trip": locked_trip,
+        "host_423_stamped": host_423_stamped,
         "unreachable_host_errors": unreachable_samples,
         # Rows NOT attempted because the IP breaker tripped and their host had throttled us or is
         # Shopify-served.
@@ -2920,6 +3167,8 @@ async def run_external_referral_refresh_batch(
         "price_skipped_currency_mismatch": price_skipped_currency_mismatch,
         "price_skipped_non_positive": price_skipped_non_positive,
         "price_skipped_unreadable": price_skipped_unreadable,
+        "price_not_read": price_not_read,
+        "availability_not_read": availability_not_read,
         "price_unreadable_reasons": price_unreadable_reasons,
         # Which hosts' pages the extractor would not price, so night one says WHERE (a host whose
         # pages name no currency shows up here every night until it is looked at).
@@ -2927,6 +3176,14 @@ async def run_external_referral_refresh_batch(
             sorted(price_unreadable_hosts.items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         ),
         "availability_changed": availability_changed,
+        # Rows whose served URL names no product handle, and what EXTERNAL_SEED_HANDLELESS_READ decided for them
+        # (`count_handleless_read`): nothing is counted with the flag off.
+        "handleless_read": handleless_read_summary(
+            handleless_read_mode(), handleless_totals, handleless_hosts, handleless_lines
+        ),
+        # The unconfirmed-dead hide (EXTERNAL_SEED_DEAD_UNCONFIRMED_HIDE): per host and in total, what the run
+        # observed, its candidates, what it hid (`on`) or would have (`shadow`), and what the host brake held.
+        "unconfirmed_hide": unconfirmed_hide,
         # The catalogue price lane: off, or how many hosts it planned and read, what each read came to,
         # how many rows it priced, and why the others kept their page read (`rows`).
         "catalogue": {

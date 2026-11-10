@@ -41,7 +41,11 @@ def _worker_id() -> str:
 async def run_agent_purchase_events() -> Dict[str, Any]:
     if not (purchase_events.is_enabled() and agent_purchase_ledger.is_enabled()):
         return {"skipped": "disabled"}
-    detected = await purchase_events.detect(lookback_hours=_int_env(_LOOKBACK_ENV, 72, 1, 168))
+    try:
+        detected = await purchase_events.detect(lookback_hours=_int_env(_LOOKBACK_ENV, 72, 1, 168))
+    except Exception as exc:  # noqa: BLE001 - events already recorded are still handed over
+        logger.warning("agent_purchase_events: detect failed error_type=%s", type(exc).__name__)
+        detected = {"detect_failed": 1}
     handed = await purchase_events.hand_over(worker=_worker_id())
     if detected or handed:
         logger.info("agent_purchase_events: detected=%s handed=%s", detected, handed)

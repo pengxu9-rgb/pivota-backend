@@ -1,10 +1,6 @@
-"""GET /agents/{agent_id}/merchants: a merchant's contact email only where the agent ordered.
+"""GET /agents/{agent_id}/merchants: contact_email only where the agent has ordered.
 
-With the agent's allowed_merchants NULL the route lists every approved merchant (up to 100),
-and it returned each one's contact_email unconditionally, so any agent portal account could
-read the contact address of merchants it had never traded with. GET /agent/v1/merchants
-returns the address only where the calling agent has orders; this route now applies the same
-rule. Orders, GMV and every other field are unchanged.
+Same rule as GET /agent/v1/merchants. Orders, GMV and every other field are unchanged.
 
 Drives the real route on a minimal app (never `main`, never TestClient) against the test DB,
 with real signed JWTs so the route's own ownership check runs.
@@ -195,6 +191,14 @@ def _app():
     return app
 
 
+async def _set_allowed(agent_id: str, allowed):
+    from db.agents import agents
+
+    await database.execute(
+        agents.update().where(agents.c.agent_id == agent_id).values(allowed_merchants=allowed)
+    )
+
+
 async def _get(agent_id: str, token: str):
     transport = httpx.ASGITransport(app=_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
@@ -256,3 +260,13 @@ async def test_staff_reading_an_agent_get_the_same_view_the_agent_gets(_rows):
 async def test_another_agent_is_still_refused(_rows):
     resp = await _get(AGENT, _agent_token(OTHER_AGENT))
     assert resp.status_code == 403, resp.text
+
+
+async def test_an_empty_allow_list_lists_no_merchants(_rows):
+    await _set_allowed(AGENT, [])
+    resp = await _get(AGENT, _agent_token(AGENT))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["access_type"] == "restricted"
+    assert body["merchants"] == []
+    assert body["count"] == 0

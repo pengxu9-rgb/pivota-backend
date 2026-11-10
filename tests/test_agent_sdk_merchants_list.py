@@ -12,10 +12,12 @@ Drives the real route on a minimal app (never `main`, never TestClient) against 
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import uuid
+from typing import Optional
 
 import httpx
 import pytest
@@ -167,60 +169,208 @@ R_DEMO = f"merch_ml_demorig_{RUN}"
 DEMO_DOMAIN = f"pivota-review-demo-ml-{RUN}.myshopify.com"
 
 
-def _known_rig_id() -> str:
+async def _ensure_columns(table: str, columns, undo: list) -> None:
+    """Add each missing column as TEXT and record it in `undo`. The dialect gate shares one
+    database, and tests/test_connection_layer_postgres.py leaves a `merchant_stores` with only
+    `store_id` plus a few columns (no `name`), which CREATE TABLE IF NOT EXISTS then keeps.
+    A probe per column so the same code works on both dialects."""
+    for column in columns:
+        try:
+            await database.fetch_all(f"SELECT {column} FROM {table} WHERE 1 = 0")
+        except Exception:  # noqa: BLE001 - the probe only says "missing"
+            await database.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+            undo.append(("column", table, column))
+
+
+async def _restore(undo: list) -> None:
+    """Put the shared database's schema back as found: newest first; a column added to a
+    table this fixture created goes with the table."""
+    dropped = set()
+    for item in reversed(undo):
+        if item[0] == "table":
+            await database.execute(f"DROP TABLE IF EXISTS {item[1]}")
+            dropped.add(item[1])
+        elif item[1] not in dropped:
+            await database.execute(f"ALTER TABLE {item[1]} DROP COLUMN {item[2]}")
+
+
+async def _pick_known_rig() -> tuple:
+    """A baked-in rig id this test can make approved + PSP-connected, so only the rig
+    exclusion can keep it out. Prefer an id the shared DB does not hold; otherwise borrow
+    an existing row and return its original state for restoring."""
     from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
 
-    return sorted(KNOWN_TEST_MERCHANT_IDS)[0]
+    ids = sorted(KNOWN_TEST_MERCHANT_IDS)
+    for mid in ids:
+        row = await database.fetch_one(
+            "SELECT 1 AS x FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
+        )
+        if row is None:
+            return mid, None
+    mid = ids[0]
+    row = await database.fetch_one(
+        "SELECT status, psp_connected FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
+    )
+    return mid, {"status": row["status"], "psp_connected": row["psp_connected"]}
+
+
+RIG_STORE_ID = f"st_ml_{RUN}"
+RIG_STEPS = ("known", "stores_table", "stores_columns", "store_row", "rig_rows", "orders")
+
+
+@contextlib.asynccontextmanager
+async def _rig_rows(fail_after: Optional[str] = None):
+    """Seed the three rigs. Every mutation is recorded the moment it succeeds and the
+    `try` opens before the first one, so a setup error part-way still undoes exactly what
+    was done: the shared dialect-gate DB must never keep a baked-in id approved +
+    PSP-connected, a stray store row, or an added column. `fail_after` injects that
+    setup error for the teardown tests."""
+    from services import test_merchant_policy
+
+    test_merchant_policy.reset_cache()
+    undo: list = []   # schema: tables / columns this created
+    done: list = []   # rows: what to delete or put back, in order
+
+    def _step(name: str) -> None:
+        if fail_after == name:
+            raise RuntimeError(f"injected setup failure after {name}")
+
+    try:
+        r_known, known_original = await _pick_known_rig()
+        if known_original is None:
+            await database.execute(_merchant_row(r_known))
+            done.append(("delete_merchant", r_known))
+        else:
+            await database.execute(
+                "UPDATE merchant_onboarding SET status = 'approved', psp_connected = TRUE "
+                "WHERE merchant_id = :m",
+                {"m": r_known},
+            )
+            done.append(("restore_merchant", r_known, known_original))
+        _step("known")
+        if not await _table_exists("merchant_stores"):
+            await database.execute(
+                "CREATE TABLE merchant_stores ("
+                "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
+                "platform VARCHAR(50) NOT NULL, name VARCHAR(255) NOT NULL, domain VARCHAR(255), "
+                "api_key TEXT, status VARCHAR(50) DEFAULT 'connected', "
+                "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE "
+                "DEFAULT CURRENT_TIMESTAMP)"
+            )
+            undo.append(("table", "merchant_stores"))
+        _step("stores_table")
+        await _ensure_columns("merchant_stores", ("merchant_id", "platform", "name", "domain"), undo)
+        _step("stores_columns")
+        await database.execute(
+            "INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain) "
+            "VALUES (:s, :m, 'shopify', 'demo', :d)",
+            {"s": RIG_STORE_ID, "m": R_DEMO, "d": DEMO_DOMAIN},
+        )
+        done.append(("delete_store", RIG_STORE_ID))
+        _step("store_row")
+        for mid in (R_ENV, R_DEMO):
+            await database.execute(_merchant_row(mid))
+            done.append(("delete_merchant", mid))
+        _step("rig_rows")
+        for mid in (R_ENV, R_DEMO, r_known):
+            await database.execute(_order(mid, AGENT, 11))
+            done.append(("delete_orders", mid))
+        _step("orders")
+        yield {"known": r_known, "env": R_ENV, "demo": R_DEMO}
+    finally:
+        for item in reversed(done):
+            if item[0] == "delete_orders":
+                await database.execute(
+                    "DELETE FROM orders WHERE agent_id = :a AND merchant_id = :m",
+                    {"a": AGENT, "m": item[1]},
+                )
+            elif item[0] == "delete_merchant":
+                await database.execute(
+                    "DELETE FROM merchant_onboarding WHERE merchant_id = :m", {"m": item[1]}
+                )
+            elif item[0] == "restore_merchant":
+                await database.execute(
+                    "UPDATE merchant_onboarding SET status = :s, psp_connected = :p "
+                    "WHERE merchant_id = :m",
+                    {"s": item[2]["status"], "p": item[2]["psp_connected"], "m": item[1]},
+                )
+            elif item[0] == "delete_store":
+                await database.execute(
+                    "DELETE FROM merchant_stores WHERE store_id = :s", {"s": item[1]}
+                )
+        await _restore(undo)
+        test_merchant_policy.reset_cache()
 
 
 @pytest.fixture
 async def _rigs(_rows, monkeypatch):
-    from services import test_merchant_policy
-
     monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
-    test_merchant_policy.reset_cache()
-    r_known = _known_rig_id()
-    # The shared dialect-gate DB may already hold this real id; only touch it if absent.
-    known_was_absent = (
-        await database.fetch_one(
-            "SELECT 1 AS x FROM merchant_onboarding WHERE merchant_id = :m", {"m": r_known}
+    # Checked around EVERY rig test, not only in the dedicated teardown tests: those run
+    # after earlier rig tests, so a schema change one of them left behind would already
+    # be part of their "before".
+    before = await _db_state()
+    async with _rig_rows() as rigs:
+        yield rigs
+    assert (await _db_state()) == before, "rig teardown left the shared DB changed"
+
+
+async def _columns(table: str) -> list:
+    """Column names over the async connection (a second, sync engine would wait on the
+    SQLite file lock)."""
+    from db.database import IS_SQLITE
+
+    if IS_SQLITE:
+        rows = await database.fetch_all(f"PRAGMA table_info({table})")
+        return sorted(r["name"] for r in rows)
+    rows = await database.fetch_all(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = :t",
+        {"t": table},
+    )
+    return sorted(r["column_name"] for r in rows)
+
+
+async def _db_state() -> dict:
+    """What the rig setup may touch, for before/after comparison."""
+    from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+
+    watched = sorted(KNOWN_TEST_MERCHANT_IDS) + [R_ENV, R_DEMO]
+    merchants = {}
+    for mid in watched:
+        row = await database.fetch_one(
+            "SELECT status, psp_connected FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
         )
-        is None
+        if row is not None:
+            merchants[mid] = (row["status"], None if row["psp_connected"] is None else bool(row["psp_connected"]))
+    store_cols = await _columns("merchant_stores") if await _table_exists("merchant_stores") else None
+    store_rows = None
+    if store_cols is not None:
+        row = await database.fetch_one(
+            "SELECT COUNT(*) AS n FROM merchant_stores WHERE store_id = :s", {"s": RIG_STORE_ID}
+        )
+        store_rows = int(row["n"])
+    params = {f"m{i}": mid for i, mid in enumerate(watched)}
+    in_list = ", ".join(f":m{i}" for i in range(len(watched)))
+    row = await database.fetch_one(
+        f"SELECT COUNT(*) AS n FROM orders WHERE agent_id = :a AND merchant_id IN ({in_list})",
+        {**params, "a": AGENT},
     )
-    stores_created = not await _table_exists("merchant_stores")
-    await database.execute(
-        "CREATE TABLE IF NOT EXISTS merchant_stores ("
-        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, "
-        "platform VARCHAR(50) NOT NULL, name VARCHAR(255) NOT NULL, domain VARCHAR(255), "
-        "api_key TEXT, status VARCHAR(50) DEFAULT 'connected', "
-        "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE "
-        "DEFAULT CURRENT_TIMESTAMP)"
-    )
-    store_id = f"st_ml_{RUN}"
-    await database.execute(
-        "INSERT INTO merchant_stores (store_id, merchant_id, platform, name, domain) "
-        "VALUES (:s, :m, 'shopify', 'demo', :d)",
-        {"s": store_id, "m": R_DEMO, "d": DEMO_DOMAIN},
-    )
-    rig_ids = [R_ENV, R_DEMO] + ([r_known] if known_was_absent else [])
-    for mid in rig_ids:
-        await database.execute(_merchant_row(mid))
-    for mid in [R_ENV, R_DEMO, r_known]:
-        await database.execute(_order(mid, AGENT, 11))
+    return {
+        "merchants": merchants,
+        "store_cols": store_cols,
+        "store_rows": store_rows,
+        "orders": int(row["n"]),
+    }
 
-    yield {"known": r_known, "env": R_ENV, "demo": R_DEMO}
 
-    params = {f"m{i}": mid for i, mid in enumerate([R_ENV, R_DEMO, r_known])}
-    in_list = ", ".join(f":m{i}" for i in range(3))
-    await database.execute(
-        f"DELETE FROM orders WHERE agent_id = :a AND merchant_id IN ({in_list})", {**params, "a": AGENT}
-    )
-    for mid in rig_ids:
-        await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid})
-    await database.execute("DELETE FROM merchant_stores WHERE store_id = :s", {"s": store_id})
-    if stores_created:
-        await database.execute("DROP TABLE IF EXISTS merchant_stores")
-    test_merchant_policy.reset_cache()
+async def _assert_rigs_are_eligible_but_for_the_exclusion(rigs) -> None:
+    """Guard against a vacuous pass: every rig row must otherwise qualify for `available`."""
+    for mid in rigs.values():
+        row = await database.fetch_one(
+            "SELECT status, psp_connected FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
+        )
+        assert row is not None, mid
+        assert row["status"] == "approved" and bool(row["psp_connected"]) is True, mid
 
 
 def _app(allowed_merchants=None, agent_id=AGENT):
@@ -407,6 +557,7 @@ async def test_a_db_error_is_not_echoed_to_the_caller(_rows, monkeypatch):
 
 
 async def test_test_and_demo_rigs_never_list_in_available(_rigs):
+    await _assert_rigs_are_eligible_but_for_the_exclusion(_rigs)
     for agent in (AGENT, f"agent_ml_brand_new_{RUN}"):
         ids = {m["merchant_id"] for m in (await _get(_app(agent_id=agent))).json()["merchants"]}
         assert not ids & set(_rigs.values()), ids & set(_rigs.values())
@@ -415,6 +566,7 @@ async def test_test_and_demo_rigs_never_list_in_available(_rigs):
 
 
 async def test_test_and_demo_rigs_never_list_in_mine(_rigs):
+    await _assert_rigs_are_eligible_but_for_the_exclusion(_rigs)
     ids = {m["merchant_id"] for m in (await _get(_app(), {"scope": "mine"})).json()["merchants"]}
     assert not ids & set(_rigs.values())
     assert M_ORDERED in ids
@@ -426,7 +578,33 @@ async def test_an_allowlist_cannot_reach_a_rig(_rigs):
     assert body["pagination"]["total"] == 1
 
 
-async def test_a_failed_rig_lookup_still_applies_the_static_ids(_rigs, monkeypatch):
+async def test_a_failed_demo_domain_lookup_still_applies_the_static_ids(_rigs, monkeypatch):
+    # The path production takes: the policy's merchant_stores query fails inside the resolver.
+    real_fetch_all = database.fetch_all
+
+    async def _stores_down(query, *a, **k):
+        if "merchant_stores" in str(query):
+            raise RuntimeError("merchant_stores unavailable")
+        return await real_fetch_all(query, *a, **k)
+
+    from services import test_merchant_policy
+
+    # No backoff here, so the recovery check below can retry at once; the window itself
+    # is pinned in tests/services/test_test_merchant_policy.py.
+    monkeypatch.setattr(test_merchant_policy, "_FAILURE_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(database, "fetch_all", _stores_down)
+    ids = {m["merchant_id"] for m in (await _get(_app())).json()["merchants"]}
+    assert _rigs["known"] not in ids
+    assert _rigs["env"] not in ids
+    # No last-good demo set yet (cache reset by the fixture), so only the domain leg is lost.
+    assert _rigs["demo"] in ids
+    # And the failure was not cached: once the store lookup recovers, the demo rig is gone.
+    monkeypatch.setattr(database, "fetch_all", real_fetch_all)
+    ids = {m["merchant_id"] for m in (await _get(_app())).json()["merchants"]}
+    assert _rigs["demo"] not in ids
+
+
+async def test_the_route_falls_back_to_static_ids_if_the_policy_raises(_rigs, monkeypatch):
     import routes.agent_sdk_fixed as mod
 
     async def _boom(*a, **k):
@@ -438,3 +616,45 @@ async def test_a_failed_rig_lookup_still_applies_the_static_ids(_rigs, monkeypat
     assert _rigs["known"] not in ids
     assert _rigs["env"] not in ids
     assert _rigs["demo"] in ids
+
+
+async def test_rig_teardown_leaves_the_db_as_found(_rows, monkeypatch):
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
+    before = await _db_state()
+    async with _rig_rows() as rigs:
+        assert (await _db_state()) != before
+        await _assert_rigs_are_eligible_but_for_the_exclusion(rigs)
+    assert (await _db_state()) == before
+
+
+async def test_rig_teardown_restores_a_borrowed_baked_in_row(_rows, monkeypatch):
+    # Every baked-in id already present (non-approved, PSP off): the fixture must borrow
+    # one and put it back exactly.
+    from services.test_merchant_policy import KNOWN_TEST_MERCHANT_IDS
+
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
+    seeded = []
+    for mid in sorted(KNOWN_TEST_MERCHANT_IDS):
+        if await database.fetch_one(
+            "SELECT 1 AS x FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid}
+        ) is None:
+            await database.execute(_merchant_row(mid, status="pending", psp=False))
+            seeded.append(mid)
+    try:
+        before = await _db_state()
+        async with _rig_rows() as rigs:
+            await _assert_rigs_are_eligible_but_for_the_exclusion(rigs)
+        assert (await _db_state()) == before
+    finally:
+        for mid in seeded:
+            await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id = :m", {"m": mid})
+
+
+@pytest.mark.parametrize("fail_after", RIG_STEPS)
+async def test_a_rig_setup_error_leaves_the_db_as_found(_rows, monkeypatch, fail_after):
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", R_ENV)
+    before = await _db_state()
+    with pytest.raises(RuntimeError, match="injected setup failure"):
+        async with _rig_rows(fail_after=fail_after):
+            pass
+    assert (await _db_state()) == before

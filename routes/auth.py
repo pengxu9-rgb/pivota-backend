@@ -8,7 +8,7 @@ import asyncio
 import json
 import os
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from textwrap import dedent
 from typing import Any, Dict, Optional
 
@@ -23,6 +23,7 @@ from db.auth_identity import (
     PORTAL_TO_MEMBERSHIP_TYPE,
     ensure_identity,
     get_active_membership_by_email,
+    insert_credential_hash_if_absent,
     record_identity_event,
     upsert_credential_hash,
     upsert_membership,
@@ -394,6 +395,22 @@ async def _safe_upsert_credential_hash(
         logger.warning("[Auth] Canonical credential sync skipped: %s", exc)
 
 
+async def _safe_insert_credential_hash_if_absent(
+    *,
+    identity_id: str,
+    password_hash: str,
+    source: str,
+) -> None:
+    try:
+        await insert_credential_hash_if_absent(
+            identity_id=identity_id,
+            password_hash=password_hash,
+            source=source,
+        )
+    except Exception as exc:
+        logger.warning("[Auth] Canonical credential insert skipped: %s", exc)
+
+
 async def _safe_ensure_identity(
     *,
     email: str,
@@ -415,6 +432,11 @@ async def _safe_record_identity_event(**kwargs) -> None:
 
 
 async def _resolve_agent_id_for_email(email: str) -> Optional[str]:
+    """An agent whose address is `email`, by email match alone.
+
+    Only for deciding whether to email a reset link to that mailbox (the reset
+    flow then proves the mailbox). Never a login link: see _resolve_linked_agent_id.
+    """
     try:
         row = await _auth_fetch_one(
             """
@@ -447,25 +469,207 @@ async def _resolve_agent_id_for_email(email: str) -> Optional[str]:
 
 
 async def _resolve_merchant_id_for_user(user: Optional[dict], email: str) -> Optional[str]:
+    """The merchant this users row is linked to: users.merchant_id, nothing else.
+
+    It used to fall back to `merchant_onboarding.contact_email`. Nothing proves a
+    mailbox at /api/auth/register, so anyone could register a staff-onboarded
+    merchant's contact address and log in with that merchant's id in a verified
+    token. users.merchant_id is written only by the merchant's own signup, the
+    Shopify claim, staff, or a merchant-portal password reset (which proves the
+    mailbox, see _link_tenants_after_mailbox_proof). The demo map stays: it is
+    off in production.
+    """
     merchant_id = user.get("merchant_id") if user else None
     if merchant_id:
         return str(merchant_id)
+    return _demo_merchant_ids().get(email)
+
+
+# A membership written at most this long before its users row still counts as that
+# row's: the users row's created_at is the database clock, the membership's the app's.
+_MEMBERSHIP_CLOCK_SKEW = timedelta(seconds=60)
+
+
+def _user_created_at(user: Optional[dict]) -> Optional[datetime]:
     try:
-        merchant_record = await _auth_fetch_one(
+        value = (user or {}).get("created_at")
+    except Exception:
+        return None
+    return value if isinstance(value, datetime) else None
+
+
+def _membership_not_before(user: Optional[dict]) -> Optional[datetime]:
+    created_at = _user_created_at(user)
+    return created_at - _MEMBERSHIP_CLOCK_SKEW if created_at else None
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def _membership_predates_user(membership: Optional[dict], user: Optional[dict]) -> bool:
+    """Whether `membership` was last written before this users row existed.
+
+    Identities and memberships outlive a deleted users row, and /api/auth/register
+    reuses the identity for the same email, so a stranger who registers that email
+    again must not inherit the old account's merchant or agent membership.
+    """
+    floor = _membership_not_before(user)
+    if not membership or floor is None:
+        return False
+    written = [
+        _as_aware_utc(membership[key])
+        for key in ("created_at", "updated_at")
+        if isinstance(membership.get(key), datetime)
+    ]
+    return bool(written) and max(written) < _as_aware_utc(floor)
+
+
+async def _resolve_linked_agent_id(user: Optional[dict], email: str) -> Optional[str]:
+    """The agent this users row is linked to, or None.
+
+    An agents row whose owner_email equals the login email is not, alone, proof the
+    agent is this account's: staff create agents with an owner_email that has no
+    users row (POST /agents/create), and /api/auth/register lets anyone create that
+    users row without proving the mailbox. The link is an active agent membership,
+    bound to that agent and written after this users row existed. Only flows that
+    prove ownership write one: the agent's own registration (/agent/account/register
+    creates the users row, the agent and the membership together), the
+    password-verified merchant conversion, a password reset (mailbox proof), and the
+    login that follows one of those.
+    """
+    if not user:
+        return None
+    from db.auth_identity import has_active_membership_for_entity
+
+    try:
+        rows = await database.fetch_all(
             """
-            SELECT merchant_id
-            FROM merchant_onboarding
-            WHERE LOWER(contact_email) = LOWER(:email)
-            ORDER BY created_at DESC
-            LIMIT 1
+            SELECT agent_id
+            FROM agents
+            WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)
+            ORDER BY created_at
             """,
             {"email": email},
         )
     except Exception:
-        merchant_record = None
-    if merchant_record:
-        return str(merchant_record["merchant_id"])
-    return _demo_merchant_ids().get(email)
+        return None
+    for row in rows or []:
+        try:
+            agent_id = str(dict(row)["agent_id"] or "")
+        except Exception:
+            continue
+        if not agent_id:
+            continue
+        try:
+            linked = await has_active_membership_for_entity(
+                email=email,
+                membership_type="agent",
+                entity_id=agent_id,
+                not_before=_membership_not_before(user),
+            )
+        except Exception:
+            linked = False
+        if linked:
+            return agent_id
+    return None
+
+
+async def _email_claims_existing_tenant(
+    email: str,
+    *,
+    check_users_and_merchant_contacts: bool = True,
+    any_employee_status: bool = False,
+) -> bool:
+    """Whether `email` already belongs to someone: a login, an identity, a tenant, staff.
+
+    Self-service registration does not prove the mailbox, so it must not create the
+    users row (or set the identity's password) for an address that is already in use:
+    - a users row at that address in ANY letter case (login matches case-insensitively,
+      so a second row at `victim@x` next to `Victim@x` shares the victim's identity);
+    - a canonical identity that already has a password or any membership: register
+      would otherwise overwrite that password and inherit the memberships;
+    - an agent owner, a non-deleted merchant contact or an active employee.
+    The owner of such an address signs in, or resets the password from the portal,
+    which emails the link to that mailbox. Fails closed: an unanswerable lookup
+    refuses the registration.
+
+    `check_users_and_merchant_contacts=False` skips the users and merchant-contact
+    arms, for a caller that has already resolved both itself (merchant onboarding,
+    the Shopify claim). `any_employee_status=True` counts an employees row of any
+    status: an inactive employee can be reactivated after the address was taken,
+    which is what PUT /merchant/profile (`_login_email_claimed_by`) checks too.
+    """
+    users_arm = ("SELECT 1 FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1", None)
+    merchant_contact_arm = (
+        """
+        SELECT 1 FROM merchant_onboarding
+        WHERE LOWER(COALESCE(contact_email, '')) = LOWER(:email)
+          AND COALESCE(status, '') != 'deleted'
+        LIMIT 1
+        """,
+        None,
+    )
+    employee_arm = (
+        (
+            "SELECT 1 FROM employees WHERE LOWER(TRIM(email)) = LOWER(:email) LIMIT 1",
+            None,
+        )
+        if any_employee_status
+        else (
+            "SELECT 1 FROM employees WHERE LOWER(email) = LOWER(:email) AND status = 'active' LIMIT 1",
+            None,
+        )
+    )
+    checks = (
+        *((users_arm,) if check_users_and_merchant_contacts else ()),
+        (
+            """
+            SELECT 1 FROM auth_identities i
+            WHERE i.email_normalized = LOWER(:email)
+              AND (
+                EXISTS (SELECT 1 FROM auth_credentials c WHERE c.identity_id = i.identity_id)
+                OR EXISTS (SELECT 1 FROM auth_memberships m WHERE m.identity_id = i.identity_id)
+              )
+            LIMIT 1
+            """,
+            None,
+        ),
+        (
+            # Legacy agents rows carry the address in `email`, newer ones in owner_email.
+            """
+            SELECT 1 FROM agents
+            WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)
+               OR LOWER(COALESCE(email, '')) = LOWER(:email)
+            LIMIT 1
+            """,
+            "SELECT 1 FROM agents WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email) LIMIT 1",
+        ),
+        *((merchant_contact_arm,) if check_users_and_merchant_contacts else ()),
+        employee_arm,
+    )
+    for query, fallback in checks:
+        for attempt in (query, fallback):
+            if attempt is None:
+                continue
+            try:
+                row = await database.fetch_one(attempt, {"email": email})
+                break
+            except Exception:
+                continue
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Registration is temporarily unavailable; try again shortly.",
+            )
+        if row:
+            return True
+    return False
+
+
+EMAIL_ALREADY_REGISTERED_DETAIL = (
+    "Email already registered. Sign in, or reset your password from the portal to continue."
+)
 
 
 def _fallback_membership(
@@ -772,7 +976,12 @@ async def _email_has_portal_membership(
         if role == "merchant":
             return True
         merchant = await database.fetch_one(
-            "SELECT merchant_id FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
+            """
+            SELECT merchant_id FROM merchant_onboarding
+            WHERE LOWER(contact_email) = LOWER(:email)
+              AND COALESCE(status, '') != 'deleted'
+            LIMIT 1
+            """,
             {"email": email},
         )
         return bool(merchant)
@@ -852,13 +1061,20 @@ async def register(
         _authorize_requested_role(data.role, caller)
         normalized_email = _normalize_email(data.email)
         # Check if user already exists
-        query = "SELECT id FROM users WHERE email = :email"
+        query = "SELECT id FROM users WHERE LOWER(email) = LOWER(:email)"
         existing_user = await database.fetch_one(query=query, values={"email": normalized_email})
         
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
+            )
+        # An address that already names an agent owner, a merchant contact or an
+        # employee belongs to someone; nothing here proves this caller reads it.
+        if await _email_claims_existing_tenant(normalized_email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=EMAIL_ALREADY_REGISTERED_DETAIL,
             )
         
         # Hash password
@@ -884,7 +1100,10 @@ async def register(
             status="active",
         )
         if identity:
-            await _safe_upsert_credential_hash(
+            # Insert only: registration never replaces an identity's password. The
+            # refusal above already turned away an identity that has one; this
+            # keeps a concurrent writer's credential too.
+            await _safe_insert_credential_hash_if_absent(
                 identity_id=identity["identity_id"],
                 password_hash=password_hash,
                 source="api_auth_register",
@@ -932,7 +1151,7 @@ async def login(data: LoginRequest):
 
         # Find user by email
         query = """
-            SELECT id, email, password_hash, full_name, role, active, merchant_id
+            SELECT id, email, password_hash, full_name, role, active, merchant_id, created_at
             FROM users
             WHERE LOWER(email) = LOWER(:email)
             LIMIT 1
@@ -972,15 +1191,16 @@ async def login(data: LoginRequest):
         # address belongs to another portal (a merchant can move its login email
         # onto any free address without proving the mailbox), the password that
         # just verified is that account's password, not the employee's. Unless
-        # the password is the employee's own, or this identity already holds an
-        # active employee membership, the employees row is not this caller's:
-        # log in as the account the password belongs to, and do not promote it.
+        # the password is the employee's own legacy password, the employees row
+        # is not this caller's: log in as the account the password belongs to,
+        # and do not promote it. An active employee membership is no proof:
+        # backfills and employees_create write one with no users row at the
+        # address, so whoever later creates that users row would inherit it.
         if (
             employee_identity
             and user
             and _is_non_staff_account_role(user_role)
             and not _verify_legacy_employee_password(data.password, employee_identity)
-            and not await _safe_get_active_membership(normalized_email, "employee")
         ):
             logger.warning(
                 "[Auth] Ignoring employees row at %s for a %s login: password not proven for the employee",
@@ -1029,8 +1249,14 @@ async def login(data: LoginRequest):
                     source="employees_login_sync",
                 )
 
+        # Tenant links come from stored, proven links only, never from an email
+        # match: see _resolve_merchant_id_for_user and _resolve_linked_agent_id.
         merchant_id = await _resolve_merchant_id_for_user(user, normalized_email)
-        agent_id = await _resolve_agent_id_for_email(normalized_email)
+        agent_id = (
+            await _resolve_linked_agent_id(user, normalized_email)
+            if user_role == "agent"
+            else None
+        )
 
         if canonical_identity and user and user.get("password_hash") and not verified_with_user_password:
             await _safe_upsert_credential_hash(
@@ -1109,6 +1335,42 @@ async def login(data: LoginRequest):
                 normalized_email,
                 inferred_membership_type,
             )
+            if (
+                inferred_membership_type in {"merchant", "agent"}
+                and _membership_predates_user(membership, user)
+            ):
+                # Left by an earlier account at this email; this users row is newer.
+                await _safe_record_identity_event(
+                    event_type="stale_membership_ignored",
+                    email=normalized_email,
+                    details={
+                        "membership_type": inferred_membership_type,
+                        "entity_id": str(membership.get("entity_id") or ""),
+                        "source": "login",
+                    },
+                )
+                membership = None
+            elif (
+                membership
+                and inferred_membership_type == "employee"
+                and user
+                and _is_non_staff_account_role(user_role)
+                and not employee_identity
+            ):
+                # A merchant/agent users row whose password was not proven for an
+                # active employee: an employee membership at this address is not
+                # this caller's to use (see the guard above).
+                await _safe_record_identity_event(
+                    event_type="employee_promotion_refused",
+                    email=normalized_email,
+                    details={
+                        "users_role": user_role,
+                        "employee_id": str(membership.get("entity_id") or ""),
+                        "reason": "password_not_proven_for_employee",
+                        "source": "login_membership",
+                    },
+                )
+                membership = None
 
         if not membership and inferred_membership_type == "employee" and employee_identity:
             membership = _fallback_membership(
@@ -1330,15 +1592,22 @@ async def change_password(
     """
     try:
         # Get user from database
-        user = await database.fetch_one(
-            # Some legacy deployments used `user_id`; the canonical column is `id`
-            # but we only need the email and password hash here.
-            "SELECT email, password_hash FROM users WHERE email = :email",
+        rows = await database.fetch_all(
+            "SELECT id, email, password_hash FROM users WHERE LOWER(email) = LOWER(:email)",
             {"email": current_user["email"]}
         )
         
-        if not user:
+        if not rows:
             raise HTTPException(status_code=404, detail="User not found")
+        if len(rows) > 1:
+            # Two logins at one address in different letter case share one identity;
+            # changing the identity's password from either would hand the other
+            # row's memberships to whoever knows this one. Support resolves it.
+            raise HTTPException(
+                status_code=409,
+                detail="This email has more than one login; contact support@pivota.cc to merge them.",
+            )
+        user = rows[0]
         
         # Verify current password
         if not verify_password(data.current_password, user["password_hash"]):
@@ -1349,8 +1618,8 @@ async def change_password(
         
         # Update password
         await database.execute(
-            "UPDATE users SET password_hash = :password_hash WHERE email = :email",
-            {"password_hash": new_password_hash, "email": current_user["email"]}
+            "UPDATE users SET password_hash = :password_hash WHERE id = :id",
+            {"password_hash": new_password_hash, "id": user["id"]}
         )
         identity_id = current_user.get("identity_id")
         if not identity_id:
@@ -1408,7 +1677,7 @@ async def forgot_password(data: ForgotPasswordRequest):
         # Some deployments use `id` instead of `user_id`, but for this flow
         # we only need to know whether an email exists, so select email only
         user = _record_to_dict(await database.fetch_one(
-            "SELECT email, role FROM users WHERE email = :email",
+            "SELECT email, role FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
             {"email": normalized_email},
         ))
         employee_identity = await _fetch_active_employee_identity(normalized_email)
@@ -1457,7 +1726,13 @@ async def forgot_password(data: ForgotPasswordRequest):
             # other (or unspecified) portals.
             if not user and data.portal == "merchant":
                 merchant = await database.fetch_one(
-                    "SELECT merchant_id, business_name FROM merchant_onboarding WHERE contact_email = :email LIMIT 1",
+                    """
+                    SELECT merchant_id, business_name FROM merchant_onboarding
+                    WHERE LOWER(contact_email) = LOWER(:email)
+                      AND COALESCE(status, '') != 'deleted'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
                     {"email": normalized_email},
                 )
                 if merchant:
@@ -1486,6 +1761,36 @@ async def forgot_password(data: ForgotPasswordRequest):
                         "email": normalized_email,
                         "role": "merchant",
                     }
+
+            # Agent bootstrap: an agent owner_email with no users row yet (staff
+            # create agents that way). Same shape as the merchant bootstrap: a
+            # random password only the mailbox can replace, and an explicit
+            # agent-portal reset only. Redeeming the link links the agent
+            # (_link_tenants_after_mailbox_proof); self-registration of the
+            # address is refused, so this is how such an owner gets in.
+            if not user and data.portal == "agent":
+                agent_id = await _resolve_agent_id_for_email(normalized_email)
+                if agent_id:
+                    from utils.auth import hash_password
+
+                    await database.execute(
+                        """
+                        INSERT INTO users (email, password_hash, full_name, role, active)
+                        VALUES (:email, :password_hash, :full_name, :role, :active)
+                        """,
+                        {
+                            "email": normalized_email,
+                            "password_hash": hash_password(secrets.token_urlsafe(12)),
+                            "full_name": normalized_email.split("@")[0],
+                            "role": "agent",
+                            "active": True,
+                        },
+                    )
+                    logger.info(
+                        "[Auth] Auto-created agent user for %s to support password reset",
+                        normalized_email,
+                    )
+                    user = {"email": normalized_email, "role": "agent"}
 
             if not user:
                 # Don't reveal if email exists or not (security best practice)
@@ -1546,6 +1851,67 @@ async def forgot_password(data: ForgotPasswordRequest):
         )
 
 
+async def _link_tenants_after_mailbox_proof(email: str, portal: Optional[str]) -> None:
+    """Record the tenant links an email match suggests, now that the mailbox is proven.
+
+    A redeemed reset token was emailed to this address, so whoever redeemed it reads
+    the mailbox. That is the proof login no longer infers from an email match:
+    - merchant (or portal-less) reset of a role=merchant users row with no
+      merchant_id: link the latest non-deleted onboarding whose contact_email is
+      this address;
+    - agent (or portal-less) reset of a role=agent users row: record an active
+      agent membership for every agent whose owner_email is this address.
+    Best effort: a failure here leaves the password reset in place.
+    """
+    try:
+        user = _record_to_dict(await database.fetch_one(
+            "SELECT email, role, merchant_id FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+            {"email": email},
+        ))
+        role = ((user or {}).get("role") or "").strip().lower()
+        if not user:
+            return
+        if role == "merchant" and portal in (None, "merchant") and not user.get("merchant_id"):
+            merchant = await database.fetch_one(
+                """
+                SELECT merchant_id FROM merchant_onboarding
+                WHERE LOWER(contact_email) = LOWER(:email)
+                  AND COALESCE(status, '') != 'deleted'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"email": email},
+            )
+            if merchant and merchant["merchant_id"]:
+                await database.execute(
+                    """
+                    UPDATE users SET merchant_id = :merchant_id
+                    WHERE LOWER(email) = LOWER(:email) AND merchant_id IS NULL
+                    """,
+                    {"merchant_id": str(merchant["merchant_id"]), "email": email},
+                )
+        elif role == "agent" and portal in (None, "agent"):
+            rows = await database.fetch_all(
+                "SELECT agent_id, agent_name FROM agents WHERE LOWER(COALESCE(owner_email, '')) = LOWER(:email)",
+                {"email": email},
+            )
+            for row in rows or []:
+                agent = dict(row)
+                if not agent.get("agent_id"):
+                    continue
+                await _safe_upsert_membership(
+                    email=_normalize_email(email),
+                    membership_type="agent",
+                    role="agent",
+                    entity_id=str(agent["agent_id"]),
+                    status="active",
+                    full_name=agent.get("agent_name"),
+                    source="password_reset_mailbox_proof",
+                )
+    except Exception as exc:
+        logger.warning("[Auth] Post-reset tenant link skipped: %s", type(exc).__name__)
+
+
 @router.post("/reset-password", response_model=MessageResponse)
 async def reset_password(data: ResetPasswordRequest):
     """
@@ -1577,7 +1943,7 @@ async def reset_password(data: ResetPasswordRequest):
         token_portal = (token_record["portal"] or "").strip().lower() or None
         if token_portal:
             token_user = _record_to_dict(await database.fetch_one(
-                "SELECT email, role FROM users WHERE email = :email",
+                "SELECT email, role FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
                 {"email": token_record["user_email"]},
             ))
             token_employee = await _fetch_active_employee_identity(token_record["user_email"])
@@ -1593,8 +1959,11 @@ async def reset_password(data: ResetPasswordRequest):
         new_password_hash = hash_password(data.new_password)
         
         # Update user password
+        # Every row at this address, in any case: the link went to this mailbox, so
+        # whoever redeemed it owns the address, and a squatter's case-variant row
+        # must not keep a password they chose.
         await database.execute(
-            "UPDATE users SET password_hash = :password_hash WHERE email = :email",
+            "UPDATE users SET password_hash = :password_hash WHERE LOWER(email) = LOWER(:email)",
             {"password_hash": new_password_hash, "email": token_record["user_email"]}
         )
         identity = await _safe_ensure_identity(
@@ -1625,6 +1994,8 @@ async def reset_password(data: ResetPasswordRequest):
             "UPDATE password_reset_tokens SET used = TRUE WHERE token = :token",
             {"token": data.token}
         )
+
+        await _link_tenants_after_mailbox_proof(token_record["user_email"], token_portal)
         
         return MessageResponse(
             success=True,
