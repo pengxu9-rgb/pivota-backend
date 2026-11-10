@@ -1,9 +1,10 @@
 """Every RAW `external_product_seeds` query must exclude quarantined seeds.
 
-The shared seam (`fetch_external_seed_rows`) covers most consumers, but seven raw
+The shared seam (`fetch_external_seed_rows`) covers most consumers, but nine raw
 queries read the table directly and had to be gated by hand:
 
-    routes/agent_shop_gateway.py   offers.resolve, x5  (UNAUTHENTICATED; the 5th is the group-sibling read)
+    routes/agent_shop_gateway.py   offers.resolve, x6  (UNAUTHENTICATED; the 5th is the group-sibling read,
+                                   the 6th the signature attached-key arm for minted rows)
     routes/agent_api.py            direct-id product lookup + TEXT fallback
     routes/accounts_orders_api.py  browse-history price lookup
 
@@ -162,7 +163,7 @@ ALL_SITES = [
 def test_every_known_raw_seed_query_was_found():
     """Guards the fixture itself, and catches a NEW ungated raw query.
 
-    If someone adds a seventh raw read, this count changes and they are forced
+    If someone adds another raw read, this count changes and they are forced
     to decide — gate it, or move it to the documented ungated list — rather than
     silently joining the ungated set.
     """

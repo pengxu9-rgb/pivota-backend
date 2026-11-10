@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
@@ -5866,6 +5867,7 @@ async def _handle_offers_resolve(
         where_clauses = ["status = 'active'"]
         params: Dict[str, Any] = {"limit": attached_seed_limit}
         seed_rows: List[Any] = []
+        attached_seed_arm_error: Optional[str] = None
         # (merchant, pid) pairs the attached-ref mainline actually searched — used to
         # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
         # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
@@ -5960,13 +5962,27 @@ async def _handle_offers_resolve(
             # (OFFERS_RESOLVE_ATTACHED_SEED_ARM); runs only when the two keys above found nothing,
             # so a row they already serve is answered as before. It only FINDS rows: every row it
             # returns goes through `_append_external_offers_from_seed_rows` like any other arm's.
+            # MINTED ROWS ONLY: the arm filters on the drain's `source_system`, so a connected
+            # merchant row or a mirror row is answered exactly as with the flag off, whatever seed
+            # is attached to its key.
+            # The arm has its OWN failure boundary: a timeout or a database error here leaves
+            # `seed_rows` empty and the request goes on to the prefetch and fuzzy lanes below, as
+            # it would with the flag off. The failure is logged and reported under the arm's own
+            # name, never as the fuzzy lane's.
             if not seed_rows and sig_aliases and _attached_seed_arm_enabled():
-                seed_rows = await _fetch_signature_attached_seed_rows(
-                    database,
-                    sig_aliases=sig_aliases,
-                    market_hint=market_hint,
-                    limit=attached_seed_limit,
-                )
+                try:
+                    seed_rows = await _fetch_signature_attached_seed_rows(
+                        database,
+                        sig_aliases=sig_aliases,
+                        market_hint=market_hint,
+                        limit=attached_seed_limit,
+                    )
+                except Exception as arm_error:  # noqa: BLE001 -- fall through to the later lanes
+                    seed_rows = []
+                    attached_seed_arm_error = type(arm_error).__name__
+                    logger.warning(
+                        "offers.resolve.attached_seed_arm.failed error_type=%s", attached_seed_arm_error,
+                    )
                 if seed_rows:
                     query_label = OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY
 
@@ -6074,9 +6090,11 @@ async def _handle_offers_resolve(
             row_count=len(seed_rows or []),
             query=query_label,
             extra=(
-                {"mainline_miss_seed_ids": mainline_miss_seed_ids}
-                if mainline_miss_seed_ids
-                else None
+                {
+                    **({"mainline_miss_seed_ids": mainline_miss_seed_ids} if mainline_miss_seed_ids else {}),
+                    **({"attached_seed_arm_error": attached_seed_arm_error} if attached_seed_arm_error else {}),
+                }
+                or None
             ),
         )
     except Exception as e:
@@ -9452,15 +9470,28 @@ async def _fetch_signature_attached_seed_rows(
     market_hint: Optional[str],
     limit: int,
 ) -> List[Any]:
-    """The active seeds attached to the catalog row(s) a signature names, or [].
+    """The active seeds attached to the MINTED catalog row a signature names, or [].
 
-    The same rules the group lane's attached join applies (`_fetch_resolved_group`), no new one:
+    Minted rows only: the catalog row must carry the enrichment drain's `source_system`
+    (MINTED_SOURCE_SYSTEM). A connected merchant row, or a mirror row whose own seed is gone,
+    gets nothing from this arm even when a seed is attached to its `product_key`; those rows keep
+    the answer they have with the flag off.
+
+    Merchant scope: a request's `product.merchant_id` does NOT narrow this arm, the same as the
+    signature arm before it. A signature names one catalog row whoever the caller scoped to, and
+    the seed's seller is the store on the seed, not the row's merchant. (The group lane differs:
+    it skips a scoped request.)
+
+    Otherwise the same rules the group lane's attached join applies (`_fetch_resolved_group`):
       * the catalog row is not withdrawn (its suppression pair) -- a withdrawn listing lends its
         seed to nobody;
       * the seed is `active` and past the shared quarantine anti-join;
       * the seed is priced in the buyer market's currency (`seed_serving_currency`: a caller that
         names no market is a US buyer; a market with no known currency gets no seed).
     Stock, freshness, the outbound allowlist and every other gate run downstream, on the rows.
+    Rows come newest first with the seed id as the last sort key: the drain writes all of one
+    product's seeds in one transaction, so their timestamps tie, and without the id the order
+    (and which rows survive `limit`) would be the scan's.
     Two single-table statements, as the signature arm: the quarantine anti-join reads unqualified
     seed columns. The second is an equality probe on `attached_product_key`
     (idx_external_product_seeds_attached, migration 044).
@@ -9474,11 +9505,12 @@ async def _fetch_signature_attached_seed_rows(
             SELECT product_key
             FROM catalog_products
             WHERE pivota_signature_id = ANY(:sig_aliases)
+              AND source_system = :minted_source_system
               AND suppressed_at IS NULL
               AND suppression_reason IS NULL
             LIMIT 8
             """,
-            {"sig_aliases": sig_aliases},
+            {"sig_aliases": sig_aliases, "minted_source_system": MINTED_SOURCE_SYSTEM},
         ),
         timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
     )
@@ -9496,7 +9528,7 @@ async def _fetch_signature_attached_seed_rows(
               AND status = 'active'
               AND {SEED_SERVING_CURRENCY_CLAUSE}
             {_seed_quarantine_clause()}
-            ORDER BY updated_at DESC, created_at DESC
+            ORDER BY updated_at DESC, created_at DESC, id ASC
             LIMIT :limit
             """,
             {"product_keys": product_keys, "serving_currency": serving_currency, "limit": limit},

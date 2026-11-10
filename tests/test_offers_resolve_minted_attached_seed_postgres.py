@@ -454,3 +454,233 @@ def test_the_arm_probes_the_attached_key_index(schema_engine, monkeypatch):
         plan = "\n".join(r[0] for r in c.execute(text("EXPLAIN " + statement), params))
     assert "idx_external_product_seeds_attached" in plan, plan
     assert "Seq Scan on external_product_seeds" not in plan, plan
+
+
+# ── the arm serves MINTED rows only ───────────────────────────────────────────────────────────
+#
+# The two rows below are written by hand in the shape their producers leave (a store sync and
+# the mirror job: neither is a function a test can call for one row). Each has an ACTIVE, fresh
+# seed attached to its `product_key`, so the only thing between it and an offer is the arm's
+# `source_system` filter -- which the last step of each test proves by relabelling the row.
+
+CONNECTED_SIG = "sig_" + "c1" * 16
+CONNECTED_MERCHANT = "merch_shop_a"
+CONNECTED_PID = "7700000000001"
+CONNECTED_PK = f"prod::{CONNECTED_MERCHANT}::shopify::{CONNECTED_PID}"
+MINTED_SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
+
+
+def _attached_seed(engine, *, seed_id, external_id, product_key, host, status="active"):
+    """A seed attached to `product_key`, read moments ago unless it is not active."""
+    url = f"https://{host}/products/day-cream"
+    _sql(engine,
+         "INSERT INTO external_product_seeds (id, external_product_id, market, tool, destination_url,"
+         " canonical_url, domain, title, price_amount, price_currency, availability, seed_data, status,"
+         " attached_product_key)"
+         " VALUES (:id, :epid, 'US', '*', :url, :url, :host, 'Day Cream', 18, 'USD', 'in_stock',"
+         "         cast(:sd AS jsonb), :status, :pk)",
+         id=seed_id, epid=external_id, url=url, host=host, status=status, pk=product_key,
+         sd=json.dumps({"title": "Day Cream", "brand": "Brand Y", "variants": [
+             {"variant_id": "4400000000002", "price_amount": 18, "price_currency": "USD",
+              "currency": "USD", "availability": "in_stock"}]}))
+    _stamp_fresh(engine, seed_id)
+
+
+def _same_answer_flag_off_and_on(monkeypatch, product_id, **kw):
+    """Resolve with the flag off and on; neither may come from the arm. Returns the two answers."""
+    answers = {}
+    for flag in (None, "1"):
+        res = _resolve(monkeypatch, product_id, flag=flag, **kw)
+        assert _seed_offers(res) == [], (flag, kw)
+        assert _seed_source(res)["query"] != ARM and _seed_source(res)["row_count"] == 0, (flag, kw)
+        answers[flag] = _stable(res)
+    return answers
+
+
+@pytest.mark.parametrize("market", ["US", "SG"])
+@pytest.mark.parametrize("scoped", [True, False])
+def test_flag_on_a_connected_row_with_an_attached_seed_gets_nothing_from_the_arm(
+        schema_engine, monkeypatch, market, scoped):
+    _clear(schema_engine)
+    _sql(schema_engine,
+         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, brand,"
+         " pivota_signature_id, source_system, source_ref, updated_at)"
+         " VALUES (:pk, :m, 'shopify', :spid, 'Day Cream', 'Brand Y', :sig, 'products_cache', NULL, NOW())",
+         pk=CONNECTED_PK, m=CONNECTED_MERCHANT, spid=CONNECTED_PID, sig=CONNECTED_SIG)
+    _attached_seed(schema_engine, seed_id="eps_" + "e1" * 12, external_id="ext_" + "e1" * 12,
+                   product_key=CONNECTED_PK, host="shop-c.example")
+    kw = {"market": market, "merchant_id": CONNECTED_MERCHANT if scoped else None}
+    answers = _same_answer_flag_off_and_on(monkeypatch, CONNECTED_SIG, **kw)
+    assert answers["1"] == answers[None]
+
+    # Not vacuous: the same row and seed, labelled as the drain labels its rows, IS served (to the
+    # market the seed is priced for).
+    _sql(schema_engine, "UPDATE catalog_products SET source_system = :s WHERE product_key = :pk",
+         s=MINTED_SOURCE_SYSTEM, pk=CONNECTED_PK)
+    res = _resolve(monkeypatch, CONNECTED_SIG, flag="1", **kw)
+    assert (_seed_source(res)["query"] == ARM and len(_seed_offers(res)) == 1) is (market == "US")
+
+
+@pytest.mark.parametrize("market", ["US", "SG"])
+def test_flag_on_a_mirror_row_whose_own_seed_is_inactive_gets_nothing_from_the_arm(
+        schema_engine, monkeypatch, market):
+    """The mirror row's own seed is no longer active; ANOTHER store's active seed is attached to
+    the same key. The arm does not hand that store's seed to the mirror row."""
+    _clear(schema_engine)
+    _mirror(schema_engine)
+    _sql(schema_engine, "UPDATE external_product_seeds SET status = 'inactive' WHERE id = :id", id=MIRROR_SEED)
+    _attached_seed(schema_engine, seed_id="eps_" + "e2" * 12, external_id="ext_" + "e2" * 12,
+                   product_key=MIRROR_PK, host="shop-c.example")
+    answers = _same_answer_flag_off_and_on(monkeypatch, MIRROR_SIG, market=market)
+    assert answers["1"] == answers[None]
+
+    _sql(schema_engine, "UPDATE catalog_products SET source_system = :s WHERE product_key = :pk",
+         s=MINTED_SOURCE_SYSTEM, pk=MIRROR_PK)
+    res = _resolve(monkeypatch, MIRROR_SIG, flag="1", market=market)
+    assert (_seed_source(res)["query"] == ARM and len(_seed_offers(res)) == 1) is (market == "US")
+    assert all(o["source"]["seed_id"] != MIRROR_SEED for o in _seed_offers(res))
+
+
+# ── more than one seed on a minted row ────────────────────────────────────────────────────────
+
+RETAILER_HOST = "shop-b.example"
+SG_HOST = "shop-c.example"
+
+
+def _offer_of(host, *, seller, price):
+    url = f"https://{host}/products/calm-barrier-cream"
+    return {"merchant_inferred": seller, "destination_url": url, "canonical_url": url,
+            "image_url": f"https://{host}/img/calm-barrier-cream.jpg", "price": price, "in_stock": True,
+            "validated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+def _mint_records(schema_engine, monkeypatch, records):
+    """The drain's planner and writer over `records` that describe ONE product. Returns
+    (signature, product_key, merchant, {seed id: its planned row})."""
+    import services.catalog_enrichment_agent.apply as apply_mod
+    from services.catalog_enrichment_agent.ingestion import ingest_validated_jsonl
+
+    plan = ingest_validated_jsonl(records)
+
+    async def body(db):
+        return await apply_mod.apply_ingest_plan(plan, batch_label="minted-attached-seed-test", db=db)
+
+    counts = _run(monkeypatch, body)
+    [pdp] = plan["pdps"]
+    assert counts["pdps"] == 1 and counts["seeds"] == len(plan["seeds"]) >= 2, counts
+    assert {s["attached_product_key"] for s in plan["seeds"]} == {pdp["product_key"]}
+    for seed in plan["seeds"]:
+        _stamp_fresh(schema_engine, seed["id"])
+    return pdp["pivota_signature_id"], pdp["product_key"], pdp["merchant_id"], {s["id"]: s for s in plan["seeds"]}
+
+
+def _two_sellers(schema_engine, monkeypatch):
+    record = _record()
+    record["offers"].append(_offer_of(RETAILER_HOST, seller="Shop B", price=19.5))
+    return _mint_records(schema_engine, monkeypatch, [record])
+
+
+@pytest.mark.parametrize("scoped", [True, False])
+def test_flag_on_a_minted_row_serves_every_seller_attached_to_it(schema_engine, monkeypatch, scoped):
+    """The drain writes one seed per validated offer -- the brand store's and a retailer's -- and
+    both are the row's sellers."""
+    _clear(schema_engine)
+    sig, _pk, merchant, seeds = _two_sellers(schema_engine, monkeypatch)
+    res = _resolve(monkeypatch, sig, flag="1", merchant_id=merchant if scoped else None)
+    assert (_seed_source(res)["query"], _seed_source(res)["row_count"]) == (ARM, 2)
+    offers = _seed_offers(res)
+    assert {o["source"]["seed_id"] for o in offers} == set(seeds)
+    assert {o["execution_spec"]["merchant_domain"] for o in offers} == {HOST, RETAILER_HOST}
+    assert {(o["price"], o["currency"]) for o in offers} == {(21.0, "USD"), (19.5, "USD")}
+    # Flag off, neither.
+    assert _resolve(monkeypatch, sig, flag=None, merchant_id=merchant if scoped else None)["offers"] == []
+
+
+def test_flag_on_two_currencies_on_one_key_each_go_to_their_own_market(schema_engine, monkeypatch):
+    """One product listed in USD by the brand store and in SGD by another store: two seeds on one
+    key. Each buyer market gets the seed priced in its currency and never the other."""
+    _clear(schema_engine)
+    sgd = _record(currency="SGD")
+    sgd["pdp"]["source_domain"] = SG_HOST
+    sgd["offers"] = [_offer_of(SG_HOST, seller="Shop C", price=28.0)]
+    sig, _pk, merchant, seeds = _mint_records(schema_engine, monkeypatch, [_record(), sgd])
+    by_currency = {s["price_currency"]: sid for sid, s in seeds.items()}
+    assert sorted(by_currency) == ["SGD", "USD"]
+
+    for market, currency, host, price in (("US", "USD", HOST, 21.0), (None, "USD", HOST, 21.0),
+                                          ("SG", "SGD", SG_HOST, 28.0)):
+        res = _resolve(monkeypatch, sig, flag="1", merchant_id=merchant, market=market)
+        assert (_seed_source(res)["query"], _seed_source(res)["row_count"]) == (ARM, 1), market
+        [offer] = _seed_offers(res)
+        assert offer["source"]["seed_id"] == by_currency[currency], market
+        assert (offer["price"], offer["currency"]) == (price, currency), market
+        assert offer["execution_spec"]["merchant_domain"] == host, market
+    # A market with no known currency gets neither.
+    res = _resolve(monkeypatch, sig, flag="1", merchant_id=merchant, market="DE")
+    assert _seed_offers(res) == [] and _seed_source(res)["row_count"] == 0
+
+
+@pytest.mark.parametrize("stored_order", ["ASC", "DESC"])
+def test_seeds_with_tied_timestamps_come_in_seed_id_order(schema_engine, monkeypatch, stored_order):
+    """The drain writes one product's seeds in one transaction, so their timestamps tie. The arm's
+    order -- and which seed survives a `limit` -- is then the seed id's, whichever way the rows
+    happen to be stored."""
+    from sqlalchemy import text
+
+    import routes.agent_shop_gateway as gateway
+
+    _clear(schema_engine)
+    sig, pk, _merchant, seeds = _two_sellers(schema_engine, monkeypatch)
+    with schema_engine.connect() as c:
+        # Re-store the drain's own rows in a chosen physical order, timestamps tied.
+        c.execute(text("CREATE TEMP TABLE tied_seeds AS SELECT * FROM external_product_seeds"
+                       " WHERE attached_product_key = :pk"), {"pk": pk})
+        c.execute(text("UPDATE tied_seeds SET updated_at = '2026-11-10T10:00:00Z',"
+                       " created_at = '2026-11-10T10:00:00Z'"))
+        c.execute(text("DELETE FROM external_product_seeds WHERE attached_product_key = :pk"), {"pk": pk})
+        c.execute(text(f"INSERT INTO external_product_seeds SELECT * FROM tied_seeds ORDER BY id {stored_order}"))
+        c.execute(text("DROP TABLE tied_seeds"))
+        stored = [r[0] for r in c.execute(text(
+            "SELECT id FROM external_product_seeds WHERE attached_product_key = :pk ORDER BY ctid"), {"pk": pk})]
+    assert stored == sorted(seeds, reverse=(stored_order == "DESC"))
+
+    def arm(limit):
+        async def body(db):
+            rows = await gateway._fetch_signature_attached_seed_rows(
+                db, sig_aliases=[sig], market_hint="US", limit=limit)
+            return [dict(r)["id"] for r in rows]
+
+        return _run(monkeypatch, body)
+
+    assert arm(10) == sorted(seeds)
+    assert arm(1) == sorted(seeds)[:1]
+
+
+# ── the arm's own failure boundary ────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("error", [asyncio.TimeoutError(), RuntimeError("connection is closed")],
+                         ids=["timeout", "database_error"])
+def test_flag_on_an_arm_failure_leaves_the_flag_off_answer(schema_engine, monkeypatch, caplog, error):
+    """The arm fails; the request goes on through the later lanes and answers what it answers with
+    the flag off. The failure is reported under the arm's name, and the seed source is not an
+    error: the lanes after the arm did run."""
+    import logging
+
+    import routes.agent_shop_gateway as gateway
+
+    _clear(schema_engine)
+    sig, _pk, _seed_id, merchant = _mint(schema_engine, monkeypatch)
+    off = _resolve(monkeypatch, sig, flag=None, merchant_id=merchant)
+
+    async def failing(db, **kw):
+        raise error
+
+    monkeypatch.setattr(gateway, "_fetch_signature_attached_seed_rows", failing)
+    with caplog.at_level(logging.WARNING, logger="routes.agent_shop_gateway"):
+        res = _resolve(monkeypatch, sig, flag="1", merchant_id=merchant)
+    src = _seed_source(res)
+    assert (src["status"], src["query"], src["row_count"]) == ("ok", "external_seed_by_fuzzy_ref", 0)
+    assert src.pop("attached_seed_arm_error") == type(error).__name__
+    assert _stable(res) == _stable(off)
+    assert f"offers.resolve.attached_seed_arm.failed error_type={type(error).__name__}" in [
+        r.getMessage() for r in caplog.records]
