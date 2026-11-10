@@ -86,9 +86,6 @@ BUDGET_SECONDS=600
 BATCH=20
 # The warm-click lane's per-run cap (jobs/merchant_purchasability_sweep.py, "THE FIFTH LANE"). 0 takes
 # the lane out of the population: THE ROLLBACK, by editing this line and re-running with --enable.
-# The R-03 directory freshness check (on the worker) follows this dial through what the job publishes
-# with its daily scan; while its summary says dials_source=env, set the dial on the worker too
-# (docs/runbooks/merchant_purchasability.md, "Rollback without a re-image").
 WARM_CLICK_MAX_PER_RUN=6
 # The worker identity, exactly as setup_scheduler.sh's crawl jobs and the Tier B job use it: it
 # already holds Secret Manager access to DATABASE_URL and project-level run.invoker for Scheduler.
