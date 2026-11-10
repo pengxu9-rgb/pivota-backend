@@ -12881,7 +12881,11 @@ async def external_seed_links_endpoint(
         http_request, ops=(EXTERNAL_SEED_LINKS_MINT_OP,)
     )
     if not agent_id:
-        logger.info("external_seed_links.partner_assertion_not_credited reason=%s", reason)
+        # `utils.logger` ("pivota"): a plain module logger's INFO never reaches prod logs, so a refused or
+        # replayed mint assertion (a full nonce store included) would be invisible.
+        from utils.logger import logger as _pivota_logger
+
+        _pivota_logger.info("external_seed_links.partner_assertion_not_credited reason=%s", reason)
         return await mint_external_seed_links(body)
     issued: List[IssuedClick] = []
     result = await mint_external_seed_links(body, issued_clicks=issued)

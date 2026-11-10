@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import secrets
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from fastapi.testclient import TestClient
 
+import db.agents as db_agents
 import routes.agent_auth as agent_auth
 import routes.agent_forwarded_owner as forwarded
 import routes.agent_shop_gateway as gw
@@ -42,6 +44,9 @@ from services.bound_issuing_assertion import sign_bound_issuing_agent_assertion
 from services.commerce_attribution_service import PVT_CLICK_ID
 from services.issuing_agent_assertion import sign_issuing_agent_assertion
 from services.outbound_links_service import parse_and_verify_redirect_token
+
+#: The REAL db.agents.get_agent, captured before any fixture stubs it (the P2-1 test reads through it).
+REAL_DB_GET_AGENT = db_agents.get_agent
 
 SECRET = "test_partner_identity_secret"
 FLAG = "PARTNER_IDENTITY_FORWARDING_ENABLED"
@@ -847,9 +852,8 @@ def _shape(row: Dict[str, Any]) -> Dict[str, Any]:
 @pytest.mark.parametrize("cid,iss", [
     (PUBLIC_CLIENT, OWN_ISSUER),
     (UNPROVISIONED_CLIENT, OWN_ISSUER),
-    (INACTIVE_CLIENT, OWN_ISSUER),
     (PARTNER_A_CLIENT, "https://foreign-as.example.com"),
-], ids=["public", "confidential_unprovisioned", "inactive_agent", "foreign_issuer"])
+], ids=["public", "confidential_unprovisioned", "foreign_issuer"])
 def test_flag_on_an_unregistered_oauth_client_creates_its_order_as_today(world, oauth, cid, iss):
     # Today's behaviour = the gateway's call with no header at all: measured on the same app first.
     world["quote_owners"]["q_1"] = GATEWAY_AGENT
@@ -937,16 +941,133 @@ def test_an_unregistered_oauth_token_that_is_mismatched_is_still_refused(world, 
     assert world["created"] == []
 
 
-def test_a_replayed_unregistered_oauth_token_is_refused(world, oauth):
+@pytest.fixture()
+def claims(monkeypatch):
+    """Every nonce the real replay store is asked to claim (the real claim still runs)."""
+    seen: List[str] = []
+    real_claim = assertion_replay_guard.claim
+
+    async def spy(jti, ttl, **kw):
+        seen.append(jti)
+        return await real_claim(jti, ttl, **kw)
+
+    monkeypatch.setattr(assertion_replay_guard, "claim", spy)
+    return seen
+
+
+def test_a_replayed_unregistered_oauth_token_stays_the_gateways_and_claims_no_nonce(world, oauth, claims):
+    # O-04 delta review P3-1: the replay of an unregistered token acts as the gateway, which the same key
+    # gets with no header, so a burned nonce buys nothing and would only spend the store's capacity.
     world["quote_owners"]["q_1"] = GATEWAY_AGENT
     token = bound_oauth(PUBLIC_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_1",
                         raw=raw_json(ORDER_BODY))
     first = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
     second = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT, GATEWAY_AGENT]
+    assert "partner_agent_id" not in world["created"][1]["metadata"]
+    assert claims == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"absent_oauth_unregistered": 2}
+
+
+def test_an_unregistered_oauth_mint_claims_no_nonce(mint, oauth, claims):
+    call, batches, _ = mint
+    token = bound_oauth(PUBLIC_CLIENT, "external_seed_links.mint", method="POST", path=MINT_PATH, rid=None,
+                        raw=raw_json(MINT_BODY))
+    call(GATEWAY_KEY, token)
+    call(GATEWAY_KEY, token)
+    assert batches == [] and claims == []
+
+
+def test_a_replayed_registered_oauth_token_is_still_refused(world, oauth, claims):
+    # Replay protection stays for every subject that is adopted.
+    preview = as_oauth(world, PARTNER_A_CLIENT, "preview_quote", "POST", PREVIEW, PREVIEW_BODY)
+    assert preview.status_code == 200, preview.text
+    token = bound_oauth(PARTNER_A_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_1",
+                        raw=raw_json(ORDER_BODY))
+    first = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
+    second = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY, token)
     assert first.status_code == 200, first.text
     assert rejected(second, "replay"), second.text
-    assert [row["agent_id"] for row in world["created"]] == [GATEWAY_AGENT]
-    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"absent_oauth_unregistered": 1, "rejected_replay": 1}
+    assert [row["agent_id"] for row in world["created"]] == [PARTNER_A]
+    assert len(claims) == 3 and claims[1] == claims[2]
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"adopted": 2, "rejected_replay": 1}
+
+
+class _PivotaLines(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.INFO)
+        self.lines: List[str] = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+@pytest.fixture()
+def pivota_lines():
+    """Lines on utils.logger ("pivota"): the logger whose INFO reaches prod (it does not propagate)."""
+    handler = _PivotaLines()
+    target = logging.getLogger("pivota")
+    target.addHandler(handler)
+    try:
+        yield handler.lines
+    finally:
+        target.removeHandler(handler)
+
+
+def test_an_unregistered_oauth_outcome_names_its_iss_and_cid(world, oauth, pivota_lines):
+    # O-04 delta review P3-2: an issuer mismatch would turn every provisioned partner into this outcome;
+    # the line names the pair so that shows. Both are public identifiers.
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    foreign = "https://foreign-as.example.com"
+    res = send(world, "POST", ORDERS, GATEWAY_KEY, ORDER_BODY,
+               bound_oauth(PARTNER_A_CLIENT, "create_order", method="POST", path=ORDERS, rid="q_1",
+                           raw=raw_json(ORDER_BODY), iss=foreign))
+    assert res.status_code == 200, res.text
+    [line] = [x for x in pivota_lines if "outcome=absent_oauth_unregistered" in x]
+    assert f"iss={foreign} cid={PARTNER_A_CLIENT}" in line
+    assert SECRET not in line
+
+
+def test_a_mint_assertion_not_credited_is_logged_through_the_pivota_logger(mint, pivota_lines):
+    call, _, for_mint = mint
+    call(GATEWAY_KEY, for_mint(PARTNER_A, secret="forged"))
+    assert any("external_seed_links.partner_assertion_not_credited reason=bad_mac" in x for x in pivota_lines)
+
+
+def test_a_registered_oauth_client_whose_agent_is_inactive_is_refused(world, oauth):
+    # The registration is live (disabled_at NULL) but its agent is deactivated: a fault, not "nobody's".
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    res = as_oauth(world, INACTIVE_CLIENT, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1")
+    assert rejected(res, "subject"), res.text
+    assert world["created"] == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"rejected_subject": 1}
+
+
+class _AgentsTableDown:
+    """db.agents.database whose every read raises: db.agents.get_agent swallows it and answers None."""
+
+    def __init__(self):
+        self.reads: List[Dict[str, Any]] = []
+
+    async def fetch_one(self, sql, values=None):
+        self.reads.append(dict(values or {}))
+        raise RuntimeError("agents table unreadable")
+
+
+def test_a_registered_oauth_client_whose_agent_row_cannot_be_read_is_refused(world, oauth, monkeypatch, claims):
+    # O-04 delta review P2-1: the REAL db.agents.get_agent over a database whose read raises. It answers
+    # None, which before this fix made a provisioned partner's order the gateway's (200, no stamp).
+    monkeypatch.setattr(db_agents, "get_agent", REAL_DB_GET_AGENT)
+    down = _AgentsTableDown()
+    monkeypatch.setattr(db_agents, "database", down)
+    world["quote_owners"]["q_1"] = GATEWAY_AGENT
+    res = as_oauth(world, PARTNER_A_CLIENT, "create_order", "POST", ORDERS, ORDER_BODY, rid="q_1")
+    assert rejected(res, "subject"), res.text
+    assert down.reads == [{"agent_id": PARTNER_A}], "the real agents-row read ran, for the registered agent"
+    assert "registration" in oauth.queries
+    assert world["created"] == [] and claims == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {"rejected_subject": 1}
 
 
 def test_an_unreadable_oauth_registration_is_refused_not_taken_as_nobodys(world, oauth):
