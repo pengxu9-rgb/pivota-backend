@@ -13,7 +13,11 @@ from core.billing_constants import (
     overage_revenue_cents,
 )
 from db.database import IS_POSTGRES, database
-from services.test_traffic import not_test_traffic_sql
+# M-05 P2-2: the statement is assembled and frozen in one step (assemble_and_freeze_report_only),
+# so its GMV read is the lock: with MERCHANT_IS_TEST_FILTER_ENABLED on, a merchant that is is_test
+# then has no GMV on it, whatever its edges were stamped at write.
+from services import test_traffic
+from services.test_traffic import is_test_merchant_lock_sql, not_test_traffic_sql
 
 
 SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
@@ -640,7 +644,7 @@ async def _gmv_attribution_for_month(
     period_start: date,
     period_end: date,
 ) -> Any:
-    return await database.fetch_one(
+    row = await database.fetch_one(
         """
         SELECT
           COALESCE(SUM(net_attributed_gmv_cents), 0) AS gmv_raw_total_cents,
@@ -661,7 +665,9 @@ async def _gmv_attribution_for_month(
           -- Exclude fallback-INFERRED edges (#1481): recorded for coverage, not billed.
           AND (metadata->>'inferred')::boolean IS NOT TRUE
           -- Exclude TEST traffic (O-07, services/test_traffic.py), stamped at write.
-          AND """ + not_test_traffic_sql("metadata") + """
+          AND """ + not_test_traffic_sql("metadata") + is_test_merchant_lock_sql(
+            "commerce_attribution_edges.merchant_id"
+        ) + """
         """,
         {
             "merchant_id": merchant_id,
@@ -669,6 +675,56 @@ async def _gmv_attribution_for_month(
             "period_end": period_end,
         },
     )
+    # AFTER the read it explains (as the invoice run does), so the count describes the lock that
+    # was just taken rather than one about to be.
+    await _record_is_test_lock_drop(
+        merchant_id=merchant_id, period_start=period_start, period_end=period_end
+    )
+    return row
+
+
+async def _record_is_test_lock_drop(*, merchant_id: str, period_start: date, period_end: date) -> None:
+    """M-05 P3-B: the statement GMV read leaves out a merchant that is is_test now, and a frozen
+    statement cannot be re-assembled. So, only while MERCHANT_IS_TEST_FILTER_ENABLED is on, count
+    the edges that check drops (the read's other conditions unchanged) and write one audit line per
+    (statement = merchant + month). Read-only, in its own savepoint: a failure never aborts the
+    assembly transaction. A statement has no id before its first insert, hence merchant + month."""
+    if not test_traffic.lock_drop_audit_enabled():
+        return
+    try:
+        async with database.transaction():
+            row = await database.fetch_one(
+                """
+                SELECT COUNT(*) AS n, COALESCE(SUM(net_attributed_gmv_cents), 0) AS cents
+                FROM commerce_attribution_edges
+                WHERE merchant_id = :merchant_id
+                  AND created_at >= :period_start
+                  AND created_at < :period_end
+                  AND net_attributed_gmv_cents > 0
+                  AND (metadata->>'inferred')::boolean IS NOT TRUE
+                  AND """ + not_test_traffic_sql("metadata") + """
+                  AND """ + test_traffic.is_test_merchant_exists_sql(
+                    "commerce_attribution_edges.merchant_id"
+                ),
+                {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit read never fails the statement
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "monthly_statement",
+            ref=f"statement:{merchant_id}:{period_start.isoformat()}",
+            merchant_id=merchant_id,
+            exc=exc,
+        )
+        return
+    dropped = int(_row_get(row, "n") or 0)
+    if dropped > 0:
+        test_traffic.log_is_test_lock_drop(
+            "monthly_statement",
+            ref=f"statement:{merchant_id}:{period_start.isoformat()}",
+            merchant_id=merchant_id,
+            rows=dropped,
+            gmv_cents=int(_row_get(row, "cents") or 0),
+        )
 
 
 def _total_cogs_cents(
