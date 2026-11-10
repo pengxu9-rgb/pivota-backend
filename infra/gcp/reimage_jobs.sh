@@ -90,8 +90,12 @@ print(json.dumps({"spec": spec, "annotations": ann, "task_count": t["spec"].get(
 
 # compare REPO SHA -> "status<TAB>ahead_by<TAB>behind_by" of SHA against main (GitHub compare API)
 compare(){
-  local body
-  body="$("$CURL" -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
+  # Unauthenticated, GitHub allows 60 calls an hour PER IP, shared with everything else on that
+  # network; set GITHUB_TOKEN (e.g. `GITHUB_TOKEN=$(gh auth token)`) to lift it. A failed call is a
+  # failure, never a pass: status prints "?", a re-image refuses.
+  local body auth=()
+  [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  body="$("$CURL" -fsS --max-time 20 -H 'Accept: application/vnd.github+json' ${auth[@]+"${auth[@]}"} \
     "https://api.github.com/repos/$OWNER/$1/compare/$2...main")" || return 1
   BODY="$body" "$PYTHON" -c '
 import json, os
@@ -115,13 +119,22 @@ sha_of_image(){ # image ref -> the tag when it is a 40-hex sha, else ""
 if [ "$MODE" = status ]; then
   [ "$#" -eq 2 ] || { echo "status takes no further arguments" >&2; exit 2; }
   printf '%-38s %-15s %-12s %s\n' JOB REPO SHA BEHIND_MAIN
+  SEEN=""
   for job in $BACKEND_JOBS $GATEWAY_JOBS; do
     facts="$(job_facts "$job")"; [ -n "$facts" ] || continue
     image="${facts%%$'\t'*}"; stamp="${facts#*$'\t'}"
     sha="$(sha_of_image "$image")"; [ -n "$sha" ] || sha="$stamp"
     repo="$(repo_of "$job")"; behind="?"
     if [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
-      cmp="$(compare "$repo" "$sha" 2>/dev/null)" && behind="$(echo "$cmp" | cut -f2)"
+      # One call per (repo, sha): many jobs share an image, and the API budget is small.
+      key="$repo@$sha"
+      cached="$(printf '%s\n' "$SEEN" | awk -F'\t' -v k="$key" '$1 == k {print $2; exit}')"
+      if [ -n "$cached" ]; then
+        behind="$cached"
+      elif cmp="$(compare "$repo" "$sha" 2>/dev/null)"; then
+        behind="$(echo "$cmp" | cut -f2)"
+        SEEN="$SEEN"$'\n'"$key"$'\t'"$behind"
+      fi
     else
       sha="(digest, no stamp)"
     fi

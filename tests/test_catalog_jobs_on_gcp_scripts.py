@@ -489,3 +489,27 @@ def test_every_new_setup_job_is_in_the_reimage_registry():
     text = REIMAGE.read_text()
     for name in ("relgraph-health", "brand-official-canonical-promote", "pdp-live-read-promote"):
         assert re.search(rf"\b{name}\b", text), name
+
+
+def test_status_calls_github_once_per_distinct_sha(tmp_path):
+    jobs = {"content-canonical-election": backend_job(), "agent-pdp-orphan-reaper": backend_job(),
+            "audit-domainless-offer-currency": backend_job(), "relgraph-sync": gateway_job()}
+    proc, _, curl = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs)
+    assert proc.returncode == 0, proc.stderr
+    assert len(curl) == 2, curl  # one backend sha, one gateway sha
+    behind = [line.split()[-1] for line in proc.stdout.splitlines()[1:]]
+    assert behind == ["5"] * 4
+
+
+def test_github_token_is_sent_only_when_set(tmp_path):
+    jobs = {"content-canonical-election": backend_job()}
+    _, _, without = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs, env={"GITHUB_TOKEN": ""})
+    assert not any("Authorization" in c for c in without)
+    _, _, with_token = run(tmp_path, REIMAGE, "prod", "status", jobs=jobs, env={"GITHUB_TOKEN": "t0k"})
+    assert any("Authorization: Bearer t0k" in c for c in with_token)
+
+
+def test_status_reports_unknown_when_github_fails(tmp_path):
+    proc, _, _ = run(tmp_path, REIMAGE, "prod", "status", jobs={"content-canonical-election": backend_job()},
+                     env={"CURL_FAILS": "1"})
+    assert proc.returncode == 0 and proc.stdout.splitlines()[1].split()[-1] == "?"
