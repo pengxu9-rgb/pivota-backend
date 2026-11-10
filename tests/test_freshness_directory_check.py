@@ -215,10 +215,12 @@ async def _variant_lane(*hosts):
             "VALUES (:d, '', '', 'US', TRUE)", {"d": host})
 
 
-async def _scan(cart=(), warm=(), at=None):
+async def _scan(cart=(), warm=(), at=None, dials=None):
     """A complete cart-mint scan, through the scan cache's own writer: `cart` hosts are the cart-mint
-    lane, `warm` hosts the warm-click lane. The newest complete scan is the one the lanes read."""
+    lane, `warm` hosts the warm-click lane. The newest complete scan is the one the lanes read.
+    `dials` is what the scanning run published (none, like a scan from an older job image)."""
     await mint_scans.record(
+        dials=dials,
         scan_id=f"cms_{uuid.uuid4().hex[:16]}", scanned_at=at or datetime.now(timezone.utc), complete=True,
         reason="", seeds_scanned=len(cart) + len(warm), cart_seeds=len(cart), elapsed_ms=1,
         hosts={(h, "US"): 1 for h in cart}, warm_hosts={(h, "US"): 1 for h in warm}, warm_seeds=len(warm))
@@ -319,6 +321,7 @@ async def test_the_population_is_the_directorys_after_its_exclusions(monkeypatch
         "VALUES (:d, '', '', 'US', FALSE)", {"d": disabled})
     summary, lines = await _tick()
     assert _counts(summary, pairs=1, fresh=1), summary
+    assert summary["disabled"] == 1, "a disabled pair is skipped, and counted"
     assert _alerts(lines) == [] and _warnings(lines) == []
 
 
@@ -660,9 +663,150 @@ async def test_the_check_never_scans_the_seed_table_or_writes_the_scan_cache(mon
     async def no_scan():
         raise AssertionError("the check must never scan the seed table")
 
+    async def no_ddl_no_write(*a, **k):
+        raise AssertionError("the check must never create the scan table or write a scan")
+
     monkeypatch.setattr(sweep, "_cart_mint_lane", no_scan)
+    monkeypatch.setattr(mint_scans, "ensure_table", no_ddl_no_write)
+    monkeypatch.setattr(mint_scans, "record", no_ddl_no_write)
     before = (await database.fetch_one(f"SELECT COUNT(*) AS n FROM {mint_scans.TABLE}"))["n"]
     summary, lines = await _tick()
     assert _counts(summary, pairs=1, fresh=1), summary
     assert (await database.fetch_one(f"SELECT COUNT(*) AS n FROM {mint_scans.TABLE}"))["n"] == before
     _summary(lines)
+
+    # With the scan table GONE the check does not create it: the lane is unreadable, and stays so.
+    await database.execute(f"DROP TABLE {mint_scans.TABLE}")
+    summary, lines = await _tick()
+    assert _assert_unavailable(lines, "population_unreadable")["population_unreadable"] == 1
+    with pytest.raises(Exception):
+        await database.fetch_all(f"SELECT 1 FROM {mint_scans.TABLE} WHERE 1 = 0")
+
+
+# ── NP2-1: a degraded directory build is not a heartbeat ─────────────────────────────────────
+
+
+async def test_a_failed_disabled_read_is_unavailable_not_a_heartbeat(monkeypatch):
+    """The directory answers CLOSED for a read that failed: a failed `disabled` read marks the pair
+    disabled, and this check skips disabled pairs. So a stale merchant would vanish behind
+    pairs=0 and a heartbeat. The build says it was degraded, and the tick says so instead."""
+    import routes.agent_commerce_reap as reap_routes
+
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await _variant_lane(FRESH, STALE)
+    await mp.record_check(FRESH, "US", _card(FRESH))
+    await mp.record_check(STALE, "US", _card(STALE))
+    await _age("merchant_purchasability", "checked_at", 80, "merchant_domain", STALE)
+
+    async def broken(**kwargs):
+        raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr(reap_routes, "_refuse_if_merchant_disabled", broken)
+    summary, lines = await _tick()
+    body = _assert_unavailable(lines, "directory_degraded")
+    assert (body["pairs"], body["disabled"], body["directory_failures"], body["failure_kinds"]) == (0, 2, 2, "disabled")
+    assert body == summary and "relation" not in json.dumps(body)
+
+
+async def test_a_degraded_build_still_runs_the_clocks_over_what_it_answered(monkeypatch):
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await _variant_lane(STALE)
+    await mp.record_check(STALE, "US", _card(STALE))
+    await _age("merchant_purchasability", "checked_at", 80, "merchant_domain", STALE)
+
+    async def broken(*a, **k):
+        raise RuntimeError("boom")
+
+    real = tierb.is_cart_link_eligible
+    monkeypatch.setattr(tierb, "is_cart_link_eligible", broken)
+    summary, lines = await _tick()
+    body = _assert_unavailable(lines, "directory_degraded")
+    assert (body["pairs"], body["disabled"], body["stale"], body["failure_kinds"]) == (1, 0, 1, "cart_link")
+    assert len(_alerts(lines)) == 1
+
+    # The next clean build is a heartbeat again: the failure list is that build's own.
+    monkeypatch.setattr(tierb, "is_cart_link_eligible", real)
+    summary, lines = await _tick()
+    assert summary["unavailable"] == 0 and "directory_failures" not in summary
+    _summary(lines)
+
+
+# ── NP2-2: the dials are the sweep job's, read from what it published ────────────────────────
+
+_ENV_DIALS = {"MERCHANT_PURCHASABILITY_TTL_HOURS": "ttl_hours",
+              "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN": "warm_click_max_per_run",
+              "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS": "warm_click_not_shopify_recheck_days"}
+
+
+def _dial_echo(summary):
+    return (summary["dial_ttl_hours"], summary["dial_warm_cap"], summary["dial_recheck_days"], summary["dials_source"])
+
+
+async def test_without_published_dials_the_check_uses_its_own_env_and_says_so(monkeypatch):
+    from jobs import merchant_purchasability_sweep as sweep
+
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await _variant_lane(FRESH)
+    await mp.record_check(FRESH, "US", _card(FRESH))
+    summary, lines = await _tick()
+    assert _dial_echo(summary) == (72, sweep.DIALS["warm_click_max_per_run"].default, 7, "env")
+    _, body = _summary(lines)
+    assert _dial_echo(body) == _dial_echo(summary)
+
+    # ONE dial missing from the scan (a half-published row) is not published: all from env.
+    await _scan(dials={"ttl_hours": 24, "warm_click_max_per_run": 0})
+    summary, _ = await _tick()
+    assert _dial_echo(summary) == (72, sweep.DIALS["warm_click_max_per_run"].default, 7, "env")
+
+
+async def test_the_warm_lane_rollback_on_the_job_alone_takes_its_keys_off_the_clock(monkeypatch):
+    """The runbook's rollback sets WARM_CLICK_MAX_PER_RUN=0 on the JOB. The worker's env still says
+    the default; the check follows what the job published with its scan."""
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await mp.record_check(WARM, "US", _card(WARM))
+    await _age("merchant_purchasability", "checked_at", 80, "merchant_domain", WARM)
+    await _scan(warm=(WARM,), dials={"ttl_hours": 72, "warm_click_max_per_run": 6,
+                                     "warm_click_not_shopify_recheck_days": 7})
+    summary, lines = await _tick()
+    assert _counts(summary, pairs=1, stale=1) and summary["dials_source"] == "sweep_scan", summary
+    await _scan(warm=(WARM,), dials={"ttl_hours": 72, "warm_click_max_per_run": 0,
+                                     "warm_click_not_shopify_recheck_days": 7})
+    summary, lines = await _tick()
+    assert _counts(summary, pairs=1, untracked=1), summary
+    assert _dial_echo(summary) == (72, 0, 7, "sweep_scan") and _alerts(lines) == []
+
+
+async def test_published_ttl_and_recheck_days_win_over_the_workers_env(monkeypatch):
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    for name in _ENV_DIALS:
+        monkeypatch.setenv(name, "50")  # the worker's own values, all wrong
+    await _variant_lane(STALE)
+    await mp.record_check(STALE, "US", _card(STALE))
+    await _age("merchant_purchasability", "checked_at", 30, "merchant_domain", STALE)
+    await mp.record_check(WARM, "US", _card(WARM, card=False, verdict=Verdict.VARIANT_UNVERIFIED,
+                                             detail="products_json_page_1_status_404"))
+    await _age("merchant_purchasability", "checked_at", 60, "merchant_domain", WARM)
+    await _scan(warm=(WARM,), dials={"ttl_hours": 24, "warm_click_max_per_run": 6,
+                                     "warm_click_not_shopify_recheck_days": 2})
+    summary, lines = await _tick()
+    assert _dial_echo(summary) == (24, 6, 2, "sweep_scan")
+    by = {w["domain"]: w for w in _warnings(lines)}
+    assert by[STALE]["limit_seconds"] == 24 * 3600, "a 30 h fact is stale under the job's 24 h TTL"
+    assert _counts(summary, pairs=2, stale=1, fresh=1), "the warm key: 60 h is inside 2 d + 24 h"
+    summary, lines = await _tick(now=(await _stored_checked_at("merchant_purchasability", "merchant_domain", WARM))
+                                 + timedelta(days=2, hours=24))
+    assert {w["domain"]: w["limit_seconds"] for w in _warnings(lines)}[WARM] == (2 * 24 + 24) * 3600
+
+
+# ── NP3-2: pending is "the sweep never checked it", not "no buyer row" ───────────────────────
+
+
+async def test_a_warm_only_key_the_sweep_has_checked_is_missing_under_another_buyer_vantage(monkeypatch):
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "proxy")
+    await _scan(warm=(WARM,))
+    await mp.record_check(WARM, "US", _card(WARM))  # the sweep's own vantage: it HAS checked the key
+    await _age("merchant_purchasability", "checked_at", 400, "merchant_domain", WARM)
+    summary, lines = await _tick()
+    assert _counts(summary, pairs=1, missing=1), summary
+    assert len(_alerts(lines)) == 1

@@ -3035,6 +3035,59 @@ async def test_a_scan_that_cannot_be_cached_is_an_error_and_is_scanned_again(_db
     assert calls["scans"] == 2
 
 
+async def test_a_scan_publishes_the_dials_the_run_used_and_a_cache_only_reader_gets_them(_db, _scans, monkeypatch):
+    """The R-03 freshness check runs on another service, whose environment is not this job's. The
+    real scan writes the job's dials with its row; the cache-only read hands them back, and an
+    older reader (the 3- and 4-element filters) still reads the same lanes."""
+    _clock, calls = _scans
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "3")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", "9")
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_TTL_HOURS", "48")
+    scanned = await sweep.collect_population()
+    assert calls["scans"] == 1
+    used = {"warm_click_max_per_run": 3, "warm_click_not_shopify_recheck_days": 9, "ttl_hours": 48}
+    assert sweep.published_dials() == used and set(used) == set(sweep.PUBLISHED_DIALS)
+    row = await mint_scans.latest(complete_only=True)
+    assert row["dials"] == used
+
+    # The reader's environment says something else; what it gets is what the scan published.
+    for name in ("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "MERCHANT_PURCHASABILITY_TTL_HOURS",
+                 "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS"):
+        monkeypatch.delenv(name)
+    detail: dict = {}
+    cached = await sweep.collect_population(cart_mint=detail, cart_mint_cache_only=True)
+    assert calls["scans"] == 1 and detail["dials"] == used and cached == scanned
+    # The ordinary (scanning or cached) read carries none: only a cache-only reader needs them.
+    detail = {}
+    assert await sweep.collect_population(cart_mint=detail) == scanned and detail["dials"] is None
+
+
+async def test_a_scan_row_without_dials_reads_as_none_published(_db):
+    """A scan an older job image wrote has no dial entries, and a malformed one is not a dial."""
+    import db.merchant_purchasability_cart_mint_scans as mint_scans
+
+    await mint_scans.ensure_table()
+    await database.execute(f"DELETE FROM {mint_scans.TABLE}")
+    now = datetime.now(timezone.utc)
+    try:
+        await mint_scans.record(scan_id="cms_no_dials", scanned_at=now, complete=True, reason="",
+                                seeds_scanned=1, cart_seeds=1, elapsed_ms=1, hosts={("cart.example", "US"): 1})
+        row = await mint_scans.latest(complete_only=True)
+        assert row["dials"] == {} and row["hosts"] == {("cart.example", "US"): 1}
+        await database.execute(
+            f"UPDATE {mint_scans.TABLE} SET hosts = :h WHERE scan_id = 'cms_no_dials'",
+            {"h": json.dumps([["cart.example", "US", 1], ["ttl_hours", "", "48", mint_scans.SWEEP_DIAL_TAG],
+                              ["warm_click_max_per_run", "", True, mint_scans.SWEEP_DIAL_TAG],
+                              ["warm_click_not_shopify_recheck_days", "", 7, mint_scans.SWEEP_DIAL_TAG]])})
+        row = await mint_scans.latest(complete_only=True)
+        assert row["dials"] == {"warm_click_not_shopify_recheck_days": 7}
+        assert row["hosts"] == {("cart.example", "US"): 1} and row["warm_hosts"] == {}
+    finally:
+        await database.execute(f"DELETE FROM {mint_scans.TABLE} WHERE scan_id = 'cms_no_dials'")
+
+
 async def test_the_census_scans_fresh_and_touches_no_cache(_db, _scans):
     _clock, calls = _scans
     import db.merchant_purchasability_cart_mint_scans as mint_scans

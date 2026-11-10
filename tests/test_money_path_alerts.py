@@ -151,6 +151,20 @@ def test_every_policy_reads_a_defined_metric_and_goes_to_the_channel(defs):
                 assert threshold["duration"] == "0s", "a log counter writes no points between lines"
 
 
+def test_the_unavailable_policy_fires_on_two_ticks_in_three_hours(defs):
+    """One unreadable tick is a blip; two of the last three is a check that cannot see. `> 1` over a
+    3 h sum: `> 0` would page on every blip, and a 1 h window could never hold two hourly ticks."""
+    [policy] = [p for p in defs["alert_policies"] if p["displayName"].endswith("cannot read its population")]
+    [condition] = policy["conditions"]
+    threshold = condition["conditionThreshold"]
+    assert (threshold["comparison"], threshold["thresholdValue"], threshold["duration"]) == ("COMPARISON_GT", 1.0, "0s")
+    [aggregation] = threshold["aggregations"]
+    assert (aggregation["alignmentPeriod"], aggregation["perSeriesAligner"], aggregation["crossSeriesReducer"]) == (
+        "10800s", "ALIGN_SUM", "REDUCE_SUM")
+    assert "freshness_directory_check_unavailable" in threshold["filter"]
+    assert policy["alertStrategy"]["autoClose"] == "10800s"
+
+
 def test_the_apply_script_parses_and_never_deletes():
     subprocess.run(["bash", "-n", str(APPLY)], check=True)
     source = APPLY.read_text(encoding="utf-8")

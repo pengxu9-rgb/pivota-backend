@@ -381,6 +381,7 @@ __all__ = [
     "last_checks",
     "load_population",
     "merge_lanes",
+    "published_dials",
     "main",
     "run_merchant_purchasability_sweep",
     "warm_click_cap",
@@ -790,6 +791,9 @@ class CartMintPopulation:
     usable: bool
     reason: str = ""
     cache_write_failed: bool = False
+    #: Only on a `cache_only` read: the sweep dials the scanning run published with that scan
+    #: (`published_dials`), or {} for a scan written before they were published.
+    dials: Optional[Dict[str, int]] = None
 
 
 def _scan_slot_start(now: datetime) -> datetime:
@@ -824,7 +828,8 @@ async def _cart_mint_population(*, fresh_scan: bool = False, cache_only: bool = 
         age_s = int((_utcnow() - cached["scanned_at"]).total_seconds())
         usable = age_s <= _SCAN_MAX_AGE_S
         return CartMintPopulation(_from_scan_row(cached), "cache", age_s, usable,
-                                  "" if usable else "complete_scan_too_old")
+                                  "" if usable else "complete_scan_too_old",
+                                  dials=dict(cached.get("dials") or {}) if usable else None)
     if fresh_scan:
         lane = await _cart_mint_lane()
         return CartMintPopulation(lane, "scan", 0, lane.complete, lane.incomplete_reason)
@@ -869,6 +874,7 @@ async def _cart_mint_population(*, fresh_scan: bool = False, cache_only: bool = 
                 hosts=lane.hosts if lane else {},
                 warm_hosts=lane.warm_hosts if lane else {},
                 warm_seeds=lane.warm_seeds if lane else 0,
+                dials=published_dials(),
             )
         except Exception as exc:  # noqa: BLE001
             write_failed = True
@@ -1070,6 +1076,22 @@ def warm_click_recheck() -> timedelta:
     return timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
 
 
+#: The dials a run PUBLISHES with its daily cart-mint scan (db/merchant_purchasability_cart_mint_scans,
+#: `SWEEP_DIAL_TAG`): the ones that decide which keys this job keeps fresh, and for how long. The
+#: R-03 freshness check runs on the worker, whose environment is not this job's (the warm-lane
+#: rollback changes the JOB only), so it reads them from the scan row instead.
+PUBLISHED_DIALS = ("warm_click_max_per_run", "warm_click_not_shopify_recheck_days", "ttl_hours")
+
+
+def published_dials() -> Dict[str, int]:
+    """This process's values of `PUBLISHED_DIALS`, read now."""
+    return {
+        "warm_click_max_per_run": warm_click_cap(),
+        "warm_click_not_shopify_recheck_days": _env_int(DIALS["warm_click_not_shopify_recheck_days"]),
+        "ttl_hours": facts.ttl_hours(),
+    }
+
+
 def last_checks(due: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """`facts.list_due` rows by (stored domain, stored market): what the warm-click guard reads."""
     last: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -1220,6 +1242,7 @@ async def collect_population(
                 source=population.source, age_s=population.age_s,
                 elapsed_ms=minted.elapsed_ms, seeds_by_key=seeds_by_key,
                 warm_seeds=minted.warm_seeds, warm_seeds_by_key=warm_seeds_by_key,
+                dials=population.dials,
             )
     return lanes
 

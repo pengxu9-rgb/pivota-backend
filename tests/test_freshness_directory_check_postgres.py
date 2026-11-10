@@ -238,7 +238,9 @@ async def _tick(now=None):
     with _log() as lines:
         summary = await fresh.run_freshness_directory_check_tick(now=now)
     assert any(fresh.SUMMARY_PREFIX + "{" in line for line in lines), ("not a heartbeat", lines)
-    summary = {k: v for k, v in summary.items() if k != "build_ms"}  # a measurement, not a result
+    assert summary["dials_source"] == "env", "this module's scans publish no dials"
+    # build_ms is a measurement and the dial echo is configuration, not a result.
+    summary = {k: v for k, v in summary.items() if k != "build_ms" and not k.startswith("dial")}
     warnings = [json.loads(line.split("freshness_directory: WARNING ", 1)[1])
                 for line in lines if "freshness_directory: WARNING " in line]
     alerts = [json.loads(line.split("money_alert: ", 1)[1]) for line in lines if "money_alert: " in line]
@@ -280,7 +282,7 @@ async def _age(table, where_column, value, hours, vantage=None):
 
 
 def _zero(**counts):
-    base = {"pairs": None, "fresh": 0, "stale": 0, "missing": 0, "pending": 0, "negative": 0, "untracked": 0,
+    base = {"pairs": None, "disabled": 0, "fresh": 0, "stale": 0, "missing": 0, "pending": 0, "negative": 0, "untracked": 0,
             "unavailable": 0}
     base.update(counts)
     return base
@@ -398,7 +400,7 @@ async def test_fresh_stale_missing_and_disabled():
     assert listed.get(DISABLED) is True, listed  # the build lists it, flagged; the check skips it
 
     summary, warnings, alerts = await _tick()
-    assert summary == _zero(pairs=3, fresh=2, stale=1, missing=1), summary
+    assert summary == _zero(pairs=3, disabled=1, fresh=2, stale=1, missing=1), summary
     assert sorted((w["domain"], w["status"]) for w in warnings) == [(STALE, "stale"), (MISSING, "missing")]
     assert sorted((a["domain"], a["status"]) for a in alerts) == [(STALE, "stale"), (MISSING, "missing")]
     assert all(a["event"] == "freshness_directory_past_limit" for a in alerts)

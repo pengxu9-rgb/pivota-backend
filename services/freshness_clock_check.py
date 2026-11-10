@@ -28,10 +28,19 @@ read from that job's own code, never from a predicate restated here:
                        is re-checked only every `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` (7), so
                        its limit is that window plus the TTL (once it is due, the sweep has the
                        same TTL to reach it as any key); any other warm-only key gets the TTL;
-                     - a warm-only key with no row yet is `pending`, counted and never paged: the
-                       sweep takes at most `..._WARM_CLICK_MAX_PER_RUN` of them a run by design;
+                     - a warm-only key the sweep has never checked (no row from the sweep's own
+                       vantage either) is `pending`, counted and never paged: the sweep takes at
+                       most `..._WARM_CLICK_MAX_PER_RUN` of them a run by design. One the sweep
+                       HAS checked but that has no buyer-vantage row is `missing`, like any key;
                      - with that dial at 0 the warm-click lane is out of the population, as in
                        the sweep.
+                   KNOWN LIMIT: the sweep orders never-checked keys ahead of checked ones, and
+                   warm-only keys share a per-run cap. While the never-checked warm backlog is
+                   longer than about (TTL in runs) x cap keys, already-checked warm-only keys are
+                   not re-checked, cross the TTL and page `stale` with the sweep healthy. Measured
+                   2026-11-08 the warm cycle was about 45 h; a scan that adds a few hundred warm
+                   keys at once breaks that. The census's warm-click-only line (stale, pending)
+                   measures it; read it before flag-on and after any large seed ingest.
                    FRESH iff checked_at > now - limit, the strict rule `human_handoff_allowed` uses
                    (exactly the limit old is stale). Any verdict: a negative fact also ages.
                    KNOWN DIFFERENCE: the clock is `checked_at`, not `positive_until`. A merchant
@@ -49,18 +58,30 @@ read from that job's own code, never from a predicate restated here:
 
 Every other directory pair is `untracked` on the card clock: counted in the summary, never a page.
 
+THE DIALS ARE THE JOB'S, NOT THIS SERVICE'S. The sweep runs in its own Cloud Run Job, and the
+runbook's warm-lane rollback (`..._WARM_CLICK_MAX_PER_RUN=0`) changes that job only. So the TTL, the
+warm cap and the re-check days are read from what the sweep PUBLISHED with the cart-mint scan this
+check already reads (`sweep.PUBLISHED_DIALS`, written once a day with the scan, so a change shows
+at the next 05:00Z scan; no extra read). A scan written by an older job image carries none: the
+check then falls back to its OWN environment and says so (`dials_source: env`); until a published
+value is present, set the dials on the worker too. Every summary echoes the three values and
+their source.
+
 THE LINES, through the "pivota" logger (they survive in production):
   freshness_directory: WARNING {...}  one per (clock, pair) that is `stale` or `missing`, plus one
                                       `freshness_directory_past_limit` money alert line.
   freshness_directory_check: {...}    the per-tick summary, ONLY when the tick read everything (the
-                                      heartbeat): pairs, fresh, stale, missing, pending, negative,
-                                      untracked, unavailable, build_ms.
+                                      heartbeat): pairs, disabled, fresh, stale, missing, pending,
+                                      negative, untracked, unavailable, build_ms, the three
+                                      dial_* values and dials_source (sweep_scan | env).
   freshness_directory_check_unavailable: {...}
                                       INSTEAD of the summary when the tick could not read its
                                       population: the directory raised or took longer than
-                                      `BUILD_WAIT_SECONDS` (15 s) to build, a read failed, or a
-                                      sweep lane was unreadable (the clocks still run over what was
-                                      read). A different text, so it never satisfies the heartbeat:
+                                      `BUILD_WAIT_SECONDS` (15 s) to build, the build came back
+                                      DEGRADED (a fact read failed and answered closed: a failed
+                                      `disabled` read hides the pair from this check), a read
+                                      failed, or a sweep lane was unreadable (in the last two
+                                      cases the clocks still run over what was read). A different text, so it never satisfies the heartbeat:
                                       the went-silent policy and the unavailable policy both see it.
 Read only. Never raises.
 """
@@ -190,6 +211,16 @@ def _directory_tierb(row: Optional[Dict[str, Any]], domain: str, market: str, no
                         verdict=row.get("verdict"))
 
 
+def _dials(sweep: Any, published: Any) -> Tuple[Dict[str, int], str]:
+    """(the sweep's dials, where they came from). The values the sweep JOB published with its scan
+    when all of them are there; else this process's own environment (`env`)."""
+    if isinstance(published, dict) and all(
+            isinstance(published.get(name), int) and not isinstance(published.get(name), bool)
+            for name in sweep.PUBLISHED_DIALS):
+        return {name: int(published[name]) for name in sweep.PUBLISHED_DIALS}, "sweep_scan"
+    return sweep.published_dials(), "env"
+
+
 def _unavailable(summary: Dict[str, Any], reason: str, exc: Optional[BaseException] = None) -> Dict[str, Any]:
     summary["unavailable"] = 1
     summary["reason"] = reason
@@ -204,8 +235,8 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
     FRESHNESS_DIRECTORY_CHECK_ENABLED is off. Never raises."""
     if not directory_check_enabled():
         return None
-    summary: Dict[str, Any] = {"pairs": None, "fresh": 0, "stale": 0, "missing": 0, "pending": 0,
-                               "negative": 0, "untracked": 0, "unavailable": 0, "build_ms": None}
+    summary: Dict[str, Any] = {"pairs": None, "disabled": None, "fresh": 0, "stale": 0, "missing": 0,
+                               "pending": 0, "negative": 0, "untracked": 0, "unavailable": 0, "build_ms": None}
     try:
         import db.merchant_purchasability as mp
         from jobs import merchant_purchasability_sweep as sweep
@@ -228,11 +259,19 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
     if elapsed > directory.BUILD_WAIT_SECONDS:
         # What came back is the last clean build, served after this hour's build timed out.
         return _unavailable(summary, "directory_build_slow")
-    tally: Dict[str, int] = {}
     try:
-        lanes = await sweep.collect_population(tally=tally, cart_mint_cache_only=True)
+        degraded = directory.build_failures(facts)
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable(summary, "read_failed", exc)
+    tally: Dict[str, int] = {}
+    cart_mint: Dict[str, Any] = {}
+    try:
+        lanes = await sweep.collect_population(tally=tally, cart_mint=cart_mint, cart_mint_cache_only=True)
         last = sweep.last_checks(await mp.list_due(mp.LIST_DUE_MAX, vantage=mp.WORKER_VANTAGE, strict=True))
-        ttl = timedelta(hours=mp.ttl_hours())
+        dials, source = _dials(sweep, cart_mint.get("dials"))
+        summary.update(dial_ttl_hours=dials["ttl_hours"], dial_warm_cap=dials["warm_click_max_per_run"],
+                       dial_recheck_days=dials["warm_click_not_shopify_recheck_days"], dials_source=source)
+        ttl = timedelta(hours=dials["ttl_hours"])
         cards = _freshest(await database.fetch_all(_DIRECTORY_CARD_SQL, {"vantage": mp.buyer_vantage()}))
         tierbs = _freshest(await database.fetch_all(_DIRECTORY_TIERB_SQL))
         tierb_job = {(m.domain, m.market) for m in load_merchants()}
@@ -241,13 +280,14 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
 
     warm_only = sweep.warm_only_keys(lanes)
     population = set(sweep.merge_lanes(lanes))
-    if sweep.warm_click_cap() == 0:
+    if dials["warm_click_max_per_run"] == 0:
         population -= warm_only  # the lane is switched off: not in the sweep's population at all
-    recheck = sweep.warm_click_recheck()
+    recheck = timedelta(days=dials["warm_click_not_shopify_recheck_days"])
     cart_link = set(lanes.get("cart-link", {}))
 
     pairs = sorted({(f.merchant_domain, f.market) for f in facts if not f.disabled}, key=lambda p: (p[1], p[0]))
     summary["pairs"] = len(pairs)
+    summary["disabled"] = len({(f.merchant_domain, f.market) for f in facts if f.disabled})
     for domain, market in pairs:
         key = (domain, market)
         card_row = cards.get(key)
@@ -256,8 +296,10 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
         elif key in warm_only:
             seen = last.get(key) or {}
             no_catalog = sweep._found_no_shopify_catalog(seen.get("verdict"), seen.get("detail"))
+            # PENDING only while the sweep itself has never checked the key. With a buyer vantage the
+            # sweep does not write, a key it has checked has no buyer row: that is `missing`.
             card = _directory_card(card_row, domain, market, now, ttl + recheck if no_catalog else ttl,
-                                   absent="pending")
+                                   absent="missing" if seen else "pending")
         else:
             card = _directory_card(card_row, domain, market, now, ttl)
         results = [card]
@@ -276,6 +318,13 @@ async def run_freshness_directory_check_tick(*, now: Optional[datetime] = None) 
     unreadable = int(tally.get(sweep.UNREADABLE_TALLY, 0))
     if unreadable:
         summary["population_unreadable"] = unreadable
+    if degraded:
+        # The clocks ran over what the build did answer, but a pair whose read failed is not among
+        # them (a failed `disabled` read marks it disabled), so this tick proves nothing.
+        summary["directory_failures"] = len(degraded)
+        summary["failure_kinds"] = ",".join(sorted(set(degraded)))
+        return _unavailable(summary, "directory_degraded")
+    if unreadable:
         return _unavailable(summary, "population_unreadable")
     logger.info("%s%s", SUMMARY_PREFIX, _line(summary))
     return summary
