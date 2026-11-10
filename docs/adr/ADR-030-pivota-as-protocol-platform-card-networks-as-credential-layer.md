@@ -1,6 +1,6 @@
 # ADR-030: Pivota is the UCP/ACP platform; the checkout is the merchant's; card networks are only the credential layer
 
-**Status:** Proposed (draft 4), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1.
+**Status:** Proposed (draft 5), 2026-11-10. Nothing here is built or switched on by this ADR. Acceptance waits on the owner's questions at the end. Draft 2 aligned D3, D7 and D10 with the payment-partner flow the owner had already agreed. Drafts 3 and 4 answer the docs review of this ADR together with ADR-028 amendment 1. Draft 5 records the owner's completion rule as "not for now, conditionally later".
 
 **Decision owner:** peng. **Runtime owners:** the gateway owner (merchant protocol calls), the backend owner (records and facts).
 
@@ -8,7 +8,7 @@
 - Go protocol-native.
 - Freeze integration-only payment work. The freeze does not cover the work the agreed payment-partner flow still needs (see D10).
 - Merchant eligibility for the pilot: the merchant publishes an agentic checkout protocol (the UCP checkout capability, or ACP). That is the pilot's run condition (D11).
-- Completion is the buyer's or a payment partner's. A payment partner's own checkout agent places the order on the merchant's checkout now. Pivota does not call `complete_checkout`.
+- For now, completion is the buyer's or a payment partner's. A payment partner's own checkout agent places the order on the merchant's checkout. Pivota does not call `complete_checkout` for now. It may later, only on the conditions in D3 and by a separate owner decision.
 
 **Decisions this ADR follows and does not reopen:**
 - **2026-11-08 (ADR-028 amendment 1, #2758):**
@@ -30,14 +30,17 @@
 - **ADR-016:** Pivota is non-custodial. Holds as written.
 - **ADR-021 (Accepted):** the gateway is the protocol gateway. Merchant protocol calls are made by the gateway (D2).
 - **ADR-025:** the attribution loop. D7 says where our click id rides on this lane.
-- **ADR-028, read with its amendment 1 (#2758).** Amendment 1 keeps the card credential out of Pivota. This ADR goes one step further, on the owner's 2026-11-10 rule.
-  - **Amended (D2, the protocol route; route-choice rule 2; Phase A; the protocol-route alternative):** Pivota does not call `complete_checkout`, on a merchant's protocol or on a platform's. Amendment 1 still let Pivota complete through a protocol's payment handler; that is no longer used. See D3.
+- **ADR-028, read with its amendment 1 (#2758).** Amendment 1 keeps the card credential out of Pivota. This ADR adds the owner's 2026-11-10 rule on completion.
+  - **Amended (D2, the protocol route; route-choice rule 2; Phase A; the protocol-route alternative):** Pivota does not call `complete_checkout` for now. The protocol route is not used until the owner turns it on by a separate decision, and then only on the conditions in D3.
   - **Amended (D5, the run condition, for a payment partner's checkout agent in the pilot only):** see D11.
   - **Amended (D7, on the payment-partner route only):** see D3, "Approval" and "Payment".
   - Pivota's own browser runner stays out, as amendment 1 says.
   - Pointer lines under ADR-028 D5 and D7 are added in a follow-up once #2758 has merged, so that two changes do not edit that file at once. D2's pointer is already in #2758. The follow-up cites "ADR-030 D11" in full, because ADR-028 has a D11 of its own.
 - **ADR-029:** one purchase router for unconnected sellers. Its door, router, parent ledger and events are where a partner-completed purchase starts and is recorded (D3, D10). **Unchanged, except:**
-  - the paths Pivota itself would execute are never admitted: completion through a platform protocol (its context table and its Phase 2), completion through a merchant's protocol, Pivota's own browser route, and so the `merchant_protocol` and `pivota_browser` executors;
+  - the paths Pivota itself would execute are not admitted for now:
+    - completion through a merchant's protocol, and so the `merchant_protocol` executor, until the separate owner decision in D3, and then only on D3's conditions;
+    - completion through a platform protocol (its context table and its Phase 2), which does not meet D3's conditions as written;
+    - Pivota's own browser route and the `pivota_browser` executor, which stay out (amendment 1);
   - a `card_number` path stays not admitted;
   - its D3 is read with ADR-028's amended D6. "Stripped on arrival" is a detector. The rule is that the partner never sends a credential;
   - its owner questions 1 (a card vault) and 3 (a platform protocol as a completion route) are answered "no" by amendment 1 and the 2026-11-10 rule, once the owner confirms (question 6 below).
@@ -141,7 +144,7 @@ Lane C already does more than its "one caller" suggests:
 
 ### D3. Who completes the payment
 
-**Pivota does not call `complete_checkout`** (owner, 2026-11-10) **and never handles the card credential** (ADR-028 amendment 1). Amendment 1 alone still let Pivota complete through a protocol's payment handler. The 2026-11-10 rule closes that. A checkout completes in one of two ways.
+**Pivota does not call `complete_checkout` for now** (owner, 2026-11-10) **and never handles the card credential** (ADR-028 amendment 1). For now, a checkout completes in one of two ways. "Later, conditionally", at the end of this section, says when Pivota itself may complete.
 
 **Market, on both paths.** A merchant checkout is created, and a partner quote is requested, only for a **named** buyer market, in that market's currency (ADR-026, ADR-029 D6). A request that names no market, or whose market is assumed, gets no merchant checkout and no quote. It is answered as it is today, labelled as assumed.
 
@@ -175,14 +178,24 @@ The buyer pays on the merchant's own checkout.
 
 **Not used, on any path:** the model where an agent polls a partner or a card network for the credential and pays.
 
-**Later, recorded as intent only.** On 2026-11-10 the owner stated the intent that Pivota will, once it has the capability, complete a checkout itself with a credential minted by a payment partner or obtained from a card network directly. This ADR does **not** decide that.
-- It would reverse the 2026-11-10 rule above (completion) and ADR-028 amendment 1 (the credential). Amendment 1 puts Pivota's own credential retrieval out of scope and says reopening it needs a new decision amending D6.
+**Later, conditionally.** Pivota may later call `complete_checkout` itself. The owner's rule (2026-11-10) allows it only when all of these hold:
+- the checkout is one the merchant publishes through UCP or ACP;
+- the payment is a single-use network token issued under a card network's agent programme (Visa Intelligent Commerce, Mastercard Agent Pay);
+- the amount is the amount the buyer approved;
+- the merchant is the merchant of record;
+- Pivota never touches card data and never holds funds.
+
+**Why it is acceptable in principle** (owner, 2026-11-10). Merchants want orders from every channel. A merchant that accepts the order and the payment through UCP, or through a card network's agent programme, has accepted the transaction.
+
+**Turning it on is a separate owner decision.** Until then:
 - Nothing here authorises a call to `complete_checkout`, a card-network credential call, or any code that holds, forwards or enters a credential.
-- **When it is reopened, it needs:**
-  - the owner's explicit decision amending D6;
-  - a card-data scoping opinion from an assessor;
-  - per merchant, a payment handler that accepts the credential type and a completion grant at a trust tier Pivota holds.
-- **The preferred shape** is the one already asked of the partners: the credential delivered straight to the merchant or its processor, encrypted to the merchant, so that Pivota carries nothing it can read.
+- `complete_checkout` stays structurally refused in both clients, and ADR-028 amendment 1 stays in force.
+
+**What that decision has to settle:**
+- how the token reaches the merchant's payment handler without Pivota seeing, receiving or holding it. "Never touches card data" and ADR-028's amended D6 both require that. The shape already asked of the partners fits: the credential delivered straight to the merchant or its processor, encrypted to the merchant;
+- whether Pivota's own retrieval from a card network is part of it. Amendment 1 puts that out of scope and says reopening it needs a new decision amending D6;
+- a card-data scoping opinion from an assessor;
+- per merchant, a payment handler that accepts the credential type, and a completion grant at a trust tier Pivota holds.
 
 ### D4. Order status comes from the merchant, never from inference
 
@@ -251,7 +264,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | `UCP_ORDER_WEBHOOK_PERSIST_ENABLED` | gateway + backend | verified merchant order events are stored and served to `get_order` |
 
 - Path 2 adds no new switch. It runs behind the existing purchase-door and per-partner dials (ADR-029 D8), all off in production today.
-- No switch exists for Pivota's own completion; `complete_checkout` stays structurally refused in both clients.
+- No switch exists for Pivota's own completion; `complete_checkout` stays structurally refused in both clients until the separate owner decision (D3).
 - The existing `MERCHANT_PURCHASABILITY_GATE_ENABLED` and the agent-checkout kill switch apply to every one of them.
 
 ### D10. Reuse, freeze, retire
@@ -299,7 +312,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 | Discovery | Our catalogue; merchant `/.well-known/ucp` fetched at request time, in-memory cache; version pinned | Stored per-domain profile facts (D8); negotiated version |
 | Merchant decision | Purchasability gate; directory from cart-link and purchasability tables | + "publishes UCP checkout / ACP" fact, which is the pilot eligibility rule; the directory reads it |
 | Checkout URL | `/r` link or a merchant **cart** `continue_url` | Path 1: merchant **checkout** `continue_url`, merchant totals, our attribution inside. Path 2: our entry link, then the cart link, opened by the payment partner's agent |
-| Payment completion | Hosted page (off), partner rails (dark), or buyer on storefront | Path 1: the buyer at `continue_url`. Path 2: the payment partner's checkout agent, after the buyer approves the quoted total. Never Pivota |
+| Payment completion | Hosted page (off), partner rails (dark), or buyer on storefront | Path 1: the buyer at `continue_url`. Path 2: the payment partner's checkout agent, after the buyer approves the quoted total. Not Pivota for now (D3) |
 | Order status | None after hand-off; `esc_` not found | Merchant webhooks / `get_order` where granted; the payment partner's report; the affiliate report |
 | Cancel / after-sales | Cancel flips our row; agent refund routes refuse, staff and operations refund routes still execute | `cancel_checkout` at the merchant (path 1) or the partner's per-order cancel (path 2); adjustments surfaced; the merchant refunds |
 
@@ -327,7 +340,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 4. **Partner-completed purchase (path 2), as agreed.** The supervised live purchase on the partner that already has quote, approve and place. The other partner's order step once its specification and sandbox exist. This phase is paced by the partners, not by phases 1 to 3.
 5. **ACP adapter.** Only if the census finds ACP merchants and they issue us credentials.
 
-Pivota's own completion is not a phase of this ADR (D3, "Later").
+Pivota's own completion is not a phase of this ADR (D3, "Later, conditionally").
 
 ## Risks
 
@@ -350,7 +363,7 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 1. **First milestone.** Path 1: merchant checkout `continue_url` with merchant totals, buyer pays at the merchant. OK as the first build?
 2. **Order capability.** OK to request the order capability and declare a `webhook_url` in our public platform profile? This creates a new inbound data flow of merchant order events.
 3. **Lane A.** Frozen as-is for connected merchants, or scheduled for retirement?
-4. **Own completion later.** Confirm it stays intent only for now, with the 2026-11-10 rule and ADR-028 amendment 1 in force until a separate decision.
+4. **Own completion later.** The rule is "not for now; later only on D3's conditions". Still open: when to turn it on, and how the token reaches the merchant without Pivota handling it.
 5. **Robots and terms beyond the pilot.** D11 decides robots and terms for a payment partner's agent in the pilot only. Does it hold beyond the pilot, and how are store terms checked then?
 6. **ADR-029 questions 1 and 3.** Confirm both are closed as "no": no card vault, and no platform protocol as a completion route for Pivota.
 7. **Lane A refunds.** Staff and operations refund routes still execute a refund. Remove them, or treat reversing Pivota's own failed orchestration as a separate case (amendment 1 leaves that open)?
@@ -359,7 +372,7 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 
 **Owner statements this ADR records, to be confirmed at merge:**
 - the freeze does not cover the agreed payment-partner flow (answered below);
-- the later intent of Pivota's own completion (D3, "Later");
+- the completion rule: Pivota does not call `complete_checkout` for now; later only on D3's conditions and by a separate owner decision (D3, "Later, conditionally");
 - the payment partner's report as a source of order status on path 2 (D4);
 - the pilot's run condition, with no separate merchant permission sought (D11);
 - that the run condition is the robots-and-terms decision ADR-028 D5 requires, for a payment partner's checkout agent in the pilot (D11);
@@ -380,5 +393,5 @@ Pivota's own completion is not a phase of this ADR (D3, "Later").
 
 - **Keep building lane A.** Rejected by the owner on 2026-11-10: the defects are in custom plumbing.
 - **Require the payment partner's agent to use the merchant's protocol door now.** Rejected: the agreed contract is checkout fill through our entry link and cart link, and how the partner reaches the checkout is its own concern.
-- **Pivota completes the checkout itself.** Ruled out by the owner's 2026-11-10 rule (completion) and by ADR-028 amendment 1 (the credential). Recorded as later intent only (D3).
+- **Pivota completes the checkout itself now.** Not for now (owner, 2026-11-10). Allowed later only on D3's conditions and by a separate owner decision.
 - **Per-partner platform profiles.** Rejected for now (D6).
