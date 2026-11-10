@@ -475,17 +475,21 @@ async def test_claim_token_roundtrip_and_tamper_rejection(monkeypatch: pytest.Mo
 
 @pytest.mark.asyncio
 async def test_claim_rejects_replayed_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A consumed claim token cannot re-bind the store (the UPDATE is the lock)."""
+    """A consumed claim token cannot re-bind the store (the UPDATE is the lock), and a
+    spent link gets no further than the token table: no account or address lookup (a
+    replayed link learns nothing about any address) and no write."""
     import routes.merchant_store_connections as module
     from fastapi import HTTPException
 
     monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+    token_queries: list = []
 
     class FakeDatabase:
         async def fetch_one(self, query: str, values: dict):
-            if "UPDATE shopify_store_claim_tokens" in query:
+            if "shopify_store_claim_tokens" in query:
+                token_queries.append(query)
                 return None  # already used / expired -> no row returned
-            raise AssertionError(f"unexpected query before token consumption: {query}")
+            raise AssertionError(f"unexpected query before the token is validated: {query}")
 
         async def execute(self, *args, **kwargs):
             raise AssertionError("must not write anything when the token is spent")
@@ -517,6 +521,7 @@ async def test_claim_rejects_replayed_token(monkeypatch: pytest.MonkeyPatch) -> 
         )
     assert exc.value.status_code == 400
     assert "already been used" in str(exc.value.detail)
+    assert len(token_queries) == 1 and "UPDATE" not in token_queries[0]
 
 
 @pytest.mark.asyncio
@@ -529,14 +534,26 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
 
     class FakeDatabase:
         async def fetch_one(self, query: str, values: dict):
+            if "SELECT 1 FROM shopify_store_claim_tokens" in query:
+                return {"?column?": 1}  # live, unspent
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return None  # brand-new account
             raise AssertionError(f"unexpected query: {query}")
 
         async def execute(self, query: str, values: dict = None):
             executed.append((query, values or {}))
+
+    import routes.auth as auth_module
+
+    tenant_checks: list = []
+
+    async def address_names_no_one(email, **kwargs):
+        tenant_checks.append((email, kwargs))
+        return False
+
+    monkeypatch.setattr(auth_module, "_email_claims_existing_tenant", address_names_no_one)
 
     async def fake_ensure_tables():
         return None
@@ -580,6 +597,12 @@ async def test_claim_creates_account_and_binds_shell_merchant(monkeypatch: pytes
     assert user_values["password_hash"] != "a-good-password"
     assert module.verify_bcrypt_password("a-good-password", user_values["password_hash"])
 
+    # The new-account branch asked whether the address already names someone
+    # (an employee of any status, an agent owner, a merchant contact, an identity).
+    assert tenant_checks == [
+        ("reviewer@example.com", {"check_users_and_merchant_contacts": True})
+    ]
+
 
 @pytest.mark.asyncio
 async def test_claim_with_existing_merchant_moves_store_not_account(
@@ -594,9 +617,11 @@ async def test_claim_with_existing_merchant_moves_store_not_account(
 
     class FakeDatabase:
         async def fetch_one(self, query: str, values: dict):
+            if "SELECT 1 FROM shopify_store_claim_tokens" in query:
+                return {"?column?": 1}  # live, unspent
             if "UPDATE shopify_store_claim_tokens" in query:
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "owner@example.com",
@@ -655,17 +680,22 @@ async def test_claim_with_existing_merchant_moves_store_not_account(
 async def test_claim_rejects_wrong_password_for_existing_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The claim token proves the install, NOT ownership of an arbitrary account."""
+    """The claim token proves the install, NOT ownership of an arbitrary account. A wrong
+    password still spends the link, so one link is one password guess, not an oracle."""
     import routes.merchant_store_connections as module
     from fastapi import HTTPException
 
     monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+    consumed: list = []
 
     class FakeDatabase:
         async def fetch_one(self, query: str, values: dict):
+            if "SELECT 1 FROM shopify_store_claim_tokens" in query:
+                return {"?column?": 1}  # live, unspent
             if "UPDATE shopify_store_claim_tokens" in query:
+                consumed.append(values)
                 return {"merchant_id": "merch_shopify_abc"}
-            if "FROM users WHERE email" in query:
+            if "FROM users WHERE" in query and "email" in query:
                 return {
                     "id": 7,
                     "email": "victim@example.com",
@@ -706,3 +736,63 @@ async def test_claim_rejects_wrong_password_for_existing_account(
             )
         )
     assert exc.value.status_code == 401
+    assert len(consumed) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_a_claimed_address_before_spending_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claimed-address refusal is read-only and runs before the atomic consume, so a
+    refused installer keeps a usable link and can retry with another address."""
+    import routes.auth as auth_module
+    import routes.merchant_store_connections as module
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(module.settings, "jwt_secret_key", "test-secret")
+    seen: list = []
+
+    class FakeDatabase:
+        async def fetch_one(self, query: str, values: dict):
+            if "SELECT 1 FROM shopify_store_claim_tokens" in query:
+                seen.append("token_live")
+                return {"?column?": 1}
+            if "UPDATE shopify_store_claim_tokens" in query:
+                raise AssertionError("a refused claim must not spend the token")
+            if "FROM users WHERE" in query and "email" in query:
+                seen.append("users")
+                return None
+            raise AssertionError(f"unexpected query: {query}")
+
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("a refused claim writes nothing")
+
+    async def address_is_claimed(email, **kwargs):
+        seen.append("claimed_check")
+        return True
+
+    async def fake_ensure_tables():
+        return None
+
+    monkeypatch.setattr(auth_module, "_email_claims_existing_tenant", address_is_claimed)
+    monkeypatch.setattr(module, "database", FakeDatabase())
+    monkeypatch.setattr(module, "_ensure_shopify_oauth_tables", fake_ensure_tables)
+
+    token = module._sign_claim_token(
+        {
+            "typ": "pivota_shopify_claim",
+            "jti": "jti-claimed",
+            "merchant_id": "merch_shopify_abc",
+            "shop_domain": "demo-shop.myshopify.com",
+            "iat": 0,
+            "exp": 9999999999,
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await module.claim_shopify_store(
+            module.ShopifyStoreClaimRequest(claim_token=token, email="staff@example.com", password="a-good-password")
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "MERCHANT_SIGNIN_REQUIRED"
+    assert seen == ["token_live", "users", "claimed_check"]

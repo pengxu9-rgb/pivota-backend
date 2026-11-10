@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel
 
 from services.product_quality_service import preview_quality, full_quality_eval
+from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 
 
 router = APIRouter(
@@ -49,7 +51,10 @@ class QualityEvalRequest(BaseModel):
 
 
 @router.post("/eval")
-async def product_quality_eval(body: QualityEvalRequest):
+async def product_quality_eval(
+    body: QualityEvalRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Full product quality eval + snapshot persistence.
 
@@ -61,7 +66,11 @@ async def product_quality_eval(body: QualityEvalRequest):
     This endpoint is intended for:
     - On-submit checks when merchant clicks "提交上架"
     - Batch jobs that want to store quality history
+
+    It writes a snapshot for body.merchant_id, so the caller must be that merchant
+    (the merchant portal sends its own token and id) or staff.
     """
+    assert_merchant_scope(current_user, body.merchant_id, staff_roles=EMPLOYEE_ROLES)
     try:
         result = await full_quality_eval(
             merchant_id=body.merchant_id,

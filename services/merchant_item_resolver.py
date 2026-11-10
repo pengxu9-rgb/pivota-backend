@@ -29,9 +29,10 @@ must end the stored URL or be followed by `/`, `?` or `#`) narrows the rows, and
 done here, on one normalisation applied to both sides (`normalize_product_url`).
 
 THE PAGE NAMES A PRODUCT, NEVER A VARIANT. A URL purchase names its variant by `variant_id`, required
-beside `product_url` (the route's selector rule). A `variant=` in the URL's query is not ignored: it must
-BE that `variant_id`, or the request is refused (`check_url_variant`). Otherwise a variant-grain seed
-(`?variant=A`) would answer a caller's `?variant=B` with the record that proves only A.
+beside `product_url` (the route's selector rule). A variant in the URL is not ignored: every `variant`
+key in its query or fragment (decoded, any case) must have exactly `<variant_id>` as its value, or the
+request is refused (`check_url_variant`). Otherwise a variant-grain seed (`?variant=A`) would answer a caller's
+`?variant=B` with the record that proves only A.
 
 FAILS CLOSED. A seed whose `domain` is NULL or not lowercase is not read (`row_not_found`): the writers
 lowercase it, and a seed placed by its URL alone is reachable by `product_key` as before. Paths are
@@ -44,10 +45,12 @@ URL attached to different products): `product_ambiguous`. Never a pick.
 """
 from __future__ import annotations
 
+import html
 import ipaddress
 import logging
+import re
 from typing import Any, List, Optional, Set
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import unquote_plus, urlsplit
 
 from db.database import database
 from services.reap_agentic_purchase import PurchaseRefused
@@ -78,10 +81,10 @@ _SEED_SQL = """
      WHERE e.status = 'active'
        AND e.domain IN (:domain_apex, :domain_www)
        AND upper(e.market) = :market_country
-       AND (lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_end ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_slash ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_query ESCAPE '!'
-            OR lower(coalesce(nullif(e.canonical_url, ''), e.destination_url)) LIKE :path_fragment ESCAPE '!')
+       AND (lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_end ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_slash ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_query ESCAPE '!'
+            OR lower(trim(coalesce(nullif(e.canonical_url, ''), e.destination_url))) LIKE :path_fragment ESCAPE '!')
      ORDER BY e.id
      LIMIT :limit
 """
@@ -103,9 +106,17 @@ def _bare_host(host: str) -> str:
 def _normalized(url: Any) -> Optional[str]:
     """`<bare host><path>` for an http(s) URL, path lowercased with trailing slashes and any query or
     fragment dropped; None for anything that is not one. One rule for the caller's URL and the stored
-    ones, so the comparison is symmetric by construction."""
-    text = str(url or "").strip()
-    if not text:
+    ones, so the comparison is symmetric by construction.
+
+    A stored value is trimmed of SPACES only (what SQL `trim()` removes in both dialects, so the
+    candidate read finds every value accepted here). Then the part the comparison keeps -- scheme, host
+    and path, everything before the first `?` or `#` -- must be printable ASCII, as the caller's whole
+    URL must be: a tab, a newline or a raw non-ASCII character THERE means no caller URL can equal it, so
+    it is not a page. The query and fragment are dropped unread, so a stored `.../p?ref=café` IS the
+    caller's `.../p`, exactly as the SQL read (which does not look past the path) treats it."""
+    text = str(url or "").strip(" ")
+    compared = re.split(r"[?#]", text, maxsplit=1)[0]
+    if not text or any(not 0x21 <= ord(ch) <= 0x7E for ch in compared):
         return None
     try:
         parts = urlsplit(text)
@@ -149,19 +160,53 @@ def normalize_product_url(product_url: str, merchant_host: str) -> str:
     return normalized
 
 
-def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
-    """Refuse a URL whose query names a variant other than the request's `variant_id` (`invalid_request`).
+#: The query or fragment keys that name a variant (after decoding, case-folded). Shopify reads `variant`.
+_VARIANT_KEYS = frozenset({"variant", "variant[]"})
 
-    `variant=` (any case, every occurrence) must equal `variant_id` exactly; the request must name one.
-    Call it after `normalize_product_url` has accepted the URL."""
+#: Decoding rounds a key or value may need (percent-encoding, `+`, HTML entities). A store decodes once;
+#: past this the text is refused, never accepted half-decoded.
+_MAX_DECODE_ROUNDS = 4
+
+
+def _decoded(text: str) -> str:
+    """`text` decoded until stable, or `invalid_request` when it is still changing after
+    `_MAX_DECODE_ROUNDS` rounds (an encoding this lane will not chase)."""
+    for _ in range(_MAX_DECODE_ROUNDS + 1):
+        decoded = html.unescape(unquote_plus(text))
+        if decoded == text:
+            return text
+        text = decoded
+    raise PurchaseRefused("invalid_request", "product_url is encoded deeper than this lane reads")
+
+
+def check_url_variant(product_url: str, variant_id: Optional[str]) -> None:
+    """Refuse a URL whose query or fragment names a variant other than the request's `variant_id`.
+
+    The request must carry a `variant_id`. The query and the fragment are each read as a parameter list,
+    split on `&` and `;` BEFORE anything is decoded, so an encoded separator inside a value stays part of
+    that value. Each key is then decoded (`_decoded`) and case-folded; a key that is `variant` or
+    `variant[]` must have a value that decodes to exactly `variant_id`, else `invalid_request`
+    ("does not match": another id, leading zeros, a blank, a missing value, `<id>;x` spelled `%3B`). A key
+    that decodes to `variant=...` (an encoded `=`) is refused as unreadable. Every other parameter --
+    `utm_content=variant_a`, `sections=product-variant-picker`, a fragment word such as `variant-picker`
+    -- is not a variant key and is ignored, as a store ignores it. Call it after `normalize_product_url`
+    has accepted the URL."""
     if variant_id is None:
         raise PurchaseRefused("invalid_request", "a product_url purchase names its variant by variant_id")
     try:
-        pairs = parse_qsl(urlsplit(product_url).query, keep_blank_values=True)
+        parts = urlsplit(product_url)
     except ValueError:
         raise PurchaseRefused("invalid_request", "product_url is not a usable URL") from None
-    if any(name.lower() == "variant" and value != variant_id for name, value in pairs):
-        raise PurchaseRefused("invalid_request", "product_url names another variant than variant_id")
+    for section in (parts.query, parts.fragment):
+        for piece in re.split(r"[&;]", section):
+            raw_key, has_value, raw_value = piece.partition("=")
+            name, encoded_equals, _ = _decoded(raw_key).lower().partition("=")
+            if name not in _VARIANT_KEYS:
+                continue
+            if encoded_equals:
+                raise PurchaseRefused("invalid_request", "product_url's variant is in a form this lane cannot read")
+            if not has_value or _decoded(raw_value) != variant_id:
+                raise PurchaseRefused("invalid_request", "product_url's variant does not match variant_id")
 
 
 def _is_ip_literal(host: str) -> bool:

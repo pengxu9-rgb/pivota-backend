@@ -17,7 +17,9 @@ from services.agent_webhook_service import (
     update_webhook_config,
 )
 from services import webhook_delivery_gate
-from utils.auth import get_current_user
+from db.database import database
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 
 router = APIRouter(prefix="/agents", tags=["agent-webhooks"])
@@ -27,15 +29,6 @@ class UpdateWebhookConfigRequest(BaseModel):
     enabled: bool = False
     destination_url: Optional[str] = None
     subscribed_events: List[str] = Field(default_factory=list)
-
-
-def _authorize_agent_scope(agent_id: str, current_user: dict) -> None:
-    role = current_user.get("role")
-    if role in {"admin", "employee", "super_admin"}:
-        return
-    user_agent_id = current_user.get("agent_id") or current_user.get("user_id")
-    if str(user_agent_id or "") != str(agent_id):
-        raise HTTPException(status_code=403, detail="Not authorized")
 
 
 @router.post("/{agent_id}/webhooks/managed-inbox")
@@ -69,7 +62,7 @@ async def get_agent_webhook_config(
     agent_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         await ensure_agent_webhook_tables()
         return {
@@ -88,7 +81,7 @@ async def put_agent_webhook_config(
     request: UpdateWebhookConfigRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         config = await update_webhook_config(
             agent_id,
@@ -113,7 +106,7 @@ async def get_agent_webhook_events_catalog(
     agent_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     return list_webhook_events_catalog()
 
 
@@ -123,7 +116,7 @@ async def post_agent_webhook_test(
     request: Request,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         result = await send_test_webhook(
             agent_id,
@@ -153,7 +146,7 @@ async def get_agent_webhook_deliveries(
     status: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         return await list_deliveries(agent_id, limit=limit, status=status)
     except HTTPException:
@@ -168,7 +161,7 @@ async def post_agent_webhook_retry(
     delivery_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         delivery = await retry_delivery(agent_id, delivery_id)
         if webhook_delivery_gate.skipped_by_environment(delivery):
@@ -193,7 +186,7 @@ async def post_agent_webhook_rotate_secret(
     agent_id: str,
     current_user: dict = Depends(get_current_user),
 ):
-    _authorize_agent_scope(agent_id, current_user)
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
         result = await rotate_signing_secret(agent_id)
         return result

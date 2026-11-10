@@ -1,0 +1,18 @@
+{
+  "protocol": {
+    "name": "acp",
+    "version": "2025-09-29",
+    "supported_versions": [
+      "2025-09-29"
+    ]
+  },
+  "api_base_url": "https://merchant.example.com/api",
+  "transports": [
+    "rest"
+  ],
+  "capabilities": {
+    "services": [
+      "checkout"
+    ]
+  }
+}

@@ -201,6 +201,12 @@ def _build_payment_action_from_order(order: Dict[str, Any]) -> Dict[str, Any]:
 def _ensure_order_access(order: Optional[Dict[str, Any]], context: AgentContext) -> Dict[str, Any]:
     if not order:
         raise HTTPException(status_code=404, detail="Checkout not found")
+    # ONLY THE AGENT THAT CREATED THE CHECKOUT. Merchant access alone let any key with an unrestricted
+    # merchant scope read, pay for, return or refund another agent's checkout by id. Not found, so the id
+    # is not confirmed to a caller that does not own it.
+    owner = str(order.get("agent_id") or "").strip()
+    if not owner or owner != str(getattr(context, "agent_id", "") or "").strip():
+        raise HTTPException(status_code=404, detail="Checkout not found")
     merchant_id = str(order.get("merchant_id") or "").strip()
     if not merchant_id or not context.can_access_merchant(merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -415,6 +421,10 @@ async def create_checkout_refund(
     context: AgentContext = Depends(get_agent_context),
 ):
     order = _ensure_order_access(await get_order(checkout_id), context)
+    # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
+    from services.agent_refund_policy import refuse_agent_refund_execution
+
+    refuse_agent_refund_execution()
     response = await process_refund_route(
         order_id=checkout_id,
         refund_request=RefundRequest(

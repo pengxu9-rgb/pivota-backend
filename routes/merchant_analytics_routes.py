@@ -76,6 +76,22 @@ async def _get_principal(
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def _merchant_claim_or_403(principal: Dict[str, Any]) -> str:
+    """The merchant a merchant-role token names; the ?merchant_id= override is staff-only.
+
+    A merchant token without the claim (legacy /auth/signin mints one when
+    users.merchant_id is NULL) used to fall through to the query parameter and read
+    any merchant's series. It now gets a 403.
+    """
+    claimed = str(principal.get("entity_id") or principal.get("merchant_id") or "").strip()
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Merchant token carries no merchant_id",
+        )
+    return claimed
+
+
 def _parse_window_bound(name: str, raw: Optional[str]) -> Optional[datetime]:
     """ISO-8601 -> aware UTC, or 422.
 
@@ -459,9 +475,9 @@ async def get_trends(
         if role not in [UserRole.MERCHANT.value, UserRole.ADMIN.value, UserRole.OPERATOR.value]:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
-        # Merchant context
+        # Merchant context: a merchant reads only the merchant its token names.
         if role == UserRole.MERCHANT.value:
-            merchant_id = principal.get("entity_id") or principal.get("merchant_id") or merchant_id
+            merchant_id = _merchant_claim_or_403(principal)
         # Admin/operator must provide explicit merchant_id if not present in token
         if not merchant_id:
             raise HTTPException(status_code=400, detail="merchant_id required")
@@ -834,9 +850,9 @@ async def export_trends_csv(
         if role not in [UserRole.MERCHANT.value, UserRole.ADMIN.value, UserRole.OPERATOR.value]:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
         
-        # Merchant context
+        # Merchant context: a merchant reads only the merchant its token names.
         if role == UserRole.MERCHANT.value:
-            merchant_id = principal.get("entity_id") or principal.get("merchant_id") or merchant_id
+            merchant_id = _merchant_claim_or_403(principal)
         if not merchant_id:
             raise HTTPException(status_code=400, detail="merchant_id required")
         

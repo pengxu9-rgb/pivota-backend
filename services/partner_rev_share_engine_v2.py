@@ -237,6 +237,13 @@ async def _read_partner_contract(channel_partner_id: int) -> _PartnerContract:
     )
 
 
+# M-05 (delta review P3-D), a known gap, no check here: this engine pays on FROZEN
+# monthly_brand_statements for every attributed brand and does NOT re-read
+# merchant_onboarding.is_test. A statement assembled with MERCHANT_IS_TEST_FILTER_ENABLED on has no
+# GMV for an is_test merchant, but one frozen before the merchant was marked, or before the flag,
+# keeps its GMV take, and subscription and overage revenue are never is_test-checked (v1 neither).
+# Before PARTNER_REV_SHARE_USE_V2 goes on: make sure every month it will settle was frozen with the
+# filter on, or add services.test_traffic.is_test_merchant_lock_sql("merchant_id") below.
 async def _read_attributed_brands(channel_partner_id: int) -> list[Any]:
     rows = await database.fetch_all(
         """

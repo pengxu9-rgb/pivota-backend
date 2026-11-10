@@ -420,3 +420,41 @@ def test_confirm_untagged_transaction_writes_no_edge(client, fake_db, keypair, m
                       headers=_headers(signature, "cf-untagged", wallet=WALLET_ADDRESS))
     assert res.status_code == 200, res.text
     assert edge_calls == [], "an untagged AP2 confirm must not fabricate an edge"
+
+
+@pytest.mark.parametrize("stamp_flag", ["", "true"])
+def test_confirm_drops_server_only_keys_from_the_caller_metadata(client, fake_db, keypair, monkeypatch, stamp_flag):
+    # W3 F3: the AP2 transaction metadata is the caller's. ops_canary (and the other server-only
+    # order keys) must not reach the attribution edge, where the test-traffic predicate would
+    # read ops_canary as the payment canary and take the edge out of GMV billing.
+    from services import test_traffic
+
+    monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", stamp_flag)
+    priv, _ = keypair
+    edge_calls = []
+
+    async def fake_upsert(*, order_id, merchant_id, metadata):
+        edge_calls.append(dict(metadata))
+        return {"edge_id": "cae_test", "order_id": order_id}
+
+    monkeypatch.setattr(
+        "services.commerce_attribution_service.upsert_order_attribution_edge", fake_upsert
+    )
+    fake_db.transactions["ap2_txn_forged"] = {
+        "transaction_id": "ap2_txn_forged", "order_id": "ap2_txn_forged",
+        "agent_id": AGENT_ID, "merchant_id": "m_1", "product_id": "prod_9",
+        "amount": 25, "currency": "USD", "status": "pending",
+        "metadata": {"pvt_click_id": "clk_abc", "ops_canary": "yes",
+                     "skip_platform_order_creation": True, "test_psp_probe_granted": True},
+    }
+    body = {"transaction_id": "ap2_txn_forged"}
+    signature = _sign(priv, {**body, "nonce": "cf-forged-" + (stamp_flag or "off")})
+
+    res = client.post("/ap2/transaction/confirm", json=body,
+                      headers=_headers(signature, "cf-forged-" + (stamp_flag or "off"), wallet=WALLET_ADDRESS))
+    assert res.status_code == 200, res.text
+    (meta,) = edge_calls
+    assert meta["pvt_click_id"] == "clk_abc"
+    for key in ("ops_canary", "skip_platform_order_creation", "test_psp_probe_granted"):
+        assert key not in meta
+    assert test_traffic.classify_test_traffic(merchant_ids=["m_1"], server_metadata=meta) == []
