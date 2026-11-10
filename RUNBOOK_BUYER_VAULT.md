@@ -107,3 +107,38 @@ Railway 的健康检查默认打到 `GET /health`。该接口会：
 - **先加迁移**（`db/migrations/*.sql`，可重复执行/幂等）
 - **再加 schema gate**（更新 `db/schema_guard.py:REQUIRED_SCHEMA`）
 - 最后再改业务代码引用新字段
+
+### 4.4 Buyer identity hash keys (S-29): rollout, roll forward only
+
+`agent_user_ref` is stored as an HMAC. Today the key is the first token secret that is set, in the order `BUYER_ACTION_TOKEN_SECRET`, `CHECKOUT_TOKEN_SECRET`, `AGENT_CHECKOUT_TOKEN_SECRET`. On web and worker that is only `CHECKOUT_TOKEN_SECRET`. Three variables move it to its own key:
+
+- `BUYER_IDENTITY_LINK_LEGACY_SECRET`: the **copy**. It holds the value today's hashes were made with, and it is used only to match old rows.
+- `BUYER_IDENTITY_LINK_SECRET`: the **new key**, a fresh random value.
+- `BUYER_IDENTITY_LINK_LEGACY_READ`: the **legacy-read window**, open unless set to `off`.
+
+Steps, in order. Each step is its own revision on **both web and worker**, **worker first, then web**:
+- **Why worker first.** The worker runs the same image and prints the same boot lines, but it is `--ingress internal` and serves no route that resolves a buyer hash: no worker, job or service derives a hash from a raw `agent_user_ref` (they all take a hash that is already stored). So the worker's new revision checks the mount with no buyer traffic on it. If its boot line is wrong, fix it there, before web gets the change. For the same reason the gap between the two deploys is harmless.
+- **Web in one revision.** Web serves every route that resolves a buyer hash, so each change goes to web in a single revision, never to part of it.
+
+1. Deploy the code with nothing mounted. No hash changes, and a WARNING says the new key is missing.
+2. Mount the copy. Create it as a **separate secret** holding the current value of `CHECKOUT_TOKEN_SECRET`. It must not be a reference to the live `CHECKOUT_TOKEN_SECRET` secret or version, or step 6 would change it too. No hash changes in this state.
+3. On the new revision of **both worker and web**, read the boot line `event=buyer_identity_hash_legacy_copy_check`. It must say `legacy_copy_matches_token_key=yes dedicated_mounted=no`. On `no`, fix the copy and repeat; nothing has changed yet.
+4. Mount the new key on both services (worker, then web), never on only one.
+5. On the new revision of both services, the boot line must say `dedicated_mounted=yes`. There must be no `buyer_identity_hash_secret_refused` line and no `buyer_identity_hash_secret_missing` line.
+6. Rotate `CHECKOUT_TOKEN_SECRET` (worker, then web).
+   - **Check after step 6**, on the new revision of both services: the boot line says `legacy_copy_matches_token_key=no dedicated_mounted=yes`, and there is **no** `buyer_identity_hash_secret_refused` line. `no` is expected now: the copy holds the old value. A `refused` line means the new key is not in use; stop and fix the mount before anything else.
+
+Rules:
+- **Add no new token secret** (in particular `BUYER_ACTION_TOKEN_SECRET`, which is first in the chain) until the window is closed. Before step 4 it would become the write key and change every hash. After step 4 it makes the step-3 check meaningless.
+- **Do not rotate before step 4.** Until the new key is mounted, the token secret is still the write key.
+- **Never unmount the new key**, and never let a revision without it serve next to one with it. Buyers first seen after step 4 exist only under the new key.
+- **Never remove the copy while the window is open.**
+
+**If every buyer-hash request answers 503.** Symptom: the purchase, Reap purchase and checkout-prefill routes answer `503` with `Retry-After: 30` and the body `{"error": "TEMPORARY_UNAVAILABLE", "message": "Buyer identity hash key configuration refused: the legacy key copy is missing. ..."}`. The log has one ERROR per process, `buyer_identity_hash_secret_refused reason=legacy_copy_missing`, then hourly WARNINGs. This is not the database. The copy is missing on that service while the window is open and the new key is set, and nothing has been written under any hash. That is by design: after step 6, any fallback would move every buyer onto a new hash.
+- **The only fix: mount the copy again**, from its separate secret, on the service that lost it (worker first if both).
+- Do **not** close the window to clear the 503 (see below), and do not unmount the new key (rule above).
+
+**Closing the window is a separate, end-of-window decision, never a fix for the 503.** Setting `BUYER_IDENTITY_LINK_LEGACY_READ=off` ends the legacy read for good:
+- Every buyer first seen before step 4 then resolves to the new key's hash and **loses the link to their old rows**: saved link, purchase history and idempotency keys (a retry of an old request can open a second purchase).
+- **Nothing rehashes those rows.** No job, script or migration rewrites them, so the loss is permanent.
+- So close it only once that loss is accepted for the buyers still on the legacy hash. When you do, set `off` in the same revision as removing the copy, or earlier, on both services (worker, then web).

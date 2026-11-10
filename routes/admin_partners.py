@@ -671,6 +671,11 @@ async def retry_settlement_transfer(
                     "transfer_status": transfer_status,
                 },
             )
+        # O-05 (Peng, W3 F1): with transfers off the retry sends nothing and leaves the row
+        # `failed` — checked BEFORE the reset below. settlement_file_service.transfer checks
+        # the same flag itself, so no caller can bypass it.
+        if not settlement_file_service.transfers_enabled():
+            return _transfers_disabled_response(file_id)
 
         await database.execute(
             """
@@ -683,7 +688,17 @@ async def retry_settlement_transfer(
             {"file_id": file_id},
         )
 
-    await settlement_file_service.transfer(settlement_file_id=file_id)
+    try:
+        await settlement_file_service.transfer(settlement_file_id=file_id)
+    except settlement_file_service.SettlementTransfersDisabledError:
+        # The flag went off between the check above and the transfer: the service refused
+        # before touching Stripe, so put the row back the way the staff member found it.
+        await database.execute(
+            "UPDATE settlement_files SET transfer_status = 'failed' "
+            "WHERE id = :file_id AND transfer_status = 'pending'",
+            {"file_id": file_id},
+        )
+        return _transfers_disabled_response(file_id)
     updated = await _settlement_file_retry_result(
         channel_partner_id=channel_partner_id,
         file_id=file_id,
@@ -691,6 +706,17 @@ async def retry_settlement_transfer(
     if not updated:
         raise HTTPException(status_code=404, detail="Settlement file not found")
     return updated
+
+
+def _transfers_disabled_response(file_id: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "TRANSFERS_DISABLED",
+            "message": "Settlement transfers are disabled (SETTLEMENT_FILE_TRANSFER_ENABLED is off)",
+            "file_id": file_id,
+        },
+    )
 
 
 @router.get(

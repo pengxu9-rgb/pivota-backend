@@ -112,7 +112,7 @@ import db.merchant_purchasability as purchasability
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 import services.merchant_item_resolver as merchant_item
-from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
+from db.buyer_vault import mint_pairwise_buyer_ref, resolve_agent_user_ref_hash
 from db.commerce_attribution import surface_click_events
 from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
@@ -2206,6 +2206,14 @@ def _check_one_product_selector(product_key: Optional[str], product_url: Optiona
         raise ValueError("product_url is a cart-link selector")
 
 
+def _fingerprint_prefixes_live(req: Any) -> bool:
+    """Whether a key spelled with a selector's fingerprint prefix (`product_url:`, `variant_id:`) must be
+    refused: only where a `product_url` or `variant_id` request can exist, the cart-link lane with its dial
+    on. The hash holds `item_source`, so no other lane's request can share such a fingerprint, and with the
+    dial off every key request answers exactly as before these selectors (dark)."""
+    return getattr(req, "item_source", None) == "cart_link" and svc.is_cart_link_enabled()
+
+
 def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str, Optional[str]]:
     """`(product_key, fingerprint_product, normalized_url)` from a create-shaped body.
 
@@ -2224,7 +2232,7 @@ def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str,
         merchant_item.check_url_variant(req.product_url, getattr(req, "variant_id", None))
         return None, merchant_item.PRODUCT_URL_HASH_PREFIX + normalized, normalized
     product_key = _identifier(req.product_key, "product_key", max_chars=1024)
-    if product_key.startswith(merchant_item.PRODUCT_URL_HASH_ROOT):
+    if _fingerprint_prefixes_live(req) and product_key.startswith(merchant_item.PRODUCT_URL_HASH_ROOT):
         raise svc.PurchaseRefused("invalid_request", "product_key is a catalog key, not a product URL")
     return product_key, product_key, None
 
@@ -2248,7 +2256,7 @@ def _variant_selector(req: "StartPurchaseRequest") -> Tuple[Optional[str], Optio
     if req.variant_id is not None:
         return None, _VARIANT_ID_HASH_PREFIX + req.variant_id
     key = _identifier(req.variant_key, "variant_key", max_chars=1024) if str(req.variant_key or "").strip() else None
-    if key is not None and key.startswith(_VARIANT_ID_HASH_PREFIX):
+    if key is not None and _fingerprint_prefixes_live(req) and key.startswith(_VARIANT_ID_HASH_PREFIX):
         # No sku key starts with it (they start with their product key): one that did would share a
         # `variant_id` request's fingerprint.
         raise svc.PurchaseRefused("invalid_request", "variant_key is a sku key, not a variant_id")
@@ -3155,7 +3163,7 @@ async def start_reap_purchase(
             raise svc.PurchaseRefused("invalid_address", "country must be two letters")
 
         agent_id = str(context.agent_id)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
 
@@ -3551,8 +3559,8 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         _require_rail()
         if not svc.is_create_enabled():
             raise svc.PurchaseRefused("create_disabled")
-        owner = hash_agent_user_ref(_require_agent_user(agent_user))
         agent = str(context.agent_id)
+        owner = await resolve_agent_user_ref_hash(agent, _require_agent_user(agent_user))
         try:
             req = StartPurchaseRequest.model_validate(await request.json())
         except (ValueError, ValidationError):
@@ -3627,7 +3635,7 @@ async def recover_reap_purchase(
     """
     try:
         agent_user_ref = _require_agent_user(agent_user)
-        owner_hash = hash_agent_user_ref(agent_user_ref)
+        owner_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not owner_hash:
             raise svc.PurchaseRefused("agent_user_required")
         try:
@@ -3689,7 +3697,7 @@ async def get_reap_purchase(
         # Stored owner-scoped status reads survive create disarming/credential outages.
         # This handler makes no provider call and retains both identity dependencies.
         agent_user_ref = _require_agent_user(agent_user)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
     except svc.PurchaseRefused as exc:
@@ -3743,7 +3751,7 @@ async def list_reap_purchases(
     try:
         _require_rail()
         agent_user_ref = _require_agent_user(agent_user)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
         # Parsed HERE, not in the signature: a `Query(le=...)` refusal is a 400 that fires before
