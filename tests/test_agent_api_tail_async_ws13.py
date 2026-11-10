@@ -173,7 +173,7 @@ def _install_agent_create_order_harness(
     async def fake_get_primary_store(_merchant_id: str):
         return {"platform": "shopify", "store_id": "store_ws13"}
 
-    async def fake_load_replayable_agent_order_create_response(_order_request: Any):
+    async def fake_load_replayable_agent_order_create_response(_order_request: Any, **_replay_owner: Any):
         return None
 
     async def fake_quote_load(self: Any, *, quote_id: str):
@@ -210,6 +210,7 @@ def _install_agent_create_order_harness(
     async def fake_cache_agent_order_create_response_best_effort(
         _idempotency_key: Optional[str],
         _response: dict[str, Any],
+        **_replay_owner: Any,
     ) -> None:
         await maybe_fail("_cache_agent_order_create_response_best_effort")
 
@@ -378,3 +379,15 @@ async def test_agent_create_order_error_logging_background_failures_do_not_mask_
     assert exc_info.value.status_code == expected_status
     assert calls[fail_step] == 1
     assert any(f"background {fail_step} failed: boom-{fail_step}" in warning for warning in warnings)
+
+
+@pytest.fixture(autouse=True)
+def _quote_rows_owned_by_the_test_agent(monkeypatch):
+    """S-28: order create first checks who owns the quote row. These tests fake the quote LOAD, so
+    the quote they stand for belongs to this file's agent."""
+    import services.quote_service as quote_service_module
+
+    async def owned_row(quote_id: str):
+        return {"quote_id": quote_id, "agent_id": 'agent_ws13', "snapshot_json": {}}
+
+    monkeypatch.setattr(quote_service_module, "get_quote_owner_row", owned_row)

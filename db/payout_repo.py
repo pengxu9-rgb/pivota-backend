@@ -115,9 +115,15 @@ class PayoutRepo:
     
     async def upload(self, payout_id: int, reference: str, file_url: Optional[str] = None, 
                      method: Optional[str] = None, provider: Optional[str] = None, 
-                     external_id: Optional[str] = None) -> bool:
+                     external_id: Optional[str] = None,
+                     merchant_id: Optional[str] = None) -> bool:
         """
         Mark a payout as uploaded with payment details
+
+        `merchant_id`, when given, confines the update to that merchant's
+        payout: the route takes payout_id and merchant_id from the URL
+        separately, and without this a merchant scoped to its own id could
+        still mark another merchant's payout as uploaded.
         
         Args:
             payout_id: ID of the payout
@@ -142,18 +148,22 @@ class PayoutRepo:
           updated_at = NOW()
         WHERE id = :pid AND status = 'pending'
         """
-        
-        await database.execute(
-            query=query,
-            values={
-                "ref": reference, 
-                "file": file_url, 
-                "method": method, 
-                "provider": provider, 
-                "eid": external_id, 
-                "pid": payout_id
-            }
-        )
+        values = {
+            "ref": reference,
+            "file": file_url,
+            "method": method,
+            "provider": provider,
+            "eid": external_id,
+            "pid": payout_id,
+        }
+        if merchant_id is not None:
+            query = query.replace(
+                "WHERE id = :pid AND status = 'pending'",
+                "WHERE id = :pid AND merchant_id = :mid AND status = 'pending'",
+            )
+            values["mid"] = str(merchant_id)
+
+        await database.execute(query=query, values=values)
         return True
     
     async def confirm(self, payout_id: int) -> bool:

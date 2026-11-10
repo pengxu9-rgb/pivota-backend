@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from db.database import database
-from utils.auth import get_current_user, can_access_merchant
+from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.tenant_scope import assert_merchant_scope
 from models.standard_product import StandardProduct, ProductListResponse, ProductStatus, StandardProductVariant
 import json
 import logging
@@ -236,15 +237,9 @@ async def get_merchant_products_v2(
             f"user_role={current_user.get('role')}, user_merchant_id={current_user.get('merchant_id')}"
         )
 
-        if not can_access_merchant(current_user, merchant_id):
-            logger.warning(f"[V2] Access denied for user {current_user.get('email')}")
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"Not authorized. Your merchant_id: {current_user.get('merchant_id')}, "
-                    f"Requested: {merchant_id}"
-                ),
-            )
+        # Was can_access_merchant(), which also admits any agent token that
+        # carries no merchant-scope claim -- i.e. every self-registered agent.
+        assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_ROLES)
     except HTTPException:
         raise
     except Exception as e:
@@ -340,8 +335,7 @@ async def get_merchant_platforms(
     current_user: dict = Depends(get_current_user),
 ):
     """Get all platforms that have cached products for this merchant"""
-    if not can_access_merchant(current_user, merchant_id):
-        raise HTTPException(status_code=403, detail="Not authorized to access this merchant's data")
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_ROLES)
 
     logger.info(f"[V2] Getting platforms for merchant {merchant_id}")
 

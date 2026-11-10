@@ -738,3 +738,64 @@ async def test_an_echoed_context_carrying_a_card_number_is_dropped():
     body = _task(_card("payment.method-list", {"methods": []}))
     body["result"]["contextId"] = f"ctx-{DPAN}"
     assert (await _send(_client(_Rail(body)))).context_id is None
+
+
+# ── rule 6: the token step is refused in production, whatever the env says (S-10) ────────────────
+
+_PLATFORM_ENV_KEYS = (
+    "PIVOTA_ENV", "PIVOTA_PLATFORM", "RAILWAY_ENVIRONMENT", "RAILWAY_ENVIRONMENT_NAME",
+    "K_SERVICE", "K_REVISION", "K_CONFIGURATION", "CLOUD_RUN_JOB", "CLOUD_RUN_EXECUTION",
+)
+
+
+def _platform(monkeypatch, **env):
+    for key in _PLATFORM_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_the_token_step_actions_are_the_mint_approve_and_await_steps():
+    assert a2a.TOKEN_STEP_ACTIONS == {
+        ("payment.token-setup", "submit"), ("payment.method-list", "select-method"),
+        ("payment.action-required", "paid"), ("payment.visa-action-required", "paid"),
+        ("payment.await", "poll"),
+    }
+    assert a2a.TOKEN_STEP_ACTIONS <= a2a.ALLOWED_ACTIONS
+    assert issubclass(a2a.TokenStepRefused, a2a.ActionNotAllowed)
+
+
+@pytest.mark.parametrize("shape", [
+    {"PIVOTA_ENV": "production"},
+    {"K_SERVICE": "pivota-backend", "K_REVISION": "pivota-backend-00001-abc"},  # unresolved: fail closed
+    {"CLOUD_RUN_JOB": "a2a-rail-purchase-poll"},
+])
+@pytest.mark.parametrize("component,action", sorted(a2a.TOKEN_STEP_ACTIONS))
+async def test_in_production_every_token_step_action_raises_before_any_request(
+    monkeypatch, caplog, shape, component, action,
+):
+    _platform(monkeypatch, **shape)
+    # Every dial this code ever read, ON: none of them may matter.
+    monkeypatch.setenv("A2A_RAIL_ENABLED", "1")
+    monkeypatch.setenv("A2A_RAIL_TOKEN_STEP_ENABLED", "1")
+    rail = _Rail(TOKEN_RESULT)
+    with caplog.at_level(logging.ERROR, logger=a2a.__name__):
+        with pytest.raises(a2a.TokenStepRefused):
+            await _send(_client(rail), component, action)
+    assert rail.requests == []  # not even the access-token exchange
+    assert any("REFUSED" in r.getMessage() and "production" in r.getMessage() for r in caplog.records)
+
+
+async def test_in_production_card_binding_and_reads_still_go_through(monkeypatch):
+    _platform(monkeypatch, PIVOTA_ENV="production")
+    rail = _Rail(METHOD_LIST)
+    assert (await _send(_client(rail), "payment.method-view", "submit")).ok
+    assert len(rail.sends()) == 1
+
+
+@pytest.mark.parametrize("env", ["staging", "development"])
+async def test_outside_production_the_token_step_is_sent_as_before(monkeypatch, env):
+    _platform(monkeypatch, PIVOTA_ENV=env)
+    rail = _Rail(TOKEN_RESULT)
+    result = await _send(_client(rail), "payment.token-setup", "submit")
+    assert len(rail.sends()) == 1 and result.card("payment.token-result") is not None
