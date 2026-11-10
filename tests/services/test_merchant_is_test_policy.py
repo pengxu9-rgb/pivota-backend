@@ -367,3 +367,32 @@ async def test_a_stuck_leader_read_is_bounded_with_the_flag_on(monkeypatch, hang
     assert time.monotonic() - started < 1.0
     assert pol.static_test_merchant_ids({}) <= ids
     assert pol.cached_is_test_merchant_ids(ON) == set()
+
+
+# ── M-05 delta review P3-E: the primary-key read's warning is one short line, rate-limited ───
+
+
+async def test_primary_key_read_failures_log_the_type_once_per_interval(caplog):
+    db = _PkDB(raises=True)
+    with caplog.at_level("WARNING", logger=pol.logger.name):
+        for _ in range(3):
+            assert await pol.read_is_test_merchant_ids(db, ["m_t"]) == set()
+        lines = [r for r in caplog.records if "primary-key read FAILED" in r.getMessage()]
+        assert len(lines) == 1  # not one per order
+        assert "(RuntimeError)" in lines[0].getMessage()
+        assert "0 earlier failures suppressed" in lines[0].getMessage()
+        assert lines[0].exc_info is None  # the type only, no traceback
+        assert "is_test does not exist" not in lines[0].getMessage()
+        # after the interval, one more line, carrying the count it suppressed
+        pol._pk_last_warn_at -= pol._WARN_INTERVAL_SECONDS
+        await pol.read_is_test_merchant_ids(db, ["m_t"])
+        lines = [r for r in caplog.records if "primary-key read FAILED" in r.getMessage()]
+        assert len(lines) == 2
+        assert "2 earlier failures suppressed" in lines[1].getMessage()
+
+
+async def test_a_primary_key_timeout_is_named_in_the_warning(caplog):
+    with caplog.at_level("WARNING", logger=pol.logger.name):
+        await pol.read_is_test_merchant_ids(_PkDB(hangs=True), ["m_t"], timeout=0.05)
+    [line] = [r for r in caplog.records if "primary-key read FAILED" in r.getMessage()]
+    assert "(TimeoutError)" in line.getMessage() and line.exc_info is None

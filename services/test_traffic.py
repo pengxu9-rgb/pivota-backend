@@ -243,10 +243,53 @@ def is_test_merchant_lock_sql(merchant_column: str) -> str:
 
     if not merchant_is_test_filter_enabled():
         return ""
+    return " AND NOT " + _is_test_now_exists(merchant_column)
+
+
+def _is_test_now_exists(merchant_column: str) -> str:
     return (
-        " AND NOT EXISTS (SELECT 1 FROM merchant_onboarding mo_is_test"
+        "EXISTS (SELECT 1 FROM merchant_onboarding mo_is_test"
         f" WHERE mo_is_test.merchant_id = {merchant_column} AND mo_is_test.is_test IS TRUE)"
     )
+
+
+def is_test_merchant_exists_sql(merchant_column: str) -> str:
+    """`EXISTS (...)`: TRUE when the row's merchant is is_test NOW. The positive twin of the
+    lock-time check, for the read that counts what that check left out (`log_is_test_lock_drop`).
+    Unconditional: callers gate it on `lock_drop_audit_enabled()`."""
+    return _is_test_now_exists(merchant_column)
+
+
+def lock_drop_audit_enabled() -> bool:
+    """Whether the lock-time check is on, i.e. whether a lock site should count and record what it
+    dropped. The same flag as `is_test_merchant_lock_sql`, so with it off no extra read runs."""
+    from services.test_merchant_policy import merchant_is_test_filter_enabled
+
+    return merchant_is_test_filter_enabled()
+
+
+LOCK_DROP_LOG_PREFIX = "is_test_lock_drop"
+
+
+def log_is_test_lock_drop(site: str, *, ref: Any, merchant_id: Any, **counts: Any) -> None:
+    """The audit line for a merchant the lock-time check left out of a money lock: one line per
+    (run or statement, merchant), e.g.
+
+        is_test_lock_drop site=invoice_run ref=billing_run:41 merchant_id=m_1 rows=3 take_cents=1200
+
+    A frozen statement or an issued invoice cannot be redone, so this line is the record of WHY a
+    merchant has no GMV on it (staff marked it is_test, audited in employee_audit_logs). Written
+    through the "pivota" logger at WARNING: prod drops INFO from plain module loggers. Never
+    raises."""
+    try:
+        from utils.logger import logger as operator_logger
+
+        detail = " ".join(f"{k}={counts[k]}" for k in sorted(counts))
+        operator_logger.warning(
+            "%s site=%s ref=%s merchant_id=%s %s", LOCK_DROP_LOG_PREFIX, site, ref, merchant_id, detail
+        )
+    except Exception:  # noqa: BLE001 — an audit line never breaks a money run
+        return
 
 
 def not_test_traffic_sql(metadata_column: str) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -16,7 +17,10 @@ from db.database import IS_POSTGRES, database
 # M-05 P2-2: the statement is assembled and frozen in one step (assemble_and_freeze_report_only),
 # so its GMV read is the lock: with MERCHANT_IS_TEST_FILTER_ENABLED on, a merchant that is is_test
 # then has no GMV on it, whatever its edges were stamped at write.
+from services import test_traffic
 from services.test_traffic import is_test_merchant_lock_sql, not_test_traffic_sql
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
@@ -643,6 +647,9 @@ async def _gmv_attribution_for_month(
     period_start: date,
     period_end: date,
 ) -> Any:
+    await _record_is_test_lock_drop(
+        merchant_id=merchant_id, period_start=period_start, period_end=period_end
+    )
     return await database.fetch_one(
         """
         SELECT
@@ -674,6 +681,45 @@ async def _gmv_attribution_for_month(
             "period_end": period_end,
         },
     )
+
+
+async def _record_is_test_lock_drop(*, merchant_id: str, period_start: date, period_end: date) -> None:
+    """M-05 P3-B: the statement GMV read leaves out a merchant that is is_test now, and a frozen
+    statement cannot be re-assembled. So, only while MERCHANT_IS_TEST_FILTER_ENABLED is on, count
+    the edges that check drops (the read's other conditions unchanged) and write one audit line per
+    (statement = merchant + month). Read-only, in its own savepoint: a failure never aborts the
+    assembly transaction. A statement has no id before its first insert, hence merchant + month."""
+    if not test_traffic.lock_drop_audit_enabled():
+        return
+    try:
+        async with database.transaction():
+            row = await database.fetch_one(
+                """
+                SELECT COUNT(*) AS n, COALESCE(SUM(net_attributed_gmv_cents), 0) AS cents
+                FROM commerce_attribution_edges
+                WHERE merchant_id = :merchant_id
+                  AND created_at >= :period_start
+                  AND created_at < :period_end
+                  AND net_attributed_gmv_cents > 0
+                  AND (metadata->>'inferred')::boolean IS NOT TRUE
+                  AND """ + not_test_traffic_sql("metadata") + """
+                  AND """ + test_traffic.is_test_merchant_exists_sql(
+                    "commerce_attribution_edges.merchant_id"
+                ),
+                {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit read never fails the statement
+        logger.warning("monthly statement: is_test lock-drop count failed (%s)", type(exc).__name__)
+        return
+    dropped = int(_row_get(row, "n") or 0)
+    if dropped > 0:
+        test_traffic.log_is_test_lock_drop(
+            "monthly_statement",
+            ref=f"statement:{merchant_id}:{period_start.isoformat()}",
+            merchant_id=merchant_id,
+            rows=dropped,
+            gmv_cents=int(_row_get(row, "cents") or 0),
+        )
 
 
 def _total_cogs_cents(

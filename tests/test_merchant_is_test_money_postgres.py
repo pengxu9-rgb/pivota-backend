@@ -19,6 +19,7 @@ Review fixes:
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -84,6 +85,26 @@ async def merchants(db, monkeypatch):  # noqa: F811 - depends on the harness fix
         test_merchant_policy.reset_cache()
         for table in _OWN_TABLES:
             await db.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+
+
+@pytest.fixture
+def drop_lines():
+    """The lock-drop audit lines (services.test_traffic.log_is_test_lock_drop), as the "pivota"
+    logger emits them. That logger does not propagate, so caplog cannot see it."""
+    lines = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            if record.getMessage().startswith("is_test_lock_drop "):
+                lines.append((record.levelno, record.getMessage()))
+
+    handler = _Collect()
+    target = logging.getLogger("pivota")
+    target.addHandler(handler)
+    try:
+        yield lines
+    finally:
+        target.removeHandler(handler)
 
 
 async def _mark_flagged():
@@ -284,11 +305,23 @@ async def _history(db, *, channel_partner=None):
 
 
 @pytest.mark.parametrize("filter_flag, flagged_gmv", [("true", 0), ("", 4_000), ("false", 4_000)])
-async def test_history_leaves_the_statement_at_lock_only_with_the_filter_on(db, monkeypatch, filter_flag, flagged_gmv):
+async def test_history_leaves_the_statement_at_lock_only_with_the_filter_on(
+    db, monkeypatch, drop_lines, filter_flag, flagged_gmv
+):
     await _history(db)
     monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", filter_flag)
     assert await _statement_gmv(db, FLAGGED) == flagged_gmv
     assert await _statement_gmv(db, REAL) == 10_000
+    # P3-B: the drop is recorded, once, for the dropped merchant only; nothing with the filter off
+    if filter_flag == "true":
+        month = (TODAY - timedelta(days=1)).isoformat()
+        assert drop_lines == [(
+            logging.WARNING,
+            f"is_test_lock_drop site=monthly_statement ref=statement:{FLAGGED}:{month} "
+            f"merchant_id={FLAGGED} gmv_cents=4000 rows=1",
+        )]
+    else:
+        assert drop_lines == []
 
 
 class _Stripe:
@@ -334,7 +367,9 @@ async def _run_id(db):
 
 
 @pytest.mark.parametrize("filter_flag", ["true", "", "false"])
-async def test_history_leaves_the_invoice_at_lock_only_with_the_filter_on(db, billing, stripe_fake, monkeypatch, filter_flag):
+async def test_history_leaves_the_invoice_at_lock_only_with_the_filter_on(
+    db, billing, stripe_fake, monkeypatch, drop_lines, filter_flag
+):
     from services import gmv_aggregation_service as gmv
     from services.invoice_generation_service import generate_merchant_invoice
 
@@ -356,13 +391,20 @@ async def test_history_leaves_the_invoice_at_lock_only_with_the_filter_on(db, bi
         assert len(locks) == 1  # the unlocked pre-read already left it out: no day locks taken for it
         assert stripe_fake.invoices_created == [REAL]
         assert stripe_fake.items == [(REAL, 1_000)]
+        assert drop_lines == [(
+            logging.WARNING,
+            f"is_test_lock_drop site=invoice_run ref=billing_run:{run} merchant_id={FLAGGED} rows=1 take_cents=400",
+        )]
     else:
+        assert drop_lines == []
         assert flagged
         assert stripe_fake.invoices_created == [FLAGGED, REAL]
         assert sorted(stripe_fake.items) == sorted([(FLAGGED, 400), (REAL, 1_000)])
 
 
-async def test_a_merchant_marked_after_the_pre_read_is_left_out_by_the_read_under_the_lock(db, billing, stripe_fake, monkeypatch):
+async def test_a_merchant_marked_after_the_pre_read_is_left_out_by_the_read_under_the_lock(
+    db, billing, stripe_fake, monkeypatch, drop_lines
+):
     """The read under the day locks is the one that bills, so the is_test check must be in it too,
     not only in the unlocked pre-read."""
     from services import gmv_aggregation_service as gmv
@@ -387,8 +429,25 @@ async def test_a_merchant_marked_after_the_pre_read_is_left_out_by_the_read_unde
             await conn.close()
 
     monkeypatch.setattr(gmv, "lock_billing_days", _lock_then_staff_marks)
-    assert await generate_merchant_invoice(await _run_id(db), FLAGGED, *PERIOD) is None
+    run = await _run_id(db)
+    assert await generate_merchant_invoice(run, FLAGGED, *PERIOD) is None
     assert stripe_fake.invoices_created == []
+    assert [line for _, line in drop_lines] == [
+        f"is_test_lock_drop site=invoice_run ref=billing_run:{run} merchant_id={FLAGGED} rows=1 take_cents=400"
+    ]
+
+
+async def test_a_merchant_with_nothing_to_bill_writes_no_drop_line(db, billing, stripe_fake, monkeypatch, drop_lines):
+    """An empty read is only a DROP when the is_test check is why: a real merchant with no rollup
+    rows, and an is_test merchant with none, record nothing."""
+    from services.invoice_generation_service import generate_merchant_invoice
+
+    await _mark_flagged()
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    run = await _run_id(db)
+    for mid in (REAL, FLAGGED):
+        assert await generate_merchant_invoice(run, mid, *PERIOD) is None
+    assert drop_lines == []
 
 
 async def _paid_invoice(db, merchant_id):
@@ -413,7 +472,9 @@ async def test_history_leaves_the_settlement_take_at_lock_only_with_the_filter_o
 
 @pytest.mark.parametrize("branch", ["partner_attribution", "rollup"])
 @pytest.mark.parametrize("filter_flag", ["true", ""])
-async def test_history_puts_no_partner_in_settlement_scope_with_the_filter_on(db, billing, monkeypatch, branch, filter_flag):
+async def test_history_puts_no_partner_in_settlement_scope_with_the_filter_on(
+    db, billing, monkeypatch, drop_lines, branch, filter_flag
+):
     """run_settlement's partner scope has two legs: a partner attributed to a merchant with edges in
     the period, and a partner on a rollup row. Each must leave an is_test merchant out."""
     from services import partner_settlement_service as ps
@@ -446,5 +507,148 @@ async def test_history_puts_no_partner_in_settlement_scope_with_the_filter_on(db
     monkeypatch.setattr(ps.partner_rev_share_engine_v2, "compute_partner_comp_v2", _comp)
     monkeypatch.setattr(ps, "write_settlement_snapshot", _none)
     monkeypatch.setattr(ps, "record_settlement_completion", _none)
-    await ps.run_settlement(await _run_id(db))
+    run = await _run_id(db)
+    await ps.run_settlement(run)
     assert seen == ([8] if filter_flag == "true" else [7, 8])
+    # P3-B: one line per (run, merchant) saying which leg dropped what; nothing with the filter off
+    counts = (
+        "edge_rows=1 rollup_rows=0 take_cents=0" if branch == "partner_attribution"
+        else "edge_rows=0 rollup_rows=1 take_cents=400"
+    )
+    expected = [(
+        logging.WARNING,
+        f"is_test_lock_drop site=partner_settlement ref=billing_run:{run} merchant_id={FLAGGED} {counts}",
+    )]
+    assert drop_lines == (expected if filter_flag == "true" else [])
+
+
+async def test_a_failing_drop_count_never_fails_the_lock(db, billing, stripe_fake, monkeypatch, drop_lines):
+    """The audit read is best effort: if it fails, the invoice run, the statement read and the
+    settlement still answer as they would have, and (it runs in a savepoint) the statement's own
+    transaction is still usable."""
+    from db.database import database
+    from services import partner_settlement_service as ps
+    from services import test_traffic
+    from services.invoice_generation_service import generate_merchant_invoice
+
+    await _history(db)
+    for mid, cp in ((FLAGGED, 7), (REAL, 8)):
+        await db.execute("INSERT INTO partner_attribution (merchant_id, channel_partner_id) VALUES (:m, :c)", {"m": mid, "c": cp})
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    monkeypatch.setattr(
+        test_traffic, "is_test_merchant_exists_sql", lambda col: "EXISTS (SELECT 1 FROM no_such_table_m05)"
+    )
+    run = await _run_id(db)
+    assert await generate_merchant_invoice(run, FLAGGED, *PERIOD) is None
+    async with database.transaction():
+        assert await _statement_gmv(db, FLAGGED) == 0
+        assert await db.fetch_val("SELECT 1") == 1  # the enclosing transaction was not aborted
+    seen = []
+
+    async def _comp(cp, *a, **k):
+        seen.append(cp)
+        return {}
+
+    async def _none(*a, **k):
+        return 1
+
+    monkeypatch.setattr(ps.settings, "partner_rev_share_use_v2", True)
+    monkeypatch.setattr(ps.partner_rev_share_engine_v2, "compute_partner_comp_v2", _comp)
+    monkeypatch.setattr(ps, "write_settlement_snapshot", _none)
+    monkeypatch.setattr(ps, "record_settlement_completion", _none)
+    await ps.run_settlement(run)
+    assert seen == [8]
+    assert drop_lines == []
+
+
+# ── P3-G: a seller-keyed conversion reads BOTH merchants (the seller it re-subjects to, and the
+#    converting store) ─────────────────────────────────────────────────────────────────────────
+
+OBSERVED_SELLER = "merch_obs_seller_d"  # an observed seller: no merchant_onboarding row
+
+
+async def _seller_keyed_close(db, *, converting, seller, external_order_id):
+    """A click the real issue-time writer recorded with a seller-of-record (ADR-009 D3), then the
+    webhook/poller close. Returns the edge's (merchant_id, metadata)."""
+    from services.commerce_attribution_service import IssuedClick, issue_click
+
+    await issue_click(IssuedClick(
+        click_id="clk_shop_" + external_order_id, surface="agent_search", merchant_id=converting,
+        context={"seller_ref": seller, "seed_kind": "cross"},
+    ))
+    out = await _shopify_close(converting, external_order_id, 700, test_flag=False)
+    assert out["click_matched"] is True and out["seller_ref"] == seller
+    row = await db.fetch_one(
+        "SELECT merchant_id, metadata FROM commerce_attribution_edges WHERE external_order_id = :x",
+        {"x": external_order_id},
+    )
+    md = row["metadata"] if isinstance(row["metadata"], dict) else json.loads(row["metadata"])
+    return row["merchant_id"], md
+
+
+async def test_a_seller_keyed_conversion_is_test_when_the_seller_is(db, monkeypatch):
+    monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    await _mark_flagged()
+    subject, md = await _seller_keyed_close(db, converting=REAL, seller=FLAGGED, external_order_id="6301")
+    assert subject == FLAGGED  # re-subjected to the seller, which is not the converting store
+    assert md.get("test_traffic_reasons") == ["test_merchant"]
+
+
+async def test_a_seller_keyed_conversion_is_test_when_the_converting_store_is(db, monkeypatch):
+    monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    await _mark_flagged()
+    subject, md = await _seller_keyed_close(
+        db, converting=FLAGGED, seller=OBSERVED_SELLER, external_order_id="6302"
+    )
+    assert subject == OBSERVED_SELLER
+    assert md.get("test_traffic_reasons") == ["test_merchant"]
+
+
+async def test_a_seller_keyed_conversion_between_two_real_merchants_is_real(db, monkeypatch):
+    monkeypatch.setenv("TEST_TRAFFIC_STAMP_ENABLED", "true")
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", "true")
+    await _mark_flagged()
+    subject, md = await _seller_keyed_close(db, converting=REAL, seller=OBSERVED_SELLER, external_order_id="6303")
+    assert subject == OBSERVED_SELLER
+    assert "test_traffic" not in md
+
+
+@pytest.mark.parametrize("filter_flag", ["", "false"])
+async def test_filter_off_no_lock_site_reads_is_test_or_records_a_drop(
+    db, billing, stripe_fake, monkeypatch, drop_lines, filter_flag
+):
+    """With the filter off the drop audit issues no query at all (its count needs the column), at
+    every site, even when the read it follows comes back empty."""
+    from db.database import database
+    from services import partner_settlement_service as ps
+    from services.invoice_generation_service import generate_merchant_invoice
+
+    await _history(db)
+    monkeypatch.setenv("MERCHANT_IS_TEST_FILTER_ENABLED", filter_flag)
+    seen = []
+    for name in ("fetch_one", "fetch_all"):
+        real = getattr(database, name)
+
+        def _make(real):
+            async def _spy(query, *a, **k):
+                seen.append(str(query))
+                return await real(query, *a, **k)
+            return _spy
+
+        monkeypatch.setattr(database, name, _make(real))
+
+    async def _none(*a, **k):
+        return {}
+
+    monkeypatch.setattr(ps.settings, "partner_rev_share_use_v2", True)
+    monkeypatch.setattr(ps.partner_rev_share_engine_v2, "compute_partner_comp_v2", _none)
+    monkeypatch.setattr(ps, "write_settlement_snapshot", _none)
+    monkeypatch.setattr(ps, "record_settlement_completion", _none)
+    run = await _run_id(db)
+    assert await generate_merchant_invoice(run, "merch_nothing_to_bill", *PERIOD) is None
+    await _statement_gmv(db, FLAGGED)
+    await ps.run_settlement(run)
+    assert seen and not [q for q in seen if "is_test" in q]
+    assert drop_lines == []

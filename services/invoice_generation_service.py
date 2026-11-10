@@ -104,8 +104,7 @@ ORDER BY us.updated_at DESC NULLS LAST, us.created_at DESC NULLS LAST
 LIMIT 1
 """
 
-_GMV_ROWS_QUERY_HEAD = """
-SELECT
+_GMV_ROWS_SELECT_LIST = """
     id,
     date,
     merchant_id,
@@ -117,7 +116,9 @@ SELECT
     take_rate_bp,
     take_amount_cents,
     protocol_name
-FROM gmv_attribution_daily
+"""
+_GMV_ROWS_QUERY_HEAD = """
+SELECT""" + _GMV_ROWS_SELECT_LIST + """FROM gmv_attribution_daily
 WHERE merchant_id = :merchant_id
   AND date BETWEEN :period_start AND :period_end
   AND take_amount_cents > 0"""
@@ -135,6 +136,41 @@ def _gmv_rows_query() -> str:
     from services.test_traffic import is_test_merchant_lock_sql
 
     return _GMV_ROWS_QUERY_HEAD + is_test_merchant_lock_sql("gmv_attribution_daily.merchant_id") + _GMV_ROWS_QUERY_TAIL
+
+
+async def _record_is_test_lock_drop(
+    billing_run_id: int, merchant_id: str, period_start: date, period_end: date
+) -> None:
+    """M-05 P3-B: when the rows read came back empty, say so if the lock-time is_test check is why.
+    One read-only count, only while MERCHANT_IS_TEST_FILTER_ENABLED is on, in its own savepoint (a
+    failure must not abort the caller's transaction); one audit line per (run, merchant). The run
+    still returns None for the merchant: this records it, it does not change it."""
+    from services import test_traffic
+
+    if not test_traffic.lock_drop_audit_enabled():
+        return
+    try:
+        async with database.transaction():
+            row = await database.fetch_one(
+                _GMV_ROWS_QUERY_HEAD.replace(
+                    _GMV_ROWS_SELECT_LIST, " COUNT(*) AS n, COALESCE(SUM(take_amount_cents), 0) AS cents "
+                )
+                + " AND "
+                + test_traffic.is_test_merchant_exists_sql("gmv_attribution_daily.merchant_id"),
+                {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit read never fails the run
+        logger.warning("invoice run: is_test lock-drop count failed (%s)", type(exc).__name__)
+        return
+    dropped = _as_int(_get(row, "n"))
+    if dropped > 0:
+        test_traffic.log_is_test_lock_drop(
+            "invoice_run",
+            ref=f"billing_run:{billing_run_id}",
+            merchant_id=merchant_id,
+            rows=dropped,
+            take_cents=_as_int(_get(row, "cents")),
+        )
 
 _INSERT_BILLING_RUN_ITEM_QUERY = """
 INSERT INTO billing_run_items (
@@ -521,6 +557,7 @@ async def generate_merchant_invoice(
         },
     )
     if not rows:
+        await _record_is_test_lock_drop(billing_run_id, merchant_id, period_start, period_end)
         return None
 
     await _ensure_invoice_generation_schema()
@@ -550,6 +587,8 @@ async def generate_merchant_invoice(
                 },
             )
             if not rows:
+                # Marked is_test between the pre-read and this one: recorded here instead.
+                await _record_is_test_lock_drop(billing_run_id, merchant_id, period_start, period_end)
                 return None
             total_cents = sum(_as_int(_get(row, "take_amount_cents")) for row in rows)
 

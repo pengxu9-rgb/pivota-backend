@@ -158,6 +158,11 @@ _LEADER_READ_TIMEOUT_SECONDS = 2.0
 # One indexed lookup per id; on a timeout or any error the answer is "unknown" = not test.
 PK_READ_TIMEOUT_SECONDS = 0.5
 _PK_READ_MAX_IDS = 4
+# A failing primary-key read is hit once per order, edge and conversion: its warning carries the
+# error TYPE only (no traceback) and is logged at most once per _WARN_INTERVAL_SECONDS per process,
+# with a count of the failures it suppressed since the last line.
+_pk_last_warn_at: Optional[float] = None
+_pk_suppressed_warnings = 0
 
 # A persistent failure must not log a traceback per search.
 _WARN_INTERVAL_SECONDS = 60.0
@@ -381,6 +386,9 @@ def reset_cache() -> None:
     """Test hook — drop the memoized demo-domain and is_test sets and the failure state."""
     global _cache_value, _cache_at, _failed_at, _last_warn_at, _suppressed_warnings, _inflight
     global _is_test_value, _is_test_attempted, _is_test_last_warn_at, _is_test_fresh_at, _generation
+    global _pk_last_warn_at, _pk_suppressed_warnings
+    _pk_last_warn_at = None
+    _pk_suppressed_warnings = 0
     _generation += 1
     _is_test_fresh_at = float("-inf")
     _is_test_value = None
@@ -466,14 +474,26 @@ async def read_is_test_merchant_ids(
 
     try:
         return await asyncio.wait_for(_read(), PK_READ_TIMEOUT_SECONDS if timeout is None else timeout)
-    except Exception:  # noqa: BLE001 - a timeout included: unknown is not test
-        logger.warning(
-            "test_merchant_policy: is_test primary-key read FAILED for %s merchant(s); "
-            "classifying them as not test",
-            len(wanted),
-            exc_info=True,
-        )
+    except Exception as exc:  # noqa: BLE001 - a timeout included: unknown is not test
+        _warn_pk_read_failed(exc, len(wanted))
         return set()
+
+
+def _warn_pk_read_failed(exc: BaseException, wanted: int, *, now: Optional[float] = None) -> None:
+    global _pk_last_warn_at, _pk_suppressed_warnings
+    ts = time.monotonic() if now is None else now
+    if _pk_last_warn_at is not None and (ts - _pk_last_warn_at) < _WARN_INTERVAL_SECONDS:
+        _pk_suppressed_warnings += 1
+        return
+    logger.warning(
+        "test_merchant_policy: is_test primary-key read FAILED (%s) for %s merchant(s); "
+        "classifying them as not test (%s earlier failures suppressed)",
+        type(exc).__name__,
+        wanted,
+        _pk_suppressed_warnings,
+    )
+    _pk_last_warn_at = ts
+    _pk_suppressed_warnings = 0
 
 
 async def refresh_is_test_merchant_ids(database, *, env: Optional[Dict[str, str]] = None) -> None:
