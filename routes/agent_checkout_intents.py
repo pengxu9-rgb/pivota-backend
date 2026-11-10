@@ -19,7 +19,7 @@ from db.database import IS_POSTGRES, database, engine, metadata
 from db.schema_guard import guarded_add_columns, guarded_index
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
-from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
+from db.buyer_vault import buyer_addresses, buyer_identity_links, resolve_agent_user_ref_hash
 from routes.accounts_orders_api import get_accounts_principal
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_execution_policy import (
@@ -28,7 +28,7 @@ from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
     resolve_commerce_execution_policy,
 )
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, require_quote_for_caller
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from services.tier2_acp_lane import resolve_acp_lane_decision
 from services.acp_checkout_session_service import (
@@ -106,11 +106,13 @@ def mint_checkout_token(
     exp = now + int(ttl_seconds)
     if exp_cap is not None:
         exp = min(exp, int(exp_cap))
+    # The payload goes FIRST so that no field in it can override the version, issue time or the
+    # (capped) expiry set here.
     body = {
+        **payload,
         "v": 1,
         "iat": now,
         "exp": exp,
-        **payload,
     }
 
     payload_b64 = _base64url_encode(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
@@ -183,6 +185,9 @@ def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
     /agent/v2/payments/checkout-sessions). The new token and intent must not outlive the token that
     asked for them, or a token holder could extend its one-hour life indefinitely by re-minting.
     Its own `exp` already carries any earlier cap, so the chain can only shrink.
+
+    A presented token with no usable `exp` (only possible with the signing secret; every minted token
+    has one) still gets a cap: the default token lifetime from now. It never means "uncapped".
     """
     payload = getattr(context, "checkout_token_payload", None)
     if not isinstance(payload, dict):
@@ -191,7 +196,9 @@ def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
         exp = int(payload.get("exp") or 0)
     except (TypeError, ValueError):
         exp = 0
-    return exp if exp > 0 else None
+    if exp > 0:
+        return exp
+    return int(time.time()) + _checkout_token_ttl_seconds()
 
 
 def _checkout_token_ttl_seconds() -> int:
@@ -395,7 +402,7 @@ async def _buyer_prefill_from_identity_link(*, agent_id: str, agent_user_ref: st
     ref = str(agent_user_ref or "").strip()
     if not ref:
         return None
-    ref_hash = hash_agent_user_ref(ref)
+    ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
     if not ref_hash:
         return None
 
@@ -902,6 +909,8 @@ async def create_checkout_intent(
             },
         )
     if quote_id:
+        # S-28: a token minted for a quote may use it, so only the quote's owner may name it here.
+        await require_quote_for_caller(quote_id, context)
         try:
             quote = await QuoteService().load_active_quote_or_raise(quote_id=quote_id)
         except QuoteError as exc:
