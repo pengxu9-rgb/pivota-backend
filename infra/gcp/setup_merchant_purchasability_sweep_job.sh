@@ -83,7 +83,10 @@ SUBNET=pivota-crawl
 # The sweep's own dials, PINNED here because the task timeout below is derived from them. A re-run
 # of this script resets them; tune them here, not with `gcloud run jobs update`.
 BUDGET_SECONDS=600
-BATCH=20
+BATCH=24
+# The warm-click lane's per-run cap (jobs/merchant_purchasability_sweep.py, "THE FIFTH LANE"). 0 takes
+# the lane out of the population: THE ROLLBACK, by editing this line and re-running with --enable.
+WARM_CLICK_MAX_PER_RUN=8
 # The worker identity, exactly as setup_scheduler.sh's crawl jobs and the Tier B job use it: it
 # already holds Secret Manager access to DATABASE_URL and project-level run.invoker for Scheduler.
 SA="sa-worker@$PROJECT.iam.gserviceaccount.com"
@@ -107,9 +110,11 @@ ENV_VARS="$ENV_VARS|DB_POOL_MIN_SIZE=1|DB_POOL_MAX_SIZE=2"
 ENV_VARS="$ENV_VARS|DB_STATEMENT_TIMEOUT_SECONDS=30|DB_COMMAND_TIMEOUT_SECONDS=600"
 ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_BUDGET_SECONDS=$BUDGET_SECONDS"
 ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_BATCH=$BATCH"
+ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN=$WARM_CLICK_MAX_PER_RUN"
 ENV_VARS="$ENV_VARS|MERCHANT_PURCHASABILITY_SWEEP_ENABLED=$ENABLED"
 # THE SHARED SHOPIFY-EDGE PACER (#2474), exactly as the Reap cart-proof setup script sets it on the
-# Reap proof jobs: every request (all to Shopify stores) also takes a slot of the aggregate budget
+# Reap proof jobs: every request to a known Shopify store (every key but an unproven warm-click one,
+# see jobs/merchant_purchasability_sweep.py) also takes a slot of the aggregate budget
 # every crawl job on the crawl IP shares, and the lease cap of 2 bounds what this job can ever
 # hold of that shared schedule. CRAWL_SHOPIFY_EDGE_RPS is deliberately NOT set: every job on the
 # address must use the same shared rate. The IP breaker's dials
