@@ -140,3 +140,53 @@ async def test_later_state_on_postgres(db):
     ))
     out = (await handoffs.read_handoff(RECORD_A, _binding(ESC_A), PARTNER_A))["handoff"]
     assert out["status"] == "seller_order_observed" and out["seller_order_observed_at"]
+
+
+async def _referral_edge(db, edge_id, agent_id, at):
+    from db.commerce_attribution import commerce_attribution_edges
+
+    await db.execute(commerce_attribution_edges.insert().values(
+        edge_id=edge_id, merchant_id="merch_obs_shop_a", click_id=REFERRAL, order_id="ord_" + edge_id,
+        agent_id=agent_id, state="converted", converted_at=at, refund_count=0, refunded_amount=0,
+        created_at=at, updated_at=at,
+    ))
+
+
+async def _referral_row(db, agent_id, at):
+    from db.commerce_attribution import surface_click_events
+
+    await db.execute(surface_click_events.insert().values(
+        click_id=REFERRAL, surface="find_products_multi", agent_id=agent_id, click_count=1, impression_count=0,
+        last_click_at=at, created_at=at - timedelta(hours=1), updated_at=at,
+    ))
+
+
+async def _status(handoffs):
+    return (await handoffs.read_handoff(RECORD_A, _binding(ESC_A), PARTNER_A))["handoff"]["status"]
+
+
+async def test_later_state_is_read_only_from_a_referral_issued_to_the_partner_on_postgres(db):
+    # O-02 review B-1, on the production dialect: an order on the referral id, credited to no agent.
+    from services import storefront_handoff_record as handoffs
+
+    await handoffs.record_handoff(_record())
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await _referral_edge(db, "edge_pg_none", None, later)
+    assert await _status(handoffs) == "handed_off", "no click row: the referral was issued to nobody we know"
+    await _referral_row(db, None, later)
+    assert await _status(handoffs) == "handed_off", "an agent-less referral is not this partner's"
+    await db.execute("UPDATE surface_click_events SET agent_id = :a WHERE click_id = :c", {"a": PARTNER_A, "c": REFERRAL})
+    assert await _status(handoffs) == "seller_order_observed", "issued to the partner: its order is read"
+
+
+async def test_an_order_credited_to_another_agent_is_not_read_on_postgres(db):
+    from services import storefront_handoff_record as handoffs
+
+    await handoffs.record_handoff(_record())
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await _referral_edge(db, "edge_pg_b", PARTNER_B, later)
+    assert await _status(handoffs) == "handed_off"
+    await _referral_row(db, PARTNER_A, later)
+    assert await _status(handoffs) == "buyer_followed_link", "the follow is the partner's; B's order is not"
+    await _referral_edge(db, "edge_pg_blank", "", later)
+    assert await _status(handoffs) == "seller_order_observed", "an order credited to no agent ('') is read"

@@ -1,7 +1,14 @@
 """`/agent/v2/storefront-handoffs`: the UCP storefront hand-off record (FIX_PLAN O-02).
 
 DARK BY DEFAULT. While UCP_STOREFRONT_HANDOFF_RECORD_ENABLED is off every call answers the same
-404 `not_available`, whatever its shape, and nothing is read or written.
+404 `not_available`, whatever its shape and whoever sends it, and nothing is read or written: the
+flag is checked by a router dependency that runs FIRST, before authentication, before the body is
+read or validated, and before the partner assertion is adopted (so no nonce is burned and no
+partner rate limit or quota is charged; O-02 review B-3, status review P2-11).
+
+With the flag on, the order is: the caller's key (401), the body (400/422, before any assertion is
+looked at, so a malformed body burns no nonce), then the partner assertion (409 on a bad one, the
+partner's own 429s), then the route.
 
 Two calls, both made by the GATEWAY with its own service key and a REQUEST-BOUND (v2)
 X-Pivota-Issuing-Agent naming the partner (the O-04 assertion, adopted by
@@ -15,27 +22,45 @@ token that fails any check is 409 PARTNER_ASSERTION_REJECTED; a v1 token is neve
   POST /agent/v2/storefront-handoffs/read   read one back for get_order (op `ucp_storefront_handoff.read`)
 
 A call whose partner was NOT adopted (no assertion, a v1 token, a caller that may not vouch, the
-forwarding flag off) is refused with 403 `partner_identity_required`: a
-hand-off row is only worth having with its partner, and a read is only answered to its owner.
+forwarding flag off) is refused with 409 `partner_identity_required`, and a read of another
+partner's hand-off with 409 `not_owner`: a hand-off row is only worth having with its partner, and a
+read is only answered to its owner. 409, not 403, for the reason routes.agent_forwarded_owner
+gives (REJECTED_STATUS): the gateway's private backend hop turns any backend 401/403 into a
+transport failure, which would hide the refusal and make the agent retry (O-02 review G-1).
 The partner is never taken from the body. See services/storefront_handoff_record.py for the row.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional, Type, TypeVar
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from routes.agent_auth import AgentContext
-from routes.agent_forwarded_owner import forwarded_owner_context
+from routes.agent_auth import AgentContext, get_agent_context
+from routes.agent_forwarded_owner import adopt_forwarded_owner
 from services import storefront_handoff_record as handoffs
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/agent/v2/storefront-handoffs", tags=["agent-storefront-handoffs"])
+
+def _dark_unless_enabled() -> None:
+    """Runs before every other dependency of these routes: dark is one 404 for every request."""
+    if not handoffs.storefront_handoff_record_enabled():
+        raise HTTPException(status_code=404, detail={"error": "not_available"})
+
+
+router = APIRouter(
+    prefix="/agent/v2/storefront-handoffs",
+    tags=["agent-storefront-handoffs"],
+    dependencies=[Depends(_dark_unless_enabled)],
+)
+
+#: Who refuses a request that is not this partner's (see the module docstring).
+REFUSED_STATUS = 409
 
 
 def _anchored(pattern: str) -> str:
@@ -69,6 +94,32 @@ class HandoffReadBody(BaseModel):
     binding: str = Field(pattern=_anchored(handoffs.BINDING_RE.pattern))
 
 
+Body = TypeVar("Body", bound=BaseModel)
+
+
+def _json_body(model: Type[Body]) -> Callable[..., Any]:
+    """The body, validated as a dependency (not a FastAPI body parameter, which is parsed before
+    ANY dependency runs, the dark gate included). A failure is the same RequestValidationError,
+    with the same `("body", ...)` locations, that a body parameter raises."""
+
+    async def _dependency(request: Request) -> Body:
+        raw = await request.body()
+        try:
+            return model.model_validate_json(raw or b"")
+        except ValidationError as exc:
+            errors = []
+            for err in exc.errors(include_url=False):
+                loc = tuple(err.get("loc") or ())
+                errors.append({**err, "loc": ("body", *loc)})
+            raise RequestValidationError(errors) from None
+
+    return _dependency
+
+
+def _body_schema(model: Type[BaseModel]) -> Dict[str, Any]:
+    return {"requestBody": {"required": True, "content": {"application/json": {"schema": model.model_json_schema()}}}}
+
+
 def _adopted_partner(context: AgentContext) -> Optional[str]:
     """The partner the gateway vouched for, or None when this request acts as its own caller."""
     if not getattr(context, "forwarded_by_agent_id", None):
@@ -76,17 +127,17 @@ def _adopted_partner(context: AgentContext) -> Optional[str]:
     return str(context.agent_id or "").strip() or None
 
 
-@router.post("")
+@router.post("", openapi_extra=_body_schema(HandoffRecordBody))
 async def record_storefront_handoff(
-    body: HandoffRecordBody,
-    # rid = the hand-off record id: the one resource both calls act on (the gateway signs the same).
-    context: AgentContext = Depends(forwarded_owner_context(handoffs.RECORD_OP, resource=("body", "record_id"))),
+    request: Request,
+    caller: AgentContext = Depends(get_agent_context),
+    body: HandoffRecordBody = Depends(_json_body(HandoffRecordBody)),
 ):
-    if not handoffs.storefront_handoff_record_enabled():
-        return _refuse(404, "not_available")
+    # rid = the hand-off record id: the one resource both calls act on (the gateway signs the same).
+    context = await adopt_forwarded_owner(request, caller, ops=(handoffs.RECORD_OP,), resource=("body", "record_id"))
     partner = _adopted_partner(context)
     if partner is None:
-        return _refuse(403, "partner_identity_required")
+        return _refuse(REFUSED_STATUS, "partner_identity_required")
     try:
         outcome = await handoffs.record_handoff(handoffs.HandoffRecord(
             record_id=body.record_id,
@@ -110,16 +161,16 @@ async def record_storefront_handoff(
     return {"record_id": body.record_id, "status": handoffs.STATUS_HANDED_OFF}
 
 
-@router.post("/read")
+@router.post("/read", openapi_extra=_body_schema(HandoffReadBody))
 async def read_storefront_handoff(
-    body: HandoffReadBody,
-    context: AgentContext = Depends(forwarded_owner_context(handoffs.READ_OP, resource=("body", "record_id"))),
+    request: Request,
+    caller: AgentContext = Depends(get_agent_context),
+    body: HandoffReadBody = Depends(_json_body(HandoffReadBody)),
 ):
-    if not handoffs.storefront_handoff_record_enabled():
-        return _refuse(404, "not_available")
+    context = await adopt_forwarded_owner(request, caller, ops=(handoffs.READ_OP,), resource=("body", "record_id"))
     partner = _adopted_partner(context)
     if partner is None:
-        return _refuse(403, "partner_identity_required")
+        return _refuse(REFUSED_STATUS, "partner_identity_required")
     try:
         answered = await handoffs.read_handoff(body.record_id, body.binding, partner)
     except Exception as exc:  # noqa: BLE001
@@ -128,5 +179,5 @@ async def read_storefront_handoff(
     if answered["outcome"] == "not_found":
         return _refuse(404, "handoff_not_found")
     if answered["outcome"] == "not_owner":
-        return _refuse(403, "not_owner")
+        return _refuse(REFUSED_STATUS, "not_owner")
     return answered["handoff"]

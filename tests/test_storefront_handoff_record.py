@@ -260,8 +260,8 @@ async def test_each_owner_reads_its_own_and_is_refused_the_other(world):
 
     cross_a = await read(world, PARTNER_B, RECORD_A, ESC_A)
     cross_b = await read(world, PARTNER_A, RECORD_B, ESC_B)
-    assert refusal(cross_a) == (403, "not_owner")
-    assert refusal(cross_b) == (403, "not_owner")
+    assert refusal(cross_a) == (409, "not_owner")
+    assert refusal(cross_b) == (409, "not_owner")
 
 
 async def test_a_forged_esc_id_or_an_unknown_record_is_not_found(world):
@@ -283,7 +283,7 @@ async def test_no_partner_no_row(world):
         dict(partner=PARTNER_B, key=PARTNER_A_KEY),
     ):
         res = await record(world, case["partner"], record_body(RECORD_A, ESC_A), key=case.get("key", GATEWAY_KEY))
-        assert refusal(res) == (403, "partner_identity_required"), case
+        assert refusal(res) == (409, "partner_identity_required"), case
     # From the gateway, a v2 token for another op is REFUSED (O-04: never a quiet fallback to the gateway).
     for op in (handoffs.READ_OP, "create_order"):
         res = await record(world, PARTNER_A, record_body(RECORD_A, ESC_A), op=op)
@@ -295,7 +295,7 @@ async def test_a_read_needs_the_partner_too(world):
     await record(world, PARTNER_A, record_body(RECORD_A, ESC_A))
     for kwargs in (dict(partner=None), dict(partner=PARTNER_A, key=PARTNER_A_KEY)):
         res = await read(world, kwargs["partner"], RECORD_A, ESC_A, key=kwargs.get("key", GATEWAY_KEY))
-        assert refusal(res) == (403, "partner_identity_required"), kwargs
+        assert refusal(res) == (409, "partner_identity_required"), kwargs
     res = await read(world, PARTNER_A, RECORD_A, ESC_A, op=handoffs.RECORD_OP)
     assert res.status_code == 409 and (res.json().get("detail") or {}).get("reason") == "op"
 
@@ -303,7 +303,7 @@ async def test_a_read_needs_the_partner_too(world):
 async def test_the_forwarding_flag_off_adopts_no_partner(world, monkeypatch):
     monkeypatch.delenv(FORWARDING, raising=False)
     res = await record(world, PARTNER_A, record_body(RECORD_A, ESC_A))
-    assert refusal(res) == (403, "partner_identity_required")
+    assert refusal(res) == (409, "partner_identity_required")
     assert await _row(RECORD_A) is None
 
 
@@ -317,6 +317,48 @@ async def test_dark_by_default(world, monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
     res = await read(world, PARTNER_A, RECORD_A, ESC_A)
     assert refusal(res) == (404, "not_available")
+
+
+async def test_dark_is_one_404_before_auth_body_validation_or_adoption(world, monkeypatch):
+    # O-02 review B-3 / status review P2-11: dark answers every shape the same 404, and a valid gateway-signed
+    # call burns no nonce and charges no partner: the same token is accepted once the flag is on.
+    charged = []
+
+    async def rate(agent_id, rate_limit=None):
+        charged.append(agent_id)
+        return True, 1, int(rate_limit or 60)
+
+    monkeypatch.setattr(agent_auth, "check_rate_limit", rate)
+    monkeypatch.delenv(FLAG, raising=False)
+    body = record_body(RECORD_A, ESC_A)
+    token = bound(PARTNER_A, handoffs.RECORD_OP, path=RECORD_PATH, raw=raw_json(body), rid=RECORD_A)
+    shapes = [
+        await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=token),
+        await world.post(RECORD_PATH, json=body),  # no key at all
+        await world.post(RECORD_PATH, content=b"not json", headers={"X-API-Key": GATEWAY_KEY, "Content-Type": "application/json"}),
+        await send(world, RECORD_PATH, {**body, "quote_source": "pivota_quote", "extra": 1}, key=GATEWAY_KEY, assertion=token),
+        await world.post(READ_PATH, json={"record_id": "x"}),
+        await send(world, READ_PATH, {"record_id": RECORD_A, "binding": binding(ESC_A)}, key="ak_live_" + "ff" * 32, assertion=None),
+    ]
+    assert [refusal(res) for res in shapes] == [(404, "not_available")] * len(shapes), [r.text for r in shapes]
+    assert charged == [] and forwarded.FORWARDED_OWNER_OUTCOMES == {}
+    assert await _row(RECORD_A) is None
+    monkeypatch.setenv(FLAG, "1")
+    res = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=token)
+    assert res.status_code == 200, res.text
+    assert charged == [GATEWAY_AGENT, PARTNER_A]
+
+
+async def test_a_malformed_body_is_refused_before_the_assertion_is_adopted(world):
+    # Flag on: the body is validated before the partner assertion is looked at, so a malformed body (even one
+    # its token was signed over) burns no nonce and charges no partner.
+    bad = {**record_body(RECORD_A, ESC_A), "currency": "usd"}
+    token = bound(PARTNER_A, handoffs.RECORD_OP, path=RECORD_PATH, raw=raw_json(bad), rid=RECORD_A)
+    res = await send(world, RECORD_PATH, bad, key=GATEWAY_KEY, assertion=token)
+    assert res.status_code == 400, res.text
+    assert forwarded.FORWARDED_OWNER_OUTCOMES == {}
+    res = await world.post(RECORD_PATH, content=b"{not json", headers={"X-API-Key": GATEWAY_KEY, "Content-Type": "application/json"})
+    assert res.status_code == 400, res.text
 
 
 async def test_unauthenticated_is_refused_before_anything(world):
@@ -404,10 +446,64 @@ async def test_another_agents_referral_click_is_never_read(world):
     assert body["status"] == "handed_off" and "link_followed_at" not in body
 
 
-async def test_an_agentless_referral_click_counts(world):
+async def test_an_agentless_referral_click_is_not_read(world):
+    # O-02 review B-1: a referral id minted for no caller in particular (the product-detail mint, the shared
+    # search cache) can sit in every caller's link, so its follow is not THIS partner's buyer's.
     await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
     await _referral_click(None, click_count=1, last_click_at=datetime.now(timezone.utc) + timedelta(minutes=5))
-    assert (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()["status"] == "buyer_followed_link"
+    await _converted_edge(agent_id=None)
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["status"] == "handed_off"
+    assert "link_followed_at" not in body and "seller_order_observed_at" not in body
+
+
+async def _converted_edge(*, agent_id: Optional[str], edge_id: str = "edge_handoff_test"):
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await database.execute(commerce_attribution_edges.insert().values(
+        edge_id=edge_id, merchant_id="merch_obs_shop_a", click_id=REFERRAL_A, order_id="ord_" + edge_id,
+        agent_id=agent_id, state="converted", converted_at=later, refund_count=0, refunded_amount=0,
+        created_at=later, updated_at=later,
+    ))
+
+
+async def test_an_order_with_no_referral_click_row_is_not_read_even_if_credited_elsewhere(world):
+    # O-02 review probe 1: no surface_click_events row for the referral at all, and the converted edge credits
+    # partner B. Partner A's hand-off must not report B's buyer's order.
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    await _converted_edge(agent_id=PARTNER_B)
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["status"] == "handed_off" and "seller_order_observed_at" not in body
+
+
+async def test_two_handoffs_sharing_one_referral_id_learn_nothing_from_one_order(world):
+    # O-02 review probe 2: A's and B's hand-offs carry the same (shared, agent-less) referral id; one order.
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    await record(world, PARTNER_B, record_body(RECORD_B, ESC_B, referral_click_id=REFERRAL_A))
+    await _converted_edge(agent_id=None)
+    a = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    b = (await read(world, PARTNER_B, RECORD_B, ESC_B)).json()
+    assert (a["status"], b["status"]) == ("handed_off", "handed_off")
+
+
+async def test_a_referral_issued_to_the_partner_reports_its_order_but_never_to_the_other_partner(world):
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    await record(world, PARTNER_B, record_body(RECORD_B, ESC_B, referral_click_id=REFERRAL_A))
+    await _referral_click(PARTNER_A, click_count=1, last_click_at=datetime.now(timezone.utc) + timedelta(minutes=5))
+    await _converted_edge(agent_id=None)
+    a = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    b = (await read(world, PARTNER_B, RECORD_B, ESC_B)).json()
+    assert a["status"] == "seller_order_observed" and a["seller_order_observed_at"] and a["link_followed_at"]
+    assert b["status"] == "handed_off" and "link_followed_at" not in b
+
+
+async def test_an_order_credited_to_another_agent_is_not_this_partners_even_on_its_own_referral(world):
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    await _referral_click(PARTNER_A, click_count=1, last_click_at=datetime.now(timezone.utc) + timedelta(minutes=5))
+    await _converted_edge(agent_id=PARTNER_B)
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["status"] == "buyer_followed_link" and "seller_order_observed_at" not in body
+    await _converted_edge(agent_id=PARTNER_A, edge_id="edge_handoff_test_own")
+    assert (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()["status"] == "seller_order_observed"
 
 
 async def test_a_referred_edge_that_never_converted_is_not_an_order(world):
@@ -427,12 +523,12 @@ async def test_a_referred_edge_that_never_converted_is_not_an_order(world):
 async def test_a_v1_token_is_never_adopted(world):
     body = record_body(RECORD_A, ESC_A)
     res = await send(world, RECORD_PATH, body, key=GATEWAY_KEY, assertion=v1(PARTNER_A, handoffs.RECORD_OP))
-    assert refusal(res) == (403, "partner_identity_required")
+    assert refusal(res) == (409, "partner_identity_required")
     assert await _row(RECORD_A) is None
     await record(world, PARTNER_A, body)
     rb = {"record_id": RECORD_A, "binding": binding(ESC_A)}
     res = await send(world, READ_PATH, rb, key=GATEWAY_KEY, assertion=v1(PARTNER_A, handoffs.READ_OP))
-    assert refusal(res) == (403, "partner_identity_required")
+    assert refusal(res) == (409, "partner_identity_required")
     assert forwarded.FORWARDED_OWNER_OUTCOMES["unbound_v1"] == 2
 
 

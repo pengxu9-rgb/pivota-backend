@@ -25,16 +25,26 @@ record id lifted into a forged esc id (other items, another cart) does not match
 a guessed one. The esc id itself is not stored: a seller-priced id carries the seller's cart id,
 which is that seller's bearer handle.
 
-ROWS ARE NOT CLICKS. click_count stays 0 and `/r` never sees this id (no token carries it). The
-attribution funnel groups by surface, so the rows read as their own line; the conversion pollers
-and the inferred-click lookup only read rows /r touched.
+ROWS ARE NOT CLICKS. click_count stays 0 and `/r` never sees this id (no token carries it). Every
+reader that counts ISSUED links must leave this surface out (scripts/agent_attribution_funnel.py
+does; O-02 review B-2), or each hand-off reads as one more issued link nobody followed. The
+inferred-click lookup and the merchant funnels only read rows /r touched (click or impression
+count > 0). The conversion pollers' candidate queries (services/external_conversion_poller.py,
+services/woocommerce_conversion_poller.py) select merchants from ANY recent row, so a hand-off row
+with a merchant_id puts its merchant in the rotation; they then join a connected Shopify or
+WooCommerce store, which an escalated seller is not, so nothing is polled for it (O-02 review B-4).
 
 LATER STATE. What the hand-off became is read from records this service already keeps, keyed on
-the REFERRAL click the catalog link carried (pvt_click_id), never on anything a caller sends:
+the REFERRAL click the catalog link carried (pvt_click_id), never on anything a caller sends, and
+ONLY when that referral click was issued to THIS partner (its surface_click_events row names the
+hand-off's owner as agent_id; O-02 review B-1):
   buyer_followed_link    `/r` counted a click on that referral id at or after the hand-off;
   seller_order_observed  a converted commerce_attribution_edges row joins that referral id, at or
-                         after the hand-off.
-A referral click recorded for ANOTHER agent is never read (it is not this partner's to learn).
+                         after the hand-off, credited to this partner or to no agent.
+A referral id with no click row, an agent-less one (a link minted for no caller in particular: the
+product-detail mint, the shared search cache) or another agent's may be shared by every caller
+served that link, so it says nothing about THIS partner's buyer: such a hand-off answers
+`handed_off`, and nothing of another buyer's follow or order, nor its timing, reaches the partner.
 """
 
 from __future__ import annotations
@@ -189,23 +199,28 @@ async def _later_state(row: Mapping[str, Any], context: Mapping[str, Any]) -> Di
         return out
     since = _aware(row.get("issued_at")) or _aware(row.get("created_at"))
     owner = str(row.get("agent_id") or "")
+    if not owner:
+        return out
     try:
         click = await database.fetch_one(
             "SELECT agent_id, click_count, last_click_at FROM surface_click_events WHERE click_id = :click_id",
             {"click_id": referral},
         )
         click = dict(click) if click is not None else None
-        # Another agent's click is not this partner's to read.
-        if click and str(click.get("agent_id") or "") not in ("", owner):
+        # BOUND TO THIS PARTNER, or not read at all: no row, no agent, or another agent's.
+        if not click or str(click.get("agent_id") or "") != owner:
             return out
-        last_click = _aware(click.get("last_click_at")) if click else None
-        if click and int(click.get("click_count") or 0) > 0 and last_click and (since is None or last_click >= since):
+        last_click = _aware(click.get("last_click_at"))
+        if int(click.get("click_count") or 0) > 0 and last_click and (since is None or last_click >= since):
             out["status"] = STATUS_LINK_FOLLOWED
             out["link_followed_at"] = _iso(last_click)
+        # An order credited to ANOTHER agent is that agent's buyer's, even on this partner's referral id.
         edge = await database.fetch_one(
             "SELECT state, converted_at, created_at FROM commerce_attribution_edges "
-            "WHERE click_id = :click_id AND state = 'converted' ORDER BY created_at DESC LIMIT 1",
-            {"click_id": referral},
+            "WHERE click_id = :click_id AND state = 'converted' "
+            "AND (agent_id IS NULL OR agent_id = '' OR agent_id = :owner) "
+            "ORDER BY created_at DESC LIMIT 1",
+            {"click_id": referral, "owner": owner},
         )
         edge = dict(edge) if edge is not None else None
         if edge:
