@@ -637,9 +637,15 @@ seeds: they carry no shop domain, so the minter builds no cart on them.
     re-checked ahead of a staler one of theirs. Both numbers are pinned in the setup script.
   - **Proven Shopify before it counts.** A warm-only key is proven when its last check gave a
     verdict only a Shopify storefront gives (`SHOPIFY_STOREFRONT_VERDICTS`: ELIGIBLE, a Shopify
-    sign-in or password wall, a 410 permalink, a checkout page...), **or when it has ever held a
-    positive window** (`positive_until` set), so one throttle on a real store does not unprove
-    it. Until then its requests feed
+    sign-in or password wall, a 410 permalink, a checkout page...), **or when it held a card
+    positive recently**: its `positive_until` (armed only by `ELIGIBLE` with a card checkout)
+    ended less than `..._WARM_CLICK_STICKY_DAYS` = 14 days ago, and its last check was not a
+    no-catalog answer. So one throttle on a card-positive store does not unprove it, and a host
+    that has left Shopify stops counting within two weeks, or at its first no-catalog answer.
+    **The sticky rule covers card stores only.** A `NO_CARD_PAYMENT` or `PRICE_DRIFT` store (warm-
+    positive, but no card window), or one demoted since, is unproven by one throttle for that run.
+    Widening it to `consecutive_failures > 0` would also make a non-Shopify site that redirects
+    `/products.json` to a sign-in page sticky, so it is not done. Unproven requests feed
     neither the IP breaker nor the shared Shopify-edge budget; the run's own 1.5 s pacer still
     spaces them.
   - **Weekly for no catalog.** A warm-only key whose last check found no Shopify catalog
@@ -647,6 +653,8 @@ seeds: they carry no shop domain, so the minter builds no cart on them.
     that is not a product list; never a 5xx, a 403 or a throttle, which are transient) is
     re-checked only every `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` = 7 days, and is counted in
     `SweepReport.population_deferred_not_shopify` meanwhile. It stays in `population_total`.
+    A key that held a card positive within the 14-day sticky window is never deferred: one odd
+    page-1 answer from a store we have checked out on is far likelier transient.
   - A key another lane also names is that lane's key: no cap, always proven, never deferred.
 * **Same daily scan, same cache row.** The lane is computed in the cart-mint scan's pass over the
   seeds (no second read of the seed table) and cached in the same `hosts` array as tagged entries
@@ -712,7 +720,8 @@ pathological merchant (~300 s) ≈ 810 s — inside the 1200 s task timeout. The
 measured from the start of the run, scan included, so a slow scan shortens the checks, never the
 other way round.
 
-**No `BATCH` or `BUDGET_SECONDS` change is needed**, and raising `BATCH` buys little:
+**No `BATCH` or `BUDGET_SECONDS` change was needed** for this lane (2026-09-28; the warm-click lane
+later raised `BATCH` to 24, see below), and raising `BATCH` buys little:
 - *Coverage* depends on the batch, not on the time per target, so it is the same at 10.4 s as at
   4.4 s.
 - *Budget.* At 10.4 s a run fits ~52 targets in the 600 s budget after a 60 s scan. `BATCH` = 40
@@ -751,8 +760,9 @@ All inside the 72 h TTL. At the earlier cap of 6 of 20 the first pass's worst ga
   should settle near ~100. If a warm-only key's re-check gap passes ~60 h, raise the cap and `BATCH`
   together in the setup script (e.g. 10 of 30, ~310 s of checks).
 
-The rotation stops keeping every positive fact fresh only past *T* ≈ 1,240 (62 runs of 20 inside
-72 h). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the
+The rotation stops keeping every positive fact fresh only past *T* ≈ 1,000 keys of the OTHER lanes
+(63 runs of their 16 slots inside 72 h; the warm-click lane's 8 slots rotate separately, see the
+capacity table above). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the
 first rotation `population_never_checked` should read ~0, and a key that stays never-checked is
 one the rotation is not reaching. If *T* ever approaches that limit, raise `BATCH` in
 `infra/gcp/setup_merchant_purchasability_sweep_job.sh` (the task timeout is derived from it) —
