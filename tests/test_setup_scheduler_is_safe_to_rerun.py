@@ -41,26 +41,16 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 # Everything that exists in prod today. `describe` succeeding is how the script decides
 # create-vs-update and, previously, nothing else.
 #
-# ONE ENTRY IS AHEAD OF PROD: `relgraph-health-cron` is defined by the script but not yet
-# provisioned. It is listed here because these tests are about RERUN SAFETY — that ARM and DISARM
-# stay surgical once a trigger exists — and a permanently-absent entry would make every run of the
-# script look like it touches an extra trigger, which is the assertion below, not a real finding.
-# Verified: without this entry, test_arm_changes_exactly_one_trigger and its disarm partner FAIL.
-# Adding it does not blunt them — a foreign trigger added to the script still fails both.
+# (`relgraph-health-cron` used to be listed here as ahead of prod. Its job and trigger moved to
+# infra/gcp/setup_relgraph_health_job.sh, so this script no longer defines it; see
+# test_relgraph_health_is_no_longer_provisioned_here below.)
 #
-# (An earlier version of this note said new triggers are "created by hand". That contradicts
-# `sched()`, which creates them PAUSED precisely so running this script is safe; the hand step is
-# `ARM=relgraph-health-cron`, and only after a gateway image carrying PIVOTA-Agent #2171's script is
-# rolled onto the job — an older image fails with npm's `Missing script`.)
-# REMOVE THIS NOTE once it is live.
-#
-# `retailer-ingest-drain-cron` is AHEAD OF PROD on the same terms: it ships with the retailer
+# `retailer-ingest-drain-cron` is AHEAD OF PROD: it ships with the retailer
 # ingest pipeline's infra and does not exist until someone runs this script. Without it every run
 # here also creates-and-pauses it, which the ARM/DISARM surgery tests would read as a foreign
 # trigger. The drain tests at the bottom that need the CREATE path pass their own empty
 # EXISTING_TRIGGERS_FILE. REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
-    "relgraph-health-cron",
     "retailer-ingest-drain-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
     "commerce-index-relgraph-cron", "commerce-index-search-index-cron",
@@ -109,6 +99,14 @@ FAKE_GCLOUD = textwrap.dedent(
         fi
         exit 1 ;;
       "iam service-accounts") exit 0 ;;
+      "artifacts docker images")               # _gateway_image.sh lookups, per repository
+        for r in ${DENIED_REPOS:-}; do
+          case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;; esac
+        done
+        for r in ${MISSING_REPOS:-}; do
+          case "$*" in *"/pivota-shared/$r/gateway:"*) echo "ERROR: Image not found." >&2; exit 1 ;; esac
+        done
+        exit 0 ;;
       "run revisions describe") printf '%s' "$REVISION_JSON"; exit 0 ;;
       "run services describe")
         case "$*" in *--format=json*) printf '%s' "$WEB_JSON" ;; *) echo "https://worker.example" ;; esac
@@ -193,6 +191,51 @@ def test_a_plain_rerun_changes_no_existing_trigger_state(tmp_path):
         f"a plain re-run paused/resumed existing triggers: {sorted(touched_existing)}. "
         "Re-running must reconcile DEFINITIONS only."
     )
+
+
+def test_relgraph_health_is_no_longer_provisioned_here(tmp_path):
+    """setup_relgraph_health_job.sh owns relgraph-health and its trigger. Two owners would drift: a
+    reconcile of this script would put the job back on whatever gateway tag it was given and move
+    the trigger back to 10:00, under an armed lane provisioned by the other script."""
+    calls = _run(tmp_path, {})
+    touching = [c for c in calls if re.search(r"\brelgraph-health(-cron)?\b", c)]
+    assert not touching, touching
+
+
+@pytest.mark.parametrize("var", ["ARM", "DISARM"])
+def test_an_arm_name_this_script_does_not_define_fails_loudly(tmp_path, var):
+    """`ARM=relgraph-health-cron` was the documented hand step until that trigger moved to its own
+    script. A name sched() never saw changed nothing, so the run must say so and exit non-zero."""
+    calls, proc = _run_full(tmp_path, {var: "relgraph-health-cron"}, expect_rc=3)
+    assert "did not reach" in proc.stderr and "relgraph-health-cron" in proc.stderr
+    assert not [c for c in calls if re.search(r"\bscheduler jobs (pause|resume) relgraph-health-cron\b", c)]
+
+
+def test_a_defined_arm_name_still_passes(tmp_path):
+    calls, proc = _run_full(tmp_path, {"ARM": "content-canonical-election-cron"})
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("missing,repo", [("", "pivota"), ("pivota", "pivota-gateway")])
+def test_gateway_jobs_take_the_resolved_image_pivota_first(tmp_path, missing, repo):
+    calls = _run(tmp_path, {"MISSING_REPOS": missing})
+    sync = [c for c in calls if re.match(r"run jobs (create|update) relgraph-sync ", c)]
+    assert sync, calls[:5]
+    assert f"/pivota-shared/{repo}/gateway:" in sync[0], sync[0]
+
+
+def test_a_gateway_lookup_error_stops_the_run(tmp_path):
+    calls, proc = _run_full(tmp_path, {"DENIED_REPOS": "pivota"}, expect_rc=1)
+    assert "lookup error" in proc.stderr
+    assert not [c for c in calls if re.match(r"run jobs (create|update) ", c)]
+
+
+def test_a_space_after_a_comma_still_disarms_both(tmp_path):
+    """`DISARM="a, b"` used to pause only `a` and leave `b` - the per-minute mailer here - armed."""
+    calls = _run(tmp_path, {"DISARM": "content-canonical-election-cron, reviews-invitation-send-cron"})
+    paused = {verb_target for verb_target in _state_changes(calls) if verb_target[0] == "pause"}
+    assert ("pause", "content-canonical-election-cron") in paused
+    assert ("pause", "reviews-invitation-send-cron") in paused
 
 
 def test_it_does_not_require_the_retired_railway_files(tmp_path):

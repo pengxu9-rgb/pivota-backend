@@ -145,19 +145,25 @@ row at all, so the warm lane could never fire for them.
     (`load_population`, `_sweep_targets`):
       - one staleness order (never-checked first) over every key, but WARM-ONLY keys (named by
         no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (8, of a
-        batch of 24 in the setup script) slots of a run. So the other lanes' due keys always have the rest, and a warm-only key is never
-        re-checked ahead of a staler one of theirs;
+        batch of 24) slots of a run. So the other lanes' due keys always have the rest, and a
+        warm-only key is never re-checked ahead of a staler one of theirs;
       - a warm-only key is PROVEN SHOPIFY when its last check came back with a verdict only a
-        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`), or when it has EVER held a
-        positive window (`positive_until` set), so one throttle on a real store does not unprove
-        it. Otherwise its requests feed
-        neither the IP breaker nor the shared Shopify-edge budget (the job's own 1.5 s pacer
-        still spaces them): its throttles say nothing about the crawl IP's standing with Shopify;
+        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`), or when it HELD A CARD
+        POSITIVE RECENTLY: its `positive_until` (armed only by ELIGIBLE with a card checkout)
+        ended less than `..._WARM_CLICK_STICKY_DAYS` (14) ago, and its last check was not a
+        no-catalog answer. So one throttle on a card-positive store does not unprove it, and a
+        host that left Shopify stops being proven within two weeks, or at its first no-catalog
+        answer. A NO_CARD / PRICE_DRIFT store, or one demoted since, never arms `positive_until`,
+        so one throttle still unproves it for that run (its requests then skip the edge budget,
+        still 1.5 s apart). Unproven requests feed neither the IP breaker nor the shared
+        Shopify-edge budget: their throttles say nothing about the crawl IP's standing with Shopify;
       - a warm-only key whose last check found NO Shopify catalog (page 1 of `/products.json`
         answered 404, 410, or 200 with something that is not a product list; never a 5xx or a
         throttle, which are transient) is re-checked only every
         `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` (7), and counted in
-        `SweepReport.population_deferred_not_shopify` meanwhile.
+        `SweepReport.population_deferred_not_shopify` meanwhile -- UNLESS it held a card positive
+        within the sticky window: one odd page-1 answer from a store we have checked out on is far
+        likelier transient, so it is re-checked at the normal rotation.
 
 Wix and WooCommerce connected stores stay out on purpose: no card lane mints a cart for them
 (`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
@@ -404,7 +410,9 @@ class _Dial:
 DIALS: Dict[str, _Dial] = {
     # Merchants per run. Each one is a full redirect chain plus up to 20 catalog pages, and each
     # leaves an abandoned checkout behind, so this is a politeness bound as much as a time bound.
-    "batch": _Dial("MERCHANT_PURCHASABILITY_BATCH", 20, 1, 200),
+    # 24 = the setup script's value, so a hand-run one-off gives the other lanes the same 16 slots
+    # beside the warm-click cap of 8 that a scheduled run does.
+    "batch": _Dial("MERCHANT_PURCHASABILITY_BATCH", 24, 1, 200),
     # Wall-clock budget for one run. It stops the job STARTING a new merchant; a merchant already
     # in flight runs to completion, so a run can exceed this by one merchant's worth of fetches.
     # The Cloud Run task timeout in infra/gcp/setup_merchant_purchasability_sweep_job.sh is sized
@@ -427,6 +435,11 @@ DIALS: Dict[str, _Dial] = {
     "warm_click_not_shopify_recheck_days": _Dial(
         "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", 7, 1, 60
     ),
+    # How long after a warm-only key's last CARD positive window ENDED (`positive_until`) it still
+    # counts as proven Shopify and is exempt from the no-catalog deferral. 0 = only while the window
+    # is open. A live card store is re-checked every ~33 h and keeps its window open, so this only
+    # matters for a store that has stopped answering positively.
+    "warm_click_sticky_days": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", 14, 0, 60),
 }
 
 _WARNED: set = set()
@@ -1034,6 +1047,13 @@ def _aware_utc(value: Any) -> Optional[datetime]:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
+
+def _held_a_card_positive_recently(row: Dict[str, Any], now: datetime, sticky: timedelta) -> bool:
+    """Its `positive_until` (armed only by ELIGIBLE + card) ended less than `sticky` ago, or is
+    still open. Expiry never nulls the column, so `is not None` alone would mean "ever"."""
+    until = _aware_utc(row.get("positive_until"))
+    return until is not None and now - until < sticky
+
 #: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
 #: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
 #: on a key whichever other lanes also name it.
@@ -1257,6 +1277,7 @@ async def load_population(
     other_keys = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
     warm_cap = _env_int(DIALS["warm_click_max_per_run"])
     recheck = timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+    sticky = timedelta(days=_env_int(DIALS["warm_click_sticky_days"]))
     now = _utcnow()
     core: List[Tuple[Tuple[str, str], Optional[str]]] = []
     warm: List[Tuple[Tuple[str, str], Optional[str]]] = []
@@ -1272,6 +1293,7 @@ async def load_population(
         if (
             _found_no_shopify_catalog(row.get("verdict"), row.get("detail"))
             and checked is not None and now - checked < recheck
+            and not _held_a_card_positive_recently(row, now, sticky)
         ):
             deferred += 1
             continue
@@ -1306,7 +1328,10 @@ async def load_population(
         row = last.get((domain, market)) or {}
         proven = (domain, market) not in warm_keys or (
             str(row.get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
-            or row.get("positive_until") is not None
+            or (
+                _held_a_card_positive_recently(row, now, sticky)
+                and not _found_no_shopify_catalog(row.get("verdict"), row.get("detail"))
+            )
         )
         targets.append(Target(domain, market, variant, price_minor, currency, proven_shopify=proven))
     return targets
