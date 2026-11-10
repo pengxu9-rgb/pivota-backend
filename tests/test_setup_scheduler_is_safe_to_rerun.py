@@ -41,26 +41,16 @@ SCRIPT = REPO / "infra" / "gcp" / "setup_scheduler.sh"
 # Everything that exists in prod today. `describe` succeeding is how the script decides
 # create-vs-update and, previously, nothing else.
 #
-# ONE ENTRY IS AHEAD OF PROD: `relgraph-health-cron` is defined by the script but not yet
-# provisioned. It is listed here because these tests are about RERUN SAFETY — that ARM and DISARM
-# stay surgical once a trigger exists — and a permanently-absent entry would make every run of the
-# script look like it touches an extra trigger, which is the assertion below, not a real finding.
-# Verified: without this entry, test_arm_changes_exactly_one_trigger and its disarm partner FAIL.
-# Adding it does not blunt them — a foreign trigger added to the script still fails both.
+# (`relgraph-health-cron` used to be listed here as ahead of prod. Its job and trigger moved to
+# infra/gcp/setup_relgraph_health_job.sh, so this script no longer defines it; see
+# test_relgraph_health_is_no_longer_provisioned_here below.)
 #
-# (An earlier version of this note said new triggers are "created by hand". That contradicts
-# `sched()`, which creates them PAUSED precisely so running this script is safe; the hand step is
-# `ARM=relgraph-health-cron`, and only after a gateway image carrying PIVOTA-Agent #2171's script is
-# rolled onto the job — an older image fails with npm's `Missing script`.)
-# REMOVE THIS NOTE once it is live.
-#
-# `retailer-ingest-drain-cron` is AHEAD OF PROD on the same terms: it ships with the retailer
+# `retailer-ingest-drain-cron` is AHEAD OF PROD: it ships with the retailer
 # ingest pipeline's infra and does not exist until someone runs this script. Without it every run
 # here also creates-and-pauses it, which the ARM/DISARM surgery tests would read as a foreign
 # trigger. The drain tests at the bottom that need the CREATE path pass their own empty
 # EXISTING_TRIGGERS_FILE. REMOVE THIS NOTE once it is live.
 EXISTING_TRIGGERS = {
-    "relgraph-health-cron",
     "retailer-ingest-drain-cron",
     "relgraph-sync-cron", "reviews-invitation-send-cron",
     "commerce-index-relgraph-cron", "commerce-index-search-index-cron",
@@ -193,6 +183,15 @@ def test_a_plain_rerun_changes_no_existing_trigger_state(tmp_path):
         f"a plain re-run paused/resumed existing triggers: {sorted(touched_existing)}. "
         "Re-running must reconcile DEFINITIONS only."
     )
+
+
+def test_relgraph_health_is_no_longer_provisioned_here(tmp_path):
+    """setup_relgraph_health_job.sh owns relgraph-health and its trigger. Two owners would drift: a
+    reconcile of this script would put the job back on whatever gateway tag it was given and move
+    the trigger back to 10:00, under an armed lane provisioned by the other script."""
+    calls = _run(tmp_path, {})
+    touching = [c for c in calls if re.search(r"\brelgraph-health(-cron)?\b", c)]
+    assert not touching, touching
 
 
 def test_it_does_not_require_the_retired_railway_files(tmp_path):
