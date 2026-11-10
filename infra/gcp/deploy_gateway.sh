@@ -177,7 +177,16 @@ if [ -z "$_PUBLIC_EXPLICIT" ] && [ "$CONFIG" = preserve ] && [ "$PUBLIC" != 1 ];
   fi
 fi
 [ "$PUBLIC" = 1 ] && PUBLIC_FLAG=--allow-unauthenticated || PUBLIC_FLAG=--no-allow-unauthenticated
-IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG"
+# A gateway sha resolves in pivota (hand builds) first, then pivota-gateway (built on merge); see
+# _gateway_image.sh for why that order, and why only "not found" falls through.
+# shellcheck source=infra/gcp/_gateway_image.sh
+. "$HERE/_gateway_image.sh"
+_rc=0; IMAGE="$(resolve_gateway_image "$TAG")" || _rc=$?
+case "$_rc" in
+  0) ;;
+  1) IMAGE="$REGION-docker.pkg.dev/pivota-shared/pivota/gateway:$TAG" ;;  # in neither: today's path, which fails at deploy exactly as before
+  *) echo "cannot resolve gateway:$TAG (lookup error above); refusing to deploy" >&2; exit 1 ;;
+esac
 CANDIDATE_TAG="c-$(printf '%s' "$TAG" | tr -cd '[:alnum:]' | tail -c 12)"
 # `--no-traffic` is rejected on service CREATION, so the candidate-then-verify flow only applies to
 # an existing service. A brand-new service has no previous revision to protect anyway.
