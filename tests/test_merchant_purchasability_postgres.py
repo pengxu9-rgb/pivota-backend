@@ -72,6 +72,8 @@ if _IS_PG:
         _scans,
         # The IP-throttle cases: the sweep armed, a fake-clock pacer, the breaker state reset.
         _armed,
+        # The warm-click guard cases: synthetic lanes and staleness rows, no database.
+        _guard,
         page,
         res,
     )
@@ -320,6 +322,23 @@ async def test_the_jsonb_columns_are_really_jsonb(_migration_db):
     )
     assert row["verdict"] == "ELIGIBLE"
     assert row["first_method"] is not None
+
+
+async def test_list_due_reads_the_verdict_and_the_evidence_detail(_migration_db):
+    """The staleness read the sweep's warm-click guard decides on: `evidence->>'detail'` is the
+    Postgres half of the one statement that differs by dialect (SQLite uses json_extract)."""
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+
+    await mp.record_check("nocatalog.example", "US", res(
+        "VARIANT_UNVERIFIED", host="nocatalog.example", detail="products_json_page_1_status_404"))
+    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    rows = {r["merchant_domain"]: r for r in await mp.list_due(50, strict=True)}
+    assert (rows["nocatalog.example"]["verdict"], rows["nocatalog.example"]["detail"]) == (
+        "VARIANT_UNVERIFIED", "products_json_page_1_status_404")
+    assert rows["judydoll.com"]["verdict"] == "ELIGIBLE"
+    assert sweep._found_no_shopify_catalog(rows["nocatalog.example"]["verdict"],
+                                           rows["nocatalog.example"]["detail"]) is True
 
 
 async def test_the_ttl_window_is_computed_by_the_server(_migration_db, monkeypatch):

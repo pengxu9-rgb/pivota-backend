@@ -2161,6 +2161,14 @@ async def app_lifespan(_app: FastAPI):
     install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
+    # S-29: a deployed host hashing agent_user_refs without BUYER_IDENTITY_LINK_SECRET says so at
+    # boot (ERROR in production), not only on its first hash. Never fatal: see the function.
+    try:
+        from db.buyer_vault import report_missing_buyer_identity_hash_secret
+
+        report_missing_buyer_identity_hash_secret(force=True)
+    except Exception:  # noqa: BLE001 - a log line must never stop the boot
+        pass
 
     await startup_event()
     await startup()
