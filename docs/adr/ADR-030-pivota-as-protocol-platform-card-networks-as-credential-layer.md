@@ -296,7 +296,7 @@ Every new behaviour defaults off. With its flag off, every answer is byte-identi
 - **Scope.** Only a payment partner's checkout agent, on any merchant that meets the condition, in the pilot and beyond (owner, 2026-11-10; the first version of this section was pilot-only). Pivota's own runner stays out.
 - **Basis** (owner, 2026-11-10). Merchants want orders from every channel. A merchant that accepts the order and the payment through an agentic checkout protocol, or through a card network's agent programme, has accepted the transaction. A merchant that challenges, blocks or opts out has not, and the rules below stop there.
 - **The condition.** The merchant publishes an agentic checkout protocol: a UCP profile that lists the checkout capability, or ACP checkout. It is read from the stored fact (D8), never from a request-time fetch.
-- **Also sufficient.** The merchant, or its edge, verifies the agent under a card network's agent programme. This is ADR-028 D5's "verified recognition", observed and recorded.
+- **Also sufficient** (owner, 2026-11-10). The merchant, or its edge, verifies the agent under a card network's agent programme. This is ADR-028 D5's "verified recognition", observed and recorded.
 - **What it changes in D5, for that agent:**
   - D5's entry list gains the condition above;
   - D5's interim clause no longer applies. That clause allowed the browser route only under the merchant's written permission, or a protocol grant whose terms cover browser completion, until the robots-and-terms decision was made.
@@ -385,17 +385,14 @@ Pivota's own completion is not a phase of this ADR (D3, "Later, conditionally").
 - the payment partner's report as a source of order status on path 2 (D4);
 - the run condition, in the pilot and beyond, with no separate merchant permission sought (D11);
 - that the run condition is the robots-and-terms decision ADR-028 D5 requires, for a payment partner's checkout agent on any merchant that meets it (D11);
-- that verified recognition under a card network's agent programme is also sufficient (D11, "Also sufficient");
-- the order capability and the webhook URL in the public platform profile, behind a flag (answered below);
-- lane A frozen as it is, with no retirement scheduled (answered below);
 - the six points of the agreed partner flow of 2026-11-10 (listed at the top);
 - the single orchestration layer of 2026-11-08, with Pivota-issued cards removed (listed at the top; D10).
 
 **Answered (owner, 2026-11-10): D11 beyond the pilot.** D11 applies to every merchant that meets its condition, not only pilot merchants, and it is the robots-and-terms decision for a payment partner's checkout agent there too.
 
-**Answered (2026-11-10, on the owner's delegation; to be confirmed): the order capability.** Yes. Pivota requests the order capability in its public platform profile and declares a webhook URL, behind a flag that defaults off (D4, D9).
+**Answered (owner, 2026-11-10): the order capability.** Yes. Pivota requests the order capability in its public platform profile and declares a webhook URL, behind a flag that defaults off (D4, D9).
 
-**Answered (2026-11-10, on the owner's delegation; to be confirmed): lane A.** It stays frozen as it is for connected merchants. No retirement is scheduled now; it is revisited once the protocol lane has carried real orders. The refund rule still applies to it (D5).
+**Answered (owner, 2026-11-10): lane A.** It stays frozen as it is for connected merchants. No retirement is scheduled now; it is revisited once the protocol lane has carried real orders. The refund rule still applies to it (D5).
 
 **Answered (owner, 2026-11-10): the freeze and the agreed partner flow.** The freeze stops only custom rail work outside the agreed contract. The agreed flow's remaining work on our side of the partner rail continues: the single-session quote step, the entry link on the order, the transport to the partner's sandbox, a held state and a cancel path.
 
