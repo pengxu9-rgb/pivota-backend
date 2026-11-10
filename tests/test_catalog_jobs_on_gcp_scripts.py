@@ -108,7 +108,10 @@ FAKE_CURL = textwrap.dedent(
     #!/usr/bin/env bash
     printf '%s\n' "$*" >> "$CURL_LOG"
     [ "${CURL_FAILS:-0}" = 1 ] && exit 22
-    printf '{"status":"%s","ahead_by":%s,"behind_by":0}' "${COMPARE_STATUS:-ahead}" "${AHEAD_BY:-5}"
+    # A real compare body carries every changed file: megabytes for an old image. PAD_KB makes the
+    # fake that big, so a parse that cannot take a large body fails here and not in prod.
+    pad=""; [ -n "${PAD_KB:-}" ] && pad=$(head -c $((PAD_KB * 1024)) /dev/zero | tr '\0' 'x')
+    printf '{"status":"%s","ahead_by":%s,"behind_by":0,"pad":"%s"}' "${COMPARE_STATUS:-ahead}" "${AHEAD_BY:-5}" "$pad"
     ''').lstrip()
 
 
@@ -513,3 +516,13 @@ def test_status_reports_unknown_when_github_fails(tmp_path):
     proc, _, _ = run(tmp_path, REIMAGE, "prod", "status", jobs={"content-canonical-election": backend_job()},
                      env={"CURL_FAILS": "1"})
     assert proc.returncode == 0 and proc.stdout.splitlines()[1].split()[-1] == "?"
+
+
+def test_a_megabyte_compare_body_still_parses(tmp_path):
+    proc, _, _ = run(tmp_path, REIMAGE, "prod", "status", jobs={"content-canonical-election": backend_job()},
+                     env={"PAD_KB": "3000", "AHEAD_BY": "759"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[1].split()[-1] == "759"
+    proc, _, _ = run(tmp_path, REIMAGE, "prod", "backend", NEW, jobs={"content-canonical-election": backend_job()},
+                     env={"PAD_KB": "3000"})
+    assert proc.returncode == 0 and "DRY RUN" in proc.stdout, proc.stderr

@@ -95,11 +95,13 @@ compare(){
   # failure, never a pass: status prints "?", a re-image refuses.
   local body auth=()
   [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-  body="$("$CURL" -fsS --max-time 20 -H 'Accept: application/vnd.github+json' ${auth[@]+"${auth[@]}"} \
-    "https://api.github.com/repos/$OWNER/$1/compare/$2...main")" || return 1
-  BODY="$body" "$PYTHON" -c '
-import json, os
-d = json.loads(os.environ["BODY"])
+  # The body lists every file changed since the sha (megabytes for an old image), so it goes to
+  # python on STDIN: as an environment variable it exceeds ARG_MAX and the parse never runs.
+  body="$("$CURL" -fsS --max-time 60 -H 'Accept: application/vnd.github+json' ${auth[@]+"${auth[@]}"} \
+    "https://api.github.com/repos/$OWNER/$1/compare/$2...main?per_page=1")" || return 1
+  printf '%s' "$body" | "$PYTHON" -c '
+import json, sys
+d = json.load(sys.stdin)
 print(d["status"] + "\t" + str(d["ahead_by"]) + "\t" + str(d["behind_by"]))'
 }
 
