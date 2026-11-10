@@ -1424,20 +1424,28 @@ async def cancel_order_v2(
       503 CANCEL_NOT_CONFIRMED: the PSP surface could not be closed; not canceled; retry
       404 Order not found: unknown, or another agent's (never 403: the id is not confirmed to a non-owner)
     """
-    from services.checkout_cancel_upstream import (
-        OUTCOME_ALREADY_CANCELED,
-        OUTCOME_CANCELED,
-        OUTCOME_PAID,
-        OUTCOME_PROCESSING,
-        cancel_order_upstream,
-        refund_request_answer,
-    )
+    from services.checkout_cancel_upstream import cancel_order_upstream
 
     order = await get_order(order_id)
     if not order or str(order.get("agent_id") or "") != str(context.agent_id):
         raise HTTPException(status_code=404, detail="Order not found")
 
     result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    return cancel_upstream_answer(order_id, order, result)
+
+
+def cancel_upstream_answer(order_id: str, order: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """The answer for a `cancel_order_upstream` result: the 200 body, or the 409/503 it raises. One mapping for
+    POST /agent/v2/orders/{id}/cancel and, with the flag on, POST /agent/v1/orders/{id}/cancel
+    (routes/agent_api.py), so both doors give the gateway the same codes."""
+    from services.checkout_cancel_upstream import (
+        OUTCOME_ALREADY_CANCELED,
+        OUTCOME_CANCELED,
+        OUTCOME_PAID,
+        OUTCOME_PROCESSING,
+        refund_request_answer,
+    )
+
     outcome = result["outcome"]
     after = result.get("order") or order
     surface = result.get("payment_surface") or {}

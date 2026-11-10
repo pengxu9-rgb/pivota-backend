@@ -309,3 +309,266 @@ async def test_flag_on_a_refunded_order_is_not_a_late_payment(monkeypatch) -> No
     out = await _finalize({"order_id": "ORD_X", "status": "refunded", "payment_status": "refunded"}, recorded, monkeypatch)
     assert out == {"applied": False, "reason": "already_settled", "order_id": "ORD_X"}
     assert recorded == []
+
+
+# ---- the finalizer: a lost paid transition whose re-read fails is not silent (review P2-4) ----------------------
+
+
+@pytest.fixture()
+def money_alert_lines():
+    """Lines on the "pivota" logger (utils/logger.py), the one logger whose lines survive in production."""
+    import logging
+
+    lines: List[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            message = record.getMessage()
+            if message.startswith("money_alert: "):
+                lines.append(message)
+
+    handler = _Capture(level=logging.ERROR)
+    pivota = logging.getLogger("pivota")
+    pivota.addHandler(handler)
+    try:
+        yield lines
+    finally:
+        pivota.removeHandler(handler)
+
+
+async def _finalize_losing_the_paid_transition(monkeypatch, reread) -> Dict[str, Any]:
+    """The real finalizer on an order still unpaid in memory whose atomic paid transition refuses (someone else
+    changed the row), with the re-read staged."""
+    import db.orders as db_orders
+    from services.psp_payment_finalizer import finalize_payment_success
+
+    monkeypatch.setattr(db_orders, "get_order", reread)
+
+    async def lost(order_id: str) -> bool:
+        return False
+
+    async def never(*args: Any, **kwargs: Any):
+        raise AssertionError("no side effect after a lost paid transition")
+
+    return await finalize_payment_success(
+        {"order_id": "ORD_LOST", "merchant_id": "m_x", "status": "pending", "payment_status": "processing", "currency": "USD"},
+        psp="stripe",
+        payment_reference="pi_lost",
+        amount_minor=4200,
+        currency="usd",
+        source_event="payment_intent.succeeded",
+        mark_order_paid_fn=lost,
+        log_order_event_fn=never,
+    )
+
+
+_LOST = {"applied": False, "transitioned": False, "reason": "already_settled_concurrent", "order_id": "ORD_LOST"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["read-raises", "row-missing"])
+async def test_flag_on_a_failed_reread_after_a_lost_paid_transition_raises_the_money_alert(
+    monkeypatch, money_alert_lines, failure
+) -> None:
+    import json
+
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+
+    async def reread(order_id: str):
+        if failure == "read-raises":
+            raise ConnectionError("connection reset")
+        return None
+
+    out = await _finalize_losing_the_paid_transition(monkeypatch, reread)
+
+    assert out == _LOST, "the outcome stays fail-safe: nothing applied, nothing re-run"
+    assert len(money_alert_lines) == 1
+    body = json.loads(money_alert_lines[0][len("money_alert: "):])
+    assert body == {
+        "event": "late_payment_check_failed",
+        "order_id": "ORD_LOST",
+        "psp": "stripe",
+        "payment_reference": "pi_lost",
+        "amount_minor": "4200",
+        "currency": "USD",
+        "source_event": "payment_intent.succeeded",
+        "reason": "order_read_failed" if failure == "read-raises" else "order_missing",
+        "error_type": "ConnectionError" if failure == "read-raises" else None,
+    }
+    assert money_alert_lines[0] == "money_alert: " + json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+@pytest.mark.asyncio
+async def test_flag_on_a_reread_that_finds_a_settled_row_stays_quiet(monkeypatch, money_alert_lines) -> None:
+    """Another finalizer won the paid transition: today's answer, and no alert (the alert is for a read that failed)."""
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+
+    async def reread(order_id: str):
+        return {"order_id": order_id, "status": "paid", "payment_status": "paid"}
+
+    assert await _finalize_losing_the_paid_transition(monkeypatch, reread) == _LOST
+    assert money_alert_lines == []
+
+
+@pytest.mark.asyncio
+async def test_flag_off_a_lost_paid_transition_reads_nothing_and_alerts_nothing(monkeypatch, money_alert_lines) -> None:
+    monkeypatch.delenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", raising=False)
+
+    async def reread(order_id: str):
+        raise AssertionError("flag off: no re-read")
+
+    assert await _finalize_losing_the_paid_transition(monkeypatch, reread) == _LOST
+    assert money_alert_lines == []
+
+
+# ---- the v1 cancel door (POST /agent/v1/orders/{id}/cancel, review P1-2) -----------------------------------------
+
+
+@pytest.fixture()
+def v1_door(monkeypatch):
+    """The real v1 and v2 cancel routes in the real app, over an in-memory order store. The UPDATE the flag-off path
+    issues, its order_cancelled event and its webhook are recorded; `cancel_order_upstream` is a recording spy whose
+    outcome is staged (the producer itself is driven against Postgres)."""
+    import db.database as db_database
+    import db.products as db_products
+    import routes.agent_api as agent_api
+    import routes.agent_auth as agent_auth
+    import routes.agent_v2 as agent_v2
+    import services.agent_webhook_service as webhooks
+    import services.checkout_cancel_upstream as cancel_module
+
+    orders = {
+        "ORD_HOSTED": {
+            "order_id": "ORD_HOSTED",
+            "agent_id": "agent_a",
+            "merchant_id": "m_a",
+            "status": "pending",
+            "payment_status": "processing",
+            "payment_intent_id": "cs_test_hosted_page",
+            "metadata": {},
+        },
+        "ORD_PAID": {"order_id": "ORD_PAID", "agent_id": "agent_a", "merchant_id": "m_a", "status": "paid", "payment_status": "paid", "metadata": {}},
+        "ORD_DONE": {"order_id": "ORD_DONE", "agent_id": "agent_a", "merchant_id": "m_a", "status": "cancelled", "payment_status": "cancelled", "metadata": {}},
+        "ORD_THEIRS": {"order_id": "ORD_THEIRS", "agent_id": "agent_b", "merchant_id": "m_a", "status": "pending", "metadata": {}},
+    }
+    state: Dict[str, Any] = {"outcome": "canceled", "upstream": [], "writes": [], "events": []}
+
+    async def get_order(order_id: str):
+        row = orders.get(order_id)
+        return dict(row) if row else None
+
+    async def execute(query: Any, values: Optional[Dict[str, Any]] = None):
+        state["writes"].append(" ".join(str(query).split()))
+        if (values or {}).get("order_id") in orders:
+            orders[values["order_id"]]["status"] = "cancelled"
+        return 1
+
+    async def log_order_event(**kwargs: Any) -> None:
+        state["events"].append(("log_order_event", kwargs["event_type"]))
+
+    async def webhook(agent_id: str, **kwargs: Any) -> None:
+        state["events"].append(("webhook", kwargs["event_type"]))
+
+    async def cancel(order: Dict[str, Any], *, agent_id: str) -> Dict[str, Any]:
+        state["upstream"].append((order["order_id"], agent_id))
+        after = {**order, "status": "cancelled", "payment_status": "cancelled"} if state["outcome"] == "canceled" else order
+        return {"outcome": state["outcome"], "order": after, "payment_surface": {"action": "expired", "reference_type": "checkout_session"}}
+
+    monkeypatch.setattr(agent_api, "get_order", get_order)
+    monkeypatch.setattr(agent_v2, "get_order", get_order)
+    monkeypatch.setattr(db_database.database, "execute", execute)
+    monkeypatch.setattr(db_products, "log_order_event", log_order_event)
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", webhook)
+    monkeypatch.setattr(cancel_module, "cancel_order_upstream", cancel)
+
+    class _Ctx:
+        agent_id = "agent_a"
+        agent_name = "agent_a"
+        allowed_merchants = None
+        session_id = "s"
+
+        def can_access_merchant(self, merchant_id: str) -> bool:
+            return True
+
+    async def ctx():
+        return _Ctx()
+
+    app.dependency_overrides[agent_auth.get_agent_context] = ctx
+    try:
+        yield state
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "order_id, status, body, writes",
+    [
+        # Today's answers (the scratch differential against the branch base pins 12 cases byte for byte). A 200 is
+        # compared as bytes; an error by its detail, since the app's error envelope stamps a per-request id.
+        ("ORD_HOSTED", 200, b'{"status":"success","order_id":"ORD_HOSTED"}', 1),
+        ("ORD_PAID", 400, "Cannot cancel a paid/completed order. Please refund instead.", 0),
+        ("ORD_DONE", 200, b'{"status":"success","order_id":"ORD_DONE","message":"Order already cancelled"}', 0),
+        ("ORD_THEIRS", 403, "Not authorized for this order", 0),
+    ],
+    ids=["hosted-session", "paid", "already-cancelled", "foreign"],
+)
+async def test_flag_off_the_v1_cancel_is_todays_route(v1_door, monkeypatch, order_id, status, body, writes) -> None:
+    monkeypatch.delenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", raising=False)
+    resp = await _post(f"/agent/v1/orders/{order_id}/cancel")
+    assert resp.status_code == status, resp.text
+    assert (resp.content if status == 200 else resp.json()["detail"]) == body
+    assert v1_door["upstream"] == [], "flag off: the upstream cancel is never called"
+    assert v1_door["writes"] == ["UPDATE orders SET status = 'cancelled' WHERE order_id = :order_id"] * writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["not_canceled_paid", "not_canceled_processing", "not_confirmed"]
+)
+async def test_flag_on_the_v1_cancel_refuses_exactly_like_v2(v1_door, monkeypatch, outcome) -> None:
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+    v1_door["outcome"] = outcome
+    v1 = await _post("/agent/v1/orders/ORD_HOSTED/cancel")
+    v2 = await _post("/agent/v2/orders/ORD_HOSTED/cancel", json={})
+    assert v1.status_code == v2.status_code == {"not_confirmed": 503}.get(outcome, 409)
+    assert v1.json()["detail"] == v2.json()["detail"]
+    assert v1.json()["detail"]["canceled"] is False
+    assert v1_door["upstream"] == [("ORD_HOSTED", "agent_a")] * 2
+    assert v1_door["writes"] == [], "the v1 door no longer flips the row on its own"
+    assert v1_door["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_flag_on_the_v1_cancel_goes_upstream_and_keeps_its_own_keys(v1_door, monkeypatch) -> None:
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+    resp = await _post("/agent/v1/orders/ORD_HOSTED/cancel")
+    v2 = await _post("/agent/v2/orders/ORD_HOSTED/cancel", json={})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body == {"status": "success", "order_id": "ORD_HOSTED", "cancel": v2.json()["cancel"]}
+    assert body["cancel"]["canceled"] is True and body["cancel"]["payment_surface"]["action"] == "expired"
+    assert v1_door["writes"] == []
+    assert v1_door["events"] == [("log_order_event", "order_cancelled"), ("webhook", "order.cancelled")]
+
+
+@pytest.mark.asyncio
+async def test_flag_on_the_v1_cancel_of_a_cancelled_order_is_idempotent_and_emits_nothing(v1_door, monkeypatch) -> None:
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+    v1_door["outcome"] = "already_canceled"
+    resp = await _post("/agent/v1/orders/ORD_HOSTED/cancel")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["status"], body["order_id"], body["message"]) == ("success", "ORD_HOSTED", "Order already cancelled")
+    assert body["cancel"]["outcome"] == "already_canceled" and body["cancel"]["canceled"] is True
+    assert v1_door["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_flag_on_the_v1_cancel_keeps_its_ownership_answers(v1_door, monkeypatch) -> None:
+    monkeypatch.setenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", "1")
+    foreign = await _post("/agent/v1/orders/ORD_THEIRS/cancel")
+    unknown = await _post("/agent/v1/orders/ORD_NOBODY/cancel")
+    assert (foreign.status_code, foreign.json()["detail"]) == (403, "Not authorized for this order")
+    assert (unknown.status_code, unknown.json()["detail"]) == (404, "Order not found")
+    assert v1_door["upstream"] == []

@@ -7,7 +7,8 @@ Nothing here was told: the order stayed payable, the PSP payment the hosted page
 PaymentIntent, or a Stripe Checkout Session) stayed confirmable, and a buyer holding the link could pay an order
 the agent had just told them was canceled.
 
-WHAT THIS DOES (POST /agent/v2/orders/{order_id}/cancel, routes/agent_v2.py):
+WHAT THIS DOES (POST /agent/v2/orders/{order_id}/cancel, routes/agent_v2.py; with the flag on, also
+POST /agent/v1/orders/{order_id}/cancel, routes/agent_api.py, with the same answers):
 
 1. An order already paid is not canceled. The answer says so and names the refund-REQUEST path: refunds are the
    merchant's to make (D-03, services/agent_refund_policy.py), and nothing here executes one.
@@ -15,8 +16,9 @@ WHAT THIS DOES (POST /agent/v2/orders/{order_id}/cancel, routes/agent_v2.py):
    PaymentIntent is canceled. If the PSP refuses because the buyer has already paid (or a payment is still
    settling), the order is left alone and the answer says paid (or processing). If it fails for any other reason
    the order is left alone and the answer is "not confirmed" (retriable): never "canceled" on a guess.
-3. Only then is the order cancelled, with one conditional UPDATE that refuses a paid row. `mark_order_paid` is the
-   same kind of conditional UPDATE, so a payment and a cancel racing for one order serialise: exactly one wins.
+3. Only then is the order cancelled, with one conditional UPDATE that refuses a paid row, and a row whose payment
+   surface changed since it was read (a concurrent create_payment: `_payment_surface_unchanged`). `mark_order_paid`
+   is the same kind of conditional UPDATE, so a payment and a cancel racing for one order serialise: exactly one wins.
 
 AFTERWARDS. A cancelled order can no longer get a new PSP surface (routes/agent_payment_sdk.py create_payment), and
 a checkout token bound to it can no longer create an order or a payment (routes/agent_auth.py). A payment can still
@@ -181,9 +183,35 @@ async def close_payment_surface(order: Dict[str, Any]) -> Dict[str, Any]:
     return {"action": "failed", "reference_type": reference_type}
 
 
+def _payment_surface_unchanged(order: Dict[str, Any], surface: Dict[str, Any]) -> Any:
+    """The WHERE clause that the row still carries the payment surface this cancel closed (or still carries none).
+
+    A concurrent create_payment (routes/agent_payment_sdk.py) writes a new PSP reference (a `cs_` Checkout Session or
+    a PaymentIntent) and payment_status "processing" in one UPDATE (db.orders.update_payment_info), between this
+    cancel's read and its UPDATE. Without this clause the cancel would still win the row and answer "canceled" while
+    that new surface stays payable. With it the cancel loses and answers not-confirmed (retriable); the retry reads
+    the new reference and closes it at the PSP first.
+
+      action "none"  the row must still have NO reference, and the payment_status this cancel read: a writer that
+                     moved either one has started a payment.
+      otherwise      the row must still carry the reference that was just expired / voided, not a newer one.
+    """
+    from sqlalchemy import and_, func, or_
+
+    from db.orders import orders
+
+    if surface.get("action") == "none":
+        return and_(
+            or_(orders.c.payment_intent_id.is_(None), func.trim(orders.c.payment_intent_id) == ""),
+            func.lower(func.trim(func.coalesce(orders.c.payment_status, ""))) == _lower(order.get("payment_status")),
+        )
+    return func.trim(func.coalesce(orders.c.payment_intent_id, "")) == str(order.get("payment_intent_id") or "").strip()
+
+
 async def _cancel_row_if_unpaid(order: Dict[str, Any], *, agent_id: str, surface: Dict[str, Any]) -> bool:
-    """ONE conditional UPDATE: cancel the row only while it is not paid and not already cancelled. True when THIS
-    call cancelled it. The same shape as db.orders.mark_order_paid, which refuses a cancelled row."""
+    """ONE conditional UPDATE: cancel the row only while it is not paid, not already cancelled, and still carries
+    the payment surface this cancel closed. True when THIS call cancelled it. The same shape as
+    db.orders.mark_order_paid, which refuses a cancelled row."""
     from sqlalchemy import and_, func
 
     from db.database import database
@@ -204,6 +232,7 @@ async def _cancel_row_if_unpaid(order: Dict[str, Any], *, agent_id: str, surface
                 orders.c.order_id == str(order.get("order_id") or ""),
                 func.lower(func.coalesce(orders.c.status, "")).notin_(sorted(_PAID_ORDER_STATES | {"cancelled"})),
                 func.lower(func.coalesce(orders.c.payment_status, "")).notin_(sorted(_PAID_PAYMENT_STATES | {"cancelled"})),
+                _payment_surface_unchanged(order, surface),
             )
         )
         .values(status="cancelled", payment_status="cancelled", cancelled_at=now, updated_at=now, metadata=metadata)
@@ -237,7 +266,8 @@ async def cancel_order_upstream(order: Dict[str, Any], *, agent_id: str) -> Dict
         logger.info("checkout cancel: order %s cancelled (payment surface: %s)", order_id, action)
         return {"outcome": OUTCOME_CANCELED, "order": after, "payment_surface": surface}
 
-    # The conditional UPDATE refused: something changed the row since it was read. Say what it is now.
+    # The conditional UPDATE refused: something changed the row since it was read (a payment, another cancel, or a
+    # new payment surface). Say what it is now; a row that is neither cancelled nor paid is "not confirmed".
     after = await get_order(order_id) or order
     if is_cancelled_order(after):
         return {"outcome": OUTCOME_ALREADY_CANCELED, "order": after, "payment_surface": surface}

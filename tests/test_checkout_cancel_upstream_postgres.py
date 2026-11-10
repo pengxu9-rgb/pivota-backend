@@ -6,8 +6,8 @@
 
 FIX_PLAN C-11, CHECKOUT_CANCEL_UPSTREAM_ENABLED (services/checkout_cancel_upstream.py).
 
-HOW IT IS DRIVEN. The real routes (`POST /agent/v2/orders/{id}/cancel`, `POST /webhooks/stripe`,
-`POST /agent/v1/payments`) over httpx.ASGITransport, real `orders` and `after_sales_cases` rows, and the real
+HOW IT IS DRIVEN. The real routes (`POST /agent/v2/orders/{id}/cancel`, `POST /agent/v1/orders/{id}/cancel`,
+`POST /webhooks/stripe`, `POST /agent/v1/payments`) over httpx.ASGITransport, real `orders` and `after_sales_cases` rows, and the real
 `StripeAdapter` with its Stripe client replaced by a recording fake (the pattern of
 tests/test_stripe_payment_element_runtime.py): no live PSP is ever called. Only the agent context, the webhook's
 signature check and its best-effort side ledgers are doubled.
@@ -247,6 +247,7 @@ def flag_on(monkeypatch: pytest.MonkeyPatch) -> None:
 def _app(agent_id: str):
     from fastapi import FastAPI
 
+    import routes.agent_api as agent_api
     import routes.agent_auth as agent_auth
     import routes.agent_payment_sdk as agent_payment_sdk
     import routes.agent_v2 as agent_v2
@@ -254,6 +255,7 @@ def _app(agent_id: str):
 
     app = FastAPI()
     app.include_router(agent_v2.router)
+    app.include_router(agent_api.router)
     app.include_router(agent_payment_sdk.router)
     app.include_router(webhook_routes.router)
 
@@ -637,3 +639,228 @@ async def test_flag_off_the_route_does_not_exist_and_a_late_payment_keeps_todays
     assert await _cases() == []
     assert alerts == []
     assert stripe_fake.calls == []
+
+
+# ---- the v1 cancel door (review P1-2) ----------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def v1_side_effects(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    """The v1 route's best-effort order event and agent webhook, recorded instead of sent."""
+    import db.products as db_products
+    import services.agent_webhook_service as webhooks
+
+    sent: List[str] = []
+
+    async def log_order_event(**kwargs: Any) -> None:
+        sent.append(kwargs["event_type"])
+
+    async def webhook(agent_id: str, **kwargs: Any) -> None:
+        sent.append(kwargs["event_type"])
+
+    monkeypatch.setattr(db_products, "log_order_event", log_order_event)
+    monkeypatch.setattr(webhooks, "emit_agent_webhook_event", webhook)
+    return sent
+
+
+async def _cancel_v1(agent_id: str = OWNER):
+    return await _post(_app(agent_id), f"/agent/v1/orders/{ORDER_ID}/cancel")
+
+
+async def test_flag_on_the_v1_cancel_expires_the_hosted_session_before_it_cancels(
+    flag_on, stripe_fake, v1_side_effects
+) -> None:
+    await _insert_order(payment_intent_id="cs_cancel_v1_open")
+
+    resp = await _cancel_v1()
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "success" and body["order_id"] == ORDER_ID
+    assert body["cancel"]["outcome"] == "canceled"
+    assert body["cancel"]["payment_surface"] == {"action": "expired", "reference_type": "checkout_session"}
+    assert stripe_fake.methods() == ["checkout.sessions.expire"]
+    assert stripe_fake.session["cs_cancel_v1_open"]["status"] == "expired", "the hosted page can no longer be paid"
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"]) == ("cancelled", "cancelled")
+    assert stored["metadata"]["checkout_cancel"]["agent_id"] == OWNER
+    assert v1_side_effects == ["order_cancelled", "order.cancelled"]
+
+
+async def test_flag_on_a_v1_cancel_whose_expire_fails_is_not_confirmed_and_cancels_nothing(
+    flag_on, stripe_fake, v1_side_effects, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _insert_order(payment_intent_id="cs_cancel_v1_down")
+
+    def down(*args: Any, **kwargs: Any):
+        stripe_fake.calls.append({"method": "checkout.sessions.expire"})
+        raise RuntimeError("connection reset")
+
+    def unreadable(*args: Any, **kwargs: Any):
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(stripe_fake, "cs_expire", down)
+    monkeypatch.setattr(stripe_fake, "cs_retrieve", unreadable)
+
+    v1 = await _cancel_v1()
+    v2 = await _cancel()
+
+    assert v1.status_code == v2.status_code == 503, v1.text
+    assert v1.json()["detail"] == v2.json()["detail"]
+    assert v1.json()["detail"]["error"] == "CANCEL_NOT_CONFIRMED" and v1.json()["detail"]["canceled"] is False
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"]) == ("pending", "awaiting_payment")
+    assert v1_side_effects == []
+
+
+async def test_flag_on_a_v1_cancel_of_a_paid_order_is_v2s_409_and_no_refund(flag_on, stripe_fake, v1_side_effects) -> None:
+    await _insert_order(status="paid", payment_status="paid", payment_intent_id="pi_cancel_v1_paid")
+
+    resp = await _cancel_v1()
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "ORDER_ALREADY_PAID"
+    assert resp.json()["detail"]["refund"]["executed"] is False
+    assert stripe_fake.calls == []
+    assert (await _stored())["status"] == "paid"
+
+
+async def test_flag_off_the_v1_cancel_still_flips_the_row_and_calls_no_psp(stripe_fake, v1_side_effects, monkeypatch) -> None:
+    """Today's v1 behaviour, unchanged with the flag off (the hosted page stays payable: why the flag exists)."""
+    monkeypatch.delenv("CHECKOUT_CANCEL_UPSTREAM_ENABLED", raising=False)
+    await _insert_order(payment_intent_id="cs_cancel_v1_off")
+
+    resp = await _cancel_v1()
+
+    assert (resp.status_code, resp.content) == (200, b'{"status":"success","order_id":"ORD_CANCEL_UPSTREAM"}')
+    assert stripe_fake.calls == []
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"]) == ("cancelled", "awaiting_payment")
+    assert "checkout_cancel" not in stored["metadata"]
+
+
+# ---- cancel vs a concurrent create_payment (review P2-3) ---------------------------------------------------------
+
+
+async def _create_payment_writes(reference: str) -> None:
+    """The order write create_payment makes once the PSP returned its object (routes/agent_payment_sdk.py, step 8):
+    the real db.orders.update_payment_info, with the reference and "processing"."""
+    from db.orders import update_payment_info
+
+    await update_payment_info(
+        order_id=ORDER_ID,
+        payment_intent_id=reference,
+        client_secret="cs_secret_fake_not_real",
+        payment_status="processing",
+        psp_used="stripe",
+    )
+
+
+def _interleave_after_close(monkeypatch: pytest.MonkeyPatch, write) -> List[Dict[str, Any]]:
+    """Run `write` after the cancel read the row and closed (or found no) surface, before its UPDATE."""
+    import services.checkout_cancel_upstream as cancel_module
+
+    real_close = cancel_module.close_payment_surface
+    surfaces: List[Dict[str, Any]] = []
+
+    async def close_then_write(order: Dict[str, Any]) -> Dict[str, Any]:
+        surface = await real_close(order)
+        surfaces.append(surface)
+        await write()
+        return surface
+
+    monkeypatch.setattr(cancel_module, "close_payment_surface", close_then_write)
+    return surfaces
+
+
+@pytest.mark.parametrize("door", ["v2", "v1"])
+async def test_a_payment_surface_created_during_the_cancel_makes_the_cancel_lose(
+    flag_on, stripe_fake, v1_side_effects, monkeypatch: pytest.MonkeyPatch, door: str
+) -> None:
+    """The order has no PSP payment yet, so the cancel has nothing to close. Between its read and its UPDATE the
+    hosted page's create_payment writes a fresh Checkout Session. The cancel must not answer "canceled" over a live
+    session: it loses the row and says not confirmed; the retry closes the new session first, then cancels."""
+    import services.checkout_cancel_upstream as cancel_module
+
+    await _insert_order()
+    real_close = cancel_module.close_payment_surface
+    surfaces = _interleave_after_close(monkeypatch, lambda: _create_payment_writes("cs_cancel_race_new"))
+    cancel = _cancel_v1 if door == "v1" else _cancel
+
+    lost = await cancel()
+
+    assert surfaces == [{"action": "none", "reference_type": None}]
+    assert lost.status_code == 503, lost.text
+    assert lost.json()["detail"]["error"] == "CANCEL_NOT_CONFIRMED" and lost.json()["detail"]["canceled"] is False
+    stored = await _stored()
+    assert (stored["status"], stored["payment_status"], stored["payment_intent_id"]) == (
+        "pending",
+        "processing",
+        "cs_cancel_race_new",
+    ), "never a cancelled row carrying a live session"
+    assert stripe_fake.calls == []
+    assert v1_side_effects == []
+
+    monkeypatch.setattr(cancel_module, "close_payment_surface", real_close)
+    retried = await cancel()
+
+    assert retried.status_code == 200, retried.text
+    assert stripe_fake.methods() == ["checkout.sessions.expire"]
+    assert stripe_fake.session["cs_cancel_race_new"]["status"] == "expired"
+    assert (await _stored())["status"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [{"payment_intent_id": "pi_cancel_race_only_ref"}, {"payment_status": "requires_action"}],
+    ids=["reference-only", "payment-status-only"],
+)
+async def test_either_payment_column_moving_alone_stops_a_cancel_with_nothing_to_close(
+    flag_on, stripe_fake, monkeypatch: pytest.MonkeyPatch, columns: Dict[str, str]
+) -> None:
+    """A writer that moves only one of the two columns has still started a payment: each guard stands alone."""
+    from db.database import database
+
+    await _insert_order()
+
+    async def one_column() -> None:
+        sets = ", ".join(f"{column} = :{column}" for column in columns)
+        await database.execute(f"UPDATE orders SET {sets} WHERE order_id = :o", {**columns, "o": ORDER_ID})
+
+    _interleave_after_close(monkeypatch, one_column)
+
+    resp = await _cancel()
+
+    assert resp.status_code == 503, resp.text
+    assert (await _stored())["status"] == "pending"
+
+
+async def test_a_new_session_written_after_the_old_one_was_expired_makes_the_cancel_lose(
+    flag_on, stripe_fake, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cancel expired the session it read; create_payment then wrote a newer one. The row no longer carries
+    the surface that was closed, so the cancel loses rather than leaving the newer session payable."""
+    await _insert_order(payment_intent_id="cs_cancel_race_old")
+    _interleave_after_close(monkeypatch, lambda: _create_payment_writes("cs_cancel_race_newer"))
+
+    resp = await _cancel()
+
+    assert resp.status_code == 503, resp.text
+    assert stripe_fake.session["cs_cancel_race_old"]["status"] == "expired"
+    assert "cs_cancel_race_newer" not in stripe_fake.session, "the newer session was not touched by the first try"
+    stored = await _stored()
+    assert (stored["status"], stored["payment_intent_id"]) == ("pending", "cs_cancel_race_newer")
+
+
+async def test_an_unchanged_row_with_a_blank_reference_is_still_cancelled(flag_on, stripe_fake) -> None:
+    """The guard compares against what was read: an empty-string reference is "no surface", not a change."""
+    from db.database import database
+
+    await _insert_order()
+    await database.execute("UPDATE orders SET payment_intent_id = '' WHERE order_id = :o", {"o": ORDER_ID})
+
+    resp = await _cancel()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cancel"]["payment_surface"]["action"] == "none"
+    assert (await _stored())["status"] == "cancelled"
