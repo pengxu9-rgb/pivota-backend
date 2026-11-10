@@ -1,0 +1,134 @@
+# The backend test suites on Cloud Build, off the developer's machine. It mirrors CI:
+#   * the SQLite sweep, sharded by tests/sweep_shard.py exactly as backend-test-sweep.yml runs it
+#     (same ignores and deselect, every tests/test_*_postgres.py excluded), proven complete by
+#     scripts/merge_sweep_shards.py;
+#   * the Postgres dialect gate, sharded by scripts/postgres_dialect_gate_shards.py with the shard
+#     count and ride-alongs READ from postgres-dialect-gate.yml at run time. Each shard installs and
+#     starts its OWN Postgres 15 inside its step and connects on localhost, as CI does: the suite's
+#     network guard (tests' net_guard) refuses any non-loopback Postgres URL. Database
+#     pivota_dialect_check, which the gate requires; zero skips allowed.
+#
+# EVERY SHARD RUNS IN ITS OWN COPY OF THE SOURCE (/tmp/src, local to its step container). The steps
+# share /workspace, and tests/conftest.py keeps the SQLite test database at <repo>/pivota_test.db and
+# deletes it when a pytest process starts: eight shards in one tree delete each other's database.
+#
+# Run it with scripts/ops/run_tests_on_cloud_build.sh <worktree>: it uploads exactly the files git
+# tracks in that worktree (never an untracked file) and prints the summary.
+#
+# Nothing here deploys, pushes an image or reads a secret. The build runs as ci-tests@pivota-shared,
+# which can only write logs and read the uploaded source.
+#
+# Every test step exits 0 and records its own exit code in /workspace/ci/<step>.rc, so one red
+# shard does not cancel the others; the `summary` step decides the build's result.
+#
+# The SQLite shard count (8) is spelled in three places: the sqlite-* steps, their SWEEP_SHARDS env,
+# and the summary step. The Postgres shard count must equal postgres-dialect-gate.yml's
+# DIALECT_GATE_SHARDS (3); the summary step fails if a shard is missing.
+steps:
+  - id: deps
+    name: mirror.gcr.io/library/python:3.11
+    waitFor: ['-']
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        # A one-commit repo of exactly the uploaded files: some guard tests `git grep` the tree, as
+        # they do in CI's checkout. -f because every uploaded file was tracked where it came from.
+        git init -q && git add -A -f
+        git -c user.email=ci@cloud-build.invalid -c user.name=cloud-build commit -q --no-gpg-sign -m "uploaded snapshot"
+        python -m venv /workspace/.ci-venv
+        . /workspace/.ci-venv/bin/activate
+        python -m pip install -q --upgrade pip
+        pip install -q -r requirements.txt -r requirements-dev.txt
+        mkdir -p /workspace/ci/shards
+        python --version
+
+  - &sqlite
+    id: sqlite-1
+    name: mirror.gcr.io/library/python:3.11
+    waitFor: ['deps']
+    entrypoint: bash
+    env: ['CI=true', 'SWEEP_SHARD=1', 'SWEEP_SHARDS=8']
+    args:
+      - -c
+      - |
+        . /workspace/.ci-venv/bin/activate
+        unset DATABASE_URL
+        mkdir -p /tmp/src && (cd /workspace && tar --exclude=./.ci-venv --exclude=./ci -cf - .) | tar -C /tmp/src -xf -
+        cd /tmp/src
+        # Cloud Build's step containers have no IPv6 loopback (GitHub's runners do). Only then, and
+        # saying so, the one net-guard case that binds ::1 is deselected.
+        IPV6_DESELECT=""
+        if ! python -c "import socket; s = socket.socket(socket.AF_INET6); s.bind(('::1', 0))" 2>/dev/null; then
+          echo "NOTICE: no IPv6 loopback in this container; deselecting test_loopback_and_localhost_are_allowed"
+          IPV6_DESELECT="tests/test_net_guard.py::test_what_stays_on_loopback_passes[test_loopback_and_localhost_are_allowed]"
+        fi
+        python -m pytest tests readiness/tests $${IPV6_DESELECT:+--deselect "$$IPV6_DESELECT"} \
+          --ignore=readiness/tests/test_real_merchant_goldens.py \
+          --ignore=readiness/tests/test_shopify_live_source.py \
+          --deselect 'readiness/tests/test_summary.py::test_build_readiness_optimization_serves_stale_then_refreshes_in_background' \
+          --ignore-glob='tests/test_*_postgres.py' \
+          -q --no-header -p no:randomly -p no:cacheprovider \
+          -p tests.sweep_shard --sweep-shard "$$SWEEP_SHARD/$$SWEEP_SHARDS" \
+          --sweep-shard-manifest "/workspace/ci/shards/sweep-shard-$$SWEEP_SHARD.manifest.json" \
+          --junitxml="/workspace/ci/shards/sweep-shard-$$SWEEP_SHARD.xml" \
+          > "/workspace/ci/sqlite-$$SWEEP_SHARD.log" 2>&1
+        echo $$? > "/workspace/ci/sqlite-$$SWEEP_SHARD.rc"
+        tail -3 "/workspace/ci/sqlite-$$SWEEP_SHARD.log"
+        exit 0
+  - {<<: *sqlite, id: sqlite-2, env: ['CI=true', 'SWEEP_SHARD=2', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-3, env: ['CI=true', 'SWEEP_SHARD=3', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-4, env: ['CI=true', 'SWEEP_SHARD=4', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-5, env: ['CI=true', 'SWEEP_SHARD=5', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-6, env: ['CI=true', 'SWEEP_SHARD=6', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-7, env: ['CI=true', 'SWEEP_SHARD=7', 'SWEEP_SHARDS=8']}
+  - {<<: *sqlite, id: sqlite-8, env: ['CI=true', 'SWEEP_SHARD=8', 'SWEEP_SHARDS=8']}
+
+  - &postgres
+    id: postgres-1
+    name: mirror.gcr.io/library/python:3.11
+    waitFor: ['deps']
+    entrypoint: bash
+    env: ['CI=true', 'SHARD=1', 'PYTHONDONTWRITEBYTECODE=1',
+          'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']
+    args:
+      - -c
+      - |
+        set -e
+        apt-get -qq update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get -qq install -y postgresql >/dev/null
+        service postgresql start >/dev/null
+        su postgres -c "psql -q -c \"ALTER USER postgres PASSWORD 'postgres'\"" >/dev/null
+        su postgres -c "createdb pivota_dialect_check"
+        set +e
+        . /workspace/.ci-venv/bin/activate
+        mkdir -p /tmp/src && (cd /workspace && tar --exclude=./.ci-venv --exclude=./ci -cf - .) | tar -C /tmp/src -xf -
+        cd /tmp/src
+        FILES=$$(python scripts/ops/cloud_build_tests.py pg-files --shard "$$SHARD" \
+          --manifest "/workspace/ci/postgres-$$SHARD.manifest.json")
+        python -m pytest -q -p no:cacheprovider -rfE --junitxml="/workspace/ci/postgres-$$SHARD.xml" $$FILES \
+          > "/workspace/ci/postgres-$$SHARD.log" 2>&1
+        echo $$? > "/workspace/ci/postgres-$$SHARD.rc"
+        tail -3 "/workspace/ci/postgres-$$SHARD.log"
+        exit 0
+  - {<<: *postgres, id: postgres-2, env: ['CI=true', 'SHARD=2', 'PYTHONDONTWRITEBYTECODE=1',
+                                         'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']}
+  - {<<: *postgres, id: postgres-3, env: ['CI=true', 'SHARD=3', 'PYTHONDONTWRITEBYTECODE=1',
+                                         'DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pivota_dialect_check']}
+
+  - id: summary
+    name: mirror.gcr.io/library/python:3.11
+    waitFor: ['sqlite-1', 'sqlite-2', 'sqlite-3', 'sqlite-4', 'sqlite-5', 'sqlite-6', 'sqlite-7',
+              'sqlite-8', 'postgres-1', 'postgres-2', 'postgres-3']
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        . /workspace/.ci-venv/bin/activate
+        python scripts/ops/cloud_build_tests.py summary --ci-dir /workspace/ci --sqlite-shards 8 --pg-shards 3
+
+options:
+  machineType: E2_HIGHCPU_32
+  logging: CLOUD_LOGGING_ONLY
+serviceAccount: projects/pivota-shared/serviceAccounts/ci-tests@pivota-shared.iam.gserviceaccount.com
+timeout: 3000s
