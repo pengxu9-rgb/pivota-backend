@@ -4,12 +4,16 @@ Public merchant signup with an email that already belongs to an agent verifies t
 agent's password and then converts the account (resolve_public_merchant_identity_merge
 -> sync_merchant_auth_user rewrites users.role to 'merchant'). users holds one role per
 email, so the owner was then refused by the developer portal ("This login is for agents
-only"). The conversion now records an active agent membership per owned agent, which is
-what agent login admits a non-agent role through (routes/agent_account._holds_agent_membership).
+only"). The conversion now keeps (re-affirms) the agent memberships the account already
+held, which is what agent login admits a non-agent role through
+(routes/agent_account._holds_agent_membership). It never creates one from an owner_email
+match: that password proves only the users row, which self-service registration
+creates without mailbox proof.
 
 Pinned here:
-1. keep_converted_agent_memberships upserts one active agent membership per agents row
-   owned by the email, bound to that agent_id;
+1. keep_converted_agent_memberships re-affirms only an agent membership this account
+   already held (written after its users row) per agents row at the email, and keeps
+   nothing without the users row's age;
 2. register_merchant calls it only for a conversion from 'agent', and BEFORE the role
    rewrite, so a failed membership write leaves an intact agent account;
 3. has_active_membership_for_entity filters on the exact entity, type and active status,
@@ -35,9 +39,22 @@ class _DummyBackgroundTasks:
 
 
 @pytest.mark.asyncio
-async def test_keeps_one_active_agent_membership_per_owned_agent(monkeypatch):
+async def test_keeps_only_the_agent_memberships_the_account_already_held(monkeypatch):
+    """An owner_email match is not a link: of the two agents at this address, only the
+    one this account already holds a membership for (written after its users row)
+    is kept. The other -- e.g. staff created it at an address the converting account
+    had squatted -- gets nothing."""
+    import db.auth_identity as auth_identity
+    from datetime import datetime, timedelta, timezone
+
+    created = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
     queries = []
     upserts = []
+    checks = []
+
+    async def fetch_one(query, values=None):
+        queries.append((" ".join(str(query).split()), dict(values or {})))
+        return {"created_at": created}
 
     async def fetch_all(query, values=None):
         queries.append((" ".join(str(query).split()), dict(values or {})))
@@ -46,22 +63,51 @@ async def test_keeps_one_active_agent_membership_per_owned_agent(monkeypatch):
             {"agent_id": "agent_two", "agent_name": "Two"},
         ]
 
+    async def has_membership(*, email, membership_type, entity_id, not_before=None):
+        checks.append((email, membership_type, entity_id, not_before))
+        return entity_id == "agent_one"
+
     async def upsert_membership(**kwargs):
         upserts.append(kwargs)
         return {}
 
+    monkeypatch.setattr(module.database, "fetch_one", fetch_one)
     monkeypatch.setattr(module.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(auth_identity, "has_active_membership_for_entity", has_membership)
     monkeypatch.setattr(module, "upsert_membership", upsert_membership)
 
     kept = await module.keep_converted_agent_memberships(EMAIL)
 
-    assert kept == ["agent_one", "agent_two"]
-    assert "LOWER(owner_email) = LOWER(:email)" in queries[0][0]
-    assert queries[0][1] == {"email": EMAIL}
-    assert [(u["email"], u["membership_type"], u["role"], u["entity_id"], u["status"]) for u in upserts] == [
-        (EMAIL, "agent", "agent", "agent_one", "active"),
-        (EMAIL, "agent", "agent", "agent_two", "active"),
+    assert kept == ["agent_one"]
+    assert any("LOWER(owner_email) = LOWER(:email)" in q for q, _ in queries)
+    assert [(c[2], c[3]) for c in checks] == [
+        ("agent_one", created - timedelta(seconds=60)),
+        ("agent_two", created - timedelta(seconds=60)),
     ]
+    assert [(u["email"], u["membership_type"], u["entity_id"], u["status"]) for u in upserts] == [
+        (EMAIL, "agent", "agent_one", "active"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_without_the_users_rows_age_nothing_is_kept(monkeypatch):
+    upserts = []
+
+    async def fetch_one(query, values=None):
+        return {"created_at": None}
+
+    async def fetch_all(query, values=None):
+        raise AssertionError("no agent lookup without the row's age")
+
+    async def upsert_membership(**kwargs):
+        upserts.append(kwargs)
+
+    monkeypatch.setattr(module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
+    monkeypatch.setattr(module, "upsert_membership", upsert_membership)
+
+    assert await module.keep_converted_agent_memberships(EMAIL) == []
+    assert upserts == []
 
 
 # ── 2. register_merchant wiring ──────────────────────────────────────────────
