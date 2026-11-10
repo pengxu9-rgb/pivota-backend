@@ -55,7 +55,8 @@ _TABLES = ("merchant_purchasability", "tierb_cart_link_eligibility", "reap_agent
            mint_scans.TABLE)
 _ENVS = (fresh.DIRECTORY_FLAG_ENV, "MERCHANT_PURCHASABILITY_TTL_HOURS", "MERCHANT_PURCHASABILITY_BUYER_VANTAGE",
          directory.EXCLUDED_DOMAINS_ENV, "PIVOTA_TEST_MERCHANT_IDS", "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN",
-         "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS")
+         "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS",
+         "MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS")
 
 
 def _filter(name):
@@ -641,9 +642,13 @@ async def test_an_unreadable_sweep_lane_still_runs_the_clocks_but_is_no_heartbea
     assert len(_alerts(lines)) == 1
 
     # A complete scan older than the sweep's own fallback bound (72 h) is no better than none.
-    await _scan(at=datetime.now(timezone.utc) - timedelta(hours=73))
+    # Nor are the dials it published: a too-old scan's dials are not used.
+    await _scan(at=datetime.now(timezone.utc) - timedelta(hours=73),
+                dials={"ttl_hours": 24, "warm_click_max_per_run": 0, "warm_click_not_shopify_recheck_days": 2,
+                       "warm_click_sticky_days": 3})
     summary, lines = await _tick()
-    assert _assert_unavailable(lines, "population_unreadable")["population_unreadable"] == 1
+    body = _assert_unavailable(lines, "population_unreadable")
+    assert body["population_unreadable"] == 1 and (body["dials_source"], body["dial_ttl_hours"]) == ("env", 72)
     await _scan(at=datetime.now(timezone.utc) - timedelta(hours=71))
     summary, lines = await _tick()
     assert summary["unavailable"] == 0
@@ -739,6 +744,7 @@ _ENV_DIALS = {"MERCHANT_PURCHASABILITY_TTL_HOURS": "ttl_hours",
 
 
 def _dial_echo(summary):
+    assert summary["dial_sticky_days"] in (14, 50), summary
     return (summary["dial_ttl_hours"], summary["dial_warm_cap"], summary["dial_recheck_days"], summary["dials_source"])
 
 
@@ -766,11 +772,11 @@ async def test_the_warm_lane_rollback_on_the_job_alone_takes_its_keys_off_the_cl
     await mp.record_check(WARM, "US", _card(WARM))
     await _age("merchant_purchasability", "checked_at", 80, "merchant_domain", WARM)
     await _scan(warm=(WARM,), dials={"ttl_hours": 72, "warm_click_max_per_run": 6,
-                                     "warm_click_not_shopify_recheck_days": 7})
+                                     "warm_click_not_shopify_recheck_days": 7, "warm_click_sticky_days": 14})
     summary, lines = await _tick()
     assert _counts(summary, pairs=1, stale=1) and summary["dials_source"] == "sweep_scan", summary
     await _scan(warm=(WARM,), dials={"ttl_hours": 72, "warm_click_max_per_run": 0,
-                                     "warm_click_not_shopify_recheck_days": 7})
+                                     "warm_click_not_shopify_recheck_days": 7, "warm_click_sticky_days": 14})
     summary, lines = await _tick()
     assert _counts(summary, pairs=1, untracked=1), summary
     assert _dial_echo(summary) == (72, 0, 7, "sweep_scan") and _alerts(lines) == []
@@ -787,7 +793,7 @@ async def test_published_ttl_and_recheck_days_win_over_the_workers_env(monkeypat
                                              detail="products_json_page_1_status_404"))
     await _age("merchant_purchasability", "checked_at", 60, "merchant_domain", WARM)
     await _scan(warm=(WARM,), dials={"ttl_hours": 24, "warm_click_max_per_run": 6,
-                                     "warm_click_not_shopify_recheck_days": 2})
+                                     "warm_click_not_shopify_recheck_days": 2, "warm_click_sticky_days": 14})
     summary, lines = await _tick()
     assert _dial_echo(summary) == (24, 6, 2, "sweep_scan")
     by = {w["domain"]: w for w in _warnings(lines)}
@@ -796,6 +802,60 @@ async def test_published_ttl_and_recheck_days_win_over_the_workers_env(monkeypat
     summary, lines = await _tick(now=(await _stored_checked_at("merchant_purchasability", "merchant_domain", WARM))
                                  + timedelta(days=2, hours=24))
     assert {w["domain"]: w["limit_seconds"] for w in _warnings(lines)}[WARM] == (2 * 24 + 24) * 3600
+
+
+async def test_a_no_catalog_key_that_held_a_card_positive_recently_is_on_the_ttl_like_the_sweep(monkeypatch):
+    """The sweep does not defer a no-catalog key whose card positive ended inside the sticky window
+    (it re-checks it on the normal rotation), so the check must not give it the longer limit. Both
+    ask `sweep.warm_defer_window`; with sticky days 0 (published) the same key IS deferred."""
+    from jobs import merchant_purchasability_sweep as sweep
+
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await mp.record_check(WARM, "US", _card(WARM))  # ELIGIBLE with a card: arms positive_until
+    await mp.record_check(WARM, "US", _card(WARM, card=False, verdict=Verdict.VARIANT_UNVERIFIED,
+                                             detail="products_json_page_1_status_404"))
+    await _age("merchant_purchasability", "checked_at", 120, "merchant_domain", WARM)
+    await _age("merchant_purchasability", "positive_until", 24, "merchant_domain", WARM)
+    await _scan(warm=(WARM,))
+    [row] = await mp.list_due(10, vantage=mp.WORKER_VANTAGE, strict=True)
+    assert row["positive_until"] is not None and row["verdict"] == "VARIANT_UNVERIFIED"
+
+    sizes: dict = {}
+    targets = await sweep.load_population(50, sizes=sizes)
+    assert [(t.domain, t.market) for t in targets] == [(WARM, "US")] and sizes[sweep.WARM_DEFERRED_TALLY] == 0
+    summary, lines = await _tick()
+    assert _counts(summary, pairs=1, stale=1), summary
+    [warning] = _warnings(lines)
+    assert warning["limit_seconds"] == 72 * 3600 and summary["dial_sticky_days"] == 14
+
+    # The job publishes sticky days 0 (the worker's env still says 14): now the sweep defers it.
+    await _scan(warm=(WARM,), dials={"ttl_hours": 72, "warm_click_max_per_run": 6,
+                                     "warm_click_not_shopify_recheck_days": 7, "warm_click_sticky_days": 0})
+    summary, lines = await _tick()
+    assert _counts(summary, pairs=1, fresh=1) and summary["dial_sticky_days"] == 0, summary
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", "0")
+    sizes = {}
+    assert await sweep.load_population(50, sizes=sizes) == [] and sizes[sweep.WARM_DEFERRED_TALLY] == 1
+
+
+async def test_a_clean_build_is_clean_whatever_the_last_build_was(monkeypatch):
+    """`build_failures` answers for the build it is HANDED: a clean build served from the cache after
+    a later degraded one (which is never cached) reports no failures."""
+    monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
+    await _variant_lane(FRESH)
+    await mp.record_check(FRESH, "US", _card(FRESH))
+    directory.reset_cache()
+    clean = await directory.merchant_facts(now=0.0)
+    assert directory.build_failures(clean) == ()
+
+    async def broken(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(tierb, "is_cart_link_eligible", broken)
+    degraded = await directory.merchant_facts(now=directory.CACHE_TTL_SECONDS + 1.0)
+    assert degraded is not clean and directory.build_failures(degraded) == ("cart_link",)
+    assert directory.build_failures(clean) == (), "the cached clean build is still clean"
+    assert await directory.merchant_facts(now=1.0) is clean
 
 
 # ── NP3-2: pending is "the sweep never checked it", not "no buyer row" ───────────────────────

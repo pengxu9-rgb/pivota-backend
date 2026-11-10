@@ -134,7 +134,8 @@ async def _db(monkeypatch, tmp_path):
     for env in (fresh.DIRECTORY_FLAG_ENV, "MERCHANT_PURCHASABILITY_TTL_HOURS",
                 "MERCHANT_PURCHASABILITY_BUYER_VANTAGE", directory.EXCLUDED_DOMAINS_ENV, "PIVOTA_TEST_MERCHANT_IDS",
                 "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN",
-                "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS"):
+                "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS",
+         "MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS"):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
     directory.reset_cache()

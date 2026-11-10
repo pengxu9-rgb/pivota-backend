@@ -632,18 +632,29 @@ seeds: they carry no shop domain, so the minter builds no cart on them.
   trip the IP breaker and stop it. And the ~300 never-checked keys, swept first, would push every
   existing key's re-check back by about a day. So:
   - **A per-run cap.** One staleness order over every key, but warm-only keys (named by no other
-    lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` = 6 slots of a run. The
-    other lanes' due keys always keep the rest (14 of 20), and a warm-only key is never
-    re-checked ahead of a staler one of theirs. The cap is pinned in the setup script.
-  - **Proven Shopify before it counts.** A warm-only key is proven once its last check gave a
+    lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` = 8 slots of a run. The
+    other lanes' due keys always keep the rest (16 of `BATCH` = 24), and a warm-only key is never
+    re-checked ahead of a staler one of theirs. Both numbers are pinned in the setup script.
+  - **Proven Shopify before it counts.** A warm-only key is proven when its last check gave a
     verdict only a Shopify storefront gives (`SHOPIFY_STOREFRONT_VERDICTS`: ELIGIBLE, a Shopify
-    sign-in or password wall, a 410 permalink, a checkout page...). Until then its requests feed
+    sign-in or password wall, a 410 permalink, a checkout page...), **or when it held a card
+    positive recently**: its `positive_until` (armed only by `ELIGIBLE` with a card checkout)
+    ended less than `..._WARM_CLICK_STICKY_DAYS` = 14 days ago, and its last check was not a
+    no-catalog answer. So one throttle on a card-positive store does not unprove it, and a host
+    that has left Shopify stops counting within two weeks, or at its first no-catalog answer.
+    **The sticky rule covers card stores only.** A `NO_CARD_PAYMENT` or `PRICE_DRIFT` store (warm-
+    positive, but no card window), or one demoted since, is unproven by one throttle for that run.
+    Widening it to `consecutive_failures > 0` would also make a non-Shopify site that redirects
+    `/products.json` to a sign-in page sticky, so it is not done. Unproven requests feed
     neither the IP breaker nor the shared Shopify-edge budget; the run's own 1.5 s pacer still
     spaces them.
   - **Weekly for no catalog.** A warm-only key whose last check found no Shopify catalog
-    (`VARIANT_UNVERIFIED` with `products_json_page_1_status_<n>`, never a 429 or 503) is
+    (`VARIANT_UNVERIFIED` with `products_json_page_1_status_404`, `_410`, or `_200` with a body
+    that is not a product list; never a 5xx, a 403 or a throttle, which are transient) is
     re-checked only every `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` = 7 days, and is counted in
     `SweepReport.population_deferred_not_shopify` meanwhile. It stays in `population_total`.
+    A key that held a card positive within the 14-day sticky window is never deferred: one odd
+    page-1 answer from a store we have checked out on is far likelier transient.
   - A key another lane also names is that lane's key: no cap, always proven, never deferred.
 * **Same daily scan, same cache row.** The lane is computed in the cart-mint scan's pass over the
   seeds (no second read of the seed table) and cached in the same `hosts` array as tagged entries
@@ -664,20 +675,26 @@ SELECT scanned_at, complete,
  ORDER BY scanned_at DESC LIMIT 3;
 ```
 
-**A seed with no market (`''`) is never swept** by this lane, as by the cart-mint lane: it is
-counted in `population_skipped_market_unknown` once per lane that names it (so one such seed can
-count twice), and the warm stamp, which needs the listing market, never fires for it. That fails
-closed.
+**A seed with no market (`''`) fails closed.** Neither this lane nor the cart-mint lane keys it, so
+it is never swept and never gets a fact; it is counted in `population_skipped_market_unknown` once
+per lane that names it (one such seed can count twice). Whatever a request then asks for that
+host, the fact read answers no.
 
-**Rollback without a re-image:** set `WARM_CLICK_MAX_PER_RUN=0` in the setup script and re-run it
-with `--enable`. That takes the lane out of the population (the other four lanes are unchanged).
-A hand `gcloud run jobs update --update-env-vars MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN=0`
-works at once but is reset by the next run of the setup script.
+**Rollback, two levers:**
+- **To stop warm upgrades now:** remove `OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE` from `web`
+  (`gcloud run services update web ... --remove-env-vars OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE`, in
+  the controller's quiet window; backend deploys keep hand-set env). That stops new stamps, and a
+  stamped token is no longer eligible at click (see docs/runbooks/outbound_warm_handoff_rollout.md).
+  The sweep cap does NOT do this: facts already gathered keep stamping until they expire.
+- **To stop sweeping the lane:** set `WARM_CLICK_MAX_PER_RUN=0` in the setup script and re-run it
+  with `--enable`. That takes the lane out of the population; the other four lanes are unchanged.
+  A hand `gcloud run jobs update --update-env-vars MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN=0`
+  works at once but is reset by the next run of the setup script.
 
 **The directory freshness check follows the job's dials, a day late at most.** The R-03 check
 (`services/freshness_clock_check.py`, on the `worker`, behind `FRESHNESS_DIRECTORY_CHECK_ENABLED`)
 keeps a clock on every key the sweep refreshes. It reads `WARM_CLICK_MAX_PER_RUN`,
-`WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` and `MERCHANT_PURCHASABILITY_TTL_HOURS` from what the job
+`WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS`, `WARM_CLICK_STICKY_DAYS` and `MERCHANT_PURCHASABILITY_TTL_HOURS` from what the job
 **published with its daily cart-mint scan** (the `sweep-dial` entries of the scan row), not from the
 worker's environment, so a rollback on the job takes the warm-only keys off the clock at the next
 05:00Z scan, well inside the 72 h before any of them could page. Its summary line echoes the three
@@ -689,6 +706,12 @@ values and `dials_source`:
   `dials_source` reads `sweep_scan`, set the same dial on the worker too** (`gcloud run services
   update worker --update-env-vars ...`), or about 72 h after a rollback every warm-only key pages
   as stale for good. Re-imaging the job (below) is what makes it publish.
+
+**`MERCHANT_PURCHASABILITY_TTL_HOURS` must be the same value on `web` and on the sweep job.** The
+job's value arms `positive_until` (what the card gate reads) and is the limit the freshness check
+uses; `web`'s value is what the warm-handoff gate (`human_handoff_allowed`) compares `checked_at`
+with. Only one value is meaningful: with a shorter TTL on `web`, the handoff gate drops a merchant
+before the freshness check pages. Change it on both, in one step.
 
 **The job never redeploys on merge.** Re-image it with the setup script **and `--enable`**
 (without it the script DISARMS the lane):
@@ -719,7 +742,8 @@ pathological merchant (~300 s) ≈ 810 s — inside the 1200 s task timeout. The
 measured from the start of the run, scan included, so a slow scan shortens the checks, never the
 other way round.
 
-**No `BATCH` or `BUDGET_SECONDS` change is needed**, and raising `BATCH` buys little:
+**No `BATCH` or `BUDGET_SECONDS` change was needed** for this lane (2026-09-28; the warm-click lane
+later raised `BATCH` to 24, see below), and raising `BATCH` buys little:
 - *Coverage* depends on the batch, not on the time per target, so it is the same at 10.4 s as at
   4.4 s.
 - *Budget.* At 10.4 s a run fits ~52 targets in the 600 s budget after a 60 s scan. `BATCH` = 40
@@ -739,20 +763,28 @@ other way round.
 | checks (= abandoned checkouts) per merchant per day, 21 × 20 / *T* | ~5.6 | ~1.8 |
 | first full pass after arming (every key has a fact) | ~4 h | ~12–15 h |
 
-**With the warm-click lane and its guard (2026-11-08)** *T* ≈ 196 + 310 ≈ 506, in two parts:
-- **The other lanes' 196 keys** keep at least 14 slots a run: ≥ 294 checks a day, so each is
-  re-checked about every **16 h** (was ~11 h), a ~4.5× margin to the 72 h TTL.
-- **The 310 warm-only keys** share at most 6 slots a run, 126 checks a day. The ~100 with no
-  Shopify catalog drop to weekly (~14 a day) once seen, leaving ~210 at ~112 a day: about every
-  **45 h**, a ~1.6× margin. The first pass over the 303 never-checked ones takes ~2.5 days.
-- The request RATE does not change (the batch and the schedule are the same).
-- **Watch:** `population_never_checked` should fall by ~6 a run, and `population_deferred_not_shopify`
-  should settle near ~100. If warm-only facts age out (a warm-only key's re-check gap above ~60 h),
-  raise the cap together with `BATCH` (e.g. 10 of 30, ~310 s of checks at 10.4 s, inside the 600 s
-  budget), both in the setup script.
+**With the warm-click lane and its guard (2026-11-09: cap 8 of `BATCH` 24)** *T* ≈ 196 + 310 ≈ 506.
+Estimates, at 21 runs a day with the 01:07 → 05:07 gap counted; "lost runs" means one run in five
+does not happen:
 
-The rotation stops keeping every positive fact fresh only past *T* ≈ 1,240 (62 runs of 20 inside
-72 h). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the
+| | average gap | worst gap | worst, 1 run in 5 lost |
+|---|---|---|---|
+| the other lanes' 196 keys (≥ 16 slots a run) | ~14 h (was ~11 h) | ~16 h | ~20 h |
+| warm-only keys, first pass (303 never-checked at 8 a run, ~38 runs) | — | ~43 h | ~54 h |
+| warm-only keys, steady (~210 at ~154 a day, the ~100 no-catalog ones weekly) | ~33 h | ~36 h | ~44 h |
+
+All inside the 72 h TTL. At the earlier cap of 6 of 20 the first pass's worst gap was ~61 h, and
+~76 h with lost runs. That fails closed (the link stays a product page), but loses upgrades.
+
+- **Run length:** 24 checks at ~10.4 s ≈ 250 s, inside the 600 s budget. The request RATE per check is
+  unchanged; there are 4 more checks a run.
+- **Watch:** `population_never_checked` should fall by ~8 a run, and `population_deferred_not_shopify`
+  should settle near ~100. If a warm-only key's re-check gap passes ~60 h, raise the cap and `BATCH`
+  together in the setup script (e.g. 10 of 30, ~310 s of checks).
+
+The rotation stops keeping every positive fact fresh only past *T* ≈ 1,000 keys of the OTHER lanes
+(63 runs of their 16 slots inside 72 h; the warm-click lane's 8 slots rotate separately, see the
+capacity table above). Watch `population_total` and `population_never_checked` in the `SweepReport`: after the
 first rotation `population_never_checked` should read ~0, and a key that stays never-checked is
 one the rotation is not reaching. If *T* ever approaches that limit, raise `BATCH` in
 `infra/gcp/setup_merchant_purchasability_sweep_job.sh` (the task timeout is derived from it) —

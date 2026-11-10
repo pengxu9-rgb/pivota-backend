@@ -13,6 +13,7 @@ from core.billing_constants import (
     overage_revenue_cents,
 )
 from db.database import IS_POSTGRES, database
+from services.test_traffic import not_test_traffic_sql
 
 
 SYSTEM_DEFAULT_GMV_TAKE_RATE_BP = 1000
@@ -659,6 +660,8 @@ async def _gmv_attribution_for_month(
           AND net_attributed_gmv_cents > 0
           -- Exclude fallback-INFERRED edges (#1481): recorded for coverage, not billed.
           AND (metadata->>'inferred')::boolean IS NOT TRUE
+          -- Exclude TEST traffic (O-07, services/test_traffic.py), stamped at write.
+          AND """ + not_test_traffic_sql("metadata") + """
         """,
         {
             "merchant_id": merchant_id,

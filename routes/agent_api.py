@@ -279,6 +279,17 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         return
 
 
+def _is_stamped_test_order_create(merchant_id: Optional[str]) -> bool:
+    """O-07: whether a just-created order is test traffic that create_order stamped (the rig
+    merchant / probe legs of services.test_traffic; the canary does not create through this
+    route). False whenever TEST_TRAFFIC_STAMP_ENABLED is off, so counting is then unchanged."""
+    from services import test_traffic
+
+    if not test_traffic.stamp_enabled():
+        return False
+    return test_traffic.is_test_traffic(merchant_ids=[merchant_id])
+
+
 def _enqueue_agent_create_order_background_task(
     step_name: str,
     order_id: Any,
@@ -9500,6 +9511,9 @@ async def agent_create_order(
                     merchant_id=order_request.merchant_id,
                     order_id=order_response.order_id,
                     order_amount=order_amount,
+                    # The one call that counts an order (agents.total_orders/total_gmv). A test
+                    # order (services/test_traffic.py) is not counted while stamping is on.
+                    order_created=not _is_stamped_test_order_create(order_request.merchant_id),
                 ),
             )
         except Exception as log_error:
@@ -10936,6 +10950,14 @@ async def agent_cancel_order(
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): this door cancels the way POST /agent/v2/orders/{id}/cancel
+        # does, closing the hosted payment page at the PSP first and cancelling only an unpaid row, with v2's codes.
+        # Off (the default): the unchanged path below.
+        from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+        if checkout_cancel_upstream_enabled():
+            return await _agent_cancel_order_upstream(order_id, order, context, background_tasks)
+
         # Block cancel if clearly paid/succeeded
         paid_status = str(order.get("payment_status") or "").lower()
         if paid_status in ("paid", "succeeded", "completed"):
@@ -11005,6 +11027,50 @@ async def agent_cancel_order(
     except Exception as e:
         logger.error(f"Agent cancel error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+async def _agent_cancel_order_upstream(
+    order_id: str,
+    order: Dict[str, Any],
+    context: AgentContext,
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """The v1 cancel with CHECKOUT_CANCEL_UPSTREAM_ENABLED on: services/checkout_cancel_upstream.cancel_order_upstream
+    and v2's answers (409 ORDER_ALREADY_PAID / PAYMENT_PROCESSING, 503 CANCEL_NOT_CONFIRMED). A 200 keeps v1's own
+    keys (order_id, and the "already cancelled" message) beside v2's `cancel` block. The order_cancelled event and
+    the order.cancelled webhook go out only when THIS call cancelled the row."""
+    from routes.agent_v2 import cancel_upstream_answer
+    from services.checkout_cancel_upstream import OUTCOME_ALREADY_CANCELED, OUTCOME_CANCELED, cancel_order_upstream
+
+    result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    answer = cancel_upstream_answer(order_id, order, result)  # raises the 409 / 503 answers
+    if result["outcome"] == OUTCOME_ALREADY_CANCELED:
+        return {"status": "success", "order_id": order_id, "message": "Order already cancelled", "cancel": answer["cancel"]}
+    if result["outcome"] == OUTCOME_CANCELED:
+        try:
+            from db.products import log_order_event
+
+            await log_order_event(
+                event_type="order_cancelled",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                status="cancelled",
+                metadata={"cancelled_by": "agent"},
+            )
+        except Exception:
+            pass
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.cancelled",
+                payload={"order_id": order_id, "merchant_id": order["merchant_id"], "status": "cancelled"},
+            )
+        except Exception:
+            pass
+    return {"status": "success", "order_id": order_id, "cancel": answer["cancel"]}
 
 
 @router.get("/orders/{order_id}/track")

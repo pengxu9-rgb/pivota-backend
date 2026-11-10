@@ -35,6 +35,9 @@ Job registration happens at start-up time. Currently registers:
   generates prior-month partner settlement files from snapshots.
 - `settlement_file_transfer` — in-process monthly day-10 UTC cron,
   transfers prior-month pending settlement files through Stripe Connect.
+  DORMANT unless SETTLEMENT_FILE_TRANSFER_ENABLED is literally 'true' (O-05);
+  T7/T8 (paused) likewise need INVOICE_GENERATION_MONTHLY_ENABLED /
+  PARTNER_SETTLEMENT_MONTHLY_ENABLED to do anything once resumed.
 - `store_lifecycle_reconciliation` — hourly at :17, probes connected stores
   upstream (Shopify shop.json / Wix products query) and disconnects the ones
   the platform no longer recognises, then re-derives
@@ -300,6 +303,34 @@ def run_deadline_for(job_id: str) -> float:
         )
         return _DEFAULT_RUN_DEADLINE_SECONDS
     return float(d)
+
+
+# Money jobs with no agreed commission model behind them (FIX_PLAN O-05 / D-04). Each runs only
+# when its flag is literally "true" (case and surrounding spaces ignored; "1"/"yes"/"on" do NOT
+# arm it). Read at RUN time, so an operator arms or disarms without a redeploy, and a forced
+# run-now (POST /admin/scheduler/jobs/{id}/run-now) or a resume obeys the same gate.
+#   settlement_file_transfer    — Stripe Connect transfers to channel partners (money OUT).
+#   partner_settlement_monthly  — T8: settlement snapshots + legacy pending payout rows.
+#   invoice_generation_monthly  — T7: Stripe invoices to merchants for GMV take.
+# The flags and the literal-true parse live in services/money_flags.py (one parser for the
+# scheduler and the services that move money); re-exported here under the same names.
+from services.money_flags import (  # noqa: E402
+    INVOICE_GENERATION_MONTHLY_FLAG,
+    PARTNER_SETTLEMENT_MONTHLY_FLAG,
+    SETTLEMENT_FILE_TRANSFER_FLAG,
+    money_job_enabled,
+)
+
+
+def _skip_money_job(job_id: str, flag: str) -> None:
+    # The "pivota" logger: prod drops a module logger's INFO, and a skipped money job must be
+    # visible in the run's logs.
+    from utils.logger import logger as operator_logger
+
+    operator_logger.warning(
+        "audit_scheduler: %s SKIPPED — %s is not 'true' (raw %r); no money job ran",
+        job_id, flag, os.getenv(flag),
+    )
 
 
 def scheduler_diagnostics() -> dict:
@@ -928,6 +959,9 @@ async def start_scheduler() -> None:
             2026-07-02 -> period = 2026-06-01..2026-06-30. Idempotent on
             billing_runs.idempotency_key.
             """
+            if not money_job_enabled(INVOICE_GENERATION_MONTHLY_FLAG):
+                _skip_money_job("invoice_generation_monthly", INVOICE_GENERATION_MONTHLY_FLAG)
+                return
             today = _dt.now(_tz.utc).date()
             first_of_this_month = today.replace(day=1)
             last_of_prev_month = first_of_this_month - _td(days=1)
@@ -944,6 +978,9 @@ async def start_scheduler() -> None:
             invoice cycle has finished. Picks the most recent billing_runs
             row whose status='completed' and runs settlement against it.
             """
+            if not money_job_enabled(PARTNER_SETTLEMENT_MONTHLY_FLAG):
+                _skip_money_job("partner_settlement_monthly", PARTNER_SETTLEMENT_MONTHLY_FLAG)
+                return
             row = await database.fetch_one(
                 "SELECT id, period_start, period_end FROM billing_runs "
                 "WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1"
@@ -972,7 +1009,15 @@ async def start_scheduler() -> None:
             )
 
         async def _transfer_prior_month_for_all_partners() -> None:
-            """PR #8 day-10 wrapper: transfer prior-month pending settlement files."""
+            """PR #8 day-10 wrapper: transfer prior-month pending settlement files.
+
+            Real Stripe Connect transfers in production. Runs only when
+            SETTLEMENT_FILE_TRANSFER_ENABLED is literally 'true' (O-05: no agreed commission
+            model yet). Off, it reads and writes nothing: pending files stay pending.
+            """
+            if not money_job_enabled(SETTLEMENT_FILE_TRANSFER_FLAG):
+                _skip_money_job("settlement_file_transfer", SETTLEMENT_FILE_TRANSFER_FLAG)
+                return
             today = _dt.now(_tz.utc).date()
             prior_month = (today.replace(day=1) - _td(days=1)).replace(day=1)
             results = await settlement_file_service.transfer_all_pending_for_month(
@@ -1134,7 +1179,8 @@ async def start_scheduler() -> None:
         # PR #8 — Stripe Connect transfer, monthly on day 10 02:00 UTC.
         # Registered in-process alongside the audit scheduler; the service
         # itself gates real Stripe transfers to production unless an explicit
-        # staging override env var is set.
+        # staging override env var is set. The job body is a no-op unless
+        # SETTLEMENT_FILE_TRANSFER_ENABLED is literally 'true' (O-05).
         _add_job(
             _transfer_prior_month_for_all_partners,
             "cron",
@@ -1603,10 +1649,13 @@ async def start_scheduler() -> None:
             "+ gmv_aggregation_daily (02:00 UTC, ACTIVE) "
             "+ gmv_invoice_credit_daily (02:15 UTC, pending credits only) "
             "+ agent_share_accrual_daily (02:30 UTC, flag AGENT_SHARE_ACCRUAL_ENABLED) "
-            "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED) "
-            "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED) "
+            "+ invoice_generation_monthly (day 2 03:00 UTC, PAUSED, and flag "
+            "INVOICE_GENERATION_MONTHLY_ENABLED resolved now as %s) "
+            "+ partner_settlement_monthly (day 3 04:00 UTC, PAUSED, and flag "
+            "PARTNER_SETTLEMENT_MONTHLY_ENABLED resolved now as %s) "
             "+ settlement_file_generate (day 5 02:00 UTC, ACTIVE) "
-            "+ settlement_file_transfer (day 10 02:00 UTC, ACTIVE) "
+            "+ settlement_file_transfer (day 10 02:00 UTC, DORMANT unless "
+            "SETTLEMENT_FILE_TRANSFER_ENABLED is literally 'true' — resolved now as %s) "
             "+ catalog_row_trust_backfill (cron */6h :17, ACTIVE) "
             "+ agent_pdp_view_reconcile (cron */6h :43, ACTIVE) "
             "+ cafe24_reconciliation (15min, flag-gated CAFE24_RECONCILIATION_ENABLED) "
@@ -1639,6 +1688,9 @@ async def start_scheduler() -> None:
             "+ catalog_import_drain_tick (30s, ON by default; kill switch "
             "CATALOG_IMPORT_DRAIN_ENABLED=false — resolved now as %s) "
             "+ catalog_import_stale_reaper (5min, ACTIVE, not flag-gated)",
+            "ON" if money_job_enabled(INVOICE_GENERATION_MONTHLY_FLAG) else "OFF",
+            "ON" if money_job_enabled(PARTNER_SETTLEMENT_MONTHLY_FLAG) else "OFF",
+            "ON" if money_job_enabled(SETTLEMENT_FILE_TRANSFER_FLAG) else "OFF",
             os.getenv("OFFICIAL_DOMAIN_LIVENESS_ENABLED"),
             "ON" if liveness_job_enabled() else "OFF",
             "ON" if _catalog_import_drain_enabled() else "OFF",
