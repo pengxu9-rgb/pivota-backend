@@ -966,3 +966,31 @@ async def test_every_purchase_route_answers_503_when_the_hash_lookup_fails(
     await _nothing_written()
     assert await _count("reap_agentic_purchases") == 0
     assert stubs.catalog == [] and stubs.clicks == []
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        {"BUYER_IDENTITY_LINK_SECRET": _S29_DEDICATED},
+        {"BUYER_IDENTITY_LINK_SECRET": "same-value-test-key", "BUYER_IDENTITY_LINK_LEGACY_SECRET": "same-value-test-key"},
+        {"BUYER_IDENTITY_LINK_LEGACY_SECRET": "a-wrong-copy-test-key"},
+    ],
+    ids=["new-key-without-the-copy", "new-key-equal-to-the-copy", "wrong-copy-alone"],
+)
+async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(client, stubs, monkeypatch, s29_tables, mount):
+    """S-29b N-1. Each mistake at mount time used to (or could) move existing buyers onto a new hash,
+    so a retry missed its idempotency key. Now the buyer's retry replays its original purchase."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    original = await client.post(BASE, body())
+    assert original.status_code == 202, original.text
+    pid = original.json()["purchase_id"]
+
+    for name, value in mount.items():
+        monkeypatch.setenv(name, value)
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+    assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)

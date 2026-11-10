@@ -47,6 +47,8 @@ def test_with_the_dedicated_key_a_stored_hash_is_no_token_signature(monkeypatch)
     monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     assert buyer_vault.hash_agent_user_ref(payload_b64) == signature_hex  # the bug, when unset
 
+    # The mount: the copy and the dedicated key together (the dedicated key alone is refused).
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", TOKEN_KEY)
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
     assert buyer_vault.hash_agent_user_ref(payload_b64) == _hmac_hex(DEDICATED, payload_b64)
     assert buyer_vault.hash_agent_user_ref(payload_b64) != signature_hex
@@ -131,14 +133,14 @@ def test_the_legacy_hash_uses_the_legacy_copy_and_never_a_token_key(monkeypatch,
         assert legacy != _hmac_hex(token, USER_REF)
 
 
-def test_without_the_dedicated_key_a_mounted_legacy_copy_is_the_write_key(monkeypatch):
-    """So the token keys can rotate before the dedicated key is mounted, too: the copy holds the
-    old value, and the hash stops following the live token key."""
+@pytest.mark.parametrize("copy", [TOKEN_KEY, LEGACY_KEY, "a-wrong-copy-test-key"], ids=["matching", "other", "wrong"])
+def test_without_the_dedicated_key_the_copy_never_changes_a_hash(monkeypatch, copy):
+    """S-29b N-1: the copy mounted alone (step 2 of the rollout) writes exactly today's hash, so a
+    wrong copy changes nothing; the boot check is how ops sees it is wrong."""
     monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", copy)
 
-    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
-    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
-    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
     assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
 
 
@@ -153,9 +155,29 @@ def test_a_dedicated_key_equal_to_a_token_key_or_the_legacy_copy_is_refused(monk
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", "  " + DEDICATED + " ")
 
     assert buyer_vault._dedicated_hash_secret() == ""
-    pre_dedicated = LEGACY_KEY if equal_to != "BUYER_IDENTITY_LINK_LEGACY_SECRET" else DEDICATED
-    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(pre_dedicated, USER_REF)
+    # Today's write key: the first token key that is set (BUYER_ACTION, CHECKOUT, AGENT_CHECKOUT).
+    first_token = DEDICATED if equal_to in ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET") else TOKEN_KEY
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(first_token, USER_REF)
     assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+
+
+@pytest.mark.parametrize("copy", [None, "", "  "], ids=["unset", "empty", "whitespace"])
+def test_a_dedicated_key_without_the_copy_is_refused_while_the_window_is_open(monkeypatch, copy):
+    """S-29b N-1: no buyer moves onto the dedicated key unless the legacy read can find their old
+    rows. Refused = today's hash, for old and new buyers alike."""
+    if copy is None:
+        monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
+    else:
+        monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", copy)
+
+    assert buyer_vault._dedicated_key_problem() == "legacy_copy_missing"
+    assert buyer_vault._dedicated_hash_secret() == ""
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
+    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")  # the intended end state
+    assert buyer_vault._dedicated_key_problem() is None
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(DEDICATED, USER_REF)
 
 
 @pytest.mark.parametrize("value", ["", "  ", "\t\n"], ids=["empty", "spaces", "tab-newline"])
@@ -163,9 +185,11 @@ def test_a_whitespace_only_value_counts_as_unset(monkeypatch, value):
     # The dedicated key.
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", value)
     assert buyer_vault._dedicated_hash_secret() == ""
-    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(LEGACY_KEY, USER_REF)
-    # The legacy copy: the write key falls through to the first token key that is set.
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
+    # The legacy copy: no copy, so a real dedicated key is now refused (the window is open).
     monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", value)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
+    assert buyer_vault._dedicated_key_problem() == "legacy_copy_missing"
     assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
     # A token key: skipped, the next one is used.
     monkeypatch.setenv("BUYER_ACTION_TOKEN_SECRET", value)
@@ -291,15 +315,55 @@ def test_a_missing_legacy_copy_with_the_window_open_is_an_error_at_first_use(pla
     _state, clock = platform
     monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", DEDICATED)
 
-    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
-    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+    for _ in range(2):
+        assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
     clock["t"] += 3601
-    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
+    assert buyer_vault.hash_agent_user_ref(USER_REF) == _hmac_hex(TOKEN_KEY, USER_REF)
 
     lines = _config(records)
     assert [r.levelno for r in lines] == [logging.ERROR, logging.WARNING]
-    assert all("buyer_identity_hash_legacy_secret_missing" in r.getMessage() for r in lines)
+    assert all("buyer_identity_hash_secret_refused reason=legacy_copy_missing" in r.getMessage() for r in lines)
     assert TOKEN_KEY not in lines[0].getMessage() and DEDICATED not in lines[0].getMessage()
+
+
+# --- the boot copy check (S-29b N-1) -----------------------------------------------------------
+
+
+def _copy_check(records):
+    return [r for r in records if "buyer_identity_hash_legacy_copy_check" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "token_env,copy,answer",
+    [
+        ({"CHECKOUT_TOKEN_SECRET": "same-test-key"}, "same-test-key", "yes"),
+        ({"CHECKOUT_TOKEN_SECRET": "same-test-key"}, " same-test-key\n", "yes"),
+        ({"CHECKOUT_TOKEN_SECRET": "same-test-key"}, "a-wrong-copy-test-key", "no"),
+        ({"BUYER_ACTION_TOKEN_SECRET": "action-test-key", "CHECKOUT_TOKEN_SECRET": "same-test-key"}, "same-test-key", "no"),
+        ({}, "same-test-key", "no"),
+    ],
+    ids=["match", "padded-match", "wrong-copy", "not-the-first-token-key", "no-token-key"],
+)
+def test_the_boot_check_says_whether_the_copy_matches_todays_write_key(records, monkeypatch, token_env, copy, answer):
+    for name in ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in token_env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", copy)
+
+    assert buyer_vault.report_legacy_copy_matches_token_key() == answer
+    [line] = _copy_check(records)
+    assert f"legacy_copy_matches_token_key={answer}" in line.getMessage()
+    assert line.levelno == logging.WARNING
+    for secret in (copy.strip(), *token_env.values(), DEDICATED):
+        assert secret not in line.getMessage()
+
+
+def test_the_boot_check_is_silent_without_a_copy(records, monkeypatch):
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
+
+    assert buyer_vault.report_legacy_copy_matches_token_key() is None
+    assert _copy_check(records) == []
 
 
 def test_a_missing_legacy_copy_with_the_window_closed_is_the_intended_end_state(platform, records, monkeypatch):
@@ -392,3 +456,4 @@ def test_the_app_reports_a_missing_key_at_boot():
     lifespan = text[text.index("async def app_lifespan("):]
     lifespan = lifespan[: lifespan.index("await startup_event()")]
     assert "report_missing_buyer_identity_hash_secret(force=True)" in lifespan
+    assert "report_legacy_copy_matches_token_key()" in lifespan

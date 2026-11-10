@@ -249,9 +249,11 @@ async def test_rotating_the_token_key_keeps_every_legacy_identity(owner_db, monk
 
 
 @pytest.mark.parametrize("value", [None, "", "   "], ids=["unset", "empty", "whitespace"])
-async def test_without_the_legacy_copy_legacy_matching_is_refused_and_no_query_runs(owner_db, monkeypatch, value):
-    """The fallback choice: no copy = no legacy matching (and an ERROR, see the report tests), never
-    the live token key, even when the token key still holds the old value."""
+async def test_without_the_legacy_copy_the_dedicated_key_is_refused_and_every_buyer_keeps_todays_hash(
+        owner_db, monkeypatch, value):
+    """S-29b N-1, the copy missing (wrong name, or forgotten on one service). Before: legacy matching
+    was refused and every existing buyer silently moved onto the dedicated hash. Now the dedicated
+    key is refused: old and new buyers stay on today's token-key hash, and no lookup runs."""
     if value is None:
         monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
     else:
@@ -263,8 +265,30 @@ async def test_without_the_legacy_copy_legacy_matching_is_refused_and_no_query_r
 
     monkeypatch.setattr(owner_db, "fetch_one", no_query)
 
-    assert buyer_vault.legacy_agent_user_ref_hash(USER_REF) is None
-    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == dedicated_hash()
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, "end-user-placeholder-2") == _hmac_hex(
+        TOKEN_KEY, "end-user-placeholder-2"
+    )
+
+
+async def test_a_dedicated_key_equal_to_the_copy_keeps_every_buyer_on_todays_hash(owner_db, monkeypatch):
+    """The copy mounted twice under both names: the dedicated key is refused, nothing moves."""
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", TOKEN_KEY)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", TOKEN_KEY)
+    await _seed(owner_db, "a2a_rail_purchases", AGENT, token_key_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
+
+
+async def test_a_wrong_copy_before_the_dedicated_key_changes_no_hash(owner_db, monkeypatch):
+    """S-29b N-1, the copy mounted alone with a wrong value: writes keep today's token-key hash.
+    (With the dedicated key also mounted a wrong copy matches nothing; only the boot check
+    `legacy_copy_matches_token_key=no` can catch that, which is why the copy is checked first.)"""
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_SECRET")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", "a-wrong-copy-test-key")
+    await _seed(owner_db, "buyer_identity_links", AGENT, token_key_hash())
+
+    assert await buyer_vault.resolve_agent_user_ref_hash(AGENT, USER_REF) == token_key_hash()
 
 
 # --- the routes that read a link, end to end against the same tables ---------------------------

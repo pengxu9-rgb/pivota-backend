@@ -179,18 +179,27 @@ BUYER_IDENTITY_HASH_SECRET_ENV = "BUYER_IDENTITY_LINK_SECRET"
 #: after the dedicated key is mounted: the stored legacy hashes then stop being token signatures,
 #: and the rows stay readable.
 #:
-#: Unset while the dedicated key is set and the window is open: legacy matching is REFUSED and an
-#: ERROR says so. It never falls back to the live token key, which would tie the legacy read to a
-#: key that must rotate (and break silently when it does).
+#: Unset while the dedicated key is set and the window is open: the DEDICATED KEY is refused
+#: (`_dedicated_key_problem`), hashes stay on today's token key and an ERROR says so. Moving buyers
+#: onto the dedicated key without a legacy read would split every existing identity. It never falls
+#: back to the live token key for the legacy read, which would tie that read to a key that must
+#: rotate (and break silently when it does). The copy is READ ONLY by the legacy read, never for a
+#: write, so mounting it alone changes no hash; the boot line `legacy_copy_matches_token_key=yes|no`
+#: (`report_legacy_copy_matches_token_key`) is how ops confirms the copy before mounting the
+#: dedicated key. A WRONG copy cannot be refused by code (after the token key rotates, "differs" is
+#: the expected state), so that boot line is the check.
+#:
+#: Never remove the copy while the window is open: after the token key has rotated, a refused
+#: dedicated key falls back to the ROTATED token key and every hash changes. Close the window first.
 BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV = "BUYER_IDENTITY_LINK_LEGACY_SECRET"
 
 #: The token keys the hash fell back to before it had its own. Each one ALSO SIGNS A TOKEN: the buyer
 #: save token (routes.buyer_api._buyer_action_secret) or the checkout token
 #: (routes.agent_checkout_intents.mint_checkout_token). Those tokens are
 #: HMAC-SHA256(key, payload_b64), and agent_user_ref is a caller-chosen string, so a stored hash made
-#: with one of these keys IS a valid token signature for a payload the caller picked. Read for
-#: hashing only while neither the dedicated key nor the legacy copy is mounted (today's behaviour),
-#: and compared against the dedicated key so an equal value is refused.
+#: with one of these keys IS a valid token signature for a payload the caller picked. The WRITE key
+#: while no usable dedicated key is mounted (today's behaviour, unchanged); otherwise only compared
+#: against the dedicated key (an equal value is refused) and against the legacy copy (the boot line).
 _TOKEN_SECRET_ENVS = ("BUYER_ACTION_TOKEN_SECRET", "CHECKOUT_TOKEN_SECRET", "AGENT_CHECKOUT_TOKEN_SECRET")
 
 #: The legacy-read window. Open unless set to an off value; it only matters while the dedicated key
@@ -259,7 +268,10 @@ def _dedicated_key_problem() -> Optional[str]:
 
     Equal to a token key: every hash made with it is still a token signature (the oracle S-29
     closes). Equal to the legacy copy: it is the old key under a new name, so the legacy read
-    cannot tell old rows from new and the token-key value lives on as the write key.
+    cannot tell old rows from new and the token-key value lives on as the write key. The copy
+    missing while the window is open: every existing buyer would move onto the dedicated hash with
+    nothing to match their old rows, a silent split (S-29b N-1). Window closed and no copy is the
+    intended end state, not a problem.
     """
     dedicated = _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV)
     if not dedicated:
@@ -269,6 +281,8 @@ def _dedicated_key_problem() -> Optional[str]:
     legacy = _legacy_env_secret()
     if legacy and _same_secret(dedicated, legacy):
         return "dedicated_equals_legacy_key"
+    if not legacy and legacy_read_window_open():
+        return "legacy_copy_missing"
     return None
 
 
@@ -281,15 +295,13 @@ def _dedicated_hash_secret() -> str:
 
 
 def _pre_dedicated_hash_secret() -> str:
-    """The key a hash is WRITTEN with while there is no usable dedicated key.
+    """The key a hash is WRITTEN with while there is no usable dedicated key: today's derivation.
 
-    The legacy copy when it is mounted (so the token keys can rotate even before the dedicated key
-    is), else the first token key that is set (today's behaviour, unchanged), else "" (a laptop:
-    unkeyed SHA-256).
+    The first token key that is set, else "" (a laptop: unkeyed SHA-256). NEVER the legacy copy:
+    a wrong copy mounted ahead of the dedicated key would otherwise change every hash with no
+    signal (S-29b N-1). So mounting the copy alone changes nothing, and do not rotate the token
+    key before the dedicated key is mounted.
     """
-    legacy = _legacy_env_secret()
-    if legacy:
-        return legacy
     tokens = _token_secrets()
     return tokens[0] if tokens else ""
 
@@ -309,12 +321,7 @@ def _hash_key_config_problem() -> Optional[str]:
     """The one thing wrong with the hash keys right now, or None when nothing is."""
     if not _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV):
         return "dedicated_missing"
-    problem = _dedicated_key_problem()
-    if problem is not None:
-        return problem
-    if legacy_read_window_open() and not _legacy_env_secret():
-        return "legacy_key_missing"
-    return None
+    return _dedicated_key_problem()
 
 
 _PROBLEM_MESSAGES = {
@@ -337,13 +344,36 @@ _PROBLEM_MESSAGES = {
         + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
         + " and is IGNORED: hashes stay on the pre-dedicated key (%s). Mount a fresh random value."
     ),
-    "legacy_key_missing": (
-        "event=buyer_identity_hash_legacy_secret_missing "
+    "legacy_copy_missing": (
+        "event=buyer_identity_hash_secret_refused reason=legacy_copy_missing "
+        + BUYER_IDENTITY_HASH_SECRET_ENV
+        + " is IGNORED because "
         + BUYER_IDENTITY_HASH_LEGACY_SECRET_ENV
-        + " is unset while the legacy-read window is open: rows hashed before the dedicated key are "
-        "NOT matched (%s). Mount the legacy copy, or close the window."
+        + " is unset while the legacy-read window is open: hashes stay on the pre-dedicated key (%s). "
+        "Mount the legacy copy in the same revision, or close the window."
     ),
 }
+
+
+def report_legacy_copy_matches_token_key() -> Optional[str]:
+    """The boot check: does the legacy copy equal today's write key (the first token key set)?
+
+    Logs `event=buyer_identity_hash_legacy_copy_check legacy_copy_matches_token_key=yes|no` and
+    returns "yes"/"no"; None (no line) when no copy is mounted. Compares in constant time and logs
+    no value. "yes" is required before the dedicated key is mounted; "no" is expected only AFTER the
+    token key has rotated. A WARNING so it survives the production log level; it matches no alert.
+    """
+    legacy = _legacy_env_secret()
+    if not legacy:
+        return None
+    tokens = _token_secrets()
+    answer = "yes" if tokens and _same_secret(legacy, tokens[0]) else "no"
+    logger.warning(
+        "event=buyer_identity_hash_legacy_copy_check legacy_copy_matches_token_key=%s dedicated_mounted=%s",
+        answer,
+        "yes" if _env_secret(BUYER_IDENTITY_HASH_SECRET_ENV) else "no",
+    )
+    return answer
 
 
 def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
@@ -351,7 +381,8 @@ def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
 
     Silent on a laptop or in tests. The dedicated key merely being unset (the state between
     deploying this code and mounting the key) is a WARNING. A misconfiguration (a refused dedicated
-    key, or a missing legacy copy while the window is open) is ONE ERROR per process in production
+    key: equal to a token key or to the copy, or set without the copy while the window is open;
+    `_dedicated_key_problem`) is ONE ERROR per process in production
     (at boot or on first use) and a WARNING on each hourly repeat, and a WARNING on any other
     deployed host: the codebase's alerts match log text, and Sentry turns every ERROR into an event,
     so an hourly ERROR per instance would be noise that pages. No line carries a key, a ref or a
@@ -381,12 +412,7 @@ def report_missing_buyer_identity_hash_secret(*, force: bool = False) -> bool:
         return False
     _missing_secret_reported_at = now
     _reported_problem = problem
-    if problem == "legacy_key_missing":
-        detail = "legacy matching refused"
-    elif _pre_dedicated_hash_secret():
-        detail = "the legacy copy" if _legacy_env_secret() else "a token-signing key"
-    else:
-        detail = "no key, unkeyed sha256"
+    detail = "a token-signing key" if _pre_dedicated_hash_secret() else "no key, unkeyed sha256"
     first_error = production and problem != "dedicated_missing" and problem not in _errored_problems
     if first_error:
         _errored_problems.add(problem)
@@ -400,8 +426,8 @@ def hash_agent_user_ref(agent_user_ref: str) -> str:
     """
     The hash a NEW identity is written under: HMAC-SHA256 with BUYER_IDENTITY_LINK_SECRET.
 
-    Without a usable dedicated key it falls back to `_pre_dedicated_hash_secret` (the legacy copy,
-    else the first token key that is set, as before, else a bare SHA-256 for local dev) and reports
+    Without a usable dedicated key it falls back to `_pre_dedicated_hash_secret` (the first token
+    key that is set, exactly as before, else a bare SHA-256 for local dev) and reports
     it (`report_missing_buyer_identity_hash_secret`). Routes that look an identity up must use
     `resolve_agent_user_ref_hash`, which also matches rows written under the legacy key.
     """
@@ -419,9 +445,9 @@ def legacy_agent_user_ref_hash(agent_user_ref: str) -> Optional[str]:
     """The hash this ref had before the dedicated key, while the legacy-read window is open.
 
     Keyed with BUYER_IDENTITY_LINK_LEGACY_SECRET only, never with a live token key. None when there
-    is nothing to match: no usable dedicated key (the pre-dedicated key is then the write key), the
-    window is closed, the legacy copy is not mounted (refused, with an ERROR), or the two hashes
-    are the same.
+    is nothing to match: no usable dedicated key (the pre-dedicated key is then the write key; a
+    missing copy with the window open refuses the dedicated key), the window is closed, or the two
+    hashes are the same.
     """
     raw = str(agent_user_ref or "").strip()
     if not raw or not legacy_read_window_open():
@@ -430,8 +456,7 @@ def legacy_agent_user_ref_hash(agent_user_ref: str) -> Optional[str]:
     if not dedicated:
         return None
     legacy_key = _legacy_env_secret()
-    if not legacy_key:
-        report_missing_buyer_identity_hash_secret()
+    if not legacy_key:  # unreachable while the window is open: the dedicated key is then refused
         return None
     legacy = _keyed_hash(legacy_key, raw)
     return None if legacy == _keyed_hash(dedicated, raw) else legacy
