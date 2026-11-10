@@ -1,0 +1,90 @@
+{
+  "_about": [
+    "Freshness alert DEFINITIONS (FIX_PLAN R-03, over the protocol directory). Data only: nothing in the repo applies this file on deploy.",
+    "Apply with infra/gcp/apply_money_path_alerts.sh prod|staging (ALERT_EMAIL required for prod); it creates or updates each log metric, then each policy, and never deletes anything.",
+    "Every metric filter keys on lines written by utils/money_alerts.py (or the check's own summary line) through the pivota logger, which Cloud Run stores as textPayload; tests/test_money_path_alerts.py and tests/test_freshness_directory_check.py evaluate each filter against lines the real producers emit.",
+    "${CHANNEL} is replaced by the apply script with the email notification channel for ALERT_EMAIL (setup_monitoring.sh creates it)."
+  ],
+  "log_metrics": [
+    {
+      "name": "freshness_directory_past_limit",
+      "description": "R-03: a protocol-directory (domain, market) fact is past its clock (card fact 72 h, Tier B 48 h) or missing (FRESHNESS_DIRECTORY_CHECK_ENABLED)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"money_alert: \" AND textPayload:\"\\\"event\\\":\\\"freshness_directory_past_limit\\\"\""
+    },
+    {
+      "name": "freshness_directory_missing",
+      "description": "R-03: one count per protocol-directory (domain, market) with no fact at all on a clock, per hourly tick (the directory merchants without a fact; input of no policy of its own)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"money_alert: \" AND textPayload:\"\\\"event\\\":\\\"freshness_directory_past_limit\\\"\" AND textPayload:\"\\\"status\\\":\\\"missing\\\"\""
+    },
+    {
+      "name": "freshness_directory_check_heartbeat",
+      "description": "R-03: one line per completed protocol-directory freshness check tick (heartbeat; input of the went-silent policy)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"freshness_directory_check: {\""
+    }
+  ],
+  "alert_policies": [
+    {
+      "displayName": "prod: directory merchant fact past its limit",
+      "documentation": {
+        "content": "The protocol-directory freshness check (FRESHNESS_DIRECTORY_CHECK_ENABLED, hourly) found a merchant (domain, market) the directory can list whose card purchasability fact (buyer vantage, 72 h) or Tier B cart-link verdict (48 h) is past its limit, or that has no purchasability fact at all. Such a merchant drops out of `GET /agent/v1/merchants?scope=protocol` (or never enters it) and its purchases are refused. Each line names the clock, domain, market and status; `freshness_directory_missing` counts the missing ones. Usually a job stopped: check merchant-purchasability-sweep and tierb-cart-link-eligibility, their triggers and images. Standing: stays open while any fact is past. Definitions: infra/gcp/monitoring/money_path_alerts.json (FIX_PLAN R-03).",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "prod: directory merchant fact past its limit",
+          "conditionThreshold": {
+            "filter": "metric.type=\"logging.googleapis.com/user/freshness_directory_past_limit\" AND resource.type=\"cloud_run_revision\"",
+            "aggregations": [
+              {
+                "alignmentPeriod": "7200s",
+                "perSeriesAligner": "ALIGN_SUM",
+                "crossSeriesReducer": "REDUCE_SUM",
+                "groupByFields": [
+                  "resource.label.service_name"
+                ]
+              }
+            ],
+            "comparison": "COMPARISON_GT",
+            "thresholdValue": 0.0,
+            "duration": "0s",
+            "trigger": {
+              "count": 1
+            }
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "7200s"
+      }
+    },
+    {
+      "displayName": "prod: directory freshness check went silent",
+      "documentation": {
+        "content": "The protocol-directory freshness check printed its hourly summary in the last 24 hours and none for 3 hours. A stopped check cannot warn about a stopped job. Check the worker, /__scheduler_health (freshness_directory_check), SCHEDULER_JOB_ALLOWLIST and FRESHNESS_DIRECTORY_CHECK_ENABLED. Definitions: infra/gcp/monitoring/money_path_alerts.json (FIX_PLAN R-03).",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "summary line present in the last 24h, absent for 3h",
+          "conditionPrometheusQueryLanguage": {
+            "query": "(sum(sum_over_time(logging_googleapis_com:user_freshness_directory_check_heartbeat{monitored_resource=\"cloud_run_revision\"}[21h] offset 3h)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_freshness_directory_check_heartbeat{monitored_resource=\"cloud_run_revision\"}[3h])) > 0)",
+            "duration": "300s",
+            "evaluationInterval": "60s",
+            "disableMetricValidation": true
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "3600s"
+      }
+    }
+  ]
+}

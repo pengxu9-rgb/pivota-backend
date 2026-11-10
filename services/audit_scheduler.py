@@ -96,7 +96,7 @@ import asyncio
 import logging
 import math
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 from config.platform import is_deployed, platform_env, service_name
 from services.worker_flag import worker_flag_override  # the one AUDIT_WORKER_ENABLED parser
@@ -281,8 +281,17 @@ _JOB_RUN_DEADLINES = {
 }
 
 
+#: Deadlines of jobs registered ONLY while their flag is on (R-03). Kept out of
+#: `_JOB_RUN_DEADLINES` so that table still names exactly the jobs registered with every flag off
+#: (tests/test_scheduler_job_isolation.py holds that both ways).
+_FLAGGED_JOB_RUN_DEADLINES: Dict[str, float] = {
+    # R-03 over the protocol directory: the directory's own build, then two small table reads.
+    "freshness_directory_check": 300,
+}
+
+
 def run_deadline_for(job_id: str) -> float:
-    d = _JOB_RUN_DEADLINES.get(job_id)
+    d = _JOB_RUN_DEADLINES.get(job_id, _FLAGGED_JOB_RUN_DEADLINES.get(job_id))
     if d is None:
         logger.warning(
             "audit_scheduler: job %r has no entry in _JOB_RUN_DEADLINES; using "
@@ -1449,6 +1458,22 @@ async def start_scheduler() -> None:
             coalesce=True,
             max_instances=1,
         )
+
+        # R-03 (FIX_PLAN): a read-only freshness check over the protocol directory that writes alert
+        # lines. REGISTERED ONLY WHILE ITS FLAG IS ON, so with the flag off the registered job set (and
+        # /__scheduler_health) is exactly what it was. A flag change is an env change, i.e. a new
+        # revision, so a registration-time read is the same as a per-tick one here.
+        from services import freshness_clock_check
+        if freshness_clock_check.directory_check_enabled():
+            _add_job(
+                freshness_clock_check.run_freshness_directory_check_tick,
+                "interval",
+                seconds=freshness_clock_check.DIRECTORY_INTERVAL_SECONDS,
+                id=freshness_clock_check.DIRECTORY_JOB_ID,
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
 
         # Repairs orders whose merchant-order create was never QUEUED — an
         # enqueue lost to a DB failure, or an order predating the queue. It
