@@ -378,10 +378,14 @@ __all__ = [
     "exit_code_for",
     "is_enabled",
     "collect_population",
+    "last_checks",
     "load_population",
     "merge_lanes",
     "main",
     "run_merchant_purchasability_sweep",
+    "warm_click_cap",
+    "warm_click_recheck",
+    "warm_only_keys",
 ]
 
 
@@ -804,10 +808,23 @@ def _from_scan_row(row: Dict[str, Any]) -> CartMintLane:
     )
 
 
-async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulation:
+async def _cart_mint_population(*, fresh_scan: bool = False, cache_only: bool = False) -> CartMintPopulation:
     """The cart-mint lane under the once-a-day policy above. `fresh_scan=True` (the census) scans
-    now and neither reads nor writes the cache. RAISES `CartMintCacheUnavailable` (no scan was
-    attempted) or, with `fresh_scan`, whatever the scan raised."""
+    now and neither reads nor writes the cache. `cache_only=True` (a READER of the population, the
+    R-03 freshness check on the worker) never scans, never writes and runs no DDL: it is the last
+    complete scan, usable while it is no older than `_SCAN_MAX_AGE_S`, the same age bound a run
+    falls back under. RAISES `CartMintCacheUnavailable` (no scan was attempted) or, with
+    `fresh_scan`, whatever the scan raised; with `cache_only`, whatever the cache read raised."""
+    if fresh_scan and cache_only:
+        raise ValueError("fresh_scan and cache_only are exclusive")
+    if cache_only:
+        cached = await mint_scans.latest(complete_only=True)
+        if cached is None:
+            return CartMintPopulation(CartMintLane(hosts={}, complete=False), "cache", -1, False, "no_complete_scan")
+        age_s = int((_utcnow() - cached["scanned_at"]).total_seconds())
+        usable = age_s <= _SCAN_MAX_AGE_S
+        return CartMintPopulation(_from_scan_row(cached), "cache", age_s, usable,
+                                  "" if usable else "complete_scan_too_old")
     if fresh_scan:
         lane = await _cart_mint_lane()
         return CartMintPopulation(lane, "scan", 0, lane.complete, lane.incomplete_reason)
@@ -1036,11 +1053,37 @@ def _aware_utc(value: Any) -> Optional[datetime]:
 LANES = ("variant", "cart-link", "connected-store", "cart-mint", "warm-click")
 
 
+def warm_only_keys(lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]]) -> set:
+    """The WARM-ONLY keys: named by the warm-click lane and by no other. The one definition the
+    warm-click guard (`load_population`) and the R-03 freshness check both use."""
+    other = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
+    return {key for key in lanes.get("warm-click", {}) if key not in other}
+
+
+def warm_click_cap() -> int:
+    """`MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN`, read now. 0 = the lane is switched off."""
+    return _env_int(DIALS["warm_click_max_per_run"])
+
+
+def warm_click_recheck() -> timedelta:
+    """How often a warm-only key whose last check found no Shopify catalog is re-checked."""
+    return timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+
+
+def last_checks(due: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """`facts.list_due` rows by (stored domain, stored market): what the warm-click guard reads."""
+    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in due:
+        last[(str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))] = row
+    return last
+
+
 async def collect_population(
     *,
     tally: Optional[Dict[str, int]] = None,
     cart_mint: Optional[Dict[str, Any]] = None,
     fresh_cart_mint_scan: bool = False,
+    cart_mint_cache_only: bool = False,
 ) -> Dict[str, Dict[Tuple[str, str], Optional[str]]]:
     """Every lane's admitted (domain, market) keys, by lane name, each with its variant.
 
@@ -1055,9 +1098,11 @@ async def collect_population(
     `complete`, `source`, `age_s`, `seeds_by_key` — seeds per admitted key — and the warm-click
     lane's `warm_seeds` and `warm_seeds_by_key`, from the same scan). The cart-mint lane
     follows the once-a-day scan policy (`_cart_mint_population`); `fresh_cart_mint_scan=True`
-    scans now and touches no cache, which is what the read-only census does. This function is the
-    ONE place the population is decided: the sweep and scripts/merchant_purchasability_census.py
-    both read it.
+    scans now and touches no cache, which is what the read-only census does;
+    `cart_mint_cache_only=True` reads only the last complete scan (never scans, never writes), which
+    is what services/freshness_clock_check.py does on the worker. This function is the ONE place
+    the population is decided: the sweep, scripts/merchant_purchasability_census.py and the R-03
+    freshness check all read it.
     """
     lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]] = {name: {} for name in LANES}
 
@@ -1121,7 +1166,8 @@ async def collect_population(
             lanes["connected-store"].setdefault(key, None)
 
     population: Optional[CartMintPopulation] = await _lane(
-        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan), "cart-mint"
+        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan, cache_only=cart_mint_cache_only),
+        "cart-mint",
     )
     minted: Optional[CartMintLane] = population.lane if population is not None else None
     if population is not None:
@@ -1236,11 +1282,9 @@ async def load_population(
             "merchant_purchasability_sweep: the staleness read failed; this run sweeps in key "
             "order (error_type=%s)", type(exc).__name__,
         )
-    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for row in due:
-        key = (str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))
+    last = last_checks(due)
+    for key, row in last.items():
         seen[key] = row.get("checked_at")
-        last[key] = row
 
     def _staleness(key: Tuple[str, str]) -> Tuple[int, str]:
         checked = seen.get(key)
@@ -1250,15 +1294,15 @@ async def load_population(
 
     # THE WARM-CLICK GUARD (see "THE FIFTH LANE"). Warm-ONLY keys are the ones no other lane names;
     # a key another lane also names is swept as that lane's, unguarded, exactly as before.
-    other_keys = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
-    warm_cap = _env_int(DIALS["warm_click_max_per_run"])
-    recheck = timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+    warm_only = warm_only_keys(lanes)
+    warm_cap = warm_click_cap()
+    recheck = warm_click_recheck()
     now = _utcnow()
     core: List[Tuple[Tuple[str, str], Optional[str]]] = []
     warm: List[Tuple[Tuple[str, str], Optional[str]]] = []
     deferred = 0
     for key, variant in merged.items():
-        if key in other_keys:
+        if key not in warm_only:
             core.append((key, variant))
             continue
         if warm_cap == 0:

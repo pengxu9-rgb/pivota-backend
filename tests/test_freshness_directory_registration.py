@@ -43,3 +43,30 @@ async def test_registered_only_while_its_own_flag_is_on(monkeypatch, clean_state
     assert [j for j in rec.ids if j in MAIN_WORKER_JOB_IDS] == MAIN_WORKER_JOB_IDS
     for job_id in expected:
         assert clean_state.run_deadline_for(job_id) == 300
+
+
+async def test_the_job_is_an_hourly_cron_not_an_interval(monkeypatch, clean_state):
+    """An `interval` clock restarts on every worker deploy (which is every merge) and starves; the
+    went-silent policy would then page with the job healthy. Pinned: cron at a fixed minute, with
+    a misfire grace and coalescing, like the module's other hourly crons."""
+    import test_scheduler_job_allowlist as allowlist_suite
+
+    calls = []
+
+    class _Recording(allowlist_suite._RecordingScheduler):
+        def add_job(self, func, *a, **k):
+            super().add_job(func, *a, **k)
+            calls.append((a, k))
+
+    rec = _Recording()
+    monkeypatch.setattr("apscheduler.schedulers.asyncio.AsyncIOScheduler", lambda *a, **k: rec)
+    for key, value in {"PIVOTA_ENV": "production", "AUDIT_WORKER_ENABLED": "true",
+                       fresh.DIRECTORY_FLAG_ENV: "1"}.items():
+        monkeypatch.setenv(key, value)
+    await clean_state.start_scheduler()
+    assert clean_state._BOOT_ERROR is None, clean_state._BOOT_ERROR
+    [(args, kwargs)] = [(a, k) for a, k in calls if k.get("id") == fresh.DIRECTORY_JOB_ID]
+    assert args == ("cron",)
+    assert {k: v for k, v in kwargs.items() if k != "id"} == {
+        "minute": 34, "replace_existing": True, "misfire_grace_time": 1800, "coalesce": True, "max_instances": 1}
+    assert fresh.DIRECTORY_CRON_MINUTE == 34 and not 10 <= fresh.DIRECTORY_CRON_MINUTE <= 25

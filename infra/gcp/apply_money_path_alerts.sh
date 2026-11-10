@@ -14,6 +14,12 @@
 #      A policy over a metric created seconds ago may be refused with "Cannot find metric(s)" for
 #      up to 10 minutes: such a policy is DEFERRED (named at the end, exit 1), never half-written.
 #      Re-run the script ten minutes later; it is idempotent.
+#      ON STAGING every "prod:" display name (the policy's and each condition's) is written as
+#      "staging:", exactly as setup_monitoring.sh's environment_policy_name/body do, so staging
+#      never carries (or emails) prod names. Matching uses the renamed name.
+#      A PATCH (no updateMask) REPLACES the whole policy with the definition in git, EXCEPT
+#      `enabled`: the current value is carried over, so a policy an operator disabled stays
+#      disabled. A new policy is created enabled (the API default).
 #   It never deletes a metric, a policy or a channel.
 #
 # The same REST approach as setup_monitoring.sh (no `gcloud alpha monitoring`, whose missing
@@ -79,7 +85,13 @@ for ((i = 0; i < COUNT; i++)); do
 import json, sys
 p = json.load(open(sys.argv[1]))["alert_policies"][int(sys.argv[2])]
 p["notificationChannels"] = [sys.argv[3] if c == "${CHANNEL}" else c for c in p["notificationChannels"]]
-print(json.dumps(p))' "$DEFS" "$i" "$CHANNEL")"
+env = sys.argv[4]
+if env != "prod":
+    for entry in [p, *p.get("conditions", [])]:
+        name = entry.get("displayName", "")
+        if name.startswith("prod:"):
+            entry["displayName"] = env + ":" + name[5:]
+print(json.dumps(p))' "$DEFS" "$i" "$CHANNEL" "$ENV")"
   NAME_OF="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["displayName"])' "$BODY")"
   CURRENT="$(python3 -c '
 import json, sys
@@ -91,6 +103,13 @@ if len(hits) > 1:
     sys.exit("more than one policy named " + sys.argv[2] + "; resolve by hand first")
 print(hits[0] if hits else "")' "$EXISTING" "$NAME_OF")"
   if [ -n "$CURRENT" ]; then
+    BODY="$(python3 -c '
+import json, sys
+d, body = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+current = next(p for p in d.get("alertPolicies", []) if p.get("name") == sys.argv[3])
+if "enabled" in current:
+    body["enabled"] = current["enabled"]
+print(json.dumps(body))' "$EXISTING" "$BODY" "$CURRENT")"
     RESP="$(api PATCH "${CURRENT#projects/*/}" "$BODY")"
     VERB=updated
   else

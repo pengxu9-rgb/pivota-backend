@@ -113,14 +113,18 @@ def test_every_event_has_exactly_the_metric_meant_for_it(defs):
     assert _hits(defs, missing) == ["freshness_directory_missing", "freshness_directory_past_limit"]
     beat = '[ts] INFO - freshness_directory_check: {"fresh":1,"missing":0,"negative":0,"pairs":1}'
     assert _hits(defs, beat) == ["freshness_directory_check_heartbeat"]
+    down = '[ts] WARNING - freshness_directory_check_unavailable: {"pairs":null,"reason":"read_failed","unavailable":1}'
+    assert _hits(defs, down) == ["freshness_directory_check_unavailable"], "an unavailable tick is no heartbeat"
     assert set(expected) == set(money_alerts.EVENTS)
 
 
 def test_the_file_holds_only_the_directory_freshness_definitions(defs):
     assert sorted(m["name"] for m in defs["log_metrics"]) == [
-        "freshness_directory_check_heartbeat", "freshness_directory_missing", "freshness_directory_past_limit"]
+        "freshness_directory_check_heartbeat", "freshness_directory_check_unavailable",
+        "freshness_directory_missing", "freshness_directory_past_limit"]
     assert sorted(p["displayName"] for p in defs["alert_policies"]) == [
-        "prod: directory freshness check went silent", "prod: directory merchant fact past its limit"]
+        "prod: directory freshness check cannot read its population", "prod: directory freshness check went silent",
+        "prod: directory merchant fact past its limit"]
 
 
 def test_an_unrelated_line_feeds_no_metric(defs):
@@ -152,3 +156,84 @@ def test_the_apply_script_parses_and_never_deletes():
     source = APPLY.read_text(encoding="utf-8")
     assert "money_path_alerts.json" in source
     assert "DELETE" not in source and "metrics delete" not in source
+
+
+# ── the apply script, driven with a fake gcloud and curl ─────────────────────────────────────
+
+_FAKE_CURL = r"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+method = args[args.index("-X") + 1]
+body = args[args.index("-d") + 1] if "-d" in args else None
+url = args[-1]
+with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({"method": method, "url": url, "body": json.loads(body) if body else None}) + "\n")
+if method == "GET" and url.endswith("/notificationChannels"):
+    print(json.dumps({"notificationChannels": [{"type": "email", "name": "projects/p/notificationChannels/7",
+                                                "labels": {"email_address": "ops@example.com"}}]}))
+elif method == "GET":
+    print(open(os.environ["FAKE_POLICIES"], encoding="utf-8").read())
+else:
+    print(json.dumps({"name": "projects/p/alertPolicies/new"}))
+"""
+
+_FAKE_GCLOUD = """#!/usr/bin/env bash
+case "$1 $2" in
+  "auth print-access-token") echo fake-token ;;
+  *) exit 0 ;;
+esac
+"""
+
+
+def _run_apply(tmp_path, env_name, existing):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, text in (("curl", _FAKE_CURL), ("gcloud", _FAKE_GCLOUD)):
+        (bin_dir / name).write_text(text, encoding="utf-8")
+        (bin_dir / name).chmod(0o755)
+    policies = tmp_path / "policies.json"
+    policies.write_text(json.dumps({"alertPolicies": existing}), encoding="utf-8")
+    log = tmp_path / "requests.jsonl"
+    env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "HOME": str(tmp_path), "ALERT_EMAIL": "ops@example.com",
+           "GCLOUD": str(bin_dir / "gcloud"), "FAKE_LOG": str(log), "FAKE_POLICIES": str(policies)}
+    done = subprocess.run(["bash", str(APPLY), env_name], env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+def _writes(requests):
+    return [r for r in requests if r["method"] in ("POST", "PATCH")]
+
+
+def test_staging_policies_are_named_staging_never_prod(tmp_path, defs):
+    writes = _writes(_run_apply(tmp_path, "staging", existing=[]))
+    assert len(writes) == len(defs["alert_policies"]) and all(w["method"] == "POST" for w in writes)
+    for write in writes:
+        names = [write["body"]["displayName"]] + [c["displayName"] for c in write["body"]["conditions"]]
+        assert all(not n.startswith("prod:") for n in names), names
+        assert write["body"]["displayName"].startswith("staging: ")
+        assert write["body"]["notificationChannels"] == ["projects/p/notificationChannels/7"]
+        assert "pivota-staging" in write["url"]
+    assert sorted(w["body"]["displayName"] for w in writes) == sorted(
+        "staging:" + p["displayName"][len("prod:"):] for p in defs["alert_policies"])
+
+
+def test_prod_names_are_unchanged(tmp_path, defs):
+    writes = _writes(_run_apply(tmp_path, "prod", existing=[]))
+    assert sorted(w["body"]["displayName"] for w in writes) == sorted(p["displayName"] for p in defs["alert_policies"])
+    assert all("pivota-prod" in w["url"] for w in writes)
+
+
+def test_an_update_keeps_the_enabled_value_an_operator_set(tmp_path, defs):
+    names = [p["displayName"] for p in defs["alert_policies"]]
+    existing = [
+        {"name": "projects/pivota-prod/alertPolicies/1", "displayName": names[0], "enabled": False},
+        {"name": "projects/pivota-prod/alertPolicies/2", "displayName": names[1], "enabled": True},
+    ]
+    writes = _writes(_run_apply(tmp_path, "prod", existing=existing))
+    by_name = {w["body"]["displayName"]: w for w in writes}
+    assert by_name[names[0]]["method"] == "PATCH" and by_name[names[0]]["url"].endswith("/alertPolicies/1")
+    assert by_name[names[0]]["body"]["enabled"] is False, "a disabled policy stays disabled"
+    assert by_name[names[1]]["method"] == "PATCH" and by_name[names[1]]["body"]["enabled"] is True
+    created = [w for w in writes if w["method"] == "POST"]
+    assert created and all("enabled" not in w["body"] for w in created), "a new policy takes the API default"
