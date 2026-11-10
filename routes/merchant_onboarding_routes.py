@@ -237,19 +237,19 @@ async def refuse_signup_at_claimed_address(
 
     A public sign-up does not prove the mailbox, yet it creates the users row (and
     sets the identity's password) at this address. If the address already names an
-    employee (any status), an agent owner, or an identity with a password or a
-    membership, that row would let the caller sign in as that principal: login
-    promotes a users row to staff at an employee's address. Merchant onboarding
-    has already checked the users table and the merchant contacts; a caller that
-    has not passes `also_check_users_and_merchant_contacts=True`. The owner signs
-    in, or resets the password from the portal, which emails that mailbox.
+    employee (any status), an agent owner, or an identity with a live merchant,
+    agent or employee membership, that row would let the caller sign in as that
+    principal (login used to promote a users row to staff at an employee's
+    address). Merchant onboarding has already checked the users table and the
+    merchant contacts; a caller that has not passes
+    `also_check_users_and_merchant_contacts=True`. The owner signs in, or resets
+    the password from the portal, which emails that mailbox.
     """
     from routes.auth import _email_claims_existing_tenant
 
     if await _email_claims_existing_tenant(
         normalize_contact_email(contact_email),
         check_users_and_merchant_contacts=also_check_users_and_merchant_contacts,
-        any_employee_status=True,
     ):
         raise HTTPException(
             status_code=409,
