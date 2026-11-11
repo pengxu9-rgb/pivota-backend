@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import httpx
 
+from services.seed_data_egress_projection import serve_search_products
 from services.synthetic_call import is_synthetic_call
 
 FLAG = "AGENT_BEAUTY_SEARCH_VIA_GATEWAY"
@@ -134,7 +135,7 @@ def to_backend_envelope(
     gateway_metadata = gateway_body.get("metadata") if isinstance(gateway_body.get("metadata"), dict) else {}
     return {
         "status": "success",
-        "products": products,
+        "products": serve_search_products(products),
         "pagination": {
             "total_count": total,
             "limit": limit,

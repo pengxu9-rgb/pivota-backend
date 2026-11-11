@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import os
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -209,14 +211,26 @@ def test_the_executor_map_covers_every_rail_the_ledger_accepts():
     assert set(rails.RAIL_EXECUTOR.values()) <= set(purchases.EXECUTORS)
 
 
-def test_the_module_opens_no_database_transactions():
-    tree = ast.parse((_REPO / "db/agent_purchase_ledger.py").read_text("utf-8"))
-    calls = [
+def _transaction_calls(tree):
+    return [
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         and node.func.attr == "transaction"
     ]
-    assert not calls
+
+
+def test_the_module_opens_no_database_transactions():
+    """It never opens one. The single `transaction()` is the heal's per-row SAVEPOINT, taken only when
+    the caller already holds a transaction (so it nests: a SAVEPOINT, never a BEGIN)."""
+    tree = ast.parse((_REPO / "db/agent_purchase_ledger.py").read_text("utf-8"))
+    [heal_rows] = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_heal_rows"]
+    [guard] = [n for n in ast.walk(heal_rows) if isinstance(n, ast.If) and _transaction_calls(n)]
+    assert ast.unparse(guard.test) == "savepoint"
+    assert _transaction_calls(ast.Module(body=guard.body, type_ignores=[])) and not _transaction_calls(
+        ast.Module(body=guard.orelse, type_ignores=[]))
+    [assign] = [n for n in heal_rows.body if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "savepoint"]
+    assert ast.unparse(assign.value) == "_in_transaction()"
+    assert len(_transaction_calls(tree)) == 1
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -400,3 +414,241 @@ def test_the_prepare_gate_collects_the_postgres_statements_of_this_module():
         purchases._COUNT_REAP_MISSING_PARENTS_SQL,
     ):
         assert " ".join(statement.split()) in collected, statement.split("\n")[1][:60]
+
+
+# ── healing, row by row ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def heal_clock(monkeypatch):
+    """A clock the test moves, and an empty retry memory (it is per process). The cap is restored after
+    each test: the backfill script raises it for its own run."""
+    now = [1000.0]
+    monkeypatch.setattr(purchases, "_clock", lambda: now[0])
+    monkeypatch.setattr(purchases, "_heal_deferred_until", {})
+    monkeypatch.setattr(purchases, "_HEAL_DEFERRED_MAX", purchases._HEAL_DEFERRED_MAX)
+    return now
+
+
+async def _reaps_in_order(n: int) -> list:
+    """`n` Reap purchases, oldest first (created a day apart, so the heal order is fixed)."""
+    ids = []
+    for days in range(n, 0, -1):
+        rp = await _reap()
+        await database.execute(
+            "UPDATE reap_agentic_purchases SET created_at = datetime('now', '-' || :d || ' days') WHERE id = :i",
+            {"d": days, "i": rp},
+        )
+        ids.append(rp)
+    return ids
+
+
+def _failing_for(monkeypatch, bad, tried=None):
+    real = purchases.ensure_reap_parent
+
+    async def flaky(rail_purchase_id, **kw):
+        if tried is not None:
+            tried.append(rail_purchase_id)
+        if rail_purchase_id in bad:
+            raise RuntimeError("constraint violation")
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_reap_parent", flaky)
+    return real
+
+
+async def _heal(how: str, **kw) -> int:
+    if how == "backfill":
+        return await purchases.backfill_reap_parents(**kw)
+    return await purchases.heal_reap_parents_for_owner(AGENT, OWNER, **kw)
+
+
+@pytest.mark.parametrize("how", ["backfill", "owner"])
+async def test_a_reap_row_whose_parent_cannot_be_written_does_not_stop_the_rest(how, heal_clock, monkeypatch, caplog):
+    older, newer = await _reaps_in_order(2)
+    bad, good = (older, newer) if how == "backfill" else (newer, older)  # the bad row is tried first
+    real = _failing_for(monkeypatch, {bad})
+    with caplog.at_level(logging.WARNING, logger=purchases.__name__):
+        assert await _heal(how) == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [good]
+    [warning] = [r.getMessage() for r in caplog.records if "parent heal failed" in r.getMessage()]
+    assert "reap parent heal failed" in warning and bad in warning and "RuntimeError" in warning
+    # Left alone while it waits, even once it could be healed; tried again after the wait (short on
+    # the owner heal, a list read).
+    monkeypatch.setattr(purchases, "ensure_reap_parent", real)
+    wait = purchases.HEAL_RETRY_AFTER_SECONDS if how == "backfill" else purchases.HEAL_OWNER_RETRY_AFTER_SECONDS
+    assert await _heal(how) == 0
+    heal_clock[0] += wait - 1
+    assert await _heal(how) == 0
+    heal_clock[0] += 1
+    assert await _heal(how) == 1
+    assert sorted(r["rail_purchase_id"] for r in await _parent_rows()) == sorted([bad, good])
+
+
+@pytest.mark.parametrize("how", ["backfill", "owner"])
+async def test_a_row_waiting_to_retry_does_not_use_up_the_limit(how, heal_clock, monkeypatch):
+    older, newer = await _reaps_in_order(2)
+    bad, good = (older, newer) if how == "backfill" else (newer, older)
+    _failing_for(monkeypatch, {bad})
+    assert await _heal(how, limit=1) == 0  # the bad row is first and takes the run
+    tally = Counter()
+    if how == "backfill":
+        assert await purchases.backfill_reap_parents(limit=1, tally=tally) == 1
+        assert tally == {"deferred": 1}
+    else:
+        assert await _heal(how, limit=1) == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [good]
+
+
+async def test_failures_in_a_row_end_the_run_and_the_next_run_starts_after_them(heal_clock, monkeypatch, caplog):
+    stop = purchases.HEAL_STOP_AFTER_FAILURES_IN_A_ROW
+    ids = await _reaps_in_order(stop + 2)
+    tried = []
+    _failing_for(monkeypatch, set(ids), tried)
+    tally = Counter()
+    with caplog.at_level(logging.WARNING, logger=purchases.__name__):
+        assert await purchases.backfill_reap_parents(tally=tally) == 0
+    assert tally == {"failed": stop, "stopped": 1}
+    assert tried == ids[:stop]
+    lines = [r.getMessage() for r in caplog.records if r.name == purchases.__name__]
+    assert len(lines) == stop + 1 and f"stopped after {stop} failures in a row" in lines[-1]
+    tried.clear()
+    tally = Counter()
+    assert await purchases.backfill_reap_parents(tally=tally) == 0
+    assert tally == {"failed": 2, "deferred": stop}
+    assert tried == ids[stop:]
+
+
+async def test_a_success_resets_the_failures_in_a_row(heal_clock, monkeypatch):
+    stop = purchases.HEAL_STOP_AFTER_FAILURES_IN_A_ROW
+    ids = await _reaps_in_order(2 * stop)
+    good = {ids[stop - 1], ids[-1]}  # stop-1 failures, a success, stop-1 failures, a success
+    _failing_for(monkeypatch, set(ids) - good)
+    tally = Counter()
+    assert await purchases.backfill_reap_parents(tally=tally) == 2
+    assert tally == {"failed": 2 * (stop - 1)}
+    assert {r["rail_purchase_id"] for r in await _parent_rows()} == good
+
+
+def test_the_retry_memory_is_bounded(heal_clock, monkeypatch):
+    monkeypatch.setattr(purchases, "_HEAL_DEFERRED_MAX", 3)
+    for n in range(5):
+        purchases._defer("backfill", "reap", f"rp_{n}")
+    assert purchases._deferred_ids("backfill", "reap") == {"rp_2", "rp_3", "rp_4"}
+    heal_clock[0] += purchases.HEAL_RETRY_AFTER_SECONDS
+    assert purchases._deferred_ids("backfill", "reap") == frozenset() and purchases._heal_deferred_until == {}
+
+
+async def test_the_owner_heal_and_the_backfill_keep_separate_retry_memories(heal_clock, monkeypatch):
+    """A row the backfill failed on is still tried by the next list read, and the other way round."""
+    bad = (await _reaps_in_order(1))[0]
+    real = _failing_for(monkeypatch, {bad})
+    assert await purchases.backfill_reap_parents() == 0
+    assert purchases._deferred_ids("owner", "reap") == frozenset()
+    monkeypatch.setattr(purchases, "ensure_reap_parent", real)
+    assert await purchases.heal_reap_parents_for_owner(AGENT, OWNER) == 1
+    other = (await _reaps_in_order(1))[0]
+    _failing_for(monkeypatch, {other})
+    assert await purchases.heal_reap_parents_for_owner(AGENT, OWNER) == 0
+    assert purchases._deferred_ids("backfill", "reap") == {bad}
+    assert purchases._deferred_ids("owner", "reap") == {other}
+
+
+async def test_every_row_read_that_is_waiting_to_retry_is_counted_even_past_the_limit(heal_clock):
+    first, _over_the_limit, third, fourth = await _reaps_in_order(4)
+    purchases._defer("backfill", "reap", third)
+    purchases._defer("backfill", "reap", fourth)
+    tally = Counter()
+    # Reads limit + 2 deferred = 3 rows; the run ends at the second, and the third (read, waiting) still
+    # counts. The fourth is not read.
+    assert await purchases.backfill_reap_parents(limit=1, tally=tally) == 1
+    assert tally == {"deferred": 1}
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [first]
+
+
+async def test_the_transaction_check_reads_this_connections_transaction_stack():
+    """`_in_transaction` reads a private of databases 0.7.0; this fails if an upgrade moves it."""
+    assert purchases._in_transaction() is False
+    async with database.transaction():
+        assert purchases._in_transaction() is True
+    assert purchases._in_transaction() is False
+
+
+async def test_inside_a_callers_transaction_each_row_is_healed_in_a_savepoint(heal_clock, monkeypatch):
+    """On Postgres this is what keeps a failed row from aborting the caller's transaction
+    (tests/test_agent_purchase_events_postgres.py); here, that the nesting itself works."""
+    bad, good = await _reaps_in_order(2)
+    _failing_for(monkeypatch, {bad})
+    async with database.transaction():
+        assert await purchases.backfill_reap_parents() == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [good]
+
+
+async def _run_script(monkeypatch, **args):
+    import argparse
+
+    import scripts.backfill_agent_purchases as script
+
+    async def nothing(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(purchases, "ensure_agent_purchase_schema", nothing)
+    monkeypatch.setattr(database, "connect", nothing)
+    monkeypatch.setattr(database, "disconnect", nothing)
+    return await script.run(argparse.Namespace(**{"dry_run": False, "batch": 500, "max_batches": 10, **args}))
+
+
+async def test_the_backfill_script_carries_on_past_failures_and_stops_when_a_batch_neither_parents_nor_fails(
+        monkeypatch, capsys):
+    batches = iter([(2, {}), (0, {"failed": 1, "deferred": 2}), (0, {"deferred": 3})])
+    calls = []
+
+    async def backfill(*, limit, tally):
+        parented, outcome = next(batches)
+        tally.update(outcome)
+        calls.append(limit)
+        return parented
+
+    async def missing():
+        return 1
+
+    monkeypatch.setattr(purchases, "backfill_reap_parents", backfill)
+    monkeypatch.setattr(purchases, "count_missing_reap_parents", missing)
+    assert await _run_script(monkeypatch, batch=7) == 1  # a row failed
+    assert calls == [7, 7, 7]
+    assert capsys.readouterr().out.splitlines() == [
+        "batch=0 parented=2 total=2 failed=0 skipped_after_failure=0 stopped=0",
+        "batch=1 parented=0 total=2 failed=1 skipped_after_failure=2 stopped=0",
+        "batch=2 parented=0 total=2 failed=0 skipped_after_failure=3 stopped=0",
+        "done parented=2 failed_attempts=1 missing_parents=1",
+    ]
+
+
+async def test_rows_that_always_fail_do_not_keep_the_backfill_script_from_the_rest(monkeypatch, capsys):
+    """The oldest rows fail every time and stop the first batch; the next batch skips them and parents
+    the rest, and the script says it did not finish."""
+    stop = purchases.HEAL_STOP_AFTER_FAILURES_IN_A_ROW
+    ids = await _reaps_in_order(stop + 3)
+    _failing_for(monkeypatch, set(ids[:stop]))
+    assert await _run_script(monkeypatch) == 1
+    assert sorted(r["rail_purchase_id"] for r in await _parent_rows()) == sorted(ids[stop:])
+    assert capsys.readouterr().out.splitlines()[-1] == f"done parented=3 failed_attempts={stop} missing_parents={stop}"
+
+
+async def test_the_backfill_script_exits_0_when_every_row_is_parented(monkeypatch, capsys):
+    await _reaps_in_order(2)
+    assert await _run_script(monkeypatch) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "done parented=2 failed_attempts=0 missing_parents=0"
+
+
+async def test_more_failing_rows_than_the_retry_memory_holds_do_not_keep_the_script_from_the_rest(
+        monkeypatch, capsys):
+    """With the web-process cap, the oldest failures would be forgotten and retried batch after batch
+    (to --max-batches) instead of reaching the healthy row. The script lifts the cap for its own run."""
+    monkeypatch.setattr(purchases, "_HEAL_DEFERRED_MAX", 2)
+    monkeypatch.setattr(purchases, "HEAL_STOP_AFTER_FAILURES_IN_A_ROW", 2)
+    ids = await _reaps_in_order(5)
+    _failing_for(monkeypatch, set(ids[:4]))
+    assert await _run_script(monkeypatch, max_batches=10) == 1
+    assert [r["rail_purchase_id"] for r in await _parent_rows()] == [ids[4]]
+    assert capsys.readouterr().out.splitlines()[-1] == "done parented=1 failed_attempts=4 missing_parents=4"

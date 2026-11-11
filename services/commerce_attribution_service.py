@@ -700,11 +700,16 @@ async def upsert_order_attribution_edge(
         },
         "updated_at": now,
     }
+    # M-05: the merchant's is_test, read by primary key now (None, with no read, unless both flags
+    # are on; a failure or timeout is "not test").
+    is_test_ids = await test_traffic.read_is_test_merchant_ids([merchant_id])
     # O-07: stamp a test order's edge (services.test_traffic) so GMV, statements and outcomes skip
     # it. Off (TEST_TRAFFIC_STAMP_ENABLED unset) or a real order: the metadata is unchanged.
     test_traffic.stamp(
         values["metadata"],
-        test_traffic.classify_test_traffic(merchant_ids=[merchant_id], server_metadata=payload),
+        test_traffic.classify_test_traffic(
+            merchant_ids=[merchant_id], server_metadata=payload, is_test_merchant_ids=is_test_ids
+        ),
     )
     interaction_event = await record_commerce_event_best_effort(
         event_type="order.created",
@@ -1718,6 +1723,9 @@ async def close_external_order_conversion(
             # else: click_matched is False → T2-3 already excludes this edge; we do NOT
             #       double-guard with seller_mismatch, only stamp the converting domain.
 
+    # M-05: both merchants' is_test, read by primary key now (None, with no read, unless both flags
+    # are on; a failure or timeout is "not test").
+    is_test_ids = await test_traffic.read_is_test_merchant_ids([subject_merchant_id, merchant_id])
     values = {
         "edge_id": edge_id,
         # ADR-009 D3: the edge SUBJECT is the seller (seller_ref) when seller-keyed,
@@ -1755,6 +1763,7 @@ async def close_external_order_conversion(
                 test_traffic.classify_test_traffic(
                     merchant_ids=[subject_merchant_id, merchant_id],
                     shopify_order=None if is_self_report else note_attrs_or_payload,
+                    is_test_merchant_ids=is_test_ids,
                 ),
             )
         ),

@@ -1,6 +1,6 @@
 # ADR-028: Pivota completes the order on the merchant's own checkout; the buyer stays in the agent front
 
-**Status:** Proposed, 2026-11-02. peng decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms). **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place. **Also since 2026-11-10, D6 is the rule for now:** Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a compliance assessment and a separate owner decision (ADR-030, "D3. Who completes the payment").
+**Status:** Proposed, 2026-11-02. peng decided the direction and five questions on 2026-11-02 (see "Resolved questions"). Revised 2026-11-02 after review. One owner decision is open (D5, robots and terms); it was decided on 2026-11-10 for a payment partner's checkout agent (ADR-030 D11) and stays open for any other agent. **Amended 2026-11-08 (amendment 1)** with three decisions of the decision owner: D6 is replaced (Pivota never sees, receives or holds the card credential; the payment partner fills the merchant's checkout), and D10 (the merchant is merchant of record on every lane) and D11 (a refund is a request to the merchant) are added. See "Amendment 1" below. **Since 2026-11-10, Pivota does not call `complete_checkout` for now** (ADR-030, "D3. Who completes the payment"); the protocol route passages are marked in place. **Also since 2026-11-10, D6 is the rule for now:** Later, only under ADR-030 D3's conditions, Pivota may pass a single-use, merchant- and amount-scoped network token and its cryptogram to the merchant's payment handler, never storing or logging them; a card number or security code never passes through Pivota. Enabling that needs a compliance assessment and a separate owner decision (ADR-030, "D3. Who completes the payment").
 
 **Decision owner:** peng
 
@@ -143,6 +143,8 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 
 ### D5. Identity, the browser route and probes
 
+> **Amended 2026-11-10 (ADR-030 D11), for a payment partner's checkout agent only.** The run condition below gains one entry: the merchant publishes an agentic checkout protocol (the UCP checkout capability, or ACP). For that agent the interim clause at the end of this section no longer applies, and the robots-and-terms decision is made in ADR-030 D11. The signing rule in the first bullet reads "the agent identifies itself" on that route. Every other rule of this section stands, and Pivota's own runner is unchanged. See ADR-030, "D11. The run condition for a payment partner's checkout agent (amends ADR-028 D5)".
+
 - Every completion request MUST be signed with Pivota's agent identity: protocol signatures (UCP signed and token tiers) and, on the browser route, the card networks' agent recognition (Trusted Agent Protocol, Agent Pay, HTTP message signatures).
 - **When the browser route may run (the run condition).** It MUST run on a merchant only when one of these holds:
   - the merchant, or its edge, **verifies** our signature (verified recognition, observed and recorded);
@@ -188,6 +190,8 @@ Every rule below written as **MUST** or **MUST NOT** is enforced in code, behind
 - **Card-data scope.** Keeping credentials out of Pivota's systems is the precondition for the SAQ-A scope; it is not proof of it. A QSA scoping opinion is still to be obtained, and no SAQ-A claim relies on this ADR until it is on file.
 
 ### D7. The buyer confirms exactly what is paid
+
+> **Amended 2026-11-10 (ADR-030 D3), on the payment-partner route only.** In the same checkout session as the quote, payment is for exactly the approved total. If the partner has to re-open the session, a lower total is paid without re-asking only when the seller of record, the items and the currency are unchanged; any other change re-asks. Above the approved total the purchase fails with no charge. Everywhere else this section stands as written. See ADR-030, "D3. Who completes the payment".
 
 - **Every code attempt finishes before confirmation.** Before any payment, the agent front shows what the merchant's checkout itself returned, after all code attempts (D8): the seller of record, the items, the codes and automatic discounts applied, shipping, tax, the currency and the total.
 - **The confirmation is a cart mandate** under the buyer's consent (ADR-012-agent-transaction-rail-boundary). It binds the seller of record, the items, the currency and the total.
