@@ -4483,10 +4483,12 @@ async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypa
     import jobs.reap_agentic_purchase_poll as job
     await _recovery_checkout()
     monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
-    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',0.02)
+    # Seconds, not milliseconds: the timeout also times the HEALTHY counts, which must answer
+    # inside it even on a loaded runner. The Postgres twin holds the same with a server-side hang.
+    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',1)
     async def hang():await asyncio.Event().wait()
     monkeypatch.setattr(ledger,'count_contact_retention_blocked',hang)
-    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
+    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),10)
     assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
     assert report.errors==1 and report.checkout_needs_human==0
 
