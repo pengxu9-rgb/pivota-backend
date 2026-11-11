@@ -584,6 +584,7 @@ async def test_approve_payout_binds_approved_by_only_when_the_column_exists(
     monkeypatch.setattr(module, "database", fake)
     monkeypatch.setattr(module, "_table_columns", _columns)
     monkeypatch.setattr(module, "execute_payout", _execute_payout)
+    monkeypatch.setenv("PARTNER_PAYOUT_EXECUTION_ENABLED", "true")  # the O-05 gate (W3 F5)
 
     await module.approve_payout(42, "ops@pivota.cc")
 

@@ -104,8 +104,7 @@ ORDER BY us.updated_at DESC NULLS LAST, us.created_at DESC NULLS LAST
 LIMIT 1
 """
 
-_GMV_ROWS_QUERY = """
-SELECT
+_GMV_ROWS_SELECT_LIST = """
     id,
     date,
     merchant_id,
@@ -117,12 +116,63 @@ SELECT
     take_rate_bp,
     take_amount_cents,
     protocol_name
-FROM gmv_attribution_daily
+"""
+_GMV_ROWS_QUERY_HEAD = """
+SELECT""" + _GMV_ROWS_SELECT_LIST + """FROM gmv_attribution_daily
 WHERE merchant_id = :merchant_id
   AND date BETWEEN :period_start AND :period_end
-  AND take_amount_cents > 0
+  AND take_amount_cents > 0"""
+_GMV_ROWS_QUERY_TAIL = """
 ORDER BY date ASC, id ASC
 """
+_GMV_ROWS_QUERY = _GMV_ROWS_QUERY_HEAD + _GMV_ROWS_QUERY_TAIL
+
+
+def _gmv_rows_query() -> str:
+    """The rows an invoice bills. With MERCHANT_IS_TEST_FILTER_ENABLED on, also not a merchant that
+    is is_test at the time of the read (M-05 P2-2, services.test_traffic.is_test_merchant_lock_sql):
+    the read under the day locks is the lock, so history stamped before the flag never reaches an
+    invoice. Off, exactly _GMV_ROWS_QUERY."""
+    from services.test_traffic import is_test_merchant_lock_sql
+
+    return _GMV_ROWS_QUERY_HEAD + is_test_merchant_lock_sql("gmv_attribution_daily.merchant_id") + _GMV_ROWS_QUERY_TAIL
+
+
+async def _record_is_test_lock_drop(
+    billing_run_id: int, merchant_id: str, period_start: date, period_end: date
+) -> None:
+    """M-05 P3-B: when the rows read came back empty, say so if the lock-time is_test check is why.
+    One read-only count, only while MERCHANT_IS_TEST_FILTER_ENABLED is on, in its own savepoint (a
+    failure must not abort the caller's transaction); one audit line per (run, merchant). The run
+    still returns None for the merchant: this records it, it does not change it."""
+    from services import test_traffic
+
+    if not test_traffic.lock_drop_audit_enabled():
+        return
+    try:
+        async with database.transaction():
+            row = await database.fetch_one(
+                _GMV_ROWS_QUERY_HEAD.replace(
+                    _GMV_ROWS_SELECT_LIST, " COUNT(*) AS n, COALESCE(SUM(take_amount_cents), 0) AS cents "
+                )
+                + " AND "
+                + test_traffic.is_test_merchant_exists_sql("gmv_attribution_daily.merchant_id"),
+                {"merchant_id": merchant_id, "period_start": period_start, "period_end": period_end},
+            )
+    except Exception as exc:  # noqa: BLE001 — the audit read never fails the run
+        test_traffic.log_is_test_lock_drop_count_failed(
+            "invoice_run", ref=f"billing_run:{billing_run_id}", merchant_id=merchant_id, exc=exc
+        )
+        return
+    dropped = _as_int(_get(row, "n"))
+    if dropped > 0:
+        test_traffic.log_is_test_lock_drop(
+            "invoice_run",
+            ref=f"billing_run:{billing_run_id}",
+            merchant_id=merchant_id,
+            rows=dropped,
+            take_cents=_as_int(_get(row, "cents")),
+        )
 
 _INSERT_BILLING_RUN_ITEM_QUERY = """
 INSERT INTO billing_run_items (
@@ -501,7 +551,7 @@ async def generate_merchant_invoice(
         return None
 
     rows = await database.fetch_all(
-        _GMV_ROWS_QUERY,
+        _gmv_rows_query(),
         {
             "merchant_id": merchant_id,
             "period_start": period_start,
@@ -509,6 +559,7 @@ async def generate_merchant_invoice(
         },
     )
     if not rows:
+        await _record_is_test_lock_drop(billing_run_id, merchant_id, period_start, period_end)
         return None
 
     await _ensure_invoice_generation_schema()
@@ -527,8 +578,10 @@ async def generate_merchant_invoice(
             from services.gmv_aggregation_service import lock_billing_days
 
             await lock_billing_days(period_start, period_end, db=database)
+            # M-05 P2-2: the merchant's is_test is re-read HERE, under the lock, not trusted from
+            # the pre-read above or from the write-time stamp.
             rows = await database.fetch_all(
-                _GMV_ROWS_QUERY,
+                _gmv_rows_query(),
                 {
                     "merchant_id": merchant_id,
                     "period_start": period_start,
@@ -536,6 +589,8 @@ async def generate_merchant_invoice(
                 },
             )
             if not rows:
+                # Marked is_test between the pre-read and this one: recorded here instead.
+                await _record_is_test_lock_drop(billing_run_id, merchant_id, period_start, period_end)
                 return None
             total_cents = sum(_as_int(_get(row, "take_amount_cents")) for row in rows)
 

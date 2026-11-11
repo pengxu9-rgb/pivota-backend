@@ -117,6 +117,7 @@ from services.payment_offer_evidence_service import (
 )
 from services.refund_observability import build_order_refund_tracking_payload
 from services.seed_data_egress_projection import (
+    replace_lone_surrogates,
     serve_detail_product,
     serve_search_products,
 )
@@ -277,6 +278,17 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         request.state.traffic_taxonomy = dict(taxonomy)
     except Exception:
         return
+
+
+def _is_stamped_test_order_create(merchant_id: Optional[str]) -> bool:
+    """O-07: whether a just-created order is test traffic that create_order stamped (the rig
+    merchant / probe legs of services.test_traffic; the canary does not create through this
+    route). False whenever TEST_TRAFFIC_STAMP_ENABLED is off, so counting is then unchanged."""
+    from services import test_traffic
+
+    if not test_traffic.stamp_enabled():
+        return False
+    return test_traffic.is_test_traffic(merchant_ids=[merchant_id])
 
 
 def _enqueue_agent_create_order_background_task(
@@ -3824,7 +3836,14 @@ async def _build_external_seed_product(
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-    snapshot = _ensure_json_obj(seed_data.get("snapshot"))
+    _raw_snapshot = seed_data.get("snapshot")
+    snapshot = _ensure_json_obj(_raw_snapshot)
+    if isinstance(_raw_snapshot, str):
+        # A snapshot stored as JSON TEXT can hold an escaped lone surrogate (a split emoji), and parsing
+        # yields a raw one. Every field copied from it below -- the URLs and the id included, which go
+        # into the UTF-8 redirect token before any response boundary -- must be encodable, or the token
+        # raises and the product is silently dropped.
+        snapshot = replace_lone_surrogates(snapshot)
     canonical_url = (
         str(seed_row.get("canonical_url") or "").strip()
         or str(snapshot.get("canonical_url") or "").strip()
@@ -5618,7 +5637,7 @@ async def agent_search_products(
 
                 return {
                     "status": "success",
-                    "products": page_items,
+                    "products": serve_search_products(page_items),
                     "pagination": {
                         # Avoid COUNT(*) in hot path; provide a lower bound.
                         "total_count": page_offset + len(page_items) + (1 if has_more else 0),
@@ -8257,39 +8276,10 @@ async def agent_get_product(
         if not _context_can_access_merchant(context, merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # Special handling for Platform Orders products (SKU-xxx format)
-        # These are from Amazon/Temu and don't exist in Shopify/Wix cache
-        if product_id.startswith('SKU-'):
-            logger.info(f"Returning mock product for Platform Order SKU: {product_id}")
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id
-            )
-            return {
-                "status": "success",
-                "product": {
-                    "id": product_id,
-                    "title": f"Platform Order Product {product_id}",
-                    "price": 10.00,  # Default price, actual price is in order data
-                    "currency": "USD",
-                    "platform": "shopify",  # Mock as shopify for ACP compatibility
-                    "stock": 999,
-                    "available": True,
-                    "variants": [{
-                        "id": product_id,
-                        "title": "Default",
-                        "price": 10.00,
-                        "sku": product_id,
-                        "available": True
-                    }]
-                },
-                "metadata": {
-                    "detail_source": "upstream",
-                },
-            }
-        
+        # A `SKU-*` id gets no special case. This route used to answer any such id with a made-up product
+        # (10.00 USD, stock 999) for "Platform Orders" lines; nothing calls it that way, and a partner was
+        # served a fake price (FIX_PLAN D-10). It now takes the same lookup, and the same 404, as any id.
+        #
         # Detail source order:
         # 1) fresh_cache
         # 2) upstream (realtime path)
@@ -9500,6 +9490,9 @@ async def agent_create_order(
                     merchant_id=order_request.merchant_id,
                     order_id=order_response.order_id,
                     order_amount=order_amount,
+                    # The one call that counts an order (agents.total_orders/total_gmv). A test
+                    # order (services/test_traffic.py) is not counted while stamping is on.
+                    order_created=not _is_stamped_test_order_create(order_request.merchant_id),
                 ),
             )
         except Exception as log_error:
@@ -10936,6 +10929,14 @@ async def agent_cancel_order(
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): this door cancels the way POST /agent/v2/orders/{id}/cancel
+        # does, closing the hosted payment page at the PSP first and cancelling only an unpaid row, with v2's codes.
+        # Off (the default): the unchanged path below.
+        from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+        if checkout_cancel_upstream_enabled():
+            return await _agent_cancel_order_upstream(order_id, order, context, background_tasks)
+
         # Block cancel if clearly paid/succeeded
         paid_status = str(order.get("payment_status") or "").lower()
         if paid_status in ("paid", "succeeded", "completed"):
@@ -11005,6 +11006,50 @@ async def agent_cancel_order(
     except Exception as e:
         logger.error(f"Agent cancel error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+async def _agent_cancel_order_upstream(
+    order_id: str,
+    order: Dict[str, Any],
+    context: AgentContext,
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """The v1 cancel with CHECKOUT_CANCEL_UPSTREAM_ENABLED on: services/checkout_cancel_upstream.cancel_order_upstream
+    and v2's answers (409 ORDER_ALREADY_PAID / PAYMENT_PROCESSING, 503 CANCEL_NOT_CONFIRMED). A 200 keeps v1's own
+    keys (order_id, and the "already cancelled" message) beside v2's `cancel` block. The order_cancelled event and
+    the order.cancelled webhook go out only when THIS call cancelled the row."""
+    from routes.agent_v2 import cancel_upstream_answer
+    from services.checkout_cancel_upstream import OUTCOME_ALREADY_CANCELED, OUTCOME_CANCELED, cancel_order_upstream
+
+    result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    answer = cancel_upstream_answer(order_id, order, result)  # raises the 409 / 503 answers
+    if result["outcome"] == OUTCOME_ALREADY_CANCELED:
+        return {"status": "success", "order_id": order_id, "message": "Order already cancelled", "cancel": answer["cancel"]}
+    if result["outcome"] == OUTCOME_CANCELED:
+        try:
+            from db.products import log_order_event
+
+            await log_order_event(
+                event_type="order_cancelled",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                status="cancelled",
+                metadata={"cancelled_by": "agent"},
+            )
+        except Exception:
+            pass
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.cancelled",
+                payload={"order_id": order_id, "merchant_id": order["merchant_id"], "status": "cancelled"},
+            )
+        except Exception:
+            pass
+    return {"status": "success", "order_id": order_id, "cancel": answer["cancel"]}
 
 
 @router.get("/orders/{order_id}/track")
