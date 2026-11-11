@@ -280,7 +280,9 @@ def _optional(pattern: "re.Pattern[str]", value: Any, name: str) -> Optional[str
 #: about 1 in 10 such 14-19 digit numbers pass the Luhn check: the same exemption the transport makes
 #: (a2a_rail._REFERENCE_KEYS + _PURE_DIGITS_RE). Refusing them would strand a paid purchase in `paying`.
 _ORDER_REF_FIELDS = frozenset({"order_id", "merchant_order_id"})
-_PURE_DIGITS_RE = re.compile(r"^\d{1,128}\Z")
+#: `vic:` is the VIC order step's marker on `order_id` (a2a_rail_worker.VIC_ORDER_PREFIX): the digits after
+#: it are the rail's order reference, exempt the same way.
+_PURE_DIGITS_RE = re.compile(r"^(?:vic:)?\d{1,124}\Z|^\d{1,128}\Z")
 
 
 def _rail_ref(value: Any, name: str) -> Optional[str]:

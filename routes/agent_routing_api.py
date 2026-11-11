@@ -12,6 +12,7 @@ import json
 from db.database import database
 from services.payment_routing_service import PaymentRoutingService
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_agent_scope
 
 # Initialize router
 router = APIRouter(
@@ -74,8 +75,7 @@ async def test_agent_routing(
     """
     # Verify agent access
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         # Use simulate endpoint from routing service
@@ -112,8 +112,7 @@ async def get_agent_routing_policy(
     [Phase 5] Get this agent's routing policies
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         policy = await database.fetch_one(
@@ -156,8 +155,7 @@ async def create_agent_routing_policy(
     Note: Agent policies must respect merchant rules
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         # Validate policy structure
@@ -236,8 +234,7 @@ async def delete_agent_routing_policy(
     [Phase 5] Delete specific routing policy
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         result = await database.execute(
@@ -271,8 +268,7 @@ async def get_agent_routing_history(
     [Phase 5] Get routing decision history for this agent
     """
     # Allow: agent accessing own data, or admin/employee
-    if current_user.get("agent_id") != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-        raise HTTPException(status_code=403, detail="Access denied")
+    assert_agent_scope(current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     
     try:
         results = await database.fetch_all(

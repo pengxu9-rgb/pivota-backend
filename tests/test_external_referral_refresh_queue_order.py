@@ -42,7 +42,7 @@ def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, 
         " domain TEXT, market TEXT, price_currency TEXT, last_crawl_attempt_at TEXT,"
         " last_crawled_at TEXT, updated_at TEXT, destination_url TEXT)"
     )
-    conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT)")
+    conn.execute("CREATE TABLE catalog_products (product_key TEXT, suppressed_at TEXT, suppression_reason TEXT)")
     conn.execute(
         "CREATE TABLE catalog_source_quarantine (match_type TEXT, match_value TEXT, state TEXT,"
         " expires_at TEXT)"
@@ -61,7 +61,7 @@ def _candidates(monkeypatch, seeds, *, quarantined=(), suppressed=(), limit=50, 
             row,
         )
     conn.executemany(
-        "INSERT INTO catalog_products VALUES (?, '2026-09-01 00:00:00')", [(k,) for k in suppressed]
+        "INSERT INTO catalog_products VALUES (?, '2026-09-01 00:00:00', 'duplicate_offer')", [(k,) for k in suppressed]
     )
     conn.executemany(
         "INSERT INTO catalog_source_quarantine VALUES ('domain', ?, 'active', NULL)",

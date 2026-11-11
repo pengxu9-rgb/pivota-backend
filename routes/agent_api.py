@@ -42,12 +42,18 @@ from routes.refund_api import process_refund
 from routes.order_routes import cancel_order as admin_cancel_order
 from routes.fulfillment_api import track_order_fulfillment
 import routes.order_routes as order_routes_module
-from routes.agent_auth import AgentContext, get_agent_context, log_agent_request
+from routes.agent_auth import (
+    AgentContext,
+    ensure_checkout_token_order_access,
+    get_agent_context,
+    has_no_merchant_scope,
+    log_agent_request,
+)
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
 from services.product_query_service import get_products_hybrid
-from services.quote_service import QuoteError
+from services.quote_service import QuoteError, require_quote_for_caller
 from services.commerce_execution_policy import (
     COMMERCE_PATH_PIVOTA_DIRECT_QUOTE_FIRST,
     SURFACE_PUBLIC_AGENT_PURCHASE,
@@ -110,6 +116,11 @@ from services.payment_offer_evidence_service import (
     stable_payment_offer_hash,
 )
 from services.refund_observability import build_order_refund_tracking_payload
+from services.seed_data_egress_projection import (
+    replace_lone_surrogates,
+    serve_detail_product,
+    serve_search_products,
+)
 from services.order_confirmation_email_service import order_confirmation_email_enabled
 from db.agent_product_events import log_product_events
 from config.feature_flags import ENABLE_QUOTE_FIRST_ORDER_CREATE
@@ -267,6 +278,17 @@ def _set_request_taxonomy_state(request: Optional[Request], taxonomy: Optional[D
         request.state.traffic_taxonomy = dict(taxonomy)
     except Exception:
         return
+
+
+def _is_stamped_test_order_create(merchant_id: Optional[str]) -> bool:
+    """O-07: whether a just-created order is test traffic that create_order stamped (the rig
+    merchant / probe legs of services.test_traffic; the canary does not create through this
+    route). False whenever TEST_TRAFFIC_STAMP_ENABLED is off, so counting is then unchanged."""
+    from services import test_traffic
+
+    if not test_traffic.stamp_enabled():
+        return False
+    return test_traffic.is_test_traffic(merchant_ids=[merchant_id])
 
 
 def _enqueue_agent_create_order_background_task(
@@ -494,30 +516,117 @@ async def _build_agent_order_create_response_from_order(order: Dict[str, Any]) -
     return response
 
 
+def _order_create_replay_owner(context: Any) -> Dict[str, Optional[str]]:
+    """Who an order-create replay belongs to: the calling agent, and a checkout token's session.
+
+    Every REST partner reaches the same merchants, and the idempotency key is the caller's own
+    string, so replay (both the response cache and the order lookup) is scoped to the calling
+    agent. A checkout token is narrowed further to its own intent: the hosted page must not replay
+    an order its agent created elsewhere.
+    """
+    agent_id = str(getattr(context, "agent_id", None) or "").strip() or None
+    intent_id = None
+    token_payload = getattr(context, "checkout_token_payload", None)
+    if isinstance(token_payload, dict):
+        intent_id = str(token_payload.get("intent_id") or "").strip() or None
+    return {"agent_id": agent_id, "intent_id": intent_id}
+
+
+def _order_create_idempotency_cache_key(
+    idempotency_key: Optional[str],
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
+) -> Optional[str]:
+    """The idempotency-store key for an order create, namespaced by its owner (None = no caching)."""
+    key = str(idempotency_key or "").strip()
+    agent = str(agent_id or "").strip()
+    if not key or not agent:
+        return None
+    intent = str(intent_id or "").strip()
+    if intent:
+        return f"agent:{agent}:intent:{intent}:{key}"
+    return f"agent:{agent}:{key}"
+
+
+async def _get_cached_agent_order_create_response(
+    idempotency_key: Optional[str],
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
+) -> Any:
+    """The cached order-create response for this owner's key, or None.
+
+    Entries are stored under the owner-namespaced key. Entries written before that (under the bare
+    key, kept for the idempotency TTL) are still replayed, byte for byte, but only when the order
+    they name is this caller's: its `agent_id`, and for a checkout token its intent. Anything else is
+    a miss, so another agent's entry never answers. The legacy read can go once the TTL has passed.
+    """
+    cache_key = _order_create_idempotency_cache_key(
+        idempotency_key,
+        agent_id=agent_id,
+        intent_id=intent_id,
+    )
+    if not cache_key:
+        return None
+    record = await _AGENT_ORDER_IDEMPOTENCY_STORE.get(scope="order_create", key=cache_key)
+    if record is not None:
+        return record
+    legacy_key = str(idempotency_key or "").strip()
+    legacy = await _AGENT_ORDER_IDEMPOTENCY_STORE.get(scope="order_create", key=legacy_key)
+    legacy_value = getattr(legacy, "value", None)
+    if not isinstance(legacy_value, dict):
+        return None
+    legacy_order_id = str(legacy_value.get("order_id") or "").strip()
+    if not legacy_order_id:
+        return None
+    order = await get_order(legacy_order_id)
+    if not isinstance(order, dict) or str(order.get("agent_id") or "").strip() != str(agent_id or "").strip():
+        return None
+    if intent_id:
+        order_metadata = _coerce_json_object(order.get("metadata"))
+        if str(order_metadata.get("intent_id") or "").strip() != str(intent_id).strip():
+            return None
+    return legacy
+
+
 async def _cache_agent_order_create_response_best_effort(
     idempotency_key: Optional[str],
     response: Dict[str, Any],
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
 ) -> None:
-    if not idempotency_key:
+    cache_key = _order_create_idempotency_cache_key(
+        idempotency_key,
+        agent_id=agent_id,
+        intent_id=intent_id,
+    )
+    if not cache_key:
         return
     try:
-        await _AGENT_ORDER_IDEMPOTENCY_STORE.put(scope="order_create", key=idempotency_key, value=response)
+        await _AGENT_ORDER_IDEMPOTENCY_STORE.put(scope="order_create", key=cache_key, value=response)
     except Exception:
         pass
 
 
 async def _load_replayable_agent_order_create_response(
     order_request: CreateOrderRequest,
+    *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     replay_perf_order = getattr(order_request, "order_id", None)
     try:
         _t = time.perf_counter()
         existing_order = await find_replayable_order_for_create(
             merchant_id=order_request.merchant_id,
+            agent_id=agent_id,
             idempotency_key=getattr(order_request, "idempotency_key", None),
             quote_id=getattr(order_request, "quote_id", None),
             agent_session_id=getattr(order_request, "agent_session_id", None),
             preferred_psp=getattr(order_request, "preferred_psp", None),
+            intent_id=intent_id,
         )
         logger.info(
             "[AgentAPI][PERF] step=_load_replayable.find_replayable_order_for_create "
@@ -573,17 +682,25 @@ ORDER_CREATE_BUSY_REPLAY_MAX_DELAY_SECONDS = max(
 async def _load_replayable_agent_order_create_response_with_backoff(
     order_request: CreateOrderRequest,
     *,
+    agent_id: Optional[str],
+    intent_id: Optional[str],
     attempts: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Poll for an already-persisted order after transient asyncpg busy failures."""
     total_attempts = max(1, attempts or ORDER_CREATE_BUSY_REPLAY_ATTEMPTS)
     delay = ORDER_CREATE_BUSY_REPLAY_INITIAL_DELAY_SECONDS
     for attempt in range(total_attempts):
-        replay_response = await _load_replayable_agent_order_create_response(order_request)
+        replay_response = await _load_replayable_agent_order_create_response(
+            order_request,
+            agent_id=agent_id,
+            intent_id=intent_id,
+        )
         if replay_response:
             await _cache_agent_order_create_response_best_effort(
                 getattr(order_request, "idempotency_key", None),
                 replay_response,
+                agent_id=agent_id,
+                intent_id=intent_id,
             )
             return replay_response
         if attempt >= total_attempts - 1:
@@ -3719,7 +3836,14 @@ async def _build_external_seed_product(
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-    snapshot = _ensure_json_obj(seed_data.get("snapshot"))
+    _raw_snapshot = seed_data.get("snapshot")
+    snapshot = _ensure_json_obj(_raw_snapshot)
+    if isinstance(_raw_snapshot, str):
+        # A snapshot stored as JSON TEXT can hold an escaped lone surrogate (a split emoji), and parsing
+        # yields a raw one. Every field copied from it below -- the URLs and the id included, which go
+        # into the UTF-8 redirect token before any response boundary -- must be encodable, or the token
+        # raises and the product is silently dropped.
+        snapshot = replace_lone_surrogates(snapshot)
     canonical_url = (
         str(seed_row.get("canonical_url") or "").strip()
         or str(snapshot.get("canonical_url") or "").strip()
@@ -5189,6 +5313,53 @@ async def agent_search_products(
         limit = max(1, min(int(limit or 20), AGENT_SEARCH_LIMIT_MAX))
         offset = max(0, int(offset or 0))
 
+        # An agent whose allowlist is an EMPTY list may search NO merchant. Every lane below
+        # falls back to cross-merchant search when it finds no scope, which read `[]` as
+        # "unrestricted" (a new self-serve key starts at `[]` until staff grant merchants).
+        if has_no_merchant_scope(context):
+            if merchant_id or any(str(m or "").strip() for m in (merchant_ids or [])):
+                # A named merchant this agent may not access: the 403 the scoped lanes below give.
+                raise HTTPException(status_code=403, detail="Not authorized for this merchant")
+            background_tasks.add_task(
+                log_agent_request,
+                context=context,
+                status_code=200,
+                merchant_id="no_merchant_scope",
+            )
+            return {
+                "status": "success",
+                "products": [],
+                "pagination": {
+                    "total_count": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "page": (offset // limit) + 1,
+                    "total_pages": 0,
+                    "has_more": False,
+                },
+                "search_context": {
+                    "merchant_id": None,
+                    "merchant_ids": [],
+                    "merchants_searched": [],
+                    "cross_merchant_search": False,
+                    "catalog_surface": catalog_surface,
+                },
+                "filters_applied": {
+                    "query": query,
+                    "category": category,
+                    "catalog_surface": catalog_surface,
+                    "min_price": min_price,
+                    "max_price": max_price,
+                    "in_stock_only": in_stock_only,
+                },
+                "metadata": _finalize_search_metadata({
+                    "source": "agent_search_products",
+                    "reason_code": "no_merchant_scope",
+                    "latency_ms": int((time.perf_counter() - started) * 1000),
+                    "external_seed_returned_count": 0,
+                }),
+            }
+
         def _record_search_metric(*, mode: str, path: str, result: str) -> None:
             try:
                 record_catalog_search(
@@ -5466,7 +5637,7 @@ async def agent_search_products(
 
                 return {
                     "status": "success",
-                    "products": page_items,
+                    "products": serve_search_products(page_items),
                     "pagination": {
                         # Avoid COUNT(*) in hot path; provide a lower bound.
                         "total_count": page_offset + len(page_items) + (1 if has_more else 0),
@@ -5898,7 +6069,7 @@ async def agent_search_products(
 
             return {
                 "status": "success",
-                "products": paginated_products,
+                "products": serve_search_products(paginated_products),
                 "pagination": {
                     "total_count": total,
                     "limit": limit,
@@ -6298,7 +6469,7 @@ async def agent_search_products(
 
             return {
                 "status": "success",
-                "products": paginated_products,
+                "products": serve_search_products(paginated_products),
                 "pagination": {
                     "total_count": total,
                     "limit": limit,
@@ -6825,7 +6996,7 @@ async def agent_search_products(
         
         return {
             "status": "success",
-            "products": paginated_products,
+            "products": serve_search_products(paginated_products),
             "pagination": {
                 "total_count": total,
                 "limit": limit,
@@ -8091,13 +8262,11 @@ async def agent_get_product(
                 status_code=200,
                 merchant_id=merchant_id,
             )
-            # The stored seed_data blob is internal state; only its allowlisted projection leaves
-            # (copy-on-write: `prod` and the row it was built from keep the full blob).
-            from services.seed_data_egress_projection import project_product_seed_data
-
+            # The stored seed_data blob is internal state; only its allowlisted projection leaves, and
+            # every string is made encodable (copy-on-write: `prod` and its row keep the full blob).
             return {
                 "status": "success",
-                "product": project_product_seed_data(prod),
+                "product": serve_detail_product(prod),
                 "metadata": {
                     "detail_source": "upstream",
                 },
@@ -8451,6 +8620,8 @@ async def agent_record_payment_offer_evidence(
     order = None
     if evidence_request.order_id:
         order = await get_order(str(evidence_request.order_id))
+        # A checkout token records evidence only on its own order (before not-found: no probe).
+        ensure_checkout_token_order_access(context, order)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
@@ -8621,6 +8792,8 @@ async def agent_create_order(
     success = False
     decision_layer_decision_id: Optional[str] = None
     decision_layer_checkout_decision_id: Optional[str] = None
+    # Replay (cache + order lookup) belongs to the calling agent, and to a checkout token's intent.
+    replay_owner = _order_create_replay_owner(context)
     
     try:
         # 验证商户访问权限
@@ -8686,6 +8859,11 @@ async def agent_create_order(
                 },
             )
 
+        # S-28: a quote the caller does not own is refused BEFORE anything reads it: it carries its
+        # preview's buyer email and address, and the default replay key below is built from the
+        # quote id alone, so another agent's quote id would otherwise replay that agent's order.
+        await require_quote_for_caller(order_request.quote_id, context)
+
         order_create_idempotency_key = getattr(order_request, "idempotency_key", None)
         if order_request.quote_id and not order_create_idempotency_key:
             order_create_idempotency_key = _default_order_create_idempotency_key(
@@ -8721,9 +8899,9 @@ async def agent_create_order(
             if not order_create_idempotency_key:
                 return None
             _t = time.perf_counter()
-            existing = await _AGENT_ORDER_IDEMPOTENCY_STORE.get(
-                scope="order_create",
-                key=order_create_idempotency_key,
+            existing = await _get_cached_agent_order_create_response(
+                order_create_idempotency_key,
+                **replay_owner,
             )
             logger.info(
                 "[AgentAPI][PERF] step=idempotency.get duration_ms=%d order=%s",
@@ -8734,7 +8912,7 @@ async def agent_create_order(
 
         async def _timed_load_replayable_agent_order_create_response() -> Optional[Dict[str, Any]]:
             _t = time.perf_counter()
-            replay = await _load_replayable_agent_order_create_response(replay_order_request)
+            replay = await _load_replayable_agent_order_create_response(replay_order_request, **replay_owner)
             logger.info(
                 "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response duration_ms=%d order=%s",
                 int((time.perf_counter() - _t) * 1000),
@@ -8831,6 +9009,7 @@ async def agent_create_order(
             await _cache_agent_order_create_response_best_effort(
                 getattr(order_request, "idempotency_key", None),
                 replay_response,
+                **replay_owner,
             )
             return replay_response
 
@@ -9028,7 +9207,10 @@ async def agent_create_order(
 
             token_payload = getattr(context, "checkout_token_payload", None)
             if isinstance(token_payload, dict):
-                for key in ("intent_id", "buyer_ref", "job_id", "market", "locale", "brief_id", "brief_schema_version"):
+                # The token's intent id is what binds this order to the token (routes.agent_auth
+                # checkout_token_may_use_order), so it is always the token's, never the caller's.
+                order_request.metadata["intent_id"] = str(token_payload.get("intent_id") or "").strip() or None
+                for key in ("buyer_ref", "job_id", "market", "locale", "brief_id", "brief_schema_version"):
                     v = token_payload.get(key)
                     if v and not order_request.metadata.get(key):
                         order_request.metadata[key] = v
@@ -9162,7 +9344,7 @@ async def agent_create_order(
                 # order. Only if no order exists yet do we retry the full create.
                 if is_asyncpg_busy_error(e):
                     _t = time.perf_counter()
-                    replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+                    replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request, **replay_owner)
                     logger.info(
                         "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response_with_backoff.initial duration_ms=%d order=%s",
                         int((time.perf_counter() - _t) * 1000),
@@ -9200,7 +9382,7 @@ async def agent_create_order(
                     except Exception as e2:
                         if is_asyncpg_busy_error(e2):
                             _t = time.perf_counter()
-                            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+                            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request, **replay_owner)
                             logger.info(
                                 "[AgentAPI][PERF] step=_load_replayable_agent_order_create_response_with_backoff.retry duration_ms=%d order=%s",
                                 int((time.perf_counter() - _t) * 1000),
@@ -9337,6 +9519,9 @@ async def agent_create_order(
                     merchant_id=order_request.merchant_id,
                     order_id=order_response.order_id,
                     order_amount=order_amount,
+                    # The one call that counts an order (agents.total_orders/total_gmv). A test
+                    # order (services/test_traffic.py) is not counted while stamping is on.
+                    order_created=not _is_stamped_test_order_create(order_request.merchant_id),
                 ),
             )
         except Exception as log_error:
@@ -9588,6 +9773,7 @@ async def agent_create_order(
             lambda: _cache_agent_order_create_response_best_effort(
                 getattr(order_request, "idempotency_key", None),
                 response,
+                **replay_owner,
             ),
         )
 
@@ -9726,7 +9912,7 @@ async def agent_create_order(
     except Exception as e:
         success = False
         if is_asyncpg_busy_error(e):
-            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request)
+            replay_response = await _load_replayable_agent_order_create_response_with_backoff(order_request, **replay_owner)
             if replay_response:
                 return replay_response
             raise db_busy_http_exception()
@@ -10697,6 +10883,11 @@ async def agent_refund_order(
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
+        # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.
+        from services.agent_refund_policy import refuse_agent_refund_execution
+
+        refuse_agent_refund_execution()
+
         # Build refund request (full refund)
         class _Req(BaseModel):
             order_id: str
@@ -10767,6 +10958,14 @@ async def agent_cancel_order(
             if str(stored or "") not in allowed_refs:
                 raise HTTPException(status_code=403, detail="Not authorized for this order")
 
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): this door cancels the way POST /agent/v2/orders/{id}/cancel
+        # does, closing the hosted payment page at the PSP first and cancelling only an unpaid row, with v2's codes.
+        # Off (the default): the unchanged path below.
+        from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+        if checkout_cancel_upstream_enabled():
+            return await _agent_cancel_order_upstream(order_id, order, context, background_tasks)
+
         # Block cancel if clearly paid/succeeded
         paid_status = str(order.get("payment_status") or "").lower()
         if paid_status in ("paid", "succeeded", "completed"):
@@ -10836,6 +11035,50 @@ async def agent_cancel_order(
     except Exception as e:
         logger.error(f"Agent cancel error: {e}")
         raise HTTPException(status_code=500, detail="Failed to cancel order")
+
+
+async def _agent_cancel_order_upstream(
+    order_id: str,
+    order: Dict[str, Any],
+    context: AgentContext,
+    background_tasks: BackgroundTasks,
+) -> Dict[str, Any]:
+    """The v1 cancel with CHECKOUT_CANCEL_UPSTREAM_ENABLED on: services/checkout_cancel_upstream.cancel_order_upstream
+    and v2's answers (409 ORDER_ALREADY_PAID / PAYMENT_PROCESSING, 503 CANCEL_NOT_CONFIRMED). A 200 keeps v1's own
+    keys (order_id, and the "already cancelled" message) beside v2's `cancel` block. The order_cancelled event and
+    the order.cancelled webhook go out only when THIS call cancelled the row."""
+    from routes.agent_v2 import cancel_upstream_answer
+    from services.checkout_cancel_upstream import OUTCOME_ALREADY_CANCELED, OUTCOME_CANCELED, cancel_order_upstream
+
+    result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    answer = cancel_upstream_answer(order_id, order, result)  # raises the 409 / 503 answers
+    if result["outcome"] == OUTCOME_ALREADY_CANCELED:
+        return {"status": "success", "order_id": order_id, "message": "Order already cancelled", "cancel": answer["cancel"]}
+    if result["outcome"] == OUTCOME_CANCELED:
+        try:
+            from db.products import log_order_event
+
+            await log_order_event(
+                event_type="order_cancelled",
+                order_id=order_id,
+                merchant_id=order["merchant_id"],
+                status="cancelled",
+                metadata={"cancelled_by": "agent"},
+            )
+        except Exception:
+            pass
+        try:
+            from services.agent_webhook_service import emit_agent_webhook_event
+
+            background_tasks.add_task(
+                emit_agent_webhook_event,
+                context.agent_id,
+                event_type="order.cancelled",
+                payload={"order_id": order_id, "merchant_id": order["merchant_id"], "status": "cancelled"},
+            )
+        except Exception:
+            pass
+    return {"status": "success", "order_id": order_id, "cancel": answer["cancel"]}
 
 
 @router.get("/orders/{order_id}/track")

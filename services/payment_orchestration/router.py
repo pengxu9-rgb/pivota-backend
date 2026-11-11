@@ -11,10 +11,13 @@ the answer.
 1. HARD FILTERS for the A2A rail, each a named reason when it fails:
      a2a_rail_disabled        the rail's client is off (A2A_RAIL_ENABLED) or creating is off
                               (A2A_RAIL_CREATE_ENABLED)
-     a2a_worker_unavailable   no worker tick has started within 15 minutes (the route reads the
-                              worker's heartbeat, db/a2a_rail_ledger.worker_is_alive): a purchase
-                              opened now would never advance, expire or have its contact purged
      agent_not_in_pilot       the calling agent is not on A2A_RAIL_PILOT_AGENT_IDS
+     a2a_worker_unavailable   no worker tick has started within 15 minutes (the route reads the
+                              worker's heartbeat, db/a2a_rail_ledger.worker_is_alive, for a pilot
+                              agent only): a purchase opened now would never advance, expire or have
+                              its contact purged. After the pilot check, so an agent outside the pilot
+                              is told that, not that the worker is down (the route never reads the
+                              heartbeat for it and passes False)
      item_source_unsupported  the rail takes a merchant cart link only (`item_source=cart_link`)
      offer_code_unsupported   the rail has no field for the buyer's offer code
      merchant_not_proven      (merchant, market) is not on A2A_RAIL_MERCHANTS: a merchant is routable
@@ -141,10 +144,10 @@ def a2a_unavailable_reason(
     """None when the A2A rail may take this request (before pricing); else the named reason."""
     if not a2a_create_dials_on():
         return "a2a_rail_disabled"
-    if worker_alive is not True:
-        return "a2a_worker_unavailable"
     if str(agent_id or "") not in pilot_agents():
         return "agent_not_in_pilot"
+    if worker_alive is not True:
+        return "a2a_worker_unavailable"
     if item_source != "cart_link":
         return "item_source_unsupported"
     if has_offer_code:

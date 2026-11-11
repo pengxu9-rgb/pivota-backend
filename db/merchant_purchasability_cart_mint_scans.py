@@ -10,6 +10,8 @@ result has to live in the database; this table is that cache.
 One row per ATTEMPT, complete or not, so the job can tell "scanned today" from "tried and
 failed an hour ago" (see the policy in the sweep module). `hosts` is the lane's result as JSON
 TEXT — `[[host, market, seeds], ...]`, a few KB — so the same SQL runs on SQLite and Postgres.
+The sweep's WARM-CLICK lane, computed by the same scan, rides in the same array as TAGGED
+4-element entries `[host, market, seeds, "warm-click"]` (see `_row`), so it needed no DDL.
 Rows are pruned after `RETENTION_DAYS`.
 
 Migrations do not self-apply in prod; `ensure_table()` runs the same CREATE at first use, exactly
@@ -32,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 TABLE = "merchant_purchasability_cart_mint_scans"
 RETENTION_DAYS = 14
+#: The tag on a warm-click lane entry in `hosts`, and on the one entry carrying that lane's seed
+#: count (`["", "", seeds, WARM_CLICK_SEEDS_TAG]`; the table has no column for it). See `_row`.
+WARM_CLICK_TAG = "warm-click"
+WARM_CLICK_SEEDS_TAG = "warm-click-seeds"
 
 _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
@@ -124,6 +130,16 @@ def _row(record: Any) -> Dict[str, Any]:
         (str(h[0]), str(h[1])): int(h[2])
         for h in hosts if isinstance(h, list) and len(h) == 3
     }
+    # THE WARM-CLICK LANE, as tagged 4-element entries. A reader that predates the lane keeps only
+    # 3-element entries, so an older image reads a row written here correctly; a row an older
+    # image wrote simply carries no warm-click entries, and the lane fills at the next scan.
+    row["warm_hosts"] = {
+        (str(h[0]), str(h[1])): int(h[2])
+        for h in hosts if isinstance(h, list) and len(h) == 4 and h[3] == WARM_CLICK_TAG
+    }
+    row["warm_seeds"] = next(
+        (int(h[2]) for h in hosts if isinstance(h, list) and len(h) == 4 and h[3] == WARM_CLICK_SEEDS_TAG), 0
+    )
     return row
 
 
@@ -149,11 +165,20 @@ async def record(
     cart_seeds: int,
     elapsed_ms: int,
     hosts: Dict[Tuple[str, str], int],
+    warm_hosts: Optional[Dict[Tuple[str, str], int]] = None,
+    warm_seeds: int = 0,
 ) -> None:
-    """Write one scan, then prune rows past retention. RAISES if the insert did not land."""
+    """Write one scan, then prune rows past retention. RAISES if the insert did not land.
+
+    `warm_hosts` (the warm-click lane) is stored next to the cart hosts as tagged entries."""
     from db.database import database
 
-    payload = json.dumps(sorted([host, market, int(seeds)] for (host, market), seeds in hosts.items()))
+    payload = json.dumps(
+        sorted([host, market, int(seeds)] for (host, market), seeds in hosts.items())
+        + sorted([host, market, int(seeds), WARM_CLICK_TAG]
+                 for (host, market), seeds in (warm_hosts or {}).items())
+        + ([["", "", int(warm_seeds), WARM_CLICK_SEEDS_TAG]] if warm_hosts or warm_seeds else [])
+    )
     landed = await database.fetch_one(_INSERT_SQL, {
         "scan_id": scan_id, "scanned_at": scanned_at, "complete": bool(complete),
         "reason": reason or None, "seeds_scanned": int(seeds_scanned),
@@ -173,4 +198,4 @@ def _reset_for_tests() -> None:
     _DDL_READY = False
 
 
-__all__: List[str] = ["TABLE", "RETENTION_DAYS", "ensure_table", "latest", "record"]
+__all__: List[str] = ["TABLE", "RETENTION_DAYS", "WARM_CLICK_TAG", "WARM_CLICK_SEEDS_TAG", "ensure_table", "latest", "record"]

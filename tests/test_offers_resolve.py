@@ -2577,6 +2577,7 @@ def _resolve_exec_spec_offer(
     row_overrides: dict = None,
     allowed_domains: list = None,
     product: dict = None,
+    payload_extra: dict = None,
 ) -> dict:
     """One external offer for the exec-spec fixture, through the real route.
 
@@ -2602,7 +2603,7 @@ def _resolve_exec_spec_offer(
         json={
             "operation": "offers.resolve",
             "payload": {"product": product or {"sku_id": "SKU-1"}, "limit": 10, "market": "US",
-                        "tool": "*"},
+                        "tool": "*", **(payload_extra or {})},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
@@ -2944,7 +2945,7 @@ def test_the_claim_follows_the_url_the_link_was_actually_built_from(
     assert offer["cart_prefilled"] is None
 
 
-def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
+def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool, payload_extra=None, currency=None, expect_status=200):
     """Drive the REAL route and return (offer, decoded_token_dest).
 
     The real `_make_external_redirect_url` runs — only the DB read is faked. The token is
@@ -2959,7 +2960,12 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
 
     async def fake_fetch_all(query: str, values=None):
         if "FROM external_product_seeds" in str(query):
-            return [_seed_row_for_exec_spec(evidence=evidence)]
+            row = _seed_row_for_exec_spec(evidence=evidence)
+            if currency:
+                row["price_currency"] = currency
+                for v in row["seed_data"]["snapshot"]["variants"]:
+                    v["price_currency"] = currency
+            return [row]
         return []
 
     # These tests are about the execution spec, not about rate limiting, and the anon limiter is
@@ -2977,11 +2983,13 @@ def _resolve_offer_with_spec(monkeypatch, client, *, evidence: bool):
         "/agent/shop/v1/invoke",
         json={
             "operation": "offers.resolve",
-            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*"},
+            "payload": {"product": {"sku_id": "SKU-1"}, "limit": 10, "market": "US", "tool": "*", **(payload_extra or {})},
             "metadata": {"source": "creator-agent-ui"},
         },
     )
-    assert res.status_code == 200, res.text
+    assert res.status_code == expect_status, res.text
+    if expect_status != 200:
+        return res, None
     offers = [o for o in (res.json().get("offers") or [])
               if o.get("purchase_route") == "affiliate_outbound"]
     assert offers, "the external offer must be returned for this to prove anything"
@@ -6104,3 +6112,291 @@ def test_host_diversity_never_lets_a_flagged_offer_take_a_second_fresh_offers_sl
     assert sorted(o["source"]["seed_id"] for o in opted) == ["eps_spec", "eps_spec_2"]
     roomy = _resolve_two(monkeypatch, client, rows, limit=3, opt_in=True)
     assert [bool(o.get("requires_live_verification")) for o in roomy] == [False, False, True]
+
+
+# ---------------------------------------------------------------------------
+# FACT-DRIVEN WARM ELIGIBILITY at the mint (OUTBOUND_WARM_HANDOFF_FACT_ELIGIBLE)
+#
+# A cold seed link (no cart) whose store holds a fresh human-handoff fact is signed
+# `warm_fact: human_handoff`, so the click lane may upgrade it although the brand is not on the
+# hand allowlist; `cart_prefilled` then answers null (unknown) instead of a `false` the lane
+# would contradict. Real route, real mint, real claim; only the fact read is faked.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fact_lane(monkeypatch: pytest.MonkeyPatch, warm_lane):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_brands_raw", "someone-else.com")
+    monkeypatch.setattr(warm_lane, "outbound_warm_handoff_fact_eligible", True)
+    return warm_lane
+
+
+def test_a_cold_link_on_a_store_with_a_fresh_fact_is_stamped_and_claims_unknown(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """Product grain (no variant named): the buyer has not chosen, which is the population the
+    warm lane was built for. A named variant is pinned by the next test."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [("brand.com", "US")]
+    assert _ctx_of(offer)["warm_fact"] == "human_handoff"
+    assert offer["execution_spec"]["cart_url"] is None
+    assert offer["cart_prefilled"] is None, (
+        "the click lane may build a cart for this link, so `false` would be a claim it contradicts")
+
+
+def test_a_cold_link_without_a_fact_keeps_its_false(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    calls = _purchasability_fake(monkeypatch, purchasable=False)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [("brand.com", "US")]
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_the_flag_off_mints_exactly_what_it_minted_before(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    monkeypatch.setattr(fact_lane, "outbound_warm_handoff_fact_eligible", False)
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == [], "a referral-only offer must not cost a query while the flag is off"
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_cart_link_is_never_stamped_and_asks_once(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """A cart already IS the upgrade: no stamp, and the cart gate's one read is reused."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=True)], market="US")[0]
+    assert offer["cart_prefilled"] is True
+    assert "warm_fact" not in _ctx_of(offer)
+    assert len(calls) == 1
+
+
+def test_a_named_variant_without_a_cart_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """The variant knockout already decides the click (the lane's rebuild carries no variant),
+    so the stamp could change nothing and must not cost a read."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_seed_offers(
+        monkeypatch, client, rows=[_seed_row_for_exec_spec(evidence=False)], market="US")[0]
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_cold_out_of_stock_offer_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """A cold offer carries no `stock_declined` stamp (that needs a cart id), so the knockout
+    cannot see the decline; the stamp must not be asked for an item this answer calls sold out."""
+    import copy
+
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    row = _seed_row_for_exec_spec(evidence=False)
+    seed_data = copy.deepcopy(row["seed_data"])
+    for v in seed_data["snapshot"]["variants"]:
+        v["availability"] = "out_of_stock"
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"seed_data": seed_data, "availability": "out_of_stock"})
+    assert offer.get("in_stock") is False, offer.get("in_stock")
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_a_cart_the_enforced_preflight_refused_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """An enforced preflight withdraws the cart and signs nothing, so no knockout can see the
+    refusal at click time; a `warm_fact` stamp would hand the lane back the very cart the
+    preflight refused (be#2729 review P3-2)."""
+    import services.checkout_preflight as cp
+
+    async def refusing_preflight(offer):
+        return cp.PreflightVerdict(outcome=cp.BLOCK, reason=cp.R_GONE, would_block=True, mode=cp.mode())
+
+    monkeypatch.setattr(cp, "preflight_and_record", refusing_preflight)
+    monkeypatch.setenv("CHECKOUT_PREFLIGHT_MODE", "enforce")
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=True, product=_PRODUCT_GRAIN)
+    assert offer["execution_spec"]["cart_url"] is None, "the refused cart must be withdrawn for this to prove anything"
+    assert "warm_fact" not in _ctx_of(offer)
+    assert calls == []
+    assert offer["cart_prefilled"] is False
+
+
+def test_the_fact_is_asked_for_the_destination_host_not_the_seed_domain(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """be#2729 review P1 / delta P3-C (MF): the seed's `domain` column can name another store.
+    The click lane builds its cart on the DESTINATION host, so the mint must read that host's
+    fact; the fixture's default domain equals the dest host and could not tell them apart."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"domain": "another-store.com"})
+    assert calls == [("brand.com", "US")], calls
+    assert _ctx_of(offer)["warm_fact"] == "human_handoff"
+
+
+@pytest.mark.parametrize("listing_market", ["CA", "*"])
+def test_a_row_listed_in_another_market_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane, listing_market: str
+) -> None:
+    """be#2729 delta P3-A: the token is signed with the row's LISTING market and the click
+    re-checks that one, but the mint asks the request market. A CA-listed USD row served on a US
+    request (the attached-ref, fuzzy and group-sibling queries filter on currency only) would be
+    stamped off the US fact and re-checked against CA; a `'*'` row could never re-check at all."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(
+        monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+        row_overrides={"market": listing_market})
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+    assert offer["cart_prefilled"] is False
+
+
+def test_an_affiliate_destination_is_never_stamped_or_asked(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane
+) -> None:
+    """be#2729 delta P3-C (MK): the route hands the skip rule the offer's real destination.
+    The affiliate classifier is narrowed to this fixture's dest, so a caller that passed any
+    other string would read the fact."""
+    import routes.agent_shop_gateway as gateway
+
+    monkeypatch.setattr(gateway, "is_affiliate_destination", lambda dest: "brand.com/products/serum" in str(dest))
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    offer = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert calls == []
+    assert "warm_fact" not in _ctx_of(offer)
+
+
+# ---- decision D-10: a market the gateway ASSUMED is not a market the buyer named -------------------------------
+
+
+@pytest.mark.parametrize("flag", ["marketAssumed", "market_assumed"])
+def test_an_assumed_market_is_served_but_never_stamped_observed(monkeypatch, client: TestClient, flag: str) -> None:
+    """The gateway's get_offers sends `market: "US"` for a call that named no market, with `marketAssumed`. The
+    offer is the US one (the served market is US), but its `/r` token must not say the buyer named US: the
+    warm-handoff sink keys its gate only on an observed market."""
+    declared, declared_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True)
+    assumed, assumed_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={flag: True})
+    assert declared_payload["market_observed"] is True, "the premise: a named US is observed"
+    assert "market_observed" not in assumed_payload
+    assert assumed_payload["market"] == declared_payload["market"] == "US"
+    assert assumed["purchase_route"] == declared["purchase_route"]
+
+
+def _cart_country(url):
+    from urllib.parse import parse_qs, urlparse
+
+    return (parse_qs(urlparse(url).query).get("country") or [None])[0]
+
+
+def test_p2_n1_the_flag_never_downgrades_a_declared_market(monkeypatch, client: TestClient) -> None:
+    """P2-N1: `marketAssumed` beside a declared SG is IGNORED: the token stays observed and the SG cart pin stays.
+    The answer is the declared-SG answer, whatever the flag says."""
+    sg, sg_payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, currency="SGD", payload_extra={"market": "SG"})
+    forged, forged_payload = _resolve_offer_with_spec(
+        monkeypatch, client, evidence=True, currency="SGD", payload_extra={"market": "SG", "marketAssumed": True})
+    assert sg_payload["market_observed"] is True
+    assert forged_payload["market_observed"] is True, "beside SG the flag is ignored"
+    assert _cart_country(sg["execution_spec"]["cart_url"]) == "SG"
+    assert _cart_country(forged["execution_spec"]["cart_url"]) == "SG", "the SG pin is kept"
+
+
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+def test_p2_n1_only_a_literal_true_assumes(monkeypatch, client: TestClient, value) -> None:
+    _, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": value})
+    assert payload["market_observed"] is True, f"{value!r} is not a literal True: the declared US is kept"
+
+
+@pytest.mark.parametrize("value", [None, "maybe", {"x": 1}, [], "false", 0, False])
+def test_p3_n5_a_junk_flag_is_ignored_never_an_error(monkeypatch, client: TestClient, value) -> None:
+    """P3-N5: any value but a literal True is "not assumed" -- a 200 with the declared answer, never a 500."""
+    _, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": value})
+    assert payload["market_observed"] is True
+
+
+def test_p3_n3_an_assumed_us_cart_url_is_still_byte_identical_to_what_the_redirect_signs(monkeypatch, client: TestClient) -> None:
+    """The anti-drift assertion, for the assumed case: the published cart_url and the signed destination agree
+    (neither carries the pin a declared US would)."""
+    offer, payload = _resolve_offer_with_spec(monkeypatch, client, evidence=True, payload_extra={"marketAssumed": True})
+    spec = offer["execution_spec"]
+    assert spec["cart_url"], "evidence-stamped seed must produce a cart"
+    assert spec["cart_url"] == payload["dest"]
+    assert "market_observed" not in payload
+
+
+def test_p3_n2_an_assumed_us_is_never_asked_a_warm_fact(monkeypatch, client: TestClient, fact_lane) -> None:
+    """P3-N2: the assumed-US token is unobserved, so its click could never redeem a warm fact (`fact_no_market`):
+    none is asked or stamped, and the answer claims `cart_prefilled: false`, what a no-market answer claimed. The
+    cart GATE still runs on US (the fact read for it is the purchasability one)."""
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    declared = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN)
+    assert _ctx_of(declared)["warm_fact"] == "human_handoff", "the premise: a declared US is stamped"
+    assert declared["cart_prefilled"] is None
+    calls.clear()
+    assumed = _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN, payload_extra={"marketAssumed": True})
+    assert "warm_fact" not in _ctx_of(assumed)
+    assert assumed["cart_prefilled"] is False
+    assert "market_observed" not in _payload_of(assumed)
+    assert _payload_of(declared)["market_observed"] is True
+
+
+def test_the_assumed_flag_is_kept_by_the_normaliser_and_defaults_off() -> None:
+    import routes.agent_shop_gateway as gw
+
+    norm = gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US", "marketAssumed": True})
+    assert gw.OffersResolvePayload(**norm).market_assumed is True
+    assert gw.OffersResolvePayload(**gw._normalize_offers_resolve_payload({"product_id": "p", "market": "US"})).market_assumed is False
+
+
+@pytest.mark.parametrize("row_overrides", [
+    {},
+    # The seed's `domain` names another store: the stamp asks the destination host.
+    {"domain": "another-store.com"},
+    # The production `www.` + mixed-case spelling on both URLs.
+    {"destination_url": "https://www.Brand.com/products/serum",
+     "canonical_url": "https://www.Brand.com/products/serum"},
+    # The canonical URL wins in the mint (`canonical_url or destination_url`).
+    {"canonical_url": "https://canonical-store.com/products/serum"},
+    # No canonical URL: the mint falls back to the destination.
+    {"canonical_url": None},
+    # Listed in another market: never asked, and the sweep keys that market, not the request's.
+    {"market": "CA"},
+], ids=["plain", "seed-domain-elsewhere", "www-mixed-case", "canonical-differs", "no-canonical",
+        "listed-ca"])
+def test_the_sweep_population_holds_every_fact_the_warm_stamp_asks(
+    monkeypatch: pytest.MonkeyPatch, client: TestClient, fact_lane, row_overrides: dict
+) -> None:
+    """THE SAME PRODUCER: the real offers.resolve mint asks `human_handoff_allowed` for its warm
+    stamp, and every (host, market) it asks must be a key the purchasability sweep's warm-click
+    lane derives from the SAME row (jobs/merchant_purchasability_sweep._seed_warm_hosts). A fact
+    the stamp asks for and the sweep never gathers is a link that can never warm."""
+    import db.merchant_purchasability as mp
+    import jobs.merchant_purchasability_sweep as sweep
+    import routes.agent_shop_gateway as gateway
+
+    row = _seed_row_for_exec_spec(evidence=False)
+    row.update(row_overrides)
+    calls = _purchasability_fake(monkeypatch, purchasable=True)
+    allowed = sorted({"brand.com", "canonical-store.com", "another-store.com"})
+    _resolve_exec_spec_offer(monkeypatch, client, evidence=False, product=_PRODUCT_GRAIN,
+                             row_overrides=row_overrides, allowed_domains=allowed)
+    swept = {(host, mp.normalize_market(row["market"])) for host in sweep._seed_warm_hosts(gateway, row)}
+    if row_overrides.get("market") == "CA":
+        assert calls == [], "a CA-listed row is never asked on a US request"
+        assert swept == {("brand.com", "CA")}
+        return
+    assert calls, "the stamp must be asked for this to prove anything"
+    assert set(calls) <= swept, sorted(set(calls) - swept)
