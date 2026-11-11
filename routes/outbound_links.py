@@ -26,6 +26,7 @@ from services.outbound_links_service import (
     resolve_outbound_link,
     log_outbound_click,
     log_outbound_event,
+    note_click_write_failure,
     token_is_synthetic,
 )
 from config.settings import settings
@@ -350,8 +351,8 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 "ip": getattr(getattr(req, "client", None), "host", None),
             },
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        note_click_write_failure("log_outbound_click", "click", exc)
 
     return RedirectResponse(url=warm_redirect_url or dest, status_code=302)
 
@@ -399,8 +400,8 @@ async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str
             },
             event_type="impression",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        note_click_write_failure("log_outbound_event", "impression", exc)
 
     return {"ok": True}
 

@@ -50,8 +50,12 @@ runs it only while A2A_RAIL_WORKER_ENABLED is on and the client is configured.
                            (failed), expired (expired), abandoned (failed).
   paying (a VIC order)  -> poll the rail's checkout: in progress (wait), completed (-> completed with
                            the merchant's order number), failed (failed). `paying` ends on no clock.
-  The amount sent is the LOCKED QUOTE (`quoted_total_minor`, all-in with shipping and tax) and nothing
-  else: no quote, no order. A checkout is completed only when its total is known, in the purchase's
+  quoting (before the order) -> ask the rail for a QUOTE: the items at the buyer's confirmed price plus
+                           the merchant's shipping and tax. Recorded on the row (`quote_id`,
+                           `quoted_total_minor`, `shipping_minor`, `tax_minor`; the agent's view shows
+                           them), then the order goes out with that total and `quote_id`. No quote yet:
+                           wait. Items priced differently, or another currency: the purchase ends.
+  The amount sent is the QUOTE (`quoted_total_minor`, all-in with shipping and tax) and nothing else. A checkout is completed only when its total is known, in the purchase's
   currency and at most that amount; otherwise the order is HELD for a human in `paying`.
   Dial off: nothing more is sent for a VIC order; it stays parked (the marker keeps the sweep off it)
   until the dial is on again or a human decides. A VIC order is RECORDED, not inferred: `_vic_adopt`
@@ -100,12 +104,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 import db.a2a_rail_ledger as ledger
 from services.payment_orchestration import a2a_rail, vic_order
+from services.payment_orchestration import router as rail_router
 
 logger = logging.getLogger(__name__)
 
@@ -923,13 +929,13 @@ async def _start_vic_order(s: _Step) -> str:
     if not row.get("buyer_email") or not row.get("shipping_address"):
         # The rail fills the merchant checkout: it needs where to ship and whom to tell.
         return await _token_failed(s, "quoting", "vic_contact_missing")
-    if vic_order.order_amount(row) is None:
-        # No locked all-in total (shipping and tax included): the buyer would approve a subtotal and the
-        # merchant's checkout would come to more. No order without a quote. Nothing writes the A2A quote
-        # yet, so this fails closed; once a quote writer exists, this should WAIT (park) for the lock.
-        return await _token_failed(s, "quoting", "vic_quote_missing")
-    order = vic_order.build_order(row)
-    if order is None:  # pragma: no cover - build_order fails only without an amount, checked above
+    if vic_order.items_amount(row) is None:
+        return await _token_failed(s, "quoting", "vic_amount_invalid")
+    quoted = await _vic_quote(s)
+    if quoted is not None:
+        return quoted
+    order = vic_order.build_order(s.row)
+    if order is None:  # pragma: no cover - the quote was just recorded on the row
         return await _token_failed(s, "quoting", "vic_amount_invalid")
     if await ledger.mark_pending_write(s.id, s.worker, VIC_SUBMIT) is None:
         return "lost"
@@ -944,6 +950,76 @@ async def _start_vic_order(s: _Step) -> str:
     # Unseen: the order may exist at the rail. The write stays pending; the next step reads it back.
     await s.release(POLL_RETRY, "vic_order_outcome_unknown")
     return "outcome_unknown"
+
+
+VIC_QUOTE_WAIT = "waiting_on_quote"
+#: A quote that did not come (`retry`) or could not be read (`unrecognised`) is asked again with a growing
+#: gap (`POLL_RETRY` doubling, at most this), not every minute until the expiry sweep. The count of
+#: consecutive misses rides in last_error_code as `vic_quote:<kind>:<n>`.
+VIC_QUOTE_BACKOFF_MAX_SECONDS = 1800
+#: An answer that keeps coming back unreadable is the provider's contract, not a blip: after this many in
+#: a row the purchase fails (`vic_quote_unrecognised`). Nothing billable exists, so failing is safe.
+VIC_QUOTE_UNRECOGNISED_LIMIT = 5
+_VIC_QUOTE_MISS_RE = re.compile(r"(?:^|:)vic_quote:(retry|unrecognised):([0-9]{1,4})$")
+
+
+def _vic_quote_misses(row: Mapping[str, Any], kind: str) -> int:
+    """How many quotes in a row came back `kind` before this one (0 when the last code is another)."""
+    match = _VIC_QUOTE_MISS_RE.search(str(row.get("last_error_code") or ""))
+    return int(match[2]) if match and match[1] == kind else 0
+
+
+async def _vic_quote_miss(s: _Step, kind: str) -> str:
+    misses = _vic_quote_misses(s.row, kind) + 1
+    if kind == "unrecognised" and misses >= VIC_QUOTE_UNRECOGNISED_LIMIT:
+        return await _token_failed(s, "quoting", "vic_quote_unrecognised")
+    await s.release(min(POLL_RETRY * 2 ** min(misses - 1, 10), VIC_QUOTE_BACKOFF_MAX_SECONDS),
+                    f"vic_quote:{kind}:{misses}")
+    return VIC_QUOTE_WAIT
+
+
+async def _vic_quote(s: _Step) -> Optional[str]:
+    """Ask the rail for the all-in total (items + the merchant's shipping and tax) and record it on the row,
+    so the order goes out with the amount the merchant's checkout will come to. None when the quote is
+    recorded (`s.row` then holds it); otherwise the outcome already settled.
+
+    A fresh quote every time an order is about to go out: a quote is free and creates nothing billable, and
+    a quote from an earlier step (one the order never went out with) may have lapsed. No quote yet is a
+    WAIT, not a failure (the ledger's expiry sweep bounds it). A quote that prices the items at anything
+    but the buyer's confirmed price, or in another currency, ends the purchase: the buyer confirmed a
+    price, and shipping and tax are the only additions it may grow by (shown to them, all in, on the
+    rail's page). So does an all-in total over the rail's cap for the currency (`vic_quote_over_limit`)."""
+    row = s.row
+    quote = await s.vic.quote_order(vic_order.build_quote_request(row))
+    if quote.kind == "refused":
+        detail = quote.error_code or quote.http_status or ""
+        return await _token_failed(s, "quoting", f"vic_quote_refused:{detail}"[:64].rstrip(":"))
+    if not quote.ok:
+        return await _vic_quote_miss(s, "retry" if quote.kind == "retry" else "unrecognised")
+    if quote.client_reference not in (None, s.id):
+        logger.error("a2a_rail_worker: VIC quote names another purchase purchase=%s", s.id)
+        await s.release(POLL_RETRY, "vic_quote_mismatch")
+        return VIC_QUOTE_WAIT
+    if quote.currency != str(row.get("currency") or "").upper():
+        return await _token_failed(s, "quoting", "vic_quote_currency_mismatch")
+    if quote.items_minor != vic_order.items_amount(row):
+        return await _token_failed(s, "quoting", "vic_quote_price_changed")
+    # The rail's per-currency risk cap bounds what goes out, not only the items: create checked our price
+    # x quantity, but the order asks the buyer to approve the all-in total. Shipping and tax are bounded
+    # by it too (they can only add up to the cap less the items). No cap for the currency: no order.
+    if not rail_router.amount_ok(quote.total_minor, row.get("currency")):
+        return await _token_failed(s, "quoting", "vic_quote_over_limit")
+    try:
+        moved = await ledger.record_quote_as_holder(
+            s.id, s.worker, quote_id=quote.quote_id, quoted_total_minor=quote.total_minor,
+            shipping_minor=quote.shipping_minor, tax_minor=quote.tax_minor)
+    except ValueError:
+        # A quote id or amount we will not store (a card-number shaped id, a zero total).
+        return await _token_failed(s, "quoting", "vic_quote_invalid")
+    if moved is None:
+        return "lost"
+    s.row = moved
+    return None
 
 
 async def _vic_adopt(s: _Step, answer: Any) -> str:

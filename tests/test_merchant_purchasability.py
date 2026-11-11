@@ -62,9 +62,9 @@ FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "merchant_purchasability
 #: The three live cases the detector was built on, and what each must answer.
 #: (fixture, variant id, card_available, unit price minor, currency)
 LIVE_CASES = [
-    ("idewcare_card.html", "46722440036604", True, 1399, "USD"),
-    ("judydoll_card.html", "49922977038613", True, 1399, "USD"),
-    ("flowerbeauty_paypal_only.html", "17281773207622", False, 800, "USD"),
+    ("card_shopify_payments.html", "46722440036604", True, 1399, "USD"),
+    ("card_airwallex.html", "49922977038613", True, 1399, "USD"),
+    ("paypal_only.html", "17281773207622", False, 800, "USD"),
 ]
 
 
@@ -129,7 +129,7 @@ async def _db():
         await database.disconnect()
 
 
-def res(verdict="ELIGIBLE", *, card=None, host="judydoll.com", **over) -> PreflightResult:
+def res(verdict="ELIGIBLE", *, card=None, host="juniper-card.example", **over) -> PreflightResult:
     """A PreflightResult shaped like the sweep's, with `buyer=None` semantics throughout."""
     defaults = dict(
         host=host,
@@ -172,7 +172,7 @@ def page(variant="1", click_id="c", country="US") -> str:
     })
 
 
-async def _row(domain="judydoll.com", market="US", vantage="worker"):
+async def _row(domain="juniper-card.example", market="US", vantage="worker"):
     rows = await mp.list_facts(domain, market)
     for row in rows:
         if row.get("vantage") == vantage:
@@ -180,7 +180,7 @@ async def _row(domain="judydoll.com", market="US", vantage="worker"):
     return None
 
 
-async def _set(column, value, domain="judydoll.com", market="US", vantage="worker"):
+async def _set(column, value, domain="juniper-card.example", market="US", vantage="worker"):
     """Reach into the row to age it. The column is a LITERAL from a fixed set, never a caller
     string, so this helper cannot become an injection seam even in a test."""
     assert column in {"positive_until", "checked_at", "consecutive_failures"}
@@ -209,12 +209,12 @@ def test_the_card_merchants_carry_a_payment_provider_and_the_paypal_one_does_not
     """Names the MECHANISM, so a failure says which structure moved rather than arriving as a
     bare boolean. The card gateways differ (shopify_payments vs Airwallex) on purpose: the rule
     is the __typename plus the brands, never a known gateway name."""
-    idew = checkout_payment_methods((FIXTURES / "idewcare_card.html").read_text())[0]
-    judy = checkout_payment_methods((FIXTURES / "judydoll_card.html").read_text())[0]
-    flower = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())[0]
-    assert "shopify_payments" in idew and "Airwallex" in judy
-    assert "PAYPAL_EXPRESS" in flower
-    assert not {"shopify_payments", "Airwallex"} & set(flower)
+    shopify_card = checkout_payment_methods((FIXTURES / "card_shopify_payments.html").read_text())[0]
+    airwallex_card = checkout_payment_methods((FIXTURES / "card_airwallex.html").read_text())[0]
+    paypal_only = checkout_payment_methods((FIXTURES / "paypal_only.html").read_text())[0]
+    assert "shopify_payments" in shopify_card and "Airwallex" in airwallex_card
+    assert "PAYPAL_EXPRESS" in paypal_only
+    assert not {"shopify_payments", "Airwallex"} & set(paypal_only)
 
 
 def test_the_substring_creditcard_is_on_all_three_pages_and_must_not_be_the_detector():
@@ -224,7 +224,7 @@ def test_the_substring_creditcard_is_on_all_three_pages_and_must_not_be_the_dete
     assert all("creditcard" in b or "credit card" in b.replace("&quot;", "") for b in bodies) or True
     # The real claim: the PayPal-only page answers False even though its accept-list is READ and
     # non-empty. A substring detector would have answered True for it.
-    methods, available, _note = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    methods, available, _note = checkout_payment_methods((FIXTURES / "paypal_only.html").read_text())
     assert available is False and len(methods) >= 2
 
 
@@ -411,11 +411,11 @@ def test_a_shape_surprise_becomes_blocked_unknown_and_retryable(drift):
 
 async def test_a_shape_surprise_demotes_nobody_however_often_it_repeats(_db):
     """The whole point: a platform-wide drift must not walk every merchant to a demotion."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     armed = (await _row())["positive_until"]
     for _ in range(6):
         await mp.record_check(
-            "judydoll.com", "US",
+            "juniper-card.example", "US",
             res("BLOCKED_UNKNOWN", card=None, retryable=True, detail="detector_shape_unexpected"),
         )
     row = await _row()
@@ -497,10 +497,10 @@ def test_an_empty_accept_list_is_undetermined_not_a_negative():
 # ── price parity ────────────────────────────────────────────────────────────────────────────
 
 
-def test_the_flowerbeauty_price_drift_reproduces_the_incident():
+def test_the_paypal_only_price_drift_reproduces_the_incident():
     """USD 8.00 on the landed checkout against our indexed USD 14.95 — the measured figures from
     2026-09-22. Exact, in minor units, and NEGATIVE (the store charges less than we advertise)."""
-    body = (FIXTURES / "flowerbeauty_paypal_only.html").read_text()
+    body = (FIXTURES / "paypal_only.html").read_text()
     landed, currency = checkout_line_price(body, "17281773207622")
     assert (landed, currency) == (800, "USD")
     assert price_drift(landed, currency, 1495, "USD") == -695
@@ -563,10 +563,10 @@ def test_a_line_whose_unit_price_is_not_a_whole_minor_unit_reports_nothing():
 
 
 def test_a_read_accept_list_without_a_card_is_no_card_payment():
-    _, card, _note = checkout_payment_methods((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    _, card, _note = checkout_payment_methods((FIXTURES / "paypal_only.html").read_text())
     assert card is False, "precondition: the live PayPal-only page reads as no card"
     verdict, _ = classify_landing(
-        chain=[(200, "https://flowerbeauty.com/checkouts/cn/T")], final_status=200,
+        chain=[(200, "https://fern-paypal.example/checkouts/cn/T")], final_status=200,
         body=page(variant="17281773207622"), variant_id="17281773207622", click_id="c",
         buyer=None, market="US", card_available=card,
     )
@@ -606,7 +606,7 @@ def test_the_card_verdict_is_opt_in_so_the_tier_b_lane_is_unchanged(monkeypatch)
 
 
 async def test_a_positive_fact_needs_eligible_AND_a_card(_db):
-    """BOTH conjuncts. ELIGIBLE alone is exactly what flowerbeauty.com satisfied."""
+    """BOTH conjuncts. ELIGIBLE alone is exactly what fern-paypal.example satisfied."""
     assert mp.is_positive(res("ELIGIBLE", card=True)) is True
     assert mp.is_positive(res("ELIGIBLE", card=None)) is False
     assert mp.is_positive(res("ELIGIBLE", card=False)) is False
@@ -614,50 +614,50 @@ async def test_a_positive_fact_needs_eligible_AND_a_card(_db):
 
 
 async def test_a_positive_check_arms_the_window_and_the_door_opens(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     row = await _row()
     assert row["verdict"] == "ELIGIBLE" and row["card_available"] is True
     assert row["positive_until"] is not None and row["consecutive_failures"] == 0
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 async def test_an_eligible_check_without_a_card_arms_nothing(_db):
     """The incident, as a test."""
-    await mp.record_check("flowerbeauty.com", "US", res("ELIGIBLE", card=None))
-    assert await mp.is_purchasable("flowerbeauty.com", "US") is False
-    assert (await _row("flowerbeauty.com"))["positive_until"] is None
+    await mp.record_check("fern-paypal.example", "US", res("ELIGIBLE", card=None))
+    assert await mp.is_purchasable("fern-paypal.example", "US") is False
+    assert (await _row("fern-paypal.example"))["positive_until"] is None
 
 
 @pytest.mark.parametrize("verdict", sorted(mp.NEGATIVE_VERDICTS))
 async def test_one_confirmed_negative_advances_but_does_not_demote(_db, verdict):
     """ONE negative is not a pattern. Demoting on the first would stop a rail for a store that
     was mid-sale or bounced one redirect."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    await mp.record_check("judydoll.com", "US", res(verdict, card=False))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res(verdict, card=False))
     row = await _row()
     assert row["consecutive_failures"] == 1
     assert row["positive_until"] is not None
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 @pytest.mark.parametrize("verdict", sorted(mp.NEGATIVE_VERDICTS))
 async def test_two_consecutive_negatives_demote(_db, verdict):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    await mp.record_check("judydoll.com", "US", res(verdict, card=False))
-    await mp.record_check("judydoll.com", "US", res(verdict, card=False))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res(verdict, card=False))
+    await mp.record_check("juniper-card.example", "US", res(verdict, card=False))
     row = await _row()
     assert row["consecutive_failures"] == 2 and row["positive_until"] is None
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_one_positive_resets_the_counter_and_re_arms(_db):
-    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
-    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
-    assert await mp.is_purchasable("judydoll.com", "US") is False
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False))
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     row = await _row()
     assert row["consecutive_failures"] == 0 and row["positive_until"] is not None
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 UNVERIFIABLE = [
@@ -669,13 +669,13 @@ UNVERIFIABLE = [
 
 @pytest.mark.parametrize("verdict", UNVERIFIABLE)
 async def test_an_unverifiable_result_advances_nothing_and_clears_nothing(_db, verdict):
-    """THE HALF THAT IS EASY TO GET BACKWARDS. judydoll.com resets direct TCP from one of our
+    """THE HALF THAT IS EASY TO GET BACKWARDS. juniper-card.example resets direct TCP from one of our
     egresses while answering through another; treating that as a negative would demote a good
     merchant on a network fact."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     armed = (await _row())["positive_until"]
     for _ in range(5):
-        await mp.record_check("judydoll.com", "US", res(verdict, card=None))
+        await mp.record_check("juniper-card.example", "US", res(verdict, card=None))
     row = await _row()
     assert row["consecutive_failures"] == 0, f"{verdict} must not advance the counter"
     assert row["positive_until"] == armed, f"{verdict} must not clear the window"
@@ -685,19 +685,19 @@ async def test_an_unverifiable_result_advances_nothing_and_clears_nothing(_db, v
 @pytest.mark.parametrize("verdict", UNVERIFIABLE)
 async def test_an_unverifiable_result_cannot_rescue_a_demoted_row(_db, verdict):
     """The other direction: it clears nothing, and it arms nothing either."""
-    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
-    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
-    await mp.record_check("judydoll.com", "US", res(verdict, card=None))
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("juniper-card.example", "US", res(verdict, card=None))
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_blocked_unknown_specifically_never_advances_failures(_db):
     """Called out on its own because it is the one an implementer is most likely to add to the
     negative set: it LOOKS like a refusal and is 'any other 403'."""
     assert "BLOCKED_UNKNOWN" not in mp.NEGATIVE_VERDICTS
-    await mp.record_check("judydoll.com", "US", res("BLOCKED_UNKNOWN", card=None))
-    await mp.record_check("judydoll.com", "US", res("BLOCKED_UNKNOWN", card=None))
-    await mp.record_check("judydoll.com", "US", res("BLOCKED_UNKNOWN", card=None))
+    await mp.record_check("juniper-card.example", "US", res("BLOCKED_UNKNOWN", card=None))
+    await mp.record_check("juniper-card.example", "US", res("BLOCKED_UNKNOWN", card=None))
+    await mp.record_check("juniper-card.example", "US", res("BLOCKED_UNKNOWN", card=None))
     assert (await _row())["consecutive_failures"] == 0
 
 
@@ -705,16 +705,16 @@ async def test_blocked_unknown_specifically_never_advances_failures(_db):
 
 
 async def test_an_expired_window_is_not_purchasable(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
     past = datetime.now(timezone.utc) - timedelta(hours=1)
     await _set("positive_until", past.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else past)
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_the_ttl_dial_sets_the_window(_db, monkeypatch):
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_TTL_HOURS", "1")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     row = await _row()
     window = row["positive_until"] - row["checked_at"]
     assert timedelta(minutes=50) <= window <= timedelta(minutes=70), window
@@ -728,41 +728,41 @@ async def test_a_bad_ttl_falls_back_to_the_default(_db, monkeypatch, bad):
 
 
 async def test_a_caller_clock_may_narrow_the_answer_but_never_widen_it(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     future = datetime.now(timezone.utc) + timedelta(days=365)
-    assert await mp.is_purchasable("judydoll.com", "US", now=future) is False
+    assert await mp.is_purchasable("juniper-card.example", "US", now=future) is False
     past = datetime.now(timezone.utc) - timedelta(days=365)
-    assert await mp.is_purchasable("judydoll.com", "US", now=past) is True
+    assert await mp.is_purchasable("juniper-card.example", "US", now=past) is True
     # And a clock cannot resurrect a row the SERVER already calls expired.
     gone = datetime.now(timezone.utc) - timedelta(hours=1)
     await _set("positive_until", gone.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else gone)
-    assert await mp.is_purchasable("judydoll.com", "US", now=past) is False
+    assert await mp.is_purchasable("juniper-card.example", "US", now=past) is False
 
 
 async def test_get_fact_never_returns_an_expired_fact(_db):
     """`get_fact` has its OWN freshness clause. It is the human-facing read, so an expired row
     coming back from it would be read as "this merchant is fine" by the one person most likely
     to be deciding whether to arm the rail."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.get_fact("judydoll.com", "US") is not None
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.get_fact("juniper-card.example", "US") is not None
     past = datetime.now(timezone.utc) - timedelta(hours=1)
     await _set("positive_until", past.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else past)
-    assert await mp.get_fact("judydoll.com", "US") is None
-    assert await mp.list_facts("judydoll.com", "US"), "but the ROW is still there for an operator"
+    assert await mp.get_fact("juniper-card.example", "US") is None
+    assert await mp.list_facts("juniper-card.example", "US"), "but the ROW is still there for an operator"
 
 
 async def test_is_purchasable_fails_closed_when_the_database_raises(_db, monkeypatch):
     """FAIL-CLOSED, and this is the opposite of what a liveness check should do. A liveness sweep
     that cannot reach a store must not delete it; a PAYMENT gate that cannot prove payment must
     not permit it. Without this test a mutant that returned True on error survives everything."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
     async def _explode(*args, **kwargs):
         raise RuntimeError("pool exhausted")
 
     monkeypatch.setattr(database, "fetch_one", _explode)
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_an_undetermined_card_round_trips_as_none_and_never_as_false(_db):
@@ -801,25 +801,25 @@ async def test_the_market_check_refuses_a_market_that_is_not_iso2_upper(_db):
 async def test_a_positive_fact_from_the_wrong_vantage_does_not_open_the_door(_db):
     """Reachability is egress-dependent, measured. A fact from an egress the buyer does not pay
     from describes OUR reachability, not theirs."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
-    assert await mp.is_purchasable("judydoll.com", "US") is False, "default vantage is 'worker'"
-    assert await mp.get_fact("judydoll.com", "US") is not None, "but it IS visible to a human"
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    assert await mp.is_purchasable("juniper-card.example", "US") is False, "default vantage is 'worker'"
+    assert await mp.get_fact("juniper-card.example", "US") is not None, "but it IS visible to a human"
 
 
 async def test_the_buyer_vantage_dial_chooses_which_fact_counts(_db, monkeypatch):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "proxy")
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "worker")
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_vantages_are_separate_rows_and_demote_independently(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="worker")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="worker")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
     for _ in range(2):
-        await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False), vantage="proxy")
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+        await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False), vantage="proxy")
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
     assert (await _row(vantage="proxy"))["positive_until"] is None
 
 
@@ -827,15 +827,15 @@ async def test_vantages_are_separate_rows_and_demote_independently(_db):
 
 
 async def test_the_key_is_normalised_on_write_and_on_read(_db):
-    await mp.record_check("WWW.JudyDoll.com", "us", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "US") is True
-    assert await mp.is_purchasable("www.judydoll.com", "us") is True
-    assert len(await mp.list_facts("judydoll.com", "US")) == 1
+    await mp.record_check("WWW.Juniper-Card.example", "us", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
+    assert await mp.is_purchasable("www.juniper-card.example", "us") is True
+    assert len(await mp.list_facts("juniper-card.example", "US")) == 1
 
 
 async def test_the_fact_is_per_market(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "SG") is False
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "SG") is False
 
 
 async def test_a_missing_row_is_not_purchasable(_db):
@@ -846,7 +846,7 @@ async def test_a_missing_row_is_not_purchasable(_db):
 async def test_the_evidence_holds_no_buyer_data_and_no_page_html(_db):
     """An ALLOW-LIST, not a deny-list: the keys are fixed, so a buyer field added upstream cannot
     arrive here by default."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     evidence = (await _row())["evidence"]
     assert set(evidence) == {
         "verdict", "retryable", "detail", "final_status", "final_host",
@@ -860,28 +860,28 @@ async def test_the_evidence_holds_no_buyer_data_and_no_page_html(_db):
 async def test_the_evidence_is_bounded(_db):
     """A hostile or merely long redirect chain must not make this row the largest in the table."""
     chain = tuple((302, f"https://x.com/{'a' * 300}/{i}") for i in range(200))
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True, chain=chain))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True, chain=chain))
     stored = json.dumps((await _row())["evidence"])
     assert len(stored) <= 4000, len(stored)
 
 
 async def test_payment_methods_round_trip_as_a_list(_db):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     assert (await _row())["payment_methods"] == ["Airwallex", "PAYPAL_EXPRESS"]
 
 
 async def test_an_unusable_key_writes_nothing(_db):
-    for domain, market in (("", "US"), ("judydoll.com", ""), ("judydoll.com", "U"), ("judydoll.com", "12")):
+    for domain, market in (("", "US"), ("juniper-card.example", ""), ("juniper-card.example", "U"), ("juniper-card.example", "12")):
         assert await mp.record_check(domain, market, res("ELIGIBLE", card=True)) is None
 
 
 async def test_the_price_columns_round_trip(_db):
     await mp.record_check(
-        "flowerbeauty.com", "US",
+        "fern-paypal.example", "US",
         res("PRICE_DRIFT", card=True, landed_price_minor=800, price_drift_minor=-695),
         expected_price_minor=1495,
     )
-    row = await _row("flowerbeauty.com")
+    row = await _row("fern-paypal.example")
     assert row["landed_price_minor"] == 800
     assert row["expected_price_minor"] == 1495
     assert row["price_drift_minor"] == -695
@@ -918,15 +918,15 @@ async def test_the_job_is_dark_by_default_and_contacts_nobody(_db, monkeypatch):
 async def test_the_job_sweeps_the_population_when_armed(_db, monkeypatch, _population):
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_SWEEP_ENABLED", "true")
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_PAUSE_MS", "0")
-    fetcher = _Fetcher({"flowerbeauty.com": res("NO_CARD_PAYMENT", card=False, host="flowerbeauty.com")})
+    fetcher = _Fetcher({"fern-paypal.example": res("NO_CARD_PAYMENT", card=False, host="fern-paypal.example")})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
 
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.skipped_disabled == 0
     assert report.population == 2 and report.checked == 2 and report.written == 2
     assert report.positive == 1 and report.negative == 1
-    assert await mp.is_purchasable("judydoll.com", "US") is True
-    assert await mp.is_purchasable("flowerbeauty.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
+    assert await mp.is_purchasable("fern-paypal.example", "US") is False
 
 
 async def test_the_job_passes_check_card_and_never_a_buyer(_db, monkeypatch, _population):
@@ -985,12 +985,12 @@ async def test_one_merchant_that_raises_does_not_end_the_batch(_db, monkeypatch,
     def _boom(host, kwargs):
         raise RuntimeError("a store that hangs up")
 
-    fetcher = _Fetcher({"flowerbeauty.com": _boom})
+    fetcher = _Fetcher({"fern-paypal.example": _boom})
     monkeypatch.setattr(sweep, "_preflight", fetcher)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.errors == 1
     assert report.checked == 1 and report.written == 1
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 async def test_the_report_carries_counts_only(_db, monkeypatch, _population):
@@ -1000,7 +1000,7 @@ async def test_the_report_carries_counts_only(_db, monkeypatch, _population):
     monkeypatch.setattr(sweep, "_preflight", _Fetcher({}))
     report = await sweep.run_merchant_purchasability_sweep()
     text = repr(report)
-    for leak in ("judydoll", "flowerbeauty", ".com", "5004"):
+    for leak in ("juniper-card", "fern-paypal", ".example", ".com", "5004"):
         assert leak not in text, f"{leak!r} leaked into the report"
     from dataclasses import fields
     for field in fields(report):
@@ -1015,7 +1015,7 @@ async def test_the_second_vantage_is_configured_not_coded(_db, monkeypatch, _pop
     monkeypatch.setattr(sweep, "_preflight", fetcher)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.checked == 4, "two merchants x two vantages"
-    assert {r["vantage"] for r in await mp.list_facts("judydoll.com", "US")} == {"worker", "proxy"}
+    assert {r["vantage"] for r in await mp.list_facts("juniper-card.example", "US")} == {"worker", "proxy"}
 
 
 @pytest.mark.parametrize("bad", ["", "not-a-url", "ftp://x", "127.0.0.1:7897", "  "])
@@ -1026,9 +1026,9 @@ async def test_a_malformed_proxy_url_is_ignored_rather_than_handed_to_the_client
 
 async def test_the_population_is_the_union_of_the_two_reap_allowlists(_db, _population):
     targets = await sweep.load_population(50)
-    assert {(t.domain, t.market) for t in targets} == {("judydoll.com", "US"), ("flowerbeauty.com", "US")}
+    assert {(t.domain, t.market) for t in targets} == {("juniper-card.example", "US"), ("fern-paypal.example", "US")}
     by_domain = {t.domain: t for t in targets}
-    assert by_domain["judydoll.com"].variant_id == "50041364447509", "the Tier B row's confirmed variant"
+    assert by_domain["juniper-card.example"].variant_id == "50041364447509", "the Tier B row's confirmed variant"
 
 
 # ── the two dials (F5) ──────────────────────────────────────────────────────────────────────
@@ -1131,15 +1131,15 @@ async def test_the_ops_route_reports_enforced_from_the_enforce_dial(_db, ops_app
     """`enforced` IS the gateway's permission to act on `tier`. Hardcode it and a gateway takes
     the whole catalogue browse-only on the day the field ships, because with enforcement off
     every merchant reads browse_only."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
 
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
-    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is False, "the dial is off, so the gateway must not act on tier"
     assert body["tier"] == "purchase", "the FACT is still reported"
 
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
-    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=US")).json()
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=US")).json()
     assert body["enforced"] is True
 
 
@@ -1260,12 +1260,12 @@ async def test_the_cli_runs_one_sweep_over_the_population_and_exits_0(_db, monke
     monkeypatch.setattr(sweep, "_preflight", fetcher)
     with capture_pivota_stdout() as out:
         assert await sweep.amain() == sweep.EXIT_OK == 0
-    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"], (
+    assert sorted(host for host, _ in fetcher.calls) == ["fern-paypal.example", "juniper-card.example"], (
         "ONE sweep: each merchant exactly once"
     )
     proof = [line for line in pivota_lines(out) if _PROOF_LINE.fullmatch(line)]
     assert len(proof) == 1 and "population_unreadable=0" in proof[0], pivota_lines(out)
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 async def test_the_cli_exits_1_when_a_population_lane_cannot_be_read(_db, monkeypatch, _population):
@@ -1286,7 +1286,7 @@ async def test_the_cli_exits_1_when_a_population_lane_cannot_be_read(_db, monkey
     monkeypatch.setattr(database, "fetch_all", _cart_lane_down)
     with capture_pivota_stdout() as out:
         assert await sweep.amain() == sweep.EXIT_POPULATION_UNREADABLE == 1
-    assert [host for host, _ in fetcher.calls] == ["flowerbeauty.com"], (
+    assert [host for host, _ in fetcher.calls] == ["fern-paypal.example"], (
         "the readable (variant) lane is still swept"
     )
     assert any("1 population lane(s) could not be read" in line for line in pivota_lines(out))
@@ -1314,7 +1314,7 @@ async def test_the_variant_lane_failure_is_counted_not_swallowed(_db, monkeypatc
         await ledger.list_enabled_merchant_markets(strict=True)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_unreadable == 1
-    assert [host for host, _ in fetcher.calls] == ["judydoll.com"], "the cart lane is still swept"
+    assert [host for host, _ in fetcher.calls] == ["juniper-card.example"], "the cart lane is still swept"
     assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
 
 
@@ -1343,7 +1343,7 @@ async def test_the_cli_exits_4_when_a_check_raises(_db, monkeypatch, _population
     def _raise(_host, _kwargs):
         raise RuntimeError("a store nobody has classified")
 
-    monkeypatch.setattr(sweep, "_preflight", _Fetcher({"judydoll.com": _raise}))
+    monkeypatch.setattr(sweep, "_preflight", _Fetcher({"juniper-card.example": _raise}))
     assert await sweep.amain() == sweep.EXIT_ERRORS == 4
 
 
@@ -1510,7 +1510,7 @@ async def test_every_request_of_a_run_goes_through_one_pacer(_db, monkeypatch, _
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.checked == 2 and report.errors == 0
     assert len(pacers) == 1, "ONE pacer per run, shared by every merchant"
-    assert len(seen) == 6 and {host for _, host in seen} == {"judydoll.com", "flowerbeauty.com"}
+    assert len(seen) == 6 and {host for _, host in seen} == {"juniper-card.example", "fern-paypal.example"}
     starts = [t for t, _ in seen]
     gaps = [b - a for a, b in zip(starts, starts[1:])]
     assert min(gaps) >= MIN_REQUEST_INTERVAL_S, gaps
@@ -1523,7 +1523,7 @@ async def test_check_card_defaults_off_behaviourally_not_just_in_the_signature(m
     """
     import services.shopify_cart_link_preflight as pf
 
-    fixture = html.unescape((FIXTURES / "flowerbeauty_paypal_only.html").read_text())
+    fixture = html.unescape((FIXTURES / "paypal_only.html").read_text())
     # A landing that satisfies every pre-card check, plus the live accept-list.
     body = page(variant="17281773207622") + fixture
 
@@ -1534,16 +1534,16 @@ async def test_check_card_defaults_off_behaviourally_not_just_in_the_signature(m
                     {"id": 17281773207622, "available": True, "price": "14.95",
                      "title": "Default", "requires_shipping": True}]}]}),
                 [(200, url)])
-        return pf._Landing(200, body, [(200, "https://flowerbeauty.com/checkouts/cn/T")])
+        return pf._Landing(200, body, [(200, "https://fern-paypal.example/checkouts/cn/T")])
 
     monkeypatch.setattr(pf, "_fetch_following", _fake_fetch)
 
     default = await pf.preflight(
-        "flowerbeauty.com", market="US", variant_id="17281773207622",
+        "fern-paypal.example", market="US", variant_id="17281773207622",
         click_id="c", buyer=None,
     )
     asked = await pf.preflight(
-        "flowerbeauty.com", market="US", variant_id="17281773207622",
+        "fern-paypal.example", market="US", variant_id="17281773207622",
         click_id="c", buyer=None, check_card=True,
     )
 
@@ -1627,7 +1627,7 @@ async def test_the_reap_rail_ignores_the_fact_while_the_dial_is_off(_db, monkeyp
     monkeypatch.delenv("MERCHANT_PURCHASABILITY_ENFORCE", raising=False)
     assert mp.is_enforcement_enabled() is False
     # No fact exists at all; the gate would refuse if it were consulted.
-    assert await mp.is_purchasable("judydoll.com", "US") is False
+    assert await mp.is_purchasable("juniper-card.example", "US") is False
 
 
 async def test_the_reap_rail_consults_the_fact_only_under_the_enforce_dial(monkeypatch):
@@ -1762,7 +1762,7 @@ async def _population(_db):
     await database.execute("DELETE FROM reap_agentic_eligibility")
     await database.execute(
         "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
-        "market_country, enabled) VALUES ('flowerbeauty.com', '', '', 'US', TRUE)"
+        "market_country, enabled) VALUES ('fern-paypal.example', '', '', 'US', TRUE)"
     )
     # A disabled row, and a non-merchant override row: neither may reach the population.
     await database.execute(
@@ -1775,11 +1775,11 @@ async def _population(_db):
     await database.execute("DELETE FROM tierb_cart_link_eligibility")
     await database.execute(
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, variant_id, "
-        "checked_at) VALUES ('judydoll.com', 'US', 'ELIGIBLE', '50041364447509', CURRENT_TIMESTAMP)"
+        "checked_at) VALUES ('juniper-card.example', 'US', 'ELIGIBLE', '50041364447509', CURRENT_TIMESTAMP)"
     )
     await database.execute(
         "INSERT INTO tierb_cart_link_eligibility (shop_domain, market, verdict, variant_id, "
-        "checked_at) VALUES ('luafee.com', 'US', 'NOT_ACCEPTING_ORDERS', '1', CURRENT_TIMESTAMP)"
+        "checked_at) VALUES ('lumen-closed.example', 'US', 'NOT_ACCEPTING_ORDERS', '1', CURRENT_TIMESTAMP)"
     )
     # The CONNECTED-STORE lane's tables, present and EMPTY, so the population above is exactly
     # the two allowlists' and that lane reads (not fails to read) nothing. `_connected` fills it.
@@ -1898,7 +1898,7 @@ async def test_a_population_row_that_is_not_a_bare_host_is_not_swept(_population
     )
     domains = {t.domain for t in await sweep.load_population(50)}
     assert "urlshaped.example" not in domains and "https://urlshaped.example/" not in domains
-    assert {"flowerbeauty.com", "judydoll.com"} <= domains
+    assert {"fern-paypal.example", "juniper-card.example"} <= domains
 
 
 async def test_skipped_allowlist_rows_are_counted_in_the_report_and_logged_once(
@@ -1980,7 +1980,7 @@ async def test_the_report_line_lands_on_pivota_stdout_at_info_with_root_at_warni
     # counts-only test already polices, and the line carries nothing else.
     assert proof[0].endswith(f"merchant_purchasability_sweep: {report!r}")
     assert report.checked == 2 and report.population == 2
-    for leak in ("judydoll", "flowerbeauty", ".com", "5004"):
+    for leak in ("juniper-card", "fern-paypal", ".example", ".com", "5004"):
         assert leak not in proof[0], f"{leak!r} leaked into the proof line"
 
 
@@ -2051,8 +2051,8 @@ async def test_is_purchasable_answers_false_for_an_unknown_market_without_asking
 ):
     import logging
 
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", "US") is True, "the premise: US is positive"
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", "US") is True, "the premise: US is positive"
 
     async def _no_db(*_a, **_k):
         raise AssertionError("an unknown market must not reach the database")
@@ -2060,10 +2060,10 @@ async def test_is_purchasable_answers_false_for_an_unknown_market_without_asking
     monkeypatch.setattr(database, "fetch_one", _no_db)
     monkeypatch.setattr(database, "fetch_all", _no_db)
     caplog.set_level(logging.DEBUG, logger=mp.logger.name)
-    assert await mp.is_purchasable("judydoll.com", market) is False
-    assert await mp.is_purchasable("judydoll.com", market, now=datetime.now(timezone.utc)) is False
-    assert await mp.get_fact("judydoll.com", market) is None
-    assert await mp.list_facts("judydoll.com", market) == []
+    assert await mp.is_purchasable("juniper-card.example", market) is False
+    assert await mp.is_purchasable("juniper-card.example", market, now=datetime.now(timezone.utc)) is False
+    assert await mp.get_fact("juniper-card.example", market) is None
+    assert await mp.list_facts("juniper-card.example", market) == []
     assert [r for r in caplog.records if r.name == mp.logger.name] == [], (
         "an unknown market is an expected input, not an error: no log line (no storm)"
     )
@@ -2074,27 +2074,27 @@ async def test_an_unknown_market_is_not_answered_with_the_us_fact_on_a_live_db(_
     """The same rule with the database LIVE, so a consumer that substituted "US" would actually
     find the positive US row and answer True — the previous test can only catch that through its
     no-log assertion, because it makes the database refuse."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.is_purchasable("judydoll.com", market) is False
-    assert await mp.get_fact("judydoll.com", market) is None
-    assert await mp.list_facts("judydoll.com", market) == []
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.is_purchasable("juniper-card.example", market) is False
+    assert await mp.get_fact("juniper-card.example", market) is None
+    assert await mp.list_facts("juniper-card.example", market) == []
 
 
 @pytest.mark.parametrize("market", _UNKNOWN_MARKETS)
 async def test_record_check_refuses_to_write_under_an_unknown_market(_db, market):
     """The writer side of the same rule: nothing is ever keyed on a defaulted or truncated
     market. "USA" used to be written as "US"."""
-    assert await mp.record_check("judydoll.com", market, res("ELIGIBLE", card=True)) is None
+    assert await mp.record_check("juniper-card.example", market, res("ELIGIBLE", card=True)) is None
     count = await database.fetch_one(f"SELECT COUNT(*) AS n FROM {TABLE}")
     assert int(dict(count)["n"]) == 0
 
 
 @pytest.mark.parametrize("spelled", ["us", " US ", "Us"])
 async def test_a_present_market_is_normalised_and_bound_on_both_sides(_db, spelled):
-    await mp.record_check("judydoll.com", spelled, res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", spelled, res("ELIGIBLE", card=True))
     assert (await _row())["market_country"] == "US"
-    assert await mp.is_purchasable("judydoll.com", spelled) is True
-    assert await mp.is_purchasable("judydoll.com", "US") is True
+    assert await mp.is_purchasable("juniper-card.example", spelled) is True
+    assert await mp.is_purchasable("juniper-card.example", "US") is True
 
 
 @pytest.mark.parametrize(
@@ -2104,9 +2104,9 @@ async def test_the_ops_route_reports_market_unknown_for_a_missing_market(_db, op
     """No market -> tier browse_only with reason `market_unknown`, market null, no facts — even
     though a fresh positive US fact exists. A 200 with a distinct reason, not a 422 the gateway
     would read as "backend down" and fail open on."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
-    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=judydoll.com{query}")
+    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=juniper-card.example{query}")
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["tier"] == "browse_only"
@@ -2119,8 +2119,8 @@ async def test_the_ops_route_reports_market_unknown_for_a_missing_market(_db, op
 @pytest.mark.parametrize("spelled", ["%20us", "us%20", "Us"])
 async def test_the_ops_route_normalises_a_present_market_instead_of_refusing_it(_db, ops_app, spelled):
     """Any string is accepted and put through the one helper: " us" is US (it was a 422)."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=judydoll.com&market={spelled}")
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    response = await ops_get(ops_app, f"/ops/merchant-purchasability?domain=juniper-card.example&market={spelled}")
     assert response.status_code == 200, response.text
     body = response.json()
     assert (body["market"], body["tier"], body["reason"]) == ("US", "purchase", None)
@@ -2130,14 +2130,14 @@ async def test_the_ops_route_with_a_market_is_unchanged_apart_from_a_null_reason
     """Zero-diff for a keyed request: the only new keys are `reason` (null) and, since
     2026-10-09, `human_handoff_tier`. PINNED LITERALS — the key set and note below are main's
     response (2a590bb9c) plus those two."""
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com&market=us")).json()
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=juniper-card.example&market=us")).json()
     assert set(body) == {
         "domain", "market", "tier", "human_handoff_tier", "reason", "enforced", "buyer_vantage",
         "sweep_enabled", "ttl_hours", "facts", "note",
     }
     assert body["reason"] is None
-    assert (body["domain"], body["market"], body["tier"]) == ("judydoll.com", "US", "purchase")
+    assert (body["domain"], body["market"], body["tier"]) == ("juniper-card.example", "US", "purchase")
     assert body["note"] == "a fresh positive fact from vantage 'worker'; the door may offer purchase"
 
 
@@ -2187,7 +2187,7 @@ async def test_the_sweep_report_carries_the_market_unknown_count_and_logs_it_onc
     async def _variant_lane(**_k):
         return [
             {"merchant_domain": "nomarket.example", "market_country": ""},
-            {"merchant_domain": "judydoll.com", "market_country": "US"},
+            {"merchant_domain": "juniper-card.example", "market_country": "US"},
         ]
 
     async def _cart_lane(_statement):
@@ -2290,7 +2290,7 @@ _LEGACY_STORES = {
     "m_legacy_empty": ("shopify", "legacy-empty.myshopify.com", True),
 }
 
-#: Exactly what the lane must admit, beside the two allowlists' judydoll.com / flowerbeauty.com.
+#: Exactly what the lane must admit, beside the two allowlists' juniper-card.example / fern-paypal.example.
 _CONNECTED_EXPECTED = {
     ("conn-store.myshopify.com", "US"),
     ("url-store.myshopify.com", "US"),
@@ -2340,7 +2340,7 @@ async def test_the_population_adds_the_connected_shopify_stores(_db, _connected)
     tally: dict = {}
     targets = await sweep.load_population(50, tally=tally)
     keys = {(t.domain, t.market) for t in targets}
-    assert keys == {("judydoll.com", "US"), ("flowerbeauty.com", "US")} | _CONNECTED_EXPECTED
+    assert keys == {("juniper-card.example", "US"), ("fern-paypal.example", "US")} | _CONNECTED_EXPECTED
     assert len(targets) == len(keys), "two live rows on one host are ONE merchant x market"
     # EU, APAC, "shopify" and NULL — each skipped and COUNTED, never defaulted to US. The three
     # test merchants are counted as that and nothing else: the rig whose region is "shopify" is
@@ -2409,7 +2409,7 @@ async def test_the_connected_lane_failure_is_counted_and_the_allowlists_still_sw
     monkeypatch.setattr(database, "fetch_all", _connected_lane_down)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_unreadable == 1
-    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"]
+    assert sorted(host for host, _ in fetcher.calls) == ["fern-paypal.example", "juniper-card.example"]
     assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
 
 
@@ -2479,8 +2479,8 @@ _CART_SEEDS = (
     # it as a forgery; a gateway-built card that carries no product id cannot, and mints the cart.
     ("mpx_s_restated", "active", "restated-brand.example", "US", None, None,
      _stamped("46100000000013"), None),
-    # Overlaps the Tier B lane's judydoll.com x US, whose CONFIRMED variant must still win.
-    ("mpx_s_overlap", "active", "judydoll.com", "US", None, None, _stamped("46100000000005"), None),
+    # Overlaps the Tier B lane's juniper-card.example x US, whose CONFIRMED variant must still win.
+    ("mpx_s_overlap", "active", "juniper-card.example", "US", None, None, _stamped("46100000000005"), None),
     # Listed in JP: keyed on JP, never on the buyer default.
     ("mpx_s_jp", "active", "jp-brand.example", "JP", None, None, _stamped("46100000000006"), None),
     # REFUSED — none of these reaches the population:
@@ -2495,7 +2495,7 @@ _CART_SEEDS = (
      _stamped("46100000000011"), None),  # no http(s) URL: no lane mints a link at all
 )
 
-#: Exactly what the cart-mint lane must admit (the Tier B lane already names judydoll.com x US).
+#: Exactly what the cart-mint lane must admit (the Tier B lane already names juniper-card.example x US).
 _CART_MINT_EXPECTED = {
     ("stamp-brand.example", "US"),
     ("attached-brand.example", "US"),
@@ -2506,10 +2506,10 @@ _CART_MINT_EXPECTED = {
     ("named-brand.example", "US"),
     ("empty-variant-brand.example", "US"),
     ("restated-brand.example", "US"),
-    ("judydoll.com", "US"),
+    ("juniper-card.example", "US"),
     ("jp-brand.example", "JP"),
 }
-_ALLOWLISTS = {("judydoll.com", "US"), ("flowerbeauty.com", "US")}
+_ALLOWLISTS = {("juniper-card.example", "US"), ("fern-paypal.example", "US")}
 #: Exactly what the WARM-CLICK lane must admit: the destination host of every ACTIVE seed with an
 #: http(s) URL and an ISO-2 market, whether or not it mints a cart. The two seeds the cart-mint
 #: lane refuses (referral-only, multi-brand) are exactly the cold links the warm stamp asks about.
@@ -2595,9 +2595,9 @@ async def test_the_population_adds_every_host_the_cart_minter_builds_on(_db, _ca
     # read failed or came back incomplete.
     assert tally == {sweep.MARKET_UNKNOWN_TALLY: 2}
     assert sizes == {sweep.TOTAL_TALLY: len(keys), sweep.NEVER_CHECKED_TALLY: len(keys),
-                     sweep.CART_MINT_AGE_TALLY: 0}
+                     sweep.CART_MINT_AGE_TALLY: 0, sweep.WARM_DEFERRED_TALLY: 0}
     by_key = {(t.domain, t.market): t for t in targets}
-    assert by_key[("judydoll.com", "US")].variant_id == "50041364447509", (
+    assert by_key[("juniper-card.example", "US")].variant_id == "50041364447509", (
         "the Tier B lane's CONFIRMED variant still wins where the cart-mint lane names the key too"
     )
     # NO CATALOG HINT for a key only the cart-mint lane names. catalog-brand-*.example DO have a
@@ -2611,7 +2611,7 @@ async def test_the_lanes_are_reported_separately_for_the_census(_db, _cart_seeds
     detail: dict = {}
     lanes = await sweep.collect_population(cart_mint=detail)
     assert set(lanes["cart-mint"]) == _CART_MINT_EXPECTED
-    assert set(lanes["cart-link"]) == {("judydoll.com", "US")}
+    assert set(lanes["cart-link"]) == {("juniper-card.example", "US")}
     assert detail["complete"] is True
     assert detail["seeds_scanned"] == sum(1 for s in _CART_SEEDS if s[1] == "active")
     # One cart seed per expected key, plus the market-less one that mints a cart but is not keyed.
@@ -2635,7 +2635,7 @@ async def test_the_population_covers_every_cart_the_real_mint_builds(_db, _cart_
 
     import routes.agent_shop_gateway as gw
 
-    domains = sorted({s[2].lower() for s in _CART_SEEDS} | {"judydoll.com"})
+    domains = sorted({s[2].lower() for s in _CART_SEEDS} | {"juniper-card.example"})
 
     async def _allowed(*, market):
         return domains
@@ -2733,7 +2733,7 @@ async def test_the_cart_mint_lane_failure_is_counted_and_the_other_lanes_still_s
     monkeypatch.setattr(database, "fetch_all", _seeds_down)
     report = await sweep.run_merchant_purchasability_sweep()
     assert report.population_unreadable == 1
-    assert sorted(host for host, _ in fetcher.calls) == ["flowerbeauty.com", "judydoll.com"]
+    assert sorted(host for host, _ in fetcher.calls) == ["fern-paypal.example", "juniper-card.example"]
     assert sweep.exit_code_for(report) == sweep.EXIT_POPULATION_UNREADABLE
 
 
@@ -2974,6 +2974,7 @@ async def test_a_failed_scan_falls_back_to_the_last_complete_one_and_backs_off(_
     assert calls["scans"] == 2
     assert sweep.UNREADABLE_TALLY not in tally, "a day-old scan stands in; nothing is counted"
     assert ("stamp-brand.example", "US") in keys
+    assert ("referral-only.example", "US") in keys, "the stand-in scan carries its warm-click keys too"
     assert sizes[sweep.CART_MINT_AGE_TALLY] == 24 * 60
 
     clock.now = _DAY1 + timedelta(days=1, hours=5)
@@ -3053,7 +3054,7 @@ async def test_the_census_scans_fresh_and_touches_no_cache(_db, _scans):
 
 _MEASURED_429 = {"server": "cloudflare", "retry-after": "60", "content-type": "text/plain"}
 _CHALLENGE = {"server": "cloudflare", "cf-mitigated": "challenge", "content-type": "text/html"}
-_EXTRA_STORES = tuple(f"store{i}.example" for i in range(1, 7))  # + flowerbeauty + judydoll = 8
+_EXTRA_STORES = tuple(f"store{i}.example" for i in range(1, 7))  # + the PayPal-only store + the card store = 8
 _LONG_AGO = "2026-10-01 12:00:00"  # a literal: Postgres reads it in the session's zone, SQLite as UTC
 
 
@@ -3064,7 +3065,7 @@ async def _throttle_population():
         await database.execute(
             "INSERT INTO reap_agentic_eligibility (merchant_domain, product_key, variant_key, "
             "market_country, enabled) VALUES (:d, '', '', 'US', TRUE)", {"d": domain})
-    domains = ("flowerbeauty.com", "judydoll.com") + _EXTRA_STORES
+    domains = ("fern-paypal.example", "juniper-card.example") + _EXTRA_STORES
     for domain in domains:
         await mp.record_check(domain, "US", res("ELIGIBLE", card=True, host=domain))
     # One earlier CONFIRMED negative on one store, so a throttle visibly does not touch the count.
@@ -3394,48 +3395,48 @@ async def test_every_verdict_answers_the_human_reader_from_a_real_row(_db, verdi
     The card flag is whatever that verdict would carry (False for NO_CARD_PAYMENT, True for
     ELIGIBLE, unknown otherwise); it never decides the human answer."""
     card = {"ELIGIBLE": True, "NO_CARD_PAYMENT": False}.get(verdict)
-    assert await mp.record_check("judydoll.com", "US", res(verdict, card=card)) is not None
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is (verdict in _HUMAN_ALLOWED), verdict
+    assert await mp.record_check("juniper-card.example", "US", res(verdict, card=card)) is not None
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is (verdict in _HUMAN_ALLOWED), verdict
     # The rail's reader is unchanged: only ELIGIBLE + card opens it.
-    assert await mp.is_purchasable("judydoll.com", "US") is (verdict == "ELIGIBLE")
+    assert await mp.is_purchasable("juniper-card.example", "US") is (verdict == "ELIGIBLE")
 
 
 async def test_a_no_card_payment_row_keeps_the_human_cart_however_many_times_it_repeats(_db):
     """Two consecutive NO_CARD_PAYMENT checks DEMOTE the rail (rule 2) — and the human cart stays,
     because demotion is `positive_until`, which this reader does not consult."""
     for _ in range(3):
-        await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
-    row = await _row("flowerbeauty.com")
+        await mp.record_check("fern-paypal.example", "US", res("NO_CARD_PAYMENT", card=False))
+    row = await _row("fern-paypal.example")
     assert row["consecutive_failures"] == 3 and row["positive_until"] is None
-    assert await mp.is_purchasable("flowerbeauty.com", "US") is False
-    assert await mp.human_handoff_allowed("flowerbeauty.com", "US") is True
+    assert await mp.is_purchasable("fern-paypal.example", "US") is False
+    assert await mp.human_handoff_allowed("fern-paypal.example", "US") is True
 
 
 async def test_a_stale_fact_does_not_open_the_human_cart(_db):
     """Freshness is the LAST CHECK inside the TTL, not `positive_until`. A row nobody has
     re-checked for longer than the TTL says nothing about today's checkout."""
-    await mp.record_check("judydoll.com", "US", res("NO_CARD_PAYMENT", card=False))
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    await mp.record_check("juniper-card.example", "US", res("NO_CARD_PAYMENT", card=False))
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is True
     past = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() + 1)
     await _set("checked_at", past.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else past)
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is False
     # Just inside the window still answers.
     recent = datetime.now(timezone.utc) - timedelta(hours=mp.ttl_hours() - 1)
     await _set("checked_at", recent.strftime("%Y-%m-%d %H:%M:%S") if not IS_POSTGRES else recent)
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is True
 
 
 async def test_the_human_reader_reads_the_buyer_vantage_only(_db, monkeypatch):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True), vantage="proxy")
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is False, "default vantage is worker"
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True), vantage="proxy")
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is False, "default vantage is worker"
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_BUYER_VANTAGE", "proxy")
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is True
 
 
 async def test_the_human_reader_is_per_market_and_never_defaults_one(_db, monkeypatch):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
-    assert await mp.human_handoff_allowed("judydoll.com", "SG") is False
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is True
+    assert await mp.human_handoff_allowed("juniper-card.example", "SG") is False
     calls = []
     real = database.fetch_one
 
@@ -3445,38 +3446,38 @@ async def test_the_human_reader_is_per_market_and_never_defaults_one(_db, monkey
 
     monkeypatch.setattr(database, "fetch_one", _spy)
     for unknown in (None, "", "  ", "USA", "U1"):
-        assert await mp.human_handoff_allowed("judydoll.com", unknown) is False
+        assert await mp.human_handoff_allowed("juniper-card.example", unknown) is False
     assert calls == [], "an unknown market is answered without a database read"
 
 
 async def test_the_human_reader_fails_closed_when_the_database_raises(_db, monkeypatch):
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is True
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is True
 
     async def _explode(*args, **kwargs):
         raise RuntimeError("pool exhausted")
 
     monkeypatch.setattr(database, "fetch_one", _explode)
-    assert await mp.human_handoff_allowed("judydoll.com", "US") is False
+    assert await mp.human_handoff_allowed("juniper-card.example", "US") is False
 
 
 async def test_the_ops_route_publishes_the_human_tier_beside_the_rails(_db, ops_app, monkeypatch):
     """The gateway's gate strips a human cart on `tier`; it must have the human answer to read
     instead. The two part on NO_CARD_PAYMENT and nowhere else in this table."""
     monkeypatch.setenv("MERCHANT_PURCHASABILITY_ENFORCE", "1")
-    await mp.record_check("judydoll.com", "US", res("ELIGIBLE", card=True))
-    await mp.record_check("flowerbeauty.com", "US", res("NO_CARD_PAYMENT", card=False))
-    await mp.record_check("luafee.com", "US", res("NOT_ACCEPTING_ORDERS"))
+    await mp.record_check("juniper-card.example", "US", res("ELIGIBLE", card=True))
+    await mp.record_check("fern-paypal.example", "US", res("NO_CARD_PAYMENT", card=False))
+    await mp.record_check("lumen-closed.example", "US", res("NOT_ACCEPTING_ORDERS"))
     expected = {
-        "judydoll.com": ("purchase", "purchase"),
-        "flowerbeauty.com": ("browse_only", "purchase"),
-        "luafee.com": ("browse_only", "browse_only"),
+        "juniper-card.example": ("purchase", "purchase"),
+        "fern-paypal.example": ("browse_only", "purchase"),
+        "lumen-closed.example": ("browse_only", "browse_only"),
         "never-seen.com": ("browse_only", "browse_only"),
     }
     for domain, (tier, human) in expected.items():
         body = (await ops_get(ops_app, f"/ops/merchant-purchasability?domain={domain}&market=US")).json()
         assert (body["tier"], body["human_handoff_tier"]) == (tier, human), domain
-    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=judydoll.com")).json()
+    body = (await ops_get(ops_app, "/ops/merchant-purchasability?domain=juniper-card.example")).json()
     assert (body["tier"], body["human_handoff_tier"], body["reason"]) == (
         "browse_only", "browse_only", "market_unknown")
 
@@ -3541,4 +3542,291 @@ async def test_a_recorded_scan_round_trips_the_warm_click_lane(_db):
     finally:
         await database.execute(
             "DELETE FROM merchant_purchasability_cart_mint_scans WHERE scan_id = 'cms_warm_roundtrip'")
+
+
+# ══ the warm-click guard (be#2772 review P2-1) ═══════════════════════════════════════════════
+#
+# A third of the warm-click lane's hosts are not Shopify, and a big retailer's bot wall reads as
+# a throttle. These hold that the lane can neither starve the other lanes' keys nor trip the IP
+# breaker, and that a host with no Shopify catalog is re-checked weekly, not every rotation.
+
+_GUARD_NOW = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def _guard_lanes(core, warm_only, also_warm=()):
+    lanes = {name: {} for name in sweep.LANES}
+    for key in core:
+        lanes["cart-mint"][key] = None
+    for key in [*warm_only, *also_warm]:
+        lanes["warm-click"][key] = None
+    return lanes
+
+
+@pytest.fixture
+def _guard(monkeypatch):
+    """`load_population` over synthetic lanes and a synthetic staleness read: no database."""
+    state = {"lanes": {}, "due": []}
+
+    async def _collect(**_kwargs):
+        return state["lanes"]
+
+    async def _due(*_args, **_kwargs):
+        return state["due"]
+
+    monkeypatch.setattr(sweep, "collect_population", _collect)
+    monkeypatch.setattr(sweep.facts, "list_due", _due)
+    monkeypatch.setattr(sweep, "_utcnow", lambda: _GUARD_NOW)
+    return state
+
+
+def _due_row(key, *, hours_ago, verdict="ELIGIBLE", detail=None, positive_until=None):
+    return {"merchant_domain": key[0], "market_country": key[1],
+            "checked_at": _GUARD_NOW - timedelta(hours=hours_ago), "verdict": verdict, "detail": detail,
+            "positive_until": positive_until}
+
+
+async def test_warm_only_keys_take_at_most_the_cap_and_core_keys_the_rest(_guard, monkeypatch):
+    core = [(f"core-{i}.example", "US") for i in range(10)]
+    warm = [(f"warm-{i}.example", "US") for i in range(30)]  # never checked: first in staleness
+    _guard["lanes"] = _guard_lanes(core, warm)
+    _guard["due"] = [_due_row(k, hours_ago=20) for k in core]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "6")
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    picked = {(t.domain, t.market) for t in targets}
+    assert len(picked & set(warm)) == 6, "never-checked warm-only keys cannot fill the run"
+    assert set(core) <= picked, "every due core key still gets a slot"
+    assert len(targets) == 16, "the batch is not padded with more warm-only keys"
+    assert sizes[sweep.TOTAL_TALLY] == 40 and sizes[sweep.NEVER_CHECKED_TALLY] == 30
+
+
+async def test_a_warm_only_key_is_never_rechecked_ahead_of_a_staler_core_key(_guard, monkeypatch):
+    core = [(f"core-{i}.example", "US") for i in range(5)]
+    warm = [("warm-fresh.example", "US")]
+    _guard["lanes"] = _guard_lanes(core, warm)
+    _guard["due"] = [_due_row(k, hours_ago=30) for k in core] + [_due_row(warm[0], hours_ago=1)]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "6")
+    targets = await sweep.load_population(5)
+    assert {(t.domain, t.market) for t in targets} == set(core)
+
+
+async def test_a_key_another_lane_names_is_never_guarded(_guard, monkeypatch):
+    """A warm-click key that the cart-mint lane also names is a core key: no cap, proven."""
+    shared = ("shared.example", "US")
+    _guard["lanes"] = _guard_lanes([shared], [], also_warm=[shared])
+    _guard["due"] = [_due_row(shared, hours_ago=5, verdict="VARIANT_UNVERIFIED",
+                              detail="products_json_page_1_status_404")]
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "0")
+    sizes: dict = {}
+    [target] = await sweep.load_population(5, sizes=sizes)
+    assert (target.domain, target.proven_shopify) == ("shared.example", True)
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == 0
+
+
+async def test_a_zero_cap_takes_the_warm_click_lane_out_of_the_population(_guard, monkeypatch):
+    core = [("core.example", "US")]
+    warm = [("warm.example", "US")]
+    _guard["lanes"] = _guard_lanes(core, warm)
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", "0")
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert [(t.domain, t.market) for t in targets] == core
+    assert sizes[sweep.TOTAL_TALLY] == 1 and sizes[sweep.NEVER_CHECKED_TALLY] == 1
+
+
+@pytest.mark.parametrize("detail, hours_ago, deferred", [
+    ("products_json_page_1_status_404", 48, True),       # no catalog, checked 2 days ago
+    ("products_json_page_1_status_410", 48, True),
+    ("products_json_page_1_status_200", 48, True),       # an HTML page where the catalog would be
+    ("products_json_page_1_status_500", 48, False),      # a 5xx is transient, never "not Shopify"
+    ("products_json_page_1_status_502", 48, False),
+    ("products_json_page_1_status_403", 48, False),
+    ("products_json_page_1_status_404", 8 * 24, False),  # a week has passed: re-check it
+    ("products_json_page_1_status_429", 48, False),      # a throttle never reads as "not Shopify"
+    ("products_json_page_1_status_503", 48, False),
+    ("products_json_page_2_status_404", 48, False),      # page 1 WAS a product list
+    ("pagination_stalled", 48, False),
+])
+async def test_a_warm_only_key_with_no_shopify_catalog_is_rechecked_weekly(
+    _guard, monkeypatch, detail, hours_ago, deferred
+):
+    key = ("retailer.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=hours_ago, verdict="VARIANT_UNVERIFIED", detail=detail)]
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert (targets == []) is deferred
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == int(deferred)
+    assert sizes[sweep.TOTAL_TALLY] == 1, "a deferred key is still counted in the population"
+
+
+@pytest.mark.parametrize("verdict, proven", [
+    *[(v, True) for v in sorted(sweep.SHOPIFY_STOREFRONT_VERDICTS)],
+    ("TRANSPORT_ERROR", False), ("BLOCKED_UNKNOWN", False), ("VARIANT_UNVERIFIED", False),
+    ("UNCLASSIFIED", False), ("INVALID_INPUT", False), (None, False),
+])
+async def test_a_warm_only_key_is_proven_shopify_only_by_a_storefront_verdict(_guard, verdict, proven):
+    key = ("warm.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [] if verdict is None else [_due_row(key, hours_ago=30, verdict=verdict, detail="x")]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("verdict, detail, window_end, proven", [
+    # One throttle on a card-positive store must not unprove it, open window or recently closed.
+    ("TRANSPORT_ERROR", "throttled", timedelta(hours=40), True),
+    ("TRANSPORT_ERROR", "throttled", -timedelta(days=5), True),         # "recently", not "now"
+    ("BLOCKED_UNKNOWN", "x", -timedelta(days=5), True),
+    ("TRANSPORT_ERROR", "throttled", -(timedelta(days=14) - timedelta(hours=1)), True),
+    # P3-A: a host that held a window long ago (it replatformed, say) is not proven forever.
+    ("TRANSPORT_ERROR", "throttled", -(timedelta(days=14) + timedelta(hours=1)), False),
+    ("TRANSPORT_ERROR", "throttled", -timedelta(days=90), False),
+    # ...nor once its last check says there is no Shopify catalog at all.
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_404", -timedelta(days=5), False),
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_200", timedelta(hours=40), False),
+    # A 5xx page 1 is transient, not "no catalog": the recent positive still proves it.
+    ("VARIANT_UNVERIFIED", "products_json_page_1_status_500", -timedelta(days=5), True),
+    ("TRANSPORT_ERROR", "throttled", None, False),                      # never armed (NO_CARD...)
+])
+async def test_proven_is_sticky_for_a_recent_card_positive_only(_guard, verdict, detail, window_end, proven):
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=30, verdict=verdict, detail=detail,
+                              positive_until=None if window_end is None else _GUARD_NOW + window_end)]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("days, window_end, proven", [
+    ("0", timedelta(hours=1), True),     # 0 = only while the window is still open
+    ("0", -timedelta(hours=1), False),
+    ("30", -timedelta(days=20), True),
+])
+async def test_the_sticky_window_is_a_dial(_guard, monkeypatch, days, window_end, proven):
+    monkeypatch.setenv("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", days)
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=30, verdict="TRANSPORT_ERROR", detail="throttled",
+                              positive_until=_GUARD_NOW + window_end)]
+    [target] = await sweep.load_population(20)
+    assert target.proven_shopify is proven
+
+
+@pytest.mark.parametrize("window_end, deferred", [
+    (-timedelta(days=5), False),    # P3-C: a store we checked out on is not "no catalog" on one answer
+    (timedelta(hours=40), False),
+    (-timedelta(days=20), True),    # outside the sticky window: deferred as any other
+    (None, True),
+])
+async def test_a_recent_card_positive_is_never_deferred_as_no_catalog(_guard, window_end, deferred):
+    key = ("real-store.example", "US")
+    _guard["lanes"] = _guard_lanes([], [key])
+    _guard["due"] = [_due_row(key, hours_ago=48, verdict="VARIANT_UNVERIFIED",
+                              detail="products_json_page_1_status_404",
+                              positive_until=None if window_end is None else _GUARD_NOW + window_end)]
+    sizes: dict = {}
+    targets = await sweep.load_population(20, sizes=sizes)
+    assert (targets == []) is deferred
+    assert sizes[sweep.WARM_DEFERRED_TALLY] == int(deferred)
+    if not deferred:
+        assert targets[0].proven_shopify is False, "re-checked, but its no-catalog answer is not proof"
+
+
+async def test_sticky_proven_through_the_real_producer(_db, monkeypatch):
+    """The rows `record_check` actually writes, read back by the strict `list_due`: a card positive
+    then a throttle keeps the key proven for 14 days after its window ends, and no longer."""
+    key = ("producer-store.example", "US")
+    await mp.record_check(key[0], key[1], res("ELIGIBLE", card=True, host=key[0]))
+    await mp.record_check(key[0], key[1], res("TRANSPORT_ERROR", host=key[0], retryable=True,
+                                              throttled=True, detail="throttled"))
+
+    async def _collect(**_kwargs):
+        return _guard_lanes([], [key])
+
+    real_list_due = mp.list_due  # `sweep.facts` IS this module: keep the real one before patching
+
+    async def _due(*args, **kwargs):
+        return [r for r in await real_list_due(*args, **kwargs) if r["merchant_domain"] == key[0]]
+
+    monkeypatch.setattr(sweep, "collect_population", _collect)
+    monkeypatch.setattr(sweep.facts, "list_due", _due)
+    [row] = await _due(50, strict=True)
+    assert row["verdict"] == "TRANSPORT_ERROR" and row["positive_until"] is not None
+    window_end = row["positive_until"] if row["positive_until"].tzinfo else \
+        row["positive_until"].replace(tzinfo=timezone.utc)
+    for after, proven in ((timedelta(days=13), True), (timedelta(days=15), False)):
+        monkeypatch.setattr(sweep, "_utcnow", lambda: window_end + after)
+        [target] = await sweep.load_population(20)
+        assert target.proven_shopify is proven, after
+
+
+async def test_the_default_cap_is_eight(_guard, monkeypatch):
+    monkeypatch.delenv("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", raising=False)
+    warm = [(f"warm-{i}.example", "US") for i in range(30)]
+    _guard["lanes"] = _guard_lanes([], warm)
+    assert len(await sweep.load_population(24)) == 8
+
+
+def test_the_storefront_verdicts_are_real_preflight_verdicts():
+    assert sweep.SHOPIFY_STOREFRONT_VERDICTS <= {v.value for v in Verdict}
+
+
+async def test_an_unproven_host_feeds_neither_the_ip_breaker_nor_the_shopify_edge(monkeypatch):
+    """The two transports `_sweep_targets` builds per check, recorded: an unproven warm-only host
+    is paced by the run's pacer only; a proven one (and every core key) is unchanged."""
+    built = []
+
+    class _Paced:
+        def __init__(self, inner, pacer, *, shopify_edge):
+            built.append(("edge", shopify_edge))
+
+    class _Watch:
+        def __init__(self, inner, breaker, *, observe=True):
+            built.append(("observe", observe))
+            self.refused = 0
+
+        async def aclose(self):
+            return None
+
+    async def _check(target, *, vantage, client):
+        return res("ELIGIBLE", card=True, host=target.domain)
+
+    async def _record(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(sweep, "PacedTransport", _Paced)
+    monkeypatch.setattr(sweep, "_ThrottleWatchingTransport", _Watch)
+    monkeypatch.setattr(sweep, "_inner_transport", lambda via: None)
+    monkeypatch.setattr(sweep, "_check_one", _check)
+    monkeypatch.setattr(sweep.facts, "record_check", _record)
+    monkeypatch.setattr(sweep.httpx, "AsyncClient", lambda **_k: _NullClient())
+    counts = {name: 0 for name in sweep._COUNTS}
+    breaker = sweep._new_breaker()
+    targets = [sweep.Target("unproven.example", "US", proven_shopify=False),
+               sweep.Target("proven.example", "US")]
+    await sweep._sweep_targets(targets, [(mp.WORKER_VANTAGE, None)], {}, None, breaker, counts, 0,
+                               lambda: False)
+    assert built == [("edge", False), ("observe", False), ("edge", True), ("observe", True)]
+    assert counts["checked"] == 2
+
+
+class _NullClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+async def test_list_due_carries_the_last_verdict_and_detail(_db):
+    await mp.record_check("nocatalog.example", "US", res(
+        "VARIANT_UNVERIFIED", host="nocatalog.example", detail="products_json_page_1_status_404"))
+    row = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "nocatalog.example")
+    assert (row["verdict"], row["detail"]) == ("VARIANT_UNVERIFIED", "products_json_page_1_status_404")
+    assert sweep._found_no_shopify_catalog(row["verdict"], row["detail"]) is True
+    assert row["positive_until"] is None
+    await mp.record_check("positive.example", "US", res("ELIGIBLE", card=True, host="positive.example"))
+    positive = next(r for r in await mp.list_due(50, strict=True) if r["merchant_domain"] == "positive.example")
+    assert positive["positive_until"] is not None
 

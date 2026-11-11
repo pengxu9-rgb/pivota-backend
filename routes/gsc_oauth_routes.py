@@ -32,7 +32,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from config.settings import settings
-from utils.auth import EMPLOYEE_ROLES, get_current_user
+from utils.auth import ADMIN_ROLES, EMPLOYEE_ROLES, get_current_user
 from utils.tenant_scope import assert_merchant_scope
 
 logger = logging.getLogger(__name__)
@@ -194,13 +194,16 @@ async def start_oauth(
 
     The signed state binds the grant to merchant_id, and the callback stores the
     Google account's tokens on that merchant (replacing any earlier grant), so only
-    that merchant or staff may start it.
+    that merchant or an admin (ADMIN_ROLES on an employee membership) may start it.
+    Other staff (employee, outsourced) may read /status but not start a grant: the
+    callback trusts the state alone, so whoever starts it picks the Google account
+    whose Search Console that merchant's audits will use.
 
     A browser navigation cannot carry the Bearer token this needs, so a portal
     fetches `?format=json` with its token and then navigates to the returned
     authorization_url. Without it the route keeps answering a 302."""
     _require_enabled()
-    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_ROLES)
+    assert_merchant_scope(current_user, merchant_id, staff_roles=ADMIN_ROLES)
     nonce = secrets.token_urlsafe(16)
     expires_at = int(
         (datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()

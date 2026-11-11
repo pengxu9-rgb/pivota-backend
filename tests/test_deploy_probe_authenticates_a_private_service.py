@@ -79,6 +79,8 @@ def _deploy(tmp_path: Path, service: str, public: str, *, service_url: str | Non
     here.mkdir()
     script = here / SCRIPTS[service].name
     shutil.copy2(SCRIPTS[service], script)
+    # deploy_gateway.sh sources its gateway-image resolver from its own directory.
+    shutil.copy2(SCRIPTS[service].parent / "_gateway_image.sh", here / "_gateway_image.sh")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "gcloud").write_text(GCLOUD_STUB)

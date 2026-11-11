@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional
 
 from db.database import database
+from services.test_traffic import not_test_traffic_sql
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,10 @@ _BILLABLE_EDGE_ON_DAY = """e.created_at >= CAST(CAST(:date AS DATE) AS TIMESTAMP
   AND e.gross_attributed_gmv_cents IS NOT NULL
   -- Exclude fallback-INFERRED edges (#1481): token-less recoveries are recorded for
   -- coverage but never billed. NULL-safe (real edges lack the key → counted).
-  AND (e.metadata->>'inferred')::boolean IS NOT TRUE"""
+  AND (e.metadata->>'inferred')::boolean IS NOT TRUE
+  -- Exclude TEST traffic (O-07, services/test_traffic.py): stamped at write only while
+  -- TEST_TRAFFIC_STAMP_ENABLED is on; a caller-supplied stamp is stripped. NULL-safe.
+  AND """ + not_test_traffic_sql("e.metadata")
 
 # DATE(timestamptz) and (timestamptz)::date both read session timezone.
 # Bucketing must be UTC to match billing-period DATE columns (migrations
@@ -502,7 +506,8 @@ WITH changed AS (
            (e.created_at AT TIME ZONE 'UTC')::date AS day,
            MAX(e.updated_at) AS last_changed_at,
            BOOL_OR(e.gross_attributed_gmv_cents IS NOT NULL
-                   AND (e.metadata->>'inferred')::boolean IS NOT TRUE) AS any_billable
+                   AND (e.metadata->>'inferred')::boolean IS NOT TRUE
+                   AND """ + not_test_traffic_sql("e.metadata") + """) AS any_billable
     FROM commerce_attribution_edges e
     WHERE e.updated_at >= :changed_since
       AND e.created_at < :created_before

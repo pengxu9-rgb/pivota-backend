@@ -33,7 +33,7 @@ from services.pcs_tier_service import get_merchant_pcs_tier
 from services.agent_governance import validate_request_compat
 from services.platform_capabilities import get_store_platform_capabilities
 from services.psp_capabilities import get_psp_capabilities
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, caller_may_use_quote, require_quote_for_caller
 from services.refund_observability import build_order_refund_tracking_payload
 from services.request_market import ASSUMED_MARKET, assumed_flag_honoured, market_assumed_label, market_is_unnamed, strict_true
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
@@ -1001,7 +1001,13 @@ async def get_quote_v2(
 ):
     await expire_quote_if_needed(quote_id)
     row = await get_quote(quote_id)
-    if not row:
+    # Another agent's quote (or another checkout's, under a token) reads exactly like a missing one.
+    if not row or not caller_may_use_quote(
+        quote_id=quote_id,
+        quote_agent_id=row.get("agent_id"),
+        snapshot_json=row.get("snapshot_json"),
+        context=context,
+    ):
         raise HTTPException(status_code=404, detail="Quote not found")
     if not context.can_access_merchant(str(row.get("merchant_id") or "")):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
@@ -1027,6 +1033,9 @@ async def create_order_v2(
     context: AgentContext = Depends(get_agent_context),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
+    # S-28: the quote carries its preview's buyer email and address into the order below, so a
+    # quote the caller does not own is refused first, as if it did not exist.
+    await require_quote_for_caller(body.quote_id, context)
     service = QuoteService()
     try:
         quote = await service.load_active_quote_or_raise(quote_id=body.quote_id)
@@ -1389,6 +1398,97 @@ async def track_order_v2(
         },
         "capability": "optional",
     }
+
+
+async def _require_checkout_cancel_upstream() -> None:
+    """Off (the default): the cancel route below does not exist. Resolved BEFORE the agent context, so an off route
+    answers every caller with FastAPI's own 404 body, byte for byte what an unregistered path answers."""
+    from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+    if not checkout_cancel_upstream_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.post("/orders/{order_id}/cancel")
+async def cancel_order_v2(
+    order_id: str,
+    _enabled: None = Depends(_require_checkout_cancel_upstream),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """Cancel an unpaid order and close its hosted payment page at the PSP (FIX_PLAN C-11).
+
+    CHECKOUT_CANCEL_UPSTREAM_ENABLED (default OFF). See services/checkout_cancel_upstream.py. Answers:
+      200 cancel.outcome "canceled" | "already_canceled" (cancel.canceled true)
+      409 ORDER_ALREADY_PAID: the buyer paid first; not canceled; the refund is a request to the merchant
+      409 PAYMENT_PROCESSING: a payment is settling at the PSP; not canceled
+      503 CANCEL_NOT_CONFIRMED: the PSP surface could not be closed; not canceled; retry
+      404 Order not found: unknown, or another agent's (never 403: the id is not confirmed to a non-owner)
+    """
+    from services.checkout_cancel_upstream import cancel_order_upstream
+
+    order = await get_order(order_id)
+    if not order or str(order.get("agent_id") or "") != str(context.agent_id):
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    return cancel_upstream_answer(order_id, order, result)
+
+
+def cancel_upstream_answer(order_id: str, order: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """The answer for a `cancel_order_upstream` result: the 200 body, or the 409/503 it raises. One mapping for
+    POST /agent/v2/orders/{id}/cancel and, with the flag on, POST /agent/v1/orders/{id}/cancel
+    (routes/agent_api.py), so both doors give the gateway the same codes."""
+    from services.checkout_cancel_upstream import (
+        OUTCOME_ALREADY_CANCELED,
+        OUTCOME_CANCELED,
+        OUTCOME_PAID,
+        OUTCOME_PROCESSING,
+        refund_request_answer,
+    )
+
+    outcome = result["outcome"]
+    after = result.get("order") or order
+    surface = result.get("payment_surface") or {}
+    base = {
+        "order_id": order_id,
+        "outcome": outcome,
+        "order_state": _order_state_from_row(after),
+        "payment_status": str(after.get("payment_status") or ""),
+        "payment_surface": {"action": surface.get("action"), "reference_type": surface.get("reference_type")},
+    }
+    if outcome in (OUTCOME_CANCELED, OUTCOME_ALREADY_CANCELED):
+        return {"status": "success", "cancel": {**base, "canceled": True}}
+    if outcome == OUTCOME_PAID:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ORDER_ALREADY_PAID",
+                "message": "The buyer already paid for this order, so it was not canceled.",
+                **base,
+                "canceled": False,
+                "refund": refund_request_answer(),
+            },
+        )
+    if outcome == OUTCOME_PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "PAYMENT_PROCESSING",
+                "message": "A payment for this order is being processed, so it was not canceled.",
+                **base,
+                "canceled": False,
+            },
+        )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "CANCEL_NOT_CONFIRMED",
+            "message": "The hosted payment page could not be closed, so the order was not canceled.",
+            **base,
+            "canceled": False,
+            "retryable": True,
+        },
+    )
 
 
 @router.post("/orders/{order_id}/refunds")

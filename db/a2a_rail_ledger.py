@@ -314,12 +314,16 @@ def _require_https_url(value: Any, name: str, *, required: bool) -> Optional[str
     return text
 
 
+#: The amount columns are BIGINT: a larger value is refused here, not by the database mid-step.
+_BIGINT_MAX = 2 ** 63 - 1
+
+
 def _require_minor(value: Any, name: str, *, positive: bool = False) -> Optional[int]:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer number of minor units")
-    if value < (1 if positive else 0):
+    if not (1 if positive else 0) <= value <= _BIGINT_MAX:
         raise ValueError(f"{name} is out of range")
     return value
 
@@ -630,6 +634,57 @@ async def mark_pending_write(purchase_id: str, worker_id: str, action: str) -> O
     if IS_POSTGRES:
         return _purchase(await database.fetch_one(_MARK_PENDING_WRITE_SQL, values))
     return _purchase(await database.fetch_one(_MARK_PENDING_WRITE_SQL_SQLITE, values))
+
+
+# The provider's quote for a purchase in `quoting` (the VIC order step): the all-in total the order is then
+# sent with and the buyer approves. Only while the worker holds the row, before any token or pending write
+# (the quote precedes the order's write-ahead). A fresh quote replaces an earlier one: a quote is free and
+# no order was sent with the old one (a sent order holds a pending write until its answer is seen).
+_RECORD_QUOTE_SQL = """
+    UPDATE a2a_rail_purchases
+       SET quote_id = :quote_id,
+           quoted_total_minor = :quoted_total_minor,
+           shipping_minor = :shipping_minor,
+           tax_minor = :tax_minor,
+           updated_at = clock_timestamp()
+     WHERE id = :id
+       AND state = 'quoting'
+       AND claimed_by = :holder
+       AND pending_write IS NULL
+       AND payment_token_id IS NULL
+       AND contact_purged_at IS NULL
+    RETURNING *
+"""
+_RECORD_QUOTE_SQL_SQLITE = _RECORD_QUOTE_SQL.replace("clock_timestamp()", "CURRENT_TIMESTAMP")
+
+
+async def record_quote_as_holder(
+    purchase_id: str,
+    worker_id: str,
+    *,
+    quote_id: str,
+    quoted_total_minor: int,
+    shipping_minor: int,
+    tax_minor: int,
+) -> Optional[Dict[str, Any]]:
+    """Record the provider's quote on a held `quoting` row. None when the row is not held in `quoting`,
+    holds a token or a pending write, or its contact was purged: the quote must not be used then.
+    Malformed values raise before any SQL."""
+    values = {
+        "id": purchase_id,
+        "holder": _require(_WORKER_RE, worker_id, "worker_id"),
+        "quote_id": _rail_ref(_require(_RAIL_REF_RE, quote_id, "quote_id"), "quote_id"),
+        "quoted_total_minor": _require_minor(quoted_total_minor, "quoted_total_minor"),
+        "shipping_minor": _require_minor(shipping_minor, "shipping_minor"),
+        "tax_minor": _require_minor(tax_minor, "tax_minor"),
+    }
+    if values["quoted_total_minor"] is None or values["quoted_total_minor"] <= 0:
+        raise ValueError("quoted_total_minor must be a positive number of minor units")
+    if values["shipping_minor"] is None or values["tax_minor"] is None:
+        raise ValueError("shipping_minor and tax_minor are required")
+    if IS_POSTGRES:
+        return _purchase(await database.fetch_one(_RECORD_QUOTE_SQL, values))
+    return _purchase(await database.fetch_one(_RECORD_QUOTE_SQL_SQLITE, values))
 
 
 async def clear_pending_write(purchase_id: str, worker_id: str, action: str) -> Optional[Dict[str, Any]]:

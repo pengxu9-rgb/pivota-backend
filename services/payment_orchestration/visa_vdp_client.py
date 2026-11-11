@@ -27,7 +27,10 @@ ciphertext we cannot read) would be a separate, reviewed path, and is not this m
 
 Beyond those names, the stripper also drops values by SHAPE, whatever key holds them: any JOSE compact
 string (a JWS or JWE, which carries a token base64url-encoded where no digit rule can see it) and any
-Luhn-valid 13-19 digit run, including under keys the A2A rail treats as digits-expected.
+Luhn-valid 14-19 digit run (also dot-separated), including under keys the A2A rail treats as
+digits-expected, a JWS/JWE in JSON serialization, and a base64 token that decodes to a card number or a
+JSON object. This is fail-closed and can drop a numeric id that happens to pass Luhn; fields that logic
+needs come from a per-endpoint allowlisted parse, never from the generic stripped body.
 
 TRANSPORT HYGIENE, as in `a2a_rail` and `reap_agentic_client`:
 - requests go only to Visa's three published hosts, checked on every built URL;
@@ -40,7 +43,10 @@ TRANSPORT HYGIENE, as in `a2a_rail` and `reap_agentic_client`:
   `apikey` in every record they emit;
 - secret-bearing dataclasses keep their secrets out of `repr` (Sentry runs in the web process).
 
-Encrypted answers must carry our MLE key id (`kid`) and a fresh `iat`, or they are refused.
+Encrypted answers must carry our MLE key id (`kid`) and a fresh `iat` (epoch milliseconds), or they
+are refused as `mle_error`. An `mle_error` on a 2xx means Visa acted but we cannot read the answer:
+for a write that is outcome-unknown (read state, never resend). That Visa's answers carry our `kid`
+and an epoch-ms `iat` is to be confirmed on the first real encrypted sandbox answer.
 
 Dark by default: `from_env()` returns None unless VISA_VDP_ENABLED is on and an auth mode is fully
 configured. Secrets arrive as PEM / string env values (mounted from Secret Manager), never files in
@@ -64,7 +70,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlencode, urlsplit
 
-from services.payment_orchestration.a2a_rail import _has_card_number, _strip_credentials
+from services.payment_orchestration.a2a_rail import _has_card_number, _luhn, _strip_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -289,23 +295,74 @@ def _canon(key: Any) -> str:
     return str(key).lower().replace("_", "").replace("-", "").replace(".", "")
 
 
-#: A JOSE compact serialization (JWS: 3 parts, JWE: 5 parts). Its protected header is a JSON object,
-#: so the first part always starts `eyJ` (base64url of `{"`). Searched, not anchored: a prefix such as
-#: `Bearer ` must not hide one.
-_JOSE_COMPACT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*")
+#: A JOSE compact serialization (JWS: 3 parts, JWE: 5 parts) as a WHOLE token: no base64, dot or `=`
+#: character directly before or after it, so `Bearer <jws>` matches and `monkeyJumps.v1.json` does not.
+#: The first part must also decode to a JSON object naming `alg` or `enc` (see `_has_jose`).
+_JOSE_COMPACT_RE = re.compile(
+    r"(?<![A-Za-z0-9_.+/=-])(eyJ[A-Za-z0-9_-]+)((?:\.[A-Za-z0-9_-]*){4}|(?:\.[A-Za-z0-9_-]*){2})(?![A-Za-z0-9_.+/=-])"
+)
+#: A card-number-like run of 14-19 digits (the A2A rail's range), here also split by dots.
+_LOOSE_CARD_DIGITS_RE = re.compile(r"(?<!\d)\d(?:[ .-]?\d){13,18}(?!\d)")
+#: Base64 or base64url tokens long enough to hide a card number (16 digits = 22 base64 chars) or a
+#: JSON object. Each is decoded and the result checked, so ordinary words and ids pass.
+_B64_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_-]{16,}={0,2}")
+#: Keys of the JSON (flattened or general) JWS and JWE serializations.
+_JOSE_JSON_SIGNED = frozenset({"signature", "signatures"})
+_JOSE_JSON_ENCRYPTED = frozenset({"ciphertext"})
+
+
+def _has_jose(text: str) -> bool:
+    for match in _JOSE_COMPACT_RE.finditer(text):
+        try:
+            header = json.loads(_b64u_decode(match.group(1)))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(header, dict) and ("alg" in header or "enc" in header):
+            return True
+    return False
+
+
+def _has_loose_card_number(text: str) -> bool:
+    return any(_luhn(re.sub(r"\D", "", m.group(0))) for m in _LOOSE_CARD_DIGITS_RE.finditer(text))
+
+
+def _has_encoded_credential(text: str) -> bool:
+    """A base64 / base64url token that decodes to text holding a card number or a JSON object."""
+    if text.startswith(("https://", "http://")):
+        return False
+    for match in _B64_TOKEN_RE.finditer(text):
+        token = match.group(0).rstrip("=").replace("-", "+").replace("_", "/")
+        try:
+            decoded = base64.b64decode(token + "=" * (-len(token) % 4), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if decoded.lstrip().startswith(("{", "[")) or _has_loose_card_number(decoded):
+            return True
+    return False
 
 
 def _is_credential_shaped(value: Any) -> bool:
-    """A value that may carry a credential whatever key it sits under: a JOSE compact string, or a
-    Luhn-valid 13-19 digit run (in a string or an integer)."""
+    """A value that may carry a credential whatever key it sits under:
+    - a JOSE compact string (a whole token whose header names `alg` or `enc`);
+    - a JWS or JWE in its JSON serialization (`payload` + `signature(s)`, or `ciphertext`);
+    - a Luhn-valid 14-19 digit run, separated by nothing, spaces, dashes or dots (in a string, int or float);
+    - a base64 / base64url token that decodes to a card number or a JSON object.
+
+    Fail-closed by design: about 1 in 10 random 14-19 digit numbers pass Luhn, so a numeric id of that
+    length can be dropped too. Any field that logic needs must be read through a per-endpoint allowlisted
+    parse (as `vic_order.parse_order` does), never from this generic stripped body."""
     if isinstance(value, str):
-        return bool(_JOSE_COMPACT_RE.search(value)) or _has_card_number(value)
+        return (_has_jose(value) or _has_card_number(value) or _has_loose_card_number(value)
+                or _has_encoded_credential(value))
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
         return _has_card_number(str(abs(value)))
     if isinstance(value, float) and value.is_integer():
         return _has_card_number(str(int(abs(value))))
+    if isinstance(value, dict):
+        keys = {_canon(k) for k in value}
+        return ("payload" in keys and bool(keys & _JOSE_JSON_SIGNED)) or bool(keys & _JOSE_JSON_ENCRYPTED)
     return False
 
 
@@ -493,11 +550,21 @@ class VisaVdpClient:
         auth: Optional[str] = None,
         encrypt: bool = False,
     ) -> VdpResult:
-        """One call. `auth` defaults to mTLS when configured, else X-Pay. A timeout or transport error
-        is `outcome_unknown`: for a write the caller must read state, never resend."""
+        """One call. `auth` defaults to mTLS when configured, else X-Pay.
+
+        Outcomes a caller must treat as UNKNOWN for a write (read state, never resend):
+        - `outcome_unknown`: a timeout or transport error;
+        - `mle_error` with a 2xx status: Visa accepted and answered, but the answer could not be
+          decrypted or failed the kid/iat checks, so what Visa did is not known to us.
+
+        A path with whitespace or control characters, or one httpx cannot form into a URL, never leaves
+        the process: it comes back as `invalid_request` with no status."""
         import httpx
 
         install_log_redaction()
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in str(path)):
+            return self._done(VdpResult(None, outcome="invalid_request",
+                                        notes=["path has whitespace or control characters"]), "<invalid>", self._clock())
         mode = auth or ("mtls" if self._mtls is not None else "xpay")
         url, headers, content = self._prepare(method.upper(), path, body, auth=mode, encrypt=encrypt)
         started = self._clock()
@@ -515,6 +582,9 @@ class VisaVdpClient:
                         chunks.append(chunk)
         except (httpx.TimeoutException, asyncio.TimeoutError):
             return self._done(VdpResult(None, outcome="outcome_unknown", notes=["timeout"]), path, started)
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol):
+            return self._done(VdpResult(None, outcome="invalid_request", notes=["url rejected by httpx"]),
+                              "<invalid>", started)
         except httpx.HTTPError as exc:
             return self._done(VdpResult(None, outcome="outcome_unknown", notes=[type(exc).__name__]), path, started)
 
@@ -529,16 +599,19 @@ class VisaVdpClient:
                     VdpResult(status, outcome="unparseable", correlation_id=correlation), path, started
                 )
         if isinstance(parsed, dict) and isinstance(parsed.get("encData"), str):
+            unknown = ["2xx answer unreadable: outcome unknown for a write; read state, never resend"] \
+                if 200 <= status < 300 else []
             if self._mle is None:
                 return self._done(VdpResult(status, outcome="mle_error", correlation_id=correlation,
-                                            notes=["encrypted answer but no MLE key"]), path, started)
+                                            notes=["encrypted answer but no MLE key"] + unknown), path, started)
             try:
                 parsed = json.loads(mle_decrypt(
                     parsed["encData"], self._mle.client_key_pem,
                     expected_kid=self._mle.key_id, max_skew_s=MLE_MAX_SKEW_S,
                 ))
-            except ValueError:
-                return self._done(VdpResult(status, outcome="mle_error", correlation_id=correlation), path, started)
+            except (ValueError, RecursionError):
+                return self._done(VdpResult(status, outcome="mle_error", correlation_id=correlation,
+                                            notes=unknown), path, started)
         cleaned, removed = strip_vic_credentials(parsed)
         outcome = "ok" if 200 <= status < 300 else "http_error"
         return self._done(
