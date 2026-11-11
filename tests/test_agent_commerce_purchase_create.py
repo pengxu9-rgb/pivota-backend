@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(IS_POSTGRES, reason="the SQLite arm; Postgres ru
 BASE = "/agent/v2/commerce/purchases"
 AGENT = "agent_create_route"
 USER_REF = "user-ada"
-SHOP = "judydoll.com"
+SHOP = "example.myshopify.com"
 VARIANT = "49922977038613"
 EMAIL = "ada@example.test"
 ADDRESS = {"firstName": "Ada", "lastName": "Lovelace", "phone": "+15550100", "addressLine1": "900 Brannan St",
@@ -66,7 +66,8 @@ FACTS = {"shop_domain": SHOP, "our_price_minor": 2820, "currency": "USD", "marke
 
 
 _TABLES = ("agent_purchases", "a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys",
-           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs")
+           "reap_agentic_purchases", "reap_agentic_eligibility", "reap_agentic_buyer_refs",
+           "a2a_rail_worker_heartbeat")
 
 
 @pytest.fixture(autouse=True)
@@ -77,12 +78,14 @@ async def _db():
         for table in _TABLES:
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         await ensure_required_schema_light()
+        await a2a_ledger.record_worker_heartbeat()  # an armed worker is ticking, unless a test says not
         yield
         return
     # On Postgres these tables are shared with other files (one gate database): emptied, never dropped.
     await ensure_required_schema_light()
     for table in _TABLES:
         await database.execute(f"DELETE FROM {table}")
+    await a2a_ledger.record_worker_heartbeat()
     # asyncpg's pool belongs to this test's event loop: give it back at the end of every test.
     try:
         yield
@@ -125,7 +128,7 @@ def stubs(monkeypatch):
 
     async def _catalog(*, merchant_domain, product_key, variant_key, market_country):
         s.catalog.append((merchant_domain, product_key, variant_key, market_country))
-        return dict(s.facts), "merch_obs_judydoll", VARIANT, "brand_official"
+        return dict(s.facts), "merch_obs_shop_a", VARIANT, "brand_official"
 
     async def _click(click):
         s.clicks.append(click)
@@ -205,11 +208,17 @@ async def _count(table: str) -> int:
     return int(row["n"])
 
 
-async def _nothing_written():
-    assert await _count("a2a_rail_purchases") == 0
-    assert await _count("a2a_rail_buyer_refs") == 0
-    assert await _count("reap_agentic_purchase_keys") == 0
-    assert await _count("agent_purchases") == 0
+_WRITTEN_TABLES = ("a2a_rail_purchases", "a2a_rail_buyer_refs", "reap_agentic_purchase_keys", "agent_purchases")
+
+
+async def _written_counts() -> Dict[str, int]:
+    return {table: await _count(table) for table in _WRITTEN_TABLES}
+
+
+async def _nothing_written(since: Optional[Dict[str, int]] = None):
+    """No row in any written table, or (with `since`, from `_written_counts()`) none added since then."""
+    expected = since if since is not None else {table: 0 for table in _WRITTEN_TABLES}
+    assert await _written_counts() == expected
 
 
 # ── the door ─────────────────────────────────────────────────────────────────────────────────
@@ -422,10 +431,18 @@ async def test_a_lost_key_race_to_a_reap_purchase_is_handed_to_the_reap_route(cl
 # ── routing ──────────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("change", ["rail_off", "create_off", "not_pilot", "not_proven", "no_cap", "variant_lane", "offer_code"])
+@pytest.mark.parametrize("change", ["rail_off", "create_off", "worker_down", "worker_stale", "not_pilot", "not_proven",
+                                    "currency", "no_cap", "variant_lane", "offer_code"])
 async def test_without_a_choice_an_ineligible_request_goes_to_reap_unchanged(client, stubs, monkeypatch, change):
     b = body()
-    if change == "rail_off":
+    if change == "worker_down":
+        await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    elif change == "worker_stale":
+        await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS + 60)
+    elif change == "currency":
+        stubs.facts["currency"] = "SGD"
+        b = body(expected_currency="SGD")  # SGD has a cap; the token step cannot carry it
+    elif change == "rail_off":
         monkeypatch.delenv("A2A_RAIL_ENABLED")
     elif change == "create_off":
         monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
@@ -451,10 +468,15 @@ async def test_an_explicit_reap_choice_goes_to_reap_even_when_a2a_could_take_it(
     await _nothing_written()
 
 
-@pytest.mark.parametrize("change", ["not_pilot", "not_proven", "offer_code"])
+@pytest.mark.parametrize("change", ["worker_down", "currency", "not_pilot", "not_proven", "offer_code"])
 async def test_an_explicit_a2a_choice_it_cannot_take_is_a_404_never_reap(client, stubs, monkeypatch, change):
     b = body(payment_preference={"rail": "a2a"})
-    if change == "not_pilot":
+    if change == "worker_down":
+        await database.execute("DELETE FROM a2a_rail_worker_heartbeat")
+    elif change == "currency":
+        stubs.facts["currency"] = "SGD"
+        b["expected_currency"] = "SGD"
+    elif change == "not_pilot":
         CALLER.agent_id = "agent_not_in_pilot"
     elif change == "not_proven":
         monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV, "")
@@ -463,7 +485,7 @@ async def test_an_explicit_a2a_choice_it_cannot_take_is_a_404_never_reap(client,
     resp = await client.post(BASE, b)
     assert resp.status_code == 404 and "not_available_on_this_rail" in resp.text
     # The reason is not in the answer: an agent cannot learn the pilot list or the merchant list from it.
-    for word in ("pilot", "proven", "offer"):
+    for word in ("pilot", "proven", "offer", "worker", "currency"):
         assert word not in resp.text
     assert stubs.reap == [] and stubs.catalog == []
     await _nothing_written()
@@ -481,8 +503,8 @@ async def test_an_explicit_a2a_choice_records_the_buyer_as_the_decider(client):
 
 def test_merchant_entries_are_parsed_strictly_and_folded(monkeypatch):
     monkeypatch.setenv(rail_router.A2A_RAIL_MERCHANTS_ENV,
-                       " Judydoll.com:us ,bad, x.example:USA, :US, y.example: , www.brand.example:SG, bad host:US")
-    assert rail_router.proven_merchants() == frozenset({("judydoll.com", "US"), ("brand.example", "SG")})
+                       " Shop-A.Example:us ,bad, x.example:USA, :US, y.example: , www.brand.example:SG, bad host:US")
+    assert rail_router.proven_merchants() == frozenset({("shop-a.example", "US"), ("brand.example", "SG")})
 
 
 @pytest.mark.parametrize("raw,total,currency,ok", [
@@ -498,11 +520,126 @@ def test_the_amount_cap_is_per_currency_and_fails_closed(monkeypatch, raw, total
 
 
 def test_the_router_names_every_rail_it_drops():
-    choice = rail_router.choose_rail(agent_id="agent_x", merchant_domain=SHOP, market_country="US", item_source="cart_link")
+    args = dict(merchant_domain=SHOP, market_country="US", item_source="cart_link", currency="USD", worker_alive=True)
+    choice = rail_router.choose_rail(agent_id="agent_x", **args)
     assert (choice.rail, choice.basis, choice.dropped) == ("reap", "orchestrator_selected_rail", {"a2a": "agent_not_in_pilot"})
-    refused = rail_router.choose_rail(agent_id="agent_x", merchant_domain=SHOP, market_country="US",
-                                      item_source="cart_link", preferred="a2a")
+    refused = rail_router.choose_rail(agent_id="agent_x", preferred="a2a", **args)
     assert (refused.rail, refused.refusal) == (None, "agent_not_in_pilot")
+
+
+@pytest.mark.parametrize("worker_alive", [False, None, True])
+def test_an_agent_outside_the_pilot_is_told_so_whatever_the_heartbeat(worker_alive):
+    # The route never reads the heartbeat for a non-pilot agent and passes False; the reason must still
+    # be the pilot, not a worker that may well be ticking.
+    args = dict(merchant_domain=SHOP, market_country="US", item_source="cart_link", currency="USD",
+                worker_alive=worker_alive)
+    assert rail_router.choose_rail(agent_id="agent_x", **args).dropped == {"a2a": "agent_not_in_pilot"}
+    assert rail_router.choose_rail(agent_id="agent_x", preferred="a2a", **args).refusal == "agent_not_in_pilot"
+
+
+@pytest.mark.parametrize("over,reason", [
+    ({"worker_alive": False}, "a2a_worker_unavailable"),
+    ({"worker_alive": None}, "a2a_worker_unavailable"),  # not a yes
+    ({"currency": "SGD"}, "currency_unsupported"),
+    ({"currency": ""}, "currency_unsupported"),
+    ({"currency": "usd"}, None),
+    ({}, None),
+], ids=["worker_down", "worker_unknown", "sgd", "no_currency", "lower_case_usd", "eligible"])
+def test_the_router_refuses_a_dead_worker_and_a_currency_the_token_cannot_carry(over, reason):
+    args = dict(agent_id=AGENT, merchant_domain=SHOP, market_country="US", item_source="cart_link",
+                currency="USD", worker_alive=True)
+    args.update(over)
+    choice = rail_router.choose_rail(**args)
+    if reason is None:
+        assert choice.rail == "a2a"
+    else:
+        assert (choice.rail, choice.dropped) == ("reap", {"a2a": reason})
+        assert rail_router.choose_rail(preferred="a2a", **args).refusal == reason
+
+
+def test_the_routers_currencies_are_the_token_steps():
+    from services.payment_orchestration import a2a_rail, a2a_rail_worker
+
+    assert a2a_rail_worker.TOKEN_CURRENCIES is a2a_rail.TOKEN_CURRENCIES
+
+
+async def _age_heartbeat(*, seconds: int) -> None:
+    if IS_POSTGRES:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = now() - (:s * INTERVAL '1 second')",
+                               {"s": seconds})
+    else:
+        await database.execute("UPDATE a2a_rail_worker_heartbeat SET ticked_at = datetime('now', '-' || :s || ' seconds')",
+                               {"s": seconds})
+
+
+async def test_a_heartbeat_inside_the_window_admits_the_rail(client, stubs):
+    await _age_heartbeat(seconds=a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS - 60)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a"
+
+
+async def test_an_unreadable_heartbeat_keeps_the_rail_closed(client, stubs, monkeypatch):
+    async def broken(**_kw):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", broken)
+    resp = await client.post(BASE, body())
+    assert resp.json() == {"handled_by": "reap"}
+    await _nothing_written()
+
+
+@pytest.mark.parametrize("why", ["rail_off", "not_pilot", "reap_chosen"])
+async def test_the_heartbeat_is_read_only_for_a_request_the_rail_could_take(client, stubs, monkeypatch, why):
+    calls = []
+
+    async def spy(**_kw):
+        calls.append(1)
+        return True
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
+    b = body()
+    if why == "rail_off":
+        monkeypatch.delenv(rail_router.A2A_RAIL_CREATE_ENABLED_ENV)
+    elif why == "not_pilot":
+        CALLER.agent_id = "agent_not_in_pilot"
+    else:
+        b = body(payment_preference={"rail": "reap"})
+    assert (await client.post(BASE, b)).json() == {"handled_by": "reap"}
+    assert calls == []
+
+
+async def test_a_request_the_rail_could_take_reads_the_heartbeat_once(client, stubs, monkeypatch):
+    calls = []
+    real = a2a_ledger.worker_is_alive
+
+    async def spy(**kw):
+        calls.append(1)
+        return await real(**kw)
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", spy)
+    resp = await client.post(BASE, body())
+    assert resp.status_code == 202 and resp.json()["rail"] == "a2a" and calls == [1]
+
+
+async def test_a_slow_heartbeat_read_keeps_the_rail_closed(client, stubs, monkeypatch):
+    import asyncio
+
+    async def slow(**_kw):
+        await asyncio.sleep(5)
+        return True
+
+    monkeypatch.setattr(a2a_ledger, "worker_is_alive", slow)
+    monkeypatch.setattr(unified_routes, "_HEARTBEAT_READ_TIMEOUT_S", 0.05)
+    assert (await client.post(BASE, body())).json() == {"handled_by": "reap"}
+    await _nothing_written()
+
+
+def test_the_heartbeat_window_outlives_the_slowest_tick_cadence():
+    from services.audit_scheduler import run_deadline_for
+
+    # The job's interval is clamped to at most 600 s and a tick may run for its deadline: a window
+    # shorter than both would close the rail between two healthy ticks.
+    assert a2a_ledger.WORKER_HEARTBEAT_MAX_AGE_SECONDS >= 600 + run_deadline_for("a2a_rail_purchase_poll")
 
 
 # ── review round 1 ───────────────────────────────────────────────────────────────────────────
@@ -539,9 +676,10 @@ async def test_the_buyer_is_admitted_by_the_rails_own_rules_before_any_read(clie
     await _nothing_written()
 
 
-async def test_a_currency_with_no_cap_is_refused(client, stubs):
-    stubs.facts["currency"] = "EUR"
-    resp = await client.post(BASE, body(expected_currency="EUR"))
+async def test_a_currency_with_no_cap_is_refused(client, stubs, monkeypatch):
+    # Caps exist, but none for the shown currency (USD, the one currency the token step carries).
+    monkeypatch.setenv(rail_router.A2A_RAIL_MAX_TOTAL_MINOR_ENV, "SGD:13500")
+    resp = await client.post(BASE, body())
     assert resp.status_code == 409 and "amount_over_limit" in resp.text
     await _nothing_written()
 
@@ -690,3 +828,271 @@ async def test_the_reap_door_names_its_own_purchase_on_a_conflict(client, stubs,
     assert resp.status_code == 409 and "idempotency_conflict" in resp.text, resp.text
     detail = resp.json().get("detail") or resp.json()
     assert (detail["purchase_id"], detail["rail"]) == (pid, "reap")
+
+
+# ── S-29 P2-1: the lookup that picks the buyer's hash cannot answer ──────────────────────────
+# With the dedicated key mounted, every purchase route resolves the buyer's hash with one lookup
+# (dedicated hash, or the legacy one for a buyer with older rows). When that lookup fails, the route
+# answers a retryable 503 and writes nothing: either guess would miss the buyer's idempotency key,
+# and the retry could open a second purchase under the other hash.
+
+_S29_DEDICATED = "dedicated-test-key"
+_S29_LEGACY = "legacy-copy-test-key"
+
+
+def _s29_hash(key: str, raw: str) -> str:
+    import hashlib
+    import hmac
+
+    return hmac.new(key.encode(), raw.encode(), hashlib.sha256).hexdigest()
+
+
+@pytest.fixture
+async def s29_tables():
+    """Every owner-keyed table the lookup reads. Prod creates `buyer_identity_links` from the model
+    metadata at boot; this file's schema step does not, so a real lookup here would fail on it."""
+    from sqlalchemy.schema import CreateTable
+
+    from db.buyer_vault import buyer_identity_links
+
+    await database.execute(CreateTable(buyer_identity_links, if_not_exists=True))
+
+
+@pytest.fixture
+def s29_mounted(monkeypatch, s29_tables):
+    """After the mount: the dedicated key, the legacy copy, and a token key that has rotated away."""
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_READ", raising=False)
+
+
+@pytest.fixture
+def s29_lookup(monkeypatch):
+    """`down()` makes the lookup fail the way a busy database does; `up()` restores the real one."""
+    import db.buyer_vault as buyer_vault
+
+    real = buyer_vault._owner_rows_exist
+    calls = []
+
+    async def _timeout(agent_id, ref_hash):
+        calls.append((agent_id, ref_hash))
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    class _Switch:
+        def down(self):
+            monkeypatch.setattr(buyer_vault, "_owner_rows_exist", _timeout)
+
+        def up(self):
+            monkeypatch.setattr(buyer_vault, "_owner_rows_exist", real)
+
+    _Switch.calls = calls
+    return _Switch()
+
+
+def _assert_retryable_503(resp):
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("retry-after") == "1"
+    assert "TEMPORARY_UNAVAILABLE" in resp.text
+
+
+async def test_a_failed_hash_lookup_is_a_503_that_writes_nothing_and_the_retry_opens_one_purchase(
+        client, stubs, s29_mounted, s29_lookup):
+    """A buyer first seen after the mount (P2-1's case): the old code answered the legacy hash here."""
+    s29_lookup.down()
+    for _ in range(2):
+        _assert_retryable_503(await client.post(BASE, body()))
+    await _nothing_written()
+    assert stubs.catalog == [] and stubs.clicks == [] and stubs.reap == []
+    assert len(s29_lookup.calls) == 2
+
+    s29_lookup.up()
+    first = await client.post(BASE, body())
+    assert first.status_code == 202, first.text
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == first.json()["purchase_id"]
+    assert await _count("a2a_rail_purchases") == 1 and await _count("agent_purchases") == 1
+    row = await a2a_ledger.get_purchase_internal(first.json()["purchase_id"])
+    assert row["agent_user_ref_hash"] == _s29_hash(_S29_DEDICATED, USER_REF)
+    key = await database.fetch_one(
+        "SELECT agent_user_ref_hash FROM reap_agentic_purchase_keys WHERE idempotency_key = 'key-1'")
+    assert key["agent_user_ref_hash"] == _s29_hash(_S29_DEDICATED, USER_REF)
+
+
+async def test_a_buyer_with_a_pre_mount_purchase_gets_a_503_then_replays_it_under_the_legacy_hash(
+        client, stubs, monkeypatch, s29_tables, s29_lookup):
+    """Before the mount the token key holds the old value; ops copies it into the legacy variable,
+    mounts the dedicated key, then rotates the token key. The buyer's retry still finds its key."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    original = await client.post(BASE, body())
+    assert original.status_code == 202, original.text
+    pid = original.json()["purchase_id"]
+    assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")
+
+    s29_lookup.down()
+    _assert_retryable_503(await client.post(BASE, body()))
+    _assert_retryable_503(await client.get(BASE))
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+
+    s29_lookup.up()
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid
+    listed = await client.get(BASE)
+    assert listed.status_code == 200 and [p["rail_purchase_id"] for p in listed.json()["purchases"]] == [pid]
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("post", BASE),
+        ("get", BASE),
+        ("get", f"{BASE}/ap_0123456789abcdef01234567"),
+        ("post", "/agent/v2/commerce/reap/purchases"),
+        ("post", "/agent/v2/commerce/reap/purchases/recover"),
+        ("post", "/agent/v2/commerce/reap/purchases/rp_0123456789abcdef01234567/resume"),
+        ("get", "/agent/v2/commerce/reap/purchases"),
+        ("get", "/agent/v2/commerce/reap/purchases/rp_0123456789abcdef01234567"),
+    ],
+    ids=["create", "list", "get", "reap-create", "reap-recover", "reap-resume", "reap-list", "reap-get"],
+)
+async def test_every_purchase_route_answers_503_when_the_hash_lookup_fails(
+        client, stubs, reap_door_open, s29_mounted, s29_lookup, method, path):
+    s29_lookup.down()
+    resp = await (client.post(path, body()) if method == "post" else client.get(path))
+    _assert_retryable_503(resp)
+    assert s29_lookup.calls, "the route never reached the lookup"
+    await _nothing_written()
+    assert await _count("reap_agentic_purchases") == 0
+    assert stubs.catalog == [] and stubs.clicks == []
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        {"BUYER_IDENTITY_LINK_SECRET": "same-value-test-key", "BUYER_IDENTITY_LINK_LEGACY_SECRET": "same-value-test-key"},
+        {"BUYER_IDENTITY_LINK_LEGACY_SECRET": "a-wrong-copy-test-key"},
+    ],
+    ids=["new-key-equal-to-the-copy", "wrong-copy-alone"],
+)
+async def test_a_misconfigured_mount_keeps_a_pre_mount_buyer_on_todays_hash(client, stubs, monkeypatch, s29_tables, mount):
+    """S-29b N-1. Each mistake at mount time used to (or could) move existing buyers onto a new hash,
+    so a retry missed its idempotency key. Now the buyer's retry replays its original purchase."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    original = await client.post(BASE, body())
+    assert original.status_code == 202, original.text
+    pid = original.json()["purchase_id"]
+
+    for name, value in mount.items():
+        monkeypatch.setenv(name, value)
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
+    assert await _count("a2a_rail_purchases") == 1 and len(stubs.clicks) == 1
+    assert (await a2a_ledger.get_purchase_internal(pid))["agent_user_ref_hash"] == _s29_hash(_S29_LEGACY, USER_REF)
+
+
+async def _s29_owner_hashes() -> set:
+    """Every (table, owner hash) the create route writes: a 503 must leave every one of them alone."""
+    found = set()
+    for table in _WRITTEN_TABLES:
+        for r in await database.fetch_all(f"SELECT agent_user_ref_hash FROM {table}"):
+            found.add((table, r["agent_user_ref_hash"]))
+    return found
+
+
+def _assert_misconfigured_503(resp):
+    """The copy missing with the window open: the same 503 code and shape, a config-fault message."""
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("retry-after") == "30"
+    assert "TEMPORARY_UNAVAILABLE" in resp.text
+    assert "Buyer identity hash key configuration refused: the legacy key copy is missing" in resp.text
+    assert "database busy" not in resp.text
+
+
+async def test_the_new_key_without_the_copy_is_a_503_that_writes_nothing(client, stubs, monkeypatch, s29_tables):
+    """Step 4 before step 2 (the new key mounted, no copy): every buyer gets a retryable 503 and no
+    row is written under any hash, instead of silently guessing. Mounting the copy is the fix."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    pid = (await client.post(BASE, body())).json()["purchase_id"]
+    counts, before = await _written_counts(), await _s29_owner_hashes()
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    _assert_misconfigured_503(await client.post(BASE, body()))
+    CALLER.agent_user_ref = "post-mount-user-placeholder"
+    _assert_misconfigured_503(await client.post(BASE, body()))
+    await _nothing_written(since=counts)
+    assert len(stubs.clicks) == 1 and await _s29_owner_hashes() == before
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # the fix: mount the copy
+    CALLER.agent_user_ref = USER_REF
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == pid
+    await _nothing_written(since=counts)
+
+
+async def test_removing_the_copy_after_the_rotation_is_a_503_and_only_remounting_it_keeps_every_buyer(
+        client, stubs, monkeypatch, s29_tables):
+    """S-29c. After the rotation, a fallback for a missing copy would be the ROTATED token key:
+    every buyer, pre- and post-mount, would move onto a new hash. Instead: 503, nothing written,
+    no new hash. Re-mounting the copy is the ONLY remedy: every buyer replays its own purchase.
+    Closing the window is not one: the pre-mount buyer then misses its idempotency key and its
+    history (nothing rehashes its rows), so its retry opens a SECOND purchase."""
+    for name in ("BUYER_IDENTITY_LINK_SECRET", "BUYER_IDENTITY_LINK_LEGACY_SECRET", "BUYER_ACTION_TOKEN_SECRET",
+                 "AGENT_CHECKOUT_TOKEN_SECRET", "BUYER_IDENTITY_LINK_LEGACY_READ"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", _S29_LEGACY)
+    pre_pid = (await client.post(BASE, body())).json()["purchase_id"]  # a pre-mount buyer
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # steps 2-5
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_SECRET", _S29_DEDICATED)
+    post_ref = "post-mount-user-placeholder"
+    CALLER.agent_user_ref = post_ref
+    post = await client.post(BASE, body())
+    assert post.status_code == 202, post.text
+    post_pid = post.json()["purchase_id"]
+    monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", "rotated-token-test-key")  # step 6
+    counts, before = await _written_counts(), await _s29_owner_hashes()
+    assert {h for _t, h in before} == {_s29_hash(_S29_LEGACY, USER_REF), _s29_hash(_S29_DEDICATED, post_ref)}
+
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")  # the copy removed, window still open
+    for ref in (USER_REF, post_ref, "new-user-placeholder"):
+        CALLER.agent_user_ref = ref
+        _assert_misconfigured_503(await client.post(BASE, body()))
+        _assert_misconfigured_503(await client.get(BASE))
+    await _nothing_written(since=counts)
+    assert len(stubs.clicks) == 2 and await _s29_owner_hashes() == before
+
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_SECRET", _S29_LEGACY)  # the remedy: mount the copy again
+    for ref, pid in ((USER_REF, pre_pid), (post_ref, post_pid)):
+        CALLER.agent_user_ref = ref
+        again = await client.post(BASE, body())
+        assert again.status_code == 202 and again.json()["purchase_id"] == pid, again.text
+    await _nothing_written(since=counts)
+    assert len(stubs.clicks) == 2 and await _s29_owner_hashes() == before
+
+    # NOT a remedy: the copy removed again and the window closed. The post-mount buyer is fine, the
+    # pre-mount buyer is cut off from its rows: no history, and its retry is a second purchase.
+    monkeypatch.delenv("BUYER_IDENTITY_LINK_LEGACY_SECRET")
+    monkeypatch.setenv("BUYER_IDENTITY_LINK_LEGACY_READ", "off")
+    CALLER.agent_user_ref = post_ref
+    again = await client.post(BASE, body())
+    assert again.status_code == 202 and again.json()["purchase_id"] == post_pid
+    CALLER.agent_user_ref = USER_REF
+    listed = await client.get(BASE)
+    assert listed.status_code == 200 and listed.json()["purchases"] == []
+    split = await client.post(BASE, body())
+    assert split.status_code == 202 and split.json()["purchase_id"] not in (pre_pid, post_pid)
+    assert await _count("a2a_rail_purchases") == 3 and len(stubs.clicks) == 3

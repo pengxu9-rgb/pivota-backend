@@ -406,10 +406,11 @@ async def test_the_agent_route_answers_400_for_a_rejected_url(monkeypatch):
         raise guard.DestinationRejected("Webhook URL must point to a public address")
 
     monkeypatch.setattr(route, "update_webhook_config", reject)
-    monkeypatch.setattr(route, "_authorize_agent_scope", lambda *a, **k: None)
     request = route.UpdateWebhookConfigRequest(enabled=True, destination_url="https://10.0.0.1/x")
     with pytest.raises(HTTPException) as info:
-        await route.put_agent_webhook_config("agent_1", request, current_user={"role": "agent"})
+        await route.put_agent_webhook_config(
+            "agent_1", request, current_user={"role": "agent", "agent_id": "agent_1"}
+        )
     assert info.value.status_code == 400
 
 

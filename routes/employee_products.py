@@ -40,9 +40,11 @@ from services import seed_served_url
 from services.external_offers_service import (
     IMAGE_URLS_SCOPE_DECLARED,
     ExternalOfferUnavailable,
+    _normalize_url as _normalize_offer_url,
     resolve_external_offer,
     seed_variants_from_evidence,
 )
+from services.outbound_warm_handoff import extract_product_handle
 from services.outbound_links_service import (
     DEFAULT_DISCLOSURE_TEXT,
     DEFAULT_UTM_TEMPLATE,
@@ -66,6 +68,7 @@ from services.external_seed_audit import (
     summarize_audit_results,
 )
 from services.external_referral_readiness import (
+    EXTERNAL_REFERRAL_STALE_DAYS,
     fetch_merchant_referral_inventory,
     filter_referral_inventory_rows,
     get_merchant_referral_domains,
@@ -403,6 +406,8 @@ async def _ensure_external_seeds_table() -> None:
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_failure_streak INTEGER NOT NULL DEFAULT 0;",
         # Migration 266 / schema_guard: the retirement gap's clock, read on every observation.
         "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;",
+        # Migration 279 / schema_guard: the hard-404 run clock, read and written on every observation.
+        "ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS destination_dead_404_since TIMESTAMPTZ;",
     ]):
         deferred |= not await _execute_heal(statement)
     # The CHECK and the two partial indexes travel WITH the columns. Migration 199 and
@@ -1095,6 +1100,34 @@ SEED_DESCRIPTION_SOURCE_KEY = "description_source"
 _FILL_ONLY_DESCRIPTION_SOURCES = {"meta", "unknown"}
 # Copy an employee supplied (creation body, CSV import): never upgraded by a page read.
 SEED_DESCRIPTION_SOURCE_EMPLOYEE = "employee"
+# Who wrote the seed's title. An untitled creation takes the page's name, which on a page with several priced
+# products is the name of the node that priced it (a component on a bundle page, be#2746 review P2-A). Only a
+# title a person typed may name a pricing node for the ambiguous-price guard.
+SEED_TITLE_SOURCE_KEY = "title_source"
+SEED_TITLE_SOURCE_EMPLOYEE = "employee"
+SEED_TITLE_SOURCE_PAGE = "page"
+
+
+def _title_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+
+
+def _seed_title_a_person_typed(title: Any, seed_data: Any) -> Optional[str]:
+    """The seed's title when a person typed it, else None (the guard then decides by url alone).
+
+    Stamped rows say who wrote it. An unstamped row (written before the stamp, or by another writer) counts as
+    page-derived when its title is the page's stored name: an untitled creation stored both from the same node.
+    A typed title that happens to equal the page's name is then decided by url alone, which can only refuse.
+    """
+    text = str(title or "").strip()
+    if not text:
+        return None
+    data = seed_data if isinstance(seed_data, dict) else {}
+    source = data.get(SEED_TITLE_SOURCE_KEY)
+    if source is not None:
+        return text if source == SEED_TITLE_SOURCE_EMPLOYEE else None
+    snapshot = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
+    return None if _title_key(text) == _title_key(snapshot.get("title")) else text
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -4303,6 +4336,52 @@ async def create_external_seed(
             "currencies": refused_currencies,
             "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
         }
+    # A PAGE WITH SEVERAL PRICED PRODUCTS PRICES ITSELF AS WHICHEVER SCORED BEST, which on a bundle page was a
+    # COMPONENT: served bundle cards were created at one component's price (2026-11-07). With
+    # EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD `on`, a pricing node that does not name this seed's product
+    # (`destination_liveness.ambiguous_price_decision`) gives the seed neither its price nor its variants (the snapshot
+    # keeps no price either); a field the employee stated stands. `shadow` only logs the decision.
+    ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
+    ambiguous_refused_at_create = False
+    if ambiguous_mode != "off" and snapshot is not None and snapshot_price_refused is None:
+        try:
+            requested_for_guard: Optional[str] = _normalize_offer_url(str(dest))
+        except ValueError:
+            requested_for_guard = None
+        try:
+            decision = destination_liveness.ambiguous_price_decision(
+                evidence=evidence,
+                requested_url=requested_for_guard,
+                # ONLY THE EMPLOYEE'S OWN TITLE: `title` falls back to the page's, which is the pricing node's name, so
+                # the node would name itself. With no stated title the page is decided by its urls alone.
+                seed_title=(body.title or "").strip() or None,
+                # As G4 does: the stated brand, else the one this seed already stores.
+                seed_brand=(body.brand or "").strip()
+                or _ensure_json_obj(existing_dict.get("seed_data")).get("brand")
+                or None,
+            ) if requested_for_guard else None
+        except Exception:  # noqa: BLE001 - the guard must never cost a creation
+            logger.warning("ambiguous-price guard raised at creation; priced as without it", exc_info=True)
+            decision = None
+        if decision is not None and decision.get("refusal"):
+            _log_ambiguous_price_at_create(ambiguous_mode, decision)
+            if ambiguous_mode == "on":
+                ambiguous_refused_at_create = True
+                # The AMOUNT is what is ambiguous, never the currency (the currency check above passed): an amount
+                # the employee stated keeps the page's currency beside it, so no amount is stored without one.
+                if body.price_amount is None:
+                    price_amount = None
+                    if not (body.price_currency or "").strip():
+                        price_currency = None
+                snapshot_price_refused = {
+                    "reason": "ambiguous_product",
+                    "refusal": decision.get("refusal"),
+                    "priced_identities": decision.get("priced_identities"),
+                    "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
+                }
+                snap_price_amount = None
+                snap_price_currency = None
+                snap_variants = None
     availability = (body.availability or "").strip() or snap_availability
     utm_template = (body.utm_template or "").strip() or None
     partner_type = (body.partner_type or "").strip() or None
@@ -4364,6 +4443,9 @@ async def create_external_seed(
         if body.category is not None:
             seed_data["category"] = (body.category or "").strip() or None
         seed_data["title"] = title
+        seed_data[SEED_TITLE_SOURCE_KEY] = (
+            SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE
+        )
         if description and (
             description_origin == SEED_DESCRIPTION_SOURCE_EMPLOYEE
             or not str(seed_data.get("description") or "").strip()
@@ -4402,6 +4484,10 @@ async def create_external_seed(
                 "availability": snap_availability,
             }
         )
+        if ambiguous_refused_at_create:
+            # A re-create keeps the row's stored price (it is the one this page cannot vouch for): the stamp an earlier
+            # read left would vouch for it, so it goes, as the refresh's refusal does.
+            seed_data["snapshot"].pop("extracted_at", None)
         if snap_description:
             seed_data["snapshot"]["description"] = snap_description
             seed_data["snapshot"].pop("description_refused_source", None)
@@ -4515,6 +4601,7 @@ async def create_external_seed(
             "brand": (body.brand or "").strip() or None,
             "category": (body.category or "").strip() or None,
             "title": title,
+            SEED_TITLE_SOURCE_KEY: SEED_TITLE_SOURCE_EMPLOYEE if (body.title or "").strip() else SEED_TITLE_SOURCE_PAGE,
             "description": description or fill_only_description,
             **(
                 {SEED_DESCRIPTION_SOURCE_KEY: description_origin if description else content["description_refused_source"]}
@@ -4843,6 +4930,10 @@ async def update_external_seed(
     if body.title is not None:
         seed_data["title"] = body.title
         seed_data["snapshot"]["title"] = body.title
+        if str(body.title).strip():
+            seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
+        else:
+            seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
     if body.description is not None:
         seed_data["description"] = body.description
         seed_data["snapshot"]["description"] = body.description
@@ -5045,6 +5136,17 @@ def _read_the_served_product(
         and not observed.get("from_cache")
     )
     return observation, read
+
+
+def _snapshot_price_facts(
+    amount: Any, currency: Any, availability: Any, *, read: bool
+) -> Dict[str, Any]:
+    """The price and stock a refresh writes into `seed_data.snapshot`: the fetched ones on a read of
+    the served product, nothing otherwise, so the stored copies stand. They are the same claim as the
+    `price_amount` / `price_currency` / `availability` columns and follow the same rule."""
+    if not read:
+        return {}
+    return {"price_amount": amount, "price_currency": currency, "availability": availability}
 
 
 _canonical_for_destination = seed_served_url.canonical_for_destination
@@ -5924,6 +6026,118 @@ def _refresh_read_outcome(
     return catalogue_read.observation, True
 
 
+def _handleless_read_outcome(
+    row: Dict[str, Any],
+    dest: Optional[str],
+    observed: Dict[str, Any],
+    observation: Optional["destination_liveness.DestinationObservation"],
+    read: bool,
+    *,
+    evidence: Any,
+    price_amount: Any,
+    price_currency: Any,
+    mode: str,
+) -> Tuple[Optional["destination_liveness.DestinationObservation"], bool, Optional[Dict[str, Any]]]:
+    """(observation, read, what the handle-less read rule decided) for a page fetch of the served URL.
+
+    A served URL with no product handle is never a read under `_read_the_served_product` (`classify_destination`
+    cannot say which product a `/shop/<x>.html` is). `destination_liveness.classify_handleless_read` lets the page
+    say it, behind `EXTERNAL_SEED_HANDLELESS_READ` (`mode`, passed in: the refresh reads the env, the preview
+    takes a flag). ONE function for the refresh and its preview
+    (`scripts/ops/refresh_seeds_with_unverified_variants.py --simulate`), as `_read_the_served_product` is.
+
+    Nothing to decide -- `off`, a fetch that already read the product, no observation of the served URL, or a URL
+    that names a handle -- returns the inputs and None. Otherwise the decision's observation and read (`today`'s,
+    unchanged, on any refusal and in `shadow`) and {mode, would_read, refusal[, segment][, identity_by]}.
+    The CONTENT gate (`page_read_is_the_product`) never comes here: a handle-less read refreshes price, stock and
+    variants, never the copy or the gallery.
+    """
+    if mode not in ("shadow", "on") or read or observation is None:
+        return observation, read, None
+    if not dest or extract_product_handle(str(dest)):
+        return observation, read, None
+    try:
+        requested = _normalize_offer_url(str(dest))
+    except ValueError:
+        return observation, read, None
+    seed_data = _ensure_json_obj(row.get("seed_data"))
+    try:
+        decision = destination_liveness.classify_handleless_read(
+            requested_url=requested,
+            observed=observed,
+            evidence=evidence,
+            today=observation,
+            mode=mode,
+            seed_title=row.get("title"),
+            seed_brand=seed_data.get("brand"),
+            fresh_amount=price_amount,
+            fresh_currency=price_currency,
+            stored_amount=row.get("price_amount"),
+            stored_currency=row.get("price_currency"),
+        )
+    except Exception:  # noqa: BLE001 - THE RULE MUST NEVER COST A ROW ITS REFRESH
+        # A raise here would fail the row before its UPDATE, so it would head the queue every night. Today's
+        # observation and no read, as for any refusal; counted as `refused:error`.
+        logger.warning("handle-less read rule raised for seed_id=%r; kept today's observation",
+                       row.get("id"), exc_info=True)
+        decision = destination_liveness.HandlelessDecision(observation, False, False, "error")
+    info: Dict[str, Any] = {"mode": mode, "would_read": decision.would_read, "refusal": decision.refusal}
+    if decision.segment:
+        info["segment"] = decision.segment
+    if decision.identity_by:
+        info["identity_by"] = decision.identity_by
+    if mode == "shadow":
+        # SHADOW ONLY: the evidence a reviewer needs before `on` (title dice, price ratio), which the batch logs
+        # as one HANDLELESS_DECISION line per row. Never read by a guard; `on` and `off` carry nothing new.
+        info["detail"] = destination_liveness.handleless_decision_detail(
+            evidence=evidence,
+            seed_title=row.get("title"),
+            seed_brand=seed_data.get("brand"),
+            fresh_amount=price_amount,
+            fresh_currency=price_currency,
+            stored_amount=row.get("price_amount"),
+            stored_currency=row.get("price_currency"),
+        )
+    return decision.observation, decision.read, info
+
+
+def _handleless_read_variants(variants: Optional[List[Dict[str, Any]]], evidence: Any) -> List[Dict[str, Any]]:
+    """The page variants a handle-less read may use: only the pricing product's own (`jsonld_identity.variant_ids`,
+    its offers and its group's `hasVariant` subtree). Anything else the page lists -- a data-attribute payload, an
+    unpriced widget -- may be another product's. None listed: none used."""
+    identity = evidence.get("jsonld_identity") if isinstance(evidence, dict) else None
+    ids = {str(v) for v in (identity.get("variant_ids") or [])} if isinstance(identity, dict) else set()
+    return [v for v in (variants or []) if isinstance(v, dict) and str(v.get("variant_id") or "").strip() in ids]
+
+
+def _log_ambiguous_price_at_create(mode: str, decision: Dict[str, Any]) -> None:
+    """One `AMBIGUOUS_PRICE_CREATE {json}` line through the `pivota` logger (the one prod keeps at INFO): the mode and
+    the decision only, no URL or title. Never raises."""
+    try:
+        from utils.logger import logger as pivota_log
+
+        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice")}
+        line["mode"] = mode
+        pivota_log.info("AMBIGUOUS_PRICE_CREATE " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
+    except Exception:  # noqa: BLE001 - reporting must never cost a creation
+        return
+
+
+def _content_stale_for_serving(seed_data: Dict[str, Any]) -> bool:
+    """The row's stored `snapshot.extracted_at` is missing or older than the readiness gate's stale window."""
+    snapshot = seed_data.get("snapshot") if isinstance(seed_data.get("snapshot"), dict) else {}
+    raw = snapshot.get("extracted_at")
+    try:
+        stamped = datetime.fromisoformat(str(raw).replace("Z", "+00:00")) if raw else None
+    except ValueError:
+        stamped = None
+    if stamped is None:
+        return True
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=timezone.utc)
+    return stamped < datetime.now(timezone.utc) - timedelta(days=EXTERNAL_REFERRAL_STALE_DAYS)
+
+
 async def _refresh_external_seed_by_id(
     seed_id: str,
     *,
@@ -6071,6 +6285,81 @@ async def _refresh_external_seed_by_id(
             **({"catalogue_fallback": catalogue_fallback} if catalogue_fallback else {}),
         }
 
+    # ONE DECISION, made before anything is written: did this fetch read the product we serve?
+    # Everything below that states a price or stock derives from it: the price, currency and
+    # availability columns, their copies in `seed_data.snapshot` and `seed_data.availability`, the
+    # adoption of the page's variants, the variant reconcile, the freshness stamps, the projection,
+    # the catalogue lane's `read_source` and the liveness observation. The price block used to run
+    # BEFORE this was known and wrote the fetched page's price whatever it was -- a canonical naming
+    # another product, a 200 redirect onto another handle, a 200 bot challenge, a cached fallback, a
+    # URL with no product handle -- and the serving lanes read `price_amount` (and a stored variant's
+    # price ahead of it) first. The page's COPY (the snapshot's title, copy, image, gallery and canonical, the
+    # curated fills and the row's title / image_url fills) follows the content gate instead (`page_read_is_the_product`,
+    # below): a fetch that is not a read of the served product writes none of it.
+    # Deriving "did we read it" twice is the twin-implementation drift this file keeps paying for.
+    #
+    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
+    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
+    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
+    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
+    # The success path then runs normally. `observed["status_code"]` is the only proof that
+    # anything actually left the process -- and `_same_destination` is the only proof it went
+    # to the URL we serve rather than a legacy `destination_url` we do not.
+    # (See `_read_the_served_product` for why a status code alone is not a reading.)
+    # `classify_destination` is pure, so deciding this early costs nothing.
+    served_url = destination_liveness.destination_of(row)
+    observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
+    # A SERVED URL WITH NO PRODUCT HANDLE: the page may say which product it is (`_handleless_read_outcome`).
+    # Part of the same one decision, so every gate below follows it. A catalogue read never gets here (it is
+    # keyed by a handle).
+    handleless_read: Optional[Dict[str, Any]] = None
+    if catalogue_read is None:
+        observation, read_the_served_product, handleless_read = _handleless_read_outcome(
+            row,
+            dest,
+            observed,
+            observation,
+            read_the_served_product,
+            evidence=getattr(snapshot, "evidence", None) if snapshot else None,
+            price_amount=getattr(snapshot, "price_amount", None) if snapshot else None,
+            price_currency=getattr(snapshot, "price_currency", None) if snapshot else None,
+            mode=destination_liveness.handleless_read_mode(),
+        )
+    handleless_reads = bool(handleless_read) and read_the_served_product
+    # A PAGE WITH SEVERAL PRICED PRODUCTS (a bundle beside its components, a listing) prices the seed as whichever
+    # node scored best (`destination_liveness.ambiguous_price_decision`), which on a bundle page was a COMPONENT.
+    # `EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD`: `shadow` decides and reports (`ambiguous_price` below, counted per host
+    # by the batch) and changes nothing; `on` refuses a pricing node that does not name this seed's product: the page
+    # is then NOT a read of the served product (price, stock, variants and copy stand, as for any not-read page), while
+    # its liveness observation stands. `off` (the default) asks nothing. Only a page read is asked (a catalogue read
+    # is keyed by handle).
+    ambiguous_price: Optional[Dict[str, Any]] = None
+    ambiguous_refused = False
+    ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
+    if ambiguous_mode != "off" and read_the_served_product and catalogue_read is None and snapshot is not None:
+        try:
+            requested_for_guard: Optional[str] = _normalize_offer_url(str(dest)) if dest else None
+        except ValueError:
+            requested_for_guard = None
+        try:
+            decision = destination_liveness.ambiguous_price_decision(
+                evidence=getattr(snapshot, "evidence", None),
+                requested_url=requested_for_guard,
+                final_url=observed.get("final_url") if isinstance(observed, dict) else None,
+                # ONLY A TITLE A PERSON TYPED (review P2-A): an untitled creation stored the pricing node's own name,
+                # so on a bundle page the component would name itself by title on the first refresh.
+                seed_title=_seed_title_a_person_typed(row.get("title"), _ensure_json_obj(row.get("seed_data"))),
+                seed_brand=_ensure_json_obj(row.get("seed_data")).get("brand"),
+            ) if requested_for_guard else None
+        except Exception:  # noqa: BLE001 - THE GUARD MUST NEVER COST A ROW ITS REFRESH
+            logger.warning("ambiguous-price guard raised for seed_id=%r; read as without it", seed_id, exc_info=True)
+            decision = None
+        if decision is not None:
+            ambiguous_price = {"mode": ambiguous_mode, **decision}
+            if decision.get("refusal") and ambiguous_mode == "on":
+                ambiguous_refused = True
+                read_the_served_product = False
+
     canonical_url = getattr(snapshot, "canonical_url", None) if snapshot else None
     domain = getattr(snapshot, "domain", None) if snapshot else None
     snap_title = getattr(snapshot, "title", None) if snapshot else None
@@ -6095,6 +6384,9 @@ async def _refresh_external_seed_by_id(
     # and liveness verdict below use. (A catalogue read fetched nothing for this URL: `observed` is
     # empty, so it is never a read of the page's content.)
     _, page_read_is_the_product = _read_the_served_product(row, dest, observed)
+    if ambiguous_refused:
+        # The page's copy and gallery are the pricing node's page too: not this seed's either.
+        page_read_is_the_product = False
     gallery_declared = content["gallery_declared"]
     snap_image_urls = content["image_urls"]
     snap_description = content["description"]
@@ -6108,6 +6400,10 @@ async def _refresh_external_seed_by_id(
     # The page's variants as a SEED would store them; `snap_variants` keeps the per-read
     # provenance marks the reconcile below reads.
     adoptable_variants = seed_variants_from_evidence(evidence)
+    if handleless_reads:
+        # A handle-less read adopts and re-reads ONLY the pricing product's own variants.
+        snap_variants = _handleless_read_variants(snap_variants, evidence)
+        adoptable_variants = _handleless_read_variants(adoptable_variants, evidence) or None
 
     seed_data = _ensure_json_obj(row.get("seed_data"))
     seed_data.setdefault("snapshot", {})
@@ -6141,12 +6437,32 @@ async def _refresh_external_seed_by_id(
         # which reader priced the row last (a page read removes it).
         seed_data["snapshot"].update(
             {
-                "price_amount": snap_price_amount,
-                "price_currency": snap_price_currency,
-                "availability": snap_availability,
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
                 "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
                 or _to_iso(datetime.now(timezone.utc)),
-                "read_source": evidence.get("read_source") if isinstance(evidence, dict) else None,
+                # Which reader priced the row last: only a reader that read it (a catalogue entry for another
+                # destination than the one we serve priced nothing here).
+                **({"read_source": evidence.get("read_source") if isinstance(evidence, dict) else None}
+                   if read_the_served_product else {}),
+            }
+        )
+    elif not page_read_is_the_product:
+        # A PAGE THAT IS NOT A READ OF THE SERVED PRODUCT WRITES NO COPY. A redirect onto another handle, a 200
+        # bot challenge, a cached fallback or a fetch that reached nothing answered this fetch: its title,
+        # copy, image and canonical are another page's, and the gateway serves `snapshot.description` AHEAD of the
+        # seed's own. Only what the catalogue lane writes is written: the price facts and the clock. A handle-less
+        # read (EXTERNAL_SEED_HANDLELESS_READ `on`) also lands here: it reads price, stock and variants, never the
+        # copy (its content gate is off by design), but it DID price the row, so `read_source` (which reader priced it
+        # last) is cleared as by any page read; a fetch that priced nothing leaves it.
+        if read_the_served_product:
+            seed_data["snapshot"].pop("read_source", None)
+        seed_data["snapshot"].update(
+            {
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
+                "refreshed_at": _to_iso(getattr(snapshot, "last_checked_at", None))
+                or _to_iso(datetime.now(timezone.utc)),
             }
         )
     else:
@@ -6158,9 +6474,8 @@ async def _refresh_external_seed_by_id(
                 "title": snap_title,
                 "description": snap_description,
                 "image_url": snap_image_url,
-                "price_amount": snap_price_amount,
-                "price_currency": snap_price_currency,
-                "availability": snap_availability,
+                **_snapshot_price_facts(snap_price_amount, snap_price_currency, snap_availability,
+                                        read=read_the_served_product),
                 # `snapshot.fetched_at` DOES NOT EXIST. ExternalOfferSnapshot's fields are
                 # (..., last_checked_at, evidence, override_*) -- so this getattr has always
                 # returned None and this key has always been written as null. Nothing read it,
@@ -6177,35 +6492,37 @@ async def _refresh_external_seed_by_id(
             seed_data["snapshot"]["description_refused_source"] = description_refused_source
         else:
             seed_data["snapshot"].pop("description_refused_source", None)
-    # Only overwrite curated fields if they are missing.
-    if _should_replace_localized_copy(
-        existing_text=seed_data.get("description"),
-        incoming_text=snap_description,
-        market=market,
-        previous_canonical_url=previous_canonical_url,
-        refreshed_canonical_url=canonical_url,
-    ):
-        seed_data["description"] = snap_description
-    if not seed_data.get("title"):
-        seed_data["title"] = snap_title
-    if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
-        seed_data, content["meta_description"]
-    ):
-        # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
-        seed_data["description"] = snap_description
-        seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
-    if not seed_data.get("description"):
-        if snap_description:
+    # Only overwrite curated fields if they are missing. A page that is not a read of the served product (above)
+    # fills and replaces nothing either: an empty title, description or image would take another page's.
+    if not (content_read and not page_read_is_the_product):
+        if _should_replace_localized_copy(
+            existing_text=seed_data.get("description"),
+            incoming_text=snap_description,
+            market=market,
+            previous_canonical_url=previous_canonical_url,
+            refreshed_canonical_url=canonical_url,
+        ):
+            seed_data["description"] = snap_description
+        if not seed_data.get("title"):
+            seed_data["title"] = snap_title
+        if page_read_is_the_product and snap_description and _seed_description_is_upgradable(
+            seed_data, content["meta_description"]
+        ):
+            # SEO copy an earlier read stored, now that the page gives real copy (review of #2621).
             seed_data["description"] = snap_description
             seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
-        elif page_read_is_the_product and content["fill_only_description"]:
-            # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
-            # copy from a later read replaces it (Peng 2026-10-15). It never reaches
-            # `snapshot.description`, which the gateway serves ahead of the seed's own.
-            seed_data["description"] = content["fill_only_description"]
-            seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
-    if not seed_data.get("image_url"):
-        seed_data["image_url"] = snap_image_url
+        if not seed_data.get("description"):
+            if snap_description:
+                seed_data["description"] = snap_description
+                seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_source"]
+            elif page_read_is_the_product and content["fill_only_description"]:
+                # Nothing better on the page: SEO copy may fill an EMPTY description, tagged so real
+                # copy from a later read replaces it (Peng 2026-10-15). It never reaches
+                # `snapshot.description`, which the gateway serves ahead of the seed's own.
+                seed_data["description"] = content["fill_only_description"]
+                seed_data[SEED_DESCRIPTION_SOURCE_KEY] = content["description_refused_source"]
+        if not seed_data.get("image_url"):
+            seed_data["image_url"] = snap_image_url
     # Declared only (`_snapshot_evidence_content` gives an undeclared read none), and never over a
     # gallery another writer stamped: a storefront's own structured gallery (the drain's
     # products.json `images[]`) is the product's, and a page read's one or two declared images
@@ -6222,7 +6539,7 @@ async def _refresh_external_seed_by_id(
             # kept forever; the seed's `image_url` stays (review of #2621).
             seed_data["image_urls"] = []
             seed_data[SEED_IMAGE_URLS_SOURCE_KEY] = SEED_IMAGE_URLS_SOURCE_PAGE_READ
-    if not seed_data.get("availability"):
+    if read_the_served_product and not seed_data.get("availability"):
         seed_data["availability"] = snap_availability
     # The currencies the stored variants are priced in BEFORE this read is adopted (the adoption may
     # replace them with the read's): an empty row currency below is filled only in one of them.
@@ -6231,8 +6548,17 @@ async def _refresh_external_seed_by_id(
         existing=_seed_variants(seed_data), incoming=adoptable_variants or [], row_currency=row.get("price_currency")
     )
     # Keep the stored variants; the reconcile below is barred from these currencies too.
-    variant_adoption_refused = _variant_adoption_refusal(foreign_currencies) if adoptable_variants else None
+    # Only a read adopts variants, so only a read can have that adoption refused.
+    variant_adoption_refused = (
+        _variant_adoption_refusal(foreign_currencies) if adoptable_variants and read_the_served_product else None
+    )
     if variant_adoption_refused:
+        pass
+    elif not read_the_served_product:
+        # NOT A READ OF THE SERVED PRODUCT: its variants are another page's (a redirect onto another
+        # handle lists THAT product's sizes and prices), and `_seed_primary_price` serves a stored
+        # variant's price ahead of the column -- so adopting them would change the served price the
+        # column rule above just refused to change. The stored list stands.
         pass
     elif not content_read:
         # A catalogue read RE-PRICES the stored variants (the reconcile below); it never replaces the
@@ -6324,7 +6650,15 @@ async def _refresh_external_seed_by_id(
         if isinstance(price_read, dict) and price_read.get("status") not in (None, "", "parsed", "empty")
         else None
     )
-    if fresh_amount is None and unreadable_reason:
+    if not read_the_served_product:
+        # NOT A READ OF THE PRODUCT WE SERVE, so the page's price is not this seed's: it may be
+        # another product's (a canonical or a redirect naming another handle), a challenge page's,
+        # a cached copy's, or a page we cannot tell is the product (no handle in the URL). The
+        # stored pair stands. Counted apart from every other status, which describe a READ.
+        next_amount, next_currency = prev_amount, prev_currency
+        # Refused by the ambiguous-price guard (`on`): its own status, counted apart from `not_read`.
+        price_status = "skipped_ambiguous_product" if ambiguous_refused else "not_read"
+    elif fresh_amount is None and unreadable_reason:
         next_amount, next_currency = prev_amount, prev_currency
         price_status = "skipped_unreadable"
     elif fresh_amount is None:
@@ -6391,7 +6725,11 @@ async def _refresh_external_seed_by_id(
         else None
     )
     next_availability = fresh_availability or prev_availability
-    if fresh_availability is None:
+    if not read_the_served_product:
+        # Same rule as the price: a page that is not the served product says nothing about its stock.
+        next_availability = prev_availability
+        availability_status = "not_read"
+    elif fresh_availability is None:
         availability_status = "unavailable"
     elif prev_availability is None:
         availability_status = "filled"
@@ -6416,24 +6754,6 @@ async def _refresh_external_seed_by_id(
         "amount": next_amount,
         "currency": next_currency,
     }
-
-    # HOISTED so the stamp and the liveness observation below are gated on ONE decision.
-    # Deriving "did we reach the origin" twice is the twin-implementation drift this file
-    # keeps paying for, and here the two copies would disagree about whether a row is fresh.
-    #
-    # REACHING THIS LINE IS NOT EVIDENCE OF A FETCH. `resolve_external_offer` honours
-    # `raise_on_unavailable` only in its `except ExternalOfferUnavailable` arm; a timeout, a
-    # TLS/DNS error, a `RobotsDisallowed` (a bare RuntimeError) or a failure inside the
-    # extractor all land in its generic `except Exception`, which returns the CACHED snapshot.
-    # The success path then runs normally. `observed["status_code"]` is the only proof that
-    # anything actually left the process -- and `_same_destination` is the only proof it went
-    # to the URL we serve rather than a legacy `destination_url` we do not.
-    # ONE CLASSIFICATION, read three times: the freshness stamp, the staleness gate, and the
-    # liveness verdict below all derive from THIS (see `_read_the_served_product` for why a
-    # status code alone is not a reading). `classify_destination` is pure, so hoisting it costs
-    # nothing and removes the twin-implementation drift this file keeps paying for.
-    served_url = destination_liveness.destination_of(row)
-    observation, read_the_served_product = _refresh_read_outcome(row, dest, observed, catalogue_read)
 
     # CLEAR THE BLOCKER THIS REFRESH IS THE RECOMMENDED FIX FOR.
     #
@@ -6529,6 +6849,19 @@ async def _refresh_external_seed_by_id(
             # vouch for values nobody re-read tonight.
             seed_data["snapshot"].pop("extracted_at", None)
 
+    if ambiguous_refused:
+        # A price this run refused as ANOTHER product's (`on`): the stamp an earlier read left would vouch for a
+        # stored price this page says may be a component's, as for any refused price above.
+        seed_data["snapshot"].pop("extracted_at", None)
+
+    if handleless_read is not None:
+        # NOTHING ABOUT THE DECISION IS WRITTEN TO THE ROW: `seed_data` reaches partner agents whole (the gateway's
+        # product builder keeps unknown keys), and refusal reasons are internal state. It is counted per host by the
+        # batch, from this result.
+        handleless_read["would_flip_healthy"] = bool(handleless_read.get("would_read")) and _content_stale_for_serving(
+            _ensure_json_obj(row.get("seed_data"))
+        )
+
     served_canonical, served_domain = _next_served_canonical(
         row,
         dest,
@@ -6588,8 +6921,10 @@ async def _refresh_external_seed_by_id(
             "read_canonical_url": row.get("canonical_url"),
             "canonical_url": served_canonical,
             "domain": served_domain,
-            "title": snap_title,
-            "image_url": snap_image_url,
+            # The row's columns fill an EMPTY title / image (COALESCE above) and serving falls back to them: only from
+            # a page that is the served product, as the copy above.
+            "title": None if (content_read and not page_read_is_the_product) else snap_title,
+            "image_url": None if (content_read and not page_read_is_the_product) else snap_image_url,
             "price_amount": next_amount,
             "price_currency": next_currency,
             "availability": next_availability,
@@ -6699,6 +7034,12 @@ async def _refresh_external_seed_by_id(
         "availability_refresh": availability_refresh,
         "variant_refresh": variant_refresh,
         "destination_refresh": destination_refresh,
+        # What the handle-less read rule decided (`_handleless_read_outcome`), or None: the flag is off, or the
+        # served URL names a handle. The batch counts it once per row, from here.
+        "handleless_read": handleless_read,
+        # What the ambiguous-price guard decided (EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD shadow / on), only for a page
+        # with several priced products or a listing; absent otherwise, so `off` returns exactly what it did.
+        **({"ambiguous_price": ambiguous_price} if ambiguous_price is not None else {}),
         "attached_product_key": row.get("attached_product_key"),
         "attached_variant_id": row.get("attached_variant_id"),
         "disclosure_text": row.get("disclosure_text") or seed_data.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT,

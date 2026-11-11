@@ -127,6 +127,15 @@ unavailable rail). Neither names a reason, and neither opens anything.
      or a timeout is logged and never affects the purchase).
   3. Run the backfill once more for purchases opened between steps 1 and 2.
   Reads also heal: a single read heals that purchase, and a list read heals that owner's newest 100.
+  Every heal goes row by row: a purchase whose parent cannot be written is logged and skipped, the
+  rest are still healed, and that purchase is left alone (per process) for 10 minutes by the backfill
+  and the event job, and for 30 seconds by list reads, before it is tried again. Five failures in a
+  row end that heal run. The backfill script prints `failed=` per batch, carries on past failed rows,
+  and exits 1 if any row failed. **Exit 1** means some Reap purchases still have no parent: the purchases
+  themselves are untouched, but those rows are missing from the unified list until healed. Its last
+  line is `done parented=… failed_attempts=… missing_parents=…`; the WARNING lines
+  `reap parent heal failed purchase=rp_… error_type=…` name each one. Fix the cause, then run the
+  backfill again until it exits 0 (`missing_parents=0`).
 - Turn off: unset the dial. The table stays; nothing reads or writes it.
 
 ## Webhook events (`purchase.*`)
@@ -178,6 +187,13 @@ unless `AGENT_PURCHASE_WEBHOOKS_ENABLED` and `AGENT_PURCHASE_LEDGER_ENABLED` are
 worker service** (the job runs there; the ledger flag on `web` alone does not arm it).
 
 - Events are written to `agent_purchase_events` (migration 265) before anything is sent.
+- Both rails are detected, Reap and the A2A token rail, by the same rules. An A2A purchase whose
+  parent row the create route did not write (it is written best effort after the purchase commits)
+  is given its parent by the job before it reads, up to 50 per run, so it is not missed. The heal
+  uses the same window as the read below (state entered within the lookback), whenever the purchase
+  was created. The job's counts include `a2a_parent_heal_failed`, `a2a_parent_heal_deferred` (rows
+  read in that run that were skipped, waiting to retry after a failure) and `a2a_parent_heal_stopped`
+  (the run gave up after failures in a row).
 - Only purchases that entered their current state within `AGENT_PURCHASE_EVENTS_LOOKBACK_HOURS`
   (default 72, max 168) are considered, so switching the dial on does not replay old purchases;
   it DOES send events for purchases that changed state within that window. For a quiet first

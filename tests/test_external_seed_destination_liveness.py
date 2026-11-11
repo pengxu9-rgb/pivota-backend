@@ -1041,8 +1041,8 @@ def test_a_live_answer_after_a_streak_lifts_the_pending_reason_switch_or_no_swit
     result = _run(liveness.record_destination_observation(
         "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
     lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
-    assert len(lift) == 1
-    assert lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    # One lift per reversible reason this lane writes: the pending reason, then the unconfirmed-dead one.
+    assert [p["reason"] for _, p in lift] == [liveness.PENDING_SUPPRESSION_REASON, liveness.UNCONFIRMED_DEAD_REASON]
     sql = " ".join(lift[0][0].split())
     assert "suppression_reason = CAST(:reason AS text)" in sql, "a lift must be scoped to OUR reason"
     revert = _statements(db, "UPDATE catalog_offers SET suppressed_at = NULL")
@@ -1063,7 +1063,7 @@ def test_a_live_answer_at_streak_0_still_lifts_a_pending_row(monkeypatch):
     result = _run(liveness.record_destination_observation(
         "eps_1", liveness.DestinationObservation(liveness.VERDICT_LIVE, 200, None), now=NOW))
     lift = _statements(db, "UPDATE catalog_products SET suppressed_at = NULL")
-    assert len(lift) == 1 and lift[0][1]["reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert [p["reason"] for _, p in lift] == [liveness.PENDING_SUPPRESSION_REASON, liveness.UNCONFIRMED_DEAD_REASON]
     assert result["failure_streak"] == 0 and result["pending_lifted"] == 1
 
 
@@ -1090,10 +1090,12 @@ def test_retirement_takes_over_a_pending_row_and_relabels_its_offers(monkeypatch
     monkeypatch.setattr(liveness, "database", db)
     _run(liveness.retire_seed_for_dead_destination("eps_1", _CORROBORATED_DEAD, now=NOW))
     mirror_sql, mirror_params = next((sql, p) for sql, p in db.executed if "UPDATE catalog_products" in sql)
-    assert "suppression_reason = :pending_reason" in " ".join(mirror_sql.split())
+    assert "suppression_reason IN (:pending_reason, :unconfirmed_reason)" in " ".join(mirror_sql.split())
     assert mirror_params["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert mirror_params["unconfirmed_reason"] == liveness.UNCONFIRMED_DEAD_REASON
     relabel = _statements(db, "UPDATE catalog_offers SET suppression_reason = CAST(:final_reason AS text)")
     assert relabel and relabel[0][1]["pending_reason"] == liveness.PENDING_SUPPRESSION_REASON
+    assert relabel[0][1]["also_reason"] == liveness.UNCONFIRMED_DEAD_REASON
     assert relabel[0][1]["final_reason"] == "product_suppressed"
 
 

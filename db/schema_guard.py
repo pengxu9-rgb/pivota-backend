@@ -621,6 +621,9 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # observation: the retirement gap is measured from here, because
             # destination_checked_at is re-stamped by uncorroborated refresh observations.
             "destination_corroborated_dead_at",
+            # Migration 279. When the current run of 404/410 answers began: the unconfirmed-dead
+            # hide's 24h gap is measured from here, for the same reason as 266.
+            "destination_dead_404_since",
             # Content freshness (migration 202). Written ONLY by the success path of
             # _refresh_external_seed_by_id, so the refresh queue can order by "when did
             # we last re-read this PRICE" instead of `updated_at`, which an attach, a
@@ -630,6 +633,14 @@ REQUIRED_SCHEMA: Sequence[RequiredTableColumns] = (
             # FRESHNESS signal (advances only on a fetch that reached the origin).
             "last_crawled_at",
             "last_crawl_attempt_at",
+        },
+    ),
+    RequiredTableColumns(
+        table="merchant_onboarding",
+        columns={
+            # Migration 282. The staff-set test-merchant fact the admin route writes and
+            # services/test_merchant_policy reads behind MERCHANT_IS_TEST_FILTER_ENABLED.
+            "is_test",
         },
     ),
     RequiredTableColumns(
@@ -2512,6 +2523,16 @@ async def ensure_required_schema_light() -> None:
                   ADD COLUMN IF NOT EXISTS operating_mode VARCHAR(32) NOT NULL DEFAULT 'storefront';
                 """
             )
+            # mig 282: the staff-set test-merchant fact. Read only behind
+            # MERCHANT_IS_TEST_FILTER_ENABLED (services/test_merchant_policy), written only by
+            # POST /admin/merchants/{merchant_id}/is-test. Not in the SQLAlchemy model, so
+            # merchant_onboarding.select() never names it and a boot without it breaks no read.
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS merchant_onboarding
+                  ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
             # P0-3: DB-enforced audit idempotency (migration 144).
             # Partial UNIQUE index scoped to active stages closes the
             # check-then-insert race in POST /api/audits. The enqueue
@@ -3010,6 +3031,14 @@ async def ensure_required_schema_light() -> None:
                 """
                 ALTER TABLE IF EXISTS external_product_seeds
                   ADD COLUMN IF NOT EXISTS destination_corroborated_dead_at TIMESTAMPTZ;
+                """
+            )
+            # Migration 279: the hard-404 run clock. The writer SELECTs and UPDATEs it on every
+            # observation, so a database without it fails every refresh and sweep observation.
+            await _heal_add_columns(
+                """
+                ALTER TABLE IF EXISTS external_product_seeds
+                  ADD COLUMN IF NOT EXISTS destination_dead_404_since TIMESTAMPTZ;
                 """
             )
             await database.execute(
@@ -4443,6 +4472,8 @@ async def ensure_required_schema_light() -> None:
                 # `COALESCE(m.indexable, TRUE) IS TRUE` then dropped all of them
                 # from cross-merchant recall.
                 ("catalog_merchants", "indexable"): "BOOLEAN NOT NULL DEFAULT TRUE",
+                # migration 282: every merchant is real until staff say otherwise.
+                ("merchant_onboarding", "is_test"): "BOOLEAN NOT NULL DEFAULT FALSE",
                 ("merchant_credit_balance", "purchased_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_pending_credits"): "NUMERIC DEFAULT 0",
                 ("merchant_credit_balance", "overage_charged_credits"): "NUMERIC DEFAULT 0",

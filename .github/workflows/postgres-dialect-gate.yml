@@ -171,6 +171,9 @@ on:
       - "tests/services/test_retailer_ingest_markets_sg.py"
       - "tests/services/test_retailer_ingest_markets_phase2.py"
       - "tests/services/test_retailer_ingest_pipeline.py"
+      # tests/test_deal_code_retention_postgres.py imports its fixtures' helpers and a dozen boundary cases from this
+      # file, which the `_postgres` glob does not match; same reason as above.
+      - "tests/test_deal_code_retention.py"
       - "requirements.txt"
       - "requirements-dev.txt"
       - ".github/workflows/postgres-dialect-gate.yml"

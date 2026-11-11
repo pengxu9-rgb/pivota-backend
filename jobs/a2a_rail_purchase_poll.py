@@ -3,7 +3,8 @@
 Registered on the worker by services/audit_scheduler.py every A2A_RAIL_POLL_INTERVAL_SECONDS (default
 20). Dormant unless A2A_RAIL_WORKER_ENABLED is on AND the rail client is configured (A2A_RAIL_ENABLED,
 A2A_RAIL_BASE_URL, A2A_RAIL_API_KEY); the checks are inside the job, so registering it changes nothing
-until armed. One client per process: its per-member token cache is what keeps the token exchange off
+until armed. An armed tick first stamps the worker's heartbeat (db/a2a_rail_ledger), which the create
+route reads: while no tick runs, no new A2A purchase is opened. One client per process: its per-member token cache is what keeps the token exchange off
 every call.
 """
 
@@ -15,7 +16,8 @@ import socket
 import uuid
 from typing import Any, Dict, Optional
 
-from services.payment_orchestration import a2a_rail, a2a_rail_worker
+import db.a2a_rail_ledger as a2a_ledger
+from services.payment_orchestration import a2a_rail, a2a_rail_worker, vic_order
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,14 @@ async def run_a2a_rail_purchase_poll() -> Dict[str, Any]:
     client = _get_client()
     if client is None:
         return {"skipped": "client_not_configured"}
-    counts = await a2a_rail_worker.run_tick(client, _worker_id())
+    try:
+        # Read by the create route (another service): no fresh heartbeat, no new A2A purchase.
+        await a2a_ledger.record_worker_heartbeat()
+    except Exception as exc:  # noqa: BLE001 - the tick still steps what is open; creates pause meanwhile
+        logger.warning("a2a_rail_purchase_poll: heartbeat write failed error_type=%s", type(exc).__name__)
+    # The VIC order step's client: None until its dial is on AND a transport exists. The rail has not
+    # published its order API, so no transport is passed yet: the step stays off in every process.
+    counts = await a2a_rail_worker.run_tick(client, _worker_id(), vic=vic_order.from_env())
     if set(counts) - _QUIET_OUTCOMES:
         # WARNING, not INFO: prod drops module-logger INFO, and an operator arming the dial needs to see
         # that ticks stepped something. Quiet ticks (only parked or waiting rows) stay silent.
@@ -66,4 +75,5 @@ async def run_a2a_rail_purchase_poll() -> Dict[str, Any]:
     return counts
 
 
-_QUIET_OUTCOMES = frozenset({"parked", "waiting_on_buyer"})
+#: `orphan_tokens` is a standing count, not an event: the worker logs it itself, at most hourly.
+_QUIET_OUTCOMES = frozenset({"parked", "waiting_on_buyer", "orphan_tokens"})

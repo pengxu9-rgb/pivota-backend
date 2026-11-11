@@ -44,6 +44,12 @@ def init_sentry():
             
             # Additional context
             send_default_pii=False,  # Don't send user data by default
+
+            # NO FRAME LOCALS, anywhere. The rail clients hold provider answers in locals
+            # (`parsed`, `raw`, `body`) BEFORE their credential stripper runs, so a stack frame's
+            # variables can carry a network token, cryptogram, card or buyer data.
+            # filter_sensitive_data drops them again for payment/rail frames.
+            include_local_variables=False,
             
             # Release tracking.
             #
@@ -84,10 +90,112 @@ def init_sentry():
         return False
 
 
+#: Module-name fragments of the payment, card and rail code. A frame whose module (or file path)
+#: contains one has its local variables dropped, and an event with such a frame, or a request to such
+#: a path, has its request body dropped. Broad on purpose: over-scrubbing loses debug context only.
+SENSITIVE_MODULE_FRAGMENTS = (
+    "payment",       # services.payment_orchestration.*, routes.payment_*, payment_reconcile, ...
+    "a2a_rail",
+    "vic_order",
+    "visa_vdp",
+    "reap",          # services.reap_*, routes.reap_*, routes.agent_commerce_reap
+    "card_issu",     # services.card_issuers, services.agent_card_issuance
+    "agent_cards",
+    "card_rail",
+    "issued_cards",
+    "psp",
+    "stripe",
+    "refund",
+    "wallet",
+    "payout",
+    "ap2",
+    "acp_",
+    "checkout",
+    "purchase",
+)
+
+#: Request path fragments of the same surfaces (a body posted to one may be a rail/issuer payload).
+SENSITIVE_PATH_FRAGMENTS = (
+    "/webhooks/reap",
+    "/agent/v1/cards",
+    "/payment",
+    "/purchase",
+    "/checkout",
+    "/refund",
+    "/psp",
+    "/stripe",
+    "/wallet",
+    "/payout",
+    "/ap2",
+    "/x402",
+    "/a2a",
+)
+
+
+def _is_sensitive_module(name) -> bool:
+    text = str(name or "").strip().lower().replace("\\", "/")
+    if not text:
+        return False
+    return any(fragment in text for fragment in SENSITIVE_MODULE_FRAGMENTS)
+
+
+def _frame_is_sensitive(frame) -> bool:
+    if not isinstance(frame, dict):
+        return False
+    return any(
+        _is_sensitive_module(frame.get(key)) for key in ("module", "filename", "abs_path")
+    )
+
+
+def _iter_frames(event):
+    """Every stack frame in the event: exception chains and thread stacks."""
+    for section in ("exception", "threads"):
+        container = event.get(section)
+        values = container.get("values") if isinstance(container, dict) else container
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            stacktrace = value.get("stacktrace")
+            frames = stacktrace.get("frames") if isinstance(stacktrace, dict) else None
+            if isinstance(frames, list):
+                for frame in frames:
+                    if isinstance(frame, dict):
+                        yield frame
+    stacktrace = event.get("stacktrace")
+    frames = stacktrace.get("frames") if isinstance(stacktrace, dict) else None
+    if isinstance(frames, list):
+        for frame in frames:
+            if isinstance(frame, dict):
+                yield frame
+
+
+def _scrub_payment_frames_and_bodies(event) -> None:
+    touched_sensitive = False
+    for frame in _iter_frames(event):
+        if _frame_is_sensitive(frame):
+            touched_sensitive = True
+            frame.pop("vars", None)
+    request = event.get("request")
+    if not isinstance(request, dict):
+        return
+    url = str(request.get("url") or "").lower()
+    if touched_sensitive or any(fragment in url for fragment in SENSITIVE_PATH_FRAGMENTS):
+        for key in ("data", "cookies"):
+            if key in request:
+                request[key] = "[REDACTED]"
+
+
 def filter_sensitive_data(event, hint):
     """
     Filter sensitive data before sending to Sentry
     """
+    if not isinstance(event, dict):
+        return event
+    # Payment / card / rail code: no frame locals, no request body (see SENSITIVE_MODULE_FRAGMENTS).
+    _scrub_payment_frames_and_bodies(event)
+
     # Remove sensitive headers
     if "request" in event and "headers" in event["request"]:
         headers = event["request"]["headers"]

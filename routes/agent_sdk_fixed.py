@@ -55,6 +55,7 @@ from db.agent_ranking_log import log_ranking_batch
 from db.agent_product_events import log_product_events
 from routes.agent_auth import log_agent_request
 from services import agent_search_gateway_proxy
+from services.seed_data_egress_projection import serve_search_products
 from services.test_merchant_policy import get_excluded_merchant_ids, static_test_merchant_ids
 from config.settings import settings as _app_settings
 
@@ -644,25 +645,9 @@ async def health_check():
 # AUTHENTICATION
 # ============================================================================
 
-# RETIRED (501). POST /agent/v1/auth took no credentials of any kind. Given an email it ran
-# `SELECT agent_id, api_key FROM agents WHERE email = :email` and returned that row's
-# agents.api_key to the caller; given an unknown email it minted an agent and returned a new key.
-# - The lookup branch handed whatever agents.api_key holds to anyone who knew (or guessed) an
-#   agent's email. For hash-only agents that is the `redacted:<agent_id>` marker, which is not a
-#   credential (db/agents.py); for any legacy row that still holds a plaintext key, it was that
-#   agent's live key.
-# - The mint branch wrote a legacy agents schema (name, company, use_case, status,
-#   request_count) and skipped agent_name / agent_type / api_key_hash (NOT NULL), and it stored
-#   the plaintext key in agents.api_key without writing the key table. Auth reads the sha256 in
-#   the key table and consults agents.api_key only when no key table exists or
-#   AGENT_AUTH_ENABLE_LEGACY_API_KEY_FALLBACK is on (default off), so even a row it managed to
-#   write would hold a key that does not authenticate.
-# - Its 500 echoed the database error text to the anonymous caller.
-# Nothing calls it: no portal, gateway, SDK or doc references the path, and prod request logs
-# show no traffic to it. Agents register through POST /agent/account/register
-# (routes/agent_account.py), which mints the key hash-only, and rotate it through the
-# authenticated key routes. It takes no body, so it answers 501 for any payload rather than 422.
-@router.post("/auth")
+# RETIRED (501). Agent keys are issued by POST /agent/account/register (routes/agent_account.py)
+# and rotated through the authenticated key routes. Takes no body: 501 for any payload, never 422.
+@router.post("/auth", include_in_schema=False)
 async def generate_api_key():
     """Retired: answers 501, reads and writes nothing."""
     raise HTTPException(
@@ -679,15 +664,22 @@ async def list_merchants(
     status: str = Query(
         default="active",
         description=(
-            "Merchant status. scope=available accepts only 'active' (or its alias 'approved')."
+            "Merchant status. scope=available and scope=protocol accept only 'active' "
+            "(or its alias 'approved')."
         ),
     ),
-    scope: Literal["available", "mine"] = Query(
+    scope: Literal["available", "mine", "protocol"] = Query(
         default="available",
         description=(
             "'available' (default): approved merchants this agent can order from. "
-            "'mine': only merchants this agent has already placed orders with."
+            "'mine': only merchants this agent has already placed orders with. "
+            "'protocol': merchants a purchase reaches through a checkout protocol, one row "
+            "per merchant domain and market, with the checkout routes it can take."
         ),
+    ),
+    market: Optional[str] = Query(
+        default=None,
+        description="ISO 3166-1 alpha-2 market, e.g. US. Filters scope=protocol; ignored by the other scopes.",
     ),
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -701,8 +693,9 @@ async def list_merchants(
     and is the only scope that takes another `status`. Both scopes honour the
     agent's `allowed_merchants` the way `can_access_merchant` does: None means
     every merchant, a list (even an empty one) means only those. (The legacy
-    search lane is looser: it treats `[]` as unrestricted, and with
-    `search_all_merchants=true` it bypasses an allowlist of exactly
+    search lane now also reads `[]` as no merchant, via
+    `routes.agent_auth.has_no_merchant_scope`; it is still looser in one way:
+    with `search_all_merchants=true` it bypasses an allowlist of exactly
     `["external_seed"]`.)
 
     Both scopes drop test/demo rigs (`services/test_merchant_policy`, the same
@@ -713,12 +706,22 @@ async def list_merchants(
     Contact email, PSP type and created_at are returned only for merchants the
     agent has ordered from, so an API key cannot pull every merchant's contact
     or processor details.
+
+    `scope=protocol` is the protocol directory (services/agent_merchant_directory.py):
+    merchants no portal integration knows, reached through a payment partner's
+    checkout or a prefilled cart the buyer finishes. Rows are keyed by
+    `merchant_domain` + `market` (the pair a purchase names) and carry
+    `checkout_routes`; there is no `merchant_id`. The agent's `allowed_merchants`
+    is matched against the domain, not the merchant id the purchase route checks.
     """
-    if scope == "available" and status not in ("active", "approved"):
+    if scope in ("available", "protocol") and status not in ("active", "approved"):
         raise HTTPException(
             status_code=422,
-            detail="scope=available lists active merchants only; use scope=mine to filter by status",
+            detail=f"scope={scope} lists active merchants only; use scope=mine to filter by status",
         )
+    # `market` filters scope=protocol only; the other scopes ignore it, as they did before it existed.
+    if scope == "protocol":
+        return await _list_protocol_merchants(context=context, market=market, limit=limit, offset=offset)
     try:
         # Map status values
         if status in ("active", "approved"):
@@ -848,6 +851,41 @@ async def list_merchants(
     except Exception as e:
         logger.error(f"Failed to list merchants: {e}")
         raise HTTPException(status_code=500, detail="Failed to list merchants")
+
+async def _list_protocol_merchants(*, context: AgentContext, market: Optional[str], limit: int, offset: int):
+    from services import agent_merchant_directory as directory
+
+    if market is not None:
+        market_key = market.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", market_key):
+            raise HTTPException(status_code=422, detail="market must be an ISO 3166-1 alpha-2 code")
+    else:
+        market_key = None
+    try:
+        rows = await directory.list_for_agent(
+            agent_id=str(context.agent_id), allowed_merchants=context.allowed_merchants, market=market_key
+        )
+    except directory.DirectoryUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Merchant directory is being rebuilt; retry shortly",
+            headers={"Retry-After": "15"},
+        )
+    except Exception:
+        logger.error("Failed to list protocol merchants", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list merchants")
+    total = len(rows)
+    return {
+        "status": "success",
+        "scope": "protocol",
+        "merchants": rows[offset:offset + limit],
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": total > offset + limit,
+        },
+    }
 
 # ============================================================================
 # PRODUCTS SEARCH
@@ -1078,7 +1116,7 @@ async def search_products(
             )
             return {
                 "status": "success",
-                "products": page_items,
+                "products": serve_search_products(page_items),
                 "pagination": {
                     "total": total,
                     "limit": limit,

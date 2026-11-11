@@ -53,7 +53,8 @@ def delivery_on(monkeypatch):
 async def _db():
     if not database.is_connected:
         await database.connect()
-    for table in ("agent_purchase_events", "agent_purchases", "reap_agentic_purchases", "reap_agentic_enrollments"):
+    for table in ("agent_purchase_events", "agent_purchases", "reap_agentic_purchases", "reap_agentic_enrollments",
+                  "a2a_rail_purchases", "a2a_rail_buyer_refs"):
         await database.execute(f"DROP TABLE IF EXISTS {table}")
     await ensure_required_schema_light()
     yield
@@ -141,7 +142,8 @@ def test_the_prepare_gate_collects_the_postgres_statements():
     spec.loader.exec_module(gate)
     collected = [" ".join(str(sql).split()) for _where, sql in gate.collect_statements()]
     for statement in (events_db._INSERT_SQL, events_db._CLAIM_SQL, events_db._FINISH_SQL, events_db._RELEASE_SQL,
-                      events_db._SELECT_CLAIMABLE_SQL, events_db._REAP_CANDIDATES_SQL, events_db._CREATE_TABLE_PG):
+                      events_db._SELECT_CLAIMABLE_SQL, events_db._REAP_CANDIDATES_SQL, events_db._A2A_CANDIDATES_SQL,
+                      purchases._SELECT_A2A_MISSING_PARENTS_SQL, events_db._CREATE_TABLE_PG):
         assert " ".join(statement.split()) in collected, statement.strip().splitlines()[0]
 
 

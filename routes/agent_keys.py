@@ -13,6 +13,7 @@ from db.database import database
 from db.agents import is_redacted_agent_api_key
 from routes.agent_account import AgentNotFoundError, KeyTableUnresolvedError, reset_agent_primary_api_key
 from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_user
+from utils.tenant_scope import assert_agent_scope_or_owner
 
 router = APIRouter(prefix="/agents", tags=["agent-keys"])
 
@@ -73,11 +74,10 @@ async def get_agent_api_keys(
     current_user: dict = Depends(get_current_user)
 ):
     """Get all API keys for an agent"""
+    # Ownership BEFORE the try: the broad `except Exception` below turned a
+    # refusal into a 500 (or, on the list route, a 200 with no keys).
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
-        # Verify the agent owns this resource or is admin
-        user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            raise HTTPException(status_code=403, detail="Not authorized to view these API keys")
         
         # Check if api_keys table exists, if not create it
         await database.execute("""
@@ -194,11 +194,10 @@ async def create_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new API key for an agent"""
+    # Ownership BEFORE the try: the broad `except Exception` below turned a
+    # refusal into a 500 (or, on the list route, a 200 with no keys).
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
-        # Verify the agent owns this resource or is admin
-        user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            raise HTTPException(status_code=403, detail="Not authorized to create API keys for this agent")
         
         # Ensure table exists
         await database.execute("""
@@ -258,11 +257,10 @@ async def revoke_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Revoke an API key"""
+    # Ownership BEFORE the try: the broad `except Exception` below turned a
+    # refusal into a 500 (or, on the list route, a 200 with no keys).
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
-        # Verify the agent owns this resource or is admin
-        user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            raise HTTPException(status_code=403, detail="Not authorized to revoke this API key")
         
         # Update key status
         result = await database.execute(
@@ -294,11 +292,10 @@ async def reset_agent_api_key(
     current_user: dict = Depends(get_current_user)
 ):
     """Reset the main API key for an agent (legacy endpoint)"""
+    # Ownership BEFORE the try: the broad `except Exception` below turned a
+    # refusal into a 500 (or, on the list route, a 200 with no keys).
+    await assert_agent_scope_or_owner(database, current_user, agent_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     try:
-        # Verify the agent owns this resource or is admin
-        user_agent_id = current_user.get("agent_id") or current_user.get("email")
-        if user_agent_id != agent_id and current_user.get("role") not in EMPLOYEE_STAFF_ROLES:
-            raise HTTPException(status_code=403, detail="Not authorized to reset this API key")
 
         new_api_key, key_sync_source = await reset_agent_primary_api_key(
             agent_id=agent_id, created_by="self_reset"
