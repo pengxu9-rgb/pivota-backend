@@ -21,6 +21,10 @@ from utils.auth import hash_password, verify_password, create_access_token, get_
 
 router = APIRouter(prefix="/agent/account", tags=["agent-account"])
 
+# users.created_at is the database clock and a membership's timestamps the app's; a
+# membership the registration wrote right after the users row must not read as older.
+AGENT_LINK_CLOCK_SKEW = timedelta(seconds=60)
+
 
 # ── Self-serve registration guardrails ────────────────────────────────────────
 # POST /agent/account/register mints a live ak_live_* API key with no approval
@@ -752,6 +756,14 @@ async def register_agent(data: AgentRegisterRequest, http_request: Request):
         
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
+        # Nothing here proves the mailbox, so an address that already names an agent
+        # owner (a staff-created agent has no users row), a merchant contact or an
+        # employee is refused: the users row created here would be what agent login
+        # keys on. The owner resets the password from the portal instead.
+        from routes.auth import EMAIL_ALREADY_REGISTERED_DETAIL, _email_claims_existing_tenant
+
+        if await _email_claims_existing_tenant(email):
+            raise HTTPException(status_code=400, detail=EMAIL_ALREADY_REGISTERED_DETAIL)
 
         # Decide WHERE the key will live BEFORE any row is written, so a failed probe leaves nothing
         # behind (a 503 with an orphaned users row would block the email from ever registering).
@@ -925,7 +937,7 @@ async def _is_active_staff_account(user) -> bool:
     return bool(await _fetch_active_employee_identity(user["email"]))
 
 
-async def _holds_agent_membership(user, agent) -> bool:
+async def _holds_agent_membership(user, agent, *, clock_skew: timedelta = timedelta(0)) -> bool:
     """Whether this email holds an active agent membership for exactly this agent.
 
     auth_memberships is the model built for one email holding several portals, and only
@@ -953,7 +965,7 @@ async def _holds_agent_membership(user, agent) -> bool:
         email=user["email"],
         membership_type="agent",
         entity_id=agent["agent_id"],
-        not_before=user_created_at,
+        not_before=user_created_at - clock_skew,
     )
 
 
@@ -979,22 +991,55 @@ async def login_agent(data: AgentLoginRequest):
         if not user["active"]:
             raise HTTPException(status_code=403, detail="Account is deactivated")
 
-        # 3. Get agent record
-        agent = await database.fetch_one(
-            """
-            SELECT agent_id, agent_name, owner_email, api_key, agent_type
-            FROM agents
-            WHERE LOWER(owner_email) = LOWER(:email)
-            """,
-            {"email": email}
-        )
+        # 3. Get the agent this login is linked to. An owner may have several agents
+        # rows (staff can add one at the same owner_email); take the oldest one the
+        # link holds for, not merely the oldest.
+        agent_rows = [
+            dict(r)
+            for r in (
+                await database.fetch_all(
+                    """
+                    SELECT agent_id, agent_name, owner_email, api_key, agent_type
+                    FROM agents
+                    WHERE LOWER(owner_email) = LOWER(:email)
+                    ORDER BY created_at
+                    """,
+                    {"email": email},
+                )
+                or []
+            )
+        ]
+        is_agent_role = user["role"] == "agent"
+        staff_owner = (not is_agent_role) and bool(agent_rows) and await _is_active_staff_account(user)
 
-        if user["role"] != "agent" and not (
-            agent and (await _is_active_staff_account(user) or await _holds_agent_membership(user, agent))
-        ):
+        # role='agent' plus a matching owner_email is not proof the agent is this
+        # account's: staff create agents whose owner_email has no users row, and
+        # /api/auth/register used to let anyone create that row. The link is an
+        # agent membership for this agent written after this users row existed,
+        # which only the agent's own registration, a password reset (mailbox proof)
+        # or an earlier linked login writes (a conversion keeps one, never makes one).
+        agent = None
+        for candidate in agent_rows:
+            if staff_owner or await _holds_agent_membership(
+                user,
+                candidate,
+                clock_skew=AGENT_LINK_CLOCK_SKEW if is_agent_role else timedelta(0),
+            ):
+                agent = candidate
+                break
+
+        if not is_agent_role and agent is None:
             raise HTTPException(status_code=403, detail="This login is for agents only")
-        if not agent:
+        if not agent_rows:
             raise HTTPException(status_code=404, detail="Agent record not found")
+        if agent is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This agent is not linked to this login yet. Reset your password "
+                    "from the developer portal to confirm the email and link it."
+                ),
+            )
         
         # databases.Record → plain dict for safe .get() usage
         agent_dict = dict(agent)

@@ -413,34 +413,83 @@ def test_agent_guard_semantics():
 
     g(_agent(AGENT), AGENT)
     g(_staff("super_admin"), AGENT)
-    g({"role": "agent", "email": "Owner@Example.com"}, AGENT, owner_email="owner@example.com")
+    # A claim-less agent token names no agent; its email is not proof of ownership.
+    assert _raises_403(g, {"role": "agent", "email": "owner@example.com"}, AGENT)
     assert _raises_403(g, _agent(UNRELATED_AGENT), AGENT)
     g(_agent(AGENT), AGENT, staff_roles=())
     assert _raises_403(g, _staff("admin"), AGENT, staff_roles=())
     assert _raises_403(g, {"role": "agent", "email": AGENT}, AGENT)  # email == id is not ownership
     assert _raises_403(g, {"role": "agent", "user_id": AGENT}, AGENT)  # user_id is a users-table id
-    assert _raises_403(g, {"role": "merchant", "email": "o@example.com"}, AGENT, owner_email="o@example.com")
+    assert _raises_403(g, {"role": "merchant", "email": "o@example.com"}, AGENT)
     assert _raises_403(g, _merchant(OWNER), AGENT)
-    # A token that names a different agent cannot fall back to its email.
-    assert _raises_403(g, {**_agent(UNRELATED_AGENT), "email": "o@example.com"}, AGENT, owner_email="o@example.com")
+    assert _raises_403(g, {"role": "agent", "agent_id": ""}, AGENT)
+    assert _raises_403(g, {"role": "agent", "agent_id": [AGENT]}, AGENT)
 
 
-async def test_agent_owner_lookup_only_runs_for_an_agent_token():
+async def test_agent_or_owner_guard_never_trusts_the_owner_email():
+    """The owner_email fallback is gone on every route that used it (keys, webhooks,
+    bank details, payouts, identity issuers, protocols): a claim-less agent token
+    whose email IS the agent's owner_email is refused, and no lookup runs."""
+    from utils.auth import EMPLOYEE_STAFF_ROLES
     from utils.tenant_scope import assert_agent_scope_or_owner as g
 
-    db = _FakeDatabase()
+    class _NoLookups:
+        async def fetch_one(self, *_a, **_k):
+            raise AssertionError("the guard must not look the owner up")
 
-    async def owner_row(query, values=None, *a, **kw):
-        db.calls.append({"query": str(query), "values": values})
-        return {"owner_email": "seller@example.com"}
+        fetch_all = fetch_val = execute = fetch_one
 
-    db.fetch_one = owner_row  # type: ignore[assignment]
-    await g(db, {"role": "agent", "email": "seller@example.com"}, AGENT)
-    assert len(db.calls) == 1
-    await g(db, _agent(AGENT), AGENT)  # claim match: no lookup
-    assert len(db.calls) == 1
+    db = _NoLookups()
+    for caller in (
+        {"role": "agent", "email": "seller@example.com"},
+        {"role": "agent", "email": "seller@example.com", "agent_id": None},
+        _merchant(OWNER),
+        _agent(UNRELATED_AGENT),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await g(db, caller, AGENT)
+        assert exc.value.status_code == 403
+    await g(db, _agent(AGENT), AGENT)
+    # The route's staff set is honoured (agent_keys/webhooks/issuers pass
+    # EMPLOYEE_STAFF_ROLES; bank and payouts pass none).
+    await g(db, _staff("employee"), AGENT, staff_roles=EMPLOYEE_STAFF_ROLES)
     with pytest.raises(HTTPException):
-        await g(db, _merchant(OWNER), AGENT)  # not an agent: no lookup
-    assert len(db.calls) == 1
+        await g(db, _staff("employee"), AGENT)
     with pytest.raises(HTTPException):
-        await g(db, {"role": "agent", "email": "stranger@example.com"}, AGENT)
+        await g(db, _staff("admin"), AGENT, staff_roles=())
+
+
+class _SqliteOrders:
+    """Runs the relationship query for real, against an in-memory orders table."""
+
+    def __init__(self, rows):
+        import sqlite3
+
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.execute(
+            "CREATE TABLE orders (merchant_id TEXT, agent_id TEXT, payment_status TEXT, is_deleted BOOLEAN)"
+        )
+        self.conn.executemany("INSERT INTO orders VALUES (?, ?, ?, ?)", rows)
+
+    async def fetch_one(self, query, values=None):
+        cur = self.conn.execute(str(query), dict(values or {}))
+        return cur.fetchone()
+
+
+@pytest.mark.parametrize("rows,expected", [
+    ([], False),
+    ([(OWNER, AGENT, "pending", None)], False),
+    ([(OWNER, AGENT, "unpaid", 0), (OWNER, AGENT, "awaiting_payment", 0)], False),
+    ([(OWNER, AGENT, "failed", 0), (OWNER, AGENT, "refunded", 0), (OWNER, AGENT, None, 0)], False),
+    ([(OWNER, AGENT, "paid", 1)], False),                 # deleted (M12)
+    ([(OTHER, AGENT, "paid", 0), (OWNER, UNRELATED_AGENT, "paid", 0)], False),
+    ([(OWNER, AGENT, "paid", None)], True),
+    ([(OWNER, AGENT, "PAID", 0)], True),
+    ([(OWNER, AGENT, "succeeded", 0)], True),
+    ([(OWNER, AGENT, "completed", 0)], True),
+    ([(OWNER, AGENT, "partially_refunded", 0)], True),
+])
+async def test_relationship_needs_a_paid_non_deleted_order(rows, expected):
+    from utils.tenant_scope import merchant_has_agent_relationship
+
+    assert await merchant_has_agent_relationship(_SqliteOrders(rows), OWNER, AGENT) is expected

@@ -1,0 +1,10 @@
+{
+  "ucp": {
+    "version": "2026-01-23",
+    "supported_versions": {
+      "2026-01-11": "https://business.example.com/.well-known/ucp/2026-01-11"
+    },
+    "services": {},
+    "payment_handlers": {}
+  }
+}

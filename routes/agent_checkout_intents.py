@@ -19,7 +19,7 @@ from db.database import IS_POSTGRES, database, engine, metadata
 from db.schema_guard import guarded_add_columns, guarded_index
 import uuid
 from utils.transient_errors import db_busy_http_exception, is_asyncpg_busy_error
-from db.buyer_vault import buyer_addresses, buyer_identity_links, hash_agent_user_ref
+from db.buyer_vault import buyer_addresses, buyer_identity_links, resolve_agent_user_ref_hash
 from routes.accounts_orders_api import get_accounts_principal
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from services.commerce_execution_policy import (
@@ -28,7 +28,7 @@ from services.commerce_execution_policy import (
     SURFACE_PUBLIC_AGENT_PURCHASE,
     resolve_commerce_execution_policy,
 )
-from services.quote_service import QuoteError, QuoteService
+from services.quote_service import QuoteError, QuoteService, require_quote_for_caller
 from services.traffic_taxonomy_service import attach_traffic_taxonomy, build_traffic_taxonomy
 from services.tier2_acp_lane import resolve_acp_lane_decision
 from services.acp_checkout_session_service import (
@@ -91,18 +91,28 @@ def _checkout_token_secret() -> str:
     return (os.getenv("CHECKOUT_TOKEN_SECRET") or os.getenv("AGENT_CHECKOUT_TOKEN_SECRET") or "").strip()
 
 
-def mint_checkout_token(payload: Dict[str, Any], ttl_seconds: int = 60 * 60) -> str:
+def mint_checkout_token(
+    payload: Dict[str, Any],
+    ttl_seconds: int = 60 * 60,
+    *,
+    exp_cap: Optional[int] = None,
+) -> str:
+    """Sign a checkout token. `exp_cap` (epoch seconds) is a hard ceiling on its expiry."""
     secret = _checkout_token_secret()
     if not secret:
         raise HTTPException(status_code=500, detail="Checkout token secret is not configured")
 
     now = int(time.time())
     exp = now + int(ttl_seconds)
+    if exp_cap is not None:
+        exp = min(exp, int(exp_cap))
+    # The payload goes FIRST so that no field in it can override the version, issue time or the
+    # (capped) expiry set here.
     body = {
+        **payload,
         "v": 1,
         "iat": now,
         "exp": exp,
-        **payload,
     }
 
     payload_b64 = _base64url_encode(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
@@ -166,6 +176,29 @@ def _checkout_intent_ttl_seconds() -> int:
         val = 1800
     # Clamp to a sane range: 5min .. 6h
     return max(300, min(val, 6 * 60 * 60))
+
+
+def _presenting_checkout_token_exp(context: Any) -> Optional[int]:
+    """The expiry of the checkout token the caller presented, or None for any other credential.
+
+    A checkout token can mint a new intent and token for its own order (POST
+    /agent/v2/payments/checkout-sessions). The new token and intent must not outlive the token that
+    asked for them, or a token holder could extend its one-hour life indefinitely by re-minting.
+    Its own `exp` already carries any earlier cap, so the chain can only shrink.
+
+    A presented token with no usable `exp` (only possible with the signing secret; every minted token
+    has one) still gets a cap: the default token lifetime from now. It never means "uncapped".
+    """
+    payload = getattr(context, "checkout_token_payload", None)
+    if not isinstance(payload, dict):
+        return None
+    try:
+        exp = int(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    if exp > 0:
+        return exp
+    return int(time.time()) + _checkout_token_ttl_seconds()
 
 
 def _checkout_token_ttl_seconds() -> int:
@@ -369,7 +402,7 @@ async def _buyer_prefill_from_identity_link(*, agent_id: str, agent_user_ref: st
     ref = str(agent_user_ref or "").strip()
     if not ref:
         return None
-    ref_hash = hash_agent_user_ref(ref)
+    ref_hash = await resolve_agent_user_ref_hash(agent_id, ref)
     if not ref_hash:
         return None
 
@@ -876,6 +909,8 @@ async def create_checkout_intent(
             },
         )
     if quote_id:
+        # S-28: a token minted for a quote may use it, so only the quote's owner may name it here.
+        await require_quote_for_caller(quote_id, context)
         try:
             quote = await QuoteService().load_active_quote_or_raise(quote_id=quote_id)
         except QuoteError as exc:
@@ -919,7 +954,10 @@ async def create_checkout_intent(
             )
 
     intent_id = f"ci_{uuid.uuid4().hex}"
+    parent_token_exp = _presenting_checkout_token_exp(context)
     expires_at_sec = int(time.time()) + _checkout_intent_ttl_seconds()
+    if parent_token_exp is not None:
+        expires_at_sec = min(expires_at_sec, parent_token_exp)
     expires_at_dt = datetime.fromtimestamp(expires_at_sec, tz=timezone.utc)
 
     prefill: Optional[Dict[str, Any]] = None
@@ -945,6 +983,11 @@ async def create_checkout_intent(
         # item-level enforcement can be added later if needed).
         "items": [it.model_dump() for it in req.items],
     }
+    bound_order_id = str(req.order_id or "").strip() or None
+    if bound_order_id:
+        # Binds the token to the order this intent resumes (routes.agent_auth
+        # checkout_token_may_use_order); orders the page creates bind through intent_id.
+        token_payload["order_id"] = bound_order_id
     if agent_user_ref:
         token_payload["agent_user_ref"] = agent_user_ref
     if brief_id:
@@ -964,7 +1007,15 @@ async def create_checkout_intent(
         ),
     )
 
-    token = mint_checkout_token(token_payload, ttl_seconds=_checkout_token_ttl_seconds())
+    if parent_token_exp is not None:
+        # Minted under another checkout token: record the ceiling it inherited (audit only; `exp` is
+        # what verification enforces).
+        token_payload["parent_exp"] = parent_token_exp
+    token = mint_checkout_token(
+        token_payload,
+        ttl_seconds=_checkout_token_ttl_seconds(),
+        exp_cap=parent_token_exp,
+    )
 
     # Best-effort: store intent server-side (prefill never goes into URLs/tokens).
     # If the table isn't migrated yet, we still return a usable checkout_url without prefill.

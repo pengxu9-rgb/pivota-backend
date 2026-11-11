@@ -699,9 +699,23 @@ async def run_reap_agentic_purchase_poll(
     async def _finish() -> PollReport:
         await _price_writeback(_budget_spent)
 
+        # EACH COUNT ON ITS OWN CONNECTION. `databases` 0.7.0 keeps ONE Connection in a ContextVar
+        # that gathered tasks inherit, and this run has queried by now, so a plain gather ran all
+        # four counts on that one Connection, one at a time behind its query lock — while every
+        # timer started at the gather. One count hung on the server therefore timed the other
+        # three out with it, and a timed-out count's server-side cancel round-trip ate the next
+        # one's budget: all four -1 together, the opposite of what the separate timeouts are for.
+        # `spawn_isolated` runs each count in a fresh, empty context, so each checks out its own
+        # pool connection (at most four, briefly) and a hang can only take itself down.
+        # tests/test_reap_agentic_purchase_postgres.py holds this with a real server-side hang.
+        from services.scheduler_job_runner import spawn_isolated
+
         async def _diagnostic(name, awaitable):
             try:
-                counts[name] = await asyncio.wait_for(awaitable, timeout=STUCK_COUNT_TIMEOUT_SECONDS)
+                counts[name] = await asyncio.wait_for(
+                    spawn_isolated(awaitable, name=f"reap_agentic_poll:count:{name}"),
+                    timeout=STUCK_COUNT_TIMEOUT_SECONDS,
+                )
             except Exception as exc:
                 counts[name] = NOT_COUNTED
                 counts["errors"] += 1

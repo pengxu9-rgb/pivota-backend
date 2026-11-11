@@ -325,3 +325,74 @@ def test_the_scope_is_matched_as_a_whole_word(scope):
     claims["scope"] = scope
 
     assert _code(_resign(claims)) == "insufficient_scope"
+
+
+# --- review follow-ups (be#2710 P3-1, P3-8) ----------------------------------
+
+
+@pytest.mark.parametrize("claim", ["exp", "iat"])
+def test_a_token_without_exp_or_iat_is_refused(claim):
+    """Without `require`, a missing exp/iat would reach the lifetime arithmetic
+    as a KeyError and the route would answer 500, not 401."""
+    claims = _claims(_mint())
+    del claims[claim]
+
+    assert _code(_resign(claims)) == "missing_claim"
+
+
+def test_the_lifetime_cap_is_the_ttl_plus_one_minute_exactly():
+    from services import mcp_oauth_as as core
+    from services.buyer_access_token import MAX_LIFETIME_SECONDS, verify_buyer_access_token
+
+    assert MAX_LIFETIME_SECONDS == core.ACCESS_TOKEN_TTL_SECONDS_DEFAULT + 60
+    claims = _claims(_mint())
+    claims["exp"] = claims["iat"] + MAX_LIFETIME_SECONDS
+    assert verify_buyer_access_token(_resign(claims)).account_id == "acct_123"
+
+    claims["exp"] = claims["iat"] + MAX_LIFETIME_SECONDS + 1
+    assert _code(_resign(claims)) == "bad_lifetime"
+
+
+def test_a_token_without_token_type_is_refused():
+    claims = _claims(_mint())
+    del claims["token_type"]
+
+    assert _code(_resign(claims)) == "not_access_token"
+
+
+@pytest.mark.parametrize("sub", [" ", "\t", "   "])
+def test_a_whitespace_only_subject_is_refused(sub):
+    claims = _claims(_mint())
+    claims["sub"] = sub
+
+    assert _code(_resign(claims)) == "missing_claim"
+
+
+def test_a_deployed_verifier_refuses_the_ephemeral_key(monkeypatch):
+    """Each instance would hold its own ephemeral key under the same kid: tokens
+    would verify only where they were minted, and every restart signs buyers out."""
+    token = _mint()
+    monkeypatch.setenv("K_SERVICE", "web")
+    monkeypatch.setenv("K_REVISION", "web-00001-abc")
+    monkeypatch.setenv("K_CONFIGURATION", "web")
+
+    assert _code(token) == "not_configured"
+
+
+def test_a_deployed_verifier_with_the_shared_pem_verifies(monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+
+    from services.buyer_access_token import verify_buyer_access_token
+
+    pem = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        .decode()
+    )
+    monkeypatch.setenv("MCP_OAUTH_AS_PRIVATE_KEY_PEM", pem)
+    monkeypatch.delenv("MCP_OAUTH_AS_ALLOW_EPHEMERAL_KEY")
+    monkeypatch.setenv("K_SERVICE", "web")
+    monkeypatch.setenv("K_REVISION", "web-00001-abc")
+    monkeypatch.setenv("K_CONFIGURATION", "web")
+
+    assert verify_buyer_access_token(_mint()).account_id == "acct_123"
