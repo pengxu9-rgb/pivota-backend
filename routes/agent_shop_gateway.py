@@ -38,6 +38,8 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.identity_join_sql import MINTED_SOURCE_SYSTEM
+from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
     PURCHASABILITY_TIER_KEY,
@@ -3044,8 +3046,18 @@ class MultiSearchFilters(BaseModel):
     # `market_observed` on minted `/r` tokens; it filters and serves nothing. `exclude=True` keeps
     # it out of every `model_dump`, so no cache key or forwarded body changes because of it.
     market: Optional[str] = Field(None, exclude=True, description="Buyer market, provenance only")
+    # DECISION D-10: the gateway sends `market: "US"` for a search that named no market, and says so here. The
+    # market is then ASSUMED, not observed (`_request_market_for_multi` answers None), so a minted `/r` token never
+    # claims the buyer named it. Provenance only, and excluded from every dump like `market`.
+    market_assumed: bool = Field(False, exclude=True, description="The market was assumed, provenance only")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_true_or_false(cls, value: Any) -> bool:
+        """Only a literal True assumes; anything else (a string, a number) is the default: not assumed."""
+        return strict_true(value)
 
     @field_validator("market", mode="before")
     @classmethod
@@ -3157,8 +3169,22 @@ class OffersResolvePayload(BaseModel):
         alias="liveVerificationsDryRun",
         description="Answer identically, record no issued clicks (internal)",
     )
+    # DECISION D-10: the gateway's get_offers sends `market: "US"` for a call that named no market (so the
+    # cart gate and currency filter run as US) and says so here. The market is then ASSUMED, not observed:
+    # a minted `/r` token must not claim the buyer named it. Absent/False: unchanged.
+    market_assumed: bool = Field(
+        False,
+        alias="marketAssumed",
+        description="The market was assumed (US) for a request that named none (internal)",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("market_assumed", mode="before")
+    @classmethod
+    def _assumed_is_literal_true(cls, value: Any) -> bool:
+        """Only a literal True; anything else (None, "true", 1, {...}) is not assumed, and never an error."""
+        return strict_true(value)
 
 
 #: The live-verification reasons that are ONLY about freshness (7-day content / link clocks). A seed
@@ -3269,7 +3295,8 @@ def _normalize_offers_resolve_payload(raw_payload: Dict[str, Any]) -> Dict[str, 
     for key in ("limit", "market", "tool", "commerce_surface", "commerceSurface",
                 "include_live_verification_offers", "includeLiveVerificationOffers",
                 "live_verifications", "liveVerifications",
-                "live_verifications_dry_run", "liveVerificationsDryRun"):
+                "live_verifications_dry_run", "liveVerificationsDryRun",
+                "market_assumed", "marketAssumed"):
         if key in payload:
             normalized[key] = payload.get(key)
     return normalized
@@ -4409,6 +4436,13 @@ async def _handle_offers_resolve(
     product_id = str(payload.product.product_id or "").strip() or None
     sku_id = str(payload.product.sku_id or "").strip() or None
     market_hint = str(payload.market or "").strip() or None
+    # DECISION D-10: a market the gateway ASSUMED (US, `marketAssumed`) is the market this answer is decided for --
+    # the cart gate, the currency filter and the served market all use `market_hint` -- but it was never NAMED, so
+    # every `market_observed` / cart-pin decision below reads this instead: None, exactly as for no market.
+    # Honoured ONLY as a literal True beside a market that normalizes to US (services/request_market): beside a
+    # declared SG it is ignored, so the flag can never downgrade a market a caller named.
+    _market_assumed = assumed_flag_honoured(payload.market_assumed, market_hint)
+    observed_market_hint = None if _market_assumed else market_hint
     tool_hint = str(payload.tool or "").strip() or None
     limit = int(payload.limit or 10)
     attached_seed_limit = min(max(limit * 6, 40), 240)
@@ -5457,6 +5491,11 @@ async def _handle_offers_resolve(
                         in_stock=in_stock,
                         dest=str(canonical_url or destination_url),
                     )
+                    # An ASSUMED market is not asked a warm fact: the token is unobserved, so its click
+                    # re-check could never redeem one (`fact_no_market`), and the answer would claim a
+                    # cart the click lane cannot build. Exactly the no-market answer, as before D-10.
+                    else None
+                    if _market_assumed
                     else await _cart_purchasability.warm_fact(
                         str(canonical_url or destination_url), signed_market=used_market
                     )
@@ -5476,7 +5515,7 @@ async def _handle_offers_resolve(
                     # CA-listed USD row can serve a US request. That is pre-existing; the
                     # `warm_fact` stamp above is therefore asked only when the signed market IS
                     # the request market, so the click re-check asks the market the mint asked.
-                    market_observed=request_market_observed(market_hint),
+                    market_observed=request_market_observed(observed_market_hint),
                     tool=used_tool,
                     destination_url=str(canonical_url or destination_url),
                     utm_template=row_dict.get("utm_template") or seed_data.get("utm_template"),
@@ -5543,7 +5582,7 @@ async def _handle_offers_resolve(
                     recovery_key=_recovery_key,
                     # The SAME pin `_make_external_redirect_url` applied to the link it signed,
                     # from the same two inputs, so the published cart is the signed destination.
-                    pin_country=_cart_country_pin(market_hint, request_market_observed(market_hint)),
+                    pin_country=_cart_country_pin(market_hint, request_market_observed(observed_market_hint)),
                 )
                 # ONE decision, read twice. `cart_prefilled` and `execution_spec.rail` answer the
                 # same question — what does following our link land the buyer in — so computing
@@ -5828,6 +5867,7 @@ async def _handle_offers_resolve(
         where_clauses = ["status = 'active'"]
         params: Dict[str, Any] = {"limit": attached_seed_limit}
         seed_rows: List[Any] = []
+        attached_seed_arm_error: Optional[str] = None
         # (merchant, pid) pairs the attached-ref mainline actually searched — used to
         # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
         # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
@@ -5914,6 +5954,37 @@ async def _handle_offers_resolve(
                     )
                     if seed_rows:
                         query_label = "external_seed_by_pivota_signature"
+
+            # A MINTED catalog row (the enrichment drain's) never fills `source_ref`, and its
+            # `source_product_id` is a title slug, so neither key above reaches its seed: the seed
+            # is linked only by `attached_product_key` = the row's `product_key`. That is the third
+            # join the group lane already reads (`_fetch_resolved_group`). OFF by default
+            # (OFFERS_RESOLVE_ATTACHED_SEED_ARM); runs only when the two keys above found nothing,
+            # so a row they already serve is answered as before. It only FINDS rows: every row it
+            # returns goes through `_append_external_offers_from_seed_rows` like any other arm's.
+            # MINTED ROWS ONLY: the arm filters on the drain's `source_system`, so a connected
+            # merchant row or a mirror row is answered exactly as with the flag off, whatever seed
+            # is attached to its key.
+            # The arm has its OWN failure boundary: a timeout or a database error here leaves
+            # `seed_rows` empty and the request goes on to the prefetch and fuzzy lanes below, as
+            # it would with the flag off. The failure is logged and reported under the arm's own
+            # name, never as the fuzzy lane's.
+            if not seed_rows and sig_aliases and _attached_seed_arm_enabled():
+                try:
+                    seed_rows = await _fetch_signature_attached_seed_rows(
+                        database,
+                        sig_aliases=sig_aliases,
+                        market_hint=market_hint,
+                        limit=attached_seed_limit,
+                    )
+                except Exception as arm_error:  # noqa: BLE001 -- fall through to the later lanes
+                    seed_rows = []
+                    attached_seed_arm_error = type(arm_error).__name__
+                    logger.warning(
+                        "offers.resolve.attached_seed_arm.failed error_type=%s", attached_seed_arm_error,
+                    )
+                if seed_rows:
+                    query_label = OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY
 
         if not seed_rows:
             prefetched_internal = await _prefetch_canonical_internal_context()
@@ -6019,9 +6090,11 @@ async def _handle_offers_resolve(
             row_count=len(seed_rows or []),
             query=query_label,
             extra=(
-                {"mainline_miss_seed_ids": mainline_miss_seed_ids}
-                if mainline_miss_seed_ids
-                else None
+                {
+                    **({"mainline_miss_seed_ids": mainline_miss_seed_ids} if mainline_miss_seed_ids else {}),
+                    **({"attached_seed_arm_error": attached_seed_arm_error} if attached_seed_arm_error else {}),
+                }
+                or None
             ),
         )
     except Exception as e:
@@ -6769,7 +6842,7 @@ async def _handle_offers_resolve(
             # "nothing matched".
             redirect_url = await _make_external_redirect_url(
                 market=market_hint or "US",
-                market_observed=request_market_observed(market_hint),
+                market_observed=request_market_observed(observed_market_hint),
                 tool=tool_hint or "offers.resolve",
                 destination_url=destination,
                 utm_template=None,
@@ -9375,6 +9448,94 @@ def _group_seed_siblings_mode() -> str:
     if raw in {"1", "true", "yes", "on"}:
         return "on"
     return "off"
+
+
+# ── offers.resolve: the seed ATTACHED to a signature's catalog row ────────────────────────────
+#
+# OFF by default. Read per request, so it flips without a restart; unset, falsy or any
+# unrecognised spelling is off, and off sends neither statement below.
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV = "OFFERS_RESOLVE_ATTACHED_SEED_ARM"
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY = "external_seed_by_signature_attached_key"
+
+
+def _attached_seed_arm_enabled() -> bool:
+    raw = (os.getenv(OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+async def _fetch_signature_attached_seed_rows(
+    db: Any,
+    *,
+    sig_aliases: List[str],
+    market_hint: Optional[str],
+    limit: int,
+) -> List[Any]:
+    """The active seeds attached to the MINTED catalog row a signature names, or [].
+
+    Minted rows only: the catalog row must carry the enrichment drain's `source_system`
+    (MINTED_SOURCE_SYSTEM). A connected merchant row, or a mirror row whose own seed is gone,
+    gets nothing from this arm even when a seed is attached to its `product_key`; those rows keep
+    the answer they have with the flag off.
+
+    Merchant scope: a request's `product.merchant_id` does NOT narrow this arm, the same as the
+    signature arm before it. A signature names one catalog row whoever the caller scoped to, and
+    the seed's seller is the store on the seed, not the row's merchant. (The group lane differs:
+    it skips a scoped request.)
+
+    Otherwise the same rules the group lane's attached join applies (`_fetch_resolved_group`):
+      * the catalog row is not withdrawn (its suppression pair) -- a withdrawn listing lends its
+        seed to nobody;
+      * the seed is `active` and past the shared quarantine anti-join;
+      * the seed is priced in the buyer market's currency (`seed_serving_currency`: a caller that
+        names no market is a US buyer; a market with no known currency gets no seed).
+    Stock, freshness, the outbound allowlist and every other gate run downstream, on the rows.
+    Rows come newest first with the seed id as the last sort key: the drain writes all of one
+    product's seeds in one transaction, so their timestamps tie, and without the id the order
+    (and which rows survive `limit`) would be the scan's.
+    Two single-table statements, as the signature arm: the quarantine anti-join reads unqualified
+    seed columns. The second is an equality probe on `attached_product_key`
+    (idx_external_product_seeds_attached, migration 044).
+    """
+    serving_currency = seed_serving_currency(market_hint)
+    if not sig_aliases or serving_currency is None:
+        return []
+    key_rows = await asyncio.wait_for(
+        db.fetch_all(
+            """
+            SELECT product_key
+            FROM catalog_products
+            WHERE pivota_signature_id = ANY(:sig_aliases)
+              AND source_system = :minted_source_system
+              AND suppressed_at IS NULL
+              AND suppression_reason IS NULL
+            LIMIT 8
+            """,
+            {"sig_aliases": sig_aliases, "minted_source_system": MINTED_SOURCE_SYSTEM},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    product_keys = sorted(
+        {str(_row_to_dict(row).get("product_key") or "").strip() for row in key_rows or []} - {""}
+    )
+    if not product_keys:
+        return []
+    rows = await asyncio.wait_for(
+        db.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE attached_product_key = ANY(:product_keys)
+              AND status = 'active'
+              AND {SEED_SERVING_CURRENCY_CLAUSE}
+            {_seed_quarantine_clause()}
+            ORDER BY updated_at DESC, created_at DESC, id ASC
+            LIMIT :limit
+            """,
+            {"product_keys": product_keys, "serving_currency": serving_currency, "limit": limit},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    return list(rows or [])
 
 
 def _remaining_timeout(deadline: float, cap: float) -> float:
@@ -12830,6 +12991,11 @@ def _request_market_for_multi(
     """
     search = getattr(payload, "search", None)
     raw = getattr(search, "market", None)
+    if assumed_flag_honoured(getattr(search, "market_assumed", False), raw):
+        # The gateway ASSUMED this US (decision D-10): nobody named it. As unobserved as no market at all (and
+        # the seed lane's serving currency for None is US's, the market that was assumed). Beside any other
+        # market the flag is ignored: a declared SG stays SG, served and observed.
+        return None
     if isinstance(raw, str) and raw.strip():
         return raw
     if not isinstance(request_metadata, dict):

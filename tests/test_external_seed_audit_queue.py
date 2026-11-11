@@ -486,7 +486,8 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
     monkeypatch: pytest.MonkeyPatch, client: TestClient, read: bool
 ) -> None:
     """A read of the served page replaces stale localized copy, the variants' included. A fetch that is not a
-    read (a cached fallback: nothing reached the origin) keeps the stored variant copy (review of #2713)."""
+    read (a cached fallback: nothing reached the origin) keeps the stored copy: the variants' (review of #2713), and
+    the seed's and the snapshot's (a page that is not a read writes no copy, 2026-11-07)."""
     import routes.employee_products as employee_products_module
 
     stored_row = _seed_row(
@@ -580,11 +581,14 @@ def test_refresh_external_seed_replaces_stale_localized_description_and_variants
     # `destination_url`) could never read it again. Correcting a seed's locale has to move
     # `destination_url`; see `_next_served_canonical`. The page's claim is still recorded:
     assert stored_row["canonical_url"] == "https://shop.example/de-de/products/uv-filters-spf-45-serum"
-    assert seed_data["snapshot"]["canonical_url"] == "https://shop.example/en-us/products/uv-filters-spf-45-serum"
-    assert seed_data["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
     if read:
+        assert seed_data["snapshot"]["canonical_url"] == "https://shop.example/en-us/products/uv-filters-spf-45-serum"
+        assert seed_data["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
         assert seed_data["variants"][0]["description"] == "A lightweight SPF 45 sunscreen serum that protects and hydrates."
     else:
+        # Nothing reached the origin: the stored claim, copy and variant copy all stand.
+        assert seed_data["snapshot"]["canonical_url"] == "https://shop.example/de-de/products/uv-filters-spf-45-serum"
+        assert seed_data["description"] == "Ein leichtes Sonnenschutzserum mit Lichtschutzfaktor 45."
         assert seed_data["variants"][0]["description"] == "Ein leichtes Sonnenschutzserum mit Lichtschutzfaktor 45."
 
 
@@ -657,7 +661,8 @@ def test_refresh_external_seed_clears_stale_description_when_seed_remains_blocke
 
     seed_data = stored_row["seed_data"]
     assert seed_data.get("description") is None
-    assert seed_data["snapshot"].get("description") is None
+    # This fetch is not a read (nothing reached the origin): the snapshot keeps its stored, blank, copy.
+    assert not seed_data["snapshot"].get("description")
     assert seed_data["variants"][0].get("description") is None
 
 

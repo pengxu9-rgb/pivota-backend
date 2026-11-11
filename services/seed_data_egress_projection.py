@@ -41,8 +41,23 @@ serves the product. The two routes use two DIFFERENT rules, on purpose:
 LONE SURROGATES. jsonb cannot hold a raw lone surrogate, but JSON TEXT inside it can hold the escape
 (`\\ud83d`, what JS writes for a split emoji), and parsing that text yields one. A raw lone surrogate in a
 response makes the JSON response fail to ENCODE after the route has returned -- a 500 for the whole page,
-past every handler and fallback (be#2730 review P2-1). So every string either rule emits has lone
-surrogates replaced (U+FFFD), and the re-serialised text snapshot is ASCII-escaped.
+past every handler and fallback. Two places parse such text:
+  - this module (a text snapshot inside seed_data: be#2730 review P2-1): every string either seed_data
+    rule emits has lone surrogates replaced (U+FFFD), and the re-serialised text snapshot is ASCII-escaped;
+  - the product BUILDER (routes.agent_api._build_external_seed_product), which copies title / brand /
+    vendor / product_type / category / canonical + destination URL / image_url / external_product_id from
+    a parsed text snapshot. It runs `replace_lone_surrogates` on that snapshot AS IT PARSES IT, because the
+    URLs and the id also go into the redirect token (UTF-8, built before any response boundary), where a
+    raw lone surrogate raised and silently dropped the product (be#2740 review P3-1).
+As a backstop, every products list a search route returns (the three returns of agent_search_products,
+the cross-merchant browse fast path, the SDK legacy fallback, the gateway proxy's envelope) goes through
+`serve_search_products`, and the detail route through `serve_detail_product`: both replace lone
+surrogates in EVERY string of the product (copy-on-write; a product with none is returned as the same
+object). Strings nested deeper than _MAX_STRIP_DEPTH outside seed_data are not walked: the builder emits
+nothing that deep.
+A lone surrogate INSIDE a word (an ingredient name split by a broken emoji) reads as U+FFFD afterwards,
+so a text gate looking for that word does not match it. The gateway's retinoid net already misses such a
+word on the RAW text (gate-equivalence case S2), so the replacement loses nothing it would have caught.
 
 COPY-ON-WRITE. Both rules build new containers and never mutate their input, so the stored row and any
 cache holding the built product (the external-seed search cache shares product objects across requests)
@@ -81,8 +96,11 @@ _LONE_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 def _safe_str(value: str) -> str:
-    """The string with every lone surrogate replaced by one U+FFFD, so the response can always encode.
-    (Python never holds a VALID pair as two surrogates: json.loads joins an escaped pair into one char.)"""
+    """The string with every lone surrogate replaced by one U+FFFD, so the response can always encode;
+    the SAME object when it has none. (Python never holds a VALID pair as two surrogates: json.loads joins
+    an escaped pair into one char.)"""
+    if _LONE_SURROGATE.search(value) is None:
+        return value
     return _LONE_SURROGATE.sub("\ufffd", value)
 
 
@@ -277,8 +295,8 @@ _DROP = object()
 
 
 def _strip(value: Any, depth: int) -> Any:
-    """A NEW value with every INTERNAL_STATE_KEYS key removed at any depth and URL fields cut; _DROP when
-    the value itself must go."""
+    """A NEW value with every INTERNAL_STATE_KEYS key removed at any depth and lone surrogates replaced in
+    every key and string; _DROP when the value itself must go (deeper than _MAX_STRIP_DEPTH)."""
     if depth > _MAX_STRIP_DEPTH:
         return _DROP
     if isinstance(value, dict):
@@ -343,3 +361,73 @@ def strip_products_internal_seed_data(products: Any) -> Any:
     if not isinstance(products, list):
         return products
     return [strip_product_internal_seed_data(product) for product in products]
+
+
+# =========================================================================================================
+# 3. Both routes: what they serve
+# =========================================================================================================
+
+
+def _safe_tree(value: Any, depth: int) -> Any:
+    """`value` with lone surrogates replaced in every string and key, copy-on-write: a container with
+    nothing to replace is returned as the same object."""
+    if isinstance(value, str):
+        return _safe_str(value)
+    if depth > _MAX_STRIP_DEPTH:
+        return value
+    if isinstance(value, dict):
+        return _safe_dict(value, depth)
+    if isinstance(value, list):
+        items: Optional[List[Any]] = None
+        for index, item in enumerate(value):
+            new_item = _safe_tree(item, depth + 1)
+            if items is None and new_item is not item:
+                items = list(value[:index])
+            if items is not None:
+                items.append(new_item)
+        return value if items is None else items
+    return value
+
+
+def _safe_dict(value: Dict[Any, Any], depth: int, already_safe: frozenset = frozenset()) -> Dict[Any, Any]:
+    """_safe_tree's dict case. Values under a key in `already_safe` are kept as they are, not walked."""
+    out: Optional[Dict[Any, Any]] = None
+    for index, (key, item) in enumerate(value.items()):
+        new_key = _safe_str(key) if isinstance(key, str) else key
+        new_item = item if key in already_safe else _safe_tree(item, depth + 1)
+        if out is None and (new_key is not key or new_item is not item):
+            out = dict(list(value.items())[:index])
+        if out is not None:
+            out[new_key] = new_item
+    return value if out is None else out
+
+
+_SEED_DATA_ONLY = frozenset({"seed_data"})
+
+
+def replace_lone_surrogates(value: Any) -> Any:
+    """`value` with every lone surrogate in its strings and keys replaced by U+FFFD, so it can always be
+    encoded; the same object when nothing needed replacing (copy-on-write)."""
+    return _safe_tree(value, 0)
+
+
+def _serve_search_product(product: Any) -> Any:
+    stripped = strip_product_internal_seed_data(product)
+    if not isinstance(stripped, dict):
+        return _safe_tree(stripped, 0)
+    # Any seed_data left on `stripped` came out of _strip, which has already replaced every lone surrogate
+    # in it: walk everything else only.
+    return _safe_dict(stripped, 0, already_safe=_SEED_DATA_ONLY)
+
+
+def serve_search_products(products: Any) -> Any:
+    """SEARCH RESPONSE. Each product: seed_data stripped of internal state, then every string made
+    encodable. Copy-on-write throughout (the external-seed cache shares these product objects)."""
+    if not isinstance(products, list):
+        return products
+    return [_serve_search_product(product) for product in products]
+
+
+def serve_detail_product(product: Any) -> Any:
+    """DETAIL RESPONSE. The product with its seed_data allowlisted, then every string made encodable."""
+    return replace_lone_surrogates(project_product_seed_data(product))
