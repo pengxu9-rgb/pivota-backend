@@ -1152,6 +1152,7 @@ _ROUTE_EXAMPLES = [
     ("GET", "/agent/v1/products/search", None),
     ("POST", "/agent/internal/products/search", None),
     ("POST", "/agent/shop/v1/attribution/external-seed-links", None),
+    ("POST", "/agent/v2/storefront-cart-referrals", None),
     ("GET", "/agent/v1/products/merchants/m_1/variant/v_1", None),
     ("GET", "/agent/v1/product-groups/resolve", None),
     ("GET", "/agent/v1/product-groups/resolve-by-product-id", None),
