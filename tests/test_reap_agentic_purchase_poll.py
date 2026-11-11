@@ -1954,7 +1954,9 @@ async def test_a_count_that_times_out_is_an_error_not_a_silent_sentinel(
             seen["finished"] = True
 
     monkeypatch.setattr(ledger, "count_stuck_purchases", _hangs)
-    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 0.05)
+    # 1 s, not 50 ms: the same timeout times the healthy counts, and `errors == 1` needs them to
+    # answer inside it on a loaded runner.
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 1)
     caplog.set_level(logging.ERROR, logger="jobs.reap_agentic_purchase_poll")
 
     began = asyncio.get_running_loop().time()
@@ -1965,7 +1967,7 @@ async def test_a_count_that_times_out_is_an_error_not_a_silent_sentinel(
     assert seen == {"started": True, "cancelled": True, "finished": True}, (
         "the timed-out read was not cancelled and awaited"
     )
-    assert elapsed < 5, f"the run waited {elapsed:.1f}s on a 0.05s timeout"
+    assert elapsed < 5, f"the run waited {elapsed:.1f}s on a 1s timeout"
     assert report.stuck_over_age == job.NOT_COUNTED
     assert report.errors == 1
     assert report.advanced == 1, "the diagnostic timing out must not undo the run's real work"

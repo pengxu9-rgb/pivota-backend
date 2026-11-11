@@ -39,8 +39,7 @@ import base64
 import binascii
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -67,60 +66,83 @@ _B64URL_RE = re.compile(r"[A-Za-z0-9_-]*")
 
 
 def _b64url_decode(text: str) -> bytes:
-    # base64 silently DISCARDS characters outside its alphabet, so "@@@@"
-    # would decode to b"" and surface as a misleading length error.
-    text = (text or "").rstrip("=")
-    if not _B64URL_RE.fullmatch(text):
+    """Strict, canonical, unpadded base64url.
+
+    base64 silently DISCARDS characters outside its alphabet ("@@@@" decodes to
+    b""), accepts any amount of "=" padding, and accepts several final
+    characters for the same bytes. Each of those would give one ciphertext
+    several valid envelope strings, which fools a writer that compares
+    envelopes as strings. So: alphabet only, no "=", and the text must be the
+    canonical encoding of what it decodes to.
+    """
+    text = text or ""
+    if not _B64URL_RE.fullmatch(text) or len(text) % 4 == 1:
         raise ValueError("not base64url")
-    padded = text + "=" * (-len(text) % 4)
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+    decoded = base64.urlsafe_b64decode((text + "=" * (-len(text) % 4)).encode("ascii"))
+    if _b64url_encode(decoded) != text:
+        raise ValueError("not canonical base64url")
+    return decoded
 
 
-def _parse_key_ring(raw: str, *, source: str) -> List[Tuple[str, bytes]]:
+def _parse_key_ring(raw: str, *, source: str) -> Tuple[Optional[List[Tuple[str, bytes]]], Optional[str]]:
+    """Returns (ring, None) or (None, problem). It never raises: a traceback
+    raised from inside this frame would carry `raw`, every key in it, in its
+    locals."""
     entries = [e.strip() for e in (raw or "").split(",") if e.strip()]
     if not entries:
-        raise TokenCipherConfigError(f"{source} is not set")
+        return None, f"{source} is not set"
     ring: List[Tuple[str, bytes]] = []
     seen = set()
     for index, entry in enumerate(entries):
         kid, sep, encoded = entry.partition(":")
         if not sep or not _KID_RE.fullmatch(kid):
-            raise TokenCipherConfigError(f"{source} entry {index} must be '<kid>:<base64url key>'")
+            return None, f"{source} entry {index} must be '<kid>:<base64url key>'"
         if kid in seen:
-            raise TokenCipherConfigError(f"{source} repeats key id {kid!r}")
+            return None, f"{source} repeats key id {kid!r}"
         try:
             key = _b64url_decode(encoded)
         except (binascii.Error, ValueError):
-            raise TokenCipherConfigError(f"{source} entry {index} is not base64url") from None
+            return None, f"{source} entry {index} is not base64url"
         if len(key) != KEY_BYTES:
-            raise TokenCipherConfigError(f"{source} entry {index} must decode to {KEY_BYTES} bytes")
+            return None, f"{source} entry {index} must decode to {KEY_BYTES} bytes"
         seen.add(kid)
         ring.append((kid, key))
-    return ring
+    return ring, None
 
 
-@dataclass(frozen=True)
 class TokenCipher:
-    """A key ring. Construct it with `from_env` or `from_key_ring`, never directly."""
+    """A key ring. Construct it with `from_env` or `from_key_ring`.
 
-    _ring: Tuple[Tuple[str, bytes], ...]
+    It holds `AESGCM` objects, not key bytes, and is a plain class (identity
+    equality, no `dataclasses.asdict`), so the raw keys are not reachable
+    through `repr`, `==`, `asdict` or the locals of a failed `decrypt`.
+    """
 
-    def __post_init__(self) -> None:
+    __slots__ = ("_kids", "_aeads")
+
+    def __init__(self, ring: Sequence[Tuple[str, bytes]]) -> None:
         # Direct construction must meet the same rules as a parsed ring.
-        if not self._ring:
+        ring = tuple(ring)
+        if not ring:
             raise TokenCipherConfigError("key ring is empty")
-        kids = [kid for kid, _ in self._ring]
+        kids = [kid for kid, _ in ring]
         if len(set(kids)) != len(kids):
             raise TokenCipherConfigError("key ring repeats a key id")
-        for kid, key in self._ring:
+        for kid, key in ring:
             if not isinstance(kid, str) or not _KID_RE.fullmatch(kid):
                 raise TokenCipherConfigError("key ring has an invalid key id")
             if not isinstance(key, bytes) or len(key) != KEY_BYTES:
                 raise TokenCipherConfigError(f"key ring keys must be {KEY_BYTES} bytes")
+        self._kids: Tuple[str, ...] = tuple(kids)
+        self._aeads: Dict[str, AESGCM] = {kid: AESGCM(key) for kid, key in ring}
 
     @classmethod
     def from_key_ring(cls, raw: str, *, source: str = "key ring") -> "TokenCipher":
-        return cls(tuple(_parse_key_ring(raw, source=source)))
+        ring, problem = _parse_key_ring(raw, source=source)
+        del raw  # keep the ring string out of this frame's locals before raising
+        if problem is not None:
+            raise TokenCipherConfigError(problem)
+        return cls(ring)
 
     @classmethod
     def from_env(cls, name: str) -> "TokenCipher":
@@ -128,19 +150,16 @@ class TokenCipher:
 
     @property
     def active_key_id(self) -> str:
-        return self._ring[0][0]
-
-    def _keys(self) -> Dict[str, bytes]:
-        return dict(self._ring)
+        return self._kids[0]
 
     def encrypt(self, plaintext: str, *, aad: str) -> str:
         if not isinstance(plaintext, str) or not plaintext:
             raise TokenCipherError("plaintext must be a non-empty string")
         if not isinstance(aad, str) or not aad:
             raise TokenCipherError("aad context is required")
-        kid, key = self._ring[0]
+        kid = self._kids[0]
         nonce = os.urandom(NONCE_BYTES)
-        sealed = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), self._aad(kid, aad))
+        sealed = self._aeads[kid].encrypt(nonce, plaintext.encode("utf-8"), self._aad(kid, aad))
         return f"{ENVELOPE_PREFIX}.{kid}.{_b64url_encode(nonce + sealed)}"
 
     def decrypt(self, envelope: str, *, aad: str) -> str:
@@ -150,8 +169,8 @@ class TokenCipher:
         if len(parts) != 3 or parts[0] != ENVELOPE_PREFIX:
             raise TokenCipherError("not a token-cipher envelope")
         _, kid, body = parts
-        key = self._keys().get(kid)
-        if key is None:
+        aead = self._aeads.get(kid)
+        if aead is None:
             raise TokenCipherError("unknown key id")
         try:
             blob = _b64url_decode(body)
@@ -160,7 +179,7 @@ class TokenCipher:
         if len(blob) <= NONCE_BYTES:
             raise TokenCipherError("envelope body is too short")
         try:
-            opened = AESGCM(key).decrypt(blob[:NONCE_BYTES], blob[NONCE_BYTES:], self._aad(kid, aad))
+            opened = aead.decrypt(blob[:NONCE_BYTES], blob[NONCE_BYTES:], self._aad(kid, aad))
         except InvalidTag:
             raise TokenCipherError("authentication failed") from None
         return opened.decode("utf-8")
@@ -177,7 +196,7 @@ class TokenCipher:
         return f"{ENVELOPE_PREFIX}|{kid}|{context}".encode("utf-8")
 
     def __repr__(self) -> str:  # never print key material
-        return f"TokenCipher(active={self.active_key_id!r}, keys={len(self._ring)})"
+        return f"TokenCipher(active={self.active_key_id!r}, keys={len(self._kids)})"
 
 
 def generate_key_entry(kid: str) -> str:
