@@ -2191,17 +2191,54 @@ async def test_contact_paused_precheckout_is_rechecked_every_15_minutes_not_ever
     assert [r for r in await ledger.claim_due_purchases('paused-next', limit=10) if r['id'] == pid] == []
 
 async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypatch):
+    """A contact count that hangs ON THE SERVER must not take the other three health counts down
+    with it. The hang is a real statement through the shared `database` (pg_sleep), so it holds a
+    connection the whole time: this is what a slow plan or a stalled backend looks like.
+
+    `databases` 0.7.0 parks ONE Connection in a ContextVar that gathered tasks inherit, so while
+    the four counts ran on the run's own Connection the other three queued behind the hung one,
+    and every timer started at the gather: all four came back -1 together. Measured before the
+    fix: precheckout_paused counted (it took the lock first), the other three -1, errors=3.
+
+    The timeout is SECONDS, not milliseconds: a healthy count answers in milliseconds even on a
+    loaded runner, so the only thing that can make one of them -1 here is waiting behind the hung
+    one. (The previous 20 ms version timed the healthy counts too and flaked under CI load.)"""
     import asyncio
+    from db.database import database
     import db.reap_agentic_ledger as ledger
     import jobs.reap_agentic_purchase_poll as job
     await _recovery_checkout()
-    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
-    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',0.02)
-    async def hang():await asyncio.Event().wait()
-    monkeypatch.setattr(ledger,'count_contact_retention_blocked',hang)
-    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
-    assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
-    assert report.errors==1 and report.checkout_needs_human==0
+    monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED', '0')
+    monkeypatch.setattr(job, 'STUCK_COUNT_TIMEOUT_SECONDS', 3)
+    entered = []
+
+    async def hang():
+        entered.append(True)
+        await database.fetch_val("SELECT pg_sleep(60) /* hung_contact_count */")
+
+    monkeypatch.setattr(ledger, 'count_contact_retention_blocked', hang)
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    report = await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'), 30)
+    elapsed = loop.time() - began
+
+    assert entered == [True]
+    assert report.contact_retention_blocked == job.NOT_COUNTED == -1
+    assert (report.stuck_over_age, report.checkout_needs_human, report.precheckout_paused) == (1, 0, 0), report
+    assert report.errors == 1, report
+    assert 3 <= elapsed < 15, f"the run took {elapsed:.1f}s around a 3s timeout"
+    # Nothing of the hung count is left: no statement on the server, no pool slot held.
+    locker = await _raw_connection()
+    try:
+        still_there = await locker.fetch(
+            "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
+            "AND pid <> pg_backend_pid() AND state <> 'idle' AND query LIKE '%hung_contact_count%'"
+        )
+    finally:
+        await locker.close()
+    assert still_there == [], "the timed-out contact count is still running on the server"
+    pool = database._backend._pool
+    assert pool.get_idle_size() == pool.get_size(), "a pool connection is still checked out"
 
 async def test_stop_after_quote_prevents_next_checkout(reap, monkeypatch):
     await _active_enrollment()
@@ -2574,7 +2611,8 @@ async def test_deadline_all_owner_reads_share_original_clock_and_redaction(reap,
     expected=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
     monkeypatch.setattr(route,'_require_rail',lambda:None)
     monkeypatch.setattr(route,'_require_agent_user',lambda _: 'synthetic-user')
-    monkeypatch.setattr(route,'hash_agent_user_ref',lambda _: 'hash_alice')
+    async def _owner(_agent,_ref):return 'hash_alice'
+    monkeypatch.setattr(route,'resolve_agent_user_ref_hash',_owner)
     request=Request({'type':'http','method':'GET','path':'/purchases','query_string':b''})
     for _ in range(2):
         listed=await route.list_reap_purchases(request,SimpleNamespace(agent_id='agent_one'),None)

@@ -4483,10 +4483,12 @@ async def test_hung_contact_diagnostic_does_not_hide_other_health(reap, monkeypa
     import jobs.reap_agentic_purchase_poll as job
     await _recovery_checkout()
     monkeypatch.setenv('REAP_AGENTIC_RECONCILE_ENABLED','0')
-    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',0.02)
+    # Seconds, not milliseconds: the timeout also times the HEALTHY counts, which must answer
+    # inside it even on a loaded runner. The Postgres twin holds the same with a server-side hang.
+    monkeypatch.setattr(job,'STUCK_COUNT_TIMEOUT_SECONDS',1)
     async def hang():await asyncio.Event().wait()
     monkeypatch.setattr(ledger,'count_contact_retention_blocked',hang)
-    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),0.5)
+    report=await asyncio.wait_for(job.run_reap_agentic_purchase_poll(worker_id='health-independence'),10)
     assert report.contact_retention_blocked==-1 and report.stuck_over_age==1
     assert report.errors==1 and report.checkout_needs_human==0
 
@@ -4841,7 +4843,8 @@ async def test_deadline_all_owner_reads_share_original_clock_and_redaction(reap,
     expected=enrollment['created_at']+timedelta(seconds=ledger.HOSTED_SESSION_SECONDS)
     monkeypatch.setattr(route,'_require_rail',lambda:None)
     monkeypatch.setattr(route,'_require_agent_user',lambda _: 'synthetic-user')
-    monkeypatch.setattr(route,'hash_agent_user_ref',lambda _: 'hash_alice')
+    async def _owner(_agent,_ref):return 'hash_alice'
+    monkeypatch.setattr(route,'resolve_agent_user_ref_hash',_owner)
     request=Request({'type':'http','method':'GET','path':'/purchases','query_string':b''})
     for _ in range(2):
         listed=await route.list_reap_purchases(request,SimpleNamespace(agent_id='agent_one'),None)

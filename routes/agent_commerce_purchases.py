@@ -44,7 +44,7 @@ import db.reap_agentic_ledger as reap_ledger
 import db.tierb_cart_link_eligibility as tierb_eligibility
 import routes.agent_commerce_reap as reap_routes
 import services.reap_agentic_purchase as reap_svc
-from db.buyer_vault import hash_agent_user_ref
+from db.buyer_vault import resolve_agent_user_ref_hash
 from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
@@ -77,9 +77,9 @@ def _dark() -> JSONResponse:
     return JSONResponse(status_code=404, content={"error": "not_available"})
 
 
-def _owner_hash(agent_user: Optional[AgentUserContext]) -> str:
+async def _owner_hash(agent_user: Optional[AgentUserContext], agent_id: str) -> str:
     agent_user_ref = reap_routes._require_agent_user(agent_user)
-    agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+    agent_user_ref_hash = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
     if not agent_user_ref_hash:
         raise reap_svc.PurchaseRefused("agent_user_required")
     return agent_user_ref_hash
@@ -138,7 +138,7 @@ async def get_purchase(
     if not purchases.is_enabled():
         return _dark()
     try:
-        owner = _owner_hash(agent_user)
+        owner = await _owner_hash(agent_user, str(context.agent_id))
     except reap_svc.PurchaseRefused as exc:
         return reap_routes._refused(exc)
 
@@ -165,7 +165,7 @@ async def list_purchases(
     if not purchases.is_enabled():
         return _dark()
     try:
-        owner = _owner_hash(agent_user)
+        owner = await _owner_hash(agent_user, str(context.agent_id))
         limit = reap_routes._limit_from(request)
     except reap_svc.PurchaseRefused as exc:
         return reap_routes._refused(exc)
@@ -300,7 +300,7 @@ async def create_purchase(
         if market_country is None:
             raise reap_svc.PurchaseRefused("invalid_address", "country must be two letters")
         agent_id = str(context.agent_id)
-        owner = hash_agent_user_ref(agent_user_ref)
+        owner = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
         if not owner:
             raise reap_svc.PurchaseRefused("agent_user_required")
         idempotency_key = reap_routes._identifier(req.idempotency_key, "idempotency_key", max_chars=128)

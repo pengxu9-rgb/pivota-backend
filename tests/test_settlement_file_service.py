@@ -11,6 +11,13 @@ import pytest
 from services import settlement_file_service as service
 
 
+@pytest.fixture(autouse=True)
+def _transfers_armed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests are about what an ARMED transfer does. The off state (O-05; W3 F1) is pinned in
+    # tests/test_money_job_flags.py and tests/test_admin_partners_routes.py.
+    monkeypatch.setenv("SETTLEMENT_FILE_TRANSFER_ENABLED", "true")
+
+
 pytestmark = pytest.mark.asyncio
 
 

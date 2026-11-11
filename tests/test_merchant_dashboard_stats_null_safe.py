@@ -40,7 +40,7 @@ async def test_get_merchant_analytics_handles_null_aggregates(monkeypatch: pytes
 
     response = await module.get_merchant_analytics(
         merchant_id="merch_test_nulls",
-        current_user={"role": "merchant"},
+        current_user={"role": "merchant", "merchant_id": "merch_test_nulls"},
     )
 
     assert response["status"] == "success"
@@ -104,7 +104,7 @@ async def test_get_merchant_analytics_handles_null_recent_order_total(monkeypatc
 
     response = await module.get_merchant_analytics(
         merchant_id="merch_test_null_total",
-        current_user={"role": "merchant"},
+        current_user={"role": "merchant", "merchant_id": "merch_test_null_total"},
     )
 
     assert response["status"] == "success"
@@ -150,7 +150,7 @@ async def test_get_merchant_analytics_uses_last_30_day_customer_count(monkeypatc
 
     response = await module.get_merchant_analytics(
         merchant_id="merch_test_customers",
-        current_user={"role": "merchant"},
+        current_user={"role": "merchant", "merchant_id": "merch_test_customers"},
     )
 
     assert response["status"] == "success"

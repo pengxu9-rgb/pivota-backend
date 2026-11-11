@@ -693,6 +693,13 @@ def test_the_boot_line_shows_the_liveness_flag_raw_and_resolved(
         # Not this test's subject; pinned in its own line of the same log.
         "_catalog_import_drain_enabled": lambda: True,
     }
+    # The money-job flags on the same line (O-05): not this test's subject either, but the
+    # rendering needs their real names.
+    import services.audit_scheduler as _sched
+
+    for _name in ("money_job_enabled", "INVOICE_GENERATION_MONTHLY_FLAG",
+                  "PARTNER_SETTLEMENT_MONTHLY_FLAG", "SETTLEMENT_FILE_TRANSFER_FLAG"):
+        namespace[_name] = getattr(_sched, _name)
     values = tuple(
         eval(ast.unparse(arg), namespace) for arg in call.args[1:]  # noqa: S307
     )

@@ -317,7 +317,13 @@ def _login_setup(monkeypatch, module, *, stored_api_key: str):
     async def execute(query, values=None):
         executed.append((" ".join(str(query).split()), dict(values or {})))
 
+    async def fetch_all(query, values=None):
+        q = " ".join(str(query).split())
+        row = await fetch_one(query, values) if "FROM agents" in q else None
+        return [row] if row else []
+
     monkeypatch.setattr(module.database, "fetch_one", fetch_one)
+    monkeypatch.setattr(module.database, "fetch_all", fetch_all)
     monkeypatch.setattr(module.database, "execute", execute)
     import db.agents as agents_db
 
@@ -328,6 +334,13 @@ def _login_setup(monkeypatch, module, *, stored_api_key: str):
         return None
 
     monkeypatch.setattr(module, "_sync_agent_auth_membership", _no_membership)
+
+    # The account is linked to agent_abc (its own registration wrote the membership);
+    # login refuses a role=agent row whose agent is matched only by owner_email.
+    async def _linked(user, agent, **_kwargs):
+        return agent["agent_id"] == "agent_abc"
+
+    monkeypatch.setattr(module, "_holds_agent_membership", _linked)
     return executed
 
 

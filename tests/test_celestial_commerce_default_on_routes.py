@@ -452,7 +452,7 @@ def test_agent_commerce_payment_intent_route_reads_existing_order_action(monkeyp
 
     async def fake_get_order(order_id: str):
         assert order_id == "ord_1"
-        return {"order_id": "ord_1", "merchant_id": "merch_1", "client_secret": "pi_secret_123", "payment_status": "awaiting_payment"}
+        return {"order_id": "ord_1", "merchant_id": "merch_1", "agent_id": "agent_1", "client_secret": "pi_secret_123", "payment_status": "awaiting_payment"}
 
     async def fake_find_interaction(_order_id: str, *, merchant_id: str):
         assert merchant_id == "merch_1"
@@ -493,7 +493,7 @@ def test_agent_commerce_returns_route_reports_pending_for_wix(monkeypatch: pytes
         return FakeContext()
 
     async def fake_get_order(_order_id: str):
-        return {"order_id": "ord_1", "merchant_id": "merch_1"}
+        return {"order_id": "ord_1", "merchant_id": "merch_1", "agent_id": "agent_1"}
 
     async def fake_store(_merchant_id: str):
         return {"platform": "wix"}

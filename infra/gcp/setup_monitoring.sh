@@ -875,8 +875,8 @@ upsert_on_new_metric "prod: Reap buyer contact retention blocked" "$(policy \
 #   * Any successful relgraph-sync execution in the window counts, a manual one included, so a manual
 #     success at 08:00Z hides a failed scheduled run the night before.
 #   * A run that exits 0 having done nothing useful is a success here. NOTHING covers that today:
-#     relgraph-health (setup_scheduler.sh) would check the graph, but relgraph-health-cron has no live
-#     trigger in prod (read back 2026-11-02).
+#     relgraph-health (infra/gcp/setup_relgraph_health_job.sh) checks the graph once it is armed;
+#     relgraph-health-cron had no live trigger in prod (read back 2026-11-02).
 #   * A deliberate pause of relgraph-sync-cron fires it every morning: snooze it for the pause.
 #   * It is prod only: setup_scheduler.sh creates every trigger paused by default (PAUSED=1), and
 #     over a paused staging trigger this would page every morning.

@@ -1,13 +1,20 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from db.database import database
+from utils.auth import require_admin
 import random
 from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/test", tags=["test"])
 
 @router.post("/orders/{merchant_id}")
-async def create_simple_test_orders(merchant_id: str, count: int = 5):
-    """Generate simple test orders"""
+async def create_simple_test_orders(
+    merchant_id: str,
+    count: int = 5,
+    current_user: dict = Depends(require_admin),
+):
+    """Generate simple test orders. Admin only: this writes fake rows into the
+    real orders table, and was anonymous -- anyone could pad any merchant's
+    orders and analytics."""
     try:
         orders = []
         psps = ["stripe", "adyen", "paypal", "checkout"]
