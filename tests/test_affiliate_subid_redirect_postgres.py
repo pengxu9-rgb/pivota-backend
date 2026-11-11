@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 CLICK_ID = "clk_af5ab9000000000000000001"  # the minted shape: clk_ + 24 lowercase hex
 LINK_HOST = "click.linksynergy.com"
-FEED_LINK = f"https://{LINK_HOST}/deeplink?id=AbC123&mid=99999&murl=https%3A%2F%2Fshop-a.example.com%2Fp&u1=stale"
+FEED_LINK = f"https://{LINK_HOST}/deeplink?id=AbC123&mid=00000&murl=https%3A%2F%2Fshop-a.example.com%2Fp&u1=stale"
 
 
 def _assert_throwaway_database():

@@ -24,7 +24,7 @@ HEX = CLICK_ID[len("clk_"):]
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 #: The click row's context for a token whose ctx is just the click id (the logger adds eventType).
 PLAIN_CLICK_CTX = {PVT_CLICK_ID: CLICK_ID, "eventType": "click"}
-RAKUTEN = "https://click.linksynergy.com/deeplink?id=AbC123&mid=99999&murl=https%3A%2F%2Fshop-a.example.com%2Fp%3Fx%3D1%26y%3D2"
+RAKUTEN = "https://click.linksynergy.com/deeplink?id=AbC123&mid=00000&murl=https%3A%2F%2Fshop-a.example.com%2Fp%3Fx%3D1%26y%3D2"
 
 
 @pytest.fixture(autouse=True)
@@ -89,9 +89,9 @@ def test_rakuten_destination_gets_u1_click_id_and_the_click_records_it(written) 
 
 
 def test_existing_u1_is_replaced_not_appended(written) -> None:
-    dest = "https://click.linksynergy.com/deeplink?id=AbC123&u1=partner-a-label&mid=99999&U1=dup&%751=enc#top"
+    dest = "https://click.linksynergy.com/deeplink?id=AbC123&u1=partner-a-label&mid=00000&U1=dup&%751=enc#top"
     loc = _hit(_token(dest))
-    assert loc == f"https://click.linksynergy.com/deeplink?id=AbC123&u1={HEX}&mid=99999#top"
+    assert loc == f"https://click.linksynergy.com/deeplink?id=AbC123&u1={HEX}&mid=00000#top"
     assert [v for k, v in _query(loc) if k.lower() == "u1"] == [HEX]
     assert written["click_rows"][0]["context"][subid.CTX_REPLACED] is True
 
