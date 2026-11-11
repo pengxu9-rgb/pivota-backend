@@ -660,8 +660,42 @@ async def _get_agent_context_from_checkout_token(request: Request, token: str) -
     setattr(context, "checkout_token_payload", payload)
 
     await _enforce_checkout_token_route(request, payload)
+    await _refuse_checkout_token_of_cancelled_order(request, payload)
 
     return context
+
+
+# FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): the routes through which a hosted checkout page starts an order
+# or a payment. A token bound to an order that was canceled may no longer call them; its read routes (tracking,
+# prefill) and confirm-payment still answer, so the page can say why and a payment already made is still recorded.
+_CHECKOUT_TOKEN_START_ROUTES = frozenset(
+    {
+        ("POST", "/agent/v1/orders/create"),
+        ("POST", "/agent/v2/orders"),
+        ("POST", "/agent/v1/payments"),
+        ("POST", "/agent/v2/payments/checkout-sessions"),
+    }
+)
+
+
+async def _refuse_checkout_token_of_cancelled_order(request: Request, payload: Dict[str, Any]) -> None:
+    bound_order_id = str((payload or {}).get("order_id") or "").strip()
+    if not bound_order_id:
+        return
+    from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled, is_cancelled_order
+
+    if not checkout_cancel_upstream_enabled():
+        return
+    method = str(getattr(request, "method", "") or "").upper()
+    if (method, _matched_route_template(request)) not in _CHECKOUT_TOKEN_START_ROUTES:
+        return
+    from db.orders import get_order
+
+    if is_cancelled_order(await get_order(bound_order_id)):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "CHECKOUT_CANCELED", "message": "This checkout was canceled and can no longer be paid."},
+        )
 
 
 # The exact routes a checkout token may call: what the hosted checkout page uses, and nothing else.
@@ -906,9 +940,15 @@ async def log_agent_request(
     merchant_id: Optional[str] = None,
     order_id: Optional[str] = None,
     order_amount: Optional[float] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    order_created: bool = False,
 ):
-    """记录 Agent 请求（通常在响应后调用）"""
+    """记录 Agent 请求（通常在响应后调用）
+
+    `order_id` is logged on the usage row for any order-scoped call (get_order, tracking,
+    confirm-payment). Only `order_created=True` — passed by the order CREATE route alone — adds to
+    agents.total_orders / total_gmv (O-07: reads were counting as orders).
+    """
     
     # 获取请求信息
     request = context.request
@@ -930,8 +970,8 @@ async def log_agent_request(
     
     context.request_id = request_id
     
-    # 如果创建了订单，更新统计
-    if order_id and status_code < 400:
+    # 如果创建了订单，更新统计 — a create only; a read of an existing order is not an order.
+    if order_created and order_id and status_code < 400:
         await update_agent_stats(
             context.agent_id,
             increment_orders=1,

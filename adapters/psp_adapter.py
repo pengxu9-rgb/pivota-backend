@@ -147,6 +147,13 @@ class PSPAdapter(ABC):
         """Void/cancel a previously authorized payment when the PSP supports it."""
         return False, None, f"{self.__class__.__name__} does not support cancel_payment_authorization"
 
+    async def expire_checkout_session(
+        self,
+        session_id: str,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Close a PSP-hosted checkout page so it can no longer be paid, when the PSP has one."""
+        return False, None, f"{self.__class__.__name__} does not support expire_checkout_session"
+
 
 class StripeAdapter(PSPAdapter):
     """Stripe PSP 适配器"""
@@ -452,7 +459,44 @@ class StripeAdapter(PSPAdapter):
             return True, str(getattr(payment_intent, "id", payment_intent_ref)), None
         except Exception as e:
             return False, None, str(e)
-    
+
+    async def expire_checkout_session(
+        self,
+        session_id: str,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Expire an open Stripe Checkout Session (`cs_`): its page can no longer be paid.
+
+        Returns (ok, state, error). `state` is "expired" when this call expired it. Stripe refuses to expire a
+        session that is not `open`, so on a refusal the session is read back: "already_expired" (ok: the page
+        is closed either way), "complete_paid" or "complete_unpaid" (the buyer finished first: paid, or an
+        asynchronous payment still settling), or None when its state could not be read.
+        """
+        reference = str(session_id or "").strip()
+        if not reference.startswith("cs_"):
+            return False, None, "not a Stripe Checkout Session id"
+        try:
+            await asyncio.to_thread(
+                self._client.v1.checkout.sessions.expire,
+                reference,
+            )
+            return True, "expired", None
+        except Exception as e:
+            expire_error = str(e)
+        try:
+            session = await asyncio.to_thread(
+                self._client.v1.checkout.sessions.retrieve,
+                reference,
+            )
+        except Exception:
+            return False, None, expire_error
+        status = str(getattr(session, "status", "") or "").strip().lower()
+        payment_status = str(getattr(session, "payment_status", "") or "").strip().lower()
+        if status == "expired":
+            return True, "already_expired", None
+        if status == "complete":
+            return False, ("complete_paid" if payment_status in {"paid", "no_payment_required"} else "complete_unpaid"), expire_error
+        return False, None, expire_error
+
     async def confirm_payment(
         self,
         payment_intent_id: str,

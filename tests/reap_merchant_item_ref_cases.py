@@ -90,7 +90,7 @@ async def test_prepare_by_product_url_is_exactly_the_product_key_witness(client,
 @pytest.mark.parametrize("spelling", [
     f"https://www.{DOMAIN}/products/lip-ink",
     f"https://{DOMAIN}/products/lip-ink/",
-    f"HTTPS://{MIXED}/products/Lip-Ink?variant=49819267301653#reviews",
+    f"HTTPS://{MIXED}/products/Lip-Ink?variant={VARIANT}#reviews",
     f"http://{DOMAIN}/products/lip-ink",
     f"https://{DOMAIN}:443/products/lip-ink",
 ])
@@ -666,11 +666,18 @@ async def test_a_retry_with_another_spelling_of_the_same_page_replays(client, mo
     "?variant=" + VARIANT + "%3Bx", "?variant=" + VARIANT + "%23x", "?variant=" + VARIANT + "%26x=1",
     "?%2576ariant=111",              # D1: a key that needs a SECOND decoding round to read `variant`
     "?%26%23118%3Bariant=111",       # an HTML entity behind percent-encoding
+    # P3-A: a store reads the value up to the next `&`, so a `;` after the id is part of it
+    "?variant=" + VARIANT + ";utm=1", "?variant=" + VARIANT + ";x", "#variant=" + VARIANT + ";x",
+    "?variant=" + VARIANT + ";", "?x=1;variant=" + VARIANT + ";y", "?variant=" + VARIANT + ";variant=" + VARIANT,
+    # P3-B: the value is decoded ONCE, as a store decodes it
+    "?variant=" + "".join("%25" + format(ord(c), "x") for c in VARIANT),        # `%34%30…`, not `40…`
+    "?variant=%26%23" + str(ord(VARIANT[0])) + "%3B" + VARIANT[1:],           # `&#52;…`, not `4…`
+    "?variant=%2B" + VARIANT,                                                  # `+<id>`, not ` <id>`
 ])
 def test_every_spelling_of_another_variant_in_the_url_is_refused(tail):
-    """N1: every key that DECODES to `variant` (any case, either section, `;` or `&` separated) must have
-    exactly `variant_id` as its decoded value; the value is split off before decoding, so an encoded
-    separator stays inside it."""
+    """N1: every key that DECODES to `variant` (any case, either section, found after `;` or `&`) must have
+    exactly `variant_id` as its value as a store reads it: up to the next `&`, decoded once. The value is
+    split off before decoding, so an encoded separator stays inside it."""
     with pytest.raises(svc.PurchaseRefused) as refused:
         merchant_item.check_url_variant(URL + tail, VARIANT)
     assert refused.value.reason == "invalid_request"
@@ -695,9 +702,10 @@ def test_an_encoding_deeper_than_the_lane_reads_is_refused_not_half_decoded():
 @pytest.mark.parametrize("tail", [
     "", "?variant=" + VARIANT, "?variant[]=" + VARIANT, "#variant=" + VARIANT, "?a=1;variant=" + VARIANT,
     "?Variant=" + VARIANT, "?variant=" + VARIANT + "&utm_source=x#reviews", "?utm_source=x",
-    "?variant=" + VARIANT + ";utm=1",              # T2: `;` ends the value
+    "?variant=" + VARIANT + "&amp;utm=1",          # an HTML-escaped `&` before another key
+    "?x=1;variant=" + VARIANT + "&y=2",            # a key after `;` is found; its value ends at `&`
     "?%2576ariant=" + VARIANT,                     # D1: two rounds, agreeing
-    "?variant=%3" + VARIANT[0] + VARIANT[1:],      # the VALUE is decoded too: `%34…` is `4…`
+    "?variant=%3" + VARIANT[0] + VARIANT[1:],      # the VALUE is decoded once: `%34…` is `4…`
     # P3-4: `variant` that is not a variant KEY, as a store reads it
     "?utm_content=variant_test", "#variant-picker", "?variant=" + VARIANT + "&utm_content=variant_a",
     "?sections=product-variant-picker", "?variant_title=red", "?x=variant%3D111", "?a=1&#118;ariant=111",
@@ -808,7 +816,7 @@ async def test_a_stored_url_that_is_not_printable_ascii_is_not_a_page(monkeypatc
 async def test_a_punycode_storefront_seed_resolves(monkeypatch):
     """N4 does not hide an IDN store: its host is stored and sent as punycode (ASCII), so both sides agree."""
     await seed(monkeypatch)
-    host = "xn--shp-a-xxa.example"
+    host = "xn--shp-a-kua.example"  # a valid IDNA label (`shöp-a`)
     page = "https://" + host + "/products/lip-ink"
     await add_product(PRODUCT + "-puny")
     await add_seed("puny-seed", url=page, domain=host, attached=PRODUCT + "-puny")

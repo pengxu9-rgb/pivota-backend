@@ -30,6 +30,13 @@ Also out of scope: the AP2 and ACP protocol sessions of ADR-012. This ADR does n
 
 ### The ways an agent-paid order can be paid on an unconnected merchant
 
+> **Read with ADR-030 (2026-11-10).** Three rows of this table describe paths Pivota itself would execute. None is admitted for now.
+> - "Merchant protocol completion": not until the separate owner decision in ADR-030, "D3. Who completes the payment", and then only on that section's conditions.
+> - "Shop MCP checkout completion": does not meet those conditions as written.
+> - "Pivota's own browser route": stays out (ADR-028 amendment 1).
+>
+> The `merchant_protocol` and `pivota_browser` executors in D2, D5, D6 and D9 follow the same rule.
+
 | Path | Credential | Who places the order | Where it can work today | Buyer approval | State |
 |---|---|---|---|---|---|
 | Reap agentic purchase | the buyer's card, held by Reap | Reap's checkout agent | merchants on our Reap eligibility rows, per market | Reap's approval page | built, dark |
@@ -84,6 +91,8 @@ A path is admitted only with a declaration. An undeclared or incomplete one fail
 The router branches on these fields, never on a path's name. An agent-set preference (today `payment_preference.rail`) is a **filter**: it can narrow the candidates, and is refused when it cannot be met. It never widens them, and it is not treated as the buyer's choice (D6).
 
 ### D3. Card data
+
+> **Read with ADR-028 D6 as amended (2026-11-08, narrowed 2026-11-10) and ADR-030 D3.** For now Pivota handles no card credential, so "in memory for one attempt, on a route Pivota executes" below does not apply to any admitted path. "Stripped on arrival" is a detector; the rule is that the partner never sends a credential.
 
 ADR-028 D6 holds as written. In particular, no raw card number enters a Pivota system, and a token or cryptogram may exist only in memory for one attempt, on a route Pivota executes. On top of that, this ADR requires:
 - **A `card_number` path is admitted only when the number goes from the issuer to an executor that is not Pivota,** under that executor's PCI scope. Shop spend requests, which return the number to the calling agent, are therefore not admitted as shipped.
@@ -194,7 +203,7 @@ What this gives with today's paths:
    - The one stop above both populations (D8).
    - Handoff records for UCP escalations and get_offers carts (D9).
    - Doors ask in shadow and log the answer beside what they did. With both rails dark, the shadow answer is "handoff" almost everywhere. The value is in measuring where doors and router disagree.
-2. **Shop MCP completion,** only if question 3 is answered yes, behind its dial, after Shopify's permission, the Shop account connect, and a wallet fact. One merchant, one market, staff orders first (ADR-028 Phase A).
+2. *(Not admitted for now; see ADR-030, "D3. Who completes the payment".)* **Shop MCP completion,** only if question 3 is answered yes, behind its dial, after Shopify's permission, the Shop account connect, and a wallet fact. One merchant, one market, staff orders first (ADR-028 Phase A).
 3. **The token rail's order step,** when it is built and its declaration (D2) is complete.
 4. **A `card_number` path** only after question 1.
 
@@ -208,9 +217,9 @@ What this gives with today's paths:
 
 ## Questions for the owner
 
-1. **Card numbers.** Keep D3, which excludes Shop spend requests unless a PCI-scoped executor receives the number? Or open a separate decision on a card vault, which would change ADR-028 D6 and Pivota's card-data scope?
+1. *(Answered "keep D3; no card vault" by ADR-028 amendment 1; ADR-030 owner question 6 asks the owner to confirm.)* **Card numbers.** Keep D3, which excludes Shop spend requests unless a PCI-scoped executor receives the number? Or open a separate decision on a card vault, which would change ADR-028 D6 and Pivota's card-data scope?
 2. **Attribution against convenience.** Shop MCP completion carries no attribution today, so D6 ranks it below an attributed rail when totals are unknown. Is that right when the buyer already holds Shop Pay and the rail needs a new enrolment?
-3. **Shop MCP as a completion route.** ADR-028 D2 defines the protocol route as the merchant's protocol at the tier the merchant requires. Shop MCP's tier is granted by Shopify, not by the merchant. Admitting it means amending ADR-028 D2 to add a platform protocol route, admitted on the platform's grant plus the merchant not having opted out. Amend it, or leave Shop MCP as a handoff only?
+3. *(Answered "handoff only, for now" by ADR-030 D3; ADR-030 owner question 6 asks the owner to confirm.)* **Shop MCP as a completion route.** ADR-028 D2 defines the protocol route as the merchant's protocol at the tier the merchant requires. Shop MCP's tier is granted by Shopify, not by the merchant. Admitting it means amending ADR-028 D2 to add a platform protocol route, admitted on the platform's grant plus the merchant not having opted out. Amend it, or leave Shop MCP as a handoff only?
 4. **Partner attestation.** On `rail_managed` paths the buyer's authorization is the partner's attestation, not a primitive Pivota verified (D5). Is that acceptable for admission, or does a rail need to return verifiable evidence?
 5. **Shadow routing.** Start Phase 1 now, before any new path exists?
 

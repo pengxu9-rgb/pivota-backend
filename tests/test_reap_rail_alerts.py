@@ -416,7 +416,9 @@ async def test_a_count_that_timed_out_pages_as_failing(filters, monkeypatch, rea
         await asyncio.sleep(8)
 
     monkeypatch.setattr(ledger, "count_stuck_purchases", _hangs)
-    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 0.05)
+    # 1 s, not 50 ms: the same timeout times the healthy counts, and `errors == 1` needs them to
+    # answer inside it on a loaded runner.
+    monkeypatch.setattr(job, "STUCK_COUNT_TIMEOUT_SECONDS", 1)
     with worker_log() as lines:
         report = await _run(worker_id="w1")
     assert report.stuck_over_age == job.NOT_COUNTED and report.errors == 1

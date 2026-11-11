@@ -56,6 +56,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from db.database import database
+from services.test_traffic import not_test_traffic_sql
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,10 @@ _INT_TRANSACTED_PREDICATE = (
     "(o.order_id IS NOT NULL AND o.payment_status = ANY(:transacted))"
 )
 _PROD_TRANSACTED_PREDICATE = f"({_INT_TRANSACTED_PREDICATE} OR {_EXT_CONVERTED_PREDICATE})"
+# O-07: rows stamped test traffic at write (services/test_traffic.py). No row carries the stamp
+# while TEST_TRAFFIC_STAMP_ENABLED is off, so these leave every count as it was.
+_NOT_TEST_ORDER = not_test_traffic_sql("o.metadata")
+_NOT_TEST_EDGE = not_test_traffic_sql("cae.metadata")
 
 
 def _merchant_sql(window_key: str) -> str:
@@ -184,6 +189,7 @@ def _merchant_sql(window_key: str) -> str:
                 currency
             FROM orders o
             WHERE merchant_id IS NOT NULL
+              AND {_NOT_TEST_ORDER}
               {_window_clause(window_key, 'o')}
             UNION ALL
             -- External converted edges (T2-2): no orders row; click_matched-gated.
@@ -197,6 +203,7 @@ def _merchant_sql(window_key: str) -> str:
             FROM commerce_attribution_edges cae
             WHERE cae.merchant_id IS NOT NULL
               AND {_EXT_CONVERTED_PREDICATE}
+              AND {_NOT_TEST_EDGE}
               {_window_expr_clause(window_key, 'cae.converted_at')}
         ) u
         GROUP BY merchant_id
@@ -230,6 +237,8 @@ def _product_sql(window_key: str) -> str:
           -- recorded for coverage but EXCLUDED from the product outcome signal, same
           -- as the seller_mismatch gate. NULL-safe (real edges lack the key).
           AND (cae.metadata->>'inferred')::boolean IS NOT TRUE
+          -- O-07: test traffic (stamped at write, services/test_traffic.py) is no outcome signal.
+          AND {_NOT_TEST_EDGE}
           {_window_expr_clause(window_key, 'COALESCE(o.created_at, cae.converted_at, cae.created_at)')}
         GROUP BY cae.canonical_product_id
         HAVING count(*) FILTER (WHERE {_PROD_TRANSACTED_PREDICATE}) > 0
