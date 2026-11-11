@@ -72,6 +72,7 @@ from config.settings import settings
 from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
 from services import deal_code_capture
+from services import deal_code_retention
 from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
@@ -161,6 +162,12 @@ async def run_daily_external_referral_refresh(
     if settings.deal_code_capture_shadow:
         # ADR-027 code collection, shadow: what the promo regions of the pages this run read printed.
         summary["deal_code_capture"] = deal_code_capture.stats()
+    # ADR-027 Q18 retention of crawled codes, on EVERY run and whatever DEAL_CODE_CAPTURE_WRITE says: rows written
+    # while the flag was on must still expire after it is turned off. Never raises; counts only. Reported only when
+    # it did something (or was paused, or failed), so a run with nothing to expire keeps the summary as it was.
+    retention = await deal_code_retention.run()
+    if any(retention.values()):
+        summary["deal_code_retention"] = retention
     return summary
 
 

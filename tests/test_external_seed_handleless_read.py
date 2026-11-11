@@ -437,7 +437,8 @@ def test_shadow_writes_exactly_what_off_writes_and_keeps_a_frozen_dead_row(monke
     off = _refresh(monkeypatch, row=_seed_row(**frozen), html=html, mode="off")
 
     assert shadow["result"]["handleless_read"] == {"mode": "shadow", "would_read": True, "refusal": None,
-                                                  "identity_by": "url", "would_flip_healthy": True}
+                                                  "identity_by": "url", "would_flip_healthy": True,
+                                                  "detail": {"title_dice": 1.0, "price_ratio": 1.25}}
     assert off["result"]["handleless_read"] is None
     # The observation is today's: unverifiable, which writes no verdict, streak or clock.
     for out in (shadow, off):
@@ -743,7 +744,8 @@ def test_a_rule_that_raises_keeps_todays_observation_and_the_rows_update(monkeyp
     monkeypatch.setattr(liveness, "classify_handleless_read", boom)
     out = _refresh(monkeypatch, html=_page(_product(url=URL)), mode="shadow")
     assert out["result"]["handleless_read"] == {"mode": "shadow", "would_read": False, "refusal": "error",
-                                                "would_flip_healthy": False}
+                                                "would_flip_healthy": False,
+                                                "detail": {"title_dice": 1.0, "price_ratio": 1.25}}
     assert out["result"]["status"] == "success"
     assert [obs.verdict for obs in out["recorded"]] == [liveness.VERDICT_UNVERIFIABLE]
     assert _no_decision_in_the_row(out["seed_data"])
@@ -1065,3 +1067,195 @@ def test_a_price_reader_that_raises_on_a_twin_still_refuses_as_a_conflict(monkey
     identity = snap.evidence["jsonld_identity"]
     assert not identity.get("unavailable"), "the twin's raise must not cost the page its identity evidence"
     assert identity["priced_identities"] == 2
+
+
+# --------------------------------------------------------------------------- the shadow decision log (11-07)
+#
+# Before `on`, a reviewer needs each SHADOW decision, not only the run's totals: one HANDLELESS_DECISION line per
+# decided row (ids, host, decision, title dice, price ratio), bounded per run. `on` and `off` log and carry nothing
+# new.
+
+
+class _Lines:
+    """Stands in for the `pivota` logger: keeps each INFO message."""
+
+    def __init__(self) -> None:
+        self.messages: List[str] = []
+
+    def info(self, message: str, *args: Any) -> None:
+        self.messages.append(message % args if args else message)
+
+
+def _decision_lines(lines: _Lines) -> List[Dict[str, Any]]:
+    prefix = "HANDLELESS_DECISION "
+    assert all(m.startswith(prefix) for m in lines.messages), lines.messages
+    return [json.loads(m[len(prefix):]) for m in lines.messages]
+
+
+def test_shadow_carries_the_title_dice_and_price_ratio_of_its_decision(monkeypatch) -> None:
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), mode="shadow")
+    # The seed's "Brand Ceramide Barrier Cream" against the page's "... 50ml" (brand and sizes dropped); 25 / 20.
+    assert out["result"]["handleless_read"]["detail"] == {"title_dice": 1.0, "price_ratio": 1.25}
+    assert _no_decision_in_the_row(out["seed_data"])
+
+
+def test_a_refused_shadow_decision_still_carries_its_detail(monkeypatch) -> None:
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(redirect_hops=1), mode="shadow")
+    assert out["result"]["handleless_read"]["refusal"] == "redirect"
+    assert out["result"]["handleless_read"]["detail"] == {"title_dice": 1.0, "price_ratio": 1.25}
+
+
+@pytest.mark.parametrize("mode", ["on", "off", "unset"])
+def test_on_and_off_carry_no_detail(monkeypatch, mode: str) -> None:
+    out = _refresh(monkeypatch, html=_page(_product(url=URL)), mode=mode)
+    info = out["result"]["handleless_read"]
+    if mode == "on":
+        assert "detail" not in info
+        assert set(info) == {"mode", "would_read", "refusal", "identity_by", "would_flip_healthy"}
+    else:
+        assert info is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        ({"evidence": None, "seed_title": SEED_TITLE}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {"jsonld_identity": {"name": 42}}, "seed_title": SEED_TITLE},
+         {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {"jsonld_identity": {"name": "Brand"}}, "seed_title": SEED_TITLE, "seed_brand": "Brand"},
+         {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {"jsonld_identity": {"name": "Ceramide Toner"}}, "seed_title": "Ceramide Cream"},
+         {"title_dice": 0.5, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": "abc", "fresh_currency": "USD",
+          "stored_amount": 20, "stored_currency": "USD"}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": float("inf"), "fresh_currency": "USD",
+          "stored_amount": 20, "stored_currency": "USD"}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": float("nan"), "fresh_currency": "USD",
+          "stored_amount": 20, "stored_currency": "USD"}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": 10, "fresh_currency": "USD",
+          "stored_amount": 0, "stored_currency": "USD"}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": 10, "fresh_currency": "USD",
+          "stored_amount": 20, "stored_currency": "SGD"}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": 10, "fresh_currency": None,
+          "stored_amount": 20, "stored_currency": None}, {"title_dice": None, "price_ratio": None}),
+        ({"evidence": {}, "seed_title": "x", "fresh_amount": 30, "fresh_currency": "usd ",
+          "stored_amount": "20", "stored_currency": "USD"}, {"title_dice": None, "price_ratio": 1.5}),
+    ],
+    ids=["no_evidence", "name_not_text", "brand_only_title", "half_the_words", "price_not_a_number",
+         "price_infinite", "price_nan", "stored_zero", "other_currency", "no_currency", "currency_spelling"],
+)
+def test_the_detail_is_none_for_anything_odd_and_never_raises(kwargs: Dict[str, Any], expected: Dict[str, Any]) -> None:
+    assert liveness.handleless_decision_detail(**kwargs) == expected
+
+
+def test_the_detail_never_raises_when_the_tokenizer_does(monkeypatch) -> None:
+    def boom(*_a: Any, **_k: Any):
+        raise RuntimeError("tokenizer bug")
+
+    monkeypatch.setattr(liveness, "_title_tokens", boom)
+    detail = liveness.handleless_decision_detail(
+        evidence={"jsonld_identity": {"name": "Ceramide Cream"}}, seed_title="Ceramide Cream",
+        fresh_amount=25, fresh_currency="USD", stored_amount=20, stored_currency="USD",
+    )
+    assert detail == {"title_dice": None, "price_ratio": 1.25}
+
+
+def test_a_shadow_line_names_ids_host_and_decision_and_no_url() -> None:
+    from services.external_referral_readiness import handleless_decision_line
+
+    info = {"mode": "shadow", "would_read": False, "refusal": "segment", "segment": "collections",
+            "would_flip_healthy": False, "detail": {"title_dice": 0.8, "price_ratio": 1.1}}
+    line = handleless_decision_line("eps_1", "shop.example", info)
+    assert line == {"seed_id": "eps_1", "host": "shop.example", "would_read": False, "would_flip_healthy": False,
+                    "refusal": "segment", "segment": "collections", "identity_by": None,
+                    "title_dice": 0.8, "price_ratio": 1.1}
+    assert handleless_decision_line("eps_1", "shop.example", {**info, "mode": "on"}) is None
+    assert handleless_decision_line("eps_1", "shop.example", None) is None
+    assert handleless_decision_line("eps_1", None, {"mode": "shadow"})["host"] == "unknown"
+
+
+def test_the_shadow_log_is_bounded_per_run_and_counts_what_it_drops(monkeypatch) -> None:
+    import services.external_referral_readiness as err
+
+    lines = _Lines()
+    monkeypatch.setattr(err, "pivota_logger", lines)
+    monkeypatch.setattr(err, "HANDLELESS_DECISION_LOG_MAX", 2)
+    state: Dict[str, int] = {}
+    for i in range(5):
+        err.log_handleless_decision(state, f"eps_{i}", "shop.example", {"mode": "shadow", "would_read": True})
+    assert state == {"logged": 2, "suppressed": 3}
+    assert [line["seed_id"] for line in _decision_lines(lines)] == ["eps_0", "eps_1"]
+
+
+def test_the_shadow_log_never_raises(monkeypatch) -> None:
+    import services.external_referral_readiness as err
+
+    class Broken:
+        def info(self, *_a: Any, **_k: Any) -> None:
+            raise RuntimeError("handler bug")
+
+    monkeypatch.setattr(err, "pivota_logger", Broken())
+    state: Dict[str, int] = {}
+    err.log_handleless_decision(state, "eps_1", "shop.example", {"mode": "shadow", "would_read": True})
+    err.log_handleless_decision(state, "eps_2", "shop.example", {"mode": "shadow", "detail": "not a dict",
+                                                                 "segment": object()})
+
+
+def test_the_decision_log_goes_through_the_logger_prod_keeps() -> None:
+    import services.external_referral_readiness as err
+    from utils.logger import logger as pivota
+
+    assert err.pivota_logger is pivota
+    assert pivota.name == "pivota" and pivota.isEnabledFor(20)
+
+
+def _batch(monkeypatch, produced: Dict[str, Any]) -> Dict[str, Any]:
+    import services.external_referral_readiness as err
+
+    ids = list(produced)
+    monkeypatch.setattr(err, "get_external_referral_refresh_candidate_seed_ids", lambda *a, **k: asyncio.sleep(0, result=ids))
+    monkeypatch.setattr(err, "_fetch_refresh_candidate_hosts", lambda _ids: asyncio.sleep(0, result={i: "shop.example" for i in ids}))
+
+    async def scripted_refresh(seed_id, **_kwargs):
+        return produced[seed_id]
+
+    return asyncio.run(err.run_external_referral_refresh_batch(refresh_seed_by_id=scripted_refresh, limit=10))
+
+
+def test_the_batch_logs_one_line_per_shadow_decision(monkeypatch) -> None:
+    import jobs.external_referral_refresh as job
+    import services.external_referral_readiness as err
+
+    produced = {
+        "eps_reads": _refresh(monkeypatch, html=_page(_product(url=URL)), mode="shadow")["result"],
+        "eps_redirect": _refresh(monkeypatch, html=_page(_product(url=URL)), observed=_observed(redirect_hops=1),
+                                 mode="shadow")["result"],
+    }
+    lines = _Lines()
+    monkeypatch.setattr(err, "pivota_logger", lines)
+    summary = _batch(monkeypatch, produced)
+    got = sorted(_decision_lines(lines), key=lambda line: line["seed_id"])
+    assert got == [
+        {"seed_id": "eps_reads", "host": "shop.example", "would_read": True, "would_flip_healthy": True,
+         "refusal": None, "segment": None, "identity_by": "url", "title_dice": 1.0, "price_ratio": 1.25},
+        {"seed_id": "eps_redirect", "host": "shop.example", "would_read": False, "would_flip_healthy": False,
+         "refusal": "redirect", "segment": None, "identity_by": None, "title_dice": 1.0, "price_ratio": 1.25},
+    ]
+    assert all("http" not in m and "?" not in m for m in lines.messages)
+    block = summary["handleless_read"]
+    assert block["decision_lines"] == {"logged": 2, "suppressed": 0}
+    assert block["totals"] == {"decided": 2, "would_read": 1, "would_flip_healthy": 1, "refused:redirect": 1}
+    assert job.handleless_read_line(summary) == block
+
+
+@pytest.mark.parametrize("mode", ["on", "off"])
+def test_the_batch_logs_nothing_and_adds_nothing_outside_shadow(monkeypatch, mode: str) -> None:
+    import services.external_referral_readiness as err
+
+    produced = {"eps_reads": _refresh(monkeypatch, html=_page(_product(url=URL)), mode=mode)["result"]}
+    lines = _Lines()
+    monkeypatch.setattr(err, "pivota_logger", lines)
+    summary = _batch(monkeypatch, produced)
+    assert lines.messages == []
+    assert "decision_lines" not in summary["handleless_read"]
+    assert summary["handleless_read"]["mode"] == mode

@@ -282,9 +282,19 @@ def pilot_admission_scope() -> Optional[Dict[str, Any]]:
 
 
 def enforce_pilot_scope(*, agent_id: str, merchant_domain: str, market_country: str,
-                        product_key: str, quantity: int, variant_key: Optional[str] = None,
+                        product_key: Optional[str], quantity: int, variant_key: Optional[str] = None,
                         currency: Optional[str] = None, total_minor: Optional[int] = None,
-                        resolved: bool = True) -> None:
+                        resolved: bool = True, product_pending: bool = False) -> None:
+    """Refuse a request outside the configured pilot scope (None scope: no pilot, nothing refused).
+
+    `product_pending=True` is the PRE-CHECK for a request that names its product by the merchant's URL
+    (routes.agent_commerce_reap `product_url`): everything but `product_keys` is checked before any
+    catalog read, and the route calls this again, with the resolved key, before it reads the item. It
+    is never a way to skip the product check: a pre-check that also carries a key is refused, and a call
+    without it checks `product_keys` exactly as before (a None key is outside any pilot that lists keys).
+    """
+    if product_pending and product_key is not None:
+        raise PurchaseRefused("invalid_request", "a pilot pre-check names no product")
     if type(quantity) is not int or not 1 <= quantity <= MAX_QUANTITY:
         raise PurchaseRefused("invalid_request", "quantity must be an integer")
     try:
@@ -299,6 +309,8 @@ def enforce_pilot_scope(*, agent_id: str, merchant_domain: str, market_country: 
         raise PurchaseRefused("invalid_request", "market country is invalid")
     fields = {"agent_ids": agent_id, "merchant_domains": domain, "markets": market,
               "product_keys": product_key, "quantities": quantity}
+    if product_pending:
+        del fields["product_keys"]
     if any(value not in scope[name] for name, value in fields.items()):
         raise PurchaseRefused("pilot_scope_refused", "request is outside configured pilot scope")
     if resolved and "variant_keys" in scope and (

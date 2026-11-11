@@ -1,7 +1,7 @@
 """The A2A rail's VIC order step: the client for the rail provider's Visa Intelligent Commerce order API.
 
 The provider is a VIC Agent Enabler (TR-TSP): it holds the TRID, tokenizes with VTS, hosts the card and
-passkey pages, makes the Visa calls and, by the 10-12 agreement, FILLS THE MERCHANT CHECKOUT ITSELF
+passkey pages, makes the Visa calls and FILLS THE MERCHANT CHECKOUT ITSELF
 (executor `rail_managed`). Pivota sends a confirmed order, shows the buyer the provider's hosted page,
 and then only READS STATUS until the provider reports the merchant's order number. That is all.
 
@@ -29,7 +29,7 @@ THE RULES THIS MODULE ENFORCES
 
 Dark: `from_env()` returns None unless A2A_RAIL_VIC_ORDER_STEP_ENABLED is on AND a transport is
 configured. The provider has not published this API yet, so no production transport exists: today the
-worker runs this step only against the in-repo fake (tests/evonet_vic_fake.py). The contract it is
+worker runs this step only against the in-repo fake (tests/fake_provider_vic.py). The contract it is
 written to is the one we are asking the provider for (reports/, local).
 """
 
@@ -58,6 +58,10 @@ AUTHORIZATION_STATUSES = frozenset({"pending", "approved", "declined", "expired"
 CHECKOUT_STATUSES = frozenset({"not_started", "in_progress", "completed", "failed"})
 
 _REF_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}\Z")
+#: The rail's order id: at most 124 characters, so the worker's `vic:` marker fits the ledger's 128 (the
+#: contract says so). A longer id is not an order id here: the answer is `unrecognised`.
+_ORDER_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,124}\Z")
+_CURRENCY_RE = re.compile(r"^[A-Z]{3}\Z")
 _CODE_RE = re.compile(r"^[a-z0-9_]{1,48}\Z")
 #: 4xx answers that say nothing about the order itself: our credentials, a timeout, throttling.
 _RETRYABLE_4XX = frozenset({401, 403, 408, 429})
@@ -141,7 +145,8 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
     expires_in = auth.get("expires_in")
     answer = VicAnswer(
         kind="ok",
-        order_id=_ref(body.get("order_id")),
+        order_id=body.get("order_id") if isinstance(body.get("order_id"), str)
+        and _ORDER_ID_RE.match(body["order_id"]) else None,
         client_reference=_ref(body.get("client_reference")),
         approval_status=_word(auth.get("status"), AUTHORIZATION_STATUSES),
         hosted_url=_https(auth.get("hosted_url")),
@@ -150,8 +155,10 @@ def parse_order(body: Any, stripped: int = 0) -> VicAnswer:
         merchant_order_number=_ref(checkout.get("order_number")),
         merchant_order_status_url=_https(checkout.get("order_status_url")),
         total_minor=_minor(checkout.get("total_minor")),
+        # Exactly three upper-case letters, or None (absent OR malformed: "usd", "EURO", 978). The worker
+        # completes a checkout only on an EXACT match with the purchase's currency; None is held.
         currency=checkout.get("currency") if isinstance(checkout.get("currency"), str)
-        and re.fullmatch(r"[A-Z]{3}", checkout["currency"]) else None,
+        and _CURRENCY_RE.match(checkout["currency"]) else None,
         credential_fields_stripped=stripped,
     )
     if answer.order_id is None or answer.approval_status is None or (checkout and answer.checkout is None):
@@ -229,22 +236,22 @@ class VicOrderClient:
 
 
 def order_amount(row: Mapping[str, Any]) -> Optional[int]:
-    """The total the buyer confirmed, in minor units: the locked quote when there is one, else the unit
-    price they consented to times the quantity. None when the row has neither."""
+    """The amount the buyer approves, in minor units: the LOCKED QUOTE (`quoted_total_minor`), the all-in
+    total with shipping and tax, or None. Never the unit price times the quantity: that subtotal leaves out
+    shipping and tax, so the checkout the rail fills would come to more than the buyer approved. No quote,
+    no order (the step refuses the purchase)."""
     quoted = row.get("quoted_total_minor")
     if isinstance(quoted, int) and not isinstance(quoted, bool) and quoted > 0:
         return quoted
-    unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
-    if isinstance(unit, bool) or not isinstance(unit, int) or not isinstance(quantity, int) or unit <= 0 or quantity <= 0:
-        return None
-    return unit * quantity
+    return None
 
 
 def build_order(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
     """The order body for one purchase row, or None when the row cannot make one (the step fails it).
 
-    The provider's hosted page shows the buyer the amount they approve (`order_amount`); the provider
-    must not charge more (the contract)."""
+    `amount_minor` is the locked all-in total (`order_amount`): the amount the provider's hosted page shows
+    the buyer to approve, and a CEILING the provider must not charge above (the contract). A checkout
+    total above it is never completed here (a2a_rail_worker `_vic_checkout`)."""
     amount = order_amount(row)
     unit, quantity = row.get("our_price_minor"), row.get("quantity") or 1
     if amount is None:

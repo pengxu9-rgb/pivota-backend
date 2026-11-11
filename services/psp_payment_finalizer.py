@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from decimal import Decimal
@@ -209,6 +210,91 @@ def _full_refund_fulfillment_status(order: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+async def _late_payment_after_cancel(
+    order: Dict[str, Any],
+    *,
+    psp: str,
+    payment_reference: Optional[str],
+    amount_minor: Any,
+    currency: Optional[str],
+    source_event: str,
+) -> Optional[Dict[str, Any]]:
+    """A PSP success on a CANCELLED order, with CHECKOUT_CANCEL_UPSTREAM_ENABLED: record it and raise it as a refund
+    request (services/checkout_cancel_upstream.py). None (flag off, or not a cancelled order): today's answer."""
+    from services.checkout_cancel_upstream import (
+        checkout_cancel_upstream_enabled,
+        is_cancelled_order,
+        record_late_payment_after_cancel,
+    )
+
+    if not checkout_cancel_upstream_enabled() or not is_cancelled_order(order):
+        return None
+    reference = str(payment_reference or "").strip() or str(order.get("payment_intent_id") or "").strip()
+    amount_major = (
+        _money_from_minor_units(amount_minor, currency or str(order.get("currency") or ""))
+        if amount_minor is not None
+        else None
+    )
+    return await record_late_payment_after_cancel(
+        order,
+        psp=psp,
+        payment_reference=reference,
+        amount_major=amount_major,
+        amount_minor=amount_minor,
+        currency=currency,
+        source_event=source_event,
+    )
+
+
+# The alert line for a payment whose loss of the paid transition could not be explained (flag on only). The shape
+# of the money_alert lines (FIX_PLAN R-02): `money_alert: ` + compact sorted JSON keyed by "event", through the
+# "pivota" logger (utils/logger.py), the one logger whose lines survive in production (this module's own logger is a
+# plain module logger: prod drops its INFO). Ids and codes only.
+LATE_PAYMENT_CHECK_FAILED_EVENT = "late_payment_check_failed"
+
+
+def _emit_late_payment_check_failed(order_id: str, *, reason: str, error_type: Optional[str], **kwargs: Any) -> None:
+    """Never raises: the PSP webhook that got here must still be answered."""
+    try:
+        from utils.logger import logger as pivota_logger
+
+        body = {
+            "event": LATE_PAYMENT_CHECK_FAILED_EVENT,
+            "order_id": str(order_id or "")[:128],
+            "psp": str(kwargs.get("psp") or "")[:128],
+            "payment_reference": (str(kwargs.get("payment_reference") or "").strip()[:128] or None),
+            "amount_minor": str(kwargs["amount_minor"])[:32] if kwargs.get("amount_minor") is not None else None,
+            "currency": (str(kwargs.get("currency") or "").upper()[:8] or None),
+            "source_event": str(kwargs.get("source_event") or "")[:128],
+            "reason": reason,
+            "error_type": error_type,
+        }
+        pivota_logger.error("money_alert: %s", json.dumps(body, sort_keys=True, separators=(",", ":")))
+    except Exception:  # noqa: BLE001 - an alert must never break the money path it reports on
+        pass
+
+
+async def _late_payment_after_concurrent_cancel(order_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+    """The paid transition lost its race: re-read the row (flag on only) and treat a cancel that won as a late
+    payment. A read that fails (or finds no row) keeps today's answer, which is fail-safe (nothing is applied twice),
+    but it is not silent: the payment might be a late one on a cancelled order, so it raises the money_alert line."""
+    from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+    if not checkout_cancel_upstream_enabled():
+        return None
+    try:
+        from db.orders import get_order
+
+        current = await get_order(order_id)
+    except Exception as exc:
+        _emit_late_payment_check_failed(order_id, reason="order_read_failed", error_type=type(exc).__name__, **kwargs)
+        return None
+    if not current:
+        _emit_late_payment_check_failed(order_id, reason="order_missing", error_type=None, **kwargs)
+        return None
+    return await _late_payment_after_cancel(current, **kwargs)
+
+
 async def finalize_payment_success(
     order: Dict[str, Any],
     *,
@@ -226,6 +312,16 @@ async def finalize_payment_success(
     if not order:
         return {"applied": False, "reason": "order_missing"}
     if _is_terminal_paid_state(order) or _blocks_payment_success_recovery(order):
+        late = await _late_payment_after_cancel(
+            order,
+            psp=psp,
+            payment_reference=transaction_id or payment_reference,
+            amount_minor=amount_minor,
+            currency=currency,
+            source_event=source_event,
+        )
+        if late is not None:
+            return late
         return {"applied": False, "reason": "already_settled", "order_id": order.get("order_id")}
 
     order_id = str(order.get("order_id") or "")
@@ -266,6 +362,17 @@ async def finalize_payment_success(
     # unfulfilled order is handled by the reconcile sweep, not by re-finalizing.
     transitioned = bool(await mark_order_paid_fn(order_id))
     if not transitioned:
+        # A cancel can win this race too (services/checkout_cancel_upstream.py): then this payment is a late one.
+        late = await _late_payment_after_concurrent_cancel(
+            order_id,
+            psp=psp,
+            payment_reference=resolved_payment_reference,
+            amount_minor=amount_minor,
+            currency=currency,
+            source_event=source_event,
+        )
+        if late is not None:
+            return late
         # Someone else won the paid transition between our in-memory guard above
         # and this atomic update. Treat as already-settled, suppress duplicate
         # side effects.

@@ -67,7 +67,7 @@ def test_product_copy_and_scripts_are_never_read():
 def test_a_region_spans_its_nested_children_and_survives_unclosed_tags():
     html = '<div class="announcement-bar"><ul><li>Free shipping<li><b>enter code <i>SAVE15</i></b> today</ul></div><p>after</p>'
     assert set(_codes(html)) == {"SAVE15"}
-    assert dcc.promo_regions(html) == ["Free shipping enter code SAVE15 today"]
+    assert dcc.promo_regions(html) == ["Free shipping\nenter code SAVE15 today"]
 
 
 def test_region_text_is_bounded():
@@ -439,7 +439,7 @@ def test_shape_and_form_are_reported_so_shade_like_codes_stay_visible():
 
 def test_a_code_split_by_inline_tags_is_joined_and_block_tags_still_separate_words():
     assert set(_codes('<div class="announcement-bar">Use code <strong>SAVE</strong>10</div>')) == {"SAVE10"}
-    assert dcc.promo_regions('<div class="announcement-bar"><p>Free</p><p>shipping</p></div>') == ["Free shipping"]
+    assert dcc.promo_regions('<div class="announcement-bar"><p>Free</p><p>shipping</p></div>') == ["Free\nshipping"]
 
 
 def test_one_hundred_percent_off_is_read_whole():
@@ -696,7 +696,7 @@ def test_a_fallback_region_reads_all_of_its_text_when_a_modifier_slide_sits_insi
         '<body><div class="announcement-bar-container"><div class="announcement-bar--a">Use code ONE10</div>'
         '<div class="rte">Use code TWO10</div></div></body>'
     )
-    assert dcc.promo_regions(html) == ["Use code ONE10 Use code TWO10"]
+    assert dcc.promo_regions(html) == ["Use code ONE10\nUse code TWO10"]
 
 
 def test_block_tags_separate_words_in_a_fallback_region():
@@ -1229,3 +1229,58 @@ def test_the_bare_form_reads_a_code_only_with_a_promo_word_on_either_side():
 def test_a_minimum_spend_keeps_its_own_currency_symbol():
     got = _codes('<body><div class="announcement-bar">20% off orders over £50 with code SAVE20</div></body>')
     assert (got["SAVE20"].min_subtotal, got["SAVE20"].min_subtotal_symbol) == ("50", "£")
+
+
+
+# ---- block boundaries (review of be#2735, P3-N5) ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("html", [
+    '<div class="announcement-bar"><div>20% OFF USE CODE</div><div>48HOURS ONLY</div></div>',
+    '<div class="announcement-bar"><p>Take 15% off with code</p><p>SPRING SALE NOW</p></div>',
+    '<div class="announcement-bar"><li>Promo code:</li><li>SAVE20 EXCLUDED ITEMS</li></div>',
+])
+def test_a_code_phrase_never_reaches_into_the_next_block(html):
+    assert _codes(html) == {}
+
+
+def test_a_line_break_inside_the_phrase_words_still_reads_the_code():
+    assert set(_codes('<div class="announcement-bar">Use promo<br>code SAVE15 for 15% off</div>')) == {"SAVE15"}
+
+
+# ---- void and form tags inside one line of a bar (review of be#2735 delta 3, P3-R2) -------------------------------
+
+
+@pytest.mark.parametrize("html", [
+    '<div class="announcement-bar">Promo code:<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code<br/>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <button>SAVE15</button> for 15% off</div>',
+    '<div class="announcement-bar">Use code <label>SAVE15</label> for 15% off</div>',
+    '<div class="announcement-bar">Use code <wbr>SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <input type="hidden" value="x"> SAVE15 for 15% off</div>',
+    '<div class="announcement-bar">Use code <select><option>SAVE15</option></select> for 15% off</div>',
+])
+def test_a_void_or_form_tag_between_the_phrase_and_the_code_still_reads(html):
+    assert set(_codes(html)) == {"SAVE15"}
+
+
+def test_a_copy_code_button_inside_a_marquee_item_still_reads_and_items_stay_apart():
+    html = ('<div class="announcement-bar"><div>20% OFF USE CODE</div><div>48HOURS ONLY</div>'
+            '<div>Use code <button>SAVE15</button> for 15% off</div></div>')
+    assert set(_codes(html)) == {"SAVE15"}
+
+
+@pytest.mark.parametrize("separator", ['<img src="dot.svg">', '<svg><circle r="1"/></svg>',
+                                       '<picture><source srcset="a.webp"><img src="a.png"></picture>',
+                                       '<picture><source srcset="a.webp"></picture>'])
+def test_an_icon_between_inline_marquee_items_keeps_them_apart(separator):
+    """Review of be#2742, P3-2: images are the separators between inline marquee items, so they stay a boundary."""
+    html = (f'<div class="announcement-bar"><span>FREE SHIPPING OVER $50 USE CODE</span>{separator}'
+            '<span>SS24 COLLECTION 15% OFF</span></div>')
+    assert _codes(html) == {}
+
+
+def test_a_line_break_in_a_fallback_region_still_reads_the_code():
+    assert set(_codes('<body><div class="promo-bar-wrap">Promo code:<br>SAVE15 for 15% off</div></body>')) == {"SAVE15"}
+

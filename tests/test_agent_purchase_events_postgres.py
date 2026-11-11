@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,27 @@ async def _db():
             pass
         if not was_connected and database.is_connected:
             await database.disconnect()
+
+
+@pytest.fixture(autouse=True)
+def heal_clock(monkeypatch):
+    """A clock the test moves, and an empty heal retry memory (it is per process)."""
+    import db.agent_purchase_ledger as purchases
+
+    now = [1000.0]
+    monkeypatch.setattr(purchases, "_clock", lambda: now[0])
+    monkeypatch.setattr(purchases, "_heal_deferred_until", {})
+    return now
+
+
+async def _a2a_child(agent_id: str, n: int) -> str:
+    import db.a2a_rail_ledger as a2a_ledger
+
+    return (await a2a_ledger.create_purchase(
+        agent_id=agent_id, agent_user_ref_hash="r" * 64, merchant_domain="brand.example",
+        checkout_url=f"https://brand.example/cart/{n}:1?attributes[pivota_click_id]=c{n}",
+        currency="USD", our_price_minor=4650, consent_version="v1",
+    ))["id"]
 
 
 async def _fingerprint():
@@ -188,6 +210,8 @@ async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
     orphan = await purchase("completed", parent=False)
     old_born = await purchase("completed", ", created_at = now() - interval '30 hours'", parent=False)
     settled = await purchase("completed", ", state_entered_at = now() - interval '3 days'", parent=False)
+    inside = await purchase("completed", ", state_entered_at = now() - interval '23 hours'", parent=False)
+    outside = await purchase("completed", ", state_entered_at = now() - interval '25 hours'", parent=False)
     # Only this test's rows are judged: the dialect gate shares one database across test files.
     got = {row["id"] for row in await events_db.a2a_candidates(lookback_hours=24, limit=1000)}
     assert got & set(made) == {live, fresh}
@@ -199,9 +223,98 @@ async def test_the_a2a_candidate_read_and_the_parent_heal_plan_and_behave():
     assert healed["id"] in got
     # The heal is bounded by the detector's clock (state_entered_at), not by created_at.
     parents = {row["rail_purchase_id"] for row in await database.fetch_all(
+        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b, :c, :d)",
+        {"a": old_born, "b": settled, "c": inside, "d": outside})}
+    assert parents == {old_born, inside}  # the window is the lookback exactly
+
+
+async def test_a_database_error_on_one_heal_row_does_not_abort_the_rest(monkeypatch):
+    """A real Postgres error, not a Python raise: the heal runs outside any transaction (the job, the
+    scheduler and detect open none), so each statement commits on its own and a failed one does not
+    leave the connection in an aborted transaction for the rows after it."""
+    from db.database import database
+    import db.a2a_rail_ledger as a2a_ledger
+    import db.agent_purchase_ledger as purchases
+
+    async def child(n):
+        ap = (await a2a_ledger.create_purchase(
+            agent_id="agent_pg_heal_rows", agent_user_ref_hash="r" * 64, merchant_domain="brand.example",
+            checkout_url=f"https://brand.example/cart/{n}:1?attributes[pivota_click_id]=c{n}",
+            currency="USD", our_price_minor=4650, consent_version="v1",
+        ))["id"]
+        return ap
+
+    bad, good = await child(1), await child(2)
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = now() - interval '2 hours' WHERE id = :i",
+                           {"i": bad})  # oldest first: the bad row is healed first
+    real = purchases.ensure_a2a_parent
+
+    async def failing_in_the_database(rail_purchase_id, **kw):
+        if rail_purchase_id == bad:
+            await database.execute("SELECT 1 / 0")  # division_by_zero, raised by the server
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", failing_in_the_database)
+    assert await purchases.backfill_a2a_parents(limit=5000, lookback_hours=24) >= 1
+    rows = await database.fetch_all(
         "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
-        {"a": old_born, "b": settled})}
-    assert parents == {old_born}
+        {"a": bad, "b": good})
+    assert {r["rail_purchase_id"] for r in rows} == {good}
+    assert await database.fetch_val("SELECT 1") == 1  # the connection is usable afterwards
+
+
+async def test_the_heal_takes_the_purchase_that_entered_its_state_first():
+    """The Postgres statement's own ORDER BY (the SQLite one is a separate literal). The two rows sit
+    near the far edge of a 30-day window, so another test file's leftover parentless rows (the dialect
+    gate shares one database) are newer and cannot take the single slot."""
+    from db.database import database
+    import db.agent_purchase_ledger as purchases
+
+    born_first, entered_first = await _a2a_child("agent_pg_heal_order", 1), await _a2a_child("agent_pg_heal_order", 2)
+    for ap, created, entered in ((born_first, 710, 690), (entered_first, 705, 700)):
+        await database.execute(
+            "UPDATE a2a_rail_purchases SET created_at = now() - (:c * interval '1 hour'), "
+            "state_entered_at = now() - (:e * interval '1 hour') WHERE id = :i",
+            {"c": created, "e": entered, "i": ap})
+    try:
+        assert await purchases.backfill_a2a_parents(limit=1, lookback_hours=24 * 30) == 1
+        rows = await database.fetch_all(
+            "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
+            {"a": born_first, "b": entered_first})
+        assert [r["rail_purchase_id"] for r in rows] == [entered_first]
+    finally:
+        # Leave no parentless row behind: on a reused database it would age past the next run's rows
+        # and take the single slot.
+        for ap in (born_first, entered_first):
+            await purchases.ensure_a2a_parent(ap)
+
+
+async def test_inside_a_callers_transaction_a_database_error_on_one_row_rolls_back_only_that_row(monkeypatch):
+    """Without a SAVEPOINT per row, the failed statement aborts the caller's transaction: every later row
+    fails with InFailedSQLTransaction, and the caller's COMMIT silently rolls back."""
+    from db.database import database
+    import db.agent_purchase_ledger as purchases
+
+    bad, good = await _a2a_child("agent_pg_heal_txn", 1), await _a2a_child("agent_pg_heal_txn", 2)
+    await database.execute("UPDATE a2a_rail_purchases SET state_entered_at = now() - interval '2 hours' WHERE id = :i",
+                           {"i": bad})  # oldest first: the bad row is healed first
+    real = purchases.ensure_a2a_parent
+
+    async def failing_in_the_database(rail_purchase_id, **kw):
+        if rail_purchase_id == bad:
+            await database.execute("SELECT 1 / 0")
+        return await real(rail_purchase_id, **kw)
+
+    monkeypatch.setattr(purchases, "ensure_a2a_parent", failing_in_the_database)
+    tally = Counter()
+    async with database.transaction():
+        assert await purchases.backfill_a2a_parents(limit=5000, lookback_hours=24, tally=tally) >= 1
+        assert await database.fetch_val("SELECT 1") == 1  # the caller's transaction is still usable
+    assert tally["failed"] == 1
+    rows = await database.fetch_all(
+        "SELECT rail_purchase_id FROM agent_purchases WHERE rail = 'a2a' AND rail_purchase_id IN (:a, :b)",
+        {"a": bad, "b": good})
+    assert {r["rail_purchase_id"] for r in rows} == {good}  # committed with the caller's transaction
 
 
 async def test_a_no_action_skip_is_rechecked_and_upgraded_in_place_and_others_are_final():

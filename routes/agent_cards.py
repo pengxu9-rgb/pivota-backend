@@ -41,8 +41,16 @@ from services.agent_card_issuance import (
 )
 from services.card_issuers import CardIssuerError, IssueRequest, resolve_issuer
 from utils.logger import logger
+from utils.runtime_safety import refuse_in_production
 
-router = APIRouter(prefix="/agent/v1", tags=["agent-cards"])
+# REFUSED IN PRODUCTION, whatever AGENT_CARD_ISSUANCE_ENABLED / CARD_ISSUER say: Pivota-issued cards
+# are out of policy (Pivota never holds money), so in production every route here answers 404 before
+# auth, body validation or any issuer call. Staging and local are unchanged. Unmounting is a later PR.
+router = APIRouter(
+    prefix="/agent/v1",
+    tags=["agent-cards"],
+    dependencies=[Depends(refuse_in_production("agent_card_issuance"))],
+)
 
 
 class CardIssueRequest(BaseModel):

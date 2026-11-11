@@ -30,6 +30,7 @@ from db.auth_identity import upsert_membership
 from db.database import database
 from readiness.summary import build_readiness_summary
 from utils.auth import ADMIN_ROLES, EMPLOYEE_STAFF_ROLES, get_current_employee, get_current_user, require_admin
+from utils.tenant_scope import assert_merchant_scope, is_scope_staff
 from routes.manage_integrations import sync_legacy_primary_store_fields
 from urllib.parse import urlparse
 from utils.logger import logger as pivota_logger
@@ -227,6 +228,40 @@ async def get_user_auth_binding(contact_email: str) -> Optional[Dict[str, Any]]:
     return dict(record) if record else None
 
 
+async def refuse_signup_at_claimed_address(
+    contact_email: str,
+    *,
+    also_check_users_and_merchant_contacts: bool = False,
+) -> None:
+    """409 MERCHANT_SIGNIN_REQUIRED when a sign-up with no users row would take an address in use.
+
+    A public sign-up does not prove the mailbox, yet it creates the users row (and
+    sets the identity's password) at this address. If the address already names an
+    employee (any status), an agent owner, or an identity with a live merchant,
+    agent or employee membership, that row would let the caller sign in as that
+    principal (login used to promote a users row to staff at an employee's
+    address). Merchant onboarding has already checked the users table and the
+    merchant contacts; a caller that has not passes
+    `also_check_users_and_merchant_contacts=True`. The owner signs in, or resets
+    the password from the portal, which emails that mailbox.
+    """
+    from routes.auth import _email_claims_existing_tenant
+
+    if await _email_claims_existing_tenant(
+        normalize_contact_email(contact_email),
+        check_users_and_merchant_contacts=also_check_users_and_merchant_contacts,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=build_identity_conflict_detail(
+                code="MERCHANT_SIGNIN_REQUIRED",
+                message="Email already registered. Sign in or reset password to continue.",
+                current_role=None,
+                resolution="sign_in_or_reset_password",
+            ),
+        )
+
+
 async def sync_merchant_auth_membership(
     *,
     contact_email: str,
@@ -317,16 +352,38 @@ async def sync_merchant_auth_user(
         credential_source="merchant_sync",
     )
 
-async def keep_converted_agent_memberships(email: str) -> List[str]:
-    """Keep agent-portal access for an agent account converted into a merchant.
+# A membership written this long before its users row still counts as that row's
+# (users.created_at is the database clock, membership timestamps the app's).
+_CONVERSION_MEMBERSHIP_CLOCK_SKEW = timedelta(seconds=60)
 
-    The conversion (resolve_public_merchant_identity_merge) verifies the agent's own
-    password, then sync_merchant_auth_user rewrites users.role to 'merchant' -- and
-    users holds one role per email, so the owner could no longer sign in to the
-    developer portal ("This login is for agents only"). The owner proved the agent is
-    theirs, so record that as an active agent membership per owned agent; agent login
-    admits a non-agent role only through a membership bound to that exact agent.
+
+async def keep_converted_agent_memberships(email: str) -> List[str]:
+    """Keep the agent-portal access an agent account converted into a merchant HAD.
+
+    The conversion (resolve_public_merchant_identity_merge) verifies the agent account's
+    own password, then sync_merchant_auth_user rewrites users.role to 'merchant' --
+    users holds one role per email, and agent login admits a non-agent role only
+    through an agent membership bound to that exact agent.
+
+    It used to WRITE an agent membership for every agent whose owner_email is this
+    address. That password proves only that the caller owns the users row, and
+    /api/auth/register creates that row with no mailbox proof: register an address
+    before staff create an agent for it, convert, and the agent was yours. Now only
+    the links this account already held are kept (re-affirmed): an active agent
+    membership for that agent, written after this users row existed -- which only the
+    agent's own registration, a password reset (mailbox proof) or an earlier linked
+    login writes. An owner_email match alone links nothing.
     """
+    from db.auth_identity import has_active_membership_for_entity
+
+    user = await database.fetch_one(
+        "SELECT created_at FROM users WHERE LOWER(email) = LOWER(:email) LIMIT 1",
+        {"email": email},
+    )
+    created_at = dict(user).get("created_at") if user else None
+    if not isinstance(created_at, datetime):
+        # Without the row's age no membership can be shown to be this account's.
+        return []
     rows = await database.fetch_all(
         "SELECT agent_id, agent_name FROM agents WHERE LOWER(owner_email) = LOWER(:email)",
         {"email": email},
@@ -334,16 +391,26 @@ async def keep_converted_agent_memberships(email: str) -> List[str]:
     kept: List[str] = []
     for row in rows:
         agent = dict(row)
+        agent_id = str(agent.get("agent_id") or "")
+        if not agent_id:
+            continue
+        if not await has_active_membership_for_entity(
+            email=email,
+            membership_type="agent",
+            entity_id=agent_id,
+            not_before=created_at - _CONVERSION_MEMBERSHIP_CLOCK_SKEW,
+        ):
+            continue
         await upsert_membership(
             email=email,
             membership_type="agent",
             role="agent",
-            entity_id=str(agent["agent_id"]),
+            entity_id=agent_id,
             status="active",
             full_name=agent.get("agent_name"),
             source="merchant_conversion_keeps_agent",
         )
-        kept.append(str(agent["agent_id"]))
+        kept.append(agent_id)
     return kept
 
 
@@ -366,6 +433,26 @@ async def resolve_public_merchant_identity_merge(
 
     normalized_role = normalize_account_role(existing_user.get("role"))
     if normalized_role in {None, "merchant"}:
+        # Signup rewrites this row's password (sync_merchant_auth_user), so reusing
+        # it is a sign-in: without the current password anyone who knows the
+        # contact email (and the public store URL) would set a new password on
+        # someone else's merchant account.
+        if existing_user.get("password_hash"):
+            from utils.auth import verify_password
+
+            if not entered_password or not verify_password(
+                entered_password,
+                str(existing_user.get("password_hash") or ""),
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=build_identity_conflict_detail(
+                        code="MERCHANT_SIGNIN_REQUIRED",
+                        message="Email already registered. Sign in or reset password to continue.",
+                        current_role=normalized_role,
+                        resolution="sign_in_or_reset_password",
+                    ),
+                )
         return existing_user, None
 
     merchant_id = (
@@ -583,6 +670,24 @@ async def register_merchant(
             existing_onboarding=existing_onboarding,
             entered_password=merchant_data.password,
         )
+
+        if reuse_existing_onboarding and not existing_user:
+            # An onboarding row with this contact email but no login (staff
+            # onboarded it, or an earlier signup failed after the insert). Signup
+            # does not prove the mailbox, so it must not mint the login for it: the
+            # merchant-portal password reset does, and emails that mailbox.
+            raise HTTPException(
+                status_code=409,
+                detail=build_identity_conflict_detail(
+                    code="MERCHANT_SIGNIN_REQUIRED",
+                    message="Email already registered. Sign in or reset password to continue.",
+                    current_role=None,
+                    resolution="sign_in_or_reset_password",
+                ),
+            )
+
+        if not existing_user:
+            await refuse_signup_at_claimed_address(normalized_email)
 
         if existing_user and existing_user.get("merchant_id") and not reuse_existing_onboarding:
             linked_onboarding = await get_merchant_onboarding(existing_user["merchant_id"])
@@ -871,10 +976,17 @@ async def register_merchant(
         )
 
 @router.post("/kyc/upload", response_model=Dict[str, Any])
-async def upload_kyc(kyc_data: KYCUploadRequest):
+async def upload_kyc(
+    kyc_data: KYCUploadRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Step 2: Upload KYC documents (simulated as JSON blob)
+
+    The merchant itself or staff. Was anonymous: anyone could overwrite any
+    merchant's KYB document record.
     """
+    assert_merchant_scope(current_user, kyc_data.merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(kyc_data.merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1029,10 +1141,14 @@ async def setup_psp(
     }
 
 @router.get("/status/{merchant_id}", response_model=Dict[str, Any])
-async def get_onboarding_status(merchant_id: str):
+async def get_onboarding_status(
+    merchant_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """
-    Get merchant onboarding status (KYC + PSP setup)
+    Get merchant onboarding status (KYC + PSP setup). The merchant itself or staff.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     
     if not merchant:
@@ -1054,11 +1170,13 @@ async def get_onboarding_status(merchant_id: str):
 @router.get("/details/{merchant_id}", response_model=Dict[str, Any])
 async def get_onboarding_details(
     merchant_id: str,
-    current_user: dict = Depends(get_current_user)  # Allow all authenticated users
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Get full onboarding merchant details including KYB documents, stores, and PSPs
+    Get full onboarding merchant details including KYB documents, stores, and PSPs.
+    The merchant itself or staff (contact email, phone, KYB documents, PSPs).
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1260,11 +1378,15 @@ async def admin_repair_primary_store(
 async def list_all_onboardings(
     status: Optional[str] = None,
     include_deleted: bool = False,
-    current_user: dict = Depends(get_current_user)  # Allow authenticated users (employee/admin/agent)
+    current_user: dict = Depends(get_current_user)
 ):
     """
-    Admin: List all merchant onboardings (filtered by status if provided)
+    Staff: List all merchant onboardings (filtered by status if provided).
+    Was open to any token, including self-registered merchants and agents --
+    the whole merchant roster with contact emails.
     """
+    if not is_scope_staff(current_user, EMPLOYEE_STAFF_ROLES):
+        raise HTTPException(status_code=403, detail="Staff access required")
     try:
         merchants = await get_all_merchant_onboardings(status, include_deleted=include_deleted)
 
@@ -1522,12 +1644,15 @@ async def delete_onboarding_merchant_alias(
 async def upload_kyc_file(
     merchant_id: str,
     document_type: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Upload a KYB document for onboarding merchant (Phase 2) via multipart form.
     We only store metadata for now (no real file storage).
+    The merchant itself or staff; was anonymous.
     """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
@@ -1560,9 +1685,15 @@ async def upload_kyc_file(
 async def upload_kyc_files(
     merchant_id: str,
     files: list[UploadFile] = File(...),
-    document_type: str = Form("other")
+    document_type: str = Form("other"),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Multipart 多文件上传（商户门户使用，无需鉴权）。上传到 R2 并存元数据。"""
+    """Multipart multi-file KYB upload (metadata only for now).
+
+    The merchant itself or staff. Was unauthenticated: anyone could attach
+    documents to any merchant's KYB file.
+    """
+    assert_merchant_scope(current_user, merchant_id, staff_roles=EMPLOYEE_STAFF_ROLES)
     merchant = await get_merchant_onboarding(merchant_id)
     if not merchant:
         raise HTTPException(status_code=404, detail="Merchant not found")
