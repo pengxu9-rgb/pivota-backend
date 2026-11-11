@@ -14,7 +14,18 @@ file's filters.
 SQLite only in CI. Its guard would let it run on a Postgres DATABASE_URL (a throwaway database, name
 containing "test" and ending "dialect_check"), but the dialect gate's database is named otherwise:
 the production-dialect twin is tests/test_freshness_directory_check_postgres.py.
-It DROPS the tables it seeds, so the population is exactly the rows written here.
+THE DATABASE IS SHARED. The sweep runs every file of a shard in one process against one SQLite
+file, and other files read tables the app's startup made. So the fixture drops only a table it
+created itself, and leaves every other one as it found it:
+
+  * merchant_stores, merchant_onboarding and products_cache are the application's. They are made
+    only if absent (the two with a model from the model), are never emptied, and nothing here
+    writes a row to them. The hosts below are this file's own, so a row another file left in them
+    names none of them.
+  * the tables this feature's own modules write (the card fact, the Tier B verdict, the variant
+    allowlist, the quarantine list, the scan cache) are made by their own builders when absent. One
+    that was already there keeps its definition: its rows are set aside for the test and put back
+    after it, so the population is still exactly the rows written here.
 The scheduler registration cases need no database and live in
 tests/test_freshness_directory_registration.py.
 
@@ -46,13 +57,14 @@ from services.shopify_cart_link_preflight import PreflightResult, Verdict  # noq
 from test_reap_rail_alerts import matches, worker_log  # noqa: E402
 
 DEFS = os.path.join(os.path.dirname(__file__), "..", "infra", "gcp", "monitoring", "money_path_alerts.json")
-FRESH = "shop-a.example"
-STALE = "shop-b.example"
-MISSING = "shop-c.example"
-WARM = "shop-w.example"
-_TABLES = ("merchant_purchasability", "tierb_cart_link_eligibility", "reap_agentic_eligibility",
-           "merchant_stores", "merchant_onboarding", "catalog_source_quarantine", "products_cache",
-           mint_scans.TABLE)
+FRESH = "fresh-dir-a.example"
+STALE = "fresh-dir-b.example"
+MISSING = "fresh-dir-c.example"
+WARM = "fresh-dir-w.example"
+#: The tables this feature's own modules write. One that is already there is emptied for the test
+#: and its rows put back afterwards; it is dropped only if this fixture created it.
+_OWN_TABLES = ("merchant_purchasability", "tierb_cart_link_eligibility", "reap_agentic_eligibility",
+               "catalog_source_quarantine", mint_scans.TABLE)
 _ENVS = (fresh.DIRECTORY_FLAG_ENV, "MERCHANT_PURCHASABILITY_TTL_HOURS", "MERCHANT_PURCHASABILITY_BUYER_VANTAGE",
          directory.EXCLUDED_DOMAINS_ENV, "PIVOTA_TEST_MERCHANT_IDS", "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN",
          "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS",
@@ -107,7 +119,33 @@ def _assert_throwaway() -> None:
         return
     name = (os.getenv("DATABASE_URL") or "").rsplit("/", 1)[-1].split("?")[0]
     if "test" not in name or not name.endswith("dialect_check"):
-        pytest.fail(f"refusing to drop tables in {name!r}: throwaway only (name contains test, ends dialect_check)")
+        pytest.fail(f"refusing to empty tables in {name!r}: throwaway only (name contains test, ends dialect_check)")
+
+
+async def _table_names() -> set:
+    if IS_SQLITE:
+        rows = await database.fetch_all(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+    else:
+        rows = await database.fetch_all(
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema()")
+    return {r["name"] for r in rows}
+
+
+async def _set_aside(table: str) -> list:
+    """Every row of a table that was already there, taken out for the test (see `_put_back`)."""
+    rows = [dict(r) for r in await database.fetch_all(f"SELECT * FROM {table}")]
+    await database.execute(f"DELETE FROM {table}")
+    return rows
+
+
+async def _put_back(table: str, rows: list) -> None:
+    """The table as it was found: this test's rows out, the rows that were set aside back in."""
+    await database.execute(f"DELETE FROM {table}")
+    for row in rows:
+        names = list(row)
+        await database.execute(
+            f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join(':' + n for n in names)})", row)
 
 
 @pytest.fixture
@@ -115,7 +153,7 @@ def tierb_job(monkeypatch, tmp_path):
     """The Tier B job's merchant list, read by its own loader from a file in place of the repo's.
     Always holds one placeholder row: the loader refuses an empty list."""
     def write(*hosts):
-        rows = [{"domain": "shop-z.example", "market": "US"}] + [{"domain": h, "market": "US"} for h in hosts]
+        rows = [{"domain": "fresh-dir-z.example", "market": "US"}] + [{"domain": h, "market": "US"} for h in hosts]
         path = tmp_path / "tierb_merchants.json"
         path.write_text(json.dumps(rows), encoding="utf-8")
         monkeypatch.setattr(tierb_cart_link_merchants, "DEFAULT_MERCHANTS_PATH", path)
@@ -130,6 +168,7 @@ async def _db(monkeypatch, tierb_job):
     from db.database import metadata
     from db.merchant_onboarding import merchant_onboarding
     from db.products import products_cache
+    from db.schema_guard import ensure_required_schema_light
     from db.tierb_cart_link_eligibility_schema import ensure_schema as tierb_schema
     from services import source_quarantine, test_merchant_policy
 
@@ -141,29 +180,19 @@ async def _db(monkeypatch, tierb_job):
     mint_scans._reset_for_tests()
     if not database.is_connected:
         await database.connect()
-    for table in _TABLES:
-        await database.execute(f"DROP TABLE IF EXISTS {table}" + (" CASCADE" if IS_POSTGRES else ""))
+    found = await _table_names()
+    if not {"merchant_purchasability", "reap_agentic_eligibility"} <= found:
+        await ensure_required_schema_light()  # the production DDL, as the app's startup runs it
+    await tierb_schema()
+    assert await mint_scans.ensure_table()
+    # No module builds these two outside a migration or the app's startup: made only if absent.
     await database.execute(
-        "CREATE TABLE merchant_purchasability ("
-        "merchant_domain VARCHAR(255) NOT NULL, market_country VARCHAR(2) NOT NULL, "
-        "vantage VARCHAR(32) NOT NULL, checked_at TIMESTAMPTZ, verdict VARCHAR(32), "
-        "card_available BOOLEAN, payment_methods TEXT, landed_price_minor BIGINT, "
-        "landed_currency VARCHAR(8), expected_price_minor BIGINT, price_drift_minor BIGINT, "
-        "variant_id VARCHAR(32), evidence TEXT, consecutive_failures INTEGER NOT NULL DEFAULT 0, "
-        "positive_until TIMESTAMPTZ, PRIMARY KEY (merchant_domain, market_country, vantage))")
-    await database.execute(
-        "CREATE TABLE reap_agentic_eligibility ("
-        "merchant_domain VARCHAR(255) NOT NULL, product_key TEXT NOT NULL DEFAULT '', "
-        "variant_key TEXT NOT NULL DEFAULT '', market_country VARCHAR(2) NOT NULL, "
-        "enabled BOOLEAN NOT NULL DEFAULT FALSE, accept_variant_labels TEXT, also_accept_domains TEXT, "
-        "PRIMARY KEY (merchant_domain, market_country, product_key, variant_key))")
-    await database.execute(
-        "CREATE TABLE merchant_stores ("
+        "CREATE TABLE IF NOT EXISTS merchant_stores ("
         "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50) NOT NULL, platform VARCHAR(50) NOT NULL, "
         "name VARCHAR(255) NOT NULL, domain VARCHAR(255), api_key TEXT, status VARCHAR(50) DEFAULT 'connected', "
         "connected_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP)")
     await database.execute(
-        "CREATE TABLE catalog_source_quarantine ("
+        "CREATE TABLE IF NOT EXISTS catalog_source_quarantine ("
         + ("quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT, " if IS_SQLITE else "quarantine_id BIGSERIAL PRIMARY KEY, ")
         + "match_type TEXT NOT NULL, match_value TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'active', "
         "reason TEXT, expires_at TIMESTAMPTZ, created_by TEXT NOT NULL, "
@@ -172,23 +201,26 @@ async def _db(monkeypatch, tierb_job):
     engine = sqlalchemy.create_engine(_sync_url())
     metadata.create_all(engine, tables=[merchant_onboarding, products_cache], checkfirst=True)
     engine.dispose()
-    await tierb_schema()
-    assert await mint_scans.ensure_table()
-    await _scan(at=datetime.now(timezone.utc) - timedelta(minutes=5))  # a complete, empty scan
-    if IS_SQLITE:
-        # The production reader filters on Postgres `now()`; the Postgres arm runs the real one.
-        async def _sqlite_quarantines(*, db):
-            rows = await db.fetch_all(
-                f"SELECT {source_quarantine.QUARANTINE_COLUMNS} FROM catalog_source_quarantine WHERE state = 'active'")
-            return [source_quarantine._quarantine_from_row(dict(r)) for r in rows]
-
-        monkeypatch.setattr(source_quarantine, "load_active_quarantines", _sqlite_quarantines)
+    created = await _table_names() - found
+    aside = {table: await _set_aside(table) for table in _OWN_TABLES if table in found}
     try:
+        await _scan(at=datetime.now(timezone.utc) - timedelta(minutes=5))  # a complete, empty scan
+        if IS_SQLITE:
+            # The production reader filters on Postgres `now()`; the Postgres arm runs the real one.
+            async def _sqlite_quarantines(*, db):
+                rows = await db.fetch_all(
+                    f"SELECT {source_quarantine.QUARANTINE_COLUMNS} FROM catalog_source_quarantine "
+                    "WHERE state = 'active'")
+                return [source_quarantine._quarantine_from_row(dict(r)) for r in rows]
+
+            monkeypatch.setattr(source_quarantine, "load_active_quarantines", _sqlite_quarantines)
         yield
     finally:
         directory.reset_cache()
         mint_scans._reset_for_tests()
-        for table in _TABLES:
+        for table, rows in aside.items():
+            await _put_back(table, rows)
+        for table in sorted(created):
             await database.execute(f"DROP TABLE IF EXISTS {table}" + (" CASCADE" if IS_POSTGRES else ""))
         if IS_POSTGRES:
             await database.disconnect()
@@ -309,7 +341,7 @@ async def test_the_population_is_the_directorys_after_its_exclusions(monkeypatch
     """A development store, an operator-excluded domain and a disabled merchant are not listed, so
     their stale facts are not this check's, though all three are in the sweep's population."""
     monkeypatch.setenv(fresh.DIRECTORY_FLAG_ENV, "1")
-    dev, excluded, disabled = "shop-d.myshopify.com", "shop-e.example", "shop-f.example"
+    dev, excluded, disabled = "fresh-dir-d.myshopify.com", "fresh-dir-e.example", "fresh-dir-f.example"
     monkeypatch.setenv(directory.EXCLUDED_DOMAINS_ENV, excluded)
     await _variant_lane(FRESH, dev, excluded)
     await _scan(cart=(disabled,))
@@ -681,11 +713,16 @@ async def test_the_check_never_scans_the_seed_table_or_writes_the_scan_cache(mon
     _summary(lines)
 
     # With the scan table GONE the check does not create it: the lane is unreadable, and stays so.
-    await database.execute(f"DROP TABLE {mint_scans.TABLE}")
-    summary, lines = await _tick()
-    assert _assert_unavailable(lines, "population_unreadable")["population_unreadable"] == 1
-    with pytest.raises(Exception):
-        await database.fetch_all(f"SELECT 1 FROM {mint_scans.TABLE} WHERE 1 = 0")
+    # (Gone by name: renamed away and back, so a table the app's startup made is the same table after.)
+    away = f"{mint_scans.TABLE}_away"
+    await database.execute(f"ALTER TABLE {mint_scans.TABLE} RENAME TO {away}")
+    try:
+        summary, lines = await _tick()
+        assert _assert_unavailable(lines, "population_unreadable")["population_unreadable"] == 1
+        with pytest.raises(Exception):
+            await database.fetch_all(f"SELECT 1 FROM {mint_scans.TABLE} WHERE 1 = 0")
+    finally:
+        await database.execute(f"ALTER TABLE {away} RENAME TO {mint_scans.TABLE}")
 
 
 # ── NP2-1: a degraded directory build is not a heartbeat ─────────────────────────────────────
