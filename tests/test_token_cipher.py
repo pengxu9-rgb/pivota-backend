@@ -116,7 +116,9 @@ def test_malformed_envelopes_are_refused(ring, bad):
         pytest.param("nokid", "must be '<kid>:<base64url key>'", id="no-separator"),
         pytest.param("bad kid!:AAAA", "must be '<kid>:<base64url key>'", id="bad-kid"),
         pytest.param(
-            "k1:" + base64.urlsafe_b64encode(b"\x01" * 16).decode(), "must decode to 32 bytes", id="short-key"
+            "k1:" + base64.urlsafe_b64encode(b"\x01" * 16).rstrip(b"=").decode(),
+            "must decode to 32 bytes",
+            id="short-key",
         ),
         pytest.param("k1:@@@@", "is not base64url", id="not-base64url"),
         pytest.param(
@@ -152,9 +154,11 @@ def test_no_secret_material_in_errors_or_repr(ring):
     with pytest.raises(TokenCipherError) as excinfo:
         cipher.decrypt(sealed, aad="elsewhere")
 
+    key_bytes = base64.urlsafe_b64decode(key_text + "=" * (-len(key_text) % 4))
     for text in (str(excinfo.value), repr(cipher)):
         assert PLAINTEXT not in text
         assert key_text not in text
+        assert repr(key_bytes) not in text  # a default repr would print the key as a bytes literal
         assert sealed.split(".")[2] not in text
 
 
@@ -190,3 +194,99 @@ def test_a_trailing_newline_is_not_base64url_and_not_a_kid(ring):
 def test_direct_construction_meets_the_same_rules(ring_tuple):
     with pytest.raises(TokenCipherConfigError):
         TokenCipher(ring_tuple)
+
+
+# --- review follow-ups (be#2710 P3-1, P3-2, P3-4) ----------------------------
+
+
+def _sealed_parts(ring):
+    cipher = TokenCipher.from_key_ring(ring)
+    prefix, kid, body = cipher.encrypt(PLAINTEXT, aad=AAD).split(".")
+    return cipher, prefix, kid, body
+
+
+@pytest.mark.parametrize("padding", ["=", "==", "===="])
+def test_a_padded_envelope_body_is_refused(ring, padding):
+    """One ciphertext must have exactly one valid envelope string."""
+    cipher, prefix, kid, body = _sealed_parts(ring)
+
+    with pytest.raises(TokenCipherError, match="not base64url"):
+        cipher.decrypt(f"{prefix}.{kid}.{body}{padding}", aad=AAD)
+
+
+def test_a_non_canonical_last_character_is_refused(ring):
+    """A body whose length leaves spare bits in its last character decodes the
+    same for several last characters; only the canonical one is accepted."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    for _ in range(20):
+        cipher, prefix, kid, body = _sealed_parts(ring)
+        if len(body) % 4:
+            break
+    else:
+        pytest.skip("no envelope with spare bits in 20 tries")
+    spare = {2: 4, 3: 2}[len(body) % 4]  # unused low bits in the final character
+    last = alphabet.index(body[-1])
+    twin = alphabet[last ^ 1] if spare else None
+    assert twin and twin != body[-1]
+
+    assert cipher.decrypt(f"{prefix}.{kid}.{body}", aad=AAD) == PLAINTEXT
+    with pytest.raises(TokenCipherError, match="not base64url"):
+        cipher.decrypt(f"{prefix}.{kid}.{body[:-1]}{twin}", aad=AAD)
+
+
+@pytest.mark.parametrize("padding", ["=", "==", "====="])
+def test_a_padded_ring_entry_is_refused(padding):
+    entry = _entry("k1", b"\x04" * 32)
+
+    with pytest.raises(TokenCipherConfigError, match="is not base64url"):
+        TokenCipher.from_key_ring(entry + padding)
+
+
+def test_key_bytes_are_not_reachable_through_asdict_or_equality(ring):
+    import dataclasses
+
+    a, b = TokenCipher.from_key_ring(ring), TokenCipher.from_key_ring(ring)
+
+    assert not dataclasses.is_dataclass(a)
+    assert a != b  # identity equality: nothing compares the keys
+    assert not hasattr(a, "__dict__")
+
+
+def _all_frame_locals(exc):
+    """Locals of every frame the exception passed through below the test itself
+    (the first traceback entry is the test's own frame, which holds the key it made)."""
+    tb = exc.__traceback__.tb_next
+    while tb is not None:
+        yield from tb.tb_frame.f_locals.values()
+        tb = tb.tb_next
+
+
+def _holds(value, needles):
+    if isinstance(value, (bytes, str)):
+        return any(n in value for n in needles if type(n) is type(value))
+    if isinstance(value, (tuple, list)):
+        return any(_holds(v, needles) for v in value)
+    if isinstance(value, dict):
+        return any(_holds(v, needles) for v in value.values())
+    return False
+
+
+def test_a_failed_decrypt_traceback_holds_no_key_bytes():
+    key = b"\x05" * 32
+    cipher = TokenCipher.from_key_ring(_entry("k1", key))
+    sealed = cipher.encrypt(PLAINTEXT, aad=AAD)
+
+    with pytest.raises(TokenCipherError) as excinfo:
+        cipher.decrypt(sealed, aad="elsewhere")
+
+    assert not any(_holds(v, [key]) for v in _all_frame_locals(excinfo.value))
+
+
+def test_a_config_error_traceback_holds_no_valid_key_from_the_ring():
+    good = _entry("k1", b"\x06" * 32)
+
+    with pytest.raises(TokenCipherConfigError) as excinfo:
+        TokenCipher.from_key_ring(good + ",k2:@@@@", source="SHOP_TOKEN_ENCRYPTION_KEY")
+
+    secret = good.split(":")[1]
+    assert not any(_holds(v, [secret, b"\x06" * 32]) for v in _all_frame_locals(excinfo.value))

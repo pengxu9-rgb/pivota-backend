@@ -250,6 +250,10 @@ async def test_the_canonical_url_fallback_reads_each_id_on_postgres(db, monkeypa
 
 
 
+_LEADING_CHARS = ("\x01", "\x1f", " ", "\x7f", "\x85", "\xa0", "\u1680", "\u180e", "\u2000", "\u200b", "\u2028",
+                  "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff")
+
+
 async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypatch):
     """Review of be#2735 delta 3, P3-R1(b)(c): on Postgres the host is taken out of the URL in SQL (DISTINCT host,
     ORDER BY host, LIMIT per id), so marketplace listings that sort first never hide the store's own hosts, a store on
@@ -284,6 +288,15 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
             ("t2", "merch_t2", "https://nl\n.example/p"), ("t3", "merch_t3", "https://cr\r.example/p"),
             ("t4", "merch_t4", "https:// sp3.example/p"), ("t5", "merch_t5", "https://user@ sp5.example/p"),
             ("t6", "merch_t6", "//proto-rel.example/p"),  # Python reads no host here; SQL reading one fails closed
+            # review of be#2742 delta 3, P3-1: characters the Python side strips that "\s" does not cover, and a dotted
+            # capital I that SQL lower() would fold differently
+            ("c1", "merch_c1", "\x01https://lead1.example/p"), ("c2", "merch_c2", "\x85https://nel.example/p"),
+            ("c3", "merch_c3", "https://a@b@\x1f\x0bwww.vt.example#f"), ("c4", "merch_c4", "https://www.\u2003em.example?q"),
+            ("c5", "merch_c5", "https://zw\u200b.example/p"), ("c6", "merch_c6", "\u3000https://ideo.example/p"),
+            ("c7", "merch_c7", "https://\u00a0nbsp.example\ufeff/p"), ("c8", "merch_c8", "https://\u0130stanbul.example/p"),
+            ("c9", "merch_c9", "\x01\u3000https://two.example/p"),  # every stripped character goes, not only the first
+            # one URL per stripped character class member, before the scheme (where Python strips, or reads no host)
+            *((f"l{i}", f"merch_l{i}", f"{ch}https://lead-{i}.example/p") for i, ch in enumerate(_LEADING_CHARS)),
             ("m1", "merch_pmix", "sp4.example:8080/p"), ("m2", "merch_pmix", "https://own4.example/p")]
     for key, mid, url in rows:
         await db.execute(
@@ -305,7 +318,8 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
         "INSERT INTO catalog_products (product_key, merchant_id, platform, source_product_id, title, canonical_url)"
         " VALUES (:k, 'merch_deep', 'shopify', 'deepown', 't', 'https://zz-own.example/p')", {"k": _PREFIX + "deepown"})
     shape_ids = ("merch_p1", "merch_p2", "merch_p3", "merch_t1", "merch_t2", "merch_t3", "merch_t4", "merch_t5",
-                 "merch_t6", "merch_pmix")
+                 "merch_t6", "merch_pmix") + tuple(f"merch_c{i}" for i in range(1, 10))
+    shape_ids += tuple(f"merch_l{i}" for i in range(len(_LEADING_CHARS)))
     for mid in ("merch_mix", "merch_sq", "merch_order", "merch_ws", "merch_ns", "merch_at", "merch_deep") + shape_ids:
         await db.execute("INSERT INTO deal_lane_optout (seller_id, requested_at, recorded_by) VALUES (:s, :t, 'test')",
                          {"s": mid, "t": NOW})
@@ -321,7 +335,11 @@ async def test_the_canonical_read_takes_distinct_hosts_on_postgres(db, monkeypat
     assert deny.blocks("ws-own.example") and deny.blocks("nos-own.example") and deny.blocks("at-own.example")
     assert deny.blocks("zz-own.example")
     for host in ("sp.example", "sp2.example", "nos2.example", "tab.example", "nl.example", "cr.example", "sp3.example",
-                 "sp5.example", "proto-rel.example", "sp4.example", "own4.example"):
+                 "sp5.example", "proto-rel.example", "sp4.example", "own4.example", "lead1.example", "nel.example",
+                 "vt.example", "em.example", "zw.example", "ideo.example", "nbsp.example", "two.example"):
         assert deny.blocks(host), host
+    assert all(deny.blocks(f"lead-{i}.example") for i in range(len(_LEADING_CHARS)))
+    for url in ("https://\u0130stanbul.example/p",):  # whatever Python makes of it, SQL must read the same host
+        assert deny.blocks(w.normalize_host(url)), url
     assert not deny.delete
     assert deny.counts == {"optout_ids_canonical_only": 7 + len(shape_ids), "optout_ids_too_broad": 1}
