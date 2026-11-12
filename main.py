@@ -148,6 +148,7 @@ from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.agent_commerce_purchases import router as agent_commerce_purchases_router
 from routes.agent_storefront_handoffs import router as agent_storefront_handoffs_router
+from routes.agent_storefront_referrals import router as agent_storefront_referrals_router
 from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
@@ -1188,6 +1189,10 @@ app.include_router(agent_commerce_purchases_router)
 # and read by the gateway for the partner it vouches for. Dark (404) unless
 # UCP_STOREFRONT_HANDOFF_RECORD_ENABLED, read per request.
 app.include_router(agent_storefront_handoffs_router)
+# POST /agent/v2/storefront-cart-referrals: one referral (a click row and its tracking members) for a
+# store cart the gateway's checkout door builds. Dark (the unknown-path 404) unless
+# UCP_STOREFRONT_CART_REFERRAL_ENABLED, read per request.
+app.include_router(agent_storefront_referrals_router)
 # GET/HEAD /reap/return: the static page Reap's hosted checkout sends the buyer's browser back to
 # (the rail's default returnUrl is https://api.pivota.cc/reap/return). Public and NOT dialled:
 # a buyer mid-purchase must never land on a 404 because an operator turned the rail off. It
