@@ -310,6 +310,91 @@ async def test_a_referral_that_names_no_market_is_refused_by_name_and_nothing_is
     assert ctx_of(row)["market"] == "US"
 
 
+# --- the market is one the registry lists -----------------------------------------------------------
+
+
+def _partner_headers(token: Optional[str] = None) -> Dict[str, str]:
+    headers = {"X-API-Key": PARTNER_A_KEY, "Content-Type": "application/json"}
+    if token:
+        headers["X-Pivota-Issuing-Agent"] = token
+    return headers
+
+
+async def test_a_market_the_registry_does_not_list_is_refused_by_name(world):
+    """Two capital letters is not enough: `ZZ` is no market. Unknown is refused by name, after the
+    shape check, with no row and no nonce burned; a lower-case code is malformed, never folded."""
+    from services import market_registry
+
+    assert market_registry.market_or_none("ZZ") is None
+    body = body_for(market="ZZ")
+    token = bound(PARTNER_A, referrals.REFERRAL_OP, raw=raw_json(body))
+    res = await mint(world, None, body, token=token)
+    assert refusal_code(res) == (400, "market_unknown"), res.text
+    assert "utm_campaign" not in res.text and "clk_" not in res.text
+    # The registry lists GB; `gb` is refused as malformed (the shape check comes first), not folded.
+    assert market_registry.market_or_none("GB") is not None
+    assert refusal_code(await mint(world, PARTNER_A, body_for(market="gb"))) == (400, "market_invalid")
+    assert refusal_code(await mint(world, PARTNER_A, body_for(market="zz"))) == (400, "market_invalid")
+    assert await rows_for(HOST_A) == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES["adopted"] == 0
+    # A caller that is not our service learns nothing from the market either: the same 409 bytes.
+    for_good = await world.post(PATH, content=raw_json(body_for()), headers=_partner_headers())
+    for_unknown = await world.post(PATH, content=raw_json(body), headers=_partner_headers(token))
+    assert refusal(for_unknown) == (409, "service_caller_required")
+    assert without_metadata(for_unknown) == without_metadata(for_good)
+    # The refusal comes before the assertion is looked at: the same token, sent again, is refused for
+    # its market again, never as a replay.
+    assert refusal_code(await mint(world, None, body, token=token)) == (400, "market_unknown")
+    # Known markets mint, and record exactly the market named.
+    for market in ("GB", "US"):
+        answer = await mint(world, PARTNER_A, body_for(market=market))
+        assert answer.status_code == 200, answer.text
+        assert answer.json()["attribution"]["utm_campaign"] == market
+    assert sorted(ctx_of(r)["market"] for r in await rows_for(HOST_A)) == ["GB", "US"]
+
+
+async def test_known_is_listed_in_the_registry_whatever_its_status(world):
+    """This route records a referral for a cart the door already built: it does not decide serving.
+    One market of every rollout status the registry holds is accepted."""
+    from services import market_registry
+
+    by_status = {}
+    for code, entry in market_registry.MARKETS.items():
+        by_status.setdefault(entry["status"], code)
+    assert "served" in by_status and len(by_status) >= 2
+    for status, code in by_status.items():
+        res = await mint(world, PARTNER_A, body_for(market=code))
+        assert res.status_code == 200, (status, code, res.text)
+        assert res.json()["attribution"]["utm_campaign"] == code
+    assert sorted(ctx_of(r)["market"] for r in await rows_for(HOST_A)) == sorted(by_status.values())
+
+
+async def test_the_route_follows_the_registry_and_keeps_no_list_of_its_own(world, monkeypatch):
+    """The registry's table is the only list: add a market to it and the route accepts it, take one
+    out and the route refuses it. A second hand-kept list here would follow neither."""
+    from services import market_registry
+
+    assert refusal_code(await mint(world, PARTNER_A, body_for(market="ZZ"))) == (400, "market_unknown")
+    assert (await mint(world, PARTNER_A, body_for(market="GB"))).status_code == 200
+    changed = {code: entry for code, entry in market_registry.MARKETS.items() if code != "GB"}
+    changed["ZZ"] = dict(market_registry.MARKETS["US"])
+    monkeypatch.setattr(market_registry, "MARKETS", changed)
+    added = await mint(world, PARTNER_A, body_for(market="ZZ"))
+    assert added.status_code == 200 and added.json()["attribution"]["utm_campaign"] == "ZZ"
+    assert refusal_code(await mint(world, PARTNER_A, body_for(market="GB"))) == (400, "market_unknown")
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        await referrals.mint_referral(seller_host=HOST_A, market="GB", merchant_id=MERCHANT)
+    assert sorted(ctx_of(r)["market"] for r in await rows_for(HOST_A)) == ["GB", "ZZ"]
+
+
+async def test_the_service_mints_nothing_for_an_unlisted_market(world):
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        await referrals.mint_referral(seller_host=HOST_A, market="ZZ", merchant_id=MERCHANT)
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        referrals.referral_members(seller_host=HOST_A, market="ZZ", click_id="clk_" + "a" * 24)
+    assert await rows_for(HOST_A) == []
+
+
 @pytest.mark.parametrize("market", [None, "", "  ", "us", "USA", 840], ids=["none", "empty", "blank", "lower", "alpha3", "number"])
 async def test_the_service_mints_nothing_without_a_named_market(world, market):
     """Below the route too: the writer itself has no market to fall back on."""
@@ -384,6 +469,7 @@ _BODIES_A_STRANGER_MIGHT_SEND = {
     "no_market": raw_json({"seller_host": HOST_A}),
     "null_market": raw_json({"seller_host": HOST_A, "market": None}),
     "bad_market": raw_json({"seller_host": HOST_A, "market": "usa"}),
+    "unknown_market": raw_json({"seller_host": HOST_A, "market": "ZZ"}),
     "bad_host": raw_json({"seller_host": "Not A Host", "market": "US"}),
     "extra_field": raw_json({"seller_host": HOST_A, "market": "US", "agent_id": PARTNER_B}),
     "empty_object": b"{}",

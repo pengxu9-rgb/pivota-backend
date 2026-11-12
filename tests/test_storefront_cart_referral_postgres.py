@@ -143,6 +143,34 @@ async def test_no_market_is_no_row_and_no_default_on_postgres(db):
     assert named["attribution"]["utm_campaign"] == "GB" and _ctx(row)["market"] == "GB"
 
 
+async def test_an_unlisted_market_is_no_row_on_postgres(db, monkeypatch):
+    """Known = listed in services/market_registry.py: `ZZ` writes nothing, `gb` is malformed (case is
+    not folded), `GB` and `US` are recorded as named, and the check follows the registry's table."""
+    from services import market_registry
+    from services import storefront_cart_referral as referrals
+
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        await referrals.mint_referral(seller_host=HOST, market="ZZ", merchant_id=MERCHANT)
+    with pytest.raises(referrals.ReferralMarketRequired):
+        await referrals.mint_referral(seller_host=HOST, market="gb", merchant_id=MERCHANT)
+    assert await _rows(db) == []
+    for market in ("GB", "US"):
+        answer = await referrals.mint_referral(seller_host=HOST, market=market, merchant_id=MERCHANT)
+        assert answer["attribution"]["utm_campaign"] == market
+    assert sorted(_ctx(r)["market"] for r in await _rows(db)) == ["GB", "US"]
+    in_sql = await db.fetch_all(
+        "SELECT context->>'market' AS market FROM surface_click_events WHERE dest_domain = :h ORDER BY 1", {"h": HOST}
+    )
+    assert [dict(r)["market"] for r in in_sql] == ["GB", "US"]
+    changed = {code: entry for code, entry in market_registry.MARKETS.items() if code != "GB"}
+    changed["ZZ"] = dict(market_registry.MARKETS["US"])
+    monkeypatch.setattr(market_registry, "MARKETS", changed)
+    await referrals.mint_referral(seller_host=HOST, market="ZZ", merchant_id=MERCHANT)
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        await referrals.mint_referral(seller_host=HOST, market="GB", merchant_id=MERCHANT)
+    assert sorted(_ctx(r)["market"] for r in await _rows(db)) == ["GB", "US", "ZZ"]
+
+
 async def test_the_test_traffic_stamp_on_postgres(db, monkeypatch):
     from services import storefront_cart_referral as referrals
     from services import test_traffic

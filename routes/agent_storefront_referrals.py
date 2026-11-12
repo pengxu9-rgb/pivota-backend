@@ -15,8 +15,11 @@ nonce); then the partner assertion (409 on a bad one, the partner's own 429s); t
 
 THE MARKET IS REQUIRED and never defaulted (see services/storefront_cart_referral.py). A body with
 no `market`, a null or a blank one is 400 `market_required`; one that is not two capital letters is
-400 `market_invalid`. Named, so the gateway's log says why its cart carries no referral. Nothing is
-written and no assertion is looked at.
+400 `market_invalid` (a lower-case code included: case is not folded); a well-formed one the market
+registry (services/market_registry.py) does not list is 400 `market_unknown`. Checked in that order.
+Listed is enough, whatever the market's rollout status: this route records a referral for a cart
+the gateway already built for that market, it does not decide serving. Named, so the gateway's log
+says why its cart carries no referral. Nothing is written and no assertion is looked at.
 
 One call, made by the GATEWAY with its own service key:
 
@@ -123,6 +126,10 @@ async def mint_storefront_cart_referral(
         if code is None:
             raise
         return _refuse(BAD_BODY_STATUS, code)
+    # Required and well-formed by now; then KNOWN: listed in the market registry, whatever its rollout
+    # status. Before the assertion, so an unknown market burns no nonce.
+    if not referrals.market_is_known(body.market):
+        return _refuse(BAD_BODY_STATUS, "market_unknown")
     context = await adopt_forwarded_owner(request, caller, ops=(referrals.REFERRAL_OP,))
     partner = _adopted_partner(context)
     try:
@@ -133,8 +140,10 @@ async def mint_storefront_cart_referral(
             partner_agent_id=partner,
             via_agent_id=getattr(context, "forwarded_by_agent_id", None) if partner else None,
         )
-    except referrals.ReferralMarketRequired:  # unreachable past the body above; never a default
+    except referrals.ReferralMarketRequired:  # unreachable past the checks above; never a default
         return _refuse(BAD_BODY_STATUS, "market_required")
+    except referrals.ReferralMarketUnknown:  # reachable only if the registry changed between the two reads
+        return _refuse(BAD_BODY_STATUS, "market_unknown")
     except Exception as exc:  # noqa: BLE001 -- the door builds its cart without a referral; say so
         logger.warning("storefront_cart_referral.mint_failed error_type=%s", type(exc).__name__)
         return _refuse(503, "referral_store_unavailable")

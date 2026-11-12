@@ -28,8 +28,15 @@ with `context.kind = "ucp_storefront_cart_referral"`:
 THE MARKET IS THE CALLER'S, NEVER A DEFAULT. It becomes `utm_campaign` on the seller's cart link, so
 it is a claim about the cart: the door sends the market the cart was built for (the one it sent the
 seller, an assumed one included, which the door itself labels as assumed). A call that names none,
-or one that is not two capital letters, mints nothing (`ReferralMarketRequired`): no value is
-filled in here.
+or one that is not two capital letters, mints nothing (`ReferralMarketRequired`), and neither does
+one the market registry does not list (`ReferralMarketUnknown`): no value is filled in here.
+
+KNOWN MEANS LISTED, NOT SERVED. The one source is services/market_registry.py
+(config/market_registry.json), read at call time, and a market counts whatever its rollout status
+there (off / acquisition / shadow / served): this records a referral for a cart the door already
+decided to build for that market. It does not decide serving, and must not refuse a cart the door
+built. Case is not folded: the door sends the code in capitals, the row and `utm_campaign` carry
+exactly what was sent, and a lower-case code is refused as malformed before the registry is asked.
 
 NOT A LINK ANYBODY FOLLOWS. No `/r` token carries this id, so click_count stays 0 for ever. It is on
 the hand-off surface for that reason: every reader that counts issued links must leave that surface
@@ -47,6 +54,7 @@ import os
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlparse
 
+from services import market_registry
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import DEFAULT_UTM_TEMPLATE, append_referral_click_param, apply_utm
 from services.storefront_handoff_record import HANDOFF_SURFACE, MARKET_RE
@@ -72,10 +80,23 @@ class ReferralMarketRequired(ValueError):
     """The referral was asked for with no market, or with one that is not two capital letters."""
 
 
+class ReferralMarketUnknown(ValueError):
+    """The referral names a well-formed market the market registry does not list."""
+
+
+def market_is_known(market: str) -> bool:
+    """Listed in the market registry, whatever its rollout status (see the module note). The
+    registry's own lookup on its own table, read now: no second list is kept here."""
+    return market_registry.market_or_none(market) is not None
+
+
 def named_market(market: Any) -> str:
-    """The market exactly as the caller named it, or ReferralMarketRequired. Never a default."""
+    """The market exactly as the caller named it: required (ReferralMarketRequired), two capital
+    letters (the same), then listed in the registry (ReferralMarketUnknown). Never a default."""
     if not isinstance(market, str) or not MARKET_RE.fullmatch(market):
         raise ReferralMarketRequired("a store-cart referral names the market its cart is built for")
+    if not market_is_known(market):
+        raise ReferralMarketUnknown("a store-cart referral names a market the registry lists")
     return market
 
 
@@ -114,7 +135,8 @@ async def mint_referral(
     via_agent_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Write the referral row and return `{click_id, surface, attribution}`. Raises
-    ReferralMarketRequired, before anything is written, when `market` is not a named market; raises
+    ReferralMarketRequired or ReferralMarketUnknown, before anything is written, when `market` is
+    not a named, listed market; raises
     on a database error: the caller answers that the referral was not minted, and the door builds
     its cart without."""
     market = named_market(market)
