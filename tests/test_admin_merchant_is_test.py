@@ -138,11 +138,14 @@ async def rows(monkeypatch):
         "CREATE TABLE IF NOT EXISTS merchant_stores ("
         "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50), domain VARCHAR(255), status VARCHAR(50))"
     )
-    # The listing reads merchant_stores.status; a table another file left behind may not have it.
-    added_store_status = False
+    # The listing reads merchant_stores.status (prod has it: db/schema_guard.py indexes it), and a table another
+    # file left behind may not. Patch, never drop: the column is added and STAYS, the rule
+    # tests/schema_guard_tables.py and tests/model_schema.py follow, because dropping a column from a table some
+    # other file built is worse (and SQLite refuses it once something indexes the column). Neither helper can
+    # build this table: merchant_stores has no SQLAlchemy model, and ensure_required_schema_light neither creates
+    # it on SQLite nor adds `status` to one it finds. A table this fixture created is dropped whole below.
     if not await _has_column("merchant_stores", "status"):
         await database.execute("ALTER TABLE merchant_stores ADD COLUMN status TEXT")
-        added_store_status = True
     added_column = False
     try:
         if not await _has_column("merchant_onboarding", "is_test"):
@@ -160,8 +163,6 @@ async def rows(monkeypatch):
         await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id IN (:a, :b)", params)
         if added_column and "merchant_onboarding" not in created:
             await database.execute("ALTER TABLE merchant_onboarding DROP COLUMN is_test")
-        if added_store_status and "merchant_stores" not in created:
-            await database.execute("ALTER TABLE merchant_stores DROP COLUMN status")
         for table in reversed(created):
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         test_merchant_policy.reset_cache()
