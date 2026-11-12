@@ -2783,5 +2783,87 @@
    "occurrence": 0
   }
  ],
- "parity_disagreements": []
+ "parity_disagreements": [],
+ "map_markets_unknown_to_registry": [
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "BR",
+   "map_currency": "BRL",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (BRL) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "CN",
+   "map_currency": "CNY",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (CNY) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "DE",
+   "map_currency": "EUR",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (EUR) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "ES",
+   "map_currency": "EUR",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (EUR) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "EU",
+   "map_currency": "EUR",
+   "iso_3166_1_alpha_2": false,
+   "reason": "EU is not an ISO 3166-1 alpha-2 country code and not a market: it is a union of countries, and not all of them use EUR; the seed import accepts it and expects EUR on its own authority."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "IN",
+   "map_currency": "INR",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (INR) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "IT",
+   "map_currency": "EUR",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (EUR) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "MX",
+   "map_currency": "MXN",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (MXN) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "TH",
+   "map_currency": "THB",
+   "iso_3166_1_alpha_2": true,
+   "reason": "ISO 3166-1 country the registry does not list; the staff seed import accepts rows for it and decides the expected currency (THB) from this map alone."
+  },
+  {
+   "file": "routes/employee_products.py",
+   "scope": "<module>",
+   "market": "UK",
+   "map_currency": "GBP",
+   "iso_3166_1_alpha_2": false,
+   "reason": "UK is not an ISO 3166-1 alpha-2 country code (the code for the United Kingdom is GB, which the registry lists as GBP); the seed import accepts it as an alias and prices it in GBP on its own authority."
+  }
+ ]
 }

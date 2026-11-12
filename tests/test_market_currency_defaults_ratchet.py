@@ -46,6 +46,16 @@ A LEGITIMATE DEFAULT is marked on its own line, with a reason, and stays greppab
 
     currency = row_currency or "USD"  # market-default-ok: <why this one is not a silent default>
 
+REGENERATING. The baseline is meant to be edited DOWN by hand (delete the entry, lower the pin).
+When code moved or a file entered scope and entries must be replaced, this rewrites the file in
+its one canonical form (sorted, no line numbers, hand-written reasons kept), byte-identically
+however often it is run:
+
+    python tests/test_market_currency_defaults_ratchet.py --write-baseline
+
+It never touches BASELINE_COUNTS or UNKNOWN_MAP_MARKETS_COUNT: raising a pin is a separate,
+visible edit in this file.
+
 Marked findings are not compared with the baseline; they are counted in the summary this file
 prints on every run. The repository starts with zero markers.
 
@@ -135,6 +145,10 @@ REGISTRY_TABLE = REPO / "config" / "market_registry.json"
 #: its entry from the baseline file and lower the number here in the same change.
 BASELINE_COUNTS = {"a": 184, "b": 90, "c": 4}
 
+#: How many (map, market) pairs name a market the registry does not list. ONLY EVER LOWER THIS.
+UNKNOWN_MAP_MARKETS_COUNT = 10
+_MIN_UNKNOWN_REASON = 40
+
 MARKER = "market-default-ok"
 _MARKER_RE = re.compile(r"#.*?\b" + MARKER + r"\b:?\s*(?P<reason>.*)$")
 _MIN_MARKER_REASON = 12
@@ -143,29 +157,20 @@ _MIN_MARKER_REASON = 12
 # What counts as a currency code or a market code
 # --------------------------------------------------------------------------------------------
 
-_CURRENCIES = frozenset(
-    """AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP
-    BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL
-    GHS GIP GMD GNF GTQ GYD HKD HNL HRK HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF
-    KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR
-    MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG
-    SEK SGD SHP SLE SOS SRD SSP STN SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS
-    VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL""".split()
-)
+#: The code lists are not typed here: they are read from a checked-in reference file that names
+#: where each list was taken from and when (tests/fixtures/iso_codes_reference.json).
+ISO_REFERENCE_PATH = REPO / "tests" / "fixtures" / "iso_codes_reference.json"
+_ISO_REFERENCE = json.loads(ISO_REFERENCE_PATH.read_text(encoding="utf-8"))
+_CURRENCIES = frozenset(_ISO_REFERENCE["iso_4217"]["codes"].split())
 #: Codes that are also ordinary words or keywords. They count only where the expression itself
 #: names a currency (`sort or "TOP"` is not a currency default; `currency or "TRY"` is).
 _CURRENCY_WORDS = frozenset("ALL ANG BAM BOB COP CUP GEL GIP LAK MAD MOP PEN PHP RON SOS TOP TRY".split())
 
-_MARKETS = frozenset(
-    """AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR
-    BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC
-    EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK
-    HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB
-    LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ
-    NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU
-    RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN
-    TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW UK EU""".split()
-)
+_ISO_MARKETS = frozenset(_ISO_REFERENCE["iso_3166_1_alpha_2"]["codes"].split())
+#: NOT ISO 3166-1 alpha-2 country codes, but written as markets in this codebase, so the scan must
+#: see them: UK (the ISO code for the United Kingdom is GB) and EU (a union, not a country).
+NON_ISO_MARKET_ALIASES = frozenset({"UK", "EU"})
+_MARKETS = _ISO_MARKETS | NON_ISO_MARKET_ALIASES
 #: Two capital letters are a market on sight only for these. Every other alpha-2 code collides
 #: with a US state, a SQL keyword or an abbreviation (CA, IN, ID, NA, OR ...), so it counts only
 #: where the expression itself names a market, a country or a region.
@@ -723,6 +728,70 @@ def parity_disagreements(findings: Iterable[Finding]) -> List[dict]:
     return sorted(out, key=lambda d: (d["file"], d["scope"], d["market"], d["map_currency"]))
 
 
+def unknown_map_markets(findings: Iterable[Finding]) -> List[dict]:
+    """Every (map, market) where a hand-kept map names a market the registry does not list at
+    all. Parity cannot judge these (there is no registry currency to compare), so each one is
+    listed on its own: the map is deciding a currency for a market nobody registered."""
+    registry = registry_currencies()
+    out = []
+    for f in findings:
+        if f.kind != "c":
+            continue
+        _direction, _, rendered = f.literal.partition(" ")
+        for pair in rendered.split(","):
+            market, _, currency = pair.partition("=")
+            if market not in registry:
+                out.append({"file": f.file, "scope": f.scope, "market": market, "map_currency": currency,
+                            "iso_3166_1_alpha_2": market in _ISO_MARKETS})
+    return sorted(out, key=_unknown_key)
+
+
+def _unknown_key(row: dict) -> Tuple[str, str, str, str]:
+    return (row["file"], row["scope"], row["market"], row["map_currency"])
+
+
+def _finding_key(entry: dict) -> Tuple:
+    return (entry["file"], entry["scope"], entry["kind"], entry["shape"], entry["expr"],
+            entry["occurrence"], entry["literal"], entry["fingerprint"])
+
+
+def serialise_baseline(doc: dict) -> str:
+    """The one way the baseline file is written: fixed key order, entries sorted by a key with
+    no line number in it, one-space indent, ASCII, trailing newline. Writing the same content
+    twice, or after code moved inside a file, gives the same bytes."""
+    canonical = {
+        "_doc": doc["_doc"],
+        "version": doc["version"],
+        "findings": sorted(doc["findings"], key=_finding_key),
+        "parity_disagreements": sorted(
+            doc["parity_disagreements"], key=lambda d: (d["file"], d["scope"], d["market"], d["map_currency"])),
+        "map_markets_unknown_to_registry": sorted(doc["map_markets_unknown_to_registry"], key=_unknown_key),
+    }
+    return json.dumps(canonical, indent=1, ensure_ascii=True) + "\n"
+
+
+def render_baseline() -> str:
+    """The baseline for the code as it is now. Reasons are hand-written, so they are carried
+    over from the file on disk; a market that is new here gets an empty reason, which fails
+    test_map_markets_the_registry_does_not_know_are_each_registered until a person writes one."""
+    scan = scan_repo()
+    previous = load_baseline() if BASELINE_PATH.is_file() else {}
+    reasons = {_unknown_key(r): r.get("reason", "") for r in previous.get("map_markets_unknown_to_registry", [])}
+    unknown = [dict(r, reason=reasons.get(_unknown_key(r), "")) for r in unknown_map_markets(scan.findings)]
+    return serialise_baseline({
+        "_doc": previous.get("_doc") or _BASELINE_DOC,
+        "version": 1,
+        "findings": list(entries(scan.findings).values()),
+        "parity_disagreements": parity_disagreements(scan.findings),
+        "map_markets_unknown_to_registry": unknown,
+    })
+
+
+_BASELINE_DOC = (
+    "Every silent market/currency default on partner-reachable code on the day the ratchet was added. "
+    "ONLY EVER DELETE ENTRIES. See tests/test_market_currency_defaults_ratchet.py.")
+
+
 def summary() -> str:
     scan = scan_repo()
     by_kind = Counter(f.kind for f in scan.findings)
@@ -736,6 +805,7 @@ def summary() -> str:
         "  by shape: " + ", ".join(f"{k}/{s}={n}" for (k, s), n in sorted(by_shape.items())),
         "  marked `# %s:` (not in the baseline): %d" % (MARKER, len(scan.marked)),
         "  registry parity disagreements: %d" % len(parity_disagreements(scan.findings)),
+        "  map markets the registry does not list: %d" % len(unknown_map_markets(scan.findings)),
         "  by file:",
     ]
     lines += ["    %4d  %s" % (n, rel) for rel, n in sorted(by_file.items(), key=lambda kv: (-kv[1], kv[0]))]
@@ -797,8 +867,27 @@ def test_the_baseline_file_says_exactly_what_the_scan_says():
     assert len({e["fingerprint"] for e in stored}) == len(stored), "duplicate fingerprints in the baseline"
     wrong = [e for e in stored if e["fingerprint"] in current and e != current[e["fingerprint"]]]
     assert not wrong, "baseline entries whose fields do not match the code:\n" + json.dumps(wrong, indent=2)
-    keys = [(e["file"], e["scope"], e["kind"], e["shape"], e["expr"], e["occurrence"]) for e in stored]
-    assert keys == sorted(keys), "keep the baseline sorted by file, scope, kind, shape, expr, occurrence"
+
+
+def test_the_baseline_file_is_in_its_one_canonical_form():
+    """Sorted by a key that holds no line number, fixed formatting. So a hand edit that deletes
+    an entry is a diff of that entry only, and --write-baseline never reorders the rest."""
+    assert BASELINE_PATH.read_text(encoding="utf-8") == serialise_baseline(load_baseline()), (
+        "tests/fixtures/market_currency_defaults_baseline.json is not in canonical form (sorted by "
+        "file, scope, kind, shape, expr, occurrence; indent 1; trailing newline). Fix the order by "
+        "hand, or run: python tests/test_market_currency_defaults_ratchet.py --write-baseline")
+
+
+def test_the_repo_scan_runs_once_per_process_and_probes_are_never_cached():
+    """The repo scan parses ~570 files, so it is cached for the life of the process; every test
+    above reads the same result. scan_source is the uncached, pure entry point: the shape probes
+    below, and anything that needs a fresh look at changed text, call it directly."""
+    assert scan_repo() is scan_repo()
+    assert scan_repo.cache_info().currsize == 1 and scan_repo.cache_info().misses == 1
+    assert not hasattr(scan_source, "cache_info")
+    before = scan_source('c = x or "USD"', "routes/probe.py")
+    after = scan_source('c = x', "routes/probe.py")
+    assert len(before) == 1 and after == []
 
 
 def test_the_baseline_has_not_grown():
@@ -834,6 +923,53 @@ def test_registry_and_hand_kept_maps_agree_on_every_market_both_know():
     assert not gone, (
         "these disagreements are fixed -- delete them from `parity_disagreements` in the baseline:\n"
         + json.dumps(gone, indent=2))
+
+
+def test_map_markets_the_registry_does_not_know_are_each_registered():
+    """Parity above can only compare markets BOTH tables know. A market that only a hand-kept map
+    knows is worse, not better: the map alone decides its currency. Each one is registered in the
+    baseline with a reason, the set only shrinks, and a new one fails."""
+    current = unknown_map_markets(scan_repo().findings)
+    stored = load_baseline()["map_markets_unknown_to_registry"]
+    bare = [{k: v for k, v in row.items() if k != "reason"} for row in stored]
+    new = [row for row in current if row not in bare]
+    gone = [row for row in bare if row not in current]
+    assert not new, (
+        "a hand-kept map names a market config/market_registry.json does not list. Add the market "
+        "to the registry (and read its currency from services/market_registry.py), or drop it "
+        "from the map:\n" + json.dumps(new, indent=2))
+    assert not gone, (
+        "these markets are no longer in a hand-kept map, or the registry now lists them -- delete "
+        "them from `map_markets_unknown_to_registry` in the baseline and lower "
+        "UNKNOWN_MAP_MARKETS_COUNT:\n" + json.dumps(gone, indent=2))
+    assert len(stored) == UNKNOWN_MAP_MARKETS_COUNT, (
+        "the baseline registers %d unknown map markets; UNKNOWN_MAP_MARKETS_COUNT pins %d. The set "
+        "only shrinks: lower the pin when an entry is deleted, never raise it."
+        % (len(stored), UNKNOWN_MAP_MARKETS_COUNT))
+    thin = [row for row in stored if len(str(row.get("reason", "")).strip()) < _MIN_UNKNOWN_REASON]
+    assert not thin, "each unknown map market needs a reason a reviewer can judge:\n" + json.dumps(thin, indent=2)
+    for row in stored:
+        assert row["iso_3166_1_alpha_2"] == (row["market"] in _ISO_MARKETS)
+        if row["market"] in NON_ISO_MARKET_ALIASES:
+            assert "not an ISO 3166-1 alpha-2" in row["reason"], (
+                "%s is not an ISO 3166-1 alpha-2 country code; its reason must say so" % row["market"])
+
+
+def test_the_code_lists_are_the_reference_file_and_the_file_says_where_it_came_from():
+    """The scanner's lists ARE the checked-in reference (read above, not retyped), so this pins
+    the reference itself: its shape, its size, its stated source, and the two aliases."""
+    for name, width in (("iso_3166_1_alpha_2", 2), ("iso_4217", 3)):
+        block = _ISO_REFERENCE[name]
+        codes = block["codes"].split()
+        assert codes == sorted(set(codes)) and len(codes) == block["count"], name
+        assert all(len(c) == width and c.isalpha() and c.isupper() for c in codes), name
+        assert len(block["source"]) > 60, "%s must say where the list was taken from" % name
+    assert _ISO_MARKETS == frozenset(_ISO_REFERENCE["iso_3166_1_alpha_2"]["codes"].split()) and len(_ISO_MARKETS) == 249
+    assert _CURRENCIES == frozenset(_ISO_REFERENCE["iso_4217"]["codes"].split()) and len(_CURRENCIES) == 162
+    assert "GB" in _ISO_MARKETS and not (NON_ISO_MARKET_ALIASES & _ISO_MARKETS)
+    assert _MARKETS == _ISO_MARKETS | {"UK", "EU"}
+    assert _MARKETS_ON_SIGHT <= _MARKETS and _CURRENCY_WORDS <= _CURRENCIES
+    assert set(registry_currencies()) <= _ISO_MARKETS and set(registry_currencies().values()) <= _CURRENCIES
 
 
 # --------------------------------------------------------------------------------------------
@@ -951,3 +1087,13 @@ def test_a_marker_needs_a_real_comment():
     marked = 'c = x or "USD"  # market-default-ok: the rail settles in USD by contract\n'
     assert _marker_lines(marked) == {1: "the rail settles in USD by contract"}
     assert _marker_lines('c = x or "USD"  # market-default-ok\n') == {1: ""}
+
+
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:] == ["--write-baseline"]:
+        BASELINE_PATH.write_text(render_baseline(), encoding="utf-8")
+        print(summary())
+    else:
+        raise SystemExit("usage: python tests/test_market_currency_defaults_ratchet.py --write-baseline")
