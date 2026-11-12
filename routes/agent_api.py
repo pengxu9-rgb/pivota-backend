@@ -117,6 +117,7 @@ from services.payment_offer_evidence_service import (
 )
 from services.refund_observability import build_order_refund_tracking_payload
 from services.seed_data_egress_projection import (
+    replace_lone_surrogates,
     serve_detail_product,
     serve_search_products,
 )
@@ -3835,7 +3836,14 @@ async def _build_external_seed_product(
     market = str(seed_row.get("market") or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET
     tool = str(seed_row.get("tool") or "*").strip() or "*"
     seed_data = _ensure_json_obj(seed_row.get("seed_data"))
-    snapshot = _ensure_json_obj(seed_data.get("snapshot"))
+    _raw_snapshot = seed_data.get("snapshot")
+    snapshot = _ensure_json_obj(_raw_snapshot)
+    if isinstance(_raw_snapshot, str):
+        # A snapshot stored as JSON TEXT can hold an escaped lone surrogate (a split emoji), and parsing
+        # yields a raw one. Every field copied from it below -- the URLs and the id included, which go
+        # into the UTF-8 redirect token before any response boundary -- must be encodable, or the token
+        # raises and the product is silently dropped.
+        snapshot = replace_lone_surrogates(snapshot)
     canonical_url = (
         str(seed_row.get("canonical_url") or "").strip()
         or str(snapshot.get("canonical_url") or "").strip()
@@ -5629,7 +5637,7 @@ async def agent_search_products(
 
                 return {
                     "status": "success",
-                    "products": page_items,
+                    "products": serve_search_products(page_items),
                     "pagination": {
                         # Avoid COUNT(*) in hot path; provide a lower bound.
                         "total_count": page_offset + len(page_items) + (1 if has_more else 0),
@@ -8268,39 +8276,10 @@ async def agent_get_product(
         if not _context_can_access_merchant(context, merchant_id):
             raise HTTPException(status_code=403, detail="Not authorized for this merchant")
         
-        # Special handling for Platform Orders products (SKU-xxx format)
-        # These are from Amazon/Temu and don't exist in Shopify/Wix cache
-        if product_id.startswith('SKU-'):
-            logger.info(f"Returning mock product for Platform Order SKU: {product_id}")
-            background_tasks.add_task(
-                log_agent_request,
-                context=context,
-                status_code=200,
-                merchant_id=merchant_id
-            )
-            return {
-                "status": "success",
-                "product": {
-                    "id": product_id,
-                    "title": f"Platform Order Product {product_id}",
-                    "price": 10.00,  # Default price, actual price is in order data
-                    "currency": "USD",
-                    "platform": "shopify",  # Mock as shopify for ACP compatibility
-                    "stock": 999,
-                    "available": True,
-                    "variants": [{
-                        "id": product_id,
-                        "title": "Default",
-                        "price": 10.00,
-                        "sku": product_id,
-                        "available": True
-                    }]
-                },
-                "metadata": {
-                    "detail_source": "upstream",
-                },
-            }
-        
+        # A `SKU-*` id gets no special case. This route used to answer any such id with a made-up product
+        # (10.00 USD, stock 999) for "Platform Orders" lines; nothing calls it that way, and a partner was
+        # served a fake price (FIX_PLAN D-10). It now takes the same lookup, and the same 404, as any id.
+        #
         # Detail source order:
         # 1) fresh_cache
         # 2) upstream (realtime path)

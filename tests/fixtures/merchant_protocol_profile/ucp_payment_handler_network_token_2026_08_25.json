@@ -1,0 +1,57 @@
+{
+  "id": "processor_tokenizer_1234",
+  "version": "2026-08-25",
+  "available_instruments": [
+    {
+      "type": "card",
+      "constraints": {
+        "properties": {
+          "brand": {
+            "enum": [
+              "visa",
+              "mastercard"
+            ]
+          }
+        }
+      },
+      "ucp": {
+        "request_constraints": {
+          "path": "$['payment']['instruments'][?@['handler_id'] == 'processor_tokenizer_1234' && @['type'] == 'card']",
+          "required": [
+            "billing_address",
+            "credential"
+          ],
+          "properties": {
+            "billing_address": {
+              "required": [
+                "postal_code",
+                "address_country"
+              ]
+            },
+            "credential": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "const": "pan"
+                    }
+                  },
+                  "required": [
+                    "cvc"
+                  ]
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "const": "network_token"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

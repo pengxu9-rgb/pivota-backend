@@ -74,7 +74,7 @@ OFFER_READINESS_TIER = "referral_only"
 OFFER_MODE = "redirect"
 
 # THE WRITER'S OWN VOCABULARY, exported so a consumer never has to guess it. `sync_offer_for_seed`
-# returns exactly one of: no_seed_id, disabled, seed_missing, no_external_product_id,
+# returns exactly one of: no_seed_id, disabled, seed_missing, seed_draft, seed_not_active, no_external_product_id,
 # no_mirror_product, synced, frozen_market_mismatch, refused_currency, error -- and, for an attached seed with no mirror
 # (`sync_attached_listing_offers`): no_listing_offer, listing_offer_suppressed, refused_currency,
 # ambiguous_listing_seller, currency_not_read, listing_offer_not_written. Only `synced` means a row was written; its
@@ -104,6 +104,16 @@ OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
     {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency", "frozen_market_mismatch"}
 )
+#: routes/employee_products.NEW_EMPLOYEE_SEED_STATUS, restated so this service does not import a route module.
+#: A draft's `seed_draft` answer is deliberately NOT in the structural set above: the batch refresh reads only
+#: active seeds, and the employee routes gate the projection before calling, so it never reaches a batch count.
+SEED_DRAFT_STATUS = "draft"
+#: The one status that is served. Any other (`draft`, `disabled`, `inactive`, `paused`, or one this file has never
+#: heard of) is not served, so no writer may put its price on a served offer row (review BD-2). A blank status reads
+#: `active`, as routes/employee_products._seed_status_of reads it; the column is NOT NULL DEFAULT 'active'.
+SEED_SERVED_STATUS = "active"
+#: What `sync_offer_for_seed` answers for a non-served seed that is not a draft (a draft answers `seed_draft`).
+SEED_NOT_SERVED_SYNC_STATUS = "seed_not_active"
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 OFFER_PRICE_CONFIDENCE = Decimal("0.6")
@@ -578,7 +588,7 @@ async def upsert_catalog_offer_from_seed_row(
 
 
 _SEED_OFFER_COLUMNS = (
-    "id, external_product_id, destination_url, canonical_url, domain, "
+    "id, status, external_product_id, destination_url, canonical_url, domain, "
     "price_amount, price_currency, availability, market, attached_product_key, "
     # Only what the attached lane reads of seed_data, never the whole document.
     "seed_data -> 'variants' AS seed_variants, "
@@ -1236,6 +1246,14 @@ async def sync_offer_for_seed(
         if not row:
             return {"seed_id": seed_id, "status": "seed_missing"}
         seed = dict(row)
+        seed_status = str(seed.get("status") or "").strip().lower() or SEED_SERVED_STATUS
+        if seed_status != SEED_SERVED_STATUS:
+            # FIX_PLAN D-11 / review BD-2: ONLY A SERVED SEED PROJECTS. A draft, or a seed someone took down
+            # (disabled, inactive, paused), is not served, so no writer may put its price on a served offer row
+            # (the seed_data writer and the reconciler reach here too, not only the employee edit).
+            if seed_status == SEED_DRAFT_STATUS:
+                return {"seed_id": seed_id, "status": "seed_draft"}
+            return {"seed_id": seed_id, "status": SEED_NOT_SERVED_SYNC_STATUS, "seed_status": seed_status}
         external_product_id = seed.get("external_product_id")
         if not external_product_id:
             return {"seed_id": seed_id, "status": "no_external_product_id"}

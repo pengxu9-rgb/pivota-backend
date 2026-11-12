@@ -8,7 +8,7 @@ import it. NEVER wired into a process: `vic_order.from_env()` takes no transport
 The script a test drives:
     fake.buyer("ap_...", "approved")              # the buyer's choice on the hosted page
     fake.checkout("ap_...", "completed", order_number="1001", total_minor=4650)
-    fake.fail_next("submit", TimeoutError())      # or an HTTP status, for one call
+    fake.fail_next("submit", TimeoutError())      # or an HTTP status, for one call ("quote" too)
     fake.leak = {...}                             # extra fields merged into EVERY answer (credentials)
 """
 
@@ -24,12 +24,17 @@ class FakeProviderVic:
     def __init__(self) -> None:
         self.orders: Dict[str, Dict[str, Any]] = {}
         self.calls: List[Tuple[str, Any]] = []
-        self._faults: Dict[str, List[Any]] = {"submit": [], "status": []}
+        self._faults: Dict[str, List[Any]] = {"quote": [], "submit": [], "status": []}
         #: Merged into every answer body (top level) and its `authorization` / `checkout` objects.
         self.leak: Dict[str, Any] = {}
         #: When True a submit is RECORDED and then answered with `fail_next`'s fault (an unseen create).
         self.record_before_fault = True
         self.page_seconds = 900
+        #: The merchant's shipping and tax the fake quotes, and fields merged over every quote answer.
+        self.shipping_minor = 500
+        self.tax_minor = 340
+        self.quote_override: Dict[str, Any] = {}
+        self._quotes = 0
         #: Order ids handed out for the next new orders, in turn (else `prov_ord_NNNN`).
         self.order_ids: List[str] = []
 
@@ -51,6 +56,31 @@ class FakeProviderVic:
         return [body for op, body in self.calls if op == "submit"]
 
     # ── the wire ────────────────────────────────────────────────────────────────────────────
+
+    def quotes(self) -> List[Mapping[str, Any]]:
+        return [body for op, body in self.calls if op == "quote"]
+
+    async def quote_order(self, body: Mapping[str, Any]) -> Tuple[int, Any]:
+        self.calls.append(("quote", copy.deepcopy(dict(body))))
+        fault = self._faults["quote"].pop(0) if self._faults["quote"] else None
+        if fault is not None:
+            return await self._fault(fault)
+        self._quotes += 1
+        items = sum(int(i["unit_amount_minor"]) * int(i["quantity"]) for i in body["items"])
+        answer: Dict[str, Any] = {
+            "quote_id": f"prov_q_{self._quotes:04d}",
+            "client_reference": body["client_reference"],
+            "currency": body["currency"],
+            "items_minor": items,
+            "shipping_minor": self.shipping_minor,
+            "tax_minor": self.tax_minor,
+            "total_minor": items + self.shipping_minor + self.tax_minor,
+            "expires_in": 900,
+        }
+        answer.update(copy.deepcopy(self.quote_override))
+        if self.leak:
+            answer.update(copy.deepcopy(self.leak))
+        return 200, answer
 
     async def submit_order(self, body: Mapping[str, Any]) -> Tuple[int, Any]:
         self.calls.append(("submit", copy.deepcopy(dict(body))))

@@ -184,7 +184,9 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
     # updated_at, so a malformed row is kept 30 days after its last update, never forever. Up to TTL ahead is trusted
     # (review of be#2742, P2-A): a verification that lands while this run is going, or from a clock running ahead,
     # keeps its full grace whatever its updated_at. updated_at is bounded the same way (review of be#2742 delta, P3): a
-    # row whose only timestamp is an updated_at past the horizon has no evidence left and goes.
+    # row with no usable verified_at or expires_at whose updated_at is past the horizon has no evidence left and goes.
+    # That includes a row whose timestamps are ALL more than TTL ahead (a verifier clock that far ahead): it is not
+    # serving-valid at this run either (delta 3, P3-2).
     horizon = now + ttl
     verified_usable = and_(v.c.verified_at.isnot(None), v.c.verified_at <= horizon)
     within_grace = exists().where(and_(v.c.deal_id == o.c.deal_id, applied_history(), or_(
@@ -192,6 +194,7 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
              or_(v.c.expires_at.is_(None), v.c.expires_at >= grace_from)),
         and_(or_(v.c.verified_at.is_(None), v.c.verified_at > horizon), or_(
             and_(v.c.expires_at.isnot(None), v.c.expires_at <= horizon, v.c.expires_at >= grace_from),
+            # no usable verified_at or expires_at: updated_at alone, itself only up to the horizon
             and_(or_(v.c.expires_at.is_(None), v.c.expires_at > horizon),
                  v.c.updated_at >= grace_from, v.c.updated_at <= horizon),
         )),

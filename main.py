@@ -147,6 +147,7 @@ from routes.agent_account import router as agent_account_router  # Agent account
 from routes.agent_commerce import router as agent_commerce_router
 from routes.agent_commerce_reap import router as agent_commerce_reap_router
 from routes.agent_commerce_purchases import router as agent_commerce_purchases_router
+from routes.agent_storefront_handoffs import router as agent_storefront_handoffs_router
 from routes.reap_return import router as reap_return_router
 from routes.admin_api import router as admin_api_router
 from routes.admin_partner_cohort import router as admin_partner_cohort_router
@@ -274,6 +275,7 @@ from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_r
 from routes.admin_data_consistency import router as admin_data_consistency_router
 from routes.admin_merchant_canonicalize import router as admin_merchant_canonicalize_router
 from routes.admin_merchant_reset import router as admin_merchant_reset_router
+from routes.admin_merchant_is_test import router as admin_merchant_is_test_router
 from routes.admin_shopify_health import router as admin_shopify_health_router
 from routes.admin_amazon_oauth import router as admin_amazon_oauth_router
 from routes.admin_amazon_orders import router as admin_amazon_orders_router
@@ -1182,6 +1184,10 @@ app.include_router(agent_commerce_reap_router)
 # GET /agent/v2/commerce/purchases[/{id}]: the rail-neutral purchase read (payment orchestration
 # P0). Read-only; dark (404) unless AGENT_PURCHASE_LEDGER_ENABLED, read per request.
 app.include_router(agent_commerce_purchases_router)
+# POST /agent/v2/storefront-handoffs[/read]: the UCP storefront hand-off record (FIX_PLAN O-02), written
+# and read by the gateway for the partner it vouches for. Dark (404) unless
+# UCP_STOREFRONT_HANDOFF_RECORD_ENABLED, read per request.
+app.include_router(agent_storefront_handoffs_router)
 # GET/HEAD /reap/return: the static page Reap's hosted checkout sends the buyer's browser back to
 # (the rail's default returnUrl is https://api.pivota.cc/reap/return). Public and NOT dialled:
 # a buyer mid-purchase must never land on a 404 because an operator turned the rail off. It
@@ -1200,6 +1206,7 @@ app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplica
 app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix
 app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonicalization
 app.include_router(admin_merchant_reset_router)  # Admin merchant reset
+app.include_router(admin_merchant_is_test_router)  # Admin merchant is_test fact (staff set/clear + audit)
 app.include_router(admin_shopify_health_router)  # Admin Shopify health check
 if settings.enable_amazon_sp_api:
     app.include_router(admin_amazon_oauth_router)  # Amazon SP-API OAuth (admin-only)

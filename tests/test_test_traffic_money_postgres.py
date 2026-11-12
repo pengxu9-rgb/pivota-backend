@@ -38,7 +38,6 @@ _MIGRATIONS = Path(__file__).resolve().parent.parent / "db/migrations"
 
 REAL = "merch_shop_b"
 RIG = "merch_rig_shop_a"  # added through PIVOTA_TEST_MERCHANT_IDS below
-TODAY = datetime.now(timezone.utc).date()
 
 
 def _assert_throwaway_database():
@@ -182,14 +181,28 @@ async def _shopify_close(merchant_id, external_order_id, gross_cents, *, test_fl
     )
 
 
+async def _edge_days(db):
+    """The UTC days the producers stamped the edges on, as the roll-up buckets them.
+
+    Never a day frozen at import or read off the wall clock: a PG gate shard runs ~12 minutes, so
+    it can collect before 00:00Z and place the orders after it, or place them before and read
+    after. Both reads key on the edges' created_at, so they ask the rows which day it was."""
+    rows = await db.fetch_all(
+        "SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date AS d FROM commerce_attribution_edges ORDER BY d"
+    )
+    return [r["d"] for r in rows]
+
+
 async def _gmv_by_merchant(db):
     from services.gmv_aggregation_service import aggregate_daily
 
-    await aggregate_daily(TODAY)
+    days = await _edge_days(db)
+    for day in days:
+        await aggregate_daily(day)
     rows = await db.fetch_all(
         "SELECT merchant_id, SUM(gross_attributed_gmv_cents) AS g FROM gmv_attribution_daily "
-        "WHERE date = :d GROUP BY merchant_id",
-        {"d": TODAY},
+        "WHERE date = ANY(:days) GROUP BY merchant_id",
+        {"days": days},
     )
     return {r["merchant_id"]: int(r["g"]) for r in rows}
 
@@ -201,10 +214,11 @@ async def _statement_gmv(db, merchant_id):
     for col in ("net_attributed_gmv_cents BIGINT", "gmv_channel TEXT"):
         await db.execute(f"ALTER TABLE commerce_attribution_edges ADD COLUMN IF NOT EXISTS {col}")
     await db.execute("UPDATE commerce_attribution_edges SET net_attributed_gmv_cents = gross_attributed_gmv_cents")
+    days = await _edge_days(db)
     row = await mbs._gmv_attribution_for_month(
         merchant_id=merchant_id,
-        period_start=TODAY - timedelta(days=1),
-        period_end=TODAY + timedelta(days=1),
+        period_start=days[0] - timedelta(days=1),
+        period_end=days[-1] + timedelta(days=1),
     )
     return int(row["gmv_raw_total_cents"])
 
@@ -287,3 +301,18 @@ async def test_a_caller_supplied_stamp_never_takes_a_real_order_out_of_gmv(db, m
             9_000,
         )
         assert await _gmv_by_merchant(db) == {REAL: 9_000}
+
+
+@pytest.mark.parametrize("shift_days", [1, -1], ids=["rows_after_midnight", "rows_before_midnight"])
+async def test_the_reads_follow_the_day_the_rows_were_stamped_across_midnight(db, shift_days):
+    # A PG gate shard runs ~12 minutes: it can collect before 00:00Z and place the orders after
+    # it (or place them before and read after). Move every edge a UTC day off the wall clock: the
+    # roll-up and statement reads must still find them, so neither may anchor on "today".
+    await _scenario(db)
+    await db.execute(
+        "UPDATE commerce_attribution_edges SET created_at = created_at + make_interval(days => :n)",
+        {"n": shift_days},
+    )
+    total = 10_000 + 2_000 + 3_000 + 500 + 700 + 300
+    assert await _gmv_by_merchant(db) == {REAL: total, RIG: 4_000}
+    assert await _statement_gmv(db, REAL) == total
