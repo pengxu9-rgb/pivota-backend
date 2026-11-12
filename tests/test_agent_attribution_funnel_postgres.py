@@ -272,3 +272,26 @@ async def test_mcp_oauth_platforms_are_reported_beside_the_agents_never_as_one(_
     assert {a["agent"] for a in fn["agents"]} == {f.NO_AGENT, "agent_acme"}
     text = f.render(fn)
     assert "MCP OAUTH PLATFORMS" in text and "claimed" in text and "verified" in text
+
+
+async def test_a_storefront_handoff_record_is_not_an_issued_link(_db):
+    # O-02 review B-2: a hand-off row (surface ucp_storefront_handoff, issued_at set, click_count 0) shares the
+    # table but is no link; counted, it would add one issued-and-never-clicked link per checkout.
+    from scripts import agent_attribution_funnel as f
+
+    await _build_schema(with_purchases=False)
+    await _db.execute(
+        "INSERT INTO surface_click_events (click_id, surface, agent_id, impression_count, click_count, "
+        "issued_at, created_at, updated_at) "
+        "VALUES ('clk_h1', 'offers.resolve', 'agent_partner_a', 0, 1, :now, :now, :now), "
+        "('esh_h1', 'ucp_storefront_handoff', 'agent_partner_a', 0, 0, :now, :now, :now), "
+        "('esh_h2', 'ucp_storefront_handoff', NULL, 0, 0, NULL, :now, :now)",
+        {"now": NOW},
+    )
+    rows = await f.collect(30)
+    assert rows["_errors"] == {}
+    fn = f.build_funnel(rows, 30)
+    by = {a["agent"]: a for a in fn["agents"]}
+    assert (by["agent_partner_a"]["issued"], by["agent_partner_a"]["clicked"]) == (1, 1)
+    assert (fn["totals"]["issued"], fn["totals"]["legacy"]) == (1, 0)
+    assert f.HANDOFF_SURFACE == "ucp_storefront_handoff"

@@ -59,6 +59,8 @@ ROOT = Path(_here).resolve().parent.parent if _here else Path(os.getcwd())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval  # noqa: E402
+
 DOMAIN = "ownist.com"
 CUT_REASON = "cross_merchant_redundant_external_seed"
 CUT_SCRIPT = "step5_lane4_ownist_twin_cut"
@@ -264,6 +266,9 @@ async def revert(database: Any, manifest: Dict[str, Any]) -> int:
             )
             if row is not None:
                 restored.append(str(dict(row)["id"]))
+                if str(s.get("prior_status") or "").strip().lower() == "active":
+                    # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+                    log_seed_reactivated_outside_approval([dict(row)["id"]], tool="lane4_mirror_seed_deactivation")
     skipped = sorted({s["id"] for s in manifest.get("seeds") or []} - set(restored))
     print(f"reverted run {manifest.get('run_id')}: {len(restored)} seed(s) restored; not inactive or re-pointed, left alone: {skipped}")
     return 0

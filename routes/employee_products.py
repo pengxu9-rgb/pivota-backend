@@ -9,6 +9,7 @@ content-key catalogue endpoints below, whose offers come from
 
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 import asyncio
+import copy
 import csv
 import io
 import json
@@ -28,11 +29,12 @@ import uuid
 
 from db._ddl_guard import apply_ddl_statements
 from db.schema_guard import guarded_statements, is_lock_timeout
+import db.database as _db_core
 from db.database import database
 from db.products import products_cache
 from db.product_enrichment import get_enrichment, upsert_enrichment
 from models.standard_product import StandardProduct
-from utils.auth import get_current_employee, require_employee_permissions
+from utils.auth import EMPLOYEE_STAFF_ROLES, get_current_employee, require_employee_permissions
 
 from services import crawl_global_pacer
 from services import external_seed_destination_liveness as destination_liveness
@@ -684,11 +686,9 @@ async def _execute_seed_data_stmt(query: str, values: Dict[str, Any]) -> None:
     except Exception as exc:
         msg = str(exc)
         seed_data = values.get("seed_data")
-        if (
-            not _SEED_DATA_FORCE_TEXT
-            and isinstance(seed_data, dict)
-            and ("expected str" in msg or "got dict" in msg or "query argument" in msg)
-        ):
+        # NOT gated on the flag: a concurrent call that built its dict payload before another call flipped the
+        # flag fails the same way and must be retried too (two concurrent publishes hit exactly that).
+        if isinstance(seed_data, dict) and ("expected str" in msg or "got dict" in msg or "query argument" in msg):
             _SEED_DATA_FORCE_TEXT = True
             retry_values = dict(values)
             retry_values["seed_data"] = json.dumps(seed_data or {})
@@ -1122,6 +1122,32 @@ def _same_title(a: Any, b: Any) -> bool:
     return bool(key) and key == _title_key(b)
 
 
+def _title_keys_without_brand(value: Any, brands: Iterable[Any]) -> set:
+    """`_title_key(value)`, plus the same key with a brand cut from its start, its end, or both. Empty keys never."""
+    key = _title_key(value)
+    if not key:
+        return set()
+    out = {key}
+    for brand in brands:
+        if isinstance(brand, dict):
+            brand = brand.get("name")
+        cut = _title_key(brand) if isinstance(brand, str) else ""
+        if not cut:
+            continue
+        head = key[len(cut):] if key.startswith(cut) else key        # the prefix cut, if there is one
+        both = head[: -len(cut)] if head.endswith(cut) else head      # then the suffix
+        out |= {k for k in (head, both) if k}
+    return out
+
+
+def _same_title_but_brand(a: Any, b: Any, brands: Iterable[Any] = ()) -> bool:
+    """`_same_title`, where a brand prefix or suffix on either side does not count as a difference (review be#2764
+    P3-B): the guard's matcher drops brand words, so cutting the brand from a prefilled page name is not typing a
+    title. A missing title is unknown, never equal."""
+    brands = tuple(brands)
+    return bool(_title_keys_without_brand(a, brands) & _title_keys_without_brand(b, brands))
+
+
 def _guard_title_and_origin(title: Any, seed_data: Any) -> Tuple[Optional[str], str]:
     """(the title the ambiguous-price guard may name a pricing node by, where it came from).
 
@@ -1163,26 +1189,76 @@ def _title_source_at_creation(
     existing_seed_data: Any = None,
     existing_title: Any = None,
     title_from_row: bool = False,
+    brands: Iterable[Any] = (),
 ) -> str:
-    """Who wrote the title a creation stores: `employee` or `page`.
+    """Who wrote the title a creation stores: `employee` or `page`. Titles compare by `_same_title_but_brand`.
 
-    * A body title equal (`_title_key`) to the page's own name (this read's snapshot title, or its pricing node's
-      name) is the page's: the portal pre-fills the create form from `/external-seeds/preview`, which returns that
-      name (review P2-C). It is then decided by url alone, which can only refuse.
-    * A re-create re-sending the row's own `employee` title keeps the stamp (the person typed it before).
+    * A re-create re-sending the row's own title keeps who wrote it: `employee` only when the row is already stamped
+      so, else the page's (be#2764 review P3-A: this read may have no name, or a challenge page's, to compare with,
+      and an unstamped or `page` row's title was not typed).
+    * A body title equal to the page's own name (this read's snapshot title, or its pricing node's name) is the
+      page's: the portal pre-fills the create form from `/external-seeds/preview`, which returns that name (review
+      P2-C). It is then decided by url alone, which can only refuse.
     * An untitled re-create that keeps the row's title (this read gave no name) keeps the row's `employee` stamp
       (review P3-4); else the title is the page's.
     """
     existing = existing_seed_data if isinstance(existing_seed_data, dict) else {}
     typed_before = existing.get(SEED_TITLE_SOURCE_KEY) == SEED_TITLE_SOURCE_EMPLOYEE
+    brands = tuple(brands)
     text = str(body_title or "").strip()
     if not text:
         return SEED_TITLE_SOURCE_EMPLOYEE if (title_from_row and typed_before) else SEED_TITLE_SOURCE_PAGE
-    if typed_before and _same_title(text, existing_title):
-        return SEED_TITLE_SOURCE_EMPLOYEE
-    if any(_same_title(text, name) for name in page_names):
+    if _same_title_but_brand(text, existing_title, brands):
+        return SEED_TITLE_SOURCE_EMPLOYEE if typed_before else SEED_TITLE_SOURCE_PAGE
+    if any(_same_title_but_brand(text, name, brands) for name in page_names):
         return SEED_TITLE_SOURCE_PAGE
     return SEED_TITLE_SOURCE_EMPLOYEE
+
+
+def _page_variant_key(variant: Any) -> Optional[Tuple[str, Optional[float], str]]:
+    """(variant id, price, currency) as the preview shows it and the portal copies it; None without an id."""
+    if not isinstance(variant, dict):
+        return None
+    vid = str(variant.get("variant_id") or "").strip()
+    if not vid:
+        return None
+    amount = _as_price(variant.get("price_amount"))
+    return vid, (round(amount, 2) if amount is not None else None), str(variant.get("price_currency") or "").strip().upper()
+
+
+def _body_values_from_the_page(
+    *,
+    body_price_amount: Any,
+    body_price_currency: Any,
+    body_variants: Any,
+    page_price_amount: Any,
+    page_price_currency: Any,
+    evidence: Any,
+) -> List[str]:
+    """Which body values a refused creation got from the page (be#2764 review P2-E): `price` and / or `variants`.
+
+    The portal pre-fills the price, its currency and the variants from `/external-seeds/preview`, which shows the
+    page's pricing node and `evidence.variants` unguarded (on a bundle page: a component, and the components).
+    * `price`: the body amount is the refused node's price, with no currency or the node's own.
+    * `variants`: every body variant (id, price, currency) is one of the page's `evidence.variants` (the portal
+      copies them, and may drop some). A variant a person added or repriced makes the whole list theirs.
+    A value a person typed differently stands. Never raises (anything odd: not the page's)."""
+    out: List[str] = []
+    try:
+        amount, page_amount = _as_price(body_price_amount), _as_price(page_price_amount)
+        currency = str(body_price_currency or "").strip().upper()
+        if (amount is not None and page_amount is not None and abs(amount - page_amount) < 0.005
+                and currency in ("", str(page_price_currency or "").strip().upper())):
+            out.append("price")
+        raw = evidence.get("variants") if isinstance(evidence, dict) else None
+        page_keys = {k for k in (_page_variant_key(v) for v in (raw if isinstance(raw, list) else [])) if k}
+        if isinstance(body_variants, list) and body_variants and page_keys:
+            keys = [_page_variant_key(v) for v in body_variants]
+            if all(k is not None and k in page_keys for k in keys):
+                out.append("variants")
+    except Exception:  # noqa: BLE001 - never cost a creation
+        return out
+    return out
 
 
 def _snapshot_evidence_content(evidence: Any) -> Dict[str, Any]:
@@ -1995,6 +2071,397 @@ def _is_active_seed_unique_violation(exc: BaseException) -> bool:
     )
 
 
+#: Who may PUBLISH a seed or APPROVE a draft (owner rule, 2026-11-08): the staff roles. `outsourced` staff may create
+#: and edit drafts, and reject one, but never put a seed in front of buyers.
+SEED_PUBLISH_ROLES = frozenset(EMPLOYEE_STAFF_ROLES)
+
+#: The identity keys of an authenticated employee, most stable first. A creator stamp and a self-approval check both
+#: read these, never a display name.
+_ACTOR_ID_KEYS = ("employee_id", "employeeId", "sub", "user_id", "id")
+
+
+def _normalize_actor_part(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _seed_creator_stamp(current_user: Optional[Dict[str, Any]]) -> Optional[str]:
+    """What a staff create door writes to `created_by_employee_id`: `<id>|<email>`, normalized.
+
+    Both parts, so a later token that carries only one of them (no employee_id, or a changed id claim) still
+    matches. `|` never occurs in an id or an email. None only for an actor with no identity at all, which
+    get_current_user never returns (it requires `sub` and `email`).
+    """
+    user = current_user or {}
+    primary = next((_normalize_actor_part(user.get(k)) for k in _ACTOR_ID_KEYS if _normalize_actor_part(user.get(k))), "")
+    email = _normalize_actor_part(user.get("email"))
+    parts = [part for part in dict.fromkeys((primary, email)) if part]
+    return "|".join(parts) or None
+
+
+def _actor_identities(current_user: Optional[Dict[str, Any]]) -> set:
+    user = current_user or {}
+    return {_normalize_actor_part(user.get(k)) for k in (*_ACTOR_ID_KEYS, "email")} - {""}
+
+
+def _creator_identities(created_by: Any) -> set:
+    """The identities a stored creator names. Reads a stamp (`<id>|<email>`) and the single id or email older rows
+    hold alike."""
+    return {_normalize_actor_part(part) for part in str(created_by or "").split("|")} - {""}
+
+
+def _seed_publish_refusal(*, created_by: Any, actor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Why this actor may not publish this seed, or None. The role first, then the creator: NOBODY publishes or
+    approves a seed they created, admins included. A seed with no recorded creator is not refused (see
+    `_authorize_seed_publish`)."""
+    role = _normalize_actor_part((actor or {}).get("role"))
+    if role not in SEED_PUBLISH_ROLES:
+        return {"error": "SEED_PUBLISH_ROLE_FORBIDDEN", "role": role or None}
+    if _creator_identities(created_by) & _actor_identities(actor):
+        return {"error": "SEED_SELF_APPROVAL_FORBIDDEN"}
+    return None
+
+
+def _authorize_seed_publish(*, seed_id: str, created_by: Any, actor: Optional[Dict[str, Any]]) -> None:
+    """403 unless this actor may publish this seed. Called by `_publish_seed` itself, so no door can skip it."""
+    refusal = _seed_publish_refusal(created_by=created_by, actor=actor)
+    if refusal is not None:
+        raise HTTPException(status_code=403, detail={**refusal, "seed_id": seed_id})
+    if not _creator_identities(created_by):
+        # A legacy seed, from before every create door stamped its creator: allowed, and said so.
+        logger.warning({
+            "event": "external_seed_publish_unstamped_creator",
+            "seed_id": seed_id,
+            "actor": next((_normalize_actor_part((actor or {}).get(k)) for k in _ACTOR_ID_KEYS
+                           if _normalize_actor_part((actor or {}).get(k))), None),
+            "actor_role": _normalize_actor_part((actor or {}).get("role")) or None,
+        })
+
+
+def _seed_publish_permission(row: Optional[Dict[str, Any]], current_user: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """What the portal shows on a seed: may this viewer publish or approve it, and if not, why."""
+    created_by = (row or {}).get("created_by_employee_id")
+    refusal = _seed_publish_refusal(created_by=created_by, actor=current_user)
+    return {
+        "may_publish": refusal is None,
+        "reason": refusal["error"] if refusal else None,
+        "created_by_viewer": bool(_creator_identities(created_by) & _actor_identities(current_user)),
+    }
+
+
+#: The seed_data key on a REVISION draft: the live seed it replaces (review P2-2). A content edit to a LIVE seed never
+#: changes the live seed; it is saved as a new draft carrying this key, which goes through approval like any draft,
+#: and publishing it supersedes the live seed it names (`_publish_seed`).
+SEED_REVISION_OF_KEY = "revision_of"
+#: Set on a revision whose edit changed the price: approving it vouches for that price as an employee edit, as an
+#: in-place price edit of a live seed used to (the attached lane then reprices the canonical's listing rows).
+SEED_REVISION_PRICE_EDITED_KEY = "revision_price_edited"
+
+#: The one way an UPDATE writes `created_by_employee_id`: appending a content editor (`_merge_seed_authors`). The
+#: column is the seed's AUTHORS: its creator first, then everyone who changed its content (review P2-1), and nobody
+#: among them may publish or approve it.
+_AUTHORS_SET_CLAUSE = "created_by_employee_id = :created_by_employee_id"
+
+
+def _merge_seed_authors(stored: Any, stamp: Optional[str]) -> Optional[str]:
+    """`stored` with `stamp`'s parts appended where they are new: the creator stays first, nothing is dropped."""
+    parts = [part.strip() for part in str(stored or "").split("|") if part.strip()]
+    seen = {_normalize_actor_part(part) for part in parts}
+    for part in str(stamp or "").split("|"):
+        if part.strip() and _normalize_actor_part(part) not in seen:
+            parts.append(part.strip())
+            seen.add(_normalize_actor_part(part))
+    return "|".join(parts) or None
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _seed_content_fingerprint(row: Dict[str, Any], seed_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """What a seed shows a buyer, as the employee editor reads it (`GET /external-seeds/{id}`).
+
+    A save is a CONTENT EDIT only when this changes, so an editor that sends every field back unchanged (the portal
+    does) edits nothing, and a reviewer who only flips the status stays a reviewer. Notes and the status are not
+    content. Effective values (row column or seed_data, as the reads pick them), so a value moving from one to the
+    other is not an edit.
+    """
+    sd = seed_data or {}
+    product = sd.get("product") if isinstance(sd.get("product"), dict) else {}
+    price = _seed_primary_price(row, sd)
+    return {
+        "market": _norm_text(row.get("market")).upper(),
+        "tool": _norm_text(row.get("tool")),
+        "destination_url": _norm_text(row.get("destination_url")),
+        "canonical_url": _norm_text(row.get("canonical_url")),
+        "attached_product_key": _norm_text(row.get("attached_product_key")),
+        "title": _norm_text(sd.get("title") or row.get("title")),
+        "description": _norm_text(sd.get("description")),
+        "image_url": _norm_text(sd.get("image_url") or row.get("image_url")),
+        "image_urls": [_norm_text(u) for u in (sd.get("image_urls") or []) if _norm_text(u)],
+        "price_amount": _as_price(row.get("price_amount")),
+        "price_currency": _norm_text(row.get("price_currency")).upper(),
+        "primary_price": (_as_price(price.get("amount")), _norm_text(price.get("currency")).upper()),
+        "availability": _norm_text(sd.get("availability") or row.get("availability")),
+        "variants": json.dumps(_seed_variants(sd), sort_keys=True, default=str),
+        "product_id": _norm_text(sd.get("product_id") or product.get("product_id")),
+        "brand": _norm_text(sd.get("brand") or product.get("brand")),
+        "category": _norm_text(sd.get("category") or product.get("category")),
+        "utm_template": _norm_text(row.get("utm_template") or sd.get("utm_template")),
+        "partner_type": _norm_text(row.get("partner_type") or sd.get("partner_type")),
+        "disclosure_text": _norm_text(row.get("disclosure_text") or sd.get("disclosure_text") or DEFAULT_DISCLOSURE_TEXT),
+        "merchant_display_name": _norm_text(_seed_merchant_display_name(sd, row.get("domain"))),
+    }
+
+
+_SEED_PRICE_FINGERPRINT_KEYS = ("price_amount", "price_currency", "primary_price")
+
+
+def _seed_price_changed(
+    before_row: Dict[str, Any], before_seed_data: Optional[Dict[str, Any]],
+    after_row: Dict[str, Any], after_seed_data: Optional[Dict[str, Any]],
+) -> bool:
+    before = _seed_content_fingerprint(before_row, before_seed_data)
+    after = _seed_content_fingerprint(after_row, after_seed_data)
+    return any(before[k] != after[k] for k in _SEED_PRICE_FINGERPRINT_KEYS)
+
+
+def _published_price_source(seed_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The price vouching a PUBLISH projects with: an employee edit only for a revision whose edit moved the price."""
+    return "employee_edit" if (seed_data or {}).get(SEED_REVISION_PRICE_EDITED_KEY) else None
+
+
+def _seed_content_changed(
+    before_row: Dict[str, Any], before_seed_data: Optional[Dict[str, Any]],
+    after_row: Dict[str, Any], after_seed_data: Optional[Dict[str, Any]],
+) -> bool:
+    return _seed_content_fingerprint(before_row, before_seed_data) != _seed_content_fingerprint(after_row, after_seed_data)
+
+
+#: What a revision copies from the live seed it revises, before the edit's own values.
+_SEED_REVISION_COLUMNS = (
+    "external_product_id", "market", "tool", "utm_template", "partner_type", "disclosure_text",
+    "destination_url", "canonical_url", "domain", "title", "image_url", "price_amount", "price_currency",
+    "availability", "notes", "attached_product_key", "attached_variant_id", "seller_ref", "seed_kind",
+)
+
+
+async def _insert_seed_revision(
+    *, live_row: Dict[str, Any], values: Dict[str, Any], seed_data: Dict[str, Any], created_by: Optional[str],
+    price_edited: bool,
+) -> str:
+    """Save a content edit of a LIVE seed as a new DRAFT that revises it (review P2-2); the live seed is untouched.
+
+    The draft is the edit's: its author is the editor (so they cannot approve it), it carries `revision_of`, and its
+    approval supersedes the live seed in the same publish transaction. Returns the draft's id.
+    """
+    revision_id = _seed_id()
+    revision_data = dict(seed_data)
+    revision_data[SEED_REVISION_OF_KEY] = str(live_row.get("id"))
+    if price_edited:
+        revision_data[SEED_REVISION_PRICE_EDITED_KEY] = True
+    else:
+        revision_data.pop(SEED_REVISION_PRICE_EDITED_KEY, None)
+    columns = {c: (values[c] if c in values else live_row.get(c)) for c in _SEED_REVISION_COLUMNS}
+    # The seller-of-record (ADR-009 D3) is the live seed's: a revision is the same listing, not a new seller.
+    await _execute_seed_data_stmt(
+        """
+        INSERT INTO external_product_seeds (
+          id, external_product_id, market, tool, utm_template, partner_type, disclosure_text,
+          destination_url, canonical_url, domain, title, image_url, price_amount, price_currency,
+          availability, notes, attached_product_key, attached_variant_id, seller_ref, seed_kind,
+          seed_data, status, created_by_employee_id, created_at, updated_at
+        ) VALUES (
+          :id, :external_product_id, :market, :tool, :utm_template, :partner_type, :disclosure_text,
+          :destination_url, :canonical_url, :domain, :title, :image_url, :price_amount, :price_currency,
+          :availability, :notes, :attached_product_key, :attached_variant_id, :seller_ref, :seed_kind,
+          :seed_data, :status, :created_by_employee_id, NOW(), NOW()
+        )
+        """,
+        {
+            **columns,
+            "id": revision_id,
+            "seed_data": _seed_data_payload(revision_data),
+            "status": NEW_EMPLOYEE_SEED_STATUS,
+            "created_by_employee_id": created_by,
+        },
+    )
+    return revision_id
+
+
+def _seed_publish_locks_enabled() -> bool:
+    """The publish lock is a Postgres advisory lock; SQLite (tests, local dev) serializes its writers anyway."""
+    return bool(_db_core.IS_POSTGRES)
+
+
+def _seed_publish_lock_keys(*, market: Any, tool: Any, urls: Iterable[Optional[str]]) -> List[str]:
+    """One key per URL the publish supersedes on, in a fixed order so two publishes never deadlock.
+
+    The supersede matches `destination_url IN (:match_url, :dest)` within a (market, tool), so two publishes
+    whose URL sets share one URL can each take the other's row down: they share that URL's key and run one
+    after the other. A hash collision between unrelated keys only makes two publishes wait for each other.
+    """
+    return sorted({f"external_seed_publish|{market or ''}|{tool or ''}|{url}" for url in urls if url})
+
+
+async def _lock_seed_publish_destination(*, market: Any, tool: Any, urls: Iterable[Optional[str]]) -> None:
+    """Take the destination's publish lock for the rest of the CURRENT transaction (review BD-1)."""
+    if not _seed_publish_locks_enabled():
+        return
+    for key in _seed_publish_lock_keys(market=market, tool=tool, urls=urls):
+        await database.execute("SELECT pg_advisory_xact_lock(hashtext(:lock_key))", {"lock_key": key})
+
+
+async def _require_live_revision_base(*, seed_id: str, revision_of: str) -> None:
+    """409 `REVISION_BASE_NOT_LIVE` unless the seed this revision replaces is live NOW (review P2-B).
+
+    A revision is an edit of what was live when it was made. If that seed has since been taken down, or replaced by
+    a newer revision, publishing the old revision would undo the takedown (or silently drop the newer content), so
+    it is refused; the reviewer republishes the base, or edits again from what is live. Runs inside the publish
+    transaction, after the lock (two approvals of revisions of one seed run one after the other: the second finds
+    its base superseded). On Postgres the base row is also locked until the commit, so a takedown racing this
+    approval through ANY door either lands first (and this is the 409) or waits and lands after the publish; it never
+    slips between this check and the supersede.
+    """
+    base = await database.fetch_one(
+        "SELECT id, status FROM external_product_seeds WHERE id = :revision_of"
+        + (" FOR UPDATE" if _seed_publish_locks_enabled() else ""),
+        {"revision_of": revision_of},
+    )
+    base_status = str(dict(base).get("status") or "").strip().lower() if base else None
+    if base_status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "REVISION_BASE_NOT_LIVE", "seed_id": seed_id, "revision_of": revision_of,
+                    "base_status": base_status},
+        )
+
+
+async def _publish_seed(
+    *,
+    seed_id: str,
+    market: Any,
+    tool: Any,
+    external_product_id: Any,
+    destination_url: Optional[str],
+    canonical_url: Optional[str],
+    update_sql: str,
+    update_values: Dict[str, Any],
+    actor: Optional[Dict[str, Any]],
+    created_by: Any,
+    revision_of: Optional[str] = None,
+) -> None:
+    """THE PUBLISH STEP: a seed that was not served becomes served. Every door that turns a seed `active` runs
+    this one function: `PATCH /external-seeds/{id}` with `status=active`, an audit-queue APPROVE of a draft, and a
+    CSV upsert whose `status` column says `active` for an existing seed that is not live.
+
+    It does what a create of a live seed does, in ONE transaction, under the destination's lock:
+      1. the per-destination advisory lock, so two publishes for one destination run one after the other (two
+         drafts with DIFFERENT ids for one URL would otherwise both go live: under READ COMMITTED each supersede
+         misses the other's uncommitted row, and the active-unique index keys on the id, not the destination);
+      2. the conflict check: a live seed that holds this (market, tool, external_product_id) for ANOTHER
+         destination is a clear 409 naming it;
+      3. the supersede: the other live seeds of THIS destination are disabled;
+      4. the row's own UPDATE (`update_sql`, which must write `status = 'active'`).
+    A 409 or any failure rolls all of it back. An active-unique collision is a 409, never an unhandled 500.
+    Before any of it, `_authorize_seed_publish`: only a staff role publishes, and never one of the seed's authors
+    (its creator or a content editor; 403). A REVISION draft (`revision_of`) also supersedes the live seed it revises,
+    by id, wherever that seed points, and that seed is not a conflict for it.
+    A revision publishes only while the seed it revises is still live (`_require_live_revision_base`; 409).
+    The caller projects the published seed afterwards (`_project_published_seed`); a projection is a mirror,
+    best-effort and post-commit.
+    """
+    _authorize_seed_publish(seed_id=seed_id, created_by=created_by, actor=actor)
+    match_url = canonical_url or destination_url
+    revised = str(revision_of or "").strip()
+    try:
+        async with database.transaction():
+            await _lock_seed_publish_destination(
+                market=market, tool=tool,
+                urls=(match_url, destination_url, *((f"revision_of:{revised}",) if revised else ())),
+            )
+            if revised:
+                await _require_live_revision_base(seed_id=seed_id, revision_of=revised)
+            holder = await database.fetch_one(
+                """
+                SELECT id
+                FROM external_product_seeds
+                WHERE status = 'active'
+                  AND id <> :id
+                  AND market = :market
+                  AND tool = :tool
+                  AND external_product_id = :external_product_id
+                  AND destination_url NOT IN (:match_url, :dest)
+                  -- The live seed a revision replaces is superseded below, not a conflict.
+                  AND id <> :revision_of
+                LIMIT 1
+                """,
+                {
+                    "id": seed_id,
+                    "market": market,
+                    "tool": tool,
+                    "external_product_id": external_product_id,
+                    "match_url": match_url,
+                    "dest": destination_url,
+                    "revision_of": revised,
+                },
+            )
+            if holder:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": dict(holder).get("id")},
+                )
+            await database.execute(
+                """
+                UPDATE external_product_seeds
+                SET status = 'disabled',
+                    notes = COALESCE(notes, '') || :note,
+                    updated_at = NOW()
+                WHERE id <> :id
+                  AND status = 'active'
+                  AND (
+                    (market = :market
+                     AND tool = :tool
+                     -- As create: only seeds for THIS destination, never one matched through a canonical.
+                     AND destination_url IN (:match_url, :dest))
+                    -- A revision replaces the live seed it revises (only one holding its product id).
+                    OR (id = :revision_of AND external_product_id = :external_product_id)
+                  )
+                """,
+                {
+                    "id": seed_id,
+                    "market": market,
+                    "tool": tool,
+                    "match_url": match_url,
+                    "dest": destination_url,
+                    "revision_of": revised,
+                    "external_product_id": external_product_id,
+                    "note": f" superseded_by:{seed_id}",
+                },
+            )
+            await _execute_seed_data_stmt(update_sql, update_values)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _is_active_seed_unique_violation(exc):
+            raise HTTPException(status_code=409, detail={"error": "SEED_ACTIVE_CONFLICT"}) from exc
+        raise
+
+
+async def _project_published_seed(seed_id: str, *, price_source: Optional[str]) -> Dict[str, Any]:
+    """Project a seed that is (now) served onto the surfaces a buyer reads; best-effort and post-write.
+
+    The projection is a mirror: failing to mirror must never fail the authorized write that came before it.
+    """
+    try:
+        return await _project_refreshed_seed_to_serving_surfaces(seed_id, price_source=price_source)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "employee seed publish/edit: serving-surface projection failed for seed_id=%r",
+            seed_id, exc_info=True,
+        )
+        return {}
+
+
 class CreateExternalSeedRequest(BaseModel):
     destination_url: str = Field(..., min_length=1)
     market: Optional[str] = None
@@ -2430,6 +2897,7 @@ async def _upsert_storefront_referral_seed_candidate(
     candidate: Dict[str, Any],
     *,
     employee_id: Optional[str],
+    created_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     attached_product_key = str(candidate.get("attached_product_key") or "").strip()
     storefront_url = str(candidate.get("storefront_url") or "").strip()
@@ -2511,7 +2979,6 @@ async def _upsert_storefront_referral_seed_candidate(
         "availability": candidate.get("availability"),
         "seed_data": _seed_data_payload(seed_data),
         "notes": "storefront_seed_backfill",
-        "created_by_employee_id": str(employee_id) if employee_id else None,
         "attached_product_key": attached_product_key,
         "attached_variant_id": None,
     }
@@ -2552,7 +3019,6 @@ async def _upsert_storefront_referral_seed_candidate(
                 availability = :availability,
                 seed_data = :seed_data,
                 notes = :notes,
-                created_by_employee_id = :created_by_employee_id,
                 attached_product_key = :attached_product_key,
                 attached_variant_id = :attached_variant_id,
                 updated_at = NOW()
@@ -2604,6 +3070,8 @@ async def _upsert_storefront_referral_seed_candidate(
                 **values,
                 "id": seed_id,
                 "status": seed_status,
+                # Who created it: the run's actor when the route passed one, else the employee id it always had.
+                "created_by_employee_id": created_by or (str(employee_id) if employee_id else None),
                 "seller_ref": seller_ref,
                 "seed_kind": seed_kind,
             },
@@ -2680,6 +3148,7 @@ async def _run_external_seed_import_task(
         stats = {
             "duration_ms": duration_ms,
             "created": result.created,
+            "created_as_draft": result.createdAsDraft,
             "updated": result.updated,
             "errors_count": len(result.errors or []),
             "seed_ids_count": len(result.seedIds or []),
@@ -2755,6 +3224,8 @@ async def get_external_seed_import_task(
             "tool": data.get("tool"),
             "mode": data.get("mode"),
             "created": int(data.get("created_count") or 0),
+            # Of `created`, the drafts (the task table has no column for it; it rides in `stats`).
+            "createdAsDraft": int(_ensure_json_obj(data.get("stats")).get("created_as_draft") or 0),
             "updated": int(data.get("updated_count") or 0),
             "errors": [str(x) for x in _ensure_json_list(data.get("errors")) if str(x)],
             "warnings": [str(x) for x in _ensure_json_list(_ensure_json_obj(data.get("stats")).get("warnings")) if str(x)],
@@ -2859,7 +3330,8 @@ async def _import_external_seeds_csv_text(
       - utm_template, partner_type, disclosure_text, notes
       - attached_product_key, attached_variant_id
       - status (active|disabled): applied to an EXISTING seed. A NEW seed is created as a draft (or
-        disabled when the column says so) and is served only once published (FIX_PLAN D-11).
+        disabled when the column says so) and is served only once published (FIX_PLAN D-11). `active` on an
+        existing seed that is not live publishes it through `_publish_seed`, the same checked step as a PATCH.
     """
     await _ensure_external_seeds_table()
 
@@ -2889,7 +3361,9 @@ async def _import_external_seeds_csv_text(
     seed_ids: List[str] = []
 
     employee_id = current_user.get("employee_id") or current_user.get("employeeId")
-    created_by = str(current_user.get("email") or employee_id or "")
+    # The creator of every seed this import CREATES (a stable identity, never a display name). An update keeps the
+    # row's creator: `created_by_employee_id` is who created the seed, the self-approval check reads it.
+    created_by = _seed_creator_stamp(current_user)
 
     if is_catalog_export:
         # Catalog-style import (one row per variant, grouped into a single seed per Product URL).
@@ -3127,6 +3601,7 @@ async def _import_external_seeds_csv_text(
                     existing = dict(existing_row)
                     seed_id = str(existing.get("id"))
                     seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    before_seed_data = copy.deepcopy(seed_data)
                     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
                     seed_data["source"] = seed_data.get("source") or "employee_seed_csv_catalog"
                     if title is not None:
@@ -3156,7 +3631,6 @@ async def _import_external_seeds_csv_text(
                         "canonical_url": canonical_url_update,
                         "domain": domain_update,
                         "seed_data": _seed_data_payload(seed_data),
-                        "created_by_employee_id": str(employee_id) if employee_id else None,
                     }
                     set_clauses = [
                         "external_product_id = :external_product_id",
@@ -3165,7 +3639,6 @@ async def _import_external_seeds_csv_text(
                         "domain = :domain",
                         "seed_data = :seed_data",
                         "updated_at = NOW()",
-                        "created_by_employee_id = :created_by_employee_id",
                     ]
 
                     if title is not None:
@@ -3183,6 +3656,28 @@ async def _import_external_seeds_csv_text(
                     if availability is not None:
                         update_values["availability"] = availability
                         set_clauses.append("availability = :availability")
+
+                    # A CONTENT EDIT (review P2-1/P2-2), as a PATCH: the importer becomes an author, and a LIVE seed
+                    # is not rewritten: the row is saved as a revision draft awaiting another reviewer.
+                    after_row = {**existing, **{k: v for k, v in update_values.items() if k not in ("id", "seed_data")}}
+                    content_changed = _seed_content_changed(existing, before_seed_data, after_row, seed_data)
+                    authors = _merge_seed_authors(existing.get("created_by_employee_id"), created_by) if content_changed else (
+                        existing.get("created_by_employee_id"))
+                    if content_changed and _seed_status_of(existing) == "active" and True:
+                        revision_id = await _insert_seed_revision(
+                            live_row=existing, values=update_values, seed_data=seed_data, created_by=created_by,
+                            price_edited=_seed_price_changed(existing, before_seed_data, after_row, seed_data),
+                        )
+                        warnings.append(
+                            f"Group {group_key}: seed {seed_id} is live; the change was saved as revision draft {revision_id}, "
+                            "not served until another reviewer approves it"
+                        )
+                        updated += 1
+                        seed_ids.append(revision_id)
+                        continue
+                    if content_changed:
+                        update_values["created_by_employee_id"] = authors
+                        set_clauses.append(_AUTHORS_SET_CLAUSE)
 
                     await _execute_seed_data_stmt(
                         f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
@@ -3376,6 +3871,7 @@ async def _import_external_seeds_csv_text(
                     existing = dict(existing_row)
                     seed_id = str(existing.get("id"))
                     seed_data = _ensure_json_obj(existing.get("seed_data"))
+                    before_seed_data = copy.deepcopy(seed_data)
                     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
                     seed_data["source"] = seed_data.get("source") or "employee_seed_csv"
 
@@ -3410,7 +3906,6 @@ async def _import_external_seeds_csv_text(
                         "canonical_url": canonical_url_update,
                         "domain": domain_update,
                         "seed_data": _seed_data_payload(seed_data),
-                        "created_by_employee_id": str(employee_id) if employee_id else None,
                     }
                     set_clauses = [
                         "external_product_id = :external_product_id",
@@ -3419,7 +3914,6 @@ async def _import_external_seeds_csv_text(
                         "domain = :domain",
                         "seed_data = :seed_data",
                         "updated_at = NOW()",
-                        "created_by_employee_id = :created_by_employee_id",
                     ]
 
                     if title is not None:
@@ -3460,10 +3954,51 @@ async def _import_external_seeds_csv_text(
                         update_values["attached_variant_id"] = attached_variant_id or "∅"
                         set_clauses.append("attached_variant_id = :attached_variant_id")
 
-                    await _execute_seed_data_stmt(
-                        f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id",
-                        update_values,
-                    )
+                    # A CONTENT EDIT (review P2-1/P2-2), as a PATCH: the importer becomes an author, and a LIVE seed
+                    # is not rewritten: the row is saved as a revision draft awaiting another reviewer.
+                    after_row = {**existing, **{k: v for k, v in update_values.items() if k not in ("id", "seed_data")}}
+                    content_changed = _seed_content_changed(existing, before_seed_data, after_row, seed_data)
+                    authors = _merge_seed_authors(existing.get("created_by_employee_id"), created_by) if content_changed else (
+                        existing.get("created_by_employee_id"))
+                    if content_changed and _seed_status_of(existing) == "active" and status != "disabled":
+                        revision_id = await _insert_seed_revision(
+                            live_row=existing, values=update_values, seed_data=seed_data, created_by=created_by,
+                            price_edited=_seed_price_changed(existing, before_seed_data, after_row, seed_data),
+                        )
+                        warnings.append(
+                            f"Row {idx}: seed {seed_id} is live; the change was saved as revision draft {revision_id}, "
+                            "not served until another reviewer approves it"
+                        )
+                        updated += 1
+                        seed_ids.append(revision_id)
+                        continue
+                    if content_changed:
+                        update_values["created_by_employee_id"] = authors
+                        set_clauses.append(_AUTHORS_SET_CLAUSE)
+
+                    update_sql = f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id"
+                    if status == "active" and _seed_status_of(existing) != "active":
+                        # A PUBLISH (review BD-3): an `active` column on a seed that is not served (a draft, or one
+                        # taken down) runs the one publish step, as `PATCH status=active` does: the destination
+                        # lock, the 409 conflict check and the supersede, in one transaction with this UPDATE.
+                        # A 409 is this row's error and changes nothing; a published seed is then projected.
+                        await _publish_seed(
+                            seed_id=seed_id,
+                            market=existing.get("market"),
+                            tool=existing.get("tool"),
+                            external_product_id=update_values["external_product_id"],
+                            destination_url=dest,
+                            canonical_url=canonical_url_update,
+                            update_sql=update_sql,
+                            update_values=update_values,
+                            actor=current_user,
+                            # The authors AFTER this row: an importer who rewrote the seed may not publish it.
+                            created_by=authors,
+                            revision_of=seed_data.get(SEED_REVISION_OF_KEY),
+                        )
+                        await _project_published_seed(seed_id, price_source=_published_price_source(seed_data))
+                    else:
+                        await _execute_seed_data_stmt(update_sql, update_values)
                     updated += 1
                     seed_ids.append(seed_id)
                     continue
@@ -3623,8 +4158,33 @@ async def preview_external_seed(
         image_urls = content["image_urls"]
         description = content["description"]
 
+    # THE PREVIEW FEEDS WRITERS: the portal's create form pre-fills its price and variants from it, and the ops
+    # `sync-variants` mode PATCHes its variants (be#2764 review P2-E). With EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD
+    # `on`, a page whose pricing node does not name the served URL shows no price and no variants, as creation
+    # would store none. The preview has no typed title, so it decides by url alone (a creation whose typed title
+    # names the node still takes the page's price and variants itself). `shadow` only reports. Never raises.
+    price_amount = getattr(snapshot, "price_amount", None)
+    price_currency = getattr(snapshot, "price_currency", None)
+    ambiguous_price: Optional[Dict[str, Any]] = None
+    ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
+    if ambiguous_mode != "off":
+        try:
+            decision = destination_liveness.ambiguous_price_decision(
+                evidence=evidence, requested_url=_normalize_offer_url(str(dest)), seed_title=None
+            )
+        except Exception:  # noqa: BLE001 - the preview is best-effort
+            decision = None
+        if decision is not None:
+            refused = bool(decision.get("refusal")) and ambiguous_mode == "on"
+            ambiguous_price = {"mode": ambiguous_mode, "refused": refused,
+                               **{k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation")}}
+            if refused:
+                price_amount = price_currency = None
+                variants = []
+
     return {
         "status": "success",
+        **({"ambiguous_price": ambiguous_price} if ambiguous_price is not None else {}),
         "preview": {
             "url": dest,
             "canonical_url": canonical_url,
@@ -3635,13 +4195,28 @@ async def preview_external_seed(
             "description": description,
             "image_url": getattr(snapshot, "image_url", None),
             "image_urls": image_urls,
-            "price_amount": getattr(snapshot, "price_amount", None),
-            "price_currency": getattr(snapshot, "price_currency", None),
+            "price_amount": price_amount,
+            "price_currency": price_currency,
             "availability": getattr(snapshot, "availability", None),
             "variants": variants,
             "domain_allowed": domain_allowed,
         },
     }
+
+
+#: What the audit queue lists by default: the served seeds AND the drafts awaiting review (owner decision ED-2: an
+#: APPROVE verdict on a draft publishes it). `?status=` takes one status or a comma-separated list.
+AUDIT_QUEUE_DEFAULT_STATUSES = ("active", NEW_EMPLOYEE_SEED_STATUS)
+
+
+def _audit_queue_statuses(status: Optional[str]) -> List[str]:
+    """`?status=` as a de-duplicated list, trimmed and lower-cased; blank means the default (live + drafts)."""
+    out: List[str] = []
+    for part in str(status or "").split(","):
+        value = part.strip().lower()
+        if value and value not in out:
+            out.append(value)
+    return out or list(AUDIT_QUEUE_DEFAULT_STATUSES)
 
 
 def _build_external_seed_audit_where_clauses(
@@ -3653,8 +4228,15 @@ def _build_external_seed_audit_where_clauses(
     market: Optional[str],
     seed_id: Optional[str],
 ) -> tuple[list[str], Dict[str, Any]]:
-    where = ["status = :status"]
-    values: Dict[str, Any] = {"status": status}
+    statuses = _audit_queue_statuses(status)
+    values: Dict[str, Any] = {}
+    if len(statuses) == 1:
+        where = ["status = :status"]
+        values["status"] = statuses[0]
+    else:
+        names = [f"status_{i}" for i in range(len(statuses))]
+        where = [f"status IN ({', '.join(':' + n for n in names)})"]
+        values.update(dict(zip(names, statuses)))
 
     if attached is True:
         where.append("attached_product_key IS NOT NULL")
@@ -3735,7 +4317,9 @@ async def _fetch_external_seed_rows_for_audit(
     return [dict(row) for row in rows]
 
 
-def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, Any]:
+def _build_external_seed_audit_response_item(
+    row: Dict[str, Any], current_user: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     audit_result = audit_external_seed_row(row)
     item = build_external_seed_audit_item(row, audit_result)
     seed = item.get("seed") or {}
@@ -3743,6 +4327,9 @@ def _build_external_seed_audit_response_item(row: Dict[str, Any]) -> Dict[str, A
         seed["created_at"] = _to_iso(row.get("created_at"))
     if row.get("updated_at"):
         seed["updated_at"] = _to_iso(row.get("updated_at"))
+    # May THIS viewer approve it (their role, and not their own seed)? The portal hides the approve control if not.
+    item["publish_permission"] = _seed_publish_permission(row, current_user)
+    item["revision_of"] = _ensure_json_obj(row.get("seed_data")).get(SEED_REVISION_OF_KEY)
     return item
 
 
@@ -3877,7 +4464,7 @@ async def _delete_employee_pci_kb_scope_review_row(sku_key: str) -> None:
 async def list_external_seed_audit_queue(
     q: Optional[str] = Query(default=None),
     attached: Optional[bool] = Query(default=None),
-    status: str = Query(default="active"),
+    status: str = Query(default=",".join(AUDIT_QUEUE_DEFAULT_STATUSES)),
     merchant_id: Optional[str] = Query(default=None),
     domain: Optional[str] = Query(default=None),
     market: Optional[str] = Query(default=None),
@@ -3890,9 +4477,18 @@ async def list_external_seed_audit_queue(
 ):
     await _ensure_external_seeds_table()
     if merchant_id:
-        inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=status)
+        # The merchant inventory reads one status at a time; the queue's statuses are read in turn, in order.
+        inventory_rows: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for one_status in _audit_queue_statuses(status):
+            inventory = await fetch_merchant_referral_inventory(merchant_id=merchant_id, status=one_status)
+            for inv_row in inventory["rows"]:
+                inv_id = str(inv_row.get("id") or "")
+                if inv_id and inv_id not in seen_ids:
+                    seen_ids.add(inv_id)
+                    inventory_rows.append(inv_row)
         rows = filter_referral_inventory_rows(
-            inventory["rows"],
+            inventory_rows,
             q=q,
             attached=attached,
             domain=domain,
@@ -3919,11 +4515,13 @@ async def list_external_seed_audit_queue(
             result,
             severity=severity or "",
             anomaly_type=anomaly_type or "",
-            flagged_only=bool(flagged_only),
+            # A draft awaits a verdict whether or not the machine audit flagged it, so `flagged_only` never
+            # hides one (an explicit severity / anomaly filter still applies).
+            flagged_only=bool(flagged_only) and _seed_status_of(row) != NEW_EMPLOYEE_SEED_STATUS,
         )
     ]
 
-    items = [_build_external_seed_audit_response_item(row) for row, _ in filtered_pairs]
+    items = [_build_external_seed_audit_response_item(row, current_user) for row, _ in filtered_pairs]
     items.sort(key=audit_item_sort_key)
 
     return {
@@ -3973,11 +4571,106 @@ async def get_external_seed_audit(
             raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
         rows = [dict(row)]
 
-    item = _build_external_seed_audit_response_item(rows[0])
+    item = _build_external_seed_audit_response_item(rows[0], current_user)
     return {
         "status": "success",
         "item": item,
     }
+
+
+class ExternalSeedAuditVerdictRequest(BaseModel):
+    verdict: Literal["approve", "reject"]
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+def _audit_verdict_note(verdict: str, *, reviewer: str, reason: Optional[str]) -> str:
+    """The trace a verdict leaves on the seed's notes: who decided what, and why when they said."""
+    note = f" audit_{verdict}:{reviewer or 'unknown'}"
+    cleaned = " ".join(str(reason or "").split())[:200]
+    return f"{note} ({cleaned})" if cleaned else note
+
+
+@router.post("/external-seeds/{seed_id}/audit-verdict")
+async def record_external_seed_audit_verdict(
+    seed_id: str,
+    body: ExternalSeedAuditVerdictRequest,
+    current_user: dict = Depends(get_current_employee),
+):
+    """The audit queue's verdict on a DRAFT (owner decision ED-2).
+
+    * `approve` publishes the draft through `_publish_seed`, the same step as `PATCH status=active`: the
+      destination lock, the 409 `SEED_ACTIVE_CONFLICT` check, the supersede of the destination's other live seeds
+      in one transaction; then the seed is projected. A 409 changes nothing. Approving a seed that is already
+      live is a no-op success.
+      A REVISION draft whose live seed was taken down or replaced since is a 409 `REVISION_BASE_NOT_LIVE`.
+    * `reject` keeps the draft a draft (not served, not projected) and records the verdict on its notes.
+
+    Any other seed (disabled, paused, ...) is a 409 `SEED_NOT_A_DRAFT`: a verdict never brings a seed someone took
+    down back to life, and a live seed is taken down with `PATCH status=disabled`.
+    """
+    await _ensure_external_seeds_table()
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    row = dict(row)
+    current_status = _seed_status_of(row)
+    verdict = body.verdict
+
+    if verdict == "approve":
+        # The role is the approver's whatever the seed's state; the creator check runs in `_publish_seed`.
+        role = _normalize_actor_part(current_user.get("role"))
+        if role not in SEED_PUBLISH_ROLES:
+            raise HTTPException(
+                status_code=403,
+                detail={"error": "SEED_PUBLISH_ROLE_FORBIDDEN", "role": role or None, "seed_id": seed_id},
+            )
+    if verdict == "approve" and current_status == "active":
+        return {"status": "success", "verdict": verdict, "seed_status": "active", "published": False, "projected": {}}
+    if current_status != NEW_EMPLOYEE_SEED_STATUS:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "SEED_NOT_A_DRAFT", "seed_status": current_status, "verdict": verdict},
+        )
+
+    note = _audit_verdict_note(verdict, reviewer=_employee_id_from_user(current_user), reason=body.reason)
+    if verdict == "reject":
+        await database.execute(
+            "UPDATE external_product_seeds SET notes = COALESCE(notes, '') || :note, updated_at = NOW() "
+            "WHERE id = :id",
+            {"id": seed_id, "note": note},
+        )
+        return {
+            "status": "success", "verdict": verdict, "seed_status": current_status, "published": False,
+            "projected": {},
+        }
+
+    # The identity a PATCH publish would give it: the stored id, else the seed_data's, else the URL's.
+    external_product_id = (
+        row.get("external_product_id")
+        or _ensure_json_obj(row.get("seed_data")).get("external_product_id")
+        or _stable_external_product_id(row.get("canonical_url") or row.get("destination_url") or "")
+    )
+    await _publish_seed(
+        seed_id=seed_id,
+        market=row.get("market"),
+        tool=row.get("tool"),
+        external_product_id=external_product_id,
+        destination_url=row.get("destination_url"),
+        canonical_url=row.get("canonical_url"),
+        update_sql=(
+            "UPDATE external_product_seeds SET status = 'active', external_product_id = :external_product_id, "
+            "notes = COALESCE(notes, '') || :note, updated_at = NOW() WHERE id = :id"
+        ),
+        update_values={"id": seed_id, "external_product_id": external_product_id, "note": note},
+        actor=current_user,
+        created_by=row.get("created_by_employee_id"),
+        revision_of=_ensure_json_obj(row.get("seed_data")).get(SEED_REVISION_OF_KEY),
+    )
+    # As a PATCH publish: projected; the price is vouched for only when the draft is a revision that moved it.
+    projected = await _project_published_seed(
+        seed_id, price_source=_published_price_source(_ensure_json_obj(row.get("seed_data")))
+    )
+    return {"status": "success", "verdict": verdict, "seed_status": "active", "published": True, "projected": projected}
 
 
 @router.post("/external-seeds/backfill-storefront")
@@ -4033,15 +4726,24 @@ async def backfill_storefront_external_seeds(
     created = 0
     updated = 0
     skipped = 0
+    # Of `created` / `updated`, the seeds that are drafts: stored, not served until approved (FIX_PLAN D-11), so the
+    # portal can say "N drafts created" instead of letting a draft-only run look like a run that made nothing usable.
+    created_as_draft = 0
+    updated_as_draft = 0
     items: List[Dict[str, Any]] = []
     for candidate in candidates:
-        result = await _upsert_storefront_referral_seed_candidate(candidate, employee_id=employee_id)
+        result = await _upsert_storefront_referral_seed_candidate(
+            candidate, employee_id=employee_id, created_by=_seed_creator_stamp(current_user)
+        )
         items.append(result)
         action = str(result.get("action") or "")
+        is_draft = _seed_status_of(result) == NEW_EMPLOYEE_SEED_STATUS
         if action == "created":
             created += 1
+            created_as_draft += int(is_draft)
         elif action == "updated":
             updated += 1
+            updated_as_draft += int(is_draft)
         else:
             skipped += 1
 
@@ -4054,7 +4756,9 @@ async def backfill_storefront_external_seeds(
         "dry_run": False,
         "candidate_count": len(candidates),
         "created": created,
+        "created_as_draft": created_as_draft,
         "updated": updated,
+        "updated_as_draft": updated_as_draft,
         "skipped": skipped,
         "items": items[:20],
     }
@@ -4476,6 +5180,8 @@ async def create_external_seed(
         existing_seed_data=existing_title_seed_data,
         existing_title=existing_title,
         title_from_row=title_from_row,
+        brands=(body.brand, existing_title_seed_data.get("brand"),
+                page_identity.get("brand") if isinstance(page_identity, dict) else None),
     )
     typed_title: Optional[str] = None
     if title_source == SEED_TITLE_SOURCE_EMPLOYEE:
@@ -4485,6 +5191,8 @@ async def create_external_seed(
     # EXTERNAL_SEED_AMBIGUOUS_PRICE_GUARD `on`, a pricing node that does not name this seed's product
     # (`destination_liveness.ambiguous_price_decision`) gives the seed neither its price nor its variants (the snapshot
     # keeps no price either); a field the employee stated stands. `shadow` only logs the decision.
+    # The body's variants, unless a refusal finds they are the page's (`_body_values_from_the_page`).
+    body_variants = body.variants
     ambiguous_mode = destination_liveness.ambiguous_price_guard_mode()
     ambiguous_refused_at_create = False
     if ambiguous_mode != "off" and snapshot is not None and snapshot_price_refused is None:
@@ -4508,23 +5216,39 @@ async def create_external_seed(
             logger.warning("ambiguous-price guard raised at creation; priced as without it", exc_info=True)
             decision = None
         if decision is not None and decision.get("refusal"):
+            # A PREFILLED PRICE OR VARIANT LIST IS THE PAGE'S, not the employee's (be#2764 review P2-E): the portal
+            # copies the preview's, which on a bundle page are a component's price and the components.
+            page_values = _body_values_from_the_page(
+                body_price_amount=body.price_amount,
+                body_price_currency=body.price_currency,
+                body_variants=body.variants,
+                page_price_amount=snap_price_amount,
+                page_price_currency=snap_price_currency,
+                evidence=evidence,
+            )
             _log_ambiguous_price_at_create(ambiguous_mode, {
                 **decision,
                 "title_from": title_source if (body_title or snap_title or title_from_row) else "none",
+                "page_values": page_values,
             })
             if ambiguous_mode == "on":
                 ambiguous_refused_at_create = True
                 # The AMOUNT is what is ambiguous, never the currency (the currency check above passed): an amount
                 # the employee stated keeps the page's currency beside it, so no amount is stored without one.
-                if body.price_amount is None:
+                price_is_the_pages = "price" in page_values
+                if body.price_amount is None or price_is_the_pages:
                     price_amount = None
-                    if not (body.price_currency or "").strip():
+                    if not (body.price_currency or "").strip() or price_is_the_pages:
                         price_currency = None
+                if "variants" in page_values:
+                    body_variants = None
                 snapshot_price_refused = {
                     "reason": "ambiguous_product",
                     "refusal": decision.get("refusal"),
                     "priced_identities": decision.get("priced_identities"),
                     "snapshot_price": {"amount": snap_price_amount, "currency": snap_price_currency},
+                    # Body values found to be the page's, and so not stored.
+                    "body_values_from_the_page": page_values,
                 }
                 snap_price_amount = None
                 snap_price_currency = None
@@ -4536,7 +5260,7 @@ async def create_external_seed(
 
     held_row = dict(existing_row) if existing_row else {}
     _refuse_unstorable_employee_variants(
-        body.variants,
+        body_variants,
         stored_variants=_seed_variants(_ensure_json_obj(held_row.get("seed_data"))),
         row_currency=held_row.get("price_currency"),
     )
@@ -4546,6 +5270,7 @@ async def create_external_seed(
         row = dict(existing_row)
         seed_id = row.get("id")
         existing_seed_data = _ensure_json_obj(row.get("seed_data"))
+        before_seed_data = copy.deepcopy(existing_seed_data)
         # `destination_url` is rewritten to `dest` below, so the canonical beside it has to be
         # `dest` too -- the row's old canonical is kept only when it still is.
         canonical_url = _canonical_for_destination(dest, page_canonical_url, row.get("canonical_url"))
@@ -4641,8 +5366,8 @@ async def create_external_seed(
             # stay `snapshot.description`, which the gateway serves first (review of #2621).
             seed_data["snapshot"]["description"] = None
             seed_data["snapshot"]["description_refused_source"] = content["description_refused_source"]
-        if body.variants is not None and body.variants:
-            seed_data["variants"] = body.variants
+        if body_variants is not None and body_variants:
+            seed_data["variants"] = body_variants
         elif snap_variants:
             existing_variants = _seed_variants(seed_data)
             variant_adoption_refused = _variant_adoption_refusal(
@@ -4660,56 +5385,73 @@ async def create_external_seed(
                 seed_data["variants"] = snap_variants
 
         match_url = canonical_url or dest
-
-        await _execute_seed_data_stmt(
-            """
-            UPDATE external_product_seeds
-            SET external_product_id = :external_product_id,
-                market = :market,
-                tool = :tool,
-                utm_template = :utm_template,
-                partner_type = :partner_type,
-                disclosure_text = :disclosure_text,
-                destination_url = :destination_url,
-                canonical_url = :canonical_url,
-                domain = :domain,
-                title = :title,
-                image_url = :image_url,
-                price_amount = :price_amount,
-                price_currency = :price_currency,
-                availability = :availability,
-                seed_data = :seed_data,
-                notes = :notes,
-                created_by_employee_id = :created_by_employee_id,
-                attached_product_key = :attached_product_key,
-                attached_variant_id = :attached_variant_id,
-                updated_at = NOW()
-            WHERE id = :id
-            """,
-            {
-                "id": seed_id,
-                "external_product_id": external_product_id,
-                "market": market,
-                "tool": tool,
-                "utm_template": utm_template,
-                "partner_type": partner_type,
-                "disclosure_text": disclosure_text,
-                "destination_url": dest,
-                "canonical_url": canonical_url,
-                "domain": domain,
-                "title": title,
-                "image_url": image_url,
-                "price_amount": price_amount,
-                "price_currency": price_currency,
-                "availability": availability,
-                "seed_data": _seed_data_payload(seed_data),
-                "notes": notes,
-                "created_by_employee_id": str(employee_id) if employee_id else None,
-                "attached_product_key": attached_product_key,
-                "attached_variant_id": attached_variant_id,
-            },
-        )
-        seed_status = str(row.get("status") or "").strip() or "active"
+        update_values = {
+            "id": seed_id,
+            "external_product_id": external_product_id,
+            "market": market,
+            "tool": tool,
+            "utm_template": utm_template,
+            "partner_type": partner_type,
+            "disclosure_text": disclosure_text,
+            "destination_url": dest,
+            "canonical_url": canonical_url,
+            "domain": domain,
+            "title": title,
+            "image_url": image_url,
+            "price_amount": price_amount,
+            "price_currency": price_currency,
+            "availability": availability,
+            "seed_data": _seed_data_payload(seed_data),
+            "notes": notes,
+            "attached_product_key": attached_product_key,
+            "attached_variant_id": attached_variant_id,
+        }
+        # A CONTENT EDIT (review P2-1/P2-2), as a PATCH: the re-creator becomes an author, and a LIVE seed is not
+        # rewritten: the change is saved as a revision draft awaiting another reviewer's approval.
+        recreate_stamp = _seed_creator_stamp(current_user)
+        after_row = {**row, **{k: v for k, v in update_values.items() if k not in ("id", "seed_data")}}
+        content_changed = _seed_content_changed(row, before_seed_data, after_row, seed_data)
+        revision_of_live: Optional[str] = None
+        if content_changed and _seed_status_of(row) == "active":
+            revision_of_live = str(seed_id)
+            seed_id = await _insert_seed_revision(
+                live_row=row, values=update_values, seed_data=seed_data, created_by=recreate_stamp,
+                price_edited=_seed_price_changed(row, before_seed_data, after_row, seed_data),
+            )
+        else:
+            authors_clause = ""
+            if content_changed:
+                update_values["created_by_employee_id"] = _merge_seed_authors(
+                    row.get("created_by_employee_id"), recreate_stamp
+                )
+                authors_clause = f"\n                    {_AUTHORS_SET_CLAUSE},"
+            await _execute_seed_data_stmt(
+                f"""
+                UPDATE external_product_seeds
+                SET external_product_id = :external_product_id,
+                    market = :market,
+                    tool = :tool,
+                    utm_template = :utm_template,
+                    partner_type = :partner_type,
+                    disclosure_text = :disclosure_text,
+                    destination_url = :destination_url,
+                    canonical_url = :canonical_url,
+                    domain = :domain,
+                    title = :title,
+                    image_url = :image_url,
+                    price_amount = :price_amount,
+                    price_currency = :price_currency,
+                    availability = :availability,
+                    seed_data = :seed_data,
+                    notes = :notes,{authors_clause}
+                    attached_product_key = :attached_product_key,
+                    attached_variant_id = :attached_variant_id,
+                    updated_at = NOW()
+                WHERE id = :id
+                """,
+                update_values,
+            )
+        seed_status = NEW_EMPLOYEE_SEED_STATUS if revision_of_live else (str(row.get("status") or "").strip() or "active")
         # Only a LIVE seed supersedes the other live seeds of its destination: a draft is not served,
         # so it must not take a served seed down before anyone publishes it.
         if seed_status == "active":
@@ -4737,10 +5479,11 @@ async def create_external_seed(
                 },
             )
     else:
+        revision_of_live = None
         seed_id = _seed_id()
         seed_status = NEW_EMPLOYEE_SEED_STATUS
         external_product_id = _stable_external_product_id(match_url)
-        if snap_variants and not body.variants:
+        if snap_variants and not body_variants:
             variant_adoption_refused = _variant_adoption_refusal(
                 _foreign_variant_currencies(existing=[], incoming=snap_variants, row_currency=None)
             )
@@ -4768,7 +5511,7 @@ async def create_external_seed(
                 else ({SEED_IMAGE_URLS_SOURCE_KEY: SEED_IMAGE_URLS_SOURCE_PAGE_READ} if snap_image_urls else {})
             ),
             "availability": availability,
-            "variants": body.variants or ([] if variant_adoption_refused else (snap_variants or [])),
+            "variants": body_variants or ([] if variant_adoption_refused else (snap_variants or [])),
             "utm_template": utm_template,
             "partner_type": partner_type,
             "disclosure_text": disclosure_text,
@@ -4833,7 +5576,8 @@ async def create_external_seed(
                 "availability": availability,
                 "seed_data": _seed_data_payload(seed_data),
                 "notes": body.notes,
-                "created_by_employee_id": str(employee_id) if employee_id else None,
+                # Who created it (a stable identity): the self-approval check reads it, and no update rewrites it.
+                "created_by_employee_id": _seed_creator_stamp(current_user),
                 "attached_product_key": attached_product_key,
                 "attached_variant_id": attached_variant_id,
                 "seller_ref": seller_ref,
@@ -4860,6 +5604,8 @@ async def create_external_seed(
             "id": seed_id,
             # A new seed is a draft and is not served until it is published (NEW_EMPLOYEE_SEED_STATUS).
             "status": seed_status,
+            # Set when this re-create changed a LIVE seed: the change is this draft, the live seed is untouched.
+            "revision_of": revision_of_live,
             "external_product_id": seed_data.get("external_product_id"),
             "market": market,
             "tool": tool,
@@ -5018,6 +5764,10 @@ async def get_external_seed(
                 "brand": seed_data.get("brand") or seed_data.get("product", {}).get("brand"),
                 "category": seed_data.get("category") or seed_data.get("product", {}).get("category"),
             },
+            # May this viewer publish it? The editor disables `active` when not (their role, or their own seed).
+            "publish_permission": _seed_publish_permission(row, current_user),
+            # A revision draft names the live seed it replaces once approved.
+            "revision_of": seed_data.get(SEED_REVISION_OF_KEY),
         },
         "action": {"type": "redirect", "redirect_url": redirect_url, "disclosure_text": disclosure_text},
     }
@@ -5079,6 +5829,8 @@ async def update_external_seed(
     )
     seed_data["external_product_id"] = seed_data.get("external_product_id") or external_product_id
     seed_data.setdefault("snapshot", {})
+    # What the seed showed before this save (the edits below mutate `seed_data` in place).
+    before_seed_data = copy.deepcopy(seed_data)
 
     if body.title is not None:
         # A TITLE IS TYPED ONLY WHEN THE PATCH CHANGES IT (review P2-B): both portal editors re-send the stored title
@@ -5087,7 +5839,11 @@ async def update_external_seed(
         # fills only the latter). An empty title clears the stamp.
         if not str(body.title).strip():
             seed_data.pop(SEED_TITLE_SOURCE_KEY, None)
-        elif not any(_same_title(body.title, stored) for stored in (row.get("title"), seed_data.get("title"))):
+        elif not any(
+            # A brand cut from, or added to, the stored title is not a change either (be#2764 review P3-B).
+            _same_title_but_brand(body.title, stored, (body.brand, seed_data.get("brand")))
+            for stored in (row.get("title"), seed_data.get("title"))
+        ):
             seed_data[SEED_TITLE_SOURCE_KEY] = SEED_TITLE_SOURCE_EMPLOYEE
         seed_data["title"] = body.title
         seed_data["snapshot"]["title"] = body.title
@@ -5207,79 +5963,52 @@ async def update_external_seed(
         updates["availability"] = body.availability
         set_clauses.append("availability = :availability")
 
+    # A CONTENT EDIT (review P2-1/P2-2): this save changes what the seed shows a buyer. The editor becomes one of the
+    # seed's authors, who may not publish or approve it; and a LIVE seed is never edited in place: the edit is saved
+    # as a revision draft that needs another reviewer's approval.
+    after_row = {**row, **{k: v for k, v in updates.items() if k not in ("id", "seed_data")}}
+    content_changed = _seed_content_changed(row, before_seed_data, after_row, seed_data)
+    editor_stamp = _seed_creator_stamp(current_user)
+    authors = _merge_seed_authors(row.get("created_by_employee_id"), editor_stamp) if content_changed else (
+        row.get("created_by_employee_id"))
+    if content_changed and current_status == "active" and updates.get("status", current_status) == "active":
+        revision_id = await _insert_seed_revision(
+            live_row=row, values=updates, seed_data=seed_data, created_by=editor_stamp,
+            price_edited=_seed_price_changed(row, before_seed_data, after_row, seed_data),
+        )
+        return {
+            "status": "success",
+            "projected": {},
+            "revision": {"seed_id": revision_id, "seed_status": NEW_EMPLOYEE_SEED_STATUS, "revision_of": seed_id},
+        }
+    if content_changed:
+        updates["created_by_employee_id"] = authors
+        set_clauses.append(_AUTHORS_SET_CLAUSE)
+
     updates["seed_data"] = _seed_data_payload(seed_data)
     set_clauses.append("seed_data = :seed_data")
     set_clauses.append("updated_at = NOW()")
 
     final_status = updates.get("status", current_status)
-    # PUBLISH: a seed that was not served becomes served. It does what a create of a live seed does: the
-    # other live seeds of its destination are superseded, and a live seed that already holds its
-    # (market, tool, external_product_id) is a clear 409, never an unhandled unique-index 500.
+    # PUBLISH: a seed that was not served becomes served, through `_publish_seed`, the one publish step (the
+    # destination lock, the 409 conflict check and the supersede, in one transaction with this UPDATE).
     publishing = final_status == "active" and current_status != "active"
     update_sql = f"UPDATE external_product_seeds SET {', '.join(set_clauses)} WHERE id = :id"
     if publishing:
-        final_market = updates.get("market", row.get("market"))
-        final_tool = updates.get("tool", row.get("tool"))
-        final_epid = updates.get("external_product_id") or row.get("external_product_id")
-        publish_dest = next_destination_url
-        publish_match_url = next_canonical_url or next_destination_url
-        holder = await database.fetch_one(
-            """
-            SELECT id
-            FROM external_product_seeds
-            WHERE status = 'active'
-              AND id <> :id
-              AND market = :market
-              AND tool = :tool
-              AND external_product_id = :external_product_id
-              AND destination_url NOT IN (:match_url, :dest)
-            LIMIT 1
-            """,
-            {
-                "id": seed_id,
-                "market": final_market,
-                "tool": final_tool,
-                "external_product_id": final_epid,
-                "match_url": publish_match_url,
-                "dest": publish_dest,
-            },
+        await _publish_seed(
+            seed_id=seed_id,
+            market=updates.get("market", row.get("market")),
+            tool=updates.get("tool", row.get("tool")),
+            external_product_id=updates.get("external_product_id") or row.get("external_product_id"),
+            destination_url=next_destination_url,
+            canonical_url=next_canonical_url,
+            update_sql=update_sql,
+            update_values=updates,
+            actor=current_user,
+            # The authors AFTER this save: an editor who publishes in the same save is refused.
+            created_by=authors,
+            revision_of=seed_data.get(SEED_REVISION_OF_KEY),
         )
-        if holder:
-            raise HTTPException(
-                status_code=409,
-                detail={"error": "SEED_ACTIVE_CONFLICT", "conflicting_seed_id": dict(holder).get("id")},
-            )
-        try:
-            async with database.transaction():
-                await database.execute(
-                    """
-                    UPDATE external_product_seeds
-                    SET status = 'disabled',
-                        notes = COALESCE(notes, '') || :note,
-                        updated_at = NOW()
-                    WHERE id <> :id
-                      AND status = 'active'
-                      AND market = :market
-                      AND tool = :tool
-                      -- As create: only seeds for THIS destination, never one matched through a canonical.
-                      AND destination_url IN (:match_url, :dest)
-                    """,
-                    {
-                        "id": seed_id,
-                        "market": final_market,
-                        "tool": final_tool,
-                        "match_url": publish_match_url,
-                        "dest": publish_dest,
-                        "note": f" superseded_by:{seed_id}",
-                    },
-                )
-                await _execute_seed_data_stmt(update_sql, updates)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            if _is_active_seed_unique_violation(exc):
-                raise HTTPException(status_code=409, detail={"error": "SEED_ACTIVE_CONFLICT"}) from exc
-            raise
     else:
         await _execute_seed_data_stmt(update_sql, updates)
 
@@ -5311,15 +6040,10 @@ async def update_external_seed(
     if final_status == "active" and (
         publishing or any(k in updates for k in ("price_amount", "price_currency", "availability"))
     ):
-        try:
-            projected = await _project_refreshed_seed_to_serving_surfaces(
-                seed_id, price_source="employee_edit" if price_edited else None
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "employee seed edit: serving-surface projection failed for seed_id=%r",
-                seed_id, exc_info=True,
-            )
+        projected = await _project_published_seed(
+            seed_id,
+            price_source=_published_price_source(seed_data) if publishing else ("employee_edit" if price_edited else None),
+        )
 
     return {"status": "success", "projected": projected}
 
@@ -6359,7 +7083,8 @@ def _log_ambiguous_price_at_create(mode: str, decision: Dict[str, Any]) -> None:
     try:
         from utils.logger import logger as pivota_log
 
-        line = {k: decision.get(k) for k in ("refusal", "priced_identities", "url_relation", "title_dice", "title_from")}
+        line = {k: decision.get(k) for k in (
+            "refusal", "priced_identities", "url_relation", "title_dice", "title_from", "page_values")}
         line["mode"] = mode
         pivota_log.info("AMBIGUOUS_PRICE_CREATE " + json.dumps(line, separators=(",", ":"), sort_keys=True, default=str))
     except Exception:  # noqa: BLE001 - reporting must never cost a creation
@@ -7339,6 +8064,55 @@ class AttachSeedRequest(BaseModel):
     variant_id: Optional[str] = None
 
 
+async def _set_seed_attachment(
+    *, seed_id: str, product_key: Optional[str], variant_id: Optional[str], current_user: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach a seed to a canonical product, or detach it (`product_key` None), under the approval rule (review P2-A).
+
+    Which product a seed's offer hangs on is CONTENT (`attached_product_key` is in `_seed_content_fingerprint`), so
+    this door follows the PATCH's rule and no role can put an attachment in front of buyers alone:
+      * a LIVE seed is never re-attached in place: the change is saved as a REVISION draft authored by the actor,
+        the live seed is untouched, and another staff reviewer's approval puts it live;
+      * any other seed (a draft, a disabled one) changes in place and the actor becomes one of its authors, who may
+        not publish or approve it;
+      * a call that changes nothing writes nothing, so it makes nobody an author.
+    """
+    row = await database.fetch_one("SELECT * FROM external_product_seeds WHERE id = :id", {"id": seed_id})
+    if not row:
+        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
+    row = dict(row)
+    unchanged = (
+        _norm_text(row.get("attached_product_key")) == _norm_text(product_key)
+        and _norm_text(row.get("attached_variant_id")) == _norm_text(variant_id)
+    )
+    if unchanged:
+        return {"status": "success"}
+    values = {"attached_product_key": product_key, "attached_variant_id": variant_id}
+    editor_stamp = _seed_creator_stamp(current_user)
+    if _seed_status_of(row) == "active":
+        revision_id = await _insert_seed_revision(
+            live_row=row, values=values, seed_data=_ensure_json_obj(row.get("seed_data")), created_by=editor_stamp,
+            price_edited=False,
+        )
+        return {
+            "status": "success",
+            "revision": {"seed_id": revision_id, "seed_status": NEW_EMPLOYEE_SEED_STATUS, "revision_of": seed_id},
+        }
+    authors = _merge_seed_authors(row.get("created_by_employee_id"), editor_stamp)
+    await database.execute(
+        f"""
+        UPDATE external_product_seeds
+        SET attached_product_key = :attached_product_key,
+            attached_variant_id = :attached_variant_id,
+            {_AUTHORS_SET_CLAUSE},
+            updated_at = NOW()
+        WHERE id = :id
+        """,
+        {**values, "created_by_employee_id": authors, "id": seed_id},
+    )
+    return {"status": "success"}
+
+
 @router.post("/external-seeds/{seed_id}/attach")
 async def attach_external_seed(
     seed_id: str,
@@ -7350,17 +8124,7 @@ async def attach_external_seed(
     if pk.count("|") != 2:
         raise HTTPException(status_code=400, detail="INVALID_PRODUCT_KEY")
     vid = (body.variant_id or "").strip() or "∅"
-    await database.execute(
-        """
-        UPDATE external_product_seeds
-        SET attached_product_key = :pk,
-            attached_variant_id = :vid,
-            updated_at = NOW()
-        WHERE id = :id
-        """,
-        {"pk": pk, "vid": vid, "id": seed_id},
-    )
-    return {"status": "success"}
+    return await _set_seed_attachment(seed_id=seed_id, product_key=pk, variant_id=vid, current_user=current_user)
 
 
 @router.post("/external-seeds/{seed_id}/detach")
@@ -7369,20 +8133,7 @@ async def detach_external_seed(
     current_user: dict = Depends(get_current_employee),
 ):
     await _ensure_external_seeds_table()
-    row = await database.fetch_one("SELECT id FROM external_product_seeds WHERE id = :id", {"id": seed_id})
-    if not row:
-        raise HTTPException(status_code=404, detail="SEED_NOT_FOUND")
-    await database.execute(
-        """
-        UPDATE external_product_seeds
-        SET attached_product_key = NULL,
-            attached_variant_id = NULL,
-            updated_at = NOW()
-        WHERE id = :id
-        """,
-        {"id": seed_id},
-    )
-    return {"status": "success"}
+    return await _set_seed_attachment(seed_id=seed_id, product_key=None, variant_id=None, current_user=current_user)
 
 
 @router.get("/external-seeds/{seed_id}/resolve-subject")

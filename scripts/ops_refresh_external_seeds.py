@@ -233,6 +233,19 @@ async def _refresh_seed(
         return False, f"degraded: {payload.get('error')}"
     return False, f"unexpected_status: {status}"
 
+def preview_refused_by_ambiguous_price_guard(payload: Any) -> Optional[str]:
+    """`ambiguous_product:<refusal>` when the preview says the ambiguous-price guard (`on`) refused the page, else None.
+
+    A page with several priced products whose pricing node does not name the served URL (a bundle page priced by
+    a component) lists the COMPONENTS as its variants and their gallery: PATCHing them would store them as the
+    seed's, and no later refresh replaces them (be#2764 review P2-E). The refresh adopts neither on such a page, so
+    this mode skips the seed (the preview already withholds its variants). `shadow` reports, never refuses."""
+    info = payload.get("ambiguous_price") if isinstance(payload, dict) else None
+    if isinstance(info, dict) and info.get("refused"):
+        return f"ambiguous_product:{info.get('refusal') or 'refused'}"
+    return None
+
+
 async def _preview_seed(
     client: httpx.AsyncClient,
     base_url: str,
@@ -256,6 +269,9 @@ async def _preview_seed(
     if status != "success":
         err = payload.get("error")
         return False, f"{status}:{str(err)[:120] if err else ''}".strip(":"), [], []
+    refused = preview_refused_by_ambiguous_price_guard(payload)
+    if refused:
+        return False, refused, [], []
     preview = payload.get("preview")
     if not isinstance(preview, dict):
         return False, "invalid_preview", [], []

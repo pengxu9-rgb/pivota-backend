@@ -81,6 +81,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.database import database  # noqa: E402
 from services.catalog_enrichment_agent.ingestion import content_listing, elect_listing_keeper  # noqa: E402
 from services.external_seed_destination_liveness import CONFIRMED_DEAD_VERDICTS  # noqa: E402
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval  # noqa: E402
 
 SOURCE_SYSTEM = "catalog_enrichment_agent_v1"
 REASON = "same_key_other_listing"
@@ -522,6 +523,8 @@ async def _reverse(db: Any, m: Mapping[str, Any]) -> Dict[str, int]:
                 "id": seed_id, "status": "active", "prior": "inactive",
                 "prior_updated_at": (g.get("deactivate_prior_updated_at") or {}).get(seed_id)})
             _expect(got, [seed_id], "deactivated seeds")
+            # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+            log_seed_reactivated_outside_approval([seed_id], tool="repair_same_title_listings")
             done["reactivated"] += 1
         for r in g["restore"]:
             got = await db.fetch_all(RESUPPRESS_SQL, {"offer_id": r["offer_id"], "reason": DUPLICATE_REASON,
