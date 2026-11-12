@@ -47,6 +47,9 @@ NO_AGENT = "(none)"
 #: services.traffic_taxonomy_service.UNKNOWN_TOKEN: written into agent_id when the traffic has no
 #: agent. It names nobody, so it is reported as no agent, never as an agent called "unknown".
 UNKNOWN_AGENT_TOKEN = "unknown"
+#: The storefront hand-off record's surface (services/storefront_handoff_record.py HANDOFF_SURFACE),
+#: spelled here so the inline one-off runner needs nothing else from the image. Not a link: left out.
+HANDOFF_SURFACE = "ucp_storefront_handoff"
 
 # Purchases: the ledger's own states (migration 224). Everything not listed as terminal is
 # still in flight.
@@ -73,8 +76,13 @@ def build_queries(purchase_cols, click_cols=None):
     `issued_at` (migration 239, ADR-025 D1) separates links recorded when they were ISSUED from
     LEGACY rows that `/r` created at click time. Without the column every row is legacy: nothing
     was recorded at issue time, so nothing is claimed as issued.
+
+    A storefront hand-off record (HANDOFF_SURFACE, FIX_PLAN O-02) shares the table but is not a
+    link: `/r` never sees its id, so it would read as one more issued link nobody clicked. It is
+    left out of the referral lane entirely (O-02 review B-2).
     """
     cols = set(purchase_cols or ())
+    not_handoff = "coalesce(c.surface, '') <> :handoff_surface"
     src = "coalesce(p.item_source, 'reap_variant')" if "item_source" in cols else "'reap_variant'"
     if "issued_at" in set(click_cols or ()):
         click_counts = (
@@ -82,13 +90,13 @@ def build_queries(purchase_cols, click_cols=None):
             "count(*) FILTER (WHERE c.issued_at IS NOT NULL AND c.click_count > 0) AS clicked, "
             "count(*) FILTER (WHERE c.issued_at IS NULL) AS legacy, "
             "count(*) FILTER (WHERE c.issued_at IS NULL AND c.click_count > 0) AS legacy_clicked "
-            "FROM surface_click_events c WHERE c.created_at >= :since"
+            "FROM surface_click_events c WHERE c.created_at >= :since AND " + not_handoff
         )
     else:
         click_counts = (
             "0 AS issued, 0 AS clicked, count(*) AS legacy, "
             "count(*) FILTER (WHERE c.click_count > 0) AS legacy_clicked "
-            "FROM surface_click_events c WHERE c.created_at >= :since"
+            "FROM surface_click_events c WHERE c.created_at >= :since AND " + not_handoff
         )
     queries = {
         "clicks": (
@@ -381,6 +389,8 @@ async def collect(days):
                 params["none"] = NO_AGENT
             if ":unknown" in sql:
                 params["unknown"] = UNKNOWN_AGENT_TOKEN
+            if ":handoff_surface" in sql:
+                params["handoff_surface"] = HANDOFF_SURFACE
             try:
                 rows[name] = [dict(r) for r in await database.fetch_all(sql, params)]
             except Exception as exc:  # noqa: BLE001 -- one failed query must not hide the rest

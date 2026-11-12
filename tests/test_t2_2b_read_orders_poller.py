@@ -85,6 +85,28 @@ def _silence_commerce_events(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(svc, "record_commerce_event_best_effort", _noop)
 
 
+@pytest.fixture(autouse=True)
+async def _own_cart_link_claim_tables():
+    """This file builds the one real table its closures read, and removes it afterwards.
+
+    Every close goes through `services.conversion_click_claims.close_merchant_conversion_with_claim`.
+    That helper first asks `reap_agentic_purchases` whether the click is a Reap cart-link click,
+    through its OWN `database` import, which the FakeDB above does not replace. Nothing here
+    created that table. These tests passed only when an earlier file in the same process had
+    run `db/schema_guard.ensure_required_schema_light` (e.g. tests/test_a2a_rail_ledger.py, or
+    any full-app startup) and left the table behind. Alone, the read failed, the claim helper
+    deferred every close (ClickClaimUnavailable), and four tests saw 0 closures.
+
+    The table has no SQLAlchemy model, so it is built by the production heal itself, not by
+    DDL written here, and no row is inserted: a click with no Reap purchase is the case these
+    tests want. `tests/schema_guard_tables` drops only what the heal created.
+    """
+    from tests.schema_guard_tables import schema_guard_tables
+
+    async with schema_guard_tables(required=["reap_agentic_purchases"]):
+        yield
+
+
 def _click_row(**over: Any) -> Dict[str, Any]:
     base = {
         "click_id": "clk_known",

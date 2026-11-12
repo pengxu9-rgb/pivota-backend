@@ -2593,6 +2593,8 @@ async def run_external_referral_refresh_batch(
     proj_skips: Dict[str, int] = {}
     proj_writes: Dict[str, int] = {}
     proj_offer_skips: Dict[str, int] = {}
+    # Offer rows the attached lane gave the page's stock, by value, plus `skipped` (a stated stock no row took).
+    proj_stock: Dict[str, int] = {}
     pdp_refreshed = 0
     pdp_errored = 0
     pdp_skips: Dict[str, int] = {}
@@ -2779,6 +2781,9 @@ async def run_external_referral_refresh_batch(
                         elif _k.startswith("offer_skip_"):
                             _key = _k[len("offer_skip_"):]
                             proj_offer_skips[_key] = proj_offer_skips.get(_key, 0) + int(_v or 0)
+                        elif _k.startswith("stock_"):
+                            _key = _k[len("stock_"):]
+                            proj_stock[_key] = proj_stock.get(_key, 0) + int(_v or 0)
                 availability = result.get("availability_refresh")
                 if isinstance(availability, dict) and availability.get("status") == "applied":
                     availability_changed += 1
@@ -3188,6 +3193,9 @@ async def run_external_referral_refresh_batch(
         # Offer ROWS the attached lane refused, by reason (a seed can write its product-level row
         # and refuse a variant the page did not list).
         "projection_offer_skips": dict(sorted(proj_offer_skips.items(), key=lambda kv: -kv[1])[:8]),
+        # EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED: rows given in_stock / out_of_stock from this run's
+        # page reads, and `skipped` seeds whose stated stock no row took. All zero with the flag off.
+        "projection_stock_writes": {k: proj_stock.get(k, 0) for k in ("in_stock", "out_of_stock", "skipped")},
         "pdp_refreshed": pdp_refreshed,
         "pdp_errored": pdp_errored,
         "pdp_skips": dict(sorted(pdp_skips.items(), key=lambda kv: -kv[1])[:8]),

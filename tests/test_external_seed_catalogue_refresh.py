@@ -816,7 +816,9 @@ def test_it_stamps_freshness_and_attempt_and_projects_with_the_currency_read(mon
     query = [q for q, _ in run.sql if "last_crawled_at" in q][-1]
     assert "last_crawl_attempt_at = NOW()" in query
     assert run.stored["seed_data"]["snapshot"]["extracted_at"] >= stamp_before
-    assert run.projections[-1] == {"price_source": "refresh", "currency_read": True}
+    # The catalogue states the product in stock, so the projection also carries the stock this read stated
+    # (written onto the listing's row only with EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED on).
+    assert run.projections[-1] == {"price_source": "refresh", "currency_read": True, "availability_stated": "in_stock"}
     assert before["projection"] and len(run.projections) == 2
 
 

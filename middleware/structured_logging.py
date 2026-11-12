@@ -20,7 +20,10 @@ logger = logging.getLogger("structured_logs")
 #: (services/synthetic_call.py): a logged copy is replayable within its window by anyone holding the key.
 REDACTED_HEADER_NAMES = frozenset(
     {"authorization", "x-api-key", "x-buyer-issuer-key", "cookie", "set-cookie", "x-pivota-synthetic-assertion",
-     "x-pivota-buyer-token"}
+     "x-pivota-buyer-token",
+     # O-04: the issuing-agent assertion names an OWNER on the money routes, and a checkout token opens an
+     # order: a logged copy of either is an acting-as capability within its window.
+     "x-pivota-issuing-agent", "x-checkout-token"}
 )
 
 
