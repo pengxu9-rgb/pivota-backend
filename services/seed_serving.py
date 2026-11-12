@@ -20,11 +20,17 @@ A currency that several markets price (EUR) or that none prices has no market: N
 
 AN ACQUISITION MARKET IS REFUSED BY NAME. config/market_registry.json marks AU and JP `acquisition`: ingested
 and stored truthfully, NEVER served. So an AUD or JPY seed has no market here (`seed_row_market` is None and
-`seed_row_market_refusal` names it, 'acquisition_market:AU'), is never served, and no buyer market AU or JP
-is served a seed. The list is the registry's (`market_registry.acquisition_markets()`), never spelled here;
-when the registry serves a market it stops being refused. The truthful STORAGE stamp is not this module:
-`seed_offer_market` still declares a seed-copied offer AU or JP, which the serving gates then refuse
-(region_pricing.acquisition_market_offer_exists_sql).
+`seed_row_market_refusal` names it, 'acquisition_market:AU') and is never served. The list is the registry's
+(`market_registry.acquisition_markets()`), never spelled here; when the registry serves a market it stops being
+refused. The truthful STORAGE stamp is not this module: `seed_offer_market` still declares a seed-copied offer
+AU or JP, which the serving gates then refuse (region_pricing.acquisition_market_offer_exists_sql).
+
+THE LABEL IS NEVER A SERVING MARKET. `seed_row_market` names the store's market (GBP -> GB, though GB is `off`);
+whether a seed is served is `seed_row_served` / `seed_row_served_for` alone. A buyer is served a seed only in a
+SERVED market (the registry's served markets, which PIVOTA_SERVING_PRICING_REGIONS may only narrow: US and SG
+today), allowlisted, and every other buyer market is refused by name (`seed_buyer_market_refusal`):
+'market_not_served:GB' for a listed market that is not served, 'unknown_market:ZZ' for one the registry
+does not list.
 
 Every rule here is built from code already on main and is not spelled a second time:
   * the row's currency is `seed_offer_currency.seed_currency_of` (column and page read must agree,
@@ -42,8 +48,8 @@ from __future__ import annotations
 import logging
 from typing import Any, FrozenSet, Iterable, Mapping, Optional
 
-from services.external_seed_search import seed_serving_currency
-from services.market_registry import acquisition_markets, normalize_market
+from services.external_seed_search import DEFAULT_SEED_SERVING_MARKET, seed_serving_currency
+from services.market_registry import acquisition_markets, market_or_none, normalize_market
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
     market_for_pricing_currency,
@@ -61,8 +67,9 @@ def seed_row_currency(row: Mapping[str, Any]) -> Optional[str]:
 
 
 def refused_seed_markets() -> FrozenSet[str]:
-    """The markets a seed is never served in or labelled with: the market registry's `acquisition` markets
-    (AU and JP today). Read from config/market_registry.json at each call, never spelled here."""
+    """The markets a seed is never labelled with: the market registry's `acquisition` markets (AU and JP today).
+    config/market_registry.json is loaded once, at import of services.market_registry; this reads that loaded
+    registry at each call (so a test that patches market_registry.MARKETS is seen). Never spelled here."""
     return frozenset(acquisition_markets())
 
 
@@ -103,15 +110,36 @@ def served_currencies() -> FrozenSet[str]:
 
     Moved here from services/external_referral_readiness.served_region_currencies (2026-11-06), which re-exports it.
     """
+    regions = _served_regions()
+    return frozenset(c for c in (pricing_currency_for_region_or_none(r) for r in regions) if c)
+
+
+def _served_regions() -> FrozenSet[str]:
+    """`serving_pricing_regions()` normalised: the registry's served markets, narrowed by the env. EMPTY, loudly,
+    when the registry or the env does not load, so nothing is served rather than everything."""
     try:
         from services.index_pipeline_state_service import serving_pricing_regions
 
         regions = list(serving_pricing_regions() or [])
     except Exception as exc:
-        logger.warning("external referral refresh: no served pricing regions (%s); the queue tier uses the "
-                       "partition's currency alone", exc)
+        logger.warning("seed serving: no served pricing regions (%s); no seed is served and the refresh queue "
+                       "tier uses the partition's currency alone", exc)
         return frozenset()
-    return frozenset(c for c in (pricing_currency_for_region_or_none(r) for r in regions) if c)
+    return frozenset(code for code in (normalize_market(r) for r in regions) if code)
+
+
+def seed_buyer_market_refusal(buyer_market: Optional[str]) -> Optional[str]:
+    """Why a buyer market is served no seed at all, by name, or None when it is a served market.
+
+    A missing buyer market is the default serving market (US), as `seed_serving_currency` reads it.
+    'market_not_served:GB' for a market the registry lists but does not serve (off, acquisition, shadow, or
+    narrowed away by the env); 'unknown_market:ZZ' for one it does not list."""
+    code = normalize_market(buyer_market) or DEFAULT_SEED_SERVING_MARKET
+    if code in _served_regions():
+        return None
+    if market_or_none(code) is None:
+        return f"unknown_market:{code}"
+    return f"market_not_served:{code}"
 
 
 def seed_row_served(row: Mapping[str, Any], *, served: Optional[Iterable[str]] = None) -> bool:
@@ -128,14 +156,15 @@ def seed_row_served(row: Mapping[str, Any], *, served: Optional[Iterable[str]] =
 
 
 def seed_row_served_for(row: Mapping[str, Any], buyer_market: Optional[str]) -> bool:
-    """Whether the seed row is served to `buyer_market`: its own currency is the one
+    """Whether the seed row is served to `buyer_market`: the buyer market is a SERVED one
+    (`seed_buyer_market_refusal` is None: US and SG today) and the row's own currency is the one
     `seed_serving_currency(buyer_market)` names, the existing buyer rule.
 
     That rule reads a missing buyer market as the default serving market (US, so USD); it is not
-    restated here. A buyer market with no known currency ('DE', 'EU-DE'), an acquisition buyer market
-    ('AU', 'JP': refused by name, though region_pricing prices them) and a row that states no currency
-    are never served."""
-    if normalize_market(buyer_market) in refused_seed_markets():
+    restated here. Every buyer market that is not served is refused by name, whatever region_pricing
+    prices for it: GB (off, GBP), FR (EUR), CA, SE, KR, HK, AU and JP (acquisition), DE and an unknown
+    market. A row that states no currency is never served."""
+    if seed_buyer_market_refusal(buyer_market) is not None:
         return False
     currency = seed_row_currency(row)
     wanted = seed_serving_currency(buyer_market)
@@ -179,6 +208,7 @@ def seed_row_market_sql(alias: str) -> str:
 __all__ = [
     "market_for_currency_sql",
     "refused_seed_markets",
+    "seed_buyer_market_refusal",
     "seed_row_currency",
     "seed_row_market",
     "seed_row_market_refusal",

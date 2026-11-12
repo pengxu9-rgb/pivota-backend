@@ -233,27 +233,70 @@ def test_seed_row_served_for_a_buyer_market():
     # An acquisition buyer market is refused by name, though region_pricing prices it.
     assert m.seed_row_served_for({"market": "US", "price_currency": "AUD"}, "AU") is False
     assert m.seed_row_served_for({"market": "US", "price_currency": "JPY"}, " jp ") is False
+    # So is an `off` one, in its own currency too.
+    assert m.seed_row_served_for({"market": "US", "price_currency": "GBP"}, "GB") is False
 
 
-_BUYER_MARKETS = ["US", "SG", "GB", "DE", None, "AU", "JP", "ZZ", "EU-DE", ""]
-_ROW_CURRENCIES = ["USD", "SGD", "GBP", "EUR", "AUD", "JPY", "XYZ", None]
+_BUYER_MARKETS = ["US", "SG", "GB", "gb", "DE", None, "", "FR", "CA", "SE", "KR", "HK", "AU", "JP", "ZZ", "EU-DE"]
+_ROW_CURRENCIES = ["USD", "SGD", "GBP", "EUR", "CAD", "SEK", "KRW", "HKD", "AUD", "JPY", "XYZ", None]
+_REFUSAL = {"US": None, "SG": None, "GB": "market_not_served:GB", "DE": "unknown_market:DE",
+            "FR": "market_not_served:FR", "CA": "market_not_served:CA", "SE": "market_not_served:SE",
+            "KR": "market_not_served:KR", "HK": "market_not_served:HK", "AU": "market_not_served:AU",
+            "JP": "market_not_served:JP", "ZZ": "unknown_market:ZZ", "EU-DE": "unknown_market:EU-DE"}
 
 
 @pytest.mark.parametrize("buyer", _BUYER_MARKETS, ids=[repr(b) for b in _BUYER_MARKETS])
 def test_the_priced_path_rule_for_every_buyer_market(buyer):
-    """US/SG/GB/DE/none (and AU, JP, an unknown market): a seed is served to a buyer only in that market's
-    registry currency; DE (no single currency) and an unknown market get nothing; AU and JP get nothing.
-    A missing market is the default serving market, US (the existing buyer rule)."""
+    """US/SG/GB/DE/none and every other listed or unknown market: a seed is served only to a SERVED buyer
+    market (US, SG: the registry's served markets), and only in that market's registry currency. Every other
+    buyer market is served nothing and refused by name, even GB, FR, CA, SE, KR and HK, whose own currencies
+    region_pricing prices. A missing market is the default serving market, US (the existing buyer rule)."""
     code = market_registry.normalize_market(buyer) or "US"
-    entry = market_registry.market_or_none(code)
-    wanted = None
-    if entry is not None and entry["pricing_region"] and code not in {"AU", "JP"}:
-        wanted = entry["currency"]
+    served_markets = set(market_registry.served_markets())
+    assert served_markets == {"US", "SG"}
+    wanted = market_registry.currency_for(code) if code in served_markets else None
     served = {c for c in _ROW_CURRENCIES if m.seed_row_served_for({"market": "US", "price_currency": c}, buyer)}
     assert served == ({wanted} if wanted else set())
-    expected = {"US": {"USD"}, "SG": {"SGD"}, "GB": {"GBP"}, "DE": set(), "AU": set(), "JP": set(), "ZZ": set(),
-                "EU-DE": set()}[code]
-    assert served == expected
+    assert served == {"US": {"USD"}, "SG": {"SGD"}}.get(code, set())
+    assert m.seed_buyer_market_refusal(buyer) == _REFUSAL[code]
+
+
+def test_a_narrowed_serving_list_refuses_the_market_it_drops(monkeypatch):
+    monkeypatch.setenv("PIVOTA_SERVING_PRICING_REGIONS", "US")
+    sgd = {"market": "US", "price_currency": "SGD"}
+    assert m.seed_row_served_for(sgd, "SG") is False
+    assert m.seed_buyer_market_refusal("SG") == "market_not_served:SG"
+    assert m.seed_row_served_for({"price_currency": "USD"}, "US") is True
+
+
+def test_no_buyer_market_is_served_when_the_serving_list_does_not_load(monkeypatch):
+    import services.index_pipeline_state_service as ips
+
+    def _boom():
+        raise ValueError("registry did not load")
+
+    monkeypatch.setattr(ips, "serving_pricing_regions", _boom)
+    for buyer, currency in (("US", "USD"), (None, "USD"), ("SG", "SGD")):
+        assert m.seed_row_served_for({"price_currency": currency}, buyer) is False
+    assert m.seed_buyer_market_refusal("US") == "market_not_served:US"
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        # The previous delta: a denylist of the acquisition markets only.
+        lambda row, buyer: (market_registry.normalize_market(buyer) not in m.refused_seed_markets()
+                            and m.seed_row_currency(row) is not None
+                            and m.seed_row_currency(row) == m.seed_serving_currency(buyer)),
+        # The currency rule alone.
+        lambda row, buyer: m.seed_row_currency(row) is not None and m.seed_row_currency(row) == m.seed_serving_currency(buyer),
+    ],
+    ids=["acquisition_denylist", "currency_only"],
+)
+def test_a_buyer_rule_that_serves_an_off_market_fails(mutant):
+    cases = [({"price_currency": "GBP"}, "GB"), ({"price_currency": "CAD"}, "CA"), ({"price_currency": "KRW"}, "KR")]
+    assert any(mutant(row, buyer) for row, buyer in cases)
+    assert not any(m.seed_row_served_for(row, buyer) for row, buyer in cases)
 
 
 def test_served_currencies_moved_and_is_re_exported():
