@@ -34,6 +34,10 @@ import utils.auto_kyb_validator as kyb
 from db import merchant_onboarding as mo
 from routes.merchant_onboarding_routes import MerchantRegisterRequest
 
+# The real identity check, kept before the `signup` fixture replaces it: a recovered signup goes
+# through it (since #2763 an onboarding row with no login is refused, and a login needs its password).
+_REAL_IDENTITY_MERGE = onboarding.resolve_public_merchant_identity_merge
+
 
 def _params(query) -> dict:
     try:
@@ -193,8 +197,10 @@ async def test_the_transaction_abort_retry_does_not_schedule_an_approval(signup,
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,approved", [("pending_verification", False), ("approved", True)])
 async def test_a_recovered_signup_reports_its_own_status_not_the_old_flag(signup, monkeypatch, status, approved):
-    """Re-registering with the same email and store recovers the row. A row still pending
-    review that carries the old auto_approved=True is not told it is approved."""
+    """Re-registering with the same email, store and the login's own password recovers the row.
+    A row still pending review that carries the old auto_approved=True is not told it is approved."""
+    from utils.auth import hash_password
+
     async def existing(_email):
         return {
             "merchant_id": "merch_recovered",
@@ -204,7 +210,13 @@ async def test_a_recovered_signup_reports_its_own_status_not_the_old_flag(signup
             "approval_confidence": 0.2,
         }
 
+    async def login(_email):
+        return {"email": "owner@example.com", "role": "merchant", "merchant_id": "merch_recovered",
+                "password_hash": hash_password("hunter2hunter2")}
+
     monkeypatch.setattr(onboarding, "get_active_onboarding_by_email", existing)
+    monkeypatch.setattr(onboarding, "get_user_auth_binding", login)
+    monkeypatch.setattr(onboarding, "resolve_public_merchant_identity_merge", _REAL_IDENTITY_MERGE)
     req = MerchantRegisterRequest(
         business_name="Recovered Co",
         region="US",
@@ -217,6 +229,32 @@ async def test_a_recovered_signup_reports_its_own_status_not_the_old_flag(signup
     assert resp["auto_approved"] is approved
     assert resp["next_step"] == ("Connect PSP" if approved else "Wait for Pivota review")
     assert signup["kyc_calls"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending_verification", "approved"])
+async def test_a_recovered_signup_without_its_login_is_refused_and_never_approves(signup, monkeypatch, status):
+    """An onboarding row with this email but no login (staff-onboarded, or a signup that failed after the
+    insert) is refused, as #2763 made it: signup does not prove the mailbox. Nothing is written or approved."""
+    async def existing(_email):
+        return {"merchant_id": "merch_recovered", "store_url": "https://recover.example.com",
+                "status": status, "auto_approved": True, "approval_confidence": 0.2}
+
+    monkeypatch.setattr(onboarding, "get_active_onboarding_by_email", existing)
+    monkeypatch.setattr(onboarding, "resolve_public_merchant_identity_merge", _REAL_IDENTITY_MERGE)
+    req = MerchantRegisterRequest(
+        business_name="Recovered Co",
+        region="US",
+        contact_email="owner@example.com",
+        password="hunter2hunter2",
+        store_url="https://recover.example.com",
+    )
+    with pytest.raises(HTTPException) as exc:
+        await onboarding.register_merchant(req, _DummyBackgroundTasks())
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "MERCHANT_SIGNIN_REQUIRED"
+    assert signup["kyc_calls"] == []
+    assert [w for w in signup["writes"] if w != {"_sql": "SELECT 1"}] == []
 
 
 # ---- 2. approval is a staff decision -----------------------------------------------------
