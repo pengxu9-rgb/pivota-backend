@@ -8,10 +8,15 @@ before authentication, before the body is read and before any partner assertion 
 nonce is burned and no rate limit charged). A method other than POST is that same 404 with the flag
 on too.
 
-With the flag on, the order is: the caller's key (401), the body (400, before any assertion is
-looked at), the caller must be one of our own services (409 `service_caller_required`: an agent's
-own key cannot mint here), then the partner assertion (409 on a bad one, the partner's own 429s),
-then the write.
+With the flag on, the order is: the caller's key (401); the caller must be one of our own services
+(409 `service_caller_required`: an agent's own key cannot mint here, and is told nothing else,
+whatever its body); the body (400, before any assertion is looked at, so a refused body burns no
+nonce); then the partner assertion (409 on a bad one, the partner's own 429s); then the write.
+
+THE MARKET IS REQUIRED and never defaulted (see services/storefront_cart_referral.py). A body with
+no `market`, a null or a blank one is 400 `market_required`; one that is not two capital letters is
+400 `market_invalid`. Named, so the gateway's log says why its cart carries no referral. Nothing is
+written and no assertion is looked at.
 
 One call, made by the GATEWAY with its own service key:
 
@@ -34,6 +39,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -75,19 +81,48 @@ class ReferralBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     seller_host: str = Field(max_length=253, pattern=_anchored(handoffs.SELLER_HOST_RE.pattern))
-    market: Optional[str] = Field(default=None, pattern=_anchored(handoffs.MARKET_RE.pattern))
+    # REQUIRED, and never defaulted: it is stamped on the seller's cart link as `utm_campaign`.
+    market: str = Field(pattern=_anchored(handoffs.MARKET_RE.pattern))
     merchant_id: Optional[str] = Field(default=None, max_length=50, pattern=_anchored(r"[A-Za-z0-9_.:-]+"))
+
+
+#: The status of a body this route refuses by name (the same one a body that fails validation gets).
+BAD_BODY_STATUS = 400
+
+_read_body = _json_body(ReferralBody)
+
+
+def _market_refusal(exc: RequestValidationError) -> Optional[str]:
+    """`market_required` (absent, null or blank) or `market_invalid` when the body's `market` is why it
+    failed validation, else None. A market problem is named even beside another field's."""
+    for err in exc.errors():
+        if tuple(err.get("loc") or ())[:2] != ("body", "market"):
+            continue
+        value = err.get("input")
+        if err.get("type") == "missing" or value is None or (isinstance(value, str) and not value.strip()):
+            return "market_required"
+        return "market_invalid"
+    return None
 
 
 @router.post("")
 async def mint_storefront_cart_referral(
     request: Request,
     caller: AgentContext = Depends(get_agent_context),
-    body: ReferralBody = Depends(_json_body(ReferralBody)),
 ):
-    # Only our own services mint here. Checked before the assertion, so a refused caller burns no nonce.
+    # Only our own services mint here. Checked FIRST after the key: before the body is read, so any
+    # other caller gets this one answer whatever it sent and learns nothing of the body's shape, and
+    # before the assertion, so a refused caller burns no nonce.
     if not await agent_auth._is_service_caller(agent_auth.request_api_key(request)):
         return _refuse(REFUSED_STATUS, "service_caller_required")
+    # Read here, not as a dependency: a dependency would be resolved before the check above.
+    try:
+        body = await _read_body(request)
+    except RequestValidationError as exc:
+        code = _market_refusal(exc)
+        if code is None:
+            raise
+        return _refuse(BAD_BODY_STATUS, code)
     context = await adopt_forwarded_owner(request, caller, ops=(referrals.REFERRAL_OP,))
     partner = _adopted_partner(context)
     try:
@@ -98,6 +133,8 @@ async def mint_storefront_cart_referral(
             partner_agent_id=partner,
             via_agent_id=getattr(context, "forwarded_by_agent_id", None) if partner else None,
         )
+    except referrals.ReferralMarketRequired:  # unreachable past the body above; never a default
+        return _refuse(BAD_BODY_STATUS, "market_required")
     except Exception as exc:  # noqa: BLE001 -- the door builds its cart without a referral; say so
         logger.warning("storefront_cart_referral.mint_failed error_type=%s", type(exc).__name__)
         return _refuse(503, "referral_store_unavailable")

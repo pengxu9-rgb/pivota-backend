@@ -506,6 +506,32 @@ async def test_an_order_credited_to_another_agent_is_not_this_partners_even_on_i
     assert (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()["status"] == "seller_order_observed"
 
 
+async def test_a_test_order_is_not_a_seller_order(world, monkeypatch):
+    """A converted edge stamped as test traffic at write (a rig seller's or a test order's:
+    services.test_traffic) is not reported to the partner; a real one beside it is."""
+    from services import test_traffic
+
+    monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    await _referral_click(PARTNER_A, click_count=0, last_click_at=None)
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    async def edge(edge_id: str, metadata):
+        await database.execute(commerce_attribution_edges.insert().values(
+            edge_id=edge_id, merchant_id="merch_obs_shop_a", click_id=REFERRAL_A, order_id="ord_" + edge_id,
+            agent_id=PARTNER_A, state="converted", converted_at=later, refund_count=0, refunded_amount=0,
+            metadata=metadata, created_at=later, updated_at=later,
+        ))
+
+    await edge("edge_handoff_test", test_traffic.stamp({"click_matched": True}, [test_traffic.REASON_SHOPIFY_TEST]))
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["status"] == "handed_off" and "seller_order_observed_at" not in body
+    # Metadata that carries no stamp (none at all, or a real order's) is a seller order.
+    await edge("edge_handoff_test_own", {"click_matched": True})
+    body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+    assert body["status"] == "seller_order_observed" and body["seller_order_observed_at"]
+
+
 async def test_a_referred_edge_that_never_converted_is_not_an_order(world):
     await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
     later = datetime.now(timezone.utc) + timedelta(minutes=5)

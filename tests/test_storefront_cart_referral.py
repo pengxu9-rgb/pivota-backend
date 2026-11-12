@@ -66,7 +66,10 @@ HOST_B = "referral-test-shop-b.example.com"
 _HOSTS = (HOST_A, HOST_B)
 MERCHANT = "merch_obs_referral_test_a"
 TEST_MERCHANT = "merch_obs_referral_test_rig"
+REPORT_MERCHANT = "merch_obs_referral_test_report"
 RECORD_ID = "esh_" + "R" * 21 + "r"
+RECORD_ID_2 = "esh_" + "R" * 21 + "s"
+_RECORD_IDS = (RECORD_ID, RECORD_ID_2)
 
 
 def raw_json(body: Dict[str, Any]) -> bytes:
@@ -121,6 +124,20 @@ def refusal(res) -> tuple:
     return res.status_code, detail.get("error")
 
 
+def refusal_code(res) -> tuple:
+    """The status and the snake-case code of a named refusal, where the gateway's client reads it
+    (PIVOTA-Agent src/services/storefrontCartReferral.js refusalCode) under the /agent error envelope."""
+    body = res.json()
+    error = body.get("error")
+    if isinstance(body.get("detail"), dict) and isinstance(body["detail"].get("error"), str):
+        return res.status_code, body["detail"]["error"]
+    if isinstance(error, str):
+        return res.status_code, error
+    if isinstance(error, dict) and isinstance(error.get("details"), dict):
+        return res.status_code, error["details"].get("error")
+    return res.status_code, None
+
+
 def without_metadata(res) -> str:
     body = res.json()
     body.pop("metadata", None)
@@ -133,7 +150,8 @@ async def _clean():
         for click_id in ids:
             await database.execute("DELETE FROM commerce_attribution_edges WHERE click_id = :c", {"c": click_id})
         await database.execute("DELETE FROM surface_click_events WHERE dest_domain = :h", {"h": host})
-    await database.execute("DELETE FROM surface_click_events WHERE click_id = :c", {"c": RECORD_ID})
+    for record_id in _RECORD_IDS:
+        await database.execute("DELETE FROM surface_click_events WHERE click_id = :c", {"c": record_id})
 
 
 @pytest.fixture()
@@ -231,7 +249,7 @@ async def test_one_row_owned_by_the_partner_and_the_members_a_normal_referral_ca
 async def test_the_members_are_the_ones_the_r_issue_builders_put_on_a_destination(world):
     """Not a second vocabulary: the same two builders the `/r` issue paths call, on a product page of
     the same seller, yield exactly these names and values."""
-    for market, campaign in (("SG", "SG"), (None, "US")):
+    for market, campaign in (("SG", "SG"), ("US", "US"), ("GB", "GB")):
         res = await mint(world, PARTNER_A, body_for(HOST_B, market=market))
         assert res.status_code == 200, res.text
         answer = res.json()
@@ -246,7 +264,63 @@ async def test_the_members_are_the_ones_the_r_issue_builders_put_on_a_destinatio
         assert list(answer["attribution"].items()) == on_a_normal_referral
         assert answer["attribution"]["utm_campaign"] == campaign
     rows = await rows_for(HOST_B)
-    assert [ctx_of(r).get("market") for r in rows] in (["SG", None], [None, "SG"])
+    assert sorted(ctx_of(r).get("market") for r in rows) == ["GB", "SG", "US"]
+
+
+# --- the market is the caller's, never a default --------------------------------------------------
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("market,code", [
+    (_ABSENT, "market_required"),
+    (None, "market_required"),
+    ("", "market_required"),
+    ("  ", "market_required"),
+    ("us", "market_invalid"),
+    ("usa", "market_invalid"),
+    ("U", "market_invalid"),
+    ("U1", "market_invalid"),
+    (" US", "market_invalid"),
+    ("US\n", "market_invalid"),
+    (840, "market_invalid"),
+    (["US"], "market_invalid"),
+    (True, "market_invalid"),
+], ids=["absent", "null", "empty", "blank", "lower", "alpha3", "one_letter", "digit", "padded", "newline",
+        "number", "list", "bool"])
+async def test_a_referral_that_names_no_market_is_refused_by_name_and_nothing_is_defaulted(world, market, code):
+    """It was a 200 stamped `utm_campaign=US`. No market is filled in for the caller: the call is
+    refused by name, no row is written, and the partner's assertion is not looked at."""
+    body: Dict[str, Any] = {"seller_host": HOST_A, "merchant_id": MERCHANT}
+    if market is not _ABSENT:
+        body["market"] = market
+    token = bound(PARTNER_A, referrals.REFERRAL_OP, raw=raw_json(body))
+    res = await mint(world, None, body, token=token)
+    assert refusal_code(res) == (400, code), res.text
+    assert "utm_campaign" not in res.text and "clk_" not in res.text
+    # Named even beside another refused field.
+    also_bad = dict(body, buyer_email="buyer@example.com")
+    assert refusal_code(await mint(world, None, also_bad)) == (400, code)
+    assert await rows_for(HOST_A) == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES["adopted"] == 0
+    # The refusal burned no nonce: the gateway's corrected call may still not reuse this token (it is
+    # bound to these bytes), but a token for a good body is accepted afterwards.
+    assert (await mint(world, PARTNER_A, body_for())).status_code == 200
+    (row,) = await rows_for(HOST_A)
+    assert ctx_of(row)["market"] == "US"
+
+
+@pytest.mark.parametrize("market", [None, "", "  ", "us", "USA", 840], ids=["none", "empty", "blank", "lower", "alpha3", "number"])
+async def test_the_service_mints_nothing_without_a_named_market(world, market):
+    """Below the route too: the writer itself has no market to fall back on."""
+    with pytest.raises(referrals.ReferralMarketRequired):
+        await referrals.mint_referral(seller_host=HOST_A, market=market, merchant_id=MERCHANT)
+    with pytest.raises(referrals.ReferralMarketRequired):
+        referrals.referral_members(seller_host=HOST_A, market=market, click_id="clk_" + "a" * 24)
+    with pytest.raises(TypeError):
+        await referrals.mint_referral(seller_host=HOST_A, merchant_id=MERCHANT)
+    assert await rows_for(HOST_A) == []
+    assert not hasattr(referrals, "DEFAULT_MARKET")
 
 
 async def test_each_call_mints_its_own_click(world):
@@ -305,6 +379,57 @@ async def test_only_our_own_service_mints(world):
     assert res.status_code == 401
 
 
+_BODIES_A_STRANGER_MIGHT_SEND = {
+    "valid": raw_json({"seller_host": HOST_A, "market": "US", "merchant_id": MERCHANT}),
+    "no_market": raw_json({"seller_host": HOST_A}),
+    "null_market": raw_json({"seller_host": HOST_A, "market": None}),
+    "bad_market": raw_json({"seller_host": HOST_A, "market": "usa"}),
+    "bad_host": raw_json({"seller_host": "Not A Host", "market": "US"}),
+    "extra_field": raw_json({"seller_host": HOST_A, "market": "US", "agent_id": PARTNER_B}),
+    "empty_object": b"{}",
+    "a_list": b"[]",
+    "not_json": b"not json",
+    "empty": b"",
+}
+
+
+async def test_a_caller_that_is_not_our_service_learns_nothing_from_its_body(world):
+    """The service check comes before the body is read. A partner's own key gets the one 409 for
+    every body, byte for byte (so not which field is required, nor that one failed), with or without
+    an assertion, and no nonce is burned; no key at all is the one 401."""
+    good_raw = _BODIES_A_STRANGER_MIGHT_SEND["valid"]
+    token = bound(PARTNER_A, referrals.REFERRAL_OP, raw=good_raw)
+    answers = {}
+    anonymous = {}
+    for name, raw in _BODIES_A_STRANGER_MIGHT_SEND.items():
+        for assertion in (None, token):
+            headers = {"X-API-Key": PARTNER_A_KEY, "Content-Type": "application/json"}
+            if assertion:
+                headers["X-Pivota-Issuing-Agent"] = assertion
+            res = await world.post(PATH, content=raw, headers=headers)
+            assert refusal(res) == (409, "service_caller_required"), (name, res.text)
+            answers[(name, bool(assertion))] = without_metadata(res)
+        res = await world.post(PATH, content=raw, headers={"Content-Type": "application/json"})
+        assert res.status_code == 401, (name, res.text)
+        anonymous[name] = without_metadata(res)
+    assert len(set(answers.values())) == 1
+    assert len(set(anonymous.values())) == 1
+    for text in (*answers.values(), *anonymous.values()):
+        assert "market" not in text and "validation" not in text and "seller_host" not in text
+    assert await rows_for(HOST_A) == []
+    assert forwarded.FORWARDED_OWNER_OUTCOMES.get("adopted", 0) == 0
+    # The token none of those calls burned is still good from the gateway.
+    res = await world.post(PATH, content=good_raw, headers={
+        "X-API-Key": GATEWAY_KEY, "Content-Type": "application/json", "X-Pivota-Issuing-Agent": token,
+    })
+    assert res.status_code == 200, res.text
+    # And our own service IS told what is wrong with a body.
+    res = await world.post(PATH, content=_BODIES_A_STRANGER_MIGHT_SEND["bad_host"],
+                           headers={"X-API-Key": GATEWAY_KEY, "Content-Type": "application/json"})
+    assert res.status_code == 400 and res.json()["error"]["code"] == "INVALID_REQUEST"
+    assert "seller_host" in res.text
+
+
 async def test_a_bad_assertion_refuses_and_writes_nothing(world):
     raw = raw_json(body_for())
     cases = {
@@ -331,7 +456,6 @@ async def test_a_bad_assertion_refuses_and_writes_nothing(world):
 @pytest.mark.parametrize("bad", [
     {"seller_host": "Not A Host"},
     {"seller_host": "https://referral-test-shop-a.example.com/"},
-    {"market": "usa"},
     {"merchant_id": "has space"},
     {"buyer_email": "buyer@example.com"},
     {"click_id": "clk_" + "a" * 24},
@@ -493,3 +617,106 @@ async def test_a_hand_off_record_naming_this_click_reads_the_order_later(world, 
         created_at=now, updated_at=now,
     ))
     assert (await handoffs.read_handoff(RECORD_ID, binding, PARTNER_A))["handoff"]["status"] == "seller_order_observed"
+
+
+async def _hand_off(record_id: str, click_id: str, host: str, merchant_id: str):
+    binding = hashlib.sha256(("esc_" + record_id).encode("utf-8")).hexdigest()
+    record = handoffs.HandoffRecord(
+        record_id=record_id, binding=binding, partner_agent_id=PARTNER_A, via_agent_id=GATEWAY_AGENT,
+        seller_host=host, currency="USD", quoted_total_minor=2300, quote_source="seller_cart",
+        buyer_market="US", referral_click_id=click_id, merchant_id=merchant_id,
+    )
+    assert await handoffs.record_handoff(record) == "recorded"
+
+    async def status() -> str:
+        return (await handoffs.read_handoff(record_id, binding, PARTNER_A))["handoff"]["status"]
+
+    return status
+
+
+async def test_a_test_order_on_a_referral_is_not_a_seller_order_and_a_real_one_is(world, monkeypatch):
+    """A converted edge the order writer stamped as test traffic (a rig seller's order) is not a seller
+    order to report to the partner; the same edge for a real seller is. The edge's metadata is what
+    the writer's own classifier and stamper produce for each seller
+    (services.commerce_attribution_service.close_external_order_conversion stamps with exactly
+    these two calls; that writer's SQL is Postgres-only, so the Postgres twin drives it whole)."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv(handoffs.STOREFRONT_HANDOFF_RECORD_ENV, "1")
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", TEST_MERCHANT)
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    statuses = {}
+    for record_id, host, merchant in ((RECORD_ID, HOST_A, TEST_MERCHANT), (RECORD_ID_2, HOST_B, MERCHANT)):
+        monkeypatch.delenv(test_traffic.STAMP_FLAG, raising=False)
+        click_id = (await mint(world, PARTNER_A, body_for(host, merchant_id=merchant))).json()["click_id"]
+        status = await _hand_off(record_id, click_id, host, merchant)
+        assert await status() == "handed_off"
+        monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+        metadata = test_traffic.stamp(
+            {"click_matched": True}, test_traffic.classify_test_traffic(merchant_ids=[merchant, merchant])
+        )
+        await database.execute(commerce_attribution_edges.insert().values(
+            edge_id="edge_referral_test_" + record_id[-1], merchant_id=merchant, click_id=click_id,
+            order_id="ord_referral_test_" + record_id[-1], state="converted", agent_id=PARTNER_A,
+            converted_at=later, refund_count=0, refunded_amount=0, metadata=metadata,
+            created_at=later, updated_at=later,
+        ))
+        statuses[merchant] = (await status(), metadata.get(test_traffic.STAMP_KEY))
+    assert statuses[TEST_MERCHANT] == ("handed_off", True)
+    assert statuses[MERCHANT] == ("seller_order_observed", None)
+
+
+# --- the staff click report -----------------------------------------------------------------------
+
+
+async def test_referral_and_hand_off_rows_do_not_move_the_issued_vs_clicked_report(world, monkeypatch):
+    """Neither row is a link a buyer can follow, so neither is an issued link nobody followed: one door
+    checkout (a referral and the hand-off record naming it), a cart the door then gave up on (a
+    referral alone) and a rig seller's referral leave every number of the report where it was, for
+    the seller and overall. A normal link still counts."""
+    from datetime import datetime, timedelta, timezone
+
+    from services.click_reporting import issued_vs_clicked
+    from services.commerce_attribution_service import IssuedClick, issue_clicks
+
+    monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", TEST_MERCHANT)
+    monkeypatch.setenv(handoffs.STOREFRONT_HANDOFF_RECORD_ENV, "1")
+    start = datetime.now(timezone.utc) - timedelta(days=1)
+    end = datetime.now(timezone.utc) + timedelta(days=1)
+
+    async def report(merchant_id=None):
+        return await issued_vs_clicked(start_at=start, end_at=end, merchant_id=merchant_id)
+
+    def link(n: int) -> IssuedClick:
+        return IssuedClick(click_id=f"clk_referral_report_test_{n}", merchant_id=REPORT_MERCHANT,
+                           surface="agent", dest_domain=HOST_B, agent_id=PARTNER_A)
+
+    await issue_clicks([link(n) for n in range(3)])
+    await database.execute(
+        "UPDATE surface_click_events SET click_count = 1, first_click_at = :t, last_click_at = :t "
+        "WHERE click_id = 'clk_referral_report_test_0'", {"t": datetime.now(timezone.utc)},
+    )
+    seller_before, overall_before = await report(REPORT_MERCHANT), await report()
+    assert (seller_before["issued"], seller_before["clicked"], seller_before["issued_not_clicked"],
+            seller_before["follow_rate"]) == (3, 1, 2, 0.3333)
+
+    checkout = (await mint(world, PARTNER_A, body_for(HOST_A, merchant_id=REPORT_MERCHANT))).json()["click_id"]
+    await _hand_off(RECORD_ID, checkout, HOST_A, REPORT_MERCHANT)
+    assert (await mint(world, PARTNER_A, body_for(HOST_A, merchant_id=REPORT_MERCHANT))).status_code == 200
+    assert (await mint(world, None, body_for(HOST_A, merchant_id=TEST_MERCHANT))).status_code == 200
+    on_the_surface = [r for r in await rows_for(HOST_A)]
+    assert len(on_the_surface) == 4 and all(r["issued_at"] is not None for r in on_the_surface)
+    assert {r["surface"] for r in on_the_surface} == {handoffs.HANDOFF_SURFACE}
+
+    assert await report(REPORT_MERCHANT) == seller_before
+    assert await report() == overall_before
+    # The rig seller's referral is in no count either, the test-traffic one included.
+    rig = await report(TEST_MERCHANT)
+    assert (rig["issued"], rig["clicked"], rig["test_traffic_rows_excluded"], rig["follow_rate"]) == (0, 0, 0, None)
+
+    await issue_clicks([link(3)])
+    seller_after = await report(REPORT_MERCHANT)
+    assert (seller_after["issued"], seller_after["clicked"], seller_after["issued_not_clicked"],
+            seller_after["follow_rate"]) == (4, 1, 3, 0.25)
+    assert (await report())["issued"] == overall_before["issued"] + 1

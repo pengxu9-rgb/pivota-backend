@@ -179,6 +179,35 @@ async def test_later_state_is_read_only_from_a_referral_issued_to_the_partner_on
     assert await _status(handoffs) == "seller_order_observed", "issued to the partner: its order is read"
 
 
+async def test_a_test_order_is_not_a_seller_order_on_postgres(db, monkeypatch):
+    """The test-traffic exclusion on the stored JSONB: a stamped converted edge is not read, an
+    edge with NULL metadata or an unstamped one is."""
+    from db.commerce_attribution import commerce_attribution_edges
+    from services import storefront_handoff_record as handoffs
+    from services import test_traffic
+
+    monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+    await handoffs.record_handoff(_record())
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await _referral_row(db, PARTNER_A, later - timedelta(days=1))  # issued to the partner, followed before the hand-off
+
+    async def edge(edge_id, metadata):
+        await db.execute(commerce_attribution_edges.insert().values(
+            edge_id=edge_id, merchant_id="merch_obs_shop_a", click_id=REFERRAL, order_id="ord_" + edge_id,
+            agent_id=PARTNER_A, state="converted", converted_at=later, refund_count=0, refunded_amount=0,
+            metadata=metadata, created_at=later, updated_at=later,
+        ))
+
+    await edge("edge_pg_stamped", test_traffic.stamp({"click_matched": True}, [test_traffic.REASON_SHOPIFY_TEST]))
+    assert await _status(handoffs) == "handed_off", "a test order is not a seller order"
+    await edge("edge_pg_real", {"click_matched": True})
+    assert await _status(handoffs) == "seller_order_observed"
+    await db.execute("DELETE FROM commerce_attribution_edges WHERE edge_id = 'edge_pg_real'")
+    assert await _status(handoffs) == "handed_off"
+    await edge("edge_pg_no_metadata", None)
+    assert await _status(handoffs) == "seller_order_observed", "NULL metadata carries no stamp"
+
+
 async def test_an_order_credited_to_another_agent_is_not_read_on_postgres(db):
     from services import storefront_handoff_record as handoffs
 

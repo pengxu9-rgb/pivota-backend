@@ -26,8 +26,10 @@ a guessed one. The esc id itself is not stored: a seller-priced id carries the s
 which is that seller's bearer handle.
 
 ROWS ARE NOT CLICKS. click_count stays 0 and `/r` never sees this id (no token carries it). Every
-reader that counts ISSUED links must leave this surface out (scripts/agent_attribution_funnel.py
-does; O-02 review B-2), or each hand-off reads as one more issued link nobody followed. The
+reader that counts ISSUED links must leave this surface out, or each hand-off reads as one more
+issued link nobody followed. The two that count issued rows both do: scripts/agent_attribution_funnel.py
+(O-02 review B-2) and services/click_reporting.py (the staff issued-vs-clicked report). The operator
+smoke's per-merchant row count (scripts/smoke_commerce_channels_signoff.py) leaves it out too. The
 inferred-click lookup and the merchant funnels only read rows /r touched (click or impression
 count > 0). The conversion pollers' candidate queries (services/external_conversion_poller.py,
 services/woocommerce_conversion_poller.py) select merchants from ANY recent row, so a hand-off row
@@ -40,7 +42,9 @@ ONLY when that referral click was issued to THIS partner (its surface_click_even
 hand-off's owner as agent_id; O-02 review B-1):
   buyer_followed_link    `/r` counted a click on that referral id at or after the hand-off;
   seller_order_observed  a converted commerce_attribution_edges row joins that referral id, at or
-                         after the hand-off, credited to this partner or to no agent.
+                         after the hand-off, credited to this partner or to no agent, and NOT
+                         stamped test traffic (services.test_traffic: a rig merchant's or a test
+                         order's edge is no seller order to report to a partner).
 A referral id with no click row, an agent-less one (a link minted for no caller in particular: the
 product-detail mint, the shared search cache) or another agent's may be shared by every caller
 served that link, so it says nothing about THIS partner's buyer: such a hand-off answers
@@ -60,6 +64,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from db.database import database
 from services.commerce_attribution_service import IssuedClick, issue_click
+from services.test_traffic import not_test_traffic_sql
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +224,8 @@ async def _later_state(row: Mapping[str, Any], context: Mapping[str, Any]) -> Di
             "SELECT state, converted_at, created_at FROM commerce_attribution_edges "
             "WHERE click_id = :click_id AND state = 'converted' "
             "AND (agent_id IS NULL OR agent_id = '' OR agent_id = :owner) "
+            # A test order (stamped at write) is not a seller order: the same exclusion the money reads apply.
+            "AND " + not_test_traffic_sql("metadata") + " "
             "ORDER BY created_at DESC LIMIT 1",
             {"click_id": referral, "owner": owner},
         )

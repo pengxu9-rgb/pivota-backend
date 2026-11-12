@@ -25,6 +25,12 @@ with `context.kind = "ucp_storefront_cart_referral"`:
   dest_domain  the seller host the cart is built on;
   context      {kind, v, tool, market, join_mode, via_agent_id}.
 
+THE MARKET IS THE CALLER'S, NEVER A DEFAULT. It becomes `utm_campaign` on the seller's cart link, so
+it is a claim about the cart: the door sends the market the cart was built for (the one it sent the
+seller, an assumed one included, which the door itself labels as assumed). A call that names none,
+or one that is not two capital letters, mints nothing (`ReferralMarketRequired`): no value is
+filled in here.
+
 NOT A LINK ANYBODY FOLLOWS. No `/r` token carries this id, so click_count stays 0 for ever. It is on
 the hand-off surface for that reason: every reader that counts issued links must leave that surface
 out (see the note in services/storefront_handoff_record.py), and one filter then covers both the
@@ -43,7 +49,7 @@ from urllib.parse import parse_qsl, urlparse
 
 from services.commerce_attribution_service import IssuedClick, issue_click, new_click_id
 from services.outbound_links_service import DEFAULT_UTM_TEMPLATE, append_referral_click_param, apply_utm
-from services.storefront_handoff_record import HANDOFF_SURFACE
+from services.storefront_handoff_record import HANDOFF_SURFACE, MARKET_RE
 
 STOREFRONT_CART_REFERRAL_ENV = "UCP_STOREFRONT_CART_REFERRAL_ENABLED"
 
@@ -53,8 +59,6 @@ REFERRAL_OP = "ucp_storefront_cart.referral"
 REFERRAL_KIND = "ucp_storefront_cart_referral"
 #: The `{{tool}}` of the UTM template: the operation that builds the cart, whichever door it came in by.
 REFERRAL_TOOL = "create_checkout"
-#: The `{{market}}` when the door named none, as every `/r` issue path defaults it.
-DEFAULT_MARKET = "US"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _TRACKING_PREFIXES = ("utm_", "pvt_")
@@ -64,14 +68,25 @@ def storefront_cart_referral_enabled() -> bool:
     return str(os.getenv(STOREFRONT_CART_REFERRAL_ENV) or "").strip().lower() in _TRUTHY
 
 
-def referral_members(*, seller_host: str, market: Optional[str], click_id: str) -> Dict[str, str]:
+class ReferralMarketRequired(ValueError):
+    """The referral was asked for with no market, or with one that is not two capital letters."""
+
+
+def named_market(market: Any) -> str:
+    """The market exactly as the caller named it, or ReferralMarketRequired. Never a default."""
+    if not isinstance(market, str) or not MARKET_RE.fullmatch(market):
+        raise ReferralMarketRequired("a store-cart referral names the market its cart is built for")
+    return market
+
+
+def referral_members(*, seller_host: str, market: str, click_id: str) -> Dict[str, str]:
     """The tracking members a `/r` referral destination on `seller_host` carries for this click, in
     the order they appear there. Built by the `/r` issue path's own builders on a bare destination,
     then read back from its query, so the names and values cannot differ from a normal referral."""
     destination = apply_utm(
         f"https://{seller_host}/",
         DEFAULT_UTM_TEMPLATE,
-        {"market": str(market or DEFAULT_MARKET), "tool": REFERRAL_TOOL},
+        {"market": named_market(market), "tool": REFERRAL_TOOL},
     )
     destination = append_referral_click_param(destination, click_id)
     members: Dict[str, str] = {}
@@ -81,10 +96,10 @@ def referral_members(*, seller_host: str, market: Optional[str], click_id: str) 
     return members
 
 
-def _context(*, market: Optional[str], via_agent_id: Optional[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"kind": REFERRAL_KIND, "v": 1, "tool": REFERRAL_TOOL, "join_mode": "referral_only"}
-    if market:
-        out["market"] = market
+def _context(*, market: str, via_agent_id: Optional[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "kind": REFERRAL_KIND, "v": 1, "tool": REFERRAL_TOOL, "join_mode": "referral_only", "market": market,
+    }
     if via_agent_id:
         out["via_agent_id"] = via_agent_id
     return out
@@ -93,13 +108,16 @@ def _context(*, market: Optional[str], via_agent_id: Optional[str]) -> Dict[str,
 async def mint_referral(
     *,
     seller_host: str,
-    market: Optional[str] = None,
+    market: str,
     merchant_id: Optional[str] = None,
     partner_agent_id: Optional[str] = None,
     via_agent_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Write the referral row and return `{click_id, surface, attribution}`. Raises on a database
-    error: the caller answers that the referral was not minted, and the door builds its cart without."""
+    """Write the referral row and return `{click_id, surface, attribution}`. Raises
+    ReferralMarketRequired, before anything is written, when `market` is not a named market; raises
+    on a database error: the caller answers that the referral was not minted, and the door builds
+    its cart without."""
+    market = named_market(market)
     click_id = new_click_id()
     await issue_click(IssuedClick(
         click_id=click_id,
