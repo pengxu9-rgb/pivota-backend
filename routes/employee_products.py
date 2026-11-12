@@ -6151,6 +6151,9 @@ _PRICE_STATUSES_THAT_RE_READ_THE_STORED_PRICE = frozenset({"applied", "filled", 
 # "unknown" is the producer's way of saying it saw nothing (see the availability note in
 # `_refresh_external_seed_by_id`); it is not an observation and never overwrites a known state.
 _NO_AVAILABILITY_OBSERVATION = frozenset({"", "unknown"})
+# The refresh's availability statuses that mean the page STATED its stock this run (see the refresh's
+# availability block): what the attached offer lane may carry onto the listing's offer row.
+_AVAILABILITY_STATUSES_THAT_READ_A_STATEMENT = frozenset({"filled", "applied", "unchanged"})
 
 
 def _as_price(value: Any) -> Optional[float]:
@@ -6685,7 +6688,8 @@ def _reconcile_seed_variants_with_read(
 
 
 async def _project_refreshed_seed_to_serving_surfaces(
-    seed_id: str, *, price_source: Optional[str] = None, currency_read: bool = False
+    seed_id: str, *, price_source: Optional[str] = None, currency_read: bool = False,
+    availability_stated: Optional[str] = None,
 ) -> Dict[str, int]:
     """Push a freshly re-read seed onto the surfaces a BUYER reads.
 
@@ -6745,8 +6749,11 @@ async def _project_refreshed_seed_to_serving_surfaces(
         # `currency_read` saying the page named the currency) or `employee_edit` (the PATCH changed
         # the price). None -- an availability-only edit -- keeps the attached lane off, so a price
         # nobody re-read is never stamped fresh on the canonical's listing rows.
+        # `availability_stated`: the stock the refresh read on the page THIS run, or None (the attached lane
+        # writes it on the listing's product-level row only, behind EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED).
         outcome = await sync_offer_for_seed(
-            seed_id, attached_price_source=price_source, currency_read=currency_read
+            seed_id, attached_price_source=price_source, currency_read=currency_read,
+            availability_stated=availability_stated,
         )
         status = str((outcome or {}).get("status") or "").strip().lower()
         # Derived from the writer, never restated here. The first version guessed
@@ -6780,6 +6787,12 @@ async def _project_refreshed_seed_to_serving_surfaces(
         # a row-level skip bucket (its reasons arrive already prefixed `mirror_variants_`), or -- when
         # it raised -- an ERROR: counted in `errored`, which the run verdict reads, never folded into
         # a skip histogram that keeps only its top 8.
+        # Stock the attached lane wrote from this read (EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED):
+        # rows by value, or 1 when the page stated a stock that no row took. Summed by the batch.
+        for value, n in ((outcome or {}).get("availability_written") or {}).items():
+            counts["stock_" + str(value)] = int(n or 0)
+        if (outcome or {}).get("availability_skipped"):
+            counts["stock_skipped"] = 1
         variant_status = (outcome or {}).get("variant_status")
         if variant_status == "synced":
             counts["wrote_mirror_variants"] = 1
@@ -7956,6 +7969,11 @@ async def _refresh_external_seed_by_id(
             # a reading, and the attached lane refuses it (external_offers_service).
             currency_read=isinstance(evidence, dict)
             and evidence.get("price_currency_source") == "page",
+            # Only a stock statement this run read (filled / applied / unchanged); `unavailable` (the page
+            # stated none) and `not_read` pass None, so the offer keeps its availability.
+            availability_stated=(
+                next_availability if availability_status in _AVAILABILITY_STATUSES_THAT_READ_A_STATEMENT else None
+            ),
         )
 
     return {
