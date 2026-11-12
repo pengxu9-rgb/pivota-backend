@@ -24,7 +24,7 @@ import os
 import re
 import sys
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -37,7 +37,6 @@ pytestmark = pytest.mark.skipif(not _IS_PG, reason="needs a Postgres DATABASE_UR
 
 from tests.test_test_traffic_money_postgres import (  # noqa: E402
     REAL,
-    TODAY,
     _gmv_by_merchant,
     _order_md,
     _place,
@@ -47,6 +46,8 @@ from tests.test_test_traffic_money_postgres import (  # noqa: E402
 )
 
 FLAGGED = "merch_flagged_shop_c"
+# This file's own day, as it was imported before be#2794 took TODAY out of the test-traffic harness.
+TODAY = datetime.now(timezone.utc).date()
 _MIGRATION = Path(__file__).resolve().parent.parent / "db/migrations/282_merchant_onboarding_is_test.sql"
 _OWN_TABLES = ("merchant_onboarding", "merchant_stores", "employee_audit_logs")
 
