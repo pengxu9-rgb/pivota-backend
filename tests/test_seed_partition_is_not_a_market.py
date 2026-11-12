@@ -487,14 +487,27 @@ def test_every_allowlist_entry_is_well_formed() -> None:
 
 
 def test_removing_an_entry_or_adding_a_bogus_one_fails(repo_hits) -> None:
+    """Measured against the full list's own answer, so it does not depend on the repo being clean (a new site on
+    main fails test_no_new_seed_partition_reads, not this) or on which entry sorts first: removing ANY entry adds
+    exactly that site to `new`, and a bogus entry is exactly the one extra stale entry."""
     entries = load_allowlist()
     assert entries
-    new, stale = reconcile(repo_hits, entries[1:])
-    assert [h.key for h in new] == [(entries[0]["file"], entries[0]["qualname"], entries[0]["rule"])] and not stale
+    base_new, base_stale = reconcile(repo_hits, entries)
+    base_keys = {h.key for h in base_new}
+    checked = 0
+    for i, entry in enumerate(entries):
+        key = (entry["file"], entry["qualname"], entry["rule"])
+        if entry in base_stale:
+            continue  # it hits nothing, so removing it adds nothing (test_no_stale_allowlist_entries reports it)
+        new, stale = reconcile(repo_hits, entries[:i] + entries[i + 1:])
+        assert {h.key for h in new} - base_keys == {key}, key
+        assert stale == base_stale, key
+        checked += 1
+    assert checked > 0
     bogus = {"file": "services/seed_serving.py", "qualname": "seed_row_market", "rule": "P",
              "finding": "OK-partition", "reason": "a bogus entry that matches no site at all"}
     new, stale = reconcile(repo_hits, [*entries, bogus])
-    assert not new and stale == [bogus]
+    assert {h.key for h in new} == base_keys and stale == [*base_stale, bogus]
 
 
 def test_the_helper_module_itself_is_clean(repo_hits) -> None:

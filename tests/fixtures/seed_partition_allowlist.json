@@ -113,6 +113,13 @@
     },
     {
       "file": "routes/employee_products.py",
+      "qualname": "_publish_seed",
+      "rule": "S",
+      "finding": "OK-partition",
+      "reason": "OK-partition (#2776): the one publish step's conflict check and supersede match market = :market, the key column of the active-unique index idx_external_product_seeds_active_unique (market, tool, external_product_id), and its advisory lock keys on the same (market, tool). The partition is a storage key here, never a market or a currency."
+    },
+    {
+      "file": "routes/employee_products.py",
       "qualname": "_refresh_external_seed_by_id",
       "rule": "P",
       "finding": "N2",
@@ -148,10 +155,24 @@
     },
     {
       "file": "routes/employee_products.py",
+      "qualname": "record_external_seed_audit_verdict",
+      "rule": "P",
+      "finding": "OK-partition",
+      "reason": "OK-partition (#2776): an approve verdict hands the draft's stored partition to _publish_seed for its destination lock and active-unique conflict check (the index key), never as a market or a currency."
+    },
+    {
+      "file": "routes/employee_products.py",
       "qualname": "refresh_external_seed",
       "rule": "P",
       "finding": "E2",
       "reason": "WRONG (label): the refresh endpoint mints its redirect token with the refreshed row's partition."
+    },
+    {
+      "file": "routes/employee_products.py",
+      "qualname": "update_external_seed",
+      "rule": "P",
+      "finding": "OK-partition",
+      "reason": "OK-partition (#2776): a publishing save hands the partition the save leaves (declared, else stored: the E1 writer convention of this function's rule S entry) to _publish_seed for its destination lock and active-unique conflict check, never as a market or a currency."
     },
     {
       "file": "routes/employee_products.py",
