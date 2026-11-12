@@ -751,12 +751,14 @@ async def _insert_new_row(
         await database.execute(
             """
             INSERT INTO external_product_seeds (
-                id, external_product_id, seed_data, content_lock, seller_ref, seed_kind
+                id, external_product_id, seed_data, content_lock, seller_ref, seed_kind, created_by_employee_id
             ) VALUES (
                 :seed_id, :external_product_id,
                 CAST(:seed_data AS jsonb),
                 CAST(:content_lock AS jsonb),
-                :seller_ref, :seed_kind
+                :seller_ref, :seed_kind,
+                -- The creator, for the self-approval check: a machine, never a person (no update rewrites it).
+                'system/seed_data_writer'
             )
             ON CONFLICT (id) DO UPDATE SET
                 seed_data = EXCLUDED.seed_data,

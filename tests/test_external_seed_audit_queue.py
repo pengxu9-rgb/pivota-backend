@@ -202,15 +202,18 @@ def test_external_seed_audit_queue_supports_merchant_id_filter(
         },
     )
 
+    asked_statuses = []
+
     async def fake_inventory(*, merchant_id: str, status: str):
         assert merchant_id == "merch_1"
-        assert status == "active"
+        asked_statuses.append(status)
+        rows = [attached, unattached] if status == "active" else []
         return {
             "merchant_id": merchant_id,
             "matched_domains": ["example.com"],
-            "attached_rows": [attached],
-            "domain_unattached_rows": [unattached],
-            "rows": [attached, unattached],
+            "attached_rows": [attached] if rows else [],
+            "domain_unattached_rows": [unattached] if rows else [],
+            "rows": rows,
             "matched_via_by_seed": {"eps_attached": "attached_product_key", "eps_unattached": "merchant_domain"},
         }
 
@@ -229,6 +232,7 @@ def test_external_seed_audit_queue_supports_merchant_id_filter(
     returned_ids = [item["seed"]["id"] for item in payload["items"]]
     assert "eps_attached" in returned_ids
     assert "eps_unattached" in returned_ids
+    assert asked_statuses == ["active", "draft"], "the queue reads the live seeds and the drafts by default"
 
 
 def test_backfill_storefront_external_seeds_dry_run(
@@ -321,8 +325,9 @@ def test_backfill_storefront_external_seeds_write_mode(
         {"action": "skipped", "seed_id": "eps_3", "canonical_url": candidates[2]["storefront_url"]},
     ]
 
-    async def fake_upsert(candidate, *, employee_id=None):
+    async def fake_upsert(candidate, *, employee_id=None, created_by=None):
         assert employee_id == "emp_test"
+        assert created_by == "emp_test|test@example.com", "the run's creator stamp: the actor's id and email"
         return actions.pop(0)
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
@@ -746,6 +751,8 @@ def test_refresh_external_seed_preserves_manual_description_override_when_seed_r
         ({"price_currency": "CAD"}, "employee_edit"),
     ],
 )
+# An edit that CHANGES a live seed is a revision draft now (approval-rule review P2-2): nothing projects until
+# another reviewer approves it, and the revision carries whether its approval vouches for the price.
 def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
     monkeypatch: pytest.MonkeyPatch, client: TestClient, edit, expected_source
 ) -> None:
@@ -767,8 +774,13 @@ def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
         return {}
 
     monkeypatch.setattr(employee_products_module, "_ensure_external_seeds_table", AsyncMock(return_value=None))
+    writes = []
+
+    async def record_write(query, values):
+        writes.append({"sql": query, **values})
+
     monkeypatch.setattr(employee_products_module.database, "fetch_one", fake_fetch_one)
-    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", AsyncMock(return_value=None))
+    monkeypatch.setattr(employee_products_module, "_execute_seed_data_stmt", record_write)
     monkeypatch.setattr(employee_products_module, "_project_refreshed_seed_to_serving_surfaces", fake_project)
 
     res = client.patch(
@@ -777,4 +789,13 @@ def test_an_edit_vouches_for_the_price_only_when_it_changed_the_price(
         json=edit,
     )
     assert res.status_code == 200, res.text
-    assert calls == [{"price_source": expected_source}]
+    revision = res.json().get("revision")
+    if revision:
+        (insert,) = writes
+        assert "INSERT INTO external_product_seeds" in insert["sql"] and calls == [], "the live seed is untouched"
+        vouched = "employee_edit" if insert["seed_data"].get("revision_price_edited") else None
+        assert vouched == expected_source
+    else:
+        # Nothing changed what the seed shows: edited in place, projected, and the price is not vouched for.
+        assert expected_source is None
+        assert calls == [{"price_source": expected_source}]

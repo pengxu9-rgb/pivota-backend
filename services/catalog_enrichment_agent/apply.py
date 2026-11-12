@@ -36,6 +36,8 @@ from services.catalog_offer_writer_guard import (
 
 logger = logging.getLogger("catalog_enrichment_agent.apply")
 
+from services.seed_reactivation_audit import log_upsert_revivals, read_seed_statuses  # noqa: E402
+
 
 # --- Stage upsert SQL (ONE source of truth for both the per-row and batched paths).
 #     Each is a single-row `INSERT ... VALUES (...) ON CONFLICT <natural key> ...`
@@ -686,12 +688,13 @@ _SEED_UPSERT_SQL = """
                   (id, external_product_id, market, tool, title, image_url,
                    price_amount, price_currency, destination_url,
                    canonical_url, domain, attached_product_key, status,
-                   availability, seed_data, seller_ref, seed_kind)
+                   availability, seed_data, seller_ref, seed_kind, created_by_employee_id)
                 VALUES
                   (:id, :external_product_id, :market, :tool, :title, :image_url,
                    :price_amount, :price_currency, :destination_url,
                    :canonical_url, :domain, :attached_product_key, :status,
-                   :availability, CAST(:seed_data AS jsonb), :seller_ref, :seed_kind)
+                   :availability, CAST(:seed_data AS jsonb), :seller_ref, :seed_kind,
+                   'system/catalog_enrichment_agent')
                 ON CONFLICT (id) DO UPDATE SET
                   external_product_id = EXCLUDED.external_product_id,
                   attached_product_key = EXCLUDED.attached_product_key,
@@ -2817,10 +2820,14 @@ async def _apply_ingest_plan(
             seller_ref, seed_kind = await _derive_seed_seller_for_plan_row(
                 seed, verified_storefront_domain=own_storefronts.get(str(seed.get("attached_product_key") or "")),
             )
+            # `status = EXCLUDED.status` re-asserts a planned `active` over a seed someone took down: logged
+            # (docs/runbooks/seed_reactivation_outside_approval.md). The read never raises, never blocks.
+            prior_statuses = await read_seed_statuses(database, [seed.get("id")])
             await database.execute(
                 _SEED_UPSERT_SQL,
                 {**seed, "seller_ref": seller_ref, "seed_kind": seed_kind},
             )
+            log_upsert_revivals(prior_statuses, [seed], tool="catalog_enrichment_agent")
             counts["seeds"] += 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("insert seed failed for id=%s — %s", seed.get("id"), exc)
@@ -3027,7 +3034,10 @@ async def _apply_ingest_plan_batched(
             counts["seeds_skipped_derivation"] += 1
             continue
         seed_rows.append({**seed, "seller_ref": seller_ref, "seed_kind": seed_kind})
+    # As the per-row path: a planned `active` over a seed someone took down is logged (never raises, never blocks).
+    prior_statuses = await read_seed_statuses(database, [r.get("id") for r in seed_rows])
     counts["seeds"], _, _ = await bulk_upsert(database, _SEED_UPSERT_SQL, seed_rows, label="seeds")
+    log_upsert_revivals(prior_statuses, seed_rows, tool="catalog_enrichment_agent")
 
     # 6. beauty_sku_ingredients — optional INCI capture (after skus exist). Uses
     #    the same per-row canonical intake as the non-batched path (precedence +
