@@ -398,7 +398,21 @@ async def create_payment(
         
         if order.get("payment_status") == "paid":
             raise HTTPException(status_code=400, detail="Order already paid")
-        
+
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): a cancelled order gets no PSP payment surface, neither a
+        # new one nor the reuse of one it had. Before the reuse path below, which would hand back the old one.
+        from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled, is_cancelled_order
+
+        if checkout_cancel_upstream_enabled() and is_cancelled_order(order):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "ORDER_CANCELED",
+                    "message": "This order was canceled and can no longer be paid.",
+                    "order_id": request.order_id,
+                },
+            )
+
         merchant_id = _resolve_order_merchant_id(order)
         if not merchant_id:
             raise HTTPException(status_code=400, detail="Order merchant could not be resolved")
@@ -972,16 +986,47 @@ async def create_payment(
         )
         
         # 8. Update order payment status
-        await _with_asyncpg_busy_retry(
-            "order payment info update",
-            lambda: update_payment_info(
-                order_id=request.order_id,
-                payment_intent_id=payment_intent.id,
-                client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
-                payment_status="processing",
-                psp_used=psp_used,
-            ),
-        )
+        # FIX_PLAN C-11 (CHECKOUT_CANCEL_UPSTREAM_ENABLED): the order was read as not cancelled above, but a cancel can
+        # commit while the PSP object was being created. Then the write refuses the cancelled row, the new surface is
+        # closed at the PSP, and the answer is 409: never a live reference and "processing" on a cancelled order.
+        # The off-session capture lane (_acp_offsession) keeps the unconditional write: its charge may already be
+        # captured, which a hosted-surface close does not undo.
+        if checkout_cancel_upstream_enabled() and not _acp_offsession:
+            from db.orders import update_payment_info_unless_cancelled
+
+            surface_written = await _with_asyncpg_busy_retry(
+                "order payment info update",
+                lambda: update_payment_info_unless_cancelled(
+                    order_id=request.order_id,
+                    payment_intent_id=payment_intent.id,
+                    client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
+                    payment_status="processing",
+                    psp_used=psp_used,
+                ),
+            )
+            if not surface_written:
+                from services.checkout_cancel_upstream import close_surface_created_for_cancelled_order
+
+                await close_surface_created_for_cancelled_order(order, reference=str(payment_intent.id), psp=psp_used)
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "ORDER_CANCELED",
+                        "message": "This order was canceled and can no longer be paid.",
+                        "order_id": request.order_id,
+                    },
+                )
+        else:
+            await _with_asyncpg_busy_retry(
+                "order payment info update",
+                lambda: update_payment_info(
+                    order_id=request.order_id,
+                    payment_intent_id=payment_intent.id,
+                    client_secret=payment_intent.client_secret if hasattr(payment_intent, 'client_secret') else "",
+                    payment_status="processing",
+                    psp_used=psp_used,
+                ),
+            )
 
         # P-T2.0 attribution parity: deposit a commerce_attribution_edge for this
         # protocol/checkout charge, exactly like the redirect + ops-canary paths do

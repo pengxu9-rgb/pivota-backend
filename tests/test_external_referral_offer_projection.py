@@ -303,7 +303,7 @@ def test_a_reason_bucket_never_echoes_the_raw_error():
 # ------------------------------------------------- the CALL SITE, not just the helper
 
 def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False, evidence=None,
-                   calls=None):
+                   calls=None, fresh_availability="in_stock", stored_availability=None):
     """Drive the REAL `_refresh_external_seed_by_id` and report which seeds it projected.
 
     The helper tests above pin the projection in isolation; nothing pinned that the refresh
@@ -328,7 +328,7 @@ def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False, 
             "destination_url": "https://brand.com/products/toner",
             "canonical_url": "https://brand.com/products/toner",
             "domain": "brand.com", "seed_data": {"snapshot": {}}, "status": "active",
-            "price_amount": stored_price, "price_currency": "USD",
+            "price_amount": stored_price, "price_currency": "USD", "availability": stored_availability,
         }
 
     async def fake_resolve(*, observed=None, **kwargs):
@@ -342,7 +342,7 @@ def _drive_refresh(monkeypatch, *, stored_price, fresh_price, from_cache=False, 
         return SimpleNamespace(
             canonical_url="https://brand.com/products/toner", domain="brand.com",
             title="toner", image_url=None, price_amount=fresh_price,
-            price_currency="USD", availability="in_stock", evidence=dict(evidence or {}),
+            price_currency="USD", availability=fresh_availability, evidence=dict(evidence or {}),
         )
 
     monkeypatch.setattr(ep, "_ensure_external_seeds_table", AsyncMock(return_value=None))
@@ -535,8 +535,40 @@ def test_the_refresh_vouches_for_its_price_and_says_whether_it_read_the_currency
     _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0,
                    evidence={"price_currency_source": "market_default"}, calls=calls)
     _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0, evidence={}, calls=calls)
+    # The driven page states in_stock, so every refresh also passes the stock it read (the attached lane
+    # writes it only with EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED on).
     assert calls == [
-        {"price_source": "refresh", "currency_read": True},
-        {"price_source": "refresh", "currency_read": False},
-        {"price_source": "refresh", "currency_read": False},
+        {"price_source": "refresh", "currency_read": True, "availability_stated": "in_stock"},
+        {"price_source": "refresh", "currency_read": False, "availability_stated": "in_stock"},
+        {"price_source": "refresh", "currency_read": False, "availability_stated": "in_stock"},
     ]
+
+
+@pytest.mark.parametrize("fresh, stored, expected", [
+    ("in_stock", None, "in_stock"),          # filled
+    ("out_of_stock", "in_stock", "out_of_stock"),  # applied
+    ("in_stock", "in_stock", "in_stock"),    # unchanged: still a statement this run read
+    ("unknown", "in_stock", None),           # the page stated nothing: the seed keeps in_stock, the offer is not told
+    ("unknown", None, None),
+    ("", None, None),
+])
+def test_the_refresh_passes_on_only_the_stock_its_page_stated(monkeypatch, fresh, stored, expected):
+    """The availability writer (EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED) may only carry a stock
+    statement the REFRESH read this run, never the seed column (which keeps an older or defaulted value when
+    the page says nothing)."""
+    calls: List[Dict[str, Any]] = []
+    result, projected = _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=28.0,
+                                       evidence={"price_currency_source": "page"}, calls=calls,
+                                       fresh_availability=fresh, stored_availability=stored)
+    assert projected == ["eps_proj_1"]
+    assert calls[0]["availability_stated"] == expected
+    assert result["availability_refresh"]["availability"] == (expected or stored)
+
+
+def test_a_page_that_is_not_the_served_product_passes_no_stock(monkeypatch):
+    calls: List[Dict[str, Any]] = []
+    _, projected = _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0, from_cache=True, calls=calls,
+                                  fresh_availability="out_of_stock", stored_availability="in_stock")
+    # A cached page is not the served product: nothing is projected at all, so no stock can travel.
+    assert projected == [] and calls == []
+

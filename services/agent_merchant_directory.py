@@ -148,10 +148,13 @@ class MerchantFacts:
 
 _cache: Optional[Tuple[float, Tuple[MerchantFacts, ...]]] = None
 _inflight: Optional["asyncio.Task[Tuple[MerchantFacts, ...]]"] = None
+#: The last build's own result and the failures that degraded it (see `build_failures`).
+_last_build: Optional[Tuple[Tuple[MerchantFacts, ...], Tuple[str, ...]]] = None
 
 
 def reset_cache() -> None:
-    global _cache, _inflight
+    global _cache, _inflight, _last_build
+    _last_build = None
     if _inflight is not None and not _inflight.done():
         try:
             _inflight.cancel()
@@ -358,8 +361,9 @@ async def _build() -> Tuple[Tuple[MerchantFacts, ...], List[str]]:
 async def _build_and_cache(clock: float) -> Tuple[MerchantFacts, ...]:
     """One build, run as its OWN task: it caches a clean result itself, so the cache is written
     even when every caller that was waiting for it has gone."""
-    global _cache
+    global _cache, _last_build
     result, failures = await _build()
+    _last_build = (result, tuple(failures))
     if failures:
         logger.warning(
             "agent_merchant_directory: %d fact reads failed and answered closed (%s); not cached",
@@ -411,6 +415,17 @@ async def merchant_facts(*, now: Optional[float] = None) -> Tuple[MerchantFacts,
             )
             return _cache[1]
         raise
+
+
+def build_failures(facts: Tuple[MerchantFacts, ...]) -> Tuple[str, ...]:
+    """The failures that degraded the build `merchant_facts()` handed back as `facts` (by identity),
+    or () for a clean build (a cached or stale-served one is always clean). A failed read answered
+    CLOSED for its pair -- a failed `disabled` read marks the pair disabled -- so a caller that
+    counts on the facts being complete (services/freshness_clock_check.py) must ask. What the
+    directory serves is unchanged."""
+    if _last_build is not None and _last_build[0] is facts:
+        return _last_build[1]
+    return ()
 
 
 @dataclass(frozen=True)

@@ -303,10 +303,21 @@ def test_the_env_is_exactly_the_live_jobs_with_both_served_markets(tmp_path):
         "PIVOTA_COMMIT_SHA": TAG, "DB_POOL_MIN_SIZE": "1", "DB_POOL_MAX_SIZE": "2",
         "DB_STATEMENT_TIMEOUT_SECONDS": "30", "DB_COMMAND_TIMEOUT_SECONDS": "600",
         "MERCHANT_PURCHASABILITY_BUDGET_SECONDS": env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"],
-        "MERCHANT_PURCHASABILITY_BATCH": env["MERCHANT_PURCHASABILITY_BATCH"],
-        "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN": "6",
+        "MERCHANT_PURCHASABILITY_BATCH": "24",  # 16 slots for the other lanes beside the cap of 8
+        "MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN": "8",
         "MERCHANT_PURCHASABILITY_SWEEP_ENABLED": "false",
         "CRAWL_SHOPIFY_EDGE_PACER_ENABLED": "true", "CRAWL_SHOPIFY_EDGE_LEASE": "2",
         "PIVOTA_SERVING_PRICING_REGIONS": "US,SG",
     }
     assert env["MERCHANT_PURCHASABILITY_BUDGET_SECONDS"].isdigit() and env["MERCHANT_PURCHASABILITY_BATCH"].isdigit()
+
+
+def test_the_code_defaults_equal_the_pinned_batch_and_cap(tmp_path):
+    """A hand-run one-off (no env) must split a run the way a scheduled one does: the code's batch
+    and warm-click cap defaults equal what this script pins."""
+    from jobs import merchant_purchasability_sweep as sweep
+
+    _proc, calls = _run(tmp_path, "prod", TAG)
+    env = _env_vars(_one(calls, "run", "jobs", "create", "merchant-purchasability-sweep"))
+    assert sweep.DIALS["batch"].default == int(env["MERCHANT_PURCHASABILITY_BATCH"])
+    assert sweep.DIALS["warm_click_max_per_run"].default == int(env["MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN"])

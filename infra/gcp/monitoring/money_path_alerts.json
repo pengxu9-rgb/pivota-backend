@@ -1,0 +1,133 @@
+{
+  "_about": [
+    "Freshness alert DEFINITIONS (FIX_PLAN R-03, over the protocol directory). Data only: nothing in the repo applies this file on deploy.",
+    "Apply with ALERT_EMAIL=... infra/gcp/apply_money_path_alerts.sh prod|staging (ALERT_EMAIL is required for both); it creates or updates each log metric, then each policy, and never deletes anything. On staging it renames every \"prod:\" display name to \"staging:\" (as setup_monitoring.sh does), and on an update it keeps the policy's current `enabled` value, so a policy an operator disabled stays disabled.",
+    "Every metric filter keys on lines written by utils/money_alerts.py (or the check's own summary line) through the pivota logger, which Cloud Run stores as textPayload; tests/test_money_path_alerts.py and tests/test_freshness_directory_check.py evaluate each filter against lines the real producers emit.",
+    "${CHANNEL} is replaced by the apply script with the email notification channel for ALERT_EMAIL (setup_monitoring.sh creates it)."
+  ],
+  "log_metrics": [
+    {
+      "name": "freshness_directory_past_limit",
+      "description": "R-03: a protocol-directory (domain, market) fact that a job refreshes is past its clock (card fact: the TTL, 72 h; Tier B: 48 h) or missing (FRESHNESS_DIRECTORY_CHECK_ENABLED)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"money_alert: \" AND textPayload:\"\\\"event\\\":\\\"freshness_directory_past_limit\\\"\""
+    },
+    {
+      "name": "freshness_directory_missing",
+      "description": "R-03: one count per protocol-directory (domain, market) in the purchasability sweep's population with no card fact at all, per hourly tick (input of no policy of its own)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"money_alert: \" AND textPayload:\"\\\"event\\\":\\\"freshness_directory_past_limit\\\"\" AND textPayload:\"\\\"status\\\":\\\"missing\\\"\""
+    },
+    {
+      "name": "freshness_directory_check_heartbeat",
+      "description": "R-03: one line per protocol-directory freshness check tick that read its whole population (heartbeat; input of the went-silent policy). An unavailable tick writes a different line.",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"freshness_directory_check: {\""
+    },
+    {
+      "name": "freshness_directory_check_unavailable",
+      "description": "R-03: one line per protocol-directory freshness check tick that could not read its population (the directory build failed or took over 15 s, a read failed, or a sweep lane was unreadable)",
+      "filter": "resource.type=\"cloud_run_revision\" AND textPayload:\"freshness_directory_check_unavailable: {\""
+    }
+  ],
+  "alert_policies": [
+    {
+      "displayName": "prod: directory merchant fact past its limit",
+      "documentation": {
+        "content": "The protocol-directory freshness check (FRESHNESS_DIRECTORY_CHECK_ENABLED, hourly at :34) found a merchant (domain, market) the directory can list, and that a job refreshes, whose fact is past its limit or absent: the card purchasability fact (buyer vantage, the TTL, 72 h; the 7-day re-check window plus the TTL for a warm-click-only key the sweep defers: no Shopify catalog and no card positive within the sticky window) for a pair in the purchasability sweep's population, or the Tier B cart-link ELIGIBLE verdict (48 h) for a pair the Tier B job checks. Pairs no job refreshes are counted as `untracked` in the summary and never page. A stale fact takes the merchant out of `GET /agent/v1/merchants?scope=protocol` routes and its purchases are refused. The card clock is `checked_at`, not `positive_until`: a merchant whose checks keep coming back unverifiable loses its positive window while this clock reads fresh. The TTL, the warm-click cap, the re-check days and the sticky days are the sweep JOB's, read from what it published with its daily cart-mint scan; the check's summary echoes them with `dials_source`. While that reads `env` (a job image that does not publish yet) the check is using the WORKER's environment: set the same dials on the worker too, or a warm-lane rollback on the job alone pages every warm-only key about 72 h later (docs/runbooks/merchant_purchasability.md). Known limit: never-checked warm-click keys are swept ahead of checked ones, so a large new warm backlog can push checked warm-only keys past the TTL with the sweep healthy; the summary's `pending` count shows the backlog. Each line names the clock, domain, market and status; `freshness_directory_missing` counts the missing ones. Usually a job stopped: check merchant-purchasability-sweep and tierb-cart-link-eligibility, their triggers and images. Standing: stays open while any fact is past. Definitions: infra/gcp/monitoring/money_path_alerts.json (FIX_PLAN R-03).",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "prod: directory merchant fact past its limit",
+          "conditionThreshold": {
+            "filter": "metric.type=\"logging.googleapis.com/user/freshness_directory_past_limit\" AND resource.type=\"cloud_run_revision\"",
+            "aggregations": [
+              {
+                "alignmentPeriod": "7200s",
+                "perSeriesAligner": "ALIGN_SUM",
+                "crossSeriesReducer": "REDUCE_SUM",
+                "groupByFields": [
+                  "resource.label.service_name"
+                ]
+              }
+            ],
+            "comparison": "COMPARISON_GT",
+            "thresholdValue": 0.0,
+            "duration": "0s",
+            "trigger": {
+              "count": 1
+            }
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "7200s"
+      }
+    },
+    {
+      "displayName": "prod: directory freshness check went silent",
+      "documentation": {
+        "content": "The protocol-directory freshness check printed its hourly summary (a tick that read its whole population) in the last 24 hours and none for 3 hours. A stopped check cannot warn about a stopped job, and a check that cannot read its population writes `freshness_directory_check_unavailable` instead of the summary (see that policy). Check the worker, /__scheduler_health (freshness_directory_check), SCHEDULER_JOB_ALLOWLIST and FRESHNESS_DIRECTORY_CHECK_ENABLED. Definitions: infra/gcp/monitoring/money_path_alerts.json (FIX_PLAN R-03).",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "summary line present in the last 24h, absent for 3h",
+          "conditionPrometheusQueryLanguage": {
+            "query": "(sum(sum_over_time(logging_googleapis_com:user_freshness_directory_check_heartbeat{monitored_resource=\"cloud_run_revision\"}[21h] offset 3h)) > 0) unless (sum(sum_over_time(logging_googleapis_com:user_freshness_directory_check_heartbeat{monitored_resource=\"cloud_run_revision\"}[3h])) > 0)",
+            "duration": "300s",
+            "evaluationInterval": "60s",
+            "disableMetricValidation": true
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "3600s"
+      }
+    },
+    {
+      "displayName": "prod: directory freshness check cannot read its population",
+      "documentation": {
+        "content": "Two or more of the protocol-directory freshness check's last three hourly ticks (FRESHNESS_DIRECTORY_CHECK_ENABLED) could not read their population, so they could not say whether any merchant's fact is stale. Each `freshness_directory_check_unavailable` line names the `reason`: `directory_unavailable` or `directory_build_slow` (the directory build raised or took over its 15 s wait; `build_ms` is the measured time), `directory_degraded` (the build finished but a fact read failed and answered closed, `failure_kinds` names which; a failed `disabled` read hides the pair from the check), `read_failed` (`error_type` names the exception), or `population_unreadable` (a purchasability sweep lane could not be read, or the cart-mint scan cache is missing or older than 72 h; the clocks still ran over what was read). Check the worker's database, the directory build time, and the merchant-purchasability-sweep job. Definitions: infra/gcp/monitoring/money_path_alerts.json (FIX_PLAN R-03).",
+        "mimeType": "text/markdown"
+      },
+      "combiner": "OR",
+      "conditions": [
+        {
+          "displayName": "prod: directory freshness check cannot read its population",
+          "conditionThreshold": {
+            "filter": "metric.type=\"logging.googleapis.com/user/freshness_directory_check_unavailable\" AND resource.type=\"cloud_run_revision\"",
+            "aggregations": [
+              {
+                "alignmentPeriod": "10800s",
+                "perSeriesAligner": "ALIGN_SUM",
+                "crossSeriesReducer": "REDUCE_SUM",
+                "groupByFields": [
+                  "resource.label.service_name"
+                ]
+              }
+            ],
+            "comparison": "COMPARISON_GT",
+            "thresholdValue": 1.0,
+            "duration": "0s",
+            "trigger": {
+              "count": 1
+            }
+          }
+        }
+      ],
+      "notificationChannels": [
+        "${CHANNEL}"
+      ],
+      "alertStrategy": {
+        "autoClose": "10800s"
+      }
+    }
+  ]
+}

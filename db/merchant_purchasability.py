@@ -438,7 +438,8 @@ SELECT verdict FROM merchant_purchasability
 # The sweep's due list, for ONE vantage: rows never checked first (NULLs sort first here by the
 # explicit ordering column), then oldest first.
 _SELECT_DUE_SQL = """
-SELECT merchant_domain, market_country, checked_at, verdict, evidence->>'detail' AS detail
+SELECT merchant_domain, market_country, checked_at, verdict, evidence->>'detail' AS detail,
+       positive_until
   FROM merchant_purchasability
  WHERE vantage = :vantage
  ORDER BY checked_at ASC NULLS FIRST
@@ -446,7 +447,8 @@ SELECT merchant_domain, market_country, checked_at, verdict, evidence->>'detail'
 """
 
 _SELECT_DUE_SQL_SQLITE = """
-SELECT merchant_domain, market_country, checked_at, verdict, json_extract(evidence, '$.detail') AS detail
+SELECT merchant_domain, market_country, checked_at, verdict, json_extract(evidence, '$.detail') AS detail,
+       positive_until
   FROM merchant_purchasability
  WHERE vantage = :vantage
  ORDER BY checked_at IS NOT NULL, checked_at ASC
@@ -773,9 +775,10 @@ async def list_due(
 ) -> List[Dict[str, Any]]:
     """Existing rows for one vantage, least-recently-checked first. Bounded by `limit`.
 
-    Each row carries the last check's `verdict` and its evidence `detail` (the preflight's reason
-    string), so the sweep can tell a store that answered as Shopify from one that has no Shopify
-    catalog at all (see the warm-click guard in jobs/merchant_purchasability_sweep.py).
+    Each row carries the last check's `verdict`, its evidence `detail` (the preflight's reason
+    string) and `positive_until`, so the sweep can tell a store that answered as Shopify (now or
+    ever) from one that has no Shopify catalog at all (see the warm-click guard in
+    jobs/merchant_purchasability_sweep.py).
 
     This lists what we ALREADY HOLD; it is not the population. The sweep's population comes from
     its lanes (see jobs/merchant_purchasability_sweep.py), because a merchant that has never been

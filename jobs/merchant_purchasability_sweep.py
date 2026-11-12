@@ -144,17 +144,26 @@ row at all, so the warm lane could never fire for them.
     existing key's re-check out by about a day, past the cart gate's TTL if trips repeat. So
     (`load_population`, `_sweep_targets`):
       - one staleness order (never-checked first) over every key, but WARM-ONLY keys (named by
-        no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (6) slots of
-        a run. So the other lanes' due keys always have the rest, and a warm-only key is never
-        re-checked ahead of a staler one of theirs;
-      - a warm-only key is PROVEN SHOPIFY once its last check came back with a verdict only a
-        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`). Until then its requests feed
-        neither the IP breaker nor the shared Shopify-edge budget (the job's own 1.5 s pacer
-        still spaces them): its throttles say nothing about the crawl IP's standing with Shopify;
+        no other lane) take at most `MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN` (8, of a
+        batch of 24) slots of a run. So the other lanes' due keys always have the rest, and a
+        warm-only key is never re-checked ahead of a staler one of theirs;
+      - a warm-only key is PROVEN SHOPIFY when its last check came back with a verdict only a
+        Shopify storefront can give (`SHOPIFY_STOREFRONT_VERDICTS`), or when it HELD A CARD
+        POSITIVE RECENTLY: its `positive_until` (armed only by ELIGIBLE with a card checkout)
+        ended less than `..._WARM_CLICK_STICKY_DAYS` (14) ago, and its last check was not a
+        no-catalog answer. So one throttle on a card-positive store does not unprove it, and a
+        host that left Shopify stops being proven within two weeks, or at its first no-catalog
+        answer. A NO_CARD / PRICE_DRIFT store, or one demoted since, never arms `positive_until`,
+        so one throttle still unproves it for that run (its requests then skip the edge budget,
+        still 1.5 s apart). Unproven requests feed neither the IP breaker nor the shared
+        Shopify-edge budget: their throttles say nothing about the crawl IP's standing with Shopify;
       - a warm-only key whose last check found NO Shopify catalog (page 1 of `/products.json`
-        not a product list, for any reason but a throttle) is re-checked only every
+        answered 404, 410, or 200 with something that is not a product list; never a 5xx or a
+        throttle, which are transient) is re-checked only every
         `..._WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS` (7), and counted in
-        `SweepReport.population_deferred_not_shopify` meanwhile.
+        `SweepReport.population_deferred_not_shopify` meanwhile -- UNLESS it held a card positive
+        within the sticky window: one odd page-1 answer from a store we have checked out on is far
+        likelier transient, so it is re-checked at the normal rotation.
 
 Wix and WooCommerce connected stores stay out on purpose: no card lane mints a cart for them
 (`_attach_connected_product_redirects` gives only Shopify a `shop_domain`), and the preflight is
@@ -378,10 +387,17 @@ __all__ = [
     "exit_code_for",
     "is_enabled",
     "collect_population",
+    "last_checks",
     "load_population",
     "merge_lanes",
+    "published_dials",
     "main",
     "run_merchant_purchasability_sweep",
+    "warm_click_cap",
+    "warm_click_recheck",
+    "warm_click_sticky",
+    "warm_defer_window",
+    "warm_only_keys",
 ]
 
 
@@ -401,7 +417,9 @@ class _Dial:
 DIALS: Dict[str, _Dial] = {
     # Merchants per run. Each one is a full redirect chain plus up to 20 catalog pages, and each
     # leaves an abandoned checkout behind, so this is a politeness bound as much as a time bound.
-    "batch": _Dial("MERCHANT_PURCHASABILITY_BATCH", 20, 1, 200),
+    # 24 = the setup script's value, so a hand-run one-off gives the other lanes the same 16 slots
+    # beside the warm-click cap of 8 that a scheduled run does.
+    "batch": _Dial("MERCHANT_PURCHASABILITY_BATCH", 24, 1, 200),
     # Wall-clock budget for one run. It stops the job STARTING a new merchant; a merchant already
     # in flight runs to completion, so a run can exceed this by one merchant's worth of fetches.
     # The Cloud Run task timeout in infra/gcp/setup_merchant_purchasability_sweep_job.sh is sized
@@ -419,11 +437,16 @@ DIALS: Dict[str, _Dial] = {
     # THE WARM-CLICK GUARD (see "THE FIFTH LANE"): at most this many WARM-ONLY keys (named by no
     # other lane) per run, after the other lanes' keys. 0 takes the warm-click lane out of the
     # population entirely: the rollback that needs no re-image.
-    "warm_click_max_per_run": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", 6, 0, 200),
+    "warm_click_max_per_run": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN", 8, 0, 200),
     # A warm-only key whose last check found NO Shopify catalog is re-checked only this often.
     "warm_click_not_shopify_recheck_days": _Dial(
         "MERCHANT_PURCHASABILITY_WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS", 7, 1, 60
     ),
+    # How long after a warm-only key's last CARD positive window ENDED (`positive_until`) it still
+    # counts as proven Shopify and is exempt from the no-catalog deferral. 0 = only while the window
+    # is open. A live card store is re-checked every ~33 h and keeps its window open, so this only
+    # matters for a store that has stopped answering positively.
+    "warm_click_sticky_days": _Dial("MERCHANT_PURCHASABILITY_WARM_CLICK_STICKY_DAYS", 14, 0, 60),
 }
 
 _WARNED: set = set()
@@ -786,6 +809,9 @@ class CartMintPopulation:
     usable: bool
     reason: str = ""
     cache_write_failed: bool = False
+    #: Only on a `cache_only` read: the sweep dials the scanning run published with that scan
+    #: (`published_dials`), or {} for a scan written before they were published.
+    dials: Optional[Dict[str, int]] = None
 
 
 def _scan_slot_start(now: datetime) -> datetime:
@@ -804,10 +830,24 @@ def _from_scan_row(row: Dict[str, Any]) -> CartMintLane:
     )
 
 
-async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulation:
+async def _cart_mint_population(*, fresh_scan: bool = False, cache_only: bool = False) -> CartMintPopulation:
     """The cart-mint lane under the once-a-day policy above. `fresh_scan=True` (the census) scans
-    now and neither reads nor writes the cache. RAISES `CartMintCacheUnavailable` (no scan was
-    attempted) or, with `fresh_scan`, whatever the scan raised."""
+    now and neither reads nor writes the cache. `cache_only=True` (a READER of the population, the
+    R-03 freshness check on the worker) never scans, never writes and runs no DDL: it is the last
+    complete scan, usable while it is no older than `_SCAN_MAX_AGE_S`, the same age bound a run
+    falls back under. RAISES `CartMintCacheUnavailable` (no scan was attempted) or, with
+    `fresh_scan`, whatever the scan raised; with `cache_only`, whatever the cache read raised."""
+    if fresh_scan and cache_only:
+        raise ValueError("fresh_scan and cache_only are exclusive")
+    if cache_only:
+        cached = await mint_scans.latest(complete_only=True)
+        if cached is None:
+            return CartMintPopulation(CartMintLane(hosts={}, complete=False), "cache", -1, False, "no_complete_scan")
+        age_s = int((_utcnow() - cached["scanned_at"]).total_seconds())
+        usable = age_s <= _SCAN_MAX_AGE_S
+        return CartMintPopulation(_from_scan_row(cached), "cache", age_s, usable,
+                                  "" if usable else "complete_scan_too_old",
+                                  dials=dict(cached.get("dials") or {}) if usable else None)
     if fresh_scan:
         lane = await _cart_mint_lane()
         return CartMintPopulation(lane, "scan", 0, lane.complete, lane.incomplete_reason)
@@ -852,6 +892,7 @@ async def _cart_mint_population(*, fresh_scan: bool = False) -> CartMintPopulati
                 hosts=lane.hosts if lane else {},
                 warm_hosts=lane.warm_hosts if lane else {},
                 warm_seeds=lane.warm_seeds if lane else 0,
+                dials=published_dials(),
             )
         except Exception as exc:  # noqa: BLE001
             write_failed = True
@@ -1011,10 +1052,11 @@ SHOPIFY_STOREFRONT_VERDICTS = frozenset({
 })
 
 #: The preflight's detail when page 1 of the catalog was not a product list
-#: (`products_json_page_1_status_<status>`). A throttle never lands here (it is TRANSPORT_ERROR),
-#: but 429 and 503 are excluded anyway so a future change cannot turn a throttle into "not Shopify".
+#: (`products_json_page_1_status_<status>`). Only the statuses that SAY there is no catalog defer a
+#: key: 404 and 410 (no such route), and 200 with a body that is not a product list (an HTML page
+#: where a Shopify store serves JSON). A 5xx, a 403 or a throttle is transient and never defers.
 _NO_CATALOG_DETAIL = re.compile(r"^products_json_page_1_status_(\d{3})$")
-_THROTTLE_STATUSES = frozenset({"429", "503"})
+_NO_CATALOG_STATUSES = frozenset({"200", "404", "410"})
 
 
 def _found_no_shopify_catalog(verdict: Any, detail: Any) -> bool:
@@ -1022,7 +1064,7 @@ def _found_no_shopify_catalog(verdict: Any, detail: Any) -> bool:
     if str(verdict or "") != "VARIANT_UNVERIFIED":
         return False
     match = _NO_CATALOG_DETAIL.match(str(detail or ""))
-    return bool(match) and match.group(1) not in _THROTTLE_STATUSES
+    return bool(match) and match.group(1) in _NO_CATALOG_STATUSES
 
 
 def _aware_utc(value: Any) -> Optional[datetime]:
@@ -1030,10 +1072,82 @@ def _aware_utc(value: Any) -> Optional[datetime]:
         return None
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
+
+def _held_a_card_positive_recently(row: Dict[str, Any], now: datetime, sticky: timedelta) -> bool:
+    """Its `positive_until` (armed only by ELIGIBLE + card) ended less than `sticky` ago, or is
+    still open. Expiry never nulls the column, so `is not None` alone would mean "ever"."""
+    until = _aware_utc(row.get("positive_until"))
+    return until is not None and now - until < sticky
+
 #: The lanes, in the order they are unioned. Only the cart-link lane carries a variant, and
 #: `merge_lanes` never replaces a variant with None, so the Tier B lane's CONFIRMED variant lands
 #: on a key whichever other lanes also name it.
 LANES = ("variant", "cart-link", "connected-store", "cart-mint", "warm-click")
+
+
+def warm_only_keys(lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]]) -> set:
+    """The WARM-ONLY keys: named by the warm-click lane and by no other. The one definition the
+    warm-click guard (`load_population`) and the R-03 freshness check both use."""
+    other = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
+    return {key for key in lanes.get("warm-click", {}) if key not in other}
+
+
+def warm_click_cap() -> int:
+    """`MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN`, read now. 0 = the lane is switched off."""
+    return _env_int(DIALS["warm_click_max_per_run"])
+
+
+def warm_click_recheck() -> timedelta:
+    """How often a warm-only key whose last check found no Shopify catalog is re-checked."""
+    return timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+
+
+def warm_click_sticky() -> timedelta:
+    """How long after a card positive ended a warm-only key stays on the normal cadence."""
+    return timedelta(days=_env_int(DIALS["warm_click_sticky_days"]))
+
+
+def warm_defer_window(
+    row: Dict[str, Any], now: datetime, recheck: timedelta, sticky: timedelta
+) -> Optional[timedelta]:
+    """How long after its last check the sweep leaves a WARM-ONLY key alone, or None when it is on
+    the normal rotation. `recheck` when the last check (`row`, a `facts.list_due` row) found no
+    Shopify catalog AND the key has not held a card positive within `sticky`; None otherwise.
+    THE ONE STATEMENT OF THE DEFERRAL RULE: `load_population` defers a key while its last check
+    is younger than this window, and the R-03 freshness check (services/freshness_clock_check.py)
+    adds the same window to that key's limit, so the two cannot disagree about which keys wait."""
+    if not _found_no_shopify_catalog(row.get("verdict"), row.get("detail")):
+        return None
+    if _held_a_card_positive_recently(row, now, sticky):
+        return None
+    return recheck
+
+
+#: The dials a run PUBLISHES with its daily cart-mint scan (db/merchant_purchasability_cart_mint_scans,
+#: `SWEEP_DIAL_TAG`): the ones that decide which keys this job keeps fresh, and for how long. The
+#: R-03 freshness check runs on the worker, whose environment is not this job's (the warm-lane
+#: rollback changes the JOB only), so it reads them from the scan row instead.
+PUBLISHED_DIALS = (
+    "warm_click_max_per_run", "warm_click_not_shopify_recheck_days", "warm_click_sticky_days", "ttl_hours",
+)
+
+
+def published_dials() -> Dict[str, int]:
+    """This process's values of `PUBLISHED_DIALS`, read now."""
+    return {
+        "warm_click_max_per_run": warm_click_cap(),
+        "warm_click_not_shopify_recheck_days": _env_int(DIALS["warm_click_not_shopify_recheck_days"]),
+        "warm_click_sticky_days": _env_int(DIALS["warm_click_sticky_days"]),
+        "ttl_hours": facts.ttl_hours(),
+    }
+
+
+def last_checks(due: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """`facts.list_due` rows by (stored domain, stored market): what the warm-click guard reads."""
+    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in due:
+        last[(str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))] = row
+    return last
 
 
 async def collect_population(
@@ -1041,6 +1155,7 @@ async def collect_population(
     tally: Optional[Dict[str, int]] = None,
     cart_mint: Optional[Dict[str, Any]] = None,
     fresh_cart_mint_scan: bool = False,
+    cart_mint_cache_only: bool = False,
 ) -> Dict[str, Dict[Tuple[str, str], Optional[str]]]:
     """Every lane's admitted (domain, market) keys, by lane name, each with its variant.
 
@@ -1055,9 +1170,11 @@ async def collect_population(
     `complete`, `source`, `age_s`, `seeds_by_key` — seeds per admitted key — and the warm-click
     lane's `warm_seeds` and `warm_seeds_by_key`, from the same scan). The cart-mint lane
     follows the once-a-day scan policy (`_cart_mint_population`); `fresh_cart_mint_scan=True`
-    scans now and touches no cache, which is what the read-only census does. This function is the
-    ONE place the population is decided: the sweep and scripts/merchant_purchasability_census.py
-    both read it.
+    scans now and touches no cache, which is what the read-only census does;
+    `cart_mint_cache_only=True` reads only the last complete scan (never scans, never writes), which
+    is what services/freshness_clock_check.py does on the worker. This function is the ONE place
+    the population is decided: the sweep, scripts/merchant_purchasability_census.py and the R-03
+    freshness check all read it.
     """
     lanes: Dict[str, Dict[Tuple[str, str], Optional[str]]] = {name: {} for name in LANES}
 
@@ -1121,7 +1238,8 @@ async def collect_population(
             lanes["connected-store"].setdefault(key, None)
 
     population: Optional[CartMintPopulation] = await _lane(
-        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan), "cart-mint"
+        lambda: _cart_mint_population(fresh_scan=fresh_cart_mint_scan, cache_only=cart_mint_cache_only),
+        "cart-mint",
     )
     minted: Optional[CartMintLane] = population.lane if population is not None else None
     if population is not None:
@@ -1174,6 +1292,7 @@ async def collect_population(
                 source=population.source, age_s=population.age_s,
                 elapsed_ms=minted.elapsed_ms, seeds_by_key=seeds_by_key,
                 warm_seeds=minted.warm_seeds, warm_seeds_by_key=warm_seeds_by_key,
+                dials=population.dials,
             )
     return lanes
 
@@ -1236,11 +1355,9 @@ async def load_population(
             "merchant_purchasability_sweep: the staleness read failed; this run sweeps in key "
             "order (error_type=%s)", type(exc).__name__,
         )
-    last: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for row in due:
-        key = (str(row.get("merchant_domain") or ""), str(row.get("market_country") or ""))
+    last = last_checks(due)
+    for key, row in last.items():
         seen[key] = row.get("checked_at")
-        last[key] = row
 
     def _staleness(key: Tuple[str, str]) -> Tuple[int, str]:
         checked = seen.get(key)
@@ -1250,25 +1367,24 @@ async def load_population(
 
     # THE WARM-CLICK GUARD (see "THE FIFTH LANE"). Warm-ONLY keys are the ones no other lane names;
     # a key another lane also names is swept as that lane's, unguarded, exactly as before.
-    other_keys = {key for name, lane in lanes.items() if name != "warm-click" for key in lane}
-    warm_cap = _env_int(DIALS["warm_click_max_per_run"])
-    recheck = timedelta(days=_env_int(DIALS["warm_click_not_shopify_recheck_days"]))
+    warm_only = warm_only_keys(lanes)
+    warm_cap = warm_click_cap()
+    recheck = warm_click_recheck()
+    sticky = warm_click_sticky()
     now = _utcnow()
     core: List[Tuple[Tuple[str, str], Optional[str]]] = []
     warm: List[Tuple[Tuple[str, str], Optional[str]]] = []
     deferred = 0
     for key, variant in merged.items():
-        if key in other_keys:
+        if key not in warm_only:
             core.append((key, variant))
             continue
         if warm_cap == 0:
             continue  # the lane is switched off: not in the population at all
         row = last.get(key) or {}
         checked = _aware_utc(row.get("checked_at"))
-        if (
-            _found_no_shopify_catalog(row.get("verdict"), row.get("detail"))
-            and checked is not None and now - checked < recheck
-        ):
+        window = warm_defer_window(row, now, recheck, sticky)
+        if window is not None and checked is not None and now - checked < window:
             deferred += 1
             continue
         warm.append((key, variant))
@@ -1299,8 +1415,13 @@ async def load_population(
         if variant is None and (domain, market) in reap_keys:
             variant = await _catalog_variant(domain)
         price_minor, currency = await _catalog_price(domain, variant) if variant else (None, None)
+        row = last.get((domain, market)) or {}
         proven = (domain, market) not in warm_keys or (
-            str((last.get((domain, market)) or {}).get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
+            str(row.get("verdict") or "") in SHOPIFY_STOREFRONT_VERDICTS
+            or (
+                _held_a_card_positive_recently(row, now, sticky)
+                and not _found_no_shopify_catalog(row.get("verdict"), row.get("detail"))
+            )
         )
         targets.append(Target(domain, market, variant, price_minor, currency, proven_shopify=proven))
     return targets

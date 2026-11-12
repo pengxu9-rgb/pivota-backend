@@ -52,6 +52,8 @@ async def primary_db(db):
         kind = {"seed_data": "jsonb", "price_amount": "double precision"}.get(column, "text")
         await db.execute(f"ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS {column} {kind}")
     await db.execute("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now()")
+    # Written by the writer as a literal (its creator stamp), so it is not among the bind columns above.
+    await db.execute("ALTER TABLE external_product_seeds ADD COLUMN IF NOT EXISTS created_by_employee_id text")
     await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS test_primary_seed_id ON external_product_seeds(id)")
     await db.execute(
         "INSERT INTO catalog_merchants (merchant_id,merchant_name,status,indexable) VALUES (:m,'Primary Review','active',true)",

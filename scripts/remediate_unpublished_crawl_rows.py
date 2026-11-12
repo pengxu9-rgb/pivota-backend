@@ -94,6 +94,7 @@ from scripts.onboard_external_brand_from_crawl import (
     UNPUBLISHED_SUPPRESSION_REASON,
 )
 from services.catalog_enrichment_agent.apply import live_retailer_listing_owner
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval
 from services.catalog_offer_suppression import (
     cascade_offer_suppression,
     revert_offer_suppression,
@@ -319,6 +320,8 @@ async def _revert(rows: List[Dict[str, Any]]) -> Dict[str, str]:
                 "WHERE id=:id AND status='inactive'",
                 {"id": sid},
             )
+            # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+            log_seed_reactivated_outside_approval([sid], tool=SCRIPT_NAME, row_confirmed=False)
     keys = sorted({r["content_key"] for r in rows if r.get("content_key")})
     return await _recompute_and_verify(keys, f"{UNPUBLISHED_SUPPRESSION_REASON}_revert")
 

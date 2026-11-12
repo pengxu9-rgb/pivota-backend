@@ -21,6 +21,14 @@ from routes.agent_api import agent_create_order as agent_v1_create_order
 from routes.agent_api import agent_search_products as agent_v1_search_products
 from routes.agent_api import agent_track_order as agent_v1_track_order
 from routes.agent_auth import AgentContext, ensure_checkout_token_order_access, get_agent_context
+from routes.agent_forwarded_owner import (
+    PARTNER_AGENT_ID_METADATA_KEY,
+    PARTNER_IDENTITY_METADATA_KEY,
+    forwarded_owner_context,
+    order_access_allowed,
+    partner_identity_forwarding_enabled,
+    partner_identity_metadata,
+)
 from routes.agent_checkout_intents import (
     CheckoutIntentItem,
     CreateCheckoutIntentRequest,
@@ -921,7 +929,7 @@ async def search_products_v2(
 @router.post("/quotes/preview")
 async def preview_quote_v2(
     body: QuotePreviewBody,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("preview_quote")),
 ):
     request_context = body.request_context.model_dump(exclude_none=True) if body.request_context else {}
     buyer_context = body.buyer_context or BuyerContext()
@@ -1030,7 +1038,7 @@ async def get_quote_v2(
 async def create_order_v2(
     body: CreateOrderBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("create_order", resource=("body", "quote_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     # S-28: the quote carries its preview's buyer email and address into the order below, so a
@@ -1067,6 +1075,14 @@ async def create_order_v2(
     shipping_address = _coerce_shipping_address(raw_shipping)
 
     metadata = dict(body.metadata or {})
+    if partner_identity_forwarding_enabled():
+        # The partner stamp is this service's record of a VERIFIED owner: never a caller's claim.
+        metadata.pop(PARTNER_IDENTITY_METADATA_KEY, None)
+        metadata.pop(PARTNER_AGENT_ID_METADATA_KEY, None)
+        partner_stamp = partner_identity_metadata(context)
+        if partner_stamp:
+            metadata[PARTNER_IDENTITY_METADATA_KEY] = partner_stamp
+            metadata[PARTNER_AGENT_ID_METADATA_KEY] = partner_stamp["partner_agent_id"]
     agent_v2_meta = dict(metadata.get("agent_v2") or {}) if isinstance(metadata.get("agent_v2"), dict) else {}
     agent_v2_meta.update({
         "contract_version": "merchant-network-middleware-v1",
@@ -1164,12 +1180,12 @@ async def create_order_v2(
 @router.get("/orders/{order_id}")
 async def get_order_v2(
     order_id: str,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     return {
         "status": "success",
@@ -1180,7 +1196,8 @@ async def get_order_v2(
 @router.post("/payments/checkout-sessions")
 async def create_checkout_session_v2(
     body: CreateCheckoutSessionBody,
-    context: AgentContext = Depends(get_agent_context),
+    # The gateway reaches this route for two operations: a hosted link and a strict submit_payment.
+    context: AgentContext = Depends(forwarded_owner_context("create_payment_link", "submit_payment", resource=("body", "order_id"))),
     agent_user: Optional[AgentUserContext] = Depends(get_agent_user_context),
 ):
     from services.agent_governance import agent_governance
@@ -1191,7 +1208,7 @@ async def create_checkout_session_v2(
     ensure_checkout_token_order_access(context, order)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
 
     await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
@@ -1373,7 +1390,8 @@ async def list_merchant_capabilities_v2(
 @router.get("/orders/{order_id}/tracking")
 async def track_order_v2(
     order_id: str,
-    context: AgentContext = Depends(get_agent_context),
+    # Adoption only, no `via` access: agent_v1_track_order re-checks the owner on its own.
+    context: AgentContext = Depends(forwarded_owner_context("get_order_status", resource=("path", "order_id"))),
 ):
     order = await get_order(order_id)
     if not order:
@@ -1400,19 +1418,110 @@ async def track_order_v2(
     }
 
 
+async def _require_checkout_cancel_upstream() -> None:
+    """Off (the default): the cancel route below does not exist. Resolved BEFORE the agent context, so an off route
+    answers every caller with FastAPI's own 404 body, byte for byte what an unregistered path answers."""
+    from services.checkout_cancel_upstream import checkout_cancel_upstream_enabled
+
+    if not checkout_cancel_upstream_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.post("/orders/{order_id}/cancel")
+async def cancel_order_v2(
+    order_id: str,
+    _enabled: None = Depends(_require_checkout_cancel_upstream),
+    context: AgentContext = Depends(get_agent_context),
+):
+    """Cancel an unpaid order and close its hosted payment page at the PSP (FIX_PLAN C-11).
+
+    CHECKOUT_CANCEL_UPSTREAM_ENABLED (default OFF). See services/checkout_cancel_upstream.py. Answers:
+      200 cancel.outcome "canceled" | "already_canceled" (cancel.canceled true)
+      409 ORDER_ALREADY_PAID: the buyer paid first; not canceled; the refund is a request to the merchant
+      409 PAYMENT_PROCESSING: a payment is settling at the PSP; not canceled
+      503 CANCEL_NOT_CONFIRMED: the PSP surface could not be closed; not canceled; retry
+      404 Order not found: unknown, or another agent's (never 403: the id is not confirmed to a non-owner)
+    """
+    from services.checkout_cancel_upstream import cancel_order_upstream
+
+    order = await get_order(order_id)
+    if not order or str(order.get("agent_id") or "") != str(context.agent_id):
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    result = await cancel_order_upstream(order, agent_id=str(context.agent_id))
+    return cancel_upstream_answer(order_id, order, result)
+
+
+def cancel_upstream_answer(order_id: str, order: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """The answer for a `cancel_order_upstream` result: the 200 body, or the 409/503 it raises. One mapping for
+    POST /agent/v2/orders/{id}/cancel and, with the flag on, POST /agent/v1/orders/{id}/cancel
+    (routes/agent_api.py), so both doors give the gateway the same codes."""
+    from services.checkout_cancel_upstream import (
+        OUTCOME_ALREADY_CANCELED,
+        OUTCOME_CANCELED,
+        OUTCOME_PAID,
+        OUTCOME_PROCESSING,
+        refund_request_answer,
+    )
+
+    outcome = result["outcome"]
+    after = result.get("order") or order
+    surface = result.get("payment_surface") or {}
+    base = {
+        "order_id": order_id,
+        "outcome": outcome,
+        "order_state": _order_state_from_row(after),
+        "payment_status": str(after.get("payment_status") or ""),
+        "payment_surface": {"action": surface.get("action"), "reference_type": surface.get("reference_type")},
+    }
+    if outcome in (OUTCOME_CANCELED, OUTCOME_ALREADY_CANCELED):
+        return {"status": "success", "cancel": {**base, "canceled": True}}
+    if outcome == OUTCOME_PAID:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "ORDER_ALREADY_PAID",
+                "message": "The buyer already paid for this order, so it was not canceled.",
+                **base,
+                "canceled": False,
+                "refund": refund_request_answer(),
+            },
+        )
+    if outcome == OUTCOME_PROCESSING:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "PAYMENT_PROCESSING",
+                "message": "A payment for this order is being processed, so it was not canceled.",
+                **base,
+                "canceled": False,
+            },
+        )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "CANCEL_NOT_CONFIRMED",
+            "message": "The hosted payment page could not be closed, so the order was not canceled.",
+            **base,
+            "canceled": False,
+            "retryable": True,
+        },
+    )
+
+
 @router.post("/orders/{order_id}/refunds")
 async def create_refund_v2(
     order_id: str,
     body: RefundCreateBody,
     background_tasks: BackgroundTasks,
-    context: AgentContext = Depends(get_agent_context),
+    context: AgentContext = Depends(forwarded_owner_context("request_after_sales", resource=("path", "order_id"))),
 ):
     from services.agent_governance import agent_governance
 
     order = await get_order(order_id)
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
-    if str(order.get("agent_id") or "") != str(context.agent_id):
+    if not order_access_allowed(order, context):
         raise HTTPException(status_code=403, detail="Not authorized for this order")
     await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
     # D-03 (2026-11-08): the merchant makes refunds; an agent's call never executes one.

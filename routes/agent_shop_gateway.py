@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from config.settings import resolve_public_api_base_url, settings
 from services.seed_variant_options import seed_variant_options_as_mapping
+from services.identity_join_sql import MINTED_SOURCE_SYSTEM
 from services.request_market import assumed_flag_honoured, strict_true
 from services.outbound_warm_handoff import (
     PURCHASABILITY_BROWSE_ONLY,
@@ -5866,6 +5867,7 @@ async def _handle_offers_resolve(
         where_clauses = ["status = 'active'"]
         params: Dict[str, Any] = {"limit": attached_seed_limit}
         seed_rows: List[Any] = []
+        attached_seed_arm_error: Optional[str] = None
         # (merchant, pid) pairs the attached-ref mainline actually searched — used to
         # tell a genuine mainline miss (fuzzy surfaced a seed the mainline SHOULD have
         # matched) from a legitimate cross-merchant / rebound-store fuzzy match.
@@ -5952,6 +5954,37 @@ async def _handle_offers_resolve(
                     )
                     if seed_rows:
                         query_label = "external_seed_by_pivota_signature"
+
+            # A MINTED catalog row (the enrichment drain's) never fills `source_ref`, and its
+            # `source_product_id` is a title slug, so neither key above reaches its seed: the seed
+            # is linked only by `attached_product_key` = the row's `product_key`. That is the third
+            # join the group lane already reads (`_fetch_resolved_group`). OFF by default
+            # (OFFERS_RESOLVE_ATTACHED_SEED_ARM); runs only when the two keys above found nothing,
+            # so a row they already serve is answered as before. It only FINDS rows: every row it
+            # returns goes through `_append_external_offers_from_seed_rows` like any other arm's.
+            # MINTED ROWS ONLY: the arm filters on the drain's `source_system`, so a connected
+            # merchant row or a mirror row is answered exactly as with the flag off, whatever seed
+            # is attached to its key.
+            # The arm has its OWN failure boundary: a timeout or a database error here leaves
+            # `seed_rows` empty and the request goes on to the prefetch and fuzzy lanes below, as
+            # it would with the flag off. The failure is logged and reported under the arm's own
+            # name, never as the fuzzy lane's.
+            if not seed_rows and sig_aliases and _attached_seed_arm_enabled():
+                try:
+                    seed_rows = await _fetch_signature_attached_seed_rows(
+                        database,
+                        sig_aliases=sig_aliases,
+                        market_hint=market_hint,
+                        limit=attached_seed_limit,
+                    )
+                except Exception as arm_error:  # noqa: BLE001 -- fall through to the later lanes
+                    seed_rows = []
+                    attached_seed_arm_error = type(arm_error).__name__
+                    logger.warning(
+                        "offers.resolve.attached_seed_arm.failed error_type=%s", attached_seed_arm_error,
+                    )
+                if seed_rows:
+                    query_label = OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY
 
         if not seed_rows:
             prefetched_internal = await _prefetch_canonical_internal_context()
@@ -6057,9 +6090,11 @@ async def _handle_offers_resolve(
             row_count=len(seed_rows or []),
             query=query_label,
             extra=(
-                {"mainline_miss_seed_ids": mainline_miss_seed_ids}
-                if mainline_miss_seed_ids
-                else None
+                {
+                    **({"mainline_miss_seed_ids": mainline_miss_seed_ids} if mainline_miss_seed_ids else {}),
+                    **({"attached_seed_arm_error": attached_seed_arm_error} if attached_seed_arm_error else {}),
+                }
+                or None
             ),
         )
     except Exception as e:
@@ -9415,6 +9450,94 @@ def _group_seed_siblings_mode() -> str:
     return "off"
 
 
+# ── offers.resolve: the seed ATTACHED to a signature's catalog row ────────────────────────────
+#
+# OFF by default. Read per request, so it flips without a restart; unset, falsy or any
+# unrecognised spelling is off, and off sends neither statement below.
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV = "OFFERS_RESOLVE_ATTACHED_SEED_ARM"
+OFFERS_RESOLVE_ATTACHED_SEED_ARM_QUERY = "external_seed_by_signature_attached_key"
+
+
+def _attached_seed_arm_enabled() -> bool:
+    raw = (os.getenv(OFFERS_RESOLVE_ATTACHED_SEED_ARM_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+async def _fetch_signature_attached_seed_rows(
+    db: Any,
+    *,
+    sig_aliases: List[str],
+    market_hint: Optional[str],
+    limit: int,
+) -> List[Any]:
+    """The active seeds attached to the MINTED catalog row a signature names, or [].
+
+    Minted rows only: the catalog row must carry the enrichment drain's `source_system`
+    (MINTED_SOURCE_SYSTEM). A connected merchant row, or a mirror row whose own seed is gone,
+    gets nothing from this arm even when a seed is attached to its `product_key`; those rows keep
+    the answer they have with the flag off.
+
+    Merchant scope: a request's `product.merchant_id` does NOT narrow this arm, the same as the
+    signature arm before it. A signature names one catalog row whoever the caller scoped to, and
+    the seed's seller is the store on the seed, not the row's merchant. (The group lane differs:
+    it skips a scoped request.)
+
+    Otherwise the same rules the group lane's attached join applies (`_fetch_resolved_group`):
+      * the catalog row is not withdrawn (its suppression pair) -- a withdrawn listing lends its
+        seed to nobody;
+      * the seed is `active` and past the shared quarantine anti-join;
+      * the seed is priced in the buyer market's currency (`seed_serving_currency`: a caller that
+        names no market is a US buyer; a market with no known currency gets no seed).
+    Stock, freshness, the outbound allowlist and every other gate run downstream, on the rows.
+    Rows come newest first with the seed id as the last sort key: the drain writes all of one
+    product's seeds in one transaction, so their timestamps tie, and without the id the order
+    (and which rows survive `limit`) would be the scan's.
+    Two single-table statements, as the signature arm: the quarantine anti-join reads unqualified
+    seed columns. The second is an equality probe on `attached_product_key`
+    (idx_external_product_seeds_attached, migration 044).
+    """
+    serving_currency = seed_serving_currency(market_hint)
+    if not sig_aliases or serving_currency is None:
+        return []
+    key_rows = await asyncio.wait_for(
+        db.fetch_all(
+            """
+            SELECT product_key
+            FROM catalog_products
+            WHERE pivota_signature_id = ANY(:sig_aliases)
+              AND source_system = :minted_source_system
+              AND suppressed_at IS NULL
+              AND suppression_reason IS NULL
+            LIMIT 8
+            """,
+            {"sig_aliases": sig_aliases, "minted_source_system": MINTED_SOURCE_SYSTEM},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    product_keys = sorted(
+        {str(_row_to_dict(row).get("product_key") or "").strip() for row in key_rows or []} - {""}
+    )
+    if not product_keys:
+        return []
+    rows = await asyncio.wait_for(
+        db.fetch_all(
+            f"""
+            SELECT *
+            FROM external_product_seeds
+            WHERE attached_product_key = ANY(:product_keys)
+              AND status = 'active'
+              AND {SEED_SERVING_CURRENCY_CLAUSE}
+            {_seed_quarantine_clause()}
+            ORDER BY updated_at DESC, created_at DESC, id ASC
+            LIMIT :limit
+            """,
+            {"product_keys": product_keys, "serving_currency": serving_currency, "limit": limit},
+        ),
+        timeout=OFFERS_RESOLVE_SEED_QUERY_TIMEOUT_SECONDS,
+    )
+    return list(rows or [])
+
+
 def _remaining_timeout(deadline: float, cap: float) -> float:
     remaining = deadline - time.perf_counter()
     if remaining <= 0:
@@ -12708,7 +12831,10 @@ class ExternalSeedLinksRequest(BaseModel):
     )
 
 
-async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, Any]:
+async def mint_external_seed_links(
+    body: ExternalSeedLinksRequest,
+    issued_clicks: Optional[List[IssuedClick]] = None,
+) -> Dict[str, Any]:
     """Mint the attributed links for seed cards the GATEWAY built itself.
 
     WHY THIS EXISTS. The gateway's search stack builds external-seed cards in JS straight from
@@ -12727,6 +12853,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
 
     A candidate we cannot mint (domain not allowlisted, unusable URL) is simply absent from
     `links`: the gateway keeps that card's raw URL, which is exactly what it had before.
+
+    `issued_clicks` (FIX_PLAN O-04): when given, each minted link's click is appended to it, as
+    offers.resolve does, so the route can record it as issued to the partner the gateway vouched
+    for. None (the default, and every call while PARTNER_IDENTITY_FORWARDING_ENABLED is off)
+    mints exactly as before.
     """
     default_market = str(body.market or "US").strip().upper() or "US"
     default_tool = str(body.tool or "*").strip() or "*"
@@ -12803,6 +12934,7 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             platform=redirect_identity["platform"],
             seller_ref=redirect_identity["seller_ref"],
             seed_kind=redirect_identity["seed_kind"],
+            issued_clicks=issued_clicks,
         )
         if not redirect_url:
             continue
@@ -12841,14 +12973,59 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     return {"links": links}
 
 
+#: The gateway operation name its per-response seed-link mint signs (PIVOTA-Agent
+#: src/attribution/issuingAgentAssertion.js PARTNER_IDENTITY_OPS).
+EXTERNAL_SEED_LINKS_MINT_OP = "external_seed_links.mint"
+
+
 @router.post("/attribution/external-seed-links")
 async def external_seed_links_endpoint(
     body: ExternalSeedLinksRequest,
+    http_request: Request,
     _context: AgentContext = Depends(get_agent_context),
 ) -> Dict[str, Any]:
     """Credentialed only: the gateway calls this with its internal key. Anonymous callers get
-    the same 401 every other agent route gives them — a mint is not a public read."""
-    return await mint_external_seed_links(body)
+    the same 401 every other agent route gives them — a mint is not a public read.
+
+    With PARTNER_IDENTITY_FORWARDING_ENABLED and a REQUEST-BOUND (v2) X-Pivota-Issuing-Agent from the
+    vouching gateway (the per-response mint it makes AFTER its search cache, for one caller), every
+    minted click is recorded as issued to that partner (surface_click_events.agent_id), the same
+    record offers.resolve writes. Without both, the mint is exactly as before and records nothing."""
+    from routes import agent_forwarded_owner as forwarded
+
+    assertion = (http_request.headers.get(ISSUING_AGENT_ASSERTION_HEADER) or "").strip() or None
+    if not (forwarded.partner_identity_forwarding_enabled() and assertion):
+        return await mint_external_seed_links(body)
+    # Recorded only for the vouching service's REQUEST-BOUND assertion (v2, single use). An agent's own
+    # key, or a v1 token, records nothing here: this route mints from candidates the caller supplies.
+    if not await _is_vouching_service(request_api_key(http_request)):
+        return await mint_external_seed_links(body)
+    agent_id, _op, reason = await forwarded.verify_bound_forwarded_subject(
+        http_request, ops=(EXTERNAL_SEED_LINKS_MINT_OP,)
+    )
+    if not agent_id:
+        # `utils.logger` ("pivota"): a plain module logger's INFO never reaches prod logs, so a refused or
+        # replayed mint assertion (a full nonce store included) would be invisible.
+        from utils.logger import logger as _pivota_logger
+
+        _pivota_logger.info("external_seed_links.partner_assertion_not_credited reason=%s", reason)
+        return await mint_external_seed_links(body)
+    issued: List[IssuedClick] = []
+    result = await mint_external_seed_links(body, issued_clicks=issued)
+    if issued:
+        try:
+            await issue_clicks([replace(click, agent_id=agent_id) for click in issued])
+        except Exception as e:  # noqa: BLE001 -- FAIL OPEN: the links are served; the record is lost, loudly
+            logger.warning(
+                "external_seed_links.issue_clicks_failed count=%s error_type=%s", len(issued), type(e).__name__,
+            )
+    return result
+
+
+async def _is_vouching_service(api_key: Optional[str]) -> bool:
+    import routes.agent_auth as _agent_auth
+
+    return await _agent_auth._is_service_caller(api_key)
 
 
 def _request_market_for_multi(
