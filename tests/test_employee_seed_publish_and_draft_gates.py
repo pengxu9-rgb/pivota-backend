@@ -82,7 +82,8 @@ class _Harness:
 
     def patch(self, **fields):
         return asyncio.run(self.ep.update_external_seed(
-            "seed_1", self.ep.UpdateExternalSeedRequest(**fields), current_user={"employee_id": "emp_test"}
+            "seed_1", self.ep.UpdateExternalSeedRequest(**fields),
+            current_user={"employee_id": "emp_test", "email": "staff@example.com", "role": "employee"}
         ))
 
     def updates(self):
@@ -139,10 +140,15 @@ def test_publishing_supersedes_live_siblings_writes_active_and_projects(monkeypa
     assert h.projected == [{"seed_id": "seed_1", "price_source": None}], "published, projected, price not vouched"
 
 
-def test_publishing_with_a_price_edit_vouches_for_that_price(monkeypatch):
+def test_a_publish_that_also_edits_the_price_is_refused_the_editor_is_an_author(monkeypatch):
+    """Review P2-1 (approval rule): whoever changes a seed's content may not publish it, in the same save or later.
+    (A revision whose edit moved the price is vouched for when ANOTHER reviewer approves it:
+    tests/test_employee_seed_publish_authorization.py.)"""
     h = _Harness(monkeypatch, _row("draft"))
-    h.patch(status="active", price_amount=30.0)
-    assert h.projected == [{"seed_id": "seed_1", "price_source": "employee_edit"}]
+    with pytest.raises(HTTPException) as err:
+        h.patch(status="active", price_amount=30.0)
+    assert err.value.status_code == 403 and err.value.detail["error"] == "SEED_SELF_APPROVAL_FORBIDDEN"
+    assert h.statements == [] and h.projected == []
 
 
 def test_a_live_seed_holding_the_same_id_is_a_409_and_nothing_is_written(monkeypatch):
@@ -181,10 +187,16 @@ def test_a_price_edit_on_a_draft_does_not_reach_the_live_offers(monkeypatch):
     assert h.projected == []
 
 
-def test_a_price_edit_on_a_live_seed_still_projects(monkeypatch):
+def test_a_price_edit_on_a_live_seed_is_a_revision_draft_and_projects_nothing(monkeypatch):
+    """Review P2-2 (approval rule): a live seed is never edited in place. The edit is a new draft that revises it;
+    the live seed, and the offers it projected, are untouched until another reviewer approves the revision."""
     h = _Harness(monkeypatch, _row("active"))
-    h.patch(price_amount=30.0)
-    assert h.projected == [{"seed_id": "seed_1", "price_source": "employee_edit"}]
+    out = h.patch(price_amount=30.0)
+    assert h.updates() == [] and h.projected == []
+    (insert,) = [s for s in h.statements if "INSERT INTO external_product_seeds" in s["sql"]]
+    assert (insert["status"], insert["price_amount"]) == ("draft", 30.0)
+    assert insert["seed_data"]["revision_of"] == "seed_1" and insert["seed_data"]["revision_price_edited"] is True
+    assert out["revision"] == {"seed_id": insert["id"], "seed_status": "draft", "revision_of": "seed_1"}
 
 
 def _drive_refresh(monkeypatch, status: str) -> List[str]:

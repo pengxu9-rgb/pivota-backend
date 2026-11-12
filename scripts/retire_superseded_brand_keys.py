@@ -119,6 +119,7 @@ from services.content_canonical_election import (  # noqa: E402
     pick_winner,
 )
 from services.curated_brand_feed import records_for_brand  # noqa: E402
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -757,6 +758,11 @@ async def revert_manifest(m: Dict[str, Any]) -> None:
         for s in m.get("seeds") or []:
             await database.execute(REACTIVATE_SEED_SQL, {"id": s["id"], "status": s["prior_status"],
                                                          "keys": restored})
+            if restored and str(s.get("prior_status") or "").strip().lower() == "active":
+                # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+                # No RETURNING and no status guard: the seed changed only if its row was one this revert restored.
+                log_seed_reactivated_outside_approval([s["id"]], tool="retire_superseded_brand_keys",
+                                                      previous_status="unknown", row_confirmed=False)
         handed_back, kept = 0, []
         for h in m.get("canonical_handovers") or []:
             if h["stale_key"] in restored and await database.fetch_all(HANDOVER_ELECTION_SQL, {

@@ -34,6 +34,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from services.seed_reactivation_audit import log_seed_reactivated_outside_approval
+
 RESOLVER_VERSION = "d2.v1"
 
 VALID_KINDS = ("suppress_dup", "flip_canonical", "attach_membership", "unmerge", "label_only",
@@ -1142,6 +1144,8 @@ async def revert_run(conn, run_id: str) -> Dict[str, Any]:
             reactivated = [
                 str(r["id"]) for r in await conn.fetch(REACTIVATE_SEEDS_SQL, seed_ids)
             ]
+            # Outside the draft-approval rule (ops-only; docs/runbooks/seed_reactivation_outside_approval.md).
+            log_seed_reactivated_outside_approval(reactivated, tool="identity_resolution.revert_run")
         reverted = [
             r["proposal_id"] for r in await conn.fetch(
                 MARK_REVERTED_SQL, run_id, list(MEMBERSHIP_KINDS), moved_back)
@@ -1211,6 +1215,7 @@ async def revert_proposal(
             seeds = detail.get("deactivated_seed_ids") or []
             if seeds:
                 reactivated = [str(r["id"]) for r in await conn.fetch(REACTIVATE_SEEDS_SQL, seeds)]
+                log_seed_reactivated_outside_approval(reactivated, tool="identity_resolution.revert_proposal")
         if _rowcount(await conn.execute(MARK_PROPOSAL_REVERTED_SQL, proposal_id)) != 1:
             raise RuntimeError(f"revert {label}: proposal no longer applied")
         out_run = revert_run_id or f"revert_{_now_run_id()}"

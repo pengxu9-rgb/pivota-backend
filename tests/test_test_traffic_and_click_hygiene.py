@@ -214,23 +214,115 @@ async def test_log_agent_request_counts_only_a_create(stats):
     assert len(stats) == 1
 
 
-def test_only_the_create_route_passes_order_created():
-    """Every log_agent_request call site in the routes: exactly one says order_created=True, and it
-    is inside agent_create_order."""
+def _is_the_logger(node) -> bool:
     import ast
-    import inspect
 
-    import routes.agent_api as api
+    return (isinstance(node, ast.Name) and node.id == "log_agent_request") or (
+        isinstance(node, ast.Attribute) and node.attr == "log_agent_request")
 
-    tree = ast.parse(inspect.getsource(api))
-    hits = []
-    for fn in ast.walk(tree):
-        if isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)):
-            for node in ast.walk(fn):
-                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "log_agent_request":
-                    if any(kw.arg == "order_created" for kw in node.keywords):
-                        hits.append(fn.name)
-    assert sorted(set(hits)) == ["agent_create_order"]
+
+def _log_agent_request_call_sites() -> List[Dict[str, Any]]:
+    """Every call in routes/ and services/ that reaches log_agent_request, in either shape:
+
+    * direct: ``log_agent_request(...)`` / ``module.log_agent_request(...)``
+    * handed over: any call that passes the function itself as an argument, e.g.
+      ``background_tasks.add_task(log_agent_request, ...)`` -- the keywords of that outer call are
+      the ones the logger will receive.
+
+    Modules are discovered by reading the source, never imported, so a new route file is covered the
+    day it first mentions the logger. ``function`` is the outermost enclosing def (the route).
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    sites: List[Dict[str, Any]] = []
+
+    def visit(node, owner, module):
+        for child in ast.iter_child_nodes(node):
+            inner = owner
+            if owner is None and isinstance(child, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                inner = child.name
+            if isinstance(child, ast.Call):
+                direct = _is_the_logger(child.func)
+                handed = any(_is_the_logger(a) for a in [*child.args, *(kw.value for kw in child.keywords)])
+                if direct or handed:
+                    sites.append({"module": module, "function": inner, "line": child.lineno,
+                                  "shape": "direct" if direct else "handed",
+                                  "keywords": [kw.arg for kw in child.keywords]})
+            visit(child, inner, module)
+
+    for folder in ("routes", "services"):
+        for path in sorted((root / folder).rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if "log_agent_request" not in source:
+                continue
+            visit(ast.parse(source), None, path.relative_to(root).as_posix())
+    return sites
+
+
+def test_only_the_create_route_passes_order_created():
+    """Every log_agent_request call site in routes/ and services/, direct or handed to a background
+    task: exactly one function says order_created, and it is agent_create_order."""
+    sites = _log_agent_request_call_sites()
+
+    # the scan is not blind: it reads the modules known to log, and it sees the order-scoped
+    # background-task call sites (the shape a direct-call-only walk misses)
+    modules = {s["module"] for s in sites}
+    assert {"routes/agent_api.py", "routes/fulfillment_api.py"} <= modules, sorted(modules)
+    handed_with_order_id = {s["function"] for s in sites
+                            if s["shape"] == "handed" and "order_id" in s["keywords"]}
+    assert {"agent_get_order", "agent_confirm_payment", "track_order_fulfillment"} <= handed_with_order_id, \
+        sorted(handed_with_order_id)
+    assert any(s["shape"] == "direct" and s["function"] == "agent_create_order" for s in sites)
+
+    # a **kwargs splat could carry order_created past the keyword check below
+    splats = [(s["module"], s["function"], s["line"]) for s in sites if None in s["keywords"]]
+    assert splats == [], splats
+
+    passing = sorted({(s["module"], s["function"]) for s in sites if "order_created" in s["keywords"]})
+    assert passing == [("routes/agent_api.py", "agent_create_order")], [
+        (s["module"], s["function"], s["line"]) for s in sites if "order_created" in s["keywords"]]
+
+
+def test_track_order_does_not_bump_total_orders(monkeypatch, stats):
+    """The fulfillment track route logs through a background task with the order_id; like the order
+    read it is a usage row, never an order."""
+    import routes.agent_auth as auth
+    import routes.fulfillment_api as fa
+    from routes.agent_auth import AgentContext
+    from starlette.requests import Request as _R
+
+    order = {"order_id": "ORD_A1", "agent_id": "agent_partner_a", "merchant_id": REAL,
+             "status": "paid", "payment_status": "paid", "fulfillment_status": "shipped",
+             "created_at": datetime(2026, 11, 1, tzinfo=timezone.utc)}
+
+    async def _get_order(order_id):
+        return dict(order) if order_id == order["order_id"] else None
+
+    usage: List[Dict[str, Any]] = []
+
+    async def _usage(**kwargs):
+        usage.append(kwargs)
+        return "req_test"
+
+    monkeypatch.setattr(auth, "log_agent_usage", _usage)
+    monkeypatch.setattr(fa, "get_order", _get_order)
+    app = FastAPI()
+    app.include_router(fa.router)
+
+    async def _ctx():
+        req = _R({"type": "http", "method": "GET", "path": "/", "headers": [], "query_string": b"",
+                  "client": ("203.0.113.7", 1)})
+        return AgentContext({"agent_id": "agent_partner_a", "allowed_merchants": None}, req)
+
+    app.dependency_overrides[fa.get_agent_context] = _ctx
+    client = TestClient(app)
+    for _ in range(3):
+        resp = client.get("/agent/v1/fulfillment/track/ORD_A1")
+        assert resp.status_code == 200, resp.text
+    assert [u["order_id"] for u in usage] == ["ORD_A1"] * 3
+    assert [c for c in stats if c["orders"]] == []
 
 
 @pytest.mark.parametrize("flag,counted", [("", True), ("true", False)])

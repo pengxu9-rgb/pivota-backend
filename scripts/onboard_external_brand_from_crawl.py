@@ -116,6 +116,7 @@ from services.pdp_scope_classifier import (
 # and the seed row records that seller (seller_ref/seed_kind) so T2 attribution
 # keys conversions by seller.
 from services.seller_identity import derive_seed_seller, ensure_observed_seller
+from services.seed_reactivation_audit import log_upsert_revivals, read_seed_statuses
 from services.variant_identity import PRODUCT_DERIVED
 from services.shopify_publication_signal import (
     PUBLISHED,
@@ -558,6 +559,10 @@ async def _upsert_seed(
         "pdp_ingredients_raw": p.get("raw_inci"),
         "inci_list": p.get("raw_inci"),
     }
+    # The re-run's `ON CONFLICT ... status='active'` revives a seed someone took down: read its status first, so
+    # the revival is logged (docs/runbooks/seed_reactivation_outside_approval.md). Never raises, never blocks.
+    seed_row_id = _seed_id(p["external_product_id"])
+    prior_statuses = await read_seed_statuses(database, [seed_row_id])
     # ADR-009 D3: stamp the derived seller-of-record. A crawl-onboarded brand's
     # destination IS its own store, so this resolves to seed_kind='self',
     # seller_ref=<the observed seller>. NULL only if the brand/domain were
@@ -566,10 +571,12 @@ async def _upsert_seed(
         """
         INSERT INTO external_product_seeds
           (id, external_product_id, market, tool, domain, destination_url, title, image_url,
-           price_amount, price_currency, availability, seed_data, status, seller_ref, seed_kind)
+           price_amount, price_currency, availability, seed_data, status, seller_ref, seed_kind,
+           created_by_employee_id)
         VALUES
           (:id, :epid, :market, :tool, :domain, :url, :title, :img,
-           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active', :seller_ref, :seed_kind)
+           :price, :currency, 'in_stock', CAST(:data AS jsonb), 'active', :seller_ref, :seed_kind,
+           'system/onboard_external_brand_from_crawl')
         ON CONFLICT (id) DO UPDATE SET
           title=EXCLUDED.title, image_url=EXCLUDED.image_url, price_amount=EXCLUDED.price_amount,
           price_currency=EXCLUDED.price_currency, market=EXCLUDED.market,
@@ -603,6 +610,8 @@ async def _upsert_seed(
          "currency": currency,
          "seller_ref": seller_ref, "seed_kind": seed_kind},
     )
+    log_upsert_revivals(prior_statuses, [{"id": seed_row_id, "status": "active"}],
+                        tool="onboard_external_brand_from_crawl")
 
 
 async def _set_category_and_offer(
