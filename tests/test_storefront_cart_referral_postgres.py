@@ -169,6 +169,10 @@ async def test_an_unlisted_market_is_no_row_on_postgres(db, monkeypatch):
     with pytest.raises(referrals.ReferralMarketUnknown):
         await referrals.mint_referral(seller_host=HOST, market="GB", merchant_id=MERCHANT)
     assert sorted(_ctx(r)["market"] for r in await _rows(db)) == ["GB", "US", "ZZ"]
+    monkeypatch.setattr(market_registry, "MARKETS", {"ZZ": changed["ZZ"]})
+    with pytest.raises(referrals.ReferralMarketUnknown):
+        await referrals.mint_referral(seller_host=HOST, market="US", merchant_id=MERCHANT)
+    assert len(await _rows(db)) == 3
 
 
 async def test_the_test_traffic_stamp_on_postgres(db, monkeypatch):

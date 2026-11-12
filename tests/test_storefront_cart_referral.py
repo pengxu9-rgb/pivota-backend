@@ -385,6 +385,10 @@ async def test_the_route_follows_the_registry_and_keeps_no_list_of_its_own(world
     with pytest.raises(referrals.ReferralMarketUnknown):
         await referrals.mint_referral(seller_host=HOST_A, market="GB", merchant_id=MERCHANT)
     assert sorted(ctx_of(r)["market"] for r in await rows_for(HOST_A)) == ["GB", "ZZ"]
+    # No market is known on its own account, the assumed one included: out of the registry, US is refused.
+    monkeypatch.setattr(market_registry, "MARKETS", {"ZZ": changed["ZZ"]})
+    assert refusal_code(await mint(world, PARTNER_A, body_for(market="US"))) == (400, "market_unknown")
+    assert len(await rows_for(HOST_A)) == 2
 
 
 async def test_the_service_mints_nothing_for_an_unlisted_market(world):
