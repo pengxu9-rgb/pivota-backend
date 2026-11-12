@@ -416,7 +416,8 @@ _KEEP = object()
 
 
 def _create(monkeypatch, html: str, mode: str, *, existing: Optional[List[Dict[str, Any]]] = None,
-            snapshot_title: Any = _KEEP, **body: Any) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+            snapshot_title: Any = _KEEP, no_read: bool = False,
+            **body: Any) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     import routes.employee_products as ep
     import utils.logger as ul
 
@@ -435,7 +436,7 @@ def _create(monkeypatch, html: str, mode: str, *, existing: Optional[List[Dict[s
     snapshot = _snapshot_from_html(BUNDLE, html)
     if snapshot_title is not _KEEP:
         snapshot.title = snapshot_title
-    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=None if no_read else snapshot))
     monkeypatch.setattr(ep.database, "fetch_all", AsyncMock(return_value=copy.deepcopy(existing or [])))
     monkeypatch.setattr(ep.database, "execute", AsyncMock(return_value=None))
     monkeypatch.setattr(ep, "_execute_seed_data_stmt", execute_seed)
@@ -461,8 +462,8 @@ def test_creation_off_and_shadow_take_the_components_price_as_before(monkeypatch
     assert response["snapshot_price_refused"] is None
     if mode == "shadow":
         assert [json.loads(m.split(" ", 1)[1]) for m in messages] == [
-            {"mode": "shadow", "priced_identities": 3, "refusal": "several_products", "title_dice": 0.0,
-             "title_from": "employee", "url_relation": "other_product"}]
+            {"mode": "shadow", "page_values": [], "priced_identities": 3, "refusal": "several_products",
+             "title_dice": 0.0, "title_from": "employee", "url_relation": "other_product"}]
     else:
         assert messages == []
 
@@ -682,7 +683,7 @@ URL_LESS_BUNDLE_PAGE = _page(*_url_less([_bundle_node(), *COMPONENTS]))   # the 
 def test_p2a_a_typed_title_still_names_a_url_less_pricing_node(monkeypatch) -> None:
     # The twin: a person typed the bundle's name (not the page's spelling of it), the url-less bundle node carries it,
     # so creation and the refresh read it.
-    response, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", title="Glow Collection")
+    response, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", title="The Glow Collection")
     assert write["seed_data"]["title_source"] == "employee"
     assert (write["price_amount"], response["snapshot_price_refused"]) == (48.0, None)
     out = _refresh_what_create_wrote(monkeypatch, write, URL_LESS_BUNDLE_PAGE)
@@ -731,12 +732,12 @@ def test_p2d_a_legacy_row_whose_snapshot_title_drifted_is_still_decided_by_url(m
 def test_p2d_a_legacy_typed_title_is_decided_by_url_too_and_shadow_says_so(monkeypatch) -> None:
     # The cost: an unstamped title a person may have typed no longer names the node. Shadow labels it, so the false
     # refusals can be sized before `on` (review P3-5).
-    out = _run(monkeypatch, URL_LESS_BUNDLE_PAGE, "shadow", row=_legacy_row("Glow Collection", "Brand Glow Collection"))
+    out = _run(monkeypatch, URL_LESS_BUNDLE_PAGE, "shadow", row=_legacy_row("The Glow Collection", "Brand Glow Collection"))
     assert out["result"]["ambiguous_price"]["refusal"] == "several_products"
     assert out["result"]["ambiguous_price"]["title_from"] == "legacy_differs"
     stamped = _bundle_row()
-    stamped["title"] = "Glow Collection"
-    stamped["seed_data"]["title"] = "Glow Collection"
+    stamped["title"] = "The Glow Collection"
+    stamped["seed_data"]["title"] = "The Glow Collection"
     out = _run(monkeypatch, URL_LESS_BUNDLE_PAGE, "shadow", row=stamped)
     assert (out["result"]["ambiguous_price"]["refusal"], out["result"]["ambiguous_price"]["named_by"]) == (None, "title")
 
@@ -865,14 +866,14 @@ def _stamped_row(title: str, source: Optional[str]) -> Dict[str, Any]:
 def test_p3_1_a_titled_re_create_over_an_untitled_row_is_typed(monkeypatch) -> None:
     first = COMPONENTS[0]["name"]
     _, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row(first, "page")],
-                          title="Glow Collection")
+                          title="The Glow Collection")
     assert write["seed_data"]["title_source"] == "employee"
     assert write["price_amount"] == 48.0
 
 
 def test_p3_1_an_untitled_re_create_over_a_typed_row_takes_the_pages_name(monkeypatch) -> None:
     # This read names the page, so the stored title becomes the page's name, and so does its stamp.
-    _, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("Glow Collection", "employee")],
+    _, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("The Glow Collection", "employee")],
                           title=None)
     assert write["seed_data"]["title"] == BUNDLE_TITLE
     assert write["seed_data"]["title_source"] == "page"
@@ -882,9 +883,9 @@ def test_p3_1_an_untitled_re_create_over_a_typed_row_takes_the_pages_name(monkey
 def test_p3_4_an_untitled_re_create_that_keeps_the_rows_title_keeps_its_stamp(monkeypatch, source: Any,
                                                                              kept: str) -> None:
     # This read gave no name, so the row's own title is kept, and with it who wrote it.
-    _, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("Glow Collection", source)],
+    _, write, _ = _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("The Glow Collection", source)],
                           title=None, snapshot_title=None)
-    assert write["seed_data"]["title"] == "Glow Collection"
+    assert write["seed_data"]["title"] == "The Glow Collection"
     assert write["seed_data"]["title_source"] == kept
 
 
@@ -899,11 +900,11 @@ def test_p3_4_a_kept_typed_title_still_names_the_node_at_the_re_create(monkeypat
         return real(**kwargs)
 
     monkeypatch.setattr(ep.destination_liveness, "ambiguous_price_decision", spy)
-    _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("Glow Collection", "employee")],
+    _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("The Glow Collection", "employee")],
             title=None, snapshot_title=None)
-    _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("Glow Collection", "page")],
+    _create(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", existing=[_stamped_row("The Glow Collection", "page")],
             title=None, snapshot_title=None)
-    assert seen == ["Glow Collection", None]
+    assert seen == ["The Glow Collection", None]
 
 
 def test_p3_1_a_re_create_re_sending_the_rows_typed_title_keeps_it_typed(monkeypatch) -> None:
@@ -972,8 +973,8 @@ def test_p2b_an_editor_save_that_changes_the_title_makes_it_typed(monkeypatch) -
     row = _row_from_create(write)
     out = _run(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", row=row)
     assert out["result"]["price_refresh"]["status"] == "skipped_ambiguous_product"
-    saved = _patch(monkeypatch, row, title="Glow Collection", notes="retitled")
-    assert (saved["title"], saved["seed_data"]["title_source"]) == ("Glow Collection", "employee")
+    saved = _patch(monkeypatch, row, title="The Glow Collection", notes="retitled")
+    assert (saved["title"], saved["seed_data"]["title_source"]) == ("The Glow Collection", "employee")
     out = _run(monkeypatch, URL_LESS_BUNDLE_PAGE, "on", row=saved)
     assert out["result"]["ambiguous_price"]["named_by"] == "title"
     assert out["result"]["price_refresh"]["status"] != "skipped_ambiguous_product"
@@ -981,16 +982,16 @@ def test_p2b_an_editor_save_that_changes_the_title_makes_it_typed(monkeypatch) -
 
 @pytest.mark.parametrize("source", ["employee", "page", None])
 def test_p2b_a_re_sent_title_keeps_whatever_stamp_the_row_had(monkeypatch, source: Any) -> None:
-    row = _stamped_row("Glow Collection", source)
-    saved = _patch(monkeypatch, row, title="glow collection", status="active")
+    row = _stamped_row("The Glow Collection", source)
+    saved = _patch(monkeypatch, row, title="the glow collection", status="active")
     assert saved["seed_data"].get("title_source") == source
 
 
 def test_p2b_a_re_sent_title_matching_either_stored_copy_is_unchanged(monkeypatch) -> None:
     # A refresh fills `seed_data.title` only; the editor may have loaded either copy.
-    row = _stamped_row("Glow Collection", "page")
+    row = _stamped_row("The Glow Collection", "page")
     row["seed_data"]["title"] = BUNDLE_TITLE
-    assert _patch(monkeypatch, row, title="Glow Collection")["seed_data"]["title_source"] == "page"
+    assert _patch(monkeypatch, row, title="The Glow Collection")["seed_data"]["title_source"] == "page"
     assert _patch(monkeypatch, row, title=BUNDLE_TITLE)["seed_data"]["title_source"] == "page"
     assert _patch(monkeypatch, row, title="Glow Set")["seed_data"]["title_source"] == "employee"
 
@@ -1001,21 +1002,293 @@ def test_p2b_a_re_sent_non_latin_title_is_unchanged(monkeypatch) -> None:
     assert _patch(monkeypatch, row, title="진정 토너")["seed_data"]["title_source"] == "employee"
 
 
+@pytest.mark.parametrize("title", ["", "   ", "\t\n"])
 @pytest.mark.parametrize("source", ["employee", "page"])
-def test_p2b_an_empty_title_clears_the_stamp(monkeypatch, source: str) -> None:
-    # The audit queue sends `title: ""` for a row with no title.
-    saved = _patch(monkeypatch, _stamped_row("Glow Collection", source), title="", status="active")
+def test_p2b_an_empty_title_clears_the_stamp(monkeypatch, source: str, title: str) -> None:
+    # The audit queue sends `title: ""` for a row with no title; a whitespace-only title is no title either
+    # (be#2764 review P3-E, mutant N16).
+    saved = _patch(monkeypatch, _stamped_row("The Glow Collection", source), title=title, status="active")
     assert "title_source" not in saved["seed_data"]
-    assert saved["title"] == ""
+    assert saved["title"] == title
 
 
 def test_p2b_a_save_without_a_title_leaves_the_stamp(monkeypatch) -> None:
-    saved = _patch(monkeypatch, _stamped_row("Glow Collection", "page"), notes="x")
+    saved = _patch(monkeypatch, _stamped_row("The Glow Collection", "page"), notes="x")
     assert saved["seed_data"]["title_source"] == "page"
-    assert saved["title"] == "Glow Collection"
+    assert saved["title"] == "The Glow Collection"
 
 
 def test_p2a_the_title_stamp_never_reaches_a_partner() -> None:
     from services.seed_data_egress_projection import INTERNAL_STATE_KEYS
 
     assert "title_source" in INTERNAL_STATE_KEYS
+
+
+# --------------------------------------------------------------------------- be#2764 review P2-E: prefilled values
+
+def _portal_variants(html: str) -> List[Dict[str, Any]]:
+    """The variants the portal's create form copies from the preview (its own normalisation of each entry)."""
+    snap = _snapshot_from_html(BUNDLE, html)
+    return [{"variant_id": str(v["variant_id"]), "title": v.get("title") or "", "image_url": None,
+             "label_image_url": None, "price_amount": v.get("price_amount"),
+             "price_currency": v.get("price_currency") or "", "availability": v.get("availability") or ""}
+            for v in snap.evidence["variants"] if v.get("variant_id")]
+
+
+def _prefilled_body(html: str, **over: Any) -> Dict[str, Any]:
+    snap = _snapshot_from_html(BUNDLE, html)
+    body = {"title": snap.title, "price_amount": snap.price_amount, "price_currency": snap.price_currency,
+            "variants": _portal_variants(html)}
+    body.update(over)
+    return body
+
+
+@pytest.mark.parametrize("shape", ["url_less_components", "components_claim_the_page"])
+def test_p2e_a_refused_creation_stores_no_prefilled_price_and_no_prefilled_variants(monkeypatch, shape: str) -> None:
+    # What the portal sends after a preview of a bundle page: the component's name, price and the components.
+    html = _page(*_url_less(COMPONENTS)) if shape == "url_less_components" else _claiming_bundle_page()
+    response, write, messages = _create(monkeypatch, html, "on", **_prefilled_body(html))
+    refused = response["snapshot_price_refused"]
+    assert refused["reason"] == "ambiguous_product"
+    assert refused["body_values_from_the_page"] == ["price", "variants"]
+    assert (write["price_amount"], write["price_currency"]) == (None, None)
+    assert write["seed_data"]["variants"] == []
+    assert json.loads(messages[0].split(" ", 1)[1])["page_values"] == ["price", "variants"]
+    out = _refresh_what_create_wrote(monkeypatch, write, html)
+    assert out["result"]["price_refresh"]["status"] == "skipped_ambiguous_product"
+    assert out["written"].get("price_amount") is None, "nothing the page priced is ever stored"
+    assert not out["seed_data"].get("variants")
+
+
+def test_p2e_untitled_prefilled_variants_alone_are_the_pages(monkeypatch) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    response, write, _ = _create(monkeypatch, html, "on", title=None, variants=_portal_variants(html))
+    assert response["snapshot_price_refused"]["body_values_from_the_page"] == ["variants"]
+    assert write["seed_data"]["variants"] == []
+
+
+def test_p2e_some_of_the_pages_variants_are_still_the_pages(monkeypatch) -> None:
+    # The person deleted two of the copied components: what is left is still the page's.
+    html = _page(*_url_less(COMPONENTS))
+    _, write, _ = _create(monkeypatch, html, "on", title=None, variants=_portal_variants(html)[:1])
+    assert write["seed_data"]["variants"] == []
+
+
+def test_p2e_a_typed_price_and_typed_variants_stand(monkeypatch) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    variants = _portal_variants(html)
+    variants[0]["price_amount"] = 48.0                       # a person repriced one: the list is theirs
+    response, write, _ = _create(monkeypatch, html, "on", title=None, price_amount=48.0, price_currency="USD",
+                                 variants=variants)
+    assert response["snapshot_price_refused"]["body_values_from_the_page"] == []
+    assert (write["price_amount"], write["price_currency"]) == (48.0, "USD")
+    assert write["seed_data"]["variants"] == variants
+    added = _portal_variants(html) + [{"variant_id": "GLOW-SET", "price_amount": 48.0, "price_currency": "USD"}]
+    _, write, _ = _create(monkeypatch, html, "on", title=None, variants=added)
+    assert write["seed_data"]["variants"] == added, "a variant a person added makes the list theirs"
+
+
+@pytest.mark.parametrize("amount, currency, dropped", [
+    (6.0, "USD", True), (6, None, True), (6.001, "usd", True),
+    (6.0, "EUR", False),                                     # another currency was typed: not the page's price
+    (6.5, "USD", False),
+])
+def test_p2e_only_the_refused_nodes_own_price_is_the_pages(monkeypatch, amount: Any, currency: Any,
+                                                           dropped: bool) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    _, write, _ = _create(monkeypatch, html, "on", title=None, price_amount=amount, price_currency=currency)
+    if dropped:
+        assert (write["price_amount"], write["price_currency"]) == (None, None)
+    else:
+        assert write["price_amount"] == amount
+
+
+def test_p2e_a_re_create_with_the_prefilled_price_keeps_the_rows_own(monkeypatch) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    row = _stored_bundle_row()
+    row["price_amount"] = 20.0
+    _, write, _ = _create(monkeypatch, html, "on", existing=[row], **_prefilled_body(html))
+    assert write["price_amount"] == 20.0, "the page's price is not stated: the row's stored one stands"
+    assert not write["seed_data"].get("variants"), "nor are the page's variants"
+    typed = [{"variant_id": "GLOW-SET", "price_amount": 48.0, "price_currency": "USD"}]
+    _, write, _ = _create(monkeypatch, html, "on", existing=[row], **_prefilled_body(html, variants=typed))
+    assert write["seed_data"]["variants"] == typed
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow"])
+def test_p2e_off_and_shadow_keep_the_prefilled_values_as_before(monkeypatch, mode: str) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    response, write, messages = _create(monkeypatch, html, mode, **_prefilled_body(html))
+    assert response["snapshot_price_refused"] is None
+    assert write["price_amount"] == 6.0
+    assert len(write["seed_data"]["variants"]) == 3
+    if mode == "shadow":
+        assert json.loads(messages[0].split(" ", 1)[1])["page_values"] == ["price", "variants"]
+
+
+def test_p2e_a_bundle_its_own_node_prices_keeps_the_prefilled_values(monkeypatch) -> None:
+    # Not refused: the page's price IS the seed's, prefilled or not.
+    response, write, _ = _create(monkeypatch, NAMED_BUNDLE_PAGE, "on", **_prefilled_body(NAMED_BUNDLE_PAGE))
+    assert response["snapshot_price_refused"] is None
+    assert write["price_amount"] == 48.0
+    assert write["seed_data"]["variants"]
+
+
+@pytest.mark.parametrize("variants, expected", [
+    (None, []), ([], []), ("x", []), ([{"price_amount": 6.0}], []),          # no id: never the page's
+    ([{"variant_id": "NIACINAMIDE-SERUM", "price_amount": "6.00", "price_currency": "usd"}], ["variants"]),
+    ([{"variant_id": "NIACINAMIDE-SERUM", "price_amount": None, "price_currency": "USD"}], []),
+])
+def test_p2e_variant_comparison(variants: Any, expected: List[str]) -> None:
+    import routes.employee_products as ep
+
+    evidence = _snapshot_from_html(BUNDLE, _page(*_url_less(COMPONENTS))).evidence
+    assert ep._body_values_from_the_page(body_price_amount=None, body_price_currency=None, body_variants=variants,
+                                         page_price_amount=6.0, page_price_currency="USD",
+                                         evidence=evidence) == expected
+    assert ep._body_values_from_the_page(body_price_amount=object(), body_price_currency=object(),
+                                         body_variants=object(), page_price_amount=object(),
+                                         page_price_currency=None, evidence="not a dict") == []
+
+
+def _preview(monkeypatch, html: str, mode: str) -> Dict[str, Any]:
+    import routes.employee_products as ep
+
+    if mode == "unset":
+        monkeypatch.delenv(liveness.AMBIGUOUS_PRICE_GUARD_ENV, raising=False)
+    else:
+        monkeypatch.setenv(liveness.AMBIGUOUS_PRICE_GUARD_ENV, mode)
+    monkeypatch.setattr(ep, "resolve_external_offer", AsyncMock(return_value=_snapshot_from_html(BUNDLE, html)))
+    monkeypatch.setattr(ep, "_is_domain_allowed", AsyncMock(return_value=True))
+    return asyncio.run(ep.preview_external_seed(
+        ep.PreviewExternalSeedRequest(destination_url=BUNDLE, market="US"), current_user={"employee_id": "emp_test"}))
+
+
+@pytest.mark.parametrize("shape", ["url_less_components", "components_claim_the_page", "components"])
+def test_p2e_the_preview_shows_no_refused_price_or_variants_when_on(monkeypatch, shape: str) -> None:
+    html = {"url_less_components": _page(*_url_less(COMPONENTS)), "components_claim_the_page": _claiming_bundle_page(),
+            "components": BUNDLE_PAGE}[shape]
+    out = _preview(monkeypatch, html, "on")
+    assert out["ambiguous_price"]["refused"] is True
+    assert out["ambiguous_price"]["refusal"] == "several_products"
+    assert (out["preview"]["price_amount"], out["preview"]["price_currency"], out["preview"]["variants"]) == (
+        None, None, [])
+    assert out["preview"]["title"], "the title still shows: creation decides who wrote it"
+
+
+@pytest.mark.parametrize("mode", ["off", "unset", "shadow"])
+def test_p2e_off_and_shadow_previews_show_what_they_showed(monkeypatch, mode: str) -> None:
+    out = _preview(monkeypatch, BUNDLE_PAGE, mode)
+    assert out["preview"]["price_amount"] == 6.0 and len(out["preview"]["variants"]) == 3
+    if mode == "shadow":
+        assert out["ambiguous_price"]["refused"] is False and out["ambiguous_price"]["refusal"] == "several_products"
+    else:
+        assert "ambiguous_price" not in out
+
+
+def test_p2e_a_preview_of_a_page_its_own_node_prices_is_not_withheld(monkeypatch) -> None:
+    out = _preview(monkeypatch, NAMED_BUNDLE_PAGE, "on")
+    assert out["ambiguous_price"]["refused"] is False
+    assert out["preview"]["price_amount"] == 48.0 and out["preview"]["variants"]
+    single = _preview(monkeypatch, _page(COMPONENTS[0]), "on")
+    assert "ambiguous_price" not in single
+
+
+def _ops_script():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "ops_refresh_external_seeds.py"
+    spec = importlib.util.spec_from_file_location("ops_refresh_external_seeds_g2764", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("mode, skipped", [("on", True), ("shadow", False), ("off", False)])
+def test_p2e_ops_sync_variants_skips_a_page_the_guard_refused(monkeypatch, mode: str, skipped: bool) -> None:
+    # The REAL preview's answer, through the script's own preview reader (an in-process transport, no network).
+    import httpx
+
+    payload = _preview(monkeypatch, BUNDLE_PAGE, mode)
+    ops = _ops_script()
+    assert (ops.preview_refused_by_ambiguous_price_guard(payload) is not None) is skipped
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=json.loads(json.dumps(payload, default=str)))
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ops._preview_seed(client, "http://ops.test", "t", destination_url=BUNDLE, market="US",
+                                           timeout=1.0)
+
+    ok, msg, variants, images = asyncio.run(go())
+    if skipped:
+        assert (ok, msg, variants, images) == (False, "ambiguous_product:several_products", [], [])
+    else:
+        assert ok and len(variants) == 3
+
+
+# --------------------------------------------------------------------------- be#2764 review P3-A / P3-B
+
+CHALLENGE_PAGE = "<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
+
+
+@pytest.mark.parametrize("read", ["none", "challenge"])
+@pytest.mark.parametrize("source, expected", [("page", "page"), (None, "page"), ("employee", "employee")])
+def test_p3a_a_re_create_re_sending_the_rows_title_keeps_who_wrote_it(monkeypatch, read: str, source: Any,
+                                                                      expected: str) -> None:
+    # This read has no page name (no read at all), or a challenge page's, to compare with: the row's stamp decides.
+    first = COMPONENTS[0]["name"]
+    html = _page(*_url_less(COMPONENTS))
+    _, write, _ = _create(monkeypatch, CHALLENGE_PAGE, "on", existing=[_stamped_row(first, source)], title=first,
+                          no_read=read == "none")
+    assert write["seed_data"]["title_source"] == expected
+    if expected == "page":
+        # The next good read must not let the component name itself.
+        row = _stamped_row(first, "page")
+        row["seed_data"] = copy.deepcopy(write["seed_data"])
+        out = _run(monkeypatch, html, "on", row=row)
+        assert out["result"]["price_refresh"]["status"] == "skipped_ambiguous_product"
+
+
+@pytest.mark.parametrize("brand", ["Brand", None])          # None: the pricing node's own brand
+@pytest.mark.parametrize("typed", ["Niacinamide Serum", "niacinamide serum brand", "BRAND Niacinamide Serum BRAND"])
+def test_p3b_cutting_the_brand_from_a_prefilled_name_is_not_typing_a_title(monkeypatch, typed: str,
+                                                                           brand: Any) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    response, write, _ = _create(monkeypatch, html, "on", title=typed, brand=brand)
+    assert write["seed_data"]["title_source"] == "page"
+    assert response["snapshot_price_refused"]["reason"] == "ambiguous_product"
+    out = _refresh_what_create_wrote(monkeypatch, write, html)
+    assert out["written"].get("price_amount") is None
+
+
+def test_p3b_a_patch_cutting_the_brand_keeps_the_stamp(monkeypatch) -> None:
+    html = _page(*_url_less(COMPONENTS))
+    _, write, _ = _create(monkeypatch, html, "on", title=None)
+    row = _row_from_create(write)
+    saved = _patch(monkeypatch, row, title="Niacinamide Serum", notes="tidied")
+    assert saved["seed_data"]["title_source"] == "page"
+    out = _run(monkeypatch, html, "on", row=saved)
+    assert out["written"].get("price_amount") is None, "the component must not name itself"
+    assert _patch(monkeypatch, row, title="Niacinamide Toner")["seed_data"]["title_source"] == "employee"
+
+
+@pytest.mark.parametrize("a, b, brands, same", [
+    ("Niacinamide Serum", "Brand Niacinamide Serum", ("Brand",), True),
+    ("Niacinamide Serum Brand", "Brand Niacinamide Serum", ("Brand",), True),
+    ("Niacinamide Serum", "Brand Niacinamide Serum", (), False),
+    ("Niacinamide Serum", "Brand Niacinamide Serum", ({"name": "Brand"},), True),
+    ("Brand", "Brand Niacinamide Serum", ("Brand",), False),          # the brand alone is not the product's name
+    ("Brand", "Brand", ("Brand",), True),
+    ("Niacinamide Toner", "Brand Niacinamide Serum", ("Brand",), False),
+    ("세럼", "브랜드 세럼", ("브랜드",), True),
+    (None, "Brand Niacinamide Serum", ("Brand",), False),
+    ("Niacinamide Serum", None, ("Brand", None, 7), False),
+])
+def test_p3b_titles_compare_without_a_brand_prefix_or_suffix(a: Any, b: Any, brands: Any, same: bool) -> None:
+    import routes.employee_products as ep
+
+    assert ep._same_title_but_brand(a, b, brands) is same
