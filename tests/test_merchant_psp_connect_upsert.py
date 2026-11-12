@@ -2,8 +2,47 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+async def _own_merchant_onboarding_table():
+    """This file brings the one real table its route reads, and takes it away again.
+
+    `connect_psp` looks the caller up in `merchant_onboarding` (the rejected-merchant
+    gate) through `db.merchant_onboarding.database` BEFORE it reaches any of the
+    `module.database` calls the tests below replace, so that one read goes to the
+    shared sqlite file for real. Nothing here created the table: the tests passed
+    only when an earlier test in the same process had started the full app, whose
+    startup runs `metadata.create_all`. Alone, or in a sweep shard where no such
+    test came first, five of them died on "no such table: merchant_onboarding".
+
+    The table is built from the model by `tests/model_schema.ensure_model_tables`
+    (create it if absent, patch a neighbour's narrower copy up to the model), not
+    from DDL written here. No row is inserted: an unknown merchant is the case the
+    tests want, since the gate only refuses a suppressed status.
+
+    If this fixture is what created the table it drops it again afterwards, so this
+    file does not become the next hidden provider for a file with the same
+    unstated need. A table that was already there is left alone.
+    """
+    from sqlalchemy import create_engine, inspect
+
+    from db.database import sync_url
+    from db.merchant_onboarding import merchant_onboarding
+    from tests.model_schema import ensure_model_tables
+
+    engine = create_engine(sync_url)
+    try:
+        already_there = inspect(engine).has_table(merchant_onboarding.name)
+        await ensure_model_tables([merchant_onboarding])
+        yield
+        if not already_there:
+            merchant_onboarding.drop(engine, checkfirst=True)
+    finally:
+        engine.dispose()
 
 
 def _build_client():
