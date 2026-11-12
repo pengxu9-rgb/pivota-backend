@@ -691,6 +691,28 @@ host, the fact read answers no.
   A hand `gcloud run jobs update --update-env-vars MERCHANT_PURCHASABILITY_WARM_CLICK_MAX_PER_RUN=0`
   works at once but is reset by the next run of the setup script.
 
+**The directory freshness check follows the job's dials, a day late at most.** The R-03 check
+(`services/freshness_clock_check.py`, on the `worker`, behind `FRESHNESS_DIRECTORY_CHECK_ENABLED`)
+keeps a clock on every key the sweep refreshes. It reads `WARM_CLICK_MAX_PER_RUN`,
+`WARM_CLICK_NOT_SHOPIFY_RECHECK_DAYS`, `WARM_CLICK_STICKY_DAYS` and `MERCHANT_PURCHASABILITY_TTL_HOURS` from what the job
+**published with its daily cart-mint scan** (the `sweep-dial` entries of the scan row), not from the
+worker's environment, so a rollback on the job takes the warm-only keys off the clock at the next
+05:00Z scan, well inside the 72 h before any of them could page. Its summary line echoes the three
+values and `dials_source`:
+
+- `sweep_scan`: the job's published values are in use. Nothing else to do.
+- `env`: the newest complete scan carries no dials (the job image predates the publish, or the scan
+  is from before the re-image). The check is then using the **worker's** environment. **Until
+  `dials_source` reads `sweep_scan`, set the same dial on the worker too** (`gcloud run services
+  update worker --update-env-vars ...`), or about 72 h after a rollback every warm-only key pages
+  as stale for good. Re-imaging the job (below) is what makes it publish.
+
+**`MERCHANT_PURCHASABILITY_TTL_HOURS` must be the same value on `web` and on the sweep job.** The
+job's value arms `positive_until` (what the card gate reads) and is the limit the freshness check
+uses; `web`'s value is what the warm-handoff gate (`human_handoff_allowed`) compares `checked_at`
+with. Only one value is meaningful: with a shorter TTL on `web`, the handoff gate drops a merchant
+before the freshness check pages. Change it on both, in one step.
+
 **The job never redeploys on merge.** Re-image it with the setup script **and `--enable`**
 (without it the script DISARMS the lane):
 `infra/gcp/setup_merchant_purchasability_sweep_job.sh prod <backend-tag> --enable`.

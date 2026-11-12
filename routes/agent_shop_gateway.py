@@ -12831,7 +12831,10 @@ class ExternalSeedLinksRequest(BaseModel):
     )
 
 
-async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, Any]:
+async def mint_external_seed_links(
+    body: ExternalSeedLinksRequest,
+    issued_clicks: Optional[List[IssuedClick]] = None,
+) -> Dict[str, Any]:
     """Mint the attributed links for seed cards the GATEWAY built itself.
 
     WHY THIS EXISTS. The gateway's search stack builds external-seed cards in JS straight from
@@ -12850,6 +12853,11 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
 
     A candidate we cannot mint (domain not allowlisted, unusable URL) is simply absent from
     `links`: the gateway keeps that card's raw URL, which is exactly what it had before.
+
+    `issued_clicks` (FIX_PLAN O-04): when given, each minted link's click is appended to it, as
+    offers.resolve does, so the route can record it as issued to the partner the gateway vouched
+    for. None (the default, and every call while PARTNER_IDENTITY_FORWARDING_ENABLED is off)
+    mints exactly as before.
     """
     default_market = str(body.market or "US").strip().upper() or "US"
     default_tool = str(body.tool or "*").strip() or "*"
@@ -12926,6 +12934,7 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
             platform=redirect_identity["platform"],
             seller_ref=redirect_identity["seller_ref"],
             seed_kind=redirect_identity["seed_kind"],
+            issued_clicks=issued_clicks,
         )
         if not redirect_url:
             continue
@@ -12964,14 +12973,59 @@ async def mint_external_seed_links(body: ExternalSeedLinksRequest) -> Dict[str, 
     return {"links": links}
 
 
+#: The gateway operation name its per-response seed-link mint signs (PIVOTA-Agent
+#: src/attribution/issuingAgentAssertion.js PARTNER_IDENTITY_OPS).
+EXTERNAL_SEED_LINKS_MINT_OP = "external_seed_links.mint"
+
+
 @router.post("/attribution/external-seed-links")
 async def external_seed_links_endpoint(
     body: ExternalSeedLinksRequest,
+    http_request: Request,
     _context: AgentContext = Depends(get_agent_context),
 ) -> Dict[str, Any]:
     """Credentialed only: the gateway calls this with its internal key. Anonymous callers get
-    the same 401 every other agent route gives them — a mint is not a public read."""
-    return await mint_external_seed_links(body)
+    the same 401 every other agent route gives them — a mint is not a public read.
+
+    With PARTNER_IDENTITY_FORWARDING_ENABLED and a REQUEST-BOUND (v2) X-Pivota-Issuing-Agent from the
+    vouching gateway (the per-response mint it makes AFTER its search cache, for one caller), every
+    minted click is recorded as issued to that partner (surface_click_events.agent_id), the same
+    record offers.resolve writes. Without both, the mint is exactly as before and records nothing."""
+    from routes import agent_forwarded_owner as forwarded
+
+    assertion = (http_request.headers.get(ISSUING_AGENT_ASSERTION_HEADER) or "").strip() or None
+    if not (forwarded.partner_identity_forwarding_enabled() and assertion):
+        return await mint_external_seed_links(body)
+    # Recorded only for the vouching service's REQUEST-BOUND assertion (v2, single use). An agent's own
+    # key, or a v1 token, records nothing here: this route mints from candidates the caller supplies.
+    if not await _is_vouching_service(request_api_key(http_request)):
+        return await mint_external_seed_links(body)
+    agent_id, _op, reason = await forwarded.verify_bound_forwarded_subject(
+        http_request, ops=(EXTERNAL_SEED_LINKS_MINT_OP,)
+    )
+    if not agent_id:
+        # `utils.logger` ("pivota"): a plain module logger's INFO never reaches prod logs, so a refused or
+        # replayed mint assertion (a full nonce store included) would be invisible.
+        from utils.logger import logger as _pivota_logger
+
+        _pivota_logger.info("external_seed_links.partner_assertion_not_credited reason=%s", reason)
+        return await mint_external_seed_links(body)
+    issued: List[IssuedClick] = []
+    result = await mint_external_seed_links(body, issued_clicks=issued)
+    if issued:
+        try:
+            await issue_clicks([replace(click, agent_id=agent_id) for click in issued])
+        except Exception as e:  # noqa: BLE001 -- FAIL OPEN: the links are served; the record is lost, loudly
+            logger.warning(
+                "external_seed_links.issue_clicks_failed count=%s error_type=%s", len(issued), type(e).__name__,
+            )
+    return result
+
+
+async def _is_vouching_service(api_key: Optional[str]) -> bool:
+    import routes.agent_auth as _agent_auth
+
+    return await _agent_auth._is_service_caller(api_key)
 
 
 def _request_market_for_multi(

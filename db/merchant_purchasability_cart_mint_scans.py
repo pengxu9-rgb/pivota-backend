@@ -38,6 +38,10 @@ RETENTION_DAYS = 14
 #: count (`["", "", seeds, WARM_CLICK_SEEDS_TAG]`; the table has no column for it). See `_row`.
 WARM_CLICK_TAG = "warm-click"
 WARM_CLICK_SEEDS_TAG = "warm-click-seeds"
+#: The tag on one entry per SWEEP DIAL the scanning run used (`[name, "", value, SWEEP_DIAL_TAG]`), so a
+#: read-only consumer of this row (services/freshness_clock_check.py, on another service) judges with
+#: the JOB's dials and not its own environment's. A reader that predates the tag ignores the entries.
+SWEEP_DIAL_TAG = "sweep-dial"
 
 _DDL_READY = False
 _DDL_LOCK = asyncio.Lock()
@@ -140,6 +144,12 @@ def _row(record: Any) -> Dict[str, Any]:
     row["warm_seeds"] = next(
         (int(h[2]) for h in hosts if isinstance(h, list) and len(h) == 4 and h[3] == WARM_CLICK_SEEDS_TAG), 0
     )
+    row["dials"] = {
+        str(h[0]): int(h[2])
+        for h in hosts
+        if isinstance(h, list) and len(h) == 4 and h[3] == SWEEP_DIAL_TAG and isinstance(h[2], int)
+        and not isinstance(h[2], bool)
+    }
     return row
 
 
@@ -167,10 +177,12 @@ async def record(
     hosts: Dict[Tuple[str, str], int],
     warm_hosts: Optional[Dict[Tuple[str, str], int]] = None,
     warm_seeds: int = 0,
+    dials: Optional[Dict[str, int]] = None,
 ) -> None:
     """Write one scan, then prune rows past retention. RAISES if the insert did not land.
 
-    `warm_hosts` (the warm-click lane) is stored next to the cart hosts as tagged entries."""
+    `warm_hosts` (the warm-click lane) is stored next to the cart hosts as tagged entries, and
+    `dials` (the sweep dials the scanning run used) as one `SWEEP_DIAL_TAG` entry each."""
     from db.database import database
 
     payload = json.dumps(
@@ -178,6 +190,7 @@ async def record(
         + sorted([host, market, int(seeds), WARM_CLICK_TAG]
                  for (host, market), seeds in (warm_hosts or {}).items())
         + ([["", "", int(warm_seeds), WARM_CLICK_SEEDS_TAG]] if warm_hosts or warm_seeds else [])
+        + sorted([str(name), "", int(value), SWEEP_DIAL_TAG] for name, value in (dials or {}).items())
     )
     landed = await database.fetch_one(_INSERT_SQL, {
         "scan_id": scan_id, "scanned_at": scanned_at, "complete": bool(complete),
