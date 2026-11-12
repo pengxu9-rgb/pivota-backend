@@ -313,8 +313,11 @@ def test_editing_a_seed_into_an_ingest_market_files_it_there(monkeypatch, client
     res = client.patch("/employee/products/external-seeds/eps_1", json={"market": "sg"})
 
     assert res.status_code == 200, res.text
-    (update,) = writes
-    assert update["market"] == "SG" and "market = :market" in update["sql"]
+    # The stored seed is live (no status reads active), so the edit is its revision draft (approval-rule P2-2),
+    # filed under the new market.
+    (write,) = writes
+    assert write["market"] == "SG" and "INSERT INTO external_product_seeds" in write["sql"]
+    assert write["seed_data"]["revision_of"] == "eps_1" and res.json()["revision"]["revision_of"] == "eps_1"
 
 
 # ----------------------------------------------------------------- CSV import (both sheet shapes)
