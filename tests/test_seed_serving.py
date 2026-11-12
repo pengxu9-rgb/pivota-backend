@@ -4,6 +4,9 @@ The partition (`external_product_seeds.market`) is never the answer: SGD, AUD an
 'US' partition on purpose (ingestion.SEED_PARTITION_MARKET). The SQL form runs here on SQLite (the
 dialect-neutral CASE) and in tests/test_seed_serving_postgres.py on Postgres (the full jsonb form),
 over the same SEED_ROWS, and both must give the Python answers.
+
+AU and JP are the market registry's acquisition markets (ingested, never served): an AUD or JPY seed has no
+market and is never served, refused by name ('acquisition_market:AU').
 """
 
 from __future__ import annotations
@@ -12,8 +15,9 @@ import sqlite3
 
 import pytest
 
+from services import market_registry
 from services import seed_serving as m
-from services.region_pricing import REGION_PRICING_CURRENCY, market_for_pricing_currency
+from services.region_pricing import ACQUISITION_MARKETS, REGION_PRICING_CURRENCY, market_for_pricing_currency
 from services.seed_offer_currency import currency_code
 
 # (id, partition, price_currency column, seed_data, expected currency, expected market).
@@ -23,8 +27,10 @@ SEED_ROWS = [
     # seed_data.price_currency is the writers' old "USD" default, not evidence.
     ("sgd_in_us", "US", "SGD", {"price_currency": "USD", "snapshot": {"price_currency": "SGD"}}, "SGD", "SG"),
     ("usd_in_sg", "SG", "USD", None, "USD", "US"),
-    ("aud_in_us", "US", "AUD", {"snapshot": {"price_currency": "AUD"}}, "AUD", "AU"),
-    ("jpy_in_us", "US", "JPY", {}, "JPY", "JP"),
+    # AU and JP are acquisition markets: refused by name, so no market.
+    ("aud_in_us", "US", "AUD", {"snapshot": {"price_currency": "AUD"}}, "AUD", None),
+    ("jpy_in_us", "US", "JPY", {}, "JPY", None),
+    ("aud_in_au", "AU", "AUD", None, "AUD", None),
     ("gbp_in_us", "US", "GBP", None, "GBP", "GB"),
     # EUR prices several markets: no market, never a default.
     ("eur_in_us", "US", "EUR", {"snapshot": {"price_currency": "EUR"}}, "EUR", None),
@@ -52,8 +58,10 @@ def test_the_row_currency_and_market_come_from_the_row_currency(rid, partition, 
 
 
 def test_the_market_map():
-    for code, market in (("USD", "US"), ("SGD", "SG"), ("AUD", "AU"), ("JPY", "JP")):
+    for code, market in (("USD", "US"), ("SGD", "SG"), ("GBP", "GB")):
         assert m.seed_row_market({"price_currency": code}) == market
+    for code in ("AUD", "JPY", " jpy "):
+        assert m.seed_row_market({"price_currency": code}) is None
     assert m.seed_row_market({"price_currency": "EUR"}) is None
     assert m.seed_row_market({"price_currency": " usd "}) == "US"
     assert m.seed_row_market({"price_currency": None}) is None
@@ -77,7 +85,9 @@ def test_a_projected_seed_currency_wins_over_the_column():
 _PARTITION_CASES = [
     ({"market": "US", "price_currency": "SGD"}, "SG"),
     ({"market": "SG", "price_currency": "USD"}, "US"),
-    ({"market": "US", "price_currency": "AUD"}, "AU"),
+    ({"market": "US", "price_currency": "GBP"}, "GB"),
+    ({"market": "US", "price_currency": "AUD"}, None),
+    ({"market": "AU", "price_currency": "AUD"}, None),
     ({"market": "US", "price_currency": None}, None),
     ({"market": "US", "price_currency": "EUR"}, None),
 ]
@@ -105,6 +115,65 @@ def test_a_partition_reading_mutant_fails(mutant):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Acquisition markets (AU, JP) are refused by name, from the market registry
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_the_refused_markets_are_the_registrys_acquisition_markets():
+    assert m.refused_seed_markets() == frozenset(market_registry.acquisition_markets()) == frozenset({"AU", "JP"})
+    # region_pricing's constant says the same (tests/test_market_registry.py keeps the two in parity).
+    assert m.refused_seed_markets() == frozenset(ACQUISITION_MARKETS)
+    # No served market is refused.
+    assert not m.refused_seed_markets() & set(market_registry.served_markets())
+
+
+@pytest.mark.parametrize(
+    "column, refusal",
+    [("AUD", "acquisition_market:AU"), ("JPY", "acquisition_market:JP"), (" jpy ", "acquisition_market:JP"),
+     ("USD", None), ("SGD", None), ("GBP", None), ("EUR", None), ("XYZ", None), (None, None), ("", None)],
+)
+def test_an_acquisition_market_is_refused_by_name(column, refusal):
+    row = {"market": "US", "price_currency": column}
+    assert m.seed_row_market_refusal(row) == refusal
+    if refusal is not None:
+        assert m.seed_row_market(row) is None
+
+
+def test_a_refusal_needs_the_row_currency_not_the_partition():
+    # An AU partition with a USD row is a US row; an SGD page read over an AUD-less column is SG.
+    assert m.seed_row_market_refusal({"market": "AU", "price_currency": "USD"}) is None
+    assert m.seed_row_market({"market": "AU", "price_currency": "USD"}) == "US"
+    assert m.seed_row_market_refusal({"market": "JP", "price_currency": None}) is None
+
+
+@pytest.mark.parametrize(
+    "mutant",
+    [
+        lambda row: market_for_pricing_currency(m.seed_row_currency(row)),  # no refusal at all
+        lambda row: m.seed_row_market(row) or (None if m.seed_row_currency(row) != "AUD" else "AU"),  # JP only
+    ],
+    ids=["no_refusal", "refuses_jp_only"],
+)
+def test_a_seed_row_market_that_labels_au_or_jp_fails(mutant):
+    rows = [{"price_currency": "AUD"}, {"price_currency": "JPY"}]
+    assert any(mutant(r) is not None for r in rows)
+    assert all(m.seed_row_market(r) is None for r in rows)
+
+
+def test_the_registry_decides_what_is_refused(monkeypatch):
+    """Serving AU in the registry stops refusing it; making GB an acquisition market starts. Nothing is spelled
+    in seed_serving."""
+    monkeypatch.setitem(market_registry.MARKETS, "AU", {**market_registry.MARKETS["AU"], "status": "served"})
+    monkeypatch.setitem(market_registry.MARKETS, "GB", {**market_registry.MARKETS["GB"], "status": "acquisition"})
+    assert m.refused_seed_markets() == frozenset({"JP", "GB"})
+    assert m.seed_row_market({"price_currency": "AUD"}) == "AU"
+    assert m.seed_row_market({"price_currency": "GBP"}) is None
+    assert m.seed_row_market_refusal({"price_currency": "GBP"}) == "acquisition_market:GB"
+    sql = m.market_for_currency_sql("x")
+    assert "WHEN 'AUD' THEN 'AU'" in sql and "'GBP'" not in sql and "'JPY'" not in sql
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Served
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -120,6 +189,9 @@ def test_seed_row_served_against_a_given_set():
     # Codes in the set normalise; blanks serve nothing.
     assert m.seed_row_served({"price_currency": "SGD"}, served=[" sgd "]) is True
     assert m.seed_row_served({"price_currency": ""}, served=["", " ", None]) is False
+    # An acquisition market's currency is never served, even when a caller's set names it.
+    assert m.seed_row_served({"market": "US", "price_currency": "AUD"}, served={"AUD", "USD"}) is False
+    assert m.seed_row_served({"market": "US", "price_currency": "JPY"}, served=["jpy"]) is False
 
 
 @pytest.mark.parametrize("code", ["USD", "SGD", "AUD", "JPY", "EUR", None, ""])
@@ -158,6 +230,30 @@ def test_seed_row_served_for_a_buyer_market():
     assert m.seed_row_served_for(usd, "DE") is False
     assert m.seed_row_served_for({"market": "US", "price_currency": None}, "US") is False
     assert m.seed_row_served_for({"market": "US", "price_currency": "USD", "seed_data": {"snapshot": {"price_currency": "SGD"}}}, "US") is False
+    # An acquisition buyer market is refused by name, though region_pricing prices it.
+    assert m.seed_row_served_for({"market": "US", "price_currency": "AUD"}, "AU") is False
+    assert m.seed_row_served_for({"market": "US", "price_currency": "JPY"}, " jp ") is False
+
+
+_BUYER_MARKETS = ["US", "SG", "GB", "DE", None, "AU", "JP", "ZZ", "EU-DE", ""]
+_ROW_CURRENCIES = ["USD", "SGD", "GBP", "EUR", "AUD", "JPY", "XYZ", None]
+
+
+@pytest.mark.parametrize("buyer", _BUYER_MARKETS, ids=[repr(b) for b in _BUYER_MARKETS])
+def test_the_priced_path_rule_for_every_buyer_market(buyer):
+    """US/SG/GB/DE/none (and AU, JP, an unknown market): a seed is served to a buyer only in that market's
+    registry currency; DE (no single currency) and an unknown market get nothing; AU and JP get nothing.
+    A missing market is the default serving market, US (the existing buyer rule)."""
+    code = market_registry.normalize_market(buyer) or "US"
+    entry = market_registry.market_or_none(code)
+    wanted = None
+    if entry is not None and entry["pricing_region"] and code not in {"AU", "JP"}:
+        wanted = entry["currency"]
+    served = {c for c in _ROW_CURRENCIES if m.seed_row_served_for({"market": "US", "price_currency": c}, buyer)}
+    assert served == ({wanted} if wanted else set())
+    expected = {"US": {"USD"}, "SG": {"SGD"}, "GB": {"GBP"}, "DE": set(), "AU": set(), "JP": set(), "ZZ": set(),
+                "EU-DE": set()}[code]
+    assert served == expected
 
 
 def test_served_currencies_moved_and_is_re_exported():
@@ -178,10 +274,14 @@ def test_served_currencies_follow_the_serving_regions(monkeypatch):
 
 def test_the_sql_is_generated_from_the_pricing_table(monkeypatch):
     sql = m.market_for_currency_sql("x")
-    singles = {c: mk for c, mk in ((c, market_for_pricing_currency(c)) for c in set(REGION_PRICING_CURRENCY.values())) if mk}
+    singles = {c: mk for c, mk in ((c, market_for_pricing_currency(c)) for c in set(REGION_PRICING_CURRENCY.values()))
+               if mk and mk not in m.refused_seed_markets()}
+    assert {"USD", "SGD", "GBP"} <= set(singles)
     for currency, market in singles.items():
         assert f"WHEN '{currency}' THEN '{market}'" in sql
     assert "'EUR'" not in sql
+    # The acquisition markets are refused in SQL as in Python.
+    assert "'AUD'" not in sql and "'JPY'" not in sql and "'AU'" not in sql and "'JP'" not in sql
     assert sql.endswith("ELSE NULL END)")
     # A market added to the table is added to the SQL, with no second spelling.
     monkeypatch.setitem(REGION_PRICING_CURRENCY, "NZ", "NZD")
@@ -211,8 +311,9 @@ def test_the_sql_case_on_sqlite_matches_python():
         got = dict(conn.execute(f"SELECT id, {expr} FROM eps").fetchall())
     finally:
         conn.close()
-    want = {r[0]: market_for_pricing_currency(currency_code(r[2])) for r in SEED_ROWS}
+    want = {r[0]: m.seed_row_market({"price_currency": currency_code(r[2])}) for r in SEED_ROWS}
     assert got == want
+    assert got["aud_in_us"] is None and got["jpy_in_us"] is None and got["gbp_in_us"] == "GB"
     # And for the rows whose currency is the column alone, that is seed_row_market.
     for rid, partition, column, seed_data, _currency, market in SEED_ROWS:
         if seed_data is None and column is not None:

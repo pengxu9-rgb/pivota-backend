@@ -18,12 +18,21 @@ until it has per-market offers (ADR-026 P4). `seed_offer_market` already declare
 market this way (#2701/#2704), through the same inverse map (region_pricing.market_for_pricing_currency).
 A currency that several markets price (EUR) or that none prices has no market: None, never a default.
 
+AN ACQUISITION MARKET IS REFUSED BY NAME. config/market_registry.json marks AU and JP `acquisition`: ingested
+and stored truthfully, NEVER served. So an AUD or JPY seed has no market here (`seed_row_market` is None and
+`seed_row_market_refusal` names it, 'acquisition_market:AU'), is never served, and no buyer market AU or JP
+is served a seed. The list is the registry's (`market_registry.acquisition_markets()`), never spelled here;
+when the registry serves a market it stops being refused. The truthful STORAGE stamp is not this module:
+`seed_offer_market` still declares a seed-copied offer AU or JP, which the serving gates then refuse
+(region_pricing.acquisition_market_offer_exists_sql).
+
 Every rule here is built from code already on main and is not spelled a second time:
   * the row's currency is `seed_offer_currency.seed_currency_of` (column and page read must agree,
     seed_data.price_currency is not evidence; a projected `seed_currency` is the SQL's own answer);
   * currency -> market is `region_pricing.market_for_pricing_currency`;
   * market -> currency for a buyer is `external_seed_search.seed_serving_currency`;
-  * the served currencies are the served pricing regions (`serving_pricing_regions`) through region_pricing.
+  * the served currencies are the served pricing regions (`serving_pricing_regions`) through region_pricing;
+  * the refused markets are the registry's acquisition markets (`market_registry.acquisition_markets`).
 
 No import of routes.*: jobs and scripts import this cheaply.
 """
@@ -34,6 +43,7 @@ import logging
 from typing import Any, FrozenSet, Iterable, Mapping, Optional
 
 from services.external_seed_search import seed_serving_currency
+from services.market_registry import acquisition_markets, normalize_market
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
     market_for_pricing_currency,
@@ -50,13 +60,37 @@ def seed_row_currency(row: Mapping[str, Any]) -> Optional[str]:
     return seed_currency_of(row)
 
 
-def seed_row_market(row: Mapping[str, Any]) -> Optional[str]:
-    """The market the seed row's own currency prices: USD -> US, SGD -> SG, AUD -> AU, JPY -> JP.
+def refused_seed_markets() -> FrozenSet[str]:
+    """The markets a seed is never served in or labelled with: the market registry's `acquisition` markets
+    (AU and JP today). Read from config/market_registry.json at each call, never spelled here."""
+    return frozenset(acquisition_markets())
 
-    None for a currency several markets share (EUR), for one no market prices, and for a row that states
-    no currency. NEVER the row's `market` partition, and never a default. This is the store's market for
-    a fetch, a probe, a locale, a UTM tag or a redirect token minted off the row."""
+
+def _currency_market(row: Mapping[str, Any]) -> Optional[str]:
     return market_for_pricing_currency(seed_row_currency(row))
+
+
+def seed_row_market(row: Mapping[str, Any]) -> Optional[str]:
+    """The market the seed row's own currency prices: USD -> US, SGD -> SG, GBP -> GB.
+
+    None for a currency several markets share (EUR, so DE has none), for one no market prices, for a row
+    that states no currency, and for an acquisition market, refused by name (AUD -> AU, JPY -> JP: see
+    `seed_row_market_refusal`). NEVER the row's `market` partition, and never a default. This is the store's
+    market for a fetch, a probe, a locale, a UTM tag or a redirect token minted off the row."""
+    market = _currency_market(row)
+    if market is None or market in refused_seed_markets():
+        return None
+    return market
+
+
+def seed_row_market_refusal(row: Mapping[str, Any]) -> Optional[str]:
+    """Why `seed_row_market` refused a market the row's currency does name: 'acquisition_market:AU'.
+
+    None when nothing was refused, including when the row has no market at all (no currency, EUR)."""
+    market = _currency_market(row)
+    if market is not None and market in refused_seed_markets():
+        return f"acquisition_market:{market}"
+    return None
 
 
 def served_currencies() -> FrozenSet[str]:
@@ -84,9 +118,10 @@ def seed_row_served(row: Mapping[str, Any], *, served: Optional[Iterable[str]] =
     """Whether the seed row's own currency is a served one: `served` when given, else `served_currencies()`.
 
     A row that states no currency is never served, and blank codes in `served` serve nothing. An empty
-    `served` serves nothing at all (the fail-safe of `served_currencies`)."""
+    `served` serves nothing at all (the fail-safe of `served_currencies`). A row priced in an acquisition
+    market's currency (AUD, JPY) is never served, whatever `served` says."""
     currency = seed_row_currency(row)
-    if currency is None:
+    if currency is None or seed_row_market_refusal(row) is not None:
         return False
     pool = served_currencies() if served is None else served
     return currency in {code for code in (currency_code(c) for c in pool) if code}
@@ -97,8 +132,11 @@ def seed_row_served_for(row: Mapping[str, Any], buyer_market: Optional[str]) -> 
     `seed_serving_currency(buyer_market)` names, the existing buyer rule.
 
     That rule reads a missing buyer market as the default serving market (US, so USD); it is not
-    restated here. A buyer market with no known currency ('DE', 'EU-DE') and a row that states no
-    currency are never served."""
+    restated here. A buyer market with no known currency ('DE', 'EU-DE'), an acquisition buyer market
+    ('AU', 'JP': refused by name, though region_pricing prices them) and a row that states no currency
+    are never served."""
+    if normalize_market(buyer_market) in refused_seed_markets():
+        return False
     currency = seed_row_currency(row)
     wanted = seed_serving_currency(buyer_market)
     return currency is not None and wanted is not None and currency == wanted
@@ -106,21 +144,23 @@ def seed_row_served_for(row: Mapping[str, Any], buyer_market: Optional[str]) -> 
 
 def _single_market_currencies() -> Mapping[str, str]:
     """currency -> market for every currency exactly one market prices, from REGION_PRICING_CURRENCY,
-    in the table's order. The same answer as market_for_pricing_currency, as data."""
+    in the table's order, less the refused (acquisition) markets. `seed_row_market`'s answer, as data."""
+    refused = refused_seed_markets()
     out = {}
     for currency in dict.fromkeys(REGION_PRICING_CURRENCY.values()):
         market = market_for_pricing_currency(currency)
-        if market is not None:
+        if market is not None and market not in refused:
             out[currency] = market
     return out
 
 
 def market_for_currency_sql(currency_expr: str) -> str:
-    """`market_for_pricing_currency` in SQL over a currency expression that is already normalised (trimmed,
-    upper-cased, NULL when absent): one WHEN per currency exactly one market prices, ELSE NULL.
+    """`seed_row_market`'s currency -> market in SQL over a currency expression that is already normalised
+    (trimmed, upper-cased, NULL when absent): one WHEN per currency exactly one market prices and the
+    registry does not refuse, ELSE NULL. So 'AUD' and 'JPY' are NULL, as 'EUR' is.
 
-    Generated from REGION_PRICING_CURRENCY, so a market added there is added here. The only values
-    interpolated are the table's own ISO codes. Plain CASE, so it runs on SQLite and Postgres alike."""
+    Generated from REGION_PRICING_CURRENCY and the registry, so a market added there is added here. The only
+    values interpolated are the table's own ISO codes. Plain CASE, so it runs on SQLite and Postgres alike."""
     whens = " ".join(f"WHEN '{currency}' THEN '{market}'" for currency, market in _single_market_currencies().items())
     return f"(CASE {currency_expr} {whens} ELSE NULL END)"
 
@@ -138,8 +178,10 @@ def seed_row_market_sql(alias: str) -> str:
 
 __all__ = [
     "market_for_currency_sql",
+    "refused_seed_markets",
     "seed_row_currency",
     "seed_row_market",
+    "seed_row_market_refusal",
     "seed_row_market_sql",
     "seed_row_served",
     "seed_row_served_for",

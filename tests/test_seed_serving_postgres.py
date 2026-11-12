@@ -88,3 +88,18 @@ def test_stored_shapes_agree_with_python_as_the_driver_returns_them():
     got = {r["id"]: r["seed_market"] for r in result}
     # A non-object seed_data hides the page read; JSON null seed_data / snapshot do not.
     assert got == {"seed_data_array": None, "seed_data_json_null": "SG", "snapshot_json_null": "SG"}
+
+
+def test_acquisition_markets_are_null_on_postgres_too():
+    """AU and JP are the registry's acquisition markets: the jsonb form refuses them as seed_row_market does,
+    whether the currency comes from the column or from the page read."""
+    rows = [
+        ("aud_col", "US", "AUD", None),
+        ("jpy_page", "US", None, {"snapshot": {"price_currency": "JPY"}}),
+        ("aud_partition_au", "AU", "AUD", {"snapshot": {"price_currency": "AUD"}}),
+        ("gbp_col", "US", "GBP", None),
+    ]
+    got = {r["id"]: r["seed_market"] for r in _run(rows)}
+    assert got == {"aud_col": None, "jpy_page": None, "aud_partition_au": None, "gbp_col": "GB"}
+    for rid, partition, column, seed_data in rows:
+        assert got[rid] == m.seed_row_market({"market": partition, "price_currency": column, "seed_data": seed_data}), rid
