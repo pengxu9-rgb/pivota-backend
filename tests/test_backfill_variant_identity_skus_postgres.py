@@ -164,7 +164,7 @@ async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
                  offer_type, is_first_party, why_buy_direct,
                  offer_payload, suppressed_at, created_at, updated_at)
                VALUES (:oid,:sk,:pk,:m,'external_referral','primary','referral_only',
-                 'external_referral','default','in_stock',:cur,10.0,'seed',:mkt,
+                 'external_referral','default',:av,:cur,10.0,'seed',:mkt,
                  :ot,:ifp,:wbd,
                  CAST(:pl AS jsonb),:sup,NOW(),NOW())""",
             {"oid": f"offer:pg:{i}", "sk": pk + "::canonical", "pk": pk,
@@ -172,7 +172,7 @@ async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
              "mkt": o.get("market", "US"), "ot": o.get("offer_type"),
              "ifp": o.get("is_first_party", False), "wbd": o.get("why_buy_direct"),
              "pl": json.dumps({"destination_url": o.get("dest", DEST), **(o.get("payload_extra") or {})}),
-             "sup": o.get("suppressed_at")},
+             "sup": o.get("suppressed_at"), "av": o.get("availability", "in_stock")},
         )
 
 
@@ -681,6 +681,29 @@ async def test_a_variant_row_that_inherits_a_marked_stock_is_marked_too(db):
     assert after["availability"] == "unknown" and "availability_read" not in json.loads(after["offer_payload"])
 
 
+@pytest.mark.parametrize("lane_value, pre_lane", [
+    ("in_stock", "in_stock"), ("in_stock", "out_of_stock"), ("out_of_stock", "in_stock"), ("in_stock", "unknown"),
+])
+async def test_the_rollback_restores_what_the_variant_would_have_inherited_without_the_lane(db, lane_value,
+                                                                                            pre_lane):
+    """be#2811 review P2-1: without the lane, a new variant row inherits the chosen row's PRE-lane stock, which is
+    the chosen marker's `previous`. So that is the inherited marker's `previous`, and the rollback puts back
+    exactly it: a sold-out product's variant goes back to out_of_stock (still refused at checkout), not unknown."""
+    mark = {"availability_read": {"source": "refresh", "value": lane_value, "previous": pre_lane,
+                                  "at": "2026-11-12T01:00:00+00:00"}}
+    await _seed(db, variants=[_variant()], offers=[{"payload_extra": mark, "availability": lane_value}])
+    await _run()
+    offer = await _backfill_offer(db)
+    assert offer["availability"] == lane_value
+    assert json.loads(offer["offer_payload"])["availability_read"]["previous"] == pre_lane
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+    await db.execute(AVAILABILITY_ROLLBACK_SQL)
+    after = await _backfill_offer(db)
+    assert after["availability"] == pre_lane and "availability_read" not in json.loads(after["offer_payload"])
+    canon = await db.fetch_one("SELECT availability FROM catalog_offers WHERE offer_id = 'offer:pg:0'")
+    assert canon["availability"] == pre_lane, "the variant now agrees with its rolled-back product-level row"
+
+
 @pytest.mark.parametrize("variant_kw, payload_extra", [
     ({"availability": "in_stock"}, _LANE_MARK),      # the variant states its own stock: nothing inherited
     ({}, {}),                                        # the chosen row's stock is not the lane's
@@ -712,5 +735,73 @@ async def test_the_update_path_never_marks_an_existing_variant_row(db):
         {"destination_url": DEST, **backfill._inherited_stock_marker(
             {}, {"offer_id": "offer:pg:0", "availability": "in_stock", "availability_read": _LANE_MARK["availability_read"]})}))
     assert "availability_read" in json.loads(params["offer_payload"]), "premise: the upsert is offered a marker"
+    await db.execute("UPDATE catalog_offers SET offer_payload = offer_payload || CAST('{\"kept\": 1}' AS jsonb)"
+                     " WHERE offer_id = :o", {"o": row["offer_id"]})
     await db.execute(backfill.UPSERT_OFFER_SQL, params)
-    assert "availability_read" not in json.loads((await _backfill_offer(db))["offer_payload"])
+    payload = json.loads((await _backfill_offer(db))["offer_payload"])
+    assert "availability_read" not in payload
+    # The update path MERGES into the row's payload, never replaces it (be#2811 review P3-3, mutant M14).
+    assert payload["kept"] == 1
+
+
+def _upsert_params(row, **over):
+    keys = ("offer_id", "sku_key", "product_key", "merchant_id", "catalog_track", "truth_tier", "readiness_tier",
+            "offer_mode", "channel", "currency", "list_price", "merchant_effective_price", "estimated_best_price",
+            "source_system", "source_domain", "market", "source_ref", "offer_type", "is_first_party", "why_buy_direct")
+    params = {k: row[k] for k in keys}
+    params.update(over)
+    return params
+
+
+async def test_a_variant_that_now_states_its_own_stock_drops_the_inherited_marker(db):
+    """be#2811 review P3-1: run 1 inherited the lane's stock and marked the row; the variant now states its own
+    stock, so the update path writes that and the row's old marker goes. Else the rollback would put back the
+    pre-lane stock over a stock the variant stated itself."""
+    import scripts.backfill_variant_identity_skus as backfill
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+
+    await _seed(db, variants=[_variant()], offers=[{"payload_extra": _LANE_MARK}])
+    await _run()
+    row = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                  {"s": "variant_identity_backfill_v1"}))
+    assert "availability_read" in json.loads(row["offer_payload"]), "premise: run 1 marked the inherited stock"
+    await db.execute(backfill.UPSERT_OFFER_SQL, _upsert_params(
+        row, availability="in_stock", variant_spoke=True, offer_payload=json.dumps({"destination_url": DEST})))
+    offer = await _backfill_offer(db)
+    assert offer["availability"] == "in_stock" and "availability_read" not in json.loads(offer["offer_payload"])
+    await db.execute(AVAILABILITY_ROLLBACK_SQL)
+    assert (await _backfill_offer(db))["availability"] == "in_stock", "the variant's own stock survives a rollback"
+
+
+async def test_a_silent_re_run_keeps_the_rows_inherited_marker(db):
+    """A variant that still states nothing keeps the stock it inherited (the update path leaves availability), so
+    it keeps that stock's marker too, and the rollback still reaches it."""
+    import scripts.backfill_variant_identity_skus as backfill
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+
+    await _seed(db, variants=[_variant()], offers=[{"payload_extra": _LANE_MARK}])
+    await _run()
+    row = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                  {"s": "variant_identity_backfill_v1"}))
+    marker = json.loads(row["offer_payload"])["availability_read"]
+    await db.execute(backfill.UPSERT_OFFER_SQL, _upsert_params(
+        row, availability="in_stock", variant_spoke=False, offer_payload=json.dumps({"destination_url": DEST})))
+    offer = await _backfill_offer(db)
+    assert json.loads(offer["offer_payload"])["availability_read"] == marker
+    await db.execute(AVAILABILITY_ROLLBACK_SQL)
+    assert (await _backfill_offer(db))["availability"] == "unknown"
+
+
+@pytest.mark.parametrize("variant_spoke", [True, False])
+async def test_the_update_path_takes_a_scalar_payload_without_raising(db, variant_spoke):
+    """`jsonb - text` raises on a scalar, so the marker drop is guarded to object payloads (be#2811 review P3-1)."""
+    import scripts.backfill_variant_identity_skus as backfill
+
+    await _seed(db, variants=[_variant()], offers=[{}])
+    await _run()
+    row = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                  {"s": "variant_identity_backfill_v1"}))
+    await db.execute("UPDATE catalog_offers SET offer_payload = CAST('\"scalar\"' AS jsonb) WHERE offer_id = :o",
+                     {"o": row["offer_id"]})
+    await db.execute(backfill.UPSERT_OFFER_SQL, _upsert_params(
+        row, availability="in_stock", variant_spoke=variant_spoke, offer_payload=json.dumps({"destination_url": DEST})))

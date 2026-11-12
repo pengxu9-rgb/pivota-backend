@@ -291,8 +291,14 @@ UPSERT_OFFER_SQL = """
         -- Re-stamped on the update path too, so a row this batch last touched says so (M1).
         source_system            = EXCLUDED.source_system,
         -- The inherited-stock marker belongs to an INSERT only: the update path never takes an inherited
-        -- stock (availability above), so it never claims one.
-        offer_payload            = catalog_offers.offer_payload || (EXCLUDED.offer_payload - 'availability_read'),
+        -- stock (availability above), so it never claims one. And when the variant SPOKE, the stock written is
+        -- its own, so an earlier inherited marker on the row goes too: else a rollback would put back the
+        -- pre-lane stock over a stock the variant stated (be#2811 review P3-1). `jsonb - text` raises on a
+        -- scalar payload, hence the object guard.
+        offer_payload            = (CASE WHEN :variant_spoke AND jsonb_typeof(catalog_offers.offer_payload) = 'object'
+                                         THEN catalog_offers.offer_payload - 'availability_read'
+                                         ELSE catalog_offers.offer_payload END)
+                                   || (EXCLUDED.offer_payload - 'availability_read'),
         updated_at               = NOW()
 """
 
@@ -343,8 +349,10 @@ def _inherited_stock_marker(variant: Dict[str, Any], chosen: Dict[str, Any]) -> 
 
     The attached lane marks the stock it writes (services/external_offer_dual_write.AVAILABILITY_READ_KEY) so a
     rollback can restore it; a variant row that copies that stock without a marker would keep it after the
-    rollback. The copy is marked as the lane marks its own writes: `previous` is `unknown`, the stock a new
-    row has without it. A variant that states its own stock inherits nothing and is not marked."""
+    rollback. The copy is marked as the lane marks its own writes. Its `previous` is the stock the row would
+    have inherited WITHOUT the lane: the chosen row's own pre-lane stock, its marker's `previous` (normalised
+    as an inherited stock is, `unknown` when absent; be#2811 review P2-1). A variant that states its own stock
+    inherits nothing and is not marked."""
     if _variant_stated_availability(variant):
         return {}
     marker = _jsonb(chosen.get("availability_read"))
@@ -356,7 +364,7 @@ def _inherited_stock_marker(variant: Dict[str, Any], chosen: Dict[str, Any]) -> 
         return {}
     return {"availability_read": {
         "source": "variant_backfill", "from_offer_id": chosen.get("offer_id"), "value": inherited,
-        "previous": "unknown", "at": datetime.now(timezone.utc).isoformat(),
+        "previous": normalize_availability(None, marker.get("previous")), "at": datetime.now(timezone.utc).isoformat(),
     }}
 
 

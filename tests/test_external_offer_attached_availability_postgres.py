@@ -302,6 +302,32 @@ async def test_previous_resets_when_another_writer_changed_the_stock_since(scope
     await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
     payload, availability = (await _payloads(scoped_db))["of_canon"]
     assert availability == "in_stock" and payload["availability_read"]["previous"] == "out_of_stock"
+    # ...and the rollback restores THAT, not a constant (be#2811 review P3-3, mutant M6).
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+    await scoped_db.execute(AVAILABILITY_ROLLBACK_SQL)
+    payload, availability = (await _payloads(scoped_db))["of_canon"]
+    assert availability == "out_of_stock" and "availability_read" not in payload
+
+
+@pytest.mark.parametrize("bad_marker", [
+    {"source": "refresh", "value": "in_stock"},                       # no `previous` at all
+    {"source": "refresh", "value": "in_stock", "previous": None},     # `previous` is JSON null
+])
+async def test_a_marker_with_no_previous_is_skipped_and_does_not_block_the_rollback(scoped_db, monkeypatch,
+                                                                                    bad_marker):
+    """be#2811 review P3-2: restoring a NULL `previous` would violate availability's NOT NULL and abort the
+    whole statement, so one hand-made marker would block every row. It is skipped; the lane's rows still go."""
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+
+    await _load(scoped_db)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    await scoped_db.execute(
+        "UPDATE catalog_offers SET availability = 'in_stock', offer_payload = offer_payload || CAST(:m AS jsonb)"
+        " WHERE offer_id = 'of_v1'", {"m": json.dumps({"availability_read": bad_marker})})
+    await scoped_db.execute(AVAILABILITY_ROLLBACK_SQL)
+    p = await _payloads(scoped_db)
+    assert p["of_canon"][1] == "unknown" and "availability_read" not in p["of_canon"][0], "the lane's row restored"
+    assert p["of_v1"][1] == "in_stock" and p["of_v1"][0]["availability_read"] == bad_marker, "the bad one left"
 
 
 async def test_the_rollback_restores_only_rows_whose_stock_is_still_the_lanes(scoped_db, monkeypatch):
