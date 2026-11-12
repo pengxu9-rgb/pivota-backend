@@ -14,6 +14,11 @@ row at all. So:
                     recording, or by a lane that does not record issue)
 
 Test traffic stamped at write (services/test_traffic.py) is excluded and counted separately.
+
+NOT LINKS. Rows on the storefront hand-off surface (services.storefront_handoff_record.HANDOFF_SURFACE:
+the hand-off record, and the store-cart referral of services/storefront_cart_referral.py) share the
+table and carry `issued_at`, but no `/r` link carries their id, so they can never be followed. They
+are left out of every count here, or each door checkout would read as issued links nobody followed.
 The process-local click-write failure counts (services.outbound_links_service) are attached, so a
 reader can see whether "0 clicked" could be lost writes.
 """
@@ -24,6 +29,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from db.database import database
+from services.storefront_handoff_record import HANDOFF_SURFACE
 from services.test_traffic import not_test_traffic_sql
 
 _SUMMARY_SQL = """
@@ -40,6 +46,7 @@ SELECT
 FROM surface_click_events
 WHERE COALESCE(issued_at, created_at) >= :start_at
   AND COALESCE(issued_at, created_at) < :end_at
+  AND COALESCE(surface, '') <> :handoff_surface
 """.format(not_test=not_test_traffic_sql("context"))
 
 
@@ -55,7 +62,7 @@ async def issued_vs_clicked(
     *, start_at: datetime, end_at: datetime, merchant_id: Optional[str] = None
 ) -> Dict[str, Any]:
     query = _SUMMARY_SQL
-    params: Dict[str, Any] = {"start_at": start_at, "end_at": end_at}
+    params: Dict[str, Any] = {"start_at": start_at, "end_at": end_at, "handoff_surface": HANDOFF_SURFACE}
     if merchant_id:
         query += "  AND merchant_id = :merchant_id\n"
         params["merchant_id"] = merchant_id
