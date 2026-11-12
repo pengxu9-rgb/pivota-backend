@@ -2437,6 +2437,10 @@ def _jsonld_identity(
 
     out: Dict[str, Any] = {
         "priced_identities": len(identities),
+        # Priced nodes that name the pricing product's url / @id but are NOT that product (another name or another
+        # exact price: a bundle page whose every component names the page). Read by the ambiguous-price guard: with
+        # any, a url naming the served page does not say which of them priced it.
+        "url_conflicts": sum(1 for kind, _ in identities if kind == "conflict"),
         "listing_types": sorted(listing),
         "pricing_node": pricing is not None,
     }

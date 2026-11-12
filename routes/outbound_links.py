@@ -26,9 +26,11 @@ from services.outbound_links_service import (
     resolve_outbound_link,
     log_outbound_click,
     log_outbound_event,
+    note_click_write_failure,
     token_is_synthetic,
 )
 from config.settings import settings
+from services.affiliate_subid import apply_click_subid
 from services.deal_lane_decision import TOKEN_DEAL_REF_KEY, deal_destination_at_click
 from services.outbound_warm_handoff import (
     evaluate_warm_eligibility,
@@ -317,6 +319,29 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
         except Exception:
             warm_redirect_url = None
 
+    # Affiliate sub-ID (ADR-025 D2; services/affiliate_subid.py; flag-gated, DEFAULT OFF — off, this
+    # block never runs and the redirect and click ctx are byte-identical). On a mapped network host,
+    # our click id goes into the network's sub-ID parameter (Rakuten `u1`, ...), replacing any value
+    # there, so a commission report joins back to this click. Applied HERE, after the HMAC check and
+    # to the Location only: `payload["dest"]` (the signed destination, which the click row records and
+    # the published URLs are checked against) is not changed. Never on a warm continue_url (a brand
+    # cart, never a network host), an expired or a synthetic token (both returned above: no click is
+    # recorded, so there is no click id to join on). Throw-guarded: any error keeps `dest`.
+    if settings.affiliate_subid_click_id_enabled and not warm_redirect_url:
+        try:
+            subid = apply_click_subid(
+                dest,
+                payload.get("ctx") if isinstance(payload.get("ctx"), dict) else {},
+                override_json=settings.affiliate_subid_params_json,
+            )
+            if subid.ctx_updates:
+                subid_ctx = dict(payload.get("ctx")) if isinstance(payload.get("ctx"), dict) else {}
+                subid_ctx.update(subid.ctx_updates)
+                payload["ctx"] = subid_ctx
+            dest = subid.url
+        except Exception:
+            pass
+
     # Best-effort click logging.
     try:
         await log_outbound_click(
@@ -326,8 +351,8 @@ async def redirect_endpoint(req: Request, token: str = Query(..., min_length=10)
                 "ip": getattr(getattr(req, "client", None), "host", None),
             },
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        note_click_write_failure("log_outbound_click", "click", exc)
 
     return RedirectResponse(url=warm_redirect_url or dest, status_code=302)
 
@@ -375,8 +400,8 @@ async def impression_endpoint(req: Request, body: ImpressionRequest) -> Dict[str
             },
             event_type="impression",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        note_click_write_failure("log_outbound_event", "impression", exc)
 
     return {"ok": True}
 

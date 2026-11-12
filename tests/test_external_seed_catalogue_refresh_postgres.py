@@ -386,6 +386,9 @@ async def test_flag_off_the_batch_never_reads_the_catalogue_on_postgres(scoped_d
     assert sorted(a[0] for a in asked) == sorted(s["id"] for s in seeds) and all(a[1] == {} for a in asked)
 
 
+_PLAN_NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+
+
 async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres(scoped_db, monkeypatch, capsys):
     """`scripts/ops/plan_shopify_catalogue_refresh.py` end to end: its READ ONLY reads on this schema, the
     lane's reader over the mock storefront, one `host` line, and not a byte written."""
@@ -398,9 +401,11 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     for seed in seeds:
         await _write_seed(scoped_db, seed)
     # One the lane read last night, whose last page read (carried in the column) is 40 days old.
+    # The script's clock is pinned below, so the page-read age is stamped against that same instant: a
+    # database NOW() here would make the age (and the too_old bucket) depend on the day the gate runs.
     await scoped_db.execute(
-        "UPDATE external_product_seeds SET last_crawled_at = NOW(), last_page_read_at = NOW() - interval '40 days'"
-        " WHERE id = :id", {"id": seeds[1]["id"]})
+        "UPDATE external_product_seeds SET last_crawled_at = NOW(), last_page_read_at = :read_at WHERE id = :id",
+        {"id": seeds[1]["id"], "read_at": _PLAN_NOW - timedelta(days=40)})
     snapshot_before = [dict(r) for r in await scoped_db.fetch_all(
         "SELECT id, price_amount, seed_data::text AS sd, updated_at, last_crawled_at, destination_checked_at"
         " FROM external_product_seeds ORDER BY id")]
@@ -419,7 +424,7 @@ async def test_the_dry_run_plans_the_drains_seeds_and_writes_nothing_on_postgres
     monkeypatch.setenv("CRAWL_ROBOTS_ENABLED", "false")
     monkeypatch.setenv("CRAWL_MIN_INTERVAL_SECONDS", "0")
     cp.reset_for_tests()
-    monkeypatch.setattr(mod, "_now_utc", lambda: datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc))
+    monkeypatch.setattr(mod, "_now_utc", lambda: _PLAN_NOW)
     monkeypatch.setenv("PIVOTA_ENV", "production")
     monkeypatch.setenv("CATALOGUE_PLAN_EGRESS", "pivota-crawl")
     monkeypatch.setenv("CLOUD_RUN_JOB", "plan-shopify-catalogue-refresh")

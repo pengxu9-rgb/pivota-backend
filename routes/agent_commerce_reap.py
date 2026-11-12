@@ -112,7 +112,7 @@ import db.merchant_purchasability as purchasability
 import services.reap_agentic_client as rc
 import services.reap_agentic_purchase as svc
 import services.merchant_item_resolver as merchant_item
-from db.buyer_vault import hash_agent_user_ref, mint_pairwise_buyer_ref
+from db.buyer_vault import mint_pairwise_buyer_ref, resolve_agent_user_ref_hash
 from db.commerce_attribution import surface_click_events
 from db.database import IS_POSTGRES, database
 from routes.agent_auth import AgentContext, get_agent_context
@@ -2224,8 +2224,8 @@ def _product_selector(req: Any, merchant_host: str) -> Tuple[Optional[str], str,
     spelled with the URL prefix is refused, so none hashes like one).
 
     A URL names a product page, never a variant: the request must name its variant by `variant_id`, and
-    a `variant=` in the URL's query must BE it (`merchant_item.check_url_variant`), so the query the
-    normalisation drops can never pick a different variant than the one bought.
+    a `variant=` in the URL's query or fragment must BE it (`merchant_item.check_url_variant`), so the
+    query and fragment the normalisation drops can never pick a different variant than the one bought.
     """
     if req.product_url is not None:
         normalized = merchant_item.normalize_product_url(req.product_url, merchant_host)
@@ -3163,7 +3163,7 @@ async def start_reap_purchase(
             raise svc.PurchaseRefused("invalid_address", "country must be two letters")
 
         agent_id = str(context.agent_id)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(agent_id, agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
 
@@ -3559,8 +3559,8 @@ async def resume_reap_purchase(purchase_id: str, request: Request,
         _require_rail()
         if not svc.is_create_enabled():
             raise svc.PurchaseRefused("create_disabled")
-        owner = hash_agent_user_ref(_require_agent_user(agent_user))
         agent = str(context.agent_id)
+        owner = await resolve_agent_user_ref_hash(agent, _require_agent_user(agent_user))
         try:
             req = StartPurchaseRequest.model_validate(await request.json())
         except (ValueError, ValidationError):
@@ -3635,7 +3635,7 @@ async def recover_reap_purchase(
     """
     try:
         agent_user_ref = _require_agent_user(agent_user)
-        owner_hash = hash_agent_user_ref(agent_user_ref)
+        owner_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not owner_hash:
             raise svc.PurchaseRefused("agent_user_required")
         try:
@@ -3697,7 +3697,7 @@ async def get_reap_purchase(
         # Stored owner-scoped status reads survive create disarming/credential outages.
         # This handler makes no provider call and retains both identity dependencies.
         agent_user_ref = _require_agent_user(agent_user)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
     except svc.PurchaseRefused as exc:
@@ -3751,7 +3751,7 @@ async def list_reap_purchases(
     try:
         _require_rail()
         agent_user_ref = _require_agent_user(agent_user)
-        agent_user_ref_hash = hash_agent_user_ref(agent_user_ref)
+        agent_user_ref_hash = await resolve_agent_user_ref_hash(str(context.agent_id), agent_user_ref)
         if not agent_user_ref_hash:
             raise svc.PurchaseRefused("agent_user_required")
         # Parsed HERE, not in the signature: a `Query(le=...)` refusal is a 400 that fires before

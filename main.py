@@ -250,6 +250,7 @@ from routes.admin_agents_debug import router as admin_agents_debug_router
 from routes.agent_health import router as agent_health_router
 from routes.photos import router as photos_router, start_photo_cleanup_loop
 from routes.admin_usage_debug import router as admin_usage_debug_router
+from routes.admin_click_reporting import router as admin_click_reporting_router
 from routes.agent_analytics import router as agent_analytics_router
 # Debug routers - only import if DEBUG_MODE is enabled
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
@@ -273,6 +274,7 @@ from routes.admin_cleanup_duplicates import router as admin_cleanup_duplicates_r
 from routes.admin_data_consistency import router as admin_data_consistency_router
 from routes.admin_merchant_canonicalize import router as admin_merchant_canonicalize_router
 from routes.admin_merchant_reset import router as admin_merchant_reset_router
+from routes.admin_merchant_is_test import router as admin_merchant_is_test_router
 from routes.admin_shopify_health import router as admin_shopify_health_router
 from routes.admin_amazon_oauth import router as admin_amazon_oauth_router
 from routes.admin_amazon_orders import router as admin_amazon_orders_router
@@ -1199,6 +1201,7 @@ app.include_router(admin_cleanup_duplicates_router)  # Admin cleanup for duplica
 app.include_router(admin_data_consistency_router)  # Admin data consistency check and fix
 app.include_router(admin_merchant_canonicalize_router)  # Admin merchant canonicalization
 app.include_router(admin_merchant_reset_router)  # Admin merchant reset
+app.include_router(admin_merchant_is_test_router)  # Admin merchant is_test fact (staff set/clear + audit)
 app.include_router(admin_shopify_health_router)  # Admin Shopify health check
 if settings.enable_amazon_sp_api:
     app.include_router(admin_amazon_oauth_router)  # Amazon SP-API OAuth (admin-only)
@@ -1396,6 +1399,7 @@ app.include_router(admin_agents_debug_router)  # Admin agents debug
 app.include_router(agent_health_router)  # Agent health check
 app.include_router(photos_router)  # Selfie uploads + QC (presign/confirm/qc)
 app.include_router(admin_usage_debug_router)  # Admin usage logs debug
+app.include_router(admin_click_reporting_router)  # Staff: click-outs issued vs clicked (O-08)
 app.include_router(agent_analytics_router)  # Agent analytics (funnel, queries)
 if DEBUG_MODE:
     app.include_router(agent_debug_router)  # Agent debug endpoints (TEMP)
@@ -2161,6 +2165,20 @@ async def app_lifespan(_app: FastAPI):
     install_uvicorn_access_log_redaction()
     logger.info("🌍 Platform: %s", platform_metadata())
     logger.info("🌍 Resolved environment: %s", resolved_env)
+    # S-29: a deployed host whose agent_user_ref hash keys are missing or misconfigured says so at
+    # boot, not only on its first hash: a WARNING while the dedicated key is unset, one ERROR in
+    # production for a refused dedicated key (including one set without the legacy copy), and the
+    # copy check `legacy_copy_matches_token_key=yes|no` while a copy is mounted. Never fatal.
+    try:
+        from db.buyer_vault import (
+            report_legacy_copy_matches_token_key,
+            report_missing_buyer_identity_hash_secret,
+        )
+
+        report_missing_buyer_identity_hash_secret(force=True)
+        report_legacy_copy_matches_token_key()
+    except Exception:  # noqa: BLE001 - a log line must never stop the boot
+        pass
 
     await startup_event()
     await startup()
