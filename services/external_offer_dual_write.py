@@ -659,6 +659,30 @@ ATTACHED_PRICE_SOURCES = frozenset({"refresh", "employee_edit"})
 # the date. A reader that must tell a crawl from an edit can rely on the marker only for this lane.
 PRICE_READ_SOURCE_KEY = "price_read_source"
 
+# STOCK, FROM THE SAME READ (dark: EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED, default OFF). The refresh
+# re-reads the page's own stock statement (JSON-LD `offers.availability`, normalised to in_stock / out_of_stock,
+# `unknown` when the page states none) and writes it to the SEED; the listing's offer rows kept whatever their
+# ingest wrote, so a listing ingested as `unknown` stayed `unknown` while its price was re-read every run, and the
+# gateway's own-offer money (canonicalPdpOwnMoney) needs `in_stock`: the listing was served and never purchasable.
+# With the flag on, a REFRESH that read a stock statement this run (`availability_stated`, passed by the refresh
+# only then) writes it onto the listing's PRODUCT-LEVEL row (`<pk>::canonical`) together with the price it
+# already writes there. Never from the seed column (a builder defaults it to in_stock when nothing was stated),
+# never `unknown`, never on a variant row (the product-level statement is not each variant's), never from an
+# employee edit, and never on a row whose price this run does not write.
+ATTACHED_AVAILABILITY_WRITE_ENV = "EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED"
+STATED_AVAILABILITIES = frozenset({"in_stock", "out_of_stock"})
+
+
+def attached_availability_write_enabled() -> bool:
+    """Dark launch: only an explicit truthy value turns it on."""
+    return os.getenv(ATTACHED_AVAILABILITY_WRITE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def stated_availability(value: Any) -> Optional[str]:
+    """`in_stock` / `out_of_stock` as the refresh stated it, else None (no statement, `unknown`, anything else)."""
+    token = str(value or "").strip().lower()
+    return token if token in STATED_AVAILABILITIES else None
+
 
 def price_was_read(source: Optional[str], currency_read: bool) -> bool:
     """Does the caller vouch for a price AND currency read now, so `price_checked_at` may say so?
@@ -705,6 +729,9 @@ UPDATE catalog_offers
 SET list_price = :price,
     merchant_effective_price = :price,
     estimated_best_price = :price,
+    -- The page's own stock statement, only when the plan carries one (attached_availability_write_enabled);
+    -- NULL keeps the row's availability, which is every write with the flag off.
+    availability = COALESCE(CAST(:availability AS VARCHAR), availability),
     -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.
     price_checked_at = NOW(),
     -- ...and says WHO vouched for it (PRICE_READ_SOURCE_KEY): `refresh` or `employee_edit`. Only on an
@@ -833,12 +860,15 @@ def _attached_variant_id(value: Any, page_urls: Tuple[str, ...] = ()) -> str:
 
 def plan_attached_listing_offer_writes(
     seed: Dict[str, Any], offers: list, *, source: str = "refresh", currency_read: bool = False,
-    max_ratio: Optional[float] = None,
+    max_ratio: Optional[float] = None, availability_stated: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Pure: which of the canonical's offer rows take which price. No IO, so every refusal is
     testable on the rows the SELECT returns.
 
-    Returns {"status", "writes": [{offer_id, price, currency}], "skips": {reason: n},
+    `availability_stated`: the stock the REFRESH read on the page this run (the caller passes it only with
+    ATTACHED_AVAILABILITY_WRITE_ENV on). It rides on the product-level row's write only.
+
+    Returns {"status", "writes": [{offer_id, price, currency[, availability]}], "skips": {reason: n},
     "refused": [row detail for review]}. Status is `no_listing_offer` / `listing_offer_suppressed`
     / `refused_currency` (nothing this seed may write: structural), `ambiguous_listing_seller`,
     `currency_not_read`, or `planned` (possibly with zero writes; the caller reports why).
@@ -942,6 +972,7 @@ def plan_attached_listing_offer_writes(
     writes = []
     refused = []
     skips: Dict[str, int] = {}
+    stock = stated_availability(availability_stated) if source == "refresh" else None
 
     def _skip(reason: str) -> None:
         skips[reason] = skips.get(reason, 0) + 1
@@ -960,7 +991,8 @@ def plan_attached_listing_offer_writes(
         if offer.get("sku_currency") and currency_code(offer["sku_currency"]) != currency:
             _skip("sku_currency_mismatch")
             continue
-        if offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}":
+        product_level = offer.get("sku_key") == f"{product_key}{SKU_SUFFIX}"
+        if product_level:
             price = _positive_price(seed.get("price_amount"))
             if price is None:
                 _skip("no_seed_price")
@@ -986,7 +1018,10 @@ def plan_attached_listing_offer_writes(
             refused.append({"offer_id": offer["offer_id"], "sku_key": offer.get("sku_key"),
                             "current": current, "read": price, "currency": currency})
             continue
-        writes.append({"offer_id": offer["offer_id"], "price": price, "currency": currency})
+        write = {"offer_id": offer["offer_id"], "price": price, "currency": currency}
+        if product_level and stock is not None:
+            write["availability"] = stock
+        writes.append(write)
     if not writes and skips and set(skips) == {"refused_currency"}:
         # Every live row was one the readers withhold: the seed itself is refused, and counted so.
         return {"status": "refused_currency", "writes": [], "skips": skips, "refused": refused}
@@ -1002,7 +1037,7 @@ def _positive_price(value: Any) -> Optional[float]:
 
 
 async def sync_attached_listing_offers(
-    seed: Dict[str, Any], *, source: str, currency_read: bool = False
+    seed: Dict[str, Any], *, source: str, currency_read: bool = False, availability_stated: Optional[str] = None
 ) -> Dict[str, Any]:
     """Write a seed's vouched price onto its listing's offer rows on the attached canonical.
 
@@ -1015,7 +1050,10 @@ async def sync_attached_listing_offers(
     product_key = str(seed.get("attached_product_key") or "")
     rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
     rows = [dict(r) for r in rows or []]
-    plan = plan_attached_listing_offer_writes(seed, rows, source=source, currency_read=currency_read)
+    plan = plan_attached_listing_offer_writes(
+        seed, rows, source=source, currency_read=currency_read,
+        availability_stated=availability_stated if attached_availability_write_enabled() else None,
+    )
     return await _price_listing_rows(seed, product_key, rows, plan, source=source, target="attached")
 
 
@@ -1179,7 +1217,7 @@ async def _price_listing_rows(
     )
     for write in plan["writes"]:
         read = next(o for o in rows if o["offer_id"] == write["offer_id"])
-        values = {**write, **{key: read[key] for key in ("read_offer", "read_sku", "read_product")},
+        values = {"availability": None, **write, **{key: read[key] for key in ("read_offer", "read_sku", "read_product")},
                   "read_source": source}
         # RETURNING, because `execute` reports no row count: a row the guard no longer matches
         # (currency moved, offer suppressed since the read) is a skip, not a write.
@@ -1202,7 +1240,8 @@ async def _price_listing_rows(
 
 
 async def sync_offer_for_seed(
-    seed_id: str, *, attached_price_source: Optional[str] = None, currency_read: bool = False
+    seed_id: str, *, attached_price_source: Optional[str] = None, currency_read: bool = False,
+    availability_stated: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Re-project one external seed's catalog_offers row from its current state.
 
@@ -1219,7 +1258,8 @@ async def sync_offer_for_seed(
     `attached_price_source` is the caller vouching that the seed's price is
     CURRENT, and how: `refresh` (re-read from the served page this run;
     `currency_read` says the page named the currency) or `employee_edit` (an
-    employee set the price). See ATTACHED_PRICE_SOURCES. The attached lane
+    employee set the price). See ATTACHED_PRICE_SOURCES. `availability_stated` is the stock
+    the refresh read on the page this run (ATTACHED_AVAILABILITY_WRITE_ENV). The attached lane
     stamps the listing's rows `updated_at` and `price_checked_at` with NOW(), and
     the mirror upsert stamps `price_checked_at` on the same vouching
     (`price_was_read`). A caller that merely
@@ -1255,7 +1295,8 @@ async def sync_offer_for_seed(
                 # products): there is no mirror to upsert, but the canonical carries this
                 # listing's offer rows, and those are what the PDP reads.
                 return await sync_attached_listing_offers(
-                    seed, source=attached_price_source, currency_read=currency_read
+                    seed, source=attached_price_source, currency_read=currency_read,
+                    availability_stated=availability_stated,
                 )
             # The mirror hasn't materialized this seed's product yet (or under a
             # different provenance); the batch job owns product creation. Skip.

@@ -334,10 +334,14 @@ def test_the_refresh_hook_passes_the_price_source_through(monkeypatch):
     monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
     asyncio.run(ep._project_refreshed_seed_to_serving_surfaces(
         "eps_1", price_source="refresh", currency_read=True))
-    assert seen == {"attached_price_source": "refresh", "currency_read": True}
+    assert seen == {"attached_price_source": "refresh", "currency_read": True, "availability_stated": None}
+    seen.clear()
+    asyncio.run(ep._project_refreshed_seed_to_serving_surfaces(
+        "eps_1", price_source="refresh", currency_read=True, availability_stated="in_stock"))
+    assert seen == {"attached_price_source": "refresh", "currency_read": True, "availability_stated": "in_stock"}
     seen.clear()
     asyncio.run(ep._project_refreshed_seed_to_serving_surfaces("eps_1"))
-    assert seen == {"attached_price_source": None, "currency_read": False}, (
+    assert seen == {"attached_price_source": None, "currency_read": False, "availability_stated": None}, (
         "a caller that names no price source must not open the attached lane")
 
 
@@ -348,6 +352,8 @@ def test_an_attached_seed_without_a_mirror_writes_its_listing_row(monkeypatch):
     assert result["status"] == "synced" and result["target"] == "attached"
     assert result["status"] in mod.OFFER_SYNC_WRITTEN_STATUSES
     assert fake.updates == [{"offer_id": "of_canon", "price": 22.7, "currency": "USD",
+                             # flag off (EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED): the row keeps its stock
+                             "availability": None,
                              "read_offer": "{}", "read_sku": "{}", "read_product": "{}",
                              # who vouched for the read (offer_payload.price_read_source)
                              "read_source": "refresh"}]
