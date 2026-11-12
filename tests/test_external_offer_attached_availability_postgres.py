@@ -196,3 +196,60 @@ async def test_otherwise_every_row_keeps_its_stock(scoped_db, monkeypatch, flag,
     after = await _stock(scoped_db)
     assert {k: v[0] for k, v in after.items()} == before
     assert after["of_canon"][1] == 29.2, "the price write itself is unchanged"
+
+
+# ── the marker (P2-2 of the be#2806 review): a rollback must find exactly the rows the writer touched ──────────
+
+async def _payloads(db):
+    rows = await db.fetch_all("SELECT offer_id, offer_payload::text AS p, availability FROM catalog_offers")
+    return {r["offer_id"]: (json.loads(r["p"]) if r["p"] else None, r["availability"]) for r in rows}
+
+
+@pytest.mark.parametrize("price_check_present", [True, False])
+async def test_every_row_given_a_stock_carries_the_marker_and_only_those(scoped_db, monkeypatch, price_check_present):
+    await _load(scoped_db)
+    result = await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=price_check_present)
+    assert result["availability_written"] == {"in_stock": 1}
+    p = await _payloads(scoped_db)
+    marker = p["of_canon"][0]["availability_read"]
+    assert {k: marker[k] for k in ("source", "value", "previous")} == {
+        "source": "refresh", "value": "in_stock", "previous": "unknown"}
+    assert marker["at"], "when it was written"
+    assert p["of_canon"][0]["price_read_source"] == "refresh", "the price marker is still written"
+    for oid in ("of_v1", "of_v2", "of_other"):
+        assert "availability_read" not in (p[oid][0] or {}), oid
+    marked = await scoped_db.fetch_all("SELECT offer_id FROM catalog_offers WHERE offer_payload ? 'availability_read'")
+    assert [r["offer_id"] for r in marked] == ["of_canon"], "the rollback query finds exactly the written row"
+
+
+async def test_previous_is_the_stock_before_the_FIRST_write(scoped_db, monkeypatch):
+    await _load(scoped_db)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="out_of_stock", price_check_present=True)
+    payload, availability = (await _payloads(scoped_db))["of_canon"]
+    assert availability == "out_of_stock"
+    assert payload["availability_read"]["value"] == "out_of_stock"
+    assert payload["availability_read"]["previous"] == "unknown", "a rollback restores the pre-writer stock"
+
+
+@pytest.mark.parametrize("flag, stated", [(False, "in_stock"), (True, None), (True, "unknown")])
+async def test_a_run_that_writes_no_stock_writes_no_marker(scoped_db, monkeypatch, flag, stated):
+    await _load(scoped_db)
+    result = await _sync(monkeypatch, scoped_db, flag=flag, stated=stated, price_check_present=True)
+    assert "availability_written" not in result
+    marked = await scoped_db.fetch_all("SELECT offer_id FROM catalog_offers WHERE offer_payload ? 'availability_read'")
+    assert marked == []
+    payload = (await _payloads(scoped_db))["of_canon"][0]
+    assert set(payload) == {"destination_url", "price_read_source"}, "the payload is what it was before this PR"
+
+
+async def test_a_payload_that_cannot_hold_the_marker_takes_no_stock(scoped_db, monkeypatch):
+    """A scalar payload passes through untouched (jsonb_set would raise): the stock is not written either,
+    so a stock without its marker never exists, and the run counts it as skipped."""
+    await _load(scoped_db)
+    await scoped_db.execute("UPDATE catalog_offers SET offer_payload = CAST('\"legacy\"' AS jsonb) WHERE offer_id = 'of_canon'")
+    # The listing still matches on source_ref; only its payload is a legacy scalar.
+    result = await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    payload, availability = (await _payloads(scoped_db))["of_canon"]
+    assert payload == "legacy" and availability == "unknown"
+    assert "availability_written" not in result and result.get("availability_skipped") == 1

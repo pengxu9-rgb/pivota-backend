@@ -1036,3 +1036,26 @@ def test_an_id_already_refused_keeps_its_first_reason():
                                 {"variant_id": OWN_LINK, "shopify_variant_id": V_A, "price_amount": 99}])
     plan = _plan(seed, [_variant_offer()])
     assert plan["writes"] == [] and plan["skips"] == {"variant_currency_mismatch": 1}
+
+
+@pytest.mark.parametrize("outcome, expected", [
+    ({"status": "synced", "target": "attached", "availability_written": {"in_stock": 1}}, {"stock_in_stock": 1}),
+    ({"status": "synced", "target": "attached", "availability_written": {"out_of_stock": 2}}, {"stock_out_of_stock": 2}),
+    ({"status": "synced", "target": "attached", "availability_skipped": 1}, {"stock_skipped": 1}),
+    ({"status": "synced", "target": "attached"}, {}),
+])
+def test_the_refresh_hook_counts_the_stock_the_writer_wrote(monkeypatch, outcome, expected):
+    import routes.employee_products as ep
+
+    async def fake_sync(seed_id, **kwargs):
+        return dict(outcome)
+
+    async def fake_pdp(**kwargs):
+        return "refreshed"
+
+    monkeypatch.setattr("services.external_offer_dual_write.dual_write_enabled", lambda: True)
+    monkeypatch.setattr("services.external_offer_dual_write.sync_offer_for_seed", fake_sync)
+    monkeypatch.setattr("services.seed_data_writer.refresh_agent_pdp_view_for_seed", fake_pdp)
+    counts = asyncio.run(ep._project_refreshed_seed_to_serving_surfaces(
+        "eps_1", price_source="refresh", currency_read=True, availability_stated="in_stock"))
+    assert {k: v for k, v in counts.items() if k.startswith("stock_")} == expected

@@ -567,7 +567,8 @@ def test_the_refresh_passes_on_only_the_stock_its_page_stated(monkeypatch, fresh
 
 def test_a_page_that_is_not_the_served_product_passes_no_stock(monkeypatch):
     calls: List[Dict[str, Any]] = []
-    _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0, from_cache=True, calls=calls,
-                   fresh_availability="out_of_stock", stored_availability="in_stock")
-    assert all(c.get("availability_stated") is None for c in calls)
+    _, projected = _drive_refresh(monkeypatch, stored_price=28.0, fresh_price=31.0, from_cache=True, calls=calls,
+                                  fresh_availability="out_of_stock", stored_availability="in_stock")
+    # A cached page is not the served product: nothing is projected at all, so no stock can travel.
+    assert projected == [] and calls == []
 

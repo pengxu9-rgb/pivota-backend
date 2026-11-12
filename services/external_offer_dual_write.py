@@ -671,6 +671,10 @@ PRICE_READ_SOURCE_KEY = "price_read_source"
 # employee edit, and never on a row whose price this run does not write.
 ATTACHED_AVAILABILITY_WRITE_ENV = "EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED"
 STATED_AVAILABILITIES = frozenset({"in_stock", "out_of_stock"})
+# Every row this lane gives a stock carries offer_payload.availability_read = {source, value, previous, at}:
+# `previous` is the stock the row had before this lane first wrote one. A rollback finds exactly these rows
+# (`offer_payload ? 'availability_read'`) and restores `previous`; turning the flag off alone leaves them.
+AVAILABILITY_READ_KEY = "availability_read"
 
 
 def attached_availability_write_enabled() -> bool:
@@ -729,9 +733,15 @@ UPDATE catalog_offers
 SET list_price = :price,
     merchant_effective_price = :price,
     estimated_best_price = :price,
-    -- The page's own stock statement, only when the plan carries one (attached_availability_write_enabled);
-    -- NULL keeps the row's availability, which is every write with the flag off.
-    availability = COALESCE(CAST(:availability AS VARCHAR), availability),
+    -- The page's own stock statement, only when the plan carries one (attached_availability_write_enabled)
+    -- AND the payload can carry its marker (AVAILABILITY_READ_KEY, below): a stock this lane wrote is always
+    -- findable. NULL keeps the row's availability, which is every write with the flag off.
+    availability = CASE
+        WHEN CAST(:availability AS VARCHAR) IS NOT NULL
+             AND (offer_payload IS NULL OR jsonb_typeof(offer_payload) = 'object')
+        THEN CAST(:availability AS VARCHAR)
+        ELSE availability
+    END,
     -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.
     price_checked_at = NOW(),
     -- ...and says WHO vouched for it (PRICE_READ_SOURCE_KEY): `refresh` or `employee_edit`. Only on an
@@ -741,6 +751,15 @@ SET list_price = :price,
         WHEN offer_payload IS NULL OR jsonb_typeof(offer_payload) = 'object'
         THEN jsonb_set(COALESCE(offer_payload, CAST('{}' AS jsonb)), '{price_read_source}',
                        to_jsonb(CAST(:read_source AS text)))
+             -- AVAILABILITY_READ_KEY: only on a write that carries a stock. `previous` is the row's stock
+             -- before this lane FIRST wrote one (kept across later writes), so a rollback restores it.
+             || CASE WHEN CAST(:availability AS VARCHAR) IS NULL THEN CAST('{}' AS jsonb)
+                ELSE jsonb_build_object('availability_read', jsonb_build_object(
+                    'source', CAST(:read_source AS text),
+                    'value', CAST(:availability AS VARCHAR),
+                    'previous', COALESCE(offer_payload -> 'availability_read' -> 'previous', to_jsonb(availability)),
+                    'at', to_jsonb(NOW())))
+                END
         ELSE offer_payload
     END,
     updated_at = NOW()
@@ -755,7 +774,10 @@ WHERE offer_id = :offer_id
     AND p.suppressed_at IS NULL AND p.suppression_reason IS NULL
     AND to_jsonb(sk) = CAST(:read_sku AS jsonb)
     AND to_jsonb(p) = CAST(:read_product AS jsonb))
-RETURNING offer_id
+-- `stock_written`: this write carried a stock and the row took it. RETURNING sees the new row, and the stock is
+-- written exactly when the payload can hold its marker, i.e. is an object after the write.
+RETURNING offer_id,
+    (CAST(:availability AS VARCHAR) IS NOT NULL AND jsonb_typeof(offer_payload) = 'object') AS stock_written
 """
 ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK = _without_price_check(ATTACHED_LISTING_OFFER_UPDATE_SQL, (
     ("    -- Every write this lane makes is a vouched read (ATTACHED_PRICE_SOURCES), so it dates the price.\n"
@@ -1050,11 +1072,16 @@ async def sync_attached_listing_offers(
     product_key = str(seed.get("attached_product_key") or "")
     rows = await database.fetch_all(ATTACHED_LISTING_OFFERS_SQL, {"product_key": product_key})
     rows = [dict(r) for r in rows or []]
+    stated = availability_stated if attached_availability_write_enabled() else None
     plan = plan_attached_listing_offer_writes(
-        seed, rows, source=source, currency_read=currency_read,
-        availability_stated=availability_stated if attached_availability_write_enabled() else None,
+        seed, rows, source=source, currency_read=currency_read, availability_stated=stated,
     )
-    return await _price_listing_rows(seed, product_key, rows, plan, source=source, target="attached")
+    result = await _price_listing_rows(seed, product_key, rows, plan, source=source, target="attached")
+    if source == "refresh" and stated_availability(stated) and not result.get("availability_written"):
+        # The page stated a stock and no product-level row took it (no such row, its price was refused, the
+        # row changed since the read): counted, so a run that writes none says so.
+        result["availability_skipped"] = 1
+    return result
 
 
 # ── the mirror's variant rows ────────────────────────────────────────────────────────────────────
@@ -1165,6 +1192,14 @@ async def sync_mirror_variant_offers(
     )
 
 
+def _returned_flag(row: Any, key: str) -> bool:
+    """A boolean the UPDATE's RETURNING named; False when the row does not carry it."""
+    try:
+        return bool(row[key])
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 async def _price_listing_rows(
     seed: Dict[str, Any], product_key: str, rows: list, plan: Dict[str, Any], *, source: str,
     target: str, progress: Optional[Dict[str, int]] = None,
@@ -1209,6 +1244,7 @@ async def _price_listing_rows(
             result["offer_skips"] = dict(plan["skips"])
         return result
     written = 0
+    stock_written: Dict[str, int] = {}
     skips = dict(plan["skips"])
     update_sql = (
         ATTACHED_LISTING_OFFER_UPDATE_SQL
@@ -1221,8 +1257,11 @@ async def _price_listing_rows(
                   "read_source": source}
         # RETURNING, because `execute` reports no row count: a row the guard no longer matches
         # (currency moved, offer suppressed since the read) is a skip, not a write.
-        if await database.fetch_one(update_sql, values):
+        row = await database.fetch_one(update_sql, values)
+        if row:
             written += 1
+            if write.get("availability") and _returned_flag(row, "stock_written"):
+                stock_written[write["availability"]] = stock_written.get(write["availability"], 0) + 1
             if progress is not None:
                 progress["written"] = written
         else:
@@ -1234,6 +1273,9 @@ async def _price_listing_rows(
         "offers_written": written,
         "offer_skips": skips,
     }
+    if stock_written:
+        # Offer rows given the page's stock (ATTACHED_AVAILABILITY_WRITE_ENV), by value: the run summary's count.
+        result["availability_written"] = dict(stock_written)
     if written:
         return {**result, "status": "synced"}
     return {**result, "status": "listing_offer_not_written"}

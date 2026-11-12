@@ -124,8 +124,9 @@ def test_without_a_statement_the_write_is_byte_for_byte_what_it_was():
 class FakeDB:
     """sync_offer_for_seed's reads (no mirror: the attached lane), plus the guarded UPDATE's binds."""
 
-    def __init__(self):
+    def __init__(self, refuse=False):
         self.updates: List[Dict[str, Any]] = []
+        self.refuse = refuse
 
     async def fetch_one(self, sql, params=None):
         s = str(sql)
@@ -136,7 +137,10 @@ class FakeDB:
         if s.strip().startswith("UPDATE catalog_offers"):
             assert ":availability" in s and "availability" in params, "the statement binds it on every write"
             self.updates.append(dict(params))
-            return {"offer_id": params["offer_id"]}
+            if self.refuse:
+                return None
+            # The real statement's RETURNING: the row took the stock (an object payload, as every row here).
+            return {"offer_id": params["offer_id"], "stock_written": params["availability"] is not None}
         if "information_schema" in s:
             return {"present": True}
         raise AssertionError(f"unexpected fetch_one: {s[:80]}")
@@ -149,8 +153,8 @@ class FakeDB:
         raise AssertionError("the attached lane only prices existing rows")
 
 
-def _sync(monkeypatch, *, flag, stated, source="refresh"):
-    fake = FakeDB()
+def _sync(monkeypatch, *, flag, stated, source="refresh", refuse=False):
+    fake = FakeDB(refuse=refuse)
     monkeypatch.setenv("EXTERNAL_OFFER_DUAL_WRITE_ENABLED", "1")
     if flag is None:
         monkeypatch.delenv(mod.ATTACHED_AVAILABILITY_WRITE_ENV, raising=False)
@@ -161,6 +165,10 @@ def _sync(monkeypatch, *, flag, stated, source="refresh"):
     result = asyncio.run(mod.sync_offer_for_seed(
         SEED_ID, attached_price_source=source, currency_read=True, availability_stated=stated))
     return result, {u["offer_id"]: u for u in fake.updates}
+
+
+def _sync_result(monkeypatch, **kw):
+    return _sync(monkeypatch, **kw)[0]
 
 
 @pytest.mark.parametrize("flag", [None, "", "0", "false", "off", "no"])
@@ -184,4 +192,33 @@ def test_with_the_flag_on_an_employee_edit_still_writes_no_stock(monkeypatch):
 
 def test_the_update_statement_keeps_the_rows_stock_when_told_none():
     for sql in (mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, mod.ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK):
-        assert "availability = COALESCE(CAST(:availability AS VARCHAR), availability)" in sql
+        assert "THEN CAST(:availability AS VARCHAR)\n        ELSE availability" in sql
+
+
+# ── the per-run count (P2-2) ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("stated", ["in_stock", "out_of_stock"])
+def test_the_result_counts_the_rows_given_a_stock(monkeypatch, stated):
+    result = _sync_result(monkeypatch, flag="1", stated=stated)
+    assert result["availability_written"] == {stated: 1}, "the product-level row only"
+    assert "availability_skipped" not in result
+
+
+def test_a_stated_stock_that_no_row_took_is_counted_as_skipped(monkeypatch):
+    # Every guarded UPDATE matches nothing (the rows changed since the read).
+    result = _sync_result(monkeypatch, flag="1", stated="in_stock", refuse=True)
+    assert "availability_written" not in result and result["availability_skipped"] == 1
+
+
+@pytest.mark.parametrize("flag, stated, source", [
+    (None, "in_stock", "refresh"), ("1", None, "refresh"), ("1", "unknown", "refresh"),
+    ("1", "in_stock", "employee_edit"),
+])
+def test_no_stock_means_no_count_at_all(monkeypatch, flag, stated, source):
+    result = _sync_result(monkeypatch, flag=flag, stated=stated, source=source)
+    assert "availability_written" not in result and "availability_skipped" not in result
+
+
+def test_the_statement_marks_every_row_it_gives_a_stock():
+    for sql in (mod.ATTACHED_LISTING_OFFER_UPDATE_SQL, mod.ATTACHED_LISTING_OFFER_UPDATE_SQL_WITHOUT_PRICE_CHECK):
+        assert "jsonb_build_object('availability_read'" in sql and "AS stock_written" in sql

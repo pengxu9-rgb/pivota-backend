@@ -6063,6 +6063,12 @@ async def _project_refreshed_seed_to_serving_surfaces(
         # a row-level skip bucket (its reasons arrive already prefixed `mirror_variants_`), or -- when
         # it raised -- an ERROR: counted in `errored`, which the run verdict reads, never folded into
         # a skip histogram that keeps only its top 8.
+        # Stock the attached lane wrote from this read (EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED):
+        # rows by value, or 1 when the page stated a stock that no row took. Summed by the batch.
+        for value, n in ((outcome or {}).get("availability_written") or {}).items():
+            counts["stock_" + str(value)] = int(n or 0)
+        if (outcome or {}).get("availability_skipped"):
+            counts["stock_skipped"] = 1
         variant_status = (outcome or {}).get("variant_status")
         if variant_status == "synced":
             counts["wrote_mirror_variants"] = 1
