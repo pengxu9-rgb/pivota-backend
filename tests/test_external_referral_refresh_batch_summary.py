@@ -535,3 +535,21 @@ def test_the_structural_share_rule_directly(monkeypatch):
     # Still degraded when what should have written wrote nothing, whatever the share.
     assert err.batch_run_status(**base, projections_written=0, projections_structural_skips=1,
                                 projections_written_attached=0) == "degraded"
+
+
+def test_stock_writes_reach_the_summary(monkeypatch):
+    """EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED: rows given a stock, by value, and seeds whose stated
+    stock no row took, summed across the run (P2-2 of the be#2806 review)."""
+    rows = []
+    r = _ok(); r["projection"].update({"wrote_attached": 1, "stock_in_stock": 1}); rows.append(r)
+    r = _ok(); r["projection"].update({"wrote_attached": 1, "stock_in_stock": 2}); rows.append(r)
+    r = _ok(); r["projection"].update({"wrote_attached": 1, "stock_out_of_stock": 1}); rows.append(r)
+    r = _ok(); r["projection"].update({"wrote_attached": 1, "stock_skipped": 1}); rows.append(r)
+    summary = _run(monkeypatch, rows)
+    assert summary["projection_stock_writes"] == {"in_stock": 3, "out_of_stock": 1, "skipped": 1}
+    assert summary["projection_writes"] == {"attached": 4}, "stock keys are not write targets"
+
+
+def test_a_run_with_no_stock_writes_reports_zeros(monkeypatch):
+    summary = _run(monkeypatch, [_ok(), _ok()])
+    assert summary["projection_stock_writes"] == {"in_stock": 0, "out_of_stock": 0, "skipped": 0}
