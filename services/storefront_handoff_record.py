@@ -39,7 +39,8 @@ WooCommerce store, which an escalated seller is not, so nothing is polled for it
 LATER STATE. What the hand-off became is read from records this service already keeps, keyed on
 the REFERRAL click the catalog link carried (pvt_click_id), never on anything a caller sends, and
 ONLY when that referral click was issued to THIS partner (its surface_click_events row names the
-hand-off's owner as agent_id; O-02 review B-1):
+hand-off's owner as agent_id; O-02 review B-1) and is NOT stamped test traffic
+(services.test_traffic; a stamped referral click reads as no click at all):
   buyer_followed_link    `/r` counted a click on that referral id at or after the hand-off;
   seller_order_observed  a converted commerce_attribution_edges row joins that referral id, at or
                          after the hand-off, credited to this partner or to no agent, and NOT
@@ -208,11 +209,14 @@ async def _later_state(row: Mapping[str, Any], context: Mapping[str, Any]) -> Di
         return out
     try:
         click = await database.fetch_one(
-            "SELECT agent_id, click_count, last_click_at FROM surface_click_events WHERE click_id = :click_id",
+            "SELECT agent_id, click_count, last_click_at FROM surface_click_events WHERE click_id = :click_id "
+            # A referral click stamped test traffic at write (a synthetic caller's, a rig seller's) is
+            # nobody's buyer: it is not found here, so neither a follow nor an order is read from it.
+            "AND " + not_test_traffic_sql("context"),
             {"click_id": referral},
         )
         click = dict(click) if click is not None else None
-        # BOUND TO THIS PARTNER, or not read at all: no row, no agent, or another agent's.
+        # BOUND TO THIS PARTNER, or not read at all: no row, no agent, another agent's, or a test click.
         if not click or str(click.get("agent_id") or "") != owner:
             return out
         last_click = _aware(click.get("last_click_at"))

@@ -142,7 +142,7 @@ async def mint_storefront_cart_referral(
         )
     except referrals.ReferralMarketRequired:  # unreachable past the checks above; never a default
         return _refuse(BAD_BODY_STATUS, "market_required")
-    except referrals.ReferralMarketUnknown:  # reachable only if the registry changed between the two reads
+    except referrals.ReferralMarketUnknown:  # unreachable past the check above (one loaded table)
         return _refuse(BAD_BODY_STATUS, "market_unknown")
     except Exception as exc:  # noqa: BLE001 -- the door builds its cart without a referral; say so
         logger.warning("storefront_cart_referral.mint_failed error_type=%s", type(exc).__name__)

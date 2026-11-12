@@ -31,8 +31,10 @@ seller, an assumed one included, which the door itself labels as assumed). A cal
 or one that is not two capital letters, mints nothing (`ReferralMarketRequired`), and neither does
 one the market registry does not list (`ReferralMarketUnknown`): no value is filled in here.
 
-KNOWN MEANS LISTED, NOT SERVED. The one source is services/market_registry.py
-(config/market_registry.json), read at call time, and a market counts whatever its rollout status
+KNOWN MEANS LISTED, NOT SERVED. The one source is services/market_registry.py: its table is loaded
+from config/market_registry.json ONCE, when that module is imported, and each call here looks the
+market up in that loaded table (a change to the file takes effect at the next start, as for every
+reader of the registry). A market counts whatever its rollout status
 there (off / acquisition / shadow / served): this records a referral for a cart the door already
 decided to build for that market. It does not decide serving, and must not refuse a cart the door
 built. Case is not folded: the door sends the code in capitals, the row and `utm_campaign` carry
@@ -86,7 +88,8 @@ class ReferralMarketUnknown(ValueError):
 
 def market_is_known(market: str) -> bool:
     """Listed in the market registry, whatever its rollout status (see the module note). The
-    registry's own lookup on its own table, read now: no second list is kept here."""
+    registry's own lookup, per call, on the table it loaded at import: no second list or copy of
+    that table is kept here."""
     return market_registry.market_or_none(market) is not None
 
 

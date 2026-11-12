@@ -532,6 +532,39 @@ async def test_a_test_order_is_not_a_seller_order(world, monkeypatch):
     assert body["status"] == "seller_order_observed" and body["seller_order_observed_at"]
 
 
+async def test_a_test_referral_click_is_nobodys_buyer(world, monkeypatch):
+    """A referral click the issue writer stamped as test traffic (a rig seller's here; a synthetic
+    caller's is stamped the same way) is not read at all: a follow on it and a real, unstamped order
+    on it both leave the hand-off at handed_off. The same click unstamped reports both."""
+    from services import test_traffic
+    from services.commerce_attribution_service import IssuedClick, issue_click
+
+    rig = "merch_obs_handoff_test_rig"
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", rig)
+    monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+    await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    for merchant, expected in ((rig, "handed_off"), ("merch_obs_shop_a", "seller_order_observed")):
+        await _clean_referral()
+        await issue_click(IssuedClick(click_id=REFERRAL_A, surface="find_products_multi", agent_id=PARTNER_A,
+                                      merchant_id=merchant, context={"tool": "find_products_multi"}))
+        await database.execute(
+            "UPDATE surface_click_events SET click_count = 1, last_click_at = :t WHERE click_id = :c",
+            {"t": later, "c": REFERRAL_A},
+        )
+        stamped = _ctx(await _row(REFERRAL_A)).get(test_traffic.STAMP_KEY)
+        assert stamped is (True if merchant == rig else None)
+        await _converted_edge(agent_id=PARTNER_A)
+        body = (await read(world, PARTNER_A, RECORD_A, ESC_A)).json()
+        assert body["status"] == expected, merchant
+        assert ("link_followed_at" in body, "seller_order_observed_at" in body) == ((expected != "handed_off"),) * 2
+
+
+async def _clean_referral():
+    await database.execute("DELETE FROM surface_click_events WHERE click_id = :c", {"c": REFERRAL_A})
+    await database.execute("DELETE FROM commerce_attribution_edges WHERE click_id = :c", {"c": REFERRAL_A})
+
+
 async def test_a_referred_edge_that_never_converted_is_not_an_order(world):
     await record(world, PARTNER_A, record_body(RECORD_A, ESC_A, referral_click_id=REFERRAL_A))
     later = datetime.now(timezone.utc) + timedelta(minutes=5)

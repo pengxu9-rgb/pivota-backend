@@ -275,6 +275,60 @@ async def test_a_test_order_on_a_referral_is_not_a_seller_order_on_postgres(db, 
     assert seen[MERCHANT] == ("seller_order_observed", None)
 
 
+async def test_a_real_order_on_a_test_referral_is_not_reported_on_postgres(db, monkeypatch):
+    """A referral the writer stamped as test traffic, then a real seller's unstamped order closed on
+    it by the real conversion writer: not reported. Unstamped referral, same order: reported."""
+    from services import storefront_cart_referral as referrals
+    from services import test_traffic
+    from services.commerce_attribution_service import close_external_order_conversion
+
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", TEST_MERCHANT)
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    seen = {}
+    for record_id, stamp_the_mint in ((RECORD_ID, True), (RECORD_ID_2, False)):
+        monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+        # Minted for the rig seller so the real writer stamps the row; the row is then pointed at the real
+        # seller so the conversion writer matches it and stamps nothing on the edge. The click's stamp stays.
+        click_id = (await referrals.mint_referral(
+            seller_host=HOST, market="US", merchant_id=TEST_MERCHANT if stamp_the_mint else MERCHANT,
+            partner_agent_id=PARTNER_A, via_agent_id=GATEWAY,
+        ))["click_id"]
+        if stamp_the_mint:
+            await db.execute("UPDATE surface_click_events SET merchant_id = :m WHERE click_id = :c", {"m": MERCHANT, "c": click_id})
+        status = await _hand_off(record_id, click_id, MERCHANT)
+        closed = await close_external_order_conversion(
+            merchant_id=MERCHANT, click_id=click_id, external_order_id="ord_referral_pg_real_" + record_id[-1],
+            gross_amount_cents=2300, currency="USD", converted_at=later, is_self_report=True,
+        )
+        assert closed and closed["click_matched"] is True
+        row = dict(await db.fetch_one(
+            "SELECT c.context->>'test_traffic' AS click_stamp, e.metadata->>'test_traffic' AS edge_stamp "
+            "FROM surface_click_events c JOIN commerce_attribution_edges e ON e.click_id = c.click_id "
+            "WHERE c.click_id = :c", {"c": click_id},
+        ))
+        seen[stamp_the_mint] = (row["click_stamp"], row["edge_stamp"], await status())
+    assert seen[True] == ("true", None, "handed_off")
+    assert seen[False] == (None, None, "seller_order_observed")
+
+
+async def test_the_script_click_row_count_leaves_these_rows_out_on_postgres(db, monkeypatch):
+    """scripts/smoke_commerce_channels_signoff.py's per-merchant click row count, its own SQL run on
+    the production dialect beside a referral, the hand-off naming it and one ordinary link."""
+    from services import storefront_cart_referral as referrals
+    from services.commerce_attribution_service import IssuedClick, issue_clicks
+    from tests.test_smoke_commerce_channels_signoff import click_row_count_sql
+
+    sub_select = click_row_count_sql(monkeypatch).replace("%s", ":m")
+    checkout = (await referrals.mint_referral(
+        seller_host=HOST, market="US", merchant_id=REPORT_MERCHANT, partner_agent_id=PARTNER_A
+    ))["click_id"]
+    await _hand_off(RECORD_ID, checkout, REPORT_MERCHANT)
+    await issue_clicks([IssuedClick(click_id="clk_referral_pg_smoke_0", merchant_id=REPORT_MERCHANT, surface="agent",
+                                    dest_domain=HOST)])
+    everything = await db.fetch_val("SELECT COUNT(*) FROM surface_click_events WHERE merchant_id = :m", {"m": REPORT_MERCHANT})
+    assert (everything, await db.fetch_val(sub_select, {"m": REPORT_MERCHANT})) == (3, 1)
+
+
 async def test_the_click_report_does_not_count_these_rows_on_postgres(db, monkeypatch):
     """services/click_reporting.py on the production dialect, for one seller: a door checkout (a
     referral and the hand-off naming it) and a referral whose cart was never built move no number;

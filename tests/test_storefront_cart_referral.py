@@ -756,6 +756,32 @@ async def test_a_test_order_on_a_referral_is_not_a_seller_order_and_a_real_one_i
     assert statuses[MERCHANT] == ("seller_order_observed", None)
 
 
+async def test_a_real_order_on_a_test_referral_is_not_reported(world, monkeypatch):
+    """The referral row itself is stamped when the mint is test traffic (a rig seller's here, as a
+    synthetic caller's is). An order on it, even one no writer stamped, is not this partner's
+    buyer's: the hand-off stays handed_off. The same on an unstamped referral is reported."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv(handoffs.STOREFRONT_HANDOFF_RECORD_ENV, "1")
+    monkeypatch.setenv("PIVOTA_TEST_MERCHANT_IDS", TEST_MERCHANT)
+    monkeypatch.setenv(test_traffic.STAMP_FLAG, "true")
+    later = datetime.now(timezone.utc) + timedelta(minutes=5)
+    seen = {}
+    for record_id, host, merchant in ((RECORD_ID, HOST_A, TEST_MERCHANT), (RECORD_ID_2, HOST_B, MERCHANT)):
+        click_id = (await mint(world, PARTNER_A, body_for(host, merchant_id=merchant))).json()["click_id"]
+        (row,) = await rows_for(host)
+        status = await _hand_off(record_id, click_id, host, MERCHANT)
+        await database.execute(commerce_attribution_edges.insert().values(
+            edge_id="edge_referral_test_" + record_id[-1], merchant_id=MERCHANT, click_id=click_id,
+            order_id="ord_referral_test_" + record_id[-1], state="converted", agent_id=PARTNER_A,
+            converted_at=later, refund_count=0, refunded_amount=0, metadata={"click_matched": True},
+            created_at=later, updated_at=later,
+        ))
+        seen[merchant] = (ctx_of(row).get(test_traffic.STAMP_KEY), await status())
+    assert seen[TEST_MERCHANT] == (True, "handed_off")
+    assert seen[MERCHANT] == (None, "seller_order_observed")
+
+
 # --- the staff click report -----------------------------------------------------------------------
 
 
