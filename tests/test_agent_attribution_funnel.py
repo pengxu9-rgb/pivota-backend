@@ -176,3 +176,13 @@ def test_no_platform_rows_means_no_platform_block():
     fn = f.build_funnel({"clicks": [], "edges": []}, 30)
     assert fn["platforms"] == []
     assert "MCP OAUTH PLATFORMS" not in f.render(fn)
+
+
+def test_a_storefront_handoff_record_is_left_out_of_the_referral_lane():
+    # O-02 review B-2: the hand-off rows share surface_click_events but are no links (/r never sees their id).
+    from services.storefront_handoff_record import HANDOFF_SURFACE
+
+    assert f.HANDOFF_SURFACE == HANDOFF_SURFACE
+    for click_cols in (["issued_at"], []):
+        sql = f.build_queries(ALL_COLS, click_cols)["clicks"]
+        assert "coalesce(c.surface, '') <> :handoff_surface" in sql, click_cols
