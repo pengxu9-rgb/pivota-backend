@@ -43,6 +43,30 @@ class _FakeRequest:
         return self._body
 
 
+@pytest.fixture(autouse=True)
+async def _own_cart_link_claim_tables():
+    """This file builds the one real table the paid-order branch reads, and removes it afterwards.
+
+    The `orders/paid` branch closes through
+    `services.conversion_click_claims.close_merchant_conversion_with_claim`, which first asks
+    `reap_agentic_purchases` whether the click is a Reap cart-link click. It reads through its
+    OWN `database` import, so the `_FakeOrdersDB` patched onto `db.database` below does not
+    reach it. Nothing here created that table. The click-attribute test passed only when an
+    earlier file in the same process had run `db/schema_guard.ensure_required_schema_light`
+    (e.g. tests/test_a2a_rail_ledger.py, or any full-app startup) and left the table behind.
+    Alone, the read failed, the close was deferred (ClickClaimUnavailable), and the spy saw
+    no call.
+
+    The table has no SQLAlchemy model, so it is built by the production heal itself, not by
+    DDL written here, and no row is inserted: a click with no Reap purchase is the case this
+    file wants. `tests/schema_guard_tables` drops only what the heal created.
+    """
+    from tests.schema_guard_tables import schema_guard_tables
+
+    async with schema_guard_tables(required=["reap_agentic_purchases"]):
+        yield
+
+
 class _FakeOrdersDB:
     async def fetch_one(self, query: Any, values: Any = None):
         return None  # no Pivota orders row for an external purchase
