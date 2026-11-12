@@ -104,6 +104,10 @@ OFFER_SYNC_ERROR_STATUSES = frozenset({"error"})
 OFFER_SYNC_STRUCTURAL_SKIP_STATUSES = frozenset(
     {"no_mirror_product", "no_listing_offer", "listing_offer_suppressed", "refused_currency", "frozen_market_mismatch"}
 )
+#: routes/employee_products.NEW_EMPLOYEE_SEED_STATUS, restated so this service does not import a route module.
+#: A draft's `seed_draft` answer is deliberately NOT in the structural set above: the batch refresh reads only
+#: active seeds, and the employee routes gate the projection before calling, so it never reaches a batch count.
+SEED_DRAFT_STATUS = "draft"
 OFFER_CHANNEL = "external_referral"
 OFFER_SOURCE_SYSTEM = "external_product_seeds_mirror_v1"
 OFFER_PRICE_CONFIDENCE = Decimal("0.6")
@@ -578,7 +582,7 @@ async def upsert_catalog_offer_from_seed_row(
 
 
 _SEED_OFFER_COLUMNS = (
-    "id, external_product_id, destination_url, canonical_url, domain, "
+    "id, status, external_product_id, destination_url, canonical_url, domain, "
     "price_amount, price_currency, availability, market, attached_product_key, "
     # Only what the attached lane reads of seed_data, never the whole document.
     "seed_data -> 'variants' AS seed_variants, "
@@ -1236,6 +1240,10 @@ async def sync_offer_for_seed(
         if not row:
             return {"seed_id": seed_id, "status": "seed_missing"}
         seed = dict(row)
+        if str(seed.get("status") or "").strip().lower() == SEED_DRAFT_STATUS:
+            # FIX_PLAN D-11: a draft is not served, so no writer may put its price on a served offer row
+            # (the seed_data writer and the reconciler reach here too, not only the employee edit).
+            return {"seed_id": seed_id, "status": "seed_draft"}
         external_product_id = seed.get("external_product_id")
         if not external_product_id:
             return {"seed_id": seed_id, "status": "no_external_product_id"}

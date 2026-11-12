@@ -133,7 +133,13 @@ def test_mle_rejects_wrong_key_and_tampering(visa_mle):
     with pytest.raises(ValueError):
         vdp.mle_decrypt(jwe, visa_mle["client_key"])
     parts = jwe.split(".")
-    parts[3] = vdp._b64u(b"\x00" + vdp._b64u_decode(parts[3])[1:])
+    # Flip a bit rather than set a byte: a constant is a no-op when the random CEK/IV already put
+    # that value there (1 run in 256 for one byte), and the decrypt then rightly succeeds.
+    ciphertext = bytearray(vdp._b64u_decode(parts[3]))
+    ciphertext[0] ^= 0x01
+    tampered = vdp._b64u(bytes(ciphertext))
+    assert tampered != parts[3]
+    parts[3] = tampered
     with pytest.raises(ValueError):
         vdp.mle_decrypt(".".join(parts), visa_mle["server_key"])
     with pytest.raises(ValueError):
