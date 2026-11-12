@@ -107,8 +107,10 @@ from routes.agent_auth import (
     get_agent_context,
     request_api_key,
     resolve_issuing_context_for_request,
+    verify_checkout_token_claims,
 )
 from db.agents import resolve_agent_id_by_api_key
+from middleware.cors import FIRST_PARTY_ORIGINS
 from utils.transient_errors import db_busy_http_exception
 from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
 from db.merchant_tasks import match_recovery_key
@@ -640,6 +642,200 @@ async def _require_credential_for_money_operation(
             ),
             "operation": operation,
         },
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+# ── keyless callers: off | observe | enforce ────────────────────────────────────
+# Owner decision: this route should be closed to callers without a credential. The
+# switch is SHOP_INVOKE_KEYLESS_MODE, read per request:
+#   off      (unset, empty or ANY other value) the code path before this block existed:
+#            nothing below runs, no lookup is made, no line is logged.
+#   observe  every request is classified; answers are unchanged, except that the per-address
+#            limiter now covers every caller WITHOUT a verified credential (a header that
+#            is merely present no longer skips it). One warning line per such request.
+#   enforce  the same, and a caller without a verified credential is answered 401
+#            CREDENTIAL_REQUIRED: the same bytes whatever the operation, payload or headers.
+#
+# A header being present is not a credential. A credential is VERIFIED:
+#   trusted_key     the internal trusted key (constant-time match), as get_agent_context admits it;
+#   checkout_token  the dispatcher's X-Checkout-Token with a valid signature, unexpired, naming
+#                   an agent (verify_checkout_token_claims: in process, no database);
+#   agent_key       a well-formed agent key (X-API-Key, or Authorization: Bearer) that resolves
+#                   to an ACTIVE agent through resolve_agent_id_by_api_key (a read; no quota,
+#                   rate limit or stats are counted against the key here).
+# Everything else is keyless: none, malformed_key, unknown_or_inactive_key, bad_checkout_token.
+# lookup_error means the key could not be looked up: served and logged in observe, 503 in
+# enforce (fail closed, the money gate's rule).
+SHOP_INVOKE_KEYLESS_MODE_ENV = "SHOP_INVOKE_KEYLESS_MODE"
+INVOKE_KEYLESS_MODE_OFF = "off"
+INVOKE_KEYLESS_MODE_OBSERVE = "observe"
+INVOKE_KEYLESS_MODE_ENFORCE = "enforce"
+CREDENTIAL_REQUIRED = "CREDENTIAL_REQUIRED"
+INVOKE_VERIFIED_CREDENTIAL_CLASSES: frozenset = frozenset({"trusted_key", "agent_key", "checkout_token"})
+INVOKE_KEYLESS_CREDENTIAL_CLASSES: frozenset = frozenset({
+    "none",
+    "malformed_key",
+    "unknown_or_inactive_key",
+    "bad_checkout_token",
+    "lookup_error",
+})
+# One constant body: no operation, no reason, nothing taken from the request.
+_CREDENTIAL_REQUIRED_DETAIL: Dict[str, str] = {
+    "error": CREDENTIAL_REQUIRED,
+    "message": (
+        "This endpoint needs a credential. Send an active agent API key in X-API-Key or "
+        "Authorization: Bearer."
+    ),
+}
+# The header a first-party server proxy adds to its upstream calls. A hint, never proof.
+_INVOKE_PROXY_HOP_HEADER = "x-gateway-proxy-hop"
+# (prefix of the lower-cased User-Agent, family). First match wins; the value is never logged.
+_INVOKE_USER_AGENT_FAMILIES: Tuple[Tuple[str, str], ...] = (
+    ("python-httpx", "python-httpx"),
+    ("python", "python-other"),
+    ("aiohttp", "python-other"),
+    ("axios", "axios"),
+    ("node", "node"),
+    ("undici", "node"),
+    ("curl", "curl"),
+    ("go-http-client", "go"),
+    ("mozilla/", "browser"),
+)
+_INVOKE_KNOWN_SOURCE_EXTRA: frozenset = frozenset({"creator-agent"})
+_INVOKE_SAFE_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _invoke_keyless_mode() -> str:
+    raw = str(os.getenv(SHOP_INVOKE_KEYLESS_MODE_ENV) or "").strip().lower()
+    if raw in (INVOKE_KEYLESS_MODE_OBSERVE, INVOKE_KEYLESS_MODE_ENFORCE):
+        return raw
+    return INVOKE_KEYLESS_MODE_OFF
+
+
+async def _classify_invoke_credential(request: Request, *, checkout_token: Optional[str]) -> str:
+    """The credential class of an /invoke request. Never raises; never returns a header value.
+
+    `checkout_token` is the dispatcher's stripped value (whitespace only = none), the one the
+    money handlers forward. The cheap in-process checks run first, so a request with a valid
+    checkout token or the trusted key costs no database lookup."""
+    api_key = request_api_key(request)
+    if api_key and _is_internal_trusted_api_key(api_key):
+        return "trusted_key"
+    token_class: Optional[str] = None
+    if checkout_token:
+        try:
+            verify_checkout_token_claims(checkout_token)
+            return "checkout_token"
+        except Exception:  # noqa: BLE001 -- bad format, signature, expiry, or no secret configured
+            token_class = "bad_checkout_token"
+    if not api_key:
+        return token_class or "none"
+    if not _AGENT_API_KEY_RE.match(api_key):
+        return token_class or "malformed_key"
+    lookup: Dict[str, Any] = {}
+    try:
+        agent_id = await resolve_agent_id_by_api_key(api_key, metrics_out=lookup)
+    except Exception as exc:  # noqa: BLE001 -- AgentAuthLookupTransientError and anything else
+        logger.warning("[shop_invoke] keyless-mode key lookup failed: %s", type(exc).__name__)
+        return "lookup_error"
+    if lookup.get("auth_source") == "error":
+        # get_agent_by_key answers None when its query failed; that is "could not look".
+        logger.warning("[shop_invoke] keyless-mode key lookup failed: lookup_error")
+        return "lookup_error"
+    if agent_id:
+        return "agent_key"
+    return token_class or "unknown_or_inactive_key"
+
+
+def _invoke_user_agent_family(request: Request) -> str:
+    raw = (request.headers.get("user-agent") or "").strip().lower()
+    if not raw:
+        return "none"
+    for prefix, family in _INVOKE_USER_AGENT_FAMILIES:
+        if raw.startswith(prefix):
+            return family
+    return "other"
+
+
+def _invoke_origin_label(request: Request) -> str:
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return "none"
+    return "first_party" if origin.rstrip("/").lower() in FIRST_PARTY_ORIGINS else "other"
+
+
+def _invoke_source_label(metadata: Any) -> str:
+    raw = metadata.get("source") if isinstance(metadata, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return "none"
+    label = _normalize_surface_source(raw)
+    if label in SHOPPING_MULTI_SOURCES or label in _INVOKE_KNOWN_SOURCE_EXTRA:
+        return label
+    return "other"
+
+
+def _invoke_request_id_label(request: Request) -> str:
+    # The request-log middleware keeps a caller's own X-Request-Id, so it is caller text:
+    # only a plain id is logged as is, anything else as a short hash of it.
+    raw = getattr(getattr(request, "state", None), "request_id", None)
+    if not isinstance(raw, str) or not raw:
+        return "none"
+    if _INVOKE_SAFE_REQUEST_ID_RE.match(raw):
+        return raw
+    return "h_" + hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _log_invoke_keyless_request(
+    request: Request, *, mode: str, operation: str, credential_class: str, metadata: Any
+) -> None:
+    """The ONE line per keyless request. Fixed vocabulary only: no header value, no address,
+    no payload, no operation text outside the two known sets."""
+    known = operation in INVOKE_MONEY_OPERATIONS or operation in INVOKE_NON_MONEY_OPERATIONS
+    logger.warning(
+        "[shop_invoke] keyless request: mode=%s op=%s cred=%s ua=%s origin=%s hop=%s source=%s request_id=%s",
+        mode,
+        operation if known else "other",
+        credential_class,
+        _invoke_user_agent_family(request),
+        _invoke_origin_label(request),
+        "1" if (request.headers.get(_INVOKE_PROXY_HOP_HEADER) or "").strip() else "0",
+        _invoke_source_label(metadata),
+        _invoke_request_id_label(request),
+    )
+
+
+def _raise_invoke_anon_rate_limited() -> None:
+    raise HTTPException(
+        status_code=429,
+        detail="Too many anonymous requests; slow down or authenticate with an API key.",
+        headers={"Retry-After": "60"},
+    )
+
+
+async def _apply_invoke_keyless_mode(
+    mode: str, operation: str, request: Request, *, checkout_token: Optional[str], metadata: Any
+) -> None:
+    """observe | enforce: classify, limit the unverified, log them, and (enforce) refuse them.
+
+    Order: the limiter first (an over-budget keyless caller is 429 in every mode, and gets
+    no line, so a flood cannot fill the log), then the line, then the refusal."""
+    credential_class = await _classify_invoke_credential(request, checkout_token=checkout_token)
+    request.state.shop_invoke_credential_class = credential_class
+    if credential_class in INVOKE_VERIFIED_CREDENTIAL_CLASSES:
+        return
+    if not _check_invoke_anon_rate_limit(_review_media_client_ip(request)):
+        _raise_invoke_anon_rate_limited()
+    _log_invoke_keyless_request(
+        request, mode=mode, operation=operation, credential_class=credential_class, metadata=metadata
+    )
+    if mode != INVOKE_KEYLESS_MODE_ENFORCE:
+        return
+    if credential_class == "lookup_error":
+        raise db_busy_http_exception()
+    raise HTTPException(
+        status_code=401,
+        detail=dict(_CREDENTIAL_REQUIRED_DETAIL),
         headers={"WWW-Authenticate": "Bearer"},
     )
 
@@ -18913,18 +19109,31 @@ async def invoke_shop_operation(
     The money operations (INVOKE_MONEY_OPERATIONS) answer 401
     CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION without a checkout token or an active agent key
     (rollback: SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL=0).
+
+    SHOP_INVOKE_KEYLESS_MODE=observe|enforce (default off): callers without a VERIFIED
+    credential are logged (observe) or answered 401 CREDENTIAL_REQUIRED (enforce), whatever
+    the operation.
     """
     operation = (request.operation or "").strip()
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
 
-    # Credential-less direct callers only — see the limiter's comment block.
-    if not _request_carries_credential(http_request):
-        if not _check_invoke_anon_rate_limit(_review_media_client_ip(http_request)):
-            raise HTTPException(
-                status_code=429,
-                detail="Too many anonymous requests; slow down or authenticate with an API key.",
-                headers={"Retry-After": "60"},
-            )
+    keyless_mode = _invoke_keyless_mode()
+    if keyless_mode == INVOKE_KEYLESS_MODE_OFF:
+        # Credential-less direct callers only — see the limiter's comment block.
+        if not _request_carries_credential(http_request):
+            if not _check_invoke_anon_rate_limit(_review_media_client_ip(http_request)):
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many anonymous requests; slow down or authenticate with an API key.",
+                    headers={"Retry-After": "60"},
+                )
+    else:
+        # observe | enforce (SHOP_INVOKE_KEYLESS_MODE): the limiter covers every caller without
+        # a VERIFIED credential; enforce answers them 401 CREDENTIAL_REQUIRED here, before the
+        # money gate below and before any operation branch.
+        await _apply_invoke_keyless_mode(
+            keyless_mode, operation, http_request, checkout_token=checkout_token, metadata=request.metadata
+        )
 
     # Money operations need a checkout token or an ACTIVE agent key; checked before the
     # payload is parsed and before anything is sent upstream (see INVOKE_MONEY_OPERATIONS).

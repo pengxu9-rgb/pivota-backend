@@ -326,3 +326,77 @@ gcloud run services update web --project pivota-prod --region us-west1 \
 Not changed here (follow-up): an admitted caller's request still goes upstream with the
 backend's own key when it carries no checkout token, so the order is attributed to that
 service agent, not to the caller's agent.
+
+## `/agent/shop/v1/invoke` keyless callers: `SHOP_INVOKE_KEYLESS_MODE` (off | observe | enforce)
+
+The money gate above covers four operations. Every other operation on `/invoke` still
+serves anyone, and the per-address limiter was skipped by any request that merely carried
+an `X-API-Key`, `Authorization` or `X-Checkout-Token` header, valid or not.
+`SHOP_INVOKE_KEYLESS_MODE` closes the route to callers without a **verified** credential,
+in steps. It is read per request, so changing it needs no deploy.
+
+| Value | Behaviour |
+|---|---|
+| unset, empty, `off`, or any other value | Off. The code path before the flag existed: no classification, no key lookup, no line. |
+| `observe` | Every answer is unchanged, with one exception: the per-address limiter now covers every caller without a verified credential (a junk header no longer skips it). One warning line per such request. |
+| `enforce` | The same, and a caller without a verified credential is answered `401` `CREDENTIAL_REQUIRED`. |
+
+A header being present is not a credential. A credential is one of:
+
+- the internal trusted key (`trusted_key`);
+- an `X-Checkout-Token` with a valid signature, unexpired, naming an agent
+  (`checkout_token`; verified in process, no database; a whitespace-only token is none);
+- a well-formed agent key in `X-API-Key` or `Authorization: Bearer` that resolves to an
+  ACTIVE agent (`agent_key`; the lookup only reads, it counts no quota, rate limit or stats).
+
+Everything else is keyless: `none`, `malformed_key`, `unknown_or_inactive_key`,
+`bad_checkout_token`. `lookup_error` (the key could not be looked up) is served and logged
+in `observe` and answered `503` in `enforce`. A verified checkout token or the trusted key
+is checked first, so those requests cost no lookup. `X-API-Key` is read before
+`Authorization`, as on the keyed routes: a junk `X-API-Key` hides a good Bearer.
+
+Order inside the handler, in `observe` and `enforce`:
+
+1. Body validation (a malformed envelope is still `422`, keyless or not).
+2. Classify the credential.
+3. Per-address limiter, for every caller without a verified credential: `429` over
+   budget, in every mode. Verified callers are never counted by it.
+4. The line below, then in `enforce` the `401` (or `503` for `lookup_error`).
+5. The money gate (`SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL`), unchanged.
+6. Dispatch.
+
+With the money gate: in `observe` a keyless money operation still gets the money gate's
+own `401` (and both lines). In `enforce` the keyless `401` comes first, whatever the money
+gate's switch says, and a made-up checkout token (which the money gate passes on for the
+upstream route to reject) is refused here.
+
+The refusal is the same bytes for every keyless request, whatever the operation (known,
+unknown or empty), payload or headers. It names no operation and no reason:
+
+```
+HTTP 401
+WWW-Authenticate: Bearer
+{"detail":{"error":"CREDENTIAL_REQUIRED","message":"This endpoint needs a credential. Send an active agent API key in X-API-Key or Authorization: Bearer."}}
+```
+
+The line, at warning level, once per keyless request that passed the limiter (a `429` gets
+no line, so a flood cannot fill the log):
+
+```
+[shop_invoke] keyless request: mode=<observe|enforce> op=<name|other> cred=<none|malformed_key|unknown_or_inactive_key|bad_checkout_token|lookup_error> ua=<node|axios|python-httpx|python-other|curl|browser|go|other|none> origin=<first_party|other|none> hop=<0|1> source=<known label|other|none> request_id=<id|h_<hash>|none>
+```
+
+- `op`: the operation only when it is one the dispatcher knows, else `other`.
+- `ua`: a family from a fixed prefix table, never the header value.
+- `origin`: whether an `Origin` header is present and first-party, never its value.
+- `hop`: whether the first-party proxy's hop header is present. A hint, not proof.
+- `source`: `metadata.source` only when it normalises to a known surface label.
+- `request_id`: the request log's id for the same request, to join on. A caller-supplied
+  id that is not a plain id (`[A-Za-z0-9._-]`, at most 64 characters) is logged as `h_` plus
+  a short hash of it.
+
+No header value, address, query or payload is ever in the line.
+
+Before `enforce`, every first-party caller of `/invoke` must send a credential that
+verifies; a caller that sends none shows up in `observe` as `cred=none`. Rollback from
+`enforce`: set the flag to `observe` or remove it.
