@@ -44,7 +44,7 @@ def test_create_payment_link_payload_parses_flat_kernel_shape() -> None:
 def test_create_payment_link_proxies_to_hosted_checkout(monkeypatch) -> None:
     captured = {}
 
-    async def fake_proxy(method, path, body, *, checkout_token=None):
+    async def fake_proxy(method, path, body, *, checkout_token=None, caller_api_key=None):
         captured.update(method=method, path=path, body=body, checkout_token=checkout_token)
         # Mirror the real /agent/v2/payments/checkout-sessions response shape.
         return {
@@ -89,7 +89,7 @@ def test_create_payment_link_proxies_to_hosted_checkout(monkeypatch) -> None:
 def test_create_payment_link_omits_absent_optionals(monkeypatch) -> None:
     captured = {}
 
-    async def fake_proxy(method, path, body, *, checkout_token=None):
+    async def fake_proxy(method, path, body, *, checkout_token=None, caller_api_key=None):
         captured["body"] = body
         return {"checkout_session": {"hosted_url": "https://checkout.example/x"}}
 
@@ -110,7 +110,7 @@ def test_create_payment_link_on_the_invoke_route_needs_a_credential(monkeypatch)
 
     calls = []
 
-    async def fake_proxy(method, path, body, *, checkout_token=None):
+    async def fake_proxy(method, path, body, *, checkout_token=None, caller_api_key=None):
         calls.append((path, body, checkout_token))
         return {"checkout_session": {"hosted_url": "https://checkout.example/x"}}
 

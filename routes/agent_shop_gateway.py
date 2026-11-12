@@ -546,8 +546,9 @@ def _request_carries_credential(request: Request) -> bool:
 #       admitted exactly as get_agent_context admits it).
 # Anything else is refused with 401 CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION before the
 # payload is parsed and before any upstream call. The key lookup only READS (it does
-# not count requests, quota or stats: the caller's key is not what the upstream call
-# is made with, see _proxy_agent_api, unchanged here).
+# not count requests, quota or stats; the upstream route does that for the key the call
+# is made with, which is the caller's own only with SHOP_INVOKE_FORWARD_CALLER_KEY on,
+# see _proxy_agent_api).
 #
 # EVERY operation the /invoke dispatcher answers must be in exactly one of these two
 # sets; tests/test_invoke_money_ops_require_credential.py fails when a new one is not.
@@ -642,6 +643,27 @@ async def _require_credential_for_money_operation(
         },
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+# ── a caller with its own key acts as itself (flag, default OFF) ───────────────
+# _proxy_agent_api used to send this service's own AGENT_API_KEY for every money operation
+# that carried no checkout token, also when the caller had presented its OWN agent key. The
+# /agent/v1|v2 route then saw this service's agent: the caller's merchant allowlist, rate
+# limit, quota, governance status and order ownership were never applied, and the order was
+# owned by this service's agent.
+# With SHOP_INVOKE_FORWARD_CALLER_KEY on, the key the caller presented (request_api_key: the
+# same value the money gate above judged) is what goes upstream, as X-API-Key. Precedence:
+# checkout token, then the caller's own key, then (no key presented) this service's key as
+# before. A presented key is never swapped for this service's key: the upstream route judges it.
+# Read per call. Only 1/true/on/yes switch it on; unset or anything else is OFF, and OFF is
+# the request this route sent before the flag existed.
+_FORWARD_CALLER_KEY_ENV = "SHOP_INVOKE_FORWARD_CALLER_KEY"
+_FORWARD_CALLER_KEY_ON_VALUES = frozenset({"1", "true", "on", "yes"})
+
+
+def _invoke_forwards_caller_key() -> bool:
+    raw = str(os.getenv(_FORWARD_CALLER_KEY_ENV) or "").strip().lower()
+    return raw in _FORWARD_CALLER_KEY_ON_VALUES
 
 
 def _check_invoke_anon_rate_limit(ip: str) -> bool:
@@ -18672,20 +18694,30 @@ async def _proxy_agent_api(
     json_body: Dict[str, Any],
     *,
     checkout_token: Optional[str] = None,
+    caller_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Forward a request to the Agent API.
 
     Auth precedence:
     - If `checkout_token` is present (Checkout UI flow), forward it so agent_id is derived from the token.
+    - Else, with SHOP_INVOKE_FORWARD_CALLER_KEY on, the key the caller presented (`caller_api_key`),
+      so the upstream route applies the caller's own scope, limits, status and ownership.
     - Otherwise fall back to a server-side API key (legacy / demo mode).
     """
     url = f"{AGENT_API_BASE}{path}"
     headers: Dict[str, str] = {"Content-Type": "application/json"}
 
     token = (checkout_token or "").strip()
+    own_key = (caller_api_key or "").strip() if _invoke_forwards_caller_key() else ""
     if token:
         headers["X-Checkout-Token"] = token
+    elif own_key:
+        if not own_key.isascii():
+            # Not sendable as a header and not a key the upstream route accepts; answer what
+            # that route answers for a malformed key instead of failing while building the request.
+            raise HTTPException(status_code=401, detail={"detail": "Invalid API Key format"})
+        headers["X-API-Key"] = own_key
     else:
         if not AGENT_API_KEY:
             raise HTTPException(
@@ -18725,6 +18757,7 @@ async def _handle_create_order(
     *,
     checkout_token: Optional[str],
     request_metadata: Optional[Dict[str, Any]] = None,
+    caller_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Proxy create_order to Agent API (/agent/v1/orders/create)."""
     order_metadata = dict(order.metadata or {})
@@ -18797,13 +18830,16 @@ async def _handle_create_order(
         "customer_notes": order.customer_notes or "",
     }
 
-    return await _proxy_agent_api("POST", "/agent/v1/orders/create", body, checkout_token=checkout_token)
+    return await _proxy_agent_api(
+        "POST", "/agent/v1/orders/create", body, checkout_token=checkout_token, caller_api_key=caller_api_key
+    )
 
 
 async def _handle_create_payment_link(
     payload: "CreatePaymentLinkPayload",
     *,
     checkout_token: Optional[str],
+    caller_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Proxy create_payment_link to the Agent v2 hosted-checkout endpoint.
 
@@ -18830,10 +18866,16 @@ async def _handle_create_payment_link(
         "/agent/v2/payments/checkout-sessions",
         body,
         checkout_token=checkout_token,
+        caller_api_key=caller_api_key,
     )
 
 
-async def _handle_submit_payment(payment: PaymentPayloadBody, *, checkout_token: Optional[str]) -> Dict[str, Any]:
+async def _handle_submit_payment(
+    payment: PaymentPayloadBody,
+    *,
+    checkout_token: Optional[str],
+    caller_api_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """Proxy submit_payment to Agent API (/agent/v1/payments)."""
     # 将简单的 payment_method 字符串映射为 Agent Payment API 的结构化字段
     method_type = (payment.payment_method or "").strip() or "card"
@@ -18849,13 +18891,16 @@ async def _handle_submit_payment(payment: PaymentPayloadBody, *, checkout_token:
         "currency": payment.currency,
     }
 
-    return await _proxy_agent_api("POST", "/agent/v1/payments", body, checkout_token=checkout_token)
+    return await _proxy_agent_api(
+        "POST", "/agent/v1/payments", body, checkout_token=checkout_token, caller_api_key=caller_api_key
+    )
 
 
 async def _handle_record_payment_offer_evidence(
     payload: RecordPaymentOfferEvidencePayload,
     *,
     checkout_token: Optional[str],
+    caller_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     body = {
         **({"order_id": payload.order_id} if payload.order_id else {}),
@@ -18868,7 +18913,13 @@ async def _handle_record_payment_offer_evidence(
         **({"event_type": payload.event_type} if payload.event_type else {}),
         **({"idempotency_key": payload.idempotency_key} if payload.idempotency_key else {}),
     }
-    return await _proxy_agent_api("POST", "/agent/v1/orders/payment-offer-evidence", body, checkout_token=checkout_token)
+    return await _proxy_agent_api(
+        "POST",
+        "/agent/v1/orders/payment-offer-evidence",
+        body,
+        checkout_token=checkout_token,
+        caller_api_key=caller_api_key,
+    )
 
 
 INVOKE_SHORT_WAIT_SECONDS_RAW = os.getenv("AGENT_SHOP_INVOKE_MAX_WAIT_SECONDS")
@@ -18913,6 +18964,8 @@ async def invoke_shop_operation(
     The money operations (INVOKE_MONEY_OPERATIONS) answer 401
     CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION without a checkout token or an active agent key
     (rollback: SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL=0).
+    With SHOP_INVOKE_FORWARD_CALLER_KEY on, a money operation from a caller that presented its own
+    agent key goes upstream with THAT key (default off: this service's key, as before).
     """
     operation = (request.operation or "").strip()
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
@@ -19500,6 +19553,7 @@ async def invoke_shop_operation(
             payload.order,
             checkout_token=checkout_token,
             request_metadata=normalized_metadata,
+            caller_api_key=request_api_key(http_request),
         )
 
     if operation == "create_payment_link":
@@ -19507,6 +19561,7 @@ async def invoke_shop_operation(
         return await _handle_create_payment_link(
             payment_link_payload,
             checkout_token=checkout_token,
+            caller_api_key=request_api_key(http_request),
         )
 
     if operation == "find_products_multi":
@@ -19800,11 +19855,19 @@ async def invoke_shop_operation(
 
     if operation == "submit_payment":
         payload = SubmitPaymentPayload(**request.payload)
-        return await _handle_submit_payment(payload.payment, checkout_token=checkout_token)
+        return await _handle_submit_payment(
+            payload.payment,
+            checkout_token=checkout_token,
+            caller_api_key=request_api_key(http_request),
+        )
 
     if operation == "record_payment_offer_evidence":
         payload = RecordPaymentOfferEvidencePayload(**request.payload)
-        return await _handle_record_payment_offer_evidence(payload, checkout_token=checkout_token)
+        return await _handle_record_payment_offer_evidence(
+            payload,
+            checkout_token=checkout_token,
+            caller_api_key=request_api_key(http_request),
+        )
 
     # For now we only support product operations here.
     raise HTTPException(
