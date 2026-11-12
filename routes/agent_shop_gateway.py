@@ -108,7 +108,7 @@ from routes.agent_auth import (
     request_api_key,
     resolve_issuing_context_for_request,
 )
-from db.agents import AgentAuthLookupTransientError, resolve_agent_id_by_api_key
+from db.agents import resolve_agent_id_by_api_key
 from utils.transient_errors import db_busy_http_exception
 from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
 from db.merchant_tasks import match_recovery_key
@@ -584,11 +584,18 @@ def _invoke_money_ops_require_credential() -> bool:
     return raw not in _MONEY_OPS_REQUIRE_CREDENTIAL_OFF_VALUES
 
 
-async def _money_operation_refusal_reason(request: Request) -> Optional[str]:
+async def _money_operation_refusal_reason(
+    request: Request, *, checkout_token: Optional[str]
+) -> Optional[str]:
     """None when the request may run a money operation, else a log-safe reason label.
 
+    `checkout_token` is the DISPATCHER's value, the one the handlers pass to _proxy_agent_api,
+    never re-read from the header here: a token the dispatcher normalises away (whitespace only)
+    would otherwise pass this check and the proxy would send this service's own key.
+
+    A key lookup that fails, for any reason, answers 503 (fail closed), never "unknown key".
     Never returns or logs a header value."""
-    if (request.headers.get("x-checkout-token") or "").strip():
+    if checkout_token:
         return None
     api_key = request_api_key(request)
     if not api_key:
@@ -597,20 +604,27 @@ async def _money_operation_refusal_reason(request: Request) -> Optional[str]:
         return None
     if not _AGENT_API_KEY_RE.match(api_key):
         return "malformed_key"
+    lookup: Dict[str, Any] = {}
     try:
-        agent_id = await resolve_agent_id_by_api_key(api_key)
-    except AgentAuthLookupTransientError as exc:
-        # Fail closed, the way get_agent_context answers the same transient state.
+        agent_id = await resolve_agent_id_by_api_key(api_key, metrics_out=lookup)
+    except Exception as exc:  # noqa: BLE001 -- AgentAuthLookupTransientError and anything else
+        logger.warning("[shop_invoke] money operation key lookup failed: %s", type(exc).__name__)
         raise db_busy_http_exception() from exc
+    if lookup.get("auth_source") == "error":
+        # get_agent_by_key answers None when its query failed; that is "could not look".
+        logger.warning("[shop_invoke] money operation key lookup failed: lookup_error")
+        raise db_busy_http_exception()
     if not agent_id:
         return "unknown_or_inactive_key"
     return None
 
 
-async def _require_credential_for_money_operation(operation: str, request: Request) -> None:
+async def _require_credential_for_money_operation(
+    operation: str, request: Request, *, checkout_token: Optional[str]
+) -> None:
     if operation not in INVOKE_MONEY_OPERATIONS or not _invoke_money_ops_require_credential():
         return
-    reason = await _money_operation_refusal_reason(request)
+    reason = await _money_operation_refusal_reason(request, checkout_token=checkout_token)
     if reason is None:
         return
     logger.warning(
@@ -18914,7 +18928,8 @@ async def invoke_shop_operation(
 
     # Money operations need a checkout token or an ACTIVE agent key; checked before the
     # payload is parsed and before anything is sent upstream (see INVOKE_MONEY_OPERATIONS).
-    await _require_credential_for_money_operation(operation, http_request)
+    # It is given THIS checkout_token, the value every money handler forwards.
+    await _require_credential_for_money_operation(operation, http_request, checkout_token=checkout_token)
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
     normalized_metadata = _normalize_gateway_request_metadata(

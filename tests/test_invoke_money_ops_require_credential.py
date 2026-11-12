@@ -21,7 +21,9 @@ Pinned here:
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
+import json
 import re
 import textwrap
 from typing import Any, Dict, List, Optional
@@ -185,6 +187,7 @@ def harness(monkeypatch):
     app = FastAPI()
     app.include_router(gw.router)
     state["client"] = TestClient(app, raise_server_exceptions=False)
+    state["app"] = app
     return state
 
 
@@ -233,15 +236,139 @@ def test_a_malformed_key_is_refused_without_a_lookup(harness):
     assert harness["lookups"] == []
 
 
-def test_a_transient_lookup_failure_fails_closed_with_503_and_no_upstream(harness, monkeypatch):
-    async def flaky(api_key, metrics_out=None):
-        raise agents_db.AgentAuthLookupTransientError("fixture")
+async def _lookup_raises_transient(api_key, metrics_out=None):
+    raise agents_db.AgentAuthLookupTransientError("fixture")
 
-    monkeypatch.setattr(agents_db, "get_agent_by_key", flaky)
-    res = _post(harness, "submit_payment", MONEY_PAYLOADS["submit_payment"], {"X-API-Key": ACTIVE_KEY})
+
+async def _lookup_raises_other(api_key, metrics_out=None):
+    raise RuntimeError("fixture")
+
+
+async def _lookup_swallowed_error(api_key, metrics_out=None):
+    # What get_agent_by_key does when its query fails for a non-transient reason: None, with
+    # auth_source "error".
+    if metrics_out is not None:
+        metrics_out["auth_source"] = "error"
+    return None
+
+
+@pytest.mark.parametrize(
+    "lookup", [_lookup_raises_transient, _lookup_raises_other, _lookup_swallowed_error],
+    ids=["transient", "other_exception", "swallowed_db_error"],
+)
+@pytest.mark.parametrize("operation", sorted(gw.INVOKE_MONEY_OPERATIONS))
+def test_any_key_lookup_failure_fails_closed_with_503_and_no_upstream(harness, monkeypatch, operation, lookup):
+    monkeypatch.setattr(agents_db, "get_agent_by_key", lookup)
+    res = _post(harness, operation, MONEY_PAYLOADS[operation], {"X-API-Key": ACTIVE_KEY})
     assert res.status_code == 503, res.text
+    assert res.json()["detail"]["error"] == "TEMPORARY_UNAVAILABLE"
     assert ACTIVE_KEY not in res.text
     assert harness["client_acquired"] == 0 and harness["sent"] == []
+    assert harness["db_calls"] == [] and harness["agent_writes"] == []
+
+
+def test_a_lookup_that_found_nothing_is_still_401_not_503(harness, monkeypatch):
+    async def not_found(api_key, metrics_out=None):
+        if metrics_out is not None:
+            metrics_out["auth_source"] = "not_found"
+        return None
+
+    monkeypatch.setattr(agents_db, "get_agent_by_key", not_found)
+    res = _post(harness, "create_order", MONEY_PAYLOADS["create_order"], {"X-API-Key": UNKNOWN_KEY})
+    _assert_refused(harness, res, "create_order", {"X-API-Key": UNKNOWN_KEY})
+
+
+# A checkout token that is only whitespace is no token: the dispatcher normalises it to None and
+# the proxy would send this service's own key. Driven through the raw ASGI interface, because
+# TestClient re-encodes a b"\xa0" header as UTF-8 (b"\xc2\xa0"), which is not what a server hands
+# the app for that byte on the wire (h11 does not trim it; Starlette decodes it as latin-1).
+WHITESPACE_TOKENS = [b"   ", b"\t", b"\xa0", b" \t\xa0 "]
+
+
+def _raw_asgi_post(app, operation: str, payload: Dict[str, Any], raw_headers: List[tuple]):
+    body = json.dumps({"operation": operation, "payload": payload}).encode()
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": INVOKE,
+        "raw_path": INVOKE.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+            *raw_headers,
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    messages: List[Dict[str, Any]] = []
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+
+    asyncio.run(app(scope, receive, send))
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    content = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], dict(start["headers"]), content
+
+
+@pytest.mark.parametrize("operation", sorted(gw.INVOKE_MONEY_OPERATIONS))
+@pytest.mark.parametrize("token", WHITESPACE_TOKENS, ids=["spaces", "tab", "nbsp", "mixed"])
+def test_a_whitespace_only_checkout_token_is_refused(harness, operation, token):
+    status, headers, content = _raw_asgi_post(
+        harness["app"], operation, MONEY_PAYLOADS[operation], [(b"x-checkout-token", token)]
+    )
+    assert status == 401, content
+    assert json.loads(content)["detail"]["error"] == CODE
+    assert headers.get(b"www-authenticate") == b"Bearer"
+    assert harness["client_acquired"] == 0 and harness["sent"] == [], "our own key would have gone upstream"
+    assert harness["db_calls"] == [] and harness["lookups"] == []
+
+
+def test_the_raw_asgi_helper_admits_a_real_token(harness):
+    """Control for the test above: the same helper with a real token goes upstream with it."""
+    status, _, content = _raw_asgi_post(
+        harness["app"], "submit_payment", MONEY_PAYLOADS["submit_payment"],
+        [(b"x-checkout-token", CHECKOUT_TOKEN.encode())],
+    )
+    assert status == 200, content
+    assert [s["headers"].get("X-Checkout-Token") for s in harness["sent"]] == [CHECKOUT_TOKEN]
+
+
+def test_the_gate_reads_the_dispatchers_checkout_token_not_the_header():
+    """The gate decides on the value the handlers forward. A header the dispatcher normalised
+    away must not admit the request, whatever the header holds."""
+
+    class _Req:
+        headers = {"x-checkout-token": "ctok_fixture_value"}
+
+    assert asyncio.run(gw._money_operation_refusal_reason(_Req(), checkout_token=None)) == "no_credential"
+    assert asyncio.run(gw._money_operation_refusal_reason(_Req(), checkout_token="ctok_fixture_value")) is None
+
+
+@pytest.mark.parametrize("operation", sorted(gw.INVOKE_MONEY_OPERATIONS))
+def test_the_anonymous_rate_limit_runs_before_the_gate(harness, monkeypatch, operation):
+    """Over budget, an anonymous money call is 429 (the limiter), not 401 (the gate)."""
+    monkeypatch.setenv("SHOP_INVOKE_ANON_RPM", "1")
+    first = _post(harness, operation, MONEY_PAYLOADS[operation])
+    assert first.status_code == 401, first.text
+    second = _post(harness, operation, MONEY_PAYLOADS[operation])
+    assert second.status_code == 429, second.text
+    assert second.headers.get("retry-after") == "60"
+    assert harness["sent"] == [] and harness["lookups"] == []
 
 
 # ── admitted callers proceed exactly as today ─────────────────────────────────
@@ -384,9 +511,7 @@ def test_the_gate_never_looks_at_a_non_money_operation(harness, operation):
     class _Req:
         headers: Dict[str, str] = {}
 
-    import asyncio
-
-    assert asyncio.run(gw._require_credential_for_money_operation(operation, _Req())) is None
+    assert asyncio.run(gw._require_credential_for_money_operation(operation, _Req(), checkout_token=None)) is None
     assert harness["lookups"] == []
 
 
@@ -399,7 +524,31 @@ def test_operation_names_match_exactly_like_the_dispatcher():
 
 # ── classification guard ──────────────────────────────────────────────────────
 
-_MONEY_ROUTE_RE = re.compile(r"/agent/v\d+/(orders|payments|refunds|after-sales)")
+_MONEY_ROUTE_RE = re.compile(
+    r"/agent/v\d+/(orders|payments|refunds|after-sales|quotes|checkout-intents|checkout)\b"
+)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/agent/v1/orders/create",
+        "/agent/v2/payments/checkout-sessions",
+        "/agent/v2/orders/ORD_1/refunds",
+        "/agent/v1/after-sales/cases",
+        "/agent/v1/quotes/preview",
+        "/agent/v2/quotes/preview",
+        "/agent/v1/checkout-intents",
+        "/agent/v1/checkout/acp-session",
+    ],
+)
+def test_the_route_scan_recognises_every_order_payment_quote_and_checkout_path(path):
+    assert _MONEY_ROUTE_RE.search(path)
+
+
+@pytest.mark.parametrize("path", ["/agent/v2/products/search", "/agent/v1/merchants", "/agent/shop/v1/invoke"])
+def test_the_route_scan_ignores_read_paths(path):
+    assert not _MONEY_ROUTE_RE.search(path)
 _MONEY_HANDLERS = {
     "_handle_create_order",
     "_handle_create_payment_link",
@@ -509,6 +658,10 @@ def test_a_money_handler_is_only_dispatched_from_a_money_operation():
 def test_the_gate_runs_before_the_first_operation_branch():
     """Source-order guard: the credential check is awaited before any `if operation ...` branch."""
     src = textwrap.dedent(inspect.getsource(gw.invoke_shop_operation))
-    gate_at = src.index("await _require_credential_for_money_operation(operation, http_request)")
+    gate_at = src.index(
+        "await _require_credential_for_money_operation(operation, http_request, checkout_token=checkout_token)"
+    )
+    # ...and after the dispatcher has normalised the token it is given.
+    assert src.index("checkout_token = (http_request.headers.get(\"x-checkout-token\")") < gate_at
     first_branch = min(m.start() for m in re.finditer(r"\n    if operation (==|in) ", src))
     assert gate_at < first_branch

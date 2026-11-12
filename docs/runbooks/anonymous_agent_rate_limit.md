@@ -309,8 +309,11 @@ Anything else answers `401` with `detail.error = CREDENTIAL_REQUIRED_FOR_MONEY_O
 before the payload is parsed, with no upstream call and no database write; the log line
 `[shop_invoke] money operation refused` names the operation and a reason
 (`no_credential`, `malformed_key`, `unknown_or_inactive_key`), never a header value.
-A transient key-lookup failure answers `503` (fail closed). Every other operation is
-unchanged, credential or not.
+Any key-lookup failure (transient or not) answers `503` (fail closed) and logs
+`[shop_invoke] money operation key lookup failed`. A checkout token is the dispatcher's
+stripped value, so a whitespace-only `X-Checkout-Token` counts as none. The per-IP
+anonymous limiter runs first, so an over-budget anonymous call is `429`, not `401`.
+Every other operation is unchanged, credential or not.
 
 Rollback only — `SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL`, read per call, default ON.
 Only `0`, `false`, `off` or `no` switches the check off:
