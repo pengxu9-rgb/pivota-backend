@@ -171,7 +171,7 @@ async def _seed(database, *, variants, offers, suppressed=None, pk=PK):
              "m": o.get("merchant_id", "m_seller"), "cur": o.get("currency", "USD"),
              "mkt": o.get("market", "US"), "ot": o.get("offer_type"),
              "ifp": o.get("is_first_party", False), "wbd": o.get("why_buy_direct"),
-             "pl": json.dumps({"destination_url": o.get("dest", DEST)}),
+             "pl": json.dumps({"destination_url": o.get("dest", DEST), **(o.get("payload_extra") or {})}),
              "sup": o.get("suppressed_at")},
         )
 
@@ -651,3 +651,66 @@ async def test_a_product_suppressed_by_reason_alone_is_skipped(db):
     await _seed(db, variants=[_variant()], offers=[{}])
     await db.execute("UPDATE catalog_products SET suppression_reason='withdrawn'")
     assert (await _run())["skus"] == 0
+
+
+# ── the attached lane's stock marker (be#2806 follow-up, P3-C) ─────────────────────────────────────────────
+
+_LANE_MARK = {"availability_read": {"source": "refresh", "value": "in_stock", "previous": "unknown",
+                                    "at": "2026-11-12T01:00:00+00:00"}}
+
+
+async def _backfill_offer(db):
+    return dict(await db.fetch_one("SELECT availability, offer_payload FROM catalog_offers WHERE source_system=:s",
+                                   {"s": "variant_identity_backfill_v1"}))
+
+
+async def test_a_variant_row_that_inherits_a_marked_stock_is_marked_too(db):
+    """The attached lane marks the stock it writes so a rollback can restore it. A variant row this backfill
+    inserts with that stock inherited must carry a marker, or the rollback leaves it in_stock."""
+    await _seed(db, variants=[_variant()], offers=[{"payload_extra": _LANE_MARK}])
+    await _run()
+    offer = await _backfill_offer(db)
+    marker = json.loads(offer["offer_payload"])["availability_read"]
+    assert offer["availability"] == "in_stock"
+    assert {k: marker[k] for k in ("source", "from_offer_id", "value", "previous")} == {
+        "source": "variant_backfill", "from_offer_id": "offer:pg:0", "value": "in_stock", "previous": "unknown"}
+    assert marker["at"]
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+    await db.execute(AVAILABILITY_ROLLBACK_SQL)
+    after = await _backfill_offer(db)
+    assert after["availability"] == "unknown" and "availability_read" not in json.loads(after["offer_payload"])
+
+
+@pytest.mark.parametrize("variant_kw, payload_extra", [
+    ({"availability": "in_stock"}, _LANE_MARK),      # the variant states its own stock: nothing inherited
+    ({}, {}),                                        # the chosen row's stock is not the lane's
+    ({}, {"availability_read": {"source": "refresh", "value": "out_of_stock", "previous": "unknown"}}),
+])
+async def test_a_variant_row_whose_stock_is_not_the_lanes_is_not_marked(db, variant_kw, payload_extra):
+    # (the third case: the chosen row's stock moved since the lane wrote out_of_stock: not the lane's any more)
+    await _seed(db, variants=[_variant(**variant_kw)], offers=[{"payload_extra": payload_extra}])
+    await _run()
+    assert "availability_read" not in json.loads((await _backfill_offer(db))["offer_payload"])
+
+
+async def test_the_update_path_never_marks_an_existing_variant_row(db):
+    """The update path never takes an inherited stock (availability is replaced only when the variant spoke),
+    so it must never merge an inherited-stock marker either. Driven through the script's own upsert: a re-run
+    may pick its earlier variant row as the chosen offer, so the run alone does not reach this case."""
+    import scripts.backfill_variant_identity_skus as backfill
+
+    await _seed(db, variants=[_variant()], offers=[{}])
+    await _run()
+    row = dict(await db.fetch_one("SELECT * FROM catalog_offers WHERE source_system=:s",
+                                  {"s": "variant_identity_backfill_v1"}))
+    assert "availability_read" not in json.loads(row["offer_payload"])
+    keys = ("offer_id", "sku_key", "product_key", "merchant_id", "catalog_track", "truth_tier", "readiness_tier",
+            "offer_mode", "channel", "currency", "list_price", "merchant_effective_price", "estimated_best_price",
+            "source_system", "source_domain", "market", "source_ref", "offer_type", "is_first_party", "why_buy_direct")
+    params = {k: row[k] for k in keys}
+    params.update(availability="in_stock", variant_spoke=False, offer_payload=json.dumps(
+        {"destination_url": DEST, **backfill._inherited_stock_marker(
+            {}, {"offer_id": "offer:pg:0", "availability": "in_stock", "availability_read": _LANE_MARK["availability_read"]})}))
+    assert "availability_read" in json.loads(params["offer_payload"]), "premise: the upsert is offered a marker"
+    await db.execute(backfill.UPSERT_OFFER_SQL, params)
+    assert "availability_read" not in json.loads((await _backfill_offer(db))["offer_payload"])

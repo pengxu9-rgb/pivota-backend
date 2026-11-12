@@ -253,3 +253,68 @@ async def test_a_payload_that_cannot_hold_the_marker_takes_no_stock(scoped_db, m
     payload, availability = (await _payloads(scoped_db))["of_canon"]
     assert payload == "legacy" and availability == "unknown"
     assert "availability_written" not in result and result.get("availability_skipped") == 1
+
+
+# ── be#2806 follow-up (P3-A, P3-B, P3-D) ─────────────────────────────────────────────────────────────────────
+
+async def test_a_null_payload_takes_the_stock_and_the_marker(scoped_db, monkeypatch):
+    await _load(scoped_db)
+    await scoped_db.execute("UPDATE catalog_offers SET offer_payload = NULL WHERE offer_id = 'of_canon'")
+    result = await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    payload, availability = (await _payloads(scoped_db))["of_canon"]
+    assert availability == "in_stock" and payload["availability_read"]["previous"] == "unknown"
+    assert result["availability_written"] == {"in_stock": 1}
+
+
+async def test_the_marker_is_dated_with_the_write_itself(scoped_db, monkeypatch):
+    await _load(scoped_db)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    same = await scoped_db.fetch_val(
+        "SELECT (offer_payload -> 'availability_read' ->> 'at')::timestamptz = updated_at "
+        "FROM catalog_offers WHERE offer_id = 'of_canon'")
+    assert same is True
+
+
+async def test_every_product_level_row_of_the_listing_takes_the_stock_and_is_counted(scoped_db, monkeypatch):
+    """Two rows of this listing on the product-level sku (the served-URL shape and the seed-id shape)."""
+    await _load(scoped_db)
+    await scoped_db.execute(
+        "INSERT INTO catalog_offers (offer_id, sku_key, product_key, merchant_id, catalog_track, truth_tier,"
+        " readiness_tier, offer_mode, channel, availability, currency, list_price, merchant_effective_price,"
+        " estimated_best_price, source_system, source_ref, offer_payload, updated_at)"
+        " VALUES ('of_canon_seed', :sk, :pk, :m, 'external_referral', 'observed', 'referral_only',"
+        " 'external_referral', 'default', 'unknown', 'USD', 29.0, 29.0, 29.0, 'catalog_enrichment_agent_v1',"
+        " :sid, CAST(:pl AS jsonb), TIMESTAMP '2026-09-12 01:37:40')",
+        {"sk": f"{PK}::canonical", "pk": PK, "m": SELLER, "sid": SEED_ID,
+         "pl": json.dumps({"external_seed_id": SEED_ID})})
+    result = await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    stock = await _stock(scoped_db)
+    assert stock["of_canon"][0] == stock["of_canon_seed"][0] == "in_stock"
+    assert result["availability_written"] == {"in_stock": 2}
+
+
+async def test_previous_resets_when_another_writer_changed_the_stock_since(scoped_db, monkeypatch):
+    """P3-A: unknown -> lane in_stock -> another writer out_of_stock (marker left) -> lane in_stock. The stock
+    to restore is now out_of_stock (the other writer's), not the long-gone unknown."""
+    await _load(scoped_db)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    await scoped_db.execute("UPDATE catalog_offers SET availability = 'out_of_stock' WHERE offer_id = 'of_canon'")
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    payload, availability = (await _payloads(scoped_db))["of_canon"]
+    assert availability == "in_stock" and payload["availability_read"]["previous"] == "out_of_stock"
+
+
+async def test_the_rollback_restores_only_rows_whose_stock_is_still_the_lanes(scoped_db, monkeypatch):
+    from services.external_offer_dual_write import AVAILABILITY_ROLLBACK_SQL
+
+    await _load(scoped_db)
+    await _sync(monkeypatch, scoped_db, flag=True, stated="in_stock", price_check_present=True)
+    await scoped_db.execute(
+        "UPDATE catalog_offers SET offer_payload = offer_payload || CAST(:m AS jsonb) WHERE offer_id = 'of_v2'",
+        {"m": json.dumps({"availability_read": {"source": "refresh", "value": "in_stock", "previous": "unknown"}})})
+    # of_v2: marked in_stock but another writer has it out_of_stock since: the rollback leaves it.
+    await scoped_db.execute(AVAILABILITY_ROLLBACK_SQL)
+    p = await _payloads(scoped_db)
+    assert p["of_canon"][1] == "unknown" and "availability_read" not in p["of_canon"][0]
+    assert p["of_canon"][0]["price_read_source"] == "refresh", "the rollback touches the stock marker only"
+    assert p["of_v2"][1] == "out_of_stock" and "availability_read" in p["of_v2"][0]
