@@ -3,324 +3,356 @@
  "version": 1,
  "findings": [
   {
-   "fingerprint": "c0ac3a1956b07934",
+   "fingerprint": "715d402a033b7808",
    "file": "adapters/cafe24_adapter.py",
    "scope": "Cafe24ProductAdapter.convert_product",
    "kind": "a",
    "shape": "or",
    "literal": "'KRW'",
-   "expr": "raw.get(\"currency\")or currency or \"KRW\"",
-   "occurrence": 0
+   "expr": "raw.get('currency') or currency or 'KRW'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d7c3c6d7a55e1e75",
+   "fingerprint": "09778784c8f9b3ff",
    "file": "adapters/cafe24_adapter.py",
    "scope": "Cafe24ProductAdapter.convert_product",
    "kind": "a",
    "shape": "param",
    "literal": "'KRW'",
-   "expr": "currency=\"KRW\"",
-   "occurrence": 0
+   "expr": "currency='KRW'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "542fec1b1fce486e",
+   "fingerprint": "d41691a74a1afd3c",
    "file": "adapters/cafe24_adapter.py",
    "scope": "Cafe24ProductAdapter.fetch_products",
    "kind": "a",
    "shape": "param",
    "literal": "'KRW'",
-   "expr": "currency=\"KRW\"",
-   "occurrence": 0
+   "expr": "currency='KRW'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "968d6177aeecb874",
+   "fingerprint": "0329ac43c20f2149",
    "file": "adapters/magento_adapter.py",
    "scope": "MagentoProductAdapter.convert_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "06cfd1f801aef3bf",
+   "fingerprint": "859d74cd4c5294cc",
    "file": "adapters/magento_adapter.py",
    "scope": "MagentoProductAdapter.convert_product",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5ddf7c1929d8d50c",
+   "fingerprint": "6f0be2e34cf71928",
    "file": "adapters/magento_adapter.py",
    "scope": "MagentoProductAdapter.fetch_products",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "033b1c28c85a60e2",
+   "fingerprint": "0eca176fbfed77ca",
    "file": "adapters/merchant_api_adapter.py",
    "scope": "MerchantAPIAdapter._normalize_to_standard",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "raw_product.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "raw_product.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "05e52ac09178e3fb",
+   "fingerprint": "b57c0a8426afd235",
    "file": "adapters/paypal_adapter.py",
    "scope": "PayPalAdapter.capture_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or auth_amount.get(\"currency_code\")or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or auth_amount.get('currency_code') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "72c8ed9643edbdef",
+   "fingerprint": "7ecfcadc59e50866",
    "file": "adapters/paypal_adapter.py",
    "scope": "PayPalAdapter.create_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or order[\"purchase_units\"][0][\"amount\"].get(\"currency_code\")or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or order['purchase_units'][0]['amount'].get('currency_code') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4fdb1fe81b02cf6a",
+   "fingerprint": "602500186be045cd",
    "file": "adapters/product_adapters.py",
    "scope": "ShopifyProductAdapter.convert_to_standard",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f10a3cfde49f15be",
+   "fingerprint": "64197f1fd45f9eae",
    "file": "adapters/product_adapters.py",
    "scope": "ShopifyProductAdapter.convert_to_standard",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5dfb42567f88a580",
+   "fingerprint": "8f6d1f4d20ba9966",
    "file": "adapters/product_adapters.py",
    "scope": "ShopifyProductAdapter.fetch_product_by_id",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "shop_currency or \"USD\"",
-   "occurrence": 0
+   "expr": "shop_currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "76e60d167d30e41f",
+   "fingerprint": "bf7e8dcbb0ebe077",
    "file": "adapters/product_adapters.py",
    "scope": "ShopifyProductAdapter.fetch_products",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "shop_currency or \"USD\"",
-   "occurrence": 0
+   "expr": "shop_currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ce940f5baba3cac2",
+   "fingerprint": "f8c367b0bd5bb022",
    "file": "adapters/product_adapters.py",
    "scope": "WixProductAdapter._convert_product",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "price_data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "price_data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ed26cf1a9374a00b",
+   "fingerprint": "5aa336a358ee58b6",
    "file": "adapters/product_adapters.py",
    "scope": "fetch_merchant_products",
    "kind": "a",
    "shape": "get",
    "literal": "'KRW'",
-   "expr": "credentials.get(\"currency\",\"KRW\")",
-   "occurrence": 0
+   "expr": "credentials.get('currency', 'KRW')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e7148a5219b0becb",
+   "fingerprint": "693b87bf43cd0b1b",
    "file": "adapters/product_adapters.py",
    "scope": "fetch_merchant_products",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "credentials.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "credentials.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "42345eec92d0b8cd",
+   "fingerprint": "c31554dcf780a87a",
    "file": "adapters/product_adapters.py",
    "scope": "fetch_merchant_products",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "credentials.get(\"currency\",\"USD\")",
-   "occurrence": 1
+   "expr": "credentials.get('currency', 'USD')",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cab186c7322ff4e0",
+   "fingerprint": "d3446cadf8b59176",
    "file": "adapters/product_adapters.py",
    "scope": "fetch_merchant_products",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "credentials.get(\"currency\",\"USD\")",
-   "occurrence": 2
+   "expr": "credentials.get('currency', 'USD')",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7b57905ef3feb361",
+   "fingerprint": "27eb9bfffedb214b",
    "file": "adapters/product_adapters.py",
    "scope": "fetch_merchant_products",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "credentials.get(\"currency\",\"USD\")",
-   "occurrence": 3
+   "expr": "credentials.get('currency', 'USD')",
+   "occurrence": 3,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e6e7741ad5ac40f0",
+   "fingerprint": "85f7b606fb0d7892",
    "file": "adapters/psp_adapter.py",
    "scope": "AdyenAdapter.refund_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7efd2f59dd78d8c5",
+   "fingerprint": "f72374ad73e07448",
    "file": "adapters/sfcc_adapter.py",
    "scope": "SalesforceCommerceCloudProductAdapter.convert_product",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "fallback_currency=\"USD\"",
-   "occurrence": 0
+   "expr": "fallback_currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d25d4edd26e851d5",
+   "fingerprint": "cafdaa434bfd6da3",
    "file": "adapters/sfcc_adapter.py",
    "scope": "SalesforceCommerceCloudProductAdapter.fetch_products",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a89bd3c64a04a3c3",
+   "fingerprint": "7680a64214fa28d8",
    "file": "adapters/sfcc_adapter.py",
    "scope": "SalesforceCommerceCloudProductAdapter.fetch_products",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b0a2b94b1ab8c2c4",
+   "fingerprint": "d009fb13050e459f",
    "file": "adapters/shoplazza_adapter.py",
    "scope": "ShoplazzaProductAdapter.convert_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "caefccbd08a2fc9a",
+   "fingerprint": "f9fac30c186b8768",
    "file": "adapters/shoplazza_adapter.py",
    "scope": "ShoplazzaProductAdapter.convert_product",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2c40f1475d750344",
+   "fingerprint": "3f447d9b4c2d33f6",
    "file": "adapters/shoplazza_adapter.py",
    "scope": "ShoplazzaProductAdapter.fetch_products",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c6e5d746c05df9aa",
+   "fingerprint": "a79014ce70ebf8c7",
    "file": "adapters/shopline_adapter.py",
    "scope": "ShoplineProductAdapter.convert_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "141f7100cf4c910c",
+   "fingerprint": "e2bb217ede4a0e34",
    "file": "adapters/shopline_adapter.py",
    "scope": "ShoplineProductAdapter.convert_product",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f056a03b478c0b01",
+   "fingerprint": "9d8d44104fe50e44",
    "file": "adapters/shopline_adapter.py",
    "scope": "ShoplineProductAdapter.fetch_products",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5cead1c4d678f67e",
+   "fingerprint": "e5edd6b6e1458365",
    "file": "adapters/wix_adapter.py",
    "scope": "_build_wix_address",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "_clean_str(shipping_address.get(\"country\")).upper()or \"US\"",
-   "occurrence": 0
+   "expr": "_clean_str(shipping_address.get('country')).upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c106708306cd3d3e",
+   "fingerprint": "508b5718786c559e",
    "file": "adapters/wix_adapter.py",
    "scope": "_normalize_subdivision",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "_clean_str(country).upper()or \"US\"",
-   "occurrence": 0
+   "expr": "_clean_str(country).upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5973b467897063f3",
+   "fingerprint": "7ceac9e1f1ddf696",
    "file": "adapters/wix_adapter.py",
    "scope": "build_wix_order_payload",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "_clean_str(order.get(\"currency\")).upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "_clean_str(order.get('currency')).upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "cb9bd5173d99c169",
@@ -330,37 +362,41 @@
    "shape": "param",
    "literal": "'USD'",
    "expr": "currency='USD'",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d2116f50c8488e9e",
+   "fingerprint": "488595b19b5454a7",
    "file": "db/beneficiary_repo.py",
    "scope": "BeneficiaryRepo.upsert_default",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "fc97f7ffb6526033",
+   "fingerprint": "31230773dba45a40",
    "file": "db/catalog.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Column(\"market\",String(8),nullable=False,server_default=\"US\")",
-   "occurrence": 0
+   "expr": "Column('market', String(8), nullable=False, server_default='US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a02a8f5f4cae27ca",
+   "fingerprint": "c9175e749ee8d933",
    "file": "db/orders.py",
    "scope": "<module>",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Column(\"currency\",String(3),default=\"USD\")",
-   "occurrence": 0
+   "expr": "Column('currency', String(3), default='USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "7d408fc71fc490b8",
@@ -370,37 +406,41 @@
    "shape": "sql",
    "literal": "'USD'",
    "expr": "COALESCE(:ccy,'USD')",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f722cd4d3590c39b",
+   "fingerprint": "0587c60de0c96d8f",
    "file": "db/pdp_governance.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Column(\"market\",String(16),nullable=False,default=\"US\")",
-   "occurrence": 0
+   "expr": "Column('market', String(16), nullable=False, default='US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "112d89ef26a52e8a",
+   "fingerprint": "a1364298ac593b66",
    "file": "db/products.py",
    "scope": "<module>",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Column(\"currency\",String(10),default=\"USD\")",
-   "occurrence": 0
+   "expr": "Column('currency', String(10), default='USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d33c4ad9462bc6b0",
+   "fingerprint": "bdcd3a3c39bb14f4",
    "file": "db/products.py",
    "scope": "_resolve_order_event_currency",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "_event_currency_from_metadata(metadata)or \"USD\"",
-   "occurrence": 0
+   "expr": "_event_currency_from_metadata(metadata) or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "8692cebd35034f06",
@@ -410,427 +450,470 @@
    "shape": "sql",
    "literal": "'US'",
    "expr": "market VARCHAR(8)DEFAULT 'US'",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d1dd0c75d1b9b0df",
+   "fingerprint": "d201b6c2874085e2",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_build_shopify_cache_payload",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b103cb83bade7346",
+   "fingerprint": "3d6d6cd829d034a3",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_ingest_orders_report_csv",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(row.get(\"currency\")or \"\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "(row.get('currency') or '').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "aa34ac22b207586c",
+   "fingerprint": "bf9a836f7130c992",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_map_report_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(row.get(\"currency\")or \"USD\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "(row.get('currency') or 'USD').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c9cbed8a0dbe49c5",
+   "fingerprint": "e84125e308d3872e",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_map_report_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(row.get(\"currency\")or \"USD\").strip()or \"USD\"",
-   "occurrence": 1
+   "expr": "(row.get('currency') or 'USD').strip() or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f2b24bc27c8f1566",
+   "fingerprint": "d0db8548edad009b",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_map_report_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "row.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "row.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "71fe9bf15ffee70d",
+   "fingerprint": "b38770204c74ae2b",
    "file": "jobs/catalog_import_worker.py",
    "scope": "_map_report_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "row.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "row.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "788197fb6ab7b8b4",
+   "fingerprint": "9b4c2ee7c830b79b",
    "file": "models/catalog.py",
    "scope": "OfferNode",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "28bba11eb1cb5c51",
+   "fingerprint": "d696d64c02f17a42",
    "file": "models/catalog.py",
    "scope": "PivotOffersResolveRequest",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3a4b263030d70bbe",
+   "fingerprint": "5e3ea6e374dfaa29",
    "file": "models/catalog.py",
    "scope": "PivotQueryRequest",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "86b4af7a8ac35c58",
+   "fingerprint": "410595d782617dbe",
    "file": "models/order.py",
    "scope": "CreateOrderRequest",
    "kind": "a",
    "shape": "field",
    "literal": "'USD'",
-   "expr": "currency: str = \"USD\"",
-   "occurrence": 0
+   "expr": "currency: str = 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7b547e361778d834",
+   "fingerprint": "821b1ac2a5bb2ce7",
    "file": "models/schemas.py",
    "scope": "AgentPayRequest",
    "kind": "a",
    "shape": "field",
    "literal": "'EUR'",
-   "expr": "currency: str = \"EUR\"",
-   "occurrence": 0
+   "expr": "currency: str = 'EUR'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "62f92c0cfe5ab6b8",
+   "fingerprint": "92ad62047de40d30",
    "file": "models/standard_product.py",
    "scope": "StandardProduct",
    "kind": "a",
    "shape": "field",
    "literal": "'USD'",
-   "expr": "currency: str = \"USD\"",
-   "occurrence": 0
+   "expr": "currency: str = 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f1bdd13ab00bd150",
+   "fingerprint": "4688e1966968bc32",
    "file": "mvp/offer.py",
    "scope": "_as_geo",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "(addr.get(\"country\")or \"US\").strip().upper()[:2]or \"US\"",
-   "occurrence": 0
+   "expr": "(addr.get('country') or 'US').strip().upper()[:2] or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f15ea73ae9987081",
+   "fingerprint": "c2349267944bb3e4",
    "file": "mvp/offer.py",
    "scope": "_as_geo",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "addr.get(\"country\")or \"US\"",
-   "occurrence": 0
+   "expr": "addr.get('country') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "58eba2505b5598e3",
+   "fingerprint": "51e4cba5f74dcb92",
    "file": "readiness/channel_exports/acp.py",
    "scope": "build_acp_export",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "variant.price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "variant.price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "fb27d95d3f04d17f",
+   "fingerprint": "87f809ac30e07b9f",
    "file": "readiness/channel_exports/ucp.py",
    "scope": "build_ucp_export",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "variant.price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "variant.price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b5cce19024a0f985",
+   "fingerprint": "18039a93f0303701",
    "file": "readiness/service.py",
    "scope": "_create_local_order_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "((payload.get(\"price\")or{}).get(\"currency\"))or \"USD\"",
-   "occurrence": 0
+   "expr": "(payload.get('price') or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ccf4fce26a8c1969",
+   "fingerprint": "3a7fa3b24265523b",
    "file": "readiness/service.py",
    "scope": "attach_payment_reference_to_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "((payload.get(\"price\")or{}).get(\"currency\"))or(refreshed_order or{}).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(payload.get('price') or {}).get('currency') or (refreshed_order or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8ab09ff77310e947",
+   "fingerprint": "b9d8ca414fd3407e",
    "file": "readiness/service.py",
    "scope": "attach_payment_reference_to_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_row.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order_row.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d42e086ffff4cccd",
+   "fingerprint": "d73b72c96bc89b62",
    "file": "readiness/service.py",
    "scope": "build_export_summary_response",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "variant.price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "variant.price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a1f111910f2fe385",
+   "fingerprint": "0e7b508bbb80a80e",
    "file": "readiness/service.py",
    "scope": "create_payment_intent_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_row.get(\"currency\")or((payload.get(\"price\")or{}).get(\"currency\"))or \"USD\"",
-   "occurrence": 0
+   "expr": "order_row.get('currency') or (payload.get('price') or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3908dc4c16281ab8",
+   "fingerprint": "97e4b9be9ce6c221",
    "file": "readiness/service.py",
    "scope": "create_refund_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(refreshed_order or order_row).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(refreshed_order or order_row).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "071dc6e7522a7a31",
+   "fingerprint": "17c3a0fc851eeb25",
    "file": "readiness/service.py",
    "scope": "create_refund_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(refreshed_order or order_row).get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "(refreshed_order or order_row).get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e49f5c43aece608d",
+   "fingerprint": "f3b03a4a0dd54bf1",
    "file": "readiness/service.py",
    "scope": "create_refund_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(refreshed_order or{}).get(\"currency\")or((payload.get(\"price\")or{}).get(\"currency\"))or \"USD\"",
-   "occurrence": 0
+   "expr": "(refreshed_order or {}).get('currency') or (payload.get('price') or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "0a9a30a507bc9416",
+   "fingerprint": "18c801cb778c9e37",
    "file": "readiness/service.py",
    "scope": "create_refund_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_row.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order_row.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9bd0c635a8bb2e2b",
+   "fingerprint": "22304782c991bf58",
    "file": "readiness/service.py",
    "scope": "sync_payment_status_for_checkout",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_row.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order_row.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4a806b5d5d18763c",
+   "fingerprint": "e8f415e73de82ec8",
    "file": "readiness/summary.py",
    "scope": "_snapshot_product_to_current_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "first_variant.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "first_variant.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8d9bac2a5a3beee3",
+   "fingerprint": "2a79c75f4f6c81a6",
    "file": "readiness/summary.py",
    "scope": "_snapshot_product_to_current_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str((variant.price or{}).get(\"currency\")or \"\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "str((variant.price or {}).get('currency') or '').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bd453551cad55266",
+   "fingerprint": "5a22814feda92b14",
    "file": "routes/accounts_orders_api.py",
    "scope": "_extract_pricing_quote_payload",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3692ad09c29fbb9f",
+   "fingerprint": "f1dff6e626f3ad4b",
    "file": "routes/accounts_orders_api.py",
    "scope": "_history_row_to_item",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "row.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "row.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4d4202d10d36678d",
+   "fingerprint": "56fff5692744c8f3",
    "file": "routes/accounts_orders_api.py",
    "scope": "_history_row_to_item",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(row.get(\"currency\")or \"USD\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(row.get('currency') or 'USD').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cc29e81eebede4a8",
+   "fingerprint": "0b400252825968a4",
    "file": "routes/accounts_orders_api.py",
    "scope": "create_browse_history_event",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "body.currency or(dict(existing).get(\"currency\")if existing else None)or(resolved_price.currency if resolved_price else None)or \"USD\"",
-   "occurrence": 0
+   "expr": "body.currency or (dict(existing).get('currency') if existing else None) or (resolved_price.currency if resolved_price else None) or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "28b7970ec948b7be",
+   "fingerprint": "3e62387207e4babc",
    "file": "routes/accounts_orders_api.py",
    "scope": "get_order_detail",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "af59eec6129097e9",
+   "fingerprint": "010d964f3bc2dc9b",
    "file": "routes/accounts_orders_api.py",
    "scope": "get_order_detail",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 1
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4db8c7dffcd3622e",
+   "fingerprint": "6a2098cb1e42d01b",
    "file": "routes/accounts_orders_api.py",
    "scope": "list_orders",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6ee2bd3c68af67ea",
+   "fingerprint": "7b8f9fcc85ea3ef1",
    "file": "routes/accounts_orders_api.py",
    "scope": "public_order_lookup",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "40ac271f0606e577",
+   "fingerprint": "97e66d0b69a4e89a",
    "file": "routes/accounts_orders_api.py",
    "scope": "public_order_resume",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "11b1f6aa4d976d52",
+   "fingerprint": "68e3445bf3f94342",
    "file": "routes/accounts_orders_api.py",
    "scope": "public_order_resume",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\",\"USD\")",
-   "occurrence": 1
+   "expr": "order_data.get('currency', 'USD')",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f1835fccd6038e18",
+   "fingerprint": "4496c717e9b05149",
    "file": "routes/accounts_orders_api.py",
    "scope": "request_order_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_data.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order_data.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3ed7b730dedcf27b",
+   "fingerprint": "f89cb2e5c5a448c6",
    "file": "routes/accounts_orders_api.py",
    "scope": "request_order_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(order_data.get(\"currency\")or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(order_data.get('currency') or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6f06697103d4f7d8",
+   "fingerprint": "d4c45ad0e9308923",
    "file": "routes/agent_api.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "DEFAULT_EXTERNAL_SEED_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "DEFAULT_EXTERNAL_SEED_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2fae3796a27a8270",
+   "fingerprint": "e4e0c5e727db6522",
    "file": "routes/agent_api.py",
    "scope": "_build_agent_order_create_response_from_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "cd1306133fa0f010",
@@ -840,67 +923,74 @@
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
    "expr": "market or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e96d77f31154206f",
+   "fingerprint": "2378185d54b0513b",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_cache_key",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e5da71dfca9a46e8",
+   "fingerprint": "23988c228d440313",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "primary_price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "primary_price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bc5b4bb9df142126",
+   "fingerprint": "0dcb212fe01b5a94",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "raw_currency or \"USD\"",
-   "occurrence": 0
+   "expr": "raw_currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "153a30cbb629cb2f",
+   "fingerprint": "058a5f5ec5b015ed",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(raw_currency or \"USD\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(raw_currency or 'USD').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e85680b528ba6875",
+   "fingerprint": "d1f23663ef443d8c",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_product",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7e70d5b62f566111",
+   "fingerprint": "12879da437fb4df8",
    "file": "routes/agent_api.py",
    "scope": "_build_external_seed_product",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "c05bdb157423ab8c",
@@ -910,17 +1000,19 @@
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
    "expr": "market or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d8b211b97884ce69",
+   "fingerprint": "980654ad44e697bb",
    "file": "routes/agent_api.py",
    "scope": "_load_external_seed_products_for_search",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "2ede860d9a7c104b",
@@ -930,137 +1022,151 @@
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
    "expr": "market or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "42831a330ada7ba5",
+   "fingerprint": "721ec3e550b1d951",
    "file": "routes/agent_api.py",
    "scope": "_load_external_seed_products_with_cache",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(market or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3d14bb9f7e300ed1",
+   "fingerprint": "eb1b3621c4d75f1f",
    "file": "routes/agent_api.py",
    "scope": "_normalize_order_event_feed_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "event_currency or \"USD\"",
-   "occurrence": 0
+   "expr": "event_currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "016ed3db651f23ee",
+   "fingerprint": "0e8885685b5e3ea5",
    "file": "routes/agent_api.py",
    "scope": "agent_confirm_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8aa752198e2dcc89",
+   "fingerprint": "707221e31a376873",
    "file": "routes/agent_api.py",
    "scope": "agent_confirm_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c3166d4fa1586a8f",
+   "fingerprint": "5f433a630100ebf7",
    "file": "routes/agent_api.py",
    "scope": "agent_create_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_response.currency or order_request.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "order_response.currency or order_request.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "21d8b353e2106998",
+   "fingerprint": "a745b4ee2200a396",
    "file": "routes/agent_api.py",
    "scope": "agent_create_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snap.get(\"currency\")or order_request.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "snap.get('currency') or order_request.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8c01b3bcbd7e578f",
+   "fingerprint": "28de3b92c826539f",
    "file": "routes/agent_api.py",
    "scope": "agent_create_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snap.get(\"currency\")or order_request.currency or \"USD\"",
-   "occurrence": 1
+   "expr": "snap.get('currency') or order_request.currency or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e86fe8b3cd1afc86",
+   "fingerprint": "097c21b1a8e71aaf",
    "file": "routes/agent_api.py",
    "scope": "agent_refund_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a36e6aa0b1242be5",
+   "fingerprint": "ba3525f83c3a50bc",
    "file": "routes/agent_api.py",
    "scope": "agent_validate_cart",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "shipping_country=\"US\"",
-   "occurrence": 0
+   "expr": "shipping_country='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4f2dc7405a14a337",
+   "fingerprint": "73a69802a2fdcddd",
    "file": "routes/agent_bank.py",
    "scope": "BankDetailsRequest",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Field(\"USD\",description=\"Currency code(ISO 4217)\")",
-   "occurrence": 0
+   "expr": "Field('USD', description='Currency code (ISO 4217)')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "59268c0a458ed294",
+   "fingerprint": "112eb216371cda10",
    "file": "routes/agent_center_bd_routes.py",
    "scope": "BdColdStartAuditRequest",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Field(\"US\",min_length=2,max_length=10)",
-   "occurrence": 0
+   "expr": "Field('US', min_length=2, max_length=10)",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3ba872e764014b8d",
+   "fingerprint": "64f3631d3c038bd7",
    "file": "routes/agent_commerce.py",
    "scope": "CreateCommerceCheckoutRequest",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Field(default=\"USD\",min_length=3,max_length=8)",
-   "occurrence": 0
+   "expr": "Field(default='USD', min_length=3, max_length=8)",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "476f8d66df3617a0",
+   "fingerprint": "075fb40c65116934",
    "file": "routes/agent_commerce.py",
    "scope": "_resolve_checkout_item",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "c8be3bbe966093a9",
@@ -1070,557 +1176,613 @@
    "shape": "map",
    "literal": "market->currency AU=AUD,CA=CAD,GB=GBP,HK=HKD,JP=JPY,NZ=NZD,SG=SGD,US=USD",
    "expr": "market->currency AU=AUD,CA=CAD,GB=GBP,HK=HKD,JP=JPY,NZ=NZD,SG=SGD,US=USD",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bef2cbe474d35401",
+   "fingerprint": "d52fc163c1f31cfb",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f042543290fa8455",
+   "fingerprint": "664de2bff889661b",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\",\"USD\")",
-   "occurrence": 1
+   "expr": "order.get('currency', 'USD')",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d14770a51644c649",
+   "fingerprint": "a021953a39a93e19",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\",\"USD\")",
-   "occurrence": 2
+   "expr": "order.get('currency', 'USD')",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "eb7beb64d32fbe9c",
+   "fingerprint": "1fa6b013a8f2cbaf",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "05e72946bbda36ec",
+   "fingerprint": "465cc95f21db0423",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4d5bbf21502aeb25",
+   "fingerprint": "c9fda0f46f440775",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 2
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "713bc4f38bcd9687",
+   "fingerprint": "be9cc54eb059e7cd",
    "file": "routes/agent_payment_sdk.py",
    "scope": "create_payment",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 3
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 3,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "945600b4a7b4b82c",
+   "fingerprint": "9ab590331cd60cc3",
    "file": "routes/agent_pdp_v1.py",
    "scope": "_serving_market",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SERVING_MARKET='US'",
-   "expr": "(os.getenv(\"AGENT_PDP_SERVING_MARKET\")or DEFAULT_SERVING_MARKET).strip()or DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "(os.getenv('AGENT_PDP_SERVING_MARKET') or DEFAULT_SERVING_MARKET).strip() or DEFAULT_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9f16cba4d91ddad8",
+   "fingerprint": "3dce0aa089c24746",
    "file": "routes/agent_pdp_v1.py",
    "scope": "_serving_market",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SERVING_MARKET='US'",
-   "expr": "os.getenv(\"AGENT_PDP_SERVING_MARKET\")or DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "os.getenv('AGENT_PDP_SERVING_MARKET') or DEFAULT_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "33009224ade5393c",
+   "fingerprint": "7889ba1822cb6ce7",
    "file": "routes/agent_products.py",
    "scope": "_extract_product_card",
    "kind": "a",
    "shape": "init",
    "literal": "'USD'",
-   "expr": "currency: str = \"USD\"",
-   "occurrence": 0
+   "expr": "currency: str = 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "88dbc453a27303da",
+   "fingerprint": "b4ef2a3629f002aa",
    "file": "routes/agent_products.py",
    "scope": "get_product_details",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(variants[0].get(\"currency\")if variants else None)or \"USD\"",
-   "occurrence": 0
+   "expr": "(variants[0].get('currency') if variants else None) or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b8726b6a3fa231b3",
+   "fingerprint": "61cc8ec4f915efd2",
    "file": "routes/agent_products.py",
    "scope": "get_product_details",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "prod.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "prod.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3d38210d79540ec0",
+   "fingerprint": "9841e167801d09c3",
    "file": "routes/agent_revenue_api.py",
    "scope": "RevenuePolicyRequest",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Field(default=\"USD\",description=\"Currency code\")",
-   "occurrence": 0
+   "expr": "Field(default='USD', description='Currency code')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2d67f081d060d286",
+   "fingerprint": "dfda0d8b402a8857",
    "file": "routes/agent_revenue_api.py",
    "scope": "get_agent_earnings",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Query(\"USD\",description=\"Currency filter\")",
-   "occurrence": 0
+   "expr": "Query('USD', description='Currency filter')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "547eeb66eabfa1e5",
+   "fingerprint": "b4e2408fc629b340",
    "file": "routes/agent_routing_api.py",
    "scope": "RoutingTestRequest",
    "kind": "a",
    "shape": "kwdefault",
    "literal": "'USD'",
-   "expr": "Field(default=\"USD\",description=\"Currency code\")",
-   "occurrence": 0
+   "expr": "Field(default='USD', description='Currency code')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8235fbca7d8ba9d7",
+   "fingerprint": "61ac4b8b89ed1466",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "DEFAULT_EXTERNAL_SEED_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "DEFAULT_EXTERNAL_SEED_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "dc44cbf844ba121b",
+   "fingerprint": "c8182441aebe488a",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "primary_price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "primary_price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cbf784ca2ade5529",
+   "fingerprint": "b8cfe7a6ba5920ae",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "raw_currency or \"USD\"",
-   "occurrence": 0
+   "expr": "raw_currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e5af50f6ab2acd01",
+   "fingerprint": "7d7d4279e717f620",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_build_external_seed_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(raw_currency or \"USD\").strip()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(raw_currency or 'USD').strip() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "af0fa8a0f27d10e7",
+   "fingerprint": "29ed06cbe8ce60fd",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_build_external_seed_product",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6d94ea7a0dc03db6",
+   "fingerprint": "1e1ff9f246e6c7ff",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_build_external_seed_product",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2cea20a7ce15629d",
+   "fingerprint": "4e72c449593d45bc",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_load_external_seed_products_for_search",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "0f80d2bfefd6ed8b",
+   "fingerprint": "bc7248ed2ffa5efe",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_load_external_seed_products_for_search",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e9b2bc1999f8d0fe",
+   "fingerprint": "8d0e26d377ecf380",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_load_external_seed_products_for_search._build_guarded",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a11bdf8065549c5b",
+   "fingerprint": "9d702fe78ff37268",
    "file": "routes/agent_sdk_fixed.py",
    "scope": "_load_external_seed_products_for_search._build_guarded",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_EXTERNAL_SEED_MARKET='US'",
-   "expr": "str(seed_row.get(\"market\")or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper()or DEFAULT_EXTERNAL_SEED_MARKET",
-   "occurrence": 0
+   "expr": "str(seed_row.get('market') or DEFAULT_EXTERNAL_SEED_MARKET).strip().upper() or DEFAULT_EXTERNAL_SEED_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6e2abe630b6a9a71",
+   "fingerprint": "69262285885e013a",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_attach_connected_product_redirects",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "58875f4322b63189",
+   "fingerprint": "f35794391ee82ad2",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_attach_connected_product_redirects",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(market or \"US\").strip().upper()or \"US\"",
-   "occurrence": 0
+   "expr": "str(market or 'US').strip().upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bdee63377a210e76",
+   "fingerprint": "679eb2941f2039a1",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_build_internal_offer_summary",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "variant_payload.get(\"currency\")or product_payload.get(\"currency\")or product_payload.get(\"currency_code\")or \"USD\"",
-   "occurrence": 0
+   "expr": "variant_payload.get('currency') or product_payload.get('currency') or product_payload.get('currency_code') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d62047b5a1337e68",
+   "fingerprint": "7577d74527361136",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_build_offer_keys",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d430cda35335b7e4",
+   "fingerprint": "255ce544000bdfed",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_build_prefetched_external_seed_wrappers",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "candidate.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "candidate.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "44e6541e2e323d2f",
+   "fingerprint": "56a5fbe3b14f58a2",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_build_prefetched_external_seed_wrappers",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(candidate.get(\"market\")or \"US\").strip()or \"US\"",
-   "occurrence": 0
+   "expr": "str(candidate.get('market') or 'US').strip() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c11bb64d7c424cc1",
+   "fingerprint": "ed52f3cae3fd0edb",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_build_shop_top_offer_summary",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "variant_payload.get(\"currency\")or product_payload.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "variant_payload.get('currency') or product_payload.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ca07581684334e29",
+   "fingerprint": "869576a85a4439b2",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_collect_internal_offer_keys",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "item.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "item.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "635d396a0b4f3fe7",
+   "fingerprint": "b3f3a600e7303f55",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_collect_internal_offer_keys",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "item.get(\"currency\")or item.get(\"price\",{}).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "item.get('currency') or item.get('price', {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b6c35a525cfe8053",
+   "fingerprint": "c6070845389d9532",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_filter_external_seed_wrappers",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "product.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "df4d4ae156e6e218",
+   "fingerprint": "6f4b669f0074b65a",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_handle_find_products_multi_inner",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product_data.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "product_data.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b06d6446137d1035",
+   "fingerprint": "218eac27ba4cb272",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_handle_find_products_multi_inner",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product_data.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "product_data.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d76275cb372ce262",
+   "fingerprint": "ae9c15787e90bef2",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_handle_find_products_multi_inner",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "row_dict.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "row_dict.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f28574f56aeb79d1",
+   "fingerprint": "4d1d93192352bf95",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_handle_offers_resolve",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market_hint or \"US\"",
-   "occurrence": 0
+   "expr": "market_hint or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "999a289933d397c3",
+   "fingerprint": "65334c9a73137b2d",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_handle_offers_resolve._append_external_offers_from_seed_rows",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "row_dict.get(\"market\")or market_hint or \"US\"",
-   "occurrence": 0
+   "expr": "row_dict.get('market') or market_hint or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "79edd9a96a99ef7b",
+   "fingerprint": "670b103815eb2949",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_pivot_market_from_payload",
    "kind": "b",
    "shape": "ifexp",
    "literal": "'US'",
-   "expr": "token if len(token)== 2 else \"US\"",
-   "occurrence": 0
+   "expr": "token if len(token) == 2 else 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ec04aaa02a44974e",
+   "fingerprint": "da363ad63cacc6da",
    "file": "routes/agent_shop_gateway.py",
    "scope": "_pivot_market_from_payload",
    "kind": "b",
    "shape": "ifnot",
    "literal": "'US'",
-   "expr": "return \"US\" <- if not raw_locale",
-   "occurrence": 0
+   "expr": "return 'US' <- if not raw_locale",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "21799b085ee51cb4",
+   "fingerprint": "f71044ec5b84d274",
    "file": "routes/agent_shop_gateway.py",
    "scope": "mint_external_seed_links",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "body.market or \"US\"",
-   "occurrence": 0
+   "expr": "body.market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "376b881dde1fad72",
+   "fingerprint": "f175d01444e89238",
    "file": "routes/agent_shop_gateway.py",
    "scope": "mint_external_seed_links",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(body.market or \"US\").strip().upper()or \"US\"",
-   "occurrence": 0
+   "expr": "str(body.market or 'US').strip().upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "efd4feb1621df46d",
+   "fingerprint": "bcd4aa6a63c95a6a",
    "file": "routes/agent_v2.py",
    "scope": "_canonicalize_search_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b36cddf92a72a304",
+   "fingerprint": "779e86f2f5aaae75",
    "file": "routes/agent_v2.py",
    "scope": "_order_amounts_from_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or pricing_quote.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or pricing_quote.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "510d1a0ac7d7723b",
+   "fingerprint": "d48b89cb2a2e3335",
    "file": "routes/agent_v2.py",
    "scope": "_quote_response_from_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snapshot_json.get(\"charge_currency\")or snapshot_json.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "snapshot_json.get('charge_currency') or snapshot_json.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9060d44b47bf2746",
+   "fingerprint": "c0aa907e39af5db3",
    "file": "routes/agent_v2.py",
    "scope": "_quote_response_from_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snapshot_json.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "snapshot_json.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d22915caa8597481",
+   "fingerprint": "54d746b2aa4996ab",
    "file": "routes/agent_v2.py",
    "scope": "_quote_response_from_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snapshot_json.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "snapshot_json.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b428a4e6d72501b5",
+   "fingerprint": "b22679fa9c777c51",
    "file": "routes/agent_v2.py",
    "scope": "_quote_response_from_row",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snapshot_json.get(\"presentment_currency\")or snapshot_json.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "snapshot_json.get('presentment_currency') or snapshot_json.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "87b16acc0d249cef",
+   "fingerprint": "acbecc8127618f3e",
    "file": "routes/agent_v2.py",
    "scope": "create_order_v2",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(quote.snapshot_json or{}).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(quote.snapshot_json or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "58e575f8edc98882",
+   "fingerprint": "08e06a39f8d3fcc1",
    "file": "routes/agent_v2.py",
    "scope": "preview_quote_v2",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "result.get(\"charge_currency\")or result.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "result.get('charge_currency') or result.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "144a24ece55223f5",
+   "fingerprint": "d4b65d2fca58da45",
    "file": "routes/agent_v2.py",
    "scope": "preview_quote_v2",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "result.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "result.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "649f8ebcf8fdc237",
+   "fingerprint": "a7516d4afe24fd8d",
    "file": "routes/agent_v2.py",
    "scope": "preview_quote_v2",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "result.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "result.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "39db4ad0935b4c83",
+   "fingerprint": "ea252e27a968da6e",
    "file": "routes/agent_v2.py",
    "scope": "preview_quote_v2",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "result.get(\"presentment_currency\")or result.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "result.get('presentment_currency') or result.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "7d3b9aaeba3a7df5",
@@ -1630,667 +1792,734 @@
    "shape": "map",
    "literal": "market->currency AU=AUD,BR=BRL,CA=CAD,CN=CNY,DE=EUR,ES=EUR,EU=EUR,FR=EUR,GB=GBP,IN=INR,IT=EUR,JP=JPY,KR=KRW,MX=MXN,NZ=NZD,SG=SGD,TH=THB,UK=GBP,US=USD",
    "expr": "market->currency AU=AUD,BR=BRL,CA=CAD,CN=CNY,DE=EUR,ES=EUR,EU=EUR,FR=EUR,GB=GBP,IN=INR,IT=EUR,JP=JPY,KR=KRW,MX=MXN,NZ=NZD,SG=SGD,TH=THB,UK=GBP,US=USD",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5e23588be66be430",
+   "fingerprint": "c667fc6ffcbf2165",
    "file": "routes/employee_products.py",
    "scope": "_build_external_seed_product_view",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "primary_price.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "primary_price.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9d19011deab1f93c",
+   "fingerprint": "235186309aa5fc1d",
    "file": "routes/employee_products.py",
    "scope": "_build_external_seed_product_view",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(primary_price.get(\"currency\")or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(primary_price.get('currency') or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f3fb4ab9e056825f",
+   "fingerprint": "778c4a747e0e698c",
    "file": "routes/employee_products.py",
    "scope": "_compute_product_metrics",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product_data.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "product_data.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3bfd04ee4ff9cf4f",
+   "fingerprint": "f95835b9c38a78d6",
    "file": "routes/employee_products.py",
    "scope": "_normalize_market",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "m or \"US\"",
-   "occurrence": 0
+   "expr": "m or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bc0eaf284e8cc644",
+   "fingerprint": "f77a5571c5291809",
    "file": "routes/external_offers.py",
    "scope": "RefreshExternalOffersRequest",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Field(default=\"US\")",
-   "occurrence": 0
+   "expr": "Field(default='US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "8afc1eed11b9477e",
+   "fingerprint": "e8adf12281e4493e",
    "file": "routes/external_offers.py",
    "scope": "ResolveExternalOfferRequest",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Field(default=\"US\")",
-   "occurrence": 0
+   "expr": "Field(default='US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d21709c977453048",
+   "fingerprint": "5d15629fd3dc3ee8",
    "file": "routes/external_offers.py",
    "scope": "employee_list_snapshots",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Query(\"US\")",
-   "occurrence": 0
+   "expr": "Query('US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7d1e25ccfaa1179f",
+   "fingerprint": "37e61a7efbc22a42",
    "file": "routes/external_offers.py",
    "scope": "employee_list_snapshots",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "40b2dad13deecf70",
+   "fingerprint": "ef945b7a66276981",
    "file": "routes/offer_routes.py",
    "scope": "preflight_quote_offer",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snap.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "snap.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9bd0d0ff1d8b3cf0",
+   "fingerprint": "cd38c57336fffff6",
    "file": "routes/offer_routes.py",
    "scope": "preflight_quote_offer",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "snap.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "snap.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4cf670d3fcea1ee4",
+   "fingerprint": "67be5042d763ff7a",
    "file": "routes/order_routes.py",
    "scope": "_build_bigcommerce_address",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "shipping_address.get(\"country\")or \"US\"",
-   "occurrence": 0
+   "expr": "shipping_address.get('country') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f728c52fc4c1fbfb",
+   "fingerprint": "9546803705dad3ef",
    "file": "routes/order_routes.py",
    "scope": "_build_bigcommerce_address",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(shipping_address.get(\"country\")or \"US\").strip().upper()or \"US\"",
-   "occurrence": 0
+   "expr": "str(shipping_address.get('country') or 'US').strip().upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "0c1634e020fa35c7",
+   "fingerprint": "e9ba39258a6d61e4",
    "file": "routes/order_routes.py",
    "scope": "_build_woocommerce_address",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "shipping_address.get(\"country\")or \"US\"",
-   "occurrence": 0
+   "expr": "shipping_address.get('country') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "90d15c15f4eff4b2",
+   "fingerprint": "bce6ce2fac9c2cdf",
    "file": "routes/order_routes.py",
    "scope": "_cancel_orphan_shopify_order_without_refund_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(order or{}).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(order or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f71db7a7a6e4576f",
+   "fingerprint": "de9a3d25af8bdaa0",
    "file": "routes/order_routes.py",
    "scope": "_create_shopify_order_impl",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(order.get(\"currency\")or \"\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(order.get('currency') or '').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "1ce25edfac521e99",
+   "fingerprint": "80e2001a78be5e05",
    "file": "routes/order_routes.py",
    "scope": "_create_shopify_order_impl",
    "kind": "b",
    "shape": "get",
    "literal": "'US'",
-   "expr": "shipping_addr.get(\"country\",\"US\")",
-   "occurrence": 0
+   "expr": "shipping_addr.get('country', 'US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "54b5b3aee2bd4de7",
+   "fingerprint": "bd6089a02a0e0079",
    "file": "routes/order_routes.py",
    "scope": "_create_shopify_order_impl._finalize_success",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5faf13f1d9993877",
+   "fingerprint": "529531335e807ed9",
    "file": "routes/order_routes.py",
    "scope": "_create_shopify_order_impl._finalize_success",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7397c3cdfb8a64ad",
+   "fingerprint": "beffed34ff9798bf",
    "file": "routes/order_routes.py",
    "scope": "_create_shopify_order_impl._finalize_success",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 2
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5868538575744acd",
+   "fingerprint": "8d9335841e07b82b",
    "file": "routes/order_routes.py",
    "scope": "_log_merchant_order_retry_event_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(order or{}).get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(order or {}).get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ecac0830c4bde5f3",
+   "fingerprint": "f2d8b791a8c5d691",
    "file": "routes/order_routes.py",
    "scope": "_mark_merchant_order_sync_failed_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "base_order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "base_order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "fc6054af96bc6ba5",
+   "fingerprint": "6a6f274a417ec2ad",
    "file": "routes/order_routes.py",
    "scope": "_shopify_money_input",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency_code or \"USD\"",
-   "occurrence": 0
+   "expr": "currency_code or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "be3c0b5777eb08f3",
+   "fingerprint": "c407ac943291851f",
    "file": "routes/order_routes.py",
    "scope": "_shopify_money_input",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(currency_code or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(currency_code or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "40fb23fd332527a0",
+   "fingerprint": "6028b0147e457058",
    "file": "routes/order_routes.py",
    "scope": "create_new_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order_request.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "order_request.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6207e8180fd3c674",
+   "fingerprint": "6e04ceaf464c3471",
    "file": "routes/order_routes.py",
    "scope": "finalize_authorized_payment_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "current_order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "current_order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d5228e468afabd8b",
+   "fingerprint": "9fb21c54eb096aae",
    "file": "routes/order_routes.py",
    "scope": "finalize_authorized_payment_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "latest_order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "latest_order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "69082fc7e8f19c94",
+   "fingerprint": "7a55d19a3e03ca3c",
    "file": "routes/order_routes.py",
    "scope": "finalize_authorized_payment_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "latest_order.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "latest_order.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "699d34189a399d7b",
+   "fingerprint": "aeb34b214ae8b3df",
    "file": "routes/order_routes.py",
    "scope": "finalize_authorized_payment_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "latest_order.get(\"currency\")or \"USD\"",
-   "occurrence": 2
+   "expr": "latest_order.get('currency') or 'USD'",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "912345c59c4dd0ce",
+   "fingerprint": "5ac474d4388605ac",
    "file": "routes/outbound_links.py",
    "scope": "AllowedDomainIn",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "3e0c601b1d3cfdd3",
+   "fingerprint": "c56bc677ca1fa221",
    "file": "routes/outbound_links.py",
    "scope": "LinkRuleIn",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "fd07e16975b74753",
+   "fingerprint": "ac8aa7f2ab8637d3",
    "file": "routes/outbound_links.py",
    "scope": "ResolveRequest",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Field(default=\"US\")",
-   "occurrence": 0
+   "expr": "Field(default='US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "85cdba2b419fb55d",
+   "fingerprint": "74275e25ce9c6fd5",
    "file": "routes/outbound_links.py",
    "scope": "ShareTrafficReportIn",
    "kind": "b",
    "shape": "field",
    "literal": "'US'",
-   "expr": "market: str = \"US\"",
-   "occurrence": 0
+   "expr": "market: str = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c17197bb514d1d37",
+   "fingerprint": "95a9c10f09b36194",
    "file": "routes/outbound_links.py",
    "scope": "employee_import_csv",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Query(\"US\")",
-   "occurrence": 0
+   "expr": "Query('US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "be0ffa5b64385fcc",
+   "fingerprint": "19bcb798f8437435",
    "file": "routes/outbound_links.py",
    "scope": "employee_list_allowed_domains",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Query(\"US\")",
-   "occurrence": 0
+   "expr": "Query('US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6d82645f03b99ce8",
+   "fingerprint": "9e5b1b197c5e432d",
    "file": "routes/outbound_links.py",
    "scope": "import_csv",
    "kind": "b",
    "shape": "kwdefault",
    "literal": "'US'",
-   "expr": "Query(\"US\")",
-   "occurrence": 0
+   "expr": "Query('US')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2cc6cfb3b844a8ba",
+   "fingerprint": "40701516ae47cc31",
    "file": "routes/payment_routes.py",
    "scope": "checkout_webhook",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b1816ac3817bdc4e",
+   "fingerprint": "68638c05536d5ef6",
    "file": "routes/product_routes_v2.py",
    "scope": "_map_cache_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "50a991ca9ec2df60",
+   "fingerprint": "61f9d371b5ffbe3a",
    "file": "routes/product_routes_v2.py",
    "scope": "_map_cache_row_to_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "raw.get(\"presentment_currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "raw.get('presentment_currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f132978fc03e6e1a",
+   "fingerprint": "5c7ff000fb9c6289",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "51b39bc811a3f55a",
+   "fingerprint": "b7ed7eadb63cba8c",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 1
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 1,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5f8ef60519834c36",
+   "fingerprint": "916e4c5e79fdc974",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 2
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 2,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cbb779be98b7d112",
+   "fingerprint": "a4ee76fc6efae24b",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 3
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 3,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "af49533859dfdde4",
+   "fingerprint": "7d2a24bc4baeb57d",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 4
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 4,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "beffb5d3bfb53170",
+   "fingerprint": "6844fae20573379b",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 5
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 5,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "ee90f5997d9a5e8e",
+   "fingerprint": "052011a07212eda9",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 6
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 6,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7f55bf5a9ec0b527",
+   "fingerprint": "1144710a2111e1d0",
    "file": "routes/refund_api.py",
    "scope": "process_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 7
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 7,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b4515927068bbbca",
+   "fingerprint": "9d4396ba347939dc",
    "file": "services/acp_checkout_session_service.py",
    "scope": "_create_pivota_order",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "quote.get(\"currency\")or session.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "quote.get('currency') or session.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d5a605b47c7ba67d",
+   "fingerprint": "593d70009416de4b",
    "file": "services/acp_checkout_session_service.py",
    "scope": "complete_session",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or quote_currency or session.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or quote_currency or session.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4d129344f83aa4f2",
+   "fingerprint": "01df2d669fdff8d6",
    "file": "services/acp_checkout_session_service.py",
    "scope": "create_session",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "quote.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "quote.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4dca37e26451f265",
+   "fingerprint": "c30c30a8e8c621e3",
    "file": "services/acp_offsession_capture.py",
    "scope": "_AdyenCaptureAdapter.capture",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d839ce7d7d27050b",
+   "fingerprint": "3c0bdd354265d95d",
    "file": "services/acp_offsession_capture.py",
    "scope": "_StripeCaptureAdapter.capture",
    "kind": "a",
    "shape": "or",
    "literal": "'usd'",
-   "expr": "currency or \"usd\"",
-   "occurrence": 0
+   "expr": "currency or 'usd'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "593022173f49f882",
+   "fingerprint": "3c5edaa1382d8637",
    "file": "services/amazon_sp_api_service.py",
    "scope": "convert_amazon_order_to_platform_format",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "item_price.get(\"CurrencyCode\",\"USD\")",
-   "occurrence": 0
+   "expr": "item_price.get('CurrencyCode', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "9bd1ec68752fe6c9",
+   "fingerprint": "ea178e7351f378fb",
    "file": "services/bd_cold_start_service.py",
    "scope": "discover_products_for_audit",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "market=\"US\"",
-   "occurrence": 0
+   "expr": "market='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e5e9491d9e0d2be1",
+   "fingerprint": "cd956c1d86cccd8e",
    "file": "services/beauty_external_ranking.py",
    "scope": "build_external_seed_filter_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "external_product.get(\"currency\")or row.get(\"price_currency\")or seed_data.get(\"price_currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "external_product.get('currency') or row.get('price_currency') or seed_data.get('price_currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a035044509ab193c",
+   "fingerprint": "5c38a7921d7b130d",
    "file": "services/beauty_external_ranking.py",
    "scope": "build_external_seed_filter_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(external_product.get(\"currency\")or row.get(\"price_currency\")or seed_data.get(\"price_currency\")or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(external_product.get('currency') or row.get('price_currency') or seed_data.get('price_currency') or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "208f4c38292c2bbc",
+   "fingerprint": "75a5b1e87a0bde52",
    "file": "services/briefs_service.py",
    "scope": "build_clarify.ask_budget",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "89cd7e492a564e82",
+   "fingerprint": "1a43e794b8946abb",
    "file": "services/cafe24_integration_service.py",
    "scope": "upsert_cafe24_store",
    "kind": "a",
    "shape": "or",
    "literal": "'KRW'",
-   "expr": "currency or \"KRW\"",
-   "occurrence": 0
+   "expr": "currency or 'KRW'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "47c01742de4bc93a",
+   "fingerprint": "c2af70b73e79d98d",
    "file": "services/cafe24_integration_service.py",
    "scope": "upsert_cafe24_store",
    "kind": "a",
    "shape": "param",
    "literal": "'KRW'",
-   "expr": "currency=\"KRW\"",
-   "occurrence": 0
+   "expr": "currency='KRW'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "88c425bce796842d",
+   "fingerprint": "4ea2dfa3c05e3f49",
    "file": "services/canonical_commerce_service.py",
    "scope": "make_canonical_offer_id",
    "kind": "a",
    "shape": "or",
    "literal": "'usd'",
-   "expr": "currency or \"usd\"",
-   "occurrence": 0
+   "expr": "currency or 'usd'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "10d8e433db95ff3a",
+   "fingerprint": "fd42c739a92893c7",
    "file": "services/canonical_commerce_service.py",
    "scope": "upsert_canonical_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "product.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "a51b2ff66af1ebaa",
+   "fingerprint": "8d28e14e544fd7ed",
    "file": "services/catalog_enrichment_agent/ingestion.py",
    "scope": "_build_seed_inserts",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "market=\"US\"",
-   "occurrence": 0
+   "expr": "market='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f563c81ea2d056c8",
+   "fingerprint": "ee529ed8419973e7",
    "file": "services/catalog_enrichment_agent/ingestion.py",
    "scope": "_region_suffixes",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "1e5bdb1fa5633aa5",
+   "fingerprint": "d127f71ef91b1094",
    "file": "services/catalog_intelligence_client.py",
    "scope": "extract_catalog",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f5c986486573e050",
+   "fingerprint": "0b03efccb81faf34",
    "file": "services/catalog_intelligence_client.py",
    "scope": "extract_catalog",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "market=\"US\"",
-   "occurrence": 0
+   "expr": "market='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2df9170be1899d86",
+   "fingerprint": "daca2342833c4301",
    "file": "services/catalog_sync_service.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "MARKET_UNKNOWN_DEFAULT = \"US\"",
-   "occurrence": 0
+   "expr": "MARKET_UNKNOWN_DEFAULT = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7bf228110038d14f",
+   "fingerprint": "2f4ead2f7a4ed5bc",
    "file": "services/competitor_audit_orchestrator.py",
    "scope": "enqueue_competitor_audits",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "market=\"US\"",
-   "occurrence": 0
+   "expr": "market='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "709dacc268db37ea",
@@ -2300,127 +2529,140 @@
    "shape": "map",
    "literal": "market->currency SG=SGD,US=USD",
    "expr": "market->currency SG=SGD,US=USD",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "25c1c8a4dea17b11",
+   "fingerprint": "614693ddc692d2f6",
    "file": "services/deep_tier_prompts.py",
    "scope": "build_deep_tier_specs",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f677ef3920464609",
+   "fingerprint": "a66040e1c6dac0f4",
    "file": "services/deep_tier_prompts.py",
    "scope": "build_deep_tier_specs",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(market or \"US\").strip()or \"US\"",
-   "occurrence": 0
+   "expr": "str(market or 'US').strip() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e82018634a2f871a",
+   "fingerprint": "587a8f27852f1875",
    "file": "services/deep_tier_prompts.py",
    "scope": "build_deep_tier_specs",
    "kind": "b",
    "shape": "param",
    "literal": "'US'",
-   "expr": "market=\"US\"",
-   "occurrence": 0
+   "expr": "market='US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "196d128dd558ef50",
+   "fingerprint": "655b8c02ff428016",
    "file": "services/external_offers_service.py",
    "scope": "resolve_external_offer",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or \"US\"",
-   "occurrence": 0
+   "expr": "market or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "5694f6b7be727d5a",
+   "fingerprint": "84cd690db6caff1c",
    "file": "services/external_referral_readiness.py",
    "scope": "evaluate_external_referral_seed",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "market or normalized_row.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "market or normalized_row.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e8841bedb6ab63f6",
+   "fingerprint": "0fdee7ab58126366",
    "file": "services/external_referral_readiness.py",
    "scope": "evaluate_external_referral_seed",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(market or normalized_row.get(\"market\")or \"US\").strip().upper()or \"US\"",
-   "occurrence": 0
+   "expr": "str(market or normalized_row.get('market') or 'US').strip().upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bdd9fd4370aff903",
+   "fingerprint": "119e1823a2b4fcf3",
    "file": "services/external_seed_audit.py",
    "scope": "build_external_seed_harvester_candidates",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "row.get(\"market\")or snapshot.get(\"market\")or seed_data.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "row.get('market') or snapshot.get('market') or seed_data.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bf0d03ce4299c9c4",
+   "fingerprint": "db6f246e1d0cfa2e",
    "file": "services/external_seed_audit.py",
    "scope": "normalize_seed_variants",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(row or{}).get(\"price_currency\")or parsed_seed_data.get(\"price_currency\")or snapshot.get(\"price_currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(row or {}).get('price_currency') or parsed_seed_data.get('price_currency') or snapshot.get('price_currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7e9607e6d721d470",
+   "fingerprint": "28e9ad304e1deaae",
    "file": "services/external_seed_search.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "DEFAULT_SEED_SERVING_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "DEFAULT_SEED_SERVING_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "70a29a6ef27ffee4",
+   "fingerprint": "b99e71ce7fd1f695",
    "file": "services/external_seed_search.py",
    "scope": "seed_serving_currency",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SEED_SERVING_MARKET='US'",
-   "expr": "normalize_region(serving_market)or DEFAULT_SEED_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "normalize_region(serving_market) or DEFAULT_SEED_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2349b94fdd451cbd",
+   "fingerprint": "e2d66d207e1dcac8",
    "file": "services/offer_buyability.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "DEFAULT_SERVING_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "DEFAULT_SERVING_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6c1b9b5ae49b9dc1",
+   "fingerprint": "67e226d6c52f76c6",
    "file": "services/offer_buyability.py",
    "scope": "annotate_offer_buyability",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SERVING_MARKET='US'",
-   "expr": "_norm_market(serving_market)or DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "_norm_market(serving_market) or DEFAULT_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "7ed4f6ce71fd59e9",
@@ -2430,17 +2672,19 @@
    "shape": "param",
    "literal": "DEFAULT_SERVING_MARKET='US'",
    "expr": "serving_market=DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cfee502adc9b64e0",
+   "fingerprint": "e33b1e9de164dbf6",
    "file": "services/offer_buyability.py",
    "scope": "annotate_offer_nodes",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SERVING_MARKET='US'",
-   "expr": "_norm_market(serving_market)or DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "_norm_market(serving_market) or DEFAULT_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "3e21f2ad8ff3ef62",
@@ -2450,7 +2694,8 @@
    "shape": "param",
    "literal": "DEFAULT_SERVING_MARKET='US'",
    "expr": "serving_market=DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "4036943f95ee5159",
@@ -2460,17 +2705,19 @@
    "shape": "ifnot",
    "literal": "DEFAULT_SERVING_MARKET='US'",
    "expr": "om = DEFAULT_SERVING_MARKET <- if not om",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "c3e225087797843b",
+   "fingerprint": "e1496329f60c15f3",
    "file": "services/offer_buyability.py",
    "scope": "offer_market_availability",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_SERVING_MARKET='US'",
-   "expr": "_norm_market(serving_market)or DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "expr": "_norm_market(serving_market) or DEFAULT_SERVING_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "b89434faedc90ccd",
@@ -2480,217 +2727,239 @@
    "shape": "param",
    "literal": "DEFAULT_SERVING_MARKET='US'",
    "expr": "serving_market=DEFAULT_SERVING_MARKET",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7241a12ed3ed4ec9",
+   "fingerprint": "40039e31ea7c4d94",
    "file": "services/offer_classification.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "DEFAULT_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "DEFAULT_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6d5051f1b16fe0f3",
+   "fingerprint": "36acbf9b6a53bb0b",
    "file": "services/offer_classification.py",
    "scope": "select_best_us_offer",
    "kind": "b",
    "shape": "or",
    "literal": "DEFAULT_MARKET='US'",
-   "expr": "getattr(offer,\"market\",None)or DEFAULT_MARKET",
-   "occurrence": 0
+   "expr": "getattr(offer, 'market', None) or DEFAULT_MARKET",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "1571cfaa64de259f",
+   "fingerprint": "b29923e4de59fd0f",
    "file": "services/order_confirmation_email_service.py",
    "scope": "_compose_order_confirmation_email",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2de01408686e0902",
+   "fingerprint": "47c09d6dba2938a5",
    "file": "services/order_confirmation_email_service.py",
    "scope": "_compose_order_confirmation_email",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "str(order.get(\"currency\")or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "str(order.get('currency') or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "e93b5a0f884381d0",
+   "fingerprint": "0aa668aa4f70b71b",
    "file": "services/order_confirmation_email_service.py",
    "scope": "_format_money",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(currency or \"USD\").strip().upper()or \"USD\"",
-   "occurrence": 0
+   "expr": "(currency or 'USD').strip().upper() or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bff8e885eb224d98",
+   "fingerprint": "25bde5ea0ff5af6c",
    "file": "services/order_confirmation_email_service.py",
    "scope": "_format_money",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bcc4a389ac42ba37",
+   "fingerprint": "c5ae7c36b5c85beb",
    "file": "services/outbound_links_service.py",
    "scope": "_normalize_market_key",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "str(market or \"\").strip().upper()or \"US\"",
-   "occurrence": 0
+   "expr": "str(market or '').strip().upper() or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "d19c3d66309ff808",
+   "fingerprint": "d48ec312f89b25c1",
    "file": "services/outbound_links_service.py",
    "scope": "normalize_market",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "m or \"US\"",
-   "occurrence": 0
+   "expr": "m or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "bff405dca93490e8",
+   "fingerprint": "1074cec9034088a1",
    "file": "services/payment_offer_evidence_service.py",
    "scope": "_benefit_badge",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "row.get(\"benefit_currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "row.get('benefit_currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cb1a03ab54031202",
+   "fingerprint": "6768a3d8da39593d",
    "file": "services/payment_routing_service.py",
    "scope": "PaymentRoutingService._execute_with_failover_v2",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "payment_request.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "payment_request.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "85e952f0dd377f0f",
+   "fingerprint": "9dc74fe2a6b634c7",
    "file": "services/payment_routing_service.py",
    "scope": "PaymentRoutingService.execute_with_failover",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "payment_request.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "payment_request.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "558f349b0b1886c7",
+   "fingerprint": "109b17ecf640aee5",
    "file": "services/payment_routing_service.py",
    "scope": "PaymentRoutingService.route_transaction_dual",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "payment_request.get('currency','USD')",
-   "occurrence": 0
+   "expr": "payment_request.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "4fdf895422e1107d",
+   "fingerprint": "8319e5dd49bfb508",
    "file": "services/payment_routing_service.py",
    "scope": "PaymentRoutingService.select_psp",
    "kind": "a",
    "shape": "param",
    "literal": "'USD'",
-   "expr": "currency=\"USD\"",
-   "occurrence": 0
+   "expr": "currency='USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "2851dffd2a5bf499",
+   "fingerprint": "b6f2331bcab97029",
    "file": "services/payment_routing_service.py",
    "scope": "PaymentRoutingService.simulate_routing",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "scenario.get('currency','USD')",
-   "occurrence": 0
+   "expr": "scenario.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "041d4fa35d646199",
+   "fingerprint": "c59fb5c121aeb0fb",
    "file": "services/pci_kb_scope_review.py",
    "scope": "build_external_seed_harvester_candidates",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "row.get(\"market\")or snapshot.get(\"market\")or seed_data.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "row.get('market') or snapshot.get('market') or seed_data.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "cd3ce1e8d5f62972",
+   "fingerprint": "fb77102218a6074a",
    "file": "services/pivot_query_service.py",
    "scope": "_build_canonical_offer_node",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "row.get(\"offer_market\")or \"US\"",
-   "occurrence": 0
+   "expr": "row.get('offer_market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "19d656770f9b9eb2",
+   "fingerprint": "9dd39f98cea561c0",
    "file": "services/pivot_query_service.py",
    "scope": "_build_external_item_from_candidate",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "seed_data.get(\"market\")or row.get(\"market\")or \"US\"",
-   "occurrence": 0
+   "expr": "seed_data.get('market') or row.get('market') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "06cf52d272626782",
+   "fingerprint": "dba0263f9bea1e41",
    "file": "services/product_enrichment_ai.py",
    "scope": "build_context_from_standard_product",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "product.currency or \"USD\"",
-   "occurrence": 0
+   "expr": "product.currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "f7aaa2b0354ed3ef",
+   "fingerprint": "f2dca4248183fdc3",
    "file": "services/protocol_adapter_service.py",
    "scope": "ACPAdapter.transform_request",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "payload.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "payload.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "0f924b9cabfad80b",
+   "fingerprint": "eb6664e07cfdeb06",
    "file": "services/refund_service.py",
    "scope": "RefundService._process_psp_refund",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\")or \"USD\"",
-   "occurrence": 0
+   "expr": "order.get('currency') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "47ff9936d547c46e",
+   "fingerprint": "0cd517b244f1741c",
    "file": "services/refund_service.py",
    "scope": "RefundService.create_refund",
    "kind": "a",
    "shape": "get",
    "literal": "'USD'",
-   "expr": "order.get(\"currency\",\"USD\")",
-   "occurrence": 0
+   "expr": "order.get('currency', 'USD')",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
    "fingerprint": "13a680f0c4cb7817",
@@ -2700,87 +2969,96 @@
    "shape": "map",
    "literal": "market->currency AU=AUD,CA=CAD,FI=EUR,FR=EUR,GB=GBP,HK=HKD,HR=EUR,JP=JPY,KR=KRW,SE=SEK,SG=SGD,US=USD",
    "expr": "market->currency AU=AUD,CA=CAD,FI=EUR,FR=EUR,GB=GBP,HK=HKD,HR=EUR,JP=JPY,KR=KRW,SE=SEK,SG=SGD,US=USD",
-   "occurrence": 0
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "245d58c99766c862",
+   "fingerprint": "d59bc084d16f212e",
    "file": "services/request_market.py",
    "scope": "<module>",
    "kind": "b",
    "shape": "const",
    "literal": "'US'",
-   "expr": "ASSUMED_MARKET = \"US\"",
-   "occurrence": 0
+   "expr": "ASSUMED_MARKET = 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "26e82a9810107513",
+   "fingerprint": "d5f69ace70ff4e65",
    "file": "services/shopify_pricing_service.py",
    "scope": "ShopifyPricingService._build_checkout_payload",
    "kind": "b",
    "shape": "or",
    "literal": "'US'",
-   "expr": "shipping_address.get(\"country\")or \"US\"",
-   "occurrence": 0
+   "expr": "shipping_address.get('country') or 'US'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "7058129b3c62959d",
+   "fingerprint": "e920adb44d8eafa5",
    "file": "services/shopify_pricing_service.py",
    "scope": "ShopifyPricingService.preview_checkout_quote",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "checkout.get(\"currency\")or checkout.get(\"presentment_currency\")or(checkout.get(\"total_price_set\")or{}).get(\"presentment_money\",{}).get(\"currency_code\")or(checkout.get(\"subtotal_price_set\")or{}).get(\"p",
-   "occurrence": 0
+   "expr": "checkout.get('currency') or checkout.get('presentment_currency') or (checkout.get('total_price_set') or {}).get('presentment_money', {}).get('currency_code') or (checkout.get('subtotal_price_set') or ",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b6ee902082282133",
+   "fingerprint": "ff5bd96e6228d0d6",
    "file": "services/shopify_storefront_pricing_service.py",
    "scope": "ShopifyStorefrontPricingService._create_cart",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(cost.get(\"totalAmount\")or{}).get(\"currencyCode\")or(cost.get(\"subtotalAmount\")or{}).get(\"currencyCode\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(cost.get('totalAmount') or {}).get('currencyCode') or (cost.get('subtotalAmount') or {}).get('currencyCode') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "b295b1a02aebb595",
+   "fingerprint": "44492998e4509d97",
    "file": "services/shopify_storefront_pricing_service.py",
    "scope": "ShopifyStorefrontPricingService._get_cart_cost",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "(cost.get(\"totalAmount\")or{}).get(\"currencyCode\")or(cost.get(\"subtotalAmount\")or{}).get(\"currencyCode\")or \"USD\"",
-   "occurrence": 0
+   "expr": "(cost.get('totalAmount') or {}).get('currencyCode') or (cost.get('subtotalAmount') or {}).get('currencyCode') or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "84ef108a3600ada3",
+   "fingerprint": "2319f6c8af5fd20e",
    "file": "services/shopify_transactions_service.py",
    "scope": "ensure_external_payment_transaction_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "50940997fbf09744",
+   "fingerprint": "e16ed6af801b4f21",
    "file": "services/shopify_transactions_service.py",
    "scope": "ensure_external_refund_transaction_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   },
   {
-   "fingerprint": "6619f87638e03a53",
+   "fingerprint": "c0a8905f88c91da0",
    "file": "services/shopify_transactions_service.py",
    "scope": "ensure_shopify_parent_transaction_best_effort",
    "kind": "a",
    "shape": "or",
    "literal": "'USD'",
-   "expr": "currency or \"USD\"",
-   "occurrence": 0
+   "expr": "currency or 'USD'",
+   "occurrence": 0,
+   "origin": "2026-11-12"
   }
  ],
  "parity_disagreements": [],

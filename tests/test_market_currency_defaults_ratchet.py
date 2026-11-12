@@ -36,8 +36,10 @@ WHAT IS A FINDING (found by AST; comments, docstrings and tests never count):
   is no syntax tree to walk. The regex runs on string CONSTANTS located by AST (f-string parts are
   joined first), never on raw lines, so a comment or a docstring that mentions COALESCE is not read.
 
-SCOPE is computed, not listed by hand: the partner route files named by ROUTE_SEED_GLOBS and
-ROUTE_SEED_FILES, plus every repo module they import, transitively, including imports inside
+SCOPE has a hand-kept part and a computed part. Hand-kept: the partner route files, named by
+ROUTE_SEED_GLOBS and ROUTE_SEED_FILES. So that this list fails closed, EVERY other file in
+routes/ is filed in NON_PARTNER_ROUTES under a reason, and a route file filed nowhere fails.
+Computed: every repo module the seed routes import, transitively, including imports inside
 functions. A new services/ or db/ module that a partner route imports is therefore scanned without
 anyone adding it anywhere. jobs/ and scripts/ are out unless a route imports them. See
 OUT_OF_SCOPE and EXCLUDED_FILES for what is not scanned and why.
@@ -53,17 +55,39 @@ however often it is run:
 
     python tests/test_market_currency_defaults_ratchet.py --write-baseline
 
-It never touches BASELINE_COUNTS or UNKNOWN_MAP_MARKETS_COUNT: raising a pin is a separate,
-visible edit in this file.
+It REFUSES (exit 1, nothing written) when the code holds a default the baseline does not. With
+--accept-new it writes them, and each added entry is either `moved` (it could be paired with a
+removed entry of the same file, kind, shape and literal, whose fingerprint it names) or carries
+an empty `reason` that a test rejects until a person fills it in. Entries from the day the
+ratchet landed carry `origin` instead and are counted by GRANDFATHERED_COUNT. The command never
+touches a pin: raising one is a separate, visible edit in this file.
+
+FINGERPRINTS are built from the syntax tree written back out (ast.unparse), so a line move, a
+re-wrap, a trailing comma, the quote style or a comment inside the expression do not change
+them. Renaming a variable inside the expression, or moving it to another function, does.
 
 Marked findings are not compared with the baseline; they are counted in the summary this file
 prints on every run. The repository starts with zero markers.
 
-WHAT THIS CANNOT SEE: a default computed at runtime (`or some_function()`), a constant bound in a
-module this scan does not reach, SQL assembled from pieces at runtime, a default set by an
-environment variable or a config file, a default behind `importlib.import_module`, and anything in
-the gateway repository. It counts places where a literal stands in for a missing value; it does not
-prove a price is in the buyer's currency.
+WHAT THIS CANNOT SEE (stated limits; each was checked and is NOT detected):
+  * a default computed at runtime (`or some_function()`), set by an environment variable or a
+    config file, or behind `importlib.import_module`; anything in the gateway repository;
+  * a default in jobs/ or scripts/ that no seed route imports, and in the NON_PARTNER_ROUTES files;
+  * context taken from the assignment target: `currency = value or "usd"` and `country = cc or
+    "DE"` are missed, because a lower-case or ambiguous code counts only when the EXPRESSION names
+    a currency or a market, and the name on the left is not read;
+  * an aliased constant import: `from m import DEFAULT_CCY as CCY` then `x or CCY` (the binding is
+    seen, the use is not); and a constant bound to different codes in different files;
+  * SQL: a cast (`COALESCE(currency, 'USD'::text)`), SQLAlchemy `func.coalesce(col, "USD")`, a
+    statement assembled by string concatenation, and a bound parameter (`COALESCE(currency, :c)`);
+  * `next(iterator, "USD")`, `defaultdict(lambda: "USD")`, `Field(default_factory=lambda: "USD")`,
+    and an unannotated class attribute `currency = "USD"`;
+  * a fall-through return (`if m: return m` then `return "US"`), and a code assigned in an
+    `except:` branch when the name is assigned only once;
+  * a map written as a list of pairs (`[("US", "USD"), ...]`) or built by `M["DE"] = "EUR"`;
+  * markers are per LINE: one `# market-default-ok:` covers every default on that line.
+It counts places where a literal stands in for a missing value; it does not prove a price is in
+the buyer's currency.
 """
 
 from __future__ import annotations
@@ -118,6 +142,60 @@ ROUTE_SEED_FILES = (
     "routes/refund_api.py",
 )
 
+#: EVERY other file in routes/, filed under the reason it is not a partner door. The seeds above
+#: are a hand-kept list, so this is what makes them fail closed: a route file that is in neither
+#: place fails test_every_route_file_is_filed_as_a_partner_door_or_not, and so does one that is in
+#: both. A pattern with `*` files a whole family; a plain name files one file and must exist.
+#: Being listed here does NOT mean "never scanned": a file a seed route imports is scanned anyway.
+NON_PARTNER_ROUTES: Dict[str, Tuple[str, ...]] = {
+    "admin console and one-off maintenance endpoints, behind the admin key or an employee login; "
+    "no partner credential reaches them": (
+        "admin_*", "ap2_agent_registration.py", "ap2_trusted_issuers_admin.py", "funnel_metrics_routes.py",
+        "payment_grant_issuers.py", "substantiation_admin_routes.py",
+    ),
+    "staff (employee login) tools: review queues, finance, governance and dashboards. "
+    "employee_products.py is the one staff route among the seeds, so this family is named file by file": (
+        "employee_agent_mgmt.py", "employee_content.py", "employee_dashboard_routes.py", "employee_finance.py",
+        "employee_kb_monitoring.py", "employee_missing_endpoints.py", "employee_payouts.py",
+        "employee_pdp_governance.py", "employee_reviews.py", "employee_routing_dashboard.py",
+        "employee_settlement_rules.py", "employee_store_psp_fixes.py", "employees_security.py",
+        "channel_graph_routes.py", "questions_api.py", "routing_governance.py",
+    ),
+    "merchant portal and dashboard, behind a merchant or dashboard-user login: a merchant looking "
+    "at its own store, audits, billing, payouts, PSPs and settings": (
+        "merchant_*", "psp_*", "store_audit_*", "audit_runs_routes.py", "auth.py", "auth_routes.py",
+        "billing_routes.py", "brand_claim_routes.py", "catalog_routes.py", "citation_operator_routes.py",
+        "dashboard_api.py", "gsc_oauth_routes.py", "manage_integrations.py", "mcp_mgmt.py",
+        "operations_routes.py", "partner_invite_redeem.py", "payment_routing_routes.py", "pivot_routes.py",
+        "platform_onboarding_routes.py", "protocol_routes.py", "store_readiness.py",
+    ),
+    "commerce-platform integrations: inbound webhooks and product sync from a store platform. "
+    "They write catalogue and order data; no partner request enters by them": (
+        "shopify_*", "bigcommerce_webhooks.py", "cafe24_webhooks.py", "prestashop_webhooks.py",
+        "shopline_family_webhooks.py", "squarespace_webhooks.py", "webflow_webhooks.py", "wix_webhooks.py",
+        "woocommerce_webhooks.py", "adobe_commerce_events.py", "cafe24_integration.py", "magento_integration.py",
+        "platform_connector_prefix.py", "platform_products_sync_api.py", "product_enrichment_routes.py",
+        "product_quality_routes.py", "product_sync.py", "product_sync_monitoring.py", "refund_webhook_routes.py",
+        "sfcc_events.py", "sfcc_integration.py", "shopline_integrations.py", "sync_all_platforms.py",
+        "universal_product_sync.py", "webhook_routes.py", "wix_sync.py",
+    ),
+    "operator endpoints: debug views, bootstrap and data-repair scripts exposed as routes, health, "
+    "metrics, queues and internal probes": (
+        "debug_*", "fix_*", "init_*", "ops_*", "__catalog_health.py", "__trust_health.py", "cleanup_test_data.py",
+        "crawl_identity.py", "demo_data_routes.py", "direct_db_check.py", "mcp_e2e_test.py",
+        "migrate_employees_password.py", "performance_optimization.py", "pool_health.py",
+        "products_cache_maintenance.py", "prometheus_metrics.py", "queue_routes.py", "quick_index_setup.py",
+        "readiness_internal.py", "scheduler_health.py", "shakeout_debug.py", "simple_test_orders.py",
+    ),
+    "agent-, buyer- or protocol-facing routes that are NOT among the seeds: kept out to hold the "
+    "scope reviewed on 2026-11-12, when each held no finding. A default added to one of them is not "
+    "seen unless a seed imports the file. These are the first candidates to move to the seeds": (
+        "after_sales_cases.py", "ap2_routes.py", "buyer_api.py", "buyer_reviews.py", "fulfillment_api.py",
+        "mcp_oauth_as.py", "photos.py", "pivota_canonical_routes.py", "reviews_invitation_issuer.py",
+        "reviews_invitation_shortlink.py", "reviews_proof_issuer.py", "subject_resolve.py",
+    ),
+}
+
 #: Trees the import walk never enters, each with the reason. Everything else in the repository is
 #: in scope exactly when a seed route imports it (directly or through another module).
 OUT_OF_SCOPE = {
@@ -145,6 +223,20 @@ REGISTRY_TABLE = REPO / "config" / "market_registry.json"
 #: its entry from the baseline file and lower the number here in the same change.
 BASELINE_COUNTS = {"a": 184, "b": 90, "c": 4}
 
+#: Entries that were already in the code when the ratchet landed carry `"origin": "2026-11-12"`
+#: and need no reason. Every entry added later must say why (`reason`) or name the entry it
+#: replaces (`moved`). This is how many grandfathered entries are left. ONLY EVER LOWER THIS.
+GRANDFATHER_ORIGIN = "2026-11-12"
+GRANDFATHERED_COUNT = 278
+#: The fingerprints of those 278, frozen. An entry may say `origin` only if its fingerprint is in
+#: this file, and the file is pinned by its sha256, so nobody can grandfather a new default by
+#: typing `origin` on it. NEVER EDIT THE FILE OR THIS DIGEST: a removed default simply stops
+#: being in the baseline; its line stays here.
+GRANDFATHERED_PATH = REPO / "tests" / "fixtures" / "market_currency_defaults_grandfathered.txt"
+GRANDFATHERED_SHA256 = "c5429d7be47b0a52f221780c001699eea7b796d83b77763988014974a8f6b818"
+_PROVENANCE_KEYS = ("origin", "moved", "reason")
+_MIN_ENTRY_REASON = 40
+
 #: How many (map, market) pairs name a market the registry does not list. ONLY EVER LOWER THIS.
 UNKNOWN_MAP_MARKETS_COUNT = 10
 _MIN_UNKNOWN_REASON = 40
@@ -161,7 +253,13 @@ _MIN_MARKER_REASON = 12
 #: where each list was taken from and when (tests/fixtures/iso_codes_reference.json).
 ISO_REFERENCE_PATH = REPO / "tests" / "fixtures" / "iso_codes_reference.json"
 _ISO_REFERENCE = json.loads(ISO_REFERENCE_PATH.read_text(encoding="utf-8"))
-_CURRENCIES = frozenset(_ISO_REFERENCE["iso_4217"]["codes"].split())
+#: The currency list is CLDR's (what ICU ships), NOT the ISO 4217 table: it is the right list to
+#: DETECT a currency literal with, because it is wider (it keeps withdrawn codes).
+_CURRENCIES = frozenset(_ISO_REFERENCE["cldr_currency_codes"]["codes"].split())
+#: Codes in that list that no market may be registered with: withdrawn, or not a national currency.
+_NOT_A_MARKET_CURRENCY = frozenset(
+    (_ISO_REFERENCE["not_valid_for_a_market"]["withdrawn"] + " "
+     + _ISO_REFERENCE["not_valid_for_a_market"]["not_a_national_currency"]).split())
 #: Codes that are also ordinary words or keywords. They count only where the expression itself
 #: names a currency (`sort or "TOP"` is not a currency default; `currency or "TRY"` is).
 _CURRENCY_WORDS = frozenset("ALL ANG BAM BOB COP CUP GEL GIP LAK MAD MOP PEN PHP RON SOS TOP TRY".split())
@@ -354,17 +452,11 @@ def scan_source(source: str, rel: str, shared_constants: Optional[Dict[str, str]
     constants.update(module_constants(tree))
     found: List[Finding] = []
     claimed: Set[int] = set()
-    raw_lines = source.encode("utf-8").splitlines(keepends=True)
-
     def text(node: ast.AST) -> str:
-        # ast.get_source_segment re-splits the whole file on every call; this is the same slice.
-        first, last = node.lineno - 1, node.end_lineno - 1
-        if first == last:
-            raw = raw_lines[first][node.col_offset:node.end_col_offset]
-        else:
-            raw = b"".join([raw_lines[first][node.col_offset:], *raw_lines[first + 1:last],
-                            raw_lines[last][:node.end_col_offset]])
-        return _normalise(raw.decode("utf-8", errors="replace"))
+        # The syntax tree written back out, not the source characters: quote style, a trailing
+        # comma, redundant parentheses, line wraps and comments inside the expression all vanish,
+        # so none of them can change a fingerprint or lend a comment's words to the context.
+        return ast.unparse(node)
 
     def literal(node: ast.AST, context: object) -> Optional[Tuple[str, str]]:
         """(kind, literal as written) when `node` is a code or a constant bound to one.
@@ -646,6 +738,7 @@ class Scan(NamedTuple):
     findings: Tuple[Finding, ...]          # unmarked: these are compared with the baseline
     marked: Tuple[Tuple[Finding, str], ...]  # carrying a marker, with its reason
     stale_markers: Tuple[Tuple[str, int], ...]
+    unparseable: Tuple[str, ...]           # reached by the walk but not valid Python: never skipped quietly
 
 
 def seed_routes() -> List[str]:
@@ -658,10 +751,11 @@ def seed_routes() -> List[str]:
 @lru_cache(maxsize=1)
 def scan_repo() -> Scan:
     parsed: Dict[str, Tuple[str, ast.Module]] = {}
+    unparseable: Set[str] = set()
     todo = [s for s in seed_routes() if (REPO / s).is_file()]
     while todo:
         rel = todo.pop()
-        if rel in parsed:
+        if rel in parsed or rel in unparseable:
             continue
         source = (REPO / rel).read_text(encoding="utf-8", errors="replace")
         try:
@@ -670,6 +764,7 @@ def scan_repo() -> Scan:
                 warnings.simplefilter("ignore")
                 tree = ast.parse(source)
         except SyntaxError:
+            unparseable.add(rel)
             continue
         parsed[rel] = (source, tree)
         for module in _imports(tree, rel):
@@ -699,7 +794,7 @@ def scan_repo() -> Scan:
             else:
                 findings.append(f)
         stale.extend((rel, n) for n in sorted(set(markers) - used))
-    return Scan(files, tuple(findings), tuple(marked), tuple(stale))
+    return Scan(files, tuple(findings), tuple(marked), tuple(stale), tuple(sorted(unparseable)))
 
 
 def load_baseline() -> dict:
@@ -755,6 +850,21 @@ def _finding_key(entry: dict) -> Tuple:
             entry["occurrence"], entry["literal"], entry["fingerprint"])
 
 
+_ENTRY_KEYS = ("fingerprint", "file", "scope", "kind", "shape", "literal", "expr", "occurrence") + _PROVENANCE_KEYS
+
+
+def _ordered_entry(entry: dict) -> dict:
+    """One key order for every entry, so a hand-added `reason` lands where the writer puts it."""
+    unknown = set(entry) - set(_ENTRY_KEYS)
+    if unknown:
+        raise ValueError("unknown baseline entry field(s): %s" % sorted(unknown))
+    return {k: entry[k] for k in _ENTRY_KEYS if k in entry}
+
+
+def _bare(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k not in _PROVENANCE_KEYS}
+
+
 def serialise_baseline(doc: dict) -> str:
     """The one way the baseline file is written: fixed key order, entries sorted by a key with
     no line number in it, one-space indent, ASCII, trailing newline. Writing the same content
@@ -762,7 +872,7 @@ def serialise_baseline(doc: dict) -> str:
     canonical = {
         "_doc": doc["_doc"],
         "version": doc["version"],
-        "findings": sorted(doc["findings"], key=_finding_key),
+        "findings": sorted((_ordered_entry(e) for e in doc["findings"]), key=_finding_key),
         "parity_disagreements": sorted(
             doc["parity_disagreements"], key=lambda d: (d["file"], d["scope"], d["market"], d["map_currency"])),
         "map_markets_unknown_to_registry": sorted(doc["map_markets_unknown_to_registry"], key=_unknown_key),
@@ -770,21 +880,52 @@ def serialise_baseline(doc: dict) -> str:
     return json.dumps(canonical, indent=1, ensure_ascii=True) + "\n"
 
 
-def render_baseline() -> str:
-    """The baseline for the code as it is now. Reasons are hand-written, so they are carried
-    over from the file on disk; a market that is new here gets an empty reason, which fails
-    test_map_markets_the_registry_does_not_know_are_each_registered until a person writes one."""
+def plan_baseline() -> Tuple[dict, List[dict]]:
+    """(the baseline for the code as it is now, the entries it would ADD to the file on disk).
+
+    An entry already in the file keeps its provenance (`origin`, `moved`, `reason`). An added
+    entry is paired with a removed one when the two share file, kind, shape and literal (a map:
+    file and scope): that is a default that moved or was re-worded, and it gets
+    `"moved": "<the old fingerprint>"`. Any other added entry gets `"reason": ""`, which fails
+    test_every_entry_added_after_the_ratchet_landed_says_why until a person writes the reason.
+    Reasons for unknown map markets are carried over the same way."""
     scan = scan_repo()
     previous = load_baseline() if BASELINE_PATH.is_file() else {}
+    old = {e["fingerprint"]: e for e in previous.get("findings", [])}
+    current = entries(scan.findings)
+    freed = sorted((e for fp, e in old.items() if fp not in current), key=_finding_key)
+
+    def move_key(e: dict) -> Tuple:
+        return (e["file"], e["scope"], "c") if e["kind"] == "c" else (e["file"], e["kind"], e["shape"], e["literal"])
+
+    findings, added = [], []
+    for fp, entry in current.items():
+        entry = dict(entry)
+        if fp in old:
+            entry.update({k: old[fp][k] for k in _PROVENANCE_KEYS if k in old[fp]})
+        else:
+            source = next((e for e in freed if move_key(e) == move_key(entry)), None)
+            if source is not None:
+                freed.remove(source)
+                entry["moved"] = source["fingerprint"]
+            else:
+                entry["reason"] = ""
+            added.append(entry)
+        findings.append(entry)
     reasons = {_unknown_key(r): r.get("reason", "") for r in previous.get("map_markets_unknown_to_registry", [])}
     unknown = [dict(r, reason=reasons.get(_unknown_key(r), "")) for r in unknown_map_markets(scan.findings)]
-    return serialise_baseline({
+    doc = {
         "_doc": previous.get("_doc") or _BASELINE_DOC,
         "version": 1,
-        "findings": list(entries(scan.findings).values()),
+        "findings": findings,
         "parity_disagreements": parity_disagreements(scan.findings),
         "map_markets_unknown_to_registry": unknown,
-    })
+    }
+    return doc, added
+
+
+def render_baseline() -> str:
+    return serialise_baseline(plan_baseline()[0])
 
 
 _BASELINE_DOC = (
@@ -865,7 +1006,7 @@ def test_the_baseline_file_says_exactly_what_the_scan_says():
     current = entries(scan_repo().findings)
     stored = load_baseline()["findings"]
     assert len({e["fingerprint"] for e in stored}) == len(stored), "duplicate fingerprints in the baseline"
-    wrong = [e for e in stored if e["fingerprint"] in current and e != current[e["fingerprint"]]]
+    wrong = [e for e in stored if e["fingerprint"] in current and _bare(e) != current[e["fingerprint"]]]
     assert not wrong, "baseline entries whose fields do not match the code:\n" + json.dumps(wrong, indent=2)
 
 
@@ -900,6 +1041,57 @@ def test_the_baseline_has_not_grown():
             "the baseline holds %d kind-%s entries, fewer than the %d pinned in BASELINE_COUNTS. "
             "Lower the number in this file so the ratchet tightens behind you."
             % (counts[kind], kind, BASELINE_COUNTS[kind]))
+
+
+def test_every_entry_added_after_the_ratchet_landed_says_why():
+    """Without this, deleting one default and adding another of the same kind somewhere else, then
+    regenerating, would pass with nothing said. The 278 entries that were in the code on the day
+    the ratchet landed are marked `origin` and counted; every other entry must carry a reason a
+    reviewer can judge, or `moved` naming the fingerprint of the entry it replaced."""
+    stored = load_baseline()["findings"]
+    present = {e["fingerprint"] for e in stored}
+    grandfathered = [e for e in stored if "origin" in e]
+    frozen_text = GRANDFATHERED_PATH.read_text(encoding="utf-8")
+    assert hashlib.sha256(frozen_text.encode("utf-8")).hexdigest() == GRANDFATHERED_SHA256, (
+        "tests/fixtures/market_currency_defaults_grandfathered.txt was edited. It is the frozen list of "
+        "the defaults that existed on %s and is never changed." % GRANDFATHER_ORIGIN)
+    forged = [e for e in grandfathered if e["fingerprint"] not in set(frozen_text.split())]
+    assert not forged, (
+        "these entries say `origin` but were not in the code on %s. A new entry needs a `reason`:\n%s"
+        % (GRANDFATHER_ORIGIN, json.dumps(forged, indent=2)))
+    assert all(e["origin"] == GRANDFATHER_ORIGIN for e in grandfathered), "the only origin is %s" % GRANDFATHER_ORIGIN
+    assert len(grandfathered) == GRANDFATHERED_COUNT, (
+        "the baseline holds %d grandfathered entries; GRANDFATHERED_COUNT pins %d. A grandfathered "
+        "entry can only be deleted (then lower the pin); a new entry is never grandfathered -- "
+        "give it a `reason`." % (len(grandfathered), GRANDFATHERED_COUNT))
+    unexplained, bad_moves = [], []
+    moved_from: Counter = Counter()
+    for e in stored:
+        if "origin" in e:
+            continue
+        if "moved" in e:
+            moved_from[e["moved"]] += 1
+            if not re.fullmatch(r"[0-9a-f]{16}", str(e["moved"])) or e["moved"] in present:
+                bad_moves.append(e)
+        elif len(str(e.get("reason", "")).strip()) < _MIN_ENTRY_REASON:
+            unexplained.append(e)
+    assert not unexplained, (
+        "baseline entries added after %s with no reason. Remove the default, mark its line "
+        "`# %s: <reason>`, or write a `reason` of at least %d characters on the entry:\n%s"
+        % (GRANDFATHER_ORIGIN, MARKER, _MIN_ENTRY_REASON, json.dumps(unexplained, indent=2)))
+    assert not bad_moves, (
+        "`moved` must name the 16-hex fingerprint of an entry that is no longer in the baseline:\n"
+        + json.dumps(bad_moves, indent=2))
+    twice = sorted(fp for fp, n in moved_from.items() if n > 1)
+    assert not twice, "one removed entry cannot be the source of two moved entries: %s" % twice
+
+
+def test_no_file_in_scope_is_skipped_because_it_does_not_parse():
+    """A file that is not valid Python cannot be scanned, and neither can anything reached only
+    through it. That must be a failure with the file's name, never a smaller scope."""
+    assert not scan_repo().unparseable, (
+        "reached by the partner-route import walk but not parseable, so not scanned: %s"
+        % list(scan_repo().unparseable))
 
 
 def test_every_marker_sits_on_a_default_and_gives_a_reason():
@@ -958,18 +1150,25 @@ def test_map_markets_the_registry_does_not_know_are_each_registered():
 def test_the_code_lists_are_the_reference_file_and_the_file_says_where_it_came_from():
     """The scanner's lists ARE the checked-in reference (read above, not retyped), so this pins
     the reference itself: its shape, its size, its stated source, and the two aliases."""
-    for name, width in (("iso_3166_1_alpha_2", 2), ("iso_4217", 3)):
+    for name, width in (("iso_3166_1_alpha_2", 2), ("cldr_currency_codes", 3)):
         block = _ISO_REFERENCE[name]
         codes = block["codes"].split()
         assert codes == sorted(set(codes)) and len(codes) == block["count"], name
         assert all(len(c) == width and c.isalpha() and c.isupper() for c in codes), name
         assert len(block["source"]) > 60, "%s must say where the list was taken from" % name
     assert _ISO_MARKETS == frozenset(_ISO_REFERENCE["iso_3166_1_alpha_2"]["codes"].split()) and len(_ISO_MARKETS) == 249
-    assert _CURRENCIES == frozenset(_ISO_REFERENCE["iso_4217"]["codes"].split()) and len(_CURRENCIES) == 162
+    assert _CURRENCIES == frozenset(_ISO_REFERENCE["cldr_currency_codes"]["codes"].split()) and len(_CURRENCIES) == 162
+    assert "iso_4217" not in _ISO_REFERENCE, "the currency list is CLDR's; do not label it as the ISO 4217 table"
     assert "GB" in _ISO_MARKETS and not (NON_ISO_MARKET_ALIASES & _ISO_MARKETS)
     assert _MARKETS == _ISO_MARKETS | {"UK", "EU"}
     assert _MARKETS_ON_SIGHT <= _MARKETS and _CURRENCY_WORDS <= _CURRENCIES
-    assert set(registry_currencies()) <= _ISO_MARKETS and set(registry_currencies().values()) <= _CURRENCIES
+    assert set(registry_currencies()) <= _ISO_MARKETS
+    # Detection uses the wide list; VALIDITY does not: a market registered with a withdrawn code
+    # (the list still holds HRK) or a non-national one (XDR) must fail here.
+    assert _NOT_A_MARKET_CURRENCY <= _CURRENCIES and {"HRK", "SLL", "ZWL", "CUC"} <= _NOT_A_MARKET_CURRENCY
+    assert len(_ISO_REFERENCE["not_valid_for_a_market"]["source"]) > 60
+    invalid = {m: c for m, c in registry_currencies().items() if c not in _CURRENCIES - _NOT_A_MARKET_CURRENCY}
+    assert not invalid, "registry markets priced in a withdrawn or unknown currency code: %s" % invalid
 
 
 # --------------------------------------------------------------------------------------------
@@ -988,6 +1187,34 @@ def test_every_seed_route_exists_and_the_walk_reaches_the_pricing_modules():
                 "services/external_seed_search.py", "services/request_market.py", REGISTRY_MODULE):
         assert rel in files, "%s is no longer reached from the partner routes" % rel
     assert not any(rel.split("/")[0] in OUT_OF_SCOPE for rel in files)
+
+
+def test_every_route_file_is_filed_as_a_partner_door_or_not():
+    """The seeds are a hand-kept list; this is what makes the list fail closed. Every routes/*.py
+    is a seed or sits under exactly one NON_PARTNER_ROUTES reason. A new route file fails here
+    until someone decides which it is -- and deciding "not a partner door" is a line in this diff."""
+    names = sorted(p.name for p in (REPO / "routes").glob("*.py") if p.name != "__init__.py")
+    seeds = {s.split("/", 1)[1] for s in seed_routes()}
+    filed: Dict[str, List[str]] = {n: [] for n in names}
+    for reason, patterns in NON_PARTNER_ROUTES.items():
+        assert len(reason) > 60, "a non-partner group must say WHY its routes are not partner doors: %r" % reason
+        assert len(set(patterns)) == len(patterns), "a pattern is listed twice under: %r" % reason
+        for pattern in patterns:
+            hits = [n for n in names if fnmatch.fnmatch(n, pattern)]
+            assert hits, "NON_PARTNER_ROUTES names %r, which matches no file in routes/" % pattern
+            for n in hits:
+                filed[n].append(reason[:40])
+    missing_seeds = sorted(seeds - set(names))
+    assert not missing_seeds, "seed routes that do not exist: %s" % missing_seeds
+    unfiled = [n for n in names if n not in seeds and not filed[n]]
+    assert not unfiled, (
+        "route file(s) filed nowhere: %s. If a partner's request can enter by it, add it to "
+        "ROUTE_SEED_FILES (it is then scanned); if not, add it to NON_PARTNER_ROUTES under the "
+        "reason that fits." % unfiled)
+    both = [n for n in names if n in seeds and filed[n]]
+    assert not both, "route file(s) filed as a partner door AND as not one: %s" % both
+    twice = {n: groups for n, groups in filed.items() if len(groups) > 1}
+    assert not twice, "route file(s) under more than one NON_PARTNER_ROUTES reason: %s" % twice
 
 
 def test_every_exclusion_is_a_reached_file_with_a_reason():
@@ -1083,6 +1310,20 @@ def test_a_fingerprint_survives_a_line_move_and_a_rewrap_but_not_a_new_occurrenc
     assert not (fp(one) & fp(elsewhere))
 
 
+def test_a_fingerprint_survives_a_trailing_comma_the_quote_style_and_an_inner_comment():
+    plain = 'def f(row):\n    return pick(row.get("currency", "USD"), row)\n'
+    comma = 'def f(row):\n    return pick(\n        row.get("currency", "USD"),\n        row,\n    )\n'
+    quotes = "def f(row):\n    return pick(row.get('currency', 'USD'), row)\n"
+    comment = ('def f(row):\n    return pick(\n        row.get(  # the currency, or else\n'
+               '            "currency", "USD"),\n        row)\n')
+    parens = 'def f(row):\n    return pick((row.get("currency", ("USD"))), row)\n'
+    renamed = 'def f(row):\n    return pick(other.get("currency", "USD"), row)\n'
+    fp = lambda src: set(entries(scan_source(src, "routes/probe.py")))  # noqa: E731
+    assert len(fp(plain)) == 1
+    assert fp(plain) == fp(comma) == fp(quotes) == fp(comment) == fp(parens)
+    assert fp(plain) != fp(renamed), "a different expression is a different default"
+
+
 def test_a_marker_needs_a_real_comment():
     marked = 'c = x or "USD"  # market-default-ok: the rail settles in USD by contract\n'
     assert _marker_lines(marked) == {1: "the rail settles in USD by contract"}
@@ -1092,8 +1333,20 @@ def test_a_marker_needs_a_real_comment():
 if __name__ == "__main__":
     import sys
 
-    if sys.argv[1:] == ["--write-baseline"]:
-        BASELINE_PATH.write_text(render_baseline(), encoding="utf-8")
-        print(summary())
-    else:
-        raise SystemExit("usage: python tests/test_market_currency_defaults_ratchet.py --write-baseline")
+    _args = sys.argv[1:]
+    if not _args or _args[0] != "--write-baseline" or set(_args[1:]) - {"--accept-new"}:
+        raise SystemExit("usage: python tests/test_market_currency_defaults_ratchet.py --write-baseline [--accept-new]")
+    _doc, _added = plan_baseline()
+    if _added and "--accept-new" not in _args:
+        print("NOT WRITTEN. The code holds %d default(s) the baseline does not:" % len(_added))
+        for _e in _added:
+            print("  [%s/%s] %s in %s: %s" % (_e["kind"], _e["shape"], _e["file"], _e["scope"], _e["expr"]))
+        print("The baseline only shrinks. Remove them or mark them `# %s: <reason>`. To register them "
+              "anyway, re-run with --accept-new, then write a `reason` on every entry it adds with an "
+              "empty one (an entry it could pair with a removed one is written as `moved`)." % MARKER)
+        raise SystemExit(1)
+    BASELINE_PATH.write_text(serialise_baseline(_doc), encoding="utf-8")
+    for _e in _added:
+        print("added %s %s (%s)" % (_e["fingerprint"], _e["file"],
+                                    "moved from " + _e["moved"] if "moved" in _e else "NEEDS A REASON"))
+    print(summary())
