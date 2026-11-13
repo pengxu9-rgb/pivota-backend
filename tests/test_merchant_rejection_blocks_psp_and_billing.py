@@ -66,8 +66,9 @@ async def test_rejecting_clears_auto_approved(db):
 
 async def test_approving_does_not_resurrect_auto_approved(db):
     """An admin approving is a manual decision, not an automatic one. The gate
-    passes on status alone, so nothing needs auto_approved back."""
-    await mo.update_kyc_status("merch_1", "approved")
+    passes on status alone, so nothing needs auto_approved back. (Approval is
+    staff-only now: tests/test_managed_merchant_onboarding.py.)"""
+    await mo.update_kyc_status("merch_1", "approved", approved_by_staff=True)
 
     written = db.values[-1]
     assert written["status"] == "approved"
