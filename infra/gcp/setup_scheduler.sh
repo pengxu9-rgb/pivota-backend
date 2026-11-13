@@ -972,14 +972,19 @@ fi
 if [ "$EXTERNAL_REFERRAL_REFRESH" = true ]; then
   echo "== job: external-referral-refresh (rollout: --limit 2000 --budget-seconds 3300 --host-concurrency 4, retries 0)"
   REFRESH_ARGS="-m,jobs.external_referral_refresh,--limit,2000,--budget-seconds,3300,--host-concurrency,4"
+  # The task timeout, in ONE place. The job's crawled-code verifier finishes before it, less a margin
+  # (jobs/external_referral_refresh.verifier_deadline_seconds): it reads EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS
+  # and defaults to TASK_TIMEOUT_SECONDS_DEFAULT, which a test pins to this value. A create sets the env; an update
+  # leaves the hand-set env alone (see above), so changing the timeout here also means changing that default.
+  REFRESH_TASK_TIMEOUT_SECONDS=3600
   if have "$GCLOUD" run jobs describe external-referral-refresh --region "$REGION"; then
     "$GCLOUD" run jobs update external-referral-refresh --region "$REGION" --image "$BACKEND_IMAGE" \
-      --max-retries 0 --task-timeout 3600s --command python --args="$REFRESH_ARGS" --quiet
+      --max-retries 0 --task-timeout "${REFRESH_TASK_TIMEOUT_SECONDS}s" --command python --args="$REFRESH_ARGS" --quiet
   else
     mkcrawljob external-referral-refresh "$BACKEND_IMAGE" "$SA" \
       --set-secrets "DATABASE_URL=DATABASE_URL:latest" \
-      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-referral-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3" \
-      --task-timeout 3600s --max-retries 0 --memory 2Gi \
+      --set-env-vars "PIVOTA_ENV=$PIVOTA_ENV,PIVOTA_SERVICE_NAME=external-referral-refresh,PIVOTA_COMMIT_SHA=$BACKEND_TAG,DB_POOL_MIN_SIZE=1,DB_POOL_MAX_SIZE=3,EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS=$REFRESH_TASK_TIMEOUT_SECONDS" \
+      --task-timeout "${REFRESH_TASK_TIMEOUT_SECONDS}s" --max-retries 0 --memory 2Gi \
       --command python --args="$REFRESH_ARGS"
   fi
 else
