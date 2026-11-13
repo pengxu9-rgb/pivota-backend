@@ -1,15 +1,16 @@
 """The owner check of the keyed payment routes. Behind AGENT_PAYMENT_ORDER_OWNER_CHECK, default off.
 
-Three routes compared the caller's merchant scope with the order's MERCHANT and never the caller
+Four routes compared the caller's merchant scope with the order's MERCHANT and never the caller
 with the order's OWNER (orders.agent_id, the agent that created it):
 
-  * POST /agent/v1/payments                      (route label `payments_create`)
-  * POST /agent/v1/orders/payment-offer-evidence (`payment_offer_evidence`)
-  * GET  /agent/v1/payments/{payment_id}         (`payment_status`)
+  * POST /agent/v1/payments                           (route label `payments_create`)
+  * POST /agent/v1/orders/payment-offer-evidence      (`payment_offer_evidence`)
+  * GET  /agent/v1/payments/{payment_id}              (`payment_status`)
+  * POST /agent/v1/orders/{order_id}/confirm-payment  (`payment_confirm`)
 
 So any key in the merchant's scope that knew an order id could start or reuse a payment on
-another agent's order (and receive its payment client secret), rewrite its metadata, or read its
-payment. The order read (GET /agent/v1/orders/{id}) and the /agent/v2 routes already refuse such
+another agent's order (and receive its payment client secret), rewrite its metadata, read its
+payment, or have its payment confirmed and captured and the order marked paid. The order read (GET /agent/v1/orders/{id}) and the /agent/v2 routes already refuse such
 a caller with 403 "Not authorized for this order".
 
 The rule is the one those routes use, routes.agent_forwarded_owner.order_access_allowed, and not
@@ -25,15 +26,35 @@ because this module relies on them:
 
 Nobody is exempt. An internal trusted key is a caller like any other: it is served on the orders
 its own agent created (every order made with that key) and refused on the rest. A checkout token
-is already bound to one order of its own agent by ensure_checkout_token_order_access, which runs
-first and is not changed; such a caller owns the order by that binding, and passes this check for
-the same reason.
+is already bound to one order of its own agent by the token binding
+(routes.agent_auth.checkout_token_may_use_order), which runs first and is not changed; such a
+caller is the order's agent by that binding and so passes this check.
+
+One difference between the two, kept on purpose: the token binding strips whitespace from both
+ids before it compares them, and the owner rule compares them exactly. So a token bound to an
+order whose stored agent_id carries stray whitespace passes the binding and is NOT the owner
+here: observed it logs `caller_kind=checkout_token`, enforced it is refused. The owner rule is
+not loosened to match: trimming would make two different stored ids one owner, which can only
+widen who is served, and the shared rule the other routes use does not trim either.
 
 Modes (read per call; unset or anything else is `off`):
-  off      the three routes run exactly as they did before this module existed;
-  observe  nothing is refused; each call that `enforce` would refuse logs ONE warning line;
-  enforce  such a call is refused with 403 "Not authorized for this order" before the route reads
-           or writes anything else for the order, with one warning line.
+  off      the four routes run exactly as they did before this module existed;
+  observe  nothing is refused and no answer changes; each call from a caller that is not the
+           owner, at the point where `enforce` would refuse it, logs ONE warning line;
+  enforce  such a call is refused with 403 "Not authorized for this order", with one warning
+           line, before the route calls a PSP, writes to the order or a payment, or answers with
+           anything about the order.
+
+What still happens on a refusal, as on every early exit of these routes: POST /agent/v1/payments
+emits its own checkout-failed telemetry event (the order id and the refusal text) from its
+failure handler. Nothing else is recorded and nothing is written to the order.
+
+Where each route asks. POST /agent/v1/payments asks right after its not-found answer, for EVERY
+caller: enforced, a caller outside the merchant's scope that is not the owner gets this refusal
+instead of the route's earlier answers about the order (already paid, canceled, total or currency
+mismatch) and its merchant refusal. Its line says `scope=out`; observed, such a caller is logged
+and answered exactly as before. The other three ask after their own merchant refusal, so their
+lines always say `scope=in`.
 
 The line carries closed labels and the CALLER's own agent id. It never carries the order's id,
 the owner's id, an API key, a token, a client secret or a payment intent id.
@@ -67,9 +88,12 @@ ORDER_OWNER_DENIED_DETAIL = "Not authorized for this order"
 ROUTE_PAYMENTS_CREATE = "payments_create"
 ROUTE_PAYMENT_OFFER_EVIDENCE = "payment_offer_evidence"
 ROUTE_PAYMENT_STATUS = "payment_status"
-_ROUTES = frozenset({ROUTE_PAYMENTS_CREATE, ROUTE_PAYMENT_OFFER_EVIDENCE, ROUTE_PAYMENT_STATUS})
+ROUTE_PAYMENT_CONFIRM = "payment_confirm"
+_ROUTES = frozenset(
+    {ROUTE_PAYMENTS_CREATE, ROUTE_PAYMENT_OFFER_EVIDENCE, ROUTE_PAYMENT_STATUS, ROUTE_PAYMENT_CONFIRM}
+)
 
-#: (outcome, route, caller_kind, owner_kind, quote) counts for this process. outcome is
+#: (outcome, route, scope, caller_kind, owner_kind, quote) counts for this process. outcome is
 #: `would_refuse` (observe) or `refused` (enforce).
 ORDER_OWNER_CHECK_OUTCOMES: Counter = Counter()
 
@@ -141,11 +165,15 @@ def caller_owns_order(order: Mapping[str, Any], context: Any) -> bool:
     return bool(order_access_allowed(order, context))
 
 
-def check_order_owner(order: Mapping[str, Any], context: Any, *, route: str, mode: str) -> None:
+def check_order_owner(
+    order: Mapping[str, Any], context: Any, *, route: str, mode: str, in_scope: bool = True
+) -> None:
     """Refuse (enforce) or note (observe) a caller that does not own `order`.
 
     `mode` is the caller's reading of order_owner_check_mode(): the routes read it once and do not
-    come here at all when it is `off`. Anything that is not `enforce` refuses nothing."""
+    come here at all when it is `off`. Anything that is not `enforce` refuses nothing.
+    `in_scope` only labels the line (`scope=in|out`): whether the caller passed, or would pass, the
+    route's own merchant check. It never decides who is refused."""
     if route not in _ROUTES:
         raise ValueError(f"unknown owner-check route label: {route!r}")
     if mode not in _ACTIVE_MODES:
@@ -156,11 +184,12 @@ def check_order_owner(order: Mapping[str, Any], context: Any, *, route: str, mod
     caller_kind = _caller_kind(context)
     owner_kind = _agent_kind(str(order.get("agent_id") or "").strip())
     quote = _quote_label(order)
-    ORDER_OWNER_CHECK_OUTCOMES[(outcome, route, caller_kind, owner_kind, quote)] += 1
+    scope = "in" if in_scope is True else "out"
+    ORDER_OWNER_CHECK_OUTCOMES[(outcome, route, scope, caller_kind, owner_kind, quote)] += 1
     # utils.logger at WARNING: plain module loggers lose INFO in a deployed service.
     logger.warning(
-        "order_owner_check outcome=%s mode=%s route=%s caller_kind=%s owner_kind=%s quote=%s caller_agent_id=%s",
-        outcome, mode, route, caller_kind, owner_kind, quote, getattr(context, "agent_id", None),
+        "order_owner_check outcome=%s mode=%s route=%s scope=%s caller_kind=%s owner_kind=%s quote=%s caller_agent_id=%s",
+        outcome, mode, route, scope, caller_kind, owner_kind, quote, getattr(context, "agent_id", None),
     )
     if mode == MODE_ENFORCE:
         raise HTTPException(status_code=ORDER_OWNER_DENIED_STATUS, detail=ORDER_OWNER_DENIED_DETAIL)
@@ -172,7 +201,8 @@ async def check_payment_order_owner(order_id: Any, context: Any, *, mode: str) -
 
     A read that fails is not an answer about the owner. Observing, it is logged and the caller is
     served as before, because `observe` refuses nothing. Enforcing, it is raised: the route then
-    answers its own 500 and serves nothing."""
+    answers 500 "Failed to get payment status" (its handler for any failure; not a 503, also when
+    the database was only busy) and serves nothing."""
     if mode not in _ACTIVE_MODES:
         return
     from db.database import database

@@ -51,6 +51,7 @@ from routes.agent_auth import (
 )
 from routes.agent_order_owner_check import (
     MODE_OFF as ORDER_OWNER_CHECK_OFF,
+    ROUTE_PAYMENT_CONFIRM,
     ROUTE_PAYMENT_OFFER_EVIDENCE,
     check_order_owner,
     order_owner_check_mode,
@@ -10007,6 +10008,14 @@ async def agent_confirm_payment(
 
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): a payment is confirmed, captured and the
+        # order marked paid only for the order's owner. Before the PSP is asked anything, before
+        # any write, and before any answer below that carries the order's payment state or its
+        # payment intent id.
+        owner_check_mode = order_owner_check_mode()
+        if owner_check_mode != ORDER_OWNER_CHECK_OFF:
+            check_order_owner(order, context, route=ROUTE_PAYMENT_CONFIRM, mode=owner_check_mode)
 
         await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
 

@@ -1,11 +1,12 @@
 """The keyed payment routes serve an order's OWNER, not everyone in its merchant's scope.
 
-Three routes compared the caller's merchant scope with the order's merchant and never the caller
+Four routes compared the caller's merchant scope with the order's merchant and never the caller
 with the order's owner (orders.agent_id):
 
-    POST /agent/v1/payments                         start or reuse a payment (returns its client secret)
-    POST /agent/v1/orders/payment-offer-evidence    write the order's metadata
-    GET  /agent/v1/payments/{payment_id}            read a payment
+    POST /agent/v1/payments                           start or reuse a payment (returns its client secret)
+    POST /agent/v1/orders/payment-offer-evidence      write the order's metadata
+    GET  /agent/v1/payments/{payment_id}              read a payment
+    POST /agent/v1/orders/{order_id}/confirm-payment  confirm and capture at the PSP, mark the order paid
 
 AGENT_PAYMENT_ORDER_OWNER_CHECK (off | observe | enforce, default off) adds the owner rule the
 order read and the /agent/v2 routes already apply (routes.agent_forwarded_owner.order_access_allowed).
@@ -16,7 +17,7 @@ goes through POST /agent/shop/v1/invoke, whose proxied call is delivered to the 
 SHOP_INVOKE_FORWARD_CALLER_KEY off and on.
 
 `run_matrix` is also what the flag-off comparison against the base commit runs (every caller x
-every order x the three routes: status, body, writes, reads, PSP calls).
+every order x the four routes: status, body, writes, reads, PSP calls).
 
 Keys, secrets, ids and names below are made up.
 """
@@ -44,10 +45,12 @@ import mvp.governance as mvp_governance
 import routes.agent_api as agent_api
 import routes.agent_auth as agent_auth
 import routes.agent_forwarded_owner as forwarded_owner
+import routes.order_routes as order_routes
 import routes.agent_order_owner_check as owner_check
 import routes.agent_payment_sdk as payments
 import routes.agent_shop_gateway as gw
 import routes.agent_v2 as agent_v2
+import services.agent_governance as governance_module
 import services.market_registry as market_registry
 from db.database import database as shared_database
 from utils.logger import logger as pivota_logger
@@ -150,7 +153,12 @@ ORDER_OWNERS: Dict[str, Optional[str]] = {
     O_BLANK: "  ",
     O_OUTSIDE: OUTSIDE_AGENT,
 }
-MATRIX_ORDERS = list(ORDER_OWNERS) + [MISSING]
+# The merchant_id COLUMN is NULL; the merchant is on the order's items. Each route resolves an
+# order's merchant its own way, so these are pinned route by route further down.
+O_NM_OWNER = "ORD_fixture_null_merchant_owner"
+O_NM_THIRD = "ORD_fixture_null_merchant_third"
+NULL_MERCHANT_ORDER_OWNERS: Dict[str, Optional[str]] = {O_NM_OWNER: OWNER_AGENT, O_NM_THIRD: THIRD_AGENT}
+MATRIX_ORDERS = list(ORDER_OWNERS) + list(NULL_MERCHANT_ORDER_OWNERS) + [MISSING]
 
 LIVE_QUOTE_EXPIRY = "2099-01-01T00:00:00Z"
 PAST_QUOTE_EXPIRY = "2001-01-01T00:00:00Z"
@@ -182,6 +190,8 @@ def _order(
     payment_status: str = "processing",
     quote_expires_at: Optional[str] = LIVE_QUOTE_EXPIRY,
     metadata: Optional[Dict[str, Any]] = None,
+    null_merchant_column: bool = False,
+    psp: str = "stripe",
 ) -> Dict[str, Any]:
     pricing_quote: Dict[str, Any] = {"quote_id": f"q_{order_id}", "live_validation": {"status": "validated"}}
     if quote_expires_at is not None:
@@ -202,12 +212,29 @@ def _order(
         "created_at": "2026-01-01T00:00:00",
     }
     if with_surface:
-        row.update(psp_used="stripe", payment_intent_id=intent_of(order_id), client_secret=client_secret_of(order_id))
+        row.update(psp_used=psp, payment_intent_id=intent_of(order_id), client_secret=client_secret_of(order_id))
+    if null_merchant_column:
+        row["merchant_id"] = None
     return row
 
 
-def _orders() -> Dict[str, Dict[str, Any]]:
-    return {order_id: _order(order_id, agent_id=owner) for order_id, owner in ORDER_OWNERS.items()}
+# Order shapes the matrix is run over. `authorization_first`: confirm-payment asks the PSP to
+# confirm, then finalizes (merchant-order write and capture).
+AUTH_FIRST = {"payment_flow": {"mode": "authorization_first", "psp": "paypal", "store_platform": "shopify"}}
+SHAPES: Dict[str, Dict[str, Any]] = {
+    "surface": {},
+    "fresh": dict(with_surface=False, payment_status="unpaid"),
+    "paid": dict(payment_status="paid"),
+    "expired_quote": dict(quote_expires_at=PAST_QUOTE_EXPIRY),
+    "authorization_first": dict(payment_status="pending", psp="paypal", metadata=AUTH_FIRST),
+}
+
+
+def _orders(**shape: Any) -> Dict[str, Dict[str, Any]]:
+    rows = {order_id: _order(order_id, agent_id=owner, **shape) for order_id, owner in ORDER_OWNERS.items()}
+    for order_id, owner in NULL_MERCHANT_ORDER_OWNERS.items():
+        rows[order_id] = _order(order_id, agent_id=owner, null_merchant_column=True, **shape)
+    return rows
 
 
 def _payment_row(order: Dict[str, Any]) -> Dict[str, Any]:
@@ -307,8 +334,9 @@ def build_harness(monkeypatch, *, service_key_is_internal_trusted: bool = False)
         state["writes"].append({"write": "update_order", "order_id": str(order_id), "fields": fields})
         return True
 
-    for module in (agent_api, payments, agent_v2):
+    for module in (agent_api, payments, agent_v2, order_routes):
         monkeypatch.setattr(module, "get_order", get_order)
+    monkeypatch.setattr("db.orders.get_order", get_order)   # the token door of an order-id path route
     monkeypatch.setattr(agent_api, "update_order", update_order)
     monkeypatch.setattr(agent_api, "emit_payment_offer_analytics_event", lambda **_k: None)
 
@@ -391,6 +419,57 @@ def build_harness(monkeypatch, *, service_key_is_internal_trusted: bool = False)
     monkeypatch.setattr("mvp.ledger_events.emit_ledger_event_best_effort", lambda **_k: None)
     monkeypatch.setattr(mvp_governance.governance, "evaluate", lambda *_a, **_k: _Decision())
     monkeypatch.setattr(mvp_governance.governance, "record_audit_event", lambda **_k: None)
+
+    # confirm-payment: every PSP step and every write it can make, recorded.
+    class _PspAdapter:
+        async def confirm_payment(self, *, payment_intent_id, payment_method_id):
+            state["psp_calls"].append({"psp": "confirm_payment", "payment_intent_id": payment_intent_id})
+            return True, "authorized", None
+
+    async def resolve_order_psp_adapter(order):
+        return "paypal", _PspAdapter()
+
+    async def finalize_authorized_payment_order(order_id, *, order, source_event):
+        state["psp_calls"].append({"psp": "capture", "order_id": order_id, "currency": order["currency"]})
+        state["writes"].append({"write": "finalize_authorized_payment_order", "order_id": order_id})
+        return {"status": "success", "linked_merchant_order": None}
+
+    async def verify_order_payment_succeeded(order):
+        state["psp_calls"].append({"psp": "verify", "order_id": order["order_id"]})
+        return True, "succeeded", None
+
+    async def mark_order_paid(order_id):
+        state["writes"].append({"write": "mark_order_paid", "order_id": order_id})
+        return True
+
+    async def log_order_event(**kwargs):
+        state["writes"].append({"write": "log_order_event", **kwargs})
+        return []
+
+    async def create_order_snapshot_evidence_pack(order_id, triggered_by=None):
+        state["writes"].append({"write": "evidence_pack", "order_id": order_id})
+
+    async def enqueue_merchant_order_create(**kwargs):
+        state["writes"].append({"write": "enqueue_merchant_order_create", **kwargs})
+
+    async def emit_agent_webhook_event(agent_id, *, event_type, payload):
+        state["writes"].append({"write": "webhook", "agent_id": agent_id, "event_type": event_type, "payload": payload})
+
+    async def get_policy(agent_id, *, fail_closed=False):
+        return {"agent_id": agent_id, "max_requests_per_minute": 100000, "max_error_rate": 1.0, "status": "active"}
+
+    monkeypatch.setattr(order_routes, "_resolve_order_psp_adapter", resolve_order_psp_adapter)
+    monkeypatch.setattr(order_routes, "finalize_authorized_payment_order", finalize_authorized_payment_order)
+    monkeypatch.setattr(order_routes, "verify_order_payment_succeeded", verify_order_payment_succeeded)
+    monkeypatch.setattr(order_routes, "mark_order_paid", mark_order_paid)
+    monkeypatch.setattr(order_routes, "log_order_event", log_order_event)
+    monkeypatch.setattr("services.merchant_store_service.get_primary_store", get_primary_store)
+    monkeypatch.setattr("services.pcs_evidence_pack_service.create_order_snapshot_evidence_pack", create_order_snapshot_evidence_pack)
+    monkeypatch.setattr("services.agent_webhook_service.emit_agent_webhook_event", emit_agent_webhook_event)
+    monkeypatch.setattr(agent_api, "enqueue_merchant_order_create", enqueue_merchant_order_create)
+    monkeypatch.setattr(agent_api, "order_confirmation_email_enabled", lambda: False)
+    monkeypatch.setattr(governance_module.agent_governance, "_get_policy", get_policy)
+    monkeypatch.setattr(governance_module.agent_governance, "_metrics_store", defaultdict(governance_module.AgentMetrics))
 
     monkeypatch.setattr(gw, "_INVOKE_ANON_IP_LIMIT_STORE", {})
     monkeypatch.setattr(gw, "AGENT_API_KEY", SERVICE_KEY)
@@ -493,7 +572,7 @@ def caller_headers(caller: str, order_id: str) -> Dict[str, str]:
     raise AssertionError(caller)
 
 
-ROUTES = ["payments_create", "payment_offer_evidence", "payment_status"]
+ROUTES = ["payments_create", "payment_offer_evidence", "payment_status", "payment_confirm"]
 
 
 def call(h, route: str, caller: str, order_id: str, *, headers: Optional[Dict[str, str]] = None, **body: Any):
@@ -507,6 +586,8 @@ def call(h, route: str, caller: str, order_id: str, *, headers: Optional[Dict[st
                                       "payment_method_evidence": {"psp": "stripe", "card_network": "fixturecard"}, **body})
     if route == "payment_status":
         return h["client"].get(f"/agent/v1/payments/{payment_id_of(order_id)}", headers=headers)
+    if route == "payment_confirm":
+        return h["client"].post(f"/agent/v1/orders/{order_id}/confirm-payment", headers=headers)
     raise AssertionError(route)
 
 
@@ -546,15 +627,17 @@ def run_matrix(h) -> List[Dict[str, Any]]:
 
 # ── who is who: written out by hand, not computed from the rule under test ─────
 
-OWNER, NOT_OWNER, OUT_OF_SCOPE, TOKEN_OK, TOKEN_NOT_BOUND, NO_CREDENTIAL = (
-    "owner", "not_owner_in_scope", "out_of_scope", "token_bound", "token_not_bound", "no_credential",
+OWNER, NOT_OWNER, OUT_OF_SCOPE, OUT_OF_SCOPE_OWNER, TOKEN_OK, TOKEN_NOT_BOUND, NO_CREDENTIAL = (
+    "owner", "not_owner_in_scope", "not_owner_out_of_scope", "owner_out_of_scope", "token_bound",
+    "token_not_bound", "no_credential",
 )
 RELATION: Dict[Tuple[str, str], str] = {}
 for _order_id in ORDER_OWNERS:
     RELATION[("owner", _order_id)] = OWNER if _order_id == O_OWNER else NOT_OWNER
     RELATION[("scoped", _order_id)] = OWNER if _order_id == O_SCOPED else NOT_OWNER
     RELATION[("unrestricted", _order_id)] = NOT_OWNER
-    RELATION[("outside", _order_id)] = OUT_OF_SCOPE          # also on the order it owns: its scope lost the merchant
+    # Its scope does not hold the merchant; one order is its own (its scope lost the merchant since).
+    RELATION[("outside", _order_id)] = OUT_OF_SCOPE_OWNER if _order_id == O_OUTSIDE else OUT_OF_SCOPE
     RELATION[("internal", _order_id)] = OWNER if _order_id == O_INTERNAL else NOT_OWNER
     # The token is the owner AGENT's, so it is bound only to that agent's order.
     RELATION[("token_for_this_order", _order_id)] = TOKEN_OK if _order_id == O_OWNER else TOKEN_NOT_BOUND
@@ -569,6 +652,8 @@ MERCHANT_DENIED = {
     "payments_create": {"detail": "Not authorized for this merchant"},
     "payment_offer_evidence": {"detail": "Not authorized for this merchant"},
     "payment_status": {"detail": "Not authorized"},
+    # confirm-payment's merchant refusal has always used the owner refusal's sentence.
+    "payment_confirm": {"detail": "Not authorized for this order"},
 }
 SERVED = "served"
 
@@ -581,11 +666,28 @@ def expected(route: str, relation: str, mode: str) -> Any:
         return 403, TOKEN_ROUTE_DENIED
     if relation == TOKEN_NOT_BOUND:
         return 403, TOKEN_ORDER_DENIED
+    if relation == OUT_OF_SCOPE_OWNER:
+        return 403, MERCHANT_DENIED[route]
     if relation == OUT_OF_SCOPE:
+        # Enforced, the payment route refuses a caller that is not the owner before it looks at
+        # the merchant; the other routes look at the merchant first, as before.
+        if mode == "enforce" and route == "payments_create":
+            return 403, OWNER_DENIED
         return 403, MERCHANT_DENIED[route]
     if relation == NOT_OWNER and mode == "enforce":
         return 403, OWNER_DENIED
     return SERVED
+
+
+def expected_line_scope(route: str, relation: str, mode: str) -> Optional[str]:
+    """The `scope` label of the one line a call logs, or None when it logs none."""
+    if mode == "off":
+        return None
+    if relation == NOT_OWNER:
+        return "in"
+    if relation == OUT_OF_SCOPE and route == "payments_create":
+        return "out"
+    return None
 
 
 def assert_served(h, route: str, order_id: str, res) -> None:
@@ -601,6 +703,12 @@ def assert_served(h, route: str, order_id: str, res) -> None:
         assert body["recorded"] is True and body["order_id"] == order_id
         assert [w["order_id"] for w in h["writes"]] == [order_id]
         assert h["writes"][0]["fields"]["metadata"]["selected_payment_offer_id"] == "offer_fixture"
+    elif route == "payment_confirm":
+        # The fixture order has an open client-side surface: the route answers "pending" with the
+        # order's payment intent id (other shapes: the confirm-payment tests below).
+        assert body["status"] == "pending" and body["order_id"] == order_id
+        assert body["payment_intent_id"] == intent_of(order_id)
+        assert h["writes"] == [] and h["psp_calls"] == []
     else:
         assert body["payment"]["order_id"] == order_id
         assert body["payment"]["currency"] == order["currency"]
@@ -643,10 +751,11 @@ def test_who_is_served_and_who_is_refused(h, monkeypatch, owner_lines, route, mo
                 assert h["writes"] == [] and h["psp_calls"] == [], where
                 assert_carries_nothing_of_the_order(h, res, order_id)
             lines = [r.getMessage() for r in owner_lines]
-            if relation == NOT_OWNER and mode != "off":
+            scope = expected_line_scope(route, relation, mode)
+            if scope:
                 outcome = "refused" if mode == "enforce" else "would_refuse"
                 assert len(lines) == 1, (where, lines)
-                assert lines[0].startswith(f"order_owner_check outcome={outcome} mode={mode} route={route} "), lines
+                assert lines[0].startswith(f"order_owner_check outcome={outcome} mode={mode} route={route} scope={scope} "), lines
                 assert owner_lines[0].levelno == logging.WARNING
                 assert lines[0].endswith(f"caller_agent_id={CALLER_AGENTS[caller]}"), lines
             else:
@@ -677,7 +786,7 @@ def test_a_missing_order_answers_as_before_for_every_caller(h, monkeypatch, owne
 def test_the_matrix_covers_every_caller_and_owner_kind_asked_for():
     owners = set(ORDER_OWNERS.values())
     assert {OWNER_AGENT, SCOPED_AGENT, THIRD_AGENT, INTERNAL_AGENT, SERVICE_AGENT, None, "  ", OUTSIDE_AGENT} == owners
-    assert set(RELATION.values()) == {OWNER, NOT_OWNER, OUT_OF_SCOPE, TOKEN_OK, TOKEN_NOT_BOUND, NO_CREDENTIAL}
+    assert set(RELATION.values()) == {OWNER, NOT_OWNER, OUT_OF_SCOPE, OUT_OF_SCOPE_OWNER, TOKEN_OK, TOKEN_NOT_BOUND, NO_CREDENTIAL}
     assert len(RELATION) == len(CALLERS) * len(ORDER_OWNERS)
 
 
@@ -702,7 +811,7 @@ def test_the_flag_name_and_its_default():
 
 
 def test_every_off_value_answers_writes_and_reads_exactly_as_the_flag_unset(h, monkeypatch, owner_lines):
-    """With the flag off the three routes do what they did before it existed: same answers, same
+    """With the flag off the four routes do what they did before it existed: same answers, same
     writes, same reads, same PSP calls, for every caller and every order."""
     monkeypatch.delenv(FLAG, raising=False)
     baseline = run_matrix(h)
@@ -737,9 +846,16 @@ def test_observe_serves_exactly_what_off_serves(h, monkeypatch, owner_lines):
         after = {**after, "reads": [r for r in after["reads"] if r not in owner_reads]}
         assert after == before
         assert len(owner_reads) <= 1 and (not owner_reads or after["route"] == "payment_status")
-    not_owner_calls = sum(1 for (caller, order_id), rel in RELATION.items() if rel == NOT_OWNER) * len(ROUTES)
-    assert len(owner_lines) == not_owner_calls
     assert {r.getMessage().split()[1] for r in owner_lines} == {"outcome=would_refuse"}
+    # One line per call that enforce answers differently, and for no other call.
+    observed_lines = len(owner_lines)
+    monkeypatch.setenv(FLAG, "enforce")
+    enforced = run_matrix(h)
+    refused = [(b, e) for b, e in zip(off, enforced) if (b["status"], b["body"]) != (e["status"], e["body"])]
+    assert all((e["status"], e["body"]) == (403, OWNER_DENIED) for _, e in refused)
+    assert observed_lines == len(refused) > 0
+    hand_counted = sum(1 for route in ROUTES for rel in RELATION.values() if expected_line_scope(route, rel, "observe"))
+    assert hand_counted <= observed_lines, "the null-merchant orders add their own; never fewer than the hand table"
 
 
 def test_the_mode_is_read_on_every_call(h, monkeypatch):
@@ -840,13 +956,51 @@ def test_enforce_the_refusal_comes_before_any_answer_that_describes_the_order(h,
             continue
         assert res.status_code == status and marker in res.text, res.text
 
+    monkeypatch.setenv(FLAG, "observe")
+    observed = answers()
+    for caller in off:
+        assert (observed[caller].status_code, observed[caller].json()) == (off[caller].status_code, off[caller].json())
+
     monkeypatch.setenv(FLAG, "enforce")
     on = answers()
-    for caller in ("scoped", "unrestricted"):
+    # In the merchant's scope or outside it: a caller that is not the owner learns none of it.
+    for caller in ("scoped", "unrestricted", "outside"):
         assert (on[caller].status_code, on[caller].json()) == (403, OWNER_DENIED)
         assert marker not in on[caller].text
-    for caller in ("owner", "outside"):
-        assert (on[caller].status_code, on[caller].json()) == (off[caller].status_code, off[caller].json())
+        assert_carries_nothing_of_the_order(h, on[caller], O_OWNER)
+    assert (on["owner"].status_code, on["owner"].json()) == (off["owner"].status_code, off["owner"].json())
+
+
+@pytest.mark.parametrize("case", sorted(EARLY_ANSWERS))
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_an_owner_whose_scope_lost_the_merchant_gets_the_answers_it_always_got(h, monkeypatch, owner_lines, mode, case):
+    order_kwargs, body, status, marker = EARLY_ANSWERS[case]
+    h["orders"][O_OUTSIDE] = _order(O_OUTSIDE, agent_id=OUTSIDE_AGENT, **order_kwargs)
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    res = call(h, "payments_create", "outside", O_OUTSIDE, **body)
+    if case == "quote_expired":
+        assert (res.status_code, res.json()) == (403, MERCHANT_DENIED["payments_create"])
+    else:
+        assert res.status_code == status and marker in res.text
+    assert owner_lines == []
+
+
+@pytest.mark.parametrize("mode", ["observe", "enforce"])
+def test_a_caller_outside_the_scope_that_is_not_the_owner_is_logged_with_scope_out(h, monkeypatch, owner_lines, mode):
+    """Observed: answered as before (the merchant refusal) and logged, so the count of callers that
+    enforce will answer differently can be read. Enforced: the owner refusal."""
+    monkeypatch.setenv(FLAG, mode)
+    res = call(h, "payments_create", "outside", O_OWNER)
+    want = OWNER_DENIED if mode == "enforce" else MERCHANT_DENIED["payments_create"]
+    assert (res.status_code, res.json()) == (403, want)
+    fields = _fields(owner_lines[0])
+    assert len(owner_lines) == 1 and fields["scope"] == "out" and fields["caller_agent_id"] == OUTSIDE_AGENT
+    assert fields["outcome"] == ("refused" if mode == "enforce" else "would_refuse")
+    # The other three routes look at the merchant first: no line, and the answer they always gave.
+    for route in ("payment_offer_evidence", "payment_status", "payment_confirm"):
+        owner_lines.clear()
+        res = call(h, route, "outside", O_OWNER)
+        assert (res.status_code, res.json()) == (403, MERCHANT_DENIED[route]) and owner_lines == []
 
 
 def test_enforce_an_unrestricted_caller_is_refused_on_an_order_whose_merchant_cannot_be_resolved(h, monkeypatch):
@@ -855,10 +1009,10 @@ def test_enforce_an_unrestricted_caller_is_refused_on_an_order_whose_merchant_ca
     row["items"] = []
     h["orders"][O_THIRD] = row
     assert call(h, "payments_create", "unrestricted", O_THIRD).json() == {"detail": "Order merchant could not be resolved"}
+    assert call(h, "payments_create", "scoped", O_THIRD).json() == {"detail": "Order merchant could not be resolved"}
     monkeypatch.setenv(FLAG, "enforce")
     assert call(h, "payments_create", "unrestricted", O_THIRD).json() == OWNER_DENIED
-    # A caller with a merchant list has no scope over it: the answer it had before.
-    assert call(h, "payments_create", "scoped", O_THIRD).json() == {"detail": "Order merchant could not be resolved"}
+    assert call(h, "payments_create", "scoped", O_THIRD).json() == OWNER_DENIED
 
 
 # ══ the evidence route ═══════════════════════════════════════════════════════
@@ -884,6 +1038,202 @@ def test_evidence_for_a_quote_with_no_order_is_not_an_order_and_is_untouched(h, 
                            json={"quote_id": "q_fixture", "merchant_id": MERCHANT, "payment_method_evidence": {"psp": "stripe"}})
     assert res.status_code == 200 and res.json()["recorded"] is True and res.json()["order_id"] is None
     assert h["writes"] == [] and owner_lines == []
+
+
+# ══ the confirm-payment route ════════════════════════════════════════════════
+
+CONFIRM_SERVED = {
+    # shape -> (what the owner is answered, PSP steps, writes)
+    "surface": ("pending", [], []),
+    "expired_quote": ("pending", [], []),
+    "paid": ("success", [], []),
+    "fresh": ("success", ["verify"], ["mark_order_paid", "evidence_pack", "log_order_event", "webhook"]),
+    "authorization_first": ("success", ["confirm_payment", "capture"], ["finalize_authorized_payment_order"]),
+}
+
+
+def test_the_confirm_shapes_cover_every_order_shape():
+    assert set(CONFIRM_SERVED) == set(SHAPES)
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+@pytest.mark.parametrize("caller,order_id", NOT_OWNERS)
+def test_enforce_confirm_payment_does_nothing_for_a_caller_that_is_not_the_owner(h, monkeypatch, caller, order_id, shape):
+    """Off, a key in the merchant's scope has another agent's payment confirmed and captured at the
+    PSP, the order marked paid, and reads its payment intent id. Enforced: the one refusal, and no
+    PSP step, no write and no intent id after it."""
+    status, psp_steps, writes = CONFIRM_SERVED[shape]
+    owner = h["orders"][order_id]["agent_id"]
+    h["orders"][order_id] = _order(order_id, agent_id=owner, **SHAPES[shape])
+
+    off = call(h, "payment_confirm", caller, order_id)
+    assert off.status_code == 200 and off.json()["status"] == status, off.text
+    assert [c["psp"] for c in h["psp_calls"]] == psp_steps
+    assert [w["write"] for w in h["writes"]] == writes
+    if SHAPES[shape].get("with_surface", True):
+        assert off.json()["payment_intent_id"] == intent_of(order_id)
+
+    for mode in ("observe", "enforce"):
+        monkeypatch.setenv(FLAG, mode)
+        _reset(h)
+        res = call(h, "payment_confirm", caller, order_id)
+        if mode == "observe":
+            assert (res.status_code, res.json()) == (off.status_code, off.json())
+            assert [c["psp"] for c in h["psp_calls"]] == psp_steps and [w["write"] for w in h["writes"]] == writes
+            continue
+        assert (res.status_code, res.json()) == (403, OWNER_DENIED)
+        assert h["psp_calls"] == [] and h["writes"] == [] and h["reads"] == []
+        assert_carries_nothing_of_the_order(h, res, order_id)
+        assert "pending" not in res.text and "paid" not in res.text
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+@pytest.mark.parametrize("market", MARKETS)
+def test_the_owner_confirms_its_payment_in_every_mode_in_the_currency_of_the_orders_market(h, monkeypatch, market, shape, mode):
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    currency = market_currency(market)
+    status, psp_steps, writes = CONFIRM_SERVED[shape]
+    h["orders"][O_OWNER] = _order(O_OWNER, agent_id=OWNER_AGENT, market=market, **SHAPES[shape])
+    res = call(h, "payment_confirm", "owner", O_OWNER)
+    assert res.status_code == 200 and res.json()["status"] == status and res.json()["order_id"] == O_OWNER
+    assert [c["psp"] for c in h["psp_calls"]] == psp_steps and [w["write"] for w in h["writes"]] == writes
+    # Every amount the route records or sends on is in the order's own currency.
+    for record in h["writes"] + h["psp_calls"]:
+        for carried in (record.get("currency"), (record.get("payload") or {}).get("currency")):
+            assert carried in (None, currency), record
+    if shape == "fresh":
+        assert h["writes"][2]["currency"] == currency and h["writes"][3]["payload"]["currency"] == currency
+        assert h["writes"][3]["agent_id"] == OWNER_AGENT
+    if shape == "authorization_first":
+        assert h["psp_calls"][1]["currency"] == currency
+
+
+@pytest.mark.parametrize("market", MARKETS)
+def test_enforce_the_confirm_refusal_is_the_same_in_every_market(h, monkeypatch, market):
+    monkeypatch.setenv(FLAG, "enforce")
+    h["orders"][O_OWNER] = _order(O_OWNER, agent_id=OWNER_AGENT, market=market, **SHAPES["fresh"])
+    res = call(h, "payment_confirm", "scoped", O_OWNER)
+    assert (res.status_code, res.json()) == (403, OWNER_DENIED)
+    assert h["psp_calls"] == [] and h["writes"] == []
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_confirm_payment_with_a_checkout_token_is_bound_at_the_door_as_before(h, monkeypatch, owner_lines, mode):
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    own = call(h, "payment_confirm", "token_for_this_order", O_OWNER)
+    assert own.status_code == 200 and own.json()["payment_intent_id"] == intent_of(O_OWNER)
+    other = call(h, "payment_confirm", "token_for_this_order", O_SCOPED)
+    assert (other.status_code, other.json()) == (403, TOKEN_ORDER_DENIED)
+    assert owner_lines == []
+
+
+# ══ an order whose merchant_id column is NULL ════════════════════════════════
+#
+# Each route finds such an order's merchant its own way. None of them lets a caller that is not the
+# owner through because of it.
+
+
+def test_the_null_merchant_fixture_resolves_from_its_items_on_the_payment_route_only(h):
+    order = h["orders"][O_NM_THIRD]
+    assert order["merchant_id"] is None and payments._resolve_order_merchant_id(order) == MERCHANT
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_null_merchant_column_the_payment_route_resolves_it_from_the_items(h, monkeypatch, owner_lines, mode):
+    """The merchant is found on the items, so a scoped key is IN scope, as the route's own merchant
+    check finds. A check that read the raw column would call this caller out of scope."""
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    for caller in ("scoped", "unrestricted", "outside"):
+        owner_lines.clear()
+        res = call(h, "payments_create", caller, O_NM_THIRD)
+        if mode == "enforce":
+            assert (res.status_code, res.json()) == (403, OWNER_DENIED)
+            assert_carries_nothing_of_the_order(h, res, O_NM_THIRD)
+        elif caller == "outside":
+            assert (res.status_code, res.json()) == (403, MERCHANT_DENIED["payments_create"])
+        else:
+            assert res.status_code == 200 and res.json()["client_secret"] == client_secret_of(O_NM_THIRD)
+        if mode != "off":
+            assert [_fields(r)["scope"] for r in owner_lines] == ["out" if caller == "outside" else "in"]
+    assert call(h, "payments_create", "owner", O_NM_OWNER).status_code == 200
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_null_merchant_column_the_evidence_route_needs_the_request_to_name_a_merchant(h, monkeypatch, mode):
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    needs_merchant = {"detail": "merchant_id is required when order_id is omitted"}
+    for caller, order_id in (("scoped", O_NM_THIRD), ("unrestricted", O_NM_THIRD), ("owner", O_NM_OWNER)):
+        res = call(h, "payment_offer_evidence", caller, order_id)
+        assert (res.status_code, res.json()) == (400, needs_merchant)
+    assert h["writes"] == []
+    # Naming a merchant gets a caller past the merchant check; only the owner gets past the owner check.
+    for caller in ("scoped", "unrestricted"):
+        _reset(h)
+        res = call(h, "payment_offer_evidence", caller, O_NM_THIRD, merchant_id=MERCHANT)
+        if mode == "enforce":
+            assert (res.status_code, res.json()) == (403, OWNER_DENIED) and h["writes"] == []
+        else:
+            assert res.status_code == 200 and [w["order_id"] for w in h["writes"]] == [O_NM_THIRD]
+    _reset(h)
+    assert call(h, "payment_offer_evidence", "owner", O_NM_OWNER, merchant_id=MERCHANT).status_code == 200
+    assert [w["order_id"] for w in h["writes"]] == [O_NM_OWNER]
+
+
+@pytest.mark.parametrize("route", ["payment_status", "payment_confirm"])
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_null_merchant_column_the_status_and_confirm_routes_read_the_raw_column(h, monkeypatch, mode, route):
+    """They judge the raw column: a key with a merchant list is refused by the merchant check, the
+    owner included, as before. A key with no list passes it, and then must be the owner."""
+    _set(monkeypatch, FLAG, None if mode == "off" else mode)
+    for caller, order_id in (("scoped", O_NM_THIRD), ("owner", O_NM_OWNER)):
+        res = call(h, route, caller, order_id)
+        assert (res.status_code, res.json()) == (403, MERCHANT_DENIED[route])
+    _reset(h)
+    for caller in ("unrestricted", "internal"):
+        res = call(h, route, caller, O_NM_THIRD)
+        if mode == "enforce":
+            assert (res.status_code, res.json()) == (403, OWNER_DENIED)
+            assert_carries_nothing_of_the_order(h, res, O_NM_THIRD)
+        else:
+            assert res.status_code == 200
+    if mode == "enforce":
+        assert h["writes"] == [] and h["psp_calls"] == []
+
+
+# ══ a checkout token on an order whose stored owner carries stray whitespace ══
+
+
+@pytest.mark.parametrize("route", ["payments_create", "payment_offer_evidence", "payment_confirm"])
+def test_a_token_bound_by_the_trimming_door_is_not_the_owner_by_the_exact_rule(h, monkeypatch, owner_lines, route):
+    """The token binding trims both ids; the owner rule compares them exactly and is not loosened.
+    Such a caller is the one case that logs caller_kind=checkout_token."""
+    h["orders"][O_OWNER] = _order(O_OWNER, agent_id=OWNER_AGENT + " ")
+    token = {"X-Checkout-Token": mint_token(order_id=O_OWNER)}
+    assert agent_auth.checkout_token_may_use_order({"agent_id": OWNER_AGENT, "order_id": O_OWNER}, h["orders"][O_OWNER])
+    assert owner_check.caller_owns_order(h["orders"][O_OWNER], _ctx(OWNER_AGENT)) is False
+
+    assert call(h, route, "token", O_OWNER, headers=token).status_code == 200
+    monkeypatch.setenv(FLAG, "observe")
+    assert call(h, route, "token", O_OWNER, headers=token).status_code == 200
+    fields = _fields(owner_lines[0])
+    assert len(owner_lines) == 1 and fields["caller_kind"] == "checkout_token" and fields["owner_kind"] == "agent"
+    assert fields["caller_agent_id"] == OWNER_AGENT and fields["scope"] == "in"
+    monkeypatch.setenv(FLAG, "enforce")
+    _reset(h)
+    res = call(h, route, "token", O_OWNER, headers=token)
+    assert (res.status_code, res.json()) == (403, OWNER_DENIED) and h["writes"] == [] and h["psp_calls"] == []
+    # The key of that agent is no more the owner of the mis-stored id than its token is.
+    assert call(h, route, "owner", O_OWNER).json() == OWNER_DENIED
+
+
+def test_caller_kind_labels():
+    token_ctx = _ctx(OWNER_AGENT, checkout_token_payload={"agent_id": OWNER_AGENT})
+    assert owner_check._caller_kind(token_ctx) == "checkout_token"
+    assert owner_check._caller_kind(_ctx(OWNER_AGENT, checkout_token_payload=None)) == "agent"
+    assert owner_check._caller_kind(_ctx(OWNER_AGENT)) == "agent"
+    assert owner_check._caller_kind(_ctx(INTERNAL_AGENT)) == "internal_trusted"
+    assert owner_check._caller_kind(_ctx("")) == "none"
 
 
 def test_enforce_naming_ones_own_merchant_does_not_open_another_merchants_order(h, monkeypatch):
@@ -1052,6 +1402,15 @@ def test_caller_owns_order(monkeypatch, owner, caller, owns):
     assert owner_check.caller_owns_order({"agent_id": owner, "merchant_id": MERCHANT}, _ctx(caller)) is owns
 
 
+@pytest.mark.parametrize("owner,caller", [
+    (OWNER_AGENT + " ", OWNER_AGENT), (" " + OWNER_AGENT, OWNER_AGENT), (OWNER_AGENT, OWNER_AGENT + " "),
+    (OWNER_AGENT + "\t", OWNER_AGENT), (OWNER_AGENT + "\n", OWNER_AGENT),
+])
+def test_the_owner_compare_is_exact_and_never_trims(owner, caller):
+    assert owner_check.caller_owns_order({"agent_id": owner}, _ctx(caller)) is False
+    assert forwarded_owner.order_access_allowed({"agent_id": owner}, _ctx(caller)) is False
+
+
 def test_the_owner_is_never_compared_with_the_merchant(h, monkeypatch):
     """An agent whose id equals the order's merchant id does not own that merchant's orders."""
     monkeypatch.setenv(FLAG, "enforce")
@@ -1120,11 +1479,12 @@ def test_the_refusal_is_the_one_the_routes_that_already_check_the_owner_give(h, 
 # ══ the log line ═════════════════════════════════════════════════════════════
 
 
-LINE_FIELDS = ["outcome", "mode", "route", "caller_kind", "owner_kind", "quote", "caller_agent_id"]
+LINE_FIELDS = ["outcome", "mode", "route", "scope", "caller_kind", "owner_kind", "quote", "caller_agent_id"]
 CLOSED_LABELS = {
     "outcome": {"would_refuse", "refused"},
     "mode": {"observe", "enforce"},
     "route": set(ROUTES),
+    "scope": {"in", "out"},
     "caller_kind": {"agent", "internal_trusted", "service_agent", "checkout_token", "none"},
     "owner_kind": {"agent", "internal_trusted", "service_agent", "none"},
     "quote": {"live", "expired", "none"},
@@ -1175,9 +1535,13 @@ def test_the_outcomes_are_counted(h, monkeypatch):
     monkeypatch.setenv(FLAG, "enforce")
     call(h, "payment_status", "owner", O_INTERNAL)
     call(h, "payment_status", "owner", O_OWNER)
+    call(h, "payment_confirm", "scoped", O_OWNER)
+    call(h, "payments_create", "outside", O_OWNER)
     assert dict(owner_check.ORDER_OWNER_CHECK_OUTCOMES) == {
-        ("would_refuse", "payments_create", "agent", "agent", "live"): 2,
-        ("refused", "payment_status", "agent", "internal_trusted", "live"): 1,
+        ("would_refuse", "payments_create", "in", "agent", "agent", "live"): 2,
+        ("refused", "payment_status", "in", "agent", "internal_trusted", "live"): 1,
+        ("refused", "payment_confirm", "in", "agent", "agent", "live"): 1,
+        ("refused", "payments_create", "out", "agent", "agent", "live"): 1,
     }
 
 
@@ -1217,17 +1581,49 @@ def _owner_check_calls(source: str) -> List[ast.Call]:
 @pytest.mark.parametrize("module,name,function,label", [
     (payments, "create_payment", "check_order_owner", "ROUTE_PAYMENTS_CREATE"),
     (agent_api, "agent_record_payment_offer_evidence", "check_order_owner", "ROUTE_PAYMENT_OFFER_EVIDENCE"),
+    (agent_api, "agent_confirm_payment", "check_order_owner", "ROUTE_PAYMENT_CONFIRM"),
     (payments, "get_payment_status", "check_payment_order_owner", None),
     (owner_check, "check_payment_order_owner", "check_order_owner", "ROUTE_PAYMENT_STATUS"),
 ])
 def test_each_route_calls_the_check_once_with_its_own_label_and_the_mode_it_read(module, name, function, label):
-    calls = _owner_check_calls(_function_source(module, name))
+    source = _function_source(module, name)
+    calls = _owner_check_calls(source)
     assert [c.func.id for c in calls] == [function]
     keywords = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
     mode = "mode" if module is owner_check else "owner_check_mode"
-    assert keywords == ({"route": label, "mode": mode} if label else {"mode": mode})
+    want = {"route": label, "mode": mode} if label else {"mode": mode}
+    if name == "create_payment":
+        # Only a label for the line; the merchant is the one the route's own merchant check resolves.
+        want["in_scope"] = "context.can_access_merchant(_resolve_order_merchant_id(order) or '')"
+    assert keywords == want
     if label:
         assert getattr(owner_check, label) in ROUTES
+    if module is not owner_check:
+        # Guarded by the mode alone: no other condition decides whether a caller is judged.
+        guards = [n for n in ast.walk(ast.parse(source)) if isinstance(n, ast.If)
+                  and any(isinstance(c, ast.Call) and getattr(c.func, "id", "") == function for c in ast.walk(n))
+                  and "owner_check_mode" in ast.unparse(n.test)]
+        tests = {ast.unparse(g.test) for g in guards}
+        allowed = {"owner_check_mode != ORDER_OWNER_CHECK_OFF"}
+        if name == "agent_record_payment_offer_evidence":
+            allowed = {"owner_check_mode != ORDER_OWNER_CHECK_OFF and order is not None"}
+        assert tests == allowed
+
+
+def test_the_modules_route_labels_are_the_four_routes():
+    assert set(owner_check._ROUTES) == set(ROUTES)
+
+
+def test_the_confirm_route_checks_the_owner_before_the_psp_any_write_and_any_answer_about_the_order():
+    source = _function_source(agent_api, "agent_confirm_payment")
+    check = source.index("check_order_owner(")
+    for later in ("validate_request_compat(", "get_primary_store(", "_resolve_confirm_payment_contract(order)",
+                  "order_uses_authorization_first_payment(order)", "psp_adapter.confirm_payment(",
+                  "finalize_authorized_payment_order(\n", "verify_order_payment_succeeded(order)", "mark_order_paid(order_id)",
+                  "log_order_event(\n", "enqueue_merchant_order_create(\n", '"payment_intent_id"', "log_agent_request,"):
+        assert check < source.index(later), later
+    for earlier in ('detail="Order not found"', "context.can_access_merchant(order[\"merchant_id\"])"):
+        assert source.index(earlier) < check, earlier
 
 
 def test_the_payment_route_checks_the_owner_before_it_looks_at_the_order():
@@ -1239,6 +1635,7 @@ def test_the_payment_route_checks_the_owner_before_it_looks_at_the_order():
         assert check < source.index(later), later
     for earlier in ("ensure_checkout_token_order_access(context, order)", 'detail="Order not found"'):
         assert source.index(earlier) < check, earlier
+    assert check < source.index("if not context.can_access_merchant(merchant_id)"), "before the merchant refusal too"
 
 
 def test_the_evidence_route_checks_the_owner_after_the_merchant_and_before_the_write():
@@ -1254,7 +1651,7 @@ def test_the_status_route_checks_the_owner_after_the_merchant_and_before_the_ans
     assert source.index('detail="Not authorized"') < check < source.index('"status": "success"')
 
 
-def test_only_these_three_routes_use_the_check():
+def test_only_these_four_routes_use_the_check():
     import pathlib
 
     root = pathlib.Path(owner_check.__file__).resolve().parent.parent

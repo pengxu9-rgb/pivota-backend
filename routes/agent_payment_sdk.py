@@ -403,16 +403,21 @@ async def create_payment(
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): a caller inside the merchant's scope must
-        # also be the order's owner, checked here, before anything below can answer with the
-        # order's state, total or currency, reuse its payment surface or write a new one. A caller
-        # OUTSIDE the merchant's scope is not judged here: it goes on to the answers it had
-        # before, ending at the merchant refusal below.
+        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): the caller must be the order's owner,
+        # checked here, before anything below can answer with the order's state, total or
+        # currency, reuse its payment surface or write a new one. Enforced, that holds for a
+        # caller outside the merchant's scope too: it is refused here and no longer reaches the
+        # answers below. `in_scope` (the merchant this route resolves for the order, as the
+        # merchant refusal below does) only labels the log line.
         owner_check_mode = order_owner_check_mode()
-        if owner_check_mode != ORDER_OWNER_CHECK_OFF and context.can_access_merchant(
-            _resolve_order_merchant_id(order) or ""
-        ):
-            check_order_owner(order, context, route=ROUTE_PAYMENTS_CREATE, mode=owner_check_mode)
+        if owner_check_mode != ORDER_OWNER_CHECK_OFF:
+            check_order_owner(
+                order,
+                context,
+                route=ROUTE_PAYMENTS_CREATE,
+                mode=owner_check_mode,
+                in_scope=context.can_access_merchant(_resolve_order_merchant_id(order) or ""),
+            )
         
         if order.get("payment_status") == "paid":
             raise HTTPException(status_code=400, detail="Order already paid")
