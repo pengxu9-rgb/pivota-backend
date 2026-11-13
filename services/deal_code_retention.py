@@ -15,7 +15,8 @@ store), are never touched. The rules:
      history, whatever state a lapsed verification is in now (`expired`, or back to `unverified`), each valid-until
      clamped to verified_at + DEAL_VERIFY_TTL_HOURS; a timestamp more than that TTL past the run (malformed) is not
      trusted and the row runs on updated_at instead;
-  5. the bar text (`terms_text`): cleared once a check recorded an outcome, or 14 days after the row was created.
+  5. the bar text (`terms_text`): cleared once a check recorded an outcome, or 14 days after the row was created;
+  6. the hash of a refused code (`deal_code_refusals`: never the code): deleted 30 days after the refusal.
 Every DELETE re-checks its rule's condition, so a verification that lands between the read and the delete keeps the row.
 
 INDEPENDENT OF THE WRITE FLAG on purpose: rows written while DEAL_CODE_CAPTURE_WRITE was on must still expire after it is
@@ -39,7 +40,7 @@ from sqlalchemy import and_, exists, func, not_, or_, select
 
 from config.settings import settings
 from db.database import database
-from db.deal_lane import observed_store_offer_verifications as v, observed_store_offers as o
+from db.deal_lane import deal_code_refusals, observed_store_offer_verifications as v, observed_store_offers as o
 from services.deal_code_capture_writer import CRAWL_DEAL_ID_PREFIX, crawl_rows, read_denyset, subdomain_anchor
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,8 @@ UNVERIFIED_DAYS = 14
 REFUSED_DAYS = 7
 APPLIED_GRACE_DAYS = 30
 TERMS_TEXT_DAYS = 14
+# The hash of a refused code (deal_code_refusals, written by services/deal_code_verifier.py) is kept this long.
+REFUSAL_HASH_DAYS = 30
 BATCH = 500
 MAX_ROWS_PER_RULE = 5000
 
@@ -218,6 +221,26 @@ async def run(now: Optional[datetime] = None) -> Dict[str, int]:
         return cleared
 
     await step("cleared_terms_text", clear_terms())
+
+    # 6. refused-code hashes: 30 days after the refusal. Bounded like the other rules.
+    async def purge_refusals():
+        r = deal_code_refusals
+        cutoff = now - timedelta(days=REFUSAL_HASH_DAYS)
+        purged = 0
+        while purged < MAX_ROWS_PER_RULE:
+            rows = await database.fetch_all(select(r.c.refusal_hash).where(r.c.refused_at < cutoff)
+                                            .limit(min(BATCH, MAX_ROWS_PER_RULE - purged)))
+            hashes = [row["refusal_hash"] for row in rows]
+            if not hashes:
+                break
+            await database.execute(r.delete().where(and_(r.c.refusal_hash.in_(hashes), r.c.refused_at < cutoff)))
+            purged += len(hashes)
+        return purged
+
+    await step("deleted_refusal_hashes", purge_refusals())
+    if counts.get("deleted_refusal_hashes") == 0:
+        # Reported only when it deleted something, so a run with no refusals keeps the summary it had (review P3-1).
+        del counts["deleted_refusal_hashes"]
     if any(counts.get(k) for k in counts):
         logger.warning("deal code retention: %s", {k: n for k, n in counts.items() if n})
     return counts

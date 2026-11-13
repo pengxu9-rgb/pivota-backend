@@ -66,6 +66,8 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import time
 from typing import Any, Dict, Optional
 
 from config.settings import settings
@@ -73,6 +75,7 @@ from db.database import database
 from routes.employee_products import _refresh_external_seed_by_id
 from services import deal_code_capture
 from services import deal_code_retention
+from services import deal_code_verifier
 from services import shopify_edge_pacer
 from services.external_referral_readiness import run_external_referral_refresh_batch
 
@@ -138,6 +141,7 @@ async def run_daily_external_referral_refresh(
     ip_challenge_window_seconds: Optional[float] = None,
     ip_throttle_cooldown_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
+    started = time.monotonic()
     if settings.deal_code_capture_shadow:
         # The counters are per run: a process that runs the job twice must not report the first run again.
         deal_code_capture.reset_stats()
@@ -168,7 +172,33 @@ async def run_daily_external_referral_refresh(
     retention = await deal_code_retention.run()
     if any(retention.values()):
         summary["deal_code_retention"] = retention
+    # ADR-027 D3: test the crawled codes on each store's own UCP door (services/deal_code_verifier.py). Off unless
+    # DEAL_VERIFY_JOB_ENABLED, DEAL_VERIFY_NONCONNECTED_ENABLED and the route key are all set; then it returns {} and
+    # the summary is unchanged. After retention, so it never builds a cart for a row retention just deleted.
+    # It must finish inside the job's task timeout: the batch alone runs to its 3300 s budget (review P2-2).
+    verifier = await deal_code_verifier.run(deadline=started + verifier_deadline_seconds())
+    if verifier:
+        summary["deal_code_verifier"] = verifier
     return summary
+
+
+# The Cloud Run task timeout (infra/gcp/setup_scheduler.sh: --task-timeout 3600s) and what the verifier step leaves
+# for everything after it (the summary, the stdout lines, the exit). The verifier starts no cart past
+# started + (timeout - margin).
+TASK_TIMEOUT_SECONDS_DEFAULT = 3600
+VERIFIER_DEADLINE_MARGIN_SECONDS = 120
+
+
+def verifier_deadline_seconds() -> float:
+    """Seconds from the start of the run by which the verifier step must be done. The task timeout comes from
+    EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS when it is a whole number of seconds from 600 to 86400, else 3600."""
+    try:
+        timeout = int((os.getenv("EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS") or "").strip())
+    except ValueError:
+        timeout = TASK_TIMEOUT_SECONDS_DEFAULT
+    if not 600 <= timeout <= 86400:
+        timeout = TASK_TIMEOUT_SECONDS_DEFAULT
+    return float(timeout - VERIFIER_DEADLINE_MARGIN_SECONDS)
 
 
 # Exit codes. Both non-zero ones fail the Cloud Run execution, so an alert on a failed execution
@@ -389,6 +419,8 @@ def main() -> int:
     print("IP_THROTTLE " + json.dumps(ip_throttle_line(summary), separators=(",", ":"), default=str))
     if "deal_code_capture" in summary:
         print("DEAL_CODE_CAPTURE " + json.dumps(summary["deal_code_capture"], separators=(",", ":"), default=str))
+    if "deal_code_verifier" in summary:
+        print("DEAL_CODE_VERIFIER " + json.dumps(summary["deal_code_verifier"], separators=(",", ":"), default=str))
     # And for the catalogue price lane: hosts read, pages, rows priced, why the rest kept their page read.
     print("CATALOGUE_REFRESH " + json.dumps(summary.get("catalogue"), separators=(",", ":"), default=str))
     # And for the handle-less read rule (EXTERNAL_SEED_HANDLELESS_READ): only on a run that decided a row.
