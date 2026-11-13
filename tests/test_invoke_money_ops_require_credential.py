@@ -658,8 +658,12 @@ def test_a_money_handler_is_only_dispatched_from_a_money_operation():
 def test_the_gate_runs_before_the_first_operation_branch():
     """Source-order guard: the credential check is awaited before any `if operation ...` branch."""
     src = textwrap.dedent(inspect.getsource(gw.invoke_shop_operation))
-    gate_at = src.index(
-        "await _require_credential_for_money_operation(operation, http_request, checkout_token=checkout_token)"
+    assert src.count("await _require_credential_for_money_operation(") == 1
+    gate_at = src.index("await _require_credential_for_money_operation(")
+    # It is given the dispatcher's own values (the call also hands over the keyless step's class).
+    assert re.match(
+        r"await _require_credential_for_money_operation\(\s*operation, http_request, checkout_token=checkout_token[,)]",
+        src[gate_at:],
     )
     # ...and after the dispatcher has normalised the token it is given.
     assert src.index("checkout_token = (http_request.headers.get(\"x-checkout-token\")") < gate_at
