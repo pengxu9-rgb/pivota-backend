@@ -21,6 +21,13 @@ from routes.agent_auth import (
     get_agent_context,
     log_agent_request,
 )
+from routes.agent_order_owner_check import (
+    MODE_OFF as ORDER_OWNER_CHECK_OFF,
+    ROUTE_PAYMENTS_CREATE,
+    check_order_owner,
+    check_payment_order_owner,
+    order_owner_check_mode,
+)
 from db.merchant_onboarding import get_merchant_onboarding
 from db.orders import get_order, update_payment_info
 from adapters.psp_adapter import get_psp_adapter
@@ -395,6 +402,17 @@ async def create_payment(
         ensure_checkout_token_order_access(context, order)
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
+
+        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): a caller inside the merchant's scope must
+        # also be the order's owner, checked here, before anything below can answer with the
+        # order's state, total or currency, reuse its payment surface or write a new one. A caller
+        # OUTSIDE the merchant's scope is not judged here: it goes on to the answers it had
+        # before, ending at the merchant refusal below.
+        owner_check_mode = order_owner_check_mode()
+        if owner_check_mode != ORDER_OWNER_CHECK_OFF and context.can_access_merchant(
+            _resolve_order_merchant_id(order) or ""
+        ):
+            check_order_owner(order, context, route=ROUTE_PAYMENTS_CREATE, mode=owner_check_mode)
         
         if order.get("payment_status") == "paid":
             raise HTTPException(status_code=400, detail="Order already paid")
@@ -1486,6 +1504,13 @@ async def get_payment_status(
         # Verify access
         if not context.can_access_merchant(payment["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized")
+
+        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): the payment is read only by the owner of
+        # its order. The owner is read by the check, and only when the check is not off, so the
+        # query above is the one this route always ran.
+        owner_check_mode = order_owner_check_mode()
+        if owner_check_mode != ORDER_OWNER_CHECK_OFF:
+            await check_payment_order_owner(payment["order_id"], context, mode=owner_check_mode)
         
         return {
             "status": "success",

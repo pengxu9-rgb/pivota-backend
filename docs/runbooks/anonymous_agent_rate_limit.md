@@ -416,3 +416,126 @@ Before turning the flag on:
 Switch on / roll back: an environment change only, no build. Set
 `SHOP_INVOKE_FORWARD_CALLER_KEY=1` on the web service the same way the money check's
 switch is set above; remove the variable (or set `0`) to roll back.
+
+## The keyed payment routes serve an order's owner (`AGENT_PAYMENT_ORDER_OWNER_CHECK`)
+
+Three keyed routes compared the caller's merchant scope with the order's merchant and
+never the caller with the order's owner (`orders.agent_id`, the agent that created it):
+
+| Route | Log label | What a key in the merchant's scope could do to another agent's order |
+|---|---|---|
+| `POST /agent/v1/payments` | `payments_create` | start a payment, or reuse the open one and receive its payment client secret and payment intent id; a new payment overwrites the order's |
+| `POST /agent/v1/orders/payment-offer-evidence` | `payment_offer_evidence` | rewrite the order's metadata |
+| `GET /agent/v1/payments/{payment_id}` | `payment_status` | read the payment's status, amount and currency |
+
+`AGENT_PAYMENT_ORDER_OWNER_CHECK`, read per call, **default off**, adds the owner rule the
+order read (`GET /agent/v1/orders/{id}`) and the `/agent/v2` routes already apply
+(`routes.agent_forwarded_owner.order_access_allowed`), in
+`routes/agent_order_owner_check.py`.
+
+| Value | Effect |
+|---|---|
+| unset, `off`, anything else | The three routes run as they did before the flag existed. |
+| `observe` | Nobody is refused. Each call `enforce` would refuse logs one warning line. `GET /agent/v1/payments/{id}` makes one extra read (the order's owner). |
+| `enforce` | Such a call is answered `403 {"detail": "Not authorized for this order"}`, with the same line. |
+
+Only the exact words `observe` and `enforce` (any case, surrounding spaces ignored) switch
+it on. `1`, `true` and `on` are off.
+
+The rule: the caller's agent is the order's agent. Nobody is exempt.
+
+- An order with no owner (`agent_id` null or blank) is nobody's: every key is refused.
+- An internal trusted key is a caller like any other. It is served on the orders made with
+  that same key and refused on the rest. Rotating that key changes its agent id, so orders
+  made with the old key are refused to the new one.
+- A checkout token is already bound to one order of its own agent, by a check that runs
+  first and is not changed. It keeps working on that order, and is still refused on the
+  status route (not a checkout-token route).
+- With `PARTNER_IDENTITY_FORWARDING_ENABLED` on, the service that vouched for the owner is
+  served on an order stamped as made through it. That is the shared rule's own exception,
+  unchanged.
+
+Where the refusal sits:
+
+- A missing order or payment is `404` first, as before, for every key.
+- A caller OUTSIDE the merchant's scope gets exactly the answers it got before (ending in
+  `403 Not authorized for this merchant`, or `403 Not authorized` on the status route).
+  The owner check never answers such a caller.
+- On `POST /agent/v1/payments` a caller inside the scope that is not the owner is refused
+  before the route says anything about the order (already paid, canceled, total or
+  currency mismatch, quote state), before the reuse of a payment surface and before a new
+  one is created. The refusal body is the fixed sentence above and nothing else.
+- One exception to "outside the scope": the evidence route judges the merchant the REQUEST
+  names before the order's own. A caller that names its own merchant with another
+  merchant's order id used to be served; enforced, it is `403 Not authorized for this order`.
+
+The log line (warning, on the service logger):
+
+```
+order_owner_check outcome=<would_refuse|refused> mode=<observe|enforce> route=<label> caller_kind=<agent|internal_trusted|service_agent|checkout_token|none> owner_kind=<agent|internal_trusted|service_agent|none> quote=<live|expired|none> caller_agent_id=<the caller's own agent id>
+```
+
+`owner_kind`: `internal_trusted` is an order made with an internal trusted key,
+`service_agent` one owned by an agent listed as a service of ours
+(`issuing_excluded_agent_ids`), `none` an order with no owner. `quote=live` means the
+order's quote has not expired, so the order can still be paid. The line never carries the
+order id, the owner's id, a key, a token, a client secret or a payment intent id.
+
+If the extra read of the status route fails (the order's owner), the line is
+`order_owner_check outcome=owner_read_failed mode=<mode> route=payment_status error=<type>`:
+observing, the caller is served as before; enforcing, the route answers `500` and serves
+nothing.
+
+### Orders created through `/invoke` before `SHOP_INVOKE_FORWARD_CALLER_KEY` is on
+
+Until that switch is on, `/invoke` sends money operations upstream with the backend's own
+key. Orders created that way are owned by the backend's service agent, and calls through
+`/invoke` arrive as that agent. There is no special rule for those orders; the owner rule
+gives this:
+
+- Forwarding off: the call arrives as the service agent, which owns them. They stay
+  payable through `/invoke`, enforced or not.
+- Forwarding on: the caller arrives as itself, is not their owner, and is refused once the
+  check is enforced. This is the answer `create_payment_link` already gives for such an
+  order (previous section).
+
+So the order of the two switches is what keeps in-flight orders payable. An order can be
+paid only while its quote is live: `POST /agent/v1/payments` answers `409 QUOTE_EXPIRED`
+to everyone, the owner included, once `metadata.pricing_quote.expires_at` has passed, and
+a quote lives `QUOTE_TTL_SECONDS` (600 seconds unless that variable is set). Enforce the
+owner check only after the forwarding switch has been on for longer than that.
+
+The other mix is refused too, and is the second reason forwarding goes first: with
+forwarding OFF and the check enforced, an order a caller created with its own key on the
+keyed API is refused through `/invoke` (the call arrives as the service agent), and an
+order created through `/invoke` is refused to the caller's own key on the keyed API.
+
+### Turn-on checklist
+
+1. `SHOP_INVOKE_FORWARD_CALLER_KEY` is on, and has been for longer than `QUOTE_TTL_SECONDS`
+   (use an hour).
+2. Set `AGENT_PAYMENT_ORDER_OWNER_CHECK=observe`. Read the `order_owner_check
+   outcome=would_refuse` lines over at least a full day of traffic, by `route`,
+   `caller_kind`, `owner_kind` and `quote`:
+   - `owner_kind=internal_trusted` or `service_agent` with `quote=live`: an in-flight
+     order created through `/invoke` on the backend's key. Expected to stop within the
+     quote lifetime of step 1. If it does not, some caller still reaches `/invoke` without
+     its own key being forwarded; find it before enforcing.
+   - `owner_kind=none`: orders with no owner. Enforced, no key can pay, annotate or read
+     them on these routes. Decide what they are first.
+   - `caller_kind=internal_trusted` or `service_agent`: one of our own services acting on
+     an order it did not create. Enforced, it is refused. Find the flow first.
+   - `owner_kind=agent`, `caller_kind=agent`: one agent on another agent's order. This is
+     what the check is for; `caller_agent_id` says who. Two keys of one partner that are
+     two agents look the same; ask before enforcing.
+   - `route=payment_status` with `quote=expired`: a caller reading back an old payment of
+     an order it does not own, typically one made through `/invoke` before step 1.
+     Enforced, that read is refused for good.
+3. Set `AGENT_PAYMENT_ORDER_OWNER_CHECK=enforce`. The same lines now say
+   `outcome=refused`.
+4. Later changes: before switching `SHOP_INVOKE_FORWARD_CALLER_KEY` either way, or
+   rotating the backend's own key, while the check is enforced, set the check back to
+   `observe` for longer than `QUOTE_TTL_SECONDS`, then enforce again. Otherwise orders in
+   flight across the change are refused until their quotes expire.
+
+Roll back: an environment change only, no build. Remove the variable or set `off`.
