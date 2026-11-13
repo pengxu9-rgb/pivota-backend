@@ -414,3 +414,44 @@ def test_the_two_fences_are_distinct_and_the_documented_strip_is_anchored():
         re.sub(r"^" + re.escape(backfill.REPORT_BEGIN), "", line),
     )
     assert json.loads(recovered) == payload
+
+
+# ── the attached lane's stock marker on inherited stock (be#2806 follow-up, P3-C) ──────────────────────────────
+
+def test_an_inherited_stock_from_a_marked_row_is_marked():
+    from scripts.backfill_variant_identity_skus import _inherited_stock_marker
+
+    chosen = {"offer_id": "of_canon", "availability": "in_stock",
+              "availability_read": '{"source": "refresh", "value": "in_stock", "previous": "unknown"}'}
+    marker = _inherited_stock_marker({"variant_id": "1"}, chosen)["availability_read"]
+    assert {k: marker[k] for k in ("source", "from_offer_id", "value", "previous")} == {
+        "source": "variant_backfill", "from_offer_id": "of_canon", "value": "in_stock", "previous": "unknown"}
+    assert marker["at"]
+
+
+@pytest.mark.parametrize("chosen_previous, expected", [
+    ("in_stock", "in_stock"), ("out_of_stock", "out_of_stock"), ("unknown", "unknown"),
+    (None, "unknown"), ("In Stock", "in_stock"), ("not a token", "unknown"),
+])
+def test_the_inherited_markers_previous_is_the_chosen_rows_pre_lane_stock(chosen_previous, expected):
+    """be#2811 review P2-1: what the variant row would have inherited without the lane, normalised as an
+    inherited stock is (`normalize_availability`'s fallback), so `unknown` only when there is nothing to restore."""
+    from scripts.backfill_variant_identity_skus import _inherited_stock_marker
+
+    read = {"source": "refresh", "value": "in_stock"}
+    if chosen_previous is not None:
+        read["previous"] = chosen_previous
+    chosen = {"offer_id": "of_canon", "availability": "in_stock", "availability_read": read}
+    assert _inherited_stock_marker({"variant_id": "1"}, chosen)["availability_read"]["previous"] == expected
+
+
+def test_no_marker_when_the_stock_is_not_the_lanes_or_not_inherited():
+    from scripts.backfill_variant_identity_skus import _inherited_stock_marker
+
+    marked = {"offer_id": "of_canon", "availability": "in_stock",
+              "availability_read": {"source": "refresh", "value": "in_stock"}}
+    assert _inherited_stock_marker({"availability": "out_of_stock"}, marked) == {}, "the variant stated its own"
+    assert _inherited_stock_marker({"in_stock": False}, marked) == {}, "the variant stated its own"
+    assert _inherited_stock_marker({}, {**marked, "availability_read": None}) == {}
+    assert _inherited_stock_marker({}, {**marked, "availability_read": "not json"}) == {}
+    assert _inherited_stock_marker({}, {**marked, "availability": "out_of_stock"}) == {}, "moved since the lane"

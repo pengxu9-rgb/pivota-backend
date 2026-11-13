@@ -101,11 +101,15 @@ from services.similarity_service import (
 )
 from services.similarity_config import get_similarity_scoring_weights
 from routes.agent_auth import (
+    _AGENT_API_KEY_RE,
     AgentContext,
+    _is_internal_trusted_api_key,
     get_agent_context,
     request_api_key,
     resolve_issuing_context_for_request,
 )
+from db.agents import resolve_agent_id_by_api_key
+from utils.transient_errors import db_busy_http_exception
 from services.issuing_agent_assertion import ISSUING_AGENT_ASSERTION_HEADER
 from db.merchant_tasks import match_recovery_key
 from services.outbound_links_service import (
@@ -526,6 +530,117 @@ def _request_carries_credential(request: Request) -> bool:
         (request.headers.get("x-api-key") or "").strip()
         or (request.headers.get("authorization") or "").strip()
         or (request.headers.get("x-checkout-token") or "").strip()
+    )
+
+
+# ── money operations need a credential (2026-11-12, owner decision) ─────────────
+# The operations below create or change an order or a payment. Their handlers reach
+# _proxy_agent_api, which sends the caller's X-Checkout-Token when there is one and
+# OTHERWISE this service's own AGENT_API_KEY, so an anonymous caller used to act as
+# Pivota's own agent. Now one of these runs only when the request carries either
+#   (a) an X-Checkout-Token (forwarded as is; the /agent/v1|v2 route validates it), or
+#   (b) an agent API key (X-API-Key, or Authorization: Bearer, read by request_api_key)
+#       that resolves to an ACTIVE agent through db.agents.resolve_agent_id_by_api_key,
+#       the side-effect-free lookup the /agent/v1 dependency (get_agent_context) runs on
+#       (same key format rule, same agent_is_active rule; an internal trusted key is
+#       admitted exactly as get_agent_context admits it).
+# Anything else is refused with 401 CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION before the
+# payload is parsed and before any upstream call. The key lookup only READS (it does
+# not count requests, quota or stats: the caller's key is not what the upstream call
+# is made with, see _proxy_agent_api, unchanged here).
+#
+# EVERY operation the /invoke dispatcher answers must be in exactly one of these two
+# sets; tests/test_invoke_money_ops_require_credential.py fails when a new one is not.
+INVOKE_MONEY_OPERATIONS: frozenset = frozenset({
+    "create_order",                    # -> POST /agent/v1/orders/create
+    "create_payment_link",             # -> POST /agent/v2/payments/checkout-sessions
+    "submit_payment",                  # -> POST /agent/v1/payments
+    "record_payment_offer_evidence",   # -> POST /agent/v1/orders/payment-offer-evidence
+})
+INVOKE_NON_MONEY_OPERATIONS: frozenset = frozenset({
+    "find_products",
+    "get_product_detail",
+    "get_review_summary",
+    "list_sku_reviews",
+    "list_group_reviews",
+    "list_group_merchants",
+    "list_seller_feedback",
+    "list_review_entrypoints",
+    "resolve_review_intent",
+    "find_products_multi",
+    "offers.resolve",
+    "offers_resolve",
+    "offersResolve",
+    "find_similar_products",
+})
+CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION = "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+# Rollback only. Read per call; unset (or anything else) = ON.
+_MONEY_OPS_REQUIRE_CREDENTIAL_ENV = "SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL"
+_MONEY_OPS_REQUIRE_CREDENTIAL_OFF_VALUES = frozenset({"0", "false", "off", "no"})
+
+
+def _invoke_money_ops_require_credential() -> bool:
+    raw = str(os.getenv(_MONEY_OPS_REQUIRE_CREDENTIAL_ENV) or "").strip().lower()
+    return raw not in _MONEY_OPS_REQUIRE_CREDENTIAL_OFF_VALUES
+
+
+async def _money_operation_refusal_reason(
+    request: Request, *, checkout_token: Optional[str]
+) -> Optional[str]:
+    """None when the request may run a money operation, else a log-safe reason label.
+
+    `checkout_token` is the DISPATCHER's value, the one the handlers pass to _proxy_agent_api,
+    never re-read from the header here: a token the dispatcher normalises away (whitespace only)
+    would otherwise pass this check and the proxy would send this service's own key.
+
+    A key lookup that fails, for any reason, answers 503 (fail closed), never "unknown key".
+    Never returns or logs a header value."""
+    if checkout_token:
+        return None
+    api_key = request_api_key(request)
+    if not api_key:
+        return "no_credential"
+    if _is_internal_trusted_api_key(api_key):
+        return None
+    if not _AGENT_API_KEY_RE.match(api_key):
+        return "malformed_key"
+    lookup: Dict[str, Any] = {}
+    try:
+        agent_id = await resolve_agent_id_by_api_key(api_key, metrics_out=lookup)
+    except Exception as exc:  # noqa: BLE001 -- AgentAuthLookupTransientError and anything else
+        logger.warning("[shop_invoke] money operation key lookup failed: %s", type(exc).__name__)
+        raise db_busy_http_exception() from exc
+    if lookup.get("auth_source") == "error":
+        # get_agent_by_key answers None when its query failed; that is "could not look".
+        logger.warning("[shop_invoke] money operation key lookup failed: lookup_error")
+        raise db_busy_http_exception()
+    if not agent_id:
+        return "unknown_or_inactive_key"
+    return None
+
+
+async def _require_credential_for_money_operation(
+    operation: str, request: Request, *, checkout_token: Optional[str]
+) -> None:
+    if operation not in INVOKE_MONEY_OPERATIONS or not _invoke_money_ops_require_credential():
+        return
+    reason = await _money_operation_refusal_reason(request, checkout_token=checkout_token)
+    if reason is None:
+        return
+    logger.warning(
+        "[shop_invoke] money operation refused: operation=%s reason=%s", operation, reason
+    )
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "error": CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION,
+            "message": (
+                "This operation creates or changes an order or a payment. Send an active agent "
+                "API key (X-API-Key or Authorization: Bearer) or a checkout token (X-Checkout-Token)."
+            ),
+            "operation": operation,
+        },
+        headers={"WWW-Authenticate": "Bearer"},
     )
 
 
@@ -18792,7 +18907,12 @@ async def invoke_shop_operation(
     - create_order       (demo-only)
     - create_payment_link (guest hosted checkout → /agent/v2/payments/checkout-sessions; no charge)
     - submit_payment     (demo-only)
+    - record_payment_offer_evidence
     - find_similar_products
+
+    The money operations (INVOKE_MONEY_OPERATIONS) answer 401
+    CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION without a checkout token or an active agent key
+    (rollback: SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL=0).
     """
     operation = (request.operation or "").strip()
     checkout_token = (http_request.headers.get("x-checkout-token") or "").strip() or None
@@ -18805,6 +18925,11 @@ async def invoke_shop_operation(
                 detail="Too many anonymous requests; slow down or authenticate with an API key.",
                 headers={"Retry-After": "60"},
             )
+
+    # Money operations need a checkout token or an ACTIVE agent key; checked before the
+    # payload is parsed and before anything is sent upstream (see INVOKE_MONEY_OPERATIONS).
+    # It is given THIS checkout_token, the value every money handler forwards.
+    await _require_credential_for_money_operation(operation, http_request, checkout_token=checkout_token)
 
     # Normalize metadata: allow creatorId/creatorName to be passed at payload top-level
     normalized_metadata = _normalize_gateway_request_metadata(

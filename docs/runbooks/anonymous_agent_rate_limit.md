@@ -289,3 +289,40 @@ established here (the platform's chain semantics were not confirmed
 empirically), so the leftmost element is used, matching the convention already
 used elsewhere in this repo for logging, and the global ceiling carries the
 adversarial load. Establishing the hop count is the upgrade path.
+
+## `/agent/shop/v1/invoke` money operations need a credential (2026-11-12)
+
+Rate limiting is not authentication. The money operations on `/invoke` —
+`create_order`, `create_payment_link`, `submit_payment`,
+`record_payment_offer_evidence` (`INVOKE_MONEY_OPERATIONS` in
+`routes/agent_shop_gateway.py`) — are proxied by `_proxy_agent_api`, which sends the
+caller's `X-Checkout-Token` when there is one and otherwise the backend's OWN
+`AGENT_API_KEY`. Without a credential check an anonymous caller acted as Pivota's own
+agent. They now run only when the request carries:
+
+- an `X-Checkout-Token` (forwarded as before; the `/agent/v1|v2` route validates it), or
+- an agent API key (`X-API-Key`, or `Authorization: Bearer`) that resolves to an ACTIVE
+  agent (`db.agents.resolve_agent_id_by_api_key`, the lookup `get_agent_context` uses;
+  an internal trusted key is admitted as `get_agent_context` admits it).
+
+Anything else answers `401` with `detail.error = CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION`
+before the payload is parsed, with no upstream call and no database write; the log line
+`[shop_invoke] money operation refused` names the operation and a reason
+(`no_credential`, `malformed_key`, `unknown_or_inactive_key`), never a header value.
+Any key-lookup failure (transient or not) answers `503` (fail closed) and logs
+`[shop_invoke] money operation key lookup failed`. A checkout token is the dispatcher's
+stripped value, so a whitespace-only `X-Checkout-Token` counts as none. The per-IP
+anonymous limiter runs first, so an over-budget anonymous call is `429`, not `401`.
+Every other operation is unchanged, credential or not.
+
+Rollback only — `SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL`, read per call, default ON.
+Only `0`, `false`, `off` or `no` switches the check off:
+
+```bash
+gcloud run services update web --project pivota-prod --region us-west1 \
+  --update-env-vars SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL=0
+```
+
+Not changed here (follow-up): an admitted caller's request still goes upstream with the
+backend's own key when it carries no checkout token, so the order is attributed to that
+service agent, not to the caller's agent.

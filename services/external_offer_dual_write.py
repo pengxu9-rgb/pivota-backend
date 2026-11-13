@@ -678,8 +678,24 @@ PRICE_READ_SOURCE_KEY = "price_read_source"
 ATTACHED_AVAILABILITY_WRITE_ENV = "EXTERNAL_OFFER_ATTACHED_AVAILABILITY_WRITE_ENABLED"
 STATED_AVAILABILITIES = frozenset({"in_stock", "out_of_stock"})
 # Every row this lane gives a stock carries offer_payload.availability_read = {source, value, previous, at}:
-# `previous` is the stock the row had before this lane first wrote one. A rollback finds exactly these rows
-# (`offer_payload ? 'availability_read'`) and restores `previous`; turning the flag off alone leaves them.
+# `previous` is the stock the row had before this lane wrote it (kept across this lane's own re-writes, reset
+# to the row's current stock when another writer changed it since). A rollback finds exactly these rows and
+# restores `previous`, ONLY where the stock still equals `value` (AVAILABILITY_ROLLBACK_SQL); turning the flag
+# off alone leaves them. LIMIT: a foreign writer that set the SAME value since is indistinguishable from this
+# lane's write and is rolled back with it (`at` cannot tell them apart: this lane's own price-only writes move
+# updated_at without touching the marker).
+# scripts/backfill_variant_identity_skus copies a marked row's stock into the variant rows it inserts and
+# marks them too (source `variant_backfill`, `previous` = the marked row's own `previous`), so the rollback
+# reaches those as well and restores what they would have inherited without this lane.
+AVAILABILITY_ROLLBACK_SQL = (
+    "UPDATE catalog_offers SET availability = offer_payload -> 'availability_read' ->> 'previous', "
+    "offer_payload = offer_payload - 'availability_read', updated_at = NOW() "
+    "WHERE offer_payload ? 'availability_read' "
+    "AND availability = offer_payload -> 'availability_read' ->> 'value' "
+    # A marker with no usable `previous` (hand-made; the lane and the backfill never write one) is skipped, not
+    # restored: `availability` is NOT NULL, so restoring it would abort the whole statement (be#2811 review P3-2).
+    "AND offer_payload -> 'availability_read' ->> 'previous' IS NOT NULL"
+)
 AVAILABILITY_READ_KEY = "availability_read"
 
 
@@ -757,13 +773,17 @@ SET list_price = :price,
         WHEN offer_payload IS NULL OR jsonb_typeof(offer_payload) = 'object'
         THEN jsonb_set(COALESCE(offer_payload, CAST('{}' AS jsonb)), '{price_read_source}',
                        to_jsonb(CAST(:read_source AS text)))
-             -- AVAILABILITY_READ_KEY: only on a write that carries a stock. `previous` is the row's stock
-             -- before this lane FIRST wrote one (kept across later writes), so a rollback restores it.
+             -- AVAILABILITY_READ_KEY: only on a write that carries a stock. `previous` is the stock a rollback
+             -- restores: see the CASE below for when it is kept and when it resets.
              || CASE WHEN CAST(:availability AS VARCHAR) IS NULL THEN CAST('{}' AS jsonb)
                 ELSE jsonb_build_object('availability_read', jsonb_build_object(
                     'source', CAST(:read_source AS text),
                     'value', CAST(:availability AS VARCHAR),
-                    'previous', COALESCE(offer_payload -> 'availability_read' -> 'previous', to_jsonb(availability)),
+                    -- Kept only while the row's stock is still the one this lane last wrote: a writer that
+                    -- changed the stock and left the marker made the row's CURRENT stock the one to restore.
+                    'previous', CASE WHEN offer_payload -> 'availability_read' ->> 'value' = availability
+                                     THEN offer_payload -> 'availability_read' -> 'previous'
+                                     ELSE to_jsonb(availability) END,
                     'at', to_jsonb(NOW())))
                 END
         ELSE offer_payload

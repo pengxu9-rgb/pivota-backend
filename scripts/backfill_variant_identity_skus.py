@@ -74,6 +74,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -216,7 +217,10 @@ SELECT_LIVE_OFFERS_SQL = """
            -- brand_direct/official: pivot_query_service treats a NULL offer_type on
            -- external_referral as authoritative "unknown" and is_first_party false.
            offer_type, is_first_party, why_buy_direct,
-           coalesce(offer_payload->>'destination_url', source_ref) AS destination_url
+           coalesce(offer_payload->>'destination_url', source_ref) AS destination_url,
+           -- The attached lane's stock marker (external_offer_dual_write.AVAILABILITY_READ_KEY): a variant row
+           -- that INHERITS this row's stock is marked too, so a rollback of that stock reaches it.
+           offer_payload -> 'availability_read' AS availability_read
     FROM catalog_offers
     WHERE product_key = :pk
       AND suppressed_at IS NULL
@@ -286,7 +290,15 @@ UPSERT_OFFER_SQL = """
                                        ELSE catalog_offers.availability END,
         -- Re-stamped on the update path too, so a row this batch last touched says so (M1).
         source_system            = EXCLUDED.source_system,
-        offer_payload            = catalog_offers.offer_payload || EXCLUDED.offer_payload,
+        -- The inherited-stock marker belongs to an INSERT only: the update path never takes an inherited
+        -- stock (availability above), so it never claims one. And when the variant SPOKE, the stock written is
+        -- its own, so an earlier inherited marker on the row goes too: else a rollback would put back the
+        -- pre-lane stock over a stock the variant stated (be#2811 review P3-1). `jsonb - text` raises on a
+        -- scalar payload, hence the object guard.
+        offer_payload            = (CASE WHEN :variant_spoke AND jsonb_typeof(catalog_offers.offer_payload) = 'object'
+                                         THEN catalog_offers.offer_payload - 'availability_read'
+                                         ELSE catalog_offers.offer_payload END)
+                                   || (EXCLUDED.offer_payload - 'availability_read'),
         updated_at               = NOW()
 """
 
@@ -330,6 +342,30 @@ def normalize_availability(raw: Any, fallback: Optional[str] = None) -> str:
 def _variant_stated_availability(variant: Dict[str, Any]) -> bool:
     """Did this variant carry availability of its own, or are we inheriting the offer's?"""
     return variant.get("availability") not in (None, "") or "in_stock" in variant
+
+
+def _inherited_stock_marker(variant: Dict[str, Any], chosen: Dict[str, Any]) -> Dict[str, Any]:
+    """`{"availability_read": ...}` when a new variant row INHERITS a stock the attached lane wrote on `chosen`.
+
+    The attached lane marks the stock it writes (services/external_offer_dual_write.AVAILABILITY_READ_KEY) so a
+    rollback can restore it; a variant row that copies that stock without a marker would keep it after the
+    rollback. The copy is marked as the lane marks its own writes. Its `previous` is the stock the row would
+    have inherited WITHOUT the lane: the chosen row's own pre-lane stock, its marker's `previous` (normalised
+    as an inherited stock is, `unknown` when absent; be#2811 review P2-1). A variant that states its own stock
+    inherits nothing and is not marked."""
+    if _variant_stated_availability(variant):
+        return {}
+    marker = _jsonb(chosen.get("availability_read"))
+    if not isinstance(marker, dict) or not marker.get("value"):
+        return {}
+    inherited = normalize_availability(None, chosen.get("availability"))
+    if inherited != marker.get("value"):
+        # The chosen row's stock is no longer the one the lane wrote: it is not the lane's to roll back.
+        return {}
+    return {"availability_read": {
+        "source": "variant_backfill", "from_offer_id": chosen.get("offer_id"), "value": inherited,
+        "previous": normalize_availability(None, marker.get("previous")), "at": datetime.now(timezone.utc).isoformat(),
+    }}
 
 
 def _availability_of(variant: Dict[str, Any], fallback: Optional[str]) -> str:
@@ -648,6 +684,7 @@ async def _scan(counts, audit, *, apply, limit, page, cursor, touched, state,
                                 # Carried, not merely claimed — without this every offer is a dead
                                 # end and agent_shop_gateway filters it out.
                                 "destination_url": destination,
+                                **_inherited_stock_marker(meta["variant"], chosen),
                             }),
                         }
                         # derive_offer_id uses the same (product_key, sku_key, destination)
