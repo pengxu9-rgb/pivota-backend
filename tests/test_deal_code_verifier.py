@@ -47,9 +47,14 @@ async def _ensure_seed_table(database) -> bool:
     if created:
         await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY)")
         have = {"id"}
-    for col in _SEED_COLUMNS:
-        if col not in have:
-            await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN {col} TEXT")
+    try:
+        for col in _SEED_COLUMNS:
+            if col not in have:
+                await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN {col} TEXT")
+    except BaseException:
+        if created:  # never leave a narrow table this file made (review N-4 residual)
+            await database.execute("DROP TABLE IF EXISTS external_product_seeds")
+        raise
     return created
 
 
@@ -572,6 +577,33 @@ async def test_a_200_this_verifier_cannot_read_is_recorded_backed_off_and_stops_
     assert "glow.example" not in [c["json"]["seller_host"] for c in client.calls]
 
 
+@pytest.mark.parametrize("answer,reason", [
+    ((200, {"result": "surprise"}), "unknown_result"), ((200, ValueError("not json")), "unreadable"),
+    ((200, ["applied"]), "unreadable"), ((200, "applied"), "unreadable"), ((200, 7), "unreadable")])
+async def test_a_route_no_answer_never_downgrades_a_verified_row(db, monkeypatch, answer, reason):
+    """Review P3-A: re-checking a verified row and getting no readable answer keeps the verification and its
+    reference cart, records only the reason, and backs off."""
+    _on(monkeypatch)
+    deal = await offer(db, "v")
+    await seed(db, "s1")
+    assert (await run(StubClient([APPLIED])))["applied"] == 1
+    [before] = await verifications(db, deal)
+    assert before["state"] == "checkout_verified"
+    later = before["expires_at"].replace(tzinfo=NOW.tzinfo) - timedelta(hours=1)  # inside REVERIFY_WITHIN
+    client = StubClient([answer])
+    out = await run(client, now=later)
+    assert len(client.calls) == 1, out
+    assert out == {"due": 1, "route_errors": 1, "route_" + reason: 1, "carts": 1}, out
+    [after] = await verifications(db, deal)
+    assert after["state"] == "checkout_verified"
+    for k in ("verified_at", "expires_at", "ref_unit_price", "ref_subtotal", "ref_discount_amount", "ref_currency"):
+        assert after[k] == before[k], k
+    assert after["failure_reason"] == "route:" + reason
+    client = StubClient([APPLIED])
+    await run(client, now=later + timedelta(minutes=30))
+    assert client.calls == []
+
+
 async def test_codes_in_markets_it_cannot_test_are_counted_by_name(db, monkeypatch):
     """Review N-6: GB, DE and no-market rows are never tested, and the summary says how many."""
     _on(monkeypatch)
@@ -582,6 +614,28 @@ async def test_codes_in_markets_it_cannot_test_are_counted_by_name(db, monkeypat
     await seed(db, "s1")
     out = await run(StubClient([APPLIED]))
     assert out["skipped_market_not_verifiable"] == 3 and out["applied"] == 1
+
+
+async def test_the_out_of_market_count_is_absent_at_zero(db, monkeypatch):
+    """Review P3-B: the key appears only when some row is out of market, so a normal summary is unchanged."""
+    _on(monkeypatch)
+    await offer(db, "us")
+    await seed(db, "s1")
+    out = await run(StubClient([APPLIED]))
+    assert out == {"due": 1, "applied": 1, "carts": 1}, out
+
+
+async def test_the_out_of_market_count_reads_only_crawl_rows_the_verifier_would_test(db, monkeypatch):
+    """Review P3-B: a non-crawl row, a kind the verifier never tests and an ended deal are not counted; a lowercase
+    market is not a market it tests, so it is."""
+    _on(monkeypatch)
+    await offer(db, "gb", market="GB")
+    await offer(db, "gbnc", market="GB", crawl=False)
+    await offer(db, "gbfs", market="GB", kind="free_shipping")
+    await offer(db, "gbend", market="GB", ends_at=NOW - timedelta(days=30))
+    await offer(db, "lower", market="us")
+    out = await run(StubClient([]))
+    assert out == {"due": 0, "skipped_market_not_verifiable": 2, "carts": 0}, out
 
 
 async def test_no_cart_is_started_without_time_left_before_the_jobs_deadline(db, monkeypatch):

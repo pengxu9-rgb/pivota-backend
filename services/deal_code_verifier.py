@@ -43,8 +43,9 @@ WHAT IS RECORDED, per answer:
                    run goes on;
   - the answer was lost (a transport error) or cannot be read (a 200 that is not JSON, or an unknown result); the
                    gateway may have built a cart: the same, and the run stops;
-  - 401, 404, 5xx or an unreadable answer: the route's configuration or health, not the row's. Nothing is written,
-                   the slot stays spent, and the run stops.
+                   (in both route cases a verified row keeps its verification and records only the reason;)
+  - 401, 404 or 5xx: the route's configuration or health, not the row's. Nothing is written, the slot stays spent,
+                   and the run stops.
   - an applied answer whose cart is not whole and consistent (unit >= subtotal >= unit - code - automatic >= 0) is
                    recorded as not confirmed.
 TIME: no cart is started with less than CART_HEADROOM_SECONDS left before the caller's deadline (the refresh job's
@@ -205,12 +206,14 @@ def due(offer: Mapping[str, Any], verifications: Iterable[Mapping[str, Any]], no
     return 2, last_attempt
 
 
-async def _not_verifiable_market_count() -> int:
-    """Crawl rows with a code whose market is none or one this verifier cannot test (GB, DE, ...). Never tested;
-    counted so the summary names them (review N-6)."""
+async def _not_verifiable_market_count(now: datetime) -> int:
+    """Crawl rows the verifier would test (a code of a verifiable kind, not ended) but for their market: none, or one
+    this verifier cannot test (GB, DE, ...). Counted so the summary names them (review N-6); rows it would skip
+    anyway (free shipping, ended) are not counted, so the number is what the market rule alone leaves out."""
     row = await database.fetch_one(
         select(func.count()).select_from(o)
-        .where(and_(writer.crawl_rows(), o.c.code.isnot(None),
+        .where(and_(writer.crawl_rows(), o.c.code.isnot(None), o.c.kind.in_(VERIFIABLE_KINDS),
+                    or_(o.c.ends_at.is_(None), o.c.ends_at > now),
                     or_(o.c.market.is_(None), o.c.market.notin_(sorted(MARKET_CURRENCY))))))
     return int(row[0] or 0) if row is not None else 0
 
@@ -600,7 +603,7 @@ async def run(now: Optional[datetime] = None, *, client=None, sleep=asyncio.slee
             return counts
         candidates = await _candidates(now)
         bump("due", len(candidates))
-        out_of_market = await _not_verifiable_market_count()
+        out_of_market = await _not_verifiable_market_count(now)
         if out_of_market:
             bump("skipped_market_not_verifiable", out_of_market)
         per_run = settings.deal_verify_max_carts_per_run
