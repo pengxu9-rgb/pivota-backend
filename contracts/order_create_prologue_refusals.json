@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "authority": "This repository: the order-create path of POST /agent/v2/orders (routes/agent_v2.py create_order_v2, routes/agent_api.py agent_create_order, routes/agent_forwarded_owner.py). Pinned by tests/test_order_create_prologue_refusals_contract.py. The agent gateway vendors this file byte-identical and tests that its own release list deep-equals `refused_before_any_order`; both sides pin the file's sha256, so adding or removing a pair touches both repositories.",
+  "meaning": "Each (status, code) below is answered ONLY from the request's prologue: before the first call of the order write step (create_new_order), so no order row can exist because of this request when it is answered. Every other answer of the route, whatever its status, may have an order behind it and is NOT listed.",
+  "refused_before_any_order": {
+    "400": ["INVALID_QUOTE", "INVALID_BUYER_CONTEXT", "QUOTE_REQUIRED_BEFORE_PURCHASE", "QUOTE_MERCHANT_MISMATCH", "VARIANT_REQUIRED"],
+    "404": ["QUOTE_NOT_FOUND"],
+    "409": ["PARTNER_ASSERTION_REJECTED", "UNSUPPORTED_COMMERCE_PATH", "PREFLIGHT_FAILED"]
+  },
+  "envelope": {
+    "code": "error.details.error",
+    "reason": "error.details.reason",
+    "note": "The route's own code is error.details.error. error.code is derived from the HTTP status alone and is never a listed code. error.message equals error.details.error when the route named a code, and is otherwise a sentence."
+  },
+  "notes": {
+    "PARTNER_ASSERTION_REJECTED": {
+      "reasons": ["bad_mac", "body", "malformed", "method", "no_secret", "op", "path", "replay", "resource", "stale", "subject"],
+      "reason_that_is_not_a_plain_refusal": "replay",
+      "replay": "The assertion's single-use nonce was already claimed: a copy of this exact request reached the backend before, and that copy may have created the order. The refusal itself is still raised before any order write of THIS request, but a caller holding a guard for the order should keep it on this reason."
+    },
+    "QUOTE_NOT_FOUND": "Listed at 404 only (the caller does not own the quote, or it does not exist). The same code at 409 is the write step's own re-read of the quote, which can follow a written order, and at 400 is the pre-flight's; neither is listed."
+  },
+  "not_listed_on_purpose": {
+    "503 TEMPORARY_UNAVAILABLE": "The database was busy, or it could not be told whether the order already exists (error.details.reason is then ORDER_REPLAY_LOOKUP_UNAVAILABLE or ORDER_QUOTE_GUARD_UNAVAILABLE). An order may exist.",
+    "409 QUOTE_CONSUMED": "The quote already has its order."
+  }
+}

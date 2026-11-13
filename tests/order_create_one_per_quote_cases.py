@@ -30,6 +30,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -186,6 +187,9 @@ class QuoteStore:
     quotes: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     consume_lands: bool = True
     consume_calls: List[Tuple[str, Optional[str]]] = field(default_factory=list)
+    # A case may reshape what a quote load returns: called with (quote_id, snapshot, nth load).
+    reshape: Optional[Any] = None
+    loads: Dict[str, int] = field(default_factory=dict)
 
     def add(self, *, agent: str = AGENT_A, market: str = "US") -> str:
         _, country, currency, total = next(m for m in MARKETS if m[0] == market)
@@ -215,11 +219,12 @@ class QuoteStore:
                 details={"order_id": q["consumed_order_id"]},
             )
         subtotal = q["total"]
-        return SimpleNamespace(
+        self.loads[quote_id] = self.loads.get(quote_id, 0) + 1
+        snapshot = SimpleNamespace(
             quote_id=quote_id,
             merchant_id=MERCHANT,
             agent_id=q["agent_id"],
-            expires_at=None,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
             status="active",
             engine="shopify_storefront_cart",
             engine_ref="cart_ref_oopq",
@@ -254,6 +259,9 @@ class QuoteStore:
                 ],
             },
         )
+        if self.reshape is not None:
+            self.reshape(quote_id, snapshot, self.loads[quote_id])
+        return snapshot
 
     def consume(self, quote_id: str, order_id: Optional[str]) -> None:
         self.consume_calls.append((quote_id, order_id))
@@ -503,7 +511,16 @@ class World:
 
     # -- driving -------------------------------------------------------------
 
-    async def _post(self, path: str, payload: Dict[str, Any], *, agent: str, tag: str) -> Answer:
+    async def _post(
+        self,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        agent: str,
+        tag: str,
+        headers: Optional[Dict[str, str]] = None,
+        content: Optional[bytes] = None,
+    ) -> Answer:
         from routes.agent_auth import get_agent_context
 
         async def context() -> _Context:
@@ -515,7 +532,11 @@ class World:
         try:
             transport = httpx.ASGITransport(app=self.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.post(path, json=payload)
+                if content is not None:
+                    sent = {"Content-Type": "application/json", **(headers or {})}
+                    response = await client.post(path, content=content, headers=sent)
+                else:
+                    response = await client.post(path, json=payload, headers=headers)
         finally:
             _REQUEST_TAG.reset(tag_token)
             _REQUEST_AGENT.reset(agent_token)
@@ -1417,3 +1438,69 @@ async def test_the_order_and_its_replays_carry_the_quotes_currency_and_total(wor
         assert by_key.body["order"] == by_quote.body["order"] == created.body["order"]
     else:
         assert by_key.body == by_quote.body
+
+
+# ---------------------------------------------------------------------------
+# 8. A busy database error that arrives wrapped in an HTTP error
+# ---------------------------------------------------------------------------
+
+
+def _wrapped(status: int, detail: Any, cause_message: str) -> Any:
+    from fastapi import HTTPException
+
+    try:
+        raise RuntimeError(cause_message)
+    except RuntimeError as cause:
+        wrapped = HTTPException(status_code=status, detail=detail)
+        wrapped.__cause__ = cause
+        return wrapped
+
+
+@pytest.mark.parametrize(
+    "status, detail, cause, expected_status, expected_code",
+    [
+        # A helper turned a busy error into its own 5xx: answered as the retriable 503.
+        (500, "internal error: " + BUSY, BUSY, 503, "TEMPORARY_UNAVAILABLE"),
+        (502, {"error": "UPSTREAM_FAILED", "message": "fixture"}, BUSY, 503, "TEMPORARY_UNAVAILABLE"),
+        # Not busy: unchanged.
+        (500, "internal error: fixture", "something else", 500, "internal error: fixture"),
+        # A refusal that was decided stays that refusal, whatever is behind it.
+        (409, {"error": "QUOTE_CONSUMED", "message": "Quote already consumed"}, BUSY, 409, "QUOTE_CONSUMED"),
+        (400, {"error": "FIXTURE_REFUSAL", "message": "fixture"}, BUSY, 400, "FIXTURE_REFUSAL"),
+    ],
+    ids=["busy_500", "busy_502", "plain_500", "busy_behind_a_409", "busy_behind_a_400"],
+)
+async def test_a_busy_error_wrapped_in_a_5xx_leaves_as_the_retriable_503_and_nothing_else_changes(
+    world: World, status: int, detail: Any, cause: str, expected_status: int, expected_code: str
+) -> None:
+    import routes.agent_api as agent_api
+
+    w = world
+    quote = w.quotes.add()
+
+    async def helper_fails(_quote_id: str, _context: Any) -> None:
+        raise _wrapped(status, detail, cause)
+
+    w.monkeypatch.setattr(agent_api, "require_quote_for_caller", helper_fails)
+
+    answer = await w.create_v1(quote, key="key-1")
+
+    assert answer.status == expected_status, (answer.status, answer.body)
+    assert answer.code == expected_code, answer.body
+    assert (answer.retry_after == "1") is (expected_status == 503)
+    assert w.create_runs == [] and w.db.count("replay_lookup") == 0
+    assert await w.orders_for(quote) == []
+
+
+async def test_the_named_503_keeps_its_reason_on_the_way_out(world: World) -> None:
+    """The could-not-tell refusal has a busy error behind it and is already a 503: it is not
+    rewritten into the plain busy 503, which would lose the reason."""
+    w = world
+    quote = w.quotes.add()
+    w.after_row_busy_runs = {1}
+    w.db.fail("replay_lookup", "before", times=999, armed_after="order_insert")
+
+    answer = await w.create_v1(quote, key="key-1")
+
+    assert_retriable_503(answer, "ORDER_REPLAY_LOOKUP_UNAVAILABLE")
+    assert w.create_runs == ["r1"] and len(await w.orders_for(quote)) == 1

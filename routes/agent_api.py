@@ -9889,12 +9889,15 @@ async def agent_create_order(
         
     except HTTPException as e:
         success = False
-        # If the handler wrapped an asyncpg busy error into a 500, surface a retryable 503 instead.
-        try:
-            if is_asyncpg_busy_error(e):
-                raise db_busy_http_exception()
-        except Exception:
-            pass
+        # A 5xx that wraps a busy database error (a helper turned the busy error into its own
+        # 500) is answered as the retriable 503 instead. This used to be written as a `raise`
+        # inside `try/except Exception: pass`, which swallowed it, so the 500 left as a 500.
+        # Only a 5xx is converted: a 4xx with a busy error somewhere behind it is a refusal that
+        # was decided (e.g. the 409 for a quote that already has its order) and stays as it is,
+        # and a 503 already says "retry" (and may name why). No lookup and no create happens here.
+        busy_as_503: Optional[HTTPException] = None
+        if e.status_code >= 500 and e.status_code != 503 and is_asyncpg_busy_error(e):
+            busy_as_503 = db_busy_http_exception()
         # Quote-first telemetry: capture quote drift diagnostics distribution (no PII).
         try:
             detail = getattr(e, "detail", None)
@@ -9992,6 +9995,8 @@ async def agent_create_order(
             )
         except Exception as log_error:
             logger.warning(f"[agent_orders_create] usage logging failed for order create HTTP error: {log_error}")
+        if busy_as_503 is not None:
+            raise busy_as_503 from e
         raise
     except Exception as e:
         success = False

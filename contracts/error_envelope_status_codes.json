@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "authority": "This repository: middleware/error_handler.py (_map_status_to_error_code) and utils/error_codes.py (ErrorCode). Pinned by tests/test_order_create_prologue_refusals_contract.py. The agent gateway's model of this backend's error envelope vendors this file byte-identical.",
+  "meaning": "For an error a route raises, error.code and the default error.message are chosen by the HTTP status alone. A status not listed is answered with the 500 entry. A 422 (request validation) is answered as HTTP 400 with the 400 code and the message in `validation_message`.",
+  "status_code": {
+    "400": ["INVALID_REQUEST", "Invalid request format or parameters"],
+    "401": ["UNAUTHORIZED", "Authentication required"],
+    "403": ["FORBIDDEN", "You don't have permission to access this resource"],
+    "404": ["PRODUCT_NOT_FOUND", "Product not found"],
+    "409": ["CONFLICT", "Request conflicts with the current state of the resource"],
+    "429": ["RATE_LIMIT_EXCEEDED", "Too many requests, please try again later"],
+    "500": ["INTERNAL_SERVER_ERROR", "An unexpected error occurred"],
+    "502": ["EXTERNAL_SERVICE_ERROR", "External service request failed"],
+    "503": ["EXTERNAL_SERVICE_ERROR", "External service request failed"]
+  },
+  "validation_message": "Request validation failed"
+}
