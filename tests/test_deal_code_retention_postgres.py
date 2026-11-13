@@ -23,7 +23,9 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not _IS_PG, reason="needs 
 
 _SAFE_DB_MARKERS = ("dialect_check", "_test", "test_", "localhost/pivota_dialect")
 _MIG_275 = Path(__file__).resolve().parent.parent / "db" / "migrations" / "275_deal_lane_tables.sql"
-_TABLES = ("observed_store_offer_verifications", "observed_store_offers", "deal_lane_stops", "deal_lane_optout")
+_MIG_283 = Path(__file__).resolve().parent.parent / "db" / "migrations" / "283_deal_code_refusals.sql"
+_TABLES = ("observed_store_offer_verifications", "observed_store_offers", "deal_lane_stops", "deal_lane_optout",
+           "deal_code_refusals")
 _PREFIX = "dcr-gate-"
 # The gate shares ONE database across files; another file may have created catalog_products with a narrower schema.
 _CATALOG_DDL = "ALTER TABLE catalog_products ADD COLUMN IF NOT EXISTS source_domain text"
@@ -46,8 +48,9 @@ async def db(monkeypatch):
     was_connected = database.is_connected
     if not was_connected:
         await database.connect()
-    for stmt in split_statements(_MIG_275.read_text()):  # IF NOT EXISTS throughout
-        await database.execute(stmt)
+    for mig in (_MIG_275, _MIG_283):
+        for stmt in split_statements(mig.read_text()):  # IF NOT EXISTS throughout
+            await database.execute(stmt)
     await database.execute(_CATALOG_DDL)
 
     async def _clean():

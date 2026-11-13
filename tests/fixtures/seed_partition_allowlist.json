@@ -336,6 +336,13 @@
       "reason": "LATENT, correct guard: a legacy 'US'+SGD catalog offer fails require_market_currency and is skipped until the restamp."
     },
     {
+      "file": "services/deal_code_verifier.py",
+      "qualname": "_candidates",
+      "rule": "P",
+      "finding": "N/A",
+      "reason": "Not the seed partition: r is an observed_store_offers row (a crawled code), whose market is the writer's market evidence (the page's own currency matched the market). The verifier's seed read selects by host only and takes each seed's market from services.seed_serving.seed_row_market. Upstream, SG codes are written only for seeds whose column says SG: the refresh passes the partition to resolve_external_offer, so an SGD seed in partition US yields no market evidence (finding N2, the entry for that site); the verifier's SG path is correct but gets SG codes only once N2 is fixed."
+    },
+    {
       "file": "services/external_referral_readiness.py",
       "qualname": "evaluate_external_referral_seed",
       "rule": "P",
