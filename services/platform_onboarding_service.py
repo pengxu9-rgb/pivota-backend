@@ -77,7 +77,10 @@ async def register_platform_merchant_v2(
             "merchant_id": merchant_id,
             "business_name": business_name,
             "region": region,
-            "status": "approved",  # Auto-approve for Platform Onboarding v2
+            # Managed onboarding (D-09): never auto-approved. Staff approve
+            # through the employee approval routes, like every other signup.
+            "status": "pending_verification",
+            "auto_approved": False,
             "contact_email": contact_email or "noreply@pivota.cc",
             "created_at": now,
             "updated_at": now,
