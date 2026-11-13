@@ -21,7 +21,10 @@ Pinned here:
   * enforce consults the limiter before it looks a key up, and never counts a verified caller;
   * the lines have a budget per minute and per credential class, with one summary line;
   * the money gate (SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL) is handed the class, so a key is
-    looked up once; in off it looks for itself, as on main.
+    looked up once; in off it looks for itself, as on main;
+  * a classification or a line that FAILS: observe still answers as off and hands the money gate
+    no class (it looks for itself); enforce serves nothing (500);
+  * with SHOP_INVOKE_FORWARD_CALLER_KEY off and on: the answer table of the two flags together.
 
 Regenerate the recording only from a CLEAN tree of main (one without this change): see
 `record_parent_matrix` at the bottom of this file and the runbook section on this flag.
@@ -56,9 +59,11 @@ ENV = "SHOP_INVOKE_KEYLESS_MODE"
 MONEY_ENV = "SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL"
 RPM_ENV = "SHOP_INVOKE_ANON_RPM"
 LOG_BUDGET_ENV = "SHOP_INVOKE_KEYLESS_LOG_LINES_PER_MINUTE"
+FORWARD_ENV = "SHOP_INVOKE_FORWARD_CALLER_KEY"
 RECORDING = Path(__file__).parent / "fixtures" / "shop_invoke_keyless_mode_parent_recording.json"
 LINE_PREFIX = "[shop_invoke] keyless request:"
 LOOKUP_FAILED_PREFIX = "[shop_invoke] keyless-mode key lookup failed:"
+CLASSIFY_FAILED_PREFIX = "[shop_invoke] keyless-mode classification failed:"
 SUPPRESSED_PREFIX = "[shop_invoke] keyless lines suppressed:"
 
 # The refusal, byte for byte.
@@ -257,6 +262,22 @@ def _priced(request_market: Optional[str]) -> Optional[Dict[str, Any]]:
     return {"amount": 10.0, "currency": MARKET_CURRENCY[request_market]}
 
 
+class _FrozenWallClock:
+    """The routes module's `time`, with time() standing still. The per-address limiter counts in
+    wall-clock minutes; a run of requests that straddled a minute would get a fresh budget
+    half way, here and when the recording is made. Everything else is the real module."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self._now = float(real.time())
+
+    def time(self) -> float:
+        return self._now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
 def build_harness(
     monkeypatch, gateway=gw, *, with_request_log: bool = False, real_auth_cache: bool = False
 ) -> Dict[str, Any]:
@@ -269,9 +290,11 @@ def build_harness(
     monkeypatch.delenv(MONEY_ENV, raising=False)
     monkeypatch.delenv(RPM_ENV, raising=False)
     monkeypatch.delenv(LOG_BUDGET_ENV, raising=False)
+    monkeypatch.delenv(FORWARD_ENV, raising=False)
     monkeypatch.setenv("CHECKOUT_TOKEN_SECRET", TOKEN_SECRET)
     monkeypatch.delenv("AGENT_CHECKOUT_TOKEN_SECRET", raising=False)
     monkeypatch.setattr(gateway, "_INVOKE_ANON_IP_LIMIT_STORE", {})
+    monkeypatch.setattr(gateway, "time", _FrozenWallClock(gateway.time))
     monkeypatch.setattr(gateway, "AGENT_API_KEY", SERVICE_KEY)
     # Pinned, so the recording does not depend on the PORT / AGENT_API_BASE of the machine.
     monkeypatch.setattr(gateway, "AGENT_API_BASE", "http://127.0.0.1:8080")
@@ -1617,6 +1640,331 @@ def test_the_class_is_left_on_the_request_for_later_readers(harness, monkeypatch
     _post(harness, "create_order", {"X-API-Key": ACTIVE_KEY})
     _post(harness, "create_order", {"X-API-Key": "x"})
     assert [on_request for on_request, _handed in handed] == ["absent", "agent_key", "malformed_key"]
+
+
+# ── observe when the classification or the line FAILS ─────────────────────────
+# Injected, not provoked: nothing a caller can send is known to make either raise, so the tests
+# make them raise. Observe must still answer exactly as off, and a classification that did not
+# finish must hand the money gate NO class: the gate then looks for itself, as in off.
+
+
+class _InjectedFailure(RuntimeError):
+    pass
+
+
+# what raises -> whether the classification itself is what failed
+OBSERVE_FAILURES = {
+    "classifier": True,
+    "line": False,
+    "classifier_and_line": True,
+    # _invoke_keyless_log_allowed is behind the keyless line AND the line about a failure.
+    "classifier_and_every_line": True,
+    "every_line": False,
+}
+
+
+def _inject_observe_failure(monkeypatch, what: str) -> Dict[str, int]:
+    assert what in OBSERVE_FAILURES
+    calls = {"classifier": 0, "line": 0, "budget": 0}
+
+    async def classify(*args, **kwargs):
+        calls["classifier"] += 1
+        raise _InjectedFailure("classifier")
+
+    def line(*args, **kwargs):
+        calls["line"] += 1
+        raise _InjectedFailure("line")
+
+    def budget(label):
+        calls["budget"] += 1
+        raise _InjectedFailure("budget")
+
+    if what.startswith("classifier"):
+        monkeypatch.setattr(gw, "_classify_invoke_credential", classify)
+    if what in ("line", "classifier_and_line"):
+        monkeypatch.setattr(gw, "_log_invoke_keyless_request", line)
+    if what.endswith("every_line"):
+        monkeypatch.setattr(gw, "_invoke_keyless_log_allowed", budget)
+    return calls
+
+
+@pytest.mark.parametrize("what", sorted(OBSERVE_FAILURES))
+def test_observe_answers_the_whole_recording_when_the_classifier_or_the_line_raises(harness, monkeypatch, prod_log, what):
+    monkeypatch.setenv(ENV, "observe")
+    calls = _inject_observe_failure(monkeypatch, what)
+    got = run_everything(harness)
+    recorded = _recording()
+    assert set(got) == set(recorded)
+    for case in sorted(recorded):
+        assert got[case] == recorded[case], case
+    # The failure really happened, on every request the limiter did not answer first...
+    not_throttled = sum(1 for case in recorded.values() if case["status"] != 429)
+    if what.startswith("classifier"):
+        assert calls["classifier"] == not_throttled
+    else:
+        assert calls["line"] + calls["budget"] > 0
+    # ...and it was never logged as a keyless request.
+    assert prod_log(LINE_PREFIX) == []
+    failed = prod_log(CLASSIFY_FAILED_PREFIX)
+    if what.endswith("every_line"):
+        assert prod_log("[shop_invoke] keyless") == []
+    else:
+        assert failed == [f"{CLASSIFY_FAILED_PREFIX} _InjectedFailure"] * (calls["classifier"] or calls["line"])
+        assert all(r.levelno == logging.WARNING for r in prod_log.records if r.getMessage().startswith(CLASSIFY_FAILED_PREFIX))
+
+
+FAILURE_PROBE_CREDS = [
+    "none", "junk_api_key", "malformed_key", "unknown_key", "inactive_key", "forged_token", "garbage_token",
+    "lookup_swallowed_key", "lookup_transient_key", "active_key", "trusted_key", "minted_token",
+    "forged_token_with_active_key",
+]
+FAILURE_PROBE_REQUESTS = ["find_products_gb", "offers_resolve_gb", *sorted(MONEY_PAYLOADS)]
+
+
+def _full_answer(h, request_id: str, headers: Dict[str, str]) -> Tuple[Any, ...]:
+    h["sent"].clear()
+    h["seen"].clear()
+    h["handled"].clear()
+    res = _post(h, request_id, headers)
+    return (res.status_code, res.content, sorted(res.headers.items()), list(h["seen"]), list(h["sent"]), list(h["handled"]))
+
+
+@pytest.mark.parametrize("what", sorted(OBSERVE_FAILURES))
+def test_a_failed_classification_in_observe_hands_the_money_gate_no_class(harness, monkeypatch, what):
+    """Reads and money operations, keyless and verified: the answer, what the handlers saw and
+    what went upstream equal off. When the classification is what failed, the money gate gets
+    None and does main's own lookup."""
+    off = {
+        (rid, cid): _full_answer(harness, rid, harness["creds"][cid])
+        for rid in FAILURE_PROBE_REQUESTS for cid in FAILURE_PROBE_CREDS
+    }
+    off_lookups = len(harness["lookups"])
+    harness["lookups"].clear()
+    gw._INVOKE_ANON_IP_LIMIT_STORE.clear()
+
+    monkeypatch.setenv(ENV, "observe")
+    _inject_observe_failure(monkeypatch, what)
+    handed = _reason_spy(monkeypatch)
+    unverified = {**KEYLESS_CLASSES, **LOOKUP_ERROR_CLASSES}
+    for rid in FAILURE_PROBE_REQUESTS:
+        for cid in FAILURE_PROBE_CREDS:
+            handed.clear()
+            assert _full_answer(harness, rid, harness["creds"][cid]) == off[(rid, cid)], (rid, cid)
+            if REQUESTS_BY_ID[rid][0] not in gw.INVOKE_MONEY_OPERATIONS:
+                assert handed == []
+                continue
+            ((_on_request, credential_class),) = handed
+            if OBSERVE_FAILURES[what] or cid in unverified:
+                assert credential_class is None, (rid, cid, credential_class)
+            else:
+                # The classification finished and no line was due: the class is a real one.
+                assert credential_class == VERIFIED_CLASSES[cid]
+    if OBSERVE_FAILURES[what]:
+        # No classifier ran: every lookup is the money gate's own, exactly main's.
+        assert len(harness["lookups"]) == off_lookups > 0
+
+
+@pytest.mark.parametrize("what", sorted(OBSERVE_FAILURES))
+@pytest.mark.parametrize("operation", sorted(gw.INVOKE_MONEY_OPERATIONS))
+def test_a_failed_classification_in_observe_never_admits_a_keyless_money_operation(harness, monkeypatch, prod_log, operation, what):
+    monkeypatch.setenv(ENV, "observe")
+    _inject_observe_failure(monkeypatch, what)
+    for cred_id in ("none", "junk_api_key", "malformed_key", "unknown_key", "inactive_key", "status_inactive_key", "basic_auth"):
+        res = _post(harness, operation, harness["creds"][cred_id])
+        assert res.status_code == 401, (cred_id, res.text)
+        assert res.json()["detail"]["error"] == "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+    _nothing_ran(harness)
+    assert len(prod_log("[shop_invoke] money operation refused:")) == 7
+    # A well-formed key was looked up by the money gate (and, where it ran, by the classifier).
+    assert len(harness["lookups"]) == (3 if OBSERVE_FAILURES[what] else 6)
+
+
+def test_observe_does_not_narrow_what_it_catches(harness, monkeypatch):
+    """Whatever the classifier raises is caught, also an error that is not a RuntimeError."""
+    monkeypatch.setenv(ENV, "observe")
+    for exc in (TypeError("fixture"), KeyError("fixture"), UnicodeEncodeError("ascii", "x", 0, 1, "fixture"), AssertionError()):
+        async def classify(*args, _exc=exc, **kwargs):
+            raise _exc
+
+        monkeypatch.setattr(gw, "_classify_invoke_credential", classify)
+        assert _post(harness, "find_products_gb").status_code == 200
+        assert _post(harness, "create_order").json()["detail"]["error"] == "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+        assert _post(harness, "create_order", {"X-API-Key": ACTIVE_KEY}).status_code == 200
+
+
+ENFORCE_FAILURES = ["in_process", "lookup", "line"]
+
+
+@pytest.mark.parametrize("what", ENFORCE_FAILURES)
+@pytest.mark.parametrize("request_id", ["find_products_gb", "create_order"])
+def test_enforce_serves_nothing_when_its_classification_or_its_line_raises(harness, monkeypatch, request_id, what):
+    """Enforce has no catch-all: a step that raises is an unhandled error, answered 500 before
+    the money gate and before any operation branch. Nothing is served on a failure. A caller
+    the failing step is never reached for is answered as usual."""
+    monkeypatch.setenv(ENV, "enforce")
+
+    def boom(*args, **kwargs):
+        raise _InjectedFailure(what)
+
+    async def aboom(*args, **kwargs):
+        raise _InjectedFailure(what)
+
+    if what == "in_process":
+        monkeypatch.setattr(gw, "_classify_invoke_credential_in_process", boom)
+        reached = set(harness["creds"])
+    elif what == "lookup":
+        monkeypatch.setattr(gw, "_lookup_invoke_agent_key_class", aboom)
+        reached = {
+            cid for cid, headers in harness["creds"].items()
+            if cid not in ("minted_token", "minted_token_with_unknown_key", "minted_token_with_active_key")
+            and gw._AGENT_API_KEY_RE.match(_api_key_of(headers) or "")
+        }
+    else:
+        monkeypatch.setattr(gw, "_log_invoke_keyless_request", boom)
+        reached = set(KEYLESS_CLASSES) | set(LOOKUP_ERROR_CLASSES)
+    assert reached
+    recorded = _recording()
+    for cred_id, headers in sorted(harness["creds"].items()):
+        gw._INVOKE_ANON_IP_LIMIT_STORE.clear()
+        harness["handled"].clear()
+        harness["sent"].clear()
+        res = _post(harness, request_id, headers)
+        if cred_id in reached:
+            assert (res.status_code, res.content) == (500, b"Internal Server Error"), cred_id
+            _nothing_ran(harness)
+        elif cred_id in VERIFIED_CLASSES:
+            want = recorded[f"{request_id}|{cred_id}"]
+            assert (res.status_code, res.text) == (want["status"], want["body"]), cred_id
+        else:
+            _is_the_401(res)
+            _nothing_ran(harness)
+
+
+# ── with the flag that forwards a caller's own key ────────────────────────────
+# The two flags meet in one place: a money operation the keyless step let through reaches the
+# proxy, which sends the checkout token, else (flag on) the caller's own key, else this
+# service's key. The keyless mode never changes which of those it is.
+
+MONEY_REFUSAL = "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+KEYLESS_REFUSAL = "CREDENTIAL_REQUIRED"
+BAD_FORMAT_AT_THE_PROXY = {"detail": {"detail": "Invalid API Key format"}}
+# case -> (request, header set, money gate switch)
+COMBINATION_CASES: Dict[str, Tuple[str, str, Optional[str]]] = {
+    "keyless_read": ("find_products_gb", "none", None),
+    "keyless_money": ("create_order", "none", None),
+    "keyed_read": ("find_products_gb", "active_key", None),
+    "keyed_money": ("create_order", "active_key", None),
+    "bad_format_key_read": ("find_products_gb", "malformed_key", None),
+    "bad_format_key_money": ("create_order", "malformed_key", None),
+    "bad_format_key_money_with_the_money_gate_off": ("create_order", "malformed_key", "0"),
+    "checkout_token_read": ("find_products_gb", "minted_token", None),
+    "checkout_token_money": ("create_order", "minted_token", None),
+}
+SERVED_READ = (200, None, None)
+# (forwarding flag on?, keyless mode) -> case -> (status, error label, what went upstream)
+EXPECTED_COMBINATIONS: Dict[Tuple[bool, str], Dict[str, Tuple[int, Optional[str], Optional[str]]]] = {}
+for _forward in (False, True):
+    for _mode in ("off", "observe", "enforce"):
+        _refused = (401, KEYLESS_REFUSAL, None)
+        _enforce = _mode == "enforce"
+        EXPECTED_COMBINATIONS[(_forward, _mode)] = {
+            "keyless_read": _refused if _enforce else SERVED_READ,
+            "keyless_money": _refused if _enforce else (401, MONEY_REFUSAL, None),
+            "keyed_read": SERVED_READ,
+            "keyed_money": (200, None, "callers_key" if _forward else "service_key"),
+            "bad_format_key_read": _refused if _enforce else SERVED_READ,
+            "bad_format_key_money": _refused if _enforce else (401, MONEY_REFUSAL, None),
+            "bad_format_key_money_with_the_money_gate_off": (
+                _refused if _enforce
+                else (401, "bad_format_at_the_proxy", None) if _forward
+                else (200, None, "service_key")
+            ),
+            "checkout_token_read": SERVED_READ,
+            "checkout_token_money": (200, None, "checkout_token"),
+        }
+
+
+def _combination_answer(h, monkeypatch, case: str) -> Tuple[Tuple[int, Optional[str], Optional[str]], Tuple[Any, ...]]:
+    request_id, cred_id, money_flag = COMBINATION_CASES[case]
+    headers = h["creds"][cred_id]
+    with monkeypatch.context() as mp:
+        if money_flag is not None:
+            mp.setenv(MONEY_ENV, money_flag)
+        gw._INVOKE_ANON_IP_LIMIT_STORE.clear()
+        full = _full_answer(h, request_id, headers)
+    status, content, _headers, _seen, sent, _handled = full
+    body = json.loads(content)
+    error: Optional[str] = None
+    if status != 200:
+        error = "bad_format_at_the_proxy" if body == BAD_FORMAT_AT_THE_PROXY else body["detail"]["error"]
+    upstream: Optional[str] = None
+    if sent:
+        (call,) = sent
+        if "X-Checkout-Token" in call["headers"]:
+            assert call["headers"]["X-Checkout-Token"] == headers["X-Checkout-Token"] and "X-API-Key" not in call["headers"]
+            upstream = "checkout_token"
+        else:
+            upstream = {SERVICE_KEY: "service_key", headers.get("X-API-Key"): "callers_key"}[call["headers"]["X-API-Key"]]
+    return (status, error, upstream), full
+
+
+@pytest.mark.parametrize("forward", [None, "0", "1", "true"], ids=["unset", "zero", "one", "true"])
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_the_answer_table_of_the_keyless_mode_and_the_forwarding_flag(harness, monkeypatch, mode, forward):
+    if forward is not None:
+        monkeypatch.setenv(FORWARD_ENV, forward)
+    forwards = forward in ("1", "true")
+    assert gw._invoke_forwards_caller_key() is forwards
+    # Off first, as the reference observe is compared with.
+    reference = {case: _combination_answer(harness, monkeypatch, case) for case in COMBINATION_CASES}
+    assert {case: label for case, (label, _full) in reference.items()} == EXPECTED_COMBINATIONS[(forwards, "off")]
+    monkeypatch.setenv(ENV, mode)
+    got = {case: _combination_answer(harness, monkeypatch, case) for case in COMBINATION_CASES}
+    assert {case: label for case, (label, _full) in got.items()} == EXPECTED_COMBINATIONS[(forwards, mode)]
+    for case in COMBINATION_CASES:
+        label, full = got[case]
+        if mode != "enforce" or label[0] == 200:
+            # off, observe, and everything enforce serves: byte for byte the off answer, the
+            # same handler inputs and the same request upstream.
+            assert full == reference[case][1], case
+        else:
+            assert full[1] == EXPECTED_401_BODY and full[3:] == ([], [], []), case
+    # A priced read names its market's currency under every combination that serves it.
+    for case in ("keyed_read", "checkout_token_read"):
+        assert json.loads(got[case][1][1])["products"][0]["price"]["currency"] == "GBP"
+
+
+def test_the_forwarding_flag_changes_only_what_a_keyed_money_operation_sends_upstream(harness, monkeypatch):
+    """Control for the table and for the two tests below: with the forwarding flag on and the
+    keyless mode off, the recording differs in exactly the money operations that carry a key
+    and no checkout token, and only in the key that goes upstream."""
+    monkeypatch.setenv(FORWARD_ENV, "1")
+    got = run_everything(harness)
+    recorded = _recording()
+    differing = sorted(case for case in recorded if got[case] != recorded[case])
+    assert differing
+    for case in differing:
+        want, have = recorded[case], got[case]
+        assert (have["status"], have["headers"], have["body"], have["seen"]) == (
+            want["status"], want["headers"], want["body"], want["seen"]
+        ), case
+        (sent_want,), (sent_have,) = want["sent"], have["sent"]
+        assert sent_want["headers"]["X-API-Key"] == SERVICE_KEY != sent_have["headers"]["X-API-Key"]
+        assert {**sent_have, "headers": None} == {**sent_want, "headers": None}
+    assert {case.split("|")[1 if case.startswith("sequence|") else 0] for case in differing} == set(MONEY_PAYLOADS)
+
+
+@pytest.mark.parametrize("what", [None, *sorted(OBSERVE_FAILURES)], ids=["no_failure", *sorted(OBSERVE_FAILURES)])
+def test_observe_changes_no_answer_with_the_forwarding_flag_on(harness, monkeypatch, what):
+    monkeypatch.setenv(FORWARD_ENV, "1")
+    off = run_everything(harness)
+    monkeypatch.setenv(ENV, "observe")
+    if what is not None:
+        _inject_observe_failure(monkeypatch, what)
+    observe = run_everything(harness)
+    assert set(observe) == set(off)
+    for case in sorted(off):
+        assert observe[case] == off[case], case
 
 
 # ── a key that is not ASCII ───────────────────────────────────────────────────

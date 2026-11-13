@@ -975,8 +975,13 @@ async def _observe_invoke_keyless(
             )
         return credential_class
     except Exception as exc:  # noqa: BLE001 -- observing must never change the answer
-        if _invoke_keyless_log_allowed(_INVOKE_KEYLESS_LOG_LABEL_CLASSIFY_FAILED):
-            logger.warning("[shop_invoke] keyless-mode classification failed: %s", type(exc).__name__)
+        # None, never a class: the money gate then judges the request itself, as in off. A class
+        # handed over from a classification that did not finish could admit a money operation.
+        try:
+            if _invoke_keyless_log_allowed(_INVOKE_KEYLESS_LOG_LABEL_CLASSIFY_FAILED):
+                logger.warning("[shop_invoke] keyless-mode classification failed: %s", type(exc).__name__)
+        except Exception:  # noqa: BLE001 -- nor may the line about the failure
+            pass
         return None
 
 

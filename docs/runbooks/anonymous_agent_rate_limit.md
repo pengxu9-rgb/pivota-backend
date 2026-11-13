@@ -310,7 +310,10 @@ before the payload is parsed, with no upstream call and no database write; the l
 `[shop_invoke] money operation refused` names the operation and a reason
 (`no_credential`, `malformed_key`, `unknown_or_inactive_key`), never a header value.
 Any key-lookup failure (transient or not) answers `503` (fail closed) and logs
-`[shop_invoke] money operation key lookup failed`. A checkout token is the dispatcher's
+`[shop_invoke] money operation key lookup failed` (with `SHOP_INVOKE_KEYLESS_MODE` in
+`observe` or `enforce` the `503` is the same but that line is NOT written: the keyless step
+made the lookup and wrote `[shop_invoke] keyless-mode key lookup failed` instead, under its
+line budget; see that section). A checkout token is the dispatcher's
 stripped value, so a whitespace-only `X-Checkout-Token` counts as none. The per-IP
 anonymous limiter runs first, so an over-budget anonymous call is `429`, not `401`.
 Every other operation is unchanged, credential or not.
@@ -348,6 +351,12 @@ body `{"detail": {"detail": "Invalid API Key format"}}`, which carries none of t
 bytes; nothing is sent upstream and the backend's key is not used instead. This is
 reachable only with the money check switched off, because that check refuses the same
 values first with its own `401`.
+
+A trusted key that is itself not ASCII in the configuration half-works: it passes the
+format rule (it is a trusted key) and is matched only by a sender that puts the same raw
+bytes in the header, never by one that sends it as UTF-8; and with this flag on the proxy
+cannot build the upstream header from it, so that caller's money operation fails with a
+`500`. Keep every configured trusted key ASCII.
 
 So a keyed caller's money operation is authenticated, limited, scoped, counted and owned
 as that caller's agent, not as the backend's service agent.
@@ -537,6 +546,16 @@ The labels are the five `cred=` classes above, plus `key_lookup_failed` for the 
 `[shop_invoke] keyless-mode classification failed: <error type>` (observe only: the request
 is served as in off). One class running out of budget does not silence another.
 
+When the classification or a line itself fails:
+
+- `observe`: the request is answered exactly as in off. The money gate is handed no class
+  and looks the key up itself, as in off, so a failed classification can never admit a money
+  operation. The failure is logged as `classification failed` when that line can be written,
+  and is not logged at all when it cannot.
+- `enforce`: nothing is served. The step has no catch-all, so the request is an unhandled
+  error (`500`) before the money gate and before any operation runs. A caller the failing
+  step is not reached for (a verified one, when only the line fails) is answered as usual.
+
 When a label ran out, one summary line is written after its minute is over, at the next
 keyless request of any label:
 
@@ -575,6 +594,32 @@ Do not set `enforce` until every line is true.
    token still admits reads until it expires (the money path rechecks the agent); a junk
    `X-API-Key` beside a good Bearer is keyless.
 
+Not built yet. Each of these is built, or accepted in writing by the owner, before
+`enforce`:
+
+9. A real key from an over-budget address is not denied. Today it is answered `429`
+   unlooked until the minute is over (and, during a lookup outage, `429` rather than `503`;
+   both carry `Retry-After`). Give an over-budget address a small separate lookup
+   allowance per minute, or let a recently expired positive auth-cache entry count as
+   "the cache holds it".
+10. The per-address limiter keys on the address our own front end appends to
+    `X-Forwarded-For`, not on the first entry, which the caller writes. Until then the
+    lookup bound and the `429` do not hold against a caller that rotates that entry.
+11. The suppressed-lines summary has a window or a timer. Today it is written at the next
+    keyless request of any label, however much later that is, and carries no window: write
+    one line at the first suppression, or on a timer, and put the window in the summary.
+12. The money gate's `key lookup failed` line is dropped in `observe` and `enforce` (the
+    keyless step's budgeted line replaces it). Write both, or move every alert and search
+    that reads the old line to the new one.
+13. The line budget is per class only. One dominant caller can use up a class's lines every
+    minute and hide the rare callers `observe` exists to find: key the budget on the whole
+    label set of the line (every field has a fixed vocabulary, so it stays bounded).
+14. Lookups per address are unbounded in `observe`: every well-formed key the auth cache
+    has not seen costs one lookup, as on the keyed routes. Watch database load while
+    `observe` is on, and decide whether that is acceptable before `enforce` is planned.
+15. The change that forwards a caller's own key and compares the trusted key as bytes is
+    deployed. Before it, a key that is not ASCII made `enforce` answer `500`, not `401`.
+
 Rollback from `enforce`: set the flag to `observe` or remove it.
 
 ### The recording behind the off and observe tests
@@ -589,8 +634,9 @@ matrix in the test file. Never regenerate it to make a change to the keyless cod
 a difference there is the defect the tests exist to catch.
 
 It must come from a clean tree of main, never from a working tree or a branch: export the
-commit into an empty directory and record there. The recorder unsets the flag, so on a
-main that already has the keyless code it records the off path.
+commit into an empty directory and record there. The recorder unsets the flag (and
+`SHOP_INVOKE_FORWARD_CALLER_KEY`, the money gate's switch and the limiter's settings), so on
+a main that already has the keyless code it records the off path.
 
 ```
 git archive <main commit> | tar -x -C <empty dir>
