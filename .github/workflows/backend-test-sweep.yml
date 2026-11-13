@@ -524,7 +524,10 @@ jobs:
           # 2026-11-11: 39,741 executed on main at 73ce43e62 (#2797), 31 OVER this cap -- tripped on the push
           # run with every test PASSING, so the deploy gate refused #2797 (and #2765 with it) and prod stayed
           # on 02ca60346. Re-floated within the printed window (36,129..39,741) at the same ~97%: 38,550, cap 42,405.
-          FLOOR = 38550
+          # 2026-11-13: 42,416 executed on main at 5b33a8619 (#2818), 11 OVER this cap -- tripped on the push
+          # run with every test PASSING, so the deploy gate refused #2818 and prod stayed on 870f60bc4.
+          # Re-floated within the printed window (38,560..42,416) at the same ~97%: 41,140, cap 45,254.
+          FLOOR = 41140
           # Slack allowance, global and per-subtree: 10% of the floor, but never
           # fewer than ABS_SLACK tests. The absolute term is not decoration — a
           # pure percentage is unusable on a small tree. readiness.tests
