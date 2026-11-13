@@ -72,8 +72,12 @@ def _is_internal_trusted_api_key(api_key: Optional[str]) -> bool:
     candidate = str(api_key or "").strip()
     if not candidate or not _INTERNAL_TRUSTED_API_KEYS:
         return False
+    # Bytes, not str: a constant-time compare of two str raises TypeError on a non-ASCII
+    # character, and header values are decoded as latin-1, so one byte >= 0x80 in a key would
+    # raise out of every caller of this helper instead of being "not a trusted key".
+    candidate_bytes = candidate.encode("utf-8", "surrogatepass")
     for trusted_key in _INTERNAL_TRUSTED_API_KEYS:
-        if hmac.compare_digest(candidate, trusted_key):
+        if hmac.compare_digest(candidate_bytes, str(trusted_key).encode("utf-8", "surrogatepass")):
             return True
     return False
 

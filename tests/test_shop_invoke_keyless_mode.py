@@ -1619,38 +1619,51 @@ def test_the_class_is_left_on_the_request_for_later_readers(harness, monkeypatch
     assert [on_request for on_request, _handed in handed] == ["absent", "agent_key", "malformed_key"]
 
 
-# ── a key that is not ASCII (a defect on main, not fixed here) ────────────────
+# ── a key that is not ASCII ───────────────────────────────────────────────────
+# A header value reaches the app decoded as latin-1, so one byte >= 0x80 is a key that is not
+# ASCII. It is not the trusted key and not the agent key shape: malformed_key, like any junk.
 
 
-def _raw_post(h, operation: str, payload: Dict[str, Any]) -> int:
+def _raw_post(h, operation: str, payload: Dict[str, Any]) -> Tuple[int, bytes]:
     body = {"operation": operation, "payload": payload, "metadata": {"market": "GB"}}
-    status, _headers, _content = _raw_asgi_post(h["app"], body, [(b"x-api-key", b"k\xe9y")])
-    return status
+    status, _headers, content = _raw_asgi_post(h["app"], body, [(b"x-api-key", b"k\xe9y")])
+    return status, content
 
 
-def test_a_non_ascii_key_is_served_in_observe_as_in_off(harness, monkeypatch, prod_log):
-    """main's trusted-key comparison raises on a key that is not ASCII. Observe must still change
-    no answer: a read is served as in off, a money operation gets main's own answer."""
+def test_a_non_ascii_key_is_answered_in_observe_as_in_off(harness, monkeypatch, prod_log):
+    """Off: a read is served, a money operation gets the money gate's 401. Observe: the same
+    bytes, and one keyless line per request."""
     read = {"search": {"merchant_id": "merch_fixture", "query": "serum"}}
     off = (_raw_post(harness, "find_products", read), _raw_post(harness, "create_order", MONEY_PAYLOADS["create_order"]))
     assert prod_log("[shop_invoke] keyless") == []
+    harness["sent"].clear()
     monkeypatch.setenv(ENV, "observe")
     observe = (_raw_post(harness, "find_products", read), _raw_post(harness, "create_order", MONEY_PAYLOADS["create_order"]))
-    # KNOWN: the 500 on the money operation is main's (its money gate runs the same comparison).
-    # It becomes the money gate's 401 when the comparison is fixed; change BOTH tuples then.
-    assert observe == off == (200, 500)
-    assert prod_log("[shop_invoke] keyless") == ["[shop_invoke] keyless-mode classification failed: TypeError"] * 2
+    assert observe == off
+    assert [status for status, _content in off] == [200, 401]
+    assert json.loads(off[0][1])["products"][0]["price"]["currency"] == "GBP"
+    assert json.loads(off[1][1])["detail"]["error"] == "CREDENTIAL_REQUIRED_FOR_MONEY_OPERATION"
+    # The raw request carries no User-Agent header.
+    assert prod_log("[shop_invoke] keyless") == [
+        _expected_line("observe", op, "malformed_key", {}).replace(" ua=other ", " ua=none ")
+        for op in ("find_products", "create_order")
+    ]
     assert harness["lookups"] == [] and harness["sent"] == []
 
 
-def test_a_non_ascii_key_in_enforce_is_a_known_500(harness, monkeypatch):
-    # KNOWN, pinned and not fixed here: the trusted-key comparison this step calls raises on a
-    # key that is not ASCII, so enforce answers 500 where it should answer the 401. This test
-    # CHANGES to _is_the_401 when that comparison is fixed (a separate change).
+@pytest.mark.parametrize("operation", ["find_products", "create_order"])
+def test_a_non_ascii_key_in_enforce_is_the_401(harness, monkeypatch, prod_log, operation):
     monkeypatch.setenv(ENV, "enforce")
-    assert _raw_post(harness, "find_products", {"search": {"merchant_id": "merch_fixture"}}) == 500
+    payload = MONEY_PAYLOADS.get(operation, {"search": {"merchant_id": "merch_fixture"}})
+    status, content = _raw_post(harness, operation, payload)
+    assert (status, content) == (401, EXPECTED_401_BODY)
     _nothing_ran(harness)
-    assert gw._INVOKE_ANON_IP_LIMIT_STORE == {}
+    assert harness["lookups"] == []
+    # Counted once by the limiter, like every caller without a verified credential.
+    assert [count for _window, count in gw._INVOKE_ANON_IP_LIMIT_STORE.values()] == [1]
+    assert prod_log() == [
+        _expected_line("enforce", operation, "malformed_key", {}).replace(" ua=other ", " ua=none ")
+    ]
 
 
 # ── recording helper (not a test) ─────────────────────────────────────────────

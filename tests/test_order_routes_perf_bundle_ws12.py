@@ -119,7 +119,7 @@ def _install_order_create_harness(
     quote = quote or _quote_snapshot()
 
     async def fake_get_merchant_onboarding(merchant_id: str):
-        return {"merchant_id": merchant_id}
+        return {"merchant_id": merchant_id, "status": "approved"}
 
     async def fake_check_inventory(_merchant_id: str, _items):
         return True, {"items": []}
