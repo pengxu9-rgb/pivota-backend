@@ -49,6 +49,13 @@ from routes.agent_auth import (
     has_no_merchant_scope,
     log_agent_request,
 )
+from routes.agent_order_owner_check import (
+    MODE_OFF as ORDER_OWNER_CHECK_OFF,
+    ROUTE_PAYMENT_CONFIRM,
+    ROUTE_PAYMENT_OFFER_EVIDENCE,
+    check_order_owner,
+    order_owner_check_mode,
+)
 from routes.agent_user_auth import AgentUserContext, get_agent_user_context
 from utils.logger import logger
 from utils.agent_search_intent import infer_query_overrides
@@ -8608,6 +8615,12 @@ async def agent_record_payment_offer_evidence(
     if not context.can_access_merchant(merchant_id):
         raise HTTPException(status_code=403, detail="Not authorized for this merchant")
 
+    # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): evidence is written on an order only by its
+    # owner. After the merchant refusal, so a caller outside that scope gets the answer it had.
+    owner_check_mode = order_owner_check_mode()
+    if owner_check_mode != ORDER_OWNER_CHECK_OFF and order is not None:
+        check_order_owner(order, context, route=ROUTE_PAYMENT_OFFER_EVIDENCE, mode=owner_check_mode)
+
     metadata = _coerce_json_object((order or {}).get("metadata"))
     pricing_quote = _coerce_json_object(metadata.get("pricing_quote"))
     quote_id = str(evidence_request.quote_id or pricing_quote.get("quote_id") or "").strip() or None
@@ -9995,6 +10008,14 @@ async def agent_confirm_payment(
 
         if not context.can_access_merchant(order["merchant_id"]):
             raise HTTPException(status_code=403, detail="Not authorized for this order")
+
+        # AGENT_PAYMENT_ORDER_OWNER_CHECK (default off): a payment is confirmed, captured and the
+        # order marked paid only for the order's owner. Before the PSP is asked anything, before
+        # any write, and before any answer below that carries the order's payment state or its
+        # payment intent id.
+        owner_check_mode = order_owner_check_mode()
+        if owner_check_mode != ORDER_OWNER_CHECK_OFF:
+            check_order_owner(order, context, route=ROUTE_PAYMENT_CONFIRM, mode=owner_check_mode)
 
         await validate_request_compat(agent_governance, context.agent_id, fail_closed=True)
 
