@@ -25,6 +25,7 @@ import os
 import secrets
 import logging
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -37,6 +38,7 @@ import routes.agent_auth as agent_auth
 import routes.agent_forwarded_owner as forwarded
 import routes.agent_shop_gateway as gw
 import routes.agent_v2 as agent_v2
+import services.bound_issuing_assertion as bound_mod
 import services.issuing_agent_assertion as ia
 from main import app
 from services import assertion_replay_guard
@@ -372,15 +374,38 @@ def test_a_method_swap_is_refused(world):
     assert rejected(res, "method"), res.text
 
 
+@pytest.fixture()
+def pinned_clock(monkeypatch: pytest.MonkeyPatch):
+    """The verifier's clock, held at one whole second for the test. The boundary tests below sit one
+    second either side of MAX_SKEW_SECONDS_V2; built from the real clock (int() truncation plus the
+    time to reach the verifier) a +61 s token measured <= 60 s on a slow CI shard and was accepted.
+    Only services.bound_issuing_assertion's clock is pinned (the nonce store keeps the real one), and
+    it stays a wall-clock value, close to now, so nothing compares it with monotonic time."""
+    now = int(time.time())
+    reads: List[int] = []
+
+    def _time() -> float:
+        reads.append(now)
+        return float(now)
+
+    monkeypatch.setattr(bound_mod, "time", SimpleNamespace(time=_time))
+    yield SimpleNamespace(now=now, reads=reads)
+    assert reads, "the verifier never read the pinned clock: the boundary was not tested"
+
+
 @pytest.mark.parametrize("skew", [-61, 61, -3600, 3600])
-def test_an_expired_or_future_header_is_refused(world, skew):
-    res = create_as(world, PARTNER_A, ts=int(time.time()) + skew)
+def test_an_expired_or_future_header_is_refused(world, pinned_clock, skew):
+    assert bound_mod.MAX_SKEW_SECONDS_V2 == 60
+    res = create_as(world, PARTNER_A, ts=pinned_clock.now + skew)
     assert rejected(res, "stale"), res.text
     assert world["created"] == []
 
 
-def test_a_header_inside_the_window_is_accepted(world):
-    assert create_as(world, PARTNER_A, ts=int(time.time()) - 50).status_code == 200
+@pytest.mark.parametrize("skew", [-60, -50, 0, 50, 60])
+def test_a_header_inside_the_window_is_accepted(world, pinned_clock, skew):
+    assert bound_mod.MAX_SKEW_SECONDS_V2 == 60
+    res = create_as(world, PARTNER_A, ts=pinned_clock.now + skew)
+    assert res.status_code == 200, res.text
 
 
 @pytest.mark.parametrize("label,kwargs,reason", [
