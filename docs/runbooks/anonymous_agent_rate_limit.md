@@ -330,7 +330,7 @@ service agent, not to the caller's agent.
 ## `/agent/shop/v1/invoke` keyless callers: `SHOP_INVOKE_KEYLESS_MODE` (off | observe | enforce)
 
 The money gate above covers four operations. Every other operation on `/invoke` still
-serves anyone, and the per-address limiter was skipped by any request that merely carried
+serves anyone, and the per-address limiter is skipped by any request that merely carries
 an `X-API-Key`, `Authorization` or `X-Checkout-Token` header, valid or not.
 `SHOP_INVOKE_KEYLESS_MODE` closes the route to callers without a **verified** credential,
 in steps. It is read per request, so changing it needs no deploy.
@@ -338,8 +338,8 @@ in steps. It is read per request, so changing it needs no deploy.
 | Value | Behaviour |
 |---|---|
 | unset, empty, `off`, or any other value | Off. The code path before the flag existed: no classification, no key lookup, no line. |
-| `observe` | Every answer is unchanged, with one exception: the per-address limiter now covers every caller without a verified credential (a junk header no longer skips it). One warning line per such request. |
-| `enforce` | The same, and a caller without a verified credential is answered `401` `CREDENTIAL_REQUIRED`. |
+| `observe` | **No answer changes.** The limiter is the one off runs (any credential header still skips it). After it, each request is classified and a caller without a verified credential gets one warning line. |
+| `enforce` | A caller without a verified credential is answered `401` `CREDENTIAL_REQUIRED`. The per-address limiter covers every such caller: a header that verifies nothing no longer skips it. |
 
 A header being present is not a credential. A credential is one of:
 
@@ -351,24 +351,62 @@ A header being present is not a credential. A credential is one of:
 
 Everything else is keyless: `none`, `malformed_key`, `unknown_or_inactive_key`,
 `bad_checkout_token`. `lookup_error` (the key could not be looked up) is served and logged
-in `observe` and answered `503` in `enforce`. A verified checkout token or the trusted key
-is checked first, so those requests cost no lookup. `X-API-Key` is read before
-`Authorization`, as on the keyed routes: a junk `X-API-Key` hides a good Bearer.
+in `observe`; in `enforce` it is `503` and is never counted by the limiter, so an outage
+reads as `503` and not as `429`. A verified checkout token or the trusted key is checked
+first, so those requests cost no lookup. `X-API-Key` is read before `Authorization`, as on
+the keyed routes: a junk `X-API-Key` hides a good Bearer.
 
-Order inside the handler, in `observe` and `enforce`:
+Order inside the handler in `observe`:
 
-1. Body validation (a malformed envelope is still `422`, keyless or not).
-2. Classify the credential.
-3. Per-address limiter, for every caller without a verified credential: `429` over
-   budget, in every mode. Verified callers are never counted by it.
-4. The line below, then in `enforce` the `401` (or `503` for `lookup_error`).
-5. The money gate (`SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL`), unchanged.
-6. Dispatch.
+1. Body validation (a malformed envelope is still `422`).
+2. The limiter, exactly as in off: only a request with none of the three headers is
+   counted, and `429` over budget.
+3. Classify the credential (a well-formed key is looked up; the auth cache answers a key it
+   has seen). A caller without a verified credential gets the line. This step answers
+   nothing and cannot fail the request.
+4. The money gate (`SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL`). It is handed the class from
+   step 3, so the key is not looked up a second time.
+5. Dispatch.
+
+Order inside the handler in `enforce`:
+
+1. Body validation.
+2. The in-process checks: the trusted key, a checkout token that verifies. A verified
+   caller goes to step 6 and is never counted by the limiter.
+3. No well-formed key: keyless without a lookup. The limiter counts the request (`429`
+   over budget), then the line and the `401`.
+4. A well-formed key whose answer the auth cache already holds: no query. An active
+   agent's key goes to step 6, uncounted; any other is counted, logged and answered `401`.
+5. A well-formed key the cache does not hold: the limiter is **consulted** first, without
+   counting. An address that is over budget is answered `429` and the key is not looked
+   up. Otherwise the key is looked up: an active agent's key goes to step 6, uncounted; a
+   lookup that could not run is logged and answered `503`, uncounted; any other key is
+   counted (`429` over budget), logged and answered `401`.
+6. The money gate, handed the class, then dispatch.
+
+What a flood costs in `enforce`:
+
+- **Made-up well-formed keys from one address:** at most `SHOP_INVOKE_ANON_RPM` (default
+  60) key lookups per minute for that address, per instance; every request after that is a
+  `429` with no lookup. Each looked-up key leaves a short-lived not-found entry in the auth
+  cache, as it does on every keyed route.
+- **The price of that:** a real key that is not in the auth cache (first use, or its cache
+  entry has expired), sent from an address that is over budget, is answered `429` without a
+  lookup until that address has budget again. It is not counted. Callers that share one
+  address with keyless traffic (a server proxy that does not forward its caller's address)
+  share this.
+- The limiter keys on the first `X-Forwarded-For` entry, which the caller writes. A caller
+  that rotates it has a fresh budget each time, here as on every limiter keyed this way.
+  The lookup bound above is per address, so it does not hold against that caller.
+
+In `observe` every request with a well-formed key the cache has not seen costs one lookup,
+because a credential header still skips the limiter (the price of changing no answer).
 
 With the money gate: in `observe` a keyless money operation still gets the money gate's
 own `401` (and both lines). In `enforce` the keyless `401` comes first, whatever the money
 gate's switch says, and a made-up checkout token (which the money gate passes on for the
-upstream route to reject) is refused here.
+upstream route to reject) is refused here. In off the money gate looks the key up itself,
+as before.
 
 The refusal is the same bytes for every keyless request, whatever the operation (known,
 unknown or empty), payload or headers. It names no operation and no reason:
@@ -379,8 +417,8 @@ WWW-Authenticate: Bearer
 {"detail":{"error":"CREDENTIAL_REQUIRED","message":"This endpoint needs a credential. Send an active agent API key in X-API-Key or Authorization: Bearer."}}
 ```
 
-The line, at warning level, once per keyless request that passed the limiter (a `429` gets
-no line, so a flood cannot fill the log):
+The line, at warning level, once per keyless request the limiter did not answer (a `429`
+gets no line):
 
 ```
 [shop_invoke] keyless request: mode=<observe|enforce> op=<name|other> cred=<none|malformed_key|unknown_or_inactive_key|bad_checkout_token|lookup_error> ua=<node|axios|python-httpx|python-other|curl|browser|go|other|none> origin=<first_party|other|none> hop=<0|1> source=<known label|other|none> request_id=<id|h_<hash>|none>
@@ -397,6 +435,84 @@ no line, so a flood cannot fill the log):
 
 No header value, address, query or payload is ever in the line.
 
-Before `enforce`, every first-party caller of `/invoke` must send a credential that
-verifies; a caller that sends none shows up in `observe` as `cred=none`. Rollback from
-`enforce`: set the flag to `observe` or remove it.
+### The line budget: `SHOP_INVOKE_KEYLESS_LOG_LINES_PER_MINUTE`
+
+The limiter does not bound the lines (its address is the caller's to choose), so the lines
+have their own budget: per instance, per minute, **per label**. Default `60`. A whole
+number from `1` to `10000`; anything else (unset, `0`, negative, not a number, larger) is
+the default. Read per request.
+
+The labels are the five `cred=` classes above, plus `key_lookup_failed` for the warning
+`[shop_invoke] keyless-mode key lookup failed: <error type>` and `classify_failed` for
+`[shop_invoke] keyless-mode classification failed: <error type>` (observe only: the request
+is served as in off). One class running out of budget does not silence another.
+
+When a label ran out, one summary line is written after its minute is over, at the next
+keyless request of any label:
+
+```
+[shop_invoke] keyless lines suppressed: label=<label> suppressed=<count>
+```
+
+So a flood costs at most budget + 1 lines per label per minute per instance, whatever
+addresses or keys it rotates. A count in `observe` is therefore the lines plus the
+`suppressed=` numbers; the request log still has every request, joinable on `request_id`.
+
+### Enforce checklist
+
+Do not set `enforce` until every line is true.
+
+1. `observe` has run long enough to cover every first-party caller's traffic pattern, and
+   the lines (plus the `suppressed=` counts) show no first-party traffic under any `cred=`.
+2. Every first-party caller of `/invoke` sends a credential that verifies. A caller that
+   sends none shows up in `observe` as `cred=none`.
+3. Every key a first-party server proxy sends or forwards is an ACTIVE agent of this
+   backend. That includes any fast-path service key and any emergency fallback key the
+   proxy accepts on its own side without asking this backend: such a key shows up as
+   `cred=unknown_or_inactive_key` here.
+4. First-party server clients whose key comes from an environment variable have it set in
+   every environment. Two such clients send no key at all when theirs is unset, and show
+   up as `cred=none`.
+5. The shopping UI's review lane sends a checkout token alone when it has one. A token
+   older than its lifetime (one hour by default) is `cred=bad_checkout_token`, so under
+   `enforce` that lane gets `401` until it also sends a key or refreshes the token.
+6. This backend's own fallback hop to another instance's `/invoke`, and every script that
+   calls `/invoke`, send a credential.
+7. First-party server proxies forward their caller's address, or their keyless traffic is
+   under the per-address budget: callers behind one address share that budget, and a real
+   key not yet in the auth cache gets `429` while the address is over it (see above).
+8. Accepted as built: a forged or expired token is refused; a deactivated agent's unexpired
+   token still admits reads until it expires (the money path rechecks the agent); a junk
+   `X-API-Key` beside a good Bearer is keyless.
+
+Rollback from `enforce`: set the flag to `observe` or remove it.
+
+### The recording behind the off and observe tests
+
+`tests/test_shop_invoke_keyless_mode.py` compares off and observe, case for case, with
+`tests/fixtures/shop_invoke_keyless_mode_parent_recording.json`: what main answers without
+this flag's code (status, headers, body, what the handlers and the upstream saw).
+
+Regenerate it when, and only when, a change **on main** legitimately changes one of those
+answers (the tests then fail in off as well as in observe), or when a case is added to the
+matrix in the test file. Never regenerate it to make a change to the keyless code pass:
+a difference there is the defect the tests exist to catch.
+
+It must come from a clean tree of main, never from a working tree or a branch: export the
+commit into an empty directory and record there. The recorder unsets the flag, so on a
+main that already has the keyless code it records the off path.
+
+```
+git archive <main commit> | tar -x -C <empty dir>
+cd <empty dir>
+python -c "import sys, importlib.util; sys.path.insert(0, '.'); \
+  spec = importlib.util.spec_from_file_location('rec', '<repo>/tests/test_shop_invoke_keyless_mode.py'); \
+  m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); \
+  m.record_parent_matrix('<repo>/tests/fixtures/shop_invoke_keyless_mode_parent_recording.json')"
+```
+
+`record_parent_matrix` refuses to run when the routes module it imported is not the one in
+the working directory, or when the flag is not off. Review the diff of the recording: every
+changed case must be explained by the change on main, and a recording made on a main that
+has the keyless code is only as good as that main's off branch in the handler, so check
+that branch is untouched by the same change.

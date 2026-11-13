@@ -113,6 +113,18 @@ def _get_cached_agent_auth(cache_key: str) -> tuple[bool, Optional[Dict[str, Any
     return True, dict(cached_agent)
 
 
+def agent_auth_cache_has(api_key: str) -> bool:
+    """True when get_agent_by_key would answer this key from the auth cache, without a query.
+
+    Read only: nothing is evicted, refreshed or reordered, and a found and a not-found entry
+    both count. For a caller that must decide whether a lookup is worth a query before it
+    makes one; the answer itself still comes from get_agent_by_key."""
+    entry = _AGENT_AUTH_CACHE.get(_agent_auth_cache_key(api_key))
+    if not isinstance(entry, dict):
+        return False
+    return float(entry.get("expires_at") or 0) > time.monotonic()
+
+
 def _put_cached_agent_auth(cache_key: str, agent: Optional[Dict[str, Any]]) -> None:
     ttl = _AGENT_AUTH_POSITIVE_TTL_SECONDS if agent else _AGENT_AUTH_NEGATIVE_TTL_SECONDS
     _AGENT_AUTH_CACHE[cache_key] = {
