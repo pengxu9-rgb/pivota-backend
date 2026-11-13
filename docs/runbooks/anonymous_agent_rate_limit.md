@@ -323,6 +323,96 @@ gcloud run services update web --project pivota-prod --region us-west1 \
   --update-env-vars SHOP_INVOKE_MONEY_OPS_REQUIRE_CREDENTIAL=0
 ```
 
-Not changed here (follow-up): an admitted caller's request still goes upstream with the
+Not changed by that check: an admitted caller's request still goes upstream with the
 backend's own key when it carries no checkout token, so the order is attributed to that
-service agent, not to the caller's agent.
+service agent, not to the caller's agent. The next section is the switch for that.
+
+## `/agent/shop/v1/invoke`: a caller with its own key acts as itself
+
+Flag `SHOP_INVOKE_FORWARD_CALLER_KEY`, read per call, **default OFF**. Only `1`, `true`,
+`on` or `yes` switches it on; unset or anything else is off, and off is the request the
+route sent before the flag existed.
+
+With it on, `_proxy_agent_api` sends upstream, in this order: the caller's
+`X-Checkout-Token` when there is one (unchanged); otherwise the agent key the caller
+presented (`X-API-Key`, or `Authorization: Bearer`; the same value the money check
+judged), as `X-API-Key`; otherwise, for a caller that presented no key, the backend's own
+key as before (reachable only with the money check switched off). A presented key is
+never replaced by the backend's own key: the `/agent/v1|v2` route judges it.
+
+Only a key with the money check's own key format goes upstream (one rule,
+`_agent_key_has_money_gate_format`: an internal trusted key, or the agent key shape). Any
+other presented value (over-long, carrying CR/LF or another control character, non-ASCII,
+two keys joined, the wrong shape) is answered by the proxy itself with `401` and the fixed
+body `{"detail": {"detail": "Invalid API Key format"}}`, which carries none of the caller's
+bytes; nothing is sent upstream and the backend's key is not used instead. This is
+reachable only with the money check switched off, because that check refuses the same
+values first with its own `401`.
+
+So a keyed caller's money operation is authenticated, limited, scoped, counted and owned
+as that caller's agent, not as the backend's service agent.
+
+Calls that are served with the flag off and refused with it on (all pinned in
+`tests/test_invoke_forwards_callers_own_key.py`):
+
+| Caller | Answer with the flag on |
+|---|---|
+| Key whose `allowed_merchants` does not include the merchant (a new self-serve key has an empty list) | `403 Not authorized for this merchant` on `create_order`, `submit_payment`, `record_payment_offer_evidence` |
+| Key over its own per-minute limit or daily quota | `429`, counted against that agent. The upstream `X-RateLimit-*` / `X-Quota-*` headers are not relayed. |
+| Agent whose governance status is suspended or blocked | `403` on `create_order` and `create_payment_link`. `submit_payment` and `record_payment_offer_evidence` do not consult governance upstream and are still served. |
+| Deactivated, unknown or malformed key | Already `401` at the money check. With that check switched off: `403 Agent is deactivated` / `401` from the upstream route (deactivated, unknown) or `401 Invalid API Key format` from the proxy with no upstream call (malformed), instead of being served on the backend's key. |
+| `create_payment_link` for an order the caller does not own, including **an order it created through `/invoke` before the flag was switched on** (owned by the service agent) | `403 Not authorized for this order` |
+
+Not refused, and worth knowing before switching on:
+
+- `submit_payment` and `record_payment_offer_evidence` on an order created before the
+  switch still work: those upstream routes compare the order's merchant with the caller's
+  scope, not the order's owner.
+- A caller's own `GET /agent/v1/orders/{id}` on an order created through `/invoke` before
+  the switch is `403` before and after (the service agent owns it). Orders created after
+  the switch are owned by the caller.
+- `create_payment_link` for an order the caller created with its own key on the keyed API
+  was `403` through `/invoke` and is now served.
+- Each money operation counts TWICE against the caller in `middleware/rate_limiter.py`:
+  once for the `/invoke` call and once for the loopback call the proxy makes with the same
+  key. Both counters are hit twice:
+  - the per-key bucket (keyed on the presented key): a keyed caller gets half as many
+    money operations per minute from that bucket as it gets plain keyed calls;
+  - the global ceiling (`_reject_global`, the budget shared by every `/agent/*` request
+    that is not exempt): keyed money traffic fills it twice as fast.
+
+  With the flag off the loopback call carries the backend's own key, which the middleware
+  exempts from both counters (`trusted_api_keys`, unless `RATE_LIMIT_TRUST_INTERNAL_KEYS`
+  is switched off), so the operation counted once. A
+  caller's key is not exempt, and the loopback call is not exempted either. When the
+  second count is the one that goes over, the loopback call is refused before its route
+  runs, nothing is created or changed, and the caller receives that `429`. The per-agent
+  limit and daily quota checked by the upstream route's own auth are counted once per
+  operation.
+- An empty `X-API-Key` header AHEAD of a real one is a request with no key. The key reader
+  takes the first `X-API-Key` header; when it is empty or blank and there is no
+  `Authorization: Bearer`, a later `X-API-Key` header is not read. The money check refuses
+  such a request (`no_credential`). With that check switched off it is served on the
+  backend's key like any keyless request, flag on or off. Pinned as it is in the test file.
+- Keyless callers are not changed by this flag.
+
+Before turning the flag on:
+
+1. Count the keyed callers of the four money operations on `/invoke` first (requests that
+   carry an agent key and no checkout token). They are the only callers this flag changes.
+2. Among them, look specifically for self-serve keys whose `allowed_merchants` is an EMPTY
+   list. With the flag on every `create_order`, `submit_payment` and
+   `record_payment_offer_evidence` from such a key is `403 Not authorized for this
+   merchant` (first row of the table above); with the flag off they are served. Give those
+   keys their merchants first, or expect the refusals.
+3. Look for in-flight payment links: orders those callers created through `/invoke` before
+   the change that still need a payment link. Such an order is owned by the service agent,
+   so `create_payment_link` for it with the caller's own key is `403 Not authorized for
+   this order` once the flag is on (last row of the table above). Let those orders finish
+   or expire before switching on, or switch on at a time when none are open.
+4. Compare those callers' money-operation rate with their per-key budget in the
+   middleware: it is used twice as fast (see above).
+
+Switch on / roll back: an environment change only, no build. Set
+`SHOP_INVOKE_FORWARD_CALLER_KEY=1` on the web service the same way the money check's
+switch is set above; remove the variable (or set `0`) to roll back.
