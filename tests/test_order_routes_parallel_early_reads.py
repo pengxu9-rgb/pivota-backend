@@ -152,7 +152,7 @@ async def test_create_new_order_parallel_early_reads_success(
         calls["merchant_ids"].append(merchant_id)
         merchant_started.set()
         await asyncio.wait_for(inventory_started.wait(), timeout=1)
-        return {"merchant_id": merchant_id, "psp_connected": True}
+        return {"merchant_id": merchant_id, "psp_connected": True, "status": "approved"}
 
     async def fake_check_inventory_availability(merchant_id: str, items):
         calls["inventory"].append((merchant_id, items))
@@ -219,7 +219,7 @@ async def test_create_new_order_parallel_early_reads_inventory_insufficient(
     inventory_items = [{"product": "Test Product", "requested": 2, "available": 1}]
 
     async def fake_get_merchant_onboarding(merchant_id: str):
-        return {"merchant_id": merchant_id, "psp_connected": True}
+        return {"merchant_id": merchant_id, "psp_connected": True, "status": "approved"}
 
     async def fake_check_inventory_availability(_merchant_id: str, _items):
         return False, {"items": inventory_items}
@@ -258,7 +258,7 @@ async def test_create_new_order_parallel_early_reads_quote_load_error(
     import routes.order_routes as module
 
     async def fake_get_merchant_onboarding(merchant_id: str):
-        return {"merchant_id": merchant_id, "psp_connected": True}
+        return {"merchant_id": merchant_id, "psp_connected": True, "status": "approved"}
 
     async def fake_check_inventory_availability(_merchant_id: str, _items):
         return True, {"items": []}

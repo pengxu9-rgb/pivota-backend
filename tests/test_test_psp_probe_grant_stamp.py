@@ -42,7 +42,8 @@ async def _create(monkeypatch, *, psp_row, caller_metadata=None):
     captured: dict = {}
 
     async def _onboarding(_m):
-        return {"merchant_id": _m}
+        # Staff-approved: an order charged through the merchant's own PSP needs it (D-09).
+        return {"merchant_id": _m, "status": "approved"}
 
     async def _inventory(_m, _items):
         return True, {}

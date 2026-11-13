@@ -80,6 +80,10 @@ async def add_is_test_column() -> None:
 
 
 def _merchant_row(mid: str, host: str):
+    """An approved merchant the agent listing shows: a staff approval since the D-09 cutover
+    (verified_at set, auto_approved False) and a store (the legacy single-store record)."""
+    from datetime import datetime
+
     from db.merchant_onboarding import merchant_onboarding
 
     return merchant_onboarding.insert().values(
@@ -93,6 +97,10 @@ def _merchant_row(mid: str, host: str):
         psp_type="stripe",
         operating_mode="storefront",
         apm_enabled=False,
+        auto_approved=False,
+        verified_at=datetime(2026, 11, 9, 0, 0, 0),
+        mcp_connected=True,
+        mcp_shop_domain=host,
     )
 
 
@@ -128,8 +136,16 @@ async def rows(monkeypatch):
     )
     await database.execute(
         "CREATE TABLE IF NOT EXISTS merchant_stores ("
-        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50), domain VARCHAR(255))"
+        "store_id VARCHAR(50) PRIMARY KEY, merchant_id VARCHAR(50), domain VARCHAR(255), status VARCHAR(50))"
     )
+    # The listing reads merchant_stores.status (prod has it: db/schema_guard.py indexes it), and a table another
+    # file left behind may not. Patch, never drop: the column is added and STAYS, the rule
+    # tests/schema_guard_tables.py and tests/model_schema.py follow, because dropping a column from a table some
+    # other file built is worse (and SQLite refuses it once something indexes the column). Neither helper can
+    # build this table: merchant_stores has no SQLAlchemy model, and ensure_required_schema_light neither creates
+    # it on SQLite nor adds `status` to one it finds. A table this fixture created is dropped whole below.
+    if not await _has_column("merchant_stores", "status"):
+        await database.execute("ALTER TABLE merchant_stores ADD COLUMN status TEXT")
     added_column = False
     try:
         if not await _has_column("merchant_onboarding", "is_test"):

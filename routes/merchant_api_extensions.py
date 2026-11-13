@@ -2210,7 +2210,14 @@ async def connect_psp(
             detail=f"Unsupported PSP provider for this phase: {provider or 'unknown'}",
         )
     
-    # Validate API key format
+    # Format check only: the key is NOT validated against the PSP here (unlike
+    # /merchant/onboarding/psp/setup). Under managed onboarding (D-09) that is
+    # deliberate for now, because this connection alone lists or transacts
+    # nothing: the partner list needs a staff approval and a connected store
+    # (routes/agent_sdk_fixed.py), cross-merchant search and agent order creation
+    # need status 'approved' (routes/agent_api.py, routes/order_routes.py), and
+    # only staff can approve (db.merchant_onboarding.update_kyc_status). Live key
+    # validation belongs to the self-serve build.
     api_key = psp_data.get("api_key", "")
     if not api_key or len(api_key) < 10:
         raise HTTPException(status_code=400, detail="Invalid API key")
