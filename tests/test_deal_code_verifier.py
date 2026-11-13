@@ -72,13 +72,15 @@ async def db(monkeypatch):
             await database.execute(table.delete())
         await database.execute("DELETE FROM external_product_seeds WHERE id LIKE 'dcv-%'")
 
-    await _clean()
-    for name in ("DEAL_VERIFY_MAX_CARTS_PER_RUN", "DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY", "DEAL_VERIFY_TTL_HOURS"):
-        monkeypatch.delenv(name, raising=False)
-    from services import deal_code_capture
-
-    deal_code_capture.reset_stats()
     try:
+        # Setup is inside the try, so a failure here still drops a table this file created (review N-4).
+        await _clean()
+        for name in ("DEAL_VERIFY_MAX_CARTS_PER_RUN", "DEAL_VERIFY_MAX_CARTS_PER_HOST_PER_DAY",
+                     "DEAL_VERIFY_TTL_HOURS"):
+            monkeypatch.delenv(name, raising=False)
+        from services import deal_code_capture
+
+        deal_code_capture.reset_stats()
         yield database
     finally:
         await _clean()
@@ -349,8 +351,9 @@ def test_minor_units_become_major_units_only_for_an_integer_in_a_known_currency(
     (200, {"result": "invalid", "reason": "code_invalid"}, "refused_request", "code_invalid"),
     (400, {"error": "invalid_request", "reason": "seller_host_refused"}, "refused_request", "seller_host_refused"),
     (400, "not json", "refused_request", "invalid_request"),
-    (200, {"result": "surprise"}, "error", "unknown_result"),
-    (200, ["applied"], "error", "http_200"),
+    (200, {"result": "surprise"}, "unreadable_answer", "unknown_result"),  # review N-1
+    (200, ["applied"], "unreadable_answer", "unreadable"),
+    (200, None, "unreadable_answer", "unreadable"),
     (401, {"error": "unauthorized"}, "error", "http_401"),
     (404, {"error": "not_found"}, "error", "http_404"),
     (503, None, "error", "http_503"),
@@ -547,6 +550,40 @@ async def test_a_lost_answer_is_recorded_on_the_row_backed_off_and_stops_the_run
     assert dv.due({"kind": "percent", "market": "US", "code": "X"}, [dict(row)], NOW + timedelta(days=6)) is None
 
 
+@pytest.mark.parametrize("answer,reason", [((200, {"result": "surprise"}), "unknown_result"),
+                                           ((200, ValueError("not json")), "unreadable")])
+async def test_a_200_this_verifier_cannot_read_is_recorded_backed_off_and_stops_the_run(db, monkeypatch, answer,
+                                                                                        reason):
+    """Review N-1: the gateway answered, so a cart was likely built. Without a row the code would stay first in line
+    and cost one cart a day, verifying nothing else."""
+    _on(monkeypatch)
+    first = await offer(db, "v", observed=NOW - timedelta(hours=1))
+    await offer(db, "w", seller="shop.example", observed=NOW - timedelta(hours=2))
+    await seed(db, "s1")
+    await seed(db, "s2", host="shop.example")
+    client = StubClient([answer])
+    out = await run(client)
+    assert out["route_errors"] == 1 and out["route_" + reason] == 1 and out["left_route_stopped"] == 1
+    assert len(client.calls) == 1
+    [row] = await verifications(db, first)
+    assert row["state"] == "unverified" and row["failure_reason"] == "route:" + reason
+    client = StubClient(APPLIED)
+    await run(client, now=NOW + timedelta(days=6))
+    assert "glow.example" not in [c["json"]["seller_host"] for c in client.calls]
+
+
+async def test_codes_in_markets_it_cannot_test_are_counted_by_name(db, monkeypatch):
+    """Review N-6: GB, DE and no-market rows are never tested, and the summary says how many."""
+    _on(monkeypatch)
+    await offer(db, "gb", market="GB")
+    await offer(db, "de", market="DE")
+    await offer(db, "none", market=None)
+    await offer(db, "us")
+    await seed(db, "s1")
+    out = await run(StubClient([APPLIED]))
+    assert out["skipped_market_not_verifiable"] == 3 and out["applied"] == 1
+
+
 async def test_no_cart_is_started_without_time_left_before_the_jobs_deadline(db, monkeypatch):
     _on(monkeypatch)
     await offer(db, "d")
@@ -717,8 +754,6 @@ async def test_the_refresh_run_reports_the_verifier_only_when_it_ran(monkeypatch
 
 
 async def test_the_refresh_run_gives_the_verifier_its_task_timeout_less_a_margin(monkeypatch):
-    import time
-
     import jobs.external_referral_refresh as job
 
     async def batch(**_):
@@ -737,10 +772,21 @@ async def test_the_refresh_run_gives_the_verifier_its_task_timeout_less_a_margin
     monkeypatch.setattr(job.deal_code_retention, "run", retention)
     monkeypatch.setattr(job.deal_code_verifier, "run", verifier)
     monkeypatch.delenv("EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS", raising=False)
-    before = time.monotonic()
+    # The deadline counts from the JOB's start, not the verifier's (review N-2): the batch takes 3300 s here.
+    clock = [5000.0]
+
+    async def slow_batch(**_):
+        clock[0] += 3300.0
+        return {"status": "success"}
+
+    monkeypatch.setattr(job, "run_external_referral_refresh_batch", slow_batch)
+    monkeypatch.setattr(job.time, "monotonic", lambda: clock[0])
     await job.run_daily_external_referral_refresh(limit=1)
-    assert before + 3480 - 1 <= seen["deadline"] <= time.monotonic() + 3480
-    for value, expected in (("7200", 7080.0), ("garbage", 3480.0), ("60", 3480.0), ("", 3480.0)):
+    assert seen["deadline"] == 5000.0 + 3480.0
+    monkeypatch.undo()
+    for value, expected in (("7200", 7080.0), ("garbage", 3480.0), ("60", 3480.0), ("", 3480.0),
+                            ("86400", 86280.0), ("86401", 3480.0), ("600", 480.0), ("599", 3480.0),
+                            ("3600.5", 3480.0)):
         monkeypatch.setenv("EXTERNAL_REFERRAL_REFRESH_TASK_TIMEOUT_SECONDS", value)
         assert job.verifier_deadline_seconds() == expected
 
