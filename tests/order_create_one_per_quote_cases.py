@@ -116,20 +116,27 @@ class FaultyDatabase:
         self._real = real
         self.faults: List[Fault] = []
         self.log: List[Tuple[str, str]] = []
-        self._gates: Dict[Tuple[str, str, str], Tuple[asyncio.Event, asyncio.Event]] = {}
+        self._gates: Dict[Tuple[str, str, str], List[Any]] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)
+
+    def apply(self, world: "World", specs: List[Dict[str, Any]]) -> None:
+        for spec in specs:
+            if spec.get("step") == "after_row":
+                world.after_row_busy_runs = set(spec["runs"])
+            else:
+                self.fail(**spec)
 
     def fail(self, step: str, when: str = "before", **kwargs: Any) -> Fault:
         fault = Fault(step=step, when=when, **kwargs)
         self.faults.append(fault)
         return fault
 
-    def hold(self, tag: str, step: str, when: str = "before") -> Tuple[asyncio.Event, asyncio.Event]:
-        """Stop request `tag` at (step, when). Returns (reached, release)."""
+    def hold(self, tag: str, step: str, when: str = "before", *, skip: int = 0) -> Tuple[asyncio.Event, asyncio.Event]:
+        """Stop request `tag` at its (skip+1)th (step, when). Returns (reached, release)."""
         pair = (asyncio.Event(), asyncio.Event())
-        self._gates[(tag, step, when)] = pair
+        self._gates[(tag, step, when)] = [skip, pair]
         return pair
 
     def count(self, step: str, tag: Optional[str] = None) -> int:
@@ -137,9 +144,12 @@ class FaultyDatabase:
 
     async def _point(self, step: str, when: str) -> None:
         tag = _REQUEST_TAG.get()
-        gate = self._gates.pop((tag, step, when), None)
-        if gate is not None:
-            reached, release = gate
+        gate = self._gates.get((tag, step, when))
+        if gate is not None and gate[0] > 0:
+            gate[0] -= 1
+        elif gate is not None:
+            del self._gates[(tag, step, when)]
+            reached, release = gate[1]
             reached.set()
             await release.wait()
         seen = [s for _, s in self.log[:-1]] if when == "before" else [s for _, s in self.log]
@@ -465,7 +475,17 @@ class World:
         mp.setattr(order_routes, "_apply_server_granted_test_psp_stamp", noop)
         mp.setattr(order_routes, "upsert_order_attribution_edge", noop)
         mp.setattr(order_routes, "emit_merchant_webhook_event", noop)
-        mp.setattr(order_routes, "log_order_event", noop)
+
+        # "Busy after the row is committed": the order event write that follows the insert is not
+        # swallowed by create_new_order, so a busy error there fails the create with the row
+        # already written. `after_row_busy_runs` names which runs of the create (1-based) meet it.
+        self.after_row_busy_runs: set = set()
+
+        async def order_event(*_: Any, **__: Any) -> None:
+            if len(world.create_runs) in world.after_row_busy_runs:
+                raise RuntimeError(BUSY)
+
+        mp.setattr(order_routes, "log_order_event", order_event)
         mp.setattr(order_routes, "create_payment_with_failover", no_payment)
 
         # Count how often the whole create ran (the real one still runs).
@@ -684,7 +704,7 @@ async def test_one_request_whose_insert_answer_was_lost_writes_one_order(world: 
     w = world
     w.quotes.consume_lands = False
     quote = w.quotes.add()
-    w.db.fail("order_insert", "after", times=1)
+    w.after_row_busy_runs = {1, 2}
     w.db.fail("replay_lookup", "before", times=999, armed_after="order_insert")
 
     first = await w.create(route, quote, key="key-1")
@@ -771,6 +791,14 @@ _STEP_FAULTS: List[Tuple[str, List[Dict[str, Any]], int, int]] = [
         503,
         0,
     ),
+    ("busy_after_the_row_is_committed", [dict(step="after_row", runs=[1])], 200, 1),
+    ("busy_after_the_row_is_committed_on_every_run", [dict(step="after_row", runs=[1, 2, 3])], 200, 1),
+    (
+        "busy_after_the_row_is_committed_then_lookup_fails",
+        [dict(step="after_row", runs=[1, 2]), dict(step="replay_lookup", when="before", times=999, armed_after="order_insert", tag="r1")],
+        503,
+        1,
+    ),
     ("guard_down_for_the_whole_request", [dict(step="claim_insert", when="before", times=999, tag="r1")], 503, 0),
     (
         "guard_down_not_busy",
@@ -797,8 +825,7 @@ async def test_a_failure_at_any_step_never_makes_a_second_order_v1(
     _, faults, first_status, rows_after_first = case
     w.quotes.consume_lands = consume_lands
     quote = w.quotes.add()
-    for spec in faults:
-        w.db.fail(**spec)
+    w.db.apply(w, faults)
 
     first = await w.create_v1(quote, key="key-1", tag="r1")
 
@@ -808,6 +835,7 @@ async def test_a_failure_at_any_step_never_makes_a_second_order_v1(
     if first.status == 503:
         assert_retriable_503(first)
 
+    w.after_row_busy_runs = set()
     second = await w.create_v1(quote, key=resend_key, tag="r2")
     third = await w.create_v1(quote, key=resend_key, tag="r3")
 
@@ -829,14 +857,14 @@ async def test_a_failure_at_any_step_never_makes_a_second_order_v2(
     _, faults, first_status, rows_after_first = case
     w.quotes.consume_lands = False
     quote = w.quotes.add()
-    for spec in faults:
-        w.db.fail(**spec)
+    w.db.apply(w, faults)
 
     first = await w.create_v2(quote, key="key-1", tag="r1")
     rows = await assert_one_order_at_most(w, quote, [first])
     assert first.status == first_status, (first.status, first.body)
     assert len(rows) == rows_after_first
 
+    w.after_row_busy_runs = set()
     second = await w.create_v2(quote, key="key-2", tag="r2")
     rows = await assert_one_order_at_most(w, quote, [first, second])
     assert len(rows) == 1
@@ -1065,6 +1093,7 @@ async def test_a_soft_deleted_order_still_holds_its_quote(world: World) -> None:
     second = await w.create_v1(quote, key="key-1", tag="r2")
 
     assert second.status == 409 and second.code == "QUOTE_CONSUMED", second.body
+    assert w.db.count("order_insert", "r2") == 0, "refused by the claim's own read, not by a failed write"
     assert await w.orders_for(quote) == []
     total = await w.db._real.fetch_all("SELECT order_id FROM orders WHERE merchant_id = :m", {"m": MERCHANT})
     assert len(total) == 1
@@ -1164,6 +1193,10 @@ async def test_two_creates_at_once_make_one_order_and_both_answer_it(
     assert first.status == 200 and second.status == 200, (first.body, second.body)
     assert first.order_id == second.order_id == rows[0]["order_id"]
     assert len(await w.claims_for(quote)) == 1
+    if hold == ("order_insert", "before"):
+        # The held insert is refused by the primary key: that is the answer, at once. It is not
+        # sent again and it is not handed to the missing-column repair that follows other errors.
+        assert w.db.count("order_insert", "r1") == 1
 
 
 @pytest.mark.parametrize("hold", _HOLD_POINTS, ids=[f"{s}_{w}" for s, w in _HOLD_POINTS])
@@ -1192,6 +1225,30 @@ async def test_two_creates_at_once_while_lookups_fail_make_one_order(world: Worl
     third = await w.create_v1(quote, key="key-2", tag="r3")
     rows = await assert_one_order_at_most(w, quote, [first, second, third])
     assert third.status == 200 and len(rows) == 1 and third.order_id == rows[0]["order_id"]
+
+
+async def test_the_in_request_retry_meets_an_order_another_request_wrote_and_answers_it(world: World) -> None:
+    """The first run of the create fails before anything is written and the lookup reads "no
+    order", so the request may run the create again. Before it does, another request writes the
+    quote's order. The second run is refused by the guard and the request answers that order."""
+    w = world
+    w.quotes.consume_lands = False
+    quote = w.quotes.add()
+    w.db.fail("claim_insert", "before", tag="r1", times=1)
+    reached, release = w.db.hold("r1", "claim_insert", "before", skip=1)
+
+    first_task = asyncio.create_task(w.create_v1(quote, key="key-1", tag="r1"))
+    await asyncio.wait_for(reached.wait(), timeout=10)
+    second = await asyncio.wait_for(w.create_v1(quote, key="key-2", tag="r2"), timeout=10)
+    release.set()
+    first = await asyncio.wait_for(first_task, timeout=10)
+
+    rows = await assert_one_order_at_most(w, quote, [first, second])
+    assert len(rows) == 1
+    assert first.status == 200 and second.status == 200, (first.body, second.body)
+    assert first.order_id == second.order_id
+    assert w.create_runs == ["r1", "r1", "r2"]
+    assert w.db.count("order_insert", "r1") == 0
 
 
 async def test_many_creates_racing_on_their_own_connections_write_one_order(world: World) -> None:
@@ -1250,6 +1307,67 @@ async def test_another_agent_on_the_same_quote_id_gets_its_own_order_never_the_f
     await assert_one_order_at_most(w, quote, [a1, a2], agent=AGENT_A)
     await assert_one_order_at_most(w, quote, [b1, b2], agent=AGENT_B)
     assert a1.order_id not in json.dumps(b1.body) and a1.order_id not in json.dumps(b2.body)
+
+
+async def test_a_guard_refusal_is_answered_only_with_the_quotes_own_order(world: World) -> None:
+    """The request is past its first lookup when two rows appear: the quote's order (another key,
+    another provider choice, so nothing this request may replay) and an order of the same agent
+    for ANOTHER quote under this request's idempotency key. The guard refuses the create; the
+    lookup then finds the other quote's order by key. That is not this quote's order: 409."""
+    w = world
+    w.quotes.consume_lands = False
+    quote = w.quotes.add()
+    reached, release = w.db.hold("r1", "claim_insert", "before")
+
+    task = asyncio.create_task(w.create_v1(quote, key="key-1", tag="r1"))
+    await asyncio.wait_for(reached.wait(), timeout=10)
+    holder = _order_data(quote)
+    holder["metadata"]["idempotency_key"] = "key-other"
+    holder["psp_used"] = "adyen"
+    holder_id = await w.orders_module.create_order(holder)
+    other = _order_data(_quote_id())
+    other["metadata"]["idempotency_key"] = "key-1"
+    other_id = await w.orders_module.create_order(other)
+    release.set()
+    answer = await asyncio.wait_for(task, timeout=10)
+
+    assert answer.status == 409 and answer.code == "QUOTE_CONSUMED", answer.body
+    assert other_id not in json.dumps(answer.body)
+    assert [r["order_id"] for r in await w.orders_for(quote)] == [holder_id]
+
+
+async def test_a_guard_refusal_of_the_in_request_retry_that_cannot_be_replayed_is_the_409(world: World) -> None:
+    """The same refusal met by the request's second run of the create (its first run failed busy
+    before writing anything): the answer is the guard's 409, not a retriable 503 that would have
+    the caller resend a create that can never succeed."""
+    w = world
+    w.quotes.consume_lands = False
+    quote = w.quotes.add()
+    w.db.fail("claim_insert", "before", tag="r1", times=1)
+    reached, release = w.db.hold("r1", "claim_insert", "before", skip=1)
+
+    task = asyncio.create_task(w.create_v1(quote, key="key-1", tag="r1", preferred_psp="stripe"))
+    await asyncio.wait_for(reached.wait(), timeout=10)
+    holder = _order_data(quote)
+    holder["metadata"]["idempotency_key"] = "key-other"
+    holder["psp_used"] = "adyen"
+    holder_id = await w.orders_module.create_order(holder)
+    release.set()
+    answer = await asyncio.wait_for(task, timeout=10)
+
+    assert answer.status == 409 and answer.code == "QUOTE_CONSUMED", answer.body
+    assert [r["order_id"] for r in await w.orders_for(quote)] == [holder_id]
+
+
+async def test_a_guard_that_cannot_tell_is_named_as_the_guard_in_the_refusal(world: World) -> None:
+    w = world
+    quote = w.quotes.add()
+    w.db.fail("claim_insert", "before", times=999, message="permission denied for table order_quote_claims")
+
+    answer = await w.create_v1(quote, key="key-1")
+
+    assert_retriable_503(answer, "ORDER_QUOTE_GUARD_UNAVAILABLE")
+    assert await w.orders_for(quote) == []
 
 
 async def test_a_quote_the_caller_does_not_own_is_refused_before_anything_is_read(world: World) -> None:
