@@ -106,8 +106,8 @@ def _merchant_row(mid: str, host: str):
 
 @pytest.fixture
 async def rows(monkeypatch):
-    """Two approved, PSP-connected merchants. Everything this creates (tables, the column, rows)
-    is removed again: the Postgres dialect gate shares one database across files."""
+    """Two approved, PSP-connected merchants. The rows and any table this creates are removed again
+    (the Postgres dialect gate shares one database across files); a column it adds stays."""
     import sqlalchemy
 
     from db.database import metadata
@@ -146,11 +146,12 @@ async def rows(monkeypatch):
     # it on SQLite nor adds `status` to one it finds. A table this fixture created is dropped whole below.
     if not await _has_column("merchant_stores", "status"):
         await database.execute("ALTER TABLE merchant_stores ADD COLUMN status TEXT")
-    added_column = False
     try:
+        # Same rule for merchant_onboarding.is_test: added when missing, never dropped. A merchant_onboarding
+        # another file (or tests/model_schema.ensure_model_tables, or tests/schema_guard_tables.py) built is
+        # left with the column, as prod has it after migration 282 or the schema_guard boot heal.
         if not await _has_column("merchant_onboarding", "is_test"):
             await add_is_test_column()
-            added_column = True
         await database.execute(_merchant_row(M_TEST, TEST_HOST))
         await database.execute(_merchant_row(M_REAL, REAL_HOST))
         yield
@@ -161,8 +162,6 @@ async def rows(monkeypatch):
             params,
         )
         await database.execute("DELETE FROM merchant_onboarding WHERE merchant_id IN (:a, :b)", params)
-        if added_column and "merchant_onboarding" not in created:
-            await database.execute("ALTER TABLE merchant_onboarding DROP COLUMN is_test")
         for table in reversed(created):
             await database.execute(f"DROP TABLE IF EXISTS {table}")
         test_merchant_policy.reset_cache()
