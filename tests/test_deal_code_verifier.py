@@ -37,15 +37,20 @@ def _on(monkeypatch, **extra):
         monkeypatch.setenv(k, str(val))
 
 
-async def _ensure_seed_table(database):
+async def _ensure_seed_table(database) -> bool:
+    """The seed columns this file reads, on the shared test database. True when this file CREATED the table, so the
+    fixture drops it again: a narrow table left behind would break every later file that creates its own wider one
+    with CREATE TABLE IF NOT EXISTS (the sweep shards share one SQLite file). An existing table only gains columns."""
     rows = await database.fetch_all("PRAGMA table_info(external_product_seeds)")
     have = {r["name"] for r in rows}
-    if not have:
+    created = not have
+    if created:
         await database.execute("CREATE TABLE external_product_seeds (id TEXT PRIMARY KEY)")
         have = {"id"}
     for col in _SEED_COLUMNS:
         if col not in have:
             await database.execute(f"ALTER TABLE external_product_seeds ADD COLUMN {col} TEXT")
+    return created
 
 
 @pytest.fixture
@@ -60,7 +65,7 @@ async def db(monkeypatch):
     was_connected = database.is_connected
     if not was_connected:
         await database.connect()
-    await _ensure_seed_table(database)
+    created_seed_table = await _ensure_seed_table(database)
 
     async def _clean():
         for table in reversed(tables):
@@ -77,6 +82,8 @@ async def db(monkeypatch):
         yield database
     finally:
         await _clean()
+        if created_seed_table:
+            await database.execute("DROP TABLE IF EXISTS external_product_seeds")
         if not was_connected:
             await database.disconnect()
 
