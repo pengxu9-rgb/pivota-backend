@@ -30,7 +30,7 @@ whether a seed is served is `seed_row_served` / `seed_row_served_for` alone. A b
 SERVED market (the registry's served markets, which PIVOTA_SERVING_PRICING_REGIONS may only narrow: US and SG
 today), allowlisted, and every other buyer market is refused by name (`seed_buyer_market_refusal`):
 'market_not_served:GB' for a listed market that is not served, 'unknown_market:ZZ' for one the registry
-does not list.
+does not list, and 'market_required' when no buyer market is given (never defaulted to US).
 
 Every rule here is built from code already on main and is not spelled a second time:
   * the row's currency is `seed_offer_currency.seed_currency_of` (column and page read must agree,
@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 from typing import Any, FrozenSet, Iterable, Mapping, Optional
 
-from services.external_seed_search import DEFAULT_SEED_SERVING_MARKET, seed_serving_currency
+from services.external_seed_search import seed_serving_currency
 from services.market_registry import acquisition_markets, market_or_none, normalize_market
 from services.region_pricing import (
     REGION_PRICING_CURRENCY,
@@ -131,10 +131,12 @@ def _served_regions() -> FrozenSet[str]:
 def seed_buyer_market_refusal(buyer_market: Optional[str]) -> Optional[str]:
     """Why a buyer market is served no seed at all, by name, or None when it is a served market.
 
-    A missing buyer market is the default serving market (US), as `seed_serving_currency` reads it.
-    'market_not_served:GB' for a market the registry lists but does not serve (off, acquisition, shadow, or
-    narrowed away by the env); 'unknown_market:ZZ' for one it does not list."""
-    code = normalize_market(buyer_market) or DEFAULT_SEED_SERVING_MARKET
+    'market_required' when no buyer market is given (None, blank): a missing market is REFUSED, never read
+    as the default serving market. 'market_not_served:GB' for a market the registry lists but does not serve
+    (off, acquisition, shadow, or narrowed away by the env); 'unknown_market:ZZ' for one it does not list."""
+    code = normalize_market(buyer_market)
+    if not code:
+        return "market_required"
     if code in _served_regions():
         return None
     if market_or_none(code) is None:
@@ -160,10 +162,10 @@ def seed_row_served_for(row: Mapping[str, Any], buyer_market: Optional[str]) -> 
     (`seed_buyer_market_refusal` is None: US and SG today) and the row's own currency is the one
     `seed_serving_currency(buyer_market)` names, the existing buyer rule.
 
-    That rule reads a missing buyer market as the default serving market (US, so USD); it is not
-    restated here. Every buyer market that is not served is refused by name, whatever region_pricing
-    prices for it: GB (off, GBP), FR (EUR), CA, SE, KR, HK, AU and JP (acquisition), DE and an unknown
-    market. A row that states no currency is never served."""
+    A missing buyer market is refused ('market_required') before that rule is read, so its own
+    missing-market default (US) is never reached from here. Every buyer market that is not served is
+    refused by name, whatever region_pricing prices for it: GB (off, GBP), FR (EUR), CA, SE, KR, HK,
+    AU and JP (acquisition), DE and an unknown market. A row that states no currency is never served."""
     if seed_buyer_market_refusal(buyer_market) is not None:
         return False
     currency = seed_row_currency(row)

@@ -223,9 +223,11 @@ def test_seed_row_served_for_a_buyer_market():
     assert m.seed_row_served_for(sgd, "US") is False
     assert m.seed_row_served_for(usd, "US") is True
     assert m.seed_row_served_for(usd, "SG") is False
-    # The existing buyer rule (seed_serving_currency) reads a missing market as the default serving market.
-    assert m.seed_row_served_for(usd, None) is True
-    assert m.seed_row_served_for(sgd, None) is False
+    # A missing buyer market is refused by name, never defaulted to US.
+    for missing in (None, "", "  "):
+        assert m.seed_row_served_for(usd, missing) is False
+        assert m.seed_row_served_for(sgd, missing) is False
+        assert m.seed_buyer_market_refusal(missing) == "market_required"
     # A market with no known currency, and a row with none, are never served.
     assert m.seed_row_served_for(usd, "DE") is False
     assert m.seed_row_served_for({"market": "US", "price_currency": None}, "US") is False
@@ -242,7 +244,8 @@ _ROW_CURRENCIES = ["USD", "SGD", "GBP", "EUR", "CAD", "SEK", "KRW", "HKD", "AUD"
 _REFUSAL = {"US": None, "SG": None, "GB": "market_not_served:GB", "DE": "unknown_market:DE",
             "FR": "market_not_served:FR", "CA": "market_not_served:CA", "SE": "market_not_served:SE",
             "KR": "market_not_served:KR", "HK": "market_not_served:HK", "AU": "market_not_served:AU",
-            "JP": "market_not_served:JP", "ZZ": "unknown_market:ZZ", "EU-DE": "unknown_market:EU-DE"}
+            "JP": "market_not_served:JP", "ZZ": "unknown_market:ZZ", "EU-DE": "unknown_market:EU-DE",
+            "": "market_required"}
 
 
 @pytest.mark.parametrize("buyer", _BUYER_MARKETS, ids=[repr(b) for b in _BUYER_MARKETS])
@@ -250,8 +253,8 @@ def test_the_priced_path_rule_for_every_buyer_market(buyer):
     """US/SG/GB/DE/none and every other listed or unknown market: a seed is served only to a SERVED buyer
     market (US, SG: the registry's served markets), and only in that market's registry currency. Every other
     buyer market is served nothing and refused by name, even GB, FR, CA, SE, KR and HK, whose own currencies
-    region_pricing prices. A missing market is the default serving market, US (the existing buyer rule)."""
-    code = market_registry.normalize_market(buyer) or "US"
+    region_pricing prices. A missing market (None, '') is served nothing and refused as 'market_required'."""
+    code = market_registry.normalize_market(buyer)
     served_markets = set(market_registry.served_markets())
     assert served_markets == {"US", "SG"}
     wanted = market_registry.currency_for(code) if code in served_markets else None
@@ -276,7 +279,7 @@ def test_no_buyer_market_is_served_when_the_serving_list_does_not_load(monkeypat
         raise ValueError("registry did not load")
 
     monkeypatch.setattr(ips, "serving_pricing_regions", _boom)
-    for buyer, currency in (("US", "USD"), (None, "USD"), ("SG", "SGD")):
+    for buyer, currency in (("US", "USD"), ("SG", "SGD")):
         assert m.seed_row_served_for({"price_currency": currency}, buyer) is False
     assert m.seed_buyer_market_refusal("US") == "market_not_served:US"
 
@@ -297,6 +300,19 @@ def test_a_buyer_rule_that_serves_an_off_market_fails(mutant):
     cases = [({"price_currency": "GBP"}, "GB"), ({"price_currency": "CAD"}, "CA"), ({"price_currency": "KRW"}, "KR")]
     assert any(mutant(row, buyer) for row, buyer in cases)
     assert not any(m.seed_row_served_for(row, buyer) for row, buyer in cases)
+
+
+def test_the_old_missing_market_means_us_default_fails():
+    """The rule before 11-13 read a missing buyer market as US. The ratchet (be#2808) forbids a silent market
+    default on partner-reachable code; this pins that a missing market is refused, not served USD."""
+    def old_refusal(buyer):
+        code = market_registry.normalize_market(buyer) or "US"
+        return None if code in {"US", "SG"} else f"market_not_served:{code}"
+
+    usd = {"price_currency": "USD"}
+    assert old_refusal(None) is None and m.seed_serving_currency(None) == "USD"
+    assert m.seed_buyer_market_refusal(None) == "market_required"
+    assert m.seed_row_served_for(usd, None) is False
 
 
 def test_served_currencies_moved_and_is_re_exported():
