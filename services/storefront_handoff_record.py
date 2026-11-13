@@ -26,8 +26,10 @@ a guessed one. The esc id itself is not stored: a seller-priced id carries the s
 which is that seller's bearer handle.
 
 ROWS ARE NOT CLICKS. click_count stays 0 and `/r` never sees this id (no token carries it). Every
-reader that counts ISSUED links must leave this surface out (scripts/agent_attribution_funnel.py
-does; O-02 review B-2), or each hand-off reads as one more issued link nobody followed. The
+reader that counts ISSUED links must leave this surface out, or each hand-off reads as one more
+issued link nobody followed. The two that count issued rows both do: scripts/agent_attribution_funnel.py
+(O-02 review B-2) and services/click_reporting.py (the staff issued-vs-clicked report). The operator
+smoke's per-merchant row count (scripts/smoke_commerce_channels_signoff.py) leaves it out too. The
 inferred-click lookup and the merchant funnels only read rows /r touched (click or impression
 count > 0). The conversion pollers' candidate queries (services/external_conversion_poller.py,
 services/woocommerce_conversion_poller.py) select merchants from ANY recent row, so a hand-off row
@@ -37,10 +39,13 @@ WooCommerce store, which an escalated seller is not, so nothing is polled for it
 LATER STATE. What the hand-off became is read from records this service already keeps, keyed on
 the REFERRAL click the catalog link carried (pvt_click_id), never on anything a caller sends, and
 ONLY when that referral click was issued to THIS partner (its surface_click_events row names the
-hand-off's owner as agent_id; O-02 review B-1):
+hand-off's owner as agent_id; O-02 review B-1) and is NOT stamped test traffic
+(services.test_traffic; a stamped referral click reads as no click at all):
   buyer_followed_link    `/r` counted a click on that referral id at or after the hand-off;
   seller_order_observed  a converted commerce_attribution_edges row joins that referral id, at or
-                         after the hand-off, credited to this partner or to no agent.
+                         after the hand-off, credited to this partner or to no agent, and NOT
+                         stamped test traffic (services.test_traffic: a rig merchant's or a test
+                         order's edge is no seller order to report to a partner).
 A referral id with no click row, an agent-less one (a link minted for no caller in particular: the
 product-detail mint, the shared search cache) or another agent's may be shared by every caller
 served that link, so it says nothing about THIS partner's buyer: such a hand-off answers
@@ -60,6 +65,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from db.database import database
 from services.commerce_attribution_service import IssuedClick, issue_click
+from services.test_traffic import not_test_traffic_sql
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +209,14 @@ async def _later_state(row: Mapping[str, Any], context: Mapping[str, Any]) -> Di
         return out
     try:
         click = await database.fetch_one(
-            "SELECT agent_id, click_count, last_click_at FROM surface_click_events WHERE click_id = :click_id",
+            "SELECT agent_id, click_count, last_click_at FROM surface_click_events WHERE click_id = :click_id "
+            # A referral click stamped test traffic at write (a synthetic caller's, a rig seller's) is
+            # nobody's buyer: it is not found here, so neither a follow nor an order is read from it.
+            "AND " + not_test_traffic_sql("context"),
             {"click_id": referral},
         )
         click = dict(click) if click is not None else None
-        # BOUND TO THIS PARTNER, or not read at all: no row, no agent, or another agent's.
+        # BOUND TO THIS PARTNER, or not read at all: no row, no agent, another agent's, or a test click.
         if not click or str(click.get("agent_id") or "") != owner:
             return out
         last_click = _aware(click.get("last_click_at"))
@@ -219,6 +228,8 @@ async def _later_state(row: Mapping[str, Any], context: Mapping[str, Any]) -> Di
             "SELECT state, converted_at, created_at FROM commerce_attribution_edges "
             "WHERE click_id = :click_id AND state = 'converted' "
             "AND (agent_id IS NULL OR agent_id = '' OR agent_id = :owner) "
+            # A test order (stamped at write) is not a seller order: the same exclusion the money reads apply.
+            "AND " + not_test_traffic_sql("metadata") + " "
             "ORDER BY created_at DESC LIMIT 1",
             {"click_id": referral, "owner": owner},
         )

@@ -380,7 +380,7 @@ def _fetch_merchant_commerce_readiness_evidence(
                         (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s AND event_type = 'order.created') AS ordered_event_count,
                         (SELECT COUNT(*) FROM commerce_interaction_events WHERE merchant_id = %s AND event_type = 'refund.succeeded') AS refunded_event_count,
                         (SELECT COUNT(*) FROM surface_listing_states WHERE merchant_id = %s) AS listing_row_count,
-                        (SELECT COUNT(*) FROM surface_click_events WHERE merchant_id = %s) AS click_row_count,
+                        (SELECT COUNT(*) FROM surface_click_events WHERE merchant_id = %s AND COALESCE(surface, '') <> 'ucp_storefront_handoff') AS click_row_count,
                         (SELECT COUNT(*) FROM commerce_attribution_edges WHERE merchant_id = %s) AS attribution_edge_count
                     """,
                     (

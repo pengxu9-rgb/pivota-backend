@@ -343,3 +343,79 @@ def test_smoke_commerce_channels_signoff_uses_detected_wix_platform(monkeypatch,
     assert webhook_step["body"]["platform"] == "wix"
     assert all(call["platform"] == "wix" for call in backfill_calls)
     assert not any("/v1/catalog/connectors/shopify/webhooks" in url for _, url, _ in fake_session.calls)
+
+
+# --- the per-merchant click row count leaves the storefront hand-off surface out --------------------
+
+
+class _CapturingCursor:
+    def __init__(self, statements):
+        self._statements = statements
+        self.description = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._statements.append((sql, params))
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
+class _CapturingConnection:
+    def __init__(self, statements):
+        self._statements = statements
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return _CapturingCursor(self._statements)
+
+
+def click_row_count_sql(monkeypatch) -> str:
+    """The `click_row_count` sub-select exactly as the script's readiness evidence read sends it."""
+    import re
+
+    statements = []
+    monkeypatch.setattr(module, "_connect_postgres", lambda url: _CapturingConnection(statements))
+    module._fetch_merchant_commerce_readiness_evidence(database_url="postgresql://unused", merchant_id="merch_1")
+    (ledger_sql,) = [sql for sql, _ in statements if "click_row_count" in sql]
+    (sub_select,) = re.findall(r"\((SELECT COUNT\(\*\) FROM surface_click_events[^\n]*)\) AS click_row_count", ledger_sql)
+    return sub_select
+
+
+def test_the_click_row_count_does_not_count_storefront_hand_off_rows(monkeypatch) -> None:
+    """A hand-off record and a store-cart referral share surface_click_events but are not click rows
+    (services/storefront_handoff_record.py). The script's own count, run as written on a table
+    holding both beside two ordinary rows, counts the ordinary ones only, per merchant."""
+    import sqlite3
+
+    from services.storefront_handoff_record import HANDOFF_SURFACE
+
+    sub_select = click_row_count_sql(monkeypatch)
+    # The script is standalone and spells the surface out: it must be the one the writers use.
+    assert f"<> '{HANDOFF_SURFACE}'" in sub_select
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE surface_click_events (click_id TEXT PRIMARY KEY, merchant_id TEXT, surface TEXT)")
+    db.executemany("INSERT INTO surface_click_events VALUES (?, ?, ?)", [
+        ("clk_link_1", "merch_1", "agent"),
+        ("clk_link_2", "merch_1", "find_products_multi"),
+        ("esh_record", "merch_1", HANDOFF_SURFACE),
+        ("clk_referral", "merch_1", HANDOFF_SURFACE),
+        ("clk_other_merchant", "merch_2", "agent"),
+        ("clk_other_referral", "merch_2", HANDOFF_SURFACE),
+    ])
+    count = lambda merchant: db.execute(sub_select.replace("%s", "?"), (merchant,)).fetchone()[0]  # noqa: E731
+    assert (count("merch_1"), count("merch_2"), count("merch_3")) == (2, 1, 0)
+    db.close()
